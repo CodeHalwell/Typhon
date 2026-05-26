@@ -406,6 +406,15 @@ pub enum TycError {
     },
 
     /// A function was called with the wrong number of positional arguments.
+    ///
+    /// Special-case: when `expected == actual` the literal "expected N,
+    /// got N" reads as a self-contradiction. This shape appears when the
+    /// upstream type-checker bumps `expected` to include keyword-only
+    /// parameters (so the count comparison passes if you sum
+    /// positional + kw-only) but the user passed every argument
+    /// positionally. The diagnostic rephrases for that case via the
+    /// `#[help]` slot so the user sees "pass them by name" instead of
+    /// "expected 2, got 2". FINDINGS #36.
     #[error("wrong number of arguments to `{name}`: expected {expected}, got {actual}")]
     #[diagnostic(
         code(tyc::arg_count),
@@ -415,6 +424,13 @@ pub enum TycError {
         name: String,
         expected: usize,
         actual: usize,
+        /// Optional help string populated by the constructor when the
+        /// count-equal case fires. `Some("function `f` declares some
+        /// parameters as keyword-only; pass them by name (e.g.
+        /// `f(a=1, b=2)`)")` for kw-only mismatch; `None` otherwise so
+        /// miette skips the help block.
+        #[help]
+        suggestion: Option<String>,
         #[source_code]
         src: NamedSource<String>,
         #[label("called with {actual} argument(s) here")]
@@ -1614,6 +1630,15 @@ impl TycError {
     }
 
     /// Construct a [`TycError::WrongArgCount`] diagnostic.
+    ///
+    /// When `expected == actual` the rendered message reads "expected N,
+    /// got N", which is self-contradictory at the headline level. The
+    /// upstream checker produces this shape when the call site passed
+    /// every argument positionally but some of the parameters are
+    /// keyword-only — the count comparison sums positional + kw-only,
+    /// so it passes if you ignore the calling-convention mismatch.
+    /// In that case the constructor populates the `#[help]` field with
+    /// "pass them by name" so the user gets actionable advice. FINDINGS #36.
     pub fn wrong_arg_count(
         name: impl Into<String>,
         expected: usize,
@@ -1623,10 +1648,20 @@ impl TycError {
         offset: usize,
         length: usize,
     ) -> Self {
+        let name_s: String = name.into();
+        let suggestion = if expected == actual {
+            Some(format!(
+                "`{name_s}` declares some parameters as keyword-only; \
+                 pass them by name (e.g. `{name_s}(a=1, b=2)`)"
+            ))
+        } else {
+            None
+        };
         Self::WrongArgCount {
-            name: name.into(),
+            name: name_s,
             expected,
             actual,
+            suggestion,
             src: NamedSource::new(path.into(), source.into()),
             span: SourceSpan::new(SourceOffset::from(offset), length),
         }
@@ -2561,6 +2596,41 @@ mod tests {
         assert!(msg.contains("f"));
         assert!(msg.contains('2'), "expected count should appear");
         assert!(msg.contains('3'), "actual count should appear");
+    }
+
+    #[test]
+    fn wrong_arg_count_equal_counts_gets_kw_only_help() {
+        // FINDINGS #36: when expected == actual, the headline alone is
+        // self-contradictory ("expected 2, got 2"). The constructor
+        // populates the help slot with a kw-only nudge so the message
+        // makes sense.
+        let e = TycError::wrong_arg_count("f", 2, 2, "a.ty", "f(1, 2)", 0, 7);
+        let TycError::WrongArgCount { suggestion, .. } = &e else {
+            panic!("expected WrongArgCount variant");
+        };
+        let help = suggestion
+            .as_deref()
+            .expect("equal-counts case must populate the help slot");
+        assert!(
+            help.contains("keyword-only"),
+            "help should mention keyword-only, got: {help}"
+        );
+        assert!(help.contains("pass them by name"));
+    }
+
+    #[test]
+    fn wrong_arg_count_unequal_counts_no_help() {
+        // The kw-only hint must NOT fire on a genuine count mismatch
+        // (otherwise users would see "pass them by name" for the
+        // unrelated forgot-an-argument case).
+        let e = TycError::wrong_arg_count("f", 2, 3, "a.ty", "f(1, 2, 3)", 0, 9);
+        let TycError::WrongArgCount { suggestion, .. } = &e else {
+            panic!("expected WrongArgCount variant");
+        };
+        assert!(
+            suggestion.is_none(),
+            "unequal-counts must NOT carry the kw-only hint; got: {suggestion:?}"
+        );
     }
 
     #[test]
