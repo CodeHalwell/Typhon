@@ -4,6 +4,49 @@
 
 Realistic milestones for one person plus AI assistance. The headline target is a useful subset shippable in twelve months.
 
+## Current release
+
+**[v0.7.0](https://github.com/CodeHalwell/Typhon/releases/tag/v0.7.0) — 2026-05-25.**
+The carry-over minor release that closes the Round-3 apps-feedback
+campaign on top of v0.6.0 / v0.6.1. Phases 0–3 + Phase 5 / 5.5 /
+6 are complete; v0.7.0 ships the third stress round's findings as
+compiler features rather than open issues. Strictly additive — every
+previously-accepted program continues to compile to identical Python.
+
+Headline changes vs. v0.6.1:
+
+- `pub *` wildcard re-export aggregation in `__init__.ty`, transitive
+  through sub-packages (cycle-safe via a `visited` set), backed by
+  `tyc::pub_name_collision` and `tyc::pub_star_outside_init`.
+- Declare-only `let NAME: T` with arm-assignment in `match` / `if` /
+  `elif` / `else`. Companion `tyc::use_of_uninitialised` definite-
+  assignment analysis fires on reads from paths that didn't assign.
+- `with cm() as r:` types `r` from `__enter__` / `__aenter__` and
+  from `@contextmanager` / `@asynccontextmanager` factories.
+- `await` on `Callable[..., Awaitable[T]]` / `Coroutine[Y, S, T]`
+  unwraps to `T` — the biggest single Round-3 finding.
+- Same-newtype arithmetic preserves the newtype across
+  `+ - * // % **`. Cross-module generic method dispatch propagates
+  class TypeVars.
+- Resolver / syntax polish: nested arm-import binding, sibling
+  `if`/`elif` no longer trips `no_block_shadow`, multi-line `go
+  expr(...)` parses, ternary narrowing, `tyc::field_default_ordering`.
+- Five new production-shaped reference apps under `examples/apps/`
+  (real-time game server, static site generator, vector DB, API
+  gateway, stream processor) on top of the original ten. All fifteen
+  re-organised into grouped subdirectories with `pub *` `__init__.ty`
+  facades. VS Code extension bumped to `0.2.0`.
+
+For the per-release breakdown of the v0.3.x / v0.4.x / v0.5.x /
+v0.6.x line — and the canonical phase-by-phase status below — see
+[CHANGELOG.md](../CHANGELOG.md) and the [Project
+Status](https://codehalwell.github.io/Typhon/introduction/status/)
+docs-site page.
+
+Open frontier work (full HKT unification, general inter-procedural
+field-init audit) is unchanged from v0.5.0 — see
+[`TYPE_SYSTEM_FRONTIER.md`](../TYPE_SYSTEM_FRONTIER.md).
+
 ## Phase 0 — Foundation (months 1–2) ✅ complete
 
 - ✅ Fork `ruff_python_parser` and `ruff_python_ast` into `vendor/`. The

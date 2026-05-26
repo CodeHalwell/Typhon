@@ -11,7 +11,7 @@
     Default version:           the latest GitHub Release.
 
 .PARAMETER Version
-    A release tag to install (e.g. "v0.3.0"). Defaults to the latest
+    A release tag to install (e.g. "v0.7.0"). Defaults to the latest
     release resolved via the GitHub API.
 
 .PARAMETER InstallDir
@@ -27,7 +27,7 @@
 
 .EXAMPLE
     # Install a specific version to a custom directory
-    .\install.ps1 -Version v0.3.0 -InstallDir C:\Tools\Typhon
+    .\install.ps1 -Version v0.7.0 -InstallDir C:\Tools\Typhon
 
 .EXAMPLE
     # Install without modifying PATH
