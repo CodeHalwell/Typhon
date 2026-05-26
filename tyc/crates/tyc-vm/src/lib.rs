@@ -330,6 +330,28 @@ print(fast(7))
     }
 
     #[test]
+    fn subclass_constructor_inherits_parent_fields() {
+        // FINDINGS #22: `class Dog(Animal):` should accept the parent's
+        // `name`/`age` kwargs in addition to its own `breed`. The desugar
+        // pass now prepends the parent's field annotations to the
+        // subclass body so the VM's auto-`__init__` collects all three.
+        let src = r#"
+class Animal:
+    name: str
+    age: int
+
+class Dog(Animal):
+    breed: str
+
+let d = Dog(name="Rex", age=5, breed="Husky")
+print(d.name)
+print(d.age)
+print(d.breed)
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    #[test]
     fn extend_builtin_str_method_dispatches() {
         // FINDINGS #21: `extend str: def slug(self) -> str: …` used to
         // fail at runtime with AttributeError. The VM now runs the same

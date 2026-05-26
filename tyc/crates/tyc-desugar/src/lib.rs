@@ -1058,6 +1058,16 @@ fn desugar_mod_module_with(m: &ModModule, options: &DesugarOptions) -> ModModule
     // Merge `impl` pseudo-classes into their target classes and remove the stubs.
     let (merged_body, _) = merge_impl_blocks(new_body);
 
+    // FINDINGS #22: propagate parent field annotations into subclass bodies
+    // so the VM's auto-`__init__` synthesiser (which reads `class.fields`
+    // directly from class-body `AnnAssign` nodes) accepts inherited fields
+    // as kwargs. The compile path runs through CPython's `@dataclass(slots
+    // =True)` decorator, which already walks the MRO when collecting
+    // fields, so no transformation is needed there — but the duplicated
+    // annotation is harmless under `@dataclass` and keeps the desugared
+    // module consistent across run modes.
+    let merged_body = inherit_parent_fields(merged_body);
+
     // Inject `@functools.cache` on every top-level function name the purity
     // analyser flagged as opted-into memoisation.  Returns whether any cache
     // decorator was added so we can also inject `import functools` once.
@@ -2725,6 +2735,124 @@ fn merge_impl_blocks(body: Vec<Stmt>) -> (Vec<Stmt>, bool) {
         .collect();
 
     (new_body, true)
+}
+
+/// FINDINGS #22: walk every class in `body`, build a `name → field-annotation`
+/// map, and prepend the parent class's field annotations to every subclass
+/// whose direct base is present in the map. Fields are inserted ahead of
+/// the existing class body so they precede any locally-declared field
+/// (parent fields first matches CPython's `@dataclass` MRO walk).
+///
+/// Only `AnnAssign` statements that look like \"field declarations\"
+/// (target is a bare `Name`, annotation is present) are propagated. Class
+/// methods, docstrings, and class-level assignments are left on the parent
+/// only — the VM's `find_method` already walks `class.bases`, so methods
+/// are inherited at lookup time without duplication.
+///
+/// A field declared on both parent and child is kept from the child (the
+/// child's annotation wins; the parent's copy is dropped from the
+/// prepended block). This matches `@dataclass` field-override semantics.
+///
+/// Recurses into nested function/class bodies so a class defined inside a
+/// function still benefits from this transformation.
+fn inherit_parent_fields(body: Vec<Stmt>) -> Vec<Stmt> {
+    // First pass: collect each class's own field annotations, indexed by name.
+    let mut field_map: HashMap<String, Vec<Stmt>> = HashMap::new();
+    fn collect_fields(stmts: &[Stmt], field_map: &mut HashMap<String, Vec<Stmt>>) {
+        for stmt in stmts {
+            if let Stmt::ClassDef(c) = stmt {
+                let mut fields: Vec<Stmt> = Vec::new();
+                for member in &c.body {
+                    if let Stmt::AnnAssign(a) = member {
+                        if matches!(a.target.as_ref(), Expr::Name(_)) {
+                            fields.push(member.clone());
+                        }
+                    }
+                }
+                field_map.insert(c.name.as_str().to_owned(), fields);
+                collect_fields(&c.body, field_map);
+            } else if let Stmt::FunctionDef(f) = stmt {
+                collect_fields(&f.body, field_map);
+            }
+        }
+    }
+    collect_fields(&body, &mut field_map);
+
+    fn rewrite(stmts: Vec<Stmt>, field_map: &HashMap<String, Vec<Stmt>>) -> Vec<Stmt> {
+        stmts
+            .into_iter()
+            .map(|stmt| match stmt {
+                Stmt::ClassDef(mut c) => {
+                    // Recurse so a class defined inside another class
+                    // body is also rewritten.
+                    let inner = std::mem::take(&mut c.body);
+                    c.body = rewrite(inner, field_map);
+
+                    // Names already declared as fields on `c` — never
+                    // shadow a child field with the parent's annotation.
+                    let mut own_field_names: std::collections::HashSet<String> =
+                        std::collections::HashSet::new();
+                    for s in &c.body {
+                        if let Stmt::AnnAssign(a) = s {
+                            if let Expr::Name(n) = a.target.as_ref() {
+                                own_field_names.insert(n.id.as_str().to_owned());
+                            }
+                        }
+                    }
+
+                    // Walk every direct base name; prepend the
+                    // matching parent's fields (skip any name the
+                    // child already declares). Bases are walked in
+                    // declaration order so the resulting body reads
+                    // [base_a fields, base_b fields, own fields,
+                    // methods].
+                    let mut inherited: Vec<Stmt> = Vec::new();
+                    for base in c.bases() {
+                        if let Expr::Name(n) = base {
+                            if let Some(parent_fields) = field_map.get(n.id.as_str()) {
+                                for pf in parent_fields {
+                                    if let Stmt::AnnAssign(a) = pf {
+                                        if let Expr::Name(nf) = a.target.as_ref() {
+                                            if own_field_names.contains(nf.id.as_str()) {
+                                                continue;
+                                            }
+                                            own_field_names
+                                                .insert(nf.id.as_str().to_owned());
+                                            inherited.push(pf.clone());
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if !inherited.is_empty() {
+                        // Insert inherited fields after any leading
+                        // docstring so `__doc__` is preserved.
+                        let insert_at = if let Some(Stmt::Expr(e)) = c.body.first() {
+                            if matches!(&*e.value, Expr::StringLiteral(_)) {
+                                1
+                            } else {
+                                0
+                            }
+                        } else {
+                            0
+                        };
+                        for (i, field) in inherited.into_iter().enumerate() {
+                            c.body.insert(insert_at + i, field);
+                        }
+                    }
+                    Stmt::ClassDef(c)
+                }
+                Stmt::FunctionDef(mut f) => {
+                    let inner = std::mem::take(&mut f.body);
+                    f.body = rewrite(inner, field_map);
+                    Stmt::FunctionDef(f)
+                }
+                other => other,
+            })
+            .collect()
+    }
+    rewrite(body, &field_map)
 }
 
 /// Inject an implicit receiver parameter into a method from an `impl` block.
