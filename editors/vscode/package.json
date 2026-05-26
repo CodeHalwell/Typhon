@@ -2,7 +2,7 @@
   "name": "typhon",
   "displayName": "Typhon",
   "description": "Language support for Typhon — a statically-typed superset of Python.",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "publisher": "typhon-lang",
   "license": "MIT",
   "repository": {
