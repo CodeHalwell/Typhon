@@ -2263,6 +2263,28 @@ impl<'a> Checker<'a> {
                     {
                         return false;
                     }
+                    // FINDINGS v0.7.1 #2: parameter-type conformance. The
+                    // implementer must accept at least every value the
+                    // interface promises, so each class parameter must be a
+                    // supertype of the corresponding interface parameter.
+                    // Unknown on either side is permissive (matches the
+                    // return-type rule). Self-referential interface params
+                    // are skipped to avoid recursion, mirroring the
+                    // return-type carve-out.
+                    let cmp_len = iface_sig.param_types.len().min(cls_sig.param_types.len());
+                    for i in 0..cmp_len {
+                        let ip = &iface_sig.param_types[i];
+                        let cp = &cls_sig.param_types[i];
+                        if matches!(ip, Type::Unknown) || matches!(cp, Type::Unknown) {
+                            continue;
+                        }
+                        if *ip == iface_class_type {
+                            continue;
+                        }
+                        if !self.is_assignable(cp, ip) {
+                            return false;
+                        }
+                    }
                 }
                 _ => return false,
             }
@@ -2390,6 +2412,31 @@ impl<'a> Checker<'a> {
                             iface_sig.return_type.display(),
                             cls_sig.return_type.display()
                         ));
+                    }
+                    // FINDINGS v0.7.1 #2: parameter-type mismatches were
+                    // silent before. Compare each position contravariantly
+                    // (class param must accept the interface param's type)
+                    // and surface the first mismatching index. Unknowns and
+                    // self-typed interface params are skipped.
+                    let cmp_len = iface_sig.param_types.len().min(cls_sig.param_types.len());
+                    for i in 0..cmp_len {
+                        let ip = &iface_sig.param_types[i];
+                        let cp = &cls_sig.param_types[i];
+                        if matches!(ip, Type::Unknown) || matches!(cp, Type::Unknown) {
+                            continue;
+                        }
+                        if *ip == iface_class_type {
+                            continue;
+                        }
+                        if !self.is_assignable(cp, ip) {
+                            missing.push(format!(
+                                "{m}(param {} type mismatch: expected `{}`, got `{}`)",
+                                i,
+                                ip.display(),
+                                cp.display(),
+                            ));
+                            break;
+                        }
                     }
                 }
                 Some(cls_sig) => missing.push(format!(
@@ -16627,6 +16674,44 @@ def main() -> None:
         assert!(
             !d.has_errors(),
             "list.append must still resolve; got: {:?}",
+            d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    /// FINDINGS v0.7.1 #2: interface parameter-type mismatches were silent.
+    /// A class whose method has the right name and arity but wrong param
+    /// type must NOT satisfy the interface.
+    #[test]
+    fn v071_interface_param_type_mismatch_rejected() {
+        let src = "\
+interface Repo:
+    def save(self, item: str) -> bool: ...
+
+class BadRepo:
+    pass
+
+impl BadRepo:
+    def save(self, item: int) -> bool:
+        return True
+
+def use(r: Repo) -> None:
+    pass
+
+def main() -> None:
+    use(BadRepo())
+";
+        let d = check(src);
+        assert!(
+            d.has_errors(),
+            "interface param-type mismatch must be flagged; got: {:?}",
+            d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+        assert!(
+            d.errors().iter().any(|e| {
+                let m = e.to_string();
+                m.contains("save") || m.contains("Repo")
+            }),
+            "diagnostic should reference the interface or method; got: {:?}",
             d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
         );
     }
