@@ -1327,6 +1327,28 @@ pub enum TycError {
         #[label("annotate this binding to fix")]
         span: SourceSpan,
     },
+
+    /// A type annotation references a deprecated `typing.<Name>` alias by
+    /// name (`List[int]`, `Dict[str, int]`, `Optional[int]`,
+    /// `Union[int, str]`, …) even though the import is rejected. The
+    /// reference is silently accepted as a forward-reference name; this
+    /// warning surfaces the inconsistency so users migrate to the
+    /// built-in lowercase forms (`list`, `dict`, `T?`, `A | B`).
+    #[error("`{name}` in an annotation is the deprecated `typing.{name}` alias")]
+    #[diagnostic(
+        severity(Warning),
+        code(tyc::typing_alias_in_annotation),
+        url("https://typhon.dev/lang/diagnostics/typing_alias_in_annotation"),
+        help("Use `{suggestion}` instead — the deprecated `typing.{name}` alias is rejected on import and should not be used in annotations either.")
+    )]
+    TypingAliasInAnnotation {
+        name: String,
+        suggestion: String,
+        #[source_code]
+        src: NamedSource<String>,
+        #[label("prefer `{suggestion}` here")]
+        span: SourceSpan,
+    },
 }
 
 impl TycError {
@@ -2448,6 +2470,24 @@ impl TycError {
         Self::EmptyCollectionNoAnnotation {
             name: name.into(),
             literal: literal.into(),
+            src: NamedSource::new(path.into(), source.into()),
+            span: SourceSpan::new(SourceOffset::from(offset), length.max(1)),
+        }
+    }
+
+    /// Construct a [`TycError::TypingAliasInAnnotation`] warning for a
+    /// deprecated `typing.<Name>` alias referenced from an annotation.
+    pub fn typing_alias_in_annotation(
+        name: impl Into<String>,
+        suggestion: impl Into<String>,
+        path: impl Into<String>,
+        source: impl Into<String>,
+        offset: usize,
+        length: usize,
+    ) -> Self {
+        Self::TypingAliasInAnnotation {
+            name: name.into(),
+            suggestion: suggestion.into(),
             src: NamedSource::new(path.into(), source.into()),
             span: SourceSpan::new(SourceOffset::from(offset), length.max(1)),
         }

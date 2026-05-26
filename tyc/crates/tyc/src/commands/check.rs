@@ -11,8 +11,8 @@ use clap::Args;
 use miette::{miette, Result};
 
 use tyc_analyse::{
-    analyse_empty_collection_bindings, analyse_purity, evaluate_comptime_with_functions,
-    purity_diagnostics,
+    analyse_empty_collection_bindings, analyse_purity, analyse_typing_alias_annotations,
+    evaluate_comptime_with_functions, purity_diagnostics,
 };
 use tyc_db::{check_file_with_imports, extract_shapes_for_path, TycDatabase};
 use tyc_diagnostics::{Diagnostics, TycError};
@@ -874,6 +874,17 @@ fn run_secondary_passes(
     // silently swallows later element-type mismatches. The pass walks the
     // already-preprocessed module, so spans line up with `prep.python_source`.
     diags.extend(analyse_empty_collection_bindings(
+        &module,
+        path,
+        &prep.python_source,
+    ));
+
+    // Typing-alias-in-annotation lint (`tyc::typing_alias_in_annotation`):
+    // the `typing.List` / `typing.Dict` / `Optional` / `Union` aliases are
+    // rejected on import but were silently accepted inside annotations as
+    // forward-reference names. Walk every annotation and surface the same
+    // migration advice.
+    diags.extend(analyse_typing_alias_annotations(
         &module,
         path,
         &prep.python_source,

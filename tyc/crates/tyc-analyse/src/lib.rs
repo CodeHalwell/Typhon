@@ -2930,12 +2930,188 @@ fn empty_collection_kind(expr: &Expr) -> Option<&'static str> {
     }
 }
 
+/// Names that, when referenced inside a type annotation, indicate the
+/// user is reaching for a deprecated `typing.<Name>` alias even though
+/// the import would have been rejected by `tyc::typing_alias_deprecated`.
+/// The returned suggestion mirrors the migration target.
+fn typing_alias_suggestion(name: &str) -> Option<&'static str> {
+    match name {
+        "List" => Some("list"),
+        "Dict" => Some("dict"),
+        "Tuple" => Some("tuple"),
+        "Set" => Some("set"),
+        "FrozenSet" => Some("frozenset"),
+        "Type" => Some("type"),
+        // Optional[T] -> T? (Typhon's nullable sugar). The suggestion is
+        // a single concrete sigil rather than a generic spelling because
+        // the migration is mechanical.
+        "Optional" => Some("T?"),
+        // Union[A, B] -> A | B.
+        "Union" => Some("A | B"),
+        _ => None,
+    }
+}
+
+/// Walk every annotation expression in `module` and warn when it
+/// references a deprecated `typing.<Name>` alias by bare name (`List`,
+/// `Dict`, `Tuple`, `Set`, `FrozenSet`, `Type`, `Optional`, `Union`).
+/// The annotation is silently accepted as a forward-reference name; the
+/// warning surfaces the inconsistency so users migrate to the built-in
+/// lowercase / sugar forms.
+pub fn analyse_typing_alias_annotations(
+    module: &ModModule,
+    path: &str,
+    source: &str,
+) -> Diagnostics {
+    let mut diags = Diagnostics::new();
+    walk_annotation_stmts(&module.body, path, source, &mut diags);
+    diags
+}
+
+fn walk_annotation_stmts(body: &[Stmt], path: &str, source: &str, diags: &mut Diagnostics) {
+    for stmt in body {
+        match stmt {
+            Stmt::AnnAssign(a) => {
+                walk_annotation_expr(&a.annotation, path, source, diags);
+            }
+            Stmt::FunctionDef(f) => {
+                if let Some(ret) = f.returns.as_deref() {
+                    walk_annotation_expr(ret, path, source, diags);
+                }
+                for param in f.parameters.posonlyargs.iter() {
+                    if let Some(ann) = param.parameter.annotation.as_deref() {
+                        walk_annotation_expr(ann, path, source, diags);
+                    }
+                }
+                for param in f.parameters.args.iter() {
+                    if let Some(ann) = param.parameter.annotation.as_deref() {
+                        walk_annotation_expr(ann, path, source, diags);
+                    }
+                }
+                for param in f.parameters.kwonlyargs.iter() {
+                    if let Some(ann) = param.parameter.annotation.as_deref() {
+                        walk_annotation_expr(ann, path, source, diags);
+                    }
+                }
+                if let Some(va) = f.parameters.vararg.as_deref() {
+                    if let Some(ann) = va.annotation.as_deref() {
+                        walk_annotation_expr(ann, path, source, diags);
+                    }
+                }
+                if let Some(kw) = f.parameters.kwarg.as_deref() {
+                    if let Some(ann) = kw.annotation.as_deref() {
+                        walk_annotation_expr(ann, path, source, diags);
+                    }
+                }
+                walk_annotation_stmts(&f.body, path, source, diags);
+            }
+            Stmt::ClassDef(c) => walk_annotation_stmts(&c.body, path, source, diags),
+            Stmt::If(i) => {
+                walk_annotation_stmts(&i.body, path, source, diags);
+                for clause in &i.elif_else_clauses {
+                    walk_annotation_stmts(&clause.body, path, source, diags);
+                }
+            }
+            Stmt::While(w) => {
+                walk_annotation_stmts(&w.body, path, source, diags);
+                walk_annotation_stmts(&w.orelse, path, source, diags);
+            }
+            Stmt::For(f) => {
+                walk_annotation_stmts(&f.body, path, source, diags);
+                walk_annotation_stmts(&f.orelse, path, source, diags);
+            }
+            Stmt::With(w) => walk_annotation_stmts(&w.body, path, source, diags),
+            Stmt::Try(t) => {
+                walk_annotation_stmts(&t.body, path, source, diags);
+                walk_annotation_stmts(&t.orelse, path, source, diags);
+                walk_annotation_stmts(&t.finalbody, path, source, diags);
+                for h in &t.handlers {
+                    let ruff_python_ast::ExceptHandler::ExceptHandler(h) = h;
+                    walk_annotation_stmts(&h.body, path, source, diags);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Recurse into an annotation expression and report every name reference
+/// that looks like a `typing.<Name>` alias. Walks subscripts (`List[int]`),
+/// unions, tuples, and `Optional[T]` recursively so nested usages like
+/// `dict[str, Optional[int]]` are flagged on the inner `Optional`, not
+/// silently passed through.
+fn walk_annotation_expr(expr: &Expr, path: &str, source: &str, diags: &mut Diagnostics) {
+    match expr {
+        Expr::Name(n) => {
+            if let Some(suggestion) = typing_alias_suggestion(n.id.as_str()) {
+                let span_start = n.range.start().to_usize();
+                let length = n.id.as_str().len();
+                diags.push_warning(TycError::typing_alias_in_annotation(
+                    n.id.as_str().to_owned(),
+                    suggestion,
+                    path,
+                    source.to_owned(),
+                    span_start,
+                    length,
+                ));
+            }
+        }
+        Expr::Subscript(s) => {
+            // `List[int]` / `Optional[int]` / `Union[int, str]` / nested
+            // forms. Visit both the head (which produces the warning when
+            // it's a typing alias) and the slice (so inner annotations
+            // like `list[Optional[int]]` still surface).
+            walk_annotation_expr(&s.value, path, source, diags);
+            walk_annotation_expr(&s.slice, path, source, diags);
+        }
+        Expr::Tuple(t) => {
+            for e in &t.elts {
+                walk_annotation_expr(e, path, source, diags);
+            }
+        }
+        Expr::BinOp(b) => {
+            // `A | B` union sugar — recurse so a `List | None` still
+            // warns on the deprecated `List`.
+            walk_annotation_expr(&b.left, path, source, diags);
+            walk_annotation_expr(&b.right, path, source, diags);
+        }
+        Expr::Attribute(a) => {
+            // `typing.List[int]` — only warn when the head is exactly
+            // `typing`; any other `foo.List` is the user's own attribute.
+            if let Expr::Name(head) = a.value.as_ref() {
+                if head.id.as_str() == "typing" {
+                    if let Some(suggestion) = typing_alias_suggestion(a.attr.as_str()) {
+                        let span_start = a.range.start().to_usize();
+                        let length = a.range.len().to_usize().max(1);
+                        diags.push_warning(TycError::typing_alias_in_annotation(
+                            a.attr.as_str().to_owned(),
+                            suggestion,
+                            path,
+                            source.to_owned(),
+                            span_start,
+                            length,
+                        ));
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod lint_tests {
     use super::*;
     use tyc_syntax::preprocess::preprocess;
+
+    fn parse(src: &str) -> ModModule {
+        let prep = preprocess(src);
+        tyc_syntax::parse_module(&prep.python_source)
+            .expect("parse failed")
+            .into_syntax()
+    }
 
     // ── Finding #3: empty_collection_no_annotation ──────────────────────────
 
@@ -2998,6 +3174,107 @@ mod lint_tests {
             .into_syntax();
         let diags = analyse_empty_collection_bindings(&module, "x.ty", &prep.python_source);
         assert!(diags.warnings().is_empty());
+    }
+
+    // ── Finding #4: typing_alias_in_annotation ──────────────────────────────
+
+    #[test]
+    fn list_in_annotation_warns() {
+        let src = "def f(xs: List[int]) -> None:\n    pass\n";
+        let module = parse(src);
+        let diags =
+            analyse_typing_alias_annotations(&module, "x.ty", &preprocess(src).python_source);
+        assert_eq!(
+            diags.warnings().len(),
+            1,
+            "`List[int]` annotation must warn; got {:?}",
+            diags.warnings()
+        );
+    }
+
+    #[test]
+    fn optional_in_annotation_warns() {
+        let src = "def f(x: Optional[int]) -> None:\n    pass\n";
+        let module = parse(src);
+        let diags =
+            analyse_typing_alias_annotations(&module, "x.ty", &preprocess(src).python_source);
+        assert_eq!(diags.warnings().len(), 1);
+    }
+
+    #[test]
+    fn dict_in_annotation_warns() {
+        let src = "def f(x: Dict[str, int]) -> None:\n    pass\n";
+        let module = parse(src);
+        let diags =
+            analyse_typing_alias_annotations(&module, "x.ty", &preprocess(src).python_source);
+        assert_eq!(diags.warnings().len(), 1);
+    }
+
+    #[test]
+    fn union_in_annotation_warns() {
+        let src = "def f(x: Union[int, str]) -> None:\n    pass\n";
+        let module = parse(src);
+        let diags =
+            analyse_typing_alias_annotations(&module, "x.ty", &preprocess(src).python_source);
+        assert_eq!(diags.warnings().len(), 1);
+    }
+
+    #[test]
+    fn nested_optional_in_annotation_warns() {
+        let src = "def f(x: list[Optional[int]]) -> None:\n    pass\n";
+        let module = parse(src);
+        let diags =
+            analyse_typing_alias_annotations(&module, "x.ty", &preprocess(src).python_source);
+        assert_eq!(
+            diags.warnings().len(),
+            1,
+            "nested Optional must still warn; got {:?}",
+            diags.warnings()
+        );
+    }
+
+    #[test]
+    fn return_type_alias_warns() {
+        let src = "def f() -> List[int]:\n    return []\n";
+        let module = parse(src);
+        let diags =
+            analyse_typing_alias_annotations(&module, "x.ty", &preprocess(src).python_source);
+        assert_eq!(diags.warnings().len(), 1);
+    }
+
+    #[test]
+    fn ann_assign_with_typing_alias_warns() {
+        let src = "let xs: List[int] = [1, 2]\n";
+        let prep = preprocess(src);
+        let module = tyc_syntax::parse_module(&prep.python_source)
+            .expect("parse failed")
+            .into_syntax();
+        let diags = analyse_typing_alias_annotations(&module, "x.ty", &prep.python_source);
+        assert_eq!(diags.warnings().len(), 1);
+    }
+
+    #[test]
+    fn lowercase_annotation_silent() {
+        // The recommended form must not warn — it's exactly what we want.
+        let src = "def f(xs: list[int]) -> None:\n    pass\n";
+        let module = parse(src);
+        let diags =
+            analyse_typing_alias_annotations(&module, "x.ty", &preprocess(src).python_source);
+        assert!(
+            diags.warnings().is_empty(),
+            "lowercase annotation must be silent; got {:?}",
+            diags.warnings()
+        );
+    }
+
+    #[test]
+    fn typing_dot_alias_in_annotation_warns() {
+        // `typing.List[int]` — fully-qualified form must also warn.
+        let src = "def f(xs: typing.List[int]) -> None:\n    pass\n";
+        let module = parse(src);
+        let diags =
+            analyse_typing_alias_annotations(&module, "x.ty", &preprocess(src).python_source);
+        assert_eq!(diags.warnings().len(), 1);
     }
 }
 
