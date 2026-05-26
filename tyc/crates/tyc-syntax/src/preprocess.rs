@@ -2949,10 +2949,58 @@ fn parse_typed_let_unpack(body: &str) -> Option<TypedLetUnpack> {
     let close = close?;
     let inside = &after_paren[..close];
     let after_close = after_paren[close + 1..].trim_start();
-    let rhs = after_close.strip_prefix('=')?.trim();
-    if rhs.is_empty() {
-        return None;
-    }
+    // Two supported shapes for the post-`)` portion:
+    //   1. `= EXPR`                              → no outer annotation
+    //   2. `: tuple[T1, T2, …] = EXPR`           → outer-annotation form
+    //      (Finding #17). The outer `tuple[...]` is distributed to per-
+    //      element annotations on the synthesised `let` bindings.
+    let (outer_annotation, rhs) = if let Some(after_colon) = after_close.strip_prefix(':') {
+        // Walk to the next top-level `=` to split annotation from RHS.
+        // Bracket-aware so `tuple[dict[str, int], str]` survives.
+        let bytes = after_colon.as_bytes();
+        let mut depth = 0i32;
+        let mut eq_pos = None;
+        let mut in_str: Option<u8> = None;
+        let mut j = 0;
+        while j < bytes.len() {
+            let b = bytes[j];
+            if let Some(q) = in_str {
+                if b == b'\\' && j + 1 < bytes.len() {
+                    j += 2;
+                    continue;
+                }
+                if b == q {
+                    in_str = None;
+                }
+                j += 1;
+                continue;
+            }
+            match b {
+                b'\'' | b'"' => in_str = Some(b),
+                b'(' | b'[' | b'{' => depth += 1,
+                b')' | b']' | b'}' => depth -= 1,
+                b'=' if depth == 0 => {
+                    eq_pos = Some(j);
+                    break;
+                }
+                _ => {}
+            }
+            j += 1;
+        }
+        let eq = eq_pos?;
+        let ann = after_colon[..eq].trim();
+        let rhs = after_colon[eq + 1..].trim();
+        if ann.is_empty() || rhs.is_empty() {
+            return None;
+        }
+        (Some(ann.to_owned()), rhs.to_owned())
+    } else {
+        let rhs = after_close.strip_prefix('=')?.trim();
+        if rhs.is_empty() {
+            return None;
+        }
+        (None, rhs.to_owned())
+    };
     // Split captures by top-level commas (commas inside `[...]` /
     // `(...)` stay grouped so `dict[str, int]` survives).
     let raw_captures = split_top_level_commas_lite(inside);
@@ -2968,7 +3016,7 @@ fn parse_typed_let_unpack(body: &str) -> Option<TypedLetUnpack> {
         }
         let (name, annotation) = if let Some(colon) = find_top_level_colon(cap) {
             saw_annotation = true;
-            (cap[..colon].trim(), Some(cap[colon + 1..].trim()))
+            (cap[..colon].trim(), Some(cap[colon + 1..].trim().to_owned()))
         } else {
             (cap, None)
         };
@@ -2977,8 +3025,32 @@ fn parse_typed_let_unpack(body: &str) -> Option<TypedLetUnpack> {
         }
         captures.push(TypedLetCapture {
             name: name.to_owned(),
-            annotation: annotation.map(|s| s.to_owned()),
+            annotation,
         });
+    }
+    // Outer-annotation form: distribute the `tuple[T1, T2, …]` annotation
+    // across the per-element captures. The two lists must agree on
+    // length; mismatches fall back to None so the downstream parser /
+    // checker surfaces a clearer error than a silent rewrite. Per-
+    // element annotations the user already supplied take precedence.
+    if let Some(outer) = outer_annotation.as_deref() {
+        let slots = parse_outer_tuple_annotation(outer);
+        match slots {
+            Some(slots) if slots.len() == captures.len() => {
+                for (cap, slot) in captures.iter_mut().zip(slots.into_iter()) {
+                    if cap.annotation.is_none() {
+                        cap.annotation = Some(slot);
+                        saw_annotation = true;
+                    }
+                }
+            }
+            _ => {
+                // Outer annotation wasn't a recognisable `tuple[...]`
+                // shape (or arity mismatched). Leave the line untouched
+                // so the existing parser produces a focused error.
+                return None;
+            }
+        }
     }
     if !saw_annotation {
         // Pure untyped destructuring — let the existing path handle
@@ -2987,8 +3059,56 @@ fn parse_typed_let_unpack(body: &str) -> Option<TypedLetUnpack> {
     }
     Some(TypedLetUnpack {
         captures,
-        rhs: rhs.to_owned(),
+        rhs,
     })
+}
+
+/// Parse a `tuple[T1, T2, …]` outer annotation into its per-slot types.
+/// Returns `None` for any other shape (bare names, `list[int]`,
+/// `Tuple[...]` capitalised PEP-484 alias, …). The outer-annotation
+/// rewrite only fires for plain `tuple[...]` — that's the contract the
+/// fix documents and keeps the rewrite scope narrow. Finding #17.
+fn parse_outer_tuple_annotation(ann: &str) -> Option<Vec<String>> {
+    let ann = ann.trim();
+    let inner = ann.strip_prefix("tuple")?.trim_start();
+    let inner = inner.strip_prefix('[')?;
+    // Match the matching `]` at depth 0.
+    let bytes = inner.as_bytes();
+    let mut depth = 0i32;
+    let mut close = None;
+    for (i, &b) in bytes.iter().enumerate() {
+        match b {
+            b'[' => depth += 1,
+            b']' => {
+                if depth == 0 {
+                    close = Some(i);
+                    break;
+                }
+                depth -= 1;
+            }
+            _ => {}
+        }
+    }
+    let close = close?;
+    // Trailing characters after the `]` aren't part of a clean
+    // `tuple[…]` annotation — bail.
+    if !inner[close + 1..].trim().is_empty() {
+        return None;
+    }
+    let slots_str = &inner[..close];
+    let slots: Vec<String> = split_top_level_commas_lite(slots_str)
+        .into_iter()
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty())
+        .collect();
+    // Reject the variadic form `tuple[int, ...]` — the per-element
+    // rewrite needs a fixed arity. Also reject single-slot forms (a
+    // tuple unpack with one element is already untyped destructuring
+    // territory).
+    if slots.len() < 2 || slots.iter().any(|s| s == "...") {
+        return None;
+    }
+    Some(slots)
 }
 
 /// Top-level comma split that ignores brackets and string literals.
@@ -8919,6 +9039,49 @@ string content
             result.python_source
         );
         assert!(result.frozen_class_lines.contains(&0));
+    }
+
+    // ── #17: outer-annotation tuple unpack ────────────────────────────────
+    #[test]
+    fn outer_annotation_tuple_unpack_rewrites_to_per_element() {
+        // `let (a, b): tuple[int, str] = pair()` distributes the outer
+        // tuple type to per-element annotations. Equivalent to the
+        // already-supported `let (a: int, b: str) = pair()` form.
+        let src = "let (a, b): tuple[int, str] = pair()\n";
+        let out = expand_typed_let_unpack(src);
+        assert!(
+            out.contains("let __typhon_unpack_0__ = pair()"),
+            "expected temp binding; got:\n{out}"
+        );
+        assert!(
+            out.contains("let a: int = __typhon_unpack_0__[0]"),
+            "expected `a: int` element; got:\n{out}"
+        );
+        assert!(
+            out.contains("let b: str = __typhon_unpack_0__[1]"),
+            "expected `b: str` element; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn outer_annotation_tuple_unpack_three_elements() {
+        let src = "let (a, b, c): tuple[int, str, bool] = triple()\n";
+        let out = expand_typed_let_unpack(src);
+        assert!(out.contains("let a: int = __typhon_unpack_0__[0]"));
+        assert!(out.contains("let b: str = __typhon_unpack_0__[1]"));
+        assert!(out.contains("let c: bool = __typhon_unpack_0__[2]"));
+    }
+
+    #[test]
+    fn outer_annotation_tuple_unpack_non_tuple_annotation_is_left_alone() {
+        // A non-tuple outer annotation can't drive per-element types, so the
+        // pass leaves it for downstream layers to surface a clear error.
+        let src = "let (a, b): list[int] = pair()\n";
+        let out = expand_typed_let_unpack(src);
+        assert_eq!(
+            out, src,
+            "non-tuple outer annotation must be left untouched; got:\n{out}"
+        );
     }
 
     // ── #9: interface async-def auto-ellipsis ─────────────────────────────
