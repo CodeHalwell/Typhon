@@ -2340,110 +2340,208 @@ fn format_with_spec(value: &Value, default: &str, spec: &str) -> Result<String, 
     if spec.is_empty() {
         return Ok(default.to_owned());
     }
-    // Very small subset: `.Nf`, `,d`, `>N`, `<N`, `^N`, plus combined width+precision.
-    // Anything else falls through to the default string repr.
-    let mut chars = spec.chars().peekable();
-    let _fill = ' ';
+    // Implements a useful subset of Python's PEP 3101 format mini-language:
+    //   [[fill]align][sign][#][0][width][,][.precision][type]
+    // Notable for FINDINGS #20: zero-pad (`0`) and alternate-form (`#`,
+    // adds `0x`/`0o`/`0b` for hex/oct/bin) are now handled. Anything not
+    // recognised falls through to the default string repr.
+    let raw: Vec<char> = spec.chars().collect();
+    let mut i = 0usize;
+    let mut fill: char = ' ';
     let mut align: Option<char> = None;
     let mut sign: Option<char> = None;
+    let mut alternate = false;
+    let mut zero_pad = false;
     let mut width: Option<usize> = None;
     let mut precision: Option<usize> = None;
     let mut typ: Option<char> = None;
     let mut comma = false;
-    let mut buf: String;
 
-    while let Some(&c) = chars.peek() {
-        if c == '<' || c == '>' || c == '^' {
+    // Optional `[fill]align` — fill is any char *immediately followed by*
+    // an alignment specifier; otherwise the first char is treated as the
+    // alignment itself.
+    if raw.len() >= 2 && matches!(raw[1], '<' | '>' | '^' | '=') {
+        fill = raw[0];
+        align = Some(raw[1]);
+        i = 2;
+    } else if let Some(&c) = raw.first() {
+        if matches!(c, '<' | '>' | '^' | '=') {
             align = Some(c);
-            chars.next();
-            continue;
+            i = 1;
         }
-        if c == '+' || c == '-' {
-            sign = Some(c);
-            chars.next();
-            continue;
-        }
-        if c.is_ascii_digit() {
-            let mut n = 0usize;
-            while let Some(&c) = chars.peek() {
-                if let Some(d) = c.to_digit(10) {
-                    n = n * 10 + d as usize;
-                    chars.next();
-                } else {
-                    break;
-                }
-            }
-            width = Some(n);
-            continue;
-        }
-        if c == '.' {
-            chars.next();
-            let mut n = 0usize;
-            while let Some(&c) = chars.peek() {
-                if let Some(d) = c.to_digit(10) {
-                    n = n * 10 + d as usize;
-                    chars.next();
-                } else {
-                    break;
-                }
-            }
-            precision = Some(n);
-            continue;
-        }
-        if c == ',' {
-            comma = true;
-            chars.next();
-            continue;
-        }
-        typ = Some(c);
-        chars.next();
     }
 
+    while i < raw.len() {
+        let c = raw[i];
+        match c {
+            '+' | '-' | ' ' if sign.is_none() => {
+                sign = Some(c);
+                i += 1;
+            }
+            '#' => {
+                alternate = true;
+                i += 1;
+            }
+            '0' if width.is_none() => {
+                zero_pad = true;
+                i += 1;
+            }
+            d if d.is_ascii_digit() => {
+                let mut n = 0usize;
+                while i < raw.len() {
+                    if let Some(k) = raw[i].to_digit(10) {
+                        n = n * 10 + k as usize;
+                        i += 1;
+                    } else {
+                        break;
+                    }
+                }
+                width = Some(n);
+            }
+            ',' => {
+                comma = true;
+                i += 1;
+            }
+            '.' => {
+                i += 1;
+                let mut n = 0usize;
+                while i < raw.len() {
+                    if let Some(k) = raw[i].to_digit(10) {
+                        n = n * 10 + k as usize;
+                        i += 1;
+                    } else {
+                        break;
+                    }
+                }
+                precision = Some(n);
+            }
+            _ => {
+                typ = Some(c);
+                i += 1;
+            }
+        }
+    }
+
+    // The conversion type implies a *numeric* default alignment (right);
+    // zero-pad implies fill='0' and align='=' (sign before pad). Strings
+    // default to left-aligned. We approximate by tracking `is_numeric`.
+    let is_numeric = matches!(value, Value::Int(_) | Value::Float(_) | Value::Bool(_));
+    if zero_pad && align.is_none() {
+        align = Some('=');
+        fill = '0';
+    }
+
+    let mut buf: String;
+    let mut prefix = String::new();
+    let mut explicit_sign = String::new();
     match value {
         Value::Float(x) => {
             let p = precision.unwrap_or(6);
-            buf = format!("{:.*}", p, x);
-        }
-        Value::Int(i) => {
-            if comma {
-                buf = format_with_commas(*i);
-            } else if let Some('x') = typ {
-                buf = format!("{:x}", i);
-            } else if let Some('X') = typ {
-                buf = format!("{:X}", i);
-            } else if let Some('b') = typ {
-                buf = format!("{:b}", i);
-            } else if let Some('o') = typ {
-                buf = format!("{:o}", i);
-            } else {
-                buf = i.to_string();
+            let (abs, neg) = (x.abs(), *x < 0.0 || x.is_sign_negative());
+            match typ {
+                Some('e') => buf = format!("{:.*e}", p, abs),
+                Some('E') => buf = format!("{:.*E}", p, abs),
+                Some('g') | Some('G') => {
+                    // Python's `g` uses precision as significant digits.
+                    let sig = if p == 0 { 1 } else { p };
+                    buf = format!("{:.*e}", sig.saturating_sub(1), abs);
+                }
+                _ => buf = format!("{:.*}", p, abs),
             }
-            if let Some('+') = sign {
-                if *i >= 0 {
-                    buf.insert(0, '+');
+            if neg {
+                explicit_sign.push('-');
+            } else if let Some('+') = sign {
+                explicit_sign.push('+');
+            } else if let Some(' ') = sign {
+                explicit_sign.push(' ');
+            }
+        }
+        Value::Int(i_val) => {
+            let (abs, neg) = (i_val.abs(), *i_val < 0);
+            match typ {
+                Some('x') => {
+                    buf = format!("{:x}", abs);
+                    if alternate {
+                        prefix.push_str("0x");
+                    }
+                }
+                Some('X') => {
+                    buf = format!("{:X}", abs);
+                    if alternate {
+                        prefix.push_str("0X");
+                    }
+                }
+                Some('b') => {
+                    buf = format!("{:b}", abs);
+                    if alternate {
+                        prefix.push_str("0b");
+                    }
+                }
+                Some('o') => {
+                    buf = format!("{:o}", abs);
+                    if alternate {
+                        prefix.push_str("0o");
+                    }
+                }
+                _ => {
+                    buf = if comma {
+                        format_with_commas(abs)
+                    } else {
+                        abs.to_string()
+                    };
                 }
             }
+            if neg {
+                explicit_sign.push('-');
+            } else if let Some('+') = sign {
+                explicit_sign.push('+');
+            } else if let Some(' ') = sign {
+                explicit_sign.push(' ');
+            }
+        }
+        Value::Bool(b) => {
+            buf = (*b as i64).to_string();
         }
         _ => buf = default.to_owned(),
     }
 
+    // Apply width: combine sign + prefix + body, then pad.
     if let Some(w) = width {
-        if buf.len() < w {
-            let pad = w - buf.len();
-            let p = " ".repeat(pad);
-            buf = match align.unwrap_or('>') {
-                '<' => format!("{buf}{p}"),
+        let total_len = explicit_sign.chars().count() + prefix.chars().count() + buf.chars().count();
+        if total_len < w {
+            let pad = w - total_len;
+            // Default alignment: numeric → right, string → left.
+            let eff_align = align.unwrap_or(if is_numeric { '>' } else { '<' });
+            match eff_align {
+                '<' => {
+                    let core = format!("{explicit_sign}{prefix}{buf}");
+                    let p: String = std::iter::repeat(fill).take(pad).collect();
+                    return Ok(format!("{core}{p}"));
+                }
                 '^' => {
                     let lo = pad / 2;
                     let hi = pad - lo;
-                    format!("{}{}{}", " ".repeat(lo), buf, " ".repeat(hi))
+                    let lo_s: String = std::iter::repeat(fill).take(lo).collect();
+                    let hi_s: String = std::iter::repeat(fill).take(hi).collect();
+                    return Ok(format!(
+                        "{lo_s}{explicit_sign}{prefix}{buf}{hi_s}"
+                    ));
                 }
-                _ => format!("{p}{buf}"),
-            };
+                '=' => {
+                    // Pad between sign/prefix and the digits — used by
+                    // zero-pad on numbers.
+                    let p: String = std::iter::repeat(fill).take(pad).collect();
+                    return Ok(format!("{explicit_sign}{prefix}{p}{buf}"));
+                }
+                _ => {
+                    // '>' (default for numbers)
+                    let p: String = std::iter::repeat(fill).take(pad).collect();
+                    return Ok(format!("{p}{explicit_sign}{prefix}{buf}"));
+                }
+            }
         }
     }
-    let _ = typ;
-    Ok(buf)
+    Ok(format!("{explicit_sign}{prefix}{buf}"))
 }
 
 fn format_with_commas(i: i64) -> String {
@@ -2473,6 +2571,33 @@ mod vm_tests {
         let mut interp = Interpreter::new();
         let res = interp.run_module(&module);
         (interp, res)
+    }
+
+    /// FINDINGS #20 — zero-pad, alternate-form, and width+precision for
+    /// f-string format specs must match Python.
+    #[test]
+    fn fstring_zero_pad_and_alternate_form() {
+        let v = Value::Int(42);
+        assert_eq!(format_with_spec(&v, "42", "04d").unwrap(), "0042");
+        assert_eq!(format_with_spec(&v, "42", "06").unwrap(), "000042");
+        assert_eq!(format_with_spec(&v, "42", "#x").unwrap(), "0x2a");
+        assert_eq!(format_with_spec(&v, "42", "#o").unwrap(), "0o52");
+        assert_eq!(format_with_spec(&v, "42", "#b").unwrap(), "0b101010");
+        // The findings note used `0003.142`, but CPython actually rounds
+        // `3.14` at precision 3 to `3.140`; matching Python's true output.
+        let pi = Value::Float(3.14);
+        assert_eq!(format_with_spec(&pi, "3.14", "08.3f").unwrap(), "0003.140");
+        // Test a value where the third decimal is meaningful.
+        let e = Value::Float(2.71828);
+        assert_eq!(format_with_spec(&e, "2.71828", "08.3f").unwrap(), "0002.718");
+        // Combined: alternate-form hex with zero-pad and width.
+        assert_eq!(format_with_spec(&v, "42", "#06x").unwrap(), "0x002a");
+        // Negative numbers respect sign position with zero-pad.
+        let n = Value::Int(-7);
+        assert_eq!(format_with_spec(&n, "-7", "04d").unwrap(), "-007");
+        // Default formatting still works.
+        assert_eq!(format_with_spec(&v, "42", "5").unwrap(), "   42");
+        assert_eq!(format_with_spec(&v, "42", "<5").unwrap(), "42   ");
     }
 
     /// FINDINGS #18 — `IndexMap` preserves insertion order so `tyc run`
