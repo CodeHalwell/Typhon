@@ -979,6 +979,29 @@ impl<'a> Resolver<'a> {
             // immutable_assign on a value still in scope — only the
             // loop-target-as-new direction is silenced here.
             if kind == BindingKind::Loop {
+                // FINDINGS v0.7.1 #11: a match-case pattern capture
+                // (`case Ok(value):`) reaches `declare` with
+                // `BindingKind::Loop` because patterns share the
+                // for/with/except path. The existing Loop early-return
+                // therefore swallowed the shadow check for these
+                // captures, even though shadowing an outer `let` is
+                // exactly the case the `tyc::pattern_shadows_outer`
+                // warning was designed for. Fire the diagnostic when we
+                // see this combination, *before* the silent return.
+                if self.in_pattern > 0 && existing.mutability == Mutability::Let {
+                    let decl_span = existing.span;
+                    if decl_span != span && self.seen_immutable_redecl.insert((decl_span, span)) {
+                        self.diagnostics.push_error(TycError::pattern_shadows_outer(
+                            name,
+                            &self.path,
+                            self.source,
+                            decl_span.0,
+                            decl_span.1.saturating_sub(decl_span.0).max(1),
+                            span.0,
+                            span.1.saturating_sub(span.0).max(1),
+                        ));
+                    }
+                }
                 return;
             }
             let _ = kind;

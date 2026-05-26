@@ -10862,6 +10862,32 @@ mod tests {
         )
     }
 
+    /// Like `check`, but merges the resolver's diagnostics into the
+    /// returned bundle so tests can assert on resolver-level codes
+    /// (e.g. `tyc::pattern_shadows_outer`, `tyc::immutable_assign`).
+    /// Note: the resolver may surface its own unrelated noise
+    /// (`unknown_name`, `unused_import`) so callers using this helper
+    /// should target their assertions to the specific code under test
+    /// or sanitise the source up front.
+    fn check_with_resolver(src: &str) -> Diagnostics {
+        let prep = preprocess(src);
+        let module = tyc_syntax::parse_module(&prep.python_source)
+            .unwrap()
+            .into_syntax();
+        let (resolved, resolver_diags) =
+            resolve_module("<test>".to_owned(), &prep.python_source, &module);
+        let mut diags = check_module_with(
+            "<test>",
+            &prep.python_source,
+            &resolved,
+            &module,
+            &prep.unsafe_lines,
+            &prep.frozen_class_lines,
+        );
+        diags.extend(resolver_diags);
+        diags
+    }
+
     /// Like `check`, but also runs the upstream sugar passes the real CLI
     /// chains (`with`-chain, `gather`, `go`, multi-line guards, lazy
     /// imports, typed-let-unpack, `?` operator). Tests that need a feature
@@ -10869,17 +10895,25 @@ mod tests {
     /// — use this helper instead. Mirrors `expand_for_check` in
     /// `tyc/src/commands/check.rs`.
     fn check_full(src: &str) -> Diagnostics {
+        check(&expand_for_test(src))
+    }
+
+    /// Combination of `check_full` and `check_with_resolver`.
+    fn check_full_with_resolver(src: &str) -> Diagnostics {
+        check_with_resolver(&expand_for_test(src))
+    }
+
+    fn expand_for_test(src: &str) -> String {
         use tyc_syntax::preprocess::{
             expand_gather_blocks, expand_go_calls, expand_inline_question_ops, expand_lazy_imports,
             expand_multiline_guards, expand_pipes, expand_question_ops, expand_typed_let_unpack,
             expand_with_chains,
         };
-        let expanded = expand_question_ops(&expand_inline_question_ops(&expand_pipes(
+        expand_question_ops(&expand_inline_question_ops(&expand_pipes(
             &expand_with_chains(&expand_go_calls(&expand_gather_blocks(
                 &expand_multiline_guards(&expand_lazy_imports(&expand_typed_let_unpack(src))),
             ))),
-        )));
-        check(&expanded)
+        )))
     }
 
     #[test]
@@ -16703,6 +16737,31 @@ def main() -> None:
         assert!(
             !d.has_errors(),
             "list.append must still resolve; got: {:?}",
+            d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    /// FINDINGS v0.7.1 #11: a match-case pattern capture that shadows an
+    /// outer `let` must fire `tyc::pattern_shadows_outer`.
+    #[test]
+    fn v071_pattern_shadows_outer_fires() {
+        let src = "\
+def main() -> None:
+    let value: int = 42
+    let r: Result[int, str] = Ok(1)
+    match r:
+        case Ok(value):
+            print(value)
+        case Err(_):
+            pass
+";
+        let d = check_full_with_resolver(src);
+        assert!(
+            d.errors().iter().any(|e| {
+                let m = e.to_string();
+                m.contains("pattern_shadows_outer") || m.contains("shadow")
+            }),
+            "expected pattern_shadows_outer; got: {:?}",
             d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
         );
     }
