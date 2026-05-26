@@ -230,6 +230,23 @@ pub fn preprocess(source: &str) -> PreprocessResult {
     let mut pub_star_lines: Vec<usize> = Vec::new();
     let source_owned =
         strip_pub_prefixes(source, &mut pub_names, &mut pub_lines, &mut pub_star_lines);
+    // Pre-pass: rewrite higher-kinded-type markers (`Name[_]`) inside
+    // PEP-695 class type-parameter lists down to plain TypeVars. The
+    // VM doesn't enforce kind structure; the underscore is informational
+    // for the type-checker and would otherwise crash Ruff. Operates
+    // line-by-line so any class header is normalised before the main
+    // keyword-aware loop sees it. Finding #6.
+    let source_owned = strip_hkt_markers_in_class_headers(&source_owned);
+    // Pre-pass: distribute `impl[<tp>] Alias[<args>]:` blocks targeting
+    // a sealed-union type alias across each of its variants. The
+    // existing desugar layer handles bare-name aliases (`type T = A | B`)
+    // but not the generic form (`type T[X] = A[X] | B[X]`) — the
+    // variants there are `Subscript` nodes that fall outside its
+    // walker. Expanding here, at the source level, sidesteps the
+    // missing case and emits one real `impl Variant:` block per
+    // variant so the user's method bodies wire up at every call site.
+    // Finding #7.
+    let source_owned = expand_impl_sealed_unions(&source_owned);
     let source = source_owned.as_str();
 
     let mut python_source = String::with_capacity(source.len());
@@ -1441,9 +1458,19 @@ fn append_ellipsis_to_bodiless_def(line: &str) -> Option<String> {
     };
     let indent_len = body.find(|c: char| !c.is_whitespace())?;
     let rest = &body[indent_len..];
-    if !rest.starts_with("def ") {
+    // Accept both `def …` and `async def …` interface declarations so
+    // `async def execute(self, args: dict) -> Result` gets the same
+    // auto-completion treatment as its sync counterpart.
+    let rest = if let Some(after_async) = rest.strip_prefix("async ") {
+        if !after_async.starts_with("def ") {
+            return None;
+        }
+        after_async
+    } else if rest.starts_with("def ") {
+        rest
+    } else {
         return None;
-    }
+    };
     // Confirm balanced parens before checking for the bodiless tail. Track
     // bracket depth so `[T, U]`-style annotations in the return type don't
     // throw the scanner off.
@@ -1499,6 +1526,488 @@ fn append_ellipsis_to_bodiless_def(line: &str) -> Option<String> {
     Some(format!("{}: ...{}", body.trim_end(), terminator))
 }
 
+/// Expand `impl[<tp>] Alias[<args>]:` (or the non-generic `impl Alias:`)
+/// blocks where `Alias` is a sealed-union type alias into one block per
+/// variant. The existing desugar pass distributes methods across union
+/// variants only when the variants are bare `Name` expressions; this
+/// pre-pass also handles generic aliases like
+/// `type Tree[T] = Leaf[T] | Branch[T]` by stripping the type
+/// application from each variant before producing the duplicated impl
+/// blocks. Finding #7.
+///
+/// The pass operates on text:
+///   1. Collect a map of `alias_name -> [variant_name, …]` by scanning
+///      every line that starts with `type ` at indent zero. The RHS is
+///      split on top-level `|`; each operand may be a bare `Name` or a
+///      `Name[args]` subscript — only the head name is recorded.
+///   2. Walk the source again. When a line at any indent starts with
+///      `impl ` or `impl[…] ` and the target name is in the map, capture
+///      the contiguous indented body and re-emit one `impl Variant…:`
+///      block per variant. The generic type-application form on the
+///      class name and the bracketed type-params on the impl keyword
+///      are preserved per-block so each variant carries the same `T`.
+///
+/// Line indices inside an impl block shift downstream because the body
+/// is duplicated. Downstream callers that need byte-accurate spans for
+/// the *body* of these blocks should consume the desugared AST rather
+/// than rely on raw line indices.
+fn expand_impl_sealed_unions(source: &str) -> String {
+    let aliases = collect_sealed_union_aliases_from_text(source);
+    if aliases.is_empty() {
+        return source.to_owned();
+    }
+    let lines: Vec<&str> = source.split_inclusive('\n').collect();
+    let mut out = String::with_capacity(source.len());
+    let mut idx = 0;
+    let mut in_string: Option<StringMode> = None;
+    while idx < lines.len() {
+        let line = lines[idx];
+        let pre_string = in_string;
+        let raw = line.trim_end_matches(['\n', '\r']);
+        let _code_end = scan_line_code_end(raw, &mut in_string);
+        if pre_string.is_some() {
+            out.push_str(line);
+            idx += 1;
+            continue;
+        }
+        let indent_len = raw
+            .find(|c: char| !c.is_whitespace())
+            .unwrap_or(raw.len());
+        let indent = &raw[..indent_len];
+        let rest = &raw[indent_len..];
+        // Recognise both `impl Name…:` and `impl[T,…] Name…:`.
+        let after_impl = if let Some(s) = rest.strip_prefix("impl ") {
+            Some(s)
+        } else if rest.starts_with("impl[") {
+            Some(&rest["impl".len()..])
+        } else {
+            None
+        };
+        let target_info = after_impl.and_then(parse_impl_header_target);
+        let variants = target_info
+            .as_ref()
+            .and_then(|info| aliases.get(&info.target_name));
+        if let (Some(info), Some(variants)) = (target_info.as_ref(), variants) {
+            // Capture the indented body. A "body line" is any non-blank
+            // line whose indent exceeds the header's indent; blank lines
+            // mixed in are part of the body. We stop at the first
+            // dedented non-blank line.
+            let mut body_end = idx + 1;
+            while body_end < lines.len() {
+                let candidate = lines[body_end].trim_end_matches(['\n', '\r']);
+                if candidate.chars().all(|c| c.is_whitespace()) {
+                    body_end += 1;
+                    continue;
+                }
+                let cand_indent = candidate
+                    .find(|c: char| !c.is_whitespace())
+                    .unwrap_or(candidate.len());
+                if cand_indent <= indent_len {
+                    break;
+                }
+                body_end += 1;
+            }
+            let body_slice: String = lines[idx + 1..body_end].concat();
+            // Detect the line's terminator (LF / CRLF / none) so we can
+            // emit identical separators between duplicated blocks.
+            let term = &line[raw.len()..];
+            for (i, variant) in variants.iter().enumerate() {
+                let header = format!(
+                    "{indent}impl{tp} {variant}{args}:{term}",
+                    indent = indent,
+                    tp = info.impl_type_params.as_deref().unwrap_or(""),
+                    variant = variant,
+                    args = info.target_args.as_deref().unwrap_or(""),
+                    term = term,
+                );
+                out.push_str(&header);
+                out.push_str(&body_slice);
+                // Separate consecutive duplicated blocks by a blank
+                // line so downstream parsers (which use blank lines as
+                // a visual break) stay happy. The original block had
+                // none, so we only add separation between duplicates.
+                if i + 1 < variants.len() && !body_slice.ends_with('\n') {
+                    out.push('\n');
+                }
+            }
+            idx = body_end;
+            continue;
+        }
+        out.push_str(line);
+        idx += 1;
+    }
+    out
+}
+
+/// Collect sealed-union type aliases from a Typhon source string by
+/// scanning for `type NAME[…]? = V1 | V2 | …` lines at indent zero.
+/// Each variant operand is stripped of any `[args]` subscript so the
+/// generic form (`type Tree[T] = Leaf[T] | Branch[T]`) collapses to
+/// `Tree -> [Leaf, Branch]`. Only aliases with two or more variants
+/// are recorded — single-name aliases aren't sealed unions.
+fn collect_sealed_union_aliases_from_text(
+    source: &str,
+) -> std::collections::HashMap<String, Vec<String>> {
+    let mut out = std::collections::HashMap::new();
+    let mut in_string: Option<StringMode> = None;
+    for line in source.split_inclusive('\n') {
+        let pre_string = in_string;
+        let raw = line.trim_end_matches(['\n', '\r']);
+        let _code_end = scan_line_code_end(raw, &mut in_string);
+        if pre_string.is_some() {
+            continue;
+        }
+        let indent_len = raw
+            .find(|c: char| !c.is_whitespace())
+            .unwrap_or(raw.len());
+        // Only module-level `type` aliases participate; nested ones
+        // can't legally exist in Typhon and would muddy the rewrite.
+        if indent_len != 0 {
+            continue;
+        }
+        let after = match raw.strip_prefix("type ") {
+            Some(s) => s,
+            None => continue,
+        };
+        // Skip the optional `[T,…]` type-param list after the alias name.
+        let name_end = after
+            .bytes()
+            .position(|b| !(b.is_ascii_alphanumeric() || b == b'_'));
+        let name_end = match name_end {
+            Some(p) if p > 0 => p,
+            _ => continue,
+        };
+        let name = &after[..name_end];
+        let after_name = &after[name_end..];
+        let after_tps = if after_name.starts_with('[') {
+            let bytes = after_name.as_bytes();
+            let mut depth = 0i32;
+            let mut close = None;
+            for (i, &b) in bytes.iter().enumerate() {
+                match b {
+                    b'[' => depth += 1,
+                    b']' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            close = Some(i);
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            match close {
+                Some(p) => &after_name[p + 1..],
+                None => continue,
+            }
+        } else {
+            after_name
+        };
+        let after_eq = match after_tps.trim_start().strip_prefix('=') {
+            Some(s) => s.trim_start(),
+            None => continue,
+        };
+        let stripped_comment = strip_trailing_comment(after_eq);
+        let strip_trailing = stripped_comment.trim();
+        if strip_trailing.is_empty() {
+            continue;
+        }
+        let parts: Vec<String> = split_top_level_pipes(strip_trailing)
+            .into_iter()
+            .map(|p| {
+                // Strip any `[args]` subscript so generic variants
+                // collapse to their head name.
+                let p = p.trim();
+                let head_end = p
+                    .bytes()
+                    .position(|b| !(b.is_ascii_alphanumeric() || b == b'_'))
+                    .unwrap_or(p.len());
+                p[..head_end].to_owned()
+            })
+            .filter(|p| !p.is_empty())
+            .collect();
+        if parts.len() >= 2 {
+            out.insert(name.to_owned(), parts);
+        }
+    }
+    out
+}
+
+/// Split a string on top-level `|` characters, respecting brackets
+/// (`[]`, `()`, `{}`) and string literals. The operands are returned in
+/// source order and trimmed of leading/trailing whitespace.
+fn split_top_level_pipes(s: &str) -> Vec<&str> {
+    let bytes = s.as_bytes();
+    let mut out = Vec::new();
+    let mut depth: i32 = 0;
+    let mut start = 0usize;
+    let mut in_str: Option<u8> = None;
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if let Some(q) = in_str {
+            if b == b'\\' && i + 1 < bytes.len() {
+                i += 2;
+                continue;
+            }
+            if b == q {
+                in_str = None;
+            }
+            i += 1;
+            continue;
+        }
+        match b {
+            b'\'' | b'"' => in_str = Some(b),
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => depth -= 1,
+            b'|' if depth == 0 => {
+                out.push(s[start..i].trim());
+                start = i + 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    let last = s[start..].trim();
+    if !last.is_empty() {
+        out.push(last);
+    }
+    out
+}
+
+struct ImplHeaderTarget {
+    /// Optional `[T, U]` type-params on the `impl` keyword itself,
+    /// preserved verbatim (including the brackets).
+    impl_type_params: Option<String>,
+    /// The bare class/alias name immediately following `impl[…] `.
+    target_name: String,
+    /// Optional `[T]`-style application following `target_name`
+    /// (preserved verbatim including the brackets).
+    target_args: Option<String>,
+}
+
+/// Parse the post-`impl` (or post-`impl[…]`) portion of a line into a
+/// header descriptor: the inner `[T, U]` type-params (if any), the
+/// target name, and any trailing `[T, U]` application on the name.
+/// Returns `None` for lines that don't have the expected shape (no
+/// colon, no target name, malformed brackets, …).
+fn parse_impl_header_target(after_impl: &str) -> Option<ImplHeaderTarget> {
+    let (impl_type_params, after_tps) = if after_impl.starts_with('[') {
+        let bytes = after_impl.as_bytes();
+        let mut depth = 0i32;
+        let mut end = None;
+        for (i, &b) in bytes.iter().enumerate() {
+            match b {
+                b'[' => depth += 1,
+                b']' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = Some(i + 1);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let end = end?;
+        (
+            Some(after_impl[..end].to_owned()),
+            after_impl[end..].trim_start(),
+        )
+    } else {
+        (None, after_impl.trim_start())
+    };
+    // Target name = identifier chars from the start of after_tps.
+    let name_end = after_tps
+        .bytes()
+        .position(|b| !(b.is_ascii_alphanumeric() || b == b'_'))?;
+    if name_end == 0 {
+        return None;
+    }
+    let target_name = after_tps[..name_end].to_owned();
+    let after_name = &after_tps[name_end..];
+    // Optional `[…]` application on the target name.
+    let (target_args, after_args) = if after_name.starts_with('[') {
+        let bytes = after_name.as_bytes();
+        let mut depth = 0i32;
+        let mut end = None;
+        for (i, &b) in bytes.iter().enumerate() {
+            match b {
+                b'[' => depth += 1,
+                b']' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = Some(i + 1);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let end = end?;
+        (Some(after_name[..end].to_owned()), &after_name[end..])
+    } else {
+        (None, after_name)
+    };
+    // Header must terminate with `:` (anything before — like
+    // base-class lists — disqualifies the line as a clean impl header).
+    let tail = after_args.trim_start();
+    if !tail.starts_with(':') {
+        return None;
+    }
+    Some(ImplHeaderTarget {
+        impl_type_params,
+        target_name,
+        target_args,
+    })
+}
+
+/// Rewrite higher-kinded-type markers in PEP-695 class type-parameter
+/// lists, turning `class Name[F[_], …]:` into `class Name[F, …]:` so the
+/// vendored Ruff parser accepts the header. The `[_]` is purely a marker
+/// that `F` is a 1-arg type constructor — the VM/runtime does not enforce
+/// kind structure, and the type-checker handles `F` as a regular
+/// TypeVar. Finding #6.
+///
+/// Scope-limited to the bracket-list that follows the class name. Any
+/// `_` inside default values or bases is preserved verbatim.
+fn strip_hkt_markers_in_class_headers(source: &str) -> String {
+    let mut out = String::with_capacity(source.len());
+    let mut in_string: Option<StringMode> = None;
+    for line in source.split_inclusive('\n') {
+        let pre_string = in_string;
+        let raw = line.trim_end_matches(['\n', '\r']);
+        let _code_end = scan_line_code_end(raw, &mut in_string);
+        if pre_string.is_some() {
+            out.push_str(line);
+            continue;
+        }
+        let indent_len = raw
+            .find(|c: char| !c.is_whitespace())
+            .unwrap_or(raw.len());
+        let rest = &raw[indent_len..];
+        if !rest.starts_with("class ") {
+            out.push_str(line);
+            continue;
+        }
+        // Find the first `[` after `class NAME`. Walk past the name
+        // (identifier characters only) to land on the optional
+        // type-parameter bracket.
+        let after_class = &rest["class ".len()..];
+        let name_end = match after_class
+            .bytes()
+            .position(|b| !(b.is_ascii_alphanumeric() || b == b'_'))
+        {
+            Some(p) if p > 0 => p,
+            _ => {
+                out.push_str(line);
+                continue;
+            }
+        };
+        let after_name = &after_class[name_end..];
+        if !after_name.starts_with('[') {
+            out.push_str(line);
+            continue;
+        }
+        // Match the closing `]` at depth 0.
+        let bytes = after_name.as_bytes();
+        let mut depth = 0i32;
+        let mut close = None;
+        for (i, &b) in bytes.iter().enumerate() {
+            match b {
+                b'[' => depth += 1,
+                b']' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        close = Some(i);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let close = match close {
+            Some(p) => p,
+            None => {
+                out.push_str(line);
+                continue;
+            }
+        };
+        let inside = &after_name[1..close]; // exclusive of outer `[`/`]`
+        // Quick exit: no `[_]` marker at all — leave the line alone so
+        // round-tripping stays exact for the common case.
+        if !inside.contains("[_]") {
+            out.push_str(line);
+            continue;
+        }
+        let rewritten_inside = strip_hkt_markers_in_param_list(inside);
+        if rewritten_inside == inside {
+            out.push_str(line);
+            continue;
+        }
+        // Reassemble: indent + `class NAME` + `[REWRITTEN]` + tail.
+        // `after_name` starts at the `[`, so `close` is the byte index of
+        // the matching `]` within `after_name`. The absolute position of
+        // that `]` in `raw` is `head_end + close`.
+        let head_end = indent_len + "class ".len() + name_end; // points at `[`
+        let close_byte = head_end + close; // absolute index of `]`
+        out.push_str(&raw[..head_end]);
+        out.push('[');
+        out.push_str(&rewritten_inside);
+        out.push(']');
+        out.push_str(&raw[close_byte + 1..]);
+        // Preserve the original terminator (CRLF or LF or none).
+        let term = &line[raw.len()..];
+        out.push_str(term);
+    }
+    out
+}
+
+/// Walk a comma-separated PEP-695 type-parameter list and drop any `[_]`
+/// kind-marker that immediately follows a parameter name. Bound
+/// annotations (`T: Bound`) and bare names pass through unchanged.
+fn strip_hkt_markers_in_param_list(inside: &str) -> String {
+    // Bracket-aware top-level comma split. Whitespace inside each piece
+    // is preserved so the output reads naturally.
+    let mut out = String::with_capacity(inside.len());
+    let parts = split_top_level_commas_lite(inside);
+    for (i, raw_part) in parts.iter().enumerate() {
+        let part = raw_part.trim();
+        // Match `Name[_]` (optionally followed by `: Bound` / `= Default`).
+        // We only strip the `[_]` token; everything before/after is kept.
+        let stripped = strip_one_hkt_marker(part);
+        if i > 0 {
+            out.push_str(", ");
+        }
+        out.push_str(&stripped);
+    }
+    out
+}
+
+/// For a single parameter slot, drop a trailing `[_]` kind marker that
+/// follows the parameter's identifier. Returns the slot unchanged if no
+/// marker is present.
+fn strip_one_hkt_marker(slot: &str) -> String {
+    // Find the identifier end (first non-id char).
+    let id_end = slot
+        .bytes()
+        .position(|b| !(b.is_ascii_alphanumeric() || b == b'_'))
+        .unwrap_or(slot.len());
+    if id_end == 0 {
+        return slot.to_owned();
+    }
+    let head = &slot[..id_end];
+    let tail = &slot[id_end..];
+    // Optional whitespace, then `[_]`, then whatever follows.
+    let after_ws = tail.trim_start();
+    let ws_len = tail.len() - after_ws.len();
+    if let Some(after_marker) = after_ws.strip_prefix("[_]") {
+        format!("{}{}{}", head, &tail[..ws_len], after_marker)
+    } else {
+        slot.to_owned()
+    }
+}
+
 /// Strip the `frozen` modifier from a `class NAME frozen:` or
 /// `class NAME frozen(BASES):` header so the Python parser accepts it.
 ///
@@ -1518,10 +2027,37 @@ fn strip_frozen_modifier(rest: &str) -> Option<String> {
     }
     let name = &after_class[..name_end];
     let after_name = &after_class[name_end..];
+    // Optionally consume a PEP-695 type-parameter list — `class X[T] frozen:`
+    // is a legal Typhon header even though the `frozen` modifier sits to the
+    // right of the `[T]`. We track bracket depth so `[T: Bound, U]` keeps the
+    // inner commas grouped. Without this the bracket-list ends up in `tail`
+    // and Ruff later complains about `class X[T] frozen:`.
+    let (type_params, after_tps) = if after_name.starts_with('[') {
+        let bytes = after_name.as_bytes();
+        let mut depth = 0i32;
+        let mut end = None;
+        for (i, &b) in bytes.iter().enumerate() {
+            match b {
+                b'[' => depth += 1,
+                b']' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = Some(i + 1);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let end = end?;
+        (&after_name[..end], &after_name[end..])
+    } else {
+        ("", after_name)
+    };
     // The modifier must follow whitespace and be the bare token `frozen`,
     // terminated by `:` or `(` (with whatever whitespace sits between).
-    let trimmed = after_name.trim_start();
-    let leading_ws = after_name.len() - trimmed.len();
+    let trimmed = after_tps.trim_start();
+    let leading_ws = after_tps.len() - trimmed.len();
     if leading_ws == 0 {
         return None;
     }
@@ -1536,7 +2072,7 @@ fn strip_frozen_modifier(rest: &str) -> Option<String> {
     // Anything after the modifier (bases list, colon, trailing newline) is
     // preserved verbatim — the Python parser handles `(Base):` natively.
     let tail = rest_after_mod.trim_start();
-    Some(format!("class {}{}", name, tail))
+    Some(format!("class {}{}{}", name, type_params, tail))
 }
 
 /// Same as [`make_impl_class_line`] but uses the `__typhon_builtin_ext_`
@@ -2912,10 +3448,58 @@ fn parse_typed_let_unpack(body: &str) -> Option<TypedLetUnpack> {
     let close = close?;
     let inside = &after_paren[..close];
     let after_close = after_paren[close + 1..].trim_start();
-    let rhs = after_close.strip_prefix('=')?.trim();
-    if rhs.is_empty() {
-        return None;
-    }
+    // Two supported shapes for the post-`)` portion:
+    //   1. `= EXPR`                              → no outer annotation
+    //   2. `: tuple[T1, T2, …] = EXPR`           → outer-annotation form
+    //      (Finding #17). The outer `tuple[...]` is distributed to per-
+    //      element annotations on the synthesised `let` bindings.
+    let (outer_annotation, rhs) = if let Some(after_colon) = after_close.strip_prefix(':') {
+        // Walk to the next top-level `=` to split annotation from RHS.
+        // Bracket-aware so `tuple[dict[str, int], str]` survives.
+        let bytes = after_colon.as_bytes();
+        let mut depth = 0i32;
+        let mut eq_pos = None;
+        let mut in_str: Option<u8> = None;
+        let mut j = 0;
+        while j < bytes.len() {
+            let b = bytes[j];
+            if let Some(q) = in_str {
+                if b == b'\\' && j + 1 < bytes.len() {
+                    j += 2;
+                    continue;
+                }
+                if b == q {
+                    in_str = None;
+                }
+                j += 1;
+                continue;
+            }
+            match b {
+                b'\'' | b'"' => in_str = Some(b),
+                b'(' | b'[' | b'{' => depth += 1,
+                b')' | b']' | b'}' => depth -= 1,
+                b'=' if depth == 0 => {
+                    eq_pos = Some(j);
+                    break;
+                }
+                _ => {}
+            }
+            j += 1;
+        }
+        let eq = eq_pos?;
+        let ann = after_colon[..eq].trim();
+        let rhs = after_colon[eq + 1..].trim();
+        if ann.is_empty() || rhs.is_empty() {
+            return None;
+        }
+        (Some(ann.to_owned()), rhs.to_owned())
+    } else {
+        let rhs = after_close.strip_prefix('=')?.trim();
+        if rhs.is_empty() {
+            return None;
+        }
+        (None, rhs.to_owned())
+    };
     // Split captures by top-level commas (commas inside `[...]` /
     // `(...)` stay grouped so `dict[str, int]` survives).
     let raw_captures = split_top_level_commas_lite(inside);
@@ -2931,7 +3515,7 @@ fn parse_typed_let_unpack(body: &str) -> Option<TypedLetUnpack> {
         }
         let (name, annotation) = if let Some(colon) = find_top_level_colon(cap) {
             saw_annotation = true;
-            (cap[..colon].trim(), Some(cap[colon + 1..].trim()))
+            (cap[..colon].trim(), Some(cap[colon + 1..].trim().to_owned()))
         } else {
             (cap, None)
         };
@@ -2940,8 +3524,32 @@ fn parse_typed_let_unpack(body: &str) -> Option<TypedLetUnpack> {
         }
         captures.push(TypedLetCapture {
             name: name.to_owned(),
-            annotation: annotation.map(|s| s.to_owned()),
+            annotation,
         });
+    }
+    // Outer-annotation form: distribute the `tuple[T1, T2, …]` annotation
+    // across the per-element captures. The two lists must agree on
+    // length; mismatches fall back to None so the downstream parser /
+    // checker surfaces a clearer error than a silent rewrite. Per-
+    // element annotations the user already supplied take precedence.
+    if let Some(outer) = outer_annotation.as_deref() {
+        let slots = parse_outer_tuple_annotation(outer);
+        match slots {
+            Some(slots) if slots.len() == captures.len() => {
+                for (cap, slot) in captures.iter_mut().zip(slots.into_iter()) {
+                    if cap.annotation.is_none() {
+                        cap.annotation = Some(slot);
+                        saw_annotation = true;
+                    }
+                }
+            }
+            _ => {
+                // Outer annotation wasn't a recognisable `tuple[...]`
+                // shape (or arity mismatched). Leave the line untouched
+                // so the existing parser produces a focused error.
+                return None;
+            }
+        }
     }
     if !saw_annotation {
         // Pure untyped destructuring — let the existing path handle
@@ -2950,8 +3558,56 @@ fn parse_typed_let_unpack(body: &str) -> Option<TypedLetUnpack> {
     }
     Some(TypedLetUnpack {
         captures,
-        rhs: rhs.to_owned(),
+        rhs,
     })
+}
+
+/// Parse a `tuple[T1, T2, …]` outer annotation into its per-slot types.
+/// Returns `None` for any other shape (bare names, `list[int]`,
+/// `Tuple[...]` capitalised PEP-484 alias, …). The outer-annotation
+/// rewrite only fires for plain `tuple[...]` — that's the contract the
+/// fix documents and keeps the rewrite scope narrow. Finding #17.
+fn parse_outer_tuple_annotation(ann: &str) -> Option<Vec<String>> {
+    let ann = ann.trim();
+    let inner = ann.strip_prefix("tuple")?.trim_start();
+    let inner = inner.strip_prefix('[')?;
+    // Match the matching `]` at depth 0.
+    let bytes = inner.as_bytes();
+    let mut depth = 0i32;
+    let mut close = None;
+    for (i, &b) in bytes.iter().enumerate() {
+        match b {
+            b'[' => depth += 1,
+            b']' => {
+                if depth == 0 {
+                    close = Some(i);
+                    break;
+                }
+                depth -= 1;
+            }
+            _ => {}
+        }
+    }
+    let close = close?;
+    // Trailing characters after the `]` aren't part of a clean
+    // `tuple[…]` annotation — bail.
+    if !inner[close + 1..].trim().is_empty() {
+        return None;
+    }
+    let slots_str = &inner[..close];
+    let slots: Vec<String> = split_top_level_commas_lite(slots_str)
+        .into_iter()
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty())
+        .collect();
+    // Reject the variadic form `tuple[int, ...]` — the per-element
+    // rewrite needs a fixed arity. Also reject single-slot forms (a
+    // tuple unpack with one element is already untyped destructuring
+    // territory).
+    if slots.len() < 2 || slots.iter().any(|s| s == "...") {
+        return None;
+    }
+    Some(slots)
 }
 
 /// Top-level comma split that ignores brackets and string literals.
@@ -8844,6 +9500,277 @@ string content
         assert!(
             out.contains(r#"create_task(get("""a#b"""))"#),
             "triple-quoted # must not be stripped: {out}"
+        );
+    }
+
+    // ── #8: generic + frozen combo ─────────────────────────────────────────
+    #[test]
+    fn class_generic_then_frozen_strips_modifier_and_preserves_type_params() {
+        // `class Box[T] frozen:` must parse: strip the `frozen` modifier
+        // while preserving the `[T]` PEP-695 type-parameter list so Ruff
+        // sees a legal `class Box[T]:` header. The line is recorded so
+        // desugar emits the `@dataclass(slots=True, frozen=True)`.
+        let src = "class Box[T] frozen:\n    value: T\n";
+        let result = preprocess(src);
+        assert!(
+            result.python_source.starts_with("class Box[T]:"),
+            "expected `class Box[T]:` header; got:\n{}",
+            result.python_source
+        );
+        assert!(
+            result.frozen_class_lines.contains(&0),
+            "frozen_class_lines should record line 0; got: {:?}",
+            result.frozen_class_lines
+        );
+    }
+
+    #[test]
+    fn class_generic_then_frozen_with_bound_and_bases() {
+        // `[T: Bound]` keeps the bracket-list intact across the inner colon,
+        // and the bases tail after `frozen(Base):` is preserved verbatim.
+        let src = "class Box[T: int] frozen(Base):\n    value: T\n";
+        let result = preprocess(src);
+        assert!(
+            result
+                .python_source
+                .starts_with("class Box[T: int](Base):"),
+            "expected `class Box[T: int](Base):`; got:\n{}",
+            result.python_source
+        );
+        assert!(result.frozen_class_lines.contains(&0));
+    }
+
+    // ── #6: HKT scaffold `class Functor[F[_]]:` ────────────────────────────
+    #[test]
+    fn class_with_hkt_wildcard_param_parses() {
+        // `class Functor[F[_]]:` is the documented scaffold for higher-kinded
+        // type parameters. Python's PEP-695 parser doesn't accept `F[_]` in a
+        // type-param list, so preprocess rewrites the nested `[_]` away,
+        // leaving a plain TypeVar `F`. The full body — including a method
+        // with its own type params — must parse.
+        let src = "class Functor[F[_]]:\n    def fmap[T, U](self, f, fa): ...\n";
+        let result = preprocess(src);
+        assert!(
+            result.python_source.starts_with("class Functor[F]:"),
+            "expected `class Functor[F]:` header; got:\n{}",
+            result.python_source
+        );
+        // Sanity: Ruff must accept the rewritten source.
+        let parse = crate::parse_module(&result.python_source);
+        assert!(parse.is_ok(), "rewritten HKT class must parse cleanly");
+    }
+
+    #[test]
+    fn class_with_hkt_multiple_params() {
+        // Two HKT parameters in the same header — `Bifunctor[F[_], G[_]]`.
+        let src = "class Bifunctor[F[_], G[_]]:\n    pass\n";
+        let result = preprocess(src);
+        assert!(
+            result.python_source.starts_with("class Bifunctor[F, G]:"),
+            "expected `class Bifunctor[F, G]:`; got:\n{}",
+            result.python_source
+        );
+    }
+
+    #[test]
+    fn class_with_mixed_hkt_and_plain_params() {
+        // Mixing kinded and unkinded type parameters: the kind marker
+        // disappears, plain params survive.
+        let src = "class M[F[_], A]:\n    pass\n";
+        let result = preprocess(src);
+        assert!(
+            result.python_source.starts_with("class M[F, A]:"),
+            "expected `class M[F, A]:`; got:\n{}",
+            result.python_source
+        );
+    }
+
+    // ── #17: outer-annotation tuple unpack ────────────────────────────────
+    #[test]
+    fn outer_annotation_tuple_unpack_rewrites_to_per_element() {
+        // `let (a, b): tuple[int, str] = pair()` distributes the outer
+        // tuple type to per-element annotations. Equivalent to the
+        // already-supported `let (a: int, b: str) = pair()` form.
+        let src = "let (a, b): tuple[int, str] = pair()\n";
+        let out = expand_typed_let_unpack(src);
+        assert!(
+            out.contains("let __typhon_unpack_0__ = pair()"),
+            "expected temp binding; got:\n{out}"
+        );
+        assert!(
+            out.contains("let a: int = __typhon_unpack_0__[0]"),
+            "expected `a: int` element; got:\n{out}"
+        );
+        assert!(
+            out.contains("let b: str = __typhon_unpack_0__[1]"),
+            "expected `b: str` element; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn outer_annotation_tuple_unpack_three_elements() {
+        let src = "let (a, b, c): tuple[int, str, bool] = triple()\n";
+        let out = expand_typed_let_unpack(src);
+        assert!(out.contains("let a: int = __typhon_unpack_0__[0]"));
+        assert!(out.contains("let b: str = __typhon_unpack_0__[1]"));
+        assert!(out.contains("let c: bool = __typhon_unpack_0__[2]"));
+    }
+
+    #[test]
+    fn outer_annotation_tuple_unpack_non_tuple_annotation_is_left_alone() {
+        // A non-tuple outer annotation can't drive per-element types, so the
+        // pass leaves it for downstream layers to surface a clear error.
+        let src = "let (a, b): list[int] = pair()\n";
+        let out = expand_typed_let_unpack(src);
+        assert_eq!(
+            out, src,
+            "non-tuple outer annotation must be left untouched; got:\n{out}"
+        );
+    }
+
+    // ── #9: interface async-def auto-ellipsis ─────────────────────────────
+    #[test]
+    fn interface_async_def_gets_auto_ellipsis() {
+        // Sync `def name(self) -> str` is already auto-completed inside
+        // interface blocks. The same must apply to `async def …` so users
+        // don't have to write the trailing `: ...` explicitly.
+        let src = "interface Tool:\n    async def execute(self, args: dict) -> str\n";
+        let result = preprocess(src);
+        assert!(
+            result
+                .python_source
+                .contains("async def execute(self, args: dict) -> str: ..."),
+            "expected async def auto-completed with `: ...`; got:\n{}",
+            result.python_source
+        );
+        // The synthesised source must parse cleanly through Ruff.
+        let parse = crate::parse_module(&result.python_source);
+        assert!(parse.is_ok(), "interface with async def must parse");
+    }
+
+    // ── #7: impl on a sealed-union alias distributes across variants ──────
+    #[test]
+    fn impl_on_bare_sealed_union_alias_distributes() {
+        // `impl Tree:` where `type Tree = Leaf | Branch` must distribute
+        // across both variants — the pre-pass duplicates the body once
+        // per variant so each ends up with its own `impl` block.
+        let src = "\
+class Leaf:
+    pass
+class Branch:
+    pass
+type Tree = Leaf | Branch
+impl Tree:
+    def depth(self) -> int:
+        return 0
+";
+        let out = expand_impl_sealed_unions(src);
+        assert!(
+            out.contains("impl Leaf:"),
+            "expected `impl Leaf:` block; got:\n{out}"
+        );
+        assert!(
+            out.contains("impl Branch:"),
+            "expected `impl Branch:` block; got:\n{out}"
+        );
+        assert!(
+            !out.contains("impl Tree:"),
+            "synthetic `impl Tree:` must not remain; got:\n{out}"
+        );
+        assert_eq!(
+            out.matches("def depth(self) -> int:").count(),
+            2,
+            "depth body must be replicated once per variant; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn impl_on_generic_sealed_union_alias_distributes() {
+        // `impl[T] Tree[T]:` where `type Tree[T] = Leaf[T] | Branch[T]`.
+        // The Subscript variant operands trip the desugar collector;
+        // this pre-pass strips them to bare names and re-emits one
+        // generic impl block per variant carrying the same `[T]`.
+        let src = "\
+class Leaf[T]:
+    pass
+class Branch[T]:
+    pass
+type Tree[T] = Leaf[T] | Branch[T]
+impl[T] Tree[T]:
+    def depth(self) -> int:
+        return 0
+";
+        let out = expand_impl_sealed_unions(src);
+        assert!(
+            out.contains("impl[T] Leaf[T]:"),
+            "expected `impl[T] Leaf[T]:`; got:\n{out}"
+        );
+        assert!(
+            out.contains("impl[T] Branch[T]:"),
+            "expected `impl[T] Branch[T]:`; got:\n{out}"
+        );
+        assert!(
+            !out.contains("impl[T] Tree[T]:"),
+            "the synthetic Tree-targeted block must not remain; got:\n{out}"
+        );
+        assert_eq!(
+            out.matches("def depth(self) -> int:").count(),
+            2,
+            "depth must be replicated; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn impl_on_non_alias_target_is_unchanged() {
+        // The pre-pass must be a no-op when the impl target isn't a
+        // sealed-union alias — the existing single-class path keeps
+        // working as before.
+        let src = "\
+class Foo:
+    pass
+impl Foo:
+    def bar(self) -> int:
+        return 0
+";
+        let out = expand_impl_sealed_unions(src);
+        assert_eq!(out, src, "non-alias impl must round-trip unchanged");
+    }
+
+    #[test]
+    fn impl_on_sealed_union_inside_full_preprocess() {
+        // End-to-end: after the full `preprocess`, the synthetic
+        // pseudo-classes should target the real variants and the
+        // `Tree`-named synthetic name must NOT appear in the output.
+        // This is what unblocks finding #7's `impl_unknown_class`.
+        let src = "\
+class Leaf[T]:
+    pass
+class Branch[T]:
+    pass
+type Tree[T] = Leaf[T] | Branch[T]
+impl[T] Tree[T]:
+    def depth(self) -> int:
+        return 0
+";
+        let result = preprocess(src);
+        assert!(
+            result
+                .python_source
+                .contains("class __typhon_impl_Leaf[T](object):"),
+            "expected Leaf pseudo-class; got:\n{}",
+            result.python_source
+        );
+        assert!(
+            result
+                .python_source
+                .contains("class __typhon_impl_Branch[T](object):"),
+            "expected Branch pseudo-class; got:\n{}",
+            result.python_source
+        );
+        assert!(
+            !result.python_source.contains("__typhon_impl_Tree"),
+            "the `Tree` synthetic name must not leak into preprocessed output; got:\n{}",
+            result.python_source
         );
     }
 }
