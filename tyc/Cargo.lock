@@ -2126,6 +2126,8 @@ dependencies = [
  "ruff_python_parser",
  "tempfile",
  "thiserror",
+ "tyc-analyse",
+ "tyc-desugar",
  "tyc-syntax",
 ]
 

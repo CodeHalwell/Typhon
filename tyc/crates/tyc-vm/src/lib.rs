@@ -62,7 +62,24 @@ pub fn run_source(
             .unwrap_or_default();
         VmError::Parse(format!("{where_}{e}"))
     })?;
-    let module = parsed.into_syntax();
+    let mut module = parsed.into_syntax();
+
+    // Hand the VM the desugared module so it sees the same shape as the
+    // compile path: dataclass-decorated user classes, merged impl blocks,
+    // injected runtime imports, and so on. FINDINGS #21 follow-up.
+    // Running the full desugar pass also rewrites \`extend\` user-classes
+    // into method merges; the builtin-extension rewrite below handles the
+    // \`extend str:\` / \`extend list:\` shape that desugar leaves alone.
+    let desugar_out = tyc_desugar::desugar_module(&module);
+    module = desugar_out.module;
+
+    // FINDINGS #21: rewrite \`x.method(args)\` to \`__typhon_ext_TYPE__method
+    // (x, args)\` for every receiver statically annotated as a built-in
+    // type that the source extended with \`extend BUILTIN:\`. Without this
+    // step, calls on extended built-ins fail at runtime with
+    // \`AttributeError: 'str' object has no attribute 'slug'\`.
+    let (registry, _stats) = tyc_analyse::extract_builtin_extensions(&mut module);
+    let _ = tyc_analyse::rewrite_builtin_extension_calls(&mut module, &registry);
 
     let mut interp = Interpreter::new();
     // Seed sys.argv before any user code (or import sys) can observe it.
@@ -308,6 +325,24 @@ def slow(n: int) -> int:
 let fast = cache(slow)
 print(fast(7))
 print(fast(7))
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    #[test]
+    fn extend_builtin_str_method_dispatches() {
+        // FINDINGS #21: `extend str: def slug(self) -> str: …` used to
+        // fail at runtime with AttributeError. The VM now runs the same
+        // desugar + extend-builtin extraction passes as `tyc build`, so
+        // call sites like `"Hello".slug()` rewrite to the lifted free
+        // function `__typhon_ext_str__slug("Hello")`.
+        let src = r#"
+extend str:
+    def slug(self) -> str:
+        return self.lower().replace(" ", "-")
+
+let s: str = "Hello World"
+print(s.slug())
 "#;
         assert_eq!(run_capturing(src).unwrap(), 0);
     }

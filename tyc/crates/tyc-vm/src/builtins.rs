@@ -790,11 +790,19 @@ fn make_typhon_runtime_module(interp: &Interpreter) -> Value {
             }),
         )],
     );
+    // `Result` is exposed as a type marker — the type checker uses
+    // `Result[T, E]` as a typing construct; at runtime the desugared
+    // module only needs the name to be defined. An identity callable
+    // suffices since user code never invokes `Result(...)` directly.
+    let result_marker = nf("Result", |_i, args| {
+        Ok(args.into_iter().next().unwrap_or(Value::None))
+    });
     make_module(
         "typhon_runtime",
         vec![
             ("Ok", ok),
             ("Err", err),
+            ("Result", result_marker),
             ("tasks", tasks),
             ("lazy", lazy),
             ("freeze", freeze),
