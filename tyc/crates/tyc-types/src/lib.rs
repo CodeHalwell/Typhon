@@ -4246,6 +4246,30 @@ fn collect_classes_and_functions(c: &mut Checker, body: &[Stmt]) {
     for stmt in body {
         if let Stmt::Assign(a) = stmt {
             if let Some((name, base_expr)) = extract_newtype_decl(a) {
+                // FINDINGS v0.7.1 #14: reject a newtype RHS that isn't a
+                // type expression. `newtype Bogus = "string literal"` and
+                // `newtype X = 42` (etc.) used to be silently accepted —
+                // the base just resolved to `Type::Unknown` and every
+                // downstream check then accepted any value. Detect the
+                // common non-type shapes (literal forms, lambda, call
+                // expressions other than `Result[...]`-style subscripts)
+                // and surface a dedicated diagnostic.
+                if let Some(kind) = non_type_expr_kind(&base_expr) {
+                    let span_start = base_expr.range().start().to_usize();
+                    let span_end = base_expr.range().end().to_usize();
+                    let span_len = span_end.saturating_sub(span_start).max(1);
+                    c.diagnostics.push_error(TycError::newtype_invalid_base(
+                        name.clone(),
+                        kind,
+                        &c.path,
+                        c.source,
+                        span_start,
+                        span_len,
+                    ));
+                    // Still register so downstream lookups don't panic.
+                    c.newtypes.insert(name, Type::Unknown);
+                    continue;
+                }
                 let base_ty = type_from_annotation_with_params(&base_expr, &classes, &[]);
                 c.newtypes.insert(name, base_ty);
             }
@@ -8307,6 +8331,40 @@ fn collect_narrowings_inner(c: &Checker, test: &Expr, negate: bool, out: &mut Ve
 /// `dict.get(k)` which must return `V?`, not `V` — and is the right
 /// place to grow other built-in method types (`list.pop`, `str.find`,
 /// `re.match`, …) without scattering them across the inference engine.
+/// If `expr` is clearly not a type expression, return a short
+/// human-readable label for the offending shape. Returns `None` for
+/// anything that *could* be a type — bare `Name`s, `Subscript` of a
+/// name, `Attribute` (dotted), `BinOp(|)` unions, tuple-of-types — so
+/// the calling code stays conservative and only rejects obvious
+/// literal-as-base mistakes. FINDINGS v0.7.1 #14.
+fn non_type_expr_kind(expr: &Expr) -> Option<&'static str> {
+    match expr {
+        // Bare names (and forward-reference strings handled by the
+        // annotation lowering elsewhere) are always type-shaped.
+        Expr::Name(_)
+        | Expr::Subscript(_)
+        | Expr::Attribute(_)
+        | Expr::BinOp(_)
+        | Expr::Tuple(_)
+        | Expr::NoneLiteral(_) => None,
+        // String literal — only acceptable here if it's a forward
+        // reference to a type. Treat it as an invalid base; the existing
+        // `type_from_annotation_with_params` does NOT resolve string
+        // forward refs for `newtype` so accepting it would silently
+        // give `Type::Unknown` anyway.
+        Expr::StringLiteral(_) => Some("string literal"),
+        Expr::NumberLiteral(_) => Some("number literal"),
+        Expr::BooleanLiteral(_) => Some("boolean literal"),
+        Expr::BytesLiteral(_) => Some("bytes literal"),
+        Expr::List(_) => Some("list literal"),
+        Expr::Dict(_) => Some("dict literal"),
+        Expr::Set(_) => Some("set literal"),
+        Expr::Lambda(_) => Some("lambda expression"),
+        Expr::Call(_) => Some("call expression"),
+        _ => Some("expression"),
+    }
+}
+
 /// Return `true` when `ann` is the bare name `ClassVar` or a subscripted
 /// `ClassVar[...]` annotation. Used to skip the
 /// `tyc::field_default_ordering` check on class-level constants: they're
@@ -16762,6 +16820,31 @@ def main() -> None:
         assert!(
             !d.has_errors(),
             "list.append must still resolve; got: {:?}",
+            d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    /// FINDINGS v0.7.1 #14: `newtype Foo = "any string literal"` must be
+    /// rejected — `newtype`'s RHS must be a type, not a value.
+    #[test]
+    fn v071_newtype_string_literal_rejected() {
+        let src = "newtype Bogus = \"any string literal\"\n";
+        let d = check(src);
+        assert!(
+            d.errors().iter().any(|e| matches!(e, TycError::NewtypeInvalidBase { .. })),
+            "newtype with string-literal RHS must fire newtype_invalid_base; got: {:?}",
+            d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    /// FINDINGS v0.7.1 #14: a valid `newtype X = int` is still accepted.
+    #[test]
+    fn v071_newtype_valid_base_still_accepted() {
+        let src = "newtype UserId = int\n";
+        let d = check(src);
+        assert!(
+            !d.errors().iter().any(|e| matches!(e, TycError::NewtypeInvalidBase { .. })),
+            "newtype with valid type RHS must not fire; got: {:?}",
             d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
         );
     }
