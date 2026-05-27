@@ -3276,6 +3276,51 @@ pub fn check_module_with(
 /// binding table, looking up the source module's [`ModuleShapes`],
 /// and re-keying every brought-in symbol under its local alias in the
 /// returned `ExternalShapes`.
+/// Insert an externally-supplied class shape into the checker's
+/// registries (`class_shapes`, `class_parents`, `classes`), then walk
+/// its `bases` and recursively seed every base that resolves to a
+/// project-declared shape in `by_module`. Bases that don't resolve
+/// (built-ins like `Exception`, venv classes, framework bases) stay
+/// absent on purpose — `class_hierarchy_fully_known` keys leniency
+/// off exactly that absence. Returns immediately if `name` is already
+/// in `class_shapes` so a local declaration (or an already-seeded
+/// imported class) is never clobbered. Iterative to avoid blowing the
+/// stack on deep / cyclic chains; cycles terminate naturally because
+/// the first inserted entry guards every revisit.
+fn seed_external_class_with_bases(
+    c: &mut Checker,
+    name: &str,
+    shape: &InterfaceShape,
+    by_module: &HashMap<String, ModuleShapes>,
+) {
+    let mut stack: Vec<(String, InterfaceShape)> = vec![(name.to_owned(), shape.clone())];
+    while let Some((cur_name, cur_shape)) = stack.pop() {
+        if c.class_shapes.contains_key(&cur_name) {
+            continue;
+        }
+        if !cur_shape.bases.is_empty() {
+            c.class_parents
+                .entry(cur_name.clone())
+                .or_insert_with(|| cur_shape.bases.clone());
+        }
+        // Resolve every base against `by_module` BEFORE inserting the
+        // shape, so we don't hold any borrow across the lookup loop.
+        for base in &cur_shape.bases {
+            if c.class_shapes.contains_key(base) {
+                continue;
+            }
+            for module_shapes in by_module.values() {
+                if let Some(base_shape) = module_shapes.class_shapes.get(base) {
+                    stack.push((base.clone(), base_shape.clone()));
+                    break;
+                }
+            }
+        }
+        c.class_shapes.insert(cur_name.clone(), cur_shape);
+        c.classes.push(cur_name);
+    }
+}
+
 pub fn check_module_with_imports(
     path: impl Into<String>,
     source: &str,
@@ -3293,33 +3338,51 @@ pub fn check_module_with_imports(
     // this file shadows an imported `Foo` for the rest of the
     // module body, mirroring Python's scope semantics).
     if let Some(ext) = external {
+        // Seed each imported class shape AND its `bases` chain so the
+        // four hierarchy walks (`class_hierarchy_fully_known`,
+        // `find_method`, `find_field`, `class_inherits_from`) see the
+        // same parent surface a same-module declaration would. Three
+        // things to get right (PR #150 review fallout):
+        //
+        // 1. **Parents must be seeded from `shape.bases`.** The
+        //    in-module first pass populates `class_parents` separately
+        //    from `class_shapes`, but the cross-module path used to
+        //    only seed `class_shapes` — so the hierarchy walks stopped
+        //    at the imported class itself, never saw the base, and
+        //    `class_hierarchy_fully_known` reported "fully known". The
+        //    v0.7.1 foreign-base leniency couldn't kick in, so cross-
+        //    module `class! Sub(Foreign):` false-positived every
+        //    inherited attribute access (BUG 3 from the v0.9.1 MNIST
+        //    CNN sweep).
+        //
+        // 2. **Project-declared base shapes must also be seeded.**
+        //    `tyc-db::build_external_shapes` only inserts the
+        //    explicitly-imported names into `ext.class_shapes`. If
+        //    the producer module has `class Base: ...; class
+        //    Sub(Base): ...` and the consumer does only `from m
+        //    import Sub`, `Base` is absent from `ext.class_shapes`.
+        //    Without a transitive seed, the walk would treat `Base`
+        //    as foreign (no entry → `class_hierarchy_fully_known`
+        //    returns false → diagnostic suppressed), even though the
+        //    producer hierarchy IS fully known — a false-negative
+        //    regression flagged by Codex on PR #150. We resolve this
+        //    by looking each base up in `ext.by_module` (which holds
+        //    every project module's shapes) and seeding it too,
+        //    recursively. Bases that resolve nowhere — Exception,
+        //    venv classes, `nn.Module` — stay absent, which is
+        //    exactly what triggers the foreign-base leniency.
+        //
+        // 3. **Local declarations still win on collision.** The
+        //    helper uses an `Entry::Vacant` check so an in-module
+        //    `class Foo:` populated later by
+        //    `collect_classes_and_functions` (line 4718 unconditional
+        //    `insert`) is not pre-empted. The matching
+        //    `class_parents` entry is unconditionally wiped /
+        //    overwritten in the in-module pass (see the
+        //    `parents.is_empty()` branch around line 4612).
+        let by_module = ext.by_module.as_ref();
         for (name, shape) in &ext.class_shapes {
-            // Seed `class_parents` from the imported shape's `bases`
-            // BEFORE inserting the shape (mirrors the in-module pass:
-            // `collect_classes_and_functions` populates `class_parents`
-            // separately from `class_shapes`). Without this, the
-            // hierarchy walks (`class_hierarchy_fully_known`,
-            // `find_method`, `find_field`, `class_inherits_from`) all
-            // stop at the imported class itself — they never see the
-            // foreign / built-in base — so cross-module attribute
-            // access on `class! Sub(Foreign):` false-positives
-            // `tyc::attribute_not_found` even when the same access is
-            // (correctly) lenient in-module. Stress finding from the
-            // v0.9.1 MNIST CNN sweep (BUG 3): a `class! HttpError
-            // (Exception): code: int` accessed cross-module flagged
-            // every inherited / framework-provided attribute. We use
-            // `entry(..).or_insert_with(..)` so an in-module
-            // declaration of the same name (populated later by
-            // `collect_classes_and_functions`) still wins.
-            if !shape.bases.is_empty() {
-                c.class_parents
-                    .entry(name.clone())
-                    .or_insert_with(|| shape.bases.clone());
-            }
-            c.class_shapes
-                .entry(name.clone())
-                .or_insert_with(|| shape.clone());
-            c.classes.push(name.clone());
+            seed_external_class_with_bases(&mut c, name, shape, by_module);
         }
         for (name, tps) in &ext.class_type_params {
             c.class_type_params
@@ -4611,6 +4674,15 @@ fn collect_classes_and_functions(c: &mut Checker, body: &[Stmt]) {
                     .collect();
                 if !parents.is_empty() {
                     c.class_parents.insert(name, parents);
+                } else {
+                    // Locally-declared `class Foo:` with no explicit
+                    // bases must overwrite any imported parent chain
+                    // bound earlier under the same name. Without this
+                    // remove, an imported `Foo(Bar)` (seeded in
+                    // `check_module_with_imports`) leaves a stale
+                    // entry that the four hierarchy walks would still
+                    // walk through. PR #150 review (copilot).
+                    c.class_parents.remove(&name);
                 }
             }
             Stmt::TypeAlias(ta) => {
@@ -17859,8 +17931,13 @@ def main() -> None:
     #[test]
     fn bug3_cross_module_attribute_lenient_when_foreign_base() {
         // Producer module: `class! HttpError(Exception): code: int`.
+        // The `class!` marker desugars to the same shape that plain
+        // `class` does for this test's purposes (the shape's `bases`
+        // entry is what the cross-module ingestion path walks); the
+        // `!` is preserved here so the source mirrors the reported
+        // reproduction surface — PR #150 review (copilot).
         let producer_src = "\
-class HttpError(Exception):
+class! HttpError(Exception):
     code: int
     message: str
 ";
@@ -17922,6 +17999,153 @@ def describe(e: HttpError) -> str:
             attr_errors.is_empty(),
             "cross-module attribute access on `class! Sub(Foreign):` must \
              be lenient; got: {attr_errors:?}"
+        );
+    }
+
+    /// PR #150 review (Codex P2): consumer imports ONLY `Sub` from a
+    /// producer module that declares both `class Base:` and
+    /// `class Sub(Base):`. The bogus attribute access on `Sub` must
+    /// still fire — the producer's hierarchy IS fully known, the
+    /// consumer just hasn't pulled in `Base` explicitly. The transitive
+    /// seed in `seed_external_class_with_bases` walks `ext.by_module`
+    /// to find `Base`'s shape and bring it along, so
+    /// `class_hierarchy_fully_known` doesn't bail out lenient just
+    /// because the consumer's import list happened to omit the base.
+    #[test]
+    fn bug3_transitive_base_seeded_from_by_module() {
+        let producer_src = "\
+class Base:
+    pass
+
+class Sub(Base):
+    pass
+";
+        let producer_prep = preprocess(producer_src);
+        let producer_module = tyc_syntax::parse_module(&producer_prep.python_source)
+            .unwrap()
+            .into_syntax();
+        let producer_shapes = extract_module_shapes(&producer_module);
+        let sub_shape = producer_shapes
+            .class_shapes
+            .get("Sub")
+            .expect("Sub must be exported");
+
+        let consumer_src = "\
+def label(s: Sub) -> str:
+    return s.totally_bogus_attr
+";
+        let consumer_prep = preprocess(consumer_src);
+        let consumer_module = tyc_syntax::parse_module(&consumer_prep.python_source)
+            .unwrap()
+            .into_syntax();
+        let (resolved, _) = resolve_module(
+            "<consumer>".to_owned(),
+            &consumer_prep.python_source,
+            &consumer_module,
+        );
+
+        // Mirror what `tyc-db::build_external_shapes` does for a
+        // narrow `from m import Sub`: only `Sub` lands in
+        // `ext.class_shapes`, but `ext.by_module` retains every
+        // project module's full surface so the transitive walk has
+        // somewhere to find `Base`.
+        let mut external = ExternalShapes::default();
+        external
+            .class_shapes
+            .insert("Sub".to_owned(), sub_shape.clone());
+        let mut by_module: HashMap<String, ModuleShapes> = HashMap::new();
+        by_module.insert("producer".to_owned(), producer_shapes);
+        external.by_module = std::sync::Arc::new(by_module);
+
+        let d = check_module_with_imports(
+            "<consumer>",
+            &consumer_prep.python_source,
+            &resolved,
+            &consumer_module,
+            &consumer_prep.unsafe_lines,
+            &consumer_prep.frozen_class_lines,
+            Some(&external),
+        );
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| e.to_string().contains("totally_bogus_attr")),
+            "transitive seed must keep the diagnostic firing when the \
+             producer's hierarchy is fully known but `Base` wasn't \
+             explicitly imported; got: {:?}",
+            d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    /// PR #150 review (copilot): local `class Foo:` (no bases) must
+    /// completely shadow an imported `Foo(Bar)` — including clearing
+    /// any stale `class_parents` entry left by the cross-module seed.
+    /// Otherwise the hierarchy walk on the local Foo would still walk
+    /// through to `Bar`, suppressing legitimate diagnostics.
+    #[test]
+    fn local_class_shadows_imported_parents() {
+        let producer_src = "\
+class Bar:
+    bar_field: int
+
+class Foo(Bar):
+    foo_field: int
+";
+        let producer_prep = preprocess(producer_src);
+        let producer_module = tyc_syntax::parse_module(&producer_prep.python_source)
+            .unwrap()
+            .into_syntax();
+        let producer_shapes = extract_module_shapes(&producer_module);
+        let imported_foo = producer_shapes
+            .class_shapes
+            .get("Foo")
+            .expect("Foo must be exported");
+
+        // Consumer redeclares Foo locally with NO bases and accesses
+        // `bar_field` (which only lives on the imported `Bar` chain).
+        // The local declaration must wipe the stale parents entry so
+        // `bar_field` reports as missing.
+        let consumer_src = "\
+class Foo:
+    own_field: int
+
+def label(f: Foo) -> int:
+    return f.bar_field
+";
+        let consumer_prep = preprocess(consumer_src);
+        let consumer_module = tyc_syntax::parse_module(&consumer_prep.python_source)
+            .unwrap()
+            .into_syntax();
+        let (resolved, _) = resolve_module(
+            "<consumer>".to_owned(),
+            &consumer_prep.python_source,
+            &consumer_module,
+        );
+
+        let mut external = ExternalShapes::default();
+        external
+            .class_shapes
+            .insert("Foo".to_owned(), imported_foo.clone());
+        let mut by_module: HashMap<String, ModuleShapes> = HashMap::new();
+        by_module.insert("producer".to_owned(), producer_shapes);
+        external.by_module = std::sync::Arc::new(by_module);
+
+        let d = check_module_with_imports(
+            "<consumer>",
+            &consumer_prep.python_source,
+            &resolved,
+            &consumer_module,
+            &consumer_prep.unsafe_lines,
+            &consumer_prep.frozen_class_lines,
+            Some(&external),
+        );
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| e.to_string().contains("bar_field")),
+            "local `class Foo:` (no bases) must overwrite imported \
+             parent chain — got: {:?}",
+            d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
         );
     }
 
