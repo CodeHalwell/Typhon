@@ -167,6 +167,34 @@ pub fn run(args: CheckArgs) -> Result<()> {
         .unwrap_or(&config.project.src)
         .to_owned();
     let mut shape_map = collect_project_shapes(&args.paths, &src_root_name);
+    // Aggregate `pub *` package facades into their __init__ shape so a
+    // downstream `from <pkg> import X` resolves through the facade the
+    // same way it does at build time. Without this, cross-module flow
+    // through a facade loses sealed-union variant lists, class shapes,
+    // function signatures, and interfaces — surfacing as misleading
+    // diagnostics like `tyc::missing_return` on a match the
+    // exhaustiveness checker accepted. (Bug 2 from v0.9.0 stress.)
+    {
+        let mut all_paths: Vec<PathBuf> = Vec::new();
+        for root in &args.paths {
+            if let Ok(files) = collect_ty_files(root) {
+                all_paths.extend(files);
+            }
+            // `.dty` stubs participate in the shape map on equal footing
+            // with `.ty` (stubs win), so the aggregation pass needs to
+            // see them too — otherwise a `pub *` facade implemented as
+            // `__init__.dty` or a sibling `.dty` module wouldn't be
+            // re-exported. (Copilot PR review on check.rs.)
+            if let Ok(files) = collect_dty_files(root) {
+                all_paths.extend(files);
+            }
+        }
+        crate::commands::util::aggregate_pub_star_shapes(
+            &mut shape_map,
+            &all_paths,
+            &src_root_name,
+        );
+    }
 
     // Resolved source directory for the `tyc::stdlib_module_shadow`
     // gating below. We canonicalise once here so the per-file check

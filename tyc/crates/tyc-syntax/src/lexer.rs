@@ -97,6 +97,20 @@ pub enum TyphonKeyword {
     /// `let`'s binding-only immutability — the wrapped value cannot
     /// be mutated through any reference.
     Freeze,
+    /// `frozen` — modifier on a `class` declaration. The preprocessor
+    /// strips the modifier so the Python parser sees `class X:` (or
+    /// `class X(Base):`) and records the line so the desugar pass can
+    /// emit `@dataclasses.dataclass(slots=True, frozen=True)`. The
+    /// `Frozen` keyword entry is recorded in the `stripped` list
+    /// purely so `tyc fmt` can restore the modifier — desugar uses
+    /// `frozen_class_lines` directly.
+    Frozen,
+    /// `pub *` — wildcard re-export marker. The preprocessor strips
+    /// the entire line so the Python parser doesn't see it. The
+    /// `PubStar` keyword entry is recorded in the `stripped` list
+    /// purely so `tyc fmt` can restore the line — desugar / build
+    /// orchestration uses `pub_star_lines` directly.
+    PubStar,
 }
 
 impl TyphonKeyword {
@@ -119,6 +133,8 @@ impl TyphonKeyword {
             Self::Newtype => "newtype",
             Self::Pub => "pub",
             Self::Freeze => "freeze",
+            Self::Frozen => "frozen",
+            Self::PubStar => "pub *",
         }
     }
 

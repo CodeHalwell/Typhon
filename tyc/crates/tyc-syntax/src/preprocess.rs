@@ -216,9 +216,41 @@ pub fn line_byte_starts(source: &str, lines: &[usize]) -> Vec<u32> {
     starts
 }
 
+/// Options controlling the [`preprocess`] pipeline. Defaults reproduce
+/// the behaviour every existing caller relies on; the formatter passes
+/// `expand_impl_sealed_unions: false` so that `impl Alias:` headers
+/// targeting a sealed-union alias round-trip cleanly through
+/// `tyc fmt` instead of being expanded into one synthesised
+/// `__typhon_impl_<Variant>` block per variant (B15).
+#[derive(Debug, Clone, Copy)]
+pub struct PreprocessOptions {
+    /// When `true` (default), `impl[<tp>] Alias[<args>]:` blocks whose
+    /// target is a sealed-union alias are expanded into one `impl
+    /// Variant:` block per variant. This is required by the desugar
+    /// pipeline (so the method bodies wire up at every call site); the
+    /// formatter sets it to `false` because the expansion duplicates
+    /// the body and shifts every subsequent line index, which has no
+    /// faithful round-trip back to the original source.
+    pub expand_impl_sealed_unions: bool,
+}
+
+impl Default for PreprocessOptions {
+    fn default() -> Self {
+        Self {
+            expand_impl_sealed_unions: true,
+        }
+    }
+}
+
 /// Strip Typhon-specific syntax from `source` and return the Python-
 /// compatible string together with restoration metadata.
 pub fn preprocess(source: &str) -> PreprocessResult {
+    preprocess_opts(source, PreprocessOptions::default())
+}
+
+/// Like [`preprocess`] but with explicit options. Used by the formatter
+/// to suppress destructive expansions that don't round-trip.
+pub fn preprocess_opts(source: &str, opts: PreprocessOptions) -> PreprocessResult {
     // Pre-pass: walk every line, strip a leading `pub ` modifier (at
     // module level — i.e. zero indentation), record the declared name,
     // and feed the rest of the pipeline a source string with `pub ` no
@@ -246,7 +278,11 @@ pub fn preprocess(source: &str) -> PreprocessResult {
     // missing case and emits one real `impl Variant:` block per
     // variant so the user's method bodies wire up at every call site.
     // Finding #7.
-    let source_owned = expand_impl_sealed_unions(&source_owned);
+    let source_owned = if opts.expand_impl_sealed_unions {
+        expand_impl_sealed_unions(&source_owned)
+    } else {
+        source_owned
+    };
     let source = source_owned.as_str();
 
     let mut python_source = String::with_capacity(source.len());
@@ -606,6 +642,10 @@ pub fn preprocess(source: &str) -> PreprocessResult {
             if rest.starts_with("class ") && rest.contains(" frozen") {
                 if let Some(rewritten_class) = strip_frozen_modifier(rest) {
                     frozen_class_lines.push(line_index);
+                    stripped.push(StrippedKeyword {
+                        line_index,
+                        keyword: TyphonKeyword::Frozen,
+                    });
                     let new_line = format!("{}{}", indent, rewritten_class);
                     let (rewritten, marks) = rewrite_optionals(&new_line, &mut in_string);
                     for col in marks {
@@ -780,6 +820,15 @@ pub fn preprocess(source: &str) -> PreprocessResult {
         stripped.push(StrippedKeyword {
             line_index: line_idx,
             keyword: TyphonKeyword::Pub,
+        });
+    }
+    // `pub *` lines are blanked by `strip_pub_prefixes`; emit StrippedKeyword
+    // entries so `tyc fmt` can restore the marker. The desugar / build
+    // orchestrator uses `pub_star_lines` directly and ignores these entries.
+    for &line_idx in &pub_star_lines {
+        stripped.push(StrippedKeyword {
+            line_index: line_idx,
+            keyword: TyphonKeyword::PubStar,
         });
     }
     PreprocessResult {
@@ -2082,6 +2131,49 @@ fn strip_frozen_modifier(rest: &str) -> Option<String> {
     Some(format!("class {}{}{}", name, type_params, tail))
 }
 
+/// Re-insert the `frozen` modifier into a class header previously
+/// stripped by [`strip_frozen_modifier`]. Given `class Name[T](Base):`
+/// or `class Name[T]:`, returns `class Name[T] frozen(Base):` /
+/// `class Name[T] frozen:`. Returns `None` if the line does not look
+/// like a class header (so the formatter can fall back to leaving the
+/// line untouched).
+fn reinsert_frozen_modifier(content: &str) -> Option<String> {
+    let after_class = content.strip_prefix("class ")?;
+    let name_end = after_class
+        .bytes()
+        .position(|b| !(b.is_ascii_alphanumeric() || b == b'_'))?;
+    if name_end == 0 {
+        return None;
+    }
+    let name = &after_class[..name_end];
+    let after_name = &after_class[name_end..];
+    // Optionally consume a PEP-695 type-parameter list — mirrors
+    // `strip_frozen_modifier`.
+    let (type_params, after_tps) = if after_name.starts_with('[') {
+        let bytes = after_name.as_bytes();
+        let mut depth = 0i32;
+        let mut end = None;
+        for (i, &b) in bytes.iter().enumerate() {
+            match b {
+                b'[' => depth += 1,
+                b']' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = Some(i + 1);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let end = end?;
+        (&after_name[..end], &after_name[end..])
+    } else {
+        ("", after_name)
+    };
+    Some(format!("class {}{} frozen{}", name, type_params, after_tps))
+}
+
 /// Same as [`make_impl_class_line`] but uses the `__typhon_builtin_ext_`
 /// prefix so the analyse pass can find these classes, extract their
 /// methods to free functions, and drive the call-site rewrite.  Kept
@@ -2598,6 +2690,34 @@ pub fn postprocess_full(
                 let content = &line[indent_len..];
                 let restored = unwrap_freeze_let(content).unwrap_or_else(|| content.to_owned());
                 lines[line_idx] = format!("{}freeze {}", &line[..indent_len], restored);
+            }
+            TyphonKeyword::Frozen => {
+                // Restore the `frozen` modifier on a class header. The
+                // preprocessor stripped `frozen` from a header that
+                // originally looked like `class Name[Tps] frozen[(Bases)]:`,
+                // leaving the line as `class Name[Tps][(Bases)]:`. We
+                // re-insert ` frozen` right after the name (and any
+                // PEP-695 type-param list), before either the `(` of the
+                // base list or the terminating `:`.
+                let line = &lines[line_idx];
+                let indent_len = line
+                    .find(|c: char| !c.is_whitespace())
+                    .unwrap_or(line.len());
+                let content = &line[indent_len..];
+                if let Some(restored) = reinsert_frozen_modifier(content) {
+                    lines[line_idx] = format!("{}{}", &line[..indent_len], restored);
+                }
+            }
+            TyphonKeyword::PubStar => {
+                // Restore the entire `pub *` line. The preprocessor blanked
+                // it out (replacing the line content with the empty string
+                // while preserving the terminating newline) so the Python
+                // parser ignores it; recover the original marker text here.
+                let line = &lines[line_idx];
+                let indent_len = line
+                    .find(|c: char| !c.is_whitespace())
+                    .unwrap_or(line.len());
+                lines[line_idx] = format!("{}pub *", &line[..indent_len]);
             }
         }
     }
