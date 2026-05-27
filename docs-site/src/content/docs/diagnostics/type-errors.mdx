@@ -15,17 +15,21 @@ A function parameter or return type is missing its annotation — Rule 1 of the 
 def add(a, b: int) -> int: ...    # ❌ parameter `a` has no annotation
 def greet(name: str):             # ❌ no return type
     print(name)
+def trace(f, *args, **kwargs):    # ❌ since v0.9.0 — every variadic param too
+    ...
 ```
 
-**Fix:** annotate every parameter and every return type. For a function that returns nothing, write `-> None`.
+**Fix:** annotate every parameter and every return type. For a function that returns nothing, write `-> None`. For genuinely variadic functions (typically generic decorators or `**kwargs` forwarders), the canonical idiom for `*args` / `**kwargs` is `object`:
 
 ```python
 def add(a: int, b: int) -> int: ...
 def greet(name: str) -> None:
     print(name)
+def trace[R](f: Callable[..., R], *args: object, **kwargs: object) -> R:
+    return f(*args, **kwargs)
 ```
 
-This single diagnostic covers both missing-parameter-types and missing-return-types — Typhon does not separate them today.
+This single diagnostic covers both missing-parameter-types and missing-return-types — Typhon does not separate them today. Since v0.9.0 the diagnostic also fires on `*args` and `**kwargs`, and the rendered message drops the double-backtick wrapping the previous renderer produced (was rendered as `` `parameter `x`` ``).
 
 ## `tyc::type_mismatch`
 
@@ -139,6 +143,23 @@ def f(u: User) -> str:
 ```
 
 **Fix:** add the field (or method) to the class, fix the typo, or widen the type.
+
+### v0.8.0 widening + v0.8.1 carve-out
+
+v0.8.0 extended the firing site from `TypeVar`-bounded parameters to direct class instances (`p: Point`) and generic-class receivers (`s: Stream[int]`). v0.8.1 narrowed it again so venv-introspected third-party classes don't false-positive: `InterfaceShape` carries a `partial: bool` flag set on every shape built from `inspect.signature(Cls)`, and `class_hierarchy_fully_known` returns `false` whenever any class in the chain is partial. The net effect — calls like `uvicorn.Server.serve(...)`, `httpx.AsyncClient.aclose(...)`, `fastapi.Request.body(...)` against third-party libraries stay permissive. Skipped in `unsafe:` regions and on dunder / leading-underscore names.
+
+### `extend list:` dispatches before `attribute_not_found` (v0.9.0)
+
+Until v0.9.0 an `extend list:` method on a `list[T]`-annotated receiver fell through to `attribute_not_found`. v0.9.0 consults the synthetic `__typhon_builtin_ext_list` class shape *before* the diagnostic fires, so the parameterised forms dispatch correctly:
+
+```python
+extend list:
+    def first_or[T](self, default: T) -> T:
+        return self[0] if self else default
+
+def head(xs: list[int]) -> int:
+    return xs.first_or(0)        # ✅ since v0.9.0 — was attribute_not_found before
+```
 
 ## `tyc::generic`
 

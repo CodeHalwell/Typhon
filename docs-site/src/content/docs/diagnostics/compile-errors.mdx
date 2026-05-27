@@ -55,6 +55,14 @@ impl Widget:
 
 The check walks the candidate's MRO and matches field types; it does not require an explicit `Widget(Drawable)` base. See [Interfaces](/Typhon/types/interfaces/).
 
+### v0.8.0 added parameter-type conformance
+
+The conformance check compares parameter types position-by-position (contravariant on params) in addition to arity since v0.8.0, so a `class BadRepo` claiming to implement `interface Repo: def save(self, item: str) -> bool` with a `def save(self, item: int) -> bool` impl is rejected at conformance time. Before v0.8.0 the arities matched but the parameter-type mismatch went silently.
+
+### v0.9.0 arity-message clarification
+
+The arity diagnostic message reads "got N non-self parameter(s), expected M" since v0.9.0 instead of the ambiguous "arity N; expected M". The previous wording was easy to misread when the impl matched arity but the parameter type was off, or vice versa — the new wording makes it explicit which axis the diagnostic is reporting on.
+
 ## `tyc::lazy_usage`
 
 A `lazy` construct was written in an unsupported form. The message text names the specific problem.
@@ -83,6 +91,27 @@ def f() -> None:
 ```
 
 **Fix:** rewrite to one of the supported forms above. For per-call laziness inside a function body, use a plain function or `functools.cache` directly.
+
+## `tyc::freeze_not_freezable` (v0.9.0)
+
+`freeze let X = <expr>` where the RHS constructs a value that cannot be deep-frozen — typically a non-`frozen` user class. Before v0.9.0 the failure surfaced as a runtime `TypeError` at first import; v0.9.0 pre-validates the RHS at check time so the diagnostic fires before the module ever runs.
+
+```python
+class Counter:                       # not frozen
+    value: int
+
+freeze let CFG = Counter(value=0)    # ❌ tyc::freeze_not_freezable
+                                     # `Counter` is not declared `frozen`
+```
+
+**Fix:** mark the class `frozen`, switch to a built-in container (`list` / `dict` / `set` are wrapped automatically into `tuple` / `MappingProxyType` / `frozenset`), or use a plain `let` if mutability is wanted.
+
+```python
+class Counter frozen:
+    value: int
+
+freeze let CFG = Counter(value=0)    # ✅ check-time validated
+```
 
 ## Where next
 

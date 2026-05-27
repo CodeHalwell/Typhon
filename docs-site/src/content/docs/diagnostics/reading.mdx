@@ -52,7 +52,7 @@ Every diagnostic has a `tyc::*` code. The catalog is enumerated across the follo
     [→](/Typhon/diagnostics/type-errors/) — `missing_annotation`, `type_mismatch`, `arg_count`, `not_callable`, `unknown_name`, `attribute_not_found`, `generic`, `typevar_bound`, `generator_return_type`, `cyclic_type_alias`, `comptime`, `operator_type_mismatch`, `tuple_index_out_of_range`, `python_semantic_drift`.
   </Card>
   <Card title="Binding Errors" icon="document">
-    [→](/Typhon/diagnostics/binding-errors/) — `missing_binding_kind`, `immutable_assign`, `unused_import`, `no_block_shadow`.
+    [→](/Typhon/diagnostics/binding-errors/) — `missing_binding_kind`, `immutable_assign`, `unused_import`, `no_block_shadow`, `pattern_shadows_outer`.
   </Card>
   <Card title="Nullability Errors" icon="puzzle">
     [→](/Typhon/diagnostics/nullability/) — `nullable_use`.
@@ -76,13 +76,19 @@ Every diagnostic has a `tyc::*` code. The catalog is enumerated across the follo
     [→](/Typhon/diagnostics/stub-errors/) — `stub_mismatch`.
   </Card>
   <Card title="Compile & Interface Errors" icon="error">
-    [→](/Typhon/diagnostics/compile-errors/) — `io`, `parse`, `interface_not_conforming`, `lazy_usage`, `unknown_module`, `unknown_kwarg`, `typevar_import_rejected`, `typing_alias_deprecated`.
+    [→](/Typhon/diagnostics/compile-errors/) — `io`, `parse`, `interface_not_conforming`, `lazy_usage`, `unknown_module`, `unknown_kwarg`, `typevar_import_rejected`, `typing_alias_deprecated`, `freeze_not_freezable`.
   </Card>
   <Card title="Phase 5 Interop & Lints" icon="information">
     Added in v0.1.6 — `orphan_py_import` (relative `.py` outside `src/`), `contains_secret_literal` (credential-named comptime literal), `invalid_config_value` (unknown `[emit] class-default` / etc.), `main_not_called` (script defines `main()` but never calls it).
   </Card>
   <Card title="Phase 5.5 Arity Safety" icon="approve-check">
     Added in v0.2.0 — `tyc::arg_count` now fires on auto-generated **class constructors** and **`impl` methods**, including cross-module via `from foo import Cls` and `import foo as f; f.Cls(…)`. New `tyc::missing_field_init` post-construction audit catches `X.__new__(X)` bypass patterns when required fields escape uninitialised.
+  </Card>
+  <Card title="Phase 6 Effects & v0.8.0 Lints" icon="warning">
+    Added in v0.3.0 — `blocking_in_async` (sync I/O inside `async def`), `resource_not_managed` (`open()` / `socket()` / `sqlite3.connect()` outside `with`), `div_by_zero_literal` (constant zero divisor), `newtype_violation` (wrong-typed arg to a `newtype` constructor), `unsafe_value_leak` (`Unsafe[T]` escaping a concrete-return function), `extend_builtin` (rejected built-in extension shape), `stdlib_module_shadow` (v0.6.0 — top-level `.ty` shadowing Python stdlib), `field_default_ordering` (v0.7.0). Added in v0.8.0 — `pattern_shadows_outer` firing site, `newtype_invalid_base` (`newtype Foo = "literal"`), and three lint warnings: `empty_collection_no_annotation` (`let xs = []`), `typing_alias_in_annotation` (bare `List[…]` / `Optional[…]` / `Dict[…]` / `Union[…]`), `contains_secret_literal` (inline string literals named `*_(TOKEN|SECRET|PASSWORD|PWD|KEY|API_KEY)`).
+  </Card>
+  <Card title="v0.9.0 Stress-Test Cleanup" icon="approve-check">
+    Added in v0.9.0 — `tyc::freeze_not_freezable` validates `freeze let X = <expr>` RHS at check time (was a runtime `TypeError` before). Polish on existing diagnostics: `interface_not_conforming` arity message reads "got N non-self parameter(s), expected M"; `invalid_question_op` help text covers both the Result-return cause and the comprehension carve-out; sealed-union impl distribution deduplicates by `(code, rendered message)` so a 10-variant union no longer reports 10 identical errors; `class_attr_shadows_slot` no longer false-positives on mutable-literal defaults; `MissingAnnotation` text drops the double-backtick wrapping.
   </Card>
 </CardGrid>
 

@@ -51,7 +51,21 @@ Keep it at `"error"` outside of refactor windows.
 
 The checker counts variants listed on the `type X = A | B | C` alias. If the `match` covers every variant exactly once (either explicitly or via `_`), it's exhaustive.
 
-Guards (`case X(...) if cond:`) don't satisfy exhaustiveness for the variant — you still need an unguarded fallback.
+Guards (`case X(...) if cond:`) don't satisfy exhaustiveness for the variant — you still need an unguarded fallback. Since v0.8.0 a fully-guarded variant where *every* arm carries a guard is treated as exhaustive (pragmatic heuristic — pathologically-incomplete guard cascades will no longer be flagged).
+
+### Class patterns on built-in types cover `T?` (v0.9.0)
+
+Exhaustiveness recognises `case None:` plus a class pattern on the inner type as covering a nullable subject:
+
+```python
+def show(s: str?) -> str:
+    match s:
+        case None:        return "<missing>"
+        case str() as x:  return x
+    # no missing_return — these two arms cover str? since v0.9.0
+```
+
+Before v0.9.0 this match required either a `case _:` fallback or a post-`match` `return`.
 
 ## Adding a variant
 
