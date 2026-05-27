@@ -4,7 +4,7 @@ The errors and surprises that bite people who try to write Typhon as if it were 
 
 For each entry: **trigger → diagnostic → fix**.
 
-Current release: **v0.8.1**. Pitfalls tagged with a version annotation landed in that release; older pitfalls predate v0.3.0.
+Current release: **v0.9.0**. Pitfalls tagged with a version annotation landed in that release; older pitfalls predate v0.3.0.
 
 ---
 
