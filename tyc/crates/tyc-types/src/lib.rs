@@ -2061,7 +2061,15 @@ impl<'a> Checker<'a> {
                 return true;
             }
         }
-        // Variant → sealed union coercion.
+        // Variant → sealed union coercion. Two flavours:
+        //   - non-parametric: `Shape = Circle | Rectangle` — both
+        //     expected and actual are `Type::Class(...)`.
+        //   - parametric (B22): `LinkedList[T] = Cons[T] | Nil` —
+        //     expected is `Type::Generic("LinkedList", [T])`, actual
+        //     is `Type::Class("Cons")` or `Type::Generic("Cons", [T])`.
+        //     Without this branch, `impl[T] LinkedList[T]:` method
+        //     bodies can't assign `self` (typed as the variant) into a
+        //     binding declared as the union.
         if let (Type::Class(exp_name), Type::Class(act_name)) = (expected, actual) {
             if let Some(variants) = self.sealed_unions.get(exp_name.as_str()) {
                 return variants.iter().any(|v| v == act_name);
@@ -2080,6 +2088,33 @@ impl<'a> Checker<'a> {
                 && self.class_inherits_from(act_name, exp_name)
             {
                 return true;
+            }
+        }
+        // Parametric variant → parametric sealed-union: `Cons` /
+        // `Cons[T]` into `LinkedList[T]`. The variant name is looked up
+        // in `sealed_unions` under the union's head name regardless of
+        // the user's actual instantiation; element types aren't
+        // co-checked yet (a deliberate under-approximation — variant
+        // membership is the main signal, and overly-strict element
+        // matching here would block recursive ADT walks that the
+        // existing tests rely on). See B22 stress finding.
+        let exp_head_with_arity = match expected {
+            Type::Generic(name, _) => Some((name.as_str(), true)),
+            Type::Class(name) => Some((name.as_str(), false)),
+            _ => None,
+        };
+        let act_head = match actual {
+            Type::Generic(name, _) => Some(name.as_str()),
+            Type::Class(name) => Some(name.as_str()),
+            _ => None,
+        };
+        if let (Some((exp_head, _is_generic)), Some(act_head)) =
+            (exp_head_with_arity, act_head)
+        {
+            if let Some(variants) = self.sealed_unions.get(exp_head) {
+                if variants.iter().any(|v| v == act_head) {
+                    return true;
+                }
             }
         }
         // Built-in structural conformance against a user-declared Protocol.
@@ -6618,6 +6653,17 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                 }
             }
         }
+        // `assert <test>` permanently narrows subsequent code in the
+        // surrounding block — the same way `if not <test>: return`
+        // would. Standard Python static-checker idiom, parity with
+        // mypy / pyright / pyrefly (B25b). The test is type-checked
+        // for completeness but the narrowing is the important
+        // side-effect.
+        Stmt::Assert(a) => {
+            let _ = infer_expr(c, &a.test);
+            let pos = collect_narrowings(c, &a.test, /*negate=*/ false);
+            apply_narrowings(c, &pos);
+        }
         _ => {}
     }
 }
@@ -6677,6 +6723,40 @@ fn enforce_annotation_rule(
                 c.path.clone(),
                 c.source,
                 span.0,
+                pname.len().max(1),
+            ));
+        }
+    }
+
+    // `*args` / `**kwargs` carry implicit `Any` element types if left
+    // unannotated, which silently breaks Rule 1 for every generic-shaped
+    // decorator (B14). Require an explicit `*args: T` / `**kwargs: V`
+    // — the canonical answer is `*args: object` / `**kwargs: object`
+    // when the function is truly variadic.
+    if let Some(vararg) = parameters.vararg.as_ref() {
+        if vararg.annotation.is_none() {
+            let pname = vararg.name.as_str();
+            let span_start = vararg.range.start().to_usize();
+            c.diagnostics.push_error(TycError::missing_annotation(
+                function.to_owned(),
+                format!("`*{}`", pname),
+                c.path.clone(),
+                c.source,
+                span_start,
+                pname.len().max(1),
+            ));
+        }
+    }
+    if let Some(kwarg) = parameters.kwarg.as_ref() {
+        if kwarg.annotation.is_none() {
+            let pname = kwarg.name.as_str();
+            let span_start = kwarg.range.start().to_usize();
+            c.diagnostics.push_error(TycError::missing_annotation(
+                function.to_owned(),
+                format!("`**{}`", pname),
+                c.path.clone(),
+                c.source,
+                span_start,
                 pname.len().max(1),
             ));
         }
@@ -7490,6 +7570,30 @@ fn match_is_exhaustive_for_da(c: &Checker, subject: &Expr, cases: &[MatchCase]) 
         Type::Generic(name, _) if name == "Result" => {
             vec!["Ok".to_owned(), "Err".to_owned()]
         }
+        // `T?` (= `T | None`) is exhausted by matching `case None:` plus
+        // a built-in class pattern for `T`. Map common built-ins (str,
+        // int, float, bool, bytes, list, tuple, dict, set, frozenset)
+        // to their pattern-class name so `case None:` + `case str() as
+        // s:` counts as exhaustive (B6).
+        Type::Union(variants) => {
+            let has_none = variants.iter().any(|t| matches!(t, Type::None));
+            if has_none && variants.len() == 2 {
+                let other = variants
+                    .iter()
+                    .find(|t| !matches!(t, Type::None))
+                    .cloned()
+                    .unwrap_or(Type::Unknown);
+                if let Some(cls) = builtin_class_pattern_name(&other) {
+                    vec!["None".to_owned(), cls.to_owned()]
+                } else if let Type::Class(name) = other {
+                    vec!["None".to_owned(), name]
+                } else {
+                    Vec::new()
+                }
+            } else {
+                Vec::new()
+            }
+        }
         _ => Vec::new(),
     };
     if !union_variants.is_empty() {
@@ -7773,6 +7877,15 @@ fn stmt_always_exits_aware(c: &Checker, stmt: &Stmt) -> bool {
                 && elif_else_chain_always_exits_aware(c, &s.elif_else_clauses)
         }
         Stmt::Match(m) => match_arms_always_exit_aware(c, m),
+        // `while True:` with no `break` exits the enclosing function
+        // only through `return` / `raise` inside the body, so the
+        // post-loop point is unreachable. The reachability check needs
+        // to honour this so `while True: match x: case A: return ...;
+        // case B: continue` doesn't surface `missing_return` for the
+        // function (B23 stress finding).
+        Stmt::While(w) => {
+            is_constant_true(&w.test) && !body_can_break(&w.body)
+        }
         // A `with` / `async with` block exits the enclosing function
         // only when every terminal in its body is *non-suppressible*
         // — `return` / `break` / `continue`. Bare `raise` is
@@ -7791,6 +7904,39 @@ fn stmt_always_exits_aware(c: &Checker, stmt: &Stmt) -> bool {
                 && (t.orelse.is_empty() || body_always_exits_aware(c, &t.orelse));
             finally_exits || try_and_handlers_exit
         }
+        _ => false,
+    }
+}
+
+/// True when any reachable statement in `body` is `break` (relative to
+/// the enclosing loop). Walks compound statements but does NOT descend
+/// into nested `for` / `while` bodies — a `break` there belongs to the
+/// inner loop, not the outer one. Used by the `while True:` reachability
+/// check to decide whether the loop can ever exit naturally.
+fn body_can_break(body: &[Stmt]) -> bool {
+    body.iter().any(stmt_can_break)
+}
+
+fn stmt_can_break(stmt: &Stmt) -> bool {
+    match stmt {
+        Stmt::Break(_) => true,
+        Stmt::If(s) => {
+            body_can_break(&s.body)
+                || s.elif_else_clauses.iter().any(|c| body_can_break(&c.body))
+        }
+        Stmt::Match(m) => m.cases.iter().any(|c| body_can_break(&c.body)),
+        Stmt::With(w) => body_can_break(&w.body),
+        Stmt::Try(t) => {
+            body_can_break(&t.body)
+                || t.handlers.iter().any(|h| {
+                    let ruff_python_ast::ExceptHandler::ExceptHandler(h) = h;
+                    body_can_break(&h.body)
+                })
+                || body_can_break(&t.orelse)
+                || body_can_break(&t.finalbody)
+        }
+        // Nested loops own their own `break`s — don't recurse.
+        Stmt::For(_) | Stmt::While(_) => false,
         _ => false,
     }
 }
@@ -8199,12 +8345,44 @@ fn pattern_covers_class(c: &Checker, pattern: &Pattern, class_name: &str) -> boo
                 .iter()
                 .all(|kw| is_capture_or_underscore(&kw.pattern))
         }
+        // `case None:` covers the singleton None type — used by the
+        // T? exhaustiveness path (B6). `cases_cover_type` calls in with
+        // both "None" and "NoneType" depending on which side of the
+        // union resolution we're on; accept both.
+        Pattern::MatchSingleton(s) => {
+            use ruff_python_ast::Singleton;
+            (class_name == "None" || class_name == "NoneType")
+                && matches!(s.value, Singleton::None)
+        }
         Pattern::MatchSequence(seq) => {
             (class_name == "list" || class_name == "tuple")
                 && seq.patterns.len() == 1
                 && matches!(&seq.patterns[0], Pattern::MatchStar(_))
         }
         _ => false,
+    }
+}
+
+/// Map a built-in Type to its PEP 634 class-pattern head name
+/// (`Type::Str` → `"str"`, `Type::Int` → `"int"`, etc.). Used by the
+/// `T?` exhaustiveness check to recognise that `case None:` + `case
+/// str() as s:` covers `str | None` (B6).
+fn builtin_class_pattern_name(t: &Type) -> Option<&'static str> {
+    match t {
+        Type::Str => Some("str"),
+        Type::Int => Some("int"),
+        Type::Float => Some("float"),
+        Type::Bool => Some("bool"),
+        Type::Bytes => Some("bytes"),
+        Type::Generic(name, _) => match name.as_str() {
+            "list" => Some("list"),
+            "tuple" => Some("tuple"),
+            "dict" => Some("dict"),
+            "set" => Some("set"),
+            "frozenset" => Some("frozenset"),
+            _ => None,
+        },
+        _ => None,
     }
 }
 
@@ -10785,6 +10963,16 @@ fn extract_sealed_union_variants(expr: &Expr) -> Option<Vec<String>> {
     while let Some(current) = stack.pop() {
         match current {
             Expr::Name(n) => names.push(n.id.as_str().to_owned()),
+            // `Cons[T]` parametric variant — count it by its head name
+            // so that `type LL[T] = Cons[T] | Nil` registers
+            // {Cons, Nil} just like the non-parametric form (B22).
+            Expr::Subscript(s) => {
+                if let Expr::Name(n) = s.value.as_ref() {
+                    names.push(n.id.as_str().to_owned());
+                } else {
+                    return None;
+                }
+            }
             // Push `right` first so the stack pops left-to-right and
             // preserves source order in `names`. `A | B | C` parses as
             // `BinOp(BinOp(A, B), C)`, so popping leftmost first walks
