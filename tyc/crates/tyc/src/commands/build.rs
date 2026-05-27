@@ -223,7 +223,13 @@ pub fn run(args: BuildArgs) -> Result<()> {
     // does, but applied to the type-check shape map. (Bug 2 from
     // v0.9.0 stress.)
     {
-        let all_paths: Vec<PathBuf> = sources.iter().map(|(p, _)| p.clone()).collect();
+        // Include `.dty` stub paths (the shape map is seeded with them
+        // first so a facade declared as `__init__.dty` or sibling `.dty`
+        // must aggregate too). (Copilot PR review on build.rs.)
+        let mut all_paths: Vec<PathBuf> = sources.iter().map(|(p, _)| p.clone()).collect();
+        if let Ok(dty) = crate::commands::util::collect_dty_files(&src_dir) {
+            all_paths.extend(dty);
+        }
         crate::commands::util::aggregate_pub_star_shapes(&mut project_shapes, &all_paths, src_root);
     }
     // Venv-introspection enrichment: shell to the project's Python

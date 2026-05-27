@@ -180,6 +180,14 @@ pub fn run(args: CheckArgs) -> Result<()> {
             if let Ok(files) = collect_ty_files(root) {
                 all_paths.extend(files);
             }
+            // `.dty` stubs participate in the shape map on equal footing
+            // with `.ty` (stubs win), so the aggregation pass needs to
+            // see them too — otherwise a `pub *` facade implemented as
+            // `__init__.dty` or a sibling `.dty` module wouldn't be
+            // re-exported. (Copilot PR review on check.rs.)
+            if let Ok(files) = collect_dty_files(root) {
+                all_paths.extend(files);
+            }
         }
         crate::commands::util::aggregate_pub_star_shapes(
             &mut shape_map,

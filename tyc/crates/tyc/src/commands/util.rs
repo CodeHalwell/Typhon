@@ -256,32 +256,61 @@ pub fn aggregate_pub_star_shapes(
     paths: &[PathBuf],
     src_root: &str,
 ) {
-    // First pass: identify every package directory whose __init__.ty
-    // contains `pub *`, and record the `pub_names` of every (non-init)
-    // sibling `.ty` file along the way so the merge step can filter
-    // by surface visibility.
+    use std::collections::HashSet;
+
+    // First pass (only __init__ files): identify packages with `pub *`,
+    // and record the `pub_names` of every __init__ regardless of `pub *`
+    // status. Reading non-init siblings is deferred to the second pass
+    // so projects without any facade pay almost nothing here.
+    let mut pub_star_dirs: HashSet<PathBuf> = HashSet::new();
     let mut pub_star_packages: Vec<(PathBuf, PathBuf)> = Vec::new(); // (pkg_dir, init_path)
+    let mut init_pub_names: HashMap<PathBuf, Vec<String>> = HashMap::new();
+    let mut init_has_pub_star: HashSet<PathBuf> = HashSet::new();
+    for path in paths {
+        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        if stem != "__init__" {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        let prep = preprocess(&text);
+        init_pub_names.insert(path.clone(), prep.pub_names);
+        if !prep.pub_star_lines.is_empty() {
+            init_has_pub_star.insert(path.clone());
+            if let Some(dir) = path.parent() {
+                pub_star_dirs.insert(dir.to_path_buf());
+                pub_star_packages.push((dir.to_path_buf(), path.clone()));
+            }
+        }
+    }
+    if pub_star_packages.is_empty() {
+        return;
+    }
+    // Second pass: only read non-init files whose parent dir is itself a
+    // `pub *` package (the only files whose `pub_names` participate in
+    // the merge). Skips most of the project tree.
     let mut module_pub_names: HashMap<PathBuf, Vec<String>> = HashMap::new();
     for path in paths {
         let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
             continue;
         };
+        if stem == "__init__" {
+            continue;
+        }
+        let Some(parent) = path.parent() else {
+            continue;
+        };
+        if !pub_star_dirs.contains(parent) {
+            continue;
+        }
         let Ok(text) = std::fs::read_to_string(path) else {
             continue;
         };
         let prep = preprocess(&text);
-        if stem == "__init__" {
-            if !prep.pub_star_lines.is_empty() {
-                if let Some(dir) = path.parent() {
-                    pub_star_packages.push((dir.to_path_buf(), path.clone()));
-                }
-            }
-        } else {
-            module_pub_names.insert(path.clone(), prep.pub_names);
-        }
-    }
-    if pub_star_packages.is_empty() {
-        return;
+        module_pub_names.insert(path.clone(), prep.pub_names);
     }
     // Deepest-first ordering so a parent package picks up an already-
     // aggregated sub-package shape. Sorts by component count descending,
@@ -293,7 +322,7 @@ pub fn aggregate_pub_star_shapes(
     for (pkg_dir, init_path) in &pub_star_packages {
         let pkg_dotted = path_to_dotted(init_path, src_root);
         let mut merged = shape_map.remove(&pkg_dotted).unwrap_or_default();
-        // Direct sibling .ty modules.
+        // Direct sibling .ty / .dty modules.
         for path in paths {
             let Some(parent) = path.parent() else {
                 continue;
@@ -305,19 +334,28 @@ pub fn aggregate_pub_star_shapes(
             if stem == "__init__" {
                 continue;
             }
+            // Skip siblings whose `pub_names` couldn't be loaded (a
+            // missing entry means the file failed to read in the second
+            // pass — without a visibility filter, the `None` branch in
+            // `merge_pub_visible` would leak every shape from that
+            // module, including private ones). Surface a quiet skip
+            // instead. (Gemini PR review #1.)
+            let Some(visible_names) = module_pub_names.get(path) else {
+                continue;
+            };
             let sibling_dotted = path_to_dotted(path, src_root);
             let Some(sibling_shape) = shape_map.get(&sibling_dotted) else {
                 continue;
             };
-            let visible: Option<&Vec<String>> = module_pub_names.get(path);
-            merge_pub_visible(&mut merged, sibling_shape, visible);
+            let visible_set: HashSet<&str> = visible_names.iter().map(|s| s.as_str()).collect();
+            merge_pub_visible(&mut merged, sibling_shape, Some(&visible_set));
         }
-        // Direct sub-packages: any __init__.ty whose parent.parent ==
-        // pkg_dir. Pick up the (already-aggregated, thanks to the
-        // depth-first ordering) shape under the sub-package's dotted
-        // name. Sub-packages without their own `pub *` still expose any
-        // names they bound by other means — that's the expected semantics
-        // of the build pipeline's `effective_package_surface`.
+        // Direct sub-packages: any __init__ whose parent.parent == pkg_dir.
+        // Filter the merge through the sub-package's effective public
+        // surface so `pub *` doesn't accidentally re-export a private
+        // declaration from the sub-package's __init__. Matches the
+        // build pipeline's `effective_package_surface`.
+        // (Codex / Copilot PR review #3 / #4.)
         for path in paths {
             let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
             if stem != "__init__" {
@@ -336,23 +374,104 @@ pub fn aggregate_pub_star_shapes(
             let Some(sub_shape) = shape_map.get(&sub_dotted) else {
                 continue;
             };
-            // Sub-package: re-export EVERY surface name it has (the
-            // sub-package's own `pub *` already filtered down). Pass
-            // `None` so the merge takes everything.
-            merge_pub_visible(&mut merged, sub_shape, None);
+            let mut visited: HashSet<PathBuf> = HashSet::new();
+            let surface = effective_pub_surface(
+                sub_dir,
+                paths,
+                &init_pub_names,
+                &init_has_pub_star,
+                &module_pub_names,
+                &mut visited,
+            );
+            let visible_set: HashSet<&str> = surface.iter().map(|s| s.as_str()).collect();
+            merge_pub_visible(&mut merged, sub_shape, Some(&visible_set));
         }
         shape_map.insert(pkg_dotted, merged);
     }
 }
 
+/// Compute the effective public surface name set for `pkg_dir`,
+/// mirroring `tyc::commands::build::effective_package_surface`.
+/// Returns the set of top-level names this package re-exports through
+/// its `pub *` facade — or just its top-level `pub` names if no
+/// `pub *`. Cycle-safe via the `visited` set. Used by
+/// [`aggregate_pub_star_shapes`] to filter sub-package merges so a
+/// parent `pub *` only re-exports its sub-packages' intended exports.
+fn effective_pub_surface(
+    pkg_dir: &Path,
+    paths: &[PathBuf],
+    init_pub_names: &HashMap<PathBuf, Vec<String>>,
+    init_has_pub_star: &std::collections::HashSet<PathBuf>,
+    module_pub_names: &HashMap<PathBuf, Vec<String>>,
+    visited: &mut std::collections::HashSet<PathBuf>,
+) -> std::collections::HashSet<String> {
+    let mut out: std::collections::HashSet<String> = std::collections::HashSet::new();
+    if !visited.insert(pkg_dir.to_path_buf()) {
+        return out;
+    }
+    // Locate this package's __init__ (.ty or .dty) in `paths`.
+    let init_path = paths.iter().find(|p| {
+        let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+        stem == "__init__" && p.parent() == Some(pkg_dir)
+    });
+    let Some(init_path) = init_path else {
+        return out;
+    };
+    if let Some(names) = init_pub_names.get(init_path) {
+        for n in names {
+            out.insert(n.clone());
+        }
+    }
+    if !init_has_pub_star.contains(init_path) {
+        return out;
+    }
+    // Aggregate one level deeper.
+    let mut sub_seen: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+    for sib_path in paths {
+        let Some(sib_parent) = sib_path.parent() else {
+            continue;
+        };
+        let stem = sib_path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+        if sib_parent == pkg_dir {
+            if stem == "__init__" {
+                continue;
+            }
+            if let Some(pubs) = module_pub_names.get(sib_path) {
+                for n in pubs {
+                    out.insert(n.clone());
+                }
+            }
+            continue;
+        }
+        if sib_parent.parent() == Some(pkg_dir) && sub_seen.insert(sib_parent.to_path_buf()) {
+            for name in effective_pub_surface(
+                sib_parent,
+                paths,
+                init_pub_names,
+                init_has_pub_star,
+                module_pub_names,
+                visited,
+            ) {
+                out.insert(name);
+            }
+        }
+    }
+    out
+}
+
 /// Merge `src` into `dst`, keeping only names present in `visible`
-/// (when `Some`). First-write-wins on collisions so the caller's
-/// pre-existing entries dominate. Mirrors the per-entry merge done in
-/// `tyc-types::check_module_with_imports`.
-fn merge_pub_visible(dst: &mut ModuleShapes, src: &ModuleShapes, visible: Option<&Vec<String>>) {
+/// (when `Some`). `None` re-exports every name in `src` — only safe
+/// when the caller already filtered. First-write-wins on collisions so
+/// the caller's pre-existing entries dominate. Mirrors the per-entry
+/// merge done in `tyc-types::check_module_with_imports`.
+fn merge_pub_visible(
+    dst: &mut ModuleShapes,
+    src: &ModuleShapes,
+    visible: Option<&std::collections::HashSet<&str>>,
+) {
     let include = |name: &str| -> bool {
         match visible {
-            Some(list) => list.iter().any(|n| n == name),
+            Some(set) => set.contains(name),
             None => true,
         }
     };
