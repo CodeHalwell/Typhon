@@ -7,6 +7,7 @@ description = "Purity, async, comptime, and optimisation analysis for Typhon (Ph
 
 [dependencies]
 ruff_python_ast   = { workspace = true }
+ruff_python_parser = { workspace = true }
 ruff_text_size    = { workspace = true }
 tyc-syntax        = { workspace = true }
 tyc-diagnostics   = { workspace = true }

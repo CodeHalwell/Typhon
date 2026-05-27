@@ -168,6 +168,112 @@ impl ComptimeValue {
     }
 }
 
+// ── Comptime substitution ─────────────────────────────────────────────────────
+
+/// Replace every `comptime let NAME: T = <expr>` initialiser in `module.body`
+/// with the corresponding pre-evaluated literal from `values`, and strip
+/// every `comptime def` body whose name appears in `comptime_fn_names` so
+/// that the runtime never tries to evaluate it (those bodies often call
+/// build-only intrinsics like `env(...)` that don't exist at runtime).
+///
+/// This is the same transformation the `tyc build` command applies before
+/// desugaring; it is also called by the in-process VM (`tyc run`) so that
+/// `comptime let X = ...` bindings work without a separate compile step.
+pub fn substitute_comptime_literals(
+    mut module: ModModule,
+    values: &HashMap<String, ComptimeValue>,
+    comptime_fn_names: &[String],
+) -> ModModule {
+    if values.is_empty() && comptime_fn_names.is_empty() {
+        return module;
+    }
+    module.body = module
+        .body
+        .into_iter()
+        .filter(|stmt| {
+            if let Stmt::FunctionDef(f) = stmt {
+                !comptime_fn_names.iter().any(|n| n == f.name.as_str())
+            } else {
+                true
+            }
+        })
+        .map(|stmt| substitute_stmt(stmt, values))
+        .collect();
+    module
+}
+
+fn substitute_stmt(stmt: Stmt, values: &HashMap<String, ComptimeValue>) -> Stmt {
+    if let Stmt::AnnAssign(mut ann) = stmt {
+        if let Expr::Name(ref n) = *ann.target {
+            if let Some(cv) = values.get(n.id.as_str()) {
+                // B34: `comptime let T: type = int` is a build-time type
+                // alias — the user's intent is for `T` to be substitutable
+                // wherever a type appears, not for it to be a runtime
+                // class named "T". Rewrite as `type T = int` (PEP 695
+                // `TypeAliasStatement`) so the type-checker's existing
+                // alias-resolution path picks it up automatically.
+                if let ComptimeValue::Type(_) = cv {
+                    let name_id = n.id.clone();
+                    let value_expr = comptime_value_to_expr(cv);
+                    return make_type_alias_stmt(&name_id, value_expr);
+                }
+                ann.value = Some(Box::new(comptime_value_to_expr(cv)));
+                return Stmt::AnnAssign(ann);
+            }
+        }
+        Stmt::AnnAssign(ann)
+    } else {
+        stmt
+    }
+}
+
+/// Construct a PEP 695 `type NAME = VALUE` alias statement. Used by B34
+/// to lower `comptime let T: type = int` after comptime evaluation.
+fn make_type_alias_stmt(name: &ruff_python_ast::name::Name, value: Expr) -> Stmt {
+    use ruff_python_ast::{AtomicNodeIndex, ExprName, StmtTypeAlias};
+    use ruff_text_size::TextRange;
+    let target = ExprName {
+        range: TextRange::default(),
+        node_index: AtomicNodeIndex::NONE,
+        id: name.clone(),
+        ctx: ruff_python_ast::ExprContext::Store,
+    };
+    Stmt::TypeAlias(StmtTypeAlias {
+        range: TextRange::default(),
+        node_index: AtomicNodeIndex::NONE,
+        name: Box::new(Expr::Name(target)),
+        type_params: None,
+        value: Box::new(value),
+    })
+}
+
+fn comptime_value_to_expr(value: &ComptimeValue) -> Expr {
+    use ruff_python_ast::{
+        ExprStringLiteral, StringLiteral, StringLiteralFlags, StringLiteralValue,
+    };
+    use ruff_python_parser::parse_expression;
+    use ruff_text_size::TextRange;
+    let literal = value.to_python_literal();
+    match parse_expression(&literal) {
+        Ok(parsed) => *parsed.into_syntax().body,
+        Err(_) => {
+            // Fallback to a string literal — should never trip for the
+            // value types we produce.
+            let lit = StringLiteral {
+                range: TextRange::default(),
+                node_index: ruff_python_ast::AtomicNodeIndex::NONE,
+                value: Box::from(literal.as_str()),
+                flags: StringLiteralFlags::empty(),
+            };
+            Expr::StringLiteral(ExprStringLiteral {
+                range: TextRange::default(),
+                node_index: ruff_python_ast::AtomicNodeIndex::NONE,
+                value: StringLiteralValue::single(lit),
+            })
+        }
+    }
+}
+
 // ── Public entry point ────────────────────────────────────────────────────────
 
 /// Evaluate all `comptime` bindings in `module` and return a map from binding

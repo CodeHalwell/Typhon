@@ -11,6 +11,7 @@ tyc-syntax = { workspace = true }
 tyc-diagnostics = { workspace = true }
 tyc-resolve = { workspace = true }
 tyc-types = { workspace = true }
+tyc-analyse = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }

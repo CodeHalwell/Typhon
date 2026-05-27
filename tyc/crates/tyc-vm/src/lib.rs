@@ -45,12 +45,21 @@ pub fn run_source(
     script_args: &[String],
 ) -> Result<i32, VmError> {
     // Apply the same surface-syntax expansions as `tyc build` so the parser
-    // sees identical input. `lazy import`, `gather:`, `go`, `with`-chains,
-    // pipes and `?` all get lowered to plain Python before parsing.
+    // sees identical input. `gather:`, `go`, `with`-chains, pipes and `?`
+    // all get lowered to plain Python before parsing.
+    //
+    // Note: we deliberately call `expand_lazy_lets` instead of the full
+    // `expand_lazy_imports`. The full version lowers `lazy import np =
+    // numpy` to a `__TyphonLazy_np_` proxy class that uses descriptor
+    // protocol and `__getattr__` — neither of which the VM models. The
+    // simpler `preprocess` pass below already rewrites `lazy import ALIAS
+    // = MODULE` to a plain `import MODULE as ALIAS`, which is the right
+    // shape for an in-process VM (no point deferring an import that's
+    // about to be evaluated eagerly anyway).
     let expanded = preprocess::expand_question_ops(&preprocess::expand_pipes(
         &preprocess::expand_with_chains(&preprocess::expand_go_calls(
             &preprocess::expand_gather_blocks(&preprocess::expand_multiline_guards(
-                &preprocess::expand_lazy_imports(source),
+                &preprocess::expand_typed_let_unpack(&preprocess::expand_lazy_lets(source)),
             )),
         )),
     ));
@@ -63,6 +72,23 @@ pub fn run_source(
         VmError::Parse(format!("{where_}{e}"))
     })?;
     let mut module = parsed.into_syntax();
+
+    // Evaluate `comptime` bindings and inline the resulting literals into
+    // the AST so the VM doesn't try to execute `env(...)` (a build-only
+    // intrinsic). `comptime def` bodies are stripped at the same time so
+    // a NameError from one of their build-only calls can't surface at
+    // runtime. Matches the substitution pass `tyc build` runs before
+    // desugaring.
+    let (comptime_values, _comptime_diags) = tyc_analyse::evaluate_comptime_with_functions(
+        &module,
+        &prep.comptime_bindings,
+        &prep.comptime_functions,
+    );
+    module = tyc_analyse::substitute_comptime_literals(
+        module,
+        &comptime_values,
+        &prep.comptime_functions,
+    );
 
     // Hand the VM the desugared module so it sees the same shape as the
     // compile path: dataclass-decorated user classes, merged impl blocks,
@@ -89,6 +115,14 @@ pub fn run_source(
     interp.script_argv = std::iter::once(argv0)
         .chain(script_args.iter().cloned())
         .collect();
+    // The source_root is the directory holding the entry — sibling .ty
+    // files in the same dir become importable, so multi-file projects
+    // work under `tyc run` without a separate build step.
+    if let Some(path) = origin {
+        if let Some(parent) = path.parent() {
+            interp.source_root = Some(parent.to_path_buf());
+        }
+    }
     // Bind `__name__ = "__main__"` so the standard idiom works.
     interp.root.set(
         "__name__",

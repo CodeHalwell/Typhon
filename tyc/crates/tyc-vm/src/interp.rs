@@ -37,6 +37,15 @@ pub struct Interpreter {
     /// script path; `argv[1..]` are the user-supplied arguments. Populated
     /// by `lib::run_*`, not by the host process's own argv.
     pub script_argv: Vec<String>,
+    /// Directory holding sibling `.ty` source files for cross-module
+    /// imports. When set, `from .repo import X` (and bare `import repo`)
+    /// resolves against `<source_root>/repo.ty`. Without this, multi-file
+    /// projects can only be run via `tyc run --compile`.
+    pub source_root: Option<std::path::PathBuf>,
+    /// Cache of loaded user modules keyed by their package-qualified
+    /// name (e.g. "repo" or "sub.util"). Lets the same module be imported
+    /// from multiple files without re-evaluating its body.
+    pub module_cache: HashMap<String, Value>,
 }
 
 impl Default for Interpreter {
@@ -62,6 +71,8 @@ impl Interpreter {
             // `stacker` isn't a workspace dep yet — TODO.
             max_stack_depth: 1000,
             script_argv: Vec::new(),
+            source_root: None,
+            module_cache: HashMap::new(),
         };
         crate::builtins::install(&mut interp);
         interp
@@ -277,7 +288,34 @@ impl Interpreter {
                     .as_ref()
                     .map(|i| i.as_str().to_owned())
                     .unwrap_or_default();
-                let module = self.import_module(&module_name)?;
+                // Relative imports (`from .repo import X`) carry a `level`
+                // > 0. The dot-count tells us how many package levels up
+                // to start from. The VM treats the configured source_root
+                // as the package root, so any positive level resolves the
+                // import relative to it. This is enough for the common
+                // pattern of `from .sibling import x` between files
+                // sharing a `src/` directory.
+                let module = if im.level > 0 {
+                    if module_name.is_empty() {
+                        // `from . import sibling` — load each name as a
+                        // sibling module instead of going through an
+                        // umbrella package object.
+                        for alias in &im.names {
+                            let attr = alias.name.as_str();
+                            let val = self.import_module(attr)?;
+                            let bind = alias
+                                .asname
+                                .as_ref()
+                                .map(|i| i.as_str().to_owned())
+                                .unwrap_or_else(|| attr.to_owned());
+                            env.set(&bind, val);
+                        }
+                        return Ok(());
+                    }
+                    self.import_module(&module_name)?
+                } else {
+                    self.import_module(&module_name)?
+                };
                 for alias in &im.names {
                     let attr = alias.name.as_str();
                     let val = self.get_attr(&module, attr)?;
@@ -508,7 +546,105 @@ impl Interpreter {
     // ── Imports ────────────────────────────────────────────────────────────
 
     fn import_module(&mut self, name: &str) -> Result<Value, Unwind> {
-        crate::builtins::resolve_module(self, name)
+        // Cache hit: same name imported earlier in the same VM run.
+        if let Some(cached) = self.module_cache.get(name).cloned() {
+            return Ok(cached);
+        }
+        // Try the host stdlib / typhon_runtime first so user code can't
+        // accidentally shadow `import json` with a sibling json.ty (the
+        // stdlib_module_shadow lint already nudges users away from this
+        // at check time).
+        match crate::builtins::resolve_module(self, name) {
+            Ok(v) => {
+                self.module_cache.insert(name.to_owned(), v.clone());
+                Ok(v)
+            }
+            Err(stdlib_err) => {
+                // Fall back to loading a sibling Typhon source file.
+                if let Some(loaded) = self.try_load_typhon_module(name)? {
+                    self.module_cache.insert(name.to_owned(), loaded.clone());
+                    return Ok(loaded);
+                }
+                Err(stdlib_err)
+            }
+        }
+    }
+
+    /// Resolve `name` (possibly dotted) against the configured source
+    /// root. Returns `Ok(Some(...))` on a successful load, `Ok(None)` if
+    /// no matching `.ty` file exists, and `Err` if a file exists but
+    /// failed to parse or evaluate.
+    fn try_load_typhon_module(&mut self, name: &str) -> Result<Option<Value>, Unwind> {
+        let Some(root) = self.source_root.clone() else {
+            return Ok(None);
+        };
+        // `foo.bar.baz` → `foo/bar/baz.ty` or `foo/bar/baz/__init__.ty`
+        let rel = name.replace('.', std::path::MAIN_SEPARATOR_STR);
+        let candidates = [
+            root.join(format!("{rel}.ty")),
+            root.join(&rel).join("__init__.ty"),
+        ];
+        let path = candidates.iter().find(|p| p.exists()).cloned();
+        let Some(path) = path else {
+            return Ok(None);
+        };
+
+        let source = std::fs::read_to_string(&path).map_err(|e| {
+            crate::error::Unwind::Exception(crate::error::VmException::new(
+                "ImportError",
+                format!("cannot read '{}': {e}", path.display()),
+            ))
+        })?;
+
+        // Run the same preprocess + desugar pipeline lib.rs uses for the
+        // top-level entry, so the imported module sees identical surface
+        // syntax handling.
+        use tyc_syntax::preprocess;
+        let expanded = preprocess::expand_question_ops(&preprocess::expand_pipes(
+            &preprocess::expand_with_chains(&preprocess::expand_go_calls(
+                &preprocess::expand_gather_blocks(&preprocess::expand_multiline_guards(
+                    &preprocess::expand_typed_let_unpack(&preprocess::expand_lazy_lets(&source)),
+                )),
+            )),
+        ));
+        let prep = preprocess::preprocess(&expanded);
+        let parsed = tyc_syntax::parse_module(&prep.python_source).map_err(|e| {
+            crate::error::Unwind::Exception(crate::error::VmException::new(
+                "ImportError",
+                format!("parse error in '{}': {e}", path.display()),
+            ))
+        })?;
+        let mut module = parsed.into_syntax();
+        let (comptime_values, _diags) = tyc_analyse::evaluate_comptime_with_functions(
+            &module,
+            &prep.comptime_bindings,
+            &prep.comptime_functions,
+        );
+        module = tyc_analyse::substitute_comptime_literals(
+            module,
+            &comptime_values,
+            &prep.comptime_functions,
+        );
+        let desugar_out = tyc_desugar::desugar_module(&module);
+        module = desugar_out.module;
+        let (registry, _stats) = tyc_analyse::extract_builtin_extensions(&mut module);
+        let _ = tyc_analyse::rewrite_builtin_extension_calls(&mut module, &registry);
+
+        // Evaluate the module body in a fresh child scope of root; copy
+        // every named binding into a Module namespace so attribute
+        // lookups resolve to user functions / classes / constants.
+        let module_env = Env::new_child(&self.root);
+        self.exec_block(&module.body, &module_env)?;
+
+        use crate::value::Module;
+        let mut members: HashMap<String, Value> = HashMap::new();
+        for (k, v) in module_env.snapshot().into_iter() {
+            members.insert(k, v);
+        }
+        Ok(Some(Value::Module(Rc::new(Module {
+            name: name.to_owned(),
+            members: RefCell::new(members),
+        }))))
     }
 
     // ── Expression evaluation ──────────────────────────────────────────────
@@ -847,6 +983,13 @@ impl Interpreter {
             }
             Value::Set(s) => {
                 let key = item.to_hash_key()?;
+                // The synthetic `__typhon_frozen__` sentinel must not
+                // be observable via `x in s` — a literal `"…frozen…"`
+                // probe would otherwise return True on every
+                // `freeze let`-marked set.
+                if matches!(&key, HashKey::Str(name) if name.as_str() == "__typhon_frozen__") {
+                    return Ok(false);
+                }
                 Ok(s.borrow().contains(&key))
             }
             Value::Range { start, stop, step } => match item {
@@ -1102,7 +1245,29 @@ impl Interpreter {
             } else if let Some(v) = consumed_kwargs.remove(&field.name) {
                 v
             } else if let Some(d) = &field.default {
-                d.clone()
+                // Detect the `dataclasses.field(default_factory=...)`
+                // sentinel emitted by the mutable-default rewrite. Each
+                // instance gets a freshly-invoked factory result so
+                // `tags: list[str] = []` doesn't share one list across
+                // every instance.
+                if let Value::Tuple(items) = d {
+                    if items.len() == 2 {
+                        if let Value::Str(tag) = &items[0] {
+                            if tag.as_str() == "__typhon_field_factory__" {
+                                let factory = items[1].clone();
+                                self.call_value(factory, vec![], &[])?
+                            } else {
+                                d.clone()
+                            }
+                        } else {
+                            d.clone()
+                        }
+                    } else {
+                        d.clone()
+                    }
+                } else {
+                    d.clone()
+                }
             } else {
                 return Err(type_error(format!(
                     "{}() missing required argument: '{}'",
@@ -1496,10 +1661,16 @@ impl Interpreter {
             }),
             Value::ResultOk(v) => match attr {
                 "value" => Ok((**v).clone()),
+                "map" | "map_err" | "and_then" | "or_else" => {
+                    Ok(bind_result_combinator(value.clone(), attr))
+                }
                 _ => Err(attribute_error(format!("Ok has no attribute '{}'", attr))),
             },
             Value::ResultErr(v) => match attr {
                 "value" | "error" => Ok((**v).clone()),
+                "map" | "map_err" | "and_then" | "or_else" => {
+                    Ok(bind_result_combinator(value.clone(), attr))
+                }
                 _ => Err(attribute_error(format!("Err has no attribute '{}'", attr))),
             },
             Value::Str(_)
@@ -1646,6 +1817,11 @@ impl Interpreter {
                 Ok(())
             }
             Value::Dict(d) => {
+                if crate::builtins::dict_is_frozen(d) {
+                    return Err(type_error(
+                        "'mappingproxy' object does not support item assignment",
+                    ));
+                }
                 let k = key.to_hash_key()?;
                 d.borrow_mut().insert(k, value);
                 Ok(())
@@ -1673,11 +1849,24 @@ impl Interpreter {
                 IterState::Str { chars, index: 0 }
             }
             Value::Dict(d) => {
-                let keys: Vec<HashKey> = d.borrow().keys().cloned().collect();
+                let keys: Vec<HashKey> = d
+                    .borrow()
+                    .keys()
+                    .filter(|k| !matches!(k, HashKey::Str(s) if s.as_str() == "__typhon_frozen__"))
+                    .cloned()
+                    .collect();
                 IterState::Dict { keys, index: 0 }
             }
             Value::Set(s) => {
-                let keys: Vec<HashKey> = s.borrow().iter().cloned().collect();
+                // Filter the synthetic `__typhon_frozen__` sentinel
+                // `deep_freeze_value` inserts to mark the set
+                // immutable.
+                let keys: Vec<HashKey> = s
+                    .borrow()
+                    .iter()
+                    .filter(|k| !matches!(k, HashKey::Str(s) if s.as_str() == "__typhon_frozen__"))
+                    .cloned()
+                    .collect();
                 IterState::Set { keys, index: 0 }
             }
             Value::Iter(it) => return Ok(Value::Iter(it)),
@@ -1936,9 +2125,18 @@ impl Interpreter {
                     };
                     if matches {
                         found = true;
-                        let value = Value::Exception {
-                            kind: Rc::new(exc.kind.clone()),
-                            message: Rc::new(exc.message.clone()),
+                        // If the raised exception carried a user-constructed
+                        // Instance (typical for `raise HttpError(code=500,
+                        // message="boom")` against a `class!` declaration),
+                        // bind THAT instance to the handler name so that
+                        // `e.code` / `e.message` work. Otherwise fall back
+                        // to the bare `Value::Exception` summary.
+                        let value = match &exc.value {
+                            Some(v @ Value::Instance(_)) => v.clone(),
+                            _ => Value::Exception {
+                                kind: Rc::new(exc.kind.clone()),
+                                message: Rc::new(exc.message.clone()),
+                            },
                         };
                         if let Some(name) = &h.name {
                             env.set(name.as_str(), value.clone());
@@ -1990,7 +2188,21 @@ impl Interpreter {
         // Try to resolve to a name (e.g. `ValueError`); if it isn't bound,
         // accept any name match against the exception's `kind`.
         if let Expr::Name(n) = type_expr {
-            return Ok(n.id.as_str() == exc.kind || n.id.as_str() == "Exception");
+            let name = n.id.as_str();
+            // Direct name match against the exception's kind.
+            if name == exc.kind || name == "Exception" || name == "BaseException" {
+                return Ok(true);
+            }
+            // Class-hierarchy match: if the exception carries a user
+            // Instance, walk its MRO against the named class.
+            if let Some(Value::Instance(inst)) = &exc.value {
+                if let Ok(Value::Class(target)) = self.eval_expr(type_expr, env) {
+                    if class_is_subclass(&inst.class, &target) {
+                        return Ok(true);
+                    }
+                }
+            }
+            return Ok(false);
         }
         // Bare `except:` already returned true.
         let _ = self.eval_expr(type_expr, env);
@@ -2240,6 +2452,59 @@ impl Interpreter {
         subject: &Value,
         env: &EnvRef,
     ) -> Result<bool, Unwind> {
+        // Built-in type-class patterns: `case str(): ...`, `case int() as
+        // n:`, etc. Match by Python type (PEP 634 §11.8.7). The single
+        // positional argument is the "self" capture per PEP 634; multiple
+        // positional args against a built-in type are not legal.
+        if let Expr::Name(n) = c.cls.as_ref() {
+            let head = n.id.as_str();
+            let matched = matches!(
+                (head, subject),
+                ("str", Value::Str(_))
+                    | ("int", Value::Int(_))
+                    | ("int", Value::Bool(_))
+                    | ("float", Value::Float(_))
+                    | ("bool", Value::Bool(_))
+                    | ("bytes", Value::Bytes(_))
+                    | ("list", Value::List(_))
+                    | ("tuple", Value::Tuple(_))
+                    | ("dict", Value::Dict(_))
+                    | ("set", Value::Set(_))
+                    | ("frozenset", Value::Set(_))
+            );
+            if matched {
+                // A single positional pattern means "bind whole subject" for
+                // built-in types (PEP 634). Reject multi-positional which is
+                // a class-arg-count mismatch.
+                if c.arguments.patterns.len() > 1 {
+                    return Ok(false);
+                }
+                if let Some(p) = c.arguments.patterns.first() {
+                    if !self.pattern_matches(p, subject, env)? {
+                        return Ok(false);
+                    }
+                }
+                // No keyword patterns on built-ins.
+                return Ok(c.arguments.keywords.is_empty());
+            }
+            // If we recognise the head name but didn't match, fall through —
+            // the subject isn't of that built-in type.
+            if matches!(
+                head,
+                "str"
+                    | "int"
+                    | "float"
+                    | "bool"
+                    | "bytes"
+                    | "list"
+                    | "tuple"
+                    | "dict"
+                    | "set"
+                    | "frozenset"
+            ) {
+                return Ok(false);
+            }
+        }
         let cls = self.eval_expr(&c.cls, env)?;
         // Native ADTs first.
         match (&cls, subject) {
@@ -2415,6 +2680,78 @@ fn values_identical(a: &Value, b: &Value) -> bool {
     }
 }
 
+/// Build a bound `NativeFn` that implements one of the four Result
+/// combinators (`map`, `map_err`, `and_then`, `or_else`) over a captured
+/// receiver. The four follow Rust's `Result` semantics:
+///
+/// * `Ok.map(f)` → `Ok(f(value))`; `Err.map(_)` → identity.
+/// * `Ok.map_err(_)` → identity; `Err.map_err(g)` → `Err(g(error))`.
+/// * `Ok.and_then(h)` → `h(value)` (which itself must return a `Result`);
+///   `Err.and_then(_)` → identity.
+/// * `Ok.or_else(_)` → identity; `Err.or_else(k)` → `k(error)`.
+fn bind_result_combinator(receiver: Value, attr: &str) -> Value {
+    let combinator = match attr {
+        "map" => "map",
+        "map_err" => "map_err",
+        "and_then" => "and_then",
+        "or_else" => "or_else",
+        _ => unreachable!(),
+    };
+    let name: &'static str = match combinator {
+        "map" => "Result.map",
+        "map_err" => "Result.map_err",
+        "and_then" => "Result.and_then",
+        "or_else" => "Result.or_else",
+        _ => unreachable!(),
+    };
+    let nf = NativeFn::new(name, move |interp, args| {
+        if args.len() != 1 {
+            return Err(type_error(format!(
+                "{}() takes exactly 1 argument ({} given)",
+                name,
+                args.len()
+            )));
+        }
+        let f = args.into_iter().next().unwrap();
+        match (&receiver, combinator) {
+            (Value::ResultOk(v), "map") => {
+                let mapped = interp.call_value(f, vec![(**v).clone()], &[])?;
+                Ok(Value::ResultOk(Box::new(mapped)))
+            }
+            (Value::ResultOk(_), "map_err") => Ok(receiver.clone()),
+            (Value::ResultOk(v), "and_then") => {
+                let next = interp.call_value(f, vec![(**v).clone()], &[])?;
+                match next {
+                    Value::ResultOk(_) | Value::ResultErr(_) => Ok(next),
+                    other => Err(type_error(format!(
+                        "and_then closure must return Ok(...) or Err(...); got {}",
+                        other.type_name()
+                    ))),
+                }
+            }
+            (Value::ResultOk(_), "or_else") => Ok(receiver.clone()),
+            (Value::ResultErr(_), "map") => Ok(receiver.clone()),
+            (Value::ResultErr(e), "map_err") => {
+                let mapped = interp.call_value(f, vec![(**e).clone()], &[])?;
+                Ok(Value::ResultErr(Box::new(mapped)))
+            }
+            (Value::ResultErr(_), "and_then") => Ok(receiver.clone()),
+            (Value::ResultErr(e), "or_else") => {
+                let next = interp.call_value(f, vec![(**e).clone()], &[])?;
+                match next {
+                    Value::ResultOk(_) | Value::ResultErr(_) => Ok(next),
+                    other => Err(type_error(format!(
+                        "or_else closure must return Ok(...) or Err(...); got {}",
+                        other.type_name()
+                    ))),
+                }
+            }
+            _ => unreachable!(),
+        }
+    });
+    Value::Native(Rc::new(nf))
+}
+
 fn class_is_subclass(c: &Rc<Class>, target: &Rc<Class>) -> bool {
     if Rc::ptr_eq(c, target) {
         return true;
@@ -2442,6 +2779,7 @@ fn format_with_spec(value: &Value, default: &str, spec: &str) -> Result<String, 
     let mut precision: Option<usize> = None;
     let mut typ: Option<char> = None;
     let mut comma = false;
+    let mut underscore = false;
 
     // Optional `[fill]align` — fill is any char *immediately followed by*
     // an alignment specifier; otherwise the first char is treated as the
@@ -2488,6 +2826,10 @@ fn format_with_spec(value: &Value, default: &str, spec: &str) -> Result<String, 
                 comma = true;
                 i += 1;
             }
+            '_' => {
+                underscore = true;
+                i += 1;
+            }
             '.' => {
                 i += 1;
                 let mut n = 0usize;
@@ -2524,16 +2866,22 @@ fn format_with_spec(value: &Value, default: &str, spec: &str) -> Result<String, 
         Value::Float(x) => {
             let p = precision.unwrap_or(6);
             let (abs, neg) = (x.abs(), *x < 0.0 || x.is_sign_negative());
-            match typ {
-                Some('e') => buf = format!("{:.*e}", p, abs),
-                Some('E') => buf = format!("{:.*E}", p, abs),
+            let raw: String = match typ {
+                Some('e') => format!("{:.*e}", p, abs),
+                Some('E') => format!("{:.*E}", p, abs),
                 Some('g') | Some('G') => {
                     // Python's `g` uses precision as significant digits.
                     let sig = if p == 0 { 1 } else { p };
-                    buf = format!("{:.*e}", sig.saturating_sub(1), abs);
+                    format!("{:.*e}", sig.saturating_sub(1), abs)
                 }
-                _ => buf = format!("{:.*}", p, abs),
-            }
+                _ => format!("{:.*}", p, abs),
+            };
+            buf = if comma || underscore {
+                let sep = if comma { ',' } else { '_' };
+                insert_float_thousands(&raw, sep)
+            } else {
+                raw
+            };
             if neg {
                 explicit_sign.push('-');
             } else if let Some('+') = sign {
@@ -2572,7 +2920,9 @@ fn format_with_spec(value: &Value, default: &str, spec: &str) -> Result<String, 
                 }
                 _ => {
                     buf = if comma {
-                        format_bigint_with_commas(&abs)
+                        format_bigint_with_separator(&abs, ',')
+                    } else if underscore {
+                        format_bigint_with_separator(&abs, '_')
                     } else {
                         abs.to_str_radix(10)
                     };
@@ -2630,18 +2980,51 @@ fn format_with_spec(value: &Value, default: &str, spec: &str) -> Result<String, 
     Ok(format!("{explicit_sign}{prefix}{buf}"))
 }
 
-/// Comma-separate every third digit of a non-negative `BigInt`. Caller
+/// Separator-group every third digit of a non-negative `BigInt`. Caller
 /// is responsible for prepending the sign — the body is sign-free.
-fn format_bigint_with_commas(i: &BigInt) -> String {
+fn format_bigint_with_separator(i: &BigInt, sep: char) -> String {
     let s = i.to_str_radix(10);
     let mut out = String::with_capacity(s.len() + s.len() / 3);
     for (k, c) in s.chars().rev().enumerate() {
         if k > 0 && k % 3 == 0 {
-            out.push(',');
+            out.push(sep);
         }
         out.push(c);
     }
     out.chars().rev().collect()
+}
+
+/// Insert `sep` between every three integer-part digits of a formatted
+/// float like `"3141.59"` → `"3_141.59"` (when sep='_') or `"3,141.59"`.
+/// The fractional part and any exponent are passed through verbatim.
+fn insert_float_thousands(raw: &str, sep: char) -> String {
+    let (int_part, rest) = match raw.find(['.', 'e', 'E']) {
+        Some(idx) => (&raw[..idx], &raw[idx..]),
+        None => (raw, ""),
+    };
+    // Honour every Python format-spec sign prefix (`-`, `+`, and
+    // space). Without this, an int formatted as `f"{42:+_d}"` would
+    // group as `+_42` (separator landing between sign and first
+    // digit) for any total digit count that's a multiple of three.
+    // Review thread gemini-code-assist on PR #147.
+    let (sign, body) = if let Some(stripped) = int_part.strip_prefix('-') {
+        ("-", stripped)
+    } else if let Some(stripped) = int_part.strip_prefix('+') {
+        ("+", stripped)
+    } else if let Some(stripped) = int_part.strip_prefix(' ') {
+        (" ", stripped)
+    } else {
+        ("", int_part)
+    };
+    let mut grouped = String::with_capacity(body.len() + body.len() / 3);
+    for (k, c) in body.chars().rev().enumerate() {
+        if k > 0 && k % 3 == 0 {
+            grouped.push(sep);
+        }
+        grouped.push(c);
+    }
+    let grouped: String = grouped.chars().rev().collect();
+    format!("{sign}{grouped}{rest}")
 }
 
 #[cfg(test)]

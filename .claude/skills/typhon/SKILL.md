@@ -7,14 +7,14 @@ description: Write, check, build, debug, and migrate code in the Typhon language
 
 Typhon is **a statically-typed, stricter superset of Python that emits clean CPython 3.13+** with zero runtime dependency on the toolchain. The compiler, language server, formatter, debugger wrapper, REPL, and tree-walking interpreter are all a single Rust binary called `tyc`. Every `.ty` file emits valid, idiomatic `.py`. Not all `.py` is valid Typhon.
 
-**Current release: v0.8.1** (2026-05-26). The language is **mostly additive across the v0.3.0 → v0.8.1 line** — every previously-accepted program continues to type-check identically. v0.8.0 introduces one runtime behaviour change: the VM now uses arbitrary-precision integers (`num_bigint::BigInt`), so programs that relied on silent i64 wrap-around now compute mathematically-correct results. v0.8.0 also widens several diagnostic firing sites (`tyc::attribute_not_found` on class instances, interface parameter conformance, `?` in `with`-chains, `tyc::pattern_shadows_outer`); see §7. **v0.8.1 is a bugfix point release** that narrows `tyc::attribute_not_found` to skip venv-introspected third-party classes via a new `partial` shape marker — so calls like `uvicorn.Server.serve(...)`, `httpx.AsyncClient.aclose(...)`, `fastapi.Request.body(...)` no longer false-positive. Headline frontier work (full HKT unification, general inter-procedural field-init audit) is tracked in `TYPE_SYSTEM_FRONTIER.md`.
+**Current release: v0.9.0** (2026-05-27). The language is **additive across the v0.3.0 → v0.9.0 line** — every previously-accepted program continues to type-check identically. v0.9.0 is the stress-test cleanup release closing 32 findings from a v0.8.1 stress sweep: the VM is now usable as the daily-driver runner (`Result` combinators, `open()` write modes, class patterns on built-ins, `frozenset` keys, deep `freeze let`, comptime inlining, `lazy import`, `class!` exception fields, `dataclasses.field(default_factory=...)`, `collections.deque` / `heapq` / `contextlib` / `pydantic` shims, multi-file projects, `@property` / `super()` / `@contextmanager` all work under `tyc run`); the type checker plugs silent-correctness gaps in Sequence covariance, variant-to-parametric-union flow, `while True:` reachability, post-loop narrowing, `assert` narrowing, `*args` annotation policy, `extend list[T]` dispatch, exhaustive match on `T?`, `with`-chain error mismatch, and the `comptime let T: type` alias. v0.8.0 introduced one runtime behaviour change carried into v0.9.0: the VM now uses arbitrary-precision integers (`num_bigint::BigInt`), so programs that relied on silent i64 wrap-around compute mathematically-correct results. Headline frontier work (full HKT unification, general inter-procedural field-init audit, preprocess-line-number remapping for impl-sealed-union diagnostics) is tracked in `TYPE_SYSTEM_FRONTIER.md`.
 
 LLMs have no prior knowledge of Typhon. This skill is the field reference. **Trust the docs and the compiler over assumptions from Python or any superset.** When this skill and a doc disagree, the doc wins. When the docs and the compiler disagree, the compiler wins — verify with `tyc check`.
 
 The canonical sources are:
 
 - **`README.md`** — pitch, release table, workspace layout, top-level project status.
-- **`CHANGELOG.md`** — every release back to v0.1.0. v0.3.0–v0.8.1 are the live window.
+- **`CHANGELOG.md`** — every release back to v0.1.0. v0.3.0–v0.9.0 are the live window.
 - **`docs/long-term-plan.md`** — source of truth for design decisions.
 - **`docs/language.md`** — the type system, error handling, async, `let`/`mut`, comptime.
 - **`docs/cheatsheet.md`** — 30-second syntax refresher (also `tyc cheatsheet`).
@@ -548,9 +548,13 @@ Plus `tyc::unsafe_value_leak`, `tyc::pattern_shadows_outer`, and `tyc::extend_bu
 
 ---
 
-## 7. v0.8.1 highlights
+## 7. v0.9.0 highlights
 
-The v0.3.0 → v0.8.1 line is **mostly additive**. Every previously-accepted program continues to type-check identically; the one runtime behaviour change is the VM's switch to arbitrary-precision integers in v0.8.0 (programs that relied on silent i64 wrap-around now compute different (correct) results). Highlights since v0.3.0:
+The v0.3.0 → v0.9.0 line is **additive**. Every previously-accepted program continues to type-check identically; the one runtime behaviour change is the VM's switch to arbitrary-precision integers in v0.8.0 (programs that relied on silent i64 wrap-around now compute different (correct) results). Highlights since v0.3.0:
+
+### v0.9.0 — stress-test cleanup release
+
+The big v0.8.1 → v0.9.0 sweep. The VM now runs the surface the docs always advertised; the type checker plugs silent correctness gaps in covariance, variant flow, narrowing, and error propagation. See `CHANGELOG.md` for the full list of 32 closed findings.
 
 ### v0.8.1 — bugfix point release
 

@@ -622,12 +622,17 @@ pub enum TycError {
     #[diagnostic(code(tyc::generic), url("https://typhon.dev/lang/diagnostics/generic"))]
     Generic { message: String },
 
-    /// The `?` error-propagation operator was used outside a `Result`-returning function.
+    /// The `?` error-propagation operator was used in a position where
+    /// it cannot lower correctly. Two common reasons: (a) the enclosing
+    /// function doesn't return `Result[T, E]`, or (b) the `?` sits
+    /// inside a comprehension (the lowering can't hoist a short-circuit
+    /// out of a comprehension's local scope). The error `message` is
+    /// case-specific; the static help text below covers both.
     #[error("{message}")]
     #[diagnostic(
         code(tyc::invalid_question_op),
         url("https://typhon.dev/lang/diagnostics/invalid_question_op"),
-        help("the `?` operator is only valid inside a function returning `Result[T, E]`")
+        help("the `?` operator must appear inside a function whose return type is `Result[T, E]`, AND it must not appear inside a comprehension. Rewrite a comprehension as an explicit `for`-loop, or move the `?` call out into a `let` binding before the comprehension.")
     )]
     InvalidQuestionOp {
         message: String,
@@ -902,7 +907,7 @@ pub enum TycError {
     /// of the Typhon language: every parameter and return type is annotated.
     /// Defaults on (`[strictness] no-implicit-any = true`) — turning it off
     /// is supported but almost never what you want.
-    #[error("`{what}` on `{function}` is missing a type annotation")]
+    #[error("{what} on `{function}` is missing a type annotation")]
     #[diagnostic(
         code(tyc::missing_annotation),
         url("https://typhon.dev/lang/diagnostics/missing_annotation"),
@@ -1190,6 +1195,37 @@ pub enum TycError {
         #[source_code]
         src: NamedSource<String>,
         #[label("wrap with `{name}(...)`")]
+        span: SourceSpan,
+    },
+
+    /// A `freeze let X = <expr>` whose RHS would fail
+    /// `typhon_runtime.freeze.deep_freeze` at startup. Deep-freezing
+    /// recursively converts list → tuple, dict → MappingProxy, set →
+    /// frozenset; any reachable type without an immutable equivalent
+    /// (open file handles, generators, non-`frozen` dataclasses) makes
+    /// the call raise `TypeError` at import time. We catch the common
+    /// shape (constructing a non-frozen class) at check time so the
+    /// failure surfaces in the user's editor instead of as a crash
+    /// during the first `python build/main.py` invocation.
+    #[error("`freeze let {name}` cannot be deep-frozen: `{kind}` is not freezable")]
+    #[diagnostic(
+        code(tyc::freeze_not_freezable),
+        url("https://typhon.dev/lang/diagnostics/freeze_not_freezable"),
+        help(
+            "deep_freeze can only recurse into immutable shapes (frozen \
+             classes, tuples, frozensets, mapping proxies) and primitive \
+             values (int/float/str/bool/bytes/None). Mark `{kind}` as \
+             `class {kind} frozen:` to make it freezable, or move this \
+             binding off `freeze let` so the value stays a plain mutable \
+             reference."
+        )
+    )]
+    FreezeNotFreezable {
+        name: String,
+        kind: String,
+        #[source_code]
+        src: NamedSource<String>,
+        #[label("non-freezable value here")]
         span: SourceSpan,
     },
 
@@ -2419,6 +2455,23 @@ impl TycError {
         }
     }
 
+    /// Construct a [`TycError::FreezeNotFreezable`] diagnostic.
+    pub fn freeze_not_freezable(
+        name: impl Into<String>,
+        kind: impl Into<String>,
+        path: impl Into<String>,
+        source: impl Into<String>,
+        offset: usize,
+        length: usize,
+    ) -> Self {
+        Self::FreezeNotFreezable {
+            name: name.into(),
+            kind: kind.into(),
+            src: NamedSource::new(path.into(), source.into()),
+            span: SourceSpan::new(SourceOffset::from(offset), length),
+        }
+    }
+
     /// Construct a [`TycError::NewtypeInvalidBase`] diagnostic.
     /// FINDINGS v0.7.1 #14.
     pub fn newtype_invalid_base(
@@ -2660,6 +2713,19 @@ impl TycError {
     }
 }
 
+/// Compute a dedup key for `e`: `(code, rendered message)`. Stable
+/// across copies of the same diagnostic produced by per-variant impl
+/// distribution (B24).
+fn diag_dedupe_key(e: &TycError) -> (String, String) {
+    use miette::Diagnostic;
+    let code = e
+        .code()
+        .map(|c| c.to_string())
+        .unwrap_or_else(|| "<no-code>".to_owned());
+    let message = format!("{}", e);
+    (code, message)
+}
+
 /// A list of diagnostics collected during a compiler phase.
 #[derive(Debug, Default, Clone)]
 pub struct Diagnostics {
@@ -2695,6 +2761,31 @@ impl Diagnostics {
 
     pub fn warnings(&self) -> &[TycError] {
         &self.warnings
+    }
+
+    /// Drop diagnostics that are exact duplicates of an earlier one in
+    /// the same list. Used by callers that synthesise per-variant copies
+    /// of a sealed-union impl block — without dedup, every variant
+    /// produces the same `tyc::missing_return` / `tyc::non_exhaustive_match`
+    /// once, so a 10-variant union prints 10 identical errors (B24).
+    ///
+    /// The dedup key is `(diagnostic code, rendered top-line message)`.
+    /// Both are stable across copies of the same user-written method
+    /// after preprocess expansion. Diagnostics with no code (the
+    /// `Generic` variant) compare by message alone.
+    pub fn dedupe(&mut self) {
+        let mut seen: std::collections::HashSet<(String, String)> =
+            std::collections::HashSet::new();
+        self.errors.retain(|e| {
+            let key = diag_dedupe_key(e);
+            seen.insert(key)
+        });
+        let mut seen_warn: std::collections::HashSet<(String, String)> =
+            std::collections::HashSet::new();
+        self.warnings.retain(|e| {
+            let key = diag_dedupe_key(e);
+            seen_warn.insert(key)
+        });
     }
 
     pub fn error_count(&self) -> usize {

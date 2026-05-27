@@ -1604,13 +1604,16 @@ fn build_emits_codegen_artefact_regardless_of_bootstrap_outcome() {
 
 #[test]
 fn comptime_type_value_evaluates_and_emits() {
+    // B34: `comptime let T: type = int` lowers to the PEP 695
+    // `type T = int` alias statement so the type-checker treats `T`
+    // and `int` interchangeably in subsequent annotations.
     let tmp = tempfile::tempdir().unwrap();
     scaffold(tmp.path(), "comptime let T: type = int\n");
     build(tmp.path());
     let py = main_py(tmp.path());
     assert!(
-        py.contains("T: type = int"),
-        "comptime type value should emit as bare type name; got:\n{py}"
+        py.contains("type T = int"),
+        "comptime type value should emit as PEP 695 type alias; got:\n{py}"
     );
 }
 
@@ -1624,11 +1627,11 @@ fn comptime_type_value_multiple_types() {
     build(tmp.path());
     let py = main_py(tmp.path());
     assert!(
-        py.contains("T1: type = str"),
+        py.contains("type T1 = str"),
         "comptime type value for str should emit; got:\n{py}"
     );
     assert!(
-        py.contains("T2: type = int"),
+        py.contains("type T2 = int"),
         "comptime type value for int should emit; got:\n{py}"
     );
 }
@@ -1669,10 +1672,17 @@ fn comptime_type_value_allows_runtime_builtins() {
     );
     build(tmp.path());
     let py = main_py(tmp.path());
-    for ty in ["int", "str", "bool", "float", "bytes", "type", "object"] {
+    // After B34 each `comptime let TN: type = X` lowers to
+    // `type TN = X` (PEP 695). Walk every builtin and check the
+    // emitted alias is present.
+    for (i, ty) in ["int", "str", "bool", "float", "bytes", "type", "object"]
+        .iter()
+        .enumerate()
+    {
+        let alias = format!("type T{} = {}", i + 1, ty);
         assert!(
-            py.contains(&format!("type = {ty}")),
-            "comptime type value for {ty} should emit correctly; got:\n{py}"
+            py.contains(&alias),
+            "comptime type value for {ty} should emit as `{alias}`; got:\n{py}"
         );
     }
 }

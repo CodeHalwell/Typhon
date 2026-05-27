@@ -9,18 +9,11 @@ use std::path::PathBuf;
 
 use clap::Args;
 use miette::{miette, Result};
-use ruff_python_ast::{
-    AtomicNodeIndex, Expr, ExprStringLiteral, ModModule, Stmt, StringLiteral, StringLiteralFlags,
-    StringLiteralValue,
-};
-use ruff_python_parser::parse_expression;
-use ruff_text_size::TextRange;
-
 use tyc_analyse::{
     analyse_purity, collect_gatherable_async_fn_names, detect_missed_gathers,
     evaluate_comptime_with_functions, extract_builtin_extensions, load_profile_samples,
     pgo_memoise_targets, purity_diagnostics, rewrite_auto_gather, rewrite_builtin_extension_calls,
-    rewrite_parallel_comprehensions, ComptimeValue, ProfileSample,
+    rewrite_parallel_comprehensions, substitute_comptime_literals, ProfileSample,
 };
 use tyc_db::{check_file_with_imports, extract_shapes_for_path, TycDatabase};
 use tyc_desugar::{desugar_module_with, DesugarOptions};
@@ -1271,6 +1264,140 @@ fn effective_package_surface(
 /// triple-quoted strings / comments don't falsely trigger transitive
 /// aggregation. Used by `effective_package_surface` to gate recursion
 /// into sub-packages.
+/// B28: collect `tyc::pub_name_collision` diagnostics for every
+/// `__init__.ty` whose `pub *` re-export would conflict with itself
+/// across sibling modules. Shared between `tyc build` (which fails the
+/// build on any collision) and `tyc check` (which surfaces them in CI
+/// before they reach build). Also returns `tyc::pub_star_outside_init`
+/// advice diagnostics for `pub *` markers in non-`__init__` files.
+///
+/// `sources` is the full file tree (path + raw `.ty` text) the caller
+/// has loaded. The returned vector is in source-order per file.
+pub(crate) fn detect_pub_star_diagnostics(
+    sources: &[(PathBuf, String)],
+) -> (
+    Vec<tyc_diagnostics::TycError>,
+    Vec<tyc_diagnostics::TycError>,
+) {
+    use tyc_syntax::preprocess::{
+        expand_gather_blocks, expand_go_calls, expand_inline_question_ops, expand_lazy_imports,
+        expand_multiline_guards, expand_pipes, expand_question_ops, expand_typed_let_unpack,
+        expand_with_chains, preprocess,
+    };
+    let mut errors: Vec<tyc_diagnostics::TycError> = Vec::new();
+    let mut advice: Vec<tyc_diagnostics::TycError> = Vec::new();
+
+    for (path, source) in sources {
+        let expanded = expand_question_ops(&expand_inline_question_ops(&expand_pipes(
+            &expand_with_chains(&expand_go_calls(&expand_gather_blocks(
+                &expand_multiline_guards(&expand_lazy_imports(&expand_typed_let_unpack(source))),
+            ))),
+        )));
+        let prep = preprocess(&expanded);
+        if prep.pub_star_lines.is_empty() {
+            continue;
+        }
+        let is_init = path
+            .file_name()
+            .and_then(|f| f.to_str())
+            .map(|s| s == "__init__.ty")
+            .unwrap_or(false);
+
+        if !is_init {
+            for &line_idx in &prep.pub_star_lines {
+                let offset = line_offset(&expanded, line_idx);
+                advice.push(tyc_diagnostics::TycError::pub_star_outside_init(
+                    path.display().to_string(),
+                    expanded.clone(),
+                    offset,
+                    5,
+                ));
+            }
+            continue;
+        }
+
+        // __init__.ty branch: walk siblings + sub-packages and detect
+        // duplicate names. Mirror of the inline aggregation in
+        // `tyc build`. The collision detection itself ignores the
+        // import-block synthesis (build does that for emit; check
+        // only cares about correctness).
+        let Some(parent_dir) = path.parent() else {
+            continue;
+        };
+        let mut sibling_pubs: Vec<(String, Vec<String>)> = Vec::new();
+        for (sib_path, sib_source) in sources {
+            let sib_parent = match sib_path.parent() {
+                Some(p) => p,
+                None => continue,
+            };
+            if sib_parent != parent_dir {
+                continue;
+            }
+            let stem = sib_path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+            if stem == "__init__" {
+                continue;
+            }
+            let names = extract_top_level_pub_names(sib_source);
+            if !names.is_empty() {
+                sibling_pubs.push((stem.to_owned(), names));
+            }
+        }
+        let mut sub_packages_seen: std::collections::HashSet<PathBuf> =
+            std::collections::HashSet::new();
+        let mut visited: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+        visited.insert(parent_dir.to_path_buf());
+        for (sib_path, _) in sources {
+            let sib_parent = match sib_path.parent() {
+                Some(p) => p,
+                None => continue,
+            };
+            if sib_parent.parent() == Some(parent_dir)
+                && sub_packages_seen.insert(sib_parent.to_path_buf())
+            {
+                let sub_init = sib_parent.join("__init__.ty");
+                if !sources.iter().any(|(p, _)| p == &sub_init) {
+                    continue;
+                }
+                let sub_name = match sib_parent.file_name().and_then(|s| s.to_str()) {
+                    Some(s) => s.to_owned(),
+                    None => continue,
+                };
+                let names = effective_package_surface(sib_parent, sources, &mut visited);
+                if !names.is_empty() {
+                    sibling_pubs.push((sub_name, names));
+                }
+            }
+        }
+        sibling_pubs.sort_by(|a, b| a.0.cmp(&b.0));
+
+        let mut name_origin: std::collections::HashMap<String, String> = prep
+            .pub_names
+            .iter()
+            .map(|n| (n.clone(), "<package>".to_owned()))
+            .collect();
+        let marker_line = *prep.pub_star_lines.first().unwrap_or(&0);
+        let marker_offset = line_offset(&expanded, marker_line);
+        for (sibling, names) in &sibling_pubs {
+            for name in names {
+                if let Some(prev) = name_origin.get(name).cloned() {
+                    errors.push(tyc_diagnostics::TycError::pub_name_collision(
+                        name.clone(),
+                        prev,
+                        sibling.clone(),
+                        path.display().to_string(),
+                        expanded.clone(),
+                        marker_offset,
+                        5,
+                    ));
+                } else {
+                    name_origin.insert(name.clone(), sibling.clone());
+                }
+            }
+        }
+    }
+    (errors, advice)
+}
+
 fn source_has_pub_star_marker(source: &str) -> bool {
     let mut in_triple_string = false;
     for line in source.split_inclusive('\n') {
@@ -1508,83 +1635,13 @@ fn build_source_map_v2(source_rel: &str, preprocessed: &str, line_offsets: &[usi
 }
 
 // ── Comptime literal substitution ─────────────────────────────────────────────
-
-/// Replace the RHS of every top-level annotated assignment whose name appears
-/// in `values` with the evaluated compile-time constant.
-///
-/// This transforms e.g.:
-/// ```python
-/// PORT: int = int(env("PORT", "8080"))
-/// ```
-/// into:
-/// ```python
-/// PORT: int = 8080
-/// ```
-fn substitute_comptime_literals(
-    mut module: ModModule,
-    values: &HashMap<String, ComptimeValue>,
-    comptime_fn_names: &[String],
-) -> ModModule {
-    if values.is_empty() && comptime_fn_names.is_empty() {
-        return module;
-    }
-    module.body = module
-        .body
-        .into_iter()
-        // Drop the `def` for any `comptime def` function — those are only
-        // callable during build-time evaluation (their bodies typically
-        // reference `env(...)` and other comptime-only intrinsics that do
-        // not exist at runtime), so leaving them in the emitted Python
-        // would surface a `NameError` if anything called them.
-        .filter(|stmt| {
-            if let Stmt::FunctionDef(f) = stmt {
-                !comptime_fn_names.iter().any(|n| n == f.name.as_str())
-            } else {
-                true
-            }
-        })
-        .map(|stmt| substitute_stmt(stmt, values))
-        .collect();
-    module
-}
-
-fn substitute_stmt(stmt: Stmt, values: &HashMap<String, ComptimeValue>) -> Stmt {
-    if let Stmt::AnnAssign(mut ann) = stmt {
-        if let Expr::Name(ref n) = *ann.target {
-            if let Some(cv) = values.get(n.id.as_str()) {
-                ann.value = Some(Box::new(comptime_value_to_expr(cv)));
-                return Stmt::AnnAssign(ann);
-            }
-        }
-        Stmt::AnnAssign(ann)
-    } else {
-        stmt
-    }
-}
-
-/// Convert a [`ComptimeValue`] to its Python AST expression by
-/// round-tripping through the Python expression parser.
-fn comptime_value_to_expr(value: &ComptimeValue) -> Expr {
-    let literal = value.to_python_literal();
-    match parse_expression(&literal) {
-        Ok(parsed) => *parsed.into_syntax().body,
-        Err(_) => {
-            // Fallback: emit as a string-quoted constant.  Should never happen
-            // for the value types we produce.
-            let lit = StringLiteral {
-                range: TextRange::default(),
-                node_index: AtomicNodeIndex::NONE,
-                value: Box::from(literal.as_str()),
-                flags: StringLiteralFlags::empty(),
-            };
-            Expr::StringLiteral(ExprStringLiteral {
-                range: TextRange::default(),
-                node_index: AtomicNodeIndex::NONE,
-                value: StringLiteralValue::single(lit),
-            })
-        }
-    }
-}
+//
+// `substitute_comptime_literals` was moved to `tyc-analyse` so the VM
+// (`tyc run`) can share the same comptime-inlining pass that the
+// `tyc build` command uses. Both consumers now import the public
+// `substitute_comptime_literals` re-export at the top of this file.
+// Transformation: `PORT: int = int(env("PORT", "8080"))` →
+// `PORT: int = 8080`.
 
 /// Generated `typhon_runtime/__init__.py` — exposes `Ok`/`Err`/`Result` plus
 /// the `tasks` and `lazy` submodules at the package root.

@@ -1996,7 +1996,7 @@ dependencies = [
 
 [[package]]
 name = "tyc"
-version = "0.8.1"
+version = "0.9.0"
 dependencies = [
  "clap",
  "miette",
@@ -2025,9 +2025,10 @@ dependencies = [
 
 [[package]]
 name = "tyc-analyse"
-version = "0.8.1"
+version = "0.9.0"
 dependencies = [
  "ruff_python_ast",
+ "ruff_python_parser",
  "ruff_text_size",
  "tempfile",
  "tyc-diagnostics",
@@ -2037,10 +2038,11 @@ dependencies = [
 
 [[package]]
 name = "tyc-db"
-version = "0.8.1"
+version = "0.9.0"
 dependencies = [
  "criterion",
  "salsa",
+ "tyc-analyse",
  "tyc-diagnostics",
  "tyc-resolve",
  "tyc-syntax",
@@ -2049,7 +2051,7 @@ dependencies = [
 
 [[package]]
 name = "tyc-desugar"
-version = "0.8.1"
+version = "0.9.0"
 dependencies = [
  "ruff_python_ast",
  "ruff_text_size",
@@ -2059,7 +2061,7 @@ dependencies = [
 
 [[package]]
 name = "tyc-diagnostics"
-version = "0.8.1"
+version = "0.9.0"
 dependencies = [
  "miette",
  "thiserror",
@@ -2067,7 +2069,7 @@ dependencies = [
 
 [[package]]
 name = "tyc-emit"
-version = "0.8.1"
+version = "0.9.0"
 dependencies = [
  "ruff_python_ast",
  "ruff_text_size",
@@ -2077,7 +2079,7 @@ dependencies = [
 
 [[package]]
 name = "tyc-format"
-version = "0.8.1"
+version = "0.9.0"
 dependencies = [
  "thiserror",
  "tyc-diagnostics",
@@ -2086,7 +2088,7 @@ dependencies = [
 
 [[package]]
 name = "tyc-lsp"
-version = "0.8.1"
+version = "0.9.0"
 dependencies = [
  "miette",
  "ruff_python_ast",
@@ -2107,7 +2109,7 @@ dependencies = [
 
 [[package]]
 name = "tyc-resolve"
-version = "0.8.1"
+version = "0.9.0"
 dependencies = [
  "ruff_python_ast",
  "ruff_text_size",
@@ -2117,7 +2119,7 @@ dependencies = [
 
 [[package]]
 name = "tyc-syntax"
-version = "0.8.1"
+version = "0.9.0"
 dependencies = [
  "criterion",
  "ruff_python_ast",
@@ -2127,7 +2129,7 @@ dependencies = [
 
 [[package]]
 name = "tyc-types"
-version = "0.8.1"
+version = "0.9.0"
 dependencies = [
  "ruff_python_ast",
  "ruff_text_size",
@@ -2138,7 +2140,7 @@ dependencies = [
 
 [[package]]
 name = "tyc-vm"
-version = "0.8.1"
+version = "0.9.0"
 dependencies = [
  "indexmap",
  "num-bigint",

@@ -45,9 +45,75 @@ pub enum HashKey {
     Float(u64),
     Str(RcStr),
     Tuple(Rc<Vec<HashKey>>),
+    /// A `frozenset` used as a dict key. The elements are stored sorted by
+    /// their hashed representation so two frozensets with the same members
+    /// in different insertion order hash equal.
+    FrozenSet(Rc<Vec<HashKey>>),
 }
 
 impl HashKey {
+    /// Stable, collision-safe sort key. Two distinct `HashKey` values
+    /// have distinct sort keys (the discriminant byte differs across
+    /// variants and the payload is encoded deterministically). Used
+    /// by the `FrozenSet` canonicalisation path so two frozensets
+    /// with the same members hash equal regardless of insertion
+    /// order — review thread copilot on PR #147.
+    pub fn canonical_sort_key(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(16);
+        match self {
+            HashKey::None => out.push(0),
+            HashKey::Bool(b) => {
+                out.push(1);
+                out.push(*b as u8);
+            }
+            HashKey::Int(i) => {
+                out.push(2);
+                // BigInt's sign-magnitude form: sign byte then magnitude
+                // little-endian. Add a sentinel between sign and digits
+                // so positive 1-byte values never alias negative-sign
+                // payloads.
+                let (sign, digits) = i.to_bytes_le();
+                out.push(match sign {
+                    num_bigint::Sign::Minus => 0,
+                    num_bigint::Sign::NoSign => 1,
+                    num_bigint::Sign::Plus => 2,
+                });
+                out.extend_from_slice(&(digits.len() as u32).to_be_bytes());
+                out.extend_from_slice(&digits);
+            }
+            HashKey::Float(bits) => {
+                out.push(3);
+                out.extend_from_slice(&bits.to_be_bytes());
+            }
+            HashKey::Str(s) => {
+                out.push(4);
+                out.extend_from_slice(&(s.len() as u32).to_be_bytes());
+                out.extend_from_slice(s.as_bytes());
+            }
+            HashKey::Tuple(items) => {
+                out.push(5);
+                out.extend_from_slice(&(items.len() as u32).to_be_bytes());
+                for item in items.iter() {
+                    let inner = item.canonical_sort_key();
+                    out.extend_from_slice(&(inner.len() as u32).to_be_bytes());
+                    out.extend_from_slice(&inner);
+                }
+            }
+            HashKey::FrozenSet(items) => {
+                out.push(6);
+                out.extend_from_slice(&(items.len() as u32).to_be_bytes());
+                // FrozenSet elements are already canonicalised at
+                // construction so this is deterministic.
+                for item in items.iter() {
+                    let inner = item.canonical_sort_key();
+                    out.extend_from_slice(&(inner.len() as u32).to_be_bytes());
+                    out.extend_from_slice(&inner);
+                }
+            }
+        }
+        out
+    }
+
     pub fn into_value(self) -> Value {
         match self {
             HashKey::None => Value::None,
@@ -58,6 +124,15 @@ impl HashKey {
             HashKey::Tuple(items) => Value::Tuple(Rc::new(
                 items.iter().cloned().map(HashKey::into_value).collect(),
             )),
+            HashKey::FrozenSet(items) => {
+                use std::collections::HashSet;
+                let mut set = HashSet::new();
+                for k in items.iter() {
+                    set.insert(k.clone());
+                }
+                // Surface back as a frozenset-tagged Value::Set.
+                Value::Set(Rc::new(RefCell::new(set)))
+            }
         }
     }
 }
@@ -78,6 +153,12 @@ impl PartialEq for HashKey {
             (HashKey::Float(a), HashKey::Float(b)) => a == b,
             (HashKey::Str(a), HashKey::Str(b)) => a == b,
             (HashKey::Tuple(a), HashKey::Tuple(b)) => a == b,
+            (HashKey::FrozenSet(a), HashKey::FrozenSet(b)) => {
+                // Frozenset equality is order-independent; the constructor
+                // stores items pre-sorted by their hash representation so
+                // this works as a vector compare.
+                a == b
+            }
             _ => false,
         }
     }
@@ -97,6 +178,7 @@ impl std::hash::Hash for HashKey {
             HashKey::Float(bits) => bits.hash(state),
             HashKey::Str(s) => s.hash(state),
             HashKey::Tuple(items) => items.hash(state),
+            HashKey::FrozenSet(items) => items.hash(state),
         }
     }
 }
@@ -258,19 +340,35 @@ impl fmt::Debug for Value {
             Value::Int(i) => write!(f, "{}", i.to_str_radix(10)),
             Value::Float(x) => write!(f, "{x:?}"),
             Value::Str(s) => write!(f, "{:?}", s.as_str()),
-            Value::Bytes(b) => write!(f, "b{:?}", &b[..]),
+            Value::Bytes(b) => write!(f, "{}", python_repr_bytes(b)),
             Value::List(l) => write!(f, "{:?}", l.borrow()),
             Value::Tuple(t) => write!(f, "{:?}", &t[..]),
             Value::Dict(d) => {
-                write!(f, "{{")?;
+                let frozen_key = HashKey::Str(Rc::new("__typhon_frozen__".to_owned()));
+                let is_frozen = matches!(d.borrow().get(&frozen_key), Some(Value::Bool(true)));
+                if is_frozen {
+                    write!(f, "mappingproxy({{")?;
+                } else {
+                    write!(f, "{{")?;
+                }
                 let d = d.borrow();
-                for (i, (k, v)) in d.iter().enumerate() {
-                    if i > 0 {
+                let mut emitted = 0usize;
+                for (k, v) in d.iter() {
+                    // Hide the internal freeze sentinel from user output.
+                    if matches!(k, HashKey::Str(s) if s.as_str() == "__typhon_frozen__") {
+                        continue;
+                    }
+                    if emitted > 0 {
                         write!(f, ", ")?;
                     }
                     write!(f, "{:?}: {:?}", k.clone().into_value(), v)?;
+                    emitted += 1;
                 }
-                write!(f, "}}")
+                if is_frozen {
+                    write!(f, "}})")
+                } else {
+                    write!(f, "}}")
+                }
             }
             Value::Set(_) => write!(f, "<set>"),
             Value::Range { start, stop, step } => {
@@ -347,8 +445,19 @@ impl Value {
             Value::Bytes(b) => !b.is_empty(),
             Value::List(l) => !l.borrow().is_empty(),
             Value::Tuple(t) => !t.is_empty(),
-            Value::Dict(d) => !d.borrow().is_empty(),
-            Value::Set(s) => !s.borrow().is_empty(),
+            // Truthiness ignores the synthetic `__typhon_frozen__`
+            // sentinel a `freeze let` may have inserted into a dict
+            // or set (review thread copilot on PR #147 — otherwise
+            // a frozen-and-otherwise-empty container would test as
+            // truthy under `bool(d)` / `if d:`).
+            Value::Dict(d) => {
+                let frozen_key = HashKey::Str(Rc::new("__typhon_frozen__".to_owned()));
+                d.borrow().keys().any(|k| *k != frozen_key)
+            }
+            Value::Set(s) => {
+                let frozen_key = HashKey::Str(Rc::new("__typhon_frozen__".to_owned()));
+                s.borrow().iter().any(|k| *k != frozen_key)
+            }
             Value::Range { start, stop, step } => {
                 if *step > 0 {
                     stop > start
@@ -377,6 +486,30 @@ impl Value {
                     keys.push(v.to_hash_key()?);
                 }
                 Ok(HashKey::Tuple(Rc::new(keys)))
+            }
+            // The VM doesn't track set-vs-frozenset distinctly today —
+            // hashing through here means a regular `set` literal can also
+            // appear as a dict key, which is more permissive than CPython.
+            // The (much more common) flow we care about is `frozenset(...)`
+            // as a dict key, which now works.
+            Value::Set(s) => {
+                let frozen_key = HashKey::Str(Rc::new("__typhon_frozen__".to_owned()));
+                let mut keys: Vec<HashKey> = s
+                    .borrow()
+                    .iter()
+                    .filter(|k| **k != frozen_key)
+                    .cloned()
+                    .collect();
+                // Canonical ordering so two sets with the same members
+                // produce identical `FrozenSet` payloads (and therefore
+                // hash equal). We compare on a collision-safe sort key
+                // — sorting by `DefaultHasher::finish()` alone allows
+                // two distinct elements to share an ordering slot and
+                // the resulting key ordering depends on insertion
+                // history, breaking `Eq` / `Hash` consistency
+                // (review thread copilot on PR #147).
+                keys.sort_by_key(|a| a.canonical_sort_key());
+                Ok(HashKey::FrozenSet(Rc::new(keys)))
             }
             other => Err(type_error(format!(
                 "unhashable type: '{}'",
@@ -529,7 +662,7 @@ impl Value {
             Value::Int(i) => i.to_str_radix(10),
             Value::Float(x) => format_float(*x),
             Value::Str(s) => (**s).clone(),
-            Value::Bytes(b) => format!("b{:?}", String::from_utf8_lossy(b)),
+            Value::Bytes(b) => python_repr_bytes(b),
             Value::List(l) => {
                 let l = l.borrow();
                 let mut s = String::from("[");
@@ -557,33 +690,62 @@ impl Value {
                 s
             }
             Value::Dict(d) => {
+                let frozen_key = HashKey::Str(Rc::new("__typhon_frozen__".to_owned()));
+                let is_frozen = matches!(d.borrow().get(&frozen_key), Some(Value::Bool(true)));
                 let d = d.borrow();
-                let mut s = String::from("{");
-                for (i, (k, v)) in d.iter().enumerate() {
-                    if i > 0 {
+                let mut s = String::new();
+                if is_frozen {
+                    s.push_str("mappingproxy({");
+                } else {
+                    s.push('{');
+                }
+                let mut emitted = 0usize;
+                for (k, v) in d.iter() {
+                    if matches!(k, HashKey::Str(name) if name.as_str() == "__typhon_frozen__") {
+                        continue;
+                    }
+                    if emitted > 0 {
                         s.push_str(", ");
                     }
                     s.push_str(&k.clone().into_value().py_repr());
                     s.push_str(": ");
                     s.push_str(&v.py_repr());
+                    emitted += 1;
                 }
-                s.push('}');
+                if is_frozen {
+                    s.push_str("})");
+                } else {
+                    s.push('}');
+                }
                 s
             }
             Value::Set(set) => {
                 let s = set.borrow();
-                if s.is_empty() {
-                    return "set()".into();
+                let frozen_key = HashKey::Str(Rc::new("__typhon_frozen__".to_owned()));
+                let is_frozen = s.contains(&frozen_key);
+                // Filter the synthetic `__typhon_frozen__` sentinel
+                // that `deep_freeze_value` inserts to mark the set
+                // immutable (review thread codex / copilot on PR
+                // #147 — without this the sentinel leaks into
+                // user-visible repr).
+                let items: Vec<String> = s
+                    .iter()
+                    .filter(|k| **k != frozen_key)
+                    .map(|k| k.clone().into_value().py_repr())
+                    .collect();
+                if items.is_empty() {
+                    return if is_frozen {
+                        "frozenset()".into()
+                    } else {
+                        "set()".into()
+                    };
                 }
-                let mut out = String::from("{");
-                for (i, k) in s.iter().enumerate() {
-                    if i > 0 {
-                        out.push_str(", ");
-                    }
-                    out.push_str(&k.clone().into_value().py_repr());
+                let body = items.join(", ");
+                if is_frozen {
+                    format!("frozenset({{{body}}})")
+                } else {
+                    format!("{{{body}}}")
                 }
-                out.push('}');
-                out
             }
             Value::Range { start, stop, step } => {
                 if *step == 1 {
@@ -630,6 +792,41 @@ impl Value {
             other => other.py_str(),
         }
     }
+}
+
+/// CPython-style `repr` for `bytes`: `b'...'`, falling back to `b"..."` if
+/// the value contains a `'` but no `"`. Non-printable bytes use `\xNN`,
+/// `\n` / `\r` / `\t` retain their named escapes, and `\\` is escaped.
+fn python_repr_bytes(b: &[u8]) -> String {
+    let has_single = b.contains(&b'\'');
+    let has_double = b.contains(&b'"');
+    let quote = if has_single && !has_double {
+        b'"'
+    } else {
+        b'\''
+    };
+    let mut out = String::with_capacity(b.len() + 3);
+    out.push('b');
+    out.push(quote as char);
+    for &byte in b {
+        match byte {
+            b'\\' => out.push_str("\\\\"),
+            b'\n' => out.push_str("\\n"),
+            b'\r' => out.push_str("\\r"),
+            b'\t' => out.push_str("\\t"),
+            c if c == quote => {
+                out.push('\\');
+                out.push(c as char);
+            }
+            c if (0x20..0x7f).contains(&c) => out.push(c as char),
+            c => {
+                use std::fmt::Write;
+                let _ = write!(out, "\\x{:02x}", c);
+            }
+        }
+    }
+    out.push(quote as char);
+    out
 }
 
 /// CPython-style `repr` for a string: prefer single quotes, escape the

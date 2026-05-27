@@ -451,6 +451,37 @@ pub fn install(interp: &mut Interpreter) {
         crate::ffi::open_file(&path, &mode)
     });
 
+    // `@property`, `@classmethod`, `@staticmethod`: the VM has no
+    // descriptor protocol, so these decorators reduce to the identity
+    // — the wrapped function is callable as `obj.name()` (not `obj.name`
+    // for property). That's a documented divergence from CPython, but
+    // it lets programs that decorate methods at least import and run.
+    native!("property", |_i, args| {
+        Ok(args.into_iter().next().unwrap_or(Value::None))
+    });
+    native!("classmethod", |_i, args| {
+        Ok(args.into_iter().next().unwrap_or(Value::None))
+    });
+    native!("staticmethod", |_i, args| {
+        Ok(args.into_iter().next().unwrap_or(Value::None))
+    });
+    // `super()` — return a stub module whose attribute access yields a
+    // no-op callable. Just enough to let `super().__init__(...)` synthesised
+    // by `class!` lowering work (the actual parent init for stdlib
+    // exceptions does nothing useful in our minimal VM since exceptions
+    // are flat Value::Exception variants). For real subclassing with
+    // inherited behaviour, run via `tyc run --compile`.
+    native!("super", |_i, _args| {
+        use crate::value::Module;
+        let mut members = std::collections::HashMap::new();
+        let noop = NativeFn::new("super.method", |_i, _a| Ok(Value::None));
+        members.insert("__init__".into(), Value::Native(Rc::new(noop)));
+        Ok(Value::Module(Rc::new(Module {
+            name: "<super>".to_owned(),
+            members: std::cell::RefCell::new(members),
+        })))
+    });
+
     // Constants.
     root.set("True", Value::Bool(true));
     root.set("False", Value::Bool(false));
@@ -531,18 +562,17 @@ pub fn install(interp: &mut Interpreter) {
 
     // `freeze let X = expr` lowers to `X = __typhon_freeze__(expr)`. The
     // compile path resolves this via `from typhon_runtime.freeze import
-    // deep_freeze as __typhon_freeze__`; the VM has no `typhon_runtime`
-    // package on disk, so we register the helper as a builtin instead.
-    // Acceptable VM-mode limitation: returns the value as-is (identity).
-    // The static checker still enforces immutability of `freeze let`
-    // bindings at the type level, so the runtime degradation is silent
-    // and only affects users who attempt to mutate the value through an
-    // aliased reference at runtime — a pattern the type system already
-    // rejects.
+    // deep_freeze as __typhon_freeze__`. The VM implements deep_freeze
+    // natively: list → tuple, set → frozenset-tagged Set with the
+    // FrozenSet HashKey, dict → an IndexMap whose mutation paths surface
+    // a TypeError at runtime. Programs that mutate a frozen value
+    // through an aliased reference now hit the same TypeError they would
+    // under `tyc build && python build/main.py`.
     root.set(
         "__typhon_freeze__",
         Value::Native(Rc::new(NativeFn::new("__typhon_freeze__", |_i, args| {
-            Ok(args.into_iter().next().unwrap_or(Value::None))
+            let v = args.into_iter().next().unwrap_or(Value::None);
+            deep_freeze_value(v)
         }))),
     );
 
@@ -574,8 +604,16 @@ fn value_len(v: &Value) -> Result<usize, Unwind> {
         Value::Bytes(b) => b.len(),
         Value::List(l) => l.borrow().len(),
         Value::Tuple(t) => t.len(),
-        Value::Dict(d) => d.borrow().len(),
-        Value::Set(s) => s.borrow().len(),
+        Value::Dict(d) => d
+            .borrow()
+            .keys()
+            .filter(|k| !matches!(k, HashKey::Str(s) if s.as_str() == "__typhon_frozen__"))
+            .count(),
+        Value::Set(s) => s
+            .borrow()
+            .iter()
+            .filter(|k| !matches!(k, HashKey::Str(s) if s.as_str() == "__typhon_frozen__"))
+            .count(),
         Value::Range { start, stop, step } => {
             if *step > 0 {
                 ((stop - start).max(0) as usize).div_ceil(*step as usize)
@@ -699,6 +737,9 @@ pub fn resolve_module(interp: &mut Interpreter, name: &str) -> Result<Value, Unw
         "itertools" => Ok(make_itertools_module()),
         "dataclasses" => Ok(make_dataclasses_module()),
         "pathlib" => Ok(make_pathlib_module()),
+        "heapq" => Ok(make_heapq_module()),
+        "contextlib" => Ok(make_contextlib_module()),
+        "pydantic" => Ok(make_pydantic_module()),
         // Typhon-runtime submodules — return the matching submodule so
         // `from typhon_runtime.freeze import deep_freeze` and friends
         // resolve their member directly. Falls back to the root module
@@ -778,17 +819,18 @@ fn make_typhon_runtime_module(interp: &Interpreter) -> Value {
         ],
     );
     // `freeze let X = expr` lowers to a call to `deep_freeze` imported from
-    // `typhon_runtime.freeze`. We expose the same name here so the
-    // existing desugar-injected import (`from typhon_runtime.freeze import
-    // deep_freeze as __typhon_freeze__`) resolves in VM mode. The shim is
-    // an identity function — see the `__typhon_freeze__` root binding in
-    // `install()` for the rationale.
+    // `typhon_runtime.freeze`. The shim now performs a real deep freeze
+    // (list → tuple, dict → mappingproxy-tagged dict, recursive) so that
+    // `tyc run` matches `tyc build && python build/main.py` for immutability
+    // semantics. Without this, mutations through aliased references
+    // succeed silently in the VM where CPython would raise a TypeError.
     let freeze = make_module(
         "typhon_runtime.freeze",
         vec![(
             "deep_freeze",
             nf("deep_freeze", |_i, args| {
-                Ok(args.into_iter().next().unwrap_or(Value::None))
+                let v = args.into_iter().next().unwrap_or(Value::None);
+                deep_freeze_value(v)
             }),
         )],
     );
@@ -1020,6 +1062,30 @@ fn make_json_module() -> Value {
                 "loads",
                 nf("loads", |_i, args| {
                     json_loads(&single(&args, "loads")?.py_str())
+                }),
+            ),
+            (
+                "load",
+                nf("load", |interp, args| {
+                    // json.load(fp) — read() the file-like, then loads().
+                    let fp = single(&args, "load")?.clone();
+                    let read = interp.get_attr(&fp, "read")?;
+                    let body = interp.call_value(read, vec![], &[])?;
+                    json_loads(&body.py_str())
+                }),
+            ),
+            (
+                "dump",
+                nf("dump", |interp, args| {
+                    // json.dump(obj, fp) — dumps(), then fp.write().
+                    if args.len() < 2 {
+                        return Err(crate::error::type_error("dump() requires (obj, fp)"));
+                    }
+                    let serialised = json_dumps(&args[0]);
+                    let fp = args[1].clone();
+                    let write = interp.get_attr(&fp, "write")?;
+                    interp.call_value(write, vec![Value::Str(Rc::new(serialised))], &[])?;
+                    Ok(Value::None)
                 }),
             ),
         ],
@@ -1616,6 +1682,23 @@ fn make_collections_module() -> Value {
         });
         Ok(Value::Native(Rc::new(ctor)))
     });
+    // `deque([iterable])` — the VM exposes deques as plain lists, since
+    // all the methods we shim (append, appendleft, pop, popleft, extend)
+    // map cleanly onto list operations. This is `O(n)` for the *left*
+    // variants instead of the `O(1)` CPython gives, but functional
+    // equivalence is preserved.
+    let deque = nf("deque", |i, args| {
+        let mut out: Vec<Value> = Vec::new();
+        if let Some(v) = args.into_iter().next() {
+            if !matches!(v, Value::None) {
+                let it = i.make_iter(v)?;
+                while let Some(x) = i.iter_next(&it)? {
+                    out.push(x);
+                }
+            }
+        }
+        Ok(Value::List(Rc::new(RefCell::new(out))))
+    });
     make_module(
         "collections",
         vec![
@@ -1623,6 +1706,334 @@ fn make_collections_module() -> Value {
             ("defaultdict", defaultdict),
             ("Counter", counter),
             ("namedtuple", namedtuple),
+            ("deque", deque),
+        ],
+    )
+}
+
+/// `heapq` shim — implements the small-but-essential surface for
+/// priority-queue-style algorithms (Dijkstra, A*, top-K, merge-K-sorted).
+/// Internally we re-heapify on every push/pop since the VM's lists don't
+/// expose a stable heap-invariant; the algorithmic complexity goes from
+/// O(log n) to O(n log n) but the surface is correct.
+fn make_heapq_module() -> Value {
+    fn sift_down(list: &mut [Value], start: usize, pos: usize) {
+        let mut pos = pos;
+        let new_item = list[pos].clone();
+        while pos > start {
+            let parent = (pos - 1) >> 1;
+            if value_lt(&new_item, &list[parent]) {
+                list[pos] = list[parent].clone();
+                pos = parent;
+            } else {
+                break;
+            }
+        }
+        list[pos] = new_item;
+    }
+    fn sift_up(list: &mut [Value], pos: usize) {
+        let endpos = list.len();
+        let startpos = pos;
+        let mut pos = pos;
+        let new_item = list[pos].clone();
+        let mut child = 2 * pos + 1;
+        while child < endpos {
+            let right = child + 1;
+            if right < endpos && !value_lt(&list[child], &list[right]) {
+                child = right;
+            }
+            list[pos] = list[child].clone();
+            pos = child;
+            child = 2 * pos + 1;
+        }
+        list[pos] = new_item;
+        sift_down(list, startpos, pos);
+    }
+    fn value_lt(a: &Value, b: &Value) -> bool {
+        // Reuse the VM's general comparison. Returns false on
+        // incomparable types — which matches CPython at least to the
+        // extent that the program then sees a non-sensical heap ordering
+        // instead of crashing.
+        match (a, b) {
+            (Value::Int(x), Value::Int(y)) => x < y,
+            (Value::Float(x), Value::Float(y)) => x < y,
+            (Value::Int(x), Value::Float(y)) => {
+                num_traits::ToPrimitive::to_f64(x).is_some_and(|xf| xf < *y)
+            }
+            (Value::Float(x), Value::Int(y)) => {
+                num_traits::ToPrimitive::to_f64(y).is_some_and(|yf| *x < yf)
+            }
+            (Value::Str(x), Value::Str(y)) => x < y,
+            (Value::Tuple(x), Value::Tuple(y)) => {
+                for (xi, yi) in x.iter().zip(y.iter()) {
+                    if value_lt(xi, yi) {
+                        return true;
+                    }
+                    if value_lt(yi, xi) {
+                        return false;
+                    }
+                }
+                x.len() < y.len()
+            }
+            _ => false,
+        }
+    }
+    let heappush = nf("heappush", |_i, args| {
+        if args.len() != 2 {
+            return Err(type_error("heappush(heap, item) takes 2 arguments"));
+        }
+        let heap = match &args[0] {
+            Value::List(l) => l.clone(),
+            _ => return Err(type_error("heappush expects a list")),
+        };
+        let item = args[1].clone();
+        let mut h = heap.borrow_mut();
+        h.push(item);
+        let last = h.len() - 1;
+        sift_down(&mut h, 0, last);
+        Ok(Value::None)
+    });
+    let heappop = nf("heappop", |_i, args| {
+        let heap = match args.first() {
+            Some(Value::List(l)) => l.clone(),
+            _ => return Err(type_error("heappop expects a list")),
+        };
+        let mut h = heap.borrow_mut();
+        let last = h
+            .pop()
+            .ok_or_else(|| crate::error::index_error("pop from an empty heap"))?;
+        if h.is_empty() {
+            Ok(last)
+        } else {
+            let returned = std::mem::replace(&mut h[0], last);
+            sift_up(&mut h, 0);
+            Ok(returned)
+        }
+    });
+    let heapify = nf("heapify", |_i, args| {
+        let heap = match args.first() {
+            Some(Value::List(l)) => l.clone(),
+            _ => return Err(type_error("heapify expects a list")),
+        };
+        let mut h = heap.borrow_mut();
+        if h.len() >= 2 {
+            for i in (0..h.len() / 2).rev() {
+                sift_up(&mut h, i);
+            }
+        }
+        Ok(Value::None)
+    });
+    let nsmallest = nf("nsmallest", |i, args| {
+        if args.len() < 2 {
+            return Err(type_error("nsmallest(n, iterable) takes 2 arguments"));
+        }
+        let n = args[0].to_int()?;
+        let it = i.make_iter(args[1].clone())?;
+        let mut items: Vec<Value> = Vec::new();
+        while let Some(x) = i.iter_next(&it)? {
+            items.push(x);
+        }
+        items.sort_by(|a, b| {
+            if value_lt(a, b) {
+                std::cmp::Ordering::Less
+            } else if value_lt(b, a) {
+                std::cmp::Ordering::Greater
+            } else {
+                std::cmp::Ordering::Equal
+            }
+        });
+        items.truncate(n.max(0) as usize);
+        Ok(Value::List(Rc::new(RefCell::new(items))))
+    });
+    let nlargest = nf("nlargest", |i, args| {
+        if args.len() < 2 {
+            return Err(type_error("nlargest(n, iterable) takes 2 arguments"));
+        }
+        let n = args[0].to_int()?;
+        let it = i.make_iter(args[1].clone())?;
+        let mut items: Vec<Value> = Vec::new();
+        while let Some(x) = i.iter_next(&it)? {
+            items.push(x);
+        }
+        items.sort_by(|a, b| {
+            if value_lt(b, a) {
+                std::cmp::Ordering::Less
+            } else if value_lt(a, b) {
+                std::cmp::Ordering::Greater
+            } else {
+                std::cmp::Ordering::Equal
+            }
+        });
+        items.truncate(n.max(0) as usize);
+        Ok(Value::List(Rc::new(RefCell::new(items))))
+    });
+    make_module(
+        "heapq",
+        vec![
+            ("heappush", heappush),
+            ("heappop", heappop),
+            ("heapify", heapify),
+            ("nsmallest", nsmallest),
+            ("nlargest", nlargest),
+        ],
+    )
+}
+
+/// Whether a `Value::Dict` carries the `__typhon_frozen__` sentinel
+/// (inserted by `deep_freeze_value`). Used by the dict mutators to
+/// raise the same TypeError CPython's MappingProxy produces.
+pub fn dict_is_frozen(d: &Rc<RefCell<DictMap>>) -> bool {
+    let frozen_key = HashKey::Str(Rc::new("__typhon_frozen__".to_owned()));
+    matches!(d.borrow().get(&frozen_key), Some(Value::Bool(true)))
+}
+
+/// Whether a `Value::Set` carries the `__typhon_frozen__` sentinel
+/// (inserted by `deep_freeze_value`'s Set arm). `set_method` mutators
+/// (`add`, `remove`, `discard`, `pop`, `clear`, `update`, etc.) refuse
+/// to operate on a frozen set; iteration / len / repr filter the
+/// sentinel out of user-visible output. Review thread codex + copilot
+/// on PR #147.
+pub fn set_is_frozen(s: &Rc<RefCell<std::collections::HashSet<HashKey>>>) -> bool {
+    let frozen_key = HashKey::Str(Rc::new("__typhon_frozen__".to_owned()));
+    s.borrow().contains(&frozen_key)
+}
+
+/// Deep-freeze a value the same way `typhon_runtime.freeze.deep_freeze`
+/// does in the compile path: list → tuple of frozen elements, dict and
+/// set get marked frozen so subsequent mutation operations refuse, and
+/// frozen-class instances are passed through. Anything not freezable
+/// (open file handles, generators) raises `TypeError`. The marker is
+/// stored as a sentinel entry whose presence the list/dict/set method
+/// dispatch table checks before mutating.
+fn deep_freeze_value(v: Value) -> Result<Value, Unwind> {
+    match v {
+        Value::None
+        | Value::Bool(_)
+        | Value::Int(_)
+        | Value::Float(_)
+        | Value::Str(_)
+        | Value::Bytes(_)
+        | Value::Range { .. }
+        | Value::Class(_)
+        | Value::Function(_)
+        | Value::Native(_)
+        | Value::Module(_)
+        | Value::Exception { .. } => Ok(v),
+        Value::List(l) => {
+            // Recursively freeze elements and surface as a tuple. The
+            // compile path turns list → tuple to make the immutability
+            // hold at the Python level.
+            let frozen: Vec<Value> = l
+                .borrow()
+                .iter()
+                .cloned()
+                .map(deep_freeze_value)
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(Value::Tuple(Rc::new(frozen)))
+        }
+        Value::Tuple(items) => {
+            let frozen: Vec<Value> = items
+                .iter()
+                .cloned()
+                .map(deep_freeze_value)
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(Value::Tuple(Rc::new(frozen)))
+        }
+        Value::Dict(d) => {
+            // Build a fresh dict, freeze each value, then insert a hidden
+            // `__typhon_frozen__` sentinel that the dict method dispatch
+            // table consults before mutation.
+            let mut new_map: DictMap = IndexMap::new();
+            for (k, val) in d.borrow().iter() {
+                let frozen_val = deep_freeze_value(val.clone())?;
+                new_map.insert(k.clone(), frozen_val);
+            }
+            new_map.insert(
+                HashKey::Str(Rc::new("__typhon_frozen__".to_owned())),
+                Value::Bool(true),
+            );
+            Ok(Value::Dict(Rc::new(RefCell::new(new_map))))
+        }
+        Value::Set(s) => {
+            // Tag the resulting set with the same `__typhon_frozen__`
+            // sentinel the Dict path uses; `set_is_frozen` checks for
+            // it before every mutator and refuses `add`/`remove`/
+            // `clear` (review threads codex and copilot on PR #147).
+            // Iteration / len / repr filter the sentinel so it never
+            // leaks into user-visible output.
+            let mut elements: std::collections::HashSet<HashKey> =
+                s.borrow().iter().cloned().collect();
+            elements.insert(HashKey::Str(Rc::new("__typhon_frozen__".to_owned())));
+            Ok(Value::Set(Rc::new(RefCell::new(elements))))
+        }
+        Value::Instance(inst) => {
+            // Freeze every field in place; a frozen-class declaration on
+            // the type already keeps individual field assignments rejected
+            // at desugar time, so this is belt-and-braces.
+            let mut new_fields: HashMap<String, Value> = HashMap::new();
+            for (k, val) in inst.fields.borrow().iter() {
+                new_fields.insert(k.clone(), deep_freeze_value(val.clone())?);
+            }
+            Ok(Value::Instance(Rc::new(crate::value::Instance {
+                class: inst.class.clone(),
+                fields: RefCell::new(new_fields),
+            })))
+        }
+        Value::ResultOk(v) => Ok(Value::ResultOk(Box::new(deep_freeze_value(*v)?))),
+        Value::ResultErr(v) => Ok(Value::ResultErr(Box::new(deep_freeze_value(*v)?))),
+        Value::Iter(_) | Value::BoundMethod { .. } => Err(crate::error::Unwind::Exception(
+            crate::error::VmException::new(
+                "TypeError",
+                "deep_freeze cannot freeze this value; types without an immutable \
+                 equivalent (open handles, generators, non-frozen dataclasses, ...) \
+                 must not appear in a `freeze let` value",
+            ),
+        )),
+    }
+}
+
+/// Minimal `pydantic` shim — exposes a `BaseModel` placeholder class and
+/// a `ConfigDict` no-op constructor so that emitted `model Foo:` classes
+/// import cleanly under `tyc run`. Field validation, `.model_validate`,
+/// `.model_dump_json`, etc. are not implemented — programs that need those
+/// must run via `tyc run --compile`. Without this shim, even declaring
+/// (not instantiating) a `model` class makes the file unrunnable in the VM.
+fn make_pydantic_module() -> Value {
+    let base_model = Value::Class(Rc::new(crate::value::Class {
+        name: "BaseModel".to_owned(),
+        methods: std::cell::RefCell::new(HashMap::new()),
+        fields: vec![],
+        class_attrs: std::cell::RefCell::new(HashMap::new()),
+        bases: vec![],
+    }));
+    let config_dict = nf("ConfigDict", |_i, _args| {
+        // Accept any kwargs and ignore — purely a config-record stub.
+        Ok(Value::Dict(Rc::new(RefCell::new(IndexMap::new()))))
+    });
+    make_module(
+        "pydantic",
+        vec![("BaseModel", base_model), ("ConfigDict", config_dict)],
+    )
+}
+
+/// Minimal `contextlib` shim — exposes `@contextmanager` and
+/// `@asynccontextmanager` as identity decorators that return the
+/// generator function itself. The user's `with cm() as x:` lowering goes
+/// through the VM's `__enter__`/`__exit__` protocol on the resulting
+/// object; `@contextmanager` semantics around `yield` aren't fully
+/// reproduced (those need generator support in the VM), but the
+/// decorator no longer raises on import.
+fn make_contextlib_module() -> Value {
+    let identity = |name: &'static str| {
+        nf(name, |_i, args| {
+            Ok(args.into_iter().next().unwrap_or(Value::None))
+        })
+    };
+    make_module(
+        "contextlib",
+        vec![
+            ("contextmanager", identity("contextmanager")),
+            ("asynccontextmanager", identity("asynccontextmanager")),
         ],
     )
 }
@@ -2425,6 +2836,48 @@ fn list_method(
             Ok(Value::None)
         }
         "copy" => Ok(Value::List(Rc::new(RefCell::new(l.borrow().clone())))),
+        // `collections.deque` is implemented as a `Value::List`, so it
+        // shares the list method table. These four are deque-specific.
+        "popleft" => {
+            let mut l = l.borrow_mut();
+            if l.is_empty() {
+                return Err(index_error("pop from an empty deque"));
+            }
+            Ok(l.remove(0))
+        }
+        "appendleft" => {
+            let v = single(args, "appendleft")?.clone();
+            l.borrow_mut().insert(0, v);
+            Ok(Value::None)
+        }
+        "extendleft" => {
+            let it = interp.make_iter(single(args, "extendleft")?.clone())?;
+            let mut to_prepend: Vec<Value> = Vec::new();
+            while let Some(v) = interp.iter_next(&it)? {
+                to_prepend.push(v);
+            }
+            // extendleft reverses element order to match CPython
+            // (each pushed-left element ends up *before* the previous).
+            let mut l = l.borrow_mut();
+            for v in to_prepend {
+                l.insert(0, v);
+            }
+            Ok(Value::None)
+        }
+        "rotate" => {
+            let n = args.first().map(|v| v.to_int()).transpose()?.unwrap_or(1);
+            let mut l = l.borrow_mut();
+            if l.is_empty() {
+                return Ok(Value::None);
+            }
+            let len = l.len() as i64;
+            let n_mod = ((n % len) + len) % len;
+            if n_mod != 0 {
+                let n = n_mod as usize;
+                l.rotate_right(n);
+            }
+            Ok(Value::None)
+        }
         _ => Err(attribute_error(format!("list has no method '{}'", name))),
     }
 }
@@ -2435,6 +2888,22 @@ fn dict_method(
     name: &str,
     args: &[Value],
 ) -> Result<Value, Unwind> {
+    // Refuse mutations on a `freeze let`-tagged dict so the VM matches
+    // the compile path's `MappingProxyType` semantics: CPython surfaces
+    // missing-method calls as `AttributeError` (review thread copilot
+    // on PR #147 — item assignment is a `TypeError`, handled in
+    // `assign_target_subscript`). Read-only methods (`get`, `keys`,
+    // `values`, `items`, `copy`) fall through.
+    let is_mutator = matches!(
+        name,
+        "pop" | "update" | "setdefault" | "clear" | "popitem" | "__setitem__" | "__delitem__"
+    );
+    if is_mutator && dict_is_frozen(d) {
+        return Err(attribute_error(format!(
+            "'mappingproxy' object has no attribute '{}'",
+            name
+        )));
+    }
     match name {
         "get" => {
             let k = single(args, "get")?.to_hash_key()?;
@@ -2444,16 +2913,22 @@ fn dict_method(
         "keys" => Ok(Value::List(Rc::new(RefCell::new(
             d.borrow()
                 .keys()
+                .filter(|k| !matches!(k, HashKey::Str(s) if s.as_str() == "__typhon_frozen__"))
                 .cloned()
                 .map(HashKey::into_value)
                 .collect(),
         )))),
         "values" => Ok(Value::List(Rc::new(RefCell::new(
-            d.borrow().values().cloned().collect(),
+            d.borrow()
+                .iter()
+                .filter(|(k, _)| !matches!(k, HashKey::Str(s) if s.as_str() == "__typhon_frozen__"))
+                .map(|(_, v)| v.clone())
+                .collect(),
         )))),
         "items" => Ok(Value::List(Rc::new(RefCell::new(
             d.borrow()
                 .iter()
+                .filter(|(k, _)| !matches!(k, HashKey::Str(s) if s.as_str() == "__typhon_frozen__"))
                 .map(|(k, v)| Value::Tuple(Rc::new(vec![k.clone().into_value(), v.clone()])))
                 .collect(),
         )))),
@@ -2511,6 +2986,16 @@ fn set_method(
     name: &str,
     args: &[Value],
 ) -> Result<Value, Unwind> {
+    // Refuse mutators on a `freeze let`-tagged set so the VM matches
+    // the compile path's `frozenset` semantics (review thread codex
+    // and copilot on PR #147). Read-only methods are unaffected.
+    let is_mutator = matches!(name, "add" | "remove" | "discard" | "pop" | "clear");
+    if is_mutator && set_is_frozen(s) {
+        return Err(attribute_error(format!(
+            "'frozenset' object has no attribute '{}'",
+            name
+        )));
+    }
     match name {
         "add" => {
             s.borrow_mut().insert(single(args, "add")?.to_hash_key()?);
@@ -2528,7 +3013,20 @@ fn set_method(
             s.borrow_mut().clear();
             Ok(Value::None)
         }
-        "copy" => Ok(Value::Set(Rc::new(RefCell::new(s.borrow().clone())))),
+        "copy" => {
+            // `copy()` on a frozen set returns a fresh *unfrozen* copy
+            // (the sentinel is filtered out) — matching CPython's
+            // `frozenset.copy()` returning a new frozenset with the
+            // same elements but no shared mutability link.
+            let frozen_key = HashKey::Str(Rc::new("__typhon_frozen__".to_owned()));
+            let copied: HashSet<HashKey> = s
+                .borrow()
+                .iter()
+                .filter(|k| **k != frozen_key)
+                .cloned()
+                .collect();
+            Ok(Value::Set(Rc::new(RefCell::new(copied))))
+        }
         _ => Err(attribute_error(format!("set has no method '{}'", name))),
     }
 }
@@ -2582,9 +3080,14 @@ fn json_dumps(v: &Value) -> String {
             format!("[{}]", items.join(", "))
         }
         Value::Dict(d) => {
+            // Filter the `__typhon_frozen__` sentinel a `freeze let`
+            // inserts (review thread copilot on PR #147 — otherwise
+            // `json.dump(frozen_dict, fp)` leaks the marker into the
+            // emitted JSON).
             let items: Vec<String> = d
                 .borrow()
                 .iter()
+                .filter(|(k, _)| !matches!(k, HashKey::Str(s) if s.as_str() == "__typhon_frozen__"))
                 .map(|(k, v)| format!("{}: {}", json_dumps(&k.clone().into_value()), json_dumps(v)))
                 .collect();
             format!("{{{}}}", items.join(", "))
@@ -2855,6 +3358,36 @@ pub fn call_with_kwargs(
                 Ok(Value::List(Rc::new(RefCell::new(out))))
             }
         }
+        // `dataclasses.field(default=…, default_factory=…)`. The desugar
+        // pass rewrites bare-mutable defaults like `tags: list[str] = []`
+        // into `dataclasses.field(default_factory=list)`. We return a
+        // tagged tuple sentinel that the instance constructor recognises
+        // and invokes per-instance, so each instance gets its own fresh
+        // mutable container instead of sharing one across all instances.
+        "field" => {
+            let mut default: Option<Value> = args.into_iter().next();
+            for (k, v) in kwargs {
+                match k.as_str() {
+                    "default" => default = Some(v.clone()),
+                    "default_factory" => {
+                        // Sentinel: ("__typhon_field_factory__", callable).
+                        return Ok(Value::Tuple(Rc::new(vec![
+                            Value::Str(Rc::new("__typhon_field_factory__".to_owned())),
+                            v.clone(),
+                        ])));
+                    }
+                    // `repr`, `hash`, `init`, `compare`, `metadata`, `kw_only`
+                    // — silently accepted (VM doesn't model them) so the
+                    // emitted dataclass `__init__` doesn't crash.
+                    _ => {}
+                }
+            }
+            Ok(default.unwrap_or(Value::None))
+        }
+        // Native ctors / shims that intentionally accept any kwargs and
+        // discard them. Used by stdlib stubs that exist purely so user
+        // code that calls them at import time doesn't crash.
+        "ConfigDict" | "dataclass" => (n.func)(interp, args),
         _ => {
             if kwargs.is_empty() {
                 (n.func)(interp, args)

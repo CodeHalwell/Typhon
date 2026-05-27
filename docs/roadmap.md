@@ -6,8 +6,25 @@ Realistic milestones for one person plus AI assistance. The headline target is a
 
 ## Current release
 
-**[v0.8.1](https://github.com/CodeHalwell/Typhon/releases/tag/v0.8.1) — 2026-05-26.**
-Point release on top of v0.8.0 that fixes a regression where the
+**[v0.9.0](https://github.com/CodeHalwell/Typhon/releases/tag/v0.9.0) — 2026-05-27.**
+Stress-test cleanup release. Closes **32 findings** from a v0.8.1
+stress sweep across the type checker, VM, parser, lowering passes,
+diagnostics, and CLI. The VM is now usable as the daily-driver
+runner the docs always advertised: `Result` combinators, `open()`
+write/append/binary modes, class patterns on built-ins, `frozenset`
+as a dict key, deep `freeze let`, comptime inlining, `lazy import`,
+`class!` exception fields, dataclass mutable-default factories,
+`collections.deque` / `heapq` / `contextlib` / `pydantic` shims,
+multi-file projects, and `@property` / `super()` / `@contextmanager`
+all work under `tyc run`. The type checker plugs silent-correctness
+gaps in Sequence covariance, variant-to-parametric-union flow,
+`while True:` reachability, post-loop narrowing, `assert`
+narrowing, `*args` annotation policy, `extend list[T]` dispatch,
+exhaustive match on `T?`, `with`-chain error mismatch, and the
+`comptime let T: type` alias. Additive on the accepted surface.
+
+[v0.8.1](https://github.com/CodeHalwell/Typhon/releases/tag/v0.8.1)
+is a point release on top of v0.8.0 that fixes a regression where the
 widened `tyc::attribute_not_found` rule false-positived on
 venv-introspected third-party Python classes
 (`uvicorn.Server.serve(...)`, `httpx.AsyncClient.aclose(...)`,

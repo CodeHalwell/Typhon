@@ -646,6 +646,22 @@ pub fn check_source_file_with_imports(
         }
     };
 
+    // B34: inline comptime values into the AST so the type-checker
+    // sees `comptime let T: type = int` as a `type T = int` alias
+    // declaration. Without this, `T` resolves as a distinct nominal
+    // class and `def f(x: T)` rejects `int` arguments. Matches the
+    // same substitution `tyc build` and `tyc run` apply.
+    let (comptime_values, _comptime_diags) = tyc_analyse::evaluate_comptime_with_functions(
+        &module,
+        &prep.comptime_bindings,
+        &prep.comptime_functions,
+    );
+    let module = tyc_analyse::substitute_comptime_literals(
+        module,
+        &comptime_values,
+        &prep.comptime_functions,
+    );
+
     // Collect resolve diagnostics from the cached query. The
     // `resolved_module` query now stores both the resolved bindings
     // and the diagnostics from resolution, so we don't need to re-run

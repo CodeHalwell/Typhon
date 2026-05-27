@@ -298,6 +298,50 @@ pub fn assignable(expected: &Type, actual: &Type) -> bool {
             if an == "tuple_variadic" && bn == "tuple_variadic" && aa.len() == 1 && bb.len() == 1 {
                 return assignable(&aa[0], &bb[0]);
             }
+            // B31: built-in containers conform to the read-only
+            // Sequence / Iterable / Iterator / Collection / Container /
+            // Reversible protocols covariantly. Without this rule,
+            // `f(list[Dog])` into `def f(xs: Sequence[Animal])` fails
+            // with a generic-head mismatch even though `Sequence` is
+            // declared covariant in `generic_param_variance`. The
+            // element type still has to be assignable, so the
+            // direction stays correct.
+            const READ_VIEW_HEADS: &[&str] = &[
+                "Sequence",
+                "Iterable",
+                "Iterator",
+                "Collection",
+                "Container",
+                "Reversible",
+            ];
+            if READ_VIEW_HEADS.contains(&an.as_str())
+                && aa.len() == 1
+                && matches!(bn.as_str(), "list" | "tuple" | "set" | "frozenset")
+                && !bb.is_empty()
+            {
+                return assignable(&aa[0], &bb[0]);
+            }
+            // Mapping[K, V] is invariant in K (keys participate in
+            // hashing / equality lookups against the consumer's slot)
+            // and covariant in V (read-only view). MutableMapping[K,
+            // V] is invariant in BOTH parameters — `m[k] = v` on a
+            // MutableMapping[Animal, Animal] would let you insert
+            // `Animal` instances into a backing `dict[Dog, Dog]`. The
+            // dict→view direction here therefore requires
+            // bidirectional assignability on K for both, and on V
+            // for MutableMapping. (See review thread on PR #147 from
+            // gemini-code-assist / copilot.)
+            if an == "Mapping" && aa.len() == 2 && bn == "dict" && bb.len() == 2 {
+                return assignable(&aa[0], &bb[0])
+                    && assignable(&bb[0], &aa[0])
+                    && assignable(&aa[1], &bb[1]);
+            }
+            if an == "MutableMapping" && aa.len() == 2 && bn == "dict" && bb.len() == 2 {
+                return assignable(&aa[0], &bb[0])
+                    && assignable(&bb[0], &aa[0])
+                    && assignable(&aa[1], &bb[1])
+                    && assignable(&bb[1], &aa[1]);
+            }
             if an != bn || aa.len() != bb.len() {
                 return false;
             }
@@ -2061,7 +2105,15 @@ impl<'a> Checker<'a> {
                 return true;
             }
         }
-        // Variant → sealed union coercion.
+        // Variant → sealed union coercion. Two flavours:
+        //   - non-parametric: `Shape = Circle | Rectangle` — both
+        //     expected and actual are `Type::Class(...)`.
+        //   - parametric (B22): `LinkedList[T] = Cons[T] | Nil` —
+        //     expected is `Type::Generic("LinkedList", [T])`, actual
+        //     is `Type::Class("Cons")` or `Type::Generic("Cons", [T])`.
+        //     Without this branch, `impl[T] LinkedList[T]:` method
+        //     bodies can't assign `self` (typed as the variant) into a
+        //     binding declared as the union.
         if let (Type::Class(exp_name), Type::Class(act_name)) = (expected, actual) {
             if let Some(variants) = self.sealed_unions.get(exp_name.as_str()) {
                 return variants.iter().any(|v| v == act_name);
@@ -2080,6 +2132,31 @@ impl<'a> Checker<'a> {
                 && self.class_inherits_from(act_name, exp_name)
             {
                 return true;
+            }
+        }
+        // Parametric variant → parametric sealed-union: `Cons` /
+        // `Cons[T]` into `LinkedList[T]`. The variant name is looked up
+        // in `sealed_unions` under the union's head name regardless of
+        // the user's actual instantiation; element types aren't
+        // co-checked yet (a deliberate under-approximation — variant
+        // membership is the main signal, and overly-strict element
+        // matching here would block recursive ADT walks that the
+        // existing tests rely on). See B22 stress finding.
+        let exp_head_with_arity = match expected {
+            Type::Generic(name, _) => Some((name.as_str(), true)),
+            Type::Class(name) => Some((name.as_str(), false)),
+            _ => None,
+        };
+        let act_head = match actual {
+            Type::Generic(name, _) => Some(name.as_str()),
+            Type::Class(name) => Some(name.as_str()),
+            _ => None,
+        };
+        if let (Some((exp_head, _is_generic)), Some(act_head)) = (exp_head_with_arity, act_head) {
+            if let Some(variants) = self.sealed_unions.get(exp_head) {
+                if variants.iter().any(|v| v == act_head) {
+                    return true;
+                }
             }
         }
         // Built-in structural conformance against a user-declared Protocol.
@@ -2106,6 +2183,45 @@ impl<'a> Checker<'a> {
         // `expected` so nominal and structural checks apply to each arm.
         if let Type::Union(variants) = actual {
             return variants.iter().all(|v| self.is_assignable(expected, v));
+        }
+        // B31 (sealed-union-aware variant of the read-view rule in
+        // `assignable`): list[Dog] → Sequence[Animal] when Dog
+        // inherits from Animal. The free `assignable` checks only
+        // primitive widening; route through is_assignable here so the
+        // class hierarchy is consulted.
+        if let (Type::Generic(an, aa), Type::Generic(bn, bb)) = (expected, actual) {
+            const READ_VIEW_HEADS: &[&str] = &[
+                "Sequence",
+                "Iterable",
+                "Iterator",
+                "Collection",
+                "Container",
+                "Reversible",
+            ];
+            if READ_VIEW_HEADS.contains(&an.as_str())
+                && aa.len() == 1
+                && matches!(bn.as_str(), "list" | "tuple" | "set" | "frozenset")
+                && !bb.is_empty()
+            {
+                return self.is_assignable(&aa[0], &bb[0]);
+            }
+            // Sealed-union-aware counterpart to the Mapping rule in
+            // `assignable`: Mapping[K, V] is invariant in K +
+            // covariant in V; MutableMapping[K, V] is invariant in
+            // both. The class-hierarchy-aware `is_assignable` carries
+            // the same one-way primitive widening as `assignable`, so
+            // bidirectional checks here actually enforce invariance.
+            if an == "Mapping" && aa.len() == 2 && bn == "dict" && bb.len() == 2 {
+                return self.is_assignable(&aa[0], &bb[0])
+                    && self.is_assignable(&bb[0], &aa[0])
+                    && self.is_assignable(&aa[1], &bb[1]);
+            }
+            if an == "MutableMapping" && aa.len() == 2 && bn == "dict" && bb.len() == 2 {
+                return self.is_assignable(&aa[0], &bb[0])
+                    && self.is_assignable(&bb[0], &aa[0])
+                    && self.is_assignable(&aa[1], &bb[1])
+                    && self.is_assignable(&bb[1], &aa[1]);
+            }
         }
         // Generic / generic (e.g. `Result[T, E] = Ok[V]`, `list[T] = list[V]`):
         // recurse using `is_assignable` for the inner type pairs so sealed
@@ -2482,10 +2598,10 @@ impl<'a> Checker<'a> {
                     }
                 }
                 Some(cls_sig) => missing.push(format!(
-                    "{m}(arity {}; expected {})",
+                    "{m}: signature mismatch — got {} non-self parameter(s), expected {}",
                     cls_sig.arity, iface_sig.arity
                 )),
-                None => missing.push(m.clone()),
+                None => missing.push(format!("{m}: missing")),
             }
         }
         for (f, iface_type) in &iface.shape.fields {
@@ -3270,6 +3386,26 @@ pub fn check_module_with_imports(
     // require-with` in `typhon.toml`.
     check_resource_discipline(&mut c, &module.body);
 
+    // B24: drop diagnostics that are exact duplicates of an earlier
+    // one. Sealed-union `impl Alias:` distribution duplicates each
+    // method body across every variant, so every method-level
+    // diagnostic (missing_return, non_exhaustive_match, type_mismatch)
+    // fires once per copy. Without this pass, a 10-variant union
+    // produces 10 identical errors in the report. The dedup key is
+    // (code, message), stable across copies because impl distribution
+    // doesn't touch the user-visible source text — only the byte
+    // ranges in the preprocessed buffer.
+    c.diagnostics.dedupe();
+
+    // Phase D: freezable-shape audit (B36). Every `freeze let X = …`
+    // lowers to `X = __typhon_freeze__(rhs)`; at runtime that helper
+    // raises `TypeError` if `rhs` contains a non-`frozen` dataclass or
+    // any other unfreezable shape. We walk the AST here, find every
+    // `__typhon_freeze__(...)` call, and re-walk the argument to
+    // surface a `tyc::freeze_not_freezable` diagnostic up-front so
+    // the failure shows in the editor instead of at first import.
+    check_freeze_let_freezable(&mut c, &module.body);
+
     c.diagnostics
 }
 
@@ -3978,6 +4114,207 @@ fn dotted_name_of(expr: &Expr) -> Option<String> {
             Some(format!("{}.{}", prefix, a.attr.as_str()))
         }
         _ => None,
+    }
+}
+
+/// B36 freezable-shape audit. Walk `body` for `freeze let NAME = …`
+/// bindings (post-preprocess: `NAME = __typhon_freeze__(rhs)`) and
+/// verify the RHS argument's shape would survive `deep_freeze` at
+/// runtime. Fires `tyc::freeze_not_freezable` for each non-freezable
+/// constructor call so the failure shows up in `tyc check` instead of
+/// only at first `python build/main.py` invocation. The walker covers
+/// the common shapes — list/tuple/dict/set literals + class
+/// constructors. Calls into stdlib (e.g. `dict(...)`, `tuple(...)`,
+/// `frozenset(...)`) are conservatively accepted; the runtime
+/// `deep_freeze` still rejects anything dynamic it can't recursively
+/// freeze.
+fn check_freeze_let_freezable(c: &mut Checker, body: &[Stmt]) {
+    for stmt in body {
+        check_freeze_let_freezable_stmt(c, stmt);
+    }
+}
+
+fn check_freeze_let_freezable_stmt(c: &mut Checker, stmt: &Stmt) {
+    match stmt {
+        Stmt::Assign(a) => {
+            // Find the binding name + the freeze-call argument, if any.
+            if let (Some(name), Some(arg)) = (
+                assign_target_name(&a.targets),
+                freeze_call_argument(&a.value),
+            ) {
+                check_freeze_argument(c, name, arg);
+            }
+        }
+        Stmt::AnnAssign(a) => {
+            if let (Expr::Name(n), Some(value)) = (a.target.as_ref(), a.value.as_deref()) {
+                if let Some(arg) = freeze_call_argument(value) {
+                    check_freeze_argument(c, n.id.as_str(), arg);
+                }
+            }
+        }
+        // Nested freeze let is rejected by the preprocessor (module-level
+        // only), but recurse into compound statements for completeness so
+        // any future relaxation surfaces the same audit.
+        Stmt::If(s) => {
+            check_freeze_let_freezable(c, &s.body);
+            for clause in &s.elif_else_clauses {
+                check_freeze_let_freezable(c, &clause.body);
+            }
+        }
+        Stmt::With(s) => check_freeze_let_freezable(c, &s.body),
+        Stmt::Try(s) => {
+            check_freeze_let_freezable(c, &s.body);
+            check_freeze_let_freezable(c, &s.orelse);
+            check_freeze_let_freezable(c, &s.finalbody);
+            for handler in &s.handlers {
+                let ruff_python_ast::ExceptHandler::ExceptHandler(h) = handler;
+                check_freeze_let_freezable(c, &h.body);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn assign_target_name(targets: &[Expr]) -> Option<&str> {
+    if let [Expr::Name(n)] = targets {
+        Some(n.id.as_str())
+    } else {
+        None
+    }
+}
+
+/// If `expr` is a `__typhon_freeze__(arg)` call, return the inner `arg`
+/// expression. Otherwise None.
+fn freeze_call_argument(expr: &Expr) -> Option<&Expr> {
+    let call = match expr {
+        Expr::Call(c) => c,
+        _ => return None,
+    };
+    let Expr::Name(n) = call.func.as_ref() else {
+        return None;
+    };
+    if n.id.as_str() != "__typhon_freeze__" {
+        return None;
+    }
+    call.arguments.args.first()
+}
+
+fn check_freeze_argument(c: &mut Checker, binding: &str, arg: &Expr) {
+    walk_freeze_expr(c, binding, arg);
+}
+
+fn walk_freeze_expr(c: &mut Checker, binding: &str, expr: &Expr) {
+    match expr {
+        // Literals — always freezable.
+        Expr::NumberLiteral(_)
+        | Expr::StringLiteral(_)
+        | Expr::BytesLiteral(_)
+        | Expr::BooleanLiteral(_)
+        | Expr::NoneLiteral(_)
+        | Expr::EllipsisLiteral(_) => {}
+        // Composite containers — recurse into elements.
+        Expr::List(l) => {
+            for e in &l.elts {
+                walk_freeze_expr(c, binding, e);
+            }
+        }
+        Expr::Tuple(t) => {
+            for e in &t.elts {
+                walk_freeze_expr(c, binding, e);
+            }
+        }
+        Expr::Set(s) => {
+            for e in &s.elts {
+                walk_freeze_expr(c, binding, e);
+            }
+        }
+        Expr::Dict(d) => {
+            for item in d.items.iter() {
+                if let Some(k) = &item.key {
+                    walk_freeze_expr(c, binding, k);
+                }
+                walk_freeze_expr(c, binding, &item.value);
+            }
+        }
+        Expr::FString(_) => {
+            // Resolves to `str` — freezable. Nothing to recurse into
+            // that could itself be non-freezable.
+        }
+        Expr::UnaryOp(u) => walk_freeze_expr(c, binding, &u.operand),
+        Expr::BinOp(b) => {
+            walk_freeze_expr(c, binding, &b.left);
+            walk_freeze_expr(c, binding, &b.right);
+        }
+        // Constructor calls — the most common non-freezable culprit.
+        // `Foo(...)` on a non-`frozen` class produces a value whose
+        // fields are mutable; `deep_freeze` rejects it.
+        Expr::Call(call) => {
+            let head = match call.func.as_ref() {
+                Expr::Name(n) => Some(n.id.as_str()),
+                Expr::Attribute(a) => Some(a.attr.as_str()),
+                _ => None,
+            };
+            if let Some(head) = head {
+                // Stdlib / always-freezable constructors — accept and
+                // recurse into args for nested non-freezable shapes.
+                let always_ok = matches!(
+                    head,
+                    "frozenset"
+                        | "tuple"
+                        | "int"
+                        | "float"
+                        | "str"
+                        | "bool"
+                        | "bytes"
+                        | "Ok"
+                        | "Err"
+                );
+                // User class call: freezable iff the class is declared
+                // `frozen`. Unknown identifiers are conservatively
+                // accepted (could be a newtype wrapping a freezable
+                // base, or an imported frozen class we don't have
+                // shape data for).
+                let user_class_known = c.classes.iter().any(|s| s == head);
+                if !always_ok && user_class_known && !c.frozen_classes.contains(head) {
+                    let span = call.range;
+                    c.diagnostics.push_error(TycError::freeze_not_freezable(
+                        binding.to_owned(),
+                        head.to_owned(),
+                        c.path.clone(),
+                        c.source,
+                        span.start().to_usize(),
+                        span.end()
+                            .to_usize()
+                            .saturating_sub(span.start().to_usize())
+                            .max(1),
+                    ));
+                    return;
+                }
+                // newtype constructor — base must be freezable
+                // (newtypes always wrap a primitive in the current
+                // language surface, so this is normally fine; recurse
+                // into args defensively).
+            }
+            for arg in &call.arguments.args {
+                walk_freeze_expr(c, binding, arg);
+            }
+            for kw in &call.arguments.keywords {
+                walk_freeze_expr(c, binding, &kw.value);
+            }
+        }
+        // `[x for x in xs]` produces a list at runtime (freezable to a
+        // tuple). Generator expressions are non-freezable, but the
+        // surface for `freeze let` is module-level so generators are
+        // already rare — leave them for the runtime to reject.
+        Expr::ListComp(_) | Expr::DictComp(_) | Expr::SetComp(_) => {}
+        // Bare names — could be a previously-bound freeze-let or a
+        // primitive constant; accept without further inspection. The
+        // runtime helper performs the full recursive walk.
+        Expr::Name(_) => {}
+        _ => {
+            // Conservatively accept anything else; deep_freeze will
+            // catch genuinely-unfreezable values at runtime.
+        }
     }
 }
 
@@ -6261,6 +6598,7 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                 let mut has_ann_assign = false;
                 let mut all_ann_assigns_defaulted = true;
                 let mut only_ann_assigns = true;
+                let mut any_mutable_default = false;
                 let mut first_defaulted: Option<(&ruff_python_ast::StmtAnnAssign, String)> = None;
                 for s in &cd.body {
                     match s {
@@ -6268,9 +6606,25 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                             has_ann_assign = true;
                             if a.value.is_none() {
                                 all_ann_assigns_defaulted = false;
-                            } else if first_defaulted.is_none() {
-                                if let Expr::Name(n) = a.target.as_ref() {
-                                    first_defaulted = Some((a, n.id.as_str().to_owned()));
+                            } else {
+                                // A bare-mutable-literal default
+                                // (`tags: list[str] = []`, `m: dict = {}`,
+                                // `s: set = set()`) gets rewritten by the
+                                // desugar pass into a `default_factory`
+                                // field. That's a real per-instance
+                                // dataclass field, NOT a constants
+                                // namespace, so the `class_attr_shadows_slot`
+                                // warning would be a false positive (B19).
+                                if matches!(
+                                    a.value.as_deref(),
+                                    Some(Expr::List(_)) | Some(Expr::Dict(_)) | Some(Expr::Set(_))
+                                ) {
+                                    any_mutable_default = true;
+                                }
+                                if first_defaulted.is_none() {
+                                    if let Expr::Name(n) = a.target.as_ref() {
+                                        first_defaulted = Some((a, n.id.as_str().to_owned()));
+                                    }
                                 }
                             }
                         }
@@ -6282,6 +6636,13 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                             ) => {}
                         _ => only_ann_assigns = false,
                     }
+                }
+                if any_mutable_default {
+                    // Suppress the warning for any class that owns at
+                    // least one mutable-default-rewrite field — those
+                    // are clearly intended as instance fields, not
+                    // constants.
+                    all_ann_assigns_defaulted = false;
                 }
                 if has_ann_assign
                     && all_ann_assigns_defaulted
@@ -6450,7 +6811,23 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                     // dedicated `tyc::result_error_mismatch` so the user
                     // sees a `?`-propagation framing instead of a generic
                     // type mismatch (FINDINGS #13).
-                    if is_question_op_temp(ret_expr) {
+                    //
+                    // B35: the same diagnostic applies to any
+                    // `return Err(value)` whose value's type doesn't
+                    // match the function's declared error type. Most
+                    // commonly that's an explicit `with`-chain
+                    // `else err: return Err(err)` block where `err`
+                    // carries a different error type than the function
+                    // promises.
+                    let is_q_temp = is_question_op_temp(ret_expr);
+                    let is_err_ctor = matches!(
+                        &**ret_expr,
+                        Expr::Call(call) if matches!(
+                            call.func.as_ref(),
+                            Expr::Name(n) if n.id.as_str() == "Err"
+                        )
+                    );
+                    if is_q_temp || is_err_ctor {
                         if let (Some(expected_err), Some(actual_err)) = (
                             extract_result_error_type(&expected),
                             extract_err_generic_param(&value_type),
@@ -6512,6 +6889,19 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                 check_stmt(c, s);
             }
             c.env.restore(snap_pre);
+            // B25: post-loop narrowing. A `while TEST: BODY` that has
+            // no `break` in the body can only exit through TEST going
+            // false (the natural-exit path) — so the negation of TEST
+            // holds at the join point after the loop. Apply the
+            // negated narrowings persistently so code like
+            //   while y is None: y = load()
+            //   return y + 1            # y is `int` here
+            // checks cleanly. A `break` inside the body would leave
+            // the loop while TEST is still true; in that case we have
+            // no information at the join and skip the apply.
+            if !body_can_break(&w.body) {
+                apply_narrowings(c, &neg);
+            }
         }
         Stmt::For(f) => {
             let _ = infer_expr(c, &f.iter);
@@ -6618,6 +7008,17 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                 }
             }
         }
+        // `assert <test>` permanently narrows subsequent code in the
+        // surrounding block — the same way `if not <test>: return`
+        // would. Standard Python static-checker idiom, parity with
+        // mypy / pyright / pyrefly (B25b). The test is type-checked
+        // for completeness but the narrowing is the important
+        // side-effect.
+        Stmt::Assert(a) => {
+            let _ = infer_expr(c, &a.test);
+            let pos = collect_narrowings(c, &a.test, /*negate=*/ false);
+            apply_narrowings(c, &pos);
+        }
         _ => {}
     }
 }
@@ -6677,6 +7078,40 @@ fn enforce_annotation_rule(
                 c.path.clone(),
                 c.source,
                 span.0,
+                pname.len().max(1),
+            ));
+        }
+    }
+
+    // `*args` / `**kwargs` carry implicit `Any` element types if left
+    // unannotated, which silently breaks Rule 1 for every generic-shaped
+    // decorator (B14). Require an explicit `*args: T` / `**kwargs: V`
+    // — the canonical answer is `*args: object` / `**kwargs: object`
+    // when the function is truly variadic.
+    if let Some(vararg) = parameters.vararg.as_ref() {
+        if vararg.annotation.is_none() {
+            let pname = vararg.name.as_str();
+            let span_start = vararg.range.start().to_usize();
+            c.diagnostics.push_error(TycError::missing_annotation(
+                function.to_owned(),
+                format!("`*{}`", pname),
+                c.path.clone(),
+                c.source,
+                span_start,
+                pname.len().max(1),
+            ));
+        }
+    }
+    if let Some(kwarg) = parameters.kwarg.as_ref() {
+        if kwarg.annotation.is_none() {
+            let pname = kwarg.name.as_str();
+            let span_start = kwarg.range.start().to_usize();
+            c.diagnostics.push_error(TycError::missing_annotation(
+                function.to_owned(),
+                format!("`**{}`", pname),
+                c.path.clone(),
+                c.source,
+                span_start,
                 pname.len().max(1),
             ));
         }
@@ -7490,6 +7925,30 @@ fn match_is_exhaustive_for_da(c: &Checker, subject: &Expr, cases: &[MatchCase]) 
         Type::Generic(name, _) if name == "Result" => {
             vec!["Ok".to_owned(), "Err".to_owned()]
         }
+        // `T?` (= `T | None`) is exhausted by matching `case None:` plus
+        // a built-in class pattern for `T`. Map common built-ins (str,
+        // int, float, bool, bytes, list, tuple, dict, set, frozenset)
+        // to their pattern-class name so `case None:` + `case str() as
+        // s:` counts as exhaustive (B6).
+        Type::Union(variants) => {
+            let has_none = variants.iter().any(|t| matches!(t, Type::None));
+            if has_none && variants.len() == 2 {
+                let other = variants
+                    .iter()
+                    .find(|t| !matches!(t, Type::None))
+                    .cloned()
+                    .unwrap_or(Type::Unknown);
+                if let Some(cls) = builtin_class_pattern_name(&other) {
+                    vec!["None".to_owned(), cls.to_owned()]
+                } else if let Type::Class(name) = other {
+                    vec!["None".to_owned(), name]
+                } else {
+                    Vec::new()
+                }
+            } else {
+                Vec::new()
+            }
+        }
         _ => Vec::new(),
     };
     if !union_variants.is_empty() {
@@ -7773,6 +8232,13 @@ fn stmt_always_exits_aware(c: &Checker, stmt: &Stmt) -> bool {
                 && elif_else_chain_always_exits_aware(c, &s.elif_else_clauses)
         }
         Stmt::Match(m) => match_arms_always_exit_aware(c, m),
+        // `while True:` with no `break` exits the enclosing function
+        // only through `return` / `raise` inside the body, so the
+        // post-loop point is unreachable. The reachability check needs
+        // to honour this so `while True: match x: case A: return ...;
+        // case B: continue` doesn't surface `missing_return` for the
+        // function (B23 stress finding).
+        Stmt::While(w) => is_constant_true(&w.test) && !body_can_break(&w.body),
         // A `with` / `async with` block exits the enclosing function
         // only when every terminal in its body is *non-suppressible*
         // — `return` / `break` / `continue`. Bare `raise` is
@@ -7791,6 +8257,38 @@ fn stmt_always_exits_aware(c: &Checker, stmt: &Stmt) -> bool {
                 && (t.orelse.is_empty() || body_always_exits_aware(c, &t.orelse));
             finally_exits || try_and_handlers_exit
         }
+        _ => false,
+    }
+}
+
+/// True when any reachable statement in `body` is `break` (relative to
+/// the enclosing loop). Walks compound statements but does NOT descend
+/// into nested `for` / `while` bodies — a `break` there belongs to the
+/// inner loop, not the outer one. Used by the `while True:` reachability
+/// check to decide whether the loop can ever exit naturally.
+fn body_can_break(body: &[Stmt]) -> bool {
+    body.iter().any(stmt_can_break)
+}
+
+fn stmt_can_break(stmt: &Stmt) -> bool {
+    match stmt {
+        Stmt::Break(_) => true,
+        Stmt::If(s) => {
+            body_can_break(&s.body) || s.elif_else_clauses.iter().any(|c| body_can_break(&c.body))
+        }
+        Stmt::Match(m) => m.cases.iter().any(|c| body_can_break(&c.body)),
+        Stmt::With(w) => body_can_break(&w.body),
+        Stmt::Try(t) => {
+            body_can_break(&t.body)
+                || t.handlers.iter().any(|h| {
+                    let ruff_python_ast::ExceptHandler::ExceptHandler(h) = h;
+                    body_can_break(&h.body)
+                })
+                || body_can_break(&t.orelse)
+                || body_can_break(&t.finalbody)
+        }
+        // Nested loops own their own `break`s — don't recurse.
+        Stmt::For(_) | Stmt::While(_) => false,
         _ => false,
     }
 }
@@ -8199,12 +8697,43 @@ fn pattern_covers_class(c: &Checker, pattern: &Pattern, class_name: &str) -> boo
                 .iter()
                 .all(|kw| is_capture_or_underscore(&kw.pattern))
         }
+        // `case None:` covers the singleton None type — used by the
+        // T? exhaustiveness path (B6). `cases_cover_type` calls in with
+        // both "None" and "NoneType" depending on which side of the
+        // union resolution we're on; accept both.
+        Pattern::MatchSingleton(s) => {
+            use ruff_python_ast::Singleton;
+            (class_name == "None" || class_name == "NoneType") && matches!(s.value, Singleton::None)
+        }
         Pattern::MatchSequence(seq) => {
             (class_name == "list" || class_name == "tuple")
                 && seq.patterns.len() == 1
                 && matches!(&seq.patterns[0], Pattern::MatchStar(_))
         }
         _ => false,
+    }
+}
+
+/// Map a built-in Type to its PEP 634 class-pattern head name
+/// (`Type::Str` → `"str"`, `Type::Int` → `"int"`, etc.). Used by the
+/// `T?` exhaustiveness check to recognise that `case None:` + `case
+/// str() as s:` covers `str | None` (B6).
+fn builtin_class_pattern_name(t: &Type) -> Option<&'static str> {
+    match t {
+        Type::Str => Some("str"),
+        Type::Int => Some("int"),
+        Type::Float => Some("float"),
+        Type::Bool => Some("bool"),
+        Type::Bytes => Some("bytes"),
+        Type::Generic(name, _) => match name.as_str() {
+            "list" => Some("list"),
+            "tuple" => Some("tuple"),
+            "dict" => Some("dict"),
+            "set" => Some("set"),
+            "frozenset" => Some("frozenset"),
+            _ => None,
+        },
+        _ => None,
     }
 }
 
@@ -8464,6 +8993,18 @@ fn is_builtin_generic_head(head: &str) -> bool {
         head,
         "list" | "dict" | "set" | "tuple" | "str" | "bytes" | "frozenset"
     )
+}
+
+/// Return `true` when the user has written `extend <head>: def <attr>(...)`
+/// in the same module. The preprocess pass emits these as
+/// `__typhon_builtin_ext_<head>` synthetic classes, so a method shape
+/// lookup against that class tells us whether `xs.<attr>()` on a
+/// `<head>[T]` receiver should be accepted (B12).
+fn is_user_builtin_extension(c: &Checker, head: &str, attr: &str) -> bool {
+    let sentinel = format!("__typhon_builtin_ext_{}", head);
+    c.class_shapes
+        .get(sentinel.as_str())
+        .is_some_and(|s| s.methods.contains_key(attr))
 }
 
 /// Return `true` when `attr` is a known method on the CPython builtin
@@ -9247,6 +9788,42 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
             }
         }
         Expr::Call(call) => {
+            // B2: a call of shape `first[int]([1, 2, 3])` where `first`
+            // is a generic function will type-check (the subscript is
+            // assumed to be a type-arg hint) but crash at runtime in
+            // both VM and CPython, because Python functions don't
+            // implement __class_getitem__. Surface a clear diagnostic
+            // up-front so the user knows to drop the explicit type
+            // argument (inference handles it) rather than learn at
+            // runtime via `TypeError: 'function' object is not
+            // subscriptable`.
+            if let Expr::Subscript(sub) = call.func.as_ref() {
+                if let Expr::Name(n) = sub.value.as_ref() {
+                    let head = n.id.as_str();
+                    // Only fire when the head resolves to a function,
+                    // not a class. `dict[str, int]({"a": 1})` and the
+                    // like are legitimate constructor calls on a
+                    // generic class.
+                    let is_class =
+                        c.class_shapes.contains_key(head) || c.classes.iter().any(|s| s == head);
+                    let is_function = !is_class
+                        && c.env
+                            .lookup(head)
+                            .map(|b| matches!(b.declared, Type::Function { .. }))
+                            .unwrap_or(false);
+                    if is_function {
+                        let span_start = sub.range.start().to_usize();
+                        let span_len = sub.range.end().to_usize().saturating_sub(span_start).max(1);
+                        c.diagnostics.push_error(TycError::generic(format!(
+                            "explicit type arguments on function calls (e.g. \
+                             `{head}[T](...)`) are not valid Python — function objects \
+                             don't implement __class_getitem__ and would crash at runtime. \
+                             Drop the `[...]` and let inference deduce the type."
+                        )));
+                        let _ = (span_start, span_len);
+                    }
+                }
+            }
             // Ruff folds positional and keyword arguments into `call.arguments`.
             let pos_args = &call.arguments.args;
             let kw_args = &call.arguments.keywords;
@@ -9909,6 +10486,25 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
                 }
             }
             let attr_name = a.attr.as_str();
+            // B35: `_t.error` / `_t.value` on an isinstance-narrowed
+            // `Generic("Err", [E])` / `Generic("Ok", [T])` resolves to
+            // `E` / `T`. The `with`-chain lowering injects exactly this
+            // attribute access (`let __typhon_with_err_N__ = _t.error`),
+            // so without this rule the binding falls through to
+            // `Type::Unknown` and the later `return Err(err)` doesn't
+            // carry an error-type to compare against the function's
+            // declared return.
+            if let Type::Generic(head, args) = &recv {
+                if head == "Err"
+                    && args.len() == 1
+                    && (attr_name == "error" || attr_name == "value")
+                {
+                    return args[0].clone();
+                }
+                if head == "Ok" && args.len() == 1 && attr_name == "value" {
+                    return args[0].clone();
+                }
+            }
             // Resolve attribute access on known class instances and TypeVar-bounded parameters.
             if let Some(method_type) = builtin_generic_method(&recv, attr_name) {
                 return method_type;
@@ -9928,6 +10524,13 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
                     && c.unsafe_depth == 0
                     && !attr_name.starts_with('_')
                     && !is_known_builtin_generic_attr(head, attr_name)
+                    // `extend list: def head(self) -> ...` registers a
+                    // `__typhon_builtin_ext_list` synthetic class whose
+                    // methods are dispatched via the call-site rewrite
+                    // pass at desugar time. Recognise user-added methods
+                    // here too so `xs: list[int]; xs.head()` doesn't
+                    // false-positive on attribute_not_found (B12).
+                    && !is_user_builtin_extension(c, head, attr_name)
                 {
                     let attr_start = a.attr.range.start().to_usize();
                     let attr_len = a
@@ -10785,6 +11388,16 @@ fn extract_sealed_union_variants(expr: &Expr) -> Option<Vec<String>> {
     while let Some(current) = stack.pop() {
         match current {
             Expr::Name(n) => names.push(n.id.as_str().to_owned()),
+            // `Cons[T]` parametric variant — count it by its head name
+            // so that `type LL[T] = Cons[T] | Nil` registers
+            // {Cons, Nil} just like the non-parametric form (B22).
+            Expr::Subscript(s) => {
+                if let Expr::Name(n) = s.value.as_ref() {
+                    names.push(n.id.as_str().to_owned());
+                } else {
+                    return None;
+                }
+            }
             // Push `right` first so the stack pops left-to-right and
             // preserves source order in `names`. `A | B | C` parses as
             // `BinOp(BinOp(A, B), C)`, so popping leftmost first walks
