@@ -1,9 +1,12 @@
 //! Shared helpers used by multiple `tyc` subcommands.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use miette::{miette, Result};
+use tyc_db::ModuleShapes;
 use tyc_diagnostics::{Diagnostics, TycError};
+use tyc_syntax::preprocess::preprocess;
 
 use crate::config::TyphonConfig;
 
@@ -218,6 +221,172 @@ fn collect_with_ext(root: &Path, ext: &str, acc: &mut Vec<PathBuf>) -> Result<()
         }
     }
     Ok(())
+}
+
+/// Aggregate `pub *` package-facade shapes after `collect_project_shapes`.
+///
+/// When `<pkg>/__init__.ty` contains a `pub *` marker, the build pipeline
+/// synthesises `from .sibling import name1, name2, …` lines so the
+/// emitted Python re-exports every sibling module's `pub` surface. The
+/// check pipeline never emits Python, so the synthetic imports never run
+/// — and a downstream `from pkg import SomeClass` ends up looking for
+/// `SomeClass` on `<pkg>/__init__`'s shape (which is empty by
+/// construction). This function performs the equivalent aggregation at
+/// the SHAPE level: for every `__init__.ty` carrying `pub *`, every
+/// `pub`-marked name in every direct sibling module is merged into the
+/// package's shape entry, plus every `pub`-aggregated name from each
+/// direct sub-package's effective surface.
+///
+/// Without this, cross-module import flow that uses a `pub *` facade
+/// silently loses sealed-union variants, interface shapes, function
+/// signatures, and class fields — surfacing as misleading downstream
+/// diagnostics (e.g. `tyc::missing_return` on a match the
+/// exhaustiveness checker accepted, because the reachability pass
+/// can't see the union's variant list). (Bug 2 from the v0.9.0 stress
+/// pass on a multi-package app.)
+///
+/// Aggregation processes packages in deepest-first order so a parent
+/// `pub *` __init__ picks up its sub-packages' already-aggregated
+/// surface. Cross-sibling collisions are silently resolved by
+/// first-write-wins — the build pipeline raises
+/// `tyc::pub_name_collision` separately via `detect_pub_star_diagnostics`,
+/// which both `tyc check` and `tyc build` already call.
+pub fn aggregate_pub_star_shapes(
+    shape_map: &mut HashMap<String, ModuleShapes>,
+    paths: &[PathBuf],
+    src_root: &str,
+) {
+    // First pass: identify every package directory whose __init__.ty
+    // contains `pub *`, and record the `pub_names` of every (non-init)
+    // sibling `.ty` file along the way so the merge step can filter
+    // by surface visibility.
+    let mut pub_star_packages: Vec<(PathBuf, PathBuf)> = Vec::new(); // (pkg_dir, init_path)
+    let mut module_pub_names: HashMap<PathBuf, Vec<String>> = HashMap::new();
+    for path in paths {
+        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        let Ok(text) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        let prep = preprocess(&text);
+        if stem == "__init__" {
+            if !prep.pub_star_lines.is_empty() {
+                if let Some(dir) = path.parent() {
+                    pub_star_packages.push((dir.to_path_buf(), path.clone()));
+                }
+            }
+        } else {
+            module_pub_names.insert(path.clone(), prep.pub_names);
+        }
+    }
+    if pub_star_packages.is_empty() {
+        return;
+    }
+    // Deepest-first ordering so a parent package picks up an already-
+    // aggregated sub-package shape. Sorts by component count descending,
+    // then lexicographic for determinism. Stable sort across runs.
+    pub_star_packages.sort_by(|a, b| {
+        let depth = |p: &Path| p.components().count();
+        depth(&b.0).cmp(&depth(&a.0)).then(a.0.cmp(&b.0))
+    });
+    for (pkg_dir, init_path) in &pub_star_packages {
+        let pkg_dotted = path_to_dotted(init_path, src_root);
+        let mut merged = shape_map.remove(&pkg_dotted).unwrap_or_default();
+        // Direct sibling .ty modules.
+        for path in paths {
+            let Some(parent) = path.parent() else { continue };
+            if parent != pkg_dir.as_path() {
+                continue;
+            }
+            let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+            if stem == "__init__" {
+                continue;
+            }
+            let sibling_dotted = path_to_dotted(path, src_root);
+            let Some(sibling_shape) = shape_map.get(&sibling_dotted) else {
+                continue;
+            };
+            let visible: Option<&Vec<String>> = module_pub_names.get(path);
+            merge_pub_visible(&mut merged, sibling_shape, visible);
+        }
+        // Direct sub-packages: any __init__.ty whose parent.parent ==
+        // pkg_dir. Pick up the (already-aggregated, thanks to the
+        // depth-first ordering) shape under the sub-package's dotted
+        // name. Sub-packages without their own `pub *` still expose any
+        // names they bound by other means — that's the expected semantics
+        // of the build pipeline's `effective_package_surface`.
+        for path in paths {
+            let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+            if stem != "__init__" {
+                continue;
+            }
+            let Some(sub_dir) = path.parent() else { continue };
+            if sub_dir == pkg_dir.as_path() {
+                continue;
+            }
+            if sub_dir.parent() != Some(pkg_dir.as_path()) {
+                continue;
+            }
+            let sub_dotted = path_to_dotted(path, src_root);
+            let Some(sub_shape) = shape_map.get(&sub_dotted) else {
+                continue;
+            };
+            // Sub-package: re-export EVERY surface name it has (the
+            // sub-package's own `pub *` already filtered down). Pass
+            // `None` so the merge takes everything.
+            merge_pub_visible(&mut merged, sub_shape, None);
+        }
+        shape_map.insert(pkg_dotted, merged);
+    }
+}
+
+/// Merge `src` into `dst`, keeping only names present in `visible`
+/// (when `Some`). First-write-wins on collisions so the caller's
+/// pre-existing entries dominate. Mirrors the per-entry merge done in
+/// `tyc-types::check_module_with_imports`.
+fn merge_pub_visible(dst: &mut ModuleShapes, src: &ModuleShapes, visible: Option<&Vec<String>>) {
+    let include = |name: &str| -> bool {
+        match visible {
+            Some(list) => list.iter().any(|n| n == name),
+            None => true,
+        }
+    };
+    for (name, shape) in &src.class_shapes {
+        if include(name) {
+            dst.class_shapes
+                .entry(name.clone())
+                .or_insert_with(|| shape.clone());
+        }
+    }
+    for (name, tps) in &src.class_type_params {
+        if include(name) {
+            dst.class_type_params
+                .entry(name.clone())
+                .or_insert_with(|| tps.clone());
+        }
+    }
+    for (name, arity) in &src.function_arities {
+        if include(name) {
+            dst.function_arities
+                .entry(name.clone())
+                .or_insert_with(|| arity.clone());
+        }
+    }
+    for (name, variants) in &src.sealed_unions {
+        if include(name) {
+            dst.sealed_unions
+                .entry(name.clone())
+                .or_insert_with(|| variants.clone());
+        }
+    }
+    for (name, runtime_checkable) in &src.interfaces {
+        if include(name) {
+            dst.interfaces
+                .entry(name.clone())
+                .or_insert(*runtime_checkable);
+        }
+    }
 }
 
 #[cfg(test)]

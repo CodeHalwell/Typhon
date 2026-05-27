@@ -39,7 +39,8 @@ use tyc_syntax::{
     parse_module,
     preprocess::{
         expand_gather_blocks, expand_go_calls, expand_inline_question_ops, expand_multiline_guards,
-        expand_pipes, expand_question_ops, expand_with_chains, postprocess_full, preprocess,
+        expand_pipes, expand_question_ops, expand_with_chains, postprocess_full, preprocess_opts,
+        PreprocessOptions, StrippedKeyword, StrippedOptional,
     },
 };
 
@@ -58,7 +59,21 @@ pub struct FormatResult {
 #[allow(clippy::result_large_err)]
 pub fn format_source(source: &str, path: &str) -> Result<FormatResult, TycError> {
     // Step 1: pre-process — strip Typhon keywords.
-    let prep = preprocess(source);
+    //
+    // The formatter MUST NOT run any preprocessing pass that shifts
+    // line indices, because keyword restoration in `postprocess_full`
+    // is indexed by line. The default pipeline expands `impl Alias:`
+    // headers targeting a sealed-union alias into one synthesised
+    // `impl Variant:` block per variant, duplicating the body and
+    // adding (variants - 1) * body_lines new lines. Skip that step
+    // here so the post-format file still has the user's original
+    // `impl Alias:` header and a single un-duplicated body. (B15.)
+    let prep = preprocess_opts(
+        source,
+        PreprocessOptions {
+            expand_impl_sealed_unions: false,
+        },
+    );
 
     // Step 2: parse — validate syntax, discard AST.
     //
@@ -84,7 +99,7 @@ pub fn format_source(source: &str, path: &str) -> Result<FormatResult, TycError>
     //   • Strip trailing whitespace from each line.
     //   • Ensure the file ends with exactly one newline.
     //   • Expand tabs to 4 spaces.
-    let normalised = normalise_whitespace(&prep.python_source);
+    let (normalised, line_map) = normalise_whitespace_with_map(&prep.python_source);
 
     // Step 3b: (optional) pipe the pure-Python buffer through `ruff format`
     // when the binary is on $PATH AND the buffer contains nothing that the
@@ -116,11 +131,48 @@ pub fn format_source(source: &str, path: &str) -> Result<FormatResult, TycError>
     };
 
     // Step 4: post-process — restore let/mut keywords, `?` sugar, and lazy imports.
+    //
+    // `normalise_whitespace` may shift line indices (3+ blank-line
+    // collapse and PEP-8 blank-line insertion before top-level defs and
+    // classes). The stripped/optional/lazy_import line indices reference
+    // the *pre-normalisation* python_source, so translate them through
+    // `line_map` before postprocess restores keywords. (B15 / R3.) If
+    // ruff ran, line indices are guaranteed identical because the
+    // `can_run_ruff` guard above requires the stripped lists to be
+    // empty; the translation below is a no-op in that branch.
+    let translate = |line_index: usize| -> usize {
+        line_map.get(line_index).copied().unwrap_or(line_index)
+    };
+    let translated_stripped: Vec<StrippedKeyword> = prep
+        .stripped
+        .iter()
+        .map(|s| StrippedKeyword {
+            line_index: translate(s.line_index),
+            keyword: s.keyword,
+        })
+        .collect();
+    let translated_optionals: Vec<StrippedOptional> = prep
+        .optionals
+        .iter()
+        .map(|o| StrippedOptional {
+            line_index: translate(o.line_index),
+            python_col: o.python_col,
+        })
+        .collect();
+    let translated_lazy: Vec<_> = prep
+        .lazy_imports
+        .iter()
+        .map(|li| tyc_syntax::preprocess::LazyImport {
+            line_index: translate(li.line_index),
+            alias: li.alias.clone(),
+            module: li.module.clone(),
+        })
+        .collect();
     let output = postprocess_full(
         &after_ruff,
-        &prep.stripped,
-        &prep.optionals,
-        &prep.lazy_imports,
+        &translated_stripped,
+        &translated_optionals,
+        &translated_lazy,
     );
 
     let changed = output != source;
@@ -139,11 +191,29 @@ pub fn format_source(source: &str, path: &str) -> Result<FormatResult, TycError>
 ///
 /// The pass scans each logical line and skips edits within `'…'` / `"…"` /
 /// triple-quoted regions so doc strings and embedded code stay verbatim.
+#[cfg(test)]
 fn normalise_whitespace(source: &str) -> String {
+    normalise_whitespace_with_map(source).0
+}
+
+/// Same as [`normalise_whitespace`] but also returns a translation map
+/// from input line index to the line index of that same logical line in
+/// the output. Blank-line collapse (3+ → 2) and PEP-8 blank-line
+/// insertion both perturb line indices; the map lets `postprocess_full`
+/// keep restoring keywords on the correct lines.
+///
+/// `map[i]` is the 0-based output line index of input line `i`. Indices
+/// past the end of the input are not present.
+fn normalise_whitespace_with_map(source: &str) -> (String, Vec<usize>) {
     if source.is_empty() {
-        return String::new();
+        return (String::new(), Vec::new());
     }
     let mut result = String::with_capacity(source.len());
+    // Output line counter: increments once per `result.push('\n')`.
+    let mut out_line: usize = 0;
+    // For each *input* line (i.e. each iteration of the loop below)
+    // record which output line index this input line landed on.
+    let mut line_map: Vec<usize> = Vec::new();
     let mut consecutive_blank = 0u32;
     let mut in_triple: Option<char> = None;
     // Track whether any real (non-blank, non-shebang, non-comment) line
@@ -157,6 +227,12 @@ fn normalise_whitespace(source: &str) -> String {
     // split the stack into separate orphaned statements and break
     // `tyc fmt` output for any decorated definition. PR #96 P1.
     let mut prev_top_level_was_decorator = false;
+    // Tracks `(` nesting across lines so multi-line calls keep their
+    // kwargs tight (`a=3,` on a continuation line stays `a=3,`, not
+    // `a = 3,`). Bracket / brace depth stays line-local because
+    // triple-quoted spans get verbatim treatment and `[ ]` slices
+    // don't realistically straddle newlines in idiomatic Python.
+    let mut paren_depth_carry: i32 = 0;
     for raw_line in source.lines() {
         // Triple-quoted block: keep raw, but still strip trailing spaces and
         // expand the leading tabs so indentation matches the file style.
@@ -166,7 +242,10 @@ fn normalise_whitespace(source: &str) -> String {
             (l, exited)
         } else {
             let trimmed = raw_line.trim_end();
-            (apply_simple_style_rules(trimmed), false)
+            let (rewritten, new_depth) =
+                apply_simple_style_rules_with_paren_depth(trimmed, paren_depth_carry);
+            paren_depth_carry = new_depth.max(0);
+            (rewritten, false)
         };
 
         if in_triple.is_none() && !exited_triple {
@@ -185,7 +264,14 @@ fn normalise_whitespace(source: &str) -> String {
         if rest.is_empty() {
             consecutive_blank += 1;
             if consecutive_blank <= 2 {
+                line_map.push(out_line);
                 result.push('\n');
+                out_line += 1;
+            } else {
+                // Blank line collapsed; remap to the last emitted output
+                // line so stripped entries pointing here don't slide off
+                // the end of the buffer.
+                line_map.push(out_line.saturating_sub(1));
             }
             continue;
         }
@@ -221,10 +307,12 @@ fn normalise_whitespace(source: &str) -> String {
         {
             for _ in consecutive_blank..2 {
                 result.push('\n');
+                out_line += 1;
             }
         }
         consecutive_blank = 0;
 
+        line_map.push(out_line);
         for ch in leading.chars() {
             if ch == '\t' {
                 result.push_str("    ");
@@ -234,10 +322,11 @@ fn normalise_whitespace(source: &str) -> String {
         }
         result.push_str(rest);
         result.push('\n');
+        out_line += 1;
         emitted_any_code = true;
         prev_top_level_was_decorator = is_top_level_decorator;
     }
-    result
+    (result, line_map)
 }
 
 /// Apply spacing normalisations that touch ordinary code regions only.
@@ -260,7 +349,22 @@ fn normalise_whitespace(source: &str) -> String {
 /// PEP 8's two-blank-lines-around-top-level-defs rule lives in
 /// [`normalise_whitespace`] (file-level pass) so this per-line helper
 /// stays local in scope.
+#[cfg(test)]
 fn apply_simple_style_rules(line: &str) -> String {
+    apply_simple_style_rules_with_paren_depth(line, 0).0
+}
+
+/// Variant that accepts an incoming `paren_depth` carried across lines
+/// by [`normalise_whitespace_with_map`], and returns the residual depth
+/// after the line. Continuation lines inside an open `(` then get the
+/// PEP-8 kwarg rule (`a=1` stays tight) instead of being rewritten to
+/// `a = 1`. Bracket / triple-quote state is line-local because
+/// triple-quoted spans get verbatim treatment in the outer loop and
+/// `[ ]` slices don't realistically straddle a newline in real code.
+fn apply_simple_style_rules_with_paren_depth(
+    line: &str,
+    initial_paren_depth: i32,
+) -> (String, i32) {
     let mut out = String::with_capacity(line.len());
     let mut chars = line.chars().peekable();
     let mut quote: Option<char> = None;
@@ -278,8 +382,9 @@ fn apply_simple_style_rules(line: &str) -> String {
     let mut bracket_depth: i32 = 0;
     // Track `(` nesting so `=` inside a call (kwarg) is left tight as
     // PEP 8 §arguments prescribes. The kwarg-vs-default distinction is
-    // not tracked — both forms keep `=` tight inside parens.
-    let mut paren_depth: i32 = 0;
+    // not tracked — both forms keep `=` tight inside parens. Carries
+    // across lines so multi-line calls keep their kwargs tight.
+    let mut paren_depth: i32 = initial_paren_depth;
     while let Some(c) = chars.next() {
         // Inside a triple-quoted region: emit verbatim until the matching
         // `qqq` closer.  Triple quotes that open *and* close on the same
@@ -630,7 +735,7 @@ fn apply_simple_style_rules(line: &str) -> String {
             }
         }
     }
-    out
+    (out, paren_depth)
 }
 
 /// Whether the previously-emitted character looks like the right side of

@@ -4,6 +4,89 @@ All notable changes to Typhon are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely; the
 canonical phase-by-phase status lives in `docs/roadmap.md`.
 
+## 0.9.1 — 2026-05-27
+
+Bugfix point release closing two issues surfaced by a v0.9.0 stress
+sweep on a six-package PyTorch MNIST CNN. No language, runtime, or
+diagnostic-surface changes.
+
+### Fixed — `tyc fmt` round-trip corruption
+
+`tyc fmt` could rewrite valid source into invalid (and in one case
+silently-empty) output. Four corruption modes all stemmed from the
+same underlying gap — the formatter ran the desugar pipeline's
+preprocess pass (which expands `impl Alias:` for sealed-union aliases
+into one synthetic `impl Variant:` block per variant, and which
+records line-shifting strips against the pre-normalisation source),
+then applied PEP-8 blank-line insertion that shifted line indices the
+postprocess restoration step still used unshifted:
+
+- **`impl <SealedUnionAlias>:` no longer mangled.** A header like
+  `impl AppError:` on a `type AppError = ParseErr | NetErr` no longer
+  expands into `class __typhon_impl_AppError(object):` plus a bare
+  leftover `impl` token on a separate line. The formatter now runs a
+  format-mode preprocess that skips the sealed-union expansion
+  entirely (the new `PreprocessOptions.expand_impl_sealed_unions =
+  false`); the desugar / build / check pipelines all continue to
+  expand as before.
+- **`frozen` modifier preserved.** `class P frozen:` used to come back
+  as `class P:` after formatting, silently downgrading a frozen
+  dataclass to a mutable one. The preprocessor now records a
+  `TyphonKeyword::Frozen` entry on every strip site and the
+  postprocess pass reinserts the modifier after the class name and
+  type-param list, before the base list and trailing colon.
+- **`pub *` no longer deleted.** A standalone `pub *` line in
+  `__init__.ty` used to come back as an empty file (so every package
+  facade silently became empty and downstream callers got
+  confusing `ImportError: cannot import name …` failures). The
+  preprocessor now records a `TyphonKeyword::PubStar` entry and the
+  postprocess pass restores the marker.
+- **Multi-line kwarg `=` no longer respaced.** `P(a=3, b=4)` on a
+  single line was kept tight (PEP-8), but the same call spread over
+  multiple lines came back as `a = 3, b = 4` because the per-line
+  spacing rule tracked paren depth line-locally. The depth now carries
+  across lines via the file-level normaliser, so continuation lines
+  inside an open `(` keep kwargs tight too.
+- **Line-index translation across blank-line insertion.** PEP-8
+  blank-line insertion before top-level `def`/`class` shifted line
+  indices for the entire tail of the file; keyword restoration then
+  applied `Pub`/`Frozen`/`Impl`/etc. prefixes to the wrong lines.
+  `normalise_whitespace_with_map` now returns an input→output line
+  index map that the formatter applies to the stripped / optional /
+  lazy-import lists before postprocess walks them.
+
+### Fixed — sealed-union flow through `pub *` package facades
+
+An exhaustive `match` over a sealed-union variant imported through a
+`pub *` package facade fired `tyc::missing_return` on every arm-
+terminated function, even though the exhaustiveness checker accepted
+the match (no `tyc::non_exhaustive_match` diagnostic). The two
+analyses disagreed because the consumer's `sealed_unions` registry
+was seeded from the package's `__init__.ty` shape — which is empty
+when the file is just `pub *` — and the reachability/return pass
+falls through to "not a sealed union" when the variant list is
+missing.
+
+The fix aggregates the `pub *` facade at the shape-map level, mirroring
+what the build pipeline already does at the source level (synthesising
+`from .sibling import …` lines). A new
+`tyc::commands::util::aggregate_pub_star_shapes` runs after
+`collect_project_shapes` and before the per-file check loop in both
+`tyc check` and `tyc build`: every `__init__.ty` carrying `pub *`
+gets its sibling modules' `pub` surface and every direct sub-package's
+effective surface merged into the package's shape entry. Sub-packages
+are processed deepest-first so a parent picks up the already-
+aggregated child surface. First-write-wins on collisions (cross-
+sibling name conflicts are independently surfaced by
+`detect_pub_star_diagnostics`).
+
+After this fix, `from <pkg> import Command` in a downstream module
+sees `Command` as the same sealed-union alias the source module
+declared, with the same variant list — so an exhaustive arm-
+terminated match on `Command` no longer surfaces `missing_return`,
+and the user no longer needs the `mut result: …` sentinel
+workaround.
+
 ## 0.9.0 — 2026-05-27
 
 Stress-test cleanup release. v0.8.1 stress testing surfaced 36
