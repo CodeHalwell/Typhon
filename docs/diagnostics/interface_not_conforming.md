@@ -28,6 +28,17 @@ call site rather than at class-definition time, so any usage where the
 required shape is missing fails immediately and points at the offending
 argument.
 
+Since v0.8.0 the conformance check compares parameter types
+position-by-position (contravariant on params) in addition to arity, so
+a `class BadRepo` claiming to implement `interface Repo: def save(self,
+item: str) -> bool` with a `def save(self, item: int) -> bool` impl is
+rejected at conformance time.
+
+Since v0.9.0 the arity diagnostic message reads "got N non-self
+parameter(s), expected M" instead of the ambiguous "arity N; expected
+M" — the previous wording was easy to misread when the impl matched
+arity but the parameter type was off, or vice versa.
+
 ## Fix
 
 Add the missing member(s) to the concrete type with the right parameter and

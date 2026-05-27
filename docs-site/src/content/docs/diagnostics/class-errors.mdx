@@ -144,6 +144,36 @@ extend dict:
 
 **Fix:** wrap the value in a user-defined class and put the method there, or expose a free function on the module.
 
+## `tyc::class_attr_shadows_slot`
+
+A `class` body contains only annotated defaults with no methods or per-instance fields — it reads like a namespace of constants, but `@dataclass(slots=True)` makes each name a slot descriptor at runtime, so `Klass.NAME` evaluates to the descriptor object, not the literal `3`.
+
+```python
+class Limits:
+    MAX_RETRIES: int = 3     # ⚠️ slot descriptor at runtime
+```
+
+**Fix:** annotate as `ClassVar[T]` so the dataclass decorator excludes the field from `__slots__`:
+
+```python
+from typing import ClassVar
+
+class Limits:
+    MAX_RETRIES: ClassVar[int] = 3
+```
+
+### Mutable-default carve-out (v0.9.0)
+
+The warning no longer false-positives on classes whose only annotated defaults are mutable literals (`list[str] = []`, `dict[str, int] = {}`, `set[int] = set()`, `list()` / `dict()` calls). Those defaults are rewritten at desugar time into `dataclasses.field(default_factory=...)` calls, so each instance gets its own fresh container rather than sharing a single constant — the "looks like a constants namespace" heuristic no longer applies:
+
+```python
+class Bucket:
+    items: list[str] = []        # ✅ no warning since v0.9.0 — per-instance factory
+    tags: dict[str, int] = {}    # ✅
+```
+
+The warning still fires on immutable literals (`int = 3`, `str = "x"`) where the slot-descriptor pitfall genuinely applies.
+
 ## Where next
 
 - [Classes and Models (tour)](/Typhon/tour/classes/) — teaching page.

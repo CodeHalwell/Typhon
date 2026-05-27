@@ -27,7 +27,9 @@ from .users import User
 from ..lib import helper
 ```
 
-Relative imports (`.`, `..`) work as in Python.
+Relative imports (`.`, `..`) work as in Python. Since v0.9.0 the in-process VM (`tyc run`) also resolves relative imports against the project source root — sibling `.ty` modules load on demand and each module's bindings are cached as a `Value::Module`. Multi-file projects no longer require `--compile` to handle the cross-module imports.
+
+`tyc run --compile` was tweaked at the same time: instead of `python build/main.py`, it spawns `python -m <pkg>.main` so relative imports in the entry point resolve correctly under the compiled path too.
 
 ## Conditional imports
 
@@ -81,8 +83,8 @@ error[tyc::lazy_from_import]: `lazy from … import` defeats deferred loading;
 
 Severity controlled by `[strictness] unused-import` in `typhon.toml`:
 
-- `"error"` — default. Unused imports fail the build.
-- `"warn"` — flagged as a warning.
+- `"warn"` — default since v0.8.0 (was `"error"` before). Unused imports surface as warnings.
+- `"error"` — fail the build on unused imports. Set this for CI strictness or to enforce a clean import surface.
 - `"off"` — no check.
 
 The LSP offers a "Remove unused import" quick-fix.

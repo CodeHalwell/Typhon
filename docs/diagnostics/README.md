@@ -24,6 +24,7 @@ straight from a failed build to the corresponding documentation.
 - [`tyc::duplicate_method`](./duplicate_method.md) — two `impl` / `extend` blocks on the same class both define a method with the same name.
 - [`tyc::extend_builtin`](./extend_builtin.md) — `extend` targets a Python built-in type.
 - [`tyc::field_default_ordering`](./field_default_ordering.md) — class declares a non-defaulted field after a defaulted one; the synthesised `__init__` would raise at import time.
+- [`tyc::freeze_not_freezable`](./freeze.md#compile-time-validation--tycfreeze_not_freezable-v090) — `freeze let X = <expr>` RHS constructs a non-`frozen` user class. Validated at check time since v0.9.0 (was a runtime `TypeError` before).
 - [`tyc::frozen_assign`](./frozen_assign.md) — field assignment on a `frozen` class outside its constructor.
 - [`tyc::generator_return_type`](./generator_return_type.md) — body contains `yield` but the return type isn't iterator-shaped.
 - [`tyc::generic`](./generic.md) — catch-all early-phase diagnostic.

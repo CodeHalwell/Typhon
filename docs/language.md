@@ -10,6 +10,28 @@ Each section covers what the feature does, how it desugars to Python, and what t
 
 A plain `T` forbids `None`; `T?` is the optional form. Internally `T?` is represented as a `Nullable[T]` wrapper but emits as `T | None` in Python annotations. The checker uses flow-sensitive analysis to narrow `T?` to `T` inside guards and null-checks. Attempting to call a method on a `T?` without a check is a compile error.
 
+Narrowing forms the checker recognises:
+
+- `is None` / `is not None`
+- `isinstance(x, T)` (including tuple-of-types `isinstance(x, (A, B))`)
+- `guard x = expr else: ...` early-return
+- `if x is None: return` / `raise` / `break` / `continue` early-exit
+- Exhaustive `match` arms
+- `body if test else orelse` ternary (v0.7.0) — narrows like `if`/`else`
+- De Morgan refinement (v0.4.0) — `if not (A or B): return` narrows both operands afterwards
+- `while` test-implied narrowings applied to the body (v0.3.0)
+- **`assert x is not None`** (v0.9.0) — the standard Python static-checker idiom
+- **Post-`while`-loop narrowing** (v0.9.0) — after `while y is None: y = load()` (no `break`), the post-loop `y` is narrowed to non-`None`
+- **`while True:` reachability** (v0.9.0) — a body that always returns/raises on every branch with no `break` marks the post-loop point as unreachable, so `missing_return` doesn't fire on the surrounding function
+
+### Read-view covariance (v0.9.0)
+
+For built-in containers the read-only protocols are covariant on their type parameter: `list[Subclass]` / `tuple[Subclass]` / `set[Subclass]` / `frozenset[Subclass]` flow into `Sequence[Super]` / `Iterable[Super]` / `Iterator[Super]` / `Collection[Super]` / `Container[Super]` / `Reversible[Super]` when `Subclass` inherits `Super`. `dict[K, V]` is K-invariant + V-covariant under `Mapping[K, V]` and `MutableMapping[K, V]`. The covariance is read-protocol-only — `list[Subclass]` does *not* flow into `list[Super]` (writes through the wide view would corrupt the underlying typing).
+
+### Variant → parametric union assignability (v0.9.0)
+
+Given `type LL[T] = Cons[T] | Nil`, a `Cons[T]` value is assignable into a `LL[T]` slot. Required for recursive ADT walks where the variant carries the same type parameter as the alias. Non-parametric variants (e.g. a plain `class Nil:` with no `[T]`) flow into `LL[T]` for any `T` because the variant has no `T`-dependent shape.
+
 ### Python-semantic alignment
 
 The checker treats `or`/`and` the way CPython does: the expression yields one of the operands, not a `bool`. `let chunk: str = update.text or ""` therefore type-checks — the result type is `Union[truthy(typeof(lhs)), typeof(rhs)]` (and the falsy dual for `and`). Generator functions are structurally assignable to `Iterable[T]` / `Iterator[T]` / `AsyncIterable[T]` / `AsyncIterator[T]`, so `def compose() -> ComposeResult: yield ...` flows into a parameter annotated `Iterable[Widget]` without needing a manual list materialisation. Both checks fixed real-world adopter rejections — the broader audit is tracked under the `tyc::python_semantic_drift` warning.
@@ -48,6 +70,29 @@ type Shape = Circle | Rectangle | Triangle
 ```
 
 declares a finite, sealed sum type. `match` on a sealed union must cover every variant or include a wildcard. The single biggest static-safety win over current Python and mechanically simple to implement.
+
+### Function signatures (Rule 1)
+
+Every parameter and the return type carry an annotation. Functions returning nothing must spell `-> None`. Since v0.9.0 the rule also applies to `*args` / `**kwargs` — the canonical idiom for genuinely variadic functions is `*args: object` / `**kwargs: object`:
+
+```python
+def trace[R](f: Callable[..., R], *args: object, **kwargs: object) -> R:
+    return f(*args, **kwargs)
+```
+
+`object` is the honest spelling for "really any value" at the boundary; the body still has to narrow with `isinstance` to do anything type-specific. Avoid `*args: Any` — `Any` silently drops every check.
+
+### Explicit type instantiation is rejected (v0.9.0)
+
+`func[T](args)` at the call site is rejected at check time with `tyc::operator_type_mismatch`. Type parameters are always inferred from arguments or the binding type. To pin a parameter, annotate the binding (forward) or the result position (backward):
+
+```python
+let p: tuple[int, int] = pair(1, 2)    # ✅ T inferred as int via the binding
+let xs: list[int] = first([])          # ✅ T inferred via the binding
+let xs = pair[int](1, 2)               # ❌ check-time error since v0.9.0
+```
+
+Before v0.9.0 the explicit form crashed at runtime with `'function' object is not subscriptable`. Generic *class* construction (`Box[int](value=7)`) is not affected — the `[int]` there is part of the class shape, not function-application syntax.
 
 ### No implicit `Any`
 
@@ -246,6 +291,12 @@ When to reach for which class form:
 
 `?` suffix on a `Result`-typed expression unwraps `Ok` and short-circuits `Err` to the enclosing function. The checker enforces that `?` appears only inside a function whose return type is a compatible `Result`. Desugaring is a localised `if isinstance(_x, Err): return _x; v = _x.value` pattern — not try/except, to keep stack traces clean.
 
+**Comprehension carve-out:** `?` is also rejected inside list / set / dict comprehensions and generator expressions (`tyc::invalid_question_op`). Comprehensions lower to nested `for`-loops, so the surrounding function frame `?` would short-circuit out of is not the comprehension's frame. Since v0.9.0 the diagnostic help text mentions both causes explicitly. Pre-extract with an explicit loop or chain `.and_then` / `.map` instead.
+
+### `Result` combinators
+
+`Ok` and `Err` expose `.map(f)`, `.map_err(g)`, `.and_then(f)` (chain a `Result`-returning op), and `.or_else(h)` (recover from an `Err`) as methods on the runtime classes. They landed in v0.6.0 for the compiled path; since v0.9.0 they also work under `tyc run` (the VM binds them as native methods via `NativeFn` wrappers that capture the receiver).
+
 ### `with`-chains
 
 Modelled on Elixir: sequences `Result`-producing expressions, binding the success value of each, with a single `else` block that catches the first `Err`.
@@ -260,6 +311,8 @@ else err:
     log.warn(err)
     return Err(err)
 ```
+
+Since v0.8.0 the implicit propagation path on every `?`-binding is type-checked against the enclosing function's declared error type — a chain that routes a mismatching error class no longer slips through. Since v0.9.0 the same check covers the explicit `else err: return Err(err)` form too — previously the check was gated on the synthetic `?`-op temp shape, so an `else` block could silently return an `Err` whose payload type didn't match the function's declared return.
 
 ## Async and concurrency
 

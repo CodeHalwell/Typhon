@@ -95,6 +95,29 @@ Result = Ok[T] | Err[E]
 
 Not a PyPI package. The module lives in your project's `build/` tree and ships with your wheel.
 
+## Combinators
+
+`Ok` and `Err` expose four combinator methods on the runtime classes:
+
+| Method | Receiver | Semantics |
+|---|---|---|
+| `.map(f)` | `Ok(v)` | `Ok(f(v))` — transforms the inner value |
+| `.map(f)` | `Err(e)` | `Err(e)` — pass-through |
+| `.map_err(g)` | `Err(e)` | `Err(g(e))` — converts the error type |
+| `.map_err(g)` | `Ok(v)` | `Ok(v)` — pass-through |
+| `.and_then(f)` | `Ok(v)` | `f(v)` — chains a `Result`-returning op |
+| `.and_then(f)` | `Err(e)` | `Err(e)` — pass-through |
+| `.or_else(h)` | `Err(e)` | `h(e)` — recovers from the error |
+| `.or_else(h)` | `Ok(v)` | `Ok(v)` — pass-through |
+
+```python
+let toks: Tokens   = tokenize(src).map_err(_lex_to_pipeline)?
+let ast:  Ast      = parse(toks).map_err(_parse_to_pipeline)?
+let ty:   TypedAst = check(ast).map_err(_type_to_pipeline)?
+```
+
+The combinators land in v0.6.0 and work under `tyc build && python build/main.py` from that release. Since v0.9.0 they also work under `tyc run` — the VM binds them as native methods via `NativeFn` wrappers that capture the receiver, so a typecheck-clean program no longer crashes with `AttributeError: Ok has no attribute 'and_then'` under `tyc run`.
+
 ## Common patterns
 
 ### Lifting an exception into `Result`
@@ -112,15 +135,23 @@ def load(path: str) -> Result[dict, str]:
         return Err(f"invalid JSON: {e}")
 ```
 
+The combination of `open()` write/append/binary modes (v0.9.0), `json.load` / `json.dump` riding on top, and the `with`-block honouring `__enter__` / `__exit__` means the same source runs identically under `tyc run` and the compiled path.
+
 ### Mapping over `Ok`
 
 ```python
 def parse_and_double(raw: str) -> Result[int, str]:
-    let n: int = parse(raw)?
-    return Ok(n * 2)
+    return parse(raw).map(lambda n: n * 2)
 ```
 
 ### Converting an error type
+
+```python
+def f(raw: str) -> Result[int, AppError]:
+    return parse(raw).map_err(lambda msg: AppError(message=msg))
+```
+
+Or the `match`-explicit form when you want to inspect the error first:
 
 ```python
 def f(raw: str) -> Result[int, AppError]:
@@ -130,6 +161,20 @@ def f(raw: str) -> Result[int, AppError]:
         case Err(msg):
             return Err(AppError(message=msg))
 ```
+
+### Chaining with `.and_then`
+
+```python
+def pipeline(src: str) -> Result[TypedAst, AppError]:
+    return (
+        tokenize(src)
+            .map_err(_lex_to_app)
+            .and_then(parse_toks)
+            .and_then(check_ast)
+    )
+```
+
+The chain is functionally equivalent to a `with`-chain of `?` operators; the choice is style.
 
 ## Where next
 

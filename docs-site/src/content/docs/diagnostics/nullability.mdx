@@ -17,7 +17,7 @@ let found: str? = find_user(1)
 greet(found)    # ❌
 ```
 
-**Fix:** narrow before use. Five forms:
+**Fix:** narrow before use. Seven forms (the last two added in v0.9.0):
 
 ```python
 # 1. is None / is not None
@@ -39,9 +39,21 @@ greet(f)
 
 # 5. or-fallback
 greet(found or "anonymous")
+
+# 6. assert (v0.9.0) — standard Python static-checker idiom
+assert found is not None
+greet(found)
+
+# 7. Post-while-loop (v0.9.0) — body sets it, loop must have exited
+mut cfg: Config? = None
+while cfg is None:
+    cfg = load_next()
+greet(cfg)                   # narrowed to non-None
 ```
 
 See [Flow Narrowing](/Typhon/types/narrowing/) for every form the checker recognises.
+
+**Note on `assert`:** disabling assertions with `python -O` removes the runtime guard, so safety-critical narrowing should still go through `guard` or `if x is None: return`. `assert` is best as a "this can't happen" checkpoint inside functions that already validated their inputs.
 
 ## What does *not* narrow
 

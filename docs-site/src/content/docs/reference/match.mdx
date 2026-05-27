@@ -62,6 +62,33 @@ match u:
         return n
 ```
 
+### Class patterns on built-in types (v0.9.0)
+
+`case TypeName() as binding:` matches any value whose runtime type is `TypeName` and binds it under the narrowed shape. Useful as a typed fall-through over a wide-union subject:
+
+```python
+def label(x: object) -> str:
+    match x:
+        case str() as s:   return f"str:{s}"
+        case int() as n:   return f"int:{n}"
+        case float() as f: return f"float:{f}"
+        case list() as xs: return f"list:{len(xs)}"
+        case dict() as d:  return f"dict:{len(d)}"
+        case _:            return "other"
+```
+
+The exhaustiveness pass also recognises `case None:` + a class pattern on the wrapped type as covering a `T?` subject:
+
+```python
+def show(s: str?) -> str:
+    match s:
+        case None:        return "<missing>"
+        case str() as x:  return x
+    # no missing_return since v0.9.0 — the two arms cover str?
+```
+
+`case str() as s:` works in both `tyc check` and `tyc run` since v0.9.0; before v0.9.0 the VM only matched class patterns on user-defined classes.
+
 ### Or pattern
 
 ```python
@@ -80,7 +107,11 @@ match xs:
         return "empty"
     case [head, *rest]:
         return f"head={head}, rest={rest}"
+    case [first, *middle, last]:
+        return f"{first}…{last}"
 ```
+
+Sequence patterns with star-capture work in the VM since v0.8.0.
 
 ### Mapping pattern
 
@@ -88,7 +119,12 @@ match xs:
 match cfg:
     case {"host": h, "port": p}:
         connect(h, p)
+    case {"host": h, **rest}:
+        connect(h, default_port=5432)
+        log_extras(rest)
 ```
+
+Mapping patterns with rest-capture (`**rest`) work in the VM since v0.8.0.
 
 ### Guard
 

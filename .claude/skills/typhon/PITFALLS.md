@@ -4,7 +4,7 @@ The errors and surprises that bite people who try to write Typhon as if it were 
 
 For each entry: **trigger → diagnostic → fix**.
 
-Current release: **v0.9.0**. Pitfalls tagged with a version annotation landed in that release; older pitfalls predate v0.3.0.
+Current release: **v0.9.0**. Pitfalls tagged with a version annotation landed in that release. Pitfalls 61–75 are the v0.9.0 cleanup additions covering the daily-driver VM, type-checker covariance and narrowing gaps, and multi-file project support.
 
 ---
 
@@ -1148,6 +1148,221 @@ let API_KEY = "sk-live-abc123def456"           # ⚠️ tyc::contains_secret_lit
 v0.8.0 added a heuristic lint for inline string literals named `*_(TOKEN|SECRET|PASSWORD|PWD|KEY|API_KEY)`. The warning is suppressed when the project's `[strictness] allow-secret-comptime = true`, or when the binding is comptime-loaded from `env(...)`.
 
 **Fix:** read from the environment via `comptime let API_KEY = env("API_KEY")`.
+
+---
+
+## 61. Calling a `Result` combinator under `tyc run` (v0.9.0)
+
+```python
+def parse(s: str) -> Result[int, str]: ...
+
+def doubled(s: str) -> Result[int, str]:
+    return parse(s).map(lambda n: n * 2)   # ✓ since v0.9.0 — was AttributeError before
+```
+
+Before v0.9.0 the VM did not bind the combinator methods on `Ok` / `Err`, so a typecheck-clean program crashed at run-time with `AttributeError: Ok has no attribute 'map'`. v0.9.0 binds `.map` / `.map_err` / `.and_then` / `.or_else` as native methods.
+
+**Fix:** no source change needed — rebuild against tyc ≥ v0.9.0.
+
+---
+
+## 62. `open(path, "w")` under `tyc run` (v0.9.0)
+
+```python
+def save(path: str, body: str) -> None:
+    with open(path, "w") as f:
+        f.write(body)                    # ✓ since v0.9.0 — was unsupported mode
+```
+
+Before v0.9.0 the VM's `open()` only handled read mode. v0.9.0 honours `"r"` / `"w"` / `"a"` / `"wb"` / `"r+"` and friends, plus the `with`-block protocol via `__enter__` / `__exit__`. `json.load` / `json.dump` ride on top.
+
+---
+
+## 63. `case str() as s:` under `tyc run` (v0.9.0)
+
+```python
+def label(x: object) -> str:
+    match x:
+        case str() as s: return f"str:{s}"
+        case int() as n: return f"int:{n}"
+        case _:          return "other"
+```
+
+Before v0.9.0 the VM's `match` only supported nominal patterns on user-defined classes. v0.9.0 matches `case str() as s:` / `case int() as n:` / `case float()` / `case list()` / `case dict()` / `case bool()` / `case bytes()`. The exhaustiveness checker also recognises `case None:` + `case str() as s:` as covering `str?`.
+
+---
+
+## 64. `frozenset` as a dict key under `tyc run` (v0.9.0)
+
+```python
+mut groups: dict[frozenset[str], int] = {}
+let key: frozenset[str] = frozenset({"a", "b"})
+groups[key] = 1                          # ✓ since v0.9.0 — was TypeError before
+```
+
+Before v0.9.0 the VM treated `frozenset` as unhashable. v0.9.0 adds a `HashKey::FrozenSet` variant with insertion-order-independent hashing.
+
+---
+
+## 65. `freeze let CFG = {...}` actually freezing under `tyc run` (v0.9.0)
+
+```python
+freeze let CFG: dict[str, int] = {"port": 8080}
+
+def boot() -> None:
+    CFG["port"] = 9999                   # ❌ TypeError under both tyc run and tyc build
+```
+
+Before v0.9.0 the VM treated `freeze let` as a regular `let`, so mutations through aliased references silently succeeded. v0.9.0 recursively wraps the value (list → tuple, dict → mappingproxy-tagged dict, set → frozenset) so the VM and `tyc build && python` behave identically.
+
+Plus a check-time guard: since v0.9.0 the type checker pre-validates the RHS via `tyc::freeze_not_freezable`. Constructing a non-`frozen` user class on the RHS is rejected at `tyc check` time instead of failing at first import.
+
+---
+
+## 66. `comptime let X = env(...)` under `tyc run` (v0.9.0)
+
+```python
+comptime let PORT = int(env("PORT", "8080"))   # ✓ since v0.9.0
+```
+
+Before v0.9.0 the VM didn't run the substitution pass, so `comptime let PORT = ...` crashed under `tyc run` with `NameError: env is not defined`. v0.9.0 shares the substitution pass with `tyc build`, so `tyc run`, `tyc check`, and the compiled output all see the same inlined constants.
+
+---
+
+## 67. `class!` exception fields surviving `except X as e:` (v0.9.0)
+
+```python
+class! HttpError(Exception):
+    code: int
+    message: str
+
+def main() -> None:
+    try:
+        raise HttpError(code=404, message="not found")
+    except HttpError as e:
+        print(e.code, e.message)         # ✓ since v0.9.0
+```
+
+Before v0.9.0 the VM's `class!` declarations didn't run the synthesised `__init__`, so user fields weren't initialised and `e.code` raised `AttributeError`. v0.9.0 wires the synthesised `__init__` through, and exception-type matching walks the MRO.
+
+---
+
+## 68. `*args` / `**kwargs` without annotations (v0.9.0)
+
+```python
+def trace(f, *args, **kwargs):           # ❌ tyc::missing_annotation
+    ...
+```
+
+v0.9.0 enforces Rule 1 (every parameter annotated) on `*args` / `**kwargs` too. Canonical idiom is `object`:
+
+```python
+def trace[R](f: Callable[..., R], *args: object, **kwargs: object) -> R:
+    return f(*args, **kwargs)
+```
+
+For typed variadics use a `TypeVarTuple` / a fixed-arity overload pattern depending on what you mean.
+
+---
+
+## 69. `assert x is not None` not narrowing (v0.9.0)
+
+```python
+def f(x: str?) -> int:
+    assert x is not None
+    return len(x)                        # ✓ since v0.9.0 — x narrowed to str
+```
+
+Before v0.9.0 the type checker treated `assert` as a no-op for narrowing purposes; Pyright / mypy / pyrefly all narrow it. v0.9.0 brings parity.
+
+---
+
+## 70. `while True:` loops marking the post-loop as unreachable (v0.9.0)
+
+```python
+def serve() -> Never:
+    while True:
+        handle_request()                  # body never breaks
+    # post-loop point is unreachable since v0.9.0
+```
+
+Before v0.9.0 the type checker required an unreachable `return` after `while True:` with no `break`. v0.9.0 recognises the body's "always returns/raises with no break" pattern and treats the post-loop point as unreachable, so `missing_return` doesn't fire and there's nothing to write.
+
+Plus post-while-loop narrowing: after `while y is None: y = load()` (no `break`), `y` is narrowed to non-`None` after the loop.
+
+---
+
+## 71. `Cons[T]` not assignable to `LinkedList[T]` (v0.9.0)
+
+```python
+type LL[T] = Cons[T] | Nil
+class Cons[T] frozen:
+    head: T
+    tail: LL[T]
+class Nil frozen: pass
+
+def length[T](xs: LL[T]) -> int:
+    mut cur: LL[T] = xs
+    while True:
+        match cur:
+            case Cons(head, tail):
+                cur = tail                # ✓ since v0.9.0 — Cons[T] assignable to LL[T]
+            case Nil():
+                return 0
+```
+
+Before v0.9.0 variant-to-parametric-union flow didn't deduce `Cons[T] → LL[T]`, so the loop body raised `tyc::type_mismatch`. v0.9.0 covers it.
+
+---
+
+## 72. `extend list:` not dispatching on `list[T]` receivers (v0.9.0)
+
+```python
+extend list:
+    def first_or[T](self, default: T) -> T:
+        return self[0] if self else default
+
+def head(xs: list[int]) -> int:
+    return xs.first_or(0)                # ✓ since v0.9.0 — was attribute_not_found before
+```
+
+Before v0.9.0 the dispatch table only consulted user-class shapes; a `list[T]`-annotated receiver fell through to `attribute_not_found`. v0.9.0 consults the synthetic `__typhon_builtin_ext_list` class shape first.
+
+---
+
+## 73. `func[T](args)` explicit type instantiation (v0.9.0)
+
+```python
+def identity[T](x: T) -> T: return x
+
+def main() -> None:
+    let y: int = identity[int](7)        # ❌ tyc::operator_type_mismatch (since v0.9.0)
+```
+
+Before v0.9.0 this crashed at runtime with `TypeError: 'function' object is not subscriptable`. v0.9.0 fires a clear check-time error pointing users at the bidirectional inference pattern (drop the `[int]` — `T` is inferred from the argument).
+
+---
+
+## 74. `comptime let T: type = int` (v0.9.0)
+
+```python
+comptime let Id: type = int
+def f(x: Id) -> Id: return x             # ✓ since v0.9.0
+```
+
+v0.9.0 lowers `comptime let T: type = <Type>` to a PEP 695 `type T = <Type>` alias statement so `T` is substitutable wherever a type is expected. `tyc check` runs the substitution before parsing the resolved module so check, build, and VM all see the same shape.
+
+---
+
+## 75. Multi-file projects under `tyc run` (v0.9.0)
+
+```
+src/main.ty:        from .repo.users import load
+src/repo/__init__.ty
+src/repo/users.ty:  def load() -> User: ...
+```
+
+Before v0.9.0 the VM only loaded `main.ty` and crashed on the first `from .X import` with `ImportError`. v0.9.0 walks the project source root, honours relative imports, and caches each module's bindings as a `Value::Module`. `tyc run --compile` now spawns `python -m <pkg>.main` so relative imports in the entry point resolve correctly.
 
 ---
 

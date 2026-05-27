@@ -130,6 +130,53 @@ else err:
 
 The `?` is what distinguishes a chained Result-unwrap from a regular `with` statement (context manager). See [`with`-chains](/Typhon/reference/with-chains/).
 
+## `?` is not allowed inside a comprehension
+
+Comprehensions lower to nested `for`-loops in Python, so the surrounding "enclosing function" `?` would short-circuit out of is *not* the comprehension's frame — it's an inner generator scope. `?` inside a list comprehension, set comprehension, dict comprehension, or generator expression is rejected with `tyc::invalid_question_op`:
+
+```python
+def collect(xs: list[str]) -> Result[list[int], str]:
+    return Ok([parse(x)? for x in xs])   # ❌ tyc::invalid_question_op
+```
+
+Since v0.9.0 the diagnostic help text explicitly covers both this case and the Result-return cause. The fix is to pre-extract with an explicit loop or to chain `.and_then` / `.map`:
+
+```python
+def collect(xs: list[str]) -> Result[list[int], str]:
+    mut out: list[int] = []
+    for x in xs:
+        out.append(parse(x)?)
+    return Ok(out)
+```
+
+Or, if every element is fault-tolerant, lift the loop with `.map_err`:
+
+```python
+def collect(xs: list[str]) -> Result[list[int], str]:
+    mut out: list[int] = []
+    for x in xs:
+        match parse(x):
+            case Ok(n):    out.append(n)
+            case Err(msg): return Err(msg)
+    return Ok(out)
+```
+
+## `?` propagation inside `with`-chains is fully checked (v0.8.0)
+
+When a `with`-chain binding uses `?`, the implicit "fall-through" path returns `Err(...)` to the enclosing function. v0.8.0 added error-type validation on that implicit path so a mismatching error class no longer slips through:
+
+```python
+def step1() -> Result[A, str]: ...
+def step2(a: A) -> Result[B, AppError]: ...
+
+def both() -> Result[B, str]:
+    with a = step1()?,
+         b = step2(a)?:               # ❌ result_error_mismatch — AppError ⇏ str
+        return Ok(b)
+```
+
+v0.9.0 extends this check to the explicit `else err: return Err(err)` shape too — previously the validation was gated on the synthetic `?`-op temp shape, so an `else` block could silently return the wrong error class.
+
 ## Common mistakes
 
 ### Using `?` outside a `Result` function
@@ -148,7 +195,13 @@ def f() -> Result[int, AppError]:
     let n: int = parse_str()?    # ❌ if parse_str returns Result[int, str]
 ```
 
-Fix: convert at the boundary (see above).
+Fix: convert at the boundary (see above), or use `.map_err`:
+
+```python
+def f() -> Result[int, AppError]:
+    let n: int = parse_str().map_err(lambda msg: AppError(message=msg))?
+    return Ok(n)
+```
 
 ### Using `?` on a non-`Result` value
 
@@ -157,6 +210,10 @@ let n: int = (1 + 2)?    # ❌ ? requires a Result-typed expression
 ```
 
 Fix: don't.
+
+### Using `?` inside a comprehension
+
+See the section above — pre-extract with an explicit loop instead.
 
 ## Where next
 

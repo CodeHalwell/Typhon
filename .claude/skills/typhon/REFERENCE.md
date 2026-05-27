@@ -224,7 +224,7 @@ r: str = find(2)              # roughly; the emitter binds via a temp
 print(r)
 ```
 
-Narrowing forms the checker recognises: `is None`, `is not None`, `isinstance(x, T)`, `guard`, early-return `if x is None: return`, exhaustive `match`, **ternary** `body if test else orelse` (v0.7.0), De Morgan refinement (`if not (A or B): return` narrows both operands afterwards, v0.4.0), `while` test-implied narrowings applied to body (v0.3.0).
+Narrowing forms the checker recognises: `is None`, `is not None`, `isinstance(x, T)`, `guard`, early-return `if x is None: return`, exhaustive `match`, **ternary** `body if test else orelse` (v0.7.0), De Morgan refinement (`if not (A or B): return` narrows both operands afterwards, v0.4.0), `while` test-implied narrowings applied to body (v0.3.0), **`assert x is not None`** (v0.9.0; the standard Python static-checker idiom), **post-while-loop narrowing** (v0.9.0; after `while y is None: y = load()` with no `break`, `y` is non-`None` afterwards), and **`while True:` reachability** (v0.9.0; a body that always returns/raises with no `break` marks the post-loop point as unreachable so `missing_return` doesn't fire).
 
 ---
 
@@ -275,6 +275,15 @@ class Point:
 ```
 
 `frozen=True` only blocks **field reassignment**. Nested mutable containers can still be mutated. Use `tuple` / `frozenset` for stronger guarantees.
+
+**Frozen + inheritance ordering (v0.9.0 cheatsheet clarification):** when combining `frozen` with a base class, the modifier comes **between** the class name and the base list:
+
+```python
+class Square frozen(Shape):    # ✓ parses
+    side: float
+
+# `class Square(Shape) frozen:` does NOT parse.
+```
 
 ### 3.3 `model` → Pydantic
 
@@ -679,7 +688,7 @@ let ast:  Ast      = parse(toks).map_err(_parse_to_pipeline)?
 let ty:   TypedAst = check(ast).map_err(_type_to_pipeline)?
 ```
 
-`Ok` and `Err` carry `.map`, `.map_err`, `.and_then`, `.or_else` methods on the runtime classes. Semantics: `Ok.map(f)` transforms value; `Ok.map_err(g)` identity; `and_then` chains a `Result`-returning op on `Ok`; `or_else` recovers from `Err`.
+`Ok` and `Err` carry `.map`, `.map_err`, `.and_then`, `.or_else` methods on the runtime classes. Semantics: `Ok.map(f)` transforms value; `Ok.map_err(g)` identity; `and_then` chains a `Result`-returning op on `Ok`; `or_else` recovers from `Err`. Since v0.9.0 these combinators also work under `tyc run` — the VM binds them as native methods via `NativeFn` wrappers that capture the receiver.
 
 ---
 
@@ -890,7 +899,7 @@ def primes(n: int) -> Iterator[int]:
 comptime let PORT: int = int(env("PORT", "8080"))
 comptime let DB_URL: str = env("DATABASE_URL")
 comptime let URL: str = "/".join([host, path])       # v0.3.1 str.join allowed
-comptime let T: type = int                            # v0.5.0 types-as-values
+comptime let T: type = int                            # v0.5.0 types-as-values; v0.9.0: lowers to PEP 695 `type T = int`
 
 comptime def feature(name: str) -> bool:
     return env(f"FEATURE_{name.upper()}", "0") == "1"
@@ -910,6 +919,8 @@ def feature(name: str) -> bool:
 ```
 
 `comptime def` functions are **also preserved** in the emitted `.py` so they remain callable at runtime.
+
+Since v0.9.0 `comptime let T: type = <Type>` lowers to a PEP 695 `type T = <Type>` alias statement so `T` is substitutable wherever a type is expected. `tyc check` also runs the substitution before parsing the resolved module so check, build, and VM all see the same shape. And: `comptime let X = ...` value bindings now inline in the VM via the substitution pass shared with `tyc build`, so `tyc run` no longer crashes with `NameError: env is not defined` on `comptime let PORT = int(env(...))`.
 
 The sandbox allows: arithmetic, string ops (including `str.join` v0.3.1), `env(name, default?)`, container construction with subscript including negative indexing, ternaries, `if`/`elif`/`else`, types-as-values (8 primitive heads), calls to other `comptime def` functions. Forbids: loops, exceptions, `with`-blocks, classes, free variables, `*args`/`**kwargs`/defaults, I/O, network, subprocess, random, time, uuid, arbitrary imports. Recursion depth capped at 64.
 
@@ -970,7 +981,23 @@ type Pair[A, B] = tuple[A, B]
 
 **Cross-module generic method dispatch propagates class TypeVars** (v0.7.0): `s: Stream[int]; s.map(f)` records `Callable[[int], U]` as the expected parameter and returns `Stream[U]`. Field access also propagates: `r: RecordEnv[int]; r.payload` is `int`.
 
+**Read-view covariance** (v0.9.0): `list[Subclass]` / `tuple[Subclass]` / `set[Subclass]` / `frozenset[Subclass]` flow into `Sequence[Super]` / `Iterable[Super]` / `Iterator[Super]` / `Collection[Super]` / `Container[Super]` / `Reversible[Super]` when `Subclass` inherits `Super`. `dict[K, V]` is K-invariant + V-covariant under `Mapping[K, V]`.
+
+**Variant → parametric sealed union assignability** (v0.9.0): given `type LL[T] = Cons[T] | Nil`, an `Cons[T]` value flows into a `LL[T]` slot. Required for recursive ADT walks like `mut cur: LL[T] = self`.
+
+**`func[T](args)` explicit type instantiation** (v0.9.0): rejected at check time with a clear error pointing users at the bidirectional inference pattern (drop the `[T]` — `T` is inferred from the argument). Was previously a runtime `TypeError`.
+
 **Never** import `TypeVar` from `typing`. The PEP 695 path is the only one.
+
+### Annotation policy for `*args` / `**kwargs` (v0.9.0)
+
+Rule 1 (every parameter annotated) is enforced on `*args` / `**kwargs` too. Canonical idiom for genuinely variadic functions (typically generic decorators):
+
+```python
+def trace[R](f: Callable[..., R], *args: object, **kwargs: object) -> R:
+    log(f.__name__, args, kwargs)
+    return f(*args, **kwargs)
+```
 
 ### HKT scaffold (v0.5.0)
 

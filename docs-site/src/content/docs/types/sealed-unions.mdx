@@ -140,6 +140,50 @@ class Err[E]:
 
 This is in fact how `Result[T, E]` itself is defined in `typhon_runtime`. The checker instantiates `T` and `E` at the use site.
 
+### Variant → parametric union assignability (v0.9.0)
+
+A bare variant flows into the parametric union alias even when the variant itself is generic over the same type parameter. This is the assignability rule that makes recursive ADT walks compile:
+
+```python
+class Cons[T] frozen:
+    head: T
+    tail: LL[T]
+
+class Nil[T] frozen:
+    pass
+
+type LL[T] = Cons[T] | Nil[T]
+
+def length[T](xs: LL[T]) -> int:
+    mut cur: LL[T] = xs
+    mut count: int = 0
+    while True:
+        match cur:
+            case Nil():
+                return count
+            case Cons(_, tail):
+                cur = tail          # ✅ since v0.9.0 — Cons[T] → LL[T]
+                count = count + 1
+```
+
+Before v0.9.0 the variant `Cons[T]` was not recognised as assignable to `LL[T]`, so `cur = tail` raised `tyc::type_mismatch`. The fix is purely additive — every existing program still type-checks.
+
+The rule also applies for the non-generic-variant case (`Nil` declared as a plain `class`, no `[T]`): a `Nil` value flows into `LL[T]` for any `T`, because `Nil` has no `T`-dependent shape.
+
+### Distributing `impl` over a sealed alias
+
+`impl[T] LL[T]:` distributes every method body across every variant — useful when every variant should expose the same operation:
+
+```python
+impl[T] LL[T]:
+    def is_empty(self) -> bool:
+        match self:
+            case Nil(): return True
+            case Cons(_, _): return False
+```
+
+Lowering emits `Cons.is_empty(self)` and `Nil.is_empty(self)`. Any diagnostic raised by the same line across multiple variants is deduplicated (v0.9.0) — a 10-variant union no longer reports 10 identical errors.
+
 ## Cross-file variants
 
 Variants must all be visible in the same scope as the `type` alias. A common layout:

@@ -25,9 +25,19 @@ When `Result` is used anywhere in the project, a `typhon_runtime/result.py` (or 
     class Ok(Generic[T]):
         value: T
 
+        def map(self, f): ...           # Ok(f(self.value))
+        def map_err(self, g): ...       # self (passthrough)
+        def and_then(self, f): ...      # f(self.value)
+        def or_else(self, h): ...       # self (passthrough)
+
     @dataclass(slots=True, frozen=True)
     class Err(Generic[E]):
         error: E
+
+        def map(self, f): ...           # self (passthrough)
+        def map_err(self, g): ...       # Err(g(self.error))
+        def and_then(self, f): ...      # self (passthrough)
+        def or_else(self, h): ...       # h(self.error)
 
     # Result is a type alias:
     # Result[T, E] = Ok[T] | Err[E]
@@ -39,6 +49,8 @@ When `Result` is used anywhere in the project, a `typhon_runtime/result.py` (or 
     ```
   </TabItem>
 </Tabs>
+
+The four combinator methods (`.map` / `.map_err` / `.and_then` / `.or_else`) ship with the generated `typhon_runtime/result.py` since v0.6.0. Since v0.9.0 the in-process VM (`tyc run`) also binds them as native methods via `NativeFn` wrappers that capture the receiver, so `Ok(7).and_then(double)` works identically under both execution modes.
 
 User code imports:
 
@@ -118,6 +130,8 @@ No `try`/`except`. Stack traces stay clean.
 Each step's error path runs the same `else err:` block (the unwrapped `error` is bound to `err`).
 
 Without an `else err:`, the lowering omits the block and uses bare `return _tmp_N` short-circuits.
+
+Since v0.8.0 every `?`-binding's implicit error path is type-checked against the enclosing function's declared error type. Since v0.9.0 the explicit `else err: return Err(err)` form goes through the same check — previously the validation was gated on the synthetic `?`-op temp shape, so an `else` block could silently return an `Err` whose payload type didn't match the function's declared return.
 
 ## Why a separate runtime module?
 

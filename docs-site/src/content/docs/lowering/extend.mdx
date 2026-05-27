@@ -105,7 +105,22 @@ The set that supports `extend BUILTIN:`:
 
 Other built-in types (`type`, `object`, `range`, etc.) are not currently rewritten.
 
-## Extending generic built-ins
+## Dispatching on parameterised receivers (v0.9.0)
+
+Until v0.9.0 the rewrite only fired against bare-container annotations (`xs: list`); a `list[int]`-annotated receiver fell through to `tyc::attribute_not_found`. v0.9.0 consults the synthetic `__typhon_builtin_ext_list` (and the parallel `_str` / `_dict` / `_set` / `_frozenset` / `_tuple` / `_bytes` / `_int` / `_float` / `_bool`) class shape *before* `attribute_not_found` fires, so parameterised receivers dispatch correctly:
+
+```python
+extend list:
+    def first_or[T](self, default: T) -> T:
+        return self[0] if self else default
+
+def head(xs: list[int]) -> int:
+    return xs.first_or(0)        # ✅ since v0.9.0 — was attribute_not_found before
+```
+
+The extension is still defined on the bare container (`extend list:` — *not* `extend list[T]:`), because the lowered free function is a single module-level definition that has to accept every element type. The receiver type is still required at the call site (Rule 1).
+
+## Extending parameterised built-ins (roadmap)
 
 ```python
 extend list[int]:
@@ -113,7 +128,7 @@ extend list[int]:
         return sum(x * x for x in self)
 ```
 
-Currently the rewrite matches on the *bare* container type (`list`, not `list[int]`). Generic-parameterised extensions are roadmapped.
+`extend list[int]:` with a parameterised receiver type — for cases where the extension only makes sense at a specific element type — parses but is not yet dispatched separately from the bare-container `extend list:` form. Roadmapped.
 
 ## Where next
 

@@ -34,11 +34,97 @@ venv-introspected third-party Python classes
 the chain is partial. Strictly a bugfix; no language, runtime, or
 stdlib changes beyond the carve-out.
 
-The feature surface comes from **v0.8.0** (the stress-test sweep
-release on top of v0.7.0 / v0.7.1, closing **41 findings** from a
-multi-file v0.7.1 stress report spanning the type checker, VM,
-parser, lowering passes, diagnostics, and CLI). Phases 0–3 + Phase
-5 / 5.5 / 6 are complete; v0.8.0 lands several long-missing
+Headline changes vs. v0.8.1:
+
+**VM coverage (closing the gap between `tyc run` and `tyc build && python build/main.py`):**
+
+- `Result` combinators (`.map` / `.map_err` / `.and_then` /
+  `.or_else`) work on `Ok` / `Err` values via bound `NativeFn`
+  wrappers.
+- `open()` honours `"w"` / `"a"` / `"wb"` / `"r+"` modes plus
+  `__enter__` / `__exit__`. `json.load` / `json.dump` ride on top.
+- Class patterns on built-in types (`case str() as s:`,
+  `case int() as n:`, …) match; exhaustiveness recognises
+  `case None:` + `case str() as s:` as covering `str?`.
+- `frozenset(...)` is hashable as a dict key (`HashKey::FrozenSet`).
+- f-string `_` thousands separator works the same way `,` does.
+- `bytes` repr matches CPython byte-for-byte.
+- Native shims for `collections.deque`, `heapq`,
+  `contextlib.contextmanager`, `pydantic.BaseModel`.
+- `@property` / `@classmethod` / `@staticmethod` / `super()`
+  builtins so decorated methods don't crash on import.
+- `lazy import np = numpy` uses the simpler `import M as N` rewrite.
+- Multi-file projects: sibling `.ty` modules load via the project
+  source root, relative imports work, `tyc run --compile` spawns
+  `python -m <pkg>.main` for the package-style entry point.
+- `dataclasses.field(default_factory=list)` invokes per instance.
+- `class!` synthesised `__init__` runs; `except X as e:` binds the
+  user `Instance`; exception-type matching walks the MRO.
+- `freeze let CFG = {...}` actually freezes (list → tuple, dict →
+  mappingproxy, recursive).
+- `comptime let X = ...` inlines via the substitution pass shared
+  with `tyc build`.
+- Typed tuple unpack `let (a: int, b: str) = pair()` parses in the
+  VM.
+
+**Type checker (silent-correctness gaps):**
+
+- Sequence / Iterable / Iterator / Collection / Container /
+  Reversible covariance for built-in containers
+  (`list[Dog] → Sequence[Animal]`). Mapping / MutableMapping cover
+  `dict[K, V]` (K invariant, V covariant).
+- Variant → parametric sealed union assignability
+  (`Cons[T] → LinkedList[T]`).
+- `while True:` reachability + post-while-loop narrowing.
+- `assert x is not None` narrows.
+- `*args` / `**kwargs` require annotations
+  (`*args: object` / `**kwargs: object`).
+- `extend list:` dispatches on `list[T]`-annotated receivers.
+- Exhaustive `match` on `T?` recognises built-in class patterns.
+- `with`-chain explicit `else err: return Err(err)` validates the
+  error type against the function's declared return.
+- `func[T](args)` explicit type instantiation fires a clear
+  check-time error.
+- `comptime let T: type = int` lowers to a PEP 695 `type T = int`
+  alias.
+- New `tyc::freeze_not_freezable` diagnostic validates
+  `freeze let X = <expr>` at check time.
+- `pub *` name collisions surface in `tyc check` (not just
+  `tyc build`).
+
+**Diagnostics polish:**
+
+- `interface_not_conforming` arity message rephrased to
+  "got N non-self parameter(s), expected M".
+- `invalid_question_op` help text covers both the `Result`-return
+  cause and the comprehension carve-out.
+- Sealed-union impl distribution dedupes diagnostics by
+  `(code, rendered message)` so a 10-variant union doesn't report
+  10 identical errors.
+- `class_attr_shadows_slot` no longer false-positives on
+  mutable-literal default fields.
+- `MissingAnnotation` text drops double-backtick wrapping.
+
+**Docs:**
+
+- Cheat sheet documents `class X frozen(Base):` ordering and the
+  `*args: object` idiom.
+
+**Known limitations carried forward:**
+
+- Preprocess line-number leakage (B15) — diagnostics still report
+  preprocessed-buffer line numbers for `impl Alias:` distribution
+  over sealed unions. The dedupe pass cuts the *count* of noise
+  diagnostics but each surviving diagnostic still points at a
+  synthetic line index past EOF of the original source.
+
+---
+
+The earlier feature surface comes from **v0.8.0** (the stress-test
+sweep release on top of v0.7.0 / v0.7.1, closing **41 findings**
+from a multi-file v0.7.1 stress report spanning the type checker,
+VM, parser, lowering passes, diagnostics, and CLI). Phases 0–3 +
+Phase 5 / 5.5 / 6 are complete; v0.8.0 lands several long-missing
 diagnostic firing sites, a meaningfully larger native VM stdlib,
 and five parser scaffolds the docs already advertised.
 

@@ -76,6 +76,40 @@ non-frozen dataclasses, custom classes that don't declare
 `frozen=True`. Better to fail at startup than to silently leak a
 mutable alias.
 
+## Compile-time validation — `tyc::freeze_not_freezable` (v0.9.0)
+
+Since v0.9.0 the type checker pre-validates the RHS of every
+`freeze let X = <expr>` binding. Constructing a non-`frozen` user
+class on the RHS now fires `tyc::freeze_not_freezable` at check
+time instead of letting the failure surface as a runtime
+`TypeError` at first import:
+
+```ty
+class Counter:               # not frozen
+    value: int
+
+freeze let CFG = Counter(value=0)   # ❌ tyc::freeze_not_freezable
+                                    # `Counter` is not declared `frozen`
+```
+
+Fix: declare the class `frozen`, switch to a built-in container, or
+fall back to a plain `let`:
+
+```ty
+class Counter frozen:
+    value: int
+
+freeze let CFG = Counter(value=0)   # ✓ check-time validated, runtime safe
+```
+
+## VM behaviour
+
+Since v0.9.0 `freeze let CFG = {...}` actually freezes the value in
+the VM as well: `list → tuple`, `dict → mappingproxy-tagged dict`,
+recursive. Mutations through aliased references raise the same
+`TypeError` CPython's `MappingProxy` does — `tyc run` and
+`tyc build && python build/main.py` produce identical behaviour.
+
 ## Scope (current)
 
 The v1 form is module-level only:

@@ -170,7 +170,7 @@ Frozen dataclasses pass through unchanged. File handles, sockets, generators, no
       └── ffi.rs       file-handle shim (no PyO3 yet)
 ```
 
-The VM's `Value` enum covers `Int(i64)`, `Float`, `Bool`, `Str`, `Bytes`, `None`, `List`, `Tuple`, `Dict`, `Set`, `FrozenSet`, `Function`, `Method`, `Class`, `Instance`, `NativeFunction`, `Module`, `Iterator`, `Generator`, `Coroutine`, `Task`, `Ok`/`Err`. Reference counting via `Rc<RefCell<...>>` — no GC, no thread sharing.
+The VM's `Value` enum covers `Int(BigInt)` (v0.8.0 switched from `i64`; programs that relied on silent wrap-around compute different (correct) results), `Float`, `Bool`, `Str`, `Bytes`, `None`, `List`, `Tuple`, `Dict` (insertion-ordered `IndexMap` since v0.8.0; `del d[k]` / `dict.pop` use `shift_remove`), `Set`, `FrozenSet`, `Function`, `Method`, `Class`, `Instance`, `NativeFunction`, `Module`, `Iterator`, `Generator`, `Coroutine`, `Task`, `Ok`/`Err` (with bound `.map`/`.map_err`/`.and_then`/`.or_else` combinators since v0.9.0). Reference counting via `Rc<RefCell<...>>` — no GC, no thread sharing. Recursion limit is 1000 frames (was 256 before v0.8.0) to match CPython's default.
 
 ### 2.2 Why a VM at all?
 
@@ -202,21 +202,46 @@ Built-in method dispatch on `str` / `list` / `dict` / `set` / `tuple` / `int.bit
 | `math` | `pi`, `e`, `inf`, `nan`, `sqrt`, `floor`, `ceil`, `log` (with base), `log2`, `log10`, `exp`, `sin`, `cos`, `tan`, `pow`, `fabs` |
 | `os` | `getenv`, `environ`, `path.exists`, `path.isfile`, `path.isdir` |
 | `sys` | `argv`, `platform`, `version`, `exit(code)` |
-| `json` | `dumps`, `loads` (full JSON 7159 surface) |
+| `json` | `dumps`, `loads` (full JSON 7159 surface). `json.load(f)` / `json.dump(obj, f)` ride on top of `open()` since v0.9.0 |
 | `time` | `time()`, `sleep()`, `monotonic()` |
 | `random` | `random()`, `randint(a, b)`, `seed(n)` — xorshift PRNG, **not** cryptographic |
-| `typhon_runtime` | `Ok`, `Err`, `tasks.spawn` (synchronous shim), `lazy.lazy_let`, `lazy.lazy_import` |
+| `re` (v0.8.0) | `match`, `search`, `findall`, `sub`, `split`, `compile`. `match` is anchored at the start of the string. Some flag arguments accepted but ignored |
+| `typing` (v0.8.0) | Generic constructors are runtime no-ops; type-only imports are stripped by the desugar pre-pass |
+| `collections` (v0.8.0) | `OrderedDict`, `defaultdict`, `Counter`, `namedtuple`. **`collections.deque`** added in v0.9.0 — rides on `Value::List` via new `popleft` / `appendleft` / `extendleft` / `rotate` list methods |
+| `functools` (v0.8.0) | `lru_cache`, `cache`, `cached_property`, `reduce`, `partial` |
+| `itertools` (v0.8.0) | `chain`, `count`, `cycle`, `accumulate`, `combinations`, `permutations`, `product`, `islice`, `takewhile`, `dropwhile`, `groupby` |
+| `dataclasses` (v0.8.0) | `dataclass`, `field`, `fields`, `asdict`, `astuple`. v0.9.0: `field(default_factory=list)` actually invokes the factory per instance |
+| `pathlib` (v0.8.0) | `Path` with `exists`, `read_text`, `write_text`, `parent`, `name`, `stem`, `suffix`, `with_suffix`, `joinpath` / `/` |
+| `heapq` (v0.9.0) | `heappush`, `heappop`, `heapify`, `heappushpop`, `heapreplace`, `nsmallest`, `nlargest` |
+| `contextlib` (v0.9.0) | `@contextmanager` identity decorator; `with` block honours the wrapped `__enter__` / `__exit__` shape |
+| `pydantic` (v0.9.0) | `BaseModel` placeholder so declaring a `model` doesn't `ImportError` (full validation still requires `--compile`) |
+| `typhon_runtime` | `Ok`, `Err`, `tasks.spawn` (synchronous shim), `lazy.lazy_let`, `lazy.lazy_import`. `Ok` / `Err` carry bound `.map` / `.map_err` / `.and_then` / `.or_else` combinators since v0.9.0 |
+
+### 2.4a Built-in builtins surface (v0.9.0 additions)
+
+- **`open(p, mode)`** honours `"r"` / `"w"` / `"a"` / `"wb"` / `"r+"` and friends, plus `__enter__` / `__exit__` for `with` blocks. Text and binary modes both work.
+- **`frozenset(...)`** is hashable as a dict key via `HashKey::FrozenSet` with insertion-order-independent hashing.
+- **`@property`, `@classmethod`, `@staticmethod`, `super()`** are present as identity-ish stubs so decorated methods don't crash on import.
+- **f-string `_` thousands separator** emits the same way `,` does.
+- **`bytes` repr matches CPython** byte-for-byte (`b'hi'` by default, `b"with 'embedded'"` fallback, `\xNN` for non-printable).
+- **Class patterns on built-in types** in `match` — `case str() as s:`, `case int() as n:`, etc.
+
+### 2.4b Multi-file projects (v0.9.0)
+
+The VM walks the project source root and loads sibling `.ty` modules on demand. Relative imports (`from .repo import x`, `from ..pkg.users import load`) resolve through `Value::Module` cache so circular dependencies are fine. `tyc run --compile` spawns `python -m <pkg>.main` instead of `python build/main.py` so relative imports in the entry point resolve correctly under the compiled path too.
+
+### 2.4c Freeze / comptime parity with `tyc build` (v0.9.0)
+
+`freeze let CFG = {...}` recursively wraps the value (list → tuple, dict → mappingproxy-tagged dict, set → frozenset) so mutations through aliased references raise the same `TypeError` CPython's `MappingProxy` does. `comptime let X = ...` inlines via the substitution pass shared with `tyc build`, so `comptime let PORT = int(env(...))` no longer crashes with `NameError: env is not defined` under `tyc run`.
 
 ### 2.5 Not supported (surfaces as `NotImplementedError` or `ImportError`)
 
-- **`async def` / `await` / `gather:` / `go`** — VM is synchronous-only today.
-- **Real generator functions with `yield`** — generator-expression shape works but materialises eagerly.
+- **`async def` / `await` / `gather:` / `go`** — VM is synchronous-only today. Since v0.8.0 the VM surfaces a clear `NotImplementedError` pointing at `tyc build && python build/main.py` as the fallback (was: crash).
+- **Real generator functions with `yield`** — generator-expression shape works but materialises eagerly. Same `NotImplementedError` shape as async since v0.8.0.
 - **Template strings** (`t"…"`).
 - **IPython escapes** (`%foo`, `!bar`, etc.).
-- **`with` statements other than `open()`** — full ctx-manager support is a follow-up.
-- **Mapping / class-keyword patterns in `match`**.
-- **Bigint arithmetic** — ints are `i64`; overflow raises `OverflowError`.
-- **Most third-party packages** — `numpy`, `requests`, `pandas`, `pydantic`, etc.
+- **`with` statements other than `open()` / `@contextmanager`-decorated factories** — basic context-manager protocol covers the common case since v0.9.0; arbitrary user `__enter__` / `__exit__` on plain classes is a follow-up.
+- **Most third-party packages** — `numpy`, `requests`, `pandas`, full `pydantic` validation, etc. (placeholders only).
 
 ### 2.6 Fallback rule
 

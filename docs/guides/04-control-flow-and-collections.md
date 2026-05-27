@@ -40,6 +40,38 @@ def countdown(n: int) -> None:
 
 The loop variable is `mut` because we reassign it. The checker would catch a `let` here.
 
+### `while True:` reachability
+
+Since v0.9.0 the reachability analyser recognises loops whose body always exits via `return` / `raise` on every branch with no `break`. The post-loop point is unreachable, so `tyc::missing_return` doesn't fire on the surrounding function:
+
+```python
+def serve() -> Never:
+    while True:
+        let req: Request = accept()
+        if req.is_quit():
+            raise SystemExit
+        handle(req)
+    # no return needed — post-loop point is unreachable since v0.9.0
+```
+
+Adding a `break` anywhere in the body re-enables the fall-through check.
+
+### Post-`while`-loop narrowing
+
+After a `while` loop whose test is "this value is `None`" and whose body reassigns the binding (no `break`), the post-loop binding is narrowed to non-`None`:
+
+```python
+def first_loaded(sources: list[Loader]) -> Config:
+    mut cfg: Config? = None
+    mut i: int = 0
+    while cfg is None:
+        cfg = sources[i].load()
+        i = i + 1
+    return cfg                   # ✅ narrowed to Config since v0.9.0
+```
+
+This matches the narrowing applied by `pyright`, `mypy`, and `pyrefly`.
+
 ## `for`
 
 `for` iterates anything `Iterable`:
@@ -76,6 +108,16 @@ def shipping_cost(weight: float?) -> float:
 ```
 
 Inside the `else:` block you must return, raise, or otherwise leave the enclosing function. After the `guard`, the name (`w`) is narrowed to its non-null form.
+
+Since v0.9.0 the standard Python `assert x is not None` idiom also narrows:
+
+```python
+def display(name: str?) -> str:
+    assert name is not None
+    return name.upper()          # narrowed to str
+```
+
+`assert` is a runtime check that raises `AssertionError` on the false branch — running Python with `-O` disables it. Use `assert` for "this can't happen" checkpoints inside functions that already validated their inputs; reach for `guard` or `if x is None: return` when the narrowing has to survive `-O`.
 
 `guard` is sugar for:
 

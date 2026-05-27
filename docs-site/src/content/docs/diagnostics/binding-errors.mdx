@@ -67,11 +67,36 @@ def f() -> str:
 
 Severity is configurable via [`[strictness] unused-import`](/Typhon/configuration/strictness/):
 
-- `"error"` (default) — fails CI on unused imports.
-- `"warn"` — flagged but doesn't fail the build.
+- `"warn"` (default since v0.8.0; was `"error"` before) — flagged but doesn't fail the build.
+- `"error"` — fail the build on unused imports. Set this for CI strictness.
 - `"off"` — no check.
 
 The LSP exposes a "Remove unused import" code action that fires on these diagnostics.
+
+## `tyc::pattern_shadows_outer`
+
+A `case` pattern captures a name that already exists as an immutable `let` in an enclosing scope. The capture would silently rebind the outer name inside the arm, which is almost always a typo for an intended class pattern.
+
+```python
+let radius: float = 100.0
+
+match shape:
+    case Circle(radius):     # ❌ tyc::pattern_shadows_outer — captures `radius`,
+                             #    silently rebinding the outer `let radius`
+        print(radius)
+    case _:
+        pass
+```
+
+**Fix:** rename the pattern capture, or write the keyword form to be explicit:
+
+```python
+match shape:
+    case Circle(radius=r):           # ✅ keyword-pattern, no shadowing
+        print(r)
+```
+
+The diagnostic was documented from v0.3.0 onwards but only got a firing site in v0.8.0. Sibling `case` / `if` / `elif` arms each get fresh-binding behaviour (v0.6.0+), so the diagnostic only fires on genuine shadow situations.
 
 ## `tyc::shadowing_in_same_scope` (reserved)
 

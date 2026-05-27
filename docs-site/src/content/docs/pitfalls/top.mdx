@@ -132,6 +132,92 @@ p.x = 2.0    # ❌
 
 Construct a new instance.
 
+## 16. `class X(Base) frozen:` ordering
+
+The `frozen` modifier comes **between** the class name and the base list, not after it:
+
+```python
+class Square(Shape) frozen:    # ❌ does not parse
+    side: float
+
+class Square frozen(Shape):    # ✅
+    side: float
+```
+
+The same applies to generics — type parameters sit before `frozen`: `class Stack[T] frozen:`, `class Stack[T] frozen(BaseStack):`.
+
+## 17. Unannotated `*args` / `**kwargs`
+
+Rule 1 (every parameter annotated) extends to variadic parameters since v0.9.0. Canonical idiom for genuinely variadic functions is `object`:
+
+```python
+def trace(f, *args, **kwargs):                    # ❌ tyc::missing_annotation on each
+    ...
+
+def trace[R](f: Callable[..., R], *args: object, **kwargs: object) -> R:    # ✅
+    return f(*args, **kwargs)
+```
+
+## 18. `func[T](args)` for explicit type instantiation
+
+Rejected at check time since v0.9.0. Let the binding type drive inference instead:
+
+```python
+let p = pair[int](1, 2)            # ❌ tyc::operator_type_mismatch
+let p: tuple[int, int] = pair(1, 2)  # ✅ T inferred from the binding
+let empty: list[int] = first([])     # ✅ for inference-failing positions
+```
+
+## 19. `?` inside a comprehension
+
+Comprehensions lower to nested loops in Python, so the surrounding function frame `?` would short-circuit out of is *not* the comprehension's frame:
+
+```python
+def collect(xs: list[str]) -> Result[list[int], str]:
+    return Ok([parse(x)? for x in xs])   # ❌ tyc::invalid_question_op
+```
+
+Pre-extract with an explicit loop, or chain `.and_then` / `.map`:
+
+```python
+def collect(xs: list[str]) -> Result[list[int], str]:
+    mut out: list[int] = []
+    for x in xs:
+        out.append(parse(x)?)
+    return Ok(out)
+```
+
+## 20. `freeze let X = SomeMutableClass()`
+
+The check pass validates the RHS of every `freeze let` since v0.9.0. Constructing a non-`frozen` user class on the RHS now fires `tyc::freeze_not_freezable` at check time instead of failing at first import:
+
+```python
+class Counter:                   # not frozen
+    value: int
+
+freeze let CFG = Counter(value=0)   # ❌ tyc::freeze_not_freezable
+```
+
+Mark the class `frozen`, switch to a built-in container (`list` / `dict` / `set` wrap automatically), or use a plain `let`.
+
+## 21. Heterogeneous variant inside a generic sealed union
+
+`Cons[T]` flowing into `LL[T]` works since v0.9.0:
+
+```python
+type LL[T] = Cons[T] | Nil[T]
+
+def length[T](xs: LL[T]) -> int:
+    mut cur: LL[T] = xs
+    while True:
+        match cur:
+            case Nil(): return 0
+            case Cons(_, tail):
+                cur = tail            # ✅ since v0.9.0 — was type_mismatch before
+```
+
+Before v0.9.0 the assignment fired `tyc::type_mismatch` because the variant wasn't recognised as assignable to the parametric alias. The fix is automatic — rebuild against tyc ≥ v0.9.0.
+
 ## Where next
 
 - [Python Habits to Drop](/Typhon/pitfalls/python-habits/) — patterns that work in Python but fight Typhon.

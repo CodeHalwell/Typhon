@@ -94,6 +94,32 @@ error[tyc::comptime_env_missing]: required environment variable `DATABASE_URL` i
 
 No quiet `KeyError: 'DATABASE_URL'` at the first request in production.
 
+## `comptime let T: type` — types as values (v0.5.0; PEP 695 lowering in v0.9.0)
+
+A `comptime let` can also hold a *type*, in which case the binding is substituted wherever the alias appears in an annotation:
+
+```python
+# Typhon
+comptime let IdKind: type = int
+
+def lookup(id: IdKind) -> User?:
+    return USERS.get(id)
+```
+
+```python
+# Emitted Python
+type IdKind = int
+
+def lookup(id: IdKind) -> User | None:
+    return USERS.get(id)
+```
+
+Since v0.9.0 the lowering emits a PEP 695 `type IdKind = int` alias statement. The substitution also runs before `tyc check` parses the resolved module so check, build, and `tyc run` all see the same shape — no more "alias resolves at build but not at check" drift.
+
+## VM substitution parity (v0.9.0)
+
+The in-process VM (`tyc run`) used to skip the substitution pass, so `comptime let PORT = int(env("PORT", "8080"))` crashed under `tyc run` with `NameError: env is not defined` even when the same source built cleanly. Since v0.9.0 the VM pipeline runs the same substitution pass as `tyc build`, so the inlined literal is what the VM sees.
+
 ## Sandbox
 
 Implementation in `tyc-analyse`. Walks the comptime AST, producing a `ComptimeValue` enum:
@@ -104,10 +130,11 @@ enum ComptimeValue {
     Float(f64),
     Str(String),
     Bool(bool),
+    Type(/* ... */),  // v0.5.0
 }
 ```
 
-Supported operations: literals, arithmetic, comparisons, boolean ops, ternaries, `env()`, `int()/str()/float()/bool()`, parameter and local-binding references, `if/elif/else`, `return`, `comptime def` calls.
+Supported operations: literals, arithmetic, comparisons, boolean ops, ternaries, `env()`, `int()/str()/float()/bool()`, parameter and local-binding references, `if/elif/else`, `return`, `comptime def` calls, and types-as-values via the `type` lattice (v0.5.0).
 
 Not supported (in v1): containers, string methods, loops, I/O, time, random, imports, exceptions. See [`comptime` reference](/Typhon/reference/comptime/) for the full contract.
 

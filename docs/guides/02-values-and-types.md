@@ -114,6 +114,30 @@ def main() -> None:
     greet(found)                 # ✅ everything after the guard sees `str`
 ```
 
+Since v0.9.0 the checker also narrows under `assert x is not None`:
+
+```python
+def display(name: str?) -> str:
+    assert name is not None
+    return name.upper()          # ✅ narrowed to str
+```
+
+`assert` is a runtime check that raises `AssertionError` on the false branch. Treat it as a "this can't happen" checkpoint inside functions that already validated their inputs — running Python with `-O` disables `assert`, so safety-critical narrowing should still go through `guard` or `if x is None: return`.
+
+And — also since v0.9.0 — after a `while` loop whose test is "this value is `None`" and whose body reassigns the binding (no `break`), the post-loop value is narrowed to non-`None`:
+
+```python
+def first_loaded(sources: list[Loader]) -> Config:
+    mut cfg: Config? = None
+    mut i: int = 0
+    while cfg is None:
+        cfg = sources[i].load()
+        i = i + 1
+    return cfg                   # ✅ narrowed to Config since v0.9.0
+```
+
+This matches the narrowing applied by `pyright`, `mypy`, and `pyrefly`.
+
 ### `guard` for early-return narrowing
 
 A common pattern — bail out on `None`, then use the value — has dedicated sugar:

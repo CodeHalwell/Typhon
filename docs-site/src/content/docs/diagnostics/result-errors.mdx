@@ -7,7 +7,9 @@ sidebar:
 
 ## `tyc::invalid_question_op`
 
-`?` used in a function whose return type isn't a compatible `Result`:
+`?` is rejected in two situations (the v0.9.0 help text covers both explicitly):
+
+### 1. Outside a `Result`-returning function
 
 ```python
 def f() -> int:
@@ -23,6 +25,25 @@ def f() -> Result[int, str]:
     return Ok(n)
 ```
 
+### 2. Inside a comprehension
+
+Comprehensions lower to nested `for`-loops in Python, so the surrounding function frame `?` would short-circuit out of is *not* the comprehension's frame:
+
+```python
+def collect(xs: list[str]) -> Result[list[int], str]:
+    return Ok([parse(x)? for x in xs])   # ❌ — `?` inside a comprehension
+```
+
+**Fix:** pre-extract with an explicit loop, or chain with `.and_then` / `.map`:
+
+```python
+def collect(xs: list[str]) -> Result[list[int], str]:
+    mut out: list[int] = []
+    for x in xs:
+        out.append(parse(x)?)
+    return Ok(out)
+```
+
 ## `tyc::result_error_mismatch`
 
 `?` short-circuits an `Err[E1]` to a function returning `Result[T, E2]` where `E1` is not assignable to `E2`:
@@ -35,7 +56,15 @@ def f() -> Result[int, AppError]:
     return Ok(n)
 ```
 
-**Fix:** convert at the boundary.
+**Fix:** convert at the boundary with `.map_err`:
+
+```python
+def f() -> Result[int, AppError]:
+    let n: int = parse_str().map_err(lambda msg: AppError(message=msg))?
+    return Ok(n)
+```
+
+Or unfold the bridge with `match`:
 
 ```python
 def f() -> Result[int, AppError]:
@@ -45,6 +74,8 @@ def f() -> Result[int, AppError]:
         case Err(msg):
             return Err(AppError(message=msg))
 ```
+
+Since v0.8.0 the same check fires inside `with`-chain `?`-bindings — every binding's implicit propagation path is validated against the enclosing function's declared error type. Since v0.9.0 the explicit `else err: return Err(err)` form goes through the same check too; previously the validation was gated on the synthetic `?`-op temp shape, so an `else` block could silently return an `Err` whose payload type didn't match the function's declared return.
 
 ## `tyc::result_unused` (reserved)
 

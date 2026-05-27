@@ -128,6 +128,36 @@ The `else err:` block is optional. Without it, the first `Err` short-circuits st
 
 For one or two calls, `?` on each line reads fine.
 
+## Combinators — `.map`, `.map_err`, `.and_then`, `.or_else`
+
+For functional-style chaining, `Ok` and `Err` carry four combinator methods on the runtime classes:
+
+```python
+def parse_and_double(raw: str) -> Result[int, str]:
+    return parse_port(raw).map(lambda n: n * 2)
+
+def parse_to_app(raw: str) -> Result[int, AppError]:
+    return parse_port(raw).map_err(lambda msg: AppError(message=msg))
+
+def step(raw: str) -> Result[Loaded, AppError]:
+    return (
+        parse_port(raw)
+            .map_err(lambda msg: AppError(message=msg))
+            .and_then(load_from_port)
+    )
+```
+
+| Method | On `Ok(v)` | On `Err(e)` |
+|---|---|---|
+| `.map(f)` | `Ok(f(v))` | `Err(e)` |
+| `.map_err(g)` | `Ok(v)` | `Err(g(e))` |
+| `.and_then(f)` | `f(v)` (must return `Result`) | `Err(e)` |
+| `.or_else(h)` | `Ok(v)` | `h(e)` (must return `Result`) |
+
+The combinators landed in v0.6.0 and have always worked under `tyc build && python build/main.py`. Since v0.9.0 they also work under `tyc run` — the in-process VM now binds the combinator methods natively, so a typecheck-clean program no longer crashes with `AttributeError: Ok has no attribute 'and_then'` under the default execution mode.
+
+The choice between `with`-chain + `?` and method chaining is style. `with`-chains tend to read better when each step uses the previous step's success value by name; combinator chains tend to read better when each step is a function-of-one-argument.
+
 ## Choosing your error type
 
 `E` in `Result[T, E]` can be anything. Three patterns by complexity:

@@ -94,6 +94,35 @@ let head, *rest = [1, 2, 3, 4]      # head: int, rest: list[int]
 
 `*rest` follows Python's semantics. All destructured names take the `let`/`mut` of the enclosing keyword.
 
+### Annotated tuple unpacking
+
+For typed destructuring, the per-element form annotates each name individually (v0.3.1):
+
+```python
+let (a: int, b: str) = func(x, y)   # both elements typed
+let (a: int, b)      = pair()        # b's type inferred from the RHS
+let (a, b)           = pair()        # both inferred
+```
+
+The outer-annotation form is also accepted (v0.8.0):
+
+```python
+let (a, b): tuple[int, str] = pair()
+```
+
+Both forms parse under `tyc check` and `tyc run` since v0.9.0 — the typed-element form was previously rejected by the VM's pre-parse, so multi-file projects could split on which path they ran.
+
+## `*args` and `**kwargs` annotation policy
+
+Variadic parameters are subject to Rule 1 (every parameter annotated) since v0.9.0. For genuinely variadic functions (typically generic decorators), the canonical idiom is `object`:
+
+```python
+def trace[R](f: Callable[..., R], *args: object, **kwargs: object) -> R:
+    return f(*args, **kwargs)
+```
+
+`object` is the honest spelling for "any value" at the boundary; the body still needs to narrow with `isinstance` to do anything type-specific.
+
 ## Shadowing
 
 Typhon does **not** allow shadowing a binding with another `let` /

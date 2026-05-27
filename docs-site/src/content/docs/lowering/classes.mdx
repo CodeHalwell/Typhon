@@ -59,6 +59,56 @@ import { Tabs, TabItem } from '@astrojs/starlight/components';
 
 Field reassignment is a hard error (`tyc::frozen_assign`); runtime raises `FrozenInstanceError`.
 
+### `frozen` + inheritance
+
+The `frozen` modifier sits **between** the class name and the parenthesised base list:
+
+<Tabs>
+  <TabItem label="Typhon">
+    ```python
+    class Square frozen(Shape):
+        side: float
+    ```
+  </TabItem>
+  <TabItem label="Emitted">
+    ```python
+    @dataclass(slots=True, frozen=True)
+    class Square(Shape):
+        side: float
+    ```
+  </TabItem>
+</Tabs>
+
+`class Square(Shape) frozen:` (with the modifier *after* the base list) does not parse. The same rule applies to generics: `class Stack[T] frozen:`, `class Stack[T] frozen(BaseStack):`.
+
+## Mutable-default factory rewrite
+
+Mutable-literal defaults (`[]`, `{}`, `set()`, `list()`, `dict()`) on a `class` body are rewritten to `dataclasses.field(default_factory=...)` so each instance gets its own fresh container:
+
+<Tabs>
+  <TabItem label="Typhon">
+    ```python
+    class Bucket:
+        items: list[str] = []
+        tags: dict[str, int] = {}
+    ```
+  </TabItem>
+  <TabItem label="Emitted">
+    ```python
+    from dataclasses import dataclass, field
+
+    @dataclass(slots=True)
+    class Bucket:
+        items: list[str] = field(default_factory=list)
+        tags: dict[str, int] = field(default_factory=dict)
+    ```
+  </TabItem>
+</Tabs>
+
+The rewrite applies to `class` and `class frozen` (the per-instance factories work with `frozen=True`'s `object.__setattr__`-driven `__init__`). It is *not* applied to `model` (Pydantic handles mutable defaults itself), `interface` (Protocol — no `__init__`), or `class!` (escape hatch — user owns the body verbatim). Since v0.9.0 the in-process VM (`tyc run`) also runs the factory per instance — before v0.9.0 the VM shared one container across every instance, diverging from the compiled path.
+
+`tyc::class_attr_shadows_slot` correspondingly does *not* fire on mutable-literal defaults — those become per-instance fields, not class-level slot descriptors. The warning still fires on immutable literals (`int = 3`, `str = "x"`) where the slot-descriptor pitfall applies; annotate those as `ClassVar[T]`.
+
 ## `impl ... :` merges into class body
 
 <Tabs>
@@ -175,6 +225,40 @@ Multiple `impl` blocks (across files) all merge.
 - **No `@dataclass` decorator.**
 - **`__init__` is auto-synthesised** — calls `super().__init__()` first, then assigns annotated fields in source order. The compiler strips class-level defaults that would otherwise be evaluated twice (once at class-definition time as a shared class attribute, then again per-instance in `__init__`).
 - **Hand-written `__init__` is preserved verbatim** for cases where the base class needs configuration arguments that aren't 1:1 with declared fields.
+
+### Typed exceptions
+
+A common `class!` pattern is a typed exception subclass — extending `Exception` with structured fields the handler can read:
+
+<Tabs>
+  <TabItem label="Typhon">
+    ```python
+    class! HttpError(Exception):
+        code: int
+        message: str
+
+    def fetch(url: str) -> str:
+        raise HttpError(code=404, message="not found")
+    ```
+  </TabItem>
+  <TabItem label="Emitted">
+    ```python
+    class HttpError(Exception):
+        code: int
+        message: str
+
+        def __init__(self, code: int, message: str) -> None:
+            super().__init__()
+            self.code = code
+            self.message = message
+
+    def fetch(url: str) -> str:
+        raise HttpError(code=404, message="not found")
+    ```
+  </TabItem>
+</Tabs>
+
+Since v0.9.0 the synthesised `__init__` also runs under the in-process VM (`tyc run`); before v0.9.0 the VM didn't construct user-class instances for `class!`-declared exception types, so `except HttpError as e: print(e.code)` raised `AttributeError` at runtime. Exception-type matching also walks the MRO under the VM since v0.9.0, so `except HttpError` matches subclasses.
 
 ## Auto-skip for framework bases
 

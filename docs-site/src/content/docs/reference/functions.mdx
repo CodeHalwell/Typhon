@@ -73,14 +73,27 @@ connect("localhost", 5433)              # ❌ port is keyword-only
 
 ## `*args` and `**kwargs`
 
-Each must be annotated:
+Each must be annotated — Rule 1 (every parameter annotated) extends to variadic parameters since v0.9.0:
 
 ```python
 def log_all(*messages: str, **tags: str) -> None:
     # messages: tuple[str, ...]
     # tags:     dict[str, str]
     ...
+
+def trace(f, *args, **kwargs):       # ❌ tyc::missing_annotation on every param
+    ...
 ```
+
+For genuinely variadic functions (typically generic decorators or `**kwargs` forwarders), the canonical idiom is `object`:
+
+```python
+def trace[R](f: Callable[..., R], *args: object, **kwargs: object) -> R:
+    log(f.__name__, args, kwargs)
+    return f(*args, **kwargs)
+```
+
+If you know the shape — say every variadic argument is a `str` — type it concretely. `object` is the escape hatch for "really any value"; it is honest about the lack of static knowledge without falling back to the implicit-`Any` path.
 
 ## Decorators
 
@@ -113,7 +126,16 @@ def pair[T, U](a: T, b: U) -> tuple[T, U]: ...
 def smallest[T: Ordered](xs: list[T]) -> T?: ...
 ```
 
-See [Generics](/Typhon/types/generics/) for the full reference.
+### Explicit type instantiation is not supported
+
+```python
+def identity[T](x: T) -> T: return x
+
+let y: int = identity[int](7)        # ❌ check-time error since v0.9.0
+let y: int = identity(7)             # ✅ T inferred from the argument
+```
+
+Type parameters are always inferred from arguments and the call-site expected type. `f[T](args)` used to crash at runtime with `TypeError: 'function' object is not subscriptable`; v0.9.0 fires a clear check-time error pointing users at the inference pattern. See [Generics](/Typhon/types/generics/) for the full reference.
 
 ## `async def`
 
@@ -139,6 +161,22 @@ def f() -> int:
 ```
 
 `raise` counts as an exit at runtime. Prefer exhaustive `match` over sealed unions for guaranteed full-coverage control flow.
+
+### `while True:` reachability (v0.9.0)
+
+The reachability analyser recognises infinite loops whose body always exits via `return` / `raise` on every branch and contains no `break`. The post-loop point is unreachable, so `tyc::missing_return` does not fire:
+
+```python
+def serve() -> Never:
+    while True:
+        let req: Request = accept()
+        if req.is_quit():
+            raise SystemExit
+        handle(req)
+    # post-loop point is unreachable since v0.9.0 — no fall-through warning
+```
+
+Adding a `break` anywhere in the body re-enables the fall-through check, so loops that exit cleanly still need a post-loop `return`.
 
 ## Lambdas
 
