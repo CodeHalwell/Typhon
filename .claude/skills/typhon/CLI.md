@@ -122,6 +122,10 @@ Compile-only flags are rejected by clap unless `--compile` is also passed. The s
 
 **v0.3.1:** `tyc run` (VM mode) gates on the static `tyc check` pipeline first — unresolved names, type mismatches, and arity errors fail the same way `tyc check` would. Set `TYC_SKIP_CHECK=1` to bypass. `--compile` mode always gates on the full `tyc build` pipeline (no equivalent bypass).
 
+**v0.8.0:** `tyc run --compile` rejects single-file inputs up-front with an actionable error pointing at the project-style layout (compile mode requires `typhon.toml`-driven multi-file mode because the emitter writes `build/main.py` + `build/typhon_runtime/...` alongside).
+
+**v0.9.0:** the VM now handles multi-file projects natively. Sibling `.ty` modules under the project source root load on demand; relative imports (`from .repo import x`, `from ..pkg.users import load`) resolve through a `Value::Module` cache. `tyc run --compile` now spawns `python -m <pkg>.main` instead of `python build/main.py` so relative imports in the entry point resolve correctly under the compiled path too. The VM also gained `Result` combinators, write/append/binary `open()` modes, class patterns on built-in types, `frozenset` dict keys, deep `freeze let`, comptime substitution, `lazy import np = numpy`, `class!` exception fields, `dataclasses.field(default_factory=...)` per-instance factories, and native shims for `collections.deque` / `heapq` / `contextlib` / `pydantic`. See [RUNTIME.md](RUNTIME.md) §2.4–§2.4c for the full surface.
+
 See [RUNTIME.md](RUNTIME.md) for the VM's full feature surface and the fallback rules.
 
 ---

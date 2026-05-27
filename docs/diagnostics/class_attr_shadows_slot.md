@@ -55,4 +55,22 @@ pub type Ty = TyInt | TyFloat | TyStr
 Drop the placeholder fields and the warning disappears. Construction stays
 nullary: `TyInt()`, `TyFloat()`, `TyStr()`.
 
+## Mutable-default carve-out (v0.9.0)
+
+Since v0.9.0 the warning no longer false-positives on classes whose
+only annotated defaults are mutable literals (`list[str] = []`,
+`dict[str, int] = {}`, `set[int] = set()`). Those defaults are
+rewritten at desugar time into `default_factory` calls, so each
+instance gets its own list/dict/set rather than sharing a single
+constant — and the warning's "looks like a constants namespace"
+heuristic no longer applies.
+
+```ty
+class Bucket:
+    items: list[str] = []   # ✓ no warning since v0.9.0 — per-instance factory
+```
+
+The warning still fires on immutable literals (`int = 3`, `str = "x"`),
+where the slot-descriptor pitfall actually applies.
+
 See https://typhon.dev/lang/diagnostics/class_attr_shadows_slot

@@ -56,6 +56,167 @@ The canonical per-feature status lives in the [Roadmap](/Typhon/project/roadmap/
 - ✅ CI (`cargo fmt`, `clippy -D warnings`, `cargo test --workspace`, `cargo-deny`).
 - ✅ Generated `typhon_runtime/` ships as local source — no PyPI dependency.
 
+## Landed in v0.9.0 (stress-test cleanup release)
+
+The stress-test cleanup release on top of v0.8.1. Closes **32 of the
+36 findings** from a v0.8.1 stress sweep spanning the type checker,
+VM, parser, lowering passes, diagnostics, and CLI. The VM is now
+usable as the daily-driver runner the docs always advertised; the
+type checker plugs silent-correctness gaps in covariance, variant
+flow, narrowing, and error propagation; the diagnostic surface gets
+a polish pass.
+
+The release is additive on the accepted surface — every
+previously-accepted program continues to type-check, and the new VM
+features expand what `tyc run` accepts rather than narrowing it.
+
+### Added — VM coverage (closing the gap between `tyc run` and `tyc build && python build/main.py`)
+
+- ✅ **`Result` combinators** (`.map` / `.map_err` / `.and_then` /
+  `.or_else`) now work on `Ok` / `Err` values in the VM via bound
+  `NativeFn` wrappers that capture the receiver. Previously a
+  typecheck-clean program crashed at run-time with
+  `AttributeError: Ok has no attribute 'and_then'`.
+- ✅ **`open()` honours write / append / binary modes.**
+  `open(p, "w")` / `open(p, "a")` / `open(p, "wb")` / `open(p, "r+")`
+  and friends now all work. `with`-blocks honour `__enter__` /
+  `__exit__` on the resulting file. `json.load` / `json.dump` ride
+  on top.
+- ✅ **Match against built-in class patterns.**
+  `match x: case str() as s:` / `case int() as n:` / etc. now
+  matches; the exhaustiveness pass also recognises `case None:` +
+  `case str() as s:` as covering `str?`.
+- ✅ **`frozenset(...)` is hashable as a dict key** (new
+  `HashKey::FrozenSet` variant with insertion-order-independent
+  hashing).
+- ✅ **f-string `_` thousands separator** emits the same way `,`
+  does.
+- ✅ **`bytes` repr matches CPython.** `b'hi'` (single quotes by
+  default), `b"with 'embedded'"` fallback, `\xNN` for non-printable.
+- ✅ **Native shims for `collections.deque`, `heapq`, `contextlib`,
+  `pydantic`.** Graph / queue / heap algorithms, `@contextmanager`
+  identity decorators, and `model` class declarations all run
+  cleanly. `deque` rides on `Value::List` via new `popleft` /
+  `appendleft` / `extendleft` / `rotate` list methods. `pydantic.BaseModel`
+  is a placeholder so declaring a `model` doesn't `ImportError`.
+- ✅ **`@property` / `@classmethod` / `@staticmethod` / `super()`**
+  builtins are present as identity-ish stubs so decorated methods no
+  longer crash on import.
+- ✅ **`lazy import np = numpy`** uses the simpler `import M as N`
+  rewrite in VM mode (the descriptor-based proxy class the build
+  path emits has nothing to bind against in a tree-walking VM).
+- ✅ **Multi-file projects run under both `tyc run` modes.** The VM
+  loads sibling `.ty` modules from the project source root, honours
+  relative imports (`from .repo import x`), and caches each module's
+  bindings as a `Value::Module`. `tyc run --compile` now spawns
+  `python -m <pkg>.main` instead of `python build/main.py` so
+  relative imports in the entry point resolve correctly.
+- ✅ **`dataclasses.field(default_factory=list)` actually invokes
+  the factory per instance.** The mutable-default rewrite no longer
+  shares one list across every instance.
+- ✅ **`class!` synthesised `__init__` runs.** `except HttpError as
+  e: print(e.code)` works against `class! HttpError(Exception):
+  code: int; message: str` — the handler binds the user `Instance`,
+  and exception-type matching walks the MRO.
+- ✅ **`freeze let CFG = {...}` actually freezes** (list → tuple,
+  dict → mappingproxy-tagged dict, recursive). Mutators on a frozen
+  dict raise the same `TypeError` CPython's `MappingProxy` does.
+- ✅ **`comptime let X = ...` inlines in the VM** via the
+  substitution pass shared with `tyc build`. `comptime let PORT =
+  int(env(...))` no longer crashes with `NameError: env is not
+  defined`.
+- ✅ **Typed tuple unpack `let (a: int, b: str) = pair()` parses
+  in the VM** (parity with `tyc check`).
+
+### Added — type checker
+
+- ✅ **Read-view covariance** for built-in containers.
+  `list[Subclass]` / `tuple[Subclass]` / `set[Subclass]` /
+  `frozenset[Subclass]` flow into `Sequence[Super]` /
+  `Iterable[Super]` / `Iterator[Super]` / `Collection[Super]` /
+  `Container[Super]` / `Reversible[Super]` when `Subclass` inherits
+  `Super`. Mapping / MutableMapping cover `dict[K, V]` (K invariant,
+  V covariant).
+- ✅ **Variant → parametric sealed union assignability.** `Cons[T]`
+  / `Cons` (where `type LL[T] = Cons[T] | Nil`) is assignable into
+  `LL[T]`. Required for recursive ADT walks like `mut cur: LL[T] =
+  self`.
+- ✅ **`while True:` reachability.** A loop whose body always
+  returns / raises on every branch and contains no `break` is
+  recognised as exiting; the post-loop point is unreachable and
+  `missing_return` doesn't fire.
+- ✅ **Post-while-loop narrowing.** After `while y is None: y =
+  load()` (no `break`), the post-loop `y` is narrowed to non-None.
+  Matches pyright / mypy / pyrefly.
+- ✅ **`assert x is not None` narrows.** The standard Python static-
+  checker idiom now works.
+- ✅ **`*args` / `**kwargs` require annotations** (Rule 1).
+  Canonical idiom is `*args: object` / `**kwargs: object`.
+- ✅ **`extend list:` dispatches on `list[T]`-annotated receivers.**
+  The synthetic `__typhon_builtin_ext_list` class shape is
+  consulted before `attribute_not_found` fires.
+- ✅ **Exhaustive `match` on `T?` recognises built-in class
+  patterns.** `case None: ...; case str() as s: ...` against `str?`
+  no longer surfaces `missing_return`.
+- ✅ **`with`-chain explicit `else err: return Err(err)` validates
+  the error type** against the function's declared return.
+  Previously the check was gated on the synthetic `?`-op temp
+  shape, so a `with`-chain could silently return the wrong error
+  class.
+- ✅ **`func[T](args)` explicit type instantiation** now fires a
+  clear check-time error (was: runtime `'function' object is not
+  subscriptable`).
+- ✅ **`comptime let T: type = int`** lowers to a PEP 695
+  `type T = int` alias statement so `T` is substitutable wherever a
+  type is expected. `tyc check` also runs the substitution before
+  parsing the resolved module so check mode sees the same shape as
+  build.
+- ✅ **`freeze let X = <expr>` validates the freezability of the
+  RHS at check time.** New `tyc::freeze_not_freezable` fires when
+  the RHS constructs a non-`frozen` user class, instead of letting
+  the failure surface as a runtime `TypeError` at first import.
+- ✅ **`pub *` name collisions surface in `tyc check`** (not just
+  `tyc build`). The detection logic from `tyc build` is exposed as
+  `detect_pub_star_diagnostics` and called from the check command
+  before the per-file loop so CI catches collisions before they
+  reach build.
+
+### Added — diagnostics polish
+
+- ✅ **`interface_not_conforming` arity message** now reads "got N
+  non-self parameter(s), expected M" instead of the ambiguous
+  "arity N; expected M".
+- ✅ **`invalid_question_op` help text** mentions both the
+  `Result`-return cause AND the comprehension carve-out.
+- ✅ **Sealed-union impl distribution dedupe.** `impl Alias:` over
+  a sealed union duplicates each method body across every variant;
+  the type-checker dedupes diagnostics by `(code, rendered
+  message)` so a 10-variant union no longer reports 10 identical
+  errors.
+- ✅ **`class_attr_shadows_slot` no longer false-positives** on a
+  class whose only annotated defaults are mutable literals
+  (`list[str] = []` etc.). Those become `default_factory`
+  per-instance fields, not shared constants.
+- ✅ **`MissingAnnotation` text** drops the double-backtick
+  wrapping (was rendered as `` `parameter `x`` ``).
+
+### Added — language docs
+
+- ✅ Cheat sheet documents `class X frozen(Base):` (the modifier
+  comes BETWEEN the class name and the base list) and the
+  `*args: object` / `**kwargs: object` idiom for genuinely
+  variadic functions.
+
+### Known limitations carried forward
+
+- ⏳ **Preprocess line-number leakage (B15)** — diagnostics still
+  report preprocessed-buffer line numbers for `impl Alias:`
+  distribution over sealed unions. The dedupe pass above cuts the
+  *count* of noise diagnostics, but each surviving diagnostic still
+  points at a synthetic line index past EOF of the original source.
+  Tracked for the next release — needs a proper source-map rewrite
+  through the diagnostic constructors.
+
 ## Landed in v0.8.1 (bugfix point release)
 
 A strict bugfix point release on top of v0.8.0. No language, runtime,

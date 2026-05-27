@@ -96,14 +96,17 @@ def main() -> None:
 
 ### `tyc::missing_annotation` — error
 
-A function parameter or return type lacks an explicit annotation. Every parameter and return type is annotated; functions that return nothing must spell `-> None`.
+A function parameter or return type lacks an explicit annotation. Every parameter and return type is annotated; functions that return nothing must spell `-> None`. Since v0.9.0 `*args` / `**kwargs` are also enforced — the canonical idiom for genuinely variadic functions is `*args: object` / `**kwargs: object`. The v0.9.0 diagnostic text also drops the double-backtick wrapping the previous renderer produced (was `` `parameter `x`` ``).
 
 ```ty
 def greet(name):       # error: missing annotation on `name`
     return f"hi {name}"
+
+def trace(f, *args, **kwargs):    # error since v0.9.0
+    ...
 ```
 
-**Fix:** `def greet(name: str) -> str: …`
+**Fix:** `def greet(name: str) -> str: …`; `def trace[R](f: Callable[..., R], *args: object, **kwargs: object) -> R: …`
 
 ### `tyc::implicit_any` — error (controlled by `[strictness] no-implicit-any`)
 
@@ -399,6 +402,8 @@ class Limits:
 
 **Fix:** Annotate as `ClassVar[int]`. For nullary sealed-union variants, use `class Foo frozen: pass` and match with `case Foo():`.
 
+Since v0.9.0 the warning no longer false-positives on classes whose only annotated defaults are mutable literals (`list[str] = []`, `dict[str, int] = {}`, `set[int] = set()`). Those defaults are rewritten at desugar time into `default_factory` calls — each instance gets its own value rather than sharing a single constant.
+
 ### `tyc::field_default_ordering` — error (v0.7.0)
 
 A non-defaulted field declared after a defaulted one. The synthesised `__init__` would raise `TypeError` at import time. Checked for `class`, `class frozen`, `class!`, and `plain class`; skipped for `model`/Pydantic and `interface`/Protocol.
@@ -423,6 +428,26 @@ id.name = "Bob"        # error
 ```
 
 **Fix:** Construct a new value instead of mutating.
+
+### `tyc::freeze_not_freezable` — error (v0.9.0)
+
+`freeze let X = <expr>` where the RHS constructs a non-`frozen` user class. Before v0.9.0 the failure surfaced as a runtime `TypeError` at first import; v0.9.0 pre-validates the RHS at check time.
+
+```ty
+class Counter:                       # not frozen
+    value: int
+
+freeze let CFG = Counter(value=0)    # ❌ tyc::freeze_not_freezable
+```
+
+**Fix:** Mark the class `frozen`, switch to a built-in container (list/dict/set get wrapped automatically), or use a plain `let` if mutability is wanted.
+
+```ty
+class Counter frozen:
+    value: int
+
+freeze let CFG = Counter(value=0)    # ✓
+```
 
 ### `tyc::missing_field_init` — error
 
@@ -449,7 +474,7 @@ if isinstance(x, Writer): ...   # error
 
 ### `tyc::interface_not_conforming` — error
 
-A concrete type is used where an interface is required and is missing members or has incompatible signatures.
+A concrete type is used where an interface is required and is missing members or has incompatible signatures. v0.8.0 added position-by-position (contravariant) parameter-type checking on top of arity. Since v0.9.0 the arity diagnostic reads "got N non-self parameter(s), expected M" instead of the ambiguous "arity N; expected M".
 
 ```ty
 emit(Sink(), "hi")    # error: Sink lacks `write`
@@ -510,14 +535,28 @@ n()                   # error: `int` is not callable
 
 ### `tyc::invalid_question_op` — error
 
-`?` outside a `Result`-returning function, or inside a comprehension (v0.3.1). `?` only makes sense where an `Err` can be forwarded.
+`?` outside a `Result`-returning function, or inside a comprehension (v0.3.1). `?` only makes sense where an `Err` can be forwarded. Since v0.9.0 the help text mentions both causes explicitly — the diagnostic surfaces in two situations:
+
+1. The enclosing function's return type can't hold the `Err`.
+2. The `?` appears inside a `for ... in ...` comprehension or generator expression — comprehensions lower to nested loops in Python, so the surrounding function frame `?` would short-circuit out of is not the comprehension's frame.
 
 ```ty
 def main() -> int:
-    return try_parse()?   # error: enclosing returns `int`, not `Result`
+    return try_parse()?                          # error: returns `int`, not `Result`
+
+def collect(xs: list[str]) -> Result[list[int], str]:
+    return Ok([parse(x)? for x in xs])           # error: `?` inside a comprehension
 ```
 
-**Fix:** Change the return type to `Result[T, E]`, or handle with `match`.
+**Fix:** Change the return type to `Result[T, E]`, pre-extract with an explicit loop, or handle with `match`:
+
+```ty
+def collect(xs: list[str]) -> Result[list[int], str]:
+    mut out: list[int] = []
+    for x in xs:
+        out.append(parse(x)?)
+    return Ok(out)
+```
 
 ### `tyc::result_error_mismatch` — error
 

@@ -554,7 +554,57 @@ The v0.3.0 → v0.9.0 line is **additive**. Every previously-accepted program co
 
 ### v0.9.0 — stress-test cleanup release
 
-The big v0.8.1 → v0.9.0 sweep. The VM now runs the surface the docs always advertised; the type checker plugs silent correctness gaps in covariance, variant flow, narrowing, and error propagation. See `CHANGELOG.md` for the full list of 32 closed findings.
+The big v0.8.1 → v0.9.0 sweep. Closes 32 of 36 findings from a v0.8.1 stress sweep. The VM now runs the surface the docs always advertised; the type checker plugs silent correctness gaps in covariance, variant flow, narrowing, and error propagation. See `CHANGELOG.md` for the full list.
+
+**VM coverage** (closing the gap between `tyc run` and `tyc build && python build/main.py`):
+
+- **`Result` combinators** (`.map` / `.map_err` / `.and_then` / `.or_else`) work on `Ok` / `Err` values in the VM via bound `NativeFn` wrappers (v0.9.0). Previously a typecheck-clean program crashed at run-time with `AttributeError: Ok has no attribute 'and_then'`.
+- **`open()` write / append / binary modes** (v0.9.0). `open(p, "w")` / `open(p, "a")` / `open(p, "wb")` / `open(p, "r+")` and friends work. `with`-blocks honour `__enter__` / `__exit__`. `json.load` / `json.dump` ride on top.
+- **Match against built-in class patterns** (v0.9.0). `match x: case str() as s:` / `case int() as n:` / etc. match; exhaustiveness recognises `case None:` + `case str() as s:` as covering `str?`.
+- **`frozenset(...)` hashable as a dict key** (v0.9.0) — new `HashKey::FrozenSet` variant with insertion-order-independent hashing.
+- **f-string `_` thousands separator** (v0.9.0) emits the same way `,` does.
+- **`bytes` repr matches CPython** (v0.9.0) — `b'hi'` by default, `b"with 'embedded'"` fallback, `\xNN` for non-printable bytes.
+- **Native shims for `collections.deque`, `heapq`, `contextlib`, `pydantic`** (v0.9.0). Graph / queue / heap algorithms, `@contextmanager` identity decorators, and `model` class declarations all run cleanly. `deque` rides on `Value::List` via new `popleft` / `appendleft` / `extendleft` / `rotate` list methods. `pydantic.BaseModel` is a placeholder.
+- **`@property` / `@classmethod` / `@staticmethod` / `super()`** builtins (v0.9.0) — identity-ish stubs so decorated methods don't crash on import.
+- **`lazy import np = numpy`** (v0.9.0) uses the simpler `import M as N` rewrite in VM mode (the descriptor-based proxy class the build path emits has nothing to bind against in a tree-walking VM).
+- **Multi-file projects** under both `tyc run` modes (v0.9.0). The VM loads sibling `.ty` modules from the project source root, honours relative imports (`from .repo import x`), and caches each module's bindings as a `Value::Module`. `tyc run --compile` spawns `python -m <pkg>.main` instead of `python build/main.py` so relative imports in the entry point resolve correctly.
+- **`dataclasses.field(default_factory=list)` invokes the factory per instance** (v0.9.0). `tags: list[str] = []` no longer shares one list across every instance.
+- **`class!` synthesised `__init__` runs** (v0.9.0). `except HttpError as e: print(e.code)` works against `class! HttpError(Exception): code: int; message: str` — the handler binds the user `Instance`, and exception-type matching walks the MRO.
+- **`freeze let CFG = {...}` actually freezes** (v0.9.0): list → tuple, dict → mappingproxy-tagged dict, recursive. Mutators on a frozen dict raise the same `TypeError` CPython's `MappingProxy` does.
+- **`comptime let X = ...` inlines in the VM** (v0.9.0) via the substitution pass shared with `tyc build`. `comptime let PORT = int(env(...))` no longer crashes with `NameError: env is not defined`.
+- **Typed tuple unpack `let (a: int, b: str) = pair()` parses in the VM** (v0.9.0; parity with `tyc check`).
+
+**Type checker** (silent-correctness gaps):
+
+- **Read-view covariance** (v0.9.0). `list[Subclass]` / `tuple[Subclass]` / `set[Subclass]` / `frozenset[Subclass]` flow into `Sequence[Super]` / `Iterable[Super]` / `Iterator[Super]` / `Collection[Super]` / `Container[Super]` / `Reversible[Super]`. Mapping / MutableMapping cover `dict[K, V]` (K invariant, V covariant).
+- **Variant → parametric sealed union assignability** (v0.9.0). `Cons[T]` / `Cons` (where `type LL[T] = Cons[T] | Nil`) is assignable into `LL[T]`. Required for recursive ADT walks like `mut cur: LL[T] = self`.
+- **`while True:` reachability** (v0.9.0). A loop whose body always returns/raises with no `break` is recognised as exiting; the post-loop point is unreachable and `missing_return` doesn't fire.
+- **Post-while-loop narrowing** (v0.9.0). After `while y is None: y = load()` (no `break`), `y` is narrowed to non-None after the loop.
+- **`assert x is not None` narrows** (v0.9.0) — the standard Python static-checker idiom works.
+- **`*args` / `**kwargs` require annotations** (v0.9.0; Rule 1). Canonical idiom is `*args: object` / `**kwargs: object`.
+- **`extend list:` dispatches on `list[T]`-annotated receivers** (v0.9.0). The synthetic `__typhon_builtin_ext_list` class shape is consulted before `attribute_not_found` fires.
+- **Exhaustive `match` on `T?` recognises built-in class patterns** (v0.9.0). `case None: ...; case str() as s: ...` against `str?` no longer surfaces `missing_return`.
+- **`with`-chain explicit `else err: return Err(err)` validates the error type** (v0.9.0). Previously the check was gated on the synthetic `?`-op temp shape, so a `with`-chain could silently return the wrong error class.
+- **`func[T](args)` explicit type instantiation** (v0.9.0) fires a clear check-time error instead of crashing at runtime with `'function' object is not subscriptable`.
+- **`comptime let T: type = int`** (v0.9.0) lowers to a PEP 695 `type T = int` alias so `T` is substitutable wherever a type is expected. `tyc check` runs the substitution before parsing the resolved module so check, build, and VM all see the same shape.
+- **`freeze let X = <expr>` validates freezability at check time** (v0.9.0). New `tyc::freeze_not_freezable` fires when the RHS constructs a non-`frozen` user class, instead of letting the failure surface as a runtime `TypeError` at first import.
+- **`pub *` name collisions surface in `tyc check`** (v0.9.0). The detection logic from `tyc build` is exposed as `detect_pub_star_diagnostics` and called from the check command, so CI catches collisions before they reach build.
+
+**Diagnostics polish** (v0.9.0):
+
+- **`interface_not_conforming` arity message** reads "got N non-self parameter(s), expected M" instead of the ambiguous "arity N; expected M".
+- **`invalid_question_op` help text** mentions both the Result-return cause AND the comprehension carve-out.
+- **Sealed-union impl distribution dedupes** diagnostics by `(code, rendered message)` so a 10-variant union no longer reports 10 identical errors.
+- **`class_attr_shadows_slot` no longer false-positives** on classes whose only annotated defaults are mutable literals (`list[str] = []` etc.). Those become `default_factory` per-instance fields.
+- **`MissingAnnotation` text** drops the double-backtick wrapping (was `` `parameter `x`` ``).
+
+**Docs** (v0.9.0):
+
+- Cheat sheet documents `class X frozen(Base):` (the modifier comes BETWEEN the class name and the base list, NOT after `(Base)`) and the `*args: object` / `**kwargs: object` idiom for genuinely variadic functions.
+
+**Known limitations carried forward**:
+
+- Preprocess line-number leakage (B15) — diagnostics still report preprocessed-buffer line numbers for `impl Alias:` distribution over sealed unions. The dedupe pass cuts the *count* of noise diagnostics but each surviving diagnostic still points at a synthetic line index past EOF of the original source.
 
 ### v0.8.1 — bugfix point release
 

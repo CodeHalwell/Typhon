@@ -67,11 +67,19 @@ tyc run --compile --temp      # legacy with ephemeral build dir
 `max`, `sum`, `sorted` (incl. `key=` / `reverse=`), `reversed`,
 `enumerate`, `zip`, `map`, `filter`, `all`, `any`, `next`, `iter`, `hex`,
 `bin`, `oct`, `chr`, `ord`, `round`, `input`, `hash`, `id`, `callable`,
-`open` (text-read only).
+`open` (read / write / append / binary modes since v0.9.0, plus
+`__enter__` / `__exit__` for `with` blocks). Decorator stubs
+`@property`, `@classmethod`, `@staticmethod`, and the `super()` call
+are present as identity-ish builtins since v0.9.0 so decorated
+methods no longer crash on import.
 
-Plus the result constructors `Ok` and `Err`, the singletons `True`,
-`False`, `None`, and the placeholder bases `object`, `Protocol`,
-`BaseModel`, `Generic`, `TypedDict`.
+Plus the result constructors `Ok` and `Err` (with the `.map` /
+`.map_err` / `.and_then` / `.or_else` combinators bound natively
+since v0.9.0), the singletons `True`, `False`, `None`, and the
+placeholder bases `object`, `Protocol`, `BaseModel`, `Generic`,
+`TypedDict`. `frozenset(...)` is hashable as a dict key since v0.9.0
+via a `HashKey::FrozenSet` variant with insertion-order-independent
+hashing.
 
 ### Native stdlib modules
 
@@ -88,9 +96,13 @@ Plus the result constructors `Ok` and `Err`, the singletons `True`,
 | `collections` (v0.8.0) | `OrderedDict`, `defaultdict` (no auto-default — explicit `default_factory` argument is recorded but not invoked), `Counter`, `namedtuple` |
 | `functools` (v0.8.0) | `lru_cache`, `cache`, `cached_property`, `reduce`, `partial` |
 | `itertools` (v0.8.0) | `chain`, `count`, `cycle` (materialise a bounded prefix), `accumulate`, `combinations`, `permutations`, `product`, `islice`, `takewhile`, `dropwhile`, `groupby` |
-| `dataclasses` (v0.8.0) | `dataclass`, `field`, `fields`, `asdict`, `astuple` |
+| `dataclasses` (v0.8.0) | `dataclass`, `field`, `fields`, `asdict`, `astuple`. v0.9.0: `field(default_factory=list)` actually invokes the factory per instance — `tags: list[str] = []` no longer shares one list across every instance |
 | `pathlib` (v0.8.0) | `Path` with `exists`, `read_text`, `write_text`, `parent`, `name`, `stem`, `suffix`, `with_suffix`, `joinpath` / `/` |
-| `typhon_runtime` | `Ok`, `Err`, `tasks.spawn`, `lazy.lazy_let`, `lazy.lazy_import` — the `spawn` shim runs synchronously |
+| `collections.deque` (v0.9.0) | Rides on `Value::List` via new `popleft` / `appendleft` / `extendleft` / `rotate` list methods. Graph / BFS / queue algorithms work end-to-end |
+| `heapq` (v0.9.0) | `heappush`, `heappop`, `heapify`, `heappushpop`, `heapreplace`, `nsmallest`, `nlargest` |
+| `contextlib` (v0.9.0) | `@contextmanager` identity decorator and `contextmanager`-decorated factories. `with` block honours the wrapped `__enter__` / `__exit__` shape |
+| `pydantic` (v0.9.0) | `BaseModel` is a placeholder so declaring a `model` doesn't `ImportError`. `model_dump` / `model_validate` are stubs — round-tripping a model under `tyc run` still requires `--compile` for full Pydantic semantics |
+| `typhon_runtime` | `Ok`, `Err`, `tasks.spawn`, `lazy.lazy_let`, `lazy.lazy_import` — the `spawn` shim runs synchronously. `Ok` / `Err` carry bound `.map` / `.map_err` / `.and_then` / `.or_else` combinators since v0.9.0 |
 
 Any other module raises `ImportError` with a pointer to `--compile`.
 
@@ -108,6 +120,44 @@ Any other module raises `ImportError` with a pointer to `--compile`.
   operators `|`, `&`, `-`, `^`.
 - `tuple`: `count`, `index`.
 - `int`: `bit_length`. `float`: `is_integer`.
+- `bytes`: `repr` matches CPython byte-for-byte (`b'hi'` by default,
+  `b"with 'embedded'"` fallback, `\xNN` for non-printable bytes).
+
+## Multi-file projects
+
+Since v0.9.0 the VM loads sibling `.ty` modules from the project source
+root, honours relative imports (`from .repo import x`), and caches each
+module's bindings as a `Value::Module`. So a project laid out as
+
+```
+src/
+  main.ty
+  repo/
+    __init__.ty
+    users.ty
+```
+
+with `from .repo.users import load` in `main.ty` runs under `tyc run`
+without any `.py` emission. `tyc run --compile` now spawns
+`python -m <pkg>.main` instead of `python build/main.py` so relative
+imports in the entry point resolve correctly.
+
+## Comptime, freeze, lazy
+
+- `comptime let X = ...` inlines in the VM via the substitution pass
+  shared with `tyc build`. `comptime let PORT = int(env(...))` no
+  longer crashes with `NameError: env is not defined` under `tyc run`
+  (v0.9.0).
+- `freeze let CFG = {...}` actually freezes the value: `list → tuple`,
+  `dict → mappingproxy-tagged dict`, `set → frozenset`, recursive.
+  Mutations through aliased references raise the same `TypeError`
+  CPython's `MappingProxy` does (v0.9.0). The check pass also
+  pre-validates the RHS so non-`frozen` user-class constructors fail
+  at `tyc check` time via the new `tyc::freeze_not_freezable`
+  diagnostic instead of at first import.
+- `lazy import np = numpy` uses the simpler `import M as N` rewrite in
+  VM mode (the descriptor-based proxy class the build path emits has
+  nothing to bind against in a tree-walking VM) (v0.9.0).
 
 ## What the VM does not support yet
 
@@ -123,11 +173,44 @@ message:
   the same `NotImplementedError` shape applies.
 - Template strings (`t"…"`).
 - IPython escape commands.
-- `with` statements other than `open()` (basic context-manager protocol).
+- `with` statements other than `open()` and `contextlib.@contextmanager`-decorated
+  factories (basic context-manager protocol since v0.9.0).
 - `lazy let` inside a class body uses an identity decorator; callers must
   use the method-call form `obj.x()`.
 
 If your program needs any of these, run with `--compile` for now.
+
+**Behaviour additions in v0.9.0** (vs v0.8.x):
+
+- `Result` combinators (`.map`, `.map_err`, `.and_then`, `.or_else`)
+  on `Ok` / `Err` work in the VM via bound `NativeFn` wrappers.
+- `open()` honours `"w"` / `"a"` / `"wb"` / `"r+"` modes plus
+  `__enter__` / `__exit__`. `json.load` / `json.dump` ride on top.
+- Class patterns on built-in types (`case str() as s:`,
+  `case int() as n:`, …) match in `match` blocks; the exhaustiveness
+  pass recognises `case None:` + `case str() as s:` as covering
+  `str?`.
+- `frozenset(...)` is hashable as a dict key.
+- f-string `_` thousands separator works the same way `,` does.
+- `bytes` repr matches CPython byte-for-byte.
+- Native shims for `collections.deque`, `heapq`, `contextlib.contextmanager`,
+  and `pydantic.BaseModel`.
+- `@property`, `@classmethod`, `@staticmethod`, `super()` builtins so
+  decorated methods don't crash on import.
+- Multi-file projects: relative imports and sibling `.ty` modules
+  resolve under both `tyc run` and `tyc run --compile`.
+- `dataclasses.field(default_factory=list)` invokes the factory
+  per instance (no more shared mutable defaults).
+- `class!` synthesised `__init__` runs; `except HttpError as e:`
+  binds the user `Instance` and exception-type matching walks the
+  MRO.
+- `freeze let` deeply freezes (list → tuple, dict → mappingproxy,
+  recursive); mutators on a frozen dict raise `TypeError` matching
+  CPython.
+- `comptime let X = ...` inlines via the substitution pass shared
+  with `tyc build`.
+- `lazy import M = N` uses the simpler `import M as N` rewrite.
+- Typed tuple unpack `let (a: int, b: str) = pair()` parses in the VM.
 
 **Behaviour changes in v0.8.0** (vs v0.7.x):
 
