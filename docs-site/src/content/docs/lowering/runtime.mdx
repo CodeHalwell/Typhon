@@ -156,11 +156,15 @@ The proxy intentionally implements `__str__` / `__bool__` / `__eq__` / `__len__`
 
 ## `typhon_runtime/result.py`
 
-Emitted whenever `Result`, `Ok`, or `Err` appears. Holds the small combinator surface (`map`, `map_err`, `unwrap_or`, …); `Ok` and `Err` themselves live in `__init__.py` so `from typhon_runtime import Ok, Err` works without traversing the submodule.
+Emitted whenever `Result`, `Ok`, or `Err` appears. Holds the combinator surface — `.map(f)`, `.map_err(g)`, `.and_then(f)`, `.or_else(h)` — as methods directly on the `Ok` / `Err` runtime classes (since v0.6.0); `Ok` and `Err` themselves live in `__init__.py` so `from typhon_runtime import Ok, Err` works without traversing the submodule.
+
+Since v0.9.0 the in-process VM (`tyc run`) also exposes these methods natively — `NativeFn` wrappers capture the receiver and dispatch the right combinator semantics — so `Ok(7).and_then(double)` works under both `tyc run` and `tyc build && python build/main.py`. Before v0.9.0 the methods existed only in the emitted `result.py`, so a typecheck-clean program crashed under `tyc run` with `AttributeError: Ok has no attribute 'and_then'`.
 
 ## `typhon_runtime/freeze.py`
 
 Emitted whenever `freeze let` appears (Phase 6, v0.3.0). Recursively converts `list → tuple`, `dict → MappingProxyType`, `set → frozenset`; descends into nested values; raises `TypeError` at startup on anything without a clean immutable equivalent (file handles, sockets, generators, non-frozen dataclasses). Frozen dataclasses pass through unchanged.
+
+Since v0.9.0 the type checker also pre-validates the `freeze let X = <expr>` RHS at check time via `tyc::freeze_not_freezable`, so non-`frozen` user-class constructors fail at `tyc check` instead of at first import — the deep-freeze raising `TypeError` at runtime is now a backstop for cases the static check can't see through, not the primary error surface. The VM also runs the freeze pass since v0.9.0; before v0.9.0 `tyc run` treated `freeze let` as a regular `let` and mutations through aliased references silently succeeded.
 
 The full implementation lives in `tyc/crates/tyc/src/commands/build.rs` under `TYPHON_RUNTIME_FREEZE_PY`.
 

@@ -48,6 +48,12 @@ Defer module loading until first attribute access:
 
 `np` is a proxy until first access. Subsequent accesses pass through to the loaded module. The desugarer generates a per-module proxy class with double-checked locking — thread-safe, one-shot, and no runtime dependency required (the proxy is inlined).
 
+### Under `tyc run` (v0.9.0)
+
+The in-process VM (`tyc run`) uses a simpler lowering for `lazy import name = module`: a plain `import module as name` rewrite. The descriptor-based proxy class the build path emits has nothing useful to bind against in a tree-walking interpreter (the VM doesn't go through Python's class-attribute lookup), so the VM treats `lazy import` as a regular aliased import. Module loading still happens on first import resolution rather than at parse time, so the deferral semantics are preserved for the cases the VM actually models.
+
+Before v0.9.0 `lazy import np = numpy` raised `ImportError` under `tyc run` (the compiled proxy class generation didn't apply); since v0.9.0 the same source runs cleanly under both modes.
+
 ### `lazy from` is rejected
 
 ```python
