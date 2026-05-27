@@ -3294,6 +3294,28 @@ pub fn check_module_with_imports(
     // module body, mirroring Python's scope semantics).
     if let Some(ext) = external {
         for (name, shape) in &ext.class_shapes {
+            // Seed `class_parents` from the imported shape's `bases`
+            // BEFORE inserting the shape (mirrors the in-module pass:
+            // `collect_classes_and_functions` populates `class_parents`
+            // separately from `class_shapes`). Without this, the
+            // hierarchy walks (`class_hierarchy_fully_known`,
+            // `find_method`, `find_field`, `class_inherits_from`) all
+            // stop at the imported class itself — they never see the
+            // foreign / built-in base — so cross-module attribute
+            // access on `class! Sub(Foreign):` false-positives
+            // `tyc::attribute_not_found` even when the same access is
+            // (correctly) lenient in-module. Stress finding from the
+            // v0.9.1 MNIST CNN sweep (BUG 3): a `class! HttpError
+            // (Exception): code: int` accessed cross-module flagged
+            // every inherited / framework-provided attribute. We use
+            // `entry(..).or_insert_with(..)` so an in-module
+            // declaration of the same name (populated later by
+            // `collect_classes_and_functions`) still wins.
+            if !shape.bases.is_empty() {
+                c.class_parents
+                    .entry(name.clone())
+                    .or_insert_with(|| shape.bases.clone());
+            }
             c.class_shapes
                 .entry(name.clone())
                 .or_insert_with(|| shape.clone());
@@ -17821,6 +17843,143 @@ def main() -> None:
         assert!(
             !d.has_errors(),
             "attribute access on a class with a foreign base must be lenient; got: {:?}",
+            d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    /// BUG 3 (v0.9.2 regression fix): cross-module attribute access on a
+    /// `class! Sub(Foreign):` subclass MUST stay lenient — the same way
+    /// `v071_attribute_not_found_skipped_on_unknown_base` stays lenient
+    /// in-module. The in-module pass seeds `class_parents` from the AST;
+    /// the cross-module ingestion path must seed it from
+    /// `InterfaceShape.bases` so the four hierarchy walkers
+    /// (`class_hierarchy_fully_known`, `find_method`, `find_field`,
+    /// `class_inherits_from`) all see the foreign base. Stress finding
+    /// from the v0.9.1 MNIST CNN sweep.
+    #[test]
+    fn bug3_cross_module_attribute_lenient_when_foreign_base() {
+        // Producer module: `class! HttpError(Exception): code: int`.
+        let producer_src = "\
+class HttpError(Exception):
+    code: int
+    message: str
+";
+        let producer_prep = preprocess(producer_src);
+        let producer_module = tyc_syntax::parse_module(&producer_prep.python_source)
+            .unwrap()
+            .into_syntax();
+        let producer_shapes = extract_module_shapes(&producer_module);
+        // Sanity: the shape records the foreign base, even though it
+        // doesn't show up in any class_shapes registry.
+        let http_shape = producer_shapes
+            .class_shapes
+            .get("HttpError")
+            .expect("HttpError must be exported");
+        assert_eq!(
+            http_shape.bases,
+            vec!["Exception".to_owned()],
+            "InterfaceShape.bases must record the foreign base name"
+        );
+
+        // Consumer module imports HttpError and accesses a bogus
+        // attribute. The hierarchy walks must see `Exception` and bail
+        // out lenient — same as the in-module case.
+        let consumer_src = "\
+def describe(e: HttpError) -> str:
+    return e.totally_bogus_attr
+";
+        let consumer_prep = preprocess(consumer_src);
+        let consumer_module = tyc_syntax::parse_module(&consumer_prep.python_source)
+            .unwrap()
+            .into_syntax();
+        let (resolved, _) = resolve_module(
+            "<consumer>".to_owned(),
+            &consumer_prep.python_source,
+            &consumer_module,
+        );
+
+        let mut external = ExternalShapes::default();
+        external
+            .class_shapes
+            .insert("HttpError".to_owned(), http_shape.clone());
+
+        let d = check_module_with_imports(
+            "<consumer>",
+            &consumer_prep.python_source,
+            &resolved,
+            &consumer_module,
+            &consumer_prep.unsafe_lines,
+            &consumer_prep.frozen_class_lines,
+            Some(&external),
+        );
+        let attr_errors: Vec<String> = d
+            .errors()
+            .iter()
+            .map(|e| e.to_string())
+            .filter(|s| s.contains("attribute_not_found") || s.contains("not defined on"))
+            .collect();
+        assert!(
+            attr_errors.is_empty(),
+            "cross-module attribute access on `class! Sub(Foreign):` must \
+             be lenient; got: {attr_errors:?}"
+        );
+    }
+
+    /// Companion to BUG 3: when the imported class's hierarchy IS fully
+    /// known (no foreign base), cross-module attribute access on a bogus
+    /// attribute MUST still fire `tyc::attribute_not_found`. Guards
+    /// against an over-broad fix that would suppress every cross-module
+    /// firing.
+    #[test]
+    fn cross_module_attribute_not_found_fires_when_hierarchy_known() {
+        let producer_src = "\
+class Point:
+    x: float
+    y: float
+";
+        let producer_prep = preprocess(producer_src);
+        let producer_module = tyc_syntax::parse_module(&producer_prep.python_source)
+            .unwrap()
+            .into_syntax();
+        let producer_shapes = extract_module_shapes(&producer_module);
+        let point_shape = producer_shapes
+            .class_shapes
+            .get("Point")
+            .expect("Point must be exported");
+
+        let consumer_src = "\
+def label(p: Point) -> float:
+    return p.totally_bogus_attr
+";
+        let consumer_prep = preprocess(consumer_src);
+        let consumer_module = tyc_syntax::parse_module(&consumer_prep.python_source)
+            .unwrap()
+            .into_syntax();
+        let (resolved, _) = resolve_module(
+            "<consumer>".to_owned(),
+            &consumer_prep.python_source,
+            &consumer_module,
+        );
+
+        let mut external = ExternalShapes::default();
+        external
+            .class_shapes
+            .insert("Point".to_owned(), point_shape.clone());
+
+        let d = check_module_with_imports(
+            "<consumer>",
+            &consumer_prep.python_source,
+            &resolved,
+            &consumer_module,
+            &consumer_prep.unsafe_lines,
+            &consumer_prep.frozen_class_lines,
+            Some(&external),
+        );
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| e.to_string().contains("totally_bogus_attr")),
+            "must still flag bogus attr on a fully-known cross-module class; got: {:?}",
             d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
         );
     }
