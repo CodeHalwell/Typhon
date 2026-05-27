@@ -25,24 +25,17 @@ pub fn open_file(path: &str, mode: &str) -> Result<Value, Unwind> {
 
     let path_owned = path.to_owned();
 
-    // Pre-populate the read buffer for read-or-rw modes.
-    let initial_content = if read_mode {
-        match std::fs::read(&path_owned) {
-            Ok(bytes) => bytes,
-            Err(e) => {
-                return Err(Unwind::Exception(VmException::new(
-                    "FileNotFoundError",
-                    format!("could not open '{path_owned}': {e}"),
-                )));
-            }
-        }
-    } else if append_mode {
-        // append mode lets you also read in `"a+"`, but if the file does
-        // not exist, that's fine — we just start empty.
-        std::fs::read(&path_owned).unwrap_or_default()
-    } else if write_mode {
-        // Open `"w"` truncates the file at open time so the user sees a
-        // zero-length file even if they never write.
+    // Pre-populate the read buffer. The flag layout `parse_mode`
+    // returns is the union of every character we saw, so `"w+"` /
+    // `"wb+"` and `"a+"` come back with BOTH `read_mode == true` and
+    // `write_mode` / `append_mode` set. CPython's actual semantics
+    // are: `w[+/b]` truncates / creates the file, then offers a read
+    // buffer of the empty result; `a[+/b]` creates the file if
+    // missing and seeks to end, with read returning whatever's
+    // already there. (See review thread on PR #147 from gemini /
+    // codex.)
+    let initial_content = if write_mode {
+        // `w` (with or without `+`) always truncates first.
         match std::fs::File::create(&path_owned) {
             Ok(_) => {}
             Err(e) => {
@@ -53,6 +46,20 @@ pub fn open_file(path: &str, mode: &str) -> Result<Value, Unwind> {
             }
         }
         Vec::new()
+    } else if append_mode {
+        // `a` / `a+` create the file if missing; pre-load whatever's
+        // already there for the optional read direction.
+        std::fs::read(&path_owned).unwrap_or_default()
+    } else if read_mode {
+        match std::fs::read(&path_owned) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                return Err(Unwind::Exception(VmException::new(
+                    "FileNotFoundError",
+                    format!("could not open '{path_owned}': {e}"),
+                )));
+            }
+        }
     } else {
         Vec::new()
     };
@@ -125,11 +132,37 @@ pub fn open_file(path: &str, mode: &str) -> Result<Value, Unwind> {
 
     let mut members: HashMap<String, Value> = HashMap::new();
 
+    // Helpers used by every file method to refuse operations after
+    // close() and to refuse reads / writes that don't match the
+    // mode the user actually requested (review thread copilot on PR
+    // #147).
+    let check_open = {
+        let closed = closed.clone();
+        move || -> Result<(), Unwind> {
+            if *closed.borrow() {
+                return Err(Unwind::Exception(VmException::new(
+                    "ValueError",
+                    "I/O operation on closed file".to_owned(),
+                )));
+            }
+            Ok(())
+        }
+    };
+    let reader_active = read_mode;
+
     // read() — full content, text or bytes.
     {
         let content = content_rc.clone();
         let bytes = bytes_rc.clone();
+        let check_open = check_open.clone();
         let read = NativeFn::new("read", move |_i, _args| {
+            check_open()?;
+            if !reader_active {
+                return Err(Unwind::Exception(VmException::new(
+                    "io.UnsupportedOperation",
+                    "not readable".to_owned(),
+                )));
+            }
             if binary {
                 Ok(Value::Bytes(Rc::new((*bytes).clone())))
             } else {
@@ -142,7 +175,15 @@ pub fn open_file(path: &str, mode: &str) -> Result<Value, Unwind> {
     // readlines() — text only.
     {
         let lines = lines.clone();
+        let check_open = check_open.clone();
         let readlines = NativeFn::new("readlines", move |_i, _args| {
+            check_open()?;
+            if !reader_active {
+                return Err(Unwind::Exception(VmException::new(
+                    "io.UnsupportedOperation",
+                    "not readable".to_owned(),
+                )));
+            }
             Ok(Value::List(Rc::new(RefCell::new(
                 lines
                     .iter()
@@ -158,7 +199,15 @@ pub fn open_file(path: &str, mode: &str) -> Result<Value, Unwind> {
     {
         let lines = lines.clone();
         let pos = line_pos.clone();
+        let check_open = check_open.clone();
         let readline = NativeFn::new("readline", move |_i, _args| {
+            check_open()?;
+            if !reader_active {
+                return Err(Unwind::Exception(VmException::new(
+                    "io.UnsupportedOperation",
+                    "not readable".to_owned(),
+                )));
+            }
             let mut p = pos.borrow_mut();
             if *p >= lines.len() {
                 return Ok(Value::Str(Rc::new(String::new())));
@@ -173,7 +222,9 @@ pub fn open_file(path: &str, mode: &str) -> Result<Value, Unwind> {
     // write(s) — appends to the pending buffer; returns bytes-written count.
     {
         let buf = writer_buf.clone();
+        let check_open = check_open.clone();
         let write_fn = NativeFn::new("write", move |_i, args| {
+            check_open()?;
             if !writer_active {
                 return Err(Unwind::Exception(VmException::new(
                     "io.UnsupportedOperation",
@@ -261,6 +312,13 @@ pub fn open_file(path: &str, mode: &str) -> Result<Value, Unwind> {
 }
 
 /// Parse a Python `open()` mode string into `(read, write, append, binary, plus)`.
+///
+/// CPython's `io.open` requires exactly one of `r` / `w` / `a` / `x`,
+/// at most one of `b` / `t`, and tracks them as a *set* — duplicates
+/// like `"rr"` raise `ValueError`. We mirror that here so the VM
+/// rejects nonsense like `"rw"`, `"wa"`, or `"rrt"` early instead of
+/// silently picking one of the flags (review thread copilot on PR
+/// #147).
 fn parse_mode(mode: &str) -> Result<(bool, bool, bool, bool, bool), Unwind> {
     let mut read = false;
     let mut write = false;
@@ -268,35 +326,57 @@ fn parse_mode(mode: &str) -> Result<(bool, bool, bool, bool, bool), Unwind> {
     let mut binary = false;
     let mut text = false;
     let mut plus = false;
+    let mut exclusive = false;
 
     for ch in mode.chars() {
-        match ch {
-            'r' => read = true,
-            'w' => write = true,
-            'a' => append = true,
-            'b' => binary = true,
-            't' => text = true,
-            '+' => plus = true,
-            'x' => {
-                // exclusive create — rare, treat as write
-                write = true;
-            }
+        let already_set = match ch {
+            'r' => std::mem::replace(&mut read, true),
+            'w' => std::mem::replace(&mut write, true),
+            'a' => std::mem::replace(&mut append, true),
+            'x' => std::mem::replace(&mut exclusive, true),
+            'b' => std::mem::replace(&mut binary, true),
+            't' => std::mem::replace(&mut text, true),
+            '+' => std::mem::replace(&mut plus, true),
             _ => {
                 return Err(Unwind::Exception(VmException::new(
                     "ValueError",
                     format!("invalid mode: '{mode}'"),
                 )));
             }
+        };
+        if already_set {
+            return Err(Unwind::Exception(VmException::new(
+                "ValueError",
+                format!("invalid mode: '{mode}' (duplicate flag '{ch}')"),
+            )));
         }
     }
 
+    // Exactly one of r/w/a/x.
+    let primary_count = [read, write, append, exclusive]
+        .iter()
+        .filter(|&&b| b)
+        .count();
+    if primary_count > 1 {
+        return Err(Unwind::Exception(VmException::new(
+            "ValueError",
+            format!("invalid mode: '{mode}' (must have exactly one of 'r', 'w', 'a', 'x')"),
+        )));
+    }
     if binary && text {
         return Err(Unwind::Exception(VmException::new(
             "ValueError",
             "can't have text and binary mode at once".to_owned(),
         )));
     }
-    if !(read || write || append) {
+    // `x` (exclusive create) collapses to `w` for this shim — the
+    // caller's `File::create` truncates / creates. A faithful
+    // implementation would use `File::create_new` and surface
+    // `FileExistsError`; that's tracked as a follow-up.
+    if exclusive {
+        write = true;
+    }
+    if primary_count == 0 {
         read = true; // default
     }
     if plus {

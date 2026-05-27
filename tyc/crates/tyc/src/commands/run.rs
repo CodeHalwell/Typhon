@@ -178,25 +178,48 @@ pub fn run(args: RunArgs) -> Result<()> {
     //    Python picks up the package automatically; we also stash the
     //    parent in `PYTHONPATH` for good measure.
     let mut cmd = Command::new(&args.python);
-    let has_init = out_dir.join("__init__.py").exists();
-    let entry_stem = entry
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("main")
-        .to_owned();
-    let pkg_name = out_dir
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("build")
-        .to_owned();
-    if has_init && entry.parent() == Some(out_dir.as_path()) {
-        let workdir = out_dir
-            .parent()
-            .map(|p| p.to_path_buf())
-            .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+    // Decide between script mode (`python entry.py`) and module mode
+    // (`python -m pkg.sub.entry`). We use module mode whenever the
+    // entry's immediate parent directory has an `__init__.py` — i.e.
+    // it's part of a Python package. Walk up from there to find the
+    // package root (the first ancestor whose own parent does NOT have
+    // an `__init__.py`) so `<out>/mypkg/__init__.py` works as well as
+    // the flat `<out>/__init__.py` layout. Review thread copilot on
+    // PR #147.
+    let module_invocation = entry
+        .parent()
+        .filter(|p| p.join("__init__.py").exists())
+        .map(|entry_parent| {
+            let mut segments: Vec<String> = vec![entry
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("main")
+                .to_owned()];
+            let mut current: Option<&std::path::Path> = Some(entry_parent);
+            while let Some(dir) = current {
+                if !dir.join("__init__.py").exists() {
+                    break;
+                }
+                let name = match dir.file_name().and_then(|s| s.to_str()) {
+                    Some(n) => n.to_owned(),
+                    None => break,
+                };
+                segments.push(name);
+                current = dir.parent();
+            }
+            // `segments` was built leaf → root; the cwd must sit
+            // immediately above the topmost package so `-m pkg.sub.x`
+            // resolves it.
+            let workdir = current
+                .map(|p| p.to_path_buf())
+                .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+            segments.reverse();
+            (workdir, segments.join("."))
+        });
+    if let Some((workdir, module_path)) = module_invocation {
         cmd.current_dir(&workdir);
         cmd.arg("-m");
-        cmd.arg(format!("{}.{}", pkg_name, entry_stem));
+        cmd.arg(module_path);
     } else {
         cmd.arg(&entry);
     }

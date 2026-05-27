@@ -321,14 +321,26 @@ pub fn assignable(expected: &Type, actual: &Type) -> bool {
             {
                 return assignable(&aa[0], &bb[0]);
             }
-            // Mapping[K, V] / dict[K, V] — Mapping is the read-only
-            // view, K invariant, V covariant.
-            if (an == "Mapping" || an == "MutableMapping")
-                && aa.len() == 2
-                && bn == "dict"
-                && bb.len() == 2
-            {
-                return assignable(&aa[0], &bb[0]) && assignable(&aa[1], &bb[1]);
+            // Mapping[K, V] is invariant in K (keys participate in
+            // hashing / equality lookups against the consumer's slot)
+            // and covariant in V (read-only view). MutableMapping[K,
+            // V] is invariant in BOTH parameters — `m[k] = v` on a
+            // MutableMapping[Animal, Animal] would let you insert
+            // `Animal` instances into a backing `dict[Dog, Dog]`. The
+            // dict→view direction here therefore requires
+            // bidirectional assignability on K for both, and on V
+            // for MutableMapping. (See review thread on PR #147 from
+            // gemini-code-assist / copilot.)
+            if an == "Mapping" && aa.len() == 2 && bn == "dict" && bb.len() == 2 {
+                return assignable(&aa[0], &bb[0])
+                    && assignable(&bb[0], &aa[0])
+                    && assignable(&aa[1], &bb[1]);
+            }
+            if an == "MutableMapping" && aa.len() == 2 && bn == "dict" && bb.len() == 2 {
+                return assignable(&aa[0], &bb[0])
+                    && assignable(&bb[0], &aa[0])
+                    && assignable(&aa[1], &bb[1])
+                    && assignable(&bb[1], &aa[1]);
             }
             if an != bn || aa.len() != bb.len() {
                 return false;
@@ -2193,12 +2205,22 @@ impl<'a> Checker<'a> {
             {
                 return self.is_assignable(&aa[0], &bb[0]);
             }
-            if (an == "Mapping" || an == "MutableMapping")
-                && aa.len() == 2
-                && bn == "dict"
-                && bb.len() == 2
-            {
-                return self.is_assignable(&aa[0], &bb[0]) && self.is_assignable(&aa[1], &bb[1]);
+            // Sealed-union-aware counterpart to the Mapping rule in
+            // `assignable`: Mapping[K, V] is invariant in K +
+            // covariant in V; MutableMapping[K, V] is invariant in
+            // both. The class-hierarchy-aware `is_assignable` carries
+            // the same one-way primitive widening as `assignable`, so
+            // bidirectional checks here actually enforce invariance.
+            if an == "Mapping" && aa.len() == 2 && bn == "dict" && bb.len() == 2 {
+                return self.is_assignable(&aa[0], &bb[0])
+                    && self.is_assignable(&bb[0], &aa[0])
+                    && self.is_assignable(&aa[1], &bb[1]);
+            }
+            if an == "MutableMapping" && aa.len() == 2 && bn == "dict" && bb.len() == 2 {
+                return self.is_assignable(&aa[0], &bb[0])
+                    && self.is_assignable(&bb[0], &aa[0])
+                    && self.is_assignable(&aa[1], &bb[1])
+                    && self.is_assignable(&bb[1], &aa[1]);
             }
         }
         // Generic / generic (e.g. `Result[T, E] = Ok[V]`, `list[T] = list[V]`):

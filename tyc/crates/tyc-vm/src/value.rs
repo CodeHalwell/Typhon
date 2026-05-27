@@ -13,7 +13,6 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt;
-use std::hash::Hash;
 use std::rc::Rc;
 
 use indexmap::IndexMap;
@@ -53,6 +52,68 @@ pub enum HashKey {
 }
 
 impl HashKey {
+    /// Stable, collision-safe sort key. Two distinct `HashKey` values
+    /// have distinct sort keys (the discriminant byte differs across
+    /// variants and the payload is encoded deterministically). Used
+    /// by the `FrozenSet` canonicalisation path so two frozensets
+    /// with the same members hash equal regardless of insertion
+    /// order — review thread copilot on PR #147.
+    pub fn canonical_sort_key(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(16);
+        match self {
+            HashKey::None => out.push(0),
+            HashKey::Bool(b) => {
+                out.push(1);
+                out.push(*b as u8);
+            }
+            HashKey::Int(i) => {
+                out.push(2);
+                // BigInt's sign-magnitude form: sign byte then magnitude
+                // little-endian. Add a sentinel between sign and digits
+                // so positive 1-byte values never alias negative-sign
+                // payloads.
+                let (sign, digits) = i.to_bytes_le();
+                out.push(match sign {
+                    num_bigint::Sign::Minus => 0,
+                    num_bigint::Sign::NoSign => 1,
+                    num_bigint::Sign::Plus => 2,
+                });
+                out.extend_from_slice(&(digits.len() as u32).to_be_bytes());
+                out.extend_from_slice(&digits);
+            }
+            HashKey::Float(bits) => {
+                out.push(3);
+                out.extend_from_slice(&bits.to_be_bytes());
+            }
+            HashKey::Str(s) => {
+                out.push(4);
+                out.extend_from_slice(&(s.len() as u32).to_be_bytes());
+                out.extend_from_slice(s.as_bytes());
+            }
+            HashKey::Tuple(items) => {
+                out.push(5);
+                out.extend_from_slice(&(items.len() as u32).to_be_bytes());
+                for item in items.iter() {
+                    let inner = item.canonical_sort_key();
+                    out.extend_from_slice(&(inner.len() as u32).to_be_bytes());
+                    out.extend_from_slice(&inner);
+                }
+            }
+            HashKey::FrozenSet(items) => {
+                out.push(6);
+                out.extend_from_slice(&(items.len() as u32).to_be_bytes());
+                // FrozenSet elements are already canonicalised at
+                // construction so this is deterministic.
+                for item in items.iter() {
+                    let inner = item.canonical_sort_key();
+                    out.extend_from_slice(&(inner.len() as u32).to_be_bytes());
+                    out.extend_from_slice(&inner);
+                }
+            }
+        }
+        out
+    }
+
     pub fn into_value(self) -> Value {
         match self {
             HashKey::None => Value::None,
@@ -384,8 +445,19 @@ impl Value {
             Value::Bytes(b) => !b.is_empty(),
             Value::List(l) => !l.borrow().is_empty(),
             Value::Tuple(t) => !t.is_empty(),
-            Value::Dict(d) => !d.borrow().is_empty(),
-            Value::Set(s) => !s.borrow().is_empty(),
+            // Truthiness ignores the synthetic `__typhon_frozen__`
+            // sentinel a `freeze let` may have inserted into a dict
+            // or set (review thread copilot on PR #147 — otherwise
+            // a frozen-and-otherwise-empty container would test as
+            // truthy under `bool(d)` / `if d:`).
+            Value::Dict(d) => {
+                let frozen_key = HashKey::Str(Rc::new("__typhon_frozen__".to_owned()));
+                d.borrow().keys().any(|k| *k != frozen_key)
+            }
+            Value::Set(s) => {
+                let frozen_key = HashKey::Str(Rc::new("__typhon_frozen__".to_owned()));
+                s.borrow().iter().any(|k| *k != frozen_key)
+            }
             Value::Range { start, stop, step } => {
                 if *step > 0 {
                     stop > start
@@ -421,17 +493,22 @@ impl Value {
             // The (much more common) flow we care about is `frozenset(...)`
             // as a dict key, which now works.
             Value::Set(s) => {
-                let mut keys: Vec<HashKey> = s.borrow().iter().cloned().collect();
-                // Canonical ordering so two sets with the same members hash
-                // equal regardless of insertion order.
-                keys.sort_by(|a, b| {
-                    use std::hash::Hasher;
-                    let mut ha = std::collections::hash_map::DefaultHasher::new();
-                    let mut hb = std::collections::hash_map::DefaultHasher::new();
-                    a.hash(&mut ha);
-                    b.hash(&mut hb);
-                    ha.finish().cmp(&hb.finish())
-                });
+                let frozen_key = HashKey::Str(Rc::new("__typhon_frozen__".to_owned()));
+                let mut keys: Vec<HashKey> = s
+                    .borrow()
+                    .iter()
+                    .filter(|k| **k != frozen_key)
+                    .cloned()
+                    .collect();
+                // Canonical ordering so two sets with the same members
+                // produce identical `FrozenSet` payloads (and therefore
+                // hash equal). We compare on a collision-safe sort key
+                // — sorting by `DefaultHasher::finish()` alone allows
+                // two distinct elements to share an ordering slot and
+                // the resulting key ordering depends on insertion
+                // history, breaking `Eq` / `Hash` consistency
+                // (review thread copilot on PR #147).
+                keys.sort_by_key(|a| a.canonical_sort_key());
                 Ok(HashKey::FrozenSet(Rc::new(keys)))
             }
             other => Err(type_error(format!(
@@ -644,18 +721,31 @@ impl Value {
             }
             Value::Set(set) => {
                 let s = set.borrow();
-                if s.is_empty() {
-                    return "set()".into();
+                let frozen_key = HashKey::Str(Rc::new("__typhon_frozen__".to_owned()));
+                let is_frozen = s.contains(&frozen_key);
+                // Filter the synthetic `__typhon_frozen__` sentinel
+                // that `deep_freeze_value` inserts to mark the set
+                // immutable (review thread codex / copilot on PR
+                // #147 — without this the sentinel leaks into
+                // user-visible repr).
+                let items: Vec<String> = s
+                    .iter()
+                    .filter(|k| **k != frozen_key)
+                    .map(|k| k.clone().into_value().py_repr())
+                    .collect();
+                if items.is_empty() {
+                    return if is_frozen {
+                        "frozenset()".into()
+                    } else {
+                        "set()".into()
+                    };
                 }
-                let mut out = String::from("{");
-                for (i, k) in s.iter().enumerate() {
-                    if i > 0 {
-                        out.push_str(", ");
-                    }
-                    out.push_str(&k.clone().into_value().py_repr());
+                let body = items.join(", ");
+                if is_frozen {
+                    format!("frozenset({{{body}}})")
+                } else {
+                    format!("{{{body}}}")
                 }
-                out.push('}');
-                out
             }
             Value::Range { start, stop, step } => {
                 if *step == 1 {

@@ -225,16 +225,27 @@ pub fn run(args: CheckArgs) -> Result<()> {
         };
 
         // Pre-load every file into memory so the pub-star collision
-        // pass can see the whole source tree at once. The per-file
-        // loop below re-reads from this cache instead of hitting the
-        // filesystem twice.
+        // pass can see the whole source tree at once, and the per-file
+        // loop below pulls from this cache rather than hitting the
+        // filesystem twice. `io_errors` carries (path, error) pairs
+        // for paths that failed to read so the per-file loop can
+        // emit the same `TycError::io` diagnostic it always did.
+        // Review thread copilot on PR #147.
         let mut all_sources: Vec<(PathBuf, String)> = Vec::new();
+        let mut io_errors: std::collections::HashMap<PathBuf, std::io::Error> =
+            std::collections::HashMap::new();
         for path in ty_files.iter().chain(direct_dty.iter()) {
-            // io diagnostic surfaces below in the per-file loop.
-            if let Ok(s) = std::fs::read_to_string(path) {
-                all_sources.push((path.clone(), s));
+            match std::fs::read_to_string(path) {
+                Ok(s) => all_sources.push((path.clone(), s)),
+                Err(e) => {
+                    io_errors.insert(path.clone(), e);
+                }
             }
         }
+        let source_lookup: std::collections::HashMap<PathBuf, String> = all_sources
+            .iter()
+            .map(|(p, s)| (p.clone(), s.clone()))
+            .collect();
 
         // B28: detect `pub *` name collisions and `pub *` misplaced
         // outside `__init__.ty` across the whole file set BEFORE the
@@ -253,10 +264,13 @@ pub fn run(args: CheckArgs) -> Result<()> {
         for path in ty_files.into_iter().chain(direct_dty.into_iter()) {
             file_count += 1;
 
-            let source = match std::fs::read_to_string(&path) {
-                Ok(s) => s,
-                Err(e) => {
-                    diags.push_error(TycError::io(path.display().to_string(), &e));
+            let source = match source_lookup.get(&path) {
+                Some(s) => s.clone(),
+                None => {
+                    let err = io_errors
+                        .get(&path)
+                        .expect("source absent from cache must have an io_errors entry");
+                    diags.push_error(TycError::io(path.display().to_string(), err));
                     continue;
                 }
             };

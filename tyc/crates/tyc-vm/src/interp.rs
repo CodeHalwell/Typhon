@@ -983,6 +983,13 @@ impl Interpreter {
             }
             Value::Set(s) => {
                 let key = item.to_hash_key()?;
+                // The synthetic `__typhon_frozen__` sentinel must not
+                // be observable via `x in s` — a literal `"…frozen…"`
+                // probe would otherwise return True on every
+                // `freeze let`-marked set.
+                if matches!(&key, HashKey::Str(name) if name.as_str() == "__typhon_frozen__") {
+                    return Ok(false);
+                }
                 Ok(s.borrow().contains(&key))
             }
             Value::Range { start, stop, step } => match item {
@@ -1851,7 +1858,15 @@ impl Interpreter {
                 IterState::Dict { keys, index: 0 }
             }
             Value::Set(s) => {
-                let keys: Vec<HashKey> = s.borrow().iter().cloned().collect();
+                // Filter the synthetic `__typhon_frozen__` sentinel
+                // `deep_freeze_value` inserts to mark the set
+                // immutable.
+                let keys: Vec<HashKey> = s
+                    .borrow()
+                    .iter()
+                    .filter(|k| !matches!(k, HashKey::Str(s) if s.as_str() == "__typhon_frozen__"))
+                    .cloned()
+                    .collect();
                 IterState::Set { keys, index: 0 }
             }
             Value::Iter(it) => return Ok(Value::Iter(it)),
@@ -2987,8 +3002,17 @@ fn insert_float_thousands(raw: &str, sep: char) -> String {
         Some(idx) => (&raw[..idx], &raw[idx..]),
         None => (raw, ""),
     };
+    // Honour every Python format-spec sign prefix (`-`, `+`, and
+    // space). Without this, an int formatted as `f"{42:+_d}"` would
+    // group as `+_42` (separator landing between sign and first
+    // digit) for any total digit count that's a multiple of three.
+    // Review thread gemini-code-assist on PR #147.
     let (sign, body) = if let Some(stripped) = int_part.strip_prefix('-') {
         ("-", stripped)
+    } else if let Some(stripped) = int_part.strip_prefix('+') {
+        ("+", stripped)
+    } else if let Some(stripped) = int_part.strip_prefix(' ') {
+        (" ", stripped)
     } else {
         ("", int_part)
     };

@@ -609,7 +609,11 @@ fn value_len(v: &Value) -> Result<usize, Unwind> {
             .keys()
             .filter(|k| !matches!(k, HashKey::Str(s) if s.as_str() == "__typhon_frozen__"))
             .count(),
-        Value::Set(s) => s.borrow().len(),
+        Value::Set(s) => s
+            .borrow()
+            .iter()
+            .filter(|k| !matches!(k, HashKey::Str(s) if s.as_str() == "__typhon_frozen__"))
+            .count(),
         Value::Range { start, stop, step } => {
             if *step > 0 {
                 ((stop - start).max(0) as usize).div_ceil(*step as usize)
@@ -1883,6 +1887,17 @@ pub fn dict_is_frozen(d: &Rc<RefCell<DictMap>>) -> bool {
     matches!(d.borrow().get(&frozen_key), Some(Value::Bool(true)))
 }
 
+/// Whether a `Value::Set` carries the `__typhon_frozen__` sentinel
+/// (inserted by `deep_freeze_value`'s Set arm). `set_method` mutators
+/// (`add`, `remove`, `discard`, `pop`, `clear`, `update`, etc.) refuse
+/// to operate on a frozen set; iteration / len / repr filter the
+/// sentinel out of user-visible output. Review thread codex + copilot
+/// on PR #147.
+pub fn set_is_frozen(s: &Rc<RefCell<std::collections::HashSet<HashKey>>>) -> bool {
+    let frozen_key = HashKey::Str(Rc::new("__typhon_frozen__".to_owned()));
+    s.borrow().contains(&frozen_key)
+}
+
 /// Deep-freeze a value the same way `typhon_runtime.freeze.deep_freeze`
 /// does in the compile path: list → tuple of frozen elements, dict and
 /// set get marked frozen so subsequent mutation operations refuse, and
@@ -1940,11 +1955,15 @@ fn deep_freeze_value(v: Value) -> Result<Value, Unwind> {
             Ok(Value::Dict(Rc::new(RefCell::new(new_map))))
         }
         Value::Set(s) => {
-            // A regular set in the VM already supports the frozen-hash
-            // path via to_hash_key (B16). Tag-by-recreation: a fresh
-            // set of the same elements goes through the FrozenSet
-            // HashKey serialisation path next time it's hashed.
-            let elements: std::collections::HashSet<HashKey> = s.borrow().iter().cloned().collect();
+            // Tag the resulting set with the same `__typhon_frozen__`
+            // sentinel the Dict path uses; `set_is_frozen` checks for
+            // it before every mutator and refuses `add`/`remove`/
+            // `clear` (review threads codex and copilot on PR #147).
+            // Iteration / len / repr filter the sentinel so it never
+            // leaks into user-visible output.
+            let mut elements: std::collections::HashSet<HashKey> =
+                s.borrow().iter().cloned().collect();
+            elements.insert(HashKey::Str(Rc::new("__typhon_frozen__".to_owned())));
             Ok(Value::Set(Rc::new(RefCell::new(elements))))
         }
         Value::Instance(inst) => {
@@ -2870,14 +2889,17 @@ fn dict_method(
     args: &[Value],
 ) -> Result<Value, Unwind> {
     // Refuse mutations on a `freeze let`-tagged dict so the VM matches
-    // the compile path's MappingProxy-backed TypeError. Read-only methods
-    // (`get`, `keys`, `values`, `items`, `copy`) fall through.
+    // the compile path's `MappingProxyType` semantics: CPython surfaces
+    // missing-method calls as `AttributeError` (review thread copilot
+    // on PR #147 — item assignment is a `TypeError`, handled in
+    // `assign_target_subscript`). Read-only methods (`get`, `keys`,
+    // `values`, `items`, `copy`) fall through.
     let is_mutator = matches!(
         name,
         "pop" | "update" | "setdefault" | "clear" | "popitem" | "__setitem__" | "__delitem__"
     );
     if is_mutator && dict_is_frozen(d) {
-        return Err(type_error(format!(
+        return Err(attribute_error(format!(
             "'mappingproxy' object has no attribute '{}'",
             name
         )));
@@ -2964,6 +2986,16 @@ fn set_method(
     name: &str,
     args: &[Value],
 ) -> Result<Value, Unwind> {
+    // Refuse mutators on a `freeze let`-tagged set so the VM matches
+    // the compile path's `frozenset` semantics (review thread codex
+    // and copilot on PR #147). Read-only methods are unaffected.
+    let is_mutator = matches!(name, "add" | "remove" | "discard" | "pop" | "clear");
+    if is_mutator && set_is_frozen(s) {
+        return Err(attribute_error(format!(
+            "'frozenset' object has no attribute '{}'",
+            name
+        )));
+    }
     match name {
         "add" => {
             s.borrow_mut().insert(single(args, "add")?.to_hash_key()?);
@@ -2981,7 +3013,20 @@ fn set_method(
             s.borrow_mut().clear();
             Ok(Value::None)
         }
-        "copy" => Ok(Value::Set(Rc::new(RefCell::new(s.borrow().clone())))),
+        "copy" => {
+            // `copy()` on a frozen set returns a fresh *unfrozen* copy
+            // (the sentinel is filtered out) — matching CPython's
+            // `frozenset.copy()` returning a new frozenset with the
+            // same elements but no shared mutability link.
+            let frozen_key = HashKey::Str(Rc::new("__typhon_frozen__".to_owned()));
+            let copied: HashSet<HashKey> = s
+                .borrow()
+                .iter()
+                .filter(|k| **k != frozen_key)
+                .cloned()
+                .collect();
+            Ok(Value::Set(Rc::new(RefCell::new(copied))))
+        }
         _ => Err(attribute_error(format!("set has no method '{}'", name))),
     }
 }
@@ -3035,9 +3080,14 @@ fn json_dumps(v: &Value) -> String {
             format!("[{}]", items.join(", "))
         }
         Value::Dict(d) => {
+            // Filter the `__typhon_frozen__` sentinel a `freeze let`
+            // inserts (review thread copilot on PR #147 — otherwise
+            // `json.dump(frozen_dict, fp)` leaks the marker into the
+            // emitted JSON).
             let items: Vec<String> = d
                 .borrow()
                 .iter()
+                .filter(|(k, _)| !matches!(k, HashKey::Str(s) if s.as_str() == "__typhon_frozen__"))
                 .map(|(k, v)| format!("{}: {}", json_dumps(&k.clone().into_value()), json_dumps(v)))
                 .collect();
             format!("{{{}}}", items.join(", "))
