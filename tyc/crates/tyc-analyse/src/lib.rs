@@ -230,9 +230,7 @@ fn substitute_stmt(stmt: Stmt, values: &HashMap<String, ComptimeValue>) -> Stmt 
 /// Construct a PEP 695 `type NAME = VALUE` alias statement. Used by B34
 /// to lower `comptime let T: type = int` after comptime evaluation.
 fn make_type_alias_stmt(name: &ruff_python_ast::name::Name, value: Expr) -> Stmt {
-    use ruff_python_ast::{
-        AtomicNodeIndex, ExprName, StmtTypeAlias,
-    };
+    use ruff_python_ast::{AtomicNodeIndex, ExprName, StmtTypeAlias};
     use ruff_text_size::TextRange;
     let target = ExprName {
         range: TextRange::default(),

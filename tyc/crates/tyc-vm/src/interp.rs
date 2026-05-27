@@ -574,10 +574,7 @@ impl Interpreter {
     /// root. Returns `Ok(Some(...))` on a successful load, `Ok(None)` if
     /// no matching `.ty` file exists, and `Err` if a file exists but
     /// failed to parse or evaluate.
-    fn try_load_typhon_module(
-        &mut self,
-        name: &str,
-    ) -> Result<Option<Value>, Unwind> {
+    fn try_load_typhon_module(&mut self, name: &str) -> Result<Option<Value>, Unwind> {
         let Some(root) = self.source_root.clone() else {
             return Ok(None);
         };
@@ -1848,10 +1845,8 @@ impl Interpreter {
                 let keys: Vec<HashKey> = d
                     .borrow()
                     .keys()
+                    .filter(|k| !matches!(k, HashKey::Str(s) if s.as_str() == "__typhon_frozen__"))
                     .cloned()
-                    .filter(|k| {
-                        !matches!(k, HashKey::Str(s) if s.as_str() == "__typhon_frozen__")
-                    })
                     .collect();
                 IterState::Dict { keys, index: 0 }
             }
@@ -2186,11 +2181,9 @@ impl Interpreter {
             // Class-hierarchy match: if the exception carries a user
             // Instance, walk its MRO against the named class.
             if let Some(Value::Instance(inst)) = &exc.value {
-                if let Ok(cls_val) = self.eval_expr(type_expr, env) {
-                    if let Value::Class(target) = cls_val {
-                        if class_is_subclass(&inst.class, &target) {
-                            return Ok(true);
-                        }
+                if let Ok(Value::Class(target)) = self.eval_expr(type_expr, env) {
+                    if class_is_subclass(&inst.class, &target) {
+                        return Ok(true);
                     }
                 }
             }
@@ -2450,20 +2443,20 @@ impl Interpreter {
         // positional args against a built-in type are not legal.
         if let Expr::Name(n) = c.cls.as_ref() {
             let head = n.id.as_str();
-            let matched = match (head, subject) {
+            let matched = matches!(
+                (head, subject),
                 ("str", Value::Str(_))
-                | ("int", Value::Int(_))
-                | ("int", Value::Bool(_))
-                | ("float", Value::Float(_))
-                | ("bool", Value::Bool(_))
-                | ("bytes", Value::Bytes(_))
-                | ("list", Value::List(_))
-                | ("tuple", Value::Tuple(_))
-                | ("dict", Value::Dict(_))
-                | ("set", Value::Set(_))
-                | ("frozenset", Value::Set(_)) => true,
-                _ => false,
-            };
+                    | ("int", Value::Int(_))
+                    | ("int", Value::Bool(_))
+                    | ("float", Value::Float(_))
+                    | ("bool", Value::Bool(_))
+                    | ("bytes", Value::Bytes(_))
+                    | ("list", Value::List(_))
+                    | ("tuple", Value::Tuple(_))
+                    | ("dict", Value::Dict(_))
+                    | ("set", Value::Set(_))
+                    | ("frozenset", Value::Set(_))
+            );
             if matched {
                 // A single positional pattern means "bind whole subject" for
                 // built-in types (PEP 634). Reject multi-positional which is
@@ -2483,7 +2476,16 @@ impl Interpreter {
             // the subject isn't of that built-in type.
             if matches!(
                 head,
-                "str" | "int" | "float" | "bool" | "bytes" | "list" | "tuple" | "dict" | "set" | "frozenset"
+                "str"
+                    | "int"
+                    | "float"
+                    | "bool"
+                    | "bytes"
+                    | "list"
+                    | "tuple"
+                    | "dict"
+                    | "set"
+                    | "frozenset"
             ) {
                 return Ok(false);
             }
@@ -2849,17 +2851,16 @@ fn format_with_spec(value: &Value, default: &str, spec: &str) -> Result<String, 
         Value::Float(x) => {
             let p = precision.unwrap_or(6);
             let (abs, neg) = (x.abs(), *x < 0.0 || x.is_sign_negative());
-            let raw: String;
-            match typ {
-                Some('e') => raw = format!("{:.*e}", p, abs),
-                Some('E') => raw = format!("{:.*E}", p, abs),
+            let raw: String = match typ {
+                Some('e') => format!("{:.*e}", p, abs),
+                Some('E') => format!("{:.*E}", p, abs),
                 Some('g') | Some('G') => {
                     // Python's `g` uses precision as significant digits.
                     let sig = if p == 0 { 1 } else { p };
-                    raw = format!("{:.*e}", sig.saturating_sub(1), abs);
+                    format!("{:.*e}", sig.saturating_sub(1), abs)
                 }
-                _ => raw = format!("{:.*}", p, abs),
-            }
+                _ => format!("{:.*}", p, abs),
+            };
             buf = if comma || underscore {
                 let sep = if comma { ',' } else { '_' };
                 insert_float_thousands(&raw, sep)
@@ -2982,7 +2983,7 @@ fn format_bigint_with_separator(i: &BigInt, sep: char) -> String {
 /// float like `"3141.59"` → `"3_141.59"` (when sep='_') or `"3,141.59"`.
 /// The fractional part and any exponent are passed through verbatim.
 fn insert_float_thousands(raw: &str, sep: char) -> String {
-    let (int_part, rest) = match raw.find(|c: char| c == '.' || c == 'e' || c == 'E') {
+    let (int_part, rest) = match raw.find(['.', 'e', 'E']) {
         Some(idx) => (&raw[..idx], &raw[idx..]),
         None => (raw, ""),
     };

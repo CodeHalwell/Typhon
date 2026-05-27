@@ -1075,9 +1075,7 @@ fn make_json_module() -> Value {
                 nf("dump", |interp, args| {
                     // json.dump(obj, fp) — dumps(), then fp.write().
                     if args.len() < 2 {
-                        return Err(crate::error::type_error(
-                            "dump() requires (obj, fp)",
-                        ));
+                        return Err(crate::error::type_error("dump() requires (obj, fp)"));
                     }
                     let serialised = json_dumps(&args[0]);
                     let fp = args[1].clone();
@@ -1715,7 +1713,7 @@ fn make_collections_module() -> Value {
 /// expose a stable heap-invariant; the algorithmic complexity goes from
 /// O(log n) to O(n log n) but the surface is correct.
 fn make_heapq_module() -> Value {
-    fn sift_down(list: &mut Vec<Value>, start: usize, pos: usize) {
+    fn sift_down(list: &mut [Value], start: usize, pos: usize) {
         let mut pos = pos;
         let new_item = list[pos].clone();
         while pos > start {
@@ -1729,7 +1727,7 @@ fn make_heapq_module() -> Value {
         }
         list[pos] = new_item;
     }
-    fn sift_up(list: &mut Vec<Value>, pos: usize) {
+    fn sift_up(list: &mut [Value], pos: usize) {
         let endpos = list.len();
         let startpos = pos;
         let mut pos = pos;
@@ -1894,9 +1892,18 @@ pub fn dict_is_frozen(d: &Rc<RefCell<DictMap>>) -> bool {
 /// dispatch table checks before mutating.
 fn deep_freeze_value(v: Value) -> Result<Value, Unwind> {
     match v {
-        Value::None | Value::Bool(_) | Value::Int(_) | Value::Float(_) | Value::Str(_)
-        | Value::Bytes(_) | Value::Range { .. } | Value::Class(_) | Value::Function(_)
-        | Value::Native(_) | Value::Module(_) | Value::Exception { .. } => Ok(v),
+        Value::None
+        | Value::Bool(_)
+        | Value::Int(_)
+        | Value::Float(_)
+        | Value::Str(_)
+        | Value::Bytes(_)
+        | Value::Range { .. }
+        | Value::Class(_)
+        | Value::Function(_)
+        | Value::Native(_)
+        | Value::Module(_)
+        | Value::Exception { .. } => Ok(v),
         Value::List(l) => {
             // Recursively freeze elements and surface as a tuple. The
             // compile path turns list → tuple to make the immutability
@@ -2839,11 +2846,7 @@ fn list_method(
             Ok(Value::None)
         }
         "rotate" => {
-            let n = args
-                .first()
-                .map(|v| v.to_int())
-                .transpose()?
-                .unwrap_or(1);
+            let n = args.first().map(|v| v.to_int()).transpose()?.unwrap_or(1);
             let mut l = l.borrow_mut();
             if l.is_empty() {
                 return Ok(Value::None);
@@ -2896,18 +2899,14 @@ fn dict_method(
         "values" => Ok(Value::List(Rc::new(RefCell::new(
             d.borrow()
                 .iter()
-                .filter(|(k, _)| {
-                    !matches!(k, HashKey::Str(s) if s.as_str() == "__typhon_frozen__")
-                })
+                .filter(|(k, _)| !matches!(k, HashKey::Str(s) if s.as_str() == "__typhon_frozen__"))
                 .map(|(_, v)| v.clone())
                 .collect(),
         )))),
         "items" => Ok(Value::List(Rc::new(RefCell::new(
             d.borrow()
                 .iter()
-                .filter(|(k, _)| {
-                    !matches!(k, HashKey::Str(s) if s.as_str() == "__typhon_frozen__")
-                })
+                .filter(|(k, _)| !matches!(k, HashKey::Str(s) if s.as_str() == "__typhon_frozen__"))
                 .map(|(k, v)| Value::Tuple(Rc::new(vec![k.clone().into_value(), v.clone()])))
                 .collect(),
         )))),
@@ -3323,9 +3322,7 @@ pub fn call_with_kwargs(
                     "default_factory" => {
                         // Sentinel: ("__typhon_field_factory__", callable).
                         return Ok(Value::Tuple(Rc::new(vec![
-                            Value::Str(Rc::new(
-                                "__typhon_field_factory__".to_owned(),
-                            )),
+                            Value::Str(Rc::new("__typhon_field_factory__".to_owned())),
                             v.clone(),
                         ])));
                     }

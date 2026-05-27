@@ -651,12 +651,11 @@ pub fn check_source_file_with_imports(
     // declaration. Without this, `T` resolves as a distinct nominal
     // class and `def f(x: T)` rejects `int` arguments. Matches the
     // same substitution `tyc build` and `tyc run` apply.
-    let (comptime_values, _comptime_diags) =
-        tyc_analyse::evaluate_comptime_with_functions(
-            &module,
-            &prep.comptime_bindings,
-            &prep.comptime_functions,
-        );
+    let (comptime_values, _comptime_diags) = tyc_analyse::evaluate_comptime_with_functions(
+        &module,
+        &prep.comptime_bindings,
+        &prep.comptime_functions,
+    );
     let module = tyc_analyse::substitute_comptime_literals(
         module,
         &comptime_values,

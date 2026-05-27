@@ -230,9 +230,9 @@ pub fn run(args: CheckArgs) -> Result<()> {
         // filesystem twice.
         let mut all_sources: Vec<(PathBuf, String)> = Vec::new();
         for path in ty_files.iter().chain(direct_dty.iter()) {
-            match std::fs::read_to_string(path) {
-                Ok(s) => all_sources.push((path.clone(), s)),
-                Err(_) => {} // io diagnostic surfaced below
+            // io diagnostic surfaces below in the per-file loop.
+            if let Ok(s) = std::fs::read_to_string(path) {
+                all_sources.push((path.clone(), s));
             }
         }
 

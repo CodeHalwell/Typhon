@@ -1275,7 +1275,10 @@ fn effective_package_surface(
 /// has loaded. The returned vector is in source-order per file.
 pub(crate) fn detect_pub_star_diagnostics(
     sources: &[(PathBuf, String)],
-) -> (Vec<tyc_diagnostics::TycError>, Vec<tyc_diagnostics::TycError>) {
+) -> (
+    Vec<tyc_diagnostics::TycError>,
+    Vec<tyc_diagnostics::TycError>,
+) {
     use tyc_syntax::preprocess::{
         expand_gather_blocks, expand_go_calls, expand_inline_question_ops, expand_lazy_imports,
         expand_multiline_guards, expand_pipes, expand_question_ops, expand_typed_let_unpack,
@@ -1632,22 +1635,13 @@ fn build_source_map_v2(source_rel: &str, preprocessed: &str, line_offsets: &[usi
 }
 
 // ── Comptime literal substitution ─────────────────────────────────────────────
-
-/// Replace the RHS of every top-level annotated assignment whose name appears
-/// in `values` with the evaluated compile-time constant.
-///
-/// This transforms e.g.:
-/// ```python
-/// PORT: int = int(env("PORT", "8080"))
-/// ```
-/// into:
-/// ```python
-/// PORT: int = 8080
-/// ```
-// `substitute_comptime_literals` moved to `tyc-analyse` so the VM
+//
+// `substitute_comptime_literals` was moved to `tyc-analyse` so the VM
 // (`tyc run`) can share the same comptime-inlining pass that the
-// `tyc build` command uses. The build path imports it via the public
-// re-export at the top of this file.
+// `tyc build` command uses. Both consumers now import the public
+// `substitute_comptime_literals` re-export at the top of this file.
+// Transformation: `PORT: int = int(env("PORT", "8080"))` →
+// `PORT: int = 8080`.
 
 /// Generated `typhon_runtime/__init__.py` — exposes `Ok`/`Err`/`Result` plus
 /// the `tasks` and `lazy` submodules at the package root.

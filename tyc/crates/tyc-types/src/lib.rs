@@ -2140,9 +2140,7 @@ impl<'a> Checker<'a> {
             Type::Class(name) => Some(name.as_str()),
             _ => None,
         };
-        if let (Some((exp_head, _is_generic)), Some(act_head)) =
-            (exp_head_with_arity, act_head)
-        {
+        if let (Some((exp_head, _is_generic)), Some(act_head)) = (exp_head_with_arity, act_head) {
             if let Some(variants) = self.sealed_unions.get(exp_head) {
                 if variants.iter().any(|v| v == act_head) {
                     return true;
@@ -2200,8 +2198,7 @@ impl<'a> Checker<'a> {
                 && bn == "dict"
                 && bb.len() == 2
             {
-                return self.is_assignable(&aa[0], &bb[0])
-                    && self.is_assignable(&aa[1], &bb[1]);
+                return self.is_assignable(&aa[0], &bb[0]) && self.is_assignable(&aa[1], &bb[1]);
             }
         }
         // Generic / generic (e.g. `Result[T, E] = Ok[V]`, `list[T] = list[V]`):
@@ -4119,16 +4116,15 @@ fn check_freeze_let_freezable_stmt(c: &mut Checker, stmt: &Stmt) {
     match stmt {
         Stmt::Assign(a) => {
             // Find the binding name + the freeze-call argument, if any.
-            if let (Some(name), Some(arg)) =
-                (assign_target_name(&a.targets), freeze_call_argument(&a.value))
-            {
+            if let (Some(name), Some(arg)) = (
+                assign_target_name(&a.targets),
+                freeze_call_argument(&a.value),
+            ) {
                 check_freeze_argument(c, name, arg);
             }
         }
         Stmt::AnnAssign(a) => {
-            if let (Expr::Name(n), Some(value)) =
-                (a.target.as_ref(), a.value.as_deref())
-            {
+            if let (Expr::Name(n), Some(value)) = (a.target.as_ref(), a.value.as_deref()) {
                 if let Some(arg) = freeze_call_argument(value) {
                     check_freeze_argument(c, n.id.as_str(), arg);
                 }
@@ -8220,9 +8216,7 @@ fn stmt_always_exits_aware(c: &Checker, stmt: &Stmt) -> bool {
         // to honour this so `while True: match x: case A: return ...;
         // case B: continue` doesn't surface `missing_return` for the
         // function (B23 stress finding).
-        Stmt::While(w) => {
-            is_constant_true(&w.test) && !body_can_break(&w.body)
-        }
+        Stmt::While(w) => is_constant_true(&w.test) && !body_can_break(&w.body),
         // A `with` / `async with` block exits the enclosing function
         // only when every terminal in its body is *non-suppressible*
         // — `return` / `break` / `continue`. Bare `raise` is
@@ -8258,8 +8252,7 @@ fn stmt_can_break(stmt: &Stmt) -> bool {
     match stmt {
         Stmt::Break(_) => true,
         Stmt::If(s) => {
-            body_can_break(&s.body)
-                || s.elif_else_clauses.iter().any(|c| body_can_break(&c.body))
+            body_can_break(&s.body) || s.elif_else_clauses.iter().any(|c| body_can_break(&c.body))
         }
         Stmt::Match(m) => m.cases.iter().any(|c| body_can_break(&c.body)),
         Stmt::With(w) => body_can_break(&w.body),
@@ -8688,8 +8681,7 @@ fn pattern_covers_class(c: &Checker, pattern: &Pattern, class_name: &str) -> boo
         // union resolution we're on; accept both.
         Pattern::MatchSingleton(s) => {
             use ruff_python_ast::Singleton;
-            (class_name == "None" || class_name == "NoneType")
-                && matches!(s.value, Singleton::None)
+            (class_name == "None" || class_name == "NoneType") && matches!(s.value, Singleton::None)
         }
         Pattern::MatchSequence(seq) => {
             (class_name == "list" || class_name == "tuple")
@@ -9790,8 +9782,8 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
                     // not a class. `dict[str, int]({"a": 1})` and the
                     // like are legitimate constructor calls on a
                     // generic class.
-                    let is_class = c.class_shapes.contains_key(head)
-                        || c.classes.iter().any(|s| s == head);
+                    let is_class =
+                        c.class_shapes.contains_key(head) || c.classes.iter().any(|s| s == head);
                     let is_function = !is_class
                         && c.env
                             .lookup(head)
@@ -9799,12 +9791,7 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
                             .unwrap_or(false);
                     if is_function {
                         let span_start = sub.range.start().to_usize();
-                        let span_len = sub
-                            .range
-                            .end()
-                            .to_usize()
-                            .saturating_sub(span_start)
-                            .max(1);
+                        let span_len = sub.range.end().to_usize().saturating_sub(span_start).max(1);
                         c.diagnostics.push_error(TycError::generic(format!(
                             "explicit type arguments on function calls (e.g. \
                              `{head}[T](...)`) are not valid Python — function objects \
@@ -10486,7 +10473,8 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
             // carry an error-type to compare against the function's
             // declared return.
             if let Type::Generic(head, args) = &recv {
-                if head == "Err" && args.len() == 1
+                if head == "Err"
+                    && args.len() == 1
                     && (attr_name == "error" || attr_name == "value")
                 {
                     return args[0].clone();

@@ -614,8 +614,7 @@ impl Value {
             }
             Value::Dict(d) => {
                 let frozen_key = HashKey::Str(Rc::new("__typhon_frozen__".to_owned()));
-                let is_frozen =
-                    matches!(d.borrow().get(&frozen_key), Some(Value::Bool(true)));
+                let is_frozen = matches!(d.borrow().get(&frozen_key), Some(Value::Bool(true)));
                 let d = d.borrow();
                 let mut s = String::new();
                 if is_frozen {
@@ -711,7 +710,11 @@ impl Value {
 fn python_repr_bytes(b: &[u8]) -> String {
     let has_single = b.contains(&b'\'');
     let has_double = b.contains(&b'"');
-    let quote = if has_single && !has_double { b'"' } else { b'\'' };
+    let quote = if has_single && !has_double {
+        b'"'
+    } else {
+        b'\''
+    };
     let mut out = String::with_capacity(b.len() + 3);
     out.push('b');
     out.push(quote as char);
