@@ -4,6 +4,53 @@ All notable changes to Typhon are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely; the
 canonical phase-by-phase status lives in `docs/roadmap.md`.
 
+## 0.9.2 — 2026-05-27
+
+Bugfix point release closing a cross-module regression surfaced by the
+v0.9.1 MNIST CNN stress sweep. No language, runtime, or
+diagnostic-surface changes.
+
+### Fixed — cross-module `tyc::attribute_not_found` on `class!` subclasses of foreign bases
+
+A `class! Sub(Foreign):` (e.g. `class! HttpError(Exception): code: int`)
+declared in one module and imported by another false-positived
+`tyc::attribute_not_found` on every inherited / framework-provided
+attribute access. The same access pattern stayed (correctly) lenient
+in-module — the regression only fired across module boundaries.
+
+The root cause was in cross-module shape ingestion. When the consumer
+checker seeds external `class_shapes` (from a sibling module's
+`extract_module_shapes`), it never seeded the companion `class_parents`
+map. The four hierarchy walkers
+(`class_hierarchy_fully_known`, `find_method`, `find_field`,
+`class_inherits_from`) all consult `class_parents` to traverse the
+inheritance chain — so for an imported `HttpError`, the walks stopped
+at `HttpError` itself, never saw `Exception`, and
+`class_hierarchy_fully_known` reported the chain as "fully known". The
+v0.8.0 attribute-existence check then fired on every attribute that
+HttpError didn't declare directly, even though the v0.7.1 foreign-base
+suppression should have kicked in.
+
+The fix seeds `class_parents` from `InterfaceShape.bases` during the
+external-shape ingestion (`check_module_with_imports`).
+`InterfaceShape.bases` already crosses the module boundary as part of
+the shape; it just wasn't being unpacked into the parents map. The
+in-module `collect_classes_and_functions` pass continues to insert into
+`class_parents` later in the same checker run; we use
+`entry(..).or_insert_with(..)` so a local declaration of the same name
+still wins on collision.
+
+After the fix, the four hierarchy walks see the same parent chain for
+cross-module classes that they see for in-module ones, the v0.7.1
+foreign-base leniency kicks in correctly, and downstream code that
+imports `class! HttpError(Exception):` (or `class! M(nn.Module):`,
+`class! ParseError(ValueError):`, etc.) no longer needs an `unsafe:`
+shim or per-attribute annotations. Two new tests guard against
+regression: one asserts the cross-module bogus access is lenient when
+the hierarchy includes a foreign base, the other asserts a bogus
+access on a fully-known cross-module class (no foreign base) still
+fires the diagnostic — guarding against an over-broad fix.
+
 ## 0.9.1 — 2026-05-27
 
 Bugfix point release closing two issues surfaced by a v0.9.0 stress
