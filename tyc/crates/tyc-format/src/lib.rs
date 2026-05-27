@@ -190,12 +190,7 @@ pub fn format_source(source: &str, path: &str) -> Result<FormatResult, TycError>
 ///
 /// The pass scans each logical line and skips edits within `'…'` / `"…"` /
 /// triple-quoted regions so doc strings and embedded code stay verbatim.
-#[cfg(test)]
-fn normalise_whitespace(source: &str) -> String {
-    normalise_whitespace_with_map(source).0
-}
-
-/// Same as [`normalise_whitespace`] but also returns a translation map
+/// Returns a translation map
 /// from input line index to the line index of that same logical line in
 /// the output. Blank-line collapse (3+ → 2) and PEP-8 blank-line
 /// insertion both perturb line indices; the map lets `postprocess_full`
@@ -346,20 +341,16 @@ fn normalise_whitespace_with_map(source: &str) -> (String, Vec<usize>) {
 /// - Insert spaces around `->` so `()->int:` becomes `() -> int:`.
 ///
 /// PEP 8's two-blank-lines-around-top-level-defs rule lives in
-/// [`normalise_whitespace`] (file-level pass) so this per-line helper
-/// stays local in scope.
-#[cfg(test)]
-fn apply_simple_style_rules(line: &str) -> String {
-    apply_simple_style_rules_with_paren_depth(line, 0).0
-}
-
-/// Variant that accepts an incoming `paren_depth` carried across lines
-/// by [`normalise_whitespace_with_map`], and returns the residual depth
-/// after the line. Continuation lines inside an open `(` then get the
-/// PEP-8 kwarg rule (`a=1` stays tight) instead of being rewritten to
-/// `a = 1`. Bracket / triple-quote state is line-local because
-/// triple-quoted spans get verbatim treatment in the outer loop and
-/// `[ ]` slices don't realistically straddle a newline in real code.
+/// [`normalise_whitespace_with_map`] (file-level pass) so this per-line
+/// helper stays local in scope.
+///
+/// Takes the incoming `paren_depth` carried across lines by the
+/// file-level normaliser and returns the residual depth after the line.
+/// Continuation lines inside an open `(` get the PEP-8 kwarg rule
+/// (`a=1` stays tight) instead of being rewritten to `a = 1`. Bracket /
+/// triple-quote state is line-local because triple-quoted spans get
+/// verbatim treatment in the outer loop and `[ ]` slices don't
+/// realistically straddle a newline in real code.
 fn apply_simple_style_rules_with_paren_depth(
     line: &str,
     initial_paren_depth: i32,
