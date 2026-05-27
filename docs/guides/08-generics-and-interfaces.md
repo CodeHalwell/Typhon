@@ -164,6 +164,69 @@ def smallest[T: Ordered](xs: list[T]) -> T?:
 
 Bounded type vars are listed as **partial** in the current implementation — the syntax parses, but full constraint solving across multiple arguments is still landing. For now, use bounds in single-argument signatures and verify your call sites with `tyc check`.
 
+## Read-view covariance (v0.9.0)
+
+Functions that only *read* from a collection should declare the read-view type rather than the concrete container. The checker covariates the type parameter for the standard read-only protocols, so passing a `list[Dog]` where a `Sequence[Animal]` is expected works without any cast:
+
+```python
+class Animal: name: str
+class Dog(Animal): breed: str
+
+def names(animals: Sequence[Animal]) -> list[str]:
+    return [a.name for a in animals]
+
+let dogs: list[Dog] = [Dog(name="rex", breed="poodle")]
+names(dogs)                       # ✅ since v0.9.0
+```
+
+| Read-only protocol | Variance | Concrete types that flow in |
+|---|---|---|
+| `Sequence[T]` | covariant on `T` | `list[T]`, `tuple[T, ...]` |
+| `Iterable[T]` | covariant on `T` | `list[T]`, `tuple[T, ...]`, `set[T]`, `frozenset[T]`, generators |
+| `Iterator[T]` | covariant on `T` | generators, `iter(...)` results |
+| `Collection[T]` | covariant on `T` | `list[T]`, `tuple[T, ...]`, `set[T]`, `frozenset[T]` |
+| `Container[T]` | covariant on `T` | every collection with `__contains__` |
+| `Reversible[T]` | covariant on `T` | `list[T]`, `tuple[T, ...]` |
+| `Mapping[K, V]` | K invariant, V covariant | `dict[K, V]`, `MappingProxyType[K, V]` |
+| `MutableMapping[K, V]` | K invariant, V covariant | `dict[K, V]` |
+
+Use the read-view spelling when a function does not mutate — it accepts more callers without losing precision. Reserve `list[T]` / `dict[K, V]` for functions that mutate:
+
+```python
+def total(xs: Sequence[float]) -> float:        # ✅ accepts list[float], tuple[float, ...]
+    return sum(xs)
+
+def append_zero(xs: list[float]) -> None:        # mutates — list[float] required
+    xs.append(0.0)
+```
+
+`list[Dog]` does *not* flow into `list[Animal]` — writes through the wide view would let you `append(Animal())` to a `list[Dog]`. The covariance is read-protocol-only.
+
+## Explicit type instantiation is not supported (v0.9.0)
+
+Type parameters are always inferred from arguments or the binding type:
+
+```python
+let xs = first[int]([])              # ❌ check-time error since v0.9.0
+let xs: int? = first([])             # ✅ T inferred as int from the binding
+```
+
+`func[T](args)` is rejected at check time with `tyc::operator_type_mismatch`. Before v0.9.0 this crashed at runtime with `'function' object is not subscriptable`. The fix is always to annotate the binding (forward inference) or the result position (backward inference). Generic *class* construction (`Box[int](value=7)`) is not affected — the `[int]` there is part of the class shape, not function-application syntax.
+
+## Higher-kinded type parameters (parser scaffold)
+
+A type parameter can declare itself as a *type constructor* (a generic that takes a type argument) via the `[_]` marker:
+
+```python
+class Functor[F[_]]:
+    pass
+
+def map_through[F[_], A, B](fa: F[A], f: Callable[[A], B]) -> F[B]:
+    ...
+```
+
+The parser accepts `F[_]` as a 1-arg type-constructor parameter and the resolver tracks the kind structure. **Full unification of higher-kinded types is not yet enforced** — the surface compiles, but the checker won't catch every kind mismatch. Use HKT signatures conservatively until the frontier work lands.
+
 ## Generics emit as type-erased Python
 
 Typhon erases generics at emit time. The runtime sees plain `list`, `dict`, and untyped classes; type safety is a compile-time property only.

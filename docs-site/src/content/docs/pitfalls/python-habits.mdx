@@ -70,7 +70,46 @@ assert isinstance(x, str)
 x.upper()
 ```
 
-Works, but `if isinstance(x, str): ...` or `guard ...` reads better and the checker treats them identically.
+Works, but `if isinstance(x, str): ...` or `guard ...` reads better and the checker treats them identically. Note that `assert x is not None` also narrows since v0.9.0 — the Python static-checker idiom is fully supported.
+
+## Reaching for `Any` to type variadic forwarders
+
+Pre-v0.9.0 `*args` / `**kwargs` were lenient about annotations, so the loose Python idiom of `def trace(f, *args, **kwargs):` was tolerated. Rule 1 now extends to variadic parameters too. Use `object` for "really any value", not `Any`:
+
+```python
+def trace(f, *args: Any, **kwargs: Any) -> object:    # ⚠️ Any silently drops checks
+    ...
+
+def trace[R](f: Callable[..., R], *args: object, **kwargs: object) -> R:    # ✅
+    return f(*args, **kwargs)
+```
+
+`object` is the honest spelling — the body still has to narrow with `isinstance` to do anything type-specific.
+
+## Writing `f[int](xs)` to pin a generic
+
+Python's runtime *does* let you subscript a generic function (it just returns the function back unmodified), so you might be used to spelling type arguments at the call site. Typhon rejects this at check time since v0.9.0 — let the binding type drive inference back through the call:
+
+```python
+let xs = first[int]([])           # ❌ tyc::operator_type_mismatch
+let xs: int? = first([])          # ✅ T inferred as int from the binding
+```
+
+The `first[int](...)` shape used to crash at runtime with `TypeError: 'function' object is not subscriptable` on functions that didn't carry an `__class_getitem__`. The v0.9.0 check-time rejection gives you a clean diagnostic instead of a confusing runtime trace.
+
+## Spelling `list[T]` when you only read
+
+If your function only iterates the argument, annotate as `Sequence[T]` / `Iterable[T]` — the read-view protocols are covariant on `T` since v0.9.0, so `list[Dog]` flows into `Sequence[Animal]` automatically:
+
+```python
+def names(animals: list[Animal]) -> list[str]:        # invariant — list[Dog] is rejected
+    return [a.name for a in animals]
+
+def names(animals: Sequence[Animal]) -> list[str]:    # ✅ covariant — list[Dog] flows in
+    return [a.name for a in animals]
+```
+
+Reserve `list[T]` / `dict[K, V]` for functions that mutate.
 
 ## Single-letter generic names where the meaning is unclear
 

@@ -54,6 +54,25 @@ Emits `@dataclass(slots=True, frozen=True)`. Field reassignment is a hard error;
 
 Note: dataclass `frozen=True` blocks *field* reassignment only — nested mutable containers can still be mutated. Use `tuple` / `frozenset` inside the class for deep guarantees.
 
+#### `frozen` + inheritance — ordering matters
+
+When combining `frozen` with a base class, the modifier comes **between** the class name and the base list (not after the parenthesised base):
+
+```python
+class Square frozen(Shape):     # ✅ parses, lowers to @dataclass(slots=True, frozen=True)
+    side: float
+
+class Square(Shape) frozen:     # ❌ does not parse
+    side: float
+```
+
+The same rule applies to generics — type parameters sit before `frozen`:
+
+```python
+class Stack[T] frozen:           # ✅ parses
+    items: tuple[T, ...]
+```
+
 ### Inheritance
 
 ```python
@@ -79,6 +98,23 @@ It may *not* contain:
 - `def __init__` — generated. `tyc::manual_init`.
 - Other `def` methods — put them in an `impl` block instead.
 - Plain assignments without annotations (`name = "..."` at class scope).
+
+### Mutable defaults are rewritten to per-instance factories
+
+`name: list[str] = []` (and the equivalent `{}` / `set()` / `list()` / `dict()` shapes) is **not** a Python pitfall in Typhon. The desugar pass rewrites it to `dataclasses.field(default_factory=list)`, so each instance gets its own fresh container instead of sharing a single mutable literal:
+
+```python
+class Bucket:
+    items: list[str] = []         # ✅ each Bucket() gets its own list
+    tags: dict[str, int] = {}     # ✅ each Bucket() gets its own dict
+
+let a: Bucket = Bucket()
+let b: Bucket = Bucket()
+a.items.append("x")
+print(b.items)                    # [] — not shared
+```
+
+Since v0.9.0 the VM also honours the factory (it previously executed the rewritten code path correctly under `tyc build`, but `tyc run` was sharing one container across every instance). The `tyc::class_attr_shadows_slot` warning correspondingly does not fire on mutable-literal defaults — those become per-instance fields, not class-level slot descriptors. The warning still fires on immutable literals (`int = 3`, `str = "x"`) where the slot-descriptor pitfall actually applies; annotate those as `ClassVar[T]`.
 
 ## `model` — Pydantic emission
 
@@ -219,6 +255,27 @@ Emits a bare `class` with auto-synthesised `__init__` that calls `super().__init
 - **No `@dataclass` decorator.** The class is emitted verbatim with whatever bases it declares.
 - **`__init__` is auto-synthesised** when the body declares no `def __init__` and at least one base is present. The synthesised constructor calls `super().__init__()`, then assigns every annotated field through `self` in source order.
 - **Hand-written `__init__` is preserved verbatim.** Use this when the base class needs configuration arguments that aren't 1:1 with declared fields.
+
+### Exception subclasses with fields (v0.9.0)
+
+A common `class!` pattern is a typed exception: extending `Exception` with structured fields the handler can read. v0.9.0 wires the synthesised `__init__` through the VM, so the same `.ty` source runs identically under `tyc run` and `tyc build && python build/main.py`:
+
+```python
+class! HttpError(Exception):
+    code: int
+    message: str
+
+def fetch(url: str) -> str:
+    raise HttpError(code=404, message="not found")
+
+def main() -> None:
+    try:
+        let body: str = fetch("/missing")
+    except HttpError as e:
+        print(e.code, e.message)     # ✅ binds e to the user Instance; MRO walks Exception
+```
+
+Before v0.9.0 the VM didn't run the synthesised `__init__` and `e.code` raised `AttributeError`. Exception-type matching also walks the MRO since v0.9.0, so `except HttpError` matches subclasses too.
 
 ### When to use `class!`
 

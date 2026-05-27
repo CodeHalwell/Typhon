@@ -97,7 +97,7 @@ connect("localhost", 5433)             # ❌ port is keyword-only
 
 ## `*args` and `**kwargs`
 
-Allowed, but each must be annotated:
+Allowed, but each must be annotated — Rule 1 (every parameter annotated) extends to variadic parameters since v0.9.0:
 
 ```python
 def log_all(*messages: str, **tags: str) -> None:
@@ -109,6 +109,16 @@ log_all("start", "ready", env="prod", region="eu")
 ```
 
 Inside the body, `messages` has type `tuple[str, ...]` and `tags` has type `dict[str, str]`.
+
+For genuinely variadic functions — typically generic decorators or `**kwargs` forwarders where the shape can't be pinned down at the signature — the canonical idiom is `object`:
+
+```python
+def trace[R](f: Callable[..., R], *args: object, **kwargs: object) -> R:
+    log(f.__name__, args, kwargs)
+    return f(*args, **kwargs)
+```
+
+`object` is the honest spelling for "I don't know what's coming through"; the body still has to narrow with `isinstance` to do anything type-specific. Avoid `Any` as the escape hatch — `*args: Any` silently drops every check at the boundary.
 
 ## First-class functions
 
@@ -155,6 +165,14 @@ def first[T](xs: list[T]) -> T?:
 let n: int? = first([1, 2, 3])       # T inferred as int
 let s: str? = first(["a", "b"])      # T inferred as str
 ```
+
+When the type cannot be inferred (e.g. an empty list with no context), let the binding type drive inference back through the call:
+
+```python
+let empty: int? = first([])          # ✅ T inferred as int from the binding type
+```
+
+Don't try to write `first[int]([])` — explicit type instantiation at the call site is rejected at check time since v0.9.0 (it used to crash at runtime with `'function' object is not subscriptable`). The fix is always to annotate the binding or the surrounding context so the expected type drives inference.
 
 Generics are covered in depth in [guide 8](08-generics-and-interfaces.md).
 

@@ -116,6 +116,57 @@ The `else err:` block is optional. Without it, the first `Err` short-circuits st
 
 For one or two calls, `?` on each line reads fine.
 
+## Combinators on `Ok` and `Err`
+
+`Ok` and `Err` carry four combinator methods on the runtime classes. They land in v0.6.0 for the compiled path and v0.9.0 for the in-process VM:
+
+```python
+def parse_and_double(raw: str) -> Result[int, str]:
+    return parse_port(raw).map(lambda n: n * 2)
+
+def parse_to_app(raw: str) -> Result[int, AppError]:
+    return parse_port(raw).map_err(lambda msg: AppError(message=msg))
+
+def step(raw: str) -> Result[Loaded, AppError]:
+    return (
+        parse_port(raw)
+            .map_err(lambda msg: AppError(message=msg))
+            .and_then(load_from_port)
+    )
+```
+
+| Method | On `Ok(v)` | On `Err(e)` |
+|---|---|---|
+| `.map(f)` | `Ok(f(v))` | `Err(e)` |
+| `.map_err(g)` | `Ok(v)` | `Err(g(e))` |
+| `.and_then(f)` | `f(v)` (must return `Result`) | `Err(e)` |
+| `.or_else(h)` | `Ok(v)` | `h(e)` (must return `Result`) |
+
+`with`-chains + `?` and combinator chains are functionally equivalent — choose by readability. `with`-chains tend to read better when each step uses the previous step's value by name; combinators read better when each step is a one-argument function.
+
+Before v0.9.0 the combinators worked under `tyc build && python build/main.py` but crashed under `tyc run` with `AttributeError: Ok has no attribute 'and_then'`. v0.9.0 binds them as native VM methods, so the same source runs identically under both modes.
+
+## `?` inside a comprehension is rejected
+
+Comprehensions lower to nested `for`-loops in Python, so the surrounding function frame `?` would short-circuit out of is *not* the comprehension's frame:
+
+```python
+def collect(xs: list[str]) -> Result[list[int], str]:
+    return Ok([parse(x)? for x in xs])   # ❌ tyc::invalid_question_op
+```
+
+Pre-extract with an explicit loop, or chain `.and_then` / `.map`:
+
+```python
+def collect(xs: list[str]) -> Result[list[int], str]:
+    mut out: list[int] = []
+    for x in xs:
+        out.append(parse(x)?)
+    return Ok(out)
+```
+
+Since v0.9.0 the `tyc::invalid_question_op` help text explicitly mentions this carve-out (the previous text only covered the Result-return cause).
+
 ## Choosing your error type
 
 `E` in `Result[T, E]` can be anything. Three patterns by complexity:

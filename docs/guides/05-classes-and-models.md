@@ -129,6 +129,37 @@ q.x = 5.0    # ❌ dataclasses.FrozenInstanceError at runtime; tyc::frozen_assig
 
 > **Important caveat:** dataclass `frozen=True` only stops field reassignment. If a field is a mutable container (`list`, `dict`), the container's contents can still be mutated. For deeper guarantees, use immutable containers (`tuple`, `frozenset`) inside the class.
 
+### `frozen` + inheritance — ordering matters
+
+When combining `frozen` with a base class, the modifier comes between the class name and the parenthesised base list, *not* after it:
+
+```python
+class Square frozen(Shape):       # ✅ parses
+    side: float
+
+class Square(Shape) frozen:       # ❌ does not parse
+    side: float
+```
+
+The same rule applies to generics — type parameters sit before `frozen`: `class Stack[T] frozen:`, `class Stack[T] frozen(BaseStack):`.
+
+## Mutable defaults are per-instance factories
+
+`name: list[str] = []` (and the equivalent `{}` / `set()` / `list()` / `dict()` shapes) is *not* a Python pitfall in Typhon. The desugar pass rewrites mutable-literal defaults to `dataclasses.field(default_factory=...)`, so each instance gets its own fresh container instead of sharing one mutable literal:
+
+```python
+class Bucket:
+    items: list[str] = []
+    tags: dict[str, int] = {}
+
+let a: Bucket = Bucket()
+let b: Bucket = Bucket()
+a.items.append("x")
+print(b.items)         # [] — not shared
+```
+
+Since v0.9.0 the in-process VM (`tyc run`) also honours the factory; it previously executed the rewritten code path correctly under `tyc build` but shared one container across every instance under the VM. `tyc::class_attr_shadows_slot` correspondingly does *not* fire on mutable-literal defaults — those become per-instance fields, not class-level slot descriptors. The warning still fires on immutable literals (`int = 3`, `str = "x"`) where the slot-descriptor pitfall actually applies; annotate those as `ClassVar[T]`.
+
 ## `model` — Pydantic emission
 
 When you need runtime validation — typical for API boundaries — use `model`:

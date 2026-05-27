@@ -204,6 +204,34 @@ def display(t: Token) -> str:
 
 Add a `Star` variant for multiplication and every `match` on `Token` fails to compile until you handle it. The compiler becomes your TODO list.
 
+## Class patterns on built-in types
+
+Since v0.9.0 `case TypeName() as binding:` matches any value whose runtime type is `TypeName` and binds it under the narrowed shape:
+
+```python
+def label(x: object) -> str:
+    match x:
+        case str() as s:   return f"str:{s}"
+        case int() as n:   return f"int:{n}"
+        case float() as f: return f"float:{f}"
+        case list() as xs: return f"list:{len(xs)}"
+        case _:            return "other"
+```
+
+This is the typed fall-through pattern for wide-union subjects: each `case TypeName()` narrows the scrutinee to the named built-in inside the arm.
+
+The exhaustiveness pass also recognises `case None:` plus a class pattern as covering a `T?` subject — no `case _:` needed:
+
+```python
+def show(s: str?) -> str:
+    match s:
+        case None:        return "<missing>"
+        case str() as x:  return x
+    # no missing_return — these two arms cover str? since v0.9.0
+```
+
+Both forms work under `tyc check`, `tyc run`, and `tyc build && python build/main.py`. Before v0.9.0 the VM didn't match class patterns on built-in types — the same source ran cleanly in the compiled build but raised at runtime under `tyc run`.
+
 ## Parametric sealed unions (R3-10)
 
 A sealed union can be parametric — useful for stream / reactive engines
@@ -253,6 +281,58 @@ def make_record[T](v: T) -> EventEnvelope[T]:
 The constructor call `RecordEnv(payload=v)` is treated as
 `RecordEnv[T]`, which is structurally assignable to `EventEnvelope[T]`
 because the alias is just `RecordEnv[T] | …`.
+
+### Variant → parametric union assignability
+
+Since v0.9.0 the assignability covers the case where the variant *itself* is generic over the same type parameter as the alias — the rule that makes recursive ADT walks compile:
+
+```python
+class Cons[T] frozen:
+    head: T
+    tail: LL[T]
+
+class Nil[T] frozen:
+    pass
+
+type LL[T] = Cons[T] | Nil[T]
+
+def length[T](xs: LL[T]) -> int:
+    mut cur: LL[T] = xs
+    mut count: int = 0
+    while True:
+        match cur:
+            case Nil():
+                return count
+            case Cons(_, tail):
+                cur = tail            # ✅ Cons[T] flows into LL[T] since v0.9.0
+                count = count + 1
+```
+
+Before v0.9.0 the `cur = tail` assignment raised `tyc::type_mismatch` because `Cons[T]` wasn't recognised as assignable to `LL[T]`. Recursive ADT walks — linked lists, ASTs, sealed-union streams — now compile without per-variant casts.
+
+### Distributing `impl` over a sealed alias
+
+`impl[T] LL[T]:` over a sealed-union alias distributes every method body across every variant — useful when every variant should expose the same operation:
+
+```python
+impl[T] LL[T]:
+    def is_empty(self) -> bool:
+        match self:
+            case Nil(): return True
+            case Cons(_, _): return False
+
+    def length(self) -> int:
+        mut cur: LL[T] = self
+        mut n: int = 0
+        while True:
+            match cur:
+                case Nil(): return n
+                case Cons(_, tail):
+                    cur = tail
+                    n = n + 1
+```
+
+The lowering emits the body once per variant. Since v0.9.0 any diagnostic raised by the same line across multiple variants is deduplicated by `(code, rendered message)`, so a 10-variant union no longer reports 10 identical errors when something goes wrong inside the shared body. (One known limitation: each surviving diagnostic still points at a synthetic line index inside the preprocessed buffer past the original-source EOF; the proper source-map rewrite is tracked for the next release.)
 
 ## Sealed unions vs inheritance
 

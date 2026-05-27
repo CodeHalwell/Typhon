@@ -97,22 +97,39 @@ def pair[T](a: T, b: T) -> tuple[T, T]: ...
 let p = pair(1, "two")               # T = int | str
 ```
 
-This matches Python's `|` semantics. To force a specific binding, annotate the call:
+This matches Python's `|` semantics. To force a specific binding, annotate the binding (let the result-type drive inference back through the call):
 
 ```python
-let p = pair[int](1, 2)              # explicit T = int
+let p: tuple[int, int] = pair(1, 2)  # ✅ T = int via expected-type back-propagation
 ```
+
+### Explicit type instantiation is not supported (v0.9.0)
+
+`func[T](args)` is rejected at check time:
+
+```python
+let p = pair[int](1, 2)              # ❌ check-time error since v0.9.0
+let empty = first[int]([])           # ❌ same
+```
+
+```
+error[tyc::operator_type_mismatch]: type arguments cannot be supplied at the call site;
+                                    let the expected type drive inference instead
+```
+
+Before v0.9.0 this crashed at runtime with `TypeError: 'function' object is not subscriptable`. The compiler now redirects you to bidirectional inference: annotate the binding (forward) or the result (backward), and the call infers `T` from context. Generic *class* construction (`Box[int](value=7)`) is not subject to this rule — the `[int]` there is part of the class shape, not a function-application syntax.
 
 ## When inference fails
 
-Empty collections, return-only positions, and ambiguous contexts can prevent inference. Annotate explicitly:
+Empty collections, return-only positions, and ambiguous contexts can prevent inference. Annotate the binding (forward) or pre-build a typed value:
 
 ```python
-let empty: list[int]? = first[int]([])       # ✅ explicit T
-
-# or:
 let empty: list[int] = []
 let first_or_none: int? = first(empty)       # T inferred from the list
+
+# Or pre-annotate the result:
+mut bag: list[int] = []
+bag.append(0)
 ```
 
 ## Bounded type parameters
@@ -141,14 +158,43 @@ def smallest[T: Ordered](xs: list[T]) -> T?:
 
 Variance describes how a generic type relates to its parameters: `Box[Dog]` is to `Box[Animal]` as `Dog` is to `Animal` (covariant), opposite (contravariant), or unrelated (invariant).
 
-The current checker treats container generics conservatively:
+The current checker treats container generics conservatively for the mutable forms, but **the read-only protocols are covariant on `T`** (v0.9.0):
 
 - **`list[T]`** — invariant (because `list` is mutable).
 - **`tuple[T, ...]`** — covariant (read-only).
 - **`Callable[[A], R]`** — contravariant in `A`, covariant in `R`.
 - **User generics (`Box[T]`)** — invariant by default.
 
-Full variance annotations (PEP 695's `out T`, `in T`) are partial; future work will tighten this.
+The read-view protocols flow `list[Dog] → Sequence[Animal]` since v0.9.0:
+
+| Read-only protocol | Variance | Concrete types that flow in |
+|---|---|---|
+| `Sequence[T]` | covariant on `T` | `list[T]`, `tuple[T, ...]` |
+| `Iterable[T]` | covariant on `T` | `list[T]`, `tuple[T, ...]`, `set[T]`, `frozenset[T]`, generators |
+| `Iterator[T]` | covariant on `T` | generators, `iter(...)` results |
+| `Collection[T]` | covariant on `T` | `list[T]`, `tuple[T, ...]`, `set[T]`, `frozenset[T]` |
+| `Container[T]` | covariant on `T` | every collection with `__contains__` |
+| `Reversible[T]` | covariant on `T` | `list[T]`, `tuple[T, ...]` |
+| `Mapping[K, V]` | K invariant, V covariant | `dict[K, V]`, `MappingProxyType[K, V]` |
+| `MutableMapping[K, V]` | K invariant, V covariant | `dict[K, V]` |
+
+Use the read-view spelling when a function does not mutate — it accepts more callers without losing precision. See [Collections — Read-view covariance](/Typhon/types/collections/#read-view-covariance-v090) for the worked walkthrough.
+
+Full variance annotations (PEP 695's `out T`, `in T`) on user generics are partial; future work will tighten this.
+
+## Higher-kinded type parameters (parser scaffold, v0.8.0)
+
+A type parameter can declare itself as a *type constructor* (a generic that itself takes a type argument) via the `[_]` marker:
+
+```python
+class Functor[F[_]]:
+    pass
+
+def map_through[F[_], A, B](fa: F[A], f: Callable[[A], B]) -> F[B]:
+    ...
+```
+
+The parser accepts `F[_]` as a 1-arg type-constructor parameter; the resolver tracks the kind structure. **Full unification of higher-kinded types is not yet enforced** — the surface compiles, but the checker won't catch every kind mismatch. Use HKT signatures conservatively until the frontier work in `TYPE_SYSTEM_FRONTIER.md` lands.
 
 ## Type erasure at emit
 
@@ -188,7 +234,13 @@ Fix: `def first[T](xs: list[T]) -> T?:`.
 let empty = first([])    # ❌ T unconstrained
 ```
 
-Fix: `let empty: int? = first[int]([])`.
+Fix: annotate the binding so the expected type drives inference back through the call:
+
+```python
+let empty: int? = first([])     # T inferred as int from the binding
+```
+
+(`first[int]([])` is **not** the fix — explicit type instantiation is rejected at check time since v0.9.0.)
 
 ### Calling `isinstance` on a generic type
 

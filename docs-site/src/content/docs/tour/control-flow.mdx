@@ -49,6 +49,38 @@ def countdown(n: int) -> None:
 
 The loop variable is `mut` because we reassign it. The checker would catch a `let` here with `tyc::immutable_assign`.
 
+### `while True:` and `Never`-returning functions (v0.9.0)
+
+A `while True:` loop whose body always exits via `return` or `raise` on every branch is recognised as never falling through. The post-loop point is unreachable, so `tyc::missing_return` doesn't fire on the function:
+
+```python
+def serve() -> Never:
+    while True:
+        let req: Request = accept()
+        if req.is_quit():
+            raise SystemExit
+        handle(req)
+    # no return needed here — post-loop point is unreachable since v0.9.0
+```
+
+Add a `break` anywhere in the body and the fall-through check re-engages — loops that exit cleanly still need a post-loop `return`.
+
+### Post-`while`-loop narrowing (v0.9.0)
+
+After a `while` loop whose test is "this value is `None`" and whose body reassigns the binding (no `break`), the post-loop binding is narrowed to non-`None`:
+
+```python
+def first_loaded(sources: list[Loader]) -> Config:
+    mut cfg: Config? = None
+    mut i: int = 0
+    while cfg is None:
+        cfg = sources[i].load()
+        i = i + 1
+    return cfg     # ✅ narrowed to Config since v0.9.0
+```
+
+This matches the narrowing that `pyright`, `mypy`, and `pyrefly` apply.
+
 ## `for`
 
 `for` iterates anything `Iterable`. The element type is inferred from the iterable:
@@ -85,6 +117,18 @@ def shipping_cost(weight: float?) -> float:
 ```
 
 Inside the `else:` block you must return, raise, or otherwise leave the enclosing function. After the `guard`, the name (`w`) is narrowed to its non-null form.
+
+### `assert x is not None` also narrows (v0.9.0)
+
+The standard Python static-checker idiom narrows the binding under `assert` too:
+
+```python
+def display(name: str?) -> str:
+    assert name is not None
+    return name.upper()        # narrowed to str since v0.9.0
+```
+
+`assert` is a runtime check that raises `AssertionError` on the false branch, and Typhon now treats it as a control-flow gate that narrows the binding for the rest of the scope. Use it sparingly — running Python with `-O` disables `assert`, so safety-critical narrowing should still go through `guard` or `if x is None: return`. `assert` is best for "this can't happen" checkpoints inside functions that already validated their inputs.
 
 `guard` is sugar for:
 

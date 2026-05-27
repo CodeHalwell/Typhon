@@ -122,6 +122,48 @@ def area(s: Shape) -> float:
 
 Destructured names (`r`, `w`, `h`) take the field types.
 
+#### Class patterns on built-in types (v0.9.0)
+
+`case TypeName() as binding:` narrows the scrutinee to the named built-in:
+
+```python
+def label(x: object) -> str:
+    match x:
+        case str() as s: return f"str:{s}"
+        case int() as n: return f"int:{n}"
+        case _:          return "other"
+```
+
+Exhaustiveness also recognises `case None:` + `case str() as s:` as covering a `str?` subject — no `missing_return` even without a wildcard.
+
+### `assert x is not None` (v0.9.0)
+
+The standard Python static-checker idiom narrows the binding under `assert`:
+
+```python
+def f(x: int?) -> int:
+    assert x is not None
+    return x + 1      # narrowed to int since v0.9.0
+```
+
+`assert` is treated as a control-flow gate that raises on the false branch. The narrowing covers the binding for the rest of the scope, exactly like an early-return guard would. Use it sparingly — `assert` is a runtime check, and disabling it (`python -O`) removes the guarantee. Prefer `guard` or `if x is None: return` for shape that should survive `-O`.
+
+### Post-`while`-loop narrowing (v0.9.0)
+
+After a `while` loop whose condition is "this value is `None`" and whose body reassigns the binding (and no `break` is present), the post-loop binding is narrowed to non-`None`:
+
+```python
+def load_first(sources: list[Loader]) -> Config:
+    mut y: Config? = None
+    mut i: int = 0
+    while y is None:
+        y = sources[i].load()
+        i = i + 1
+    return y          # ✅ narrowed to Config since v0.9.0 — was nullable_use before
+```
+
+The same pattern works for any narrowing form the `while` test would have applied to the body — `is None`, `is not None`, truthiness — provided no `break` jumps over the implicit "test must have been false to exit" inference.
+
 ## Re-widening
 
 A binding's narrowed type lasts *until reassignment*. If you reassign with `mut`, the new type is whatever you put in:

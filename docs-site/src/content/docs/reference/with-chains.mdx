@@ -119,7 +119,16 @@ def f() -> Result[T, AppError]:
         return Ok(loaded)
 ```
 
-Fix:
+Fix with `.map_err`:
+
+```python
+def f() -> Result[T, AppError]:
+    with parsed = parse_str().map_err(lambda msg: AppError(message=msg))?,
+         loaded = load_int(parsed)?:
+        return Ok(loaded)
+```
+
+Or unfold the bridge with `match`:
 
 ```python
 def f() -> Result[T, AppError]:
@@ -130,6 +139,8 @@ def f() -> Result[T, AppError]:
         case Err(msg):
             return Err(AppError(message=msg))
 ```
+
+Since v0.8.0 the check also runs against the implicit propagation path on every `?`-binding, so a chain that would have silently routed the wrong error class through the enclosing return now fires `tyc::result_error_mismatch` at check time. Since v0.9.0 the same check covers the explicit `else err: return Err(err)` form too — previously the check was gated on the synthetic `?`-op temp shape, so an `else` block could return an `Err` whose payload type didn't match the function's declared return.
 
 ## When to use a `with`-chain
 

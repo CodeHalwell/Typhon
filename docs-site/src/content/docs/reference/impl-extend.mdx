@@ -90,6 +90,40 @@ impl[T] Box[T]:
 
 Re-declare the generic parameters with `impl[T]`. The parameter names must match the class declaration.
 
+### Distributing `impl` over a sealed-union alias
+
+`impl[T] AliasName[T]:` over a sealed-union alias distributes every method body across every variant of the alias. Useful for ADT walks where each variant should expose the same operation:
+
+```python
+class Cons[T] frozen:
+    head: T
+    tail: LL[T]
+
+class Nil[T] frozen:
+    pass
+
+type LL[T] = Cons[T] | Nil[T]
+
+impl[T] LL[T]:
+    def is_empty(self) -> bool:
+        match self:
+            case Nil(): return True
+            case Cons(_, _): return False
+
+    def length(self) -> int:
+        mut cur: LL[T] = self
+        mut count: int = 0
+        while True:
+            match cur:
+                case Nil():
+                    return count
+                case Cons(_, tail):
+                    cur = tail
+                    count = count + 1
+```
+
+The lowering emits the body once per variant — `Cons.is_empty(self)`, `Nil.is_empty(self)`, `Cons.length(self)`, `Nil.length(self)`. Any diagnostic raised by the same line across multiple variants is now deduplicated since v0.9.0, so a 10-variant union no longer reports 10 identical errors. (The synthetic line numbers each surviving diagnostic points at are still inside the preprocessed buffer past EOF of your source; the proper source-map rewrite is tracked for the next release.)
+
 ## `extend`
 
 `extend ClassName:` is `impl`'s twin for two cases:
@@ -151,6 +185,21 @@ For built-in types (`str`, `list`, `int`, `dict`, `bytes`, `set`, `frozenset`, `
 </Tabs>
 
 **No monkey-patching.** The rewrite is strictly opt-in by static annotation. An un-annotated receiver (`some_dynamic.to_slug()`) raises `AttributeError` at runtime — Python's existing semantics.
+
+### Dispatching `extend list:` over `list[T]` receivers (v0.9.0)
+
+Until v0.9.0 the rewrite only fired against `list`-typed bindings — `list[int]` and `list[str]` fell through to `tyc::attribute_not_found`. v0.9.0 consults the synthetic `__typhon_builtin_ext_list` class shape *before* `attribute_not_found` fires, so the parameterised forms dispatch correctly:
+
+```python
+extend list:
+    def first_or[T](self, default: T) -> T:
+        return self[0] if self else default
+
+def head(xs: list[int]) -> int:
+    return xs.first_or(0)        # ✅ since v0.9.0 — was attribute_not_found before
+```
+
+The receiver type is still required (Rule 1); a bare-`list` annotation is fine, a missing annotation isn't.
 
 ### Which built-ins are extendable?
 

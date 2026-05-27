@@ -96,6 +96,30 @@ comptime let DARK_MODE: bool = feature_flag("dark_mode")
 
 Each `comptime let` is a *constant* at runtime — there's no runtime cost to checking them, because they're already inlined.
 
+### `comptime let T: type = …` — types as values
+
+A `comptime let` can also hold a *type*, in which case the binding name is substituted wherever the alias is used in annotations:
+
+```python
+comptime let IdKind: type = int
+
+def lookup(id: IdKind) -> User?:
+    return USERS.get(id)
+```
+
+Since v0.9.0 this lowers to a PEP 695 `type IdKind = int` alias statement, and the substitution pass runs before `tyc check` parses the resolved module so check, build, and `tyc run` all see the same shape. Use this when you want a build-switched type without writing two function signatures:
+
+```python
+comptime let HashAlgo: type = blake3.Blake3 if FAST_HASH else hashlib.sha256
+
+def fingerprint(data: bytes) -> HashAlgo:
+    return HashAlgo(data).digest()
+```
+
+### `comptime` inlining works under `tyc run`
+
+Since v0.9.0 the in-process VM also runs the comptime substitution pass — `comptime let PORT = int(env("PORT", "8080"))` produces the same inlined literal under `tyc run` as it does under `tyc build && python build/main.py`. Before v0.9.0 the VM crashed with `NameError: env is not defined` because the substitution didn't run before interpretation.
+
 ## Lazy loading
 
 Imports are eager in Python: importing `numpy` runs `numpy/__init__.py` even if you never call into it. For CLIs and short-running scripts, that's wasted startup. `lazy import` defers the work:
@@ -503,6 +527,22 @@ CONFIG = __typhon_freeze__({"port": 8080, "hosts": ["api.example.com", "api2.exa
 Reach for `comptime` for build-time constants (ports, feature flags, API versions). Reach for `freeze let` for large look-up tables and configuration dicts that are expensive to build but must be immutable.
 
 **Current limitation:** `freeze let` is module-level only; class-body use is planned for a future release.
+
+**Check-time validation (v0.9.0):** the type checker pre-validates the RHS of every `freeze let X = <expr>` binding. Constructing a non-`frozen` user class on the RHS now fires `tyc::freeze_not_freezable` at check time instead of letting the failure surface as a runtime `TypeError` at first import:
+
+```python
+class Counter:                       # not frozen
+    value: int
+
+freeze let CFG = Counter(value=0)    # ❌ tyc::freeze_not_freezable
+
+class Counter frozen:                # ✅ declare the class frozen first
+    value: int
+
+freeze let CFG = Counter(value=0)    # ✅
+```
+
+**VM behaviour (v0.9.0):** the in-process VM (`tyc run`) also recursively wraps `list → tuple`, `dict → mappingproxy-tagged dict`, `set → frozenset` now, so mutators on a frozen value raise the same `TypeError` CPython's `MappingProxy` does under both execution modes. Before v0.9.0 the VM treated `freeze let` as a regular `let` — mutations through aliased references silently succeeded.
 
 ---
 

@@ -144,6 +144,49 @@ impl Triangle:
 
 …or you can keep behaviour on the union by writing a free function that pattern-matches (often clearer for behaviour that depends on multiple variants at once).
 
+### Distributing `impl` over the union
+
+For methods that have the *same body shape* on every variant, write the `impl` once on the union alias and let the compiler distribute it:
+
+```python
+impl Shape:
+    def name(self) -> str:
+        match self:
+            case Circle(_):    return "circle"
+            case Rectangle(_, _): return "rectangle"
+            case Triangle(_, _):  return "triangle"
+```
+
+The lowering emits the body once per variant — `Circle.name(self)`, `Rectangle.name(self)`, `Triangle.name(self)`. Since v0.9.0 any diagnostic raised by the same line across multiple variants is deduplicated by `(code, rendered message)`, so a 10-variant union no longer reports 10 identical errors when something goes wrong inside the shared body.
+
+## Variant → parametric union flow (v0.9.0)
+
+A bare variant flows into the parametric union alias even when the variant is itself generic over the same type parameter. This is the assignability rule that makes recursive ADT walks compile:
+
+```python
+class Cons[T] frozen:
+    head: T
+    tail: LL[T]
+
+class Nil[T] frozen:
+    pass
+
+type LL[T] = Cons[T] | Nil[T]
+
+def length[T](xs: LL[T]) -> int:
+    mut cur: LL[T] = xs
+    mut count: int = 0
+    while True:
+        match cur:
+            case Nil():
+                return count
+            case Cons(_, tail):
+                cur = tail            # ✅ Cons[T] flows into LL[T]
+                count = count + 1
+```
+
+Before v0.9.0 the `cur = tail` assignment fired `tyc::type_mismatch` because `Cons[T]` wasn't recognised as assignable to `LL[T]`. Recursive ADT walks (linked lists, ASTs, sealed-union streams) now compile without per-variant casts.
+
 ## Real-world example: a parser
 
 Sealed unions shine when you have a small fixed alphabet of inputs or outputs:
@@ -180,6 +223,20 @@ def display(t: Token) -> str:
 ```
 
 Add a `Star` variant for multiplication and every `match` on `Token` fails to compile until you handle it. The compiler becomes your TODO list.
+
+### `match` on `T?` covers `None` + a class pattern (v0.9.0)
+
+For nullable subjects, the exhaustiveness pass recognises `case None:` plus a class pattern on the inner type as covering the full `T?`:
+
+```python
+def show(name: str?) -> str:
+    match name:
+        case None:        return "<anonymous>"
+        case str() as s:  return s
+    # no missing_return — these two arms cover str? since v0.9.0
+```
+
+`case TypeName() as binding:` is the class-pattern shorthand for any built-in type (`str`, `int`, `float`, `list`, `dict`, `bool`, `bytes`). The capture binds the subject under the narrowed type.
 
 ## Sealed unions vs inheritance
 

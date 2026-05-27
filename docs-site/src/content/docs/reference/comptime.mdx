@@ -80,6 +80,54 @@ User-defined functions usable from `comptime let` initialisers:
 
 Both the `comptime def` definitions and their call sites are erased; only the resulting literal values reach the emitted output.
 
+## `comptime let T: type = …` — types as values (v0.5.0, lowered properly in v0.9.0)
+
+A `comptime let` binding can also hold a *type*, in which case the binding name is substituted wherever the alias is used in annotations:
+
+<Tabs>
+  <TabItem label="Typhon">
+    ```python
+    comptime let IdKind: type = int
+
+    def lookup(id: IdKind) -> User?:
+        return USERS.get(id)
+
+    def main() -> None:
+        let u: User? = lookup(7)
+        ...
+    ```
+  </TabItem>
+  <TabItem label="Emitted Python">
+    ```python
+    type IdKind = int
+
+
+    def lookup(id: IdKind) -> User | None:
+        return USERS.get(id)
+
+
+    def main() -> None:
+        u: User | None = lookup(7)
+        ...
+    ```
+  </TabItem>
+</Tabs>
+
+v0.9.0 lowers `comptime let T: type = <Type>` to a PEP 695 `type T = <Type>` alias statement. The substitution pass also runs before `tyc check` parses the resolved module, so check, build, and `tyc run` all see the same shape — no more "alias resolves at build but not at check" drift.
+
+Use this when you want a build-switched type without writing two function signatures:
+
+```python
+comptime let HashAlgo: type = blake3.Blake3 if FAST_HASH else hashlib.sha256
+
+def fingerprint(data: bytes) -> HashAlgo:
+    return HashAlgo(data).digest()
+```
+
+## VM behaviour
+
+Since v0.9.0 `comptime let X = ...` value bindings inline under `tyc run` too, via the substitution pass shared with `tyc build`. So `comptime let PORT = int(env(...))` no longer crashes with `NameError: env is not defined` under the in-process VM — the literal is substituted in before interpretation, exactly like the compiled path.
+
 ## What the sandbox supports
 
 The v1 contract:

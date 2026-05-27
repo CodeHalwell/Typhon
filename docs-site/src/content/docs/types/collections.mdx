@@ -240,6 +240,48 @@ The standard library distinction holds:
 
 For deep immutability inside a `frozen` class, use immutable containers (`tuple`, `frozenset`) for the field types.
 
+## Read-view covariance (v0.9.0)
+
+Functions that only **read** from a collection should declare the read-view type rather than the concrete one. The checker covariates the type parameter for the standard read-only protocols, so passing a `list[Dog]` where a `Sequence[Animal]` is expected works without any cast:
+
+```python
+class Animal: name: str
+class Dog(Animal): breed: str
+
+def names(animals: Sequence[Animal]) -> list[str]:
+    return [a.name for a in animals]
+
+let dogs: list[Dog] = [Dog(name="rex", breed="poodle")]
+names(dogs)                       # ✅ since v0.9.0
+```
+
+| Read-only protocol | Variance | Concrete types that flow in |
+|---|---|---|
+| `Sequence[T]` | covariant on `T` | `list[T]`, `tuple[T, ...]` |
+| `Iterable[T]` | covariant on `T` | `list[T]`, `tuple[T, ...]`, `set[T]`, `frozenset[T]`, generators |
+| `Iterator[T]` | covariant on `T` | generators, `iter(...)` results |
+| `Collection[T]` | covariant on `T` | `list[T]`, `tuple[T, ...]`, `set[T]`, `frozenset[T]` |
+| `Container[T]` | covariant on `T` | every collection with `__contains__` |
+| `Reversible[T]` | covariant on `T` | `list[T]`, `tuple[T, ...]` |
+| `Mapping[K, V]` | K invariant, V covariant | `dict[K, V]`, `MappingProxyType[K, V]` |
+| `MutableMapping[K, V]` | K invariant, V covariant | `dict[K, V]` |
+
+Use the concrete `list[T]` / `dict[K, V]` only when the function must mutate. For pure consumption, the read-view spelling is more accurate and accepts more callers:
+
+```python
+def total(xs: Sequence[float]) -> float:        # ✅ accepts list[float], tuple[float, ...]
+    return sum(xs)
+
+def append_zero(xs: list[float]) -> None:        # mutates — list[float] required
+    xs.append(0.0)
+```
+
+Before v0.9.0 these protocols were treated as invariant on their type parameters, so callers had to widen at the call site (`list[Animal](dogs)`) or the function had to spell the union type. The v0.9.0 widening is purely additive — every previously-accepted program still type-checks.
+
+### What is *not* covariant
+
+`list[Dog]` does **not** flow into `list[Animal]` (writes through the wide view would let you `append(Animal())` to a `list[Dog]`). `dict[str, Dog]` does **not** flow into `dict[str, Animal]`. The covariance is read-protocol-only.
+
 ## Common mistakes
 
 ### Bare collection annotations
