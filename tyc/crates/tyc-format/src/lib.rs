@@ -140,9 +140,8 @@ pub fn format_source(source: &str, path: &str) -> Result<FormatResult, TycError>
     // ruff ran, line indices are guaranteed identical because the
     // `can_run_ruff` guard above requires the stripped lists to be
     // empty; the translation below is a no-op in that branch.
-    let translate = |line_index: usize| -> usize {
-        line_map.get(line_index).copied().unwrap_or(line_index)
-    };
+    let translate =
+        |line_index: usize| -> usize { line_map.get(line_index).copied().unwrap_or(line_index) };
     let translated_stripped: Vec<StrippedKeyword> = prep
         .stripped
         .iter()

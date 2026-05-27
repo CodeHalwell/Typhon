@@ -295,7 +295,9 @@ pub fn aggregate_pub_star_shapes(
         let mut merged = shape_map.remove(&pkg_dotted).unwrap_or_default();
         // Direct sibling .ty modules.
         for path in paths {
-            let Some(parent) = path.parent() else { continue };
+            let Some(parent) = path.parent() else {
+                continue;
+            };
             if parent != pkg_dir.as_path() {
                 continue;
             }
@@ -321,7 +323,9 @@ pub fn aggregate_pub_star_shapes(
             if stem != "__init__" {
                 continue;
             }
-            let Some(sub_dir) = path.parent() else { continue };
+            let Some(sub_dir) = path.parent() else {
+                continue;
+            };
             if sub_dir == pkg_dir.as_path() {
                 continue;
             }

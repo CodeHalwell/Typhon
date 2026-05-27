@@ -224,11 +224,7 @@ pub fn run(args: BuildArgs) -> Result<()> {
     // v0.9.0 stress.)
     {
         let all_paths: Vec<PathBuf> = sources.iter().map(|(p, _)| p.clone()).collect();
-        crate::commands::util::aggregate_pub_star_shapes(
-            &mut project_shapes,
-            &all_paths,
-            src_root,
-        );
+        crate::commands::util::aggregate_pub_star_shapes(&mut project_shapes, &all_paths, src_root);
     }
     // Venv-introspection enrichment: shell to the project's Python
     // and recover real signatures for every third-party class /
