@@ -37,6 +37,15 @@ pub struct Interpreter {
     /// script path; `argv[1..]` are the user-supplied arguments. Populated
     /// by `lib::run_*`, not by the host process's own argv.
     pub script_argv: Vec<String>,
+    /// Directory holding sibling `.ty` source files for cross-module
+    /// imports. When set, `from .repo import X` (and bare `import repo`)
+    /// resolves against `<source_root>/repo.ty`. Without this, multi-file
+    /// projects can only be run via `tyc run --compile`.
+    pub source_root: Option<std::path::PathBuf>,
+    /// Cache of loaded user modules keyed by their package-qualified
+    /// name (e.g. "repo" or "sub.util"). Lets the same module be imported
+    /// from multiple files without re-evaluating its body.
+    pub module_cache: HashMap<String, Value>,
 }
 
 impl Default for Interpreter {
@@ -62,6 +71,8 @@ impl Interpreter {
             // `stacker` isn't a workspace dep yet — TODO.
             max_stack_depth: 1000,
             script_argv: Vec::new(),
+            source_root: None,
+            module_cache: HashMap::new(),
         };
         crate::builtins::install(&mut interp);
         interp
@@ -277,7 +288,34 @@ impl Interpreter {
                     .as_ref()
                     .map(|i| i.as_str().to_owned())
                     .unwrap_or_default();
-                let module = self.import_module(&module_name)?;
+                // Relative imports (`from .repo import X`) carry a `level`
+                // > 0. The dot-count tells us how many package levels up
+                // to start from. The VM treats the configured source_root
+                // as the package root, so any positive level resolves the
+                // import relative to it. This is enough for the common
+                // pattern of `from .sibling import x` between files
+                // sharing a `src/` directory.
+                let module = if im.level > 0 {
+                    if module_name.is_empty() {
+                        // `from . import sibling` — load each name as a
+                        // sibling module instead of going through an
+                        // umbrella package object.
+                        for alias in &im.names {
+                            let attr = alias.name.as_str();
+                            let val = self.import_module(attr)?;
+                            let bind = alias
+                                .asname
+                                .as_ref()
+                                .map(|i| i.as_str().to_owned())
+                                .unwrap_or_else(|| attr.to_owned());
+                            env.set(&bind, val);
+                        }
+                        return Ok(());
+                    }
+                    self.import_module(&module_name)?
+                } else {
+                    self.import_module(&module_name)?
+                };
                 for alias in &im.names {
                     let attr = alias.name.as_str();
                     let val = self.get_attr(&module, attr)?;
@@ -508,7 +546,108 @@ impl Interpreter {
     // ── Imports ────────────────────────────────────────────────────────────
 
     fn import_module(&mut self, name: &str) -> Result<Value, Unwind> {
-        crate::builtins::resolve_module(self, name)
+        // Cache hit: same name imported earlier in the same VM run.
+        if let Some(cached) = self.module_cache.get(name).cloned() {
+            return Ok(cached);
+        }
+        // Try the host stdlib / typhon_runtime first so user code can't
+        // accidentally shadow `import json` with a sibling json.ty (the
+        // stdlib_module_shadow lint already nudges users away from this
+        // at check time).
+        match crate::builtins::resolve_module(self, name) {
+            Ok(v) => {
+                self.module_cache.insert(name.to_owned(), v.clone());
+                Ok(v)
+            }
+            Err(stdlib_err) => {
+                // Fall back to loading a sibling Typhon source file.
+                if let Some(loaded) = self.try_load_typhon_module(name)? {
+                    self.module_cache.insert(name.to_owned(), loaded.clone());
+                    return Ok(loaded);
+                }
+                Err(stdlib_err)
+            }
+        }
+    }
+
+    /// Resolve `name` (possibly dotted) against the configured source
+    /// root. Returns `Ok(Some(...))` on a successful load, `Ok(None)` if
+    /// no matching `.ty` file exists, and `Err` if a file exists but
+    /// failed to parse or evaluate.
+    fn try_load_typhon_module(
+        &mut self,
+        name: &str,
+    ) -> Result<Option<Value>, Unwind> {
+        let Some(root) = self.source_root.clone() else {
+            return Ok(None);
+        };
+        // `foo.bar.baz` → `foo/bar/baz.ty` or `foo/bar/baz/__init__.ty`
+        let rel = name.replace('.', std::path::MAIN_SEPARATOR_STR);
+        let candidates = [
+            root.join(format!("{rel}.ty")),
+            root.join(&rel).join("__init__.ty"),
+        ];
+        let path = candidates.iter().find(|p| p.exists()).cloned();
+        let Some(path) = path else {
+            return Ok(None);
+        };
+
+        let source = std::fs::read_to_string(&path).map_err(|e| {
+            crate::error::Unwind::Exception(crate::error::VmException::new(
+                "ImportError",
+                format!("cannot read '{}': {e}", path.display()),
+            ))
+        })?;
+
+        // Run the same preprocess + desugar pipeline lib.rs uses for the
+        // top-level entry, so the imported module sees identical surface
+        // syntax handling.
+        use tyc_syntax::preprocess;
+        let expanded = preprocess::expand_question_ops(&preprocess::expand_pipes(
+            &preprocess::expand_with_chains(&preprocess::expand_go_calls(
+                &preprocess::expand_gather_blocks(&preprocess::expand_multiline_guards(
+                    &preprocess::expand_typed_let_unpack(&preprocess::expand_lazy_lets(&source)),
+                )),
+            )),
+        ));
+        let prep = preprocess::preprocess(&expanded);
+        let parsed = tyc_syntax::parse_module(&prep.python_source).map_err(|e| {
+            crate::error::Unwind::Exception(crate::error::VmException::new(
+                "ImportError",
+                format!("parse error in '{}': {e}", path.display()),
+            ))
+        })?;
+        let mut module = parsed.into_syntax();
+        let (comptime_values, _diags) = tyc_analyse::evaluate_comptime_with_functions(
+            &module,
+            &prep.comptime_bindings,
+            &prep.comptime_functions,
+        );
+        module = tyc_analyse::substitute_comptime_literals(
+            module,
+            &comptime_values,
+            &prep.comptime_functions,
+        );
+        let desugar_out = tyc_desugar::desugar_module(&module);
+        module = desugar_out.module;
+        let (registry, _stats) = tyc_analyse::extract_builtin_extensions(&mut module);
+        let _ = tyc_analyse::rewrite_builtin_extension_calls(&mut module, &registry);
+
+        // Evaluate the module body in a fresh child scope of root; copy
+        // every named binding into a Module namespace so attribute
+        // lookups resolve to user functions / classes / constants.
+        let module_env = Env::new_child(&self.root);
+        self.exec_block(&module.body, &module_env)?;
+
+        use crate::value::Module;
+        let mut members: HashMap<String, Value> = HashMap::new();
+        for (k, v) in module_env.snapshot().into_iter() {
+            members.insert(k, v);
+        }
+        Ok(Some(Value::Module(Rc::new(Module {
+            name: name.to_owned(),
+            members: RefCell::new(members),
+        }))))
     }
 
     // ── Expression evaluation ──────────────────────────────────────────────
@@ -1674,6 +1813,11 @@ impl Interpreter {
                 Ok(())
             }
             Value::Dict(d) => {
+                if crate::builtins::dict_is_frozen(d) {
+                    return Err(type_error(
+                        "'mappingproxy' object does not support item assignment",
+                    ));
+                }
                 let k = key.to_hash_key()?;
                 d.borrow_mut().insert(k, value);
                 Ok(())
@@ -1701,7 +1845,14 @@ impl Interpreter {
                 IterState::Str { chars, index: 0 }
             }
             Value::Dict(d) => {
-                let keys: Vec<HashKey> = d.borrow().keys().cloned().collect();
+                let keys: Vec<HashKey> = d
+                    .borrow()
+                    .keys()
+                    .cloned()
+                    .filter(|k| {
+                        !matches!(k, HashKey::Str(s) if s.as_str() == "__typhon_frozen__")
+                    })
+                    .collect();
                 IterState::Dict { keys, index: 0 }
             }
             Value::Set(s) => {

@@ -9,18 +9,11 @@ use std::path::PathBuf;
 
 use clap::Args;
 use miette::{miette, Result};
-use ruff_python_ast::{
-    AtomicNodeIndex, Expr, ExprStringLiteral, ModModule, Stmt, StringLiteral, StringLiteralFlags,
-    StringLiteralValue,
-};
-use ruff_python_parser::parse_expression;
-use ruff_text_size::TextRange;
-
 use tyc_analyse::{
     analyse_purity, collect_gatherable_async_fn_names, detect_missed_gathers,
     evaluate_comptime_with_functions, extract_builtin_extensions, load_profile_samples,
     pgo_memoise_targets, purity_diagnostics, rewrite_auto_gather, rewrite_builtin_extension_calls,
-    rewrite_parallel_comprehensions, ComptimeValue, ProfileSample,
+    rewrite_parallel_comprehensions, substitute_comptime_literals, ProfileSample,
 };
 use tyc_db::{check_file_with_imports, extract_shapes_for_path, TycDatabase};
 use tyc_desugar::{desugar_module_with, DesugarOptions};
@@ -1520,71 +1513,10 @@ fn build_source_map_v2(source_rel: &str, preprocessed: &str, line_offsets: &[usi
 /// ```python
 /// PORT: int = 8080
 /// ```
-fn substitute_comptime_literals(
-    mut module: ModModule,
-    values: &HashMap<String, ComptimeValue>,
-    comptime_fn_names: &[String],
-) -> ModModule {
-    if values.is_empty() && comptime_fn_names.is_empty() {
-        return module;
-    }
-    module.body = module
-        .body
-        .into_iter()
-        // Drop the `def` for any `comptime def` function — those are only
-        // callable during build-time evaluation (their bodies typically
-        // reference `env(...)` and other comptime-only intrinsics that do
-        // not exist at runtime), so leaving them in the emitted Python
-        // would surface a `NameError` if anything called them.
-        .filter(|stmt| {
-            if let Stmt::FunctionDef(f) = stmt {
-                !comptime_fn_names.iter().any(|n| n == f.name.as_str())
-            } else {
-                true
-            }
-        })
-        .map(|stmt| substitute_stmt(stmt, values))
-        .collect();
-    module
-}
-
-fn substitute_stmt(stmt: Stmt, values: &HashMap<String, ComptimeValue>) -> Stmt {
-    if let Stmt::AnnAssign(mut ann) = stmt {
-        if let Expr::Name(ref n) = *ann.target {
-            if let Some(cv) = values.get(n.id.as_str()) {
-                ann.value = Some(Box::new(comptime_value_to_expr(cv)));
-                return Stmt::AnnAssign(ann);
-            }
-        }
-        Stmt::AnnAssign(ann)
-    } else {
-        stmt
-    }
-}
-
-/// Convert a [`ComptimeValue`] to its Python AST expression by
-/// round-tripping through the Python expression parser.
-fn comptime_value_to_expr(value: &ComptimeValue) -> Expr {
-    let literal = value.to_python_literal();
-    match parse_expression(&literal) {
-        Ok(parsed) => *parsed.into_syntax().body,
-        Err(_) => {
-            // Fallback: emit as a string-quoted constant.  Should never happen
-            // for the value types we produce.
-            let lit = StringLiteral {
-                range: TextRange::default(),
-                node_index: AtomicNodeIndex::NONE,
-                value: Box::from(literal.as_str()),
-                flags: StringLiteralFlags::empty(),
-            };
-            Expr::StringLiteral(ExprStringLiteral {
-                range: TextRange::default(),
-                node_index: AtomicNodeIndex::NONE,
-                value: StringLiteralValue::single(lit),
-            })
-        }
-    }
-}
+// `substitute_comptime_literals` moved to `tyc-analyse` so the VM
+// (`tyc run`) can share the same comptime-inlining pass that the
+// `tyc build` command uses. The build path imports it via the public
+// re-export at the top of this file.
 
 /// Generated `typhon_runtime/__init__.py` — exposes `Ok`/`Err`/`Result` plus
 /// the `tasks` and `lazy` submodules at the package root.

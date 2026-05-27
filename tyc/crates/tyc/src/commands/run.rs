@@ -164,11 +164,42 @@ pub fn run(args: RunArgs) -> Result<()> {
         ));
     }
 
-    // 3. Spawn `<python> <entry> [args...]`.  Python prepends the
-    //    script's directory to sys.path, so `import typhon_runtime`
-    //    resolves against the build dir without any PYTHONPATH plumbing.
+    // 3. Decide between two spawn shapes:
+    //    (a) script mode: `python build/main.py` — works for single-file
+    //        projects where the entry has no relative imports.
+    //    (b) module mode: `python -m <pkg>.<module>` — required when the
+    //        entry uses `from .x import y` syntax, since Python only
+    //        resolves a package's relative imports when the entry is
+    //        loaded *as a submodule of that package*. We pick this shape
+    //        whenever the build directory holds an `__init__.py` (i.e.
+    //        the project is laid out as a package).
+    //
+    //    For module mode we set the cwd to the build dir's parent so
+    //    Python picks up the package automatically; we also stash the
+    //    parent in `PYTHONPATH` for good measure.
     let mut cmd = Command::new(&args.python);
-    cmd.arg(&entry);
+    let has_init = out_dir.join("__init__.py").exists();
+    let entry_stem = entry
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("main")
+        .to_owned();
+    let pkg_name = out_dir
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("build")
+        .to_owned();
+    if has_init && entry.parent() == Some(out_dir.as_path()) {
+        let workdir = out_dir
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+        cmd.current_dir(&workdir);
+        cmd.arg("-m");
+        cmd.arg(format!("{}.{}", pkg_name, entry_stem));
+    } else {
+        cmd.arg(&entry);
+    }
     cmd.args(&args.script_args);
 
     let status = cmd

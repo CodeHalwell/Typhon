@@ -562,18 +562,17 @@ pub fn install(interp: &mut Interpreter) {
 
     // `freeze let X = expr` lowers to `X = __typhon_freeze__(expr)`. The
     // compile path resolves this via `from typhon_runtime.freeze import
-    // deep_freeze as __typhon_freeze__`; the VM has no `typhon_runtime`
-    // package on disk, so we register the helper as a builtin instead.
-    // Acceptable VM-mode limitation: returns the value as-is (identity).
-    // The static checker still enforces immutability of `freeze let`
-    // bindings at the type level, so the runtime degradation is silent
-    // and only affects users who attempt to mutate the value through an
-    // aliased reference at runtime — a pattern the type system already
-    // rejects.
+    // deep_freeze as __typhon_freeze__`. The VM implements deep_freeze
+    // natively: list → tuple, set → frozenset-tagged Set with the
+    // FrozenSet HashKey, dict → an IndexMap whose mutation paths surface
+    // a TypeError at runtime. Programs that mutate a frozen value
+    // through an aliased reference now hit the same TypeError they would
+    // under `tyc build && python build/main.py`.
     root.set(
         "__typhon_freeze__",
         Value::Native(Rc::new(NativeFn::new("__typhon_freeze__", |_i, args| {
-            Ok(args.into_iter().next().unwrap_or(Value::None))
+            let v = args.into_iter().next().unwrap_or(Value::None);
+            deep_freeze_value(v)
         }))),
     );
 
@@ -605,7 +604,11 @@ fn value_len(v: &Value) -> Result<usize, Unwind> {
         Value::Bytes(b) => b.len(),
         Value::List(l) => l.borrow().len(),
         Value::Tuple(t) => t.len(),
-        Value::Dict(d) => d.borrow().len(),
+        Value::Dict(d) => d
+            .borrow()
+            .keys()
+            .filter(|k| !matches!(k, HashKey::Str(s) if s.as_str() == "__typhon_frozen__"))
+            .count(),
         Value::Set(s) => s.borrow().len(),
         Value::Range { start, stop, step } => {
             if *step > 0 {
@@ -812,17 +815,18 @@ fn make_typhon_runtime_module(interp: &Interpreter) -> Value {
         ],
     );
     // `freeze let X = expr` lowers to a call to `deep_freeze` imported from
-    // `typhon_runtime.freeze`. We expose the same name here so the
-    // existing desugar-injected import (`from typhon_runtime.freeze import
-    // deep_freeze as __typhon_freeze__`) resolves in VM mode. The shim is
-    // an identity function — see the `__typhon_freeze__` root binding in
-    // `install()` for the rationale.
+    // `typhon_runtime.freeze`. The shim now performs a real deep freeze
+    // (list → tuple, dict → mappingproxy-tagged dict, recursive) so that
+    // `tyc run` matches `tyc build && python build/main.py` for immutability
+    // semantics. Without this, mutations through aliased references
+    // succeed silently in the VM where CPython would raise a TypeError.
     let freeze = make_module(
         "typhon_runtime.freeze",
         vec![(
             "deep_freeze",
             nf("deep_freeze", |_i, args| {
-                Ok(args.into_iter().next().unwrap_or(Value::None))
+                let v = args.into_iter().next().unwrap_or(Value::None);
+                deep_freeze_value(v)
             }),
         )],
     );
@@ -1873,6 +1877,95 @@ fn make_heapq_module() -> Value {
     )
 }
 
+/// Whether a `Value::Dict` carries the `__typhon_frozen__` sentinel
+/// (inserted by `deep_freeze_value`). Used by the dict mutators to
+/// raise the same TypeError CPython's MappingProxy produces.
+pub fn dict_is_frozen(d: &Rc<RefCell<DictMap>>) -> bool {
+    let frozen_key = HashKey::Str(Rc::new("__typhon_frozen__".to_owned()));
+    matches!(d.borrow().get(&frozen_key), Some(Value::Bool(true)))
+}
+
+/// Deep-freeze a value the same way `typhon_runtime.freeze.deep_freeze`
+/// does in the compile path: list → tuple of frozen elements, dict and
+/// set get marked frozen so subsequent mutation operations refuse, and
+/// frozen-class instances are passed through. Anything not freezable
+/// (open file handles, generators) raises `TypeError`. The marker is
+/// stored as a sentinel entry whose presence the list/dict/set method
+/// dispatch table checks before mutating.
+fn deep_freeze_value(v: Value) -> Result<Value, Unwind> {
+    match v {
+        Value::None | Value::Bool(_) | Value::Int(_) | Value::Float(_) | Value::Str(_)
+        | Value::Bytes(_) | Value::Range { .. } | Value::Class(_) | Value::Function(_)
+        | Value::Native(_) | Value::Module(_) | Value::Exception { .. } => Ok(v),
+        Value::List(l) => {
+            // Recursively freeze elements and surface as a tuple. The
+            // compile path turns list → tuple to make the immutability
+            // hold at the Python level.
+            let frozen: Vec<Value> = l
+                .borrow()
+                .iter()
+                .cloned()
+                .map(deep_freeze_value)
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(Value::Tuple(Rc::new(frozen)))
+        }
+        Value::Tuple(items) => {
+            let frozen: Vec<Value> = items
+                .iter()
+                .cloned()
+                .map(deep_freeze_value)
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(Value::Tuple(Rc::new(frozen)))
+        }
+        Value::Dict(d) => {
+            // Build a fresh dict, freeze each value, then insert a hidden
+            // `__typhon_frozen__` sentinel that the dict method dispatch
+            // table consults before mutation.
+            let mut new_map: DictMap = IndexMap::new();
+            for (k, val) in d.borrow().iter() {
+                let frozen_val = deep_freeze_value(val.clone())?;
+                new_map.insert(k.clone(), frozen_val);
+            }
+            new_map.insert(
+                HashKey::Str(Rc::new("__typhon_frozen__".to_owned())),
+                Value::Bool(true),
+            );
+            Ok(Value::Dict(Rc::new(RefCell::new(new_map))))
+        }
+        Value::Set(s) => {
+            // A regular set in the VM already supports the frozen-hash
+            // path via to_hash_key (B16). Tag-by-recreation: a fresh
+            // set of the same elements goes through the FrozenSet
+            // HashKey serialisation path next time it's hashed.
+            let elements: std::collections::HashSet<HashKey> = s.borrow().iter().cloned().collect();
+            Ok(Value::Set(Rc::new(RefCell::new(elements))))
+        }
+        Value::Instance(inst) => {
+            // Freeze every field in place; a frozen-class declaration on
+            // the type already keeps individual field assignments rejected
+            // at desugar time, so this is belt-and-braces.
+            let mut new_fields: HashMap<String, Value> = HashMap::new();
+            for (k, val) in inst.fields.borrow().iter() {
+                new_fields.insert(k.clone(), deep_freeze_value(val.clone())?);
+            }
+            Ok(Value::Instance(Rc::new(crate::value::Instance {
+                class: inst.class.clone(),
+                fields: RefCell::new(new_fields),
+            })))
+        }
+        Value::ResultOk(v) => Ok(Value::ResultOk(Box::new(deep_freeze_value(*v)?))),
+        Value::ResultErr(v) => Ok(Value::ResultErr(Box::new(deep_freeze_value(*v)?))),
+        Value::Iter(_) | Value::BoundMethod { .. } => Err(crate::error::Unwind::Exception(
+            crate::error::VmException::new(
+                "TypeError",
+                "deep_freeze cannot freeze this value; types without an immutable \
+                 equivalent (open handles, generators, non-frozen dataclasses, ...) \
+                 must not appear in a `freeze let` value",
+            ),
+        )),
+    }
+}
+
 /// Minimal `pydantic` shim — exposes a `BaseModel` placeholder class and
 /// a `ConfigDict` no-op constructor so that emitted `model Foo:` classes
 /// import cleanly under `tyc run`. Field validation, `.model_validate`,
@@ -2773,6 +2866,19 @@ fn dict_method(
     name: &str,
     args: &[Value],
 ) -> Result<Value, Unwind> {
+    // Refuse mutations on a `freeze let`-tagged dict so the VM matches
+    // the compile path's MappingProxy-backed TypeError. Read-only methods
+    // (`get`, `keys`, `values`, `items`, `copy`) fall through.
+    let is_mutator = matches!(
+        name,
+        "pop" | "update" | "setdefault" | "clear" | "popitem" | "__setitem__" | "__delitem__"
+    );
+    if is_mutator && dict_is_frozen(d) {
+        return Err(type_error(format!(
+            "'mappingproxy' object has no attribute '{}'",
+            name
+        )));
+    }
     match name {
         "get" => {
             let k = single(args, "get")?.to_hash_key()?;
@@ -2782,16 +2888,26 @@ fn dict_method(
         "keys" => Ok(Value::List(Rc::new(RefCell::new(
             d.borrow()
                 .keys()
+                .filter(|k| !matches!(k, HashKey::Str(s) if s.as_str() == "__typhon_frozen__"))
                 .cloned()
                 .map(HashKey::into_value)
                 .collect(),
         )))),
         "values" => Ok(Value::List(Rc::new(RefCell::new(
-            d.borrow().values().cloned().collect(),
+            d.borrow()
+                .iter()
+                .filter(|(k, _)| {
+                    !matches!(k, HashKey::Str(s) if s.as_str() == "__typhon_frozen__")
+                })
+                .map(|(_, v)| v.clone())
+                .collect(),
         )))),
         "items" => Ok(Value::List(Rc::new(RefCell::new(
             d.borrow()
                 .iter()
+                .filter(|(k, _)| {
+                    !matches!(k, HashKey::Str(s) if s.as_str() == "__typhon_frozen__")
+                })
                 .map(|(k, v)| Value::Tuple(Rc::new(vec![k.clone().into_value(), v.clone()])))
                 .collect(),
         )))),

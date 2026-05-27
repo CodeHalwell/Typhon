@@ -283,15 +283,31 @@ impl fmt::Debug for Value {
             Value::List(l) => write!(f, "{:?}", l.borrow()),
             Value::Tuple(t) => write!(f, "{:?}", &t[..]),
             Value::Dict(d) => {
-                write!(f, "{{")?;
+                let frozen_key = HashKey::Str(Rc::new("__typhon_frozen__".to_owned()));
+                let is_frozen = matches!(d.borrow().get(&frozen_key), Some(Value::Bool(true)));
+                if is_frozen {
+                    write!(f, "mappingproxy({{")?;
+                } else {
+                    write!(f, "{{")?;
+                }
                 let d = d.borrow();
-                for (i, (k, v)) in d.iter().enumerate() {
-                    if i > 0 {
+                let mut emitted = 0usize;
+                for (k, v) in d.iter() {
+                    // Hide the internal freeze sentinel from user output.
+                    if matches!(k, HashKey::Str(s) if s.as_str() == "__typhon_frozen__") {
+                        continue;
+                    }
+                    if emitted > 0 {
                         write!(f, ", ")?;
                     }
                     write!(f, "{:?}: {:?}", k.clone().into_value(), v)?;
+                    emitted += 1;
                 }
-                write!(f, "}}")
+                if is_frozen {
+                    write!(f, "}})")
+                } else {
+                    write!(f, "}}")
+                }
             }
             Value::Set(_) => write!(f, "<set>"),
             Value::Range { start, stop, step } => {
@@ -597,17 +613,34 @@ impl Value {
                 s
             }
             Value::Dict(d) => {
+                let frozen_key = HashKey::Str(Rc::new("__typhon_frozen__".to_owned()));
+                let is_frozen =
+                    matches!(d.borrow().get(&frozen_key), Some(Value::Bool(true)));
                 let d = d.borrow();
-                let mut s = String::from("{");
-                for (i, (k, v)) in d.iter().enumerate() {
-                    if i > 0 {
+                let mut s = String::new();
+                if is_frozen {
+                    s.push_str("mappingproxy({");
+                } else {
+                    s.push('{');
+                }
+                let mut emitted = 0usize;
+                for (k, v) in d.iter() {
+                    if matches!(k, HashKey::Str(name) if name.as_str() == "__typhon_frozen__") {
+                        continue;
+                    }
+                    if emitted > 0 {
                         s.push_str(", ");
                     }
                     s.push_str(&k.clone().into_value().py_repr());
                     s.push_str(": ");
                     s.push_str(&v.py_repr());
+                    emitted += 1;
                 }
-                s.push('}');
+                if is_frozen {
+                    s.push_str("})");
+                } else {
+                    s.push('}');
+                }
                 s
             }
             Value::Set(set) => {

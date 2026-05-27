@@ -168,6 +168,81 @@ impl ComptimeValue {
     }
 }
 
+// ── Comptime substitution ─────────────────────────────────────────────────────
+
+/// Replace every `comptime let NAME: T = <expr>` initialiser in `module.body`
+/// with the corresponding pre-evaluated literal from `values`, and strip
+/// every `comptime def` body whose name appears in `comptime_fn_names` so
+/// that the runtime never tries to evaluate it (those bodies often call
+/// build-only intrinsics like `env(...)` that don't exist at runtime).
+///
+/// This is the same transformation the `tyc build` command applies before
+/// desugaring; it is also called by the in-process VM (`tyc run`) so that
+/// `comptime let X = ...` bindings work without a separate compile step.
+pub fn substitute_comptime_literals(
+    mut module: ModModule,
+    values: &HashMap<String, ComptimeValue>,
+    comptime_fn_names: &[String],
+) -> ModModule {
+    if values.is_empty() && comptime_fn_names.is_empty() {
+        return module;
+    }
+    module.body = module
+        .body
+        .into_iter()
+        .filter(|stmt| {
+            if let Stmt::FunctionDef(f) = stmt {
+                !comptime_fn_names.iter().any(|n| n == f.name.as_str())
+            } else {
+                true
+            }
+        })
+        .map(|stmt| substitute_stmt(stmt, values))
+        .collect();
+    module
+}
+
+fn substitute_stmt(stmt: Stmt, values: &HashMap<String, ComptimeValue>) -> Stmt {
+    if let Stmt::AnnAssign(mut ann) = stmt {
+        if let Expr::Name(ref n) = *ann.target {
+            if let Some(cv) = values.get(n.id.as_str()) {
+                ann.value = Some(Box::new(comptime_value_to_expr(cv)));
+                return Stmt::AnnAssign(ann);
+            }
+        }
+        Stmt::AnnAssign(ann)
+    } else {
+        stmt
+    }
+}
+
+fn comptime_value_to_expr(value: &ComptimeValue) -> Expr {
+    use ruff_python_ast::{
+        ExprStringLiteral, StringLiteral, StringLiteralFlags, StringLiteralValue,
+    };
+    use ruff_python_parser::parse_expression;
+    use ruff_text_size::TextRange;
+    let literal = value.to_python_literal();
+    match parse_expression(&literal) {
+        Ok(parsed) => *parsed.into_syntax().body,
+        Err(_) => {
+            // Fallback to a string literal — should never trip for the
+            // value types we produce.
+            let lit = StringLiteral {
+                range: TextRange::default(),
+                node_index: ruff_python_ast::AtomicNodeIndex::NONE,
+                value: Box::from(literal.as_str()),
+                flags: StringLiteralFlags::empty(),
+            };
+            Expr::StringLiteral(ExprStringLiteral {
+                range: TextRange::default(),
+                node_index: ruff_python_ast::AtomicNodeIndex::NONE,
+                value: StringLiteralValue::single(lit),
+            })
+        }
+    }
+}
+
 // ── Public entry point ────────────────────────────────────────────────────────
 
 /// Evaluate all `comptime` bindings in `module` and return a map from binding
