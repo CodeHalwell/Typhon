@@ -2517,10 +2517,10 @@ impl<'a> Checker<'a> {
                     }
                 }
                 Some(cls_sig) => missing.push(format!(
-                    "{m}(arity {}; expected {})",
+                    "{m}: signature mismatch — got {} non-self parameter(s), expected {}",
                     cls_sig.arity, iface_sig.arity
                 )),
-                None => missing.push(m.clone()),
+                None => missing.push(format!("{m}: missing")),
             }
         }
         for (f, iface_type) in &iface.shape.fields {
@@ -6296,6 +6296,7 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                 let mut has_ann_assign = false;
                 let mut all_ann_assigns_defaulted = true;
                 let mut only_ann_assigns = true;
+                let mut any_mutable_default = false;
                 let mut first_defaulted: Option<(&ruff_python_ast::StmtAnnAssign, String)> = None;
                 for s in &cd.body {
                     match s {
@@ -6303,9 +6304,25 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                             has_ann_assign = true;
                             if a.value.is_none() {
                                 all_ann_assigns_defaulted = false;
-                            } else if first_defaulted.is_none() {
-                                if let Expr::Name(n) = a.target.as_ref() {
-                                    first_defaulted = Some((a, n.id.as_str().to_owned()));
+                            } else {
+                                // A bare-mutable-literal default
+                                // (`tags: list[str] = []`, `m: dict = {}`,
+                                // `s: set = set()`) gets rewritten by the
+                                // desugar pass into a `default_factory`
+                                // field. That's a real per-instance
+                                // dataclass field, NOT a constants
+                                // namespace, so the `class_attr_shadows_slot`
+                                // warning would be a false positive (B19).
+                                if matches!(
+                                    a.value.as_deref(),
+                                    Some(Expr::List(_)) | Some(Expr::Dict(_)) | Some(Expr::Set(_))
+                                ) {
+                                    any_mutable_default = true;
+                                }
+                                if first_defaulted.is_none() {
+                                    if let Expr::Name(n) = a.target.as_ref() {
+                                        first_defaulted = Some((a, n.id.as_str().to_owned()));
+                                    }
                                 }
                             }
                         }
@@ -6317,6 +6334,13 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                             ) => {}
                         _ => only_ann_assigns = false,
                     }
+                }
+                if any_mutable_default {
+                    // Suppress the warning for any class that owns at
+                    // least one mutable-default-rewrite field — those
+                    // are clearly intended as instance fields, not
+                    // constants.
+                    all_ann_assigns_defaulted = false;
                 }
                 if has_ann_assign
                     && all_ann_assigns_defaulted
@@ -8644,6 +8668,18 @@ fn is_builtin_generic_head(head: &str) -> bool {
     )
 }
 
+/// Return `true` when the user has written `extend <head>: def <attr>(...)`
+/// in the same module. The preprocess pass emits these as
+/// `__typhon_builtin_ext_<head>` synthetic classes, so a method shape
+/// lookup against that class tells us whether `xs.<attr>()` on a
+/// `<head>[T]` receiver should be accepted (B12).
+fn is_user_builtin_extension(c: &Checker, head: &str, attr: &str) -> bool {
+    let sentinel = format!("__typhon_builtin_ext_{}", head);
+    c.class_shapes
+        .get(sentinel.as_str())
+        .is_some_and(|s| s.methods.contains_key(attr))
+}
+
 /// Return `true` when `attr` is a known method on the CPython builtin
 /// container named `head`. The list is intentionally conservative — only
 /// public, stable methods are listed; new entries can be added as needed.
@@ -10106,6 +10142,13 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
                     && c.unsafe_depth == 0
                     && !attr_name.starts_with('_')
                     && !is_known_builtin_generic_attr(head, attr_name)
+                    // `extend list: def head(self) -> ...` registers a
+                    // `__typhon_builtin_ext_list` synthetic class whose
+                    // methods are dispatched via the call-site rewrite
+                    // pass at desugar time. Recognise user-added methods
+                    // here too so `xs: list[int]; xs.head()` doesn't
+                    // false-positive on attribute_not_found (B12).
+                    && !is_user_builtin_extension(c, head, attr_name)
                 {
                     let attr_start = a.attr.range.start().to_usize();
                     let attr_len = a

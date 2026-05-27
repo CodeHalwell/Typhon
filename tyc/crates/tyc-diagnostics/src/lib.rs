@@ -622,12 +622,17 @@ pub enum TycError {
     #[diagnostic(code(tyc::generic), url("https://typhon.dev/lang/diagnostics/generic"))]
     Generic { message: String },
 
-    /// The `?` error-propagation operator was used outside a `Result`-returning function.
+    /// The `?` error-propagation operator was used in a position where
+    /// it cannot lower correctly. Two common reasons: (a) the enclosing
+    /// function doesn't return `Result[T, E]`, or (b) the `?` sits
+    /// inside a comprehension (the lowering can't hoist a short-circuit
+    /// out of a comprehension's local scope). The error `message` is
+    /// case-specific; the static help text below covers both.
     #[error("{message}")]
     #[diagnostic(
         code(tyc::invalid_question_op),
         url("https://typhon.dev/lang/diagnostics/invalid_question_op"),
-        help("the `?` operator is only valid inside a function returning `Result[T, E]`")
+        help("the `?` operator must appear inside a function whose return type is `Result[T, E]`, AND it must not appear inside a comprehension. Rewrite a comprehension as an explicit `for`-loop, or move the `?` call out into a `let` binding before the comprehension.")
     )]
     InvalidQuestionOp {
         message: String,
@@ -902,7 +907,7 @@ pub enum TycError {
     /// of the Typhon language: every parameter and return type is annotated.
     /// Defaults on (`[strictness] no-implicit-any = true`) — turning it off
     /// is supported but almost never what you want.
-    #[error("`{what}` on `{function}` is missing a type annotation")]
+    #[error("{what} on `{function}` is missing a type annotation")]
     #[diagnostic(
         code(tyc::missing_annotation),
         url("https://typhon.dev/lang/diagnostics/missing_annotation"),
