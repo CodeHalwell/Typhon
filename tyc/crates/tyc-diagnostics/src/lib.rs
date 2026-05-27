@@ -2713,6 +2713,19 @@ impl TycError {
     }
 }
 
+/// Compute a dedup key for `e`: `(code, rendered message)`. Stable
+/// across copies of the same diagnostic produced by per-variant impl
+/// distribution (B24).
+fn diag_dedupe_key(e: &TycError) -> (String, String) {
+    use miette::Diagnostic;
+    let code = e
+        .code()
+        .map(|c| c.to_string())
+        .unwrap_or_else(|| "<no-code>".to_owned());
+    let message = format!("{}", e);
+    (code, message)
+}
+
 /// A list of diagnostics collected during a compiler phase.
 #[derive(Debug, Default, Clone)]
 pub struct Diagnostics {
@@ -2748,6 +2761,31 @@ impl Diagnostics {
 
     pub fn warnings(&self) -> &[TycError] {
         &self.warnings
+    }
+
+    /// Drop diagnostics that are exact duplicates of an earlier one in
+    /// the same list. Used by callers that synthesise per-variant copies
+    /// of a sealed-union impl block — without dedup, every variant
+    /// produces the same `tyc::missing_return` / `tyc::non_exhaustive_match`
+    /// once, so a 10-variant union prints 10 identical errors (B24).
+    ///
+    /// The dedup key is `(diagnostic code, rendered top-line message)`.
+    /// Both are stable across copies of the same user-written method
+    /// after preprocess expansion. Diagnostics with no code (the
+    /// `Generic` variant) compare by message alone.
+    pub fn dedupe(&mut self) {
+        let mut seen: std::collections::HashSet<(String, String)> =
+            std::collections::HashSet::new();
+        self.errors.retain(|e| {
+            let key = diag_dedupe_key(e);
+            seen.insert(key)
+        });
+        let mut seen_warn: std::collections::HashSet<(String, String)> =
+            std::collections::HashSet::new();
+        self.warnings.retain(|e| {
+            let key = diag_dedupe_key(e);
+            seen_warn.insert(key)
+        });
     }
 
     pub fn error_count(&self) -> usize {

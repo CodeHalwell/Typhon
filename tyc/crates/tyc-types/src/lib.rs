@@ -3367,6 +3367,17 @@ pub fn check_module_with_imports(
     // require-with` in `typhon.toml`.
     check_resource_discipline(&mut c, &module.body);
 
+    // B24: drop diagnostics that are exact duplicates of an earlier
+    // one. Sealed-union `impl Alias:` distribution duplicates each
+    // method body across every variant, so every method-level
+    // diagnostic (missing_return, non_exhaustive_match, type_mismatch)
+    // fires once per copy. Without this pass, a 10-variant union
+    // produces 10 identical errors in the report. The dedup key is
+    // (code, message), stable across copies because impl distribution
+    // doesn't touch the user-visible source text — only the byte
+    // ranges in the preprocessed buffer.
+    c.diagnostics.dedupe();
+
     // Phase D: freezable-shape audit (B36). Every `freeze let X = …`
     // lowers to `X = __typhon_freeze__(rhs)`; at runtime that helper
     // raises `TypeError` if `rhs` contains a non-`frozen` dataclass or
