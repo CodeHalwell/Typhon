@@ -3367,6 +3367,15 @@ pub fn check_module_with_imports(
     // require-with` in `typhon.toml`.
     check_resource_discipline(&mut c, &module.body);
 
+    // Phase D: freezable-shape audit (B36). Every `freeze let X = …`
+    // lowers to `X = __typhon_freeze__(rhs)`; at runtime that helper
+    // raises `TypeError` if `rhs` contains a non-`frozen` dataclass or
+    // any other unfreezable shape. We walk the AST here, find every
+    // `__typhon_freeze__(...)` call, and re-walk the argument to
+    // surface a `tyc::freeze_not_freezable` diagnostic up-front so
+    // the failure shows in the editor instead of at first import.
+    check_freeze_let_freezable(&mut c, &module.body);
+
     c.diagnostics
 }
 
@@ -4075,6 +4084,208 @@ fn dotted_name_of(expr: &Expr) -> Option<String> {
             Some(format!("{}.{}", prefix, a.attr.as_str()))
         }
         _ => None,
+    }
+}
+
+/// B36 freezable-shape audit. Walk `body` for `freeze let NAME = …`
+/// bindings (post-preprocess: `NAME = __typhon_freeze__(rhs)`) and
+/// verify the RHS argument's shape would survive `deep_freeze` at
+/// runtime. Fires `tyc::freeze_not_freezable` for each non-freezable
+/// constructor call so the failure shows up in `tyc check` instead of
+/// only at first `python build/main.py` invocation. The walker covers
+/// the common shapes — list/tuple/dict/set literals + class
+/// constructors. Calls into stdlib (e.g. `dict(...)`, `tuple(...)`,
+/// `frozenset(...)`) are conservatively accepted; the runtime
+/// `deep_freeze` still rejects anything dynamic it can't recursively
+/// freeze.
+fn check_freeze_let_freezable(c: &mut Checker, body: &[Stmt]) {
+    for stmt in body {
+        check_freeze_let_freezable_stmt(c, stmt);
+    }
+}
+
+fn check_freeze_let_freezable_stmt(c: &mut Checker, stmt: &Stmt) {
+    match stmt {
+        Stmt::Assign(a) => {
+            // Find the binding name + the freeze-call argument, if any.
+            if let (Some(name), Some(arg)) =
+                (assign_target_name(&a.targets), freeze_call_argument(&a.value))
+            {
+                check_freeze_argument(c, name, arg);
+            }
+        }
+        Stmt::AnnAssign(a) => {
+            if let (Expr::Name(n), Some(value)) =
+                (a.target.as_ref(), a.value.as_deref())
+            {
+                if let Some(arg) = freeze_call_argument(value) {
+                    check_freeze_argument(c, n.id.as_str(), arg);
+                }
+            }
+        }
+        // Nested freeze let is rejected by the preprocessor (module-level
+        // only), but recurse into compound statements for completeness so
+        // any future relaxation surfaces the same audit.
+        Stmt::If(s) => {
+            check_freeze_let_freezable(c, &s.body);
+            for clause in &s.elif_else_clauses {
+                check_freeze_let_freezable(c, &clause.body);
+            }
+        }
+        Stmt::With(s) => check_freeze_let_freezable(c, &s.body),
+        Stmt::Try(s) => {
+            check_freeze_let_freezable(c, &s.body);
+            check_freeze_let_freezable(c, &s.orelse);
+            check_freeze_let_freezable(c, &s.finalbody);
+            for handler in &s.handlers {
+                let ruff_python_ast::ExceptHandler::ExceptHandler(h) = handler;
+                check_freeze_let_freezable(c, &h.body);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn assign_target_name(targets: &[Expr]) -> Option<&str> {
+    if let [Expr::Name(n)] = targets {
+        Some(n.id.as_str())
+    } else {
+        None
+    }
+}
+
+/// If `expr` is a `__typhon_freeze__(arg)` call, return the inner `arg`
+/// expression. Otherwise None.
+fn freeze_call_argument(expr: &Expr) -> Option<&Expr> {
+    let call = match expr {
+        Expr::Call(c) => c,
+        _ => return None,
+    };
+    let Expr::Name(n) = call.func.as_ref() else {
+        return None;
+    };
+    if n.id.as_str() != "__typhon_freeze__" {
+        return None;
+    }
+    call.arguments.args.first()
+}
+
+fn check_freeze_argument(c: &mut Checker, binding: &str, arg: &Expr) {
+    walk_freeze_expr(c, binding, arg);
+}
+
+fn walk_freeze_expr(c: &mut Checker, binding: &str, expr: &Expr) {
+    match expr {
+        // Literals — always freezable.
+        Expr::NumberLiteral(_)
+        | Expr::StringLiteral(_)
+        | Expr::BytesLiteral(_)
+        | Expr::BooleanLiteral(_)
+        | Expr::NoneLiteral(_)
+        | Expr::EllipsisLiteral(_) => {}
+        // Composite containers — recurse into elements.
+        Expr::List(l) => {
+            for e in &l.elts {
+                walk_freeze_expr(c, binding, e);
+            }
+        }
+        Expr::Tuple(t) => {
+            for e in &t.elts {
+                walk_freeze_expr(c, binding, e);
+            }
+        }
+        Expr::Set(s) => {
+            for e in &s.elts {
+                walk_freeze_expr(c, binding, e);
+            }
+        }
+        Expr::Dict(d) => {
+            for item in d.items.iter() {
+                if let Some(k) = &item.key {
+                    walk_freeze_expr(c, binding, k);
+                }
+                walk_freeze_expr(c, binding, &item.value);
+            }
+        }
+        Expr::FString(_) => {
+            // Resolves to `str` — freezable. Nothing to recurse into
+            // that could itself be non-freezable.
+        }
+        Expr::UnaryOp(u) => walk_freeze_expr(c, binding, &u.operand),
+        Expr::BinOp(b) => {
+            walk_freeze_expr(c, binding, &b.left);
+            walk_freeze_expr(c, binding, &b.right);
+        }
+        // Constructor calls — the most common non-freezable culprit.
+        // `Foo(...)` on a non-`frozen` class produces a value whose
+        // fields are mutable; `deep_freeze` rejects it.
+        Expr::Call(call) => {
+            let head = match call.func.as_ref() {
+                Expr::Name(n) => Some(n.id.as_str()),
+                Expr::Attribute(a) => Some(a.attr.as_str()),
+                _ => None,
+            };
+            if let Some(head) = head {
+                // Stdlib / always-freezable constructors — accept and
+                // recurse into args for nested non-freezable shapes.
+                let always_ok = matches!(
+                    head,
+                    "frozenset"
+                        | "tuple"
+                        | "int"
+                        | "float"
+                        | "str"
+                        | "bool"
+                        | "bytes"
+                        | "Ok"
+                        | "Err"
+                );
+                // User class call: freezable iff the class is declared
+                // `frozen`. Unknown identifiers are conservatively
+                // accepted (could be a newtype wrapping a freezable
+                // base, or an imported frozen class we don't have
+                // shape data for).
+                let user_class_known = c.classes.iter().any(|s| s == head);
+                if !always_ok && user_class_known && !c.frozen_classes.contains(head) {
+                    let span = call.range;
+                    c.diagnostics.push_error(TycError::freeze_not_freezable(
+                        binding.to_owned(),
+                        head.to_owned(),
+                        c.path.clone(),
+                        c.source,
+                        span.start().to_usize(),
+                        span.end()
+                            .to_usize()
+                            .saturating_sub(span.start().to_usize())
+                            .max(1),
+                    ));
+                    return;
+                }
+                // newtype constructor — base must be freezable
+                // (newtypes always wrap a primitive in the current
+                // language surface, so this is normally fine; recurse
+                // into args defensively).
+            }
+            for arg in &call.arguments.args {
+                walk_freeze_expr(c, binding, arg);
+            }
+            for kw in &call.arguments.keywords {
+                walk_freeze_expr(c, binding, &kw.value);
+            }
+        }
+        // `[x for x in xs]` produces a list at runtime (freezable to a
+        // tuple). Generator expressions are non-freezable, but the
+        // surface for `freeze let` is module-level so generators are
+        // already rare — leave them for the runtime to reject.
+        Expr::ListComp(_) | Expr::DictComp(_) | Expr::SetComp(_) => {}
+        // Bare names — could be a previously-bound freeze-let or a
+        // primitive constant; accept without further inspection. The
+        // runtime helper performs the full recursive walk.
+        Expr::Name(_) => {}
+        _ => {
+            // Conservatively accept anything else; deep_freeze will
+            // catch genuinely-unfreezable values at runtime.
+        }
     }
 }
 
@@ -6571,7 +6782,23 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                     // dedicated `tyc::result_error_mismatch` so the user
                     // sees a `?`-propagation framing instead of a generic
                     // type mismatch (FINDINGS #13).
-                    if is_question_op_temp(ret_expr) {
+                    //
+                    // B35: the same diagnostic applies to any
+                    // `return Err(value)` whose value's type doesn't
+                    // match the function's declared error type. Most
+                    // commonly that's an explicit `with`-chain
+                    // `else err: return Err(err)` block where `err`
+                    // carries a different error type than the function
+                    // promises.
+                    let is_q_temp = is_question_op_temp(ret_expr);
+                    let is_err_ctor = matches!(
+                        &**ret_expr,
+                        Expr::Call(call) if matches!(
+                            call.func.as_ref(),
+                            Expr::Name(n) if n.id.as_str() == "Err"
+                        )
+                    );
+                    if is_q_temp || is_err_ctor {
                         if let (Some(expected_err), Some(actual_err)) = (
                             extract_result_error_type(&expected),
                             extract_err_generic_param(&value_type),
@@ -6633,6 +6860,19 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                 check_stmt(c, s);
             }
             c.env.restore(snap_pre);
+            // B25: post-loop narrowing. A `while TEST: BODY` that has
+            // no `break` in the body can only exit through TEST going
+            // false (the natural-exit path) — so the negation of TEST
+            // holds at the join point after the loop. Apply the
+            // negated narrowings persistently so code like
+            //   while y is None: y = load()
+            //   return y + 1            # y is `int` here
+            // checks cleanly. A `break` inside the body would leave
+            // the loop while TEST is still true; in that case we have
+            // no information at the join and skip the apply.
+            if !body_can_break(&w.body) {
+                apply_narrowings(c, &neg);
+            }
         }
         Stmt::For(f) => {
             let _ = infer_expr(c, &f.iter);
@@ -10226,6 +10466,24 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
                 }
             }
             let attr_name = a.attr.as_str();
+            // B35: `_t.error` / `_t.value` on an isinstance-narrowed
+            // `Generic("Err", [E])` / `Generic("Ok", [T])` resolves to
+            // `E` / `T`. The `with`-chain lowering injects exactly this
+            // attribute access (`let __typhon_with_err_N__ = _t.error`),
+            // so without this rule the binding falls through to
+            // `Type::Unknown` and the later `return Err(err)` doesn't
+            // carry an error-type to compare against the function's
+            // declared return.
+            if let Type::Generic(head, args) = &recv {
+                if head == "Err" && args.len() == 1
+                    && (attr_name == "error" || attr_name == "value")
+                {
+                    return args[0].clone();
+                }
+                if head == "Ok" && args.len() == 1 && attr_name == "value" {
+                    return args[0].clone();
+                }
+            }
             // Resolve attribute access on known class instances and TypeVar-bounded parameters.
             if let Some(method_type) = builtin_generic_method(&recv, attr_name) {
                 return method_type;

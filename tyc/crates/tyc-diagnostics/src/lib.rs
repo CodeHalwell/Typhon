@@ -1198,6 +1198,37 @@ pub enum TycError {
         span: SourceSpan,
     },
 
+    /// A `freeze let X = <expr>` whose RHS would fail
+    /// `typhon_runtime.freeze.deep_freeze` at startup. Deep-freezing
+    /// recursively converts list → tuple, dict → MappingProxy, set →
+    /// frozenset; any reachable type without an immutable equivalent
+    /// (open file handles, generators, non-`frozen` dataclasses) makes
+    /// the call raise `TypeError` at import time. We catch the common
+    /// shape (constructing a non-frozen class) at check time so the
+    /// failure surfaces in the user's editor instead of as a crash
+    /// during the first `python build/main.py` invocation.
+    #[error("`freeze let {name}` cannot be deep-frozen: `{kind}` is not freezable")]
+    #[diagnostic(
+        code(tyc::freeze_not_freezable),
+        url("https://typhon.dev/lang/diagnostics/freeze_not_freezable"),
+        help(
+            "deep_freeze can only recurse into immutable shapes (frozen \
+             classes, tuples, frozensets, mapping proxies) and primitive \
+             values (int/float/str/bool/bytes/None). Mark `{kind}` as \
+             `class {kind} frozen:` to make it freezable, or move this \
+             binding off `freeze let` so the value stays a plain mutable \
+             reference."
+        )
+    )]
+    FreezeNotFreezable {
+        name: String,
+        kind: String,
+        #[source_code]
+        src: NamedSource<String>,
+        #[label("non-freezable value here")]
+        span: SourceSpan,
+    },
+
     /// A `newtype Foo = <expr>` whose RHS isn't a recognised type
     /// expression (it's a string literal, number, function call, …).
     /// `newtype` is a nominal alias of an existing type, so the RHS
@@ -2419,6 +2450,23 @@ impl TycError {
             base: base.into(),
             arg_type,
             arg_type_short,
+            src: NamedSource::new(path.into(), source.into()),
+            span: SourceSpan::new(SourceOffset::from(offset), length),
+        }
+    }
+
+    /// Construct a [`TycError::FreezeNotFreezable`] diagnostic.
+    pub fn freeze_not_freezable(
+        name: impl Into<String>,
+        kind: impl Into<String>,
+        path: impl Into<String>,
+        source: impl Into<String>,
+        offset: usize,
+        length: usize,
+    ) -> Self {
+        Self::FreezeNotFreezable {
+            name: name.into(),
+            kind: kind.into(),
             src: NamedSource::new(path.into(), source.into()),
             span: SourceSpan::new(SourceOffset::from(offset), length),
         }

@@ -206,6 +206,17 @@ fn substitute_stmt(stmt: Stmt, values: &HashMap<String, ComptimeValue>) -> Stmt 
     if let Stmt::AnnAssign(mut ann) = stmt {
         if let Expr::Name(ref n) = *ann.target {
             if let Some(cv) = values.get(n.id.as_str()) {
+                // B34: `comptime let T: type = int` is a build-time type
+                // alias — the user's intent is for `T` to be substitutable
+                // wherever a type appears, not for it to be a runtime
+                // class named "T". Rewrite as `type T = int` (PEP 695
+                // `TypeAliasStatement`) so the type-checker's existing
+                // alias-resolution path picks it up automatically.
+                if let ComptimeValue::Type(_) = cv {
+                    let name_id = n.id.clone();
+                    let value_expr = comptime_value_to_expr(cv);
+                    return make_type_alias_stmt(&name_id, value_expr);
+                }
                 ann.value = Some(Box::new(comptime_value_to_expr(cv)));
                 return Stmt::AnnAssign(ann);
             }
@@ -214,6 +225,28 @@ fn substitute_stmt(stmt: Stmt, values: &HashMap<String, ComptimeValue>) -> Stmt 
     } else {
         stmt
     }
+}
+
+/// Construct a PEP 695 `type NAME = VALUE` alias statement. Used by B34
+/// to lower `comptime let T: type = int` after comptime evaluation.
+fn make_type_alias_stmt(name: &ruff_python_ast::name::Name, value: Expr) -> Stmt {
+    use ruff_python_ast::{
+        AtomicNodeIndex, ExprName, StmtTypeAlias,
+    };
+    use ruff_text_size::TextRange;
+    let target = ExprName {
+        range: TextRange::default(),
+        node_index: AtomicNodeIndex::NONE,
+        id: name.clone(),
+        ctx: ruff_python_ast::ExprContext::Store,
+    };
+    Stmt::TypeAlias(StmtTypeAlias {
+        range: TextRange::default(),
+        node_index: AtomicNodeIndex::NONE,
+        name: Box::new(Expr::Name(target)),
+        type_params: None,
+        value: Box::new(value),
+    })
 }
 
 fn comptime_value_to_expr(value: &ComptimeValue) -> Expr {

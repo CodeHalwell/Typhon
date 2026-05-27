@@ -1264,6 +1264,137 @@ fn effective_package_surface(
 /// triple-quoted strings / comments don't falsely trigger transitive
 /// aggregation. Used by `effective_package_surface` to gate recursion
 /// into sub-packages.
+/// B28: collect `tyc::pub_name_collision` diagnostics for every
+/// `__init__.ty` whose `pub *` re-export would conflict with itself
+/// across sibling modules. Shared between `tyc build` (which fails the
+/// build on any collision) and `tyc check` (which surfaces them in CI
+/// before they reach build). Also returns `tyc::pub_star_outside_init`
+/// advice diagnostics for `pub *` markers in non-`__init__` files.
+///
+/// `sources` is the full file tree (path + raw `.ty` text) the caller
+/// has loaded. The returned vector is in source-order per file.
+pub(crate) fn detect_pub_star_diagnostics(
+    sources: &[(PathBuf, String)],
+) -> (Vec<tyc_diagnostics::TycError>, Vec<tyc_diagnostics::TycError>) {
+    use tyc_syntax::preprocess::{
+        expand_gather_blocks, expand_go_calls, expand_inline_question_ops, expand_lazy_imports,
+        expand_multiline_guards, expand_pipes, expand_question_ops, expand_typed_let_unpack,
+        expand_with_chains, preprocess,
+    };
+    let mut errors: Vec<tyc_diagnostics::TycError> = Vec::new();
+    let mut advice: Vec<tyc_diagnostics::TycError> = Vec::new();
+
+    for (path, source) in sources {
+        let expanded = expand_question_ops(&expand_inline_question_ops(&expand_pipes(
+            &expand_with_chains(&expand_go_calls(&expand_gather_blocks(
+                &expand_multiline_guards(&expand_lazy_imports(&expand_typed_let_unpack(source))),
+            ))),
+        )));
+        let prep = preprocess(&expanded);
+        if prep.pub_star_lines.is_empty() {
+            continue;
+        }
+        let is_init = path
+            .file_name()
+            .and_then(|f| f.to_str())
+            .map(|s| s == "__init__.ty")
+            .unwrap_or(false);
+
+        if !is_init {
+            for &line_idx in &prep.pub_star_lines {
+                let offset = line_offset(&expanded, line_idx);
+                advice.push(tyc_diagnostics::TycError::pub_star_outside_init(
+                    path.display().to_string(),
+                    expanded.clone(),
+                    offset,
+                    5,
+                ));
+            }
+            continue;
+        }
+
+        // __init__.ty branch: walk siblings + sub-packages and detect
+        // duplicate names. Mirror of the inline aggregation in
+        // `tyc build`. The collision detection itself ignores the
+        // import-block synthesis (build does that for emit; check
+        // only cares about correctness).
+        let Some(parent_dir) = path.parent() else {
+            continue;
+        };
+        let mut sibling_pubs: Vec<(String, Vec<String>)> = Vec::new();
+        for (sib_path, sib_source) in sources {
+            let sib_parent = match sib_path.parent() {
+                Some(p) => p,
+                None => continue,
+            };
+            if sib_parent != parent_dir {
+                continue;
+            }
+            let stem = sib_path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+            if stem == "__init__" {
+                continue;
+            }
+            let names = extract_top_level_pub_names(sib_source);
+            if !names.is_empty() {
+                sibling_pubs.push((stem.to_owned(), names));
+            }
+        }
+        let mut sub_packages_seen: std::collections::HashSet<PathBuf> =
+            std::collections::HashSet::new();
+        let mut visited: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+        visited.insert(parent_dir.to_path_buf());
+        for (sib_path, _) in sources {
+            let sib_parent = match sib_path.parent() {
+                Some(p) => p,
+                None => continue,
+            };
+            if sib_parent.parent() == Some(parent_dir)
+                && sub_packages_seen.insert(sib_parent.to_path_buf())
+            {
+                let sub_init = sib_parent.join("__init__.ty");
+                if !sources.iter().any(|(p, _)| p == &sub_init) {
+                    continue;
+                }
+                let sub_name = match sib_parent.file_name().and_then(|s| s.to_str()) {
+                    Some(s) => s.to_owned(),
+                    None => continue,
+                };
+                let names = effective_package_surface(sib_parent, sources, &mut visited);
+                if !names.is_empty() {
+                    sibling_pubs.push((sub_name, names));
+                }
+            }
+        }
+        sibling_pubs.sort_by(|a, b| a.0.cmp(&b.0));
+
+        let mut name_origin: std::collections::HashMap<String, String> = prep
+            .pub_names
+            .iter()
+            .map(|n| (n.clone(), "<package>".to_owned()))
+            .collect();
+        let marker_line = *prep.pub_star_lines.first().unwrap_or(&0);
+        let marker_offset = line_offset(&expanded, marker_line);
+        for (sibling, names) in &sibling_pubs {
+            for name in names {
+                if let Some(prev) = name_origin.get(name).cloned() {
+                    errors.push(tyc_diagnostics::TycError::pub_name_collision(
+                        name.clone(),
+                        prev,
+                        sibling.clone(),
+                        path.display().to_string(),
+                        expanded.clone(),
+                        marker_offset,
+                        5,
+                    ));
+                } else {
+                    name_origin.insert(name.clone(), sibling.clone());
+                }
+            }
+        }
+    }
+    (errors, advice)
+}
+
 fn source_has_pub_star_marker(source: &str) -> bool {
     let mut in_triple_string = false;
     for line in source.split_inclusive('\n') {

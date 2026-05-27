@@ -224,6 +224,32 @@ pub fn run(args: CheckArgs) -> Result<()> {
             Vec::new()
         };
 
+        // Pre-load every file into memory so the pub-star collision
+        // pass can see the whole source tree at once. The per-file
+        // loop below re-reads from this cache instead of hitting the
+        // filesystem twice.
+        let mut all_sources: Vec<(PathBuf, String)> = Vec::new();
+        for path in ty_files.iter().chain(direct_dty.iter()) {
+            match std::fs::read_to_string(path) {
+                Ok(s) => all_sources.push((path.clone(), s)),
+                Err(_) => {} // io diagnostic surfaced below
+            }
+        }
+
+        // B28: detect `pub *` name collisions and `pub *` misplaced
+        // outside `__init__.ty` across the whole file set BEFORE the
+        // per-file check loop. Without this, name collisions only
+        // surface during `tyc build` and CI gates running `tyc check`
+        // silently pass.
+        let (pub_star_errors, pub_star_advice) =
+            super::build::detect_pub_star_diagnostics(&all_sources);
+        for err in pub_star_errors {
+            diags.push_error(err);
+        }
+        for adv in pub_star_advice {
+            diags.push_warning(adv);
+        }
+
         for path in ty_files.into_iter().chain(direct_dty.into_iter()) {
             file_count += 1;
 

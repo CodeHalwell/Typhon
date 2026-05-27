@@ -2042,6 +2042,7 @@ version = "0.8.1"
 dependencies = [
  "criterion",
  "salsa",
+ "tyc-analyse",
  "tyc-diagnostics",
  "tyc-resolve",
  "tyc-syntax",
