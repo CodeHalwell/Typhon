@@ -298,6 +298,38 @@ pub fn assignable(expected: &Type, actual: &Type) -> bool {
             if an == "tuple_variadic" && bn == "tuple_variadic" && aa.len() == 1 && bb.len() == 1 {
                 return assignable(&aa[0], &bb[0]);
             }
+            // B31: built-in containers conform to the read-only
+            // Sequence / Iterable / Iterator / Collection / Container /
+            // Reversible protocols covariantly. Without this rule,
+            // `f(list[Dog])` into `def f(xs: Sequence[Animal])` fails
+            // with a generic-head mismatch even though `Sequence` is
+            // declared covariant in `generic_param_variance`. The
+            // element type still has to be assignable, so the
+            // direction stays correct.
+            const READ_VIEW_HEADS: &[&str] = &[
+                "Sequence",
+                "Iterable",
+                "Iterator",
+                "Collection",
+                "Container",
+                "Reversible",
+            ];
+            if READ_VIEW_HEADS.contains(&an.as_str())
+                && aa.len() == 1
+                && matches!(bn.as_str(), "list" | "tuple" | "set" | "frozenset")
+                && !bb.is_empty()
+            {
+                return assignable(&aa[0], &bb[0]);
+            }
+            // Mapping[K, V] / dict[K, V] — Mapping is the read-only
+            // view, K invariant, V covariant.
+            if (an == "Mapping" || an == "MutableMapping")
+                && aa.len() == 2
+                && bn == "dict"
+                && bb.len() == 2
+            {
+                return assignable(&aa[0], &bb[0]) && assignable(&aa[1], &bb[1]);
+            }
             if an != bn || aa.len() != bb.len() {
                 return false;
             }
@@ -2141,6 +2173,36 @@ impl<'a> Checker<'a> {
         // `expected` so nominal and structural checks apply to each arm.
         if let Type::Union(variants) = actual {
             return variants.iter().all(|v| self.is_assignable(expected, v));
+        }
+        // B31 (sealed-union-aware variant of the read-view rule in
+        // `assignable`): list[Dog] → Sequence[Animal] when Dog
+        // inherits from Animal. The free `assignable` checks only
+        // primitive widening; route through is_assignable here so the
+        // class hierarchy is consulted.
+        if let (Type::Generic(an, aa), Type::Generic(bn, bb)) = (expected, actual) {
+            const READ_VIEW_HEADS: &[&str] = &[
+                "Sequence",
+                "Iterable",
+                "Iterator",
+                "Collection",
+                "Container",
+                "Reversible",
+            ];
+            if READ_VIEW_HEADS.contains(&an.as_str())
+                && aa.len() == 1
+                && matches!(bn.as_str(), "list" | "tuple" | "set" | "frozenset")
+                && !bb.is_empty()
+            {
+                return self.is_assignable(&aa[0], &bb[0]);
+            }
+            if (an == "Mapping" || an == "MutableMapping")
+                && aa.len() == 2
+                && bn == "dict"
+                && bb.len() == 2
+            {
+                return self.is_assignable(&aa[0], &bb[0])
+                    && self.is_assignable(&aa[1], &bb[1]);
+            }
         }
         // Generic / generic (e.g. `Result[T, E] = Ok[V]`, `list[T] = list[V]`):
         // recurse using `is_assignable` for the inner type pairs so sealed
@@ -9461,6 +9523,47 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
             }
         }
         Expr::Call(call) => {
+            // B2: a call of shape `first[int]([1, 2, 3])` where `first`
+            // is a generic function will type-check (the subscript is
+            // assumed to be a type-arg hint) but crash at runtime in
+            // both VM and CPython, because Python functions don't
+            // implement __class_getitem__. Surface a clear diagnostic
+            // up-front so the user knows to drop the explicit type
+            // argument (inference handles it) rather than learn at
+            // runtime via `TypeError: 'function' object is not
+            // subscriptable`.
+            if let Expr::Subscript(sub) = call.func.as_ref() {
+                if let Expr::Name(n) = sub.value.as_ref() {
+                    let head = n.id.as_str();
+                    // Only fire when the head resolves to a function,
+                    // not a class. `dict[str, int]({"a": 1})` and the
+                    // like are legitimate constructor calls on a
+                    // generic class.
+                    let is_class = c.class_shapes.contains_key(head)
+                        || c.classes.iter().any(|s| s == head);
+                    let is_function = !is_class
+                        && c.env
+                            .lookup(head)
+                            .map(|b| matches!(b.declared, Type::Function { .. }))
+                            .unwrap_or(false);
+                    if is_function {
+                        let span_start = sub.range.start().to_usize();
+                        let span_len = sub
+                            .range
+                            .end()
+                            .to_usize()
+                            .saturating_sub(span_start)
+                            .max(1);
+                        c.diagnostics.push_error(TycError::generic(format!(
+                            "explicit type arguments on function calls (e.g. \
+                             `{head}[T](...)`) are not valid Python — function objects \
+                             don't implement __class_getitem__ and would crash at runtime. \
+                             Drop the `[...]` and let inference deduce the type."
+                        )));
+                        let _ = (span_start, span_len);
+                    }
+                }
+            }
             // Ruff folds positional and keyword arguments into `call.arguments`.
             let pos_args = &call.arguments.args;
             let kw_args = &call.arguments.keywords;

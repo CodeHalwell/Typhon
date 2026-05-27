@@ -28,6 +28,12 @@ Every parameter and every return type carries an annotation:
 `T?` is shorthand for `T | None`. A function that returns nothing must say
 `-> None` explicitly.
 
+`*args` and `**kwargs` also need annotations — the idiomatic spelling is
+`*args: object` / `**kwargs: object` when a function is genuinely variadic
+(typically generic decorators):
+
+    def trace(f: Callable[..., R], *args: object, **kwargs: object) -> R: ...
+
 ## Classes
 
     class Point:                # default = dataclass(slots=True, frozen=False)
@@ -37,6 +43,12 @@ Every parameter and every return type carries an annotation:
     class Vec frozen:           # immutable, slotted dataclass
         dx: int
         dy: int
+
+    # When combining `frozen` with inheritance the modifier comes BETWEEN
+    # the class name and the base list (not after `(Base)`):
+    class Square frozen(Shape):  # ✅ parses
+        side: float
+    # `class Square(Shape) frozen:` does NOT parse.
 
     plain class Bag:            # no decorator at all
         items: list[str]
