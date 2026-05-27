@@ -451,6 +451,37 @@ pub fn install(interp: &mut Interpreter) {
         crate::ffi::open_file(&path, &mode)
     });
 
+    // `@property`, `@classmethod`, `@staticmethod`: the VM has no
+    // descriptor protocol, so these decorators reduce to the identity
+    // — the wrapped function is callable as `obj.name()` (not `obj.name`
+    // for property). That's a documented divergence from CPython, but
+    // it lets programs that decorate methods at least import and run.
+    native!("property", |_i, args| {
+        Ok(args.into_iter().next().unwrap_or(Value::None))
+    });
+    native!("classmethod", |_i, args| {
+        Ok(args.into_iter().next().unwrap_or(Value::None))
+    });
+    native!("staticmethod", |_i, args| {
+        Ok(args.into_iter().next().unwrap_or(Value::None))
+    });
+    // `super()` — return a stub module whose attribute access yields a
+    // no-op callable. Just enough to let `super().__init__(...)` synthesised
+    // by `class!` lowering work (the actual parent init for stdlib
+    // exceptions does nothing useful in our minimal VM since exceptions
+    // are flat Value::Exception variants). For real subclassing with
+    // inherited behaviour, run via `tyc run --compile`.
+    native!("super", |_i, _args| {
+        use crate::value::Module;
+        let mut members = std::collections::HashMap::new();
+        let noop = NativeFn::new("super.method", |_i, _a| Ok(Value::None));
+        members.insert("__init__".into(), Value::Native(Rc::new(noop)));
+        Ok(Value::Module(Rc::new(Module {
+            name: "<super>".to_owned(),
+            members: std::cell::RefCell::new(members),
+        })))
+    });
+
     // Constants.
     root.set("True", Value::Bool(true));
     root.set("False", Value::Bool(false));
@@ -699,6 +730,9 @@ pub fn resolve_module(interp: &mut Interpreter, name: &str) -> Result<Value, Unw
         "itertools" => Ok(make_itertools_module()),
         "dataclasses" => Ok(make_dataclasses_module()),
         "pathlib" => Ok(make_pathlib_module()),
+        "heapq" => Ok(make_heapq_module()),
+        "contextlib" => Ok(make_contextlib_module()),
+        "pydantic" => Ok(make_pydantic_module()),
         // Typhon-runtime submodules — return the matching submodule so
         // `from typhon_runtime.freeze import deep_freeze` and friends
         // resolve their member directly. Falls back to the root module
@@ -1020,6 +1054,32 @@ fn make_json_module() -> Value {
                 "loads",
                 nf("loads", |_i, args| {
                     json_loads(&single(&args, "loads")?.py_str())
+                }),
+            ),
+            (
+                "load",
+                nf("load", |interp, args| {
+                    // json.load(fp) — read() the file-like, then loads().
+                    let fp = single(&args, "load")?.clone();
+                    let read = interp.get_attr(&fp, "read")?;
+                    let body = interp.call_value(read, vec![], &[])?;
+                    json_loads(&body.py_str())
+                }),
+            ),
+            (
+                "dump",
+                nf("dump", |interp, args| {
+                    // json.dump(obj, fp) — dumps(), then fp.write().
+                    if args.len() < 2 {
+                        return Err(crate::error::type_error(
+                            "dump() requires (obj, fp)",
+                        ));
+                    }
+                    let serialised = json_dumps(&args[0]);
+                    let fp = args[1].clone();
+                    let write = interp.get_attr(&fp, "write")?;
+                    interp.call_value(write, vec![Value::Str(Rc::new(serialised))], &[])?;
+                    Ok(Value::None)
                 }),
             ),
         ],
@@ -1616,6 +1676,23 @@ fn make_collections_module() -> Value {
         });
         Ok(Value::Native(Rc::new(ctor)))
     });
+    // `deque([iterable])` — the VM exposes deques as plain lists, since
+    // all the methods we shim (append, appendleft, pop, popleft, extend)
+    // map cleanly onto list operations. This is `O(n)` for the *left*
+    // variants instead of the `O(1)` CPython gives, but functional
+    // equivalence is preserved.
+    let deque = nf("deque", |i, args| {
+        let mut out: Vec<Value> = Vec::new();
+        if let Some(v) = args.into_iter().next() {
+            if !matches!(v, Value::None) {
+                let it = i.make_iter(v)?;
+                while let Some(x) = i.iter_next(&it)? {
+                    out.push(x);
+                }
+            }
+        }
+        Ok(Value::List(Rc::new(RefCell::new(out))))
+    });
     make_module(
         "collections",
         vec![
@@ -1623,6 +1700,221 @@ fn make_collections_module() -> Value {
             ("defaultdict", defaultdict),
             ("Counter", counter),
             ("namedtuple", namedtuple),
+            ("deque", deque),
+        ],
+    )
+}
+
+/// `heapq` shim — implements the small-but-essential surface for
+/// priority-queue-style algorithms (Dijkstra, A*, top-K, merge-K-sorted).
+/// Internally we re-heapify on every push/pop since the VM's lists don't
+/// expose a stable heap-invariant; the algorithmic complexity goes from
+/// O(log n) to O(n log n) but the surface is correct.
+fn make_heapq_module() -> Value {
+    fn sift_down(list: &mut Vec<Value>, start: usize, pos: usize) {
+        let mut pos = pos;
+        let new_item = list[pos].clone();
+        while pos > start {
+            let parent = (pos - 1) >> 1;
+            if value_lt(&new_item, &list[parent]) {
+                list[pos] = list[parent].clone();
+                pos = parent;
+            } else {
+                break;
+            }
+        }
+        list[pos] = new_item;
+    }
+    fn sift_up(list: &mut Vec<Value>, pos: usize) {
+        let endpos = list.len();
+        let startpos = pos;
+        let mut pos = pos;
+        let new_item = list[pos].clone();
+        let mut child = 2 * pos + 1;
+        while child < endpos {
+            let right = child + 1;
+            if right < endpos && !value_lt(&list[child], &list[right]) {
+                child = right;
+            }
+            list[pos] = list[child].clone();
+            pos = child;
+            child = 2 * pos + 1;
+        }
+        list[pos] = new_item;
+        sift_down(list, startpos, pos);
+    }
+    fn value_lt(a: &Value, b: &Value) -> bool {
+        // Reuse the VM's general comparison. Returns false on
+        // incomparable types — which matches CPython at least to the
+        // extent that the program then sees a non-sensical heap ordering
+        // instead of crashing.
+        match (a, b) {
+            (Value::Int(x), Value::Int(y)) => x < y,
+            (Value::Float(x), Value::Float(y)) => x < y,
+            (Value::Int(x), Value::Float(y)) => {
+                num_traits::ToPrimitive::to_f64(x).is_some_and(|xf| xf < *y)
+            }
+            (Value::Float(x), Value::Int(y)) => {
+                num_traits::ToPrimitive::to_f64(y).is_some_and(|yf| *x < yf)
+            }
+            (Value::Str(x), Value::Str(y)) => x < y,
+            (Value::Tuple(x), Value::Tuple(y)) => {
+                for (xi, yi) in x.iter().zip(y.iter()) {
+                    if value_lt(xi, yi) {
+                        return true;
+                    }
+                    if value_lt(yi, xi) {
+                        return false;
+                    }
+                }
+                x.len() < y.len()
+            }
+            _ => false,
+        }
+    }
+    let heappush = nf("heappush", |_i, args| {
+        if args.len() != 2 {
+            return Err(type_error("heappush(heap, item) takes 2 arguments"));
+        }
+        let heap = match &args[0] {
+            Value::List(l) => l.clone(),
+            _ => return Err(type_error("heappush expects a list")),
+        };
+        let item = args[1].clone();
+        let mut h = heap.borrow_mut();
+        h.push(item);
+        let last = h.len() - 1;
+        sift_down(&mut h, 0, last);
+        Ok(Value::None)
+    });
+    let heappop = nf("heappop", |_i, args| {
+        let heap = match args.first() {
+            Some(Value::List(l)) => l.clone(),
+            _ => return Err(type_error("heappop expects a list")),
+        };
+        let mut h = heap.borrow_mut();
+        let last = h
+            .pop()
+            .ok_or_else(|| crate::error::index_error("pop from an empty heap"))?;
+        if h.is_empty() {
+            Ok(last)
+        } else {
+            let returned = std::mem::replace(&mut h[0], last);
+            sift_up(&mut h, 0);
+            Ok(returned)
+        }
+    });
+    let heapify = nf("heapify", |_i, args| {
+        let heap = match args.first() {
+            Some(Value::List(l)) => l.clone(),
+            _ => return Err(type_error("heapify expects a list")),
+        };
+        let mut h = heap.borrow_mut();
+        if h.len() >= 2 {
+            for i in (0..h.len() / 2).rev() {
+                sift_up(&mut h, i);
+            }
+        }
+        Ok(Value::None)
+    });
+    let nsmallest = nf("nsmallest", |i, args| {
+        if args.len() < 2 {
+            return Err(type_error("nsmallest(n, iterable) takes 2 arguments"));
+        }
+        let n = args[0].to_int()?;
+        let it = i.make_iter(args[1].clone())?;
+        let mut items: Vec<Value> = Vec::new();
+        while let Some(x) = i.iter_next(&it)? {
+            items.push(x);
+        }
+        items.sort_by(|a, b| {
+            if value_lt(a, b) {
+                std::cmp::Ordering::Less
+            } else if value_lt(b, a) {
+                std::cmp::Ordering::Greater
+            } else {
+                std::cmp::Ordering::Equal
+            }
+        });
+        items.truncate(n.max(0) as usize);
+        Ok(Value::List(Rc::new(RefCell::new(items))))
+    });
+    let nlargest = nf("nlargest", |i, args| {
+        if args.len() < 2 {
+            return Err(type_error("nlargest(n, iterable) takes 2 arguments"));
+        }
+        let n = args[0].to_int()?;
+        let it = i.make_iter(args[1].clone())?;
+        let mut items: Vec<Value> = Vec::new();
+        while let Some(x) = i.iter_next(&it)? {
+            items.push(x);
+        }
+        items.sort_by(|a, b| {
+            if value_lt(b, a) {
+                std::cmp::Ordering::Less
+            } else if value_lt(a, b) {
+                std::cmp::Ordering::Greater
+            } else {
+                std::cmp::Ordering::Equal
+            }
+        });
+        items.truncate(n.max(0) as usize);
+        Ok(Value::List(Rc::new(RefCell::new(items))))
+    });
+    make_module(
+        "heapq",
+        vec![
+            ("heappush", heappush),
+            ("heappop", heappop),
+            ("heapify", heapify),
+            ("nsmallest", nsmallest),
+            ("nlargest", nlargest),
+        ],
+    )
+}
+
+/// Minimal `pydantic` shim — exposes a `BaseModel` placeholder class and
+/// a `ConfigDict` no-op constructor so that emitted `model Foo:` classes
+/// import cleanly under `tyc run`. Field validation, `.model_validate`,
+/// `.model_dump_json`, etc. are not implemented — programs that need those
+/// must run via `tyc run --compile`. Without this shim, even declaring
+/// (not instantiating) a `model` class makes the file unrunnable in the VM.
+fn make_pydantic_module() -> Value {
+    let base_model = Value::Class(Rc::new(crate::value::Class {
+        name: "BaseModel".to_owned(),
+        methods: std::cell::RefCell::new(HashMap::new()),
+        fields: vec![],
+        class_attrs: std::cell::RefCell::new(HashMap::new()),
+        bases: vec![],
+    }));
+    let config_dict = nf("ConfigDict", |_i, _args| {
+        // Accept any kwargs and ignore — purely a config-record stub.
+        Ok(Value::Dict(Rc::new(RefCell::new(IndexMap::new()))))
+    });
+    make_module(
+        "pydantic",
+        vec![("BaseModel", base_model), ("ConfigDict", config_dict)],
+    )
+}
+
+/// Minimal `contextlib` shim — exposes `@contextmanager` and
+/// `@asynccontextmanager` as identity decorators that return the
+/// generator function itself. The user's `with cm() as x:` lowering goes
+/// through the VM's `__enter__`/`__exit__` protocol on the resulting
+/// object; `@contextmanager` semantics around `yield` aren't fully
+/// reproduced (those need generator support in the VM), but the
+/// decorator no longer raises on import.
+fn make_contextlib_module() -> Value {
+    let identity = |name: &'static str| {
+        nf(name, |_i, args| {
+            Ok(args.into_iter().next().unwrap_or(Value::None))
+        })
+    };
+    make_module(
+        "contextlib",
+        vec![
+            ("contextmanager", identity("contextmanager")),
+            ("asynccontextmanager", identity("asynccontextmanager")),
         ],
     )
 }
@@ -2425,6 +2717,52 @@ fn list_method(
             Ok(Value::None)
         }
         "copy" => Ok(Value::List(Rc::new(RefCell::new(l.borrow().clone())))),
+        // `collections.deque` is implemented as a `Value::List`, so it
+        // shares the list method table. These four are deque-specific.
+        "popleft" => {
+            let mut l = l.borrow_mut();
+            if l.is_empty() {
+                return Err(index_error("pop from an empty deque"));
+            }
+            Ok(l.remove(0))
+        }
+        "appendleft" => {
+            let v = single(args, "appendleft")?.clone();
+            l.borrow_mut().insert(0, v);
+            Ok(Value::None)
+        }
+        "extendleft" => {
+            let it = interp.make_iter(single(args, "extendleft")?.clone())?;
+            let mut to_prepend: Vec<Value> = Vec::new();
+            while let Some(v) = interp.iter_next(&it)? {
+                to_prepend.push(v);
+            }
+            // extendleft reverses element order to match CPython
+            // (each pushed-left element ends up *before* the previous).
+            let mut l = l.borrow_mut();
+            for v in to_prepend {
+                l.insert(0, v);
+            }
+            Ok(Value::None)
+        }
+        "rotate" => {
+            let n = args
+                .first()
+                .map(|v| v.to_int())
+                .transpose()?
+                .unwrap_or(1);
+            let mut l = l.borrow_mut();
+            if l.is_empty() {
+                return Ok(Value::None);
+            }
+            let len = l.len() as i64;
+            let n_mod = ((n % len) + len) % len;
+            if n_mod != 0 {
+                let n = n_mod as usize;
+                l.rotate_right(n);
+            }
+            Ok(Value::None)
+        }
         _ => Err(attribute_error(format!("list has no method '{}'", name))),
     }
 }
@@ -2855,6 +3193,38 @@ pub fn call_with_kwargs(
                 Ok(Value::List(Rc::new(RefCell::new(out))))
             }
         }
+        // `dataclasses.field(default=…, default_factory=…)`. The desugar
+        // pass rewrites bare-mutable defaults like `tags: list[str] = []`
+        // into `dataclasses.field(default_factory=list)`. We return a
+        // tagged tuple sentinel that the instance constructor recognises
+        // and invokes per-instance, so each instance gets its own fresh
+        // mutable container instead of sharing one across all instances.
+        "field" => {
+            let mut default: Option<Value> = args.into_iter().next();
+            for (k, v) in kwargs {
+                match k.as_str() {
+                    "default" => default = Some(v.clone()),
+                    "default_factory" => {
+                        // Sentinel: ("__typhon_field_factory__", callable).
+                        return Ok(Value::Tuple(Rc::new(vec![
+                            Value::Str(Rc::new(
+                                "__typhon_field_factory__".to_owned(),
+                            )),
+                            v.clone(),
+                        ])));
+                    }
+                    // `repr`, `hash`, `init`, `compare`, `metadata`, `kw_only`
+                    // — silently accepted (VM doesn't model them) so the
+                    // emitted dataclass `__init__` doesn't crash.
+                    _ => {}
+                }
+            }
+            Ok(default.unwrap_or(Value::None))
+        }
+        // Native ctors / shims that intentionally accept any kwargs and
+        // discard them. Used by stdlib stubs that exist purely so user
+        // code that calls them at import time doesn't crash.
+        "ConfigDict" | "dataclass" => (n.func)(interp, args),
         _ => {
             if kwargs.is_empty() {
                 (n.func)(interp, args)

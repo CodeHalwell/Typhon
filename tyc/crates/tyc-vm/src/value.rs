@@ -13,6 +13,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt;
+use std::hash::Hash;
 use std::rc::Rc;
 
 use indexmap::IndexMap;
@@ -45,6 +46,10 @@ pub enum HashKey {
     Float(u64),
     Str(RcStr),
     Tuple(Rc<Vec<HashKey>>),
+    /// A `frozenset` used as a dict key. The elements are stored sorted by
+    /// their hashed representation so two frozensets with the same members
+    /// in different insertion order hash equal.
+    FrozenSet(Rc<Vec<HashKey>>),
 }
 
 impl HashKey {
@@ -58,6 +63,15 @@ impl HashKey {
             HashKey::Tuple(items) => Value::Tuple(Rc::new(
                 items.iter().cloned().map(HashKey::into_value).collect(),
             )),
+            HashKey::FrozenSet(items) => {
+                use std::collections::HashSet;
+                let mut set = HashSet::new();
+                for k in items.iter() {
+                    set.insert(k.clone());
+                }
+                // Surface back as a frozenset-tagged Value::Set.
+                Value::Set(Rc::new(RefCell::new(set)))
+            }
         }
     }
 }
@@ -78,6 +92,12 @@ impl PartialEq for HashKey {
             (HashKey::Float(a), HashKey::Float(b)) => a == b,
             (HashKey::Str(a), HashKey::Str(b)) => a == b,
             (HashKey::Tuple(a), HashKey::Tuple(b)) => a == b,
+            (HashKey::FrozenSet(a), HashKey::FrozenSet(b)) => {
+                // Frozenset equality is order-independent; the constructor
+                // stores items pre-sorted by their hash representation so
+                // this works as a vector compare.
+                a == b
+            }
             _ => false,
         }
     }
@@ -97,6 +117,7 @@ impl std::hash::Hash for HashKey {
             HashKey::Float(bits) => bits.hash(state),
             HashKey::Str(s) => s.hash(state),
             HashKey::Tuple(items) => items.hash(state),
+            HashKey::FrozenSet(items) => items.hash(state),
         }
     }
 }
@@ -258,7 +279,7 @@ impl fmt::Debug for Value {
             Value::Int(i) => write!(f, "{}", i.to_str_radix(10)),
             Value::Float(x) => write!(f, "{x:?}"),
             Value::Str(s) => write!(f, "{:?}", s.as_str()),
-            Value::Bytes(b) => write!(f, "b{:?}", &b[..]),
+            Value::Bytes(b) => write!(f, "{}", python_repr_bytes(b)),
             Value::List(l) => write!(f, "{:?}", l.borrow()),
             Value::Tuple(t) => write!(f, "{:?}", &t[..]),
             Value::Dict(d) => {
@@ -377,6 +398,25 @@ impl Value {
                     keys.push(v.to_hash_key()?);
                 }
                 Ok(HashKey::Tuple(Rc::new(keys)))
+            }
+            // The VM doesn't track set-vs-frozenset distinctly today —
+            // hashing through here means a regular `set` literal can also
+            // appear as a dict key, which is more permissive than CPython.
+            // The (much more common) flow we care about is `frozenset(...)`
+            // as a dict key, which now works.
+            Value::Set(s) => {
+                let mut keys: Vec<HashKey> = s.borrow().iter().cloned().collect();
+                // Canonical ordering so two sets with the same members hash
+                // equal regardless of insertion order.
+                keys.sort_by(|a, b| {
+                    use std::hash::Hasher;
+                    let mut ha = std::collections::hash_map::DefaultHasher::new();
+                    let mut hb = std::collections::hash_map::DefaultHasher::new();
+                    a.hash(&mut ha);
+                    b.hash(&mut hb);
+                    ha.finish().cmp(&hb.finish())
+                });
+                Ok(HashKey::FrozenSet(Rc::new(keys)))
             }
             other => Err(type_error(format!(
                 "unhashable type: '{}'",
@@ -529,7 +569,7 @@ impl Value {
             Value::Int(i) => i.to_str_radix(10),
             Value::Float(x) => format_float(*x),
             Value::Str(s) => (**s).clone(),
-            Value::Bytes(b) => format!("b{:?}", String::from_utf8_lossy(b)),
+            Value::Bytes(b) => python_repr_bytes(b),
             Value::List(l) => {
                 let l = l.borrow();
                 let mut s = String::from("[");
@@ -630,6 +670,37 @@ impl Value {
             other => other.py_str(),
         }
     }
+}
+
+/// CPython-style `repr` for `bytes`: `b'...'`, falling back to `b"..."` if
+/// the value contains a `'` but no `"`. Non-printable bytes use `\xNN`,
+/// `\n` / `\r` / `\t` retain their named escapes, and `\\` is escaped.
+fn python_repr_bytes(b: &[u8]) -> String {
+    let has_single = b.contains(&b'\'');
+    let has_double = b.contains(&b'"');
+    let quote = if has_single && !has_double { b'"' } else { b'\'' };
+    let mut out = String::with_capacity(b.len() + 3);
+    out.push('b');
+    out.push(quote as char);
+    for &byte in b {
+        match byte {
+            b'\\' => out.push_str("\\\\"),
+            b'\n' => out.push_str("\\n"),
+            b'\r' => out.push_str("\\r"),
+            b'\t' => out.push_str("\\t"),
+            c if c == quote => {
+                out.push('\\');
+                out.push(c as char);
+            }
+            c if (0x20..0x7f).contains(&c) => out.push(c as char),
+            c => {
+                use std::fmt::Write;
+                let _ = write!(out, "\\x{:02x}", c);
+            }
+        }
+    }
+    out.push(quote as char);
+    out
 }
 
 /// CPython-style `repr` for a string: prefer single quotes, escape the

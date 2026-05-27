@@ -45,12 +45,21 @@ pub fn run_source(
     script_args: &[String],
 ) -> Result<i32, VmError> {
     // Apply the same surface-syntax expansions as `tyc build` so the parser
-    // sees identical input. `lazy import`, `gather:`, `go`, `with`-chains,
-    // pipes and `?` all get lowered to plain Python before parsing.
+    // sees identical input. `gather:`, `go`, `with`-chains, pipes and `?`
+    // all get lowered to plain Python before parsing.
+    //
+    // Note: we deliberately call `expand_lazy_lets` instead of the full
+    // `expand_lazy_imports`. The full version lowers `lazy import np =
+    // numpy` to a `__TyphonLazy_np_` proxy class that uses descriptor
+    // protocol and `__getattr__` — neither of which the VM models. The
+    // simpler `preprocess` pass below already rewrites `lazy import ALIAS
+    // = MODULE` to a plain `import MODULE as ALIAS`, which is the right
+    // shape for an in-process VM (no point deferring an import that's
+    // about to be evaluated eagerly anyway).
     let expanded = preprocess::expand_question_ops(&preprocess::expand_pipes(
         &preprocess::expand_with_chains(&preprocess::expand_go_calls(
             &preprocess::expand_gather_blocks(&preprocess::expand_multiline_guards(
-                &preprocess::expand_lazy_imports(source),
+                &preprocess::expand_lazy_lets(source),
             )),
         )),
     ));
