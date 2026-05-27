@@ -893,6 +893,106 @@ pub fn generic_param_variance(head: &str, idx: usize) -> Variance {
     }
 }
 
+/// Returns `true` if `ty` directly or transitively mentions the TypeVar
+/// with the given `name`.  Used by [`infer_class_variance`] to classify
+/// each type parameter's variance positions.
+fn type_mentions_typevar(ty: &Type, name: &str) -> bool {
+    match ty {
+        Type::TypeVar(n) => n.as_str() == name,
+        Type::Generic(_, args) => args.iter().any(|a| type_mentions_typevar(a, name)),
+        Type::Union(vs) => vs.iter().any(|v| type_mentions_typevar(v, name)),
+        Type::Function { params, ret, .. } => {
+            params.iter().any(|p| type_mentions_typevar(p, name))
+                || type_mentions_typevar(ret, name)
+        }
+        _ => false,
+    }
+}
+
+/// Infer the variance of each type parameter in `type_params` from the
+/// merged class shape (fields + methods contributed by `impl` blocks).
+///
+/// Variance rules applied:
+///
+/// - A TypeVar that appears in a **field annotation** contributes an
+///   invariant slot (dataclass fields are mutable by default; even when
+///   the emitted `@dataclass(frozen=True)` is used we don't have that
+///   information here, so we stay conservative).
+/// - A TypeVar that appears **only in method return types** is Covariant.
+/// - A TypeVar that appears **only in method parameter types** is
+///   Contravariant.
+/// - Any combination of field + method positions yields Invariant.
+///
+/// Constructor (`__init__`) and other dunder methods are excluded from the
+/// method scan because their parameter types mirror the field types —
+/// counting them would double-count the field-invariant contribution.
+///
+/// This is the standard first-order variance analysis used by mypy and
+/// pyright for user-declared `Generic` subclasses.
+pub fn infer_class_variance(shape: &InterfaceShape, type_params: &[String]) -> Vec<Variance> {
+    type_params
+        .iter()
+        .map(|tp| {
+            // Fields → invariant contribution (mutable in default
+            // dataclass emit; conservative without frozen info).
+            let in_fields = shape
+                .fields
+                .values()
+                .any(|ft| type_mentions_typevar(ft, tp));
+            if in_fields {
+                return Variance::Invariant;
+            }
+
+            let mut has_covariant = false;
+            let mut has_contravariant = false;
+            for (method_name, sig) in &shape.methods {
+                // Dunders that are implementation artefacts, not part
+                // of the public generic surface.
+                if method_name.starts_with("__") && method_name.ends_with("__") {
+                    continue;
+                }
+                // Return type → covariant (T flows out).
+                if type_mentions_typevar(&sig.return_type, tp) {
+                    has_covariant = true;
+                }
+                // Parameter types → contravariant (T flows in).
+                if sig
+                    .param_types
+                    .iter()
+                    .any(|pt| type_mentions_typevar(pt, tp))
+                {
+                    has_contravariant = true;
+                }
+            }
+            match (has_covariant, has_contravariant) {
+                (true, false) => Variance::Covariant,
+                (false, true) => Variance::Contravariant,
+                _ => Variance::Invariant,
+            }
+        })
+        .collect()
+}
+
+/// Like [`generic_param_variance`] but also consults a per-class
+/// user-inferred variance table before falling back to the stdlib map.
+///
+/// The `user_table` maps class names to the ordered `Vec<Variance>` that
+/// [`infer_class_variance`] produced during the module shape extraction
+/// pass.  Indices correspond to the position of the type parameter in the
+/// `class Foo[T, U, …]:` declaration.
+pub fn generic_param_variance_for(
+    head: &str,
+    idx: usize,
+    user_table: &std::collections::HashMap<String, Vec<Variance>>,
+) -> Variance {
+    if let Some(variances) = user_table.get(head) {
+        if let Some(v) = variances.get(idx) {
+            return *v;
+        }
+    }
+    generic_param_variance(head, idx)
+}
+
 /// Translate an annotation expression into a [`Type`].
 ///
 /// `classes` is the set of class names declared in the enclosing module so
@@ -1288,13 +1388,20 @@ fn bind_typevars(
                 bind_typevars(f, a, bindings);
             }
         }
-        // Higher-kinded type constructor binding: treat `F[_]` as a type variable
-        // that should unify with the actual type constructor head.
-        // E.g. `F[_]` against `list[int]` could bind `F → list`.
-        (Type::TypeConstructor(name, _arity), Type::Generic(head, _args)) => {
-            // For now, we bind the constructor name to the generic head.
-            // A complete implementation would validate arity matches.
-            bindings.insert(name.clone(), Type::Class(head.clone()));
+        // Higher-kinded type constructor binding: `F[_]` against a concrete
+        // generic like `list[int]` binds `F → list` (the constructor head).
+        // Arity validation: the TypeConstructor's declared arity (number of
+        // `_` placeholders) must equal the number of type arguments in the
+        // concrete generic.  A mismatch — e.g. `F[_, _]` (arity 2) against
+        // `list[int]` (arity 1) — is a type error at the use site; we leave
+        // the TypeConstructor unbound so the substitution pass produces a
+        // visible `TypeConstructor` in the output type rather than silently
+        // emitting the wrong head.
+        (Type::TypeConstructor(name, arity), Type::Generic(head, args)) => {
+            if *arity == args.len() {
+                bindings.insert(name.clone(), Type::Class(head.clone()));
+            }
+            // Arity mismatch: leave unbound (no insertion).
         }
         (
             Type::Function {
@@ -1661,6 +1768,13 @@ struct Checker<'a> {
     /// `Type::Generic("Box", [Int])` rather than `Type::Class("Box")`
     /// (FINDINGS #46).
     class_type_params: HashMap<String, Vec<String>>,
+    /// Per-class inferred variance for PEP 695 type parameters.  Keyed by
+    /// the class name; the `Vec` is ordered by type-parameter declaration
+    /// position (same order as `class_type_params`).  Used by
+    /// `is_assignable`'s Generic arm to apply the correct subtyping
+    /// direction per slot instead of always defaulting to invariant for
+    /// user-declared generics.
+    class_type_param_variance: HashMap<String, Vec<Variance>>,
     /// Classes declared with the `frozen` modifier (`class Foo frozen:`).
     /// Used to reject attribute writes to instances of these classes at
     /// check time — matches the runtime behaviour of the emitted
@@ -1962,6 +2076,7 @@ impl<'a> Checker<'a> {
             interfaces: HashMap::new(),
             class_shapes: HashMap::new(),
             class_type_params: HashMap::new(),
+            class_type_param_variance: HashMap::new(),
             frozen_classes: std::collections::HashSet::new(),
             class_parents: HashMap::new(),
             unsafe_depth: 0,
@@ -1987,6 +2102,14 @@ impl<'a> Checker<'a> {
     fn is_unsafe_marker(&self, range: TextRange) -> bool {
         let start = u32::from(range.start());
         self.unsafe_line_starts.binary_search(&start).is_ok()
+    }
+
+    /// Look up the variance of the `idx`-th type parameter of the generic
+    /// class `head`.  Checks the per-class inferred table first (populated
+    /// during the module-scan pass), then falls back to the stdlib
+    /// hand-curated map, then defaults to `Invariant`.
+    fn param_variance(&self, head: &str, idx: usize) -> Variance {
+        generic_param_variance_for(head, idx, &self.class_type_param_variance)
     }
 
     /// Assignment compatibility check that accounts for sealed-union subtyping
@@ -2139,7 +2262,7 @@ impl<'a> Checker<'a> {
                     .zip(bb)
                     .enumerate()
                     .all(
-                        |(idx, (formal, actual_arg))| match generic_param_variance(an, idx) {
+                        |(idx, (formal, actual_arg))| match self.param_variance(an, idx) {
                             Variance::Covariant => self.is_assignable(formal, actual_arg),
                             Variance::Contravariant => self.is_assignable(actual_arg, formal),
                             Variance::Invariant => {
@@ -2911,6 +3034,12 @@ pub struct ModuleShapes {
     /// inference at cross-module call sites (`Box(value=42)` produces
     /// `Box[int]` even when `Box` is imported).
     pub class_type_params: HashMap<String, Vec<String>>,
+    /// Per-class inferred variance for user-declared generic classes.
+    /// Indexed by class name; the `Vec` is ordered by type-parameter
+    /// declaration position.  Forwarded to consuming checkers so
+    /// cross-module generic assignability uses the inferred variance
+    /// instead of the invariant default.
+    pub class_type_param_variance: HashMap<String, Vec<Variance>>,
     /// Free-function arities keyed by name. Forwarded to the checker
     /// so `from foo import bar; bar(1)` triggers the same
     /// `tyc::arg_count` check that an in-module `def bar` would.
@@ -2956,6 +3085,9 @@ pub struct ModuleShapes {
 pub struct ExternalShapes {
     pub class_shapes: HashMap<String, InterfaceShape>,
     pub class_type_params: HashMap<String, Vec<String>>,
+    /// Per-class inferred variance for user-declared generic classes,
+    /// re-keyed under the local import name that the consumer sees.
+    pub class_type_param_variance: HashMap<String, Vec<Variance>>,
     pub function_arities: HashMap<String, ArityInfo>,
     /// Sealed-union aliases re-keyed under the local import name of the
     /// alias (`from foo import Event` → `"Event" → ["A", "B", ...]`).
@@ -3114,9 +3246,21 @@ pub fn extract_module_shapes(module: &ModModule) -> ModuleShapes {
         }
     }
 
+    // Infer per-class type-parameter variance from the merged class shapes.
+    // This must come after the second sweep (impl-merge) so the shapes
+    // reflect methods contributed by `impl ClassName:` blocks.
+    let mut class_type_param_variance: HashMap<String, Vec<Variance>> = HashMap::new();
+    for (name, tps) in &class_type_params {
+        if let Some(shape) = class_shapes.get(name) {
+            let variances = infer_class_variance(shape, tps);
+            class_type_param_variance.insert(name.clone(), variances);
+        }
+    }
+
     ModuleShapes {
         class_shapes,
         class_type_params,
+        class_type_param_variance,
         function_arities,
         sealed_unions,
         interfaces,
@@ -3187,6 +3331,11 @@ pub fn check_module_with_imports(
             c.class_type_params
                 .entry(name.clone())
                 .or_insert_with(|| tps.clone());
+        }
+        for (name, variances) in &ext.class_type_param_variance {
+            c.class_type_param_variance
+                .entry(name.clone())
+                .or_insert_with(|| variances.clone());
         }
         for (name, info) in &ext.function_arities {
             c.function_arity_info
@@ -4510,6 +4659,15 @@ fn collect_classes_and_functions(c: &mut Checker, body: &[Stmt]) {
                     ));
                 }
             }
+        }
+    }
+    // Compute per-class variance from the merged shapes (after impl blocks
+    // have been folded in so method contributions are visible).
+    for name in c.class_type_params.keys().cloned().collect::<Vec<_>>() {
+        if let Some(shape) = c.class_shapes.get(&name) {
+            let tps = c.class_type_params.get(&name).cloned().unwrap_or_default();
+            let variances = infer_class_variance(shape, &tps);
+            c.class_type_param_variance.entry(name).or_insert(variances);
         }
     }
     // Third pass: record function signatures (also needs the full class list).

@@ -25,6 +25,24 @@
 //! the bound results: `map_pure` returns results in input order.  Code
 //! that relied on the laziness of a generator expression is unaffected
 //! because we only touch list-comprehensions.
+//!
+//! Additionally, accumulator-loop patterns are rewritten:
+//!
+//!   ```python
+//!   for x in xs:
+//!       out.append(f(x))
+//!   ```
+//!
+//!   becomes
+//!
+//!   ```python
+//!   out.extend(typhon_runtime.parallel.map_pure(f, xs))
+//!   ```
+//!
+//!   when `f` is pure and `out` is a local list accumulator.  The
+//!   conditions mirror those for comprehension rewrites: single-target
+//!   for-loop, pure callee, no loop filters, body is exactly one
+//!   `NAME.append(CALLEE(TARGET))` statement.
 
 use std::collections::HashSet;
 
@@ -32,6 +50,7 @@ use ruff_python_ast::{
     name::Name, Arguments, AtomicNodeIndex, Comprehension, Expr, ExprAttribute, ExprCall,
     ExprContext, ExprDictComp, ExprLambda, ExprListComp, ExprName, ExprSet, ExprSetComp,
     ExprStarred, ExprTuple, ModModule, Parameter, ParameterWithDefault, Parameters, Stmt,
+    StmtExpr,
 };
 use ruff_text_size::TextRange;
 
@@ -40,9 +59,13 @@ use ruff_text_size::TextRange;
 pub struct ParallelStats {
     /// Number of comprehensions converted to `map_pure` calls.
     pub rewrites: usize,
+    /// Number of `for … out.append(f(x))` loops converted to
+    /// `out.extend(map_pure(f, xs))` calls.
+    pub accumulator_rewrites: usize,
 }
 
-/// Walk `module` and rewrite eligible list comprehensions in place.
+/// Walk `module` and rewrite eligible list comprehensions and
+/// accumulator loops in place.
 ///
 /// `pure_callees` is the set of bare-name functions that the purity pass
 /// already proved safe to invoke concurrently.  When the set is empty the
@@ -56,6 +79,10 @@ pub struct ParallelStats {
 /// iterable's size cannot be inferred (e.g. it is an arbitrary call or
 /// bound name), the threshold is treated as zero — the user opted into
 /// `auto-parallel` and we honour that for unknown sizes.
+///
+/// Accumulator loops matching `for TARGET in ITER: OUT.append(PURE_FN(TARGET))`
+/// are rewritten to `OUT.extend(typhon_runtime.parallel.map_pure(PURE_FN, ITER))`
+/// when `PURE_FN` is in the pure set.
 pub fn rewrite_parallel_comprehensions(
     module: &mut ModModule,
     pure_callees: &HashSet<String>,
@@ -128,10 +155,20 @@ fn rewrite_stmt(stmt: &mut Stmt, ctx: &RewriteCtx<'_>, stats: &mut ParallelStats
                 rewrite_stmt(s, ctx, stats);
             }
         }
-        Stmt::For(f) => {
-            rewrite_expr(&mut f.iter, ctx, stats);
-            for s in &mut f.body {
-                rewrite_stmt(s, ctx, stats);
+        Stmt::For(_) => {
+            // Try to rewrite `for x in xs: out.append(f(x))` →
+            // `out.extend(typhon_runtime.parallel.map_pure(f, xs))`.
+            // The replacement is done by replacing the mutable borrow
+            // in `stmt` in-place.
+            if try_rewrite_for_accumulator(stmt, ctx, stats) {
+                return;
+            }
+            // Not rewritten — descend into the body normally.
+            if let Stmt::For(f) = stmt {
+                rewrite_expr(&mut f.iter, ctx, stats);
+                for s in &mut f.body {
+                    rewrite_stmt(s, ctx, stats);
+                }
             }
         }
         Stmt::With(w) => {
@@ -141,6 +178,187 @@ fn rewrite_stmt(stmt: &mut Stmt, ctx: &RewriteCtx<'_>, stats: &mut ParallelStats
         }
         _ => {}
     }
+}
+
+/// Detect and rewrite the accumulator pattern:
+///
+/// ```python
+/// for TARGET in ITER:
+///     OUT.append(PURE_FN(TARGET))
+/// ```
+///
+/// into:
+///
+/// ```python
+/// OUT.extend(typhon_runtime.parallel.map_pure(PURE_FN, ITER))
+/// ```
+///
+/// Returns `true` and replaces `stmt` in-place when the pattern matches
+/// and `PURE_FN` is in `ctx.pure`.  Returns `false` without modifying
+/// `stmt` otherwise.
+fn try_rewrite_for_accumulator(
+    stmt: &mut Stmt,
+    ctx: &RewriteCtx<'_>,
+    stats: &mut ParallelStats,
+) -> bool {
+    let Stmt::For(for_stmt) = stmt else {
+        return false;
+    };
+
+    // Gate: no `else` clause, no `async for`.
+    if !for_stmt.orelse.is_empty() {
+        return false;
+    }
+    if for_stmt.is_async {
+        return false;
+    }
+    let Expr::Name(target_name) = for_stmt.target.as_ref() else {
+        return false;
+    };
+    let target = target_name.id.as_str().to_owned();
+
+    // Gate: body is a single statement.
+    if for_stmt.body.len() != 1 {
+        return false;
+    }
+
+    // Gate: body statement is an expression statement.
+    let Stmt::Expr(body_expr) = &for_stmt.body[0] else {
+        return false;
+    };
+
+    // Gate: the expression is `OUT.append(...)`.
+    let Expr::Call(call) = body_expr.value.as_ref() else {
+        return false;
+    };
+    let Expr::Attribute(attr) = call.func.as_ref() else {
+        return false;
+    };
+    if attr.attr.as_str() != "append" {
+        return false;
+    }
+    let Expr::Name(acc_name) = attr.value.as_ref() else {
+        return false;
+    };
+    let accumulator = acc_name.id.clone();
+
+    // Gate: exactly one positional argument, no keyword args.
+    if call.arguments.args.len() != 1 || !call.arguments.keywords.is_empty() {
+        return false;
+    }
+    let arg = &call.arguments.args[0];
+
+    // Gate: argument is `PURE_FN(TARGET)`.
+    let Expr::Call(inner_call) = arg else {
+        return false;
+    };
+    let Expr::Name(fn_name) = inner_call.func.as_ref() else {
+        return false;
+    };
+    let callee = fn_name.id.as_str();
+
+    // Gate: the callee is in the pure set.
+    if !ctx.pure.contains(callee) {
+        return false;
+    }
+
+    // Gate: inner call has exactly one positional arg equal to TARGET.
+    if inner_call.arguments.args.len() != 1 || !inner_call.arguments.keywords.is_empty() {
+        return false;
+    }
+    let inner_arg = &inner_call.arguments.args[0];
+    let Expr::Name(inner_arg_name) = inner_arg else {
+        return false;
+    };
+    if inner_arg_name.id.as_str() != target.as_str() {
+        return false;
+    }
+
+    // All conditions met — build the replacement:
+    // `OUT.extend(typhon_runtime.parallel.map_pure(PURE_FN, ITER))`
+    let range = for_stmt.range;
+    let iter = for_stmt.iter.as_ref().clone();
+    let callee_name = fn_name.id.clone();
+
+    // Build `typhon_runtime.parallel.map_pure`
+    let runtime_attr = make_dotted_attr("typhon_runtime", &["parallel", "map_pure"], range);
+
+    // Build `map_pure(PURE_FN, ITER)`
+    let map_call = Expr::Call(ExprCall {
+        node_index: AtomicNodeIndex::NONE,
+        range,
+        func: Box::new(runtime_attr),
+        arguments: Arguments {
+            range,
+            node_index: AtomicNodeIndex::NONE,
+            args: Box::from([
+                Expr::Name(ExprName {
+                    node_index: AtomicNodeIndex::NONE,
+                    range,
+                    id: callee_name,
+                    ctx: ExprContext::Load,
+                }),
+                iter,
+            ]),
+            keywords: Box::from([]),
+        },
+    });
+
+    // Build `OUT.extend(...)`
+    let extend_attr = Expr::Attribute(ExprAttribute {
+        node_index: AtomicNodeIndex::NONE,
+        range,
+        value: Box::new(Expr::Name(ExprName {
+            node_index: AtomicNodeIndex::NONE,
+            range,
+            id: accumulator,
+            ctx: ExprContext::Load,
+        })),
+        attr: ruff_python_ast::Identifier::new("extend", range),
+        ctx: ExprContext::Load,
+    });
+    let extend_call = Expr::Call(ExprCall {
+        node_index: AtomicNodeIndex::NONE,
+        range,
+        func: Box::new(extend_attr),
+        arguments: Arguments {
+            range,
+            node_index: AtomicNodeIndex::NONE,
+            args: Box::from([map_call]),
+            keywords: Box::from([]),
+        },
+    });
+
+    *stmt = Stmt::Expr(StmtExpr {
+        node_index: AtomicNodeIndex::NONE,
+        range,
+        value: Box::new(extend_call),
+    });
+
+    stats.accumulator_rewrites += 1;
+    true
+}
+
+/// Build a dotted attribute expression like `a.b.c` from a base name and
+/// a chain of attribute names.  All nodes share `range` as their source
+/// location (the rewriter uses the enclosing statement's range).
+fn make_dotted_attr(base: &str, attrs: &[&str], range: TextRange) -> Expr {
+    let mut expr = Expr::Name(ExprName {
+        node_index: AtomicNodeIndex::NONE,
+        range,
+        id: Name::new(base),
+        ctx: ExprContext::Load,
+    });
+    for attr in attrs {
+        expr = Expr::Attribute(ExprAttribute {
+            node_index: AtomicNodeIndex::NONE,
+            range,
+            value: Box::new(expr),
+            attr: ruff_python_ast::Identifier::new(*attr, range),
+            ctx: ExprContext::Load,
+        });
+    }
+    expr
 }
 
 fn rewrite_expr(expr: &mut Expr, ctx: &RewriteCtx<'_>, stats: &mut ParallelStats) {

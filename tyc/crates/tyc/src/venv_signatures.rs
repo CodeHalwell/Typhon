@@ -421,6 +421,7 @@ fn shapes_from_introspected(intro: &IntrospectedModule) -> ModuleShapes {
     ModuleShapes {
         class_shapes,
         class_type_params: HashMap::new(),
+        class_type_param_variance: HashMap::new(),
         function_arities,
         sealed_unions: HashMap::new(),
         interfaces: HashMap::new(),

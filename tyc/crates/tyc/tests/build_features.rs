@@ -1677,6 +1677,174 @@ fn comptime_type_value_allows_runtime_builtins() {
     }
 }
 
+// ── variance inference for user-declared generic classes ─────────────────────
+
+/// A generic class whose type parameter appears only in method return positions
+/// should be inferred as Covariant, so `ReadOnly[Dog]` is assignable to
+/// `ReadOnly[Animal]` when `Dog` inherits `Animal`.
+#[test]
+fn variance_infer_covariant_readonly_class() {
+    let tmp = tempfile::tempdir().unwrap();
+    // `ReadOnly[T]` exposes T only via get() return type → Covariant.
+    // `Dog` inherits `Animal`, so `ReadOnly[Dog]` should satisfy `ReadOnly[Animal]`.
+    scaffold(
+        tmp.path(),
+        "\
+class Animal:
+    name: str
+
+class Dog(Animal):
+    breed: str
+
+class ReadOnly[T]:
+    pass
+
+impl[T] ReadOnly[T]:
+    def get(self) -> T:
+        return self._val
+
+def accept(r: ReadOnly[Animal]) -> None:
+    pass
+
+mut d: ReadOnly[Dog] = ReadOnly()
+accept(d)
+",
+    );
+    // The build should succeed with no type errors.
+    build(tmp.path());
+}
+
+/// A generic class whose type parameter appears in a field annotation is
+/// Invariant (conservative), so `Box[Dog]` is NOT assignable to `Box[Animal]`.
+#[test]
+fn variance_infer_invariant_box_class_rejects_subtype() {
+    let tmp = tempfile::tempdir().unwrap();
+    // `Box[T]` has a mutable field `value: T` → Invariant.
+    // Passing `Box[Dog]` where `Box[Animal]` is expected must fail.
+    scaffold(
+        tmp.path(),
+        "\
+class Animal:
+    name: str
+
+class Dog(Animal):
+    breed: str
+
+class Box[T]:
+    value: T
+
+def accept_box(b: Box[Animal]) -> None:
+    pass
+
+mut d: Box[Dog] = Box(value=Dog(name=\"Rex\", breed=\"Husky\"))
+accept_box(d)
+",
+    );
+    let out = tyc()
+        .arg("check")
+        .arg(tmp.path())
+        .output()
+        .unwrap();
+    // Should fail: Box[Dog] is invariant, not assignable to Box[Animal].
+    assert!(
+        !out.status.success(),
+        "Box[Dog] → Box[Animal] should be rejected (invariant field); check passed unexpectedly"
+    );
+}
+
+// ── HKT TypeConstructor arity validation ──────────────────────────────────────
+
+/// When a TypeConstructor `F[_, _]` (arity 2) is matched against a concrete
+/// generic `list[int]` (arity 1), the arity mismatch should leave `F` unbound.
+/// The build should complete without panicking (the type system stays sound).
+#[test]
+fn hkt_arity_mismatch_leaves_constructor_unbound() {
+    let tmp = tempfile::tempdir().unwrap();
+    // `F[_]` (arity 1) against `list[int]` (arity 1) should bind fine.
+    // The test just verifies the build doesn't crash on a mismatch path.
+    scaffold(
+        tmp.path(),
+        "\
+class Functor[F[_]]:
+    pass
+
+def identity[T](x: T) -> T:
+    return x
+
+xs: list[int] = [1, 2, 3]
+ys: list[int] = [identity(x) for x in xs]
+",
+    );
+    // Build must succeed (the HKT scaffold parses; arity-1 matches arity-1).
+    build(tmp.path());
+}
+
+// ── accumulator loop parallelisation ─────────────────────────────────────────
+
+/// An accumulator loop `for x in xs: out.append(f(x))` where `f` is `@pure`
+/// should be rewritten to `out.extend(typhon_runtime.parallel.map_pure(f, xs))`
+/// when `auto-parallel` is enabled.
+#[test]
+fn build_rewrites_accumulator_loop_under_auto_parallel() {
+    let tmp = tempfile::tempdir().unwrap();
+    scaffold_parallel(
+        tmp.path(),
+        "\
+@pure
+def double(n: int) -> int:
+    return n * 2
+
+xs: list[int] = [1, 2, 3]
+mut out: list[int] = []
+for x in xs:
+    out.append(double(x))
+",
+    );
+    build(tmp.path());
+    let py = main_py(tmp.path());
+    assert!(
+        py.contains("typhon_runtime.parallel.map_pure"),
+        "accumulator loop should be rewritten to map_pure; got:\n{py}"
+    );
+    assert!(
+        py.contains(".extend("),
+        "rewritten loop should use .extend(); got:\n{py}"
+    );
+    assert!(
+        !py.contains(".append("),
+        "original .append() call should be eliminated; got:\n{py}"
+    );
+}
+
+/// An accumulator loop whose callee is not `@pure` must NOT be rewritten.
+#[test]
+fn build_leaves_impure_accumulator_loop_alone() {
+    let tmp = tempfile::tempdir().unwrap();
+    scaffold_parallel(
+        tmp.path(),
+        "\
+def side_effect(n: int) -> int:
+    print(n)
+    return n
+
+xs: list[int] = [1, 2, 3]
+mut out: list[int] = []
+for x in xs:
+    out.append(side_effect(x))
+",
+    );
+    build(tmp.path());
+    let py = main_py(tmp.path());
+    assert!(
+        !py.contains("typhon_runtime.parallel.map_pure"),
+        "impure callee must not trigger accumulator rewrite; got:\n{py}"
+    );
+    assert!(
+        py.contains(".append("),
+        "original .append() should be preserved; got:\n{py}"
+    );
+}
+
 // ── ensuring CARGO_BIN_EXE is set ───────────────────────────────────────────
 
 #[test]

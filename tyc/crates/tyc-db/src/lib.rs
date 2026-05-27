@@ -741,6 +741,11 @@ fn build_external_shapes(
                     .class_type_params
                     .insert(b.name.clone(), tps.clone());
             }
+            if let Some(variances) = module_shapes.class_type_param_variance.get(member) {
+                external
+                    .class_type_param_variance
+                    .insert(b.name.clone(), variances.clone());
+            }
             // If the foreign module declared `Foo` as an interface
             // (Protocol-shaped), record that fact — together with
             // the source's `@runtime_checkable` opt-in — under the
