@@ -276,7 +276,9 @@ impl Emitter {
                         self.write(" = ");
                         self.write(constructor);
                         self.write("(");
-                        self.write(&format!("\"{}\"", tv.name));
+                        self.write("\"");
+                        self.write(&tv.name);
+                        self.write("\"");
                         // Carry the declared bound through to the
                         // legacy form so `def f[T: Iface](...)` lowers
                         // to `T = TypeVar("T", bound=Iface)`. Bounds
@@ -1126,7 +1128,8 @@ impl Emitter {
                 let outer = pick_fstring_outer_quote(fs);
                 self.fstring_quote_stack.push(outer);
                 self.write("f");
-                self.write(&outer.to_string());
+                let mut buf = [0; 4];
+                self.write(outer.encode_utf8(&mut buf));
                 for part in fs.value.iter() {
                     match part {
                         FStringPart::Literal(lit) => {
@@ -1159,7 +1162,8 @@ impl Emitter {
                                         // runtime output of `f"{x!r}"` etc.
                                         if let Some(c) = interp.conversion.to_char() {
                                             self.write("!");
-                                            self.write(&c.to_string());
+                                            let mut buf = [0; 4];
+                                            self.write(c.encode_utf8(&mut buf));
                                         }
                                         // Emit `:FORMAT_SPEC` — the spec is
                                         // itself a mini-f-string that may
@@ -1191,7 +1195,8 @@ impl Emitter {
                         }
                     }
                 }
-                self.write(&outer.to_string());
+                let mut buf = [0; 4];
+                self.write(outer.encode_utf8(&mut buf));
                 self.fstring_quote_stack.pop();
             }
 
@@ -1262,14 +1267,17 @@ impl Emitter {
                 let use_triple = outer.is_none()
                     && (s.value.first_literal_flags().is_triple_quoted() || text.contains('\n'));
                 if use_triple {
-                    let delim = format!("{}{}{}", quote, quote, quote);
-                    self.write(&delim);
+                    let mut buf = [0; 4];
+                    let q_str = quote.encode_utf8(&mut buf);
+                    for _ in 0..3 { self.write(q_str); }
                     self.write(&escape_triple_quoted_string(text, quote));
-                    self.write(&delim);
+                    for _ in 0..3 { self.write(q_str); }
                 } else {
-                    self.write(&quote.to_string());
+                    let mut buf = [0; 4];
+                    let q_str = quote.encode_utf8(&mut buf);
+                    self.write(q_str);
                     self.write(&escape_python_string_with_quote(text, quote));
-                    self.write(&quote.to_string());
+                    self.write(q_str);
                 }
             }
 

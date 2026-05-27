@@ -1,3 +1,7 @@
 ## 2024-05-14 - String escaping optimization
 **Learning:** `format!("\\x{:02x}", byte)` and `.to_string()` for characters are surprisingly slow in hot loops due to formatting overhead and heap allocations. Using manual byte indexing with a hex table and `char::encode_utf8` on a small stack buffer avoids allocations and is over 35x faster.
 **Action:** When emitting code or serializing strings, always prefer pushing `char` directly, `encode_utf8`, or manual appending using `push_str` rather than using the `format!` macro or `.to_string()`.
+
+## 2024-06-25 - [AST Emission String Allocations]
+**Learning:** Bypassing the core `write` method (e.g. by using `std::fmt::Write` directly on `self.output`) breaks state tracking like indentation and line/column offsets. `ruff_python_ast::Int` is a big integer and cannot be passed to `itoa::Buffer::format` directly without converting or extracting.
+**Action:** Instead of bypassing `write` to avoid string allocations, allocate a small stack buffer with `let mut buf = [0; 4];` and use `char::encode_utf8(&mut buf)` to pass a safe `&str` reference into `self.write()`, and replace `format!` of single chars with `self.write("\"")`. For larger types like Int/Float/Complex where formatting must happen but using `write!` bypasses tracking, use standard `format!` if the string is required to be passed to `self.write()`, or extract the primitive types if using `itoa`/`ryu`.
