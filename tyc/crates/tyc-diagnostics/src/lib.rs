@@ -2788,6 +2788,48 @@ impl Diagnostics {
         });
     }
 
+    /// Like [`dedupe`] but normalises variant class names to their sealed-union
+    /// alias before comparing messages. This covers the case where
+    /// `impl Alias:` distribution produces per-variant diagnostics whose
+    /// messages differ only in the embedded class name — e.g. a method that
+    /// references `self.field` will fire `tyc::attribute_not_found` as
+    /// "Circle has no attribute 'x'" on the `Circle` copy and "Rectangle has
+    /// no attribute 'x'" on the `Rectangle` copy. After normalisation both
+    /// messages read "Shape has no attribute 'x'" and the dedup fires.
+    pub fn dedupe_with_union_map(
+        &mut self,
+        sealed_unions: &std::collections::HashMap<String, Vec<String>>,
+    ) {
+        // Build variant→alias reverse map for message normalisation.
+        let variant_to_alias: std::collections::HashMap<String, String> = sealed_unions
+            .iter()
+            .flat_map(|(alias, variants)| {
+                variants
+                    .iter()
+                    .map(move |v| (v.clone(), alias.clone()))
+            })
+            .collect();
+        let normalize = |msg: &str| -> String {
+            let mut s = msg.to_owned();
+            for (variant, alias) in &variant_to_alias {
+                s = s.replace(variant.as_str(), alias.as_str());
+            }
+            s
+        };
+        let mut seen: std::collections::HashSet<(String, String)> =
+            std::collections::HashSet::new();
+        self.errors.retain(|e| {
+            let (code, msg) = diag_dedupe_key(e);
+            seen.insert((code, normalize(&msg)))
+        });
+        let mut seen_warn: std::collections::HashSet<(String, String)> =
+            std::collections::HashSet::new();
+        self.warnings.retain(|e| {
+            let (code, msg) = diag_dedupe_key(e);
+            seen_warn.insert((code, normalize(&msg)))
+        });
+    }
+
     pub fn error_count(&self) -> usize {
         self.errors.len()
     }
@@ -3965,5 +4007,73 @@ mod tests {
             let code = err.code().unwrap().to_string();
             assert_eq!(&code, expected_code, "code mismatch: got {code}");
         }
+    }
+
+    // ── dedupe_with_union_map ─────────────────────────────────────────────────
+
+    fn make_attr_error(class_name: &str) -> TycError {
+        TycError::attribute_not_found(
+            class_name,
+            "radius",
+            "a.ty",
+            &format!("let _: int = {class_name}().radius"),
+            0,
+            5,
+        )
+    }
+
+    #[test]
+    fn dedupe_with_union_map_removes_per_variant_copies() {
+        // Simulate `impl Shape:` distributed to Circle and Rectangle —
+        // each produces "Circle has no attribute 'radius'" /
+        // "Rectangle has no attribute 'radius'". Both should collapse to one.
+        let mut diags = Diagnostics::new();
+        diags.push_error(make_attr_error("Circle"));
+        diags.push_error(make_attr_error("Rectangle"));
+        diags.push_error(make_attr_error("Triangle"));
+
+        let mut sealed_unions = std::collections::HashMap::new();
+        sealed_unions.insert(
+            "Shape".to_owned(),
+            vec!["Circle".to_owned(), "Rectangle".to_owned(), "Triangle".to_owned()],
+        );
+
+        diags.dedupe_with_union_map(&sealed_unions);
+        assert_eq!(
+            diags.error_count(),
+            1,
+            "three per-variant copies must collapse to one; got: {:?}",
+            diags.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn dedupe_with_union_map_preserves_unrelated_errors() {
+        // Two errors with different codes / different messages must be kept.
+        let mut diags = Diagnostics::new();
+        diags.push_error(TycError::unknown_name("foo", "a.ty", "foo", 0, 3));
+        diags.push_error(TycError::unknown_name("bar", "a.ty", "bar", 0, 3));
+
+        let sealed_unions: std::collections::HashMap<String, Vec<String>> =
+            std::collections::HashMap::new();
+        diags.dedupe_with_union_map(&sealed_unions);
+        assert_eq!(
+            diags.error_count(),
+            2,
+            "distinct errors must not be collapsed"
+        );
+    }
+
+    #[test]
+    fn dedupe_with_union_map_handles_empty_unions() {
+        let mut diags = Diagnostics::new();
+        diags.push_error(make_attr_error("Circle"));
+        diags.push_error(make_attr_error("Circle"));
+
+        let sealed_unions: std::collections::HashMap<String, Vec<String>> =
+            std::collections::HashMap::new();
+        diags.dedupe_with_union_map(&sealed_unions);
+        // Plain dedup by (code, message) still fires for identical errors.
+        assert_eq!(diags.error_count(), 1);
     }
 }

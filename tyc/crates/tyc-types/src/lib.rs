@@ -937,6 +937,214 @@ pub fn generic_param_variance(head: &str, idx: usize) -> Variance {
     }
 }
 
+/// Check whether `target` type-parameter name appears anywhere in an
+/// annotation expression, respecting the positional direction.
+///
+/// Returns `(in_covariant_pos, in_contravariant_pos)` for the given
+/// expression under `current_variance` (the polarity of the current position).
+///
+/// - A bare field or return-type annotation is in covariant position
+///   (current_variance = Covariant).
+/// - A function/method parameter annotation is in contravariant position
+///   (current_variance = Contravariant).
+/// - Inside `Callable[[...], Ret]`, the parameter list flips polarity;
+///   the return position retains current polarity.
+fn annotation_variance_positions(
+    expr: &Expr,
+    target: &str,
+    current_variance: Variance,
+) -> (bool, bool) {
+    match expr {
+        Expr::Name(n) => {
+            if n.id.as_str() == target {
+                match current_variance {
+                    Variance::Covariant => (true, false),
+                    Variance::Contravariant => (false, true),
+                    Variance::Invariant => (true, true),
+                }
+            } else {
+                (false, false)
+            }
+        }
+        Expr::Subscript(s) => {
+            let head = match s.value.as_ref() {
+                Expr::Name(n) => n.id.as_str(),
+                Expr::Attribute(a) => a.attr.as_str(),
+                _ => "",
+            };
+            if head == "Callable" {
+                // Callable[[Arg1, Arg2], Ret] — params list is at slice[0],
+                // return is at slice[1].  The params flip polarity; the
+                // return inherits current polarity.
+                if let Expr::Tuple(t) = s.slice.as_ref() {
+                    if t.elts.len() == 2 {
+                        let flipped = match current_variance {
+                            Variance::Covariant => Variance::Contravariant,
+                            Variance::Contravariant => Variance::Covariant,
+                            Variance::Invariant => Variance::Invariant,
+                        };
+                        let (c0, i0) =
+                            annotation_variance_positions(&t.elts[0], target, flipped);
+                        let (c1, i1) =
+                            annotation_variance_positions(&t.elts[1], target, current_variance);
+                        return (c0 || c1, i0 || i1);
+                    }
+                }
+                // Also handle Callable[[...list...], Ret] where the first elt
+                // is itself a List literal.
+                // Fallback: scan slice as-is with current polarity.
+                annotation_variance_positions(&s.slice, target, current_variance)
+            } else if head == "Optional" || head == "Final" || head == "ClassVar" {
+                annotation_variance_positions(&s.slice, target, current_variance)
+            } else if head == "Union" {
+                // All union members share the same polarity.
+                if let Expr::Tuple(t) = s.slice.as_ref() {
+                    t.elts.iter().fold((false, false), |(ac, ai), e| {
+                        let (c, i) = annotation_variance_positions(e, target, current_variance);
+                        (ac || c, ai || i)
+                    })
+                } else {
+                    annotation_variance_positions(&s.slice, target, current_variance)
+                }
+            } else {
+                // Generic[T1, T2] — without knowing the generic's own
+                // variance we must assume invariant for each slot.
+                // (Except for a few known covariant heads like Sequence,
+                // tuple etc. which the caller can rely on via
+                // generic_param_variance — but for the purpose of inferring
+                // variance of user-defined type params inside user class
+                // bodies, the safe default is invariant.)
+                // We just scan all arguments as invariant (both positions).
+                if let Expr::Tuple(t) = s.slice.as_ref() {
+                    t.elts.iter().fold((false, false), |(ac, ai), e| {
+                        let (c, i) = annotation_variance_positions(e, target, Variance::Invariant);
+                        (ac || c, ai || i)
+                    })
+                } else {
+                    annotation_variance_positions(&s.slice, target, Variance::Invariant)
+                }
+            }
+        }
+        Expr::BinOp(b) if matches!(b.op, ruff_python_ast::Operator::BitOr) => {
+            let (cl, il) = annotation_variance_positions(&b.left, target, current_variance);
+            let (cr, ir) = annotation_variance_positions(&b.right, target, current_variance);
+            (cl || cr, il || ir)
+        }
+        Expr::Tuple(t) => t.elts.iter().fold((false, false), |(ac, ai), e| {
+            let (c, i) = annotation_variance_positions(e, target, current_variance);
+            (ac || c, ai || i)
+        }),
+        _ => (false, false),
+    }
+}
+
+/// Infer the variance of each type parameter for a class body.
+///
+/// For **non-frozen** classes all parameters are invariant — mutable fields
+/// can be written, so no widening is safe.
+///
+/// For **frozen** classes:
+/// - Field annotation → covariant position.
+/// - Method return annotation → covariant position.
+/// - Method parameter annotations (non-self) → contravariant position.
+/// - `Callable[[T], R]` inside an annotation flips T's polarity.
+///
+/// Each type parameter is then classified:
+/// - Only in covariant positions → [`Variance::Covariant`]
+/// - Only in contravariant positions → [`Variance::Contravariant`]
+/// - In both, or neither → [`Variance::Covariant`] for unused params
+///   (safe: an unused T carries no data so widening is fine), invariant for
+///   ambiguous ones.
+pub fn infer_class_variance(
+    class_body: &[Stmt],
+    type_params: &[String],
+    is_frozen: bool,
+) -> Vec<Variance> {
+    if !is_frozen {
+        return vec![Variance::Invariant; type_params.len()];
+    }
+
+    // For each type param track whether it appears in a covariant and/or
+    // contravariant position in the class body.
+    let mut in_covariant: Vec<bool> = vec![false; type_params.len()];
+    let mut in_contravariant: Vec<bool> = vec![false; type_params.len()];
+
+    for stmt in class_body {
+        match stmt {
+            Stmt::AnnAssign(a) => {
+                // Field annotation — covariant position (frozen: read-only).
+                for (idx, tp) in type_params.iter().enumerate() {
+                    let (c, i) =
+                        annotation_variance_positions(&a.annotation, tp, Variance::Covariant);
+                    if c {
+                        in_covariant[idx] = true;
+                    }
+                    if i {
+                        in_contravariant[idx] = true;
+                    }
+                }
+            }
+            Stmt::FunctionDef(f) => {
+                // Return type — covariant position.
+                if let Some(ret) = f.returns.as_deref() {
+                    for (idx, tp) in type_params.iter().enumerate() {
+                        let (c, i) =
+                            annotation_variance_positions(ret, tp, Variance::Covariant);
+                        if c {
+                            in_covariant[idx] = true;
+                        }
+                        if i {
+                            in_contravariant[idx] = true;
+                        }
+                    }
+                }
+                // Parameters (skip the first param which is `self`/`cls`).
+                let all_params: Vec<_> = f
+                    .parameters
+                    .posonlyargs
+                    .iter()
+                    .chain(f.parameters.args.iter())
+                    .chain(f.parameters.kwonlyargs.iter())
+                    .collect();
+                // Determine whether this is a static method (no implicit self).
+                let is_static = f.decorator_list.iter().any(|d| {
+                    matches!(&d.expression, Expr::Name(n) if n.id.as_str() == "staticmethod")
+                });
+                let skip = if is_static { 0 } else { 1 };
+                for param in all_params.into_iter().skip(skip) {
+                    if let Some(ann) = &param.parameter.annotation {
+                        for (idx, tp) in type_params.iter().enumerate() {
+                            let (c, i) = annotation_variance_positions(
+                                ann,
+                                tp,
+                                Variance::Contravariant,
+                            );
+                            if c {
+                                in_covariant[idx] = true;
+                            }
+                            if i {
+                                in_contravariant[idx] = true;
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    type_params
+        .iter()
+        .enumerate()
+        .map(|(idx, _)| match (in_covariant[idx], in_contravariant[idx]) {
+            (_, true) if in_covariant[idx] => Variance::Invariant, // both
+            (_, true) => Variance::Contravariant,                   // only contra
+            (true, _) => Variance::Covariant,                       // only cov
+            (false, false) => Variance::Covariant, // unused → safe to be covariant
+        })
+        .collect()
+}
+
 /// Translate an annotation expression into a [`Type`].
 ///
 /// `classes` is the set of class names declared in the enclosing module so
@@ -1328,6 +1536,26 @@ fn bind_typevars(
             }
         }
         (Type::Generic(fh, fa), Type::Generic(ah, aa)) if fh == ah && fa.len() == aa.len() => {
+            for (f, a) in fa.iter().zip(aa) {
+                bind_typevars(f, a, bindings);
+            }
+        }
+        // HKT head binding: `Generic("F", [TypeVar("A"), ...])` against
+        // `Generic("list", [Class("int"), ...])` where all formal args are
+        // TypeVars and arities match.  This is the F[A] → list[int] case
+        // that arises when F is an HKT type parameter (`class K[F[_], A]:`)
+        // and a concrete application `list[int]` is passed as the argument.
+        // We bind the head name F → Class(list) and each TypeVar to the
+        // corresponding actual arg slot.
+        (Type::Generic(fh, fa), Type::Generic(ah, aa))
+            if fh != ah
+                && fa.len() == aa.len()
+                && !fa.is_empty()
+                && fa.iter().all(|t| matches!(t, Type::TypeVar(_))) =>
+        {
+            bindings
+                .entry(fh.clone())
+                .or_insert_with(|| Type::Class(ah.clone()));
             for (f, a) in fa.iter().zip(aa) {
                 bind_typevars(f, a, bindings);
             }
@@ -1786,6 +2014,14 @@ struct Checker<'a> {
     /// signature pre-scan from `@contextmanager` / `@asynccontextmanager`
     /// (bare-name and `contextlib.<name>` forms).
     contextmanager_yields: HashMap<String, Type>,
+    /// Inferred variance for each type parameter of user-declared generic
+    /// classes. Populated after `populate_frozen_classes` in
+    /// `check_module_with_imports`. Keyed by class name; values are
+    /// parallel to the class's `class_type_params` entry.
+    /// For frozen classes, variance is inferred from field / method-return
+    /// (covariant positions) vs method-parameter (contravariant positions)
+    /// usage. Non-frozen classes stay invariant (mutable fields).
+    class_variance: HashMap<String, Vec<Variance>>,
 }
 
 /// Per-function arity metadata kept alongside `Type::Function` so the
@@ -2022,6 +2258,7 @@ impl<'a> Checker<'a> {
             partial_returning_fns: HashMap::new(),
             module_registry: std::sync::Arc::new(HashMap::new()),
             contextmanager_yields: HashMap::new(),
+            class_variance: HashMap::new(),
         }
     }
 
@@ -2255,7 +2492,7 @@ impl<'a> Checker<'a> {
                     .zip(bb)
                     .enumerate()
                     .all(
-                        |(idx, (formal, actual_arg))| match generic_param_variance(an, idx) {
+                        |(idx, (formal, actual_arg))| match self.user_param_variance(an, idx) {
                             Variance::Covariant => self.is_assignable(formal, actual_arg),
                             Variance::Contravariant => self.is_assignable(actual_arg, formal),
                             Variance::Invariant => {
@@ -2330,6 +2567,22 @@ impl<'a> Checker<'a> {
             },
             other => other.clone(),
         }
+    }
+
+    /// Variance of the `idx`-th type parameter of a generic head, consulting
+    /// user-inferred variance first and falling back to the built-in table.
+    ///
+    /// `self.class_variance` is populated in `check_module_with_imports` after
+    /// `populate_frozen_classes` and seeded from `ExternalShapes::class_variance`
+    /// for imported generics.  If the class is not in the table (built-in or
+    /// unknown), we fall back to [`generic_param_variance`].
+    fn user_param_variance(&self, head: &str, idx: usize) -> Variance {
+        if let Some(variances) = self.class_variance.get(head) {
+            if let Some(&v) = variances.get(idx) {
+                return v;
+            }
+        }
+        generic_param_variance(head, idx)
     }
 
     /// Unwrap a chain of `newtype Foo = …` declarations until a non-
@@ -3047,6 +3300,11 @@ pub struct ModuleShapes {
     /// Greeter)` rather than firing `tyc::interface_isinstance` on a
     /// pattern that the source module legitimately authored.
     pub interfaces: HashMap<String, bool>,
+    /// Inferred variance for each type parameter of generic classes declared
+    /// in this module. Parallel to `class_type_params`; absent for
+    /// non-generic classes. Populated by `extract_module_shapes` so
+    /// cross-module callers can apply the same covariance rules.
+    pub class_variance: HashMap<String, Vec<Variance>>,
 }
 
 /// Imports resolved to their source modules' [`ModuleShapes`], keyed
@@ -3087,6 +3345,11 @@ pub struct ExternalShapes {
     /// re-keyed under the local import name so the `isinstance`
     /// check sees the source module's opt-in.
     pub interfaces: HashMap<String, bool>,
+    /// Inferred variance for each type parameter of imported generic
+    /// classes. Re-keyed under the local import name. Consulted by the
+    /// consumer's `user_param_variance` so frozen-class covariance works
+    /// the same whether the class is declared locally or imported.
+    pub class_variance: HashMap<String, Vec<Variance>>,
     /// Bare imports that need attribute-access resolution. Keyed by
     /// the *local* binding name; the value is the dotted module path
     /// the import refers to (e.g. `("np", "numpy")` for
@@ -3116,6 +3379,15 @@ pub struct ExternalShapes {
 /// silently tolerated: the goal here is to publish the surface API for
 /// downstream callers, not to validate it.
 pub fn extract_module_shapes(module: &ModModule) -> ModuleShapes {
+    extract_module_shapes_with_frozen(module, &[])
+}
+
+/// Like [`extract_module_shapes`] but also infers generic-class variance
+/// for classes declared with the `frozen` modifier. `frozen_starts` is the
+/// pre-computed byte-offset list from the preprocessor (the same slice
+/// passed to [`check_module_with_imports`] as `frozen_class_lines` after
+/// conversion through [`unsafe_byte_starts`]).
+pub fn extract_module_shapes_with_frozen(module: &ModModule, frozen_starts: &[u32]) -> ModuleShapes {
     let mut classes: Vec<String> = Vec::new();
     for stmt in &module.body {
         match stmt {
@@ -3230,12 +3502,38 @@ pub fn extract_module_shapes(module: &ModModule) -> ModuleShapes {
         }
     }
 
+    // Infer generic-class variance for frozen classes (non-frozen classes
+    // stay invariant).  We determine which classes are frozen the same way
+    // `populate_frozen_classes` does: compare each class's source range
+    // against the precomputed byte offsets.
+    let mut class_variance: HashMap<String, Vec<Variance>> = HashMap::new();
+    for stmt in &module.body {
+        if let Stmt::ClassDef(cd) = stmt {
+            let name = cd.name.as_str();
+            let tps = type_param_names_from(cd.type_params.as_deref());
+            if !tps.is_empty() {
+                let is_frozen = if frozen_starts.is_empty() {
+                    false
+                } else {
+                    let class_start = u32::from(cd.range.start());
+                    let name_start = u32::from(cd.name.range.start());
+                    frozen_starts
+                        .iter()
+                        .any(|&m| m >= class_start && m <= name_start)
+                };
+                let variances = infer_class_variance(&cd.body, &tps, is_frozen);
+                class_variance.insert(name.to_owned(), variances);
+            }
+        }
+    }
+
     ModuleShapes {
         class_shapes,
         class_type_params,
         function_arities,
         sealed_unions,
         interfaces,
+        class_variance,
     }
 }
 
@@ -3423,6 +3721,14 @@ pub fn check_module_with_imports(
                 });
             }
         }
+        // Cross-module variance: seed inferred variance for imported generic
+        // classes so `user_param_variance` can apply the same covariance
+        // rules as for locally-declared frozen generics.
+        for (name, variances) in &ext.class_variance {
+            c.class_variance
+                .entry(name.clone())
+                .or_insert_with(|| variances.clone());
+        }
         // Stash the by-module registry for attribute access on
         // `Type::Module(name)` (bare `import M` form). The clone
         // here is just an `Arc::clone` (O(1) refcount bump) thanks
@@ -3441,6 +3747,20 @@ pub fn check_module_with_imports(
     // references work.
     collect_classes_and_functions(&mut c, &module.body);
     populate_frozen_classes(&mut c, &module.body, &frozen_starts);
+    // Infer variance for user-declared generic classes.  We do this after
+    // `populate_frozen_classes` so that `c.frozen_classes` is complete and
+    // we can correctly classify frozen vs non-frozen generics.
+    for stmt in &module.body {
+        if let Stmt::ClassDef(cd) = stmt {
+            let name = cd.name.as_str();
+            let tps = type_param_names_from(cd.type_params.as_deref());
+            if !tps.is_empty() {
+                let is_frozen = c.frozen_classes.contains(name);
+                let variances = infer_class_variance(&cd.body, &tps, is_frozen);
+                c.class_variance.insert(name.to_owned(), variances);
+            }
+        }
+    }
     // Cross-function field-init audit pre-pass: identify helper
     // functions whose body is `return X.__new__(X)` (or
     // `obj = X.__new__(X); return obj`). At call sites, the LHS is
@@ -3480,7 +3800,11 @@ pub fn check_module_with_imports(
     // (code, message), stable across copies because impl distribution
     // doesn't touch the user-visible source text — only the byte
     // ranges in the preprocessed buffer.
-    c.diagnostics.dedupe();
+    // dedupe_with_union_map normalises variant class names to the alias
+    // before comparing — handles the case where messages differ only in
+    // the embedded variant name (e.g. "Circle has no attr" vs
+    // "Rectangle has no attr" both normalise to "Shape has no attr").
+    c.diagnostics.dedupe_with_union_map(&c.sealed_unions);
 
     // Phase D: freezable-shape audit (B36). Every `freeze let X = …`
     // lowers to `X = __typhon_freeze__(rhs)`; at runtime that helper
@@ -17575,6 +17899,57 @@ def f() -> int:
         );
     }
 
+    #[test]
+    fn hkt_generic_head_binding_from_applied_form() {
+        // `Generic("F", [TypeVar("A")])` against `Generic("list", [Int])` should
+        // bind F → Class("list") and A → Int. This is the `F[A]` vs `list[int]`
+        // case that arises in HKT method signatures like:
+        //   `def fmap[F[_], A, B](container: F[A], f: A -> B) -> F[B]`
+        // where the formal `container: F[A]` is represented as
+        // `Generic("F", [TypeVar("A")])` and the actual is `list[int]`.
+        use crate::{bind_typevars_and_substitute, Type};
+
+        let formal_params = vec![Type::Generic(
+            "F".to_owned(),
+            vec![Type::TypeVar("A".to_owned())],
+        )];
+        let actual_args = vec![Type::Generic("list".to_owned(), vec![Type::Int])];
+        let return_type = Type::Generic("F".to_owned(), vec![Type::TypeVar("A".to_owned())]);
+
+        let result = bind_typevars_and_substitute(&formal_params, &actual_args, &return_type);
+        assert_eq!(
+            result,
+            Type::Generic("list".to_owned(), vec![Type::Int]),
+            "Generic(F,[A]) against Generic(list,[Int]) must yield Generic(list,[Int]); got {result:?}"
+        );
+    }
+
+    #[test]
+    fn hkt_generic_head_binding_with_different_arg_typevar() {
+        // `Generic("F", [TypeVar("A")])` as formal, `Generic("list", [Int])` actual;
+        // return type is `Generic("F", [TypeVar("B")])` where B is bound via a
+        // separate `TypeVar("B")` formal.
+        // Expected: return becomes `Generic("list", [Str])`.
+        use crate::{bind_typevars_and_substitute, Type};
+
+        let formal_params = vec![
+            Type::Generic("F".to_owned(), vec![Type::TypeVar("A".to_owned())]),
+            Type::TypeVar("B".to_owned()),
+        ];
+        let actual_args = vec![
+            Type::Generic("list".to_owned(), vec![Type::Int]),
+            Type::Str,
+        ];
+        let return_type = Type::Generic("F".to_owned(), vec![Type::TypeVar("B".to_owned())]);
+
+        let result = bind_typevars_and_substitute(&formal_params, &actual_args, &return_type);
+        assert_eq!(
+            result,
+            Type::Generic("list".to_owned(), vec![Type::Str]),
+            "return F[B] with F→list, B→Str must yield list[Str]; got {result:?}"
+        );
+    }
+
     // ── v0.7.1 stress-test findings ───────────────────────────────────────────
 
     /// FINDINGS v0.7.1 #1: attribute access on a `Type::Class` instance.
@@ -18204,6 +18579,66 @@ def label(p: Point) -> float:
                 .iter()
                 .any(|e| e.to_string().contains("totally_bogus_attr")),
             "must still flag bogus attr on a fully-known cross-module class; got: {:?}",
+            d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    // ── frozen generic covariance ─────────────────────────────────────────
+
+    /// A frozen generic class with T only in field/return positions should be
+    /// covariant in T: Box[Dog] must be assignable to Box[Animal].
+    #[test]
+    fn frozen_generic_box_dog_assignable_to_box_animal() {
+        let src = "\
+class Animal:
+    name: str
+
+class Dog(Animal):
+    breed: str
+
+class Box[T] frozen:
+    value: T
+
+def use_box(b: Box[Animal]) -> str:
+    return b.value.name
+
+let d: Dog = Dog(name=\"Rex\", breed=\"Husky\")
+let b: Box[Dog] = Box(value=d)
+use_box(b)
+";
+        let d = check(src);
+        assert!(
+            !d.has_errors(),
+            "Box[Dog] must be assignable to Box[Animal] for frozen Box[T]: {:?}",
+            d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    /// A non-frozen generic class with T should remain invariant:
+    /// MutableBox[Dog] must NOT be assignable to MutableBox[Animal].
+    #[test]
+    fn non_frozen_generic_box_dog_not_assignable_to_box_animal() {
+        let src = "\
+class Animal:
+    name: str
+
+class Dog(Animal):
+    breed: str
+
+class MutableBox[T]:
+    value: T
+
+def use_box(b: MutableBox[Animal]) -> str:
+    return b.value.name
+
+let d: Dog = Dog(name=\"Rex\", breed=\"Husky\")
+let b: MutableBox[Dog] = MutableBox(value=d)
+use_box(b)
+";
+        let d = check(src);
+        assert!(
+            d.has_errors(),
+            "MutableBox[Dog] must NOT be assignable to MutableBox[Animal] (invariant): {:?}",
             d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
         );
     }

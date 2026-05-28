@@ -24,7 +24,7 @@ use tyc_syntax::{
     },
 };
 use tyc_types::{
-    check_module_with, check_module_with_imports, extract_module_shapes, ExternalShapes,
+    check_module_with, check_module_with_imports, extract_module_shapes_with_frozen, ExternalShapes,
 };
 
 /// Re-export so downstream crates (CLI, LSP) can name the type
@@ -489,7 +489,8 @@ pub fn extract_shapes_for_path(_path: &str, text: &str) -> ModuleShapes {
         Ok(p) => p.into_syntax(),
         Err(_) => return ModuleShapes::default(),
     };
-    extract_module_shapes(&module)
+    let frozen_starts = line_byte_starts(&prep.python_source, &prep.frozen_class_lines);
+    extract_module_shapes_with_frozen(&module, &frozen_starts)
 }
 
 /// Newtype wrapper around `Arc<ModuleShapes>` so the Salsa-tracked
@@ -756,6 +757,13 @@ fn build_external_shapes(
                 external
                     .class_type_params
                     .insert(b.name.clone(), tps.clone());
+            }
+            // Propagate inferred variance so that cross-module frozen
+            // generics are treated as covariant in the consumer's checker.
+            if let Some(variances) = module_shapes.class_variance.get(member) {
+                external
+                    .class_variance
+                    .insert(b.name.clone(), variances.clone());
             }
             // If the foreign module declared `Foo` as an interface
             // (Protocol-shaped), record that fact — together with
