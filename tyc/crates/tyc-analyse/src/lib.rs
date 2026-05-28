@@ -2953,9 +2953,12 @@ pub fn analyse_secret_literal_bindings(
     module: &ModModule,
     path: &str,
     source: &str,
+    allow_secret_comptime: bool,
 ) -> Diagnostics {
     let mut diags = Diagnostics::new();
-    walk_secret_literal_stmts(&module.body, path, source, &mut diags);
+    if !allow_secret_comptime {
+        walk_secret_literal_stmts(&module.body, path, source, &mut diags);
+    }
     diags
 }
 
@@ -3540,7 +3543,8 @@ mod lint_tests {
     #[test]
     fn secret_literal_fires_on_string_assign() {
         let module = parse("API_TOKEN = \"abc\"\n");
-        let diags = analyse_secret_literal_bindings(&module, "x.ty", "API_TOKEN = \"abc\"\n");
+        let diags =
+            analyse_secret_literal_bindings(&module, "x.ty", "API_TOKEN = \"abc\"\n", false);
         assert_eq!(
             diags.warnings().len(),
             1,
@@ -3553,7 +3557,7 @@ mod lint_tests {
     fn secret_literal_fires_on_password_and_pwd() {
         let src = "DB_PASSWORD = \"secret\"\nDB_PWD = \"abc\"\n";
         let module = parse(src);
-        let diags = analyse_secret_literal_bindings(&module, "x.ty", src);
+        let diags = analyse_secret_literal_bindings(&module, "x.ty", src, false);
         assert_eq!(diags.warnings().len(), 2);
     }
 
@@ -3561,7 +3565,7 @@ mod lint_tests {
     fn secret_literal_fires_on_openai_api_key() {
         let src = "OPENAI_API_KEY = \"sk-foo\"\n";
         let module = parse(src);
-        let diags = analyse_secret_literal_bindings(&module, "x.ty", src);
+        let diags = analyse_secret_literal_bindings(&module, "x.ty", src, false);
         assert_eq!(diags.warnings().len(), 1);
     }
 
@@ -3569,7 +3573,7 @@ mod lint_tests {
     fn secret_literal_fires_on_my_secret() {
         let src = "MY_SECRET = \"abc\"\n";
         let module = parse(src);
-        let diags = analyse_secret_literal_bindings(&module, "x.ty", src);
+        let diags = analyse_secret_literal_bindings(&module, "x.ty", src, false);
         assert_eq!(diags.warnings().len(), 1);
     }
 
@@ -3578,7 +3582,7 @@ mod lint_tests {
         // The whole point of the lint: env-driven RHS should NOT warn.
         let src = "import os\nAPI_TOKEN = os.getenv(\"API_TOKEN\")\n";
         let module = parse(src);
-        let diags = analyse_secret_literal_bindings(&module, "x.ty", src);
+        let diags = analyse_secret_literal_bindings(&module, "x.ty", src, false);
         assert!(
             diags.warnings().is_empty(),
             "env-driven RHS must not warn; got {:?}",
@@ -3591,7 +3595,7 @@ mod lint_tests {
         // A regular `let username = "x"` must stay silent.
         let src = "username = \"alice\"\nMONKEY = \"chimp\"\n";
         let module = parse(src);
-        let diags = analyse_secret_literal_bindings(&module, "x.ty", src);
+        let diags = analyse_secret_literal_bindings(&module, "x.ty", src, false);
         assert!(
             diags.warnings().is_empty(),
             "unrelated binding name must not warn; got {:?}",
@@ -3607,7 +3611,7 @@ mod lint_tests {
         let module = tyc_syntax::parse_module(&prep.python_source)
             .expect("parse failed")
             .into_syntax();
-        let diags = analyse_secret_literal_bindings(&module, "x.ty", &prep.python_source);
+        let diags = analyse_secret_literal_bindings(&module, "x.ty", &prep.python_source, false);
         assert_eq!(
             diags.warnings().len(),
             1,

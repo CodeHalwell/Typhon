@@ -335,6 +335,7 @@ pub fn run(args: CheckArgs) -> Result<()> {
                 &path.display().to_string(),
                 &source,
                 has_project_config.then_some(&vetting_ctx),
+                config.strictness.allow_secret_comptime,
             );
             diags.extend(analysis_diags);
         }
@@ -942,6 +943,7 @@ fn run_secondary_passes(
     path: &str,
     source: &str,
     vetting_ctx: Option<&ImportVettingContext>,
+    allow_secret_comptime: bool,
 ) -> Diagnostics {
     let mut diags = Diagnostics::new();
     let expanded = expand_for_check(source);
@@ -1020,6 +1022,7 @@ fn run_secondary_passes(
         &module,
         path,
         &prep.python_source,
+        allow_secret_comptime,
     ));
 
     if let Some(ctx) = vetting_ctx {
