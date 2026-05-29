@@ -169,3 +169,33 @@ table th {
   outline: 2px solid var(--sl-color-accent);
   outline-offset: 2px;
 }
+
+
+/* Accessibility: Improve keyboard focus indication for interactive elements */
+/* Selects in theme dropdown, pagination links, and card components */
+a:focus-visible,
+button:focus-visible,
+details summary:focus-visible,
+select:focus-visible {
+  outline: 2px solid var(--sl-color-accent);
+  outline-offset: 2px;
+  border-radius: 0.25rem;
+}
+
+/* Starlight specific focus fixes */
+.sl-link-card:focus-within {
+  background: var(--sl-color-gray-7, var(--sl-color-gray-6));
+  border-color: var(--sl-color-gray-2);
+}
+
+.sl-link-card:focus-within .icon {
+  color: var(--sl-color-white);
+}
+
+/* Respect user's motion preferences */
+@media (prefers-reduced-motion: reduce) {
+  .card:hover,
+  .sl-link-card:hover {
+    transform: none;
+  }
+}
