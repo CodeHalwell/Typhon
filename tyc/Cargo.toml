@@ -64,6 +64,7 @@ num-bigint  = "0.4"
 num-integer = "0.1"
 num-traits  = "0.2"
 regex       = "1"
+stacker     = "0.1"
 
 # Internal crates
 tyc-syntax      = { path = "crates/tyc-syntax" }

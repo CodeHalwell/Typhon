@@ -17,6 +17,7 @@ indexmap           = { workspace = true }
 num-bigint         = { workspace = true }
 num-traits         = { workspace = true }
 num-integer        = { workspace = true }
+stacker            = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

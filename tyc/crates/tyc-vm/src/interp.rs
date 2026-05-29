@@ -64,11 +64,10 @@ impl Interpreter {
             // (FINDINGS #31). The tree-walking interpreter still pays a
             // real Rust stack frame for each Typhon frame, so values much
             // beyond this risk overflowing the OS thread stack rather
-            // than hitting our explicit guard. If the host process has a
-            // smaller stack, `tyc run` should be invoked with
-            // `RUST_MIN_STACK` set or a dedicated thread with a larger
-            // stack; a true fix would use `stacker::maybe_grow` but
-            // `stacker` isn't a workspace dep yet — TODO.
+            // than hitting our explicit guard. `stacker::maybe_grow`
+            // (called inside `call_function`) ensures the OS stack is
+            // extended when it runs low, so this limit acts as a
+            // logical recursion guard matching CPython's default.
             max_stack_depth: 1000,
             script_argv: Vec::new(),
             source_root: None,
@@ -1106,14 +1105,19 @@ impl Interpreter {
         // Wrap the body in a closure so every early `return` decrements the
         // counter on the way out — including a failure in `bind_args`.
         let call_env = Env::new_child(&f.closure);
-        let result = (|| -> Result<Value, Unwind> {
+        // `stacker::maybe_grow` ensures the OS thread stack is extended
+        // when it runs low, preventing stack overflows on deeply-recursive
+        // Typhon programs. The red-zone (32 KiB) triggers growth before
+        // overflow; the new segment is 1 MiB.  Only this site needs the
+        // guard because it is the sole place where interpreter frames nest.
+        let result = stacker::maybe_grow(32 * 1024, 1024 * 1024, || -> Result<Value, Unwind> {
             self.bind_args(f, args, kwargs, receiver, &call_env)?;
             match self.exec_block(&f.body, &call_env) {
                 Ok(()) => Ok(Value::None),
                 Err(Unwind::Return(v)) => Ok(v),
                 Err(other) => Err(other),
             }
-        })();
+        });
         self.stack_depth -= 1;
         result
     }
