@@ -1476,6 +1476,29 @@ pub enum TycError {
         #[label("prefer `{suggestion}` here")]
         span: SourceSpan,
     },
+
+    /// A dict literal was supplied where a model/class instance is
+    /// expected.  Distinct from the generic [`TycError::TypeMismatch`]
+    /// so the help text can enumerate the specific missing fields by
+    /// name, redirecting the user to the constructor form with the
+    /// exact keyword arguments they need to supply. FINDINGS #38.
+    #[error("expected `{model}`, found a dict literal")]
+    #[diagnostic(
+        code(tyc::type_mismatch),
+        url("https://typhon.dev/lang/diagnostics/type_mismatch"),
+        help("Use the constructor form instead: `{model}({field_hint})`")
+    )]
+    ModelLiteralMismatch {
+        model: String,
+        /// Comma-separated list of missing fields rendered as `field=…`
+        /// pairs, e.g. `"name=…, age=…"`.  Built by
+        /// [`TycError::model_literal_mismatch`].
+        field_hint: String,
+        #[source_code]
+        src: NamedSource<String>,
+        #[label("this dict literal cannot be used where `{model}` is expected")]
+        span: SourceSpan,
+    },
 }
 
 impl TycError {
@@ -2707,6 +2730,40 @@ impl TycError {
         Self::TypingAliasInAnnotation {
             name: name.into(),
             suggestion: suggestion.into(),
+            src: NamedSource::new(path.into(), source.into()),
+            span: SourceSpan::new(SourceOffset::from(offset), length.max(1)),
+        }
+    }
+
+    /// Construct a [`TycError::ModelLiteralMismatch`] diagnostic.
+    ///
+    /// `missing_fields` is the list of field names from the model's shape
+    /// that were not supplied in the dict literal (or all required fields
+    /// when the full constructor form is preferred). Each field is
+    /// rendered as `"field=…"` in the help text, separated by `", "`.
+    /// FINDINGS #38.
+    #[allow(clippy::too_many_arguments)]
+    pub fn model_literal_mismatch(
+        model: impl Into<String>,
+        missing_fields: &[String],
+        path: impl Into<String>,
+        source: impl Into<String>,
+        offset: usize,
+        length: usize,
+    ) -> Self {
+        let model: String = model.into();
+        let field_hint = if missing_fields.is_empty() {
+            "field=…".to_owned()
+        } else {
+            missing_fields
+                .iter()
+                .map(|f| format!("{f}=…"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        Self::ModelLiteralMismatch {
+            model,
+            field_hint,
             src: NamedSource::new(path.into(), source.into()),
             span: SourceSpan::new(SourceOffset::from(offset), length.max(1)),
         }

@@ -143,6 +143,22 @@ pub struct PreprocessResult {
     /// `tyc::pub_star_outside_init` diagnostic. (Carries line indices
     /// rather than a bool so the diagnostic spans the exact marker.)
     pub pub_star_lines: Vec<usize>,
+    /// Maps 0-based line indices in the **expanded** (preprocessed)
+    /// source that are synthetic copies produced by
+    /// `expand_impl_sealed_unions` back to the 0-based line index of
+    /// the original `impl Alias:` header that generated them.
+    ///
+    /// Only lines from the 2nd, 3rd, … Nth variant copies are recorded
+    /// here; the first copy occupies the same line range as the original
+    /// source, so it needs no remapping.
+    ///
+    /// Downstream passes (e.g. `tyc-db`) can use this map to remap
+    /// diagnostic spans that fall inside synthesised regions so they
+    /// point at the user-written `impl Alias:` header instead of a
+    /// phantom line past EOF of the original source.
+    ///
+    /// See TODO(#32) for the full span-remapping plan.
+    pub synthetic_line_map: std::collections::HashMap<usize, usize>,
 }
 
 impl PreprocessResult {
@@ -278,11 +294,13 @@ pub fn preprocess_opts(source: &str, opts: PreprocessOptions) -> PreprocessResul
     // missing case and emits one real `impl Variant:` block per
     // variant so the user's method bodies wire up at every call site.
     // Finding #7.
-    let source_owned = if opts.expand_impl_sealed_unions {
+    let (source_owned, synthetic_pairs) = if opts.expand_impl_sealed_unions {
         expand_impl_sealed_unions(&source_owned)
     } else {
-        source_owned
+        (source_owned, Vec::new())
     };
+    let synthetic_line_map: std::collections::HashMap<usize, usize> =
+        synthetic_pairs.into_iter().collect();
     let source = source_owned.as_str();
 
     let mut python_source = String::with_capacity(source.len());
@@ -844,6 +862,7 @@ pub fn preprocess_opts(source: &str, opts: PreprocessOptions) -> PreprocessResul
         plain_class_lines,
         pub_names,
         pub_star_lines,
+        synthetic_line_map,
     }
 }
 
@@ -1600,13 +1619,19 @@ fn append_ellipsis_to_bodiless_def(line: &str) -> Option<String> {
 /// is duplicated. Downstream callers that need byte-accurate spans for
 /// the *body* of these blocks should consume the desugared AST rather
 /// than rely on raw line indices.
-fn expand_impl_sealed_unions(source: &str) -> String {
+/// Returns `(expanded_source, synthetic_pairs)` where `synthetic_pairs` is a
+/// list of `(expanded_line_0based, original_impl_header_line_0based)` entries
+/// for every line that belongs to the 2nd, 3rd, … Nth variant copy of an
+/// `impl Alias:` block.  The first copy sits at the same line indices as the
+/// original source, so it is not listed.
+fn expand_impl_sealed_unions(source: &str) -> (String, Vec<(usize, usize)>) {
     let aliases = collect_sealed_union_aliases_from_text(source);
     if aliases.is_empty() {
-        return source.to_owned();
+        return (source.to_owned(), Vec::new());
     }
     let lines: Vec<&str> = source.split_inclusive('\n').collect();
     let mut out = String::with_capacity(source.len());
+    let mut synthetic_pairs: Vec<(usize, usize)> = Vec::new();
     let mut idx = 0;
     let mut in_string: Option<StringMode> = None;
     while idx < lines.len() {
@@ -1635,6 +1660,8 @@ fn expand_impl_sealed_unions(source: &str) -> String {
             .as_ref()
             .and_then(|info| aliases.get(&info.target_name));
         if let (Some(info), Some(variants)) = (target_info.as_ref(), variants) {
+            // Record the original 0-based line index of this `impl Alias:` header.
+            let original_header_line = idx;
             // Capture the indented body. A "body line" is any non-blank
             // line whose indent exceeds the header's indent. Blank lines
             // sitting *between* body lines are kept; trailing blank lines
@@ -1660,6 +1687,8 @@ fn expand_impl_sealed_unions(source: &str) -> String {
             }
             body_end = last_body_line.map(|i| i + 1).unwrap_or(body_end);
             let body_slice: String = lines[idx + 1..body_end].concat();
+            // The block occupies 1 (header) + body lines.
+            let block_line_count = 1 + (body_end - (idx + 1));
             // Detect the line's terminator (LF / CRLF / none) so we can
             // emit identical separators between duplicated blocks.
             let term = &line[raw.len()..];
@@ -1673,6 +1702,24 @@ fn expand_impl_sealed_unions(source: &str) -> String {
                     args = info.target_args.as_deref().unwrap_or(""),
                     term = term,
                 );
+                // For copies beyond the first (i >= 1), record every line
+                // of the emitted block as synthetic, mapping back to the
+                // original `impl Alias:` header line.
+                if i >= 1 {
+                    // Count the lines already in `out` to find the expanded
+                    // line number of the first line of this copy.
+                    let expanded_start =
+                        out.chars().filter(|&c| c == '\n').count();
+                    for offset in 0..block_line_count {
+                        synthetic_pairs
+                            .push((expanded_start + offset, original_header_line));
+                    }
+                    // Also account for the extra blank-line separator that
+                    // was emitted between the previous copy and this one.
+                    // (That separator line itself is already accounted for
+                    // because we counted '\n' in `out` which already
+                    // includes the separator.)
+                }
                 out.push_str(&header);
                 out.push_str(&body_slice);
                 // Separate consecutive duplicated blocks by a blank line.
@@ -1696,7 +1743,7 @@ fn expand_impl_sealed_unions(source: &str) -> String {
         out.push_str(line);
         idx += 1;
     }
-    out
+    (out, synthetic_pairs)
 }
 
 /// Collect sealed-union type aliases from a Typhon source string by
@@ -9789,7 +9836,7 @@ impl Tree:
     def depth(self) -> int:
         return 0
 ";
-        let out = expand_impl_sealed_unions(src);
+        let (out, _pairs) = expand_impl_sealed_unions(src);
         assert!(
             out.contains("impl Leaf:"),
             "expected `impl Leaf:` block; got:\n{out}"
@@ -9825,7 +9872,7 @@ impl[T] Tree[T]:
     def depth(self) -> int:
         return 0
 ";
-        let out = expand_impl_sealed_unions(src);
+        let (out, _pairs) = expand_impl_sealed_unions(src);
         assert!(
             out.contains("impl[T] Leaf[T]:"),
             "expected `impl[T] Leaf[T]:`; got:\n{out}"
@@ -9857,7 +9904,7 @@ impl Foo:
     def bar(self) -> int:
         return 0
 ";
-        let out = expand_impl_sealed_unions(src);
+        let (out, _pairs) = expand_impl_sealed_unions(src);
         assert_eq!(out, src, "non-alias impl must round-trip unchanged");
     }
 
@@ -9897,5 +9944,68 @@ impl[T] Tree[T]:
             "the `Tree` synthetic name must not leak into preprocessed output; got:\n{}",
             result.python_source
         );
+    }
+
+    #[test]
+    fn expand_impl_sealed_unions_populates_synthetic_line_map() {
+        // A 2-variant sealed union with an `impl Alias:` block should
+        // produce exactly one set of synthetic pairs — the lines of the
+        // 2nd variant's copy are remapped to the header line of the
+        // original `impl Alias:` declaration.
+        let src = "\
+class Leaf:
+    pass
+class Branch:
+    pass
+type Tree = Leaf | Branch
+impl Tree:
+    def depth(self) -> int:
+        return 0
+";
+        let (out, pairs) = expand_impl_sealed_unions(src);
+        assert!(
+            out.contains("impl Leaf:") && out.contains("impl Branch:"),
+            "expansion must produce both variant blocks"
+        );
+        // The original source has 9 lines (0-based 0..8).
+        // The `impl Tree:` header is at line 5 (0-based).
+        // The second copy (Branch) lives in the expanded output past
+        // the first copy (Leaf); all its lines should map back to line 5.
+        assert!(
+            !pairs.is_empty(),
+            "synthetic_pairs must be non-empty for a 2-variant expansion; got {pairs:?}"
+        );
+        for &(_, orig) in &pairs {
+            assert_eq!(
+                orig, 5,
+                "all synthetic lines must map to the impl header at line 5; got {orig}"
+            );
+        }
+    }
+
+    #[test]
+    fn preprocess_populates_synthetic_line_map_field() {
+        let src = "\
+class Leaf:
+    pass
+class Branch:
+    pass
+type Tree = Leaf | Branch
+impl Tree:
+    def depth(self) -> int:
+        return 0
+";
+        let result = preprocess(src);
+        assert!(
+            !result.synthetic_line_map.is_empty(),
+            "PreprocessResult.synthetic_line_map must be populated for a sealed union expansion"
+        );
+        // Every mapped value is the line of the `impl Tree:` header (line 5).
+        for (&_expanded, &orig) in &result.synthetic_line_map {
+            assert_eq!(
+                orig, 5,
+                "mapped original line must be the impl header (line 5); got {orig}"
+            );
+        }
     }
 }

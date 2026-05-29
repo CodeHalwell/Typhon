@@ -2713,6 +2713,30 @@ impl<'a> Checker<'a> {
                 }
             }
         }
+        // FINDINGS #38: when `expected` is a model/class with a known shape
+        // and `actual` is a dict generic, emit a dedicated diagnostic that
+        // enumerates the model's fields so the user knows the exact
+        // constructor form to use. This replaces the generic "dict literals
+        // don't auto-coerce" hint with a concrete `Model(field=…, …)` example.
+        if let (Type::Class(exp_name), Type::Generic(act_head, _)) = (expected, actual) {
+            if act_head == "dict" {
+                if let Some(shape) = self.class_shapes.get(exp_name.as_str()).cloned() {
+                    if !shape.field_order.is_empty() {
+                        let fields: Vec<String> =
+                            shape.field_order.iter().cloned().collect();
+                        self.diagnostics.push_error(TycError::model_literal_mismatch(
+                            exp_name.clone(),
+                            &fields,
+                            &self.path,
+                            self.source,
+                            span.0,
+                            length,
+                        ));
+                        return;
+                    }
+                }
+            }
+        }
         self.diagnostics.push_error(TycError::type_mismatch(
             expected.display(),
             actual.display(),
@@ -18205,6 +18229,77 @@ def label(p: Point) -> float:
                 .any(|e| e.to_string().contains("totally_bogus_attr")),
             "must still flag bogus attr on a fully-known cross-module class; got: {:?}",
             d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    // ── FINDINGS #38: ModelLiteralMismatch ────────────────────────────────
+
+    /// Assigning a dict literal to a model-typed binding when the model has
+    /// a known shape emits `ModelLiteralMismatch` instead of the generic
+    /// `TypeMismatch`, and the diagnostic's help text enumerates every
+    /// field of the model so the user knows the exact constructor form.
+    #[test]
+    fn model_literal_mismatch_emits_field_hint() {
+        // `Foo` has fields `name: str` and `age: int`.
+        // Assigning `{"name": "Alice"}` is missing `age`, so
+        // `try_infer_typed_dict_literal` returns `None` (missing required
+        // field), the dict is inferred as `dict[str, str]`, and
+        // `mismatch(Foo, dict[str, str])` should fire `ModelLiteralMismatch`
+        // with both `name=…` and `age=…` in the field hint.
+        let src = "\
+model Foo:
+    name: str
+    age: int
+let x: Foo = {\"name\": \"Alice\"}
+";
+        let d = check(src);
+        let errs = d.errors();
+        assert!(
+            errs.iter()
+                .any(|e| matches!(e, TycError::ModelLiteralMismatch { .. })),
+            "expected ModelLiteralMismatch; got: {:?}",
+            errs.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+        // The field hint must mention the missing field `age`.
+        let hint_has_age = errs.iter().any(|e| {
+            if let TycError::ModelLiteralMismatch { field_hint, .. } = e {
+                field_hint.contains("age=…")
+            } else {
+                false
+            }
+        });
+        assert!(
+            hint_has_age,
+            "ModelLiteralMismatch field_hint must contain 'age=…'; got: {:?}",
+            errs.iter()
+                .filter_map(|e| {
+                    if let TycError::ModelLiteralMismatch { field_hint, .. } = e {
+                        Some(field_hint.as_str())
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// An empty dict literal assigned to a model also emits
+    /// `ModelLiteralMismatch` (all fields are listed).
+    #[test]
+    fn model_literal_mismatch_empty_dict_lists_all_fields() {
+        let src = "\
+model Foo:
+    name: str
+    age: int
+let x: Foo = {}
+";
+        let d = check(src);
+        let errs = d.errors();
+        assert!(
+            errs.iter()
+                .any(|e| matches!(e, TycError::ModelLiteralMismatch { .. })),
+            "empty dict vs model must emit ModelLiteralMismatch; got: {:?}",
+            errs.iter().map(|e| e.to_string()).collect::<Vec<_>>()
         );
     }
 }
