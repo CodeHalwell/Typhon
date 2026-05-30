@@ -2071,8 +2071,10 @@ dependencies = [
 name = "tyc-emit"
 version = "0.9.2"
 dependencies = [
+ "itoa",
  "ruff_python_ast",
  "ruff_text_size",
+ "ryu",
  "thiserror",
  "tyc-syntax",
 ]
