@@ -644,6 +644,33 @@ model-extra = \"allow\"
     // ── stub-check tests ──────────────────────────────────────────────────
 
     #[test]
+    fn allow_secret_comptime_defaults_to_false() {
+        let cfg = TyphonConfig::default();
+        assert_eq!(
+            cfg.strictness.allow_secret_comptime, false,
+            "default allow-secret-comptime must be false, got {:?}",
+            cfg.strictness.allow_secret_comptime
+        );
+    }
+
+    #[test]
+    fn allow_secret_comptime_round_trips_through_toml() {
+        let toml_src = "\
+[project]
+name = \"demo\"
+
+[strictness]
+allow-secret-comptime = true
+";
+        let parsed: TyphonConfig = toml::from_str(toml_src).expect("parse");
+        assert_eq!(
+            parsed.strictness.allow_secret_comptime, true,
+            "allow-secret-comptime should be true, got {:?}",
+            parsed.strictness.allow_secret_comptime
+        );
+    }
+
+    #[test]
     fn stub_check_defaults_to_error() {
         let cfg = TyphonConfig::default();
         assert_eq!(
