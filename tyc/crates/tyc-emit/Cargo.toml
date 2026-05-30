@@ -6,8 +6,10 @@ license.workspace = true
 description = "Python code emitter — lowers a plain Python AST to .py source text"
 
 [dependencies]
+itoa = "1.0.18"
 ruff_python_ast = { workspace = true }
 ruff_text_size = { workspace = true }
+ryu = "1.0.23"
 thiserror = { workspace = true }
 
 [dev-dependencies]

@@ -1227,14 +1227,34 @@ impl Emitter {
             // Typed-literal arms — each was previously a `Constant` variant.
             Expr::NumberLiteral(n) => match &n.value {
                 Number::Int(i) => {
-                    self.write(&i.to_string());
+                    // Avoid heap allocation if it fits in 64 bits (positive or negative)
+                    if let Some(small) = i.as_i64() {
+                        let mut buf = itoa::Buffer::new();
+                        self.write(buf.format(small));
+                    } else if let Some(small_u) = i.as_u64() {
+                        let mut buf = itoa::Buffer::new();
+                        self.write(buf.format(small_u));
+                    } else {
+                        self.write(&i.to_string());
+                    }
                 }
                 Number::Float(f) => {
                     // `{}` drops `.0` on whole-number f64 — emit `1` rather
                     // than `1.0`, which then loads as int at runtime and
                     // breaks isinstance(x, float), JSON output, repr, etc.
                     // Use Debug formatting so 1.0 stays "1.0".
-                    self.write(&format!("{:?}", f));
+                    if f.is_infinite() {
+                        if *f < 0.0 {
+                            self.write("-inf");
+                        } else {
+                            self.write("inf");
+                        }
+                    } else if f.is_nan() {
+                        self.write("nan");
+                    } else {
+                        let mut buf = ryu::Buffer::new();
+                        self.write(buf.format(*f));
+                    }
                 }
                 Number::Complex { real, imag } => {
                     if *real != 0.0 {
