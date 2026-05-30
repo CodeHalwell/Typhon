@@ -134,6 +134,14 @@ table th {
   color: var(--sl-color-gray-1);
 }
 
+table tbody tr {
+  transition: background-color 120ms ease;
+}
+
+table tbody tr:hover {
+  background-color: color-mix(in srgb, var(--sl-color-gray-6) 60%, transparent);
+}
+
 /* Two-column compare block */
 .compare {
   display: grid;
@@ -176,7 +184,9 @@ table th {
 a:focus-visible,
 button:focus-visible,
 details summary:focus-visible,
-select:focus-visible {
+select:focus-visible,
+input:focus-visible,
+textarea:focus-visible {
   outline: 2px solid var(--sl-color-accent);
   outline-offset: 2px;
   border-radius: 0.25rem;
