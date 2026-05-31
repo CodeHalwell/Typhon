@@ -439,16 +439,31 @@ impl Interpreter {
         let mut fields = Vec::new();
         let mut methods: HashMap<String, Rc<Function>> = HashMap::new();
         let mut class_attrs: HashMap<String, Value> = HashMap::new();
+        let mut properties: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut classmethods: std::collections::HashSet<String> = std::collections::HashSet::new();
 
         for stmt in &c.body {
             match stmt {
                 Stmt::FunctionDef(f) => {
                     let func = self.build_function(f, &body_env)?;
                     let mut v = Value::Function(Rc::new(func));
+                    let has_deco = |want: &str| {
+                        f.decorator_list.iter().any(|d| {
+                            matches!(&d.expression, Expr::Name(n) if n.id.as_str() == want)
+                        })
+                    };
+                    let is_property = has_deco("property");
+                    let is_classmethod = has_deco("classmethod");
                     for deco in f.decorator_list.iter().rev() {
                         v = self.apply_decorator(deco, v, &body_env)?;
                     }
                     if let Value::Function(f) = &v {
+                        if is_property {
+                            properties.insert(f.name.clone());
+                        }
+                        if is_classmethod {
+                            classmethods.insert(f.name.clone());
+                        }
                         methods.insert(f.name.clone(), f.clone());
                     } else {
                         class_attrs.insert(f.name.as_str().into(), v);
@@ -488,6 +503,12 @@ impl Interpreter {
             for (name, v) in base.class_attrs.borrow().iter() {
                 class_attrs.entry(name.clone()).or_insert_with(|| v.clone());
             }
+            for name in base.properties.borrow().iter() {
+                properties.insert(name.clone());
+            }
+            for name in base.classmethods.borrow().iter() {
+                classmethods.insert(name.clone());
+            }
         }
 
         Ok(Rc::new(Class {
@@ -496,6 +517,8 @@ impl Interpreter {
             fields,
             class_attrs: RefCell::new(class_attrs),
             bases,
+            properties: RefCell::new(properties),
+            classmethods: RefCell::new(classmethods),
         }))
     }
 
@@ -879,10 +902,10 @@ impl Interpreter {
                             InterpolatedStringElement::Interpolation(interp) => {
                                 let v = self.eval_expr(&interp.expression, env)?;
                                 let s = match interp.conversion {
-                                    ast::ConversionFlag::Repr => v.py_repr(),
+                                    ast::ConversionFlag::Repr => self.repr_of(&v)?,
                                     ast::ConversionFlag::Str
                                     | ast::ConversionFlag::None
-                                    | ast::ConversionFlag::Ascii => v.py_str(),
+                                    | ast::ConversionFlag::Ascii => self.str_of(&v)?,
                                 };
                                 // Format spec: limited support — width / precision for floats only.
                                 if let Some(spec) = &interp.format_spec {
@@ -931,8 +954,57 @@ impl Interpreter {
         Ok(Value::Bool(true))
     }
 
+    /// Invoke a single-argument rich-comparison dunder (`__eq__`, `__lt__`, …)
+    /// on an instance operand, returning the boolean truthiness if one exists.
+    fn cmp_dunder(&mut self, op: CmpOp, l: &Value, r: &Value) -> Result<Option<bool>, Unwind> {
+        let (name, rname): (&str, &str) = match op {
+            CmpOp::Eq => ("__eq__", "__eq__"),
+            CmpOp::NotEq => ("__ne__", "__ne__"),
+            CmpOp::Lt => ("__lt__", "__gt__"),
+            CmpOp::LtE => ("__le__", "__ge__"),
+            CmpOp::Gt => ("__gt__", "__lt__"),
+            CmpOp::GtE => ("__ge__", "__le__"),
+            _ => return Ok(None),
+        };
+        if let Value::Instance(i) = l {
+            if let Some(m) = self.find_method(&i.class, name) {
+                let res = self.call_value(
+                    Value::BoundMethod {
+                        receiver: Box::new(l.clone()),
+                        function: m,
+                    },
+                    vec![r.clone()],
+                    &[],
+                )?;
+                return Ok(Some(res.truthy()));
+            }
+        }
+        // Reflected comparison on the right instance operand.
+        if let Value::Instance(i) = r {
+            if let Some(m) = self.find_method(&i.class, rname) {
+                let res = self.call_value(
+                    Value::BoundMethod {
+                        receiver: Box::new(r.clone()),
+                        function: m,
+                    },
+                    vec![l.clone()],
+                    &[],
+                )?;
+                return Ok(Some(res.truthy()));
+            }
+        }
+        Ok(None)
+    }
+
     fn cmp_op(&mut self, op: CmpOp, l: &Value, r: &Value) -> Result<bool, Unwind> {
         use std::cmp::Ordering::*;
+        // User-defined rich comparisons take priority when an operand is a
+        // class instance (Python's `__eq__` / `__lt__` / … protocol).
+        if matches!(l, Value::Instance(_)) || matches!(r, Value::Instance(_)) {
+            if let Some(b) = self.cmp_dunder(op, l, r)? {
+                return Ok(b);
+            }
+        }
         Ok(match op {
             CmpOp::Eq => l.py_eq(r),
             CmpOp::NotEq => !l.py_eq(r),
@@ -971,8 +1043,24 @@ impl Interpreter {
 
     fn contains(&mut self, container: &Value, item: &Value) -> Result<bool, Unwind> {
         match container {
-            Value::List(l) => Ok(l.borrow().iter().any(|v| v.py_eq(item))),
-            Value::Tuple(t) => Ok(t.iter().any(|v| v.py_eq(item))),
+            Value::List(l) => {
+                let items: Vec<Value> = l.borrow().clone();
+                for v in &items {
+                    if self.cmp_op(CmpOp::Eq, v, item)? {
+                        return Ok(true);
+                    }
+                }
+                Ok(false)
+            }
+            Value::Tuple(t) => {
+                let items = t.clone();
+                for v in items.iter() {
+                    if self.cmp_op(CmpOp::Eq, v, item)? {
+                        return Ok(true);
+                    }
+                }
+                Ok(false)
+            }
             Value::Str(s) => {
                 let needle = item.py_str();
                 Ok(s.contains(&needle))
@@ -1011,6 +1099,24 @@ impl Interpreter {
                 }
                 _ => Ok(false),
             },
+            Value::Instance(i) => {
+                // `x in obj` → obj.__contains__(x).
+                if let Some(m) = self.find_method(&i.class, "__contains__") {
+                    let res = self.call_value(
+                        Value::BoundMethod {
+                            receiver: Box::new(container.clone()),
+                            function: m,
+                        },
+                        vec![item.clone()],
+                        &[],
+                    )?;
+                    return Ok(res.truthy());
+                }
+                Err(type_error(format!(
+                    "argument of type '{}' is not iterable",
+                    container.type_name()
+                )))
+            }
             other => Err(type_error(format!(
                 "argument of type '{}' is not iterable",
                 other.type_name()
@@ -1306,6 +1412,43 @@ impl Interpreter {
         None
     }
 
+    /// Invoke a zero-argument dunder method on an instance, if defined.
+    pub fn call_dunder0(&mut self, v: &Value, name: &str) -> Result<Option<Value>, Unwind> {
+        if let Value::Instance(i) = v {
+            if let Some(m) = self.find_method(&i.class, name) {
+                let r = self.call_value(
+                    Value::BoundMethod {
+                        receiver: Box::new(v.clone()),
+                        function: m,
+                    },
+                    vec![],
+                    &[],
+                )?;
+                return Ok(Some(r));
+            }
+        }
+        Ok(None)
+    }
+
+    /// `str(v)` honouring a user `__str__` (then `__repr__`) on instances.
+    pub fn str_of(&mut self, v: &Value) -> Result<String, Unwind> {
+        if let Some(r) = self.call_dunder0(v, "__str__")? {
+            return Ok(r.py_str());
+        }
+        if let Some(r) = self.call_dunder0(v, "__repr__")? {
+            return Ok(r.py_str());
+        }
+        Ok(v.py_str())
+    }
+
+    /// `repr(v)` honouring a user `__repr__` on instances.
+    pub fn repr_of(&mut self, v: &Value) -> Result<String, Unwind> {
+        if let Some(r) = self.call_dunder0(v, "__repr__")? {
+            return Ok(r.py_str());
+        }
+        Ok(v.py_repr())
+    }
+
     // ── Operators ──────────────────────────────────────────────────────────
 
     pub fn binop(&mut self, l: &Value, op: Operator, r: &Value) -> Result<Value, Unwind> {
@@ -1439,6 +1582,35 @@ impl Interpreter {
             return Ok(Set(Rc::new(RefCell::new(out))));
         }
 
+        // Operator overloading: dispatch to the left operand's dunder method,
+        // falling back to the right operand's reflected dunder (`__radd__`).
+        if let Some(dunder) = binop_dunder(op) {
+            if let Value::Instance(i) = l {
+                if let Some(m) = self.find_method(&i.class, dunder) {
+                    return self.call_value(
+                        Value::BoundMethod {
+                            receiver: Box::new(l.clone()),
+                            function: m,
+                        },
+                        vec![r.clone()],
+                        &[],
+                    );
+                }
+            }
+            if let (Some(rdunder), Value::Instance(i)) = (binop_reflected_dunder(op), r) {
+                if let Some(m) = self.find_method(&i.class, rdunder) {
+                    return self.call_value(
+                        Value::BoundMethod {
+                            receiver: Box::new(r.clone()),
+                            function: m,
+                        },
+                        vec![l.clone()],
+                        &[],
+                    );
+                }
+            }
+        }
+
         Err(type_error(format!(
             "unsupported operand type(s) for {}: '{}' and '{}'",
             op.as_str(),
@@ -1518,6 +1690,22 @@ impl Interpreter {
                 let idx = normalize_index(i, b.len())
                     .ok_or_else(|| index_error("bytes index out of range"))?;
                 Ok(Value::Int(BigInt::from(b[idx] as i64)))
+            }
+            Value::Instance(i) => {
+                if let Some(m) = self.find_method(&i.class, "__getitem__") {
+                    return self.call_value(
+                        Value::BoundMethod {
+                            receiver: Box::new(target.clone()),
+                            function: m,
+                        },
+                        vec![key.clone()],
+                        &[],
+                    );
+                }
+                Err(type_error(format!(
+                    "'{}' object is not subscriptable",
+                    target.type_name()
+                )))
             }
             other => Err(type_error(format!(
                 "'{}' object is not subscriptable",
@@ -1633,9 +1821,28 @@ impl Interpreter {
                 if let Some(v) = inst.fields.borrow().get(attr) {
                     return Ok(v.clone());
                 }
+                // `@property` getters are invoked on read, not returned as a method.
+                if inst.class.properties.borrow().contains(attr) {
+                    if let Some(m) = self.find_method(&inst.class, attr) {
+                        return self.call_value(
+                            Value::BoundMethod {
+                                receiver: Box::new(value.clone()),
+                                function: m,
+                            },
+                            vec![],
+                            &[],
+                        );
+                    }
+                }
                 if let Some(m) = self.find_method(&inst.class, attr) {
+                    // `@classmethod` binds the class object as `cls`, not the instance.
+                    let receiver = if inst.class.classmethods.borrow().contains(attr) {
+                        Box::new(Value::Class(inst.class.clone()))
+                    } else {
+                        Box::new(value.clone())
+                    };
                     return Ok(Value::BoundMethod {
-                        receiver: Box::new(value.clone()),
+                        receiver,
                         function: m,
                     });
                 }
@@ -1649,6 +1856,13 @@ impl Interpreter {
                     return Ok(v.clone());
                 }
                 if let Some(m) = class.methods.borrow().get(attr) {
+                    // `@classmethod` accessed on the class binds `cls` to the class.
+                    if class.classmethods.borrow().contains(attr) {
+                        return Ok(Value::BoundMethod {
+                            receiver: Box::new(value.clone()),
+                            function: m.clone(),
+                        });
+                    }
                     return Ok(Value::Function(m.clone()));
                 }
                 Err(attribute_error(format!(
@@ -1691,6 +1905,29 @@ impl Interpreter {
                     crate::builtins::dispatch_method(interp, &attr_name, args)
                 });
                 Ok(Value::Native(Rc::new(nf)))
+            }
+            // Unbound builtin-type methods: `str.strip(x)`, `list.append(xs, v)`,
+            // `dict.get(d, k)`. The type constructors are registered as natives
+            // named after the type; accessing a method on one yields a function
+            // that dispatches with the explicit receiver as its first argument.
+            // This is what the documented pipe idiom `x |> str.lower()` lowers to.
+            Value::Native(nf)
+                if matches!(
+                    nf.name,
+                    "str" | "list" | "dict" | "set" | "frozenset" | "tuple" | "bytes"
+                ) =>
+            {
+                let attr_name: Rc<str> = Rc::from(attr);
+                let m = NativeFn::new("method", move |interp, args| {
+                    if args.is_empty() {
+                        return Err(type_error(format!(
+                            "unbound method '{}' needs an argument",
+                            attr_name
+                        )));
+                    }
+                    crate::builtins::dispatch_method(interp, &attr_name, args)
+                });
+                Ok(Value::Native(Rc::new(m)))
             }
             Value::Exception { kind, message } => match attr {
                 "args" => Ok(Value::Tuple(Rc::new(vec![Value::Str(message.clone())]))),
@@ -1884,96 +2121,113 @@ impl Interpreter {
         let Value::Iter(state) = it else {
             return Err(type_error("not an iterator"));
         };
-        let next: Result<Option<Value>, Unwind> = match &mut *state.borrow_mut() {
-            IterState::Range {
-                current,
-                stop,
-                step,
-            } => {
-                let done = if *step > 0 {
-                    *current >= *stop
-                } else {
-                    *current <= *stop
-                };
-                if done {
-                    Ok(None)
-                } else {
-                    let v = Value::Int(BigInt::from(*current));
-                    *current += *step;
-                    Ok(Some(v))
+        // Iterator adapters that wrap an inner iterator (Enumerate, Zip, Map,
+        // Filter) must recurse into `iter_next` on that inner iterator. The
+        // recursion needs `&mut self`, and bumping our own state afterwards
+        // needs a fresh `state.borrow_mut()`, so we cannot keep the scrutinee
+        // borrow alive across it. Handle the leaf states inline (returning from
+        // within the borrow scope) and, for the recursive states, clone out the
+        // handles we need and drop the borrow *before* recursing.
+        enum Recurse {
+            Enumerate(Rc<RefCell<IterState>>),
+            Zip(Vec<Rc<RefCell<IterState>>>),
+            Map(Value, Rc<RefCell<IterState>>),
+            Filter(Value, Rc<RefCell<IterState>>),
+        }
+
+        let recurse = {
+            let mut guard = state.borrow_mut();
+            match &mut *guard {
+                IterState::Range {
+                    current,
+                    stop,
+                    step,
+                } => {
+                    let done = if *step > 0 {
+                        *current >= *stop
+                    } else {
+                        *current <= *stop
+                    };
+                    return if done {
+                        Ok(None)
+                    } else {
+                        let v = Value::Int(BigInt::from(*current));
+                        *current += *step;
+                        Ok(Some(v))
+                    };
                 }
-            }
-            IterState::List { items, index } => {
-                let l = items.borrow();
-                if *index >= l.len() {
-                    Ok(None)
-                } else {
-                    let v = l[*index].clone();
-                    *index += 1;
-                    Ok(Some(v))
+                IterState::List { items, index } => {
+                    let l = items.borrow();
+                    return if *index >= l.len() {
+                        Ok(None)
+                    } else {
+                        let v = l[*index].clone();
+                        *index += 1;
+                        Ok(Some(v))
+                    };
                 }
-            }
-            IterState::Tuple { items, index } => {
-                if *index >= items.len() {
-                    Ok(None)
-                } else {
-                    let v = items[*index].clone();
-                    *index += 1;
-                    Ok(Some(v))
+                IterState::Tuple { items, index } => {
+                    return if *index >= items.len() {
+                        Ok(None)
+                    } else {
+                        let v = items[*index].clone();
+                        *index += 1;
+                        Ok(Some(v))
+                    };
                 }
-            }
-            IterState::Str { chars, index } => {
-                if *index >= chars.len() {
-                    Ok(None)
-                } else {
-                    let v = Value::Str(Rc::new(chars[*index].to_string()));
-                    *index += 1;
-                    Ok(Some(v))
+                IterState::Str { chars, index } => {
+                    return if *index >= chars.len() {
+                        Ok(None)
+                    } else {
+                        let v = Value::Str(Rc::new(chars[*index].to_string()));
+                        *index += 1;
+                        Ok(Some(v))
+                    };
                 }
-            }
-            IterState::Dict { keys, index } => {
-                if *index >= keys.len() {
-                    Ok(None)
-                } else {
-                    let v = keys[*index].clone().into_value();
-                    *index += 1;
-                    Ok(Some(v))
+                IterState::Dict { keys, index } => {
+                    return if *index >= keys.len() {
+                        Ok(None)
+                    } else {
+                        let v = keys[*index].clone().into_value();
+                        *index += 1;
+                        Ok(Some(v))
+                    };
                 }
-            }
-            IterState::Set { keys, index } => {
-                if *index >= keys.len() {
-                    Ok(None)
-                } else {
-                    let v = keys[*index].clone().into_value();
-                    *index += 1;
-                    Ok(Some(v))
+                IterState::Set { keys, index } => {
+                    return if *index >= keys.len() {
+                        Ok(None)
+                    } else {
+                        let v = keys[*index].clone().into_value();
+                        *index += 1;
+                        Ok(Some(v))
+                    };
                 }
+                IterState::Enumerate { inner, .. } => Recurse::Enumerate(inner.clone()),
+                IterState::Zip { inners } => Recurse::Zip(inners.clone()),
+                IterState::Map { func, inner } => Recurse::Map(func.clone(), inner.clone()),
+                IterState::Filter { func, inner } => Recurse::Filter(func.clone(), inner.clone()),
             }
-            IterState::Enumerate { inner, index } => {
-                let inner = inner.clone();
-                drop(state.borrow_mut());
-                match self.iter_next(&Value::Iter(inner))? {
-                    Some(v) => {
-                        let idx = match &mut *state.borrow_mut() {
-                            IterState::Enumerate { index, .. } => {
-                                let i = *index;
-                                *index += 1;
-                                i
-                            }
-                            _ => unreachable!(),
-                        };
-                        let _ = index; // appease the borrow checker — value above is correct
-                        return Ok(Some(Value::Tuple(Rc::new(vec![
-                            Value::Int(BigInt::from(idx)),
-                            v,
-                        ]))));
-                    }
-                    None => return Ok(None),
+        };
+
+        match recurse {
+            Recurse::Enumerate(inner) => match self.iter_next(&Value::Iter(inner))? {
+                Some(v) => {
+                    let idx = match &mut *state.borrow_mut() {
+                        IterState::Enumerate { index, .. } => {
+                            let i = *index;
+                            *index += 1;
+                            i
+                        }
+                        _ => unreachable!(),
+                    };
+                    Ok(Some(Value::Tuple(Rc::new(vec![
+                        Value::Int(BigInt::from(idx)),
+                        v,
+                    ]))))
                 }
-            }
-            IterState::Zip { inners } => {
-                let inners = inners.clone();
-                drop(state.borrow_mut());
+                None => Ok(None),
+            },
+            Recurse::Zip(inners) => {
                 let mut out = Vec::with_capacity(inners.len());
                 for i in &inners {
                     match self.iter_next(&Value::Iter(i.clone()))? {
@@ -1981,37 +2235,26 @@ impl Interpreter {
                         None => return Ok(None),
                     }
                 }
-                return Ok(Some(Value::Tuple(Rc::new(out))));
+                Ok(Some(Value::Tuple(Rc::new(out))))
             }
-            IterState::Map { func, inner } => {
-                let func = func.clone();
-                let inner = inner.clone();
-                drop(state.borrow_mut());
-                match self.iter_next(&Value::Iter(inner))? {
-                    Some(v) => return Ok(Some(self.call_value(func, vec![v], &[])?)),
+            Recurse::Map(func, inner) => match self.iter_next(&Value::Iter(inner))? {
+                Some(v) => Ok(Some(self.call_value(func, vec![v], &[])?)),
+                None => Ok(None),
+            },
+            Recurse::Filter(func, inner) => loop {
+                match self.iter_next(&Value::Iter(inner.clone()))? {
+                    Some(v) => {
+                        let keep = self
+                            .call_value(func.clone(), vec![v.clone()], &[])?
+                            .truthy();
+                        if keep {
+                            return Ok(Some(v));
+                        }
+                    }
                     None => return Ok(None),
                 }
-            }
-            IterState::Filter { func, inner } => {
-                let func = func.clone();
-                let inner = inner.clone();
-                drop(state.borrow_mut());
-                loop {
-                    match self.iter_next(&Value::Iter(inner.clone()))? {
-                        Some(v) => {
-                            let keep = self
-                                .call_value(func.clone(), vec![v.clone()], &[])?
-                                .truthy();
-                            if keep {
-                                return Ok(Some(v));
-                            }
-                        }
-                        None => return Ok(None),
-                    }
-                }
-            }
-        };
-        next
+            },
+        }
     }
 
     // ── Comprehensions ─────────────────────────────────────────────────────
@@ -2689,6 +2932,44 @@ fn values_identical(a: &Value, b: &Value) -> bool {
 /// * `Ok.and_then(h)` → `h(value)` (which itself must return a `Result`);
 ///   `Err.and_then(_)` → identity.
 /// * `Ok.or_else(_)` → identity; `Err.or_else(k)` → `k(error)`.
+/// The dunder method name a binary operator dispatches to on its left operand.
+fn binop_dunder(op: Operator) -> Option<&'static str> {
+    Some(match op {
+        Operator::Add => "__add__",
+        Operator::Sub => "__sub__",
+        Operator::Mult => "__mul__",
+        Operator::MatMult => "__matmul__",
+        Operator::Div => "__truediv__",
+        Operator::FloorDiv => "__floordiv__",
+        Operator::Mod => "__mod__",
+        Operator::Pow => "__pow__",
+        Operator::LShift => "__lshift__",
+        Operator::RShift => "__rshift__",
+        Operator::BitOr => "__or__",
+        Operator::BitXor => "__xor__",
+        Operator::BitAnd => "__and__",
+    })
+}
+
+/// The reflected dunder dispatched to on the right operand when the left has none.
+fn binop_reflected_dunder(op: Operator) -> Option<&'static str> {
+    Some(match op {
+        Operator::Add => "__radd__",
+        Operator::Sub => "__rsub__",
+        Operator::Mult => "__rmul__",
+        Operator::MatMult => "__rmatmul__",
+        Operator::Div => "__rtruediv__",
+        Operator::FloorDiv => "__rfloordiv__",
+        Operator::Mod => "__rmod__",
+        Operator::Pow => "__rpow__",
+        Operator::LShift => "__rlshift__",
+        Operator::RShift => "__rrshift__",
+        Operator::BitOr => "__ror__",
+        Operator::BitXor => "__rxor__",
+        Operator::BitAnd => "__rand__",
+    })
+}
+
 fn bind_result_combinator(receiver: Value, attr: &str) -> Value {
     let combinator = match attr {
         "map" => "map",
@@ -2757,6 +3038,11 @@ fn class_is_subclass(c: &Rc<Class>, target: &Rc<Class>) -> bool {
         return true;
     }
     c.bases.iter().any(|b| class_is_subclass(b, target))
+}
+
+/// Public wrapper so the `format()` builtin can reuse the f-string formatter.
+pub fn format_with_spec_pub(value: &Value, default: &str, spec: &str) -> Result<String, Unwind> {
+    format_with_spec(value, default, spec)
 }
 
 fn format_with_spec(value: &Value, default: &str, spec: &str) -> Result<String, Unwind> {

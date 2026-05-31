@@ -2679,6 +2679,7 @@ fn builtin_names() -> std::collections::HashSet<&'static str> {
         "iter",
         "next",
         "repr",
+        "ascii",
         "id",
         "hash",
         "type",

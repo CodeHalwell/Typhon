@@ -32,15 +32,19 @@ pub fn install(interp: &mut Interpreter) {
             if i > 0 {
                 out.push(' ');
             }
-            out.push_str(&a.py_str());
+            out.push_str(&interp.str_of(a)?);
         }
         println!("{}", out);
-        let _ = interp;
         Ok(Value::None)
     });
 
-    native!("len", |_i, args| {
+    native!("len", |interp, args| {
         let v = single(&args, "len")?;
+        if let Value::Instance(_) = v {
+            if let Some(r) = interp.call_dunder0(v, "__len__")? {
+                return Ok(Value::Int(r.to_bigint()?));
+            }
+        }
         Ok(Value::Int(num_bigint::BigInt::from(value_len(v)? as i64)))
     });
 
@@ -69,16 +73,124 @@ pub fn install(interp: &mut Interpreter) {
         _ => Err(type_error("range() expected 1–3 arguments")),
     });
 
-    native!("str", |_i, args| {
+    native!("str", |interp, args| {
         Ok(Value::Str(Rc::new(match args.first() {
-            Some(v) => v.py_str(),
+            Some(v) => interp.str_of(v)?,
             None => String::new(),
         })))
     });
 
     native!("int", |_i, args| {
         let v = single(&args, "int")?;
+        // `int(str, base)` — parse a string in the given radix.
+        if let (Value::Str(s), Some(base_v)) = (v, args.get(1)) {
+            let base = base_v.to_int()?;
+            if !(2..=36).contains(&base) {
+                return Err(value_error("int() base must be >= 2 and <= 36, or 0"));
+            }
+            let trimmed = s.trim();
+            let (neg, digits) = match trimmed.strip_prefix('-') {
+                Some(rest) => (true, rest),
+                None => (false, trimmed.strip_prefix('+').unwrap_or(trimmed)),
+            };
+            // Tolerate the conventional 0x/0o/0b prefixes for bases 16/8/2.
+            let digits = match base {
+                16 => digits.strip_prefix("0x").or_else(|| digits.strip_prefix("0X")).unwrap_or(digits),
+                8 => digits.strip_prefix("0o").or_else(|| digits.strip_prefix("0O")).unwrap_or(digits),
+                2 => digits.strip_prefix("0b").or_else(|| digits.strip_prefix("0B")).unwrap_or(digits),
+                _ => digits,
+            };
+            let cleaned: String = digits.chars().filter(|&c| c != '_').collect();
+            return match num_bigint::BigInt::parse_bytes(cleaned.as_bytes(), base as u32) {
+                Some(n) => Ok(Value::Int(if neg { -n } else { n })),
+                None => Err(value_error(format!(
+                    "invalid literal for int() with base {}: '{}'",
+                    base, s
+                ))),
+            };
+        }
         Ok(Value::Int(v.to_bigint()?))
+    });
+
+    native!("divmod", |_i, args| {
+        use num_integer::Integer;
+        use num_traits::Zero;
+        let a = args.first().ok_or_else(|| type_error("divmod expected 2 arguments"))?;
+        let b = args.get(1).ok_or_else(|| type_error("divmod expected 2 arguments"))?;
+        match (a, b) {
+            (Value::Int(x), Value::Int(y)) => {
+                if y.is_zero() {
+                    return Err(value_error("integer division or modulo by zero"));
+                }
+                Ok(Value::Tuple(Rc::new(vec![
+                    Value::Int(x.div_floor(y)),
+                    Value::Int(x.mod_floor(y)),
+                ])))
+            }
+            _ => {
+                let xf = a.to_float()?;
+                let yf = b.to_float()?;
+                if yf == 0.0 {
+                    return Err(value_error("float divmod()"));
+                }
+                let q = (xf / yf).floor();
+                Ok(Value::Tuple(Rc::new(vec![
+                    Value::Float(q),
+                    Value::Float(xf - q * yf),
+                ])))
+            }
+        }
+    });
+
+    native!("pow", |interp, args| {
+        let a = args.first().ok_or_else(|| type_error("pow expected at least 2 arguments"))?;
+        let b = args.get(1).ok_or_else(|| type_error("pow expected at least 2 arguments"))?;
+        // 3-arg form: modular exponentiation (ints only).
+        if let Some(m) = args.get(2) {
+            if let (Value::Int(base), Value::Int(exp), Value::Int(modv)) = (a, b, m) {
+                use num_traits::{Signed, Zero};
+                if modv.is_zero() {
+                    return Err(value_error("pow() 3rd argument cannot be 0"));
+                }
+                if exp.is_negative() {
+                    return Err(value_error(
+                        "pow() 2nd argument cannot be negative when 3rd argument specified",
+                    ));
+                }
+                return Ok(Value::Int(base.modpow(exp, modv)));
+            }
+            return Err(type_error("pow() 3rd argument not allowed unless all arguments are integers"));
+        }
+        interp.binop(a, ruff_python_ast::Operator::Pow, b)
+    });
+
+    native!("format", |interp, args| {
+        let v = args.first().ok_or_else(|| type_error("format expected at least 1 argument"))?;
+        let spec = args.get(1).map(|s| s.py_str()).unwrap_or_default();
+        let base = interp.str_of(v)?;
+        Ok(Value::Str(Rc::new(crate::interp::format_with_spec_pub(v, &base, &spec)?)))
+    });
+
+    native!("ascii", |interp, args| {
+        let v = single(&args, "ascii")?;
+        let r = interp.repr_of(v)?;
+        // Escape any non-ASCII characters as \xNN / \uNNNN / \UNNNNNNNN.
+        let mut out = String::with_capacity(r.len());
+        for c in r.chars() {
+            if c.is_ascii() {
+                out.push(c);
+            } else {
+                let n = c as u32;
+                if n <= 0xff {
+                    out.push_str(&format!("\\x{:02x}", n));
+                } else if n <= 0xffff {
+                    out.push_str(&format!("\\u{:04x}", n));
+                } else {
+                    out.push_str(&format!("\\U{:08x}", n));
+                }
+            }
+        }
+        Ok(Value::Str(Rc::new(out)))
     });
 
     native!("float", |_i, args| {
@@ -127,6 +239,10 @@ pub fn install(interp: &mut Interpreter) {
     native!("dict", |i, args| {
         let mut map: DictMap = IndexMap::new();
         if let Some(v) = args.into_iter().next() {
+            // `dict(other_dict)` — shallow copy of an existing mapping.
+            if let Value::Dict(d) = &v {
+                return Ok(Value::Dict(Rc::new(RefCell::new(d.borrow().clone()))));
+            }
             let it = i.make_iter(v)?;
             while let Some(pair) = i.iter_next(&it)? {
                 match pair {
@@ -151,8 +267,8 @@ pub fn install(interp: &mut Interpreter) {
         Ok(Value::Set(Rc::new(RefCell::new(out))))
     });
 
-    native!("repr", |_i, args| Ok(Value::Str(Rc::new(
-        single(&args, "repr")?.py_repr()
+    native!("repr", |interp, args| Ok(Value::Str(Rc::new(
+        interp.repr_of(single(&args, "repr")?)?
     ))));
 
     native!("type", |_i, args| {
@@ -499,6 +615,8 @@ pub fn install(interp: &mut Interpreter) {
             fields: vec![],
             class_attrs: std::cell::RefCell::new(HashMap::new()),
             bases: vec![],
+            properties: std::cell::RefCell::new(std::collections::HashSet::new()),
+            classmethods: std::cell::RefCell::new(std::collections::HashSet::new()),
         })),
     );
     // Common typing names that show up as zero-effort bases.
@@ -511,6 +629,8 @@ pub fn install(interp: &mut Interpreter) {
                 fields: vec![],
                 class_attrs: std::cell::RefCell::new(HashMap::new()),
                 bases: vec![],
+            properties: std::cell::RefCell::new(std::collections::HashSet::new()),
+            classmethods: std::cell::RefCell::new(std::collections::HashSet::new()),
             })),
         );
     }
@@ -1118,13 +1238,27 @@ fn make_time_module() -> Value {
             ),
             (
                 "monotonic",
-                nf("monotonic", |_i, _args| {
-                    let t = std::time::Instant::now().elapsed().as_secs_f64();
-                    Ok(Value::Float(t))
-                }),
+                nf("monotonic", |_i, _args| Ok(Value::Float(monotonic_secs()))),
+            ),
+            (
+                "perf_counter",
+                nf("perf_counter", |_i, _args| Ok(Value::Float(monotonic_secs()))),
+            ),
+            (
+                "process_time",
+                nf("process_time", |_i, _args| Ok(Value::Float(monotonic_secs()))),
             ),
         ],
     )
+}
+
+/// Seconds since the first call (a fixed reference point), so `monotonic`,
+/// `perf_counter`, and `process_time` return increasing values across calls.
+fn monotonic_secs() -> f64 {
+    use std::sync::OnceLock;
+    use std::time::Instant;
+    static START: OnceLock<Instant> = OnceLock::new();
+    START.get_or_init(Instant::now).elapsed().as_secs_f64()
 }
 
 fn make_random_module() -> Value {
@@ -1402,6 +1536,8 @@ fn make_re_module() -> Value {
             fields: vec![],
             class_attrs: RefCell::new(HashMap::new()),
             bases: vec![],
+            properties: std::cell::RefCell::new(std::collections::HashSet::new()),
+            classmethods: std::cell::RefCell::new(std::collections::HashSet::new()),
         });
         Value::Instance(Rc::new(crate::value::Instance {
             class: cls,
@@ -1457,6 +1593,8 @@ fn make_re_module() -> Value {
             fields: vec![],
             class_attrs: RefCell::new(HashMap::new()),
             bases: vec![],
+            properties: std::cell::RefCell::new(std::collections::HashSet::new()),
+            classmethods: std::cell::RefCell::new(std::collections::HashSet::new()),
         });
         Value::Instance(Rc::new(crate::value::Instance {
             class: cls,
@@ -2005,6 +2143,8 @@ fn make_pydantic_module() -> Value {
         fields: vec![],
         class_attrs: std::cell::RefCell::new(HashMap::new()),
         bases: vec![],
+            properties: std::cell::RefCell::new(std::collections::HashSet::new()),
+            classmethods: std::cell::RefCell::new(std::collections::HashSet::new()),
     }));
     let config_dict = nf("ConfigDict", |_i, _args| {
         // Accept any kwargs and ignore — purely a config-record stub.
@@ -2503,6 +2643,8 @@ fn make_pathlib_module() -> Value {
             fields: vec![],
             class_attrs: RefCell::new(HashMap::new()),
             bases: vec![],
+            properties: std::cell::RefCell::new(std::collections::HashSet::new()),
+            classmethods: std::cell::RefCell::new(std::collections::HashSet::new()),
         })
     }
     fn make_path(s: String) -> Value {
@@ -2650,9 +2792,33 @@ fn str_method(
     Ok(match name {
         "upper" => Value::Str(Rc::new(s.to_uppercase())),
         "lower" => Value::Str(Rc::new(s.to_lowercase())),
-        "strip" => Value::Str(Rc::new(s.trim().to_owned())),
-        "lstrip" => Value::Str(Rc::new(s.trim_start().to_owned())),
-        "rstrip" => Value::Str(Rc::new(s.trim_end().to_owned())),
+        "strip" => match args.first() {
+            Some(v) => {
+                let chars: Vec<char> = v.py_str().chars().collect();
+                Value::Str(Rc::new(
+                    s.trim_matches(|c| chars.contains(&c)).to_owned(),
+                ))
+            }
+            None => Value::Str(Rc::new(s.trim().to_owned())),
+        },
+        "lstrip" => match args.first() {
+            Some(v) => {
+                let chars: Vec<char> = v.py_str().chars().collect();
+                Value::Str(Rc::new(
+                    s.trim_start_matches(|c| chars.contains(&c)).to_owned(),
+                ))
+            }
+            None => Value::Str(Rc::new(s.trim_start().to_owned())),
+        },
+        "rstrip" => match args.first() {
+            Some(v) => {
+                let chars: Vec<char> = v.py_str().chars().collect();
+                Value::Str(Rc::new(
+                    s.trim_end_matches(|c| chars.contains(&c)).to_owned(),
+                ))
+            }
+            None => Value::Str(Rc::new(s.trim_end().to_owned())),
+        },
         "split" => {
             let parts: Vec<Value> = match args.first() {
                 Some(v) => {
@@ -2742,6 +2908,133 @@ fn str_method(
                 })
                 .collect(),
         )),
+        "index" => {
+            let needle = single(args, "index")?.py_str();
+            match s.find(&needle) {
+                Some(i) => Value::Int(num_bigint::BigInt::from(i as i64)),
+                None => return Err(value_error("substring not found")),
+            }
+        }
+        "rindex" => {
+            let needle = single(args, "rindex")?.py_str();
+            match s.rfind(&needle) {
+                Some(i) => Value::Int(num_bigint::BigInt::from(i as i64)),
+                None => return Err(value_error("substring not found")),
+            }
+        }
+        "isnumeric" | "isdecimal" => {
+            Value::Bool(!s.is_empty() && s.chars().all(|c| c.is_numeric()))
+        }
+        "istitle" => Value::Bool(is_title_case(s)),
+        "casefold" => Value::Str(Rc::new(s.to_lowercase())),
+        "removeprefix" => {
+            let p = single(args, "removeprefix")?.py_str();
+            Value::Str(Rc::new(s.strip_prefix(&p).unwrap_or(s).to_owned()))
+        }
+        "removesuffix" => {
+            let p = single(args, "removesuffix")?.py_str();
+            Value::Str(Rc::new(s.strip_suffix(&p).unwrap_or(s).to_owned()))
+        }
+        "center" | "ljust" | "rjust" => {
+            let width = single(args, name)?.to_int().unwrap_or(0).max(0) as usize;
+            let fill = args
+                .get(1)
+                .map(|v| v.py_str().chars().next().unwrap_or(' '))
+                .unwrap_or(' ');
+            let len = s.chars().count();
+            if len >= width {
+                Value::Str(s.clone())
+            } else {
+                let pad = width - len;
+                let pad_str = |n: usize| fill.to_string().repeat(n);
+                let out = match name {
+                    "ljust" => format!("{}{}", s, pad_str(pad)),
+                    "rjust" => format!("{}{}", pad_str(pad), s),
+                    _ => {
+                        let left = pad / 2;
+                        format!("{}{}{}", pad_str(left), s, pad_str(pad - left))
+                    }
+                };
+                Value::Str(Rc::new(out))
+            }
+        }
+        "zfill" => {
+            let width = single(args, "zfill")?.to_int().unwrap_or(0).max(0) as usize;
+            let len = s.chars().count();
+            if len >= width {
+                Value::Str(s.clone())
+            } else {
+                let pad = "0".repeat(width - len);
+                let out = if let Some(rest) = s.strip_prefix('-') {
+                    format!("-{}{}", pad, rest)
+                } else if let Some(rest) = s.strip_prefix('+') {
+                    format!("+{}{}", pad, rest)
+                } else {
+                    format!("{}{}", pad, s)
+                };
+                Value::Str(Rc::new(out))
+            }
+        }
+        "rsplit" => {
+            let maxsplit = args.get(1).and_then(|v| v.to_int().ok()).unwrap_or(-1);
+            let parts: Vec<Value> = match args.first() {
+                Some(v) => {
+                    let sep = v.py_str();
+                    let mut collected: Vec<String> = if maxsplit < 0 {
+                        s.split(&sep).map(|p| p.to_owned()).collect()
+                    } else {
+                        s.rsplitn((maxsplit + 1) as usize, &sep)
+                            .map(|p| p.to_owned())
+                            .collect::<Vec<_>>()
+                            .into_iter()
+                            .rev()
+                            .collect()
+                    };
+                    collected.drain(..).map(|p| Value::Str(Rc::new(p))).collect()
+                }
+                None => s
+                    .split_whitespace()
+                    .map(|p| Value::Str(Rc::new(p.to_owned())))
+                    .collect(),
+            };
+            Value::List(Rc::new(RefCell::new(parts)))
+        }
+        "partition" | "rpartition" => {
+            let sep = single(args, name)?.py_str();
+            let found = if name == "partition" {
+                s.find(&sep)
+            } else {
+                s.rfind(&sep)
+            };
+            let triple = match found {
+                Some(i) => vec![
+                    Value::Str(Rc::new(s[..i].to_owned())),
+                    Value::Str(Rc::new(sep.clone())),
+                    Value::Str(Rc::new(s[i + sep.len()..].to_owned())),
+                ],
+                None => {
+                    if name == "partition" {
+                        vec![
+                            Value::Str(s.clone()),
+                            Value::Str(Rc::new(String::new())),
+                            Value::Str(Rc::new(String::new())),
+                        ]
+                    } else {
+                        vec![
+                            Value::Str(Rc::new(String::new())),
+                            Value::Str(Rc::new(String::new())),
+                            Value::Str(s.clone()),
+                        ]
+                    }
+                }
+            };
+            Value::Tuple(Rc::new(triple))
+        }
+        "expandtabs" => {
+            let tabsize = args.first().and_then(|v| v.to_int().ok()).unwrap_or(8).max(0) as usize;
+            let spaces = " ".repeat(tabsize.max(1));
+            Value::Str(Rc::new(s.replace('\t', &spaces)))
+        }
         "format" => return Err(not_implemented("str.format (use f-strings)")),
         "encode" => Value::Bytes(Rc::new(s.as_bytes().to_vec())),
         _ => return Err(attribute_error(format!("str has no method '{}'", name))),
@@ -3027,7 +3320,61 @@ fn set_method(
                 .collect();
             Ok(Value::Set(Rc::new(RefCell::new(copied))))
         }
+        "union" | "intersection" | "difference" | "symmetric_difference" => {
+            let a = set_keys_no_sentinel(s);
+            let mut acc: HashSet<HashKey> = a;
+            for arg in args {
+                let b = value_to_key_set(arg)?;
+                acc = match name {
+                    "union" => acc.union(&b).cloned().collect(),
+                    "intersection" => acc.intersection(&b).cloned().collect(),
+                    "difference" => acc.difference(&b).cloned().collect(),
+                    _ => acc.symmetric_difference(&b).cloned().collect(),
+                };
+            }
+            Ok(Value::Set(Rc::new(RefCell::new(acc))))
+        }
+        "issubset" | "issuperset" | "isdisjoint" => {
+            let a = set_keys_no_sentinel(s);
+            let b = value_to_key_set(single(args, name)?)?;
+            let result = match name {
+                "issubset" => a.is_subset(&b),
+                "issuperset" => a.is_superset(&b),
+                _ => a.is_disjoint(&b),
+            };
+            Ok(Value::Bool(result))
+        }
+        "update" => {
+            for arg in args {
+                let b = value_to_key_set(arg)?;
+                s.borrow_mut().extend(b);
+            }
+            Ok(Value::None)
+        }
         _ => Err(attribute_error(format!("set has no method '{}'", name))),
+    }
+}
+
+/// The members of a set, excluding the internal `freeze let` sentinel.
+fn set_keys_no_sentinel(s: &Rc<RefCell<HashSet<HashKey>>>) -> HashSet<HashKey> {
+    let frozen_key = HashKey::Str(Rc::new("__typhon_frozen__".to_owned()));
+    s.borrow()
+        .iter()
+        .filter(|k| **k != frozen_key)
+        .cloned()
+        .collect()
+}
+
+/// Coerce a set-method argument (set / list / tuple / frozenset) into a key set.
+fn value_to_key_set(v: &Value) -> Result<HashSet<HashKey>, Unwind> {
+    match v {
+        Value::Set(other) => Ok(set_keys_no_sentinel(other)),
+        Value::List(l) => l.borrow().iter().map(|x| x.to_hash_key()).collect(),
+        Value::Tuple(t) => t.iter().map(|x| x.to_hash_key()).collect(),
+        _ => Err(type_error(format!(
+            "'{}' object is not a valid set operand",
+            v.type_name()
+        ))),
     }
 }
 
@@ -3063,6 +3410,59 @@ fn num_method(v: &Value, name: &str, _args: &[Value]) -> Result<Value, Unwind> {
 }
 
 // ── JSON ───────────────────────────────────────────────────────────────────
+
+/// `json.dumps(v, indent=n)` — pretty-printed with `n`-space indentation.
+fn json_dumps_indent(v: &Value, indent: usize, level: usize) -> String {
+    let pad = " ".repeat(indent * (level + 1));
+    let close_pad = " ".repeat(indent * level);
+    match v {
+        Value::List(l) => {
+            let items = l.borrow();
+            if items.is_empty() {
+                return "[]".into();
+            }
+            let body: Vec<String> = items
+                .iter()
+                .map(|x| format!("{}{}", pad, json_dumps_indent(x, indent, level + 1)))
+                .collect();
+            format!("[\n{}\n{}]", body.join(",\n"), close_pad)
+        }
+        Value::Tuple(t) => {
+            if t.is_empty() {
+                return "[]".into();
+            }
+            let body: Vec<String> = t
+                .iter()
+                .map(|x| format!("{}{}", pad, json_dumps_indent(x, indent, level + 1)))
+                .collect();
+            format!("[\n{}\n{}]", body.join(",\n"), close_pad)
+        }
+        Value::Dict(d) => {
+            let d = d.borrow();
+            let entries: Vec<(HashKey, Value)> = d
+                .iter()
+                .filter(|(k, _)| !matches!(k, HashKey::Str(s) if s.as_str() == "__typhon_frozen__"))
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            if entries.is_empty() {
+                return "{}".into();
+            }
+            let body: Vec<String> = entries
+                .iter()
+                .map(|(k, val)| {
+                    format!(
+                        "{}{}: {}",
+                        pad,
+                        json_dumps(&k.clone().into_value()),
+                        json_dumps_indent(val, indent, level + 1)
+                    )
+                })
+                .collect();
+            format!("{{\n{}\n{}}}", body.join(",\n"), close_pad)
+        }
+        other => json_dumps(other),
+    }
+}
 
 fn json_dumps(v: &Value) -> String {
     match v {
@@ -3384,6 +3784,36 @@ pub fn call_with_kwargs(
             }
             Ok(default.unwrap_or(Value::None))
         }
+        // `json.dumps(obj, indent=n, sort_keys=...)` — honour the common
+        // `indent` kwarg for pretty-printing (others are accepted/ignored).
+        "dumps" => {
+            let obj = args
+                .first()
+                .ok_or_else(|| type_error("dumps() missing argument"))?;
+            let mut indent: Option<usize> = None;
+            for (k, v) in kwargs {
+                if k == "indent" {
+                    if let Value::Int(_) = v {
+                        indent = v.to_int().ok().filter(|n| *n > 0).map(|n| n as usize);
+                    }
+                }
+            }
+            match indent {
+                Some(n) => Ok(Value::Str(Rc::new(json_dumps_indent(obj, n, 0)))),
+                None => Ok(Value::Str(Rc::new(json_dumps(obj)))),
+            }
+        }
+        // `dict(a=1, b=2)` and `dict(other, c=3)` — keyword pairs become entries.
+        "dict" => {
+            let base = (n.func)(interp, args)?;
+            if let Value::Dict(d) = &base {
+                let mut m = d.borrow_mut();
+                for (k, v) in kwargs {
+                    m.insert(HashKey::Str(Rc::new(k.clone())), v.clone());
+                }
+            }
+            Ok(base)
+        }
         // Native ctors / shims that intentionally accept any kwargs and
         // discard them. Used by stdlib stubs that exist purely so user
         // code that calls them at import time doesn't crash.
@@ -3399,6 +3829,28 @@ pub fn call_with_kwargs(
             }
         }
     }
+}
+
+fn is_title_case(s: &str) -> bool {
+    let mut saw_cased = false;
+    let mut prev_cased = false;
+    for c in s.chars() {
+        if c.is_alphabetic() {
+            let upper = c.is_uppercase();
+            if prev_cased {
+                if upper {
+                    return false;
+                }
+            } else if !upper {
+                return false;
+            }
+            saw_cased = true;
+            prev_cased = true;
+        } else {
+            prev_cased = false;
+        }
+    }
+    saw_cased
 }
 
 fn title_case(s: &str) -> String {

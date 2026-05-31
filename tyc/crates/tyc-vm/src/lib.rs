@@ -437,4 +437,127 @@ print(list(accumulate([1, 2, 3, 4])))
 "#;
         assert_eq!(run_capturing(src).unwrap(), 0);
     }
+
+    #[test]
+    fn lazy_iterator_adapters_do_not_panic() {
+        // Regression: enumerate / zip / map / filter previously panicked with
+        // "RefCell already borrowed" the moment they were iterated.
+        let src = r#"
+for i, v in enumerate(["a", "b"]):
+    print(i, v)
+for a, b in zip([1, 2], ["x", "y"]):
+    print(a, b)
+print(list(map(lambda x: x * 2, [1, 2, 3])))
+print(list(filter(lambda x: x > 1, [1, 2, 3])))
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    #[test]
+    fn str_strip_honours_chars_argument() {
+        let src = r#"
+def main() -> None:
+    let a: str = "...hi...".strip(".")
+    if a != "hi":
+        raise ValueError("strip(chars) ignored its argument")
+    let b: str = "42".zfill(5)
+    if b != "00042":
+        raise ValueError("zfill broken")
+main()
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    #[test]
+    fn dunder_methods_dispatch() {
+        // Regression: __str__ / __eq__ / __add__ were silently ignored.
+        let src = r#"
+class V:
+    n: int
+
+impl V:
+    def __str__(self) -> str:
+        return f"V({self.n})"
+    def __eq__(self, o: object) -> bool:
+        match o:
+            case V(x): return self.n == x
+            case _: return False
+    def __add__(self, o: V) -> V:
+        return V(n=self.n + o.n)
+
+def main() -> None:
+    let a: V = V(n=2)
+    let b: V = V(n=3)
+    if str(a) != "V(2)":
+        raise ValueError("__str__ ignored")
+    if not (a == V(n=2)):
+        raise ValueError("__eq__ ignored")
+    if (a + b).n != 5:
+        raise ValueError("__add__ ignored")
+    if a not in [V(n=2), b]:
+        raise ValueError("in-operator ignored __eq__")
+main()
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    #[test]
+    fn property_classmethod_staticmethod() {
+        let src = r#"
+class C:
+    r: float
+
+impl C:
+    @property
+    def area(self) -> float:
+        return 3.14 * self.r * self.r
+    @staticmethod
+    def unit() -> C:
+        return C(r=1.0)
+    @classmethod
+    def of(cls, r: float) -> C:
+        return C(r=r)
+
+def main() -> None:
+    let c: C = C.of(2.0)
+    if c.area < 12.0:
+        raise ValueError("property not invoked")
+    if C.unit().r != 1.0:
+        raise ValueError("staticmethod broken")
+main()
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    #[test]
+    fn numeric_builtins_pow_divmod_intbase() {
+        let src = r#"
+def main() -> None:
+    let q: tuple[int, int] = divmod(17, 5)
+    if q[0] != 3 or q[1] != 2:
+        raise ValueError("divmod broken")
+    if pow(2, 10, 100) != 24:
+        raise ValueError("modular pow broken")
+    if int("ff", 16) != 255:
+        raise ValueError("int(str, base) broken")
+main()
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    #[test]
+    fn unbound_builtin_method_via_pipe() {
+        // Regression: `x |> str.lower()` lowers to `str.lower(x)`, which
+        // requires unbound builtin-type method access to work.
+        let src = r#"
+def norm(raw: str) -> str:
+    return raw |> str.strip() |> str.lower() |> str.replace(",", "")
+
+def main() -> None:
+    if norm("  A,B  ") != "ab":
+        raise ValueError("unbound str method / pipe broken")
+main()
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
 }

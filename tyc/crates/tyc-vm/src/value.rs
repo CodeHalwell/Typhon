@@ -269,6 +269,12 @@ pub struct Class {
     /// Base classes in MRO order (after head). For v1 we only walk the chain
     /// for method lookup; we don't compute C3 linearisation.
     pub bases: Vec<Rc<Class>>,
+    /// Method names decorated with `@property` — accessed without `()` and
+    /// invoked lazily on attribute read.
+    pub properties: RefCell<std::collections::HashSet<String>>,
+    /// Method names decorated with `@classmethod` — the receiver is bound to
+    /// the class object (`cls`) rather than the instance.
+    pub classmethods: RefCell<std::collections::HashSet<String>>,
 }
 
 #[derive(Clone)]
