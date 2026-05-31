@@ -42,7 +42,7 @@ The reference VS Code extension lives in `editors/vscode/`. Other editors need a
 
 ### Extension settings
 
-Open VS Code settings (`Cmd/Ctrl+,`) and search "Typhon":
+Open VS Code settings (<kbd>Cmd</kbd> / <kbd>Ctrl</kbd> + <kbd>,</kbd>) and search "Typhon":
 
 | Setting | Default | Purpose |
 |---------|---------|---------|
@@ -53,7 +53,7 @@ Open VS Code settings (`Cmd/Ctrl+,`) and search "Typhon":
 ### Troubleshooting
 
 - **LSP doesn't start.** Open `View → Output → Typhon`. The extension logs the `tyc lsp` invocation; if `tyc` isn't on the PATH the *editor process* sees, set `typhon.lsp.path` to an absolute path.
-- **Diagnostics seem stale.** `tyc lsp` republishes on `did_change`. If you see staleness, save the file (`Cmd/Ctrl+S`) and check the Output panel for errors.
+- **Diagnostics seem stale.** `tyc lsp` republishes on `did_change`. If you see staleness, save the file (<kbd>Cmd</kbd> / <kbd>Ctrl</kbd> + <kbd>S</kbd>) and check the Output panel for errors.
 
 ## Neovim
 
