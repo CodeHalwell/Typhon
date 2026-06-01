@@ -6,6 +6,29 @@ Realistic milestones for one person plus AI assistance. The headline target is a
 
 ## Current release
 
+**[v0.10.0](https://github.com/CodeHalwell/Typhon/releases/tag/v0.10.0) — 2026-06-01.**
+VM completeness release. Stress-testing the tree-walking VM past v0.9.2
+surfaced a batch of correctness and coverage gaps that stopped `tyc run`
+from being a drop-in for `tyc build && python` on real-world programs.
+The VM now dispatches dunders and rich comparisons (`__add__` + reflected
+forms, `__eq__` / `__lt__` / …, `__str__` / `__repr__` / `__len__` /
+`__getitem__` / `__contains__`) on user instances, runs finite generators
+eagerly (`yield` / `yield from`, capped at 1M items), models `type(x)` as
+a real type object (`type(x).__name__`, `type(x) == int`), invokes
+`@property` getters on attribute read, binds `cls` for `@classmethod`, and
+ships the long tail of missing builtins — `divmod`, `pow` (2- and 3-arg),
+`format`, `ascii`, `int(str, base)` (incl. `base=0`), full set algebra,
+the missing string methods, `json.dumps(indent=…)`, `time.perf_counter` /
+`process_time`, `math.gcd` / `lcm` / `factorial` / `isqrt` / `comb` /
+`perm`. `max` / `min` / `list.sort` accept `key=` / `reverse=` /
+`default=` kwargs, and pydantic `model_validate` / `model_dump` /
+`model_dump_json` make flat `model` classes usable under `tyc run`. The
+type checker plugs three exhaustiveness / augmented-assign false positives
+(`match` over `bool` / string-literal unions / fixed-arity tuples, and
+`s += 5` type-mismatch on scalar targets), and `tyc-emit` shaves heap
+allocations out of the literal-emission hot path. Additive on the accepted
+surface.
+
 **[v0.9.0](https://github.com/CodeHalwell/Typhon/releases/tag/v0.9.0) — 2026-05-27.**
 Stress-test cleanup release. Closes **32 findings** from a v0.8.1
 stress sweep across the type checker, VM, parser, lowering passes,

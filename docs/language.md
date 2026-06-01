@@ -16,13 +16,25 @@ Narrowing forms the checker recognises:
 - `isinstance(x, T)` (including tuple-of-types `isinstance(x, (A, B))`)
 - `guard x = expr else: ...` early-return
 - `if x is None: return` / `raise` / `break` / `continue` early-exit
-- Exhaustive `match` arms
+- Exhaustive `match` arms — covers sealed unions, `Result`, and since
+  v0.10.0 also `bool` subjects (a `case True:` / `case False:` pair),
+  string-literal unions (`type C = "a" | "b"` with a guardless
+  `case "literal":` per variant), and irrefutable fixed-arity tuple
+  patterns (`match` on `tuple[int, int]` ending in `case (x, y):`)
 - `body if test else orelse` ternary (v0.7.0) — narrows like `if`/`else`
 - De Morgan refinement (v0.4.0) — `if not (A or B): return` narrows both operands afterwards
 - `while` test-implied narrowings applied to the body (v0.3.0)
 - **`assert x is not None`** (v0.9.0) — the standard Python static-checker idiom
 - **Post-`while`-loop narrowing** (v0.9.0) — after `while y is None: y = load()` (no `break`), the post-loop `y` is narrowed to non-`None`
 - **`while True:` reachability** (v0.9.0) — a body that always returns/raises on every branch with no `break` marks the post-loop point as unreachable, so `missing_return` doesn't fire on the surrounding function
+
+### Augmented assignment is type-checked (v0.10.0)
+
+`s += 5` on a `str` target now fires `tyc::operator_type_mismatch`, the
+same as `s = s + 5`. The check is restricted to scalar targets
+(`int` / `float` / `bool` / `str` / `bytes`); mutable containers keep
+their looser in-place semantics (`list += any_iterable`) to avoid false
+positives.
 
 ### Read-view covariance (v0.9.0)
 

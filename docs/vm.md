@@ -59,6 +59,11 @@ tyc run --compile --temp      # legacy with ephemeral build dir
 - Imports: `import`, `from ... import`, `as` aliasing, dotted module
   access. The full list of modules the VM can resolve natively is below.
 - Comprehensions: list, set, dict, generator (eagerly materialised in v1).
+- Generators: `yield` / `yield from` work under `tyc run` since v0.10.0 via
+  eager materialisation — a yield-bearing function runs to completion with
+  each yielded value buffered, and the call returns an iterator over the
+  collected values (capped at `GENERATOR_CAP = 1_000_000` items). Lazy /
+  unbounded generators (`while True: yield`) still need `tyc build`.
 
 ### Built-in functions
 
@@ -68,10 +73,20 @@ tyc run --compile --temp      # legacy with ephemeral build dir
 `enumerate`, `zip`, `map`, `filter`, `all`, `any`, `next`, `iter`, `hex`,
 `bin`, `oct`, `chr`, `ord`, `round`, `input`, `hash`, `id`, `callable`,
 `open` (read / write / append / binary modes since v0.9.0, plus
-`__enter__` / `__exit__` for `with` blocks). Decorator stubs
-`@property`, `@classmethod`, `@staticmethod`, and the `super()` call
-are present as identity-ish builtins since v0.9.0 so decorated
-methods no longer crash on import.
+`__enter__` / `__exit__` for `with` blocks). Since v0.10.0 also `divmod`
+(raises `ZeroDivisionError` with CPython messages), `pow` (2- and 3-arg
+modular), `format`, `ascii`, and `int(str, base)` including `base=0`
+(autodetect `0x` / `0o` / `0b`). `min` / `max` accept `key=` / `default=`
+keyword arguments. Decorator stubs `@property`, `@classmethod`,
+`@staticmethod`, and the `super()` call are present as identity-ish
+builtins since v0.9.0 so decorated methods no longer crash on import.
+
+Since v0.10.0 `type(x)` returns a **real type object**, not a plain
+string. `type(x).__name__` resolves to the type name, `str(type(x))`
+renders `<class 'int'>`, and equality holds across the expected cases:
+`type(a) == type(b)`, `type(inst) == SomeClass`, `type(5) == int`,
+`type(5) == type(6)`. User instances map to their declaring class;
+builtins map to cached singleton type objects.
 
 Plus the result constructors `Ok` and `Err` (with the `.map` /
 `.map_err` / `.and_then` / `.or_else` combinators bound natively
@@ -85,11 +100,11 @@ hashing.
 
 | Module | What you get |
 |---|---|
-| `math` | `pi`, `e`, `inf`, `nan`, `sqrt`, `floor`, `ceil`, `log` (with base), `log2`, `log10`, `exp`, `sin`, `cos`, `tan`, `pow`, `fabs` |
+| `math` | `pi`, `e`, `inf`, `nan`, `sqrt`, `floor`, `ceil`, `log` (with base), `log2`, `log10`, `exp`, `sin`, `cos`, `tan`, `pow`, `fabs`. v0.10.0: `gcd`, `lcm`, `factorial`, `isqrt`, `comb`, `perm` (all reject non-integer args) |
 | `os` | `getenv`, `environ`, `os.path.exists`, `isfile`, `isdir` |
 | `sys` | `argv`, `platform`, `version`, `exit(code)` |
-| `json` | `dumps`, `loads` (full JSON 7159 surface) |
-| `time` | `time()`, `sleep()`, `monotonic()` |
+| `json` | `dumps`, `loads` (full JSON 7159 surface). v0.10.0: `dumps(indent=…)` pretty-prints |
+| `time` | `time()`, `sleep()`, `monotonic()`. v0.10.0: `perf_counter()`, `process_time()` |
 | `random` | `random()`, `randint(a, b)`, `seed(n)` — xorshift PRNG, NOT cryptographic |
 | `re` (v0.8.0) | `match`, `search`, `findall`, `sub`, `split`, `compile`. `match` is anchored at the start of the string. Some flag arguments (`re.MULTILINE`, etc.) are accepted but ignored — `tyc::python_semantic_drift` warns when the impact would change behaviour |
 | `typing` (v0.8.0) | Generic constructors used at runtime are no-ops; `Callable`, `List`, etc. are accepted in import position and ignored at runtime. Type-only imports are stripped by the desugar pre-pass |
@@ -101,7 +116,7 @@ hashing.
 | `collections.deque` (v0.9.0) | Rides on `Value::List` via new `popleft` / `appendleft` / `extendleft` / `rotate` list methods. Graph / BFS / queue algorithms work end-to-end |
 | `heapq` (v0.9.0) | `heappush`, `heappop`, `heapify`, `heappushpop`, `heapreplace`, `nsmallest`, `nlargest` |
 | `contextlib` (v0.9.0) | `@contextmanager` identity decorator and `contextmanager`-decorated factories. `with` block honours the wrapped `__enter__` / `__exit__` shape |
-| `pydantic` (v0.9.0) | `BaseModel` is a placeholder so declaring a `model` doesn't `ImportError`. `model_dump` / `model_validate` are stubs — round-tripping a model under `tyc run` still requires `--compile` for full Pydantic semantics |
+| `pydantic` (v0.9.0, expanded v0.10.0) | `BaseModel` is a placeholder so declaring a `model` doesn't `ImportError`. Since v0.10.0 `Model.model_validate(mapping)` constructs an instance from a dict, `inst.model_dump()` returns a dict of fields in declaration order, and `model_dump_json()` the JSON form — flat `model` classes are usable under `tyc run`. Nested-model validation is not type-directed yet; deeply-nested models still need `--compile` |
 | `typhon_runtime` | `Ok`, `Err`, `tasks.spawn`, `lazy.lazy_let`, `lazy.lazy_import` — the `spawn` shim runs synchronously. `Ok` / `Err` carry bound `.map` / `.map_err` / `.and_then` / `.or_else` combinators since v0.9.0 |
 
 Any other module raises `ImportError` with a pointer to `--compile`.
@@ -111,17 +126,51 @@ Any other module raises `ImportError` with a pointer to `--compile`.
 - `str`: `upper`, `lower`, `strip`, `lstrip`, `rstrip`, `split`,
   `splitlines`, `join`, `replace`, `startswith`, `endswith`, `find`,
   `rfind`, `count`, `isdigit`, `isalpha`, `isalnum`, `isspace`, `isupper`,
-  `islower`, `title`, `capitalize`, `swapcase`, `encode`.
+  `islower`, `title`, `capitalize`, `swapcase`, `encode`. Since v0.10.0
+  also `index`, `rindex`, `center`, `ljust`, `rjust`, `zfill`, `rsplit`,
+  `partition`, `rpartition`, `removeprefix`, `removesuffix`, `casefold`,
+  `isnumeric`, `istitle`, `expandtabs`. `strip` / `lstrip` / `rstrip`
+  now honour their `chars` argument (previously silently ignored), and
+  `str.format` stringifies values through a user `__str__`.
 - `list`: `append`, `extend`, `insert`, `pop`, `remove`, `index`, `count`,
-  `clear`, `reverse`, `sort`, `copy`.
+  `clear`, `reverse`, `sort`, `copy`. Since v0.10.0 `sort` accepts
+  `reverse=` / `key=` kwargs and honours a user `__lt__` / `__eq__`;
+  `index` / `count` / `remove` and `in` membership use `__eq__`-aware
+  comparison instead of identity.
 - `dict`: `get`, `keys`, `values`, `items`, `pop`, `update`, `setdefault`,
-  `clear`, `copy`.
+  `clear`, `copy`. Since v0.10.0 `dict(other_dict)` shallow-copies and
+  `dict(**kwargs)` works.
 - `set`: `add`, `remove`, `discard`, `clear`, `copy`. Plus the binary
-  operators `|`, `&`, `-`, `^`.
+  operators `|`, `&`, `-`, `^`. Since v0.10.0 also the named forms
+  `union`, `intersection`, `difference`, `symmetric_difference`,
+  `issubset`, `issuperset`, `isdisjoint`, `update`. `frozenset` preserves
+  the frozen sentinel through `union` / `intersection` / `difference` /
+  `symmetric_difference`; `update` is rejected on frozensets.
 - `tuple`: `count`, `index`.
 - `int`: `bit_length`. `float`: `is_integer`.
 - `bytes`: `repr` matches CPython byte-for-byte (`b'hi'` by default,
   `b"with 'embedded'"` fallback, `\xNN` for non-printable bytes).
+
+### Dunder dispatch on user instances (v0.10.0)
+
+Before v0.10.0 the VM only dispatched dunders for native types. It now
+honours them on user-class instances:
+
+- **Operator overloading.** `__add__` / `__sub__` / `__mul__` /
+  `__truediv__` / `__floordiv__` / `__mod__` / `__pow__` / `__matmul__` /
+  `__lshift__` / `__rshift__` / `__and__` / `__or__` / `__xor__` plus the
+  reflected `__radd__` / `__rmul__` / … forms. Previously `a + b` for two
+  user instances raised `TypeError: unsupported operand type`.
+- **Rich comparisons.** `__eq__` / `__ne__` / `__lt__` / `__le__` /
+  `__gt__` / `__ge__` dispatch, and feed `in` / `list.index` /
+  `list.count` / `list.remove` / `list.sort`.
+- **`__str__` / `__repr__`** are honoured by `print` / `str` / `repr` /
+  f-strings. **`__len__` / `__getitem__` / `__contains__`** dispatch on
+  the matching builtin call.
+- **`@property` getters** are invoked on attribute read; **`@classmethod`**
+  binds the class as `cls`. Both are inherited through bases, and the
+  descriptor marker is cleared when a subclass plain method overrides an
+  inherited property / classmethod.
 
 ## Multi-file projects
 
@@ -168,17 +217,49 @@ message:
   v0.8.0 surfaces a clear `NotImplementedError` pointing at `tyc build &&
   python build/main.py` as the fallback (previously crashed the
   interpreter).
-- Real generator functions with `yield` (generator *expressions* and the
-  list-comp-shaped form work, but they're materialised eagerly). v0.8.0:
-  the same `NotImplementedError` shape applies.
+- **Lazy / unbounded generators.** Finite `yield` / `yield from` work
+  since v0.10.0 via eager materialisation, but the worst case
+  (`while True: yield`) hits the `GENERATOR_CAP = 1_000_000` ceiling and
+  raises a clear `RuntimeError` instead of streaming. Truly lazy /
+  unbounded generators still need `tyc build`.
+- **`@contextmanager` generators inside `with` blocks.** Eager collection
+  runs the generator's setup and teardown at call time, so the `with`
+  body can't run between them; the VM emits a clear "use `tyc build`"
+  message.
 - Template strings (`t"…"`).
 - IPython escape commands.
 - `with` statements other than `open()` and `contextlib.@contextmanager`-decorated
   factories (basic context-manager protocol since v0.9.0).
 - `lazy let` inside a class body uses an identity decorator; callers must
   use the method-call form `obj.x()`.
+- **Nested-model `pydantic.model_validate`** is not type-directed — a
+  nested dict stays a dict; deeply-nested models need `tyc build`.
 
 If your program needs any of these, run with `--compile` for now.
+
+**Behaviour additions in v0.10.0** (vs v0.9.x):
+
+- Dunder dispatch on user instances: operator overloading + reflected
+  forms, rich comparisons, `__str__` / `__repr__` / `__len__` /
+  `__getitem__` / `__contains__`, `@property` / `@classmethod`
+  (inherited through bases).
+- Finite generators (`yield` / `yield from`) via eager materialisation,
+  capped at 1M items.
+- `type(x)` returns a real type object (`type(x).__name__`,
+  `type(x) == int`, `str(type(x))` → `<class 'int'>`).
+- Pydantic `model_validate` / `model_dump` / `model_dump_json` for flat
+  `model` classes.
+- `max` / `min` / `list.sort` accept `key=` / `reverse=` / `default=`
+  kwargs.
+- Builtins backlog: `divmod`, `pow` (2- and 3-arg), `format`, `ascii`,
+  `int(str, base)` (incl. `base=0`), full set algebra, the missing
+  string methods, `dict(other)` / `dict(**kwargs)`, `math.gcd` / `lcm`
+  / `factorial` / `isqrt` / `comb` / `perm`, `json.dumps(indent=…)`,
+  `time.perf_counter` / `process_time`.
+- `enumerate` / `zip` / `map` / `filter` no longer panic with
+  `RefCell already borrowed` the instant they are iterated.
+- `Path.read_text` / `write_text` / `open` tolerate (and ignore)
+  `encoding=` / `errors=` kwargs instead of rejecting the call.
 
 **Behaviour additions in v0.9.0** (vs v0.8.x):
 

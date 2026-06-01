@@ -38,7 +38,7 @@ import { Aside, TabItem, Tabs } from '@astrojs/starlight/components';
 - **Runtime validation** — Pydantic checks types and rejects on construction.
 - **`extra="forbid"`** — unexpected fields raise `ValidationError`, not silently drop.
 - **`@dataclass`-style construction** — `UserInput(email="a@b")`.
-- **`.model_dump()` / `.model_validate()`** — for JSON serialisation.
+- **`.model_dump()` / `.model_validate()`** — for JSON serialisation. Since v0.10.0 these (plus `.model_dump_json()`) also work under the in-process VM (`tyc run`) for flat `model` classes: `model_validate(mapping)` constructs an instance from a dict, `model_dump()` returns the fields in declaration order, and `model_dump_json()` the JSON form. Nested-model validation is not type-directed in the VM yet — deeply-nested models still need `--compile`.
 
 ## When to use `model` vs `class`
 
