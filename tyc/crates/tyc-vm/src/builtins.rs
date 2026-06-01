@@ -4039,6 +4039,11 @@ fn json_dumps_indent(v: &Value, indent: usize, level: usize) -> String {
     }
 }
 
+/// Public wrapper so `interp.rs` (`model_dump_json`) can reuse the serializer.
+pub fn json_dumps_pub(v: &Value) -> String {
+    json_dumps(v)
+}
+
 fn json_dumps(v: &Value) -> String {
     match v {
         Value::None => "null".into(),
@@ -4483,6 +4488,9 @@ pub fn call_with_kwargs(
         // discard them. Used by stdlib stubs that exist purely so user
         // code that calls them at import time doesn't crash.
         "ConfigDict" | "dataclass" => (n.func)(interp, args),
+        // Text-IO helpers accept an `encoding=` (and `errors=`) kwarg the VM
+        // doesn't model (it is always UTF-8). Drop the kwargs and run.
+        "write_text" | "read_text" | "open" => (n.func)(interp, args),
         // Built-in method calls (e.g. `"hello".format(name="x")`). The NativeFn
         // named "method" is the closure returned by `get_attr` for any built-in
         // type receiver. We forward kwargs by appending a sentinel dict keyed on

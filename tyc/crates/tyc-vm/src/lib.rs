@@ -454,6 +454,30 @@ print(list(filter(lambda x: x > 1, [1, 2, 3])))
     }
 
     #[test]
+    fn pydantic_model_validate_and_dump() {
+        // Flat `model` classes round-trip through model_validate / model_dump.
+        let src = r#"
+model User:
+    id: int
+    name: str
+    active: bool
+
+def main() -> None:
+    let data: dict[str, object] = {"id": 1, "name": "Ada", "active": True}
+    let u: User = User.model_validate(data)
+    if u.id != 1 or u.name != "Ada" or not u.active:
+        raise ValueError("model_validate fields wrong")
+    let d: dict[str, object] = u.model_dump()
+    if d["name"] != "Ada":
+        raise ValueError("model_dump wrong")
+    if u.model_dump_json() != "{\"id\": 1, \"name\": \"Ada\", \"active\": true}":
+        raise ValueError("model_dump_json wrong: " + u.model_dump_json())
+main()
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    #[test]
     fn generators_run_eagerly() {
         // `yield` / `yield from` generators iterate correctly under the VM's
         // eager-collection model.

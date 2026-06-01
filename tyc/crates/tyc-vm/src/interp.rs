@@ -1938,6 +1938,28 @@ impl Interpreter {
                         function: m,
                     });
                 }
+                // Pydantic `model` instances expose `model_dump()` →
+                // dict-of-fields and `model_dump_json()` → JSON string.
+                if attr == "model_dump" || attr == "model_dump_json" {
+                    let inst = inst.clone();
+                    let as_json = attr == "model_dump_json";
+                    let nf = NativeFn::new("model_dump", move |_i, _args| {
+                        let mut map: DictMap = IndexMap::new();
+                        let fields = inst.fields.borrow();
+                        for field in &inst.class.fields {
+                            if let Some(v) = fields.get(&field.name) {
+                                map.insert(HashKey::Str(Rc::new(field.name.clone())), v.clone());
+                            }
+                        }
+                        let dict = Value::Dict(Rc::new(RefCell::new(map)));
+                        if as_json {
+                            Ok(Value::Str(Rc::new(crate::builtins::json_dumps_pub(&dict))))
+                        } else {
+                            Ok(dict)
+                        }
+                    });
+                    return Ok(Value::Native(Rc::new(nf)));
+                }
                 Err(attribute_error(format!(
                     "'{}' object has no attribute '{}'",
                     inst.class.name, attr
@@ -1960,6 +1982,31 @@ impl Interpreter {
                         });
                     }
                     return Ok(Value::Function(m.clone()));
+                }
+                // Pydantic `model` class methods: `Model.model_validate(dict)`
+                // builds an instance from a mapping (validation is not modelled;
+                // it maps fields to constructor kwargs).
+                if attr == "model_validate" {
+                    let cls = class.clone();
+                    let nf = NativeFn::new("model_validate", move |interp, args| {
+                        let arg = args
+                            .into_iter()
+                            .next()
+                            .ok_or_else(|| type_error("model_validate() requires a mapping"))?;
+                        let Value::Dict(d) = arg else {
+                            return Err(type_error("model_validate() expects a dict"));
+                        };
+                        let kwargs: Vec<(String, Value)> = d
+                            .borrow()
+                            .iter()
+                            .filter_map(|(k, v)| match k {
+                                HashKey::Str(s) => Some(((**s).clone(), v.clone())),
+                                _ => None,
+                            })
+                            .collect();
+                        interp.instantiate(&cls, vec![], &kwargs)
+                    });
+                    return Ok(Value::Native(Rc::new(nf)));
                 }
                 Err(attribute_error(format!(
                     "type object '{}' has no attribute '{}'",
