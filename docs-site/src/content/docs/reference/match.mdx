@@ -89,6 +89,27 @@ def show(s: str?) -> str:
 
 `case str() as s:` works in both `tyc check` and `tyc run` since v0.9.0; before v0.9.0 the VM only matched class patterns on user-defined classes.
 
+Since v0.10.0 the exhaustiveness pass also certifies three more shapes, so they no longer false-positive `tyc::missing_return`:
+
+```python
+def flag(b: bool) -> str:
+    match b:
+        case True:  return "on"
+        case False: return "off"      # exhaustive — both bool inhabitants covered
+
+type Dir = "n" | "s"
+def step(d: Dir) -> int:
+    match d:
+        case "n": return 1
+        case "s": return -1           # exhaustive — every string-literal variant covered
+
+def add(p: tuple[int, int]) -> int:
+    match p:
+        case (x, y): return x + y     # exhaustive — fixed-arity tuple, length is static
+```
+
+Variadic `tuple[int, ...]` is intentionally excluded; non-exhaustive bool / string-literal subjects and wrong-arity tuple patterns still fire.
+
 ### Or pattern
 
 ```python

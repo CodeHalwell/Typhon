@@ -91,7 +91,7 @@ Every diagnostic code is registered here. Search `tyc::CODE_NAME` to find every 
 
 ### `tyc-vm`
 
-In-process tree-walking interpreter for `.ty` source. Default execution mode for `tyc run` — no `build/` directory, no CPython spawn. Reuses the preprocess + parse pipeline from `tyc-syntax` and walks the AST with a Rust environment. Native support covers core language, `Result[T, E]`, ~50 builtins, `math` / `os` / `sys` / `json` / `time` / `random` shims, and `str` / `list` / `dict` / `set` methods. Unsupported features (async, real generators, full CPython stdlib) raise `NotImplementedError` at runtime with a pointer to `--compile`.
+In-process tree-walking interpreter for `.ty` source. Default execution mode for `tyc run` — no `build/` directory, no CPython spawn. Reuses the preprocess + parse pipeline from `tyc-syntax` and walks the AST with a Rust environment. Native support covers core language, `Result[T, E]`, dunder dispatch / rich comparisons on user instances (v0.10.0), finite generators via eager materialisation (v0.10.0), `type(x)` as a real type object (v0.10.0), ~50 builtins, `math` / `os` / `sys` / `json` / `time` / `random` shims, and `str` / `list` / `dict` / `set` methods. Unsupported features (async, lazy / unbounded generators, full CPython stdlib) raise `NotImplementedError` at runtime with a pointer to `--compile`.
 
 ### `tyc`
 
