@@ -7020,9 +7020,28 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
             let _ = infer_expr(c, &e.value);
         }
         Stmt::AugAssign(a) => {
-            let _ = infer_expr(c, &a.target);
-            let _ = infer_expr(c, &a.value);
+            let l = infer_expr(c, &a.target);
+            let r = infer_expr(c, &a.value);
             check_attr_assign_not_frozen(c, &a.target);
+            // Operator-compatibility check, mirroring `Expr::BinOp`. Restricted
+            // to scalar targets (int/float/bool/str/bytes) where `x op= y` has
+            // the same operand rules as `x = x op y`; mutable containers have
+            // looser in-place semantics (`list += any_iterable`) so we stay
+            // permissive there to avoid false positives.
+            let l_stripped = l.strip_none();
+            let r_stripped = r.strip_none();
+            let scalar_target = matches!(
+                l_stripped,
+                Type::Int | Type::Float | Type::Bool | Type::Str | Type::Bytes
+            );
+            if scalar_target {
+                if let Some(op_str) = arithmetic_op_str(a.op) {
+                    if !operator_operands_compatible(a.op, &l_stripped, &r_stripped) {
+                        let span = (a.range.start().to_usize(), a.range.end().to_usize());
+                        c.operator_type_mismatch(op_str, &l_stripped, &r_stripped, span);
+                    }
+                }
+            }
         }
         Stmt::With(w) => {
             for item in &w.items {
@@ -13619,6 +13638,39 @@ def f(c: Color) -> int:
                     .iter()
                     .any(|e| matches!(e, TycError::MissingReturn { .. })),
                 "incomplete bool/str-literal match must fire missing_return: {:?}",
+                d.errors()
+            );
+        }
+    }
+
+    #[test]
+    fn augmented_assign_checks_scalar_operands() {
+        // `s += 5` (str += int) must fire operator_type_mismatch, matching the
+        // `s = s + 5` form — but container `+=` stays permissive.
+        for bad in [
+            "def f() -> None:\n    mut s: str = \"x\"\n    s += 5\n",
+            "def f() -> None:\n    mut n: int = 0\n    n += \"x\"\n",
+        ] {
+            let d = check(bad);
+            assert!(
+                d.errors()
+                    .iter()
+                    .any(|e| matches!(e, TycError::OperatorTypeMismatch { .. })),
+                "scalar augmented assign mismatch must fire: {:?}",
+                d.errors()
+            );
+        }
+        for ok in [
+            "def f() -> None:\n    mut n: int = 0\n    n += 1\n",
+            "def f() -> None:\n    mut xs: list[int] = [1]\n    xs += [2]\n",
+            "def f() -> None:\n    mut xs: list[int] = [1]\n    xs += (2, 3)\n",
+        ] {
+            let d = check(ok);
+            assert!(
+                !d.errors()
+                    .iter()
+                    .any(|e| matches!(e, TycError::OperatorTypeMismatch { .. })),
+                "valid augmented assign must not fire: {:?}",
                 d.errors()
             );
         }
