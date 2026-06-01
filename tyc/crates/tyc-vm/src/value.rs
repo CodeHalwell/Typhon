@@ -556,9 +556,12 @@ impl Value {
             }
             (ResultOk(a), ResultOk(b)) => a.py_eq(b),
             (ResultErr(a), ResultErr(b)) => a.py_eq(b),
-            // Type objects (from `type(x)`) compare by identity-or-name, so
-            // `type(a) == type(b)` and `type(inst) == SomeClass` both work.
-            (Class(a), Class(b)) => Rc::ptr_eq(a, b) || a.name == b.name,
+            // Type objects (from `type(x)`) compare by identity. Builtin type
+            // objects are cached singletons and user classes are single `Rc`s,
+            // so `type(a) == type(b)` and `type(inst) == SomeClass` both hold
+            // without name matching (which would wrongly equate same-named
+            // classes from different modules).
+            (Class(a), Class(b)) => Rc::ptr_eq(a, b),
             // `type(5) == int`: the RHS `int` is the builtin constructor
             // (a native named "int"); match it against the type object's name.
             (Class(c), Native(n)) | (Native(n), Class(c)) => c.name == n.name,

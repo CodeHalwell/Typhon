@@ -11,8 +11,7 @@ use std::rc::Rc;
 use indexmap::IndexMap;
 
 use crate::error::{
-    attribute_error, index_error, key_error, stop_iteration, type_error,
-    value_error, Unwind,
+    attribute_error, index_error, key_error, stop_iteration, type_error, value_error, Unwind,
 };
 use crate::interp::{normalize_index, Interpreter};
 use crate::value::{DictMap, HashKey, IterState, Module, NativeFn, Value};
@@ -40,10 +39,26 @@ pub fn install(interp: &mut Interpreter) {
     });
 
     native!("len", |interp, args| {
+        use num_traits::Signed;
         let v = single(&args, "len")?;
         if let Value::Instance(_) = v {
             if let Some(r) = interp.call_dunder0(v, "__len__")? {
-                return Ok(Value::Int(r.to_bigint()?));
+                // `__len__` must return a non-negative int (CPython raises
+                // TypeError for non-int, ValueError for negative).
+                let n = match r {
+                    Value::Int(i) => i,
+                    Value::Bool(b) => num_bigint::BigInt::from(b as i64),
+                    other => {
+                        return Err(type_error(format!(
+                            "'{}' object cannot be interpreted as an integer",
+                            other.type_name()
+                        )))
+                    }
+                };
+                if n.is_negative() {
+                    return Err(value_error("__len__() should return >= 0"));
+                }
+                return Ok(Value::Int(n));
             }
         }
         Ok(Value::Int(num_bigint::BigInt::from(value_len(v)? as i64)))
@@ -85,8 +100,12 @@ pub fn install(interp: &mut Interpreter) {
         let v = single(&args, "int")?;
         // `int(str, base)` — parse a string in the given radix.
         if let (Value::Str(s), Some(base_v)) = (v, args.get(1)) {
-            let base = base_v.to_int()?;
-            if !(2..=36).contains(&base) {
+            // `base` must be an integer (Python rejects float/str bases).
+            if !matches!(base_v, Value::Int(_) | Value::Bool(_)) {
+                return Err(type_error("int() base must be an integer"));
+            }
+            let mut base = base_v.to_int()?;
+            if base != 0 && !(2..=36).contains(&base) {
                 return Err(value_error("int() base must be >= 2 and <= 36, or 0"));
             }
             let trimmed = s.trim();
@@ -94,12 +113,48 @@ pub fn install(interp: &mut Interpreter) {
                 Some(rest) => (true, rest),
                 None => (false, trimmed.strip_prefix('+').unwrap_or(trimmed)),
             };
-            // Tolerate the conventional 0x/0o/0b prefixes for bases 16/8/2.
-            let digits = match base {
-                16 => digits.strip_prefix("0x").or_else(|| digits.strip_prefix("0X")).unwrap_or(digits),
-                8 => digits.strip_prefix("0o").or_else(|| digits.strip_prefix("0O")).unwrap_or(digits),
-                2 => digits.strip_prefix("0b").or_else(|| digits.strip_prefix("0B")).unwrap_or(digits),
-                _ => digits,
+            // `base == 0` autodetects the radix from a 0x/0o/0b prefix
+            // (defaulting to 10); for an explicit base, tolerate the matching
+            // conventional prefix.
+            let digits = if base == 0 {
+                if let Some(rest) = digits
+                    .strip_prefix("0x")
+                    .or_else(|| digits.strip_prefix("0X"))
+                {
+                    base = 16;
+                    rest
+                } else if let Some(rest) = digits
+                    .strip_prefix("0o")
+                    .or_else(|| digits.strip_prefix("0O"))
+                {
+                    base = 8;
+                    rest
+                } else if let Some(rest) = digits
+                    .strip_prefix("0b")
+                    .or_else(|| digits.strip_prefix("0B"))
+                {
+                    base = 2;
+                    rest
+                } else {
+                    base = 10;
+                    digits
+                }
+            } else {
+                match base {
+                    16 => digits
+                        .strip_prefix("0x")
+                        .or_else(|| digits.strip_prefix("0X"))
+                        .unwrap_or(digits),
+                    8 => digits
+                        .strip_prefix("0o")
+                        .or_else(|| digits.strip_prefix("0O"))
+                        .unwrap_or(digits),
+                    2 => digits
+                        .strip_prefix("0b")
+                        .or_else(|| digits.strip_prefix("0B"))
+                        .unwrap_or(digits),
+                    _ => digits,
+                }
             };
             let cleaned: String = digits.chars().filter(|&c| c != '_').collect();
             return match num_bigint::BigInt::parse_bytes(cleaned.as_bytes(), base as u32) {
@@ -116,12 +171,19 @@ pub fn install(interp: &mut Interpreter) {
     native!("divmod", |_i, args| {
         use num_integer::Integer;
         use num_traits::Zero;
-        let a = args.first().ok_or_else(|| type_error("divmod expected 2 arguments"))?;
-        let b = args.get(1).ok_or_else(|| type_error("divmod expected 2 arguments"))?;
+        let a = args
+            .first()
+            .ok_or_else(|| type_error("divmod expected 2 arguments"))?;
+        let b = args
+            .get(1)
+            .ok_or_else(|| type_error("divmod expected 2 arguments"))?;
         match (a, b) {
             (Value::Int(x), Value::Int(y)) => {
                 if y.is_zero() {
-                    return Err(value_error("integer division or modulo by zero"));
+                    return Err(Unwind::Exception(crate::error::VmException::new(
+                        "ZeroDivisionError",
+                        "integer division or modulo by zero",
+                    )));
                 }
                 Ok(Value::Tuple(Rc::new(vec![
                     Value::Int(x.div_floor(y)),
@@ -132,7 +194,10 @@ pub fn install(interp: &mut Interpreter) {
                 let xf = a.to_float()?;
                 let yf = b.to_float()?;
                 if yf == 0.0 {
-                    return Err(value_error("float divmod()"));
+                    return Err(Unwind::Exception(crate::error::VmException::new(
+                        "ZeroDivisionError",
+                        "float divmod()",
+                    )));
                 }
                 let q = (xf / yf).floor();
                 Ok(Value::Tuple(Rc::new(vec![
@@ -144,8 +209,12 @@ pub fn install(interp: &mut Interpreter) {
     });
 
     native!("pow", |interp, args| {
-        let a = args.first().ok_or_else(|| type_error("pow expected at least 2 arguments"))?;
-        let b = args.get(1).ok_or_else(|| type_error("pow expected at least 2 arguments"))?;
+        let a = args
+            .first()
+            .ok_or_else(|| type_error("pow expected at least 2 arguments"))?;
+        let b = args
+            .get(1)
+            .ok_or_else(|| type_error("pow expected at least 2 arguments"))?;
         // 3-arg form: modular exponentiation (ints only).
         if let Some(m) = args.get(2) {
             if let (Value::Int(base), Value::Int(exp), Value::Int(modv)) = (a, b, m) {
@@ -160,16 +229,22 @@ pub fn install(interp: &mut Interpreter) {
                 }
                 return Ok(Value::Int(base.modpow(exp, modv)));
             }
-            return Err(type_error("pow() 3rd argument not allowed unless all arguments are integers"));
+            return Err(type_error(
+                "pow() 3rd argument not allowed unless all arguments are integers",
+            ));
         }
         interp.binop(a, ruff_python_ast::Operator::Pow, b)
     });
 
     native!("format", |interp, args| {
-        let v = args.first().ok_or_else(|| type_error("format expected at least 1 argument"))?;
+        let v = args
+            .first()
+            .ok_or_else(|| type_error("format expected at least 1 argument"))?;
         let spec = args.get(1).map(|s| s.py_str()).unwrap_or_default();
         let base = interp.str_of(v)?;
-        Ok(Value::Str(Rc::new(crate::interp::format_with_spec_pub(v, &base, &spec)?)))
+        Ok(Value::Str(Rc::new(crate::interp::format_with_spec_pub(
+            v, &base, &spec,
+        )?)))
     });
 
     native!("ascii", |interp, args| {
@@ -642,8 +717,8 @@ pub fn install(interp: &mut Interpreter) {
                 fields: vec![],
                 class_attrs: std::cell::RefCell::new(HashMap::new()),
                 bases: vec![],
-            properties: std::cell::RefCell::new(std::collections::HashSet::new()),
-            classmethods: std::cell::RefCell::new(std::collections::HashSet::new()),
+                properties: std::cell::RefCell::new(std::collections::HashSet::new()),
+                classmethods: std::cell::RefCell::new(std::collections::HashSet::new()),
             })),
         );
     }
@@ -990,11 +1065,28 @@ fn make_typhon_runtime_module(interp: &Interpreter) -> Value {
 fn make_math_module() -> Value {
     /// Compute factorial of n as a BigInt. CPython raises ValueError for
     /// negative inputs and TypeError for non-integers.
+    // Integer-domain math functions reject non-integers (CPython raises
+    // `TypeError` — a `float` "cannot be interpreted as an integer", even an
+    // integral one like `5.0`).
+    fn require_int(v: &Value, func: &str) -> Result<num_bigint::BigInt, Unwind> {
+        match v {
+            Value::Int(i) => Ok(i.clone()),
+            Value::Bool(b) => Ok(num_bigint::BigInt::from(*b as i64)),
+            _ => Err(type_error(format!(
+                "'{}' object cannot be interpreted as an integer (math.{}())",
+                v.type_name(),
+                func
+            ))),
+        }
+    }
+
     fn bigint_factorial(n: &num_bigint::BigInt) -> Result<num_bigint::BigInt, Unwind> {
         use num_bigint::BigInt;
         use num_traits::{One, Signed};
         if n.is_negative() {
-            return Err(value_error("math.factorial() not defined for negative values"));
+            return Err(value_error(
+                "math.factorial() not defined for negative values",
+            ));
         }
         let mut result = BigInt::one();
         let mut i = BigInt::from(2);
@@ -1299,13 +1391,17 @@ fn make_math_module() -> Value {
             (
                 "degrees",
                 nf("degrees", |_i, args| {
-                    Ok(Value::Float(single(&args, "degrees")?.to_float()?.to_degrees()))
+                    Ok(Value::Float(
+                        single(&args, "degrees")?.to_float()?.to_degrees(),
+                    ))
                 }),
             ),
             (
                 "radians",
                 nf("radians", |_i, args| {
-                    Ok(Value::Float(single(&args, "radians")?.to_float()?.to_radians()))
+                    Ok(Value::Float(
+                        single(&args, "radians")?.to_float()?.to_radians(),
+                    ))
                 }),
             ),
             // ── floating-point remainder ──────────────────────────────────────
@@ -1360,9 +1456,9 @@ fn make_math_module() -> Value {
                     if args.is_empty() {
                         return Ok(Value::Int(num_bigint::BigInt::from(0)));
                     }
-                    let mut acc = args[0].to_bigint()?;
+                    let mut acc = require_int(&args[0], "gcd")?;
                     for v in &args[1..] {
-                        acc = bigint_gcd(acc, v.to_bigint()?);
+                        acc = bigint_gcd(acc, require_int(v, "gcd")?);
                     }
                     Ok(Value::Int(acc))
                 }),
@@ -1374,9 +1470,9 @@ fn make_math_module() -> Value {
                     if args.is_empty() {
                         return Ok(Value::Int(num_bigint::BigInt::from(1)));
                     }
-                    let mut acc = args[0].to_bigint()?;
+                    let mut acc = require_int(&args[0], "lcm")?;
                     for v in &args[1..] {
-                        let b = v.to_bigint()?;
+                        let b = require_int(v, "lcm")?;
                         if acc.is_zero() || b.is_zero() {
                             acc = num_bigint::BigInt::from(0);
                         } else {
@@ -1390,41 +1486,43 @@ fn make_math_module() -> Value {
             (
                 "factorial",
                 nf("factorial", |_i, args| {
-                    let n = single(&args, "factorial")?.to_bigint()?;
+                    let n = require_int(single(&args, "factorial")?, "factorial")?;
                     Ok(Value::Int(bigint_factorial(&n)?))
                 }),
             ),
             (
                 "isqrt",
                 nf("isqrt", |_i, args| {
-                    let n = single(&args, "isqrt")?.to_bigint()?;
+                    let n = require_int(single(&args, "isqrt")?, "isqrt")?;
                     Ok(Value::Int(bigint_isqrt(&n)?))
                 }),
             ),
             (
                 "comb",
                 nf("comb", |_i, args| {
-                    let n = args
-                        .first()
-                        .ok_or_else(|| type_error("comb() needs args"))?
-                        .to_bigint()?;
-                    let k = args
-                        .get(1)
-                        .ok_or_else(|| type_error("comb() needs args"))?
-                        .to_bigint()?;
+                    let n = require_int(
+                        args.first()
+                            .ok_or_else(|| type_error("comb() needs args"))?,
+                        "comb",
+                    )?;
+                    let k = require_int(
+                        args.get(1).ok_or_else(|| type_error("comb() needs args"))?,
+                        "comb",
+                    )?;
                     Ok(Value::Int(bigint_comb_full(n, k)?))
                 }),
             ),
             (
                 "perm",
                 nf("perm", |_i, args| {
-                    let n = args
-                        .first()
-                        .ok_or_else(|| type_error("perm() needs args"))?
-                        .to_bigint()?;
+                    let n = require_int(
+                        args.first()
+                            .ok_or_else(|| type_error("perm() needs args"))?,
+                        "perm",
+                    )?;
                     // If k is omitted, perm(n) = n!
                     let k = match args.get(1) {
-                        Some(v) => v.to_bigint()?,
+                        Some(v) => require_int(v, "perm")?,
                         None => n.clone(),
                     };
                     Ok(Value::Int(bigint_perm(n, k)?))
@@ -1598,11 +1696,15 @@ fn make_time_module() -> Value {
             ),
             (
                 "perf_counter",
-                nf("perf_counter", |_i, _args| Ok(Value::Float(monotonic_secs()))),
+                nf("perf_counter", |_i, _args| {
+                    Ok(Value::Float(monotonic_secs()))
+                }),
             ),
             (
                 "process_time",
-                nf("process_time", |_i, _args| Ok(Value::Float(monotonic_secs()))),
+                nf("process_time", |_i, _args| {
+                    Ok(Value::Float(monotonic_secs()))
+                }),
             ),
         ],
     )
@@ -2499,8 +2601,8 @@ fn make_pydantic_module() -> Value {
         fields: vec![],
         class_attrs: std::cell::RefCell::new(HashMap::new()),
         bases: vec![],
-            properties: std::cell::RefCell::new(std::collections::HashSet::new()),
-            classmethods: std::cell::RefCell::new(std::collections::HashSet::new()),
+        properties: std::cell::RefCell::new(std::collections::HashSet::new()),
+        classmethods: std::cell::RefCell::new(std::collections::HashSet::new()),
     }));
     let config_dict = nf("ConfigDict", |_i, _args| {
         // Accept any kwargs and ignore — purely a config-record stub.
@@ -3139,6 +3241,20 @@ pub fn dispatch_method(
     }
 }
 
+/// The optional `chars` argument to `strip`/`lstrip`/`rstrip`. Python requires
+/// it to be a `str` (or `None`) — non-string arguments raise `TypeError`.
+fn strip_chars(args: &[Value], method: &str) -> Result<Option<Vec<char>>, Unwind> {
+    match args.first() {
+        None | Some(Value::None) => Ok(None),
+        Some(Value::Str(cs)) => Ok(Some(cs.chars().collect())),
+        Some(other) => Err(type_error(format!(
+            "{}() arg must be None or str, not {}",
+            method,
+            other.type_name()
+        ))),
+    }
+}
+
 fn str_method(
     interp: &mut Interpreter,
     s: &Rc<String>,
@@ -3148,31 +3264,20 @@ fn str_method(
     Ok(match name {
         "upper" => Value::Str(Rc::new(s.to_uppercase())),
         "lower" => Value::Str(Rc::new(s.to_lowercase())),
-        "strip" => match args.first() {
-            Some(v) => {
-                let chars: Vec<char> = v.py_str().chars().collect();
-                Value::Str(Rc::new(
-                    s.trim_matches(|c| chars.contains(&c)).to_owned(),
-                ))
-            }
+        "strip" => match strip_chars(args, "strip")? {
+            Some(chars) => Value::Str(Rc::new(s.trim_matches(|c| chars.contains(&c)).to_owned())),
             None => Value::Str(Rc::new(s.trim().to_owned())),
         },
-        "lstrip" => match args.first() {
-            Some(v) => {
-                let chars: Vec<char> = v.py_str().chars().collect();
-                Value::Str(Rc::new(
-                    s.trim_start_matches(|c| chars.contains(&c)).to_owned(),
-                ))
-            }
+        "lstrip" => match strip_chars(args, "lstrip")? {
+            Some(chars) => Value::Str(Rc::new(
+                s.trim_start_matches(|c| chars.contains(&c)).to_owned(),
+            )),
             None => Value::Str(Rc::new(s.trim_start().to_owned())),
         },
-        "rstrip" => match args.first() {
-            Some(v) => {
-                let chars: Vec<char> = v.py_str().chars().collect();
-                Value::Str(Rc::new(
-                    s.trim_end_matches(|c| chars.contains(&c)).to_owned(),
-                ))
-            }
+        "rstrip" => match strip_chars(args, "rstrip")? {
+            Some(chars) => Value::Str(Rc::new(
+                s.trim_end_matches(|c| chars.contains(&c)).to_owned(),
+            )),
             None => Value::Str(Rc::new(s.trim_end().to_owned())),
         },
         "split" => {
@@ -3292,11 +3397,27 @@ fn str_method(
             Value::Str(Rc::new(s.strip_suffix(&p).unwrap_or(s).to_owned()))
         }
         "center" | "ljust" | "rjust" => {
-            let width = single(args, name)?.to_int().unwrap_or(0).max(0) as usize;
-            let fill = args
-                .get(1)
-                .map(|v| v.py_str().chars().next().unwrap_or(' '))
-                .unwrap_or(' ');
+            let width = single(args, name)?.to_int()?.max(0) as usize;
+            // `fillchar` (optional) must be exactly one character.
+            let fill = match args.get(1) {
+                Some(Value::Str(fs)) => {
+                    let mut chars = fs.chars();
+                    match (chars.next(), chars.next()) {
+                        (Some(c), None) => c,
+                        _ => {
+                            return Err(type_error(
+                                "The fill character must be exactly one character long",
+                            ))
+                        }
+                    }
+                }
+                Some(_) => {
+                    return Err(type_error(
+                        "The fill character must be a unicode character, not int",
+                    ))
+                }
+                None => ' ',
+            };
             let len = s.chars().count();
             if len >= width {
                 Value::Str(s.clone())
@@ -3346,7 +3467,10 @@ fn str_method(
                             .rev()
                             .collect()
                     };
-                    collected.drain(..).map(|p| Value::Str(Rc::new(p))).collect()
+                    collected
+                        .drain(..)
+                        .map(|p| Value::Str(Rc::new(p)))
+                        .collect()
                 }
                 None => s
                     .split_whitespace()
@@ -3387,9 +3511,34 @@ fn str_method(
             Value::Tuple(Rc::new(triple))
         }
         "expandtabs" => {
-            let tabsize = args.first().and_then(|v| v.to_int().ok()).unwrap_or(8).max(0) as usize;
-            let spaces = " ".repeat(tabsize.max(1));
-            Value::Str(Rc::new(s.replace('\t', &spaces)))
+            // Expand tabs so the next column is a multiple of `tabsize`
+            // (CPython semantics), resetting the column on newlines.
+            let tabsize = match args.first() {
+                Some(v) => v.to_int()?.max(0) as usize,
+                None => 8,
+            };
+            let mut out = String::with_capacity(s.len());
+            let mut column = 0usize;
+            for c in s.chars() {
+                match c {
+                    '\t' => {
+                        if tabsize > 0 {
+                            let spaces = tabsize - (column % tabsize);
+                            out.push_str(&" ".repeat(spaces));
+                            column += spaces;
+                        }
+                    }
+                    '\n' | '\r' => {
+                        out.push(c);
+                        column = 0;
+                    }
+                    _ => {
+                        out.push(c);
+                        column += 1;
+                    }
+                }
+            }
+            Value::Str(Rc::new(out))
         }
         "format" => {
             // Positional and named `str.format()`. Keyword arguments arrive
@@ -3415,7 +3564,6 @@ fn str_format(
     pos_args: &[Value],
     kwargs: &[(String, Value)],
 ) -> Result<Value, Unwind> {
-    let _ = interp; // may be used for future format types
     let mut out = String::new();
     let chars: Vec<char> = template.chars().collect();
     let mut i = 0usize;
@@ -3486,11 +3634,14 @@ fn str_format(
                         .ok_or_else(|| key_error(format!("'{}'", field_ref)))?
                 };
 
-                // Apply format spec if present
+                // Apply format spec if present. The default stringification
+                // honours a user `__str__` (via `str_of`), matching `print` /
+                // `str` and CPython's `"{}".format(obj)`.
+                let default = interp.str_of(&value)?;
                 let formatted = if spec.is_empty() {
-                    value.py_str()
+                    default
                 } else {
-                    crate::interp::format_with_spec_pub(&value, &value.py_str(), spec)?
+                    crate::interp::format_with_spec_pub(&value, &default, spec)?
                 };
                 out.push_str(&formatted);
             }
@@ -3622,19 +3773,50 @@ fn list_method(
                 }
             }
             let mut items = l.borrow().clone();
+            // `sort_by` closures can't return `Result`, so capture the first
+            // error (from a user `__lt__`/`__eq__`) and surface it afterwards.
+            let mut sort_error: Option<Unwind> = None;
             if let Some(f) = key_fn {
                 let mut keyed: Vec<(Value, Value)> = Vec::with_capacity(items.len());
                 for v in items {
                     let kv = interp.call_value(f.clone(), vec![v.clone()], &[])?;
                     keyed.push((kv, v));
                 }
-                keyed.sort_by(|a, b| a.0.py_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+                keyed.sort_by(|a, b| {
+                    if sort_error.is_some() {
+                        return std::cmp::Ordering::Equal;
+                    }
+                    match interp.value_cmp(&a.0, &b.0) {
+                        Ok(o) => o,
+                        Err(e) => {
+                            sort_error = Some(e);
+                            std::cmp::Ordering::Equal
+                        }
+                    }
+                });
+                if let Some(e) = sort_error {
+                    return Err(e);
+                }
                 if reverse {
                     keyed.reverse();
                 }
                 items = keyed.into_iter().map(|(_, v)| v).collect();
             } else {
-                items.sort_by(|a, b| a.py_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                items.sort_by(|a, b| {
+                    if sort_error.is_some() {
+                        return std::cmp::Ordering::Equal;
+                    }
+                    match interp.value_cmp(a, b) {
+                        Ok(o) => o,
+                        Err(e) => {
+                            sort_error = Some(e);
+                            std::cmp::Ordering::Equal
+                        }
+                    }
+                });
+                if let Some(e) = sort_error {
+                    return Err(e);
+                }
                 if reverse {
                     items.reverse();
                 }
@@ -3857,7 +4039,10 @@ fn set_method(
     // Refuse mutators on a `freeze let`-tagged set so the VM matches
     // the compile path's `frozenset` semantics (review thread codex
     // and copilot on PR #147). Read-only methods are unaffected.
-    let is_mutator = matches!(name, "add" | "remove" | "discard" | "pop" | "clear");
+    let is_mutator = matches!(
+        name,
+        "add" | "remove" | "discard" | "pop" | "clear" | "update"
+    );
     if is_mutator && set_is_frozen(s) {
         return Err(attribute_error(format!(
             "'frozenset' object has no attribute '{}'",
@@ -3906,6 +4091,11 @@ fn set_method(
                     "difference" => acc.difference(&b).cloned().collect(),
                     _ => acc.symmetric_difference(&b).cloned().collect(),
                 };
+            }
+            // A set operation on a `frozenset` yields a `frozenset` — carry the
+            // immutability sentinel over so the result stays read-only.
+            if set_is_frozen(s) {
+                acc.insert(HashKey::Str(Rc::new("__typhon_frozen__".to_owned())));
             }
             Ok(Value::Set(Rc::new(RefCell::new(acc))))
         }
@@ -4359,9 +4549,8 @@ pub fn call_with_kwargs(
                 }
             }
             if candidates.is_empty() {
-                return default.ok_or_else(|| {
-                    value_error(format!("{}() arg is an empty sequence", n.name))
-                });
+                return default
+                    .ok_or_else(|| value_error(format!("{}() arg is an empty sequence", n.name)));
             }
             let mut best = candidates[0].clone();
             let mut best_key = match &key_fn {
@@ -4491,11 +4680,9 @@ pub fn call_with_kwargs(
         // Text-IO helpers accept an `encoding=` (and `errors=`) kwarg the VM
         // doesn't model (it is always UTF-8). Drop the kwargs and run.
         "write_text" | "read_text" | "open" => (n.func)(interp, args),
-        // Built-in method calls (e.g. `"hello".format(name="x")`). The NativeFn
-        // named "method" is the closure returned by `get_attr` for any built-in
-        // type receiver. We forward kwargs by appending a sentinel dict keyed on
-        // `__typhon_kwargs_dict__` = True, plus the individual kwarg entries.
-        // The `str_format` implementation in str_method detects this sentinel.
+        // Bound builtin methods (the "method" native) never reach here — they
+        // are intercepted in `call_value`, which forwards kwargs via the
+        // tuple sentinel (`make_kwargs_sentinel` / `split_kwargs`).
         _ => {
             if kwargs.is_empty() {
                 (n.func)(interp, args)
@@ -4513,15 +4700,31 @@ pub fn call_with_kwargs(
 /// `Class` whose only meaningful attribute is its `name`. Used by `type(x)`
 /// so type comparisons and `.__name__` work uniformly with user classes.
 fn make_builtin_type(name: &str) -> Value {
-    Value::Class(Rc::new(crate::value::Class {
-        name: name.to_owned(),
-        methods: std::cell::RefCell::new(HashMap::new()),
-        fields: vec![],
-        class_attrs: std::cell::RefCell::new(HashMap::new()),
-        bases: vec![],
-        properties: std::cell::RefCell::new(std::collections::HashSet::new()),
-        classmethods: std::cell::RefCell::new(std::collections::HashSet::new()),
-    }))
+    // Cache one canonical `Class` object per builtin type name so repeated
+    // `type(x)` calls return the *same* object — `type(5) == type(6)` then
+    // holds by identity (Class equality is identity-based; see `py_eq`).
+    thread_local! {
+        static CACHE: RefCell<HashMap<String, Rc<crate::value::Class>>> =
+            RefCell::new(HashMap::new());
+    }
+    CACHE.with(|c| {
+        let cls = c
+            .borrow_mut()
+            .entry(name.to_owned())
+            .or_insert_with(|| {
+                Rc::new(crate::value::Class {
+                    name: name.to_owned(),
+                    methods: std::cell::RefCell::new(HashMap::new()),
+                    fields: vec![],
+                    class_attrs: std::cell::RefCell::new(HashMap::new()),
+                    bases: vec![],
+                    properties: std::cell::RefCell::new(std::collections::HashSet::new()),
+                    classmethods: std::cell::RefCell::new(std::collections::HashSet::new()),
+                })
+            })
+            .clone();
+        Value::Class(cls)
+    })
 }
 
 fn is_title_case(s: &str) -> bool {

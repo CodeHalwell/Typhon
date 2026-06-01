@@ -461,9 +461,9 @@ impl Interpreter {
                     let func = self.build_function(f, &body_env)?;
                     let mut v = Value::Function(Rc::new(func));
                     let has_deco = |want: &str| {
-                        f.decorator_list.iter().any(|d| {
-                            matches!(&d.expression, Expr::Name(n) if n.id.as_str() == want)
-                        })
+                        f.decorator_list.iter().any(
+                            |d| matches!(&d.expression, Expr::Name(n) if n.id.as_str() == want),
+                        )
                     };
                     let is_property = has_deco("property");
                     let is_classmethod = has_deco("classmethod");
@@ -508,6 +508,11 @@ impl Interpreter {
             }
         }
 
+        // Names the subclass defines itself — an inherited descriptor marker
+        // (`@property` / `@classmethod`) must NOT carry over to a name the
+        // subclass has overridden with a plain method.
+        let own_method_names: std::collections::HashSet<String> = methods.keys().cloned().collect();
+
         // Inherit methods from base classes that aren't already overridden.
         for base in &bases {
             for (name, m) in base.methods.borrow().iter() {
@@ -517,10 +522,14 @@ impl Interpreter {
                 class_attrs.entry(name.clone()).or_insert_with(|| v.clone());
             }
             for name in base.properties.borrow().iter() {
-                properties.insert(name.clone());
+                if !own_method_names.contains(name) {
+                    properties.insert(name.clone());
+                }
             }
             for name in base.classmethods.borrow().iter() {
-                classmethods.insert(name.clone());
+                if !own_method_names.contains(name) {
+                    classmethods.insert(name.clone());
+                }
             }
         }
 
@@ -864,11 +873,8 @@ impl Interpreter {
             Expr::YieldFrom(y) => {
                 let iterable = self.eval_expr(&y.value, env)?;
                 let it = self.make_iter(iterable)?;
-                loop {
-                    match self.iter_next(&it)? {
-                        Some(v) => self.push_yield(v)?,
-                        None => break,
-                    }
+                while let Some(v) = self.iter_next(&it)? {
+                    self.push_yield(v)?;
                 }
                 Ok(Value::None)
             }
@@ -1031,6 +1037,22 @@ impl Interpreter {
     /// `list.count`, `list.remove`, and membership tests).
     pub fn values_equal(&mut self, a: &Value, b: &Value) -> Result<bool, Unwind> {
         self.cmp_op(CmpOp::Eq, a, b)
+    }
+
+    /// Total ordering honouring a user `__lt__` / `__eq__` on instances (used
+    /// by `list.sort` / `sorted` so custom comparison dunders take effect).
+    pub fn value_cmp(&mut self, a: &Value, b: &Value) -> Result<std::cmp::Ordering, Unwind> {
+        use std::cmp::Ordering;
+        if matches!(a, Value::Instance(_)) || matches!(b, Value::Instance(_)) {
+            if self.cmp_op(CmpOp::Lt, a, b)? {
+                return Ok(Ordering::Less);
+            }
+            if self.cmp_op(CmpOp::Eq, a, b)? {
+                return Ok(Ordering::Equal);
+            }
+            return Ok(Ordering::Greater);
+        }
+        Ok(a.py_cmp(b).unwrap_or(Ordering::Equal))
     }
 
     fn cmp_op(&mut self, op: CmpOp, l: &Value, r: &Value) -> Result<bool, Unwind> {
@@ -1297,12 +1319,12 @@ impl Interpreter {
                 let outcome = self.exec_block(&f.body, &call_env);
                 let buffer = self.gen_buffers.pop().unwrap_or_default();
                 return match outcome {
-                    Ok(()) | Err(Unwind::Return(_)) => Ok(Value::Iter(Rc::new(RefCell::new(
-                        IterState::List {
+                    Ok(()) | Err(Unwind::Return(_)) => {
+                        Ok(Value::Iter(Rc::new(RefCell::new(IterState::List {
                             items: Rc::new(RefCell::new(buffer)),
                             index: 0,
-                        },
-                    )))),
+                        }))))
+                    }
                     Err(other) => Err(other),
                 };
             }
@@ -1525,10 +1547,10 @@ impl Interpreter {
     /// `str(v)` honouring a user `__str__` (then `__repr__`) on instances.
     pub fn str_of(&mut self, v: &Value) -> Result<String, Unwind> {
         if let Some(r) = self.call_dunder0(v, "__str__")? {
-            return Ok(r.py_str());
+            return require_str_return(r, "__str__");
         }
         if let Some(r) = self.call_dunder0(v, "__repr__")? {
-            return Ok(r.py_str());
+            return require_str_return(r, "__repr__");
         }
         Ok(v.py_str())
     }
@@ -1536,7 +1558,7 @@ impl Interpreter {
     /// `repr(v)` honouring a user `__repr__` on instances.
     pub fn repr_of(&mut self, v: &Value) -> Result<String, Unwind> {
         if let Some(r) = self.call_dunder0(v, "__repr__")? {
-            return Ok(r.py_str());
+            return require_str_return(r, "__repr__");
         }
         Ok(v.py_repr())
     }
@@ -3077,15 +3099,6 @@ fn values_identical(a: &Value, b: &Value) -> bool {
     }
 }
 
-/// Build a bound `NativeFn` that implements one of the four Result
-/// combinators (`map`, `map_err`, `and_then`, `or_else`) over a captured
-/// receiver. The four follow Rust's `Result` semantics:
-///
-/// * `Ok.map(f)` → `Ok(f(value))`; `Err.map(_)` → identity.
-/// * `Ok.map_err(_)` → identity; `Err.map_err(g)` → `Err(g(error))`.
-/// * `Ok.and_then(h)` → `h(value)` (which itself must return a `Result`);
-///   `Err.and_then(_)` → identity.
-/// * `Ok.or_else(_)` → identity; `Err.or_else(k)` → `k(error)`.
 /// Whether a function body is a generator — i.e. contains a `yield` /
 /// `yield from` reachable without crossing a nested function/lambda boundary.
 fn body_is_generator(body: &[Stmt]) -> bool {
@@ -3110,18 +3123,13 @@ fn stmt_has_yield(s: &Stmt) -> bool {
                     .any(|c| body_is_generator(&c.body))
         }
         While(x) => {
-            expr_has_yield(&x.test)
-                || body_is_generator(&x.body)
-                || body_is_generator(&x.orelse)
+            expr_has_yield(&x.test) || body_is_generator(&x.body) || body_is_generator(&x.orelse)
         }
         For(x) => {
-            expr_has_yield(&x.iter)
-                || body_is_generator(&x.body)
-                || body_is_generator(&x.orelse)
+            expr_has_yield(&x.iter) || body_is_generator(&x.body) || body_is_generator(&x.orelse)
         }
         With(x) => {
-            x.items.iter().any(|i| expr_has_yield(&i.context_expr))
-                || body_is_generator(&x.body)
+            x.items.iter().any(|i| expr_has_yield(&i.context_expr)) || body_is_generator(&x.body)
         }
         Match(x) => {
             expr_has_yield(&x.subject) || x.cases.iter().any(|c| body_is_generator(&c.body))
@@ -3152,20 +3160,65 @@ fn expr_has_yield(e: &Expr) -> bool {
         Call(x) => {
             expr_has_yield(&x.func)
                 || x.arguments.args.iter().any(expr_has_yield)
-                || x.arguments.keywords.iter().any(|k| expr_has_yield(&k.value))
+                || x.arguments
+                    .keywords
+                    .iter()
+                    .any(|k| expr_has_yield(&k.value))
         }
         Tuple(x) => x.elts.iter().any(expr_has_yield),
         List(x) => x.elts.iter().any(expr_has_yield),
         Set(x) => x.elts.iter().any(expr_has_yield),
         Starred(x) => expr_has_yield(&x.value),
-        If(x) => {
-            expr_has_yield(&x.test) || expr_has_yield(&x.body) || expr_has_yield(&x.orelse)
-        }
+        If(x) => expr_has_yield(&x.test) || expr_has_yield(&x.body) || expr_has_yield(&x.orelse),
         Named(x) => expr_has_yield(&x.value),
         Await(x) => expr_has_yield(&x.value),
         Subscript(x) => expr_has_yield(&x.value) || expr_has_yield(&x.slice),
         Attribute(x) => expr_has_yield(&x.value),
+        // Comprehensions: only the outermost iterable runs in the enclosing
+        // scope, so a `yield` there belongs to us. (Yields elsewhere in a
+        // comprehension are a SyntaxError, so scanning them is harmless.)
+        ListComp(x) => comprehension_has_yield(&x.generators) || expr_has_yield(&x.elt),
+        SetComp(x) => comprehension_has_yield(&x.generators) || expr_has_yield(&x.elt),
+        Generator(x) => comprehension_has_yield(&x.generators) || expr_has_yield(&x.elt),
+        DictComp(x) => {
+            comprehension_has_yield(&x.generators)
+                || x.key.as_deref().is_some_and(expr_has_yield)
+                || expr_has_yield(&x.value)
+        }
+        FString(x) => fstring_has_yield(x),
         _ => false,
+    }
+}
+
+fn comprehension_has_yield(generators: &[ast::Comprehension]) -> bool {
+    generators
+        .iter()
+        .any(|g| expr_has_yield(&g.iter) || g.ifs.iter().any(expr_has_yield))
+}
+
+fn fstring_has_yield(f: &ast::ExprFString) -> bool {
+    f.value.iter().any(|part| match part {
+        FStringPart::Literal(_) => false,
+        FStringPart::FString(fs) => fs.elements.iter().any(|el| match el {
+            InterpolatedStringElement::Literal(_) => false,
+            InterpolatedStringElement::Interpolation(interp) => expr_has_yield(&interp.expression),
+        }),
+    })
+}
+
+/// Enforce that `__str__` / `__repr__` returned a `str` (CPython raises
+/// `TypeError` otherwise) and unwrap it.
+fn require_str_return(v: Value, dunder: &str) -> Result<String, Unwind> {
+    match v {
+        Value::Str(s) => Ok((*s).clone()),
+        other => Err(Unwind::Exception(VmException::new(
+            "TypeError",
+            format!(
+                "{} returned non-string (type {})",
+                dunder,
+                other.type_name()
+            ),
+        ))),
     }
 }
 
@@ -3207,6 +3260,15 @@ fn binop_reflected_dunder(op: Operator) -> Option<&'static str> {
     })
 }
 
+/// Build a bound `NativeFn` that implements one of the four Result
+/// combinators (`map`, `map_err`, `and_then`, `or_else`) over a captured
+/// receiver. The four follow Rust's `Result` semantics:
+///
+/// * `Ok.map(f)` → `Ok(f(value))`; `Err.map(_)` → identity.
+/// * `Ok.map_err(_)` → identity; `Err.map_err(g)` → `Err(g(error))`.
+/// * `Ok.and_then(h)` → `h(value)` (which itself must return a `Result`);
+///   `Err.and_then(_)` → identity.
+/// * `Ok.or_else(_)` → identity; `Err.or_else(k)` → `k(error)`.
 fn bind_result_combinator(receiver: Value, attr: &str) -> Value {
     let combinator = match attr {
         "map" => "map",
@@ -3468,9 +3530,7 @@ fn format_with_spec(value: &Value, default: &str, spec: &str) -> Result<String, 
                         // at least 2 exponent digits with an explicit sign: `3.141590e+00`.
                         normalise_exp_notation(format!("{:.*e}", p, abs), false)
                     }
-                    Some('E') => {
-                        normalise_exp_notation(format!("{:.*e}", p, abs), true)
-                    }
+                    Some('E') => normalise_exp_notation(format!("{:.*e}", p, abs), true),
                     Some('g') | Some('G') => {
                         // Python's `g` uses precision as significant digits.
                         // After computing the exponential form we apply CPython's

@@ -454,6 +454,89 @@ print(list(filter(lambda x: x > 1, [1, 2, 3])))
     }
 
     #[test]
+    fn review_fixes_builtin_semantics() {
+        // Batch of PR-review correctness fixes: int(str, 0) radix autodetect,
+        // ZeroDivisionError from divmod, frozenset ops staying frozen,
+        // integer-domain math rejecting floats, and str.format honouring __str__.
+        let src = r#"
+import math
+
+class P:
+    n: int
+
+impl P:
+    def __str__(self) -> str:
+        return f"P{self.n}"
+
+def main() -> None:
+    if int("0xff", 0) != 255 or int("0b101", 0) != 5 or int("42", 0) != 42:
+        raise ValueError("int base 0 autodetect broken")
+    try:
+        let _ = divmod(5, 0)
+        raise ValueError("divmod by zero should raise")
+    except ZeroDivisionError:
+        pass
+    let f: frozenset = frozenset([1, 2])
+    let u: frozenset = f.union([3])
+    try:
+        u.add(9)
+        raise ValueError("frozenset union result must stay frozen")
+    except AttributeError:
+        pass
+    try:
+        let _x: int = math.factorial(5.9)
+        raise ValueError("factorial must reject floats")
+    except TypeError:
+        pass
+    if "{}".format(P(n=7)) != "P7":
+        raise ValueError("str.format must honour __str__")
+main()
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    #[test]
+    fn review_fixes_dunder_and_descriptors() {
+        // __str__ returning a non-str raises TypeError; a subclass overriding a
+        // base @property with a plain method is treated as a method.
+        let src = r#"
+class Bad:
+    n: int
+
+impl Bad:
+    def __str__(self) -> int:
+        return self.n
+
+class Base:
+    v: int
+
+impl Base:
+    @property
+    def x(self) -> int:
+        return self.v
+
+class Child(Base):
+    v: int
+
+impl Child:
+    def x(self) -> int:
+        return self.v + 100
+
+def main() -> None:
+    try:
+        let _ = str(Bad(n=5))
+        raise ValueError("__str__ returning non-str must raise")
+    except TypeError:
+        pass
+    let c: Child = Child(v=1)
+    if c.x() != 101:
+        raise ValueError("overridden property must be a method")
+main()
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    #[test]
     fn pydantic_model_validate_and_dump() {
         // Flat `model` classes round-trip through model_validate / model_dump.
         let src = r#"
