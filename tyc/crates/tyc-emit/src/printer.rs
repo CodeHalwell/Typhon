@@ -1257,10 +1257,13 @@ impl Emitter {
                     }
                 }
                 Number::Complex { real, imag } => {
+                    let mut buf = ryu::Buffer::new();
                     if *real != 0.0 {
-                        self.write(&format!("{}+", real));
+                        self.write(buf.format(*real));
+                        self.write("+");
                     }
-                    self.write(&format!("{}j", imag));
+                    self.write(buf.format(*imag));
+                    self.write("j");
                 }
             },
 
