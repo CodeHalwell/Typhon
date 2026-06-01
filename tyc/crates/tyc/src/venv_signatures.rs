@@ -335,13 +335,22 @@ fn introspect_batch_via_python(
     for m in modules {
         cmd.arg(m);
     }
-    let mut child = cmd
-        .current_dir(cwd)
+    cmd.current_dir(cwd)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .ok()?;
+        .stderr(std::process::Stdio::null());
+    // Retry transient spawn failures once. fork() can fail with EAGAIN
+    // under CI fork pressure (parallel tests, container PID limits),
+    // and a silent None here would cache the module as a miss for the
+    // rest of the run. A 50 ms backoff is plenty to clear typical
+    // resource contention.
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(_) => {
+            std::thread::sleep(Duration::from_millis(50));
+            cmd.spawn().ok()?
+        }
+    };
     {
         let mut stdin = child.stdin.take()?;
         stdin.write_all(INTROSPECT_SCRIPT.as_bytes()).ok()?;
