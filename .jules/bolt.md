@@ -4,3 +4,6 @@
 ## 2024-05-15 - Number literal formatting optimization
 **Learning:** `i.to_string()` and `format!("{:?}", f)` cause unnecessary heap allocations when emitting number literals in the AST emitter, which is a hot path.
 **Action:** Use stack-allocated buffers like `itoa::Buffer` and `ryu::Buffer` for formatting numbers to eliminate heap allocations, taking care to handle `ryu`'s lack of support for `NaN` and `inf` explicitly.
+## 2024-06-01 - Avoid allocating in AST pattern matching
+**Learning:** Checking for decorators by dynamically allocating their full path (e.g. `Some(format!("{}.{}", n.id.as_str(), a.attr.as_str()))`) causes thousands of useless small string allocations across large files during desugaring.
+**Action:** When pattern-matching AST nodes to check names, use nested structural matching on the nodes directly with string slice equality (`==` or `matches!`) instead of `to_owned()` and `format!`.

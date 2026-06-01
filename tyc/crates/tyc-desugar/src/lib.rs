@@ -1174,35 +1174,25 @@ fn is_purity_marker(d: &Expr) -> bool {
     }
 }
 
-fn has_cache_decorator(decorators: &[Decorator]) -> bool {
-    decorators.iter().any(|d| {
-        let path = match &d.expression {
-            Expr::Name(n) => Some(n.id.as_str().to_owned()),
-            Expr::Attribute(a) => {
-                if let Expr::Name(n) = a.value.as_ref() {
-                    Some(format!("{}.{}", n.id.as_str(), a.attr.as_str()))
-                } else {
-                    None
-                }
+fn is_cache_decorator_expr(expr: &Expr) -> bool {
+    match expr {
+        Expr::Name(n) => matches!(n.id.as_str(), "cache" | "lru_cache"),
+        Expr::Attribute(a) => {
+            if let Expr::Name(n) = a.value.as_ref() {
+                n.id.as_str() == "functools" && matches!(a.attr.as_str(), "cache" | "lru_cache")
+            } else {
+                false
             }
-            Expr::Call(c) => match c.func.as_ref() {
-                Expr::Name(n) => Some(n.id.as_str().to_owned()),
-                Expr::Attribute(a) => {
-                    if let Expr::Name(n) = a.value.as_ref() {
-                        Some(format!("{}.{}", n.id.as_str(), a.attr.as_str()))
-                    } else {
-                        None
-                    }
-                }
-                _ => None,
-            },
-            _ => None,
-        };
-        matches!(
-            path.as_deref(),
-            Some("cache" | "lru_cache" | "functools.cache" | "functools.lru_cache")
-        )
-    })
+        }
+        Expr::Call(c) => is_cache_decorator_expr(c.func.as_ref()),
+        _ => false,
+    }
+}
+
+fn has_cache_decorator(decorators: &[Decorator]) -> bool {
+    decorators
+        .iter()
+        .any(|d| is_cache_decorator_expr(&d.expression))
 }
 
 /// `true` when `body` binds the bare module name `functools` (so the
