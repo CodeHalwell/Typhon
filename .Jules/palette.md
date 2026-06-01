@@ -7,3 +7,6 @@
 ## 2026-05-30 - Improve Data Table Legibility and Form Element Keyboard Navigation
 **Learning:** Found that long markdown data tables across the docs site were missing visual guidance (like row hover effects), making it difficult for the eye to track horizontal data accurately. Also discovered input/textarea elements missed the custom focus ring applied to other interactive elements.
 **Action:** Added a subtle background color transition on `table tbody tr:hover` to improve reading UX for wide technical tables, and included `input` and `textarea` in the explicit `:focus-visible` ring rule to complete keyboard accessibility for form fields.
+## 2026-06-01 - [Improve keyboard shortcut `<kbd>` styling]
+**Learning:** Found that inline keyboard shortcuts (`<kbd>` elements) inside Starlight markdown content blended too much with regular text and lacked the standard "key" appearance, making instructions like `Cmd + C` harder to read quickly.
+**Action:** Added targeted CSS to `custom.css` for `.sl-markdown-content kbd` to provide a subtle background, border, border-bottom, and shadow. This gives the keys a 3D, pressable appearance, making keyboard shortcuts stand out intuitively.
