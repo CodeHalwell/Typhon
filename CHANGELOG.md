@@ -4,6 +4,205 @@ All notable changes to Typhon are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely; the
 canonical phase-by-phase status lives in `docs/roadmap.md`.
 
+## 0.10.0 — 2026-06-01
+
+VM completeness release. Stress-testing the tree-walking VM past v0.9.2
+surfaced a large batch of correctness and coverage gaps that prevented
+`tyc run` from being a drop-in replacement for `tyc build && python`
+on real-world programs. This release closes the biggest of them — the
+VM now dispatches dunders / rich-comparisons on user classes, runs
+finite generators, models `type(x)` as a real type object, and ships
+the long-tail of missing string / set / math / json / time builtins.
+The type checker also picks up three exhaustiveness / augmented-assign
+false-positive fixes, and `tyc-emit` shaves heap allocations out of
+the literal-emission hot path.
+
+### Added — VM dunder dispatch and rich comparisons
+
+- **Operator overloading on instances.** `__add__` / `__sub__` /
+  `__mul__` / `__truediv__` / `__floordiv__` / `__mod__` / `__pow__` /
+  `__matmul__` / `__lshift__` / `__rshift__` / `__and__` / `__or__` /
+  `__xor__` plus the reflected `__radd__` / `__rmul__` / … forms now
+  dispatch on user-class instances. Previously `a + b` for two user
+  instances raised `TypeError: unsupported operand type`.
+- **Rich comparisons on instances.** `__eq__` / `__ne__` / `__lt__` /
+  `__le__` / `__gt__` / `__ge__` now dispatch. The `in` operator and
+  `list.index` / `list.count` / `list.remove` / list-tuple membership
+  now use `__eq__`-aware comparison instead of identity, so they work
+  on instances that define equality.
+- **`__str__` / `__repr__`** honoured by `print` / `str` / `repr` /
+  f-strings. `__len__` / `__getitem__` / `__contains__` dispatch on
+  the matching builtin call.
+- **`@property` getters** invoked on attribute read. **`@classmethod`**
+  binds the class as `cls`. Both inherited through bases.
+- **Inherited `@property` / `@classmethod` markers cleared on
+  override.** A subclass plain method shadowing an inherited property
+  no longer carries the descriptor marker.
+
+### Added — VM generator support
+
+- **`yield` / `yield from` finally work under `tyc run`.** A tree-walk
+  can't suspend a frame and `Rc` values aren't `Send` (ruling out
+  thread-based coroutines), so generators are eagerly materialised: a
+  yield-bearing function runs to completion with each yielded value
+  pushed onto a per-call buffer, and the call returns an iterator over
+  the collected values. Detected via `body_is_generator` (scans for
+  `yield` without crossing nested function / lambda boundaries); nested
+  / recursive generators get a stack of buffers.
+- **`GENERATOR_CAP = 1_000_000`** bounds the worst case (`while True:
+  yield`) to a clear `RuntimeError` instead of an unbounded hang. Lazy /
+  unbounded generators still need `tyc build`.
+- **`@contextmanager` generators in `with`** get a clear "use `tyc
+  build`" message — eager collection runs setup + teardown at call
+  time, so the `with` body can't run between them.
+
+### Added — VM `type(x)` as a real type object
+
+`type(x)` previously returned a plain string, so two common idioms
+were silently broken: `type(x).__name__` produced a bound method, and
+`type(x) == int` was always false. It now returns a type object —
+user instances map to their declaring `Class`, builtins map to a
+lightweight named class object. `type(x).__name__` / `Cls.__name__`
+resolve to the type name, `str(type(x))` renders `<class 'int'>`, and
+equality holds across all the expected cases: `type(a) == type(b)`,
+`type(inst) == SomeClass`, `type(5) == int` (matched against the
+builtin constructor's name), `type(5) == type(6)`. Native==Native
+stays identity-only so distinct bound methods don't compare equal,
+and builtin type objects are cached singletons so `Class` equality is
+identity-based (no cross-module same-name collisions).
+
+### Added — VM pydantic `model_validate` / `model_dump`
+
+`Model.model_validate(mapping)` constructs a model instance from a
+dict (maps fields to constructor kwargs); `inst.model_dump()` returns
+a dict of the instance's fields in declaration order, and
+`model_dump_json()` the JSON form. Flat `model` classes are now
+usable under `tyc run`. Nested-model validation is not type-directed
+yet — a nested dict stays a dict; use `tyc build` for deeply-nested
+models.
+
+### Added — VM keyword args to builtin methods
+
+- `max()` / `min()` accept `key=` and `default=` keyword arguments.
+- `list.sort()` accepts `reverse=` and `key=` (previously rejected all
+  kwargs). `list.sort` honours user `__lt__` / `__eq__` via
+  `interp.value_cmp` for both the keyed and unkeyed paths.
+- Implemented via a kwargs sentinel (`make_kwargs_sentinel` /
+  `split_kwargs`) since native fns have no kwargs slot. The dispatcher
+  unpacks the trailing sentinel before invoking the builtin.
+
+### Added — VM missing string / set / numeric / time / json builtins
+
+- **String methods**: `index`, `rindex`, `center`, `ljust`, `rjust`,
+  `zfill`, `rsplit`, `partition`, `rpartition`, `removeprefix`,
+  `removesuffix`, `casefold`, `isnumeric`, `istitle`, `expandtabs`.
+  `strip` / `lstrip` / `rstrip` now honour their `chars` argument
+  (previously ignored, silent wrong results). `str.format`
+  stringifies values through `str_of` so a user `__str__` is
+  honoured.
+- **Set algebra**: `union`, `intersection`, `difference`,
+  `symmetric_difference`, `issubset`, `issuperset`, `isdisjoint`,
+  `update`. `frozenset.union` / `intersection` / `difference` /
+  `symmetric_difference` preserve the frozen sentinel; `update` is
+  rejected on frozensets.
+- **`dict(other_dict)`** shallow-copies; **`dict(**kwargs)`** keyword
+  form works.
+- **`divmod`**: raises `ZeroDivisionError` (not `ValueError`) for int
+  and float divide-by-zero, with CPython messages.
+- **`pow`**: 2-arg and 3-arg modular pow.
+- **`format`** / **`ascii`** added. **`ascii`** also registered as a
+  known builtin in the resolver.
+- **`int(str, base)`**: now supports `base=0` (autodetect 0x / 0o /
+  0b radix) and validates the base is an integer.
+- **`math.gcd` / `lcm` / `factorial` / `isqrt` / `comb` / `perm`**
+  reject non-integer args (a float cannot be interpreted as an
+  integer).
+- **`len(obj)`**: a user `__len__` must return a non-negative int.
+- **`str_of` / `repr_of`**: a user `__str__` / `__repr__` returning a
+  non-`str` raises `TypeError`.
+- **`json.dumps(indent=…)`** pretty-prints.
+- **`time.perf_counter`** and **`process_time`** added.
+  **`time.monotonic`** fixed (was always returning ~0).
+- **Unbound builtin-type methods** (e.g. `str.lower(x)`) work,
+  unblocking the documented pipe idiom that lowers to
+  `str.lower(x)`.
+
+### Fixed — VM iterator-adapter panic
+
+`enumerate` / `zip` / `map` / `filter` panicked with
+`RefCell already borrowed` the instant they were iterated. The match
+scrutinee in `iter_next` held a borrow that the matched arm
+re-borrowed when it recursed. The borrow is now released before the
+recursive call.
+
+### Fixed — `Path.read_text` / `write_text` / `open` tolerate
+`encoding=` / `errors=`
+
+The VM doesn't model these kwargs (it is always UTF-8), but the
+builtins now accept and ignore them instead of rejecting the call.
+
+### Added — type checker exhaustiveness fixes
+
+- **Exhaustive `match` on `bool` and string-literal unions.**
+  `match b: case True / case False` and `match s` over a `type C =
+  "a" | "b"` union matched on every member no longer false-positive
+  `tyc::missing_return`. `cases_cover_type` now certifies a `bool`
+  subject when both arms (or a wildcard) are present, and a `LitStr`
+  subject when a guardless `case "literal":` covers each variant.
+- **Irrefutable fixed-arity tuple patterns recognised as exhaustive.**
+  A `match` on a `tuple[int, int]` ending in a guardless
+  `case (x, y):` covers every inhabitant (the tuple's length is
+  statically known), but the missing-return analysis only certified
+  sequence coverage when a tail-star arm was present. Variadic
+  `tuple[int, ...]` is intentionally excluded; non-exhaustive tuples,
+  fixed-length patterns over variable-length lists, and wrong-arity
+  patterns all still fire.
+- **Augmented assignment on scalar targets is type-checked.**
+  `s += 5` (str + int) now fires `operator_type_mismatch`, matching
+  the existing check on `s = s + 5`. Restricted to scalars
+  (int / float / bool / str / bytes); mutable containers keep their
+  looser in-place semantics (`list += any_iterable`) to avoid false
+  positives.
+
+### Fixed — strictness knob plumbing
+
+`allow_secret_comptime` was documented in `typhon.toml` strictness
+config but never threaded into `analyse_secret_literal_bindings`, so
+the user-facing escape hatch had no effect. Now wired through.
+
+### Changed — emit hot path heap allocations
+
+- Integer and float literal emission switched from heap-allocating
+  `.to_string()` / `format!` to stack-allocated `itoa` / `ryu`
+  buffers in the AST emitter. Falls back to `to_string()` for
+  bigints outside `i64`/`u64`; handles `NaN` / `inf` explicitly
+  since `ryu` doesn't support them.
+- Char and string emission in `tyc-emit` no longer allocates per
+  call.
+
+### Fixed — examples / docs-site polish
+
+- `examples/apps/13-vector-db` dropped invalid explicit type args on
+  function calls (`new_collection[int](...)`) that the v0.9.0 checker
+  correctly rejects. The brackets are gone; inference deduces the
+  type parameter at every call site.
+- docs-site a11y: alt text on the hero image, `<kbd>` tags around
+  keyboard shortcuts, `:focus-visible` extended to inputs and
+  textareas, `prefers-reduced-motion` wrapping on card hover
+  animations, table-row hover background transition.
+
+### Known limitations carried forward
+
+- Lazy / unbounded VM generators still need `tyc build` (eager
+  collection caps at 1M items).
+- `@contextmanager` generators inside `with` blocks still need
+  `tyc build` under the VM (eager collection runs setup + teardown
+  at call time).
+- Nested-model `pydantic.model_validate` is not type-directed in the
+  VM; deeply-nested models still need `tyc build`.
+- Preprocess line-number leakage (B15) for `impl Alias:` distribution
+  over sealed unions — unchanged from v0.9.0.
+
 ## 0.9.2 — 2026-05-27
 
 Bugfix point release closing a cross-module regression surfaced by the
