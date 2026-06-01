@@ -84,7 +84,7 @@ async def create_collection(req: CreateCollectionRequest) -> CreateCollectionRes
         let m = m_opt
         let cid: CollectionId = CollectionId(STATE.next_cid)
         STATE.next_cid = STATE.next_cid + 1
-        let col: Collection[int] = new_collection[int](
+        let col: Collection[int] = new_collection(
             cid, req.name, Dim(req.dim), m, STATE.config.hnsw,
         )
         STATE.collections[req.name] = col
@@ -187,7 +187,7 @@ async def batch_search(
 
 # The snapshot pipeline — exercises the `with`-chain `?` form.
 def _do_snapshot(col: Collection[int], dir: str, seq: SnapshotSeq) -> Result[SnapshotInfo, SnapshotError]:
-    with info = write_snapshot[int](col, dir, seq)?:
+    with info = write_snapshot(col, dir, seq)?:
         return Ok(info)
 
 
@@ -214,7 +214,7 @@ async def restore(name: str) -> CreateCollectionResponse:
             case Ok(loaded):
                 let cid: CollectionId = CollectionId(STATE.next_cid)
                 STATE.next_cid = STATE.next_cid + 1
-                match hydrate_collection[int](loaded, cid, STATE.config.hnsw):
+                match hydrate_collection(loaded, cid, STATE.config.hnsw):
                     case Ok(col):
                         STATE.collections[name] = col
                         return CreateCollectionResponse(

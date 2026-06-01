@@ -163,7 +163,7 @@ pub def hydrate_collection[D](
     # we instantiate directly).
     from indexes import new_collection
     from domain import VectorId as VId
-    let col: Collection[D] = new_collection[D](cid, loaded.name, dim_wrapped, m, params)
+    let col: Collection[D] = new_collection(cid, loaded.name, dim_wrapped, m, params)
     for (vid_raw, vec, meta) in loaded.vectors:
         match col.insert(VId(vid_raw), vec, meta):
             case Ok(_):
