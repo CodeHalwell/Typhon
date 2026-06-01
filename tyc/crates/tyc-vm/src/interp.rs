@@ -46,7 +46,19 @@ pub struct Interpreter {
     /// name (e.g. "repo" or "sub.util"). Lets the same module be imported
     /// from multiple files without re-evaluating its body.
     pub module_cache: HashMap<String, Value>,
+    /// Stack of value buffers for generator functions. The VM has no way to
+    /// suspend a tree-walk mid-frame, so a `yield`-bearing function is run
+    /// eagerly to completion with each yielded value pushed onto the top
+    /// buffer; the call then returns an iterator over the collected values.
+    /// A stack supports nested/recursive generators. See `GENERATOR_CAP`.
+    pub gen_buffers: Vec<Vec<Value>>,
 }
+
+/// Upper bound on values an eagerly-evaluated generator may yield before the
+/// VM gives up. Bounds the worst case (an unbounded `while True: yield`) to a
+/// clear error instead of an unbounded hang; `tyc build` runs such generators
+/// lazily on CPython.
+const GENERATOR_CAP: usize = 1_000_000;
 
 impl Default for Interpreter {
     fn default() -> Self {
@@ -73,6 +85,7 @@ impl Interpreter {
             script_argv: Vec::new(),
             source_root: None,
             module_cache: HashMap::new(),
+            gen_buffers: Vec::new(),
         };
         crate::builtins::install(&mut interp);
         interp
@@ -439,16 +452,31 @@ impl Interpreter {
         let mut fields = Vec::new();
         let mut methods: HashMap<String, Rc<Function>> = HashMap::new();
         let mut class_attrs: HashMap<String, Value> = HashMap::new();
+        let mut properties: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut classmethods: std::collections::HashSet<String> = std::collections::HashSet::new();
 
         for stmt in &c.body {
             match stmt {
                 Stmt::FunctionDef(f) => {
                     let func = self.build_function(f, &body_env)?;
                     let mut v = Value::Function(Rc::new(func));
+                    let has_deco = |want: &str| {
+                        f.decorator_list.iter().any(
+                            |d| matches!(&d.expression, Expr::Name(n) if n.id.as_str() == want),
+                        )
+                    };
+                    let is_property = has_deco("property");
+                    let is_classmethod = has_deco("classmethod");
                     for deco in f.decorator_list.iter().rev() {
                         v = self.apply_decorator(deco, v, &body_env)?;
                     }
                     if let Value::Function(f) = &v {
+                        if is_property {
+                            properties.insert(f.name.clone());
+                        }
+                        if is_classmethod {
+                            classmethods.insert(f.name.clone());
+                        }
                         methods.insert(f.name.clone(), f.clone());
                     } else {
                         class_attrs.insert(f.name.as_str().into(), v);
@@ -480,6 +508,11 @@ impl Interpreter {
             }
         }
 
+        // Names the subclass defines itself — an inherited descriptor marker
+        // (`@property` / `@classmethod`) must NOT carry over to a name the
+        // subclass has overridden with a plain method.
+        let own_method_names: std::collections::HashSet<String> = methods.keys().cloned().collect();
+
         // Inherit methods from base classes that aren't already overridden.
         for base in &bases {
             for (name, m) in base.methods.borrow().iter() {
@@ -487,6 +520,16 @@ impl Interpreter {
             }
             for (name, v) in base.class_attrs.borrow().iter() {
                 class_attrs.entry(name.clone()).or_insert_with(|| v.clone());
+            }
+            for name in base.properties.borrow().iter() {
+                if !own_method_names.contains(name) {
+                    properties.insert(name.clone());
+                }
+            }
+            for name in base.classmethods.borrow().iter() {
+                if !own_method_names.contains(name) {
+                    classmethods.insert(name.clone());
+                }
             }
         }
 
@@ -496,6 +539,8 @@ impl Interpreter {
             fields,
             class_attrs: RefCell::new(class_attrs),
             bases,
+            properties: RefCell::new(properties),
+            classmethods: RefCell::new(classmethods),
         }))
     }
 
@@ -815,9 +860,24 @@ impl Interpreter {
                 self.eval_listcomp(&listy, env)
             }
             Expr::Await(_) => Err(vm_unsupported_use_compile("await expressions")),
-            Expr::Yield(_) | Expr::YieldFrom(_) => Err(vm_unsupported_use_compile(
-                "generators (`yield` / `yield from`)",
-            )),
+            Expr::Yield(y) => {
+                let v = match &y.value {
+                    Some(e) => self.eval_expr(e, env)?,
+                    None => Value::None,
+                };
+                self.push_yield(v)?;
+                // `send()` is unsupported in eager mode — a yield expression
+                // evaluates to None (the common `yield x`-as-statement case).
+                Ok(Value::None)
+            }
+            Expr::YieldFrom(y) => {
+                let iterable = self.eval_expr(&y.value, env)?;
+                let it = self.make_iter(iterable)?;
+                while let Some(v) = self.iter_next(&it)? {
+                    self.push_yield(v)?;
+                }
+                Ok(Value::None)
+            }
             Expr::TString(_) => Err(not_implemented("template strings")),
             Expr::IpyEscapeCommand(_) => Err(not_implemented("IPython escape commands")),
         }
@@ -879,10 +939,10 @@ impl Interpreter {
                             InterpolatedStringElement::Interpolation(interp) => {
                                 let v = self.eval_expr(&interp.expression, env)?;
                                 let s = match interp.conversion {
-                                    ast::ConversionFlag::Repr => v.py_repr(),
+                                    ast::ConversionFlag::Repr => self.repr_of(&v)?,
                                     ast::ConversionFlag::Str
                                     | ast::ConversionFlag::None
-                                    | ast::ConversionFlag::Ascii => v.py_str(),
+                                    | ast::ConversionFlag::Ascii => self.str_of(&v)?,
                                 };
                                 // Format spec: limited support — width / precision for floats only.
                                 if let Some(spec) = &interp.format_spec {
@@ -931,8 +991,79 @@ impl Interpreter {
         Ok(Value::Bool(true))
     }
 
+    /// Invoke a single-argument rich-comparison dunder (`__eq__`, `__lt__`, …)
+    /// on an instance operand, returning the boolean truthiness if one exists.
+    fn cmp_dunder(&mut self, op: CmpOp, l: &Value, r: &Value) -> Result<Option<bool>, Unwind> {
+        let (name, rname): (&str, &str) = match op {
+            CmpOp::Eq => ("__eq__", "__eq__"),
+            CmpOp::NotEq => ("__ne__", "__ne__"),
+            CmpOp::Lt => ("__lt__", "__gt__"),
+            CmpOp::LtE => ("__le__", "__ge__"),
+            CmpOp::Gt => ("__gt__", "__lt__"),
+            CmpOp::GtE => ("__ge__", "__le__"),
+            _ => return Ok(None),
+        };
+        if let Value::Instance(i) = l {
+            if let Some(m) = self.find_method(&i.class, name) {
+                let res = self.call_value(
+                    Value::BoundMethod {
+                        receiver: Box::new(l.clone()),
+                        function: m,
+                    },
+                    vec![r.clone()],
+                    &[],
+                )?;
+                return Ok(Some(res.truthy()));
+            }
+        }
+        // Reflected comparison on the right instance operand.
+        if let Value::Instance(i) = r {
+            if let Some(m) = self.find_method(&i.class, rname) {
+                let res = self.call_value(
+                    Value::BoundMethod {
+                        receiver: Box::new(r.clone()),
+                        function: m,
+                    },
+                    vec![l.clone()],
+                    &[],
+                )?;
+                return Ok(Some(res.truthy()));
+            }
+        }
+        Ok(None)
+    }
+
+    /// `a == b` honouring a user `__eq__` on instances (used by `list.index`,
+    /// `list.count`, `list.remove`, and membership tests).
+    pub fn values_equal(&mut self, a: &Value, b: &Value) -> Result<bool, Unwind> {
+        self.cmp_op(CmpOp::Eq, a, b)
+    }
+
+    /// Total ordering honouring a user `__lt__` / `__eq__` on instances (used
+    /// by `list.sort` / `sorted` so custom comparison dunders take effect).
+    pub fn value_cmp(&mut self, a: &Value, b: &Value) -> Result<std::cmp::Ordering, Unwind> {
+        use std::cmp::Ordering;
+        if matches!(a, Value::Instance(_)) || matches!(b, Value::Instance(_)) {
+            if self.cmp_op(CmpOp::Lt, a, b)? {
+                return Ok(Ordering::Less);
+            }
+            if self.cmp_op(CmpOp::Eq, a, b)? {
+                return Ok(Ordering::Equal);
+            }
+            return Ok(Ordering::Greater);
+        }
+        Ok(a.py_cmp(b).unwrap_or(Ordering::Equal))
+    }
+
     fn cmp_op(&mut self, op: CmpOp, l: &Value, r: &Value) -> Result<bool, Unwind> {
         use std::cmp::Ordering::*;
+        // User-defined rich comparisons take priority when an operand is a
+        // class instance (Python's `__eq__` / `__lt__` / … protocol).
+        if matches!(l, Value::Instance(_)) || matches!(r, Value::Instance(_)) {
+            if let Some(b) = self.cmp_dunder(op, l, r)? {
+                return Ok(b);
+            }
+        }
         Ok(match op {
             CmpOp::Eq => l.py_eq(r),
             CmpOp::NotEq => !l.py_eq(r),
@@ -971,8 +1102,24 @@ impl Interpreter {
 
     fn contains(&mut self, container: &Value, item: &Value) -> Result<bool, Unwind> {
         match container {
-            Value::List(l) => Ok(l.borrow().iter().any(|v| v.py_eq(item))),
-            Value::Tuple(t) => Ok(t.iter().any(|v| v.py_eq(item))),
+            Value::List(l) => {
+                let items: Vec<Value> = l.borrow().clone();
+                for v in &items {
+                    if self.cmp_op(CmpOp::Eq, v, item)? {
+                        return Ok(true);
+                    }
+                }
+                Ok(false)
+            }
+            Value::Tuple(t) => {
+                let items = t.clone();
+                for v in items.iter() {
+                    if self.cmp_op(CmpOp::Eq, v, item)? {
+                        return Ok(true);
+                    }
+                }
+                Ok(false)
+            }
             Value::Str(s) => {
                 let needle = item.py_str();
                 Ok(s.contains(&needle))
@@ -1011,6 +1158,24 @@ impl Interpreter {
                 }
                 _ => Ok(false),
             },
+            Value::Instance(i) => {
+                // `x in obj` → obj.__contains__(x).
+                if let Some(m) = self.find_method(&i.class, "__contains__") {
+                    let res = self.call_value(
+                        Value::BoundMethod {
+                            receiver: Box::new(container.clone()),
+                            function: m,
+                        },
+                        vec![item.clone()],
+                        &[],
+                    )?;
+                    return Ok(res.truthy());
+                }
+                Err(type_error(format!(
+                    "argument of type '{}' is not iterable",
+                    container.type_name()
+                )))
+            }
             other => Err(type_error(format!(
                 "argument of type '{}' is not iterable",
                 other.type_name()
@@ -1068,6 +1233,15 @@ impl Interpreter {
         match func {
             Value::Native(n) => {
                 if !kwargs.is_empty() {
+                    // The generic bound builtin-method dispatcher (`obj.sort`,
+                    // `obj.method`) can't see kwargs through its fixed native
+                    // signature, so forward them as a trailing sentinel arg the
+                    // method handlers unpack. Other natives use the by-name path.
+                    if n.name == "method" {
+                        let mut args = args;
+                        args.push(crate::builtins::make_kwargs_sentinel(kwargs));
+                        return (n.func)(self, args);
+                    }
                     // For v1, native fns receive positional args only.
                     // Special-case common kwarg-accepting builtins (sorted, dict.get) by name.
                     return crate::builtins::call_with_kwargs(self, &n, args, kwargs);
@@ -1089,6 +1263,33 @@ impl Interpreter {
         }
     }
 
+    /// Append a yielded value to the current generator's buffer, enforcing the
+    /// eager-evaluation cap. Errors if no generator frame is active (a `yield`
+    /// the detector missed) or the cap is exceeded.
+    fn push_yield(&mut self, v: Value) -> Result<(), Unwind> {
+        match self.gen_buffers.last_mut() {
+            Some(buf) => {
+                if buf.len() >= GENERATOR_CAP {
+                    return Err(Unwind::Exception(VmException::new(
+                        "RuntimeError",
+                        format!(
+                            "generator exceeded the VM's eager-evaluation limit ({} values); \
+                             the tree-walking VM materialises generators eagerly — run unbounded \
+                             or lazily-consumed generators with `tyc build` then `python`",
+                            GENERATOR_CAP
+                        ),
+                    )));
+                }
+                buf.push(v);
+                Ok(())
+            }
+            None => Err(Unwind::Exception(VmException::new(
+                "RuntimeError",
+                "`yield` outside of a generator function",
+            ))),
+        }
+    }
+
     fn call_function(
         &mut self,
         f: &Function,
@@ -1106,8 +1307,27 @@ impl Interpreter {
         // Wrap the body in a closure so every early `return` decrements the
         // counter on the way out — including a failure in `bind_args`.
         let call_env = Env::new_child(&f.closure);
+        let is_generator = body_is_generator(&f.body);
         let result = (|| -> Result<Value, Unwind> {
             self.bind_args(f, args, kwargs, receiver, &call_env)?;
+            if is_generator {
+                // Eager-collection generator: run the body to completion with
+                // `yield`s captured into a fresh buffer, then hand back an
+                // iterator over the collected values. `return` (with or without
+                // a value) ends collection, matching a generator's StopIteration.
+                self.gen_buffers.push(Vec::new());
+                let outcome = self.exec_block(&f.body, &call_env);
+                let buffer = self.gen_buffers.pop().unwrap_or_default();
+                return match outcome {
+                    Ok(()) | Err(Unwind::Return(_)) => {
+                        Ok(Value::Iter(Rc::new(RefCell::new(IterState::List {
+                            items: Rc::new(RefCell::new(buffer)),
+                            index: 0,
+                        }))))
+                    }
+                    Err(other) => Err(other),
+                };
+            }
             match self.exec_block(&f.body, &call_env) {
                 Ok(()) => Ok(Value::None),
                 Err(Unwind::Return(v)) => Ok(v),
@@ -1306,6 +1526,43 @@ impl Interpreter {
         None
     }
 
+    /// Invoke a zero-argument dunder method on an instance, if defined.
+    pub fn call_dunder0(&mut self, v: &Value, name: &str) -> Result<Option<Value>, Unwind> {
+        if let Value::Instance(i) = v {
+            if let Some(m) = self.find_method(&i.class, name) {
+                let r = self.call_value(
+                    Value::BoundMethod {
+                        receiver: Box::new(v.clone()),
+                        function: m,
+                    },
+                    vec![],
+                    &[],
+                )?;
+                return Ok(Some(r));
+            }
+        }
+        Ok(None)
+    }
+
+    /// `str(v)` honouring a user `__str__` (then `__repr__`) on instances.
+    pub fn str_of(&mut self, v: &Value) -> Result<String, Unwind> {
+        if let Some(r) = self.call_dunder0(v, "__str__")? {
+            return require_str_return(r, "__str__");
+        }
+        if let Some(r) = self.call_dunder0(v, "__repr__")? {
+            return require_str_return(r, "__repr__");
+        }
+        Ok(v.py_str())
+    }
+
+    /// `repr(v)` honouring a user `__repr__` on instances.
+    pub fn repr_of(&mut self, v: &Value) -> Result<String, Unwind> {
+        if let Some(r) = self.call_dunder0(v, "__repr__")? {
+            return require_str_return(r, "__repr__");
+        }
+        Ok(v.py_repr())
+    }
+
     // ── Operators ──────────────────────────────────────────────────────────
 
     pub fn binop(&mut self, l: &Value, op: Operator, r: &Value) -> Result<Value, Unwind> {
@@ -1439,6 +1696,35 @@ impl Interpreter {
             return Ok(Set(Rc::new(RefCell::new(out))));
         }
 
+        // Operator overloading: dispatch to the left operand's dunder method,
+        // falling back to the right operand's reflected dunder (`__radd__`).
+        if let Some(dunder) = binop_dunder(op) {
+            if let Value::Instance(i) = l {
+                if let Some(m) = self.find_method(&i.class, dunder) {
+                    return self.call_value(
+                        Value::BoundMethod {
+                            receiver: Box::new(l.clone()),
+                            function: m,
+                        },
+                        vec![r.clone()],
+                        &[],
+                    );
+                }
+            }
+            if let (Some(rdunder), Value::Instance(i)) = (binop_reflected_dunder(op), r) {
+                if let Some(m) = self.find_method(&i.class, rdunder) {
+                    return self.call_value(
+                        Value::BoundMethod {
+                            receiver: Box::new(r.clone()),
+                            function: m,
+                        },
+                        vec![l.clone()],
+                        &[],
+                    );
+                }
+            }
+        }
+
         Err(type_error(format!(
             "unsupported operand type(s) for {}: '{}' and '{}'",
             op.as_str(),
@@ -1518,6 +1804,22 @@ impl Interpreter {
                 let idx = normalize_index(i, b.len())
                     .ok_or_else(|| index_error("bytes index out of range"))?;
                 Ok(Value::Int(BigInt::from(b[idx] as i64)))
+            }
+            Value::Instance(i) => {
+                if let Some(m) = self.find_method(&i.class, "__getitem__") {
+                    return self.call_value(
+                        Value::BoundMethod {
+                            receiver: Box::new(target.clone()),
+                            function: m,
+                        },
+                        vec![key.clone()],
+                        &[],
+                    );
+                }
+                Err(type_error(format!(
+                    "'{}' object is not subscriptable",
+                    target.type_name()
+                )))
             }
             other => Err(type_error(format!(
                 "'{}' object is not subscriptable",
@@ -1633,11 +1935,52 @@ impl Interpreter {
                 if let Some(v) = inst.fields.borrow().get(attr) {
                     return Ok(v.clone());
                 }
+                // `@property` getters are invoked on read, not returned as a method.
+                if inst.class.properties.borrow().contains(attr) {
+                    if let Some(m) = self.find_method(&inst.class, attr) {
+                        return self.call_value(
+                            Value::BoundMethod {
+                                receiver: Box::new(value.clone()),
+                                function: m,
+                            },
+                            vec![],
+                            &[],
+                        );
+                    }
+                }
                 if let Some(m) = self.find_method(&inst.class, attr) {
+                    // `@classmethod` binds the class object as `cls`, not the instance.
+                    let receiver = if inst.class.classmethods.borrow().contains(attr) {
+                        Box::new(Value::Class(inst.class.clone()))
+                    } else {
+                        Box::new(value.clone())
+                    };
                     return Ok(Value::BoundMethod {
-                        receiver: Box::new(value.clone()),
+                        receiver,
                         function: m,
                     });
+                }
+                // Pydantic `model` instances expose `model_dump()` →
+                // dict-of-fields and `model_dump_json()` → JSON string.
+                if attr == "model_dump" || attr == "model_dump_json" {
+                    let inst = inst.clone();
+                    let as_json = attr == "model_dump_json";
+                    let nf = NativeFn::new("model_dump", move |_i, _args| {
+                        let mut map: DictMap = IndexMap::new();
+                        let fields = inst.fields.borrow();
+                        for field in &inst.class.fields {
+                            if let Some(v) = fields.get(&field.name) {
+                                map.insert(HashKey::Str(Rc::new(field.name.clone())), v.clone());
+                            }
+                        }
+                        let dict = Value::Dict(Rc::new(RefCell::new(map)));
+                        if as_json {
+                            Ok(Value::Str(Rc::new(crate::builtins::json_dumps_pub(&dict))))
+                        } else {
+                            Ok(dict)
+                        }
+                    });
+                    return Ok(Value::Native(Rc::new(nf)));
                 }
                 Err(attribute_error(format!(
                     "'{}' object has no attribute '{}'",
@@ -1645,11 +1988,47 @@ impl Interpreter {
                 )))
             }
             Value::Class(class) => {
+                // `Cls.__name__` / `type(x).__name__`.
+                if attr == "__name__" || attr == "__qualname__" {
+                    return Ok(Value::Str(Rc::new(class.name.clone())));
+                }
                 if let Some(v) = class.class_attrs.borrow().get(attr) {
                     return Ok(v.clone());
                 }
                 if let Some(m) = class.methods.borrow().get(attr) {
+                    // `@classmethod` accessed on the class binds `cls` to the class.
+                    if class.classmethods.borrow().contains(attr) {
+                        return Ok(Value::BoundMethod {
+                            receiver: Box::new(value.clone()),
+                            function: m.clone(),
+                        });
+                    }
                     return Ok(Value::Function(m.clone()));
+                }
+                // Pydantic `model` class methods: `Model.model_validate(dict)`
+                // builds an instance from a mapping (validation is not modelled;
+                // it maps fields to constructor kwargs).
+                if attr == "model_validate" {
+                    let cls = class.clone();
+                    let nf = NativeFn::new("model_validate", move |interp, args| {
+                        let arg = args
+                            .into_iter()
+                            .next()
+                            .ok_or_else(|| type_error("model_validate() requires a mapping"))?;
+                        let Value::Dict(d) = arg else {
+                            return Err(type_error("model_validate() expects a dict"));
+                        };
+                        let kwargs: Vec<(String, Value)> = d
+                            .borrow()
+                            .iter()
+                            .filter_map(|(k, v)| match k {
+                                HashKey::Str(s) => Some(((**s).clone(), v.clone())),
+                                _ => None,
+                            })
+                            .collect();
+                        interp.instantiate(&cls, vec![], &kwargs)
+                    });
+                    return Ok(Value::Native(Rc::new(nf)));
                 }
                 Err(attribute_error(format!(
                     "type object '{}' has no attribute '{}'",
@@ -1691,6 +2070,29 @@ impl Interpreter {
                     crate::builtins::dispatch_method(interp, &attr_name, args)
                 });
                 Ok(Value::Native(Rc::new(nf)))
+            }
+            // Unbound builtin-type methods: `str.strip(x)`, `list.append(xs, v)`,
+            // `dict.get(d, k)`. The type constructors are registered as natives
+            // named after the type; accessing a method on one yields a function
+            // that dispatches with the explicit receiver as its first argument.
+            // This is what the documented pipe idiom `x |> str.lower()` lowers to.
+            Value::Native(nf)
+                if matches!(
+                    nf.name,
+                    "str" | "list" | "dict" | "set" | "frozenset" | "tuple" | "bytes"
+                ) =>
+            {
+                let attr_name: Rc<str> = Rc::from(attr);
+                let m = NativeFn::new("method", move |interp, args| {
+                    if args.is_empty() {
+                        return Err(type_error(format!(
+                            "unbound method '{}' needs an argument",
+                            attr_name
+                        )));
+                    }
+                    crate::builtins::dispatch_method(interp, &attr_name, args)
+                });
+                Ok(Value::Native(Rc::new(m)))
             }
             Value::Exception { kind, message } => match attr {
                 "args" => Ok(Value::Tuple(Rc::new(vec![Value::Str(message.clone())]))),
@@ -1884,96 +2286,113 @@ impl Interpreter {
         let Value::Iter(state) = it else {
             return Err(type_error("not an iterator"));
         };
-        let next: Result<Option<Value>, Unwind> = match &mut *state.borrow_mut() {
-            IterState::Range {
-                current,
-                stop,
-                step,
-            } => {
-                let done = if *step > 0 {
-                    *current >= *stop
-                } else {
-                    *current <= *stop
-                };
-                if done {
-                    Ok(None)
-                } else {
-                    let v = Value::Int(BigInt::from(*current));
-                    *current += *step;
-                    Ok(Some(v))
+        // Iterator adapters that wrap an inner iterator (Enumerate, Zip, Map,
+        // Filter) must recurse into `iter_next` on that inner iterator. The
+        // recursion needs `&mut self`, and bumping our own state afterwards
+        // needs a fresh `state.borrow_mut()`, so we cannot keep the scrutinee
+        // borrow alive across it. Handle the leaf states inline (returning from
+        // within the borrow scope) and, for the recursive states, clone out the
+        // handles we need and drop the borrow *before* recursing.
+        enum Recurse {
+            Enumerate(Rc<RefCell<IterState>>),
+            Zip(Vec<Rc<RefCell<IterState>>>),
+            Map(Value, Rc<RefCell<IterState>>),
+            Filter(Value, Rc<RefCell<IterState>>),
+        }
+
+        let recurse = {
+            let mut guard = state.borrow_mut();
+            match &mut *guard {
+                IterState::Range {
+                    current,
+                    stop,
+                    step,
+                } => {
+                    let done = if *step > 0 {
+                        *current >= *stop
+                    } else {
+                        *current <= *stop
+                    };
+                    return if done {
+                        Ok(None)
+                    } else {
+                        let v = Value::Int(BigInt::from(*current));
+                        *current += *step;
+                        Ok(Some(v))
+                    };
                 }
-            }
-            IterState::List { items, index } => {
-                let l = items.borrow();
-                if *index >= l.len() {
-                    Ok(None)
-                } else {
-                    let v = l[*index].clone();
-                    *index += 1;
-                    Ok(Some(v))
+                IterState::List { items, index } => {
+                    let l = items.borrow();
+                    return if *index >= l.len() {
+                        Ok(None)
+                    } else {
+                        let v = l[*index].clone();
+                        *index += 1;
+                        Ok(Some(v))
+                    };
                 }
-            }
-            IterState::Tuple { items, index } => {
-                if *index >= items.len() {
-                    Ok(None)
-                } else {
-                    let v = items[*index].clone();
-                    *index += 1;
-                    Ok(Some(v))
+                IterState::Tuple { items, index } => {
+                    return if *index >= items.len() {
+                        Ok(None)
+                    } else {
+                        let v = items[*index].clone();
+                        *index += 1;
+                        Ok(Some(v))
+                    };
                 }
-            }
-            IterState::Str { chars, index } => {
-                if *index >= chars.len() {
-                    Ok(None)
-                } else {
-                    let v = Value::Str(Rc::new(chars[*index].to_string()));
-                    *index += 1;
-                    Ok(Some(v))
+                IterState::Str { chars, index } => {
+                    return if *index >= chars.len() {
+                        Ok(None)
+                    } else {
+                        let v = Value::Str(Rc::new(chars[*index].to_string()));
+                        *index += 1;
+                        Ok(Some(v))
+                    };
                 }
-            }
-            IterState::Dict { keys, index } => {
-                if *index >= keys.len() {
-                    Ok(None)
-                } else {
-                    let v = keys[*index].clone().into_value();
-                    *index += 1;
-                    Ok(Some(v))
+                IterState::Dict { keys, index } => {
+                    return if *index >= keys.len() {
+                        Ok(None)
+                    } else {
+                        let v = keys[*index].clone().into_value();
+                        *index += 1;
+                        Ok(Some(v))
+                    };
                 }
-            }
-            IterState::Set { keys, index } => {
-                if *index >= keys.len() {
-                    Ok(None)
-                } else {
-                    let v = keys[*index].clone().into_value();
-                    *index += 1;
-                    Ok(Some(v))
+                IterState::Set { keys, index } => {
+                    return if *index >= keys.len() {
+                        Ok(None)
+                    } else {
+                        let v = keys[*index].clone().into_value();
+                        *index += 1;
+                        Ok(Some(v))
+                    };
                 }
+                IterState::Enumerate { inner, .. } => Recurse::Enumerate(inner.clone()),
+                IterState::Zip { inners } => Recurse::Zip(inners.clone()),
+                IterState::Map { func, inner } => Recurse::Map(func.clone(), inner.clone()),
+                IterState::Filter { func, inner } => Recurse::Filter(func.clone(), inner.clone()),
             }
-            IterState::Enumerate { inner, index } => {
-                let inner = inner.clone();
-                drop(state.borrow_mut());
-                match self.iter_next(&Value::Iter(inner))? {
-                    Some(v) => {
-                        let idx = match &mut *state.borrow_mut() {
-                            IterState::Enumerate { index, .. } => {
-                                let i = *index;
-                                *index += 1;
-                                i
-                            }
-                            _ => unreachable!(),
-                        };
-                        let _ = index; // appease the borrow checker — value above is correct
-                        return Ok(Some(Value::Tuple(Rc::new(vec![
-                            Value::Int(BigInt::from(idx)),
-                            v,
-                        ]))));
-                    }
-                    None => return Ok(None),
+        };
+
+        match recurse {
+            Recurse::Enumerate(inner) => match self.iter_next(&Value::Iter(inner))? {
+                Some(v) => {
+                    let idx = match &mut *state.borrow_mut() {
+                        IterState::Enumerate { index, .. } => {
+                            let i = *index;
+                            *index += 1;
+                            i
+                        }
+                        _ => unreachable!(),
+                    };
+                    Ok(Some(Value::Tuple(Rc::new(vec![
+                        Value::Int(BigInt::from(idx)),
+                        v,
+                    ]))))
                 }
-            }
-            IterState::Zip { inners } => {
-                let inners = inners.clone();
-                drop(state.borrow_mut());
+                None => Ok(None),
+            },
+            Recurse::Zip(inners) => {
                 let mut out = Vec::with_capacity(inners.len());
                 for i in &inners {
                     match self.iter_next(&Value::Iter(i.clone()))? {
@@ -1981,37 +2400,26 @@ impl Interpreter {
                         None => return Ok(None),
                     }
                 }
-                return Ok(Some(Value::Tuple(Rc::new(out))));
+                Ok(Some(Value::Tuple(Rc::new(out))))
             }
-            IterState::Map { func, inner } => {
-                let func = func.clone();
-                let inner = inner.clone();
-                drop(state.borrow_mut());
-                match self.iter_next(&Value::Iter(inner))? {
-                    Some(v) => return Ok(Some(self.call_value(func, vec![v], &[])?)),
+            Recurse::Map(func, inner) => match self.iter_next(&Value::Iter(inner))? {
+                Some(v) => Ok(Some(self.call_value(func, vec![v], &[])?)),
+                None => Ok(None),
+            },
+            Recurse::Filter(func, inner) => loop {
+                match self.iter_next(&Value::Iter(inner.clone()))? {
+                    Some(v) => {
+                        let keep = self
+                            .call_value(func.clone(), vec![v.clone()], &[])?
+                            .truthy();
+                        if keep {
+                            return Ok(Some(v));
+                        }
+                    }
                     None => return Ok(None),
                 }
-            }
-            IterState::Filter { func, inner } => {
-                let func = func.clone();
-                let inner = inner.clone();
-                drop(state.borrow_mut());
-                loop {
-                    match self.iter_next(&Value::Iter(inner.clone()))? {
-                        Some(v) => {
-                            let keep = self
-                                .call_value(func.clone(), vec![v.clone()], &[])?
-                                .truthy();
-                            if keep {
-                                return Ok(Some(v));
-                            }
-                        }
-                        None => return Ok(None),
-                    }
-                }
-            }
-        };
-        next
+            },
+        }
     }
 
     // ── Comprehensions ─────────────────────────────────────────────────────
@@ -2248,6 +2656,17 @@ impl Interpreter {
         let mut entered: Vec<Value> = Vec::with_capacity(w.items.len());
         for item in &w.items {
             let cm = self.eval_expr(&item.context_expr, env)?;
+            // A `@contextmanager`-decorated generator can't act as a context
+            // manager under eager evaluation: the VM runs the whole generator
+            // body (setup *and* teardown) at call time, so there's no point at
+            // which to run the `with` body between them. Surface a clear hint
+            // rather than a cryptic missing-`__enter__` AttributeError.
+            if matches!(cm, Value::Iter(_)) {
+                return Err(vm_unsupported_use_compile(
+                    "`@contextmanager` generators as context managers (the VM evaluates \
+                     generators eagerly); run with `tyc build` then `python`",
+                ));
+            }
             // Strict context-manager protocol: __enter__ must exist. The
             // file shim in `ffi.rs` returns the file object itself from
             // __enter__, so a `with open(...) as f:` block binds `f` to
@@ -2680,6 +3099,167 @@ fn values_identical(a: &Value, b: &Value) -> bool {
     }
 }
 
+/// Whether a function body is a generator — i.e. contains a `yield` /
+/// `yield from` reachable without crossing a nested function/lambda boundary.
+fn body_is_generator(body: &[Stmt]) -> bool {
+    body.iter().any(stmt_has_yield)
+}
+
+fn stmt_has_yield(s: &Stmt) -> bool {
+    use ruff_python_ast::Stmt::*;
+    match s {
+        // Nested function / class scopes own their own yields.
+        FunctionDef(_) | ClassDef(_) => false,
+        Expr(e) => expr_has_yield(&e.value),
+        Return(r) => r.value.as_deref().is_some_and(expr_has_yield),
+        Assign(a) => expr_has_yield(&a.value),
+        AugAssign(a) => expr_has_yield(&a.value),
+        AnnAssign(a) => a.value.as_deref().is_some_and(expr_has_yield),
+        If(x) => {
+            expr_has_yield(&x.test)
+                || body_is_generator(&x.body)
+                || x.elif_else_clauses
+                    .iter()
+                    .any(|c| body_is_generator(&c.body))
+        }
+        While(x) => {
+            expr_has_yield(&x.test) || body_is_generator(&x.body) || body_is_generator(&x.orelse)
+        }
+        For(x) => {
+            expr_has_yield(&x.iter) || body_is_generator(&x.body) || body_is_generator(&x.orelse)
+        }
+        With(x) => {
+            x.items.iter().any(|i| expr_has_yield(&i.context_expr)) || body_is_generator(&x.body)
+        }
+        Match(x) => {
+            expr_has_yield(&x.subject) || x.cases.iter().any(|c| body_is_generator(&c.body))
+        }
+        Try(x) => {
+            body_is_generator(&x.body)
+                || x.handlers.iter().any(|h| {
+                    let ruff_python_ast::ExceptHandler::ExceptHandler(h) = h;
+                    body_is_generator(&h.body)
+                })
+                || body_is_generator(&x.orelse)
+                || body_is_generator(&x.finalbody)
+        }
+        _ => false,
+    }
+}
+
+fn expr_has_yield(e: &Expr) -> bool {
+    use ruff_python_ast::Expr::*;
+    match e {
+        Yield(_) | YieldFrom(_) => true,
+        // A lambda is its own scope — its (rare) yields aren't ours.
+        Lambda(_) => false,
+        BoolOp(x) => x.values.iter().any(expr_has_yield),
+        BinOp(x) => expr_has_yield(&x.left) || expr_has_yield(&x.right),
+        UnaryOp(x) => expr_has_yield(&x.operand),
+        Compare(x) => expr_has_yield(&x.left) || x.comparators.iter().any(expr_has_yield),
+        Call(x) => {
+            expr_has_yield(&x.func)
+                || x.arguments.args.iter().any(expr_has_yield)
+                || x.arguments
+                    .keywords
+                    .iter()
+                    .any(|k| expr_has_yield(&k.value))
+        }
+        Tuple(x) => x.elts.iter().any(expr_has_yield),
+        List(x) => x.elts.iter().any(expr_has_yield),
+        Set(x) => x.elts.iter().any(expr_has_yield),
+        Starred(x) => expr_has_yield(&x.value),
+        If(x) => expr_has_yield(&x.test) || expr_has_yield(&x.body) || expr_has_yield(&x.orelse),
+        Named(x) => expr_has_yield(&x.value),
+        Await(x) => expr_has_yield(&x.value),
+        Subscript(x) => expr_has_yield(&x.value) || expr_has_yield(&x.slice),
+        Attribute(x) => expr_has_yield(&x.value),
+        // Comprehensions: only the outermost iterable runs in the enclosing
+        // scope, so a `yield` there belongs to us. (Yields elsewhere in a
+        // comprehension are a SyntaxError, so scanning them is harmless.)
+        ListComp(x) => comprehension_has_yield(&x.generators) || expr_has_yield(&x.elt),
+        SetComp(x) => comprehension_has_yield(&x.generators) || expr_has_yield(&x.elt),
+        Generator(x) => comprehension_has_yield(&x.generators) || expr_has_yield(&x.elt),
+        DictComp(x) => {
+            comprehension_has_yield(&x.generators)
+                || x.key.as_deref().is_some_and(expr_has_yield)
+                || expr_has_yield(&x.value)
+        }
+        FString(x) => fstring_has_yield(x),
+        _ => false,
+    }
+}
+
+fn comprehension_has_yield(generators: &[ast::Comprehension]) -> bool {
+    generators
+        .iter()
+        .any(|g| expr_has_yield(&g.iter) || g.ifs.iter().any(expr_has_yield))
+}
+
+fn fstring_has_yield(f: &ast::ExprFString) -> bool {
+    f.value.iter().any(|part| match part {
+        FStringPart::Literal(_) => false,
+        FStringPart::FString(fs) => fs.elements.iter().any(|el| match el {
+            InterpolatedStringElement::Literal(_) => false,
+            InterpolatedStringElement::Interpolation(interp) => expr_has_yield(&interp.expression),
+        }),
+    })
+}
+
+/// Enforce that `__str__` / `__repr__` returned a `str` (CPython raises
+/// `TypeError` otherwise) and unwrap it.
+fn require_str_return(v: Value, dunder: &str) -> Result<String, Unwind> {
+    match v {
+        Value::Str(s) => Ok((*s).clone()),
+        other => Err(Unwind::Exception(VmException::new(
+            "TypeError",
+            format!(
+                "{} returned non-string (type {})",
+                dunder,
+                other.type_name()
+            ),
+        ))),
+    }
+}
+
+/// The dunder method name a binary operator dispatches to on its left operand.
+fn binop_dunder(op: Operator) -> Option<&'static str> {
+    Some(match op {
+        Operator::Add => "__add__",
+        Operator::Sub => "__sub__",
+        Operator::Mult => "__mul__",
+        Operator::MatMult => "__matmul__",
+        Operator::Div => "__truediv__",
+        Operator::FloorDiv => "__floordiv__",
+        Operator::Mod => "__mod__",
+        Operator::Pow => "__pow__",
+        Operator::LShift => "__lshift__",
+        Operator::RShift => "__rshift__",
+        Operator::BitOr => "__or__",
+        Operator::BitXor => "__xor__",
+        Operator::BitAnd => "__and__",
+    })
+}
+
+/// The reflected dunder dispatched to on the right operand when the left has none.
+fn binop_reflected_dunder(op: Operator) -> Option<&'static str> {
+    Some(match op {
+        Operator::Add => "__radd__",
+        Operator::Sub => "__rsub__",
+        Operator::Mult => "__rmul__",
+        Operator::MatMult => "__rmatmul__",
+        Operator::Div => "__rtruediv__",
+        Operator::FloorDiv => "__rfloordiv__",
+        Operator::Mod => "__rmod__",
+        Operator::Pow => "__rpow__",
+        Operator::LShift => "__rlshift__",
+        Operator::RShift => "__rrshift__",
+        Operator::BitOr => "__ror__",
+        Operator::BitXor => "__rxor__",
+        Operator::BitAnd => "__rand__",
+    })
+}
+
 /// Build a bound `NativeFn` that implements one of the four Result
 /// combinators (`map`, `map_err`, `and_then`, `or_else`) over a captured
 /// receiver. The four follow Rust's `Result` semantics:
@@ -2757,6 +3337,76 @@ fn class_is_subclass(c: &Rc<Class>, target: &Rc<Class>) -> bool {
         return true;
     }
     c.bases.iter().any(|b| class_is_subclass(b, target))
+}
+
+/// Re-format Rust's `{:e}` exponent notation to match CPython's output:
+/// - Exponent always has an explicit sign (`+` or `-`)
+/// - Exponent is zero-padded to at least 2 digits
+/// - If `upper` is true, convert `e` → `E`
+///
+/// Example: `"3.141590e0"` → `"3.141590e+00"`.
+/// (FINDINGS: Rust's `{:.6e}` gives `e0`, CPython gives `e+00`.)
+fn normalise_exp_notation(s: String, upper: bool) -> String {
+    // Find the `e` marker (Rust always uses lowercase in `{:e}`).
+    let e_pos = match s.find('e') {
+        Some(p) => p,
+        None => return s,
+    };
+    let mantissa = &s[..e_pos];
+    let exp_str = &s[e_pos + 1..]; // may be `0`, `-4`, `+4`, `100`, ...
+    let (sign, digits) = if let Some(rest) = exp_str.strip_prefix('-') {
+        ("-", rest)
+    } else if let Some(rest) = exp_str.strip_prefix('+') {
+        ("+", rest)
+    } else {
+        ("+", exp_str)
+    };
+    // Zero-pad to at least 2 digits.
+    let padded = if digits.len() < 2 {
+        format!("{:0>2}", digits)
+    } else {
+        digits.to_owned()
+    };
+    let e_char = if upper { 'E' } else { 'e' };
+    format!("{mantissa}{e_char}{sign}{padded}")
+}
+
+/// CPython-compatible `g`/`G` float formatting.
+///
+/// Rules (PEP 3101 / C printf `%g`):
+/// 1. Use scientific notation when the exponent is < −4 or ≥ precision.
+/// 2. Trailing zeros after the decimal point are removed.
+/// 3. The decimal point is removed if there are no remaining digits after it.
+/// 4. Exponent sign and 2-digit pad follow the same rules as `e`.
+fn format_g(abs: f64, sig: usize, upper: bool) -> String {
+    // Format in scientific notation to determine the exponent.
+    let sci = format!("{:.*e}", sig.saturating_sub(1), abs);
+    // Parse out the exponent.
+    let exp: i32 = if let Some(pos) = sci.find('e') {
+        sci[pos + 1..].parse().unwrap_or(0)
+    } else {
+        0
+    };
+    let result = if exp < -4 || exp >= sig as i32 {
+        // Scientific notation path.
+        let raw = normalise_exp_notation(sci, upper);
+        // Strip trailing zeros from mantissa part before `e`.
+        let e_pos = raw.find(if upper { 'E' } else { 'e' }).unwrap_or(raw.len());
+        let mantissa = raw[..e_pos].trim_end_matches('0').trim_end_matches('.');
+        format!("{}{}", mantissa, &raw[e_pos..])
+    } else {
+        // Fixed notation: format with enough decimal places, then strip zeros.
+        let decimal_places = (sig as i32 - 1 - exp).max(0) as usize;
+        let fixed = format!("{:.*}", decimal_places, abs);
+        // Strip trailing zeros after decimal point.
+        if fixed.contains('.') {
+            let stripped = fixed.trim_end_matches('0').trim_end_matches('.');
+            stripped.to_owned()
+        } else {
+            fixed
+        }
+    };
+    result
 }
 
 fn format_with_spec(value: &Value, default: &str, spec: &str) -> Result<String, Unwind> {
@@ -2866,15 +3516,32 @@ fn format_with_spec(value: &Value, default: &str, spec: &str) -> Result<String, 
         Value::Float(x) => {
             let p = precision.unwrap_or(6);
             let (abs, neg) = (x.abs(), *x < 0.0 || x.is_sign_negative());
-            let raw: String = match typ {
-                Some('e') => format!("{:.*e}", p, abs),
-                Some('E') => format!("{:.*E}", p, abs),
-                Some('g') | Some('G') => {
-                    // Python's `g` uses precision as significant digits.
-                    let sig = if p == 0 { 1 } else { p };
-                    format!("{:.*e}", sig.saturating_sub(1), abs)
+            // CPython formats NaN and inf with lowercase letters regardless of
+            // type specifier (even `E` gives `nan`/`inf`). Rust emits `NaN`
+            // which differs. Handle them specially before the general branch.
+            let raw: String = if x.is_nan() {
+                "nan".to_owned()
+            } else if x.is_infinite() {
+                "inf".to_owned()
+            } else {
+                match typ {
+                    Some('e') => {
+                        // Rust's {:e} produces e.g. `3.141590e0`; CPython requires
+                        // at least 2 exponent digits with an explicit sign: `3.141590e+00`.
+                        normalise_exp_notation(format!("{:.*e}", p, abs), false)
+                    }
+                    Some('E') => normalise_exp_notation(format!("{:.*e}", p, abs), true),
+                    Some('g') | Some('G') => {
+                        // Python's `g` uses precision as significant digits.
+                        // After computing the exponential form we apply CPython's
+                        // `g` rules: strip trailing zeros in the mantissa, then
+                        // decide whether to render as fixed or scientific notation.
+                        let sig = if p == 0 { 1 } else { p };
+                        let upper = matches!(typ, Some('G'));
+                        format_g(abs, sig, upper)
+                    }
+                    _ => format!("{:.*}", p, abs),
                 }
-                _ => format!("{:.*}", p, abs),
             };
             buf = if comma || underscore {
                 let sep = if comma { ',' } else { '_' };
@@ -2882,7 +3549,7 @@ fn format_with_spec(value: &Value, default: &str, spec: &str) -> Result<String, 
             } else {
                 raw
             };
-            if neg {
+            if neg && !x.is_nan() {
                 explicit_sign.push('-');
             } else if let Some('+') = sign {
                 explicit_sign.push('+');
@@ -2978,6 +3645,16 @@ fn format_with_spec(value: &Value, default: &str, spec: &str) -> Result<String, 
         }
     }
     Ok(format!("{explicit_sign}{prefix}{buf}"))
+}
+
+/// Public wrapper so `builtins.rs` can call the format-spec engine for
+/// `str.format()` without needing to re-implement or duplicate the logic.
+pub fn format_with_spec_pub(
+    value: &crate::value::Value,
+    default: &str,
+    spec: &str,
+) -> Result<String, crate::error::Unwind> {
+    format_with_spec(value, default, spec)
 }
 
 /// Separator-group every third digit of a non-negative `BigInt`. Caller
@@ -3189,19 +3866,25 @@ result = f(xs)
     /// the error message must point users at the `tyc build && python`
     /// workaround.
     #[test]
-    fn yield_error_mentions_tyc_build_fallback() {
+    fn generator_eager_collection_runs() {
+        // Generators are materialised eagerly: iterating one yields its values,
+        // including `yield from`.
         let src = r#"
 def gen():
-    yield 1
-gen()
+    for i in range(3):
+        yield i * i
+
+def flat():
+    yield from [1, 2]
+    yield 3
+
+squares = list(gen())
+flattened = list(flat())
 "#;
-        let (_interp, res) = parse_and_run(src);
-        let err = res.expect_err("yield should error");
-        let msg = format!("{:?}", err);
-        assert!(
-            msg.contains("tyc build") && msg.contains("python"),
-            "yield error should mention `tyc build` + `python` fallback, got: {msg}"
-        );
+        let (interp, res) = parse_and_run(src);
+        res.expect("generator should run");
+        assert_eq!(interp.root.get("squares").unwrap().py_str(), "[0, 1, 4]");
+        assert_eq!(interp.root.get("flattened").unwrap().py_str(), "[1, 2, 3]");
     }
 
     #[test]

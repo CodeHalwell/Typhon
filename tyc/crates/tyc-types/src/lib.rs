@@ -7020,9 +7020,28 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
             let _ = infer_expr(c, &e.value);
         }
         Stmt::AugAssign(a) => {
-            let _ = infer_expr(c, &a.target);
-            let _ = infer_expr(c, &a.value);
+            let l = infer_expr(c, &a.target);
+            let r = infer_expr(c, &a.value);
             check_attr_assign_not_frozen(c, &a.target);
+            // Operator-compatibility check, mirroring `Expr::BinOp`. Restricted
+            // to scalar targets (int/float/bool/str/bytes) where `x op= y` has
+            // the same operand rules as `x = x op y`; mutable containers have
+            // looser in-place semantics (`list += any_iterable`) so we stay
+            // permissive there to avoid false positives.
+            let l_stripped = l.strip_none();
+            let r_stripped = r.strip_none();
+            let scalar_target = matches!(
+                l_stripped,
+                Type::Int | Type::Float | Type::Bool | Type::Str | Type::Bytes
+            );
+            if scalar_target {
+                if let Some(op_str) = arithmetic_op_str(a.op) {
+                    if !operator_operands_compatible(a.op, &l_stripped, &r_stripped) {
+                        let span = (a.range.start().to_usize(), a.range.end().to_usize());
+                        c.operator_type_mismatch(op_str, &l_stripped, &r_stripped, span);
+                    }
+                }
+            }
         }
         Stmt::With(w) => {
             for item in &w.items {
@@ -8581,6 +8600,75 @@ fn cases_cover_type(c: &Checker, cases: &[MatchCase], ty: &Type) -> bool {
     if let Type::Union(variants) = ty {
         return variants.iter().all(|v| cases_cover_type(c, cases, v));
     }
+    // Fixed-arity tuple subject (`tuple[int, str]` → `Generic("tuple", [..])`).
+    // Its length is statically known, so a guardless sequence pattern of the
+    // same arity with all-irrefutable (capture / `_`) elements — e.g.
+    // `case (x, y):` against `tuple[int, int]` — covers every inhabitant.
+    // (Variadic `tuple[int, ...]` is `Generic("tuple_variadic", _)` and is
+    // intentionally excluded — its length is not fixed.)
+    if let Type::Generic(head, elems) = ty {
+        if head == "tuple" {
+            let arity = elems.len();
+            for case in cases {
+                if case.guard.is_some() {
+                    continue;
+                }
+                if is_wildcard_pattern(&case.pattern) {
+                    return true;
+                }
+                if let Pattern::MatchSequence(seq) = &case.pattern {
+                    let has_star = seq
+                        .patterns
+                        .iter()
+                        .any(|p| matches!(p, Pattern::MatchStar(_)));
+                    if !has_star
+                        && seq.patterns.len() == arity
+                        && seq.patterns.iter().all(is_capture_or_underscore)
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    // `bool` has exactly two inhabitants: matching both `True` and `False`
+    // (or any guardless wildcard) is exhaustive.
+    if matches!(ty, Type::Bool) {
+        let mut saw_true = false;
+        let mut saw_false = false;
+        for case in cases {
+            if case.guard.is_some() {
+                continue;
+            }
+            if is_wildcard_pattern(&case.pattern) {
+                return true;
+            }
+            match pattern_bool_value(&case.pattern) {
+                Some(true) => saw_true = true,
+                Some(false) => saw_false = true,
+                None => {}
+            }
+        }
+        return saw_true && saw_false;
+    }
+    // A string-literal singleton type (`LitStr("red")`, a member of a
+    // `type Color = "red" | "green"` union) is covered by a guardless
+    // `case "red":` or any wildcard. Union recursion above hands us one
+    // variant at a time.
+    if let Type::LitStr(want) = ty {
+        for case in cases {
+            if case.guard.is_some() {
+                continue;
+            }
+            if is_wildcard_pattern(&case.pattern) {
+                return true;
+            }
+            if pattern_str_value(&case.pattern).as_deref() == Some(want.as_str()) {
+                return true;
+            }
+        }
+        return false;
+    }
     let class_name = match ty {
         Type::Class(n) => n.clone(),
         Type::Generic(head, _) => {
@@ -8840,6 +8928,35 @@ fn is_capture_or_underscore(pattern: &Pattern) -> bool {
             Some(inner) => is_capture_or_underscore(inner),
         },
         _ => false,
+    }
+}
+
+/// The boolean a `case True:` / `case False:` pattern matches, if any.
+fn pattern_bool_value(pattern: &Pattern) -> Option<bool> {
+    match pattern {
+        Pattern::MatchSingleton(s) => match s.value {
+            ruff_python_ast::Singleton::True => Some(true),
+            ruff_python_ast::Singleton::False => Some(false),
+            ruff_python_ast::Singleton::None => None,
+        },
+        Pattern::MatchValue(v) => match v.value.as_ref() {
+            Expr::BooleanLiteral(b) => Some(b.value),
+            _ => None,
+        },
+        Pattern::MatchAs(a) => a.pattern.as_ref().and_then(|p| pattern_bool_value(p)),
+        _ => None,
+    }
+}
+
+/// The string a `case "literal":` pattern matches, if any.
+fn pattern_str_value(pattern: &Pattern) -> Option<String> {
+    match pattern {
+        Pattern::MatchValue(v) => match v.value.as_ref() {
+            Expr::StringLiteral(s) => Some(s.value.to_str().to_owned()),
+            _ => None,
+        },
+        Pattern::MatchAs(a) => a.pattern.as_ref().and_then(|p| pattern_str_value(p)),
+        _ => None,
     }
 }
 
@@ -13403,6 +13520,160 @@ impl Foo:
             "non-exhaustive match on `self.<field>` must still fire missing_return: {:?}",
             d.errors()
         );
+    }
+
+    #[test]
+    fn irrefutable_tuple_pattern_is_exhaustive() {
+        // A guardless `case (x, y):` against a fixed-arity `tuple[int, int]`
+        // is irrefutable, so a match ending in it must NOT fire missing_return.
+        let src = "\
+def f(p: tuple[int, int]) -> str:
+    match p:
+        case (0, 0):
+            return \"origin\"
+        case (x, y):
+            return f\"{x},{y}\"
+";
+        let d = check(src);
+        assert!(
+            !d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::MissingReturn { .. })),
+            "irrefutable tuple pattern must be exhaustive: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn non_exhaustive_tuple_match_still_fires() {
+        // Without an irrefutable arm, a tuple match is NOT exhaustive — and a
+        // fixed-length pattern over a variable-length list never is.
+        for src in [
+            "\
+def f(p: tuple[int, int]) -> str:
+    match p:
+        case (0, 0):
+            return \"o\"
+",
+            "\
+def f(p: list[int]) -> int:
+    match p:
+        case [a, b]:
+            return a + b
+",
+            "\
+def f(p: tuple[int, int, int]) -> str:
+    match p:
+        case (x, y):
+            return \"no\"
+",
+        ] {
+            let d = check(src);
+            assert!(
+                d.errors()
+                    .iter()
+                    .any(|e| matches!(e, TycError::MissingReturn { .. })),
+                "non-exhaustive tuple/list match must fire missing_return: {:?}",
+                d.errors()
+            );
+        }
+    }
+
+    #[test]
+    fn bool_and_str_literal_matches_are_exhaustive() {
+        // `match b: case True / case False` and a str-literal union matched on
+        // every member are exhaustive — must not fire missing_return.
+        for src in [
+            "\
+def f(b: bool) -> str:
+    match b:
+        case True:
+            return \"t\"
+        case False:
+            return \"f\"
+",
+            "\
+type Color = \"red\" | \"green\"
+
+def f(c: Color) -> int:
+    match c:
+        case \"red\":
+            return 1
+        case \"green\":
+            return 2
+",
+        ] {
+            let d = check(src);
+            assert!(
+                !d.errors()
+                    .iter()
+                    .any(|e| matches!(e, TycError::MissingReturn { .. })),
+                "bool/str-literal exhaustive match must not fire missing_return: {:?}",
+                d.errors()
+            );
+        }
+    }
+
+    #[test]
+    fn incomplete_bool_and_str_literal_matches_fire() {
+        for src in [
+            "\
+def f(b: bool) -> str:
+    match b:
+        case True:
+            return \"t\"
+",
+            "\
+type Color = \"red\" | \"green\"
+
+def f(c: Color) -> int:
+    match c:
+        case \"red\":
+            return 1
+",
+        ] {
+            let d = check(src);
+            assert!(
+                d.errors()
+                    .iter()
+                    .any(|e| matches!(e, TycError::MissingReturn { .. })),
+                "incomplete bool/str-literal match must fire missing_return: {:?}",
+                d.errors()
+            );
+        }
+    }
+
+    #[test]
+    fn augmented_assign_checks_scalar_operands() {
+        // `s += 5` (str += int) must fire operator_type_mismatch, matching the
+        // `s = s + 5` form — but container `+=` stays permissive.
+        for bad in [
+            "def f() -> None:\n    mut s: str = \"x\"\n    s += 5\n",
+            "def f() -> None:\n    mut n: int = 0\n    n += \"x\"\n",
+        ] {
+            let d = check(bad);
+            assert!(
+                d.errors()
+                    .iter()
+                    .any(|e| matches!(e, TycError::OperatorTypeMismatch { .. })),
+                "scalar augmented assign mismatch must fire: {:?}",
+                d.errors()
+            );
+        }
+        for ok in [
+            "def f() -> None:\n    mut n: int = 0\n    n += 1\n",
+            "def f() -> None:\n    mut xs: list[int] = [1]\n    xs += [2]\n",
+            "def f() -> None:\n    mut xs: list[int] = [1]\n    xs += (2, 3)\n",
+        ] {
+            let d = check(ok);
+            assert!(
+                !d.errors()
+                    .iter()
+                    .any(|e| matches!(e, TycError::OperatorTypeMismatch { .. })),
+                "valid augmented assign must not fire: {:?}",
+                d.errors()
+            );
+        }
     }
 
     #[test]

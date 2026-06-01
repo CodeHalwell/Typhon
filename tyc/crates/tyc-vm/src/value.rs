@@ -269,6 +269,12 @@ pub struct Class {
     /// Base classes in MRO order (after head). For v1 we only walk the chain
     /// for method lookup; we don't compute C3 linearisation.
     pub bases: Vec<Rc<Class>>,
+    /// Method names decorated with `@property` — accessed without `()` and
+    /// invoked lazily on attribute read.
+    pub properties: RefCell<std::collections::HashSet<String>>,
+    /// Method names decorated with `@classmethod` — the receiver is bound to
+    /// the class object (`cls`) rather than the instance.
+    pub classmethods: RefCell<std::collections::HashSet<String>>,
 }
 
 #[derive(Clone)]
@@ -550,6 +556,16 @@ impl Value {
             }
             (ResultOk(a), ResultOk(b)) => a.py_eq(b),
             (ResultErr(a), ResultErr(b)) => a.py_eq(b),
+            // Type objects (from `type(x)`) compare by identity. Builtin type
+            // objects are cached singletons and user classes are single `Rc`s,
+            // so `type(a) == type(b)` and `type(inst) == SomeClass` both hold
+            // without name matching (which would wrongly equate same-named
+            // classes from different modules).
+            (Class(a), Class(b)) => Rc::ptr_eq(a, b),
+            // `type(5) == int`: the RHS `int` is the builtin constructor
+            // (a native named "int"); match it against the type object's name.
+            (Class(c), Native(n)) | (Native(n), Class(c)) => c.name == n.name,
+            (Native(a), Native(b)) => Rc::ptr_eq(a, b),
             _ => false,
         }
     }

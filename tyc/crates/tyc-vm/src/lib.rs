@@ -437,4 +437,432 @@ print(list(accumulate([1, 2, 3, 4])))
 "#;
         assert_eq!(run_capturing(src).unwrap(), 0);
     }
+
+    #[test]
+    fn lazy_iterator_adapters_do_not_panic() {
+        // Regression: enumerate / zip / map / filter previously panicked with
+        // "RefCell already borrowed" the moment they were iterated.
+        let src = r#"
+for i, v in enumerate(["a", "b"]):
+    print(i, v)
+for a, b in zip([1, 2], ["x", "y"]):
+    print(a, b)
+print(list(map(lambda x: x * 2, [1, 2, 3])))
+print(list(filter(lambda x: x > 1, [1, 2, 3])))
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    #[test]
+    fn review_fixes_builtin_semantics() {
+        // Batch of PR-review correctness fixes: int(str, 0) radix autodetect,
+        // ZeroDivisionError from divmod, frozenset ops staying frozen,
+        // integer-domain math rejecting floats, and str.format honouring __str__.
+        let src = r#"
+import math
+
+class P:
+    n: int
+
+impl P:
+    def __str__(self) -> str:
+        return f"P{self.n}"
+
+def main() -> None:
+    if int("0xff", 0) != 255 or int("0b101", 0) != 5 or int("42", 0) != 42:
+        raise ValueError("int base 0 autodetect broken")
+    try:
+        let _ = divmod(5, 0)
+        raise ValueError("divmod by zero should raise")
+    except ZeroDivisionError:
+        pass
+    let f: frozenset = frozenset([1, 2])
+    let u: frozenset = f.union([3])
+    try:
+        u.add(9)
+        raise ValueError("frozenset union result must stay frozen")
+    except AttributeError:
+        pass
+    try:
+        let _x: int = math.factorial(5.9)
+        raise ValueError("factorial must reject floats")
+    except TypeError:
+        pass
+    if "{}".format(P(n=7)) != "P7":
+        raise ValueError("str.format must honour __str__")
+main()
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    #[test]
+    fn review_fixes_dunder_and_descriptors() {
+        // __str__ returning a non-str raises TypeError; a subclass overriding a
+        // base @property with a plain method is treated as a method.
+        let src = r#"
+class Bad:
+    n: int
+
+impl Bad:
+    def __str__(self) -> int:
+        return self.n
+
+class Base:
+    v: int
+
+impl Base:
+    @property
+    def x(self) -> int:
+        return self.v
+
+class Child(Base):
+    v: int
+
+impl Child:
+    def x(self) -> int:
+        return self.v + 100
+
+def main() -> None:
+    try:
+        let _ = str(Bad(n=5))
+        raise ValueError("__str__ returning non-str must raise")
+    except TypeError:
+        pass
+    let c: Child = Child(v=1)
+    if c.x() != 101:
+        raise ValueError("overridden property must be a method")
+main()
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    #[test]
+    fn pydantic_model_validate_and_dump() {
+        // Flat `model` classes round-trip through model_validate / model_dump.
+        let src = r#"
+model User:
+    id: int
+    name: str
+    active: bool
+
+def main() -> None:
+    let data: dict[str, object] = {"id": 1, "name": "Ada", "active": True}
+    let u: User = User.model_validate(data)
+    if u.id != 1 or u.name != "Ada" or not u.active:
+        raise ValueError("model_validate fields wrong")
+    let d: dict[str, object] = u.model_dump()
+    if d["name"] != "Ada":
+        raise ValueError("model_dump wrong")
+    if u.model_dump_json() != "{\"id\": 1, \"name\": \"Ada\", \"active\": true}":
+        raise ValueError("model_dump_json wrong: " + u.model_dump_json())
+main()
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    #[test]
+    fn generators_run_eagerly() {
+        // `yield` / `yield from` generators iterate correctly under the VM's
+        // eager-collection model.
+        let src = r#"
+from typing import Iterator
+
+def squares(n: int) -> Iterator[int]:
+    for i in range(n):
+        yield i * i
+
+def flatten(rows: list[list[int]]) -> Iterator[int]:
+    for row in rows:
+        yield from row
+
+def main() -> None:
+    if list(squares(4)) != [0, 1, 4, 9]:
+        raise ValueError("squares generator wrong")
+    if sum(squares(4)) != 14:
+        raise ValueError("sum over generator wrong")
+    if list(flatten([[1, 2], [3]])) != [1, 2, 3]:
+        raise ValueError("yield from wrong")
+main()
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    #[test]
+    fn type_object_model() {
+        // type(x) is a real type object: .__name__, str(), and == all work
+        // for both builtins and user classes.
+        let src = r#"
+class Foo:
+    x: int
+
+def main() -> None:
+    if type(5).__name__ != "int":
+        raise ValueError("builtin __name__ wrong")
+    if type([1]).__name__ != "list":
+        raise ValueError("list __name__ wrong")
+    if not (type(5) == int):
+        raise ValueError("type(5) == int failed")
+    if type(5) == str:
+        raise ValueError("type(5) == str should be False")
+    if str(type(5)) != "<class 'int'>":
+        raise ValueError("str(type) wrong")
+    let f: Foo = Foo(x=1)
+    if type(f).__name__ != "Foo":
+        raise ValueError("user class __name__ wrong")
+    if not (type(f) == Foo):
+        raise ValueError("type(inst) == Class failed")
+    if type(5) != type(6):
+        raise ValueError("type(5) == type(6) failed")
+main()
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    #[test]
+    fn str_strip_honours_chars_argument() {
+        let src = r#"
+def main() -> None:
+    let a: str = "...hi...".strip(".")
+    if a != "hi":
+        raise ValueError("strip(chars) ignored its argument")
+    let b: str = "42".zfill(5)
+    if b != "00042":
+        raise ValueError("zfill broken")
+main()
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    #[test]
+    fn dunder_methods_dispatch() {
+        // Regression: __str__ / __eq__ / __add__ were silently ignored.
+        let src = r#"
+class V:
+    n: int
+
+impl V:
+    def __str__(self) -> str:
+        return f"V({self.n})"
+    def __eq__(self, o: object) -> bool:
+        match o:
+            case V(x): return self.n == x
+            case _: return False
+    def __add__(self, o: V) -> V:
+        return V(n=self.n + o.n)
+
+def main() -> None:
+    let a: V = V(n=2)
+    let b: V = V(n=3)
+    if str(a) != "V(2)":
+        raise ValueError("__str__ ignored")
+    if not (a == V(n=2)):
+        raise ValueError("__eq__ ignored")
+    if (a + b).n != 5:
+        raise ValueError("__add__ ignored")
+    if a not in [V(n=2), b]:
+        raise ValueError("in-operator ignored __eq__")
+main()
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    #[test]
+    fn property_classmethod_staticmethod() {
+        let src = r#"
+class C:
+    r: float
+
+impl C:
+    @property
+    def area(self) -> float:
+        return 3.14 * self.r * self.r
+    @staticmethod
+    def unit() -> C:
+        return C(r=1.0)
+    @classmethod
+    def of(cls, r: float) -> C:
+        return C(r=r)
+
+def main() -> None:
+    let c: C = C.of(2.0)
+    if c.area < 12.0:
+        raise ValueError("property not invoked")
+    if C.unit().r != 1.0:
+        raise ValueError("staticmethod broken")
+main()
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    #[test]
+    fn numeric_builtins_pow_divmod_intbase() {
+        let src = r#"
+def main() -> None:
+    let q: tuple[int, int] = divmod(17, 5)
+    if q[0] != 3 or q[1] != 2:
+        raise ValueError("divmod broken")
+    if pow(2, 10, 100) != 24:
+        raise ValueError("modular pow broken")
+    if int("ff", 16) != 255:
+        raise ValueError("int(str, base) broken")
+main()
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    #[test]
+    fn unbound_builtin_method_via_pipe() {
+        // Regression: `x |> str.lower()` lowers to `str.lower(x)`, which
+        // requires unbound builtin-type method access to work.
+        let src = r#"
+def norm(raw: str) -> str:
+    return raw |> str.strip() |> str.lower() |> str.replace(",", "")
+
+def main() -> None:
+    if norm("  A,B  ") != "ab":
+        raise ValueError("unbound str method / pipe broken")
+main()
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    // ── Regression tests for VM stdlib/builtin gaps (N16 gap-fill) ────────
+
+    #[test]
+    fn math_integer_domain_functions() {
+        // gap 1: gcd, lcm, factorial, isqrt, comb, perm must return correct ints.
+        let src = r#"
+import math
+if math.gcd(12, 18) != 6:
+    raise ValueError("gcd wrong")
+if math.lcm(4, 6) != 12:
+    raise ValueError("lcm wrong")
+if math.factorial(5) != 120:
+    raise ValueError("factorial wrong")
+if math.isqrt(17) != 4:
+    raise ValueError("isqrt wrong")
+if math.comb(5, 2) != 10:
+    raise ValueError("comb wrong")
+if math.perm(5, 2) != 20:
+    raise ValueError("perm wrong")
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    #[test]
+    fn math_float_functions_and_constants() {
+        // gap 1: tau, trunc, copysign, hypot, degrees, radians, expm1, log1p, atan2.
+        let src = r#"
+import math
+if abs(math.tau - 6.283185307179586) > 1e-10:
+    raise ValueError("tau wrong")
+if math.trunc(3.7) != 3:
+    raise ValueError("trunc wrong")
+if math.copysign(3.0, -1.0) != -3.0:
+    raise ValueError("copysign wrong")
+if abs(math.hypot(3.0, 4.0) - 5.0) > 1e-10:
+    raise ValueError("hypot wrong")
+if abs(math.degrees(math.pi) - 180.0) > 1e-10:
+    raise ValueError("degrees wrong")
+if abs(math.radians(180.0) - math.pi) > 1e-10:
+    raise ValueError("radians wrong")
+if abs(math.expm1(1.0) - 1.718281828459045) > 1e-10:
+    raise ValueError("expm1 wrong")
+if abs(math.log1p(1.0) - 0.6931471805599453) > 1e-10:
+    raise ValueError("log1p wrong")
+if abs(math.atan2(1.0, 1.0) - 0.7853981633974483) > 1e-10:
+    raise ValueError("atan2 wrong")
+if abs(math.fmod(10.0, 3.0) - 1.0) > 1e-10:
+    raise ValueError("fmod wrong")
+if abs(math.dist([0,0],[3,4]) - 5.0) > 1e-10:
+    raise ValueError("dist wrong")
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    #[test]
+    fn counter_most_common_and_elements() {
+        // gap 2: Counter.most_common() and Counter.elements() must work.
+        let src = r#"
+from collections import Counter
+c = Counter(["a", "b", "a", "c", "a", "b"])
+mc = c.most_common(2)
+if len(mc) != 2:
+    raise ValueError("most_common(2) length wrong")
+if mc[0][0] != "a" or mc[0][1] != 3:
+    raise ValueError("most_common top entry wrong")
+if mc[1][0] != "b" or mc[1][1] != 2:
+    raise ValueError("most_common second entry wrong")
+elems = c.elements()
+if len(elems) != 6:
+    raise ValueError("elements() total count wrong")
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    #[test]
+    fn str_format_positional_and_spec() {
+        // gap 3: str.format() with positional args and format specs.
+        let src = r#"
+r1 = "{0}-{1}-{0}".format("a", "b")
+if r1 != "a-b-a":
+    raise ValueError("positional format wrong: " + r1)
+r2 = "{}-{}".format(1, 2)
+if r2 != "1-2":
+    raise ValueError("auto-index format wrong: " + r2)
+r3 = "{:.2f}".format(3.14159)
+if r3 != "3.14":
+    raise ValueError("float spec wrong: " + r3)
+r4 = "{:05d}".format(42)
+if r4 != "00042":
+    raise ValueError("int spec wrong: " + r4)
+r5 = "{{literal}}".format()
+if r5 != "{literal}":
+    raise ValueError("escaped braces wrong: " + r5)
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    #[test]
+    fn str_format_named_kwargs() {
+        // gap 3: str.format() with keyword arguments.
+        let src = r#"
+r = "{name} says {greeting}".format(name="Alice", greeting="hello")
+if r != "Alice says hello":
+    raise ValueError("named format wrong: " + r)
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    #[test]
+    fn fstring_exponent_notation_matches_cpython() {
+        // gap 4: f"{x:e}" must produce CPython-style `e+NN` not Rust `eN`.
+        let src = r#"
+r1 = f"{3.14159:e}"
+if r1 != "3.141590e+00":
+    raise ValueError("e format wrong: " + r1)
+r2 = f"{12345.678:.2e}"
+if r2 != "1.23e+04":
+    raise ValueError("e with precision wrong: " + r2)
+r3 = f"{0.0001:e}"
+if r3 != "1.000000e-04":
+    raise ValueError("negative exp wrong: " + r3)
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    #[test]
+    fn frozenset_repr_matches_cpython() {
+        // gap 5: repr(frozenset([...])) must be "frozenset({...})" not "{...}".
+        let src = r#"
+r = repr(frozenset())
+if r != "frozenset()":
+    raise ValueError("empty frozenset repr wrong: " + r)
+fs = frozenset([1])
+r2 = repr(fs)
+if not r2.startswith("frozenset("):
+    raise ValueError("frozenset repr wrong: " + r2)
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
 }
