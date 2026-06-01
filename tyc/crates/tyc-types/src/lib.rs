@@ -8612,6 +8612,44 @@ fn cases_cover_type(c: &Checker, cases: &[MatchCase], ty: &Type) -> bool {
             }
         }
     }
+    // `bool` has exactly two inhabitants: matching both `True` and `False`
+    // (or any guardless wildcard) is exhaustive.
+    if matches!(ty, Type::Bool) {
+        let mut saw_true = false;
+        let mut saw_false = false;
+        for case in cases {
+            if case.guard.is_some() {
+                continue;
+            }
+            if is_wildcard_pattern(&case.pattern) {
+                return true;
+            }
+            match pattern_bool_value(&case.pattern) {
+                Some(true) => saw_true = true,
+                Some(false) => saw_false = true,
+                None => {}
+            }
+        }
+        return saw_true && saw_false;
+    }
+    // A string-literal singleton type (`LitStr("red")`, a member of a
+    // `type Color = "red" | "green"` union) is covered by a guardless
+    // `case "red":` or any wildcard. Union recursion above hands us one
+    // variant at a time.
+    if let Type::LitStr(want) = ty {
+        for case in cases {
+            if case.guard.is_some() {
+                continue;
+            }
+            if is_wildcard_pattern(&case.pattern) {
+                return true;
+            }
+            if pattern_str_value(&case.pattern).as_deref() == Some(want.as_str()) {
+                return true;
+            }
+        }
+        return false;
+    }
     let class_name = match ty {
         Type::Class(n) => n.clone(),
         Type::Generic(head, _) => {
@@ -8871,6 +8909,35 @@ fn is_capture_or_underscore(pattern: &Pattern) -> bool {
             Some(inner) => is_capture_or_underscore(inner),
         },
         _ => false,
+    }
+}
+
+/// The boolean a `case True:` / `case False:` pattern matches, if any.
+fn pattern_bool_value(pattern: &Pattern) -> Option<bool> {
+    match pattern {
+        Pattern::MatchSingleton(s) => match s.value {
+            ruff_python_ast::Singleton::True => Some(true),
+            ruff_python_ast::Singleton::False => Some(false),
+            ruff_python_ast::Singleton::None => None,
+        },
+        Pattern::MatchValue(v) => match v.value.as_ref() {
+            Expr::BooleanLiteral(b) => Some(b.value),
+            _ => None,
+        },
+        Pattern::MatchAs(a) => a.pattern.as_ref().and_then(|p| pattern_bool_value(p)),
+        _ => None,
+    }
+}
+
+/// The string a `case "literal":` pattern matches, if any.
+fn pattern_str_value(pattern: &Pattern) -> Option<String> {
+    match pattern {
+        Pattern::MatchValue(v) => match v.value.as_ref() {
+            Expr::StringLiteral(s) => Some(s.value.to_str().to_owned()),
+            _ => None,
+        },
+        Pattern::MatchAs(a) => a.pattern.as_ref().and_then(|p| pattern_str_value(p)),
+        _ => None,
     }
 }
 
@@ -13488,6 +13555,70 @@ def f(p: tuple[int, int, int]) -> str:
                     .iter()
                     .any(|e| matches!(e, TycError::MissingReturn { .. })),
                 "non-exhaustive tuple/list match must fire missing_return: {:?}",
+                d.errors()
+            );
+        }
+    }
+
+    #[test]
+    fn bool_and_str_literal_matches_are_exhaustive() {
+        // `match b: case True / case False` and a str-literal union matched on
+        // every member are exhaustive — must not fire missing_return.
+        for src in [
+            "\
+def f(b: bool) -> str:
+    match b:
+        case True:
+            return \"t\"
+        case False:
+            return \"f\"
+",
+            "\
+type Color = \"red\" | \"green\"
+
+def f(c: Color) -> int:
+    match c:
+        case \"red\":
+            return 1
+        case \"green\":
+            return 2
+",
+        ] {
+            let d = check(src);
+            assert!(
+                !d.errors()
+                    .iter()
+                    .any(|e| matches!(e, TycError::MissingReturn { .. })),
+                "bool/str-literal exhaustive match must not fire missing_return: {:?}",
+                d.errors()
+            );
+        }
+    }
+
+    #[test]
+    fn incomplete_bool_and_str_literal_matches_fire() {
+        for src in [
+            "\
+def f(b: bool) -> str:
+    match b:
+        case True:
+            return \"t\"
+",
+            "\
+type Color = \"red\" | \"green\"
+
+def f(c: Color) -> int:
+    match c:
+        case \"red\":
+            return 1
+",
+        ] {
+            let d = check(src);
+            assert!(
+                d.errors()
+                    .iter()
+                    .any(|e| matches!(e, TycError::MissingReturn { .. })),
+                "incomplete bool/str-literal match must fire missing_return: {:?}",
                 d.errors()
             );
         }
