@@ -8581,6 +8581,37 @@ fn cases_cover_type(c: &Checker, cases: &[MatchCase], ty: &Type) -> bool {
     if let Type::Union(variants) = ty {
         return variants.iter().all(|v| cases_cover_type(c, cases, v));
     }
+    // Fixed-arity tuple subject (`tuple[int, str]` → `Generic("tuple", [..])`).
+    // Its length is statically known, so a guardless sequence pattern of the
+    // same arity with all-irrefutable (capture / `_`) elements — e.g.
+    // `case (x, y):` against `tuple[int, int]` — covers every inhabitant.
+    // (Variadic `tuple[int, ...]` is `Generic("tuple_variadic", _)` and is
+    // intentionally excluded — its length is not fixed.)
+    if let Type::Generic(head, elems) = ty {
+        if head == "tuple" {
+            let arity = elems.len();
+            for case in cases {
+                if case.guard.is_some() {
+                    continue;
+                }
+                if is_wildcard_pattern(&case.pattern) {
+                    return true;
+                }
+                if let Pattern::MatchSequence(seq) = &case.pattern {
+                    let has_star = seq
+                        .patterns
+                        .iter()
+                        .any(|p| matches!(p, Pattern::MatchStar(_)));
+                    if !has_star
+                        && seq.patterns.len() == arity
+                        && seq.patterns.iter().all(is_capture_or_underscore)
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
     let class_name = match ty {
         Type::Class(n) => n.clone(),
         Type::Generic(head, _) => {
@@ -13403,6 +13434,63 @@ impl Foo:
             "non-exhaustive match on `self.<field>` must still fire missing_return: {:?}",
             d.errors()
         );
+    }
+
+    #[test]
+    fn irrefutable_tuple_pattern_is_exhaustive() {
+        // A guardless `case (x, y):` against a fixed-arity `tuple[int, int]`
+        // is irrefutable, so a match ending in it must NOT fire missing_return.
+        let src = "\
+def f(p: tuple[int, int]) -> str:
+    match p:
+        case (0, 0):
+            return \"origin\"
+        case (x, y):
+            return f\"{x},{y}\"
+";
+        let d = check(src);
+        assert!(
+            !d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::MissingReturn { .. })),
+            "irrefutable tuple pattern must be exhaustive: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn non_exhaustive_tuple_match_still_fires() {
+        // Without an irrefutable arm, a tuple match is NOT exhaustive — and a
+        // fixed-length pattern over a variable-length list never is.
+        for src in [
+            "\
+def f(p: tuple[int, int]) -> str:
+    match p:
+        case (0, 0):
+            return \"o\"
+",
+            "\
+def f(p: list[int]) -> int:
+    match p:
+        case [a, b]:
+            return a + b
+",
+            "\
+def f(p: tuple[int, int, int]) -> str:
+    match p:
+        case (x, y):
+            return \"no\"
+",
+        ] {
+            let d = check(src);
+            assert!(
+                d.errors()
+                    .iter()
+                    .any(|e| matches!(e, TycError::MissingReturn { .. })),
+                "non-exhaustive tuple/list match must fire missing_return: {:?}",
+                d.errors()
+            );
+        }
     }
 
     #[test]
