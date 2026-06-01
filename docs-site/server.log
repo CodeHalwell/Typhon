@@ -1,0 +1,20 @@
+
+> typhon-docs@0.1.0 dev /app/docs-site
+> astro dev
+
+09:55:33 [types] Generated 1ms
+
+ update  ▶ New version of Astro available: 6.4.2
+  Run npx @astrojs/upgrade to update
+
+09:55:34 [content] Syncing content
+09:55:34 [content] Synced content
+09:55:34 [vite] Re-optimizing dependencies because vite config has changed
+
+ astro  v5.18.2 ready in 2222 ms
+
+┃ Local    http://localhost:4321/Typhon
+┃ Network  use --host to expose
+
+09:55:34 watching for file changes...
+09:55:59 [200] /getting-started/editor-setup/ 1876ms
