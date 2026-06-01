@@ -3055,9 +3055,74 @@ fn class_is_subclass(c: &Rc<Class>, target: &Rc<Class>) -> bool {
     c.bases.iter().any(|b| class_is_subclass(b, target))
 }
 
-/// Public wrapper so the `format()` builtin can reuse the f-string formatter.
-pub fn format_with_spec_pub(value: &Value, default: &str, spec: &str) -> Result<String, Unwind> {
-    format_with_spec(value, default, spec)
+/// Re-format Rust's `{:e}` exponent notation to match CPython's output:
+/// - Exponent always has an explicit sign (`+` or `-`)
+/// - Exponent is zero-padded to at least 2 digits
+/// - If `upper` is true, convert `e` → `E`
+///
+/// Example: `"3.141590e0"` → `"3.141590e+00"`.
+/// (FINDINGS: Rust's `{:.6e}` gives `e0`, CPython gives `e+00`.)
+fn normalise_exp_notation(s: String, upper: bool) -> String {
+    // Find the `e` marker (Rust always uses lowercase in `{:e}`).
+    let e_pos = match s.find('e') {
+        Some(p) => p,
+        None => return s,
+    };
+    let mantissa = &s[..e_pos];
+    let exp_str = &s[e_pos + 1..]; // may be `0`, `-4`, `+4`, `100`, ...
+    let (sign, digits) = if let Some(rest) = exp_str.strip_prefix('-') {
+        ("-", rest)
+    } else if let Some(rest) = exp_str.strip_prefix('+') {
+        ("+", rest)
+    } else {
+        ("+", exp_str)
+    };
+    // Zero-pad to at least 2 digits.
+    let padded = if digits.len() < 2 {
+        format!("{:0>2}", digits)
+    } else {
+        digits.to_owned()
+    };
+    let e_char = if upper { 'E' } else { 'e' };
+    format!("{mantissa}{e_char}{sign}{padded}")
+}
+
+/// CPython-compatible `g`/`G` float formatting.
+///
+/// Rules (PEP 3101 / C printf `%g`):
+/// 1. Use scientific notation when the exponent is < −4 or ≥ precision.
+/// 2. Trailing zeros after the decimal point are removed.
+/// 3. The decimal point is removed if there are no remaining digits after it.
+/// 4. Exponent sign and 2-digit pad follow the same rules as `e`.
+fn format_g(abs: f64, sig: usize, upper: bool) -> String {
+    // Format in scientific notation to determine the exponent.
+    let sci = format!("{:.*e}", sig.saturating_sub(1), abs);
+    // Parse out the exponent.
+    let exp: i32 = if let Some(pos) = sci.find('e') {
+        sci[pos + 1..].parse().unwrap_or(0)
+    } else {
+        0
+    };
+    let result = if exp < -4 || exp >= sig as i32 {
+        // Scientific notation path.
+        let raw = normalise_exp_notation(sci, upper);
+        // Strip trailing zeros from mantissa part before `e`.
+        let e_pos = raw.find(if upper { 'E' } else { 'e' }).unwrap_or(raw.len());
+        let mantissa = raw[..e_pos].trim_end_matches('0').trim_end_matches('.');
+        format!("{}{}", mantissa, &raw[e_pos..])
+    } else {
+        // Fixed notation: format with enough decimal places, then strip zeros.
+        let decimal_places = (sig as i32 - 1 - exp).max(0) as usize;
+        let fixed = format!("{:.*}", decimal_places, abs);
+        // Strip trailing zeros after decimal point.
+        if fixed.contains('.') {
+            let stripped = fixed.trim_end_matches('0').trim_end_matches('.');
+            stripped.to_owned()
+        } else {
+            fixed
+        }
+    };
+    result
 }
 
 fn format_with_spec(value: &Value, default: &str, spec: &str) -> Result<String, Unwind> {
@@ -3167,15 +3232,34 @@ fn format_with_spec(value: &Value, default: &str, spec: &str) -> Result<String, 
         Value::Float(x) => {
             let p = precision.unwrap_or(6);
             let (abs, neg) = (x.abs(), *x < 0.0 || x.is_sign_negative());
-            let raw: String = match typ {
-                Some('e') => format!("{:.*e}", p, abs),
-                Some('E') => format!("{:.*E}", p, abs),
-                Some('g') | Some('G') => {
-                    // Python's `g` uses precision as significant digits.
-                    let sig = if p == 0 { 1 } else { p };
-                    format!("{:.*e}", sig.saturating_sub(1), abs)
+            // CPython formats NaN and inf with lowercase letters regardless of
+            // type specifier (even `E` gives `nan`/`inf`). Rust emits `NaN`
+            // which differs. Handle them specially before the general branch.
+            let raw: String = if x.is_nan() {
+                "nan".to_owned()
+            } else if x.is_infinite() {
+                "inf".to_owned()
+            } else {
+                match typ {
+                    Some('e') => {
+                        // Rust's {:e} produces e.g. `3.141590e0`; CPython requires
+                        // at least 2 exponent digits with an explicit sign: `3.141590e+00`.
+                        normalise_exp_notation(format!("{:.*e}", p, abs), false)
+                    }
+                    Some('E') => {
+                        normalise_exp_notation(format!("{:.*e}", p, abs), true)
+                    }
+                    Some('g') | Some('G') => {
+                        // Python's `g` uses precision as significant digits.
+                        // After computing the exponential form we apply CPython's
+                        // `g` rules: strip trailing zeros in the mantissa, then
+                        // decide whether to render as fixed or scientific notation.
+                        let sig = if p == 0 { 1 } else { p };
+                        let upper = matches!(typ, Some('G'));
+                        format_g(abs, sig, upper)
+                    }
+                    _ => format!("{:.*}", p, abs),
                 }
-                _ => format!("{:.*}", p, abs),
             };
             buf = if comma || underscore {
                 let sep = if comma { ',' } else { '_' };
@@ -3183,7 +3267,7 @@ fn format_with_spec(value: &Value, default: &str, spec: &str) -> Result<String, 
             } else {
                 raw
             };
-            if neg {
+            if neg && !x.is_nan() {
                 explicit_sign.push('-');
             } else if let Some('+') = sign {
                 explicit_sign.push('+');
@@ -3279,6 +3363,16 @@ fn format_with_spec(value: &Value, default: &str, spec: &str) -> Result<String, 
         }
     }
     Ok(format!("{explicit_sign}{prefix}{buf}"))
+}
+
+/// Public wrapper so `builtins.rs` can call the format-spec engine for
+/// `str.format()` without needing to re-implement or duplicate the logic.
+pub fn format_with_spec_pub(
+    value: &crate::value::Value,
+    default: &str,
+    spec: &str,
+) -> Result<String, crate::error::Unwind> {
+    format_with_spec(value, default, spec)
 }
 
 /// Separator-group every third digit of a non-negative `BigInt`. Caller
