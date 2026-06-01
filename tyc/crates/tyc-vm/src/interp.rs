@@ -996,6 +996,12 @@ impl Interpreter {
         Ok(None)
     }
 
+    /// `a == b` honouring a user `__eq__` on instances (used by `list.index`,
+    /// `list.count`, `list.remove`, and membership tests).
+    pub fn values_equal(&mut self, a: &Value, b: &Value) -> Result<bool, Unwind> {
+        self.cmp_op(CmpOp::Eq, a, b)
+    }
+
     fn cmp_op(&mut self, op: CmpOp, l: &Value, r: &Value) -> Result<bool, Unwind> {
         use std::cmp::Ordering::*;
         // User-defined rich comparisons take priority when an operand is a
@@ -1174,6 +1180,15 @@ impl Interpreter {
         match func {
             Value::Native(n) => {
                 if !kwargs.is_empty() {
+                    // The generic bound builtin-method dispatcher (`obj.sort`,
+                    // `obj.method`) can't see kwargs through its fixed native
+                    // signature, so forward them as a trailing sentinel arg the
+                    // method handlers unpack. Other natives use the by-name path.
+                    if n.name == "method" {
+                        let mut args = args;
+                        args.push(crate::builtins::make_kwargs_sentinel(kwargs));
+                        return (n.func)(self, args);
+                    }
                     // For v1, native fns receive positional args only.
                     // Special-case common kwarg-accepting builtins (sorted, dict.get) by name.
                     return crate::builtins::call_with_kwargs(self, &n, args, kwargs);

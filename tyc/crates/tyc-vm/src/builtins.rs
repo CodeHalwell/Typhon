@@ -3047,6 +3047,9 @@ fn list_method(
     name: &str,
     args: &[Value],
 ) -> Result<Value, Unwind> {
+    // Strip any trailing keyword-argument sentinel so positional handlers see
+    // only positional args; `sort` consults `kw`.
+    let (args, kw) = split_kwargs(args);
     match name {
         "append" => {
             l.borrow_mut().push(single(args, "append")?.clone());
@@ -3091,29 +3094,38 @@ fn list_method(
         }
         "remove" => {
             let target = single(args, "remove")?.clone();
-            let mut l = l.borrow_mut();
-            let pos = l
-                .iter()
-                .position(|v| v.py_eq(&target))
-                .ok_or_else(|| value_error("list.remove(x): x not in list"))?;
-            l.remove(pos);
+            let items = l.borrow().clone();
+            let mut found: Option<usize> = None;
+            for (i, v) in items.iter().enumerate() {
+                if interp.values_equal(v, &target)? {
+                    found = Some(i);
+                    break;
+                }
+            }
+            let pos = found.ok_or_else(|| value_error("list.remove(x): x not in list"))?;
+            l.borrow_mut().remove(pos);
             Ok(Value::None)
         }
         "index" => {
             let target = single(args, "index")?.clone();
-            let l = l.borrow();
-            let pos = l
-                .iter()
-                .position(|v| v.py_eq(&target))
-                .ok_or_else(|| value_error("list.index(x): x not in list"))?;
-            Ok(Value::Int(num_bigint::BigInt::from(pos as i64)))
+            let items = l.borrow().clone();
+            for (i, v) in items.iter().enumerate() {
+                if interp.values_equal(v, &target)? {
+                    return Ok(Value::Int(num_bigint::BigInt::from(i as i64)));
+                }
+            }
+            Err(value_error("list.index(x): x not in list"))
         }
         "count" => {
             let target = single(args, "count")?.clone();
-            let l = l.borrow();
-            Ok(Value::Int(num_bigint::BigInt::from(
-                l.iter().filter(|v| v.py_eq(&target)).count() as i64,
-            )))
+            let items = l.borrow().clone();
+            let mut n: i64 = 0;
+            for v in &items {
+                if interp.values_equal(v, &target)? {
+                    n += 1;
+                }
+            }
+            Ok(Value::Int(num_bigint::BigInt::from(n)))
         }
         "clear" => {
             l.borrow_mut().clear();
@@ -3124,8 +3136,39 @@ fn list_method(
             Ok(Value::None)
         }
         "sort" => {
-            l.borrow_mut()
-                .sort_by(|a, b| a.py_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            let mut reverse = false;
+            let mut key_fn: Option<Value> = None;
+            for (k, v) in &kw {
+                match k.as_str() {
+                    "reverse" => reverse = v.truthy(),
+                    "key" => key_fn = Some(v.clone()),
+                    _ => {
+                        return Err(type_error(format!(
+                            "sort() got an unexpected keyword argument '{}'",
+                            k
+                        )))
+                    }
+                }
+            }
+            let mut items = l.borrow().clone();
+            if let Some(f) = key_fn {
+                let mut keyed: Vec<(Value, Value)> = Vec::with_capacity(items.len());
+                for v in items {
+                    let kv = interp.call_value(f.clone(), vec![v.clone()], &[])?;
+                    keyed.push((kv, v));
+                }
+                keyed.sort_by(|a, b| a.0.py_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+                if reverse {
+                    keyed.reverse();
+                }
+                items = keyed.into_iter().map(|(_, v)| v).collect();
+            } else {
+                items.sort_by(|a, b| a.py_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                if reverse {
+                    items.reverse();
+                }
+            }
+            *l.borrow_mut() = items;
             Ok(Value::None)
         }
         "copy" => Ok(Value::List(Rc::new(RefCell::new(l.borrow().clone())))),
@@ -3706,6 +3749,44 @@ impl<'a> JsonParser<'a> {
 
 // ── Helper called by the interpreter for keyword-aware native calls ────────
 
+/// Marker tag for the trailing tuple that carries keyword arguments through
+/// the generic bound-method dispatcher (which has no kwargs slot of its own).
+const KWARGS_MARKER: &str = "__typhon_kwargs_sentinel__";
+
+/// Encode keyword arguments as a sentinel tuple appended to a method's args.
+pub fn make_kwargs_sentinel(kwargs: &[(String, Value)]) -> Value {
+    let mut m: DictMap = IndexMap::new();
+    for (k, v) in kwargs {
+        m.insert(HashKey::Str(Rc::new(k.clone())), v.clone());
+    }
+    Value::Tuple(Rc::new(vec![
+        Value::Str(Rc::new(KWARGS_MARKER.to_owned())),
+        Value::Dict(Rc::new(RefCell::new(m))),
+    ]))
+}
+
+/// If `args` ends with a kwargs sentinel, split it into (positional, keywords).
+fn split_kwargs(args: &[Value]) -> (&[Value], Vec<(String, Value)>) {
+    if let Some(Value::Tuple(t)) = args.last() {
+        if t.len() == 2 {
+            if let (Value::Str(s), Value::Dict(d)) = (&t[0], &t[1]) {
+                if s.as_str() == KWARGS_MARKER {
+                    let kw = d
+                        .borrow()
+                        .iter()
+                        .filter_map(|(k, v)| match k {
+                            HashKey::Str(s) => Some(((**s).clone(), v.clone())),
+                            _ => None,
+                        })
+                        .collect();
+                    return (&args[..args.len() - 1], kw);
+                }
+            }
+        }
+    }
+    (args, Vec::new())
+}
+
 pub fn call_with_kwargs(
     interp: &mut Interpreter,
     n: &NativeFn,
@@ -3713,6 +3794,58 @@ pub fn call_with_kwargs(
     kwargs: &[(String, Value)],
 ) -> Result<Value, Unwind> {
     match n.name {
+        "min" | "max" => {
+            let want_min = n.name == "min";
+            // Gather candidates: a single iterable, or multiple positional args.
+            let candidates: Vec<Value> = if args.len() == 1 {
+                let it = interp.make_iter(args.into_iter().next().unwrap())?;
+                let mut out = Vec::new();
+                while let Some(v) = interp.iter_next(&it)? {
+                    out.push(v);
+                }
+                out
+            } else {
+                args
+            };
+            let mut key_fn: Option<Value> = None;
+            let mut default: Option<Value> = None;
+            for (k, v) in kwargs {
+                match k.as_str() {
+                    "key" => key_fn = Some(v.clone()),
+                    "default" => default = Some(v.clone()),
+                    _ => {
+                        return Err(type_error(format!(
+                            "{}() got unexpected keyword: '{}'",
+                            n.name, k
+                        )))
+                    }
+                }
+            }
+            if candidates.is_empty() {
+                return default.ok_or_else(|| {
+                    value_error(format!("{}() arg is an empty sequence", n.name))
+                });
+            }
+            let mut best = candidates[0].clone();
+            let mut best_key = match &key_fn {
+                Some(f) => interp.call_value(f.clone(), vec![best.clone()], &[])?,
+                None => best.clone(),
+            };
+            for v in candidates.into_iter().skip(1) {
+                let vk = match &key_fn {
+                    Some(f) => interp.call_value(f.clone(), vec![v.clone()], &[])?,
+                    None => v.clone(),
+                };
+                let cmp = vk.py_cmp(&best_key).unwrap_or(std::cmp::Ordering::Equal);
+                if (want_min && cmp == std::cmp::Ordering::Less)
+                    || (!want_min && cmp == std::cmp::Ordering::Greater)
+                {
+                    best = v;
+                    best_key = vk;
+                }
+            }
+            Ok(best)
+        }
         "sorted" => {
             let mut out = Vec::new();
             let it = interp.make_iter(
