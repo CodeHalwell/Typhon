@@ -11,11 +11,12 @@ use std::rc::Rc;
 use indexmap::IndexMap;
 
 use crate::error::{
-    attribute_error, index_error, key_error, not_implemented, stop_iteration, type_error,
+    attribute_error, index_error, key_error, stop_iteration, type_error,
     value_error, Unwind,
 };
 use crate::interp::{normalize_index, Interpreter};
 use crate::value::{DictMap, HashKey, IterState, Module, NativeFn, Value};
+use num_traits::ToPrimitive as _;
 
 pub fn install(interp: &mut Interpreter) {
     let root = interp.root.clone();
@@ -148,6 +149,10 @@ pub fn install(interp: &mut Interpreter) {
                 out.insert(x.to_hash_key()?);
             }
         }
+        // Insert the `__typhon_frozen__` sentinel so that repr(), py_str(),
+        // and set_is_frozen() all recognise this as a frozenset and not a
+        // plain mutable set. Matches the sentinel path used by deep_freeze_value.
+        out.insert(HashKey::Str(Rc::new("__typhon_frozen__".to_owned())));
         Ok(Value::Set(Rc::new(RefCell::new(out))))
     });
 
@@ -855,13 +860,114 @@ fn make_typhon_runtime_module(interp: &Interpreter) -> Value {
 }
 
 fn make_math_module() -> Value {
+    /// Compute factorial of n as a BigInt. CPython raises ValueError for
+    /// negative inputs and TypeError for non-integers.
+    fn bigint_factorial(n: &num_bigint::BigInt) -> Result<num_bigint::BigInt, Unwind> {
+        use num_bigint::BigInt;
+        use num_traits::{One, Signed};
+        if n.is_negative() {
+            return Err(value_error("math.factorial() not defined for negative values"));
+        }
+        let mut result = BigInt::one();
+        let mut i = BigInt::from(2);
+        while i <= *n {
+            result *= &i;
+            i += BigInt::one();
+        }
+        Ok(result)
+    }
+
+    /// Integer square root (floor of square root). CPython raises ValueError
+    /// for negative inputs.
+    fn bigint_isqrt(n: &num_bigint::BigInt) -> Result<num_bigint::BigInt, Unwind> {
+        use num_bigint::BigInt;
+        use num_traits::{Signed, Zero};
+        if n.is_negative() {
+            return Err(value_error("math.isqrt() argument must be nonnegative"));
+        }
+        if n.is_zero() {
+            return Ok(BigInt::from(0));
+        }
+        // Newton's method for integer square root.
+        let one = BigInt::from(1u32);
+        let two = BigInt::from(2u32);
+        let mut x = n.clone();
+        let mut y = (n + &one) / &two;
+        while y < x {
+            x = y.clone();
+            y = (&x + n / &x) / &two;
+        }
+        Ok(x)
+    }
+
+    // Binomial coefficient — uses BigInt arithmetic throughout so that large
+    // inputs don't truncate via to_i64.
+    fn bigint_comb_full(
+        n_val: num_bigint::BigInt,
+        k_val: num_bigint::BigInt,
+    ) -> Result<num_bigint::BigInt, Unwind> {
+        use num_bigint::BigInt;
+        use num_traits::{One, Signed, Zero};
+        if n_val.is_negative() || k_val.is_negative() {
+            return Err(value_error("math.comb() requires non-negative integers"));
+        }
+        if k_val > n_val {
+            return Ok(BigInt::zero());
+        }
+        let k2 = std::cmp::min(k_val.clone(), n_val.clone() - k_val);
+        let mut result = BigInt::one();
+        let mut i = BigInt::zero();
+        while i < k2 {
+            result = result * (n_val.clone() - i.clone()) / (i.clone() + BigInt::one());
+            i += BigInt::one();
+        }
+        Ok(result)
+    }
+
+    fn bigint_perm(
+        n_val: num_bigint::BigInt,
+        k_val: num_bigint::BigInt,
+    ) -> Result<num_bigint::BigInt, Unwind> {
+        use num_bigint::BigInt;
+        use num_traits::{One, Signed, Zero};
+        if n_val.is_negative() || k_val.is_negative() {
+            return Err(value_error("math.perm() requires non-negative integers"));
+        }
+        if k_val > n_val {
+            return Ok(BigInt::zero());
+        }
+        let mut result = BigInt::one();
+        let mut i = BigInt::zero();
+        while i < k_val {
+            result *= n_val.clone() - i.clone();
+            i += BigInt::one();
+        }
+        Ok(result)
+    }
+
+    fn bigint_gcd(a: num_bigint::BigInt, b: num_bigint::BigInt) -> num_bigint::BigInt {
+        use num_traits::{Signed, Zero};
+        let mut a = a.abs();
+        let mut b = b.abs();
+        while !b.is_zero() {
+            let t = b.clone();
+            b = a % &t;
+            a = t;
+        }
+        a
+    }
+
     make_module(
         "math",
         vec![
+            // Constants
             ("pi", Value::Float(std::f64::consts::PI)),
             ("e", Value::Float(std::f64::consts::E)),
+            // tau = 2*pi, added in Python 3.6
+            ("tau", Value::Float(std::f64::consts::TAU)),
             ("inf", Value::Float(f64::INFINITY)),
             ("nan", Value::Float(f64::NAN)),
+            // ── floating-point basic ──────────────────────────────────────────
             (
                 "sqrt",
                 nf("sqrt", |_i, args| {
@@ -884,6 +990,85 @@ fn make_math_module() -> Value {
                     )))
                 }),
             ),
+            (
+                "trunc",
+                nf("trunc", |_i, args| {
+                    // Returns an int, consistent with CPython math.trunc.
+                    Ok(Value::Int(num_bigint::BigInt::from(
+                        single(&args, "trunc")?.to_float()?.trunc() as i64,
+                    )))
+                }),
+            ),
+            (
+                "fabs",
+                nf("fabs", |_i, args| {
+                    Ok(Value::Float(single(&args, "fabs")?.to_float()?.abs()))
+                }),
+            ),
+            (
+                "copysign",
+                nf("copysign", |_i, args| {
+                    let x = args
+                        .first()
+                        .ok_or_else(|| type_error("copysign() needs args"))?
+                        .to_float()?;
+                    let y = args
+                        .get(1)
+                        .ok_or_else(|| type_error("copysign() needs args"))?
+                        .to_float()?;
+                    Ok(Value::Float(x.copysign(y)))
+                }),
+            ),
+            (
+                "hypot",
+                nf("hypot", |_i, args| {
+                    // CPython math.hypot accepts multiple args; we handle
+                    // the common 2-arg case and fall back to n-arg norm.
+                    let sum_sq: f64 = args
+                        .iter()
+                        .map(|v| v.to_float().map(|x| x * x))
+                        .collect::<Result<Vec<_>, _>>()?
+                        .into_iter()
+                        .sum();
+                    Ok(Value::Float(sum_sq.sqrt()))
+                }),
+            ),
+            (
+                "dist",
+                nf("dist", |i, args| {
+                    // math.dist(p, q) — Euclidean distance between two points.
+                    let p = args
+                        .first()
+                        .ok_or_else(|| type_error("dist() needs two args"))?
+                        .clone();
+                    let q = args
+                        .get(1)
+                        .ok_or_else(|| type_error("dist() needs two args"))?
+                        .clone();
+                    let mut ps: Vec<f64> = Vec::new();
+                    let it = i.make_iter(p)?;
+                    while let Some(v) = i.iter_next(&it)? {
+                        ps.push(v.to_float()?);
+                    }
+                    let mut qs: Vec<f64> = Vec::new();
+                    let it2 = i.make_iter(q)?;
+                    while let Some(v) = i.iter_next(&it2)? {
+                        qs.push(v.to_float()?);
+                    }
+                    if ps.len() != qs.len() {
+                        return Err(value_error(
+                            "math.dist() points must have the same dimension",
+                        ));
+                    }
+                    let sum_sq: f64 = ps
+                        .iter()
+                        .zip(qs.iter())
+                        .map(|(a, b)| (a - b) * (a - b))
+                        .sum();
+                    Ok(Value::Float(sum_sq.sqrt()))
+                }),
+            ),
+            // ── logarithms / exponentials ─────────────────────────────────────
             (
                 "log",
                 nf("log", |_i, args| {
@@ -911,11 +1096,28 @@ fn make_math_module() -> Value {
                 }),
             ),
             (
+                "expm1",
+                nf("expm1", |_i, args| {
+                    // exp(x) - 1 with better precision near 0, matching
+                    // CPython math.expm1.
+                    Ok(Value::Float(single(&args, "expm1")?.to_float()?.exp_m1()))
+                }),
+            ),
+            (
+                "log1p",
+                nf("log1p", |_i, args| {
+                    // log(1 + x) with better precision near 0, matching
+                    // CPython math.log1p.
+                    Ok(Value::Float(single(&args, "log1p")?.to_float()?.ln_1p()))
+                }),
+            ),
+            (
                 "exp",
                 nf("exp", |_i, args| {
                     Ok(Value::Float(single(&args, "exp")?.to_float()?.exp()))
                 }),
             ),
+            // ── trig ──────────────────────────────────────────────────────────
             (
                 "sin",
                 nf("sin", |_i, args| {
@@ -935,6 +1137,81 @@ fn make_math_module() -> Value {
                 }),
             ),
             (
+                "asin",
+                nf("asin", |_i, args| {
+                    Ok(Value::Float(single(&args, "asin")?.to_float()?.asin()))
+                }),
+            ),
+            (
+                "acos",
+                nf("acos", |_i, args| {
+                    Ok(Value::Float(single(&args, "acos")?.to_float()?.acos()))
+                }),
+            ),
+            (
+                "atan",
+                nf("atan", |_i, args| {
+                    Ok(Value::Float(single(&args, "atan")?.to_float()?.atan()))
+                }),
+            ),
+            (
+                "atan2",
+                nf("atan2", |_i, args| {
+                    let y = args
+                        .first()
+                        .ok_or_else(|| type_error("atan2() needs args"))?
+                        .to_float()?;
+                    let x = args
+                        .get(1)
+                        .ok_or_else(|| type_error("atan2() needs args"))?
+                        .to_float()?;
+                    Ok(Value::Float(y.atan2(x)))
+                }),
+            ),
+            (
+                "degrees",
+                nf("degrees", |_i, args| {
+                    Ok(Value::Float(single(&args, "degrees")?.to_float()?.to_degrees()))
+                }),
+            ),
+            (
+                "radians",
+                nf("radians", |_i, args| {
+                    Ok(Value::Float(single(&args, "radians")?.to_float()?.to_radians()))
+                }),
+            ),
+            // ── floating-point remainder ──────────────────────────────────────
+            (
+                "fmod",
+                nf("fmod", |_i, args| {
+                    let x = args
+                        .first()
+                        .ok_or_else(|| type_error("fmod() needs args"))?
+                        .to_float()?;
+                    let y = args
+                        .get(1)
+                        .ok_or_else(|| type_error("fmod() needs args"))?
+                        .to_float()?;
+                    // Rust's % for floats matches C fmod semantics.
+                    Ok(Value::Float(x % y))
+                }),
+            ),
+            (
+                "remainder",
+                nf("remainder", |_i, args| {
+                    let x = args
+                        .first()
+                        .ok_or_else(|| type_error("remainder() needs args"))?
+                        .to_float()?;
+                    let y = args
+                        .get(1)
+                        .ok_or_else(|| type_error("remainder() needs args"))?
+                        .to_float()?;
+                    // IEEE 754 remainder — round-half-to-even.
+                    Ok(Value::Float(x - (x / y).round_ties_even() * y))
+                }),
+            ),
+            (
                 "pow",
                 nf("pow", |_i, args| {
                     let a = args
@@ -948,10 +1225,81 @@ fn make_math_module() -> Value {
                     Ok(Value::Float(a.powf(b)))
                 }),
             ),
+            // ── integer-domain (return int) ───────────────────────────────────
             (
-                "fabs",
-                nf("fabs", |_i, args| {
-                    Ok(Value::Float(single(&args, "fabs")?.to_float()?.abs()))
+                "gcd",
+                nf("gcd", |_i, args| {
+                    if args.is_empty() {
+                        return Ok(Value::Int(num_bigint::BigInt::from(0)));
+                    }
+                    let mut acc = args[0].to_bigint()?;
+                    for v in &args[1..] {
+                        acc = bigint_gcd(acc, v.to_bigint()?);
+                    }
+                    Ok(Value::Int(acc))
+                }),
+            ),
+            (
+                "lcm",
+                nf("lcm", |_i, args| {
+                    use num_traits::{Signed, Zero};
+                    if args.is_empty() {
+                        return Ok(Value::Int(num_bigint::BigInt::from(1)));
+                    }
+                    let mut acc = args[0].to_bigint()?;
+                    for v in &args[1..] {
+                        let b = v.to_bigint()?;
+                        if acc.is_zero() || b.is_zero() {
+                            acc = num_bigint::BigInt::from(0);
+                        } else {
+                            let g = bigint_gcd(acc.clone(), b.clone());
+                            acc = (acc / g) * b;
+                        }
+                    }
+                    Ok(Value::Int(acc.abs()))
+                }),
+            ),
+            (
+                "factorial",
+                nf("factorial", |_i, args| {
+                    let n = single(&args, "factorial")?.to_bigint()?;
+                    Ok(Value::Int(bigint_factorial(&n)?))
+                }),
+            ),
+            (
+                "isqrt",
+                nf("isqrt", |_i, args| {
+                    let n = single(&args, "isqrt")?.to_bigint()?;
+                    Ok(Value::Int(bigint_isqrt(&n)?))
+                }),
+            ),
+            (
+                "comb",
+                nf("comb", |_i, args| {
+                    let n = args
+                        .first()
+                        .ok_or_else(|| type_error("comb() needs args"))?
+                        .to_bigint()?;
+                    let k = args
+                        .get(1)
+                        .ok_or_else(|| type_error("comb() needs args"))?
+                        .to_bigint()?;
+                    Ok(Value::Int(bigint_comb_full(n, k)?))
+                }),
+            ),
+            (
+                "perm",
+                nf("perm", |_i, args| {
+                    let n = args
+                        .first()
+                        .ok_or_else(|| type_error("perm() needs args"))?
+                        .to_bigint()?;
+                    // If k is omitted, perm(n) = n!
+                    let k = match args.get(1) {
+                        Some(v) => v.to_bigint()?,
+                        None => n.clone(),
+                    };
+                    Ok(Value::Int(bigint_perm(n, k)?))
                 }),
             ),
         ],
@@ -2642,7 +2990,7 @@ pub fn dispatch_method(
 }
 
 fn str_method(
-    _interp: &mut Interpreter,
+    interp: &mut Interpreter,
     s: &Rc<String>,
     name: &str,
     args: &[Value],
@@ -2679,8 +3027,8 @@ fn str_method(
                 .ok_or_else(|| type_error("str.join requires an iterable"))?
                 .clone();
             let mut parts: Vec<String> = Vec::new();
-            let it = _interp.make_iter(iterable)?;
-            while let Some(v) = _interp.iter_next(&it)? {
+            let it = interp.make_iter(iterable)?;
+            while let Some(v) = interp.iter_next(&it)? {
                 match v {
                     Value::Str(s) => parts.push((*s).clone()),
                     _ => return Err(type_error("sequence item: expected str")),
@@ -2742,10 +3090,150 @@ fn str_method(
                 })
                 .collect(),
         )),
-        "format" => return Err(not_implemented("str.format (use f-strings)")),
+        "format" => {
+            // Implement positional and named str.format(). Kwargs are passed
+            // as the last element of `args` when the method NativeFn receives
+            // them via `call_with_kwargs`. We extract kwargs from the method
+            // call args (see `call_with_kwargs` "method" arm).
+            //
+            // The last element of `args` may be a kwargs dict injected by
+            // the "method" arm in call_with_kwargs below.
+            let (pos_args, kwargs): (&[Value], Vec<(String, Value)>) = {
+                if let Some(Value::Dict(d)) = args.last() {
+                    // Check if this is our kwargs sentinel dict
+                    if d.borrow().contains_key(&HashKey::Str(Rc::new(
+                        "__typhon_kwargs_dict__".to_owned(),
+                    ))) {
+                        let kw: Vec<(String, Value)> = d
+                            .borrow()
+                            .iter()
+                            .filter(|(k, _)| {
+                                !matches!(k, HashKey::Str(s) if s.as_str() == "__typhon_kwargs_dict__")
+                            })
+                            .map(|(k, v)| (k.clone().into_value().py_str(), v.clone()))
+                            .collect();
+                        (&args[..args.len() - 1], kw)
+                    } else {
+                        (args, Vec::new())
+                    }
+                } else {
+                    (args, Vec::new())
+                }
+            };
+            return str_format(interp, s, pos_args, &kwargs);
+        }
         "encode" => Value::Bytes(Rc::new(s.as_bytes().to_vec())),
         _ => return Err(attribute_error(format!("str has no method '{}'", name))),
     })
+}
+
+/// Implementation of `str.format(...)`. Supports:
+/// - `{}` auto-numbered positional fields
+/// - `{0}`, `{1}` explicit positional fields
+/// - `{name}` named fields
+/// - `{0:.2f}`, `{name:05d}` format-spec fields
+/// - `{{` and `}}` as literal braces
+fn str_format(
+    interp: &mut Interpreter,
+    template: &str,
+    pos_args: &[Value],
+    kwargs: &[(String, Value)],
+) -> Result<Value, Unwind> {
+    let _ = interp; // may be used for future format types
+    let mut out = String::new();
+    let chars: Vec<char> = template.chars().collect();
+    let mut i = 0usize;
+    let mut auto_idx: usize = 0;
+
+    while i < chars.len() {
+        match chars[i] {
+            '{' => {
+                if i + 1 < chars.len() && chars[i + 1] == '{' {
+                    // `{{` → literal `{`
+                    out.push('{');
+                    i += 2;
+                    continue;
+                }
+                // Find matching `}`
+                let start = i + 1;
+                let mut depth = 1usize;
+                let mut j = start;
+                while j < chars.len() && depth > 0 {
+                    if chars[j] == '{' {
+                        depth += 1;
+                    } else if chars[j] == '}' {
+                        depth -= 1;
+                    }
+                    j += 1;
+                }
+                if depth != 0 {
+                    return Err(value_error("Single '{' is not allowed in str.format()"));
+                }
+                // Field content is chars[start..j-1]
+                let field: String = chars[start..j - 1].iter().collect();
+                i = j;
+
+                // Split field_name from format_spec at the first ':'
+                let (field_ref, spec) = if let Some(colon) = field.find(':') {
+                    (&field[..colon], &field[colon + 1..])
+                } else {
+                    (field.as_str(), "")
+                };
+
+                // Resolve the value
+                let value = if field_ref.is_empty() {
+                    // `{}` auto-numbering
+                    let v = pos_args.get(auto_idx).ok_or_else(|| {
+                        index_error(format!(
+                            "Replacement index {} out of range for positional args",
+                            auto_idx
+                        ))
+                    })?;
+                    auto_idx += 1;
+                    v.clone()
+                } else if let Ok(idx) = field_ref.parse::<usize>() {
+                    // `{0}`, `{1}` etc.
+                    pos_args
+                        .get(idx)
+                        .ok_or_else(|| {
+                            index_error(format!(
+                                "Replacement index {idx} out of range for positional args"
+                            ))
+                        })?
+                        .clone()
+                } else {
+                    // `{name}` — look up in kwargs
+                    kwargs
+                        .iter()
+                        .find(|(k, _)| k == field_ref)
+                        .map(|(_, v)| v.clone())
+                        .ok_or_else(|| key_error(format!("'{}'", field_ref)))?
+                };
+
+                // Apply format spec if present
+                let formatted = if spec.is_empty() {
+                    value.py_str()
+                } else {
+                    crate::interp::format_with_spec_pub(&value, &value.py_str(), spec)?
+                };
+                out.push_str(&formatted);
+            }
+            '}' => {
+                if i + 1 < chars.len() && chars[i + 1] == '}' {
+                    // `}}` → literal `}`
+                    out.push('}');
+                    i += 2;
+                } else {
+                    return Err(value_error("Single '}' is not allowed in str.format()"));
+                }
+            }
+            c => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    Ok(Value::Str(Rc::new(out)))
 }
 
 fn list_method(
@@ -2977,6 +3465,67 @@ fn dict_method(
             Ok(Value::None)
         }
         "copy" => Ok(Value::Dict(Rc::new(RefCell::new(d.borrow().clone())))),
+        // ── Counter-specific methods ──────────────────────────────────────────
+        // These are safe to expose on all dicts because:
+        //  * `most_common` on an int-value dict is always meaningful.
+        //  * `elements` on a non-Counter dict (whose values are not ints) will
+        //    simply skip negative/non-int counts, matching CPython Counter.
+        // Added to support `collections.Counter` (PR #N16).
+        "most_common" => {
+            // `most_common([n])` — sort by count descending, return
+            // list of (key, count) tuples. Optional arg `n` limits the
+            // result to the top n entries (all if omitted / None).
+            let limit: Option<usize> = match args.first() {
+                Some(v) => Some(v.to_int()? as usize),
+                None => None,
+            };
+            let frozen_key = HashKey::Str(Rc::new("__typhon_frozen__".to_owned()));
+            let mut pairs: Vec<(Value, i64)> = d
+                .borrow()
+                .iter()
+                .filter(|(k, _)| **k != frozen_key)
+                .map(|(k, v)| {
+                    let count = match v {
+                        Value::Int(n) => n.to_i64().unwrap_or(0),
+                        _ => 0,
+                    };
+                    (k.clone().into_value(), count)
+                })
+                .collect();
+            // Stable sort: count descending, then preserve insertion order
+            // for ties (stable_sort_by gives that guarantee in Rust).
+            pairs.sort_by(|a, b| b.1.cmp(&a.1));
+            let result: Vec<Value> = pairs
+                .into_iter()
+                .take(limit.unwrap_or(usize::MAX))
+                .map(|(k, count)| {
+                    Value::Tuple(Rc::new(vec![
+                        k,
+                        Value::Int(num_bigint::BigInt::from(count)),
+                    ]))
+                })
+                .collect();
+            Ok(Value::List(Rc::new(RefCell::new(result))))
+        }
+        "elements" => {
+            // `elements()` — iterate over each element repeated by its count.
+            // Elements with count ≤ 0 are ignored (matches CPython Counter).
+            let frozen_key = HashKey::Str(Rc::new("__typhon_frozen__".to_owned()));
+            let mut out: Vec<Value> = Vec::new();
+            for (k, v) in d.borrow().iter() {
+                if *k == frozen_key {
+                    continue;
+                }
+                let count = match v {
+                    Value::Int(n) => n.to_i64().unwrap_or(0),
+                    _ => 0,
+                };
+                for _ in 0..count.max(0) {
+                    out.push(k.clone().into_value());
+                }
+            }
+            Ok(Value::List(Rc::new(RefCell::new(out))))
+        }
         _ => Err(attribute_error(format!("dict has no method '{}'", name))),
     }
 }
@@ -3388,6 +3937,25 @@ pub fn call_with_kwargs(
         // discard them. Used by stdlib stubs that exist purely so user
         // code that calls them at import time doesn't crash.
         "ConfigDict" | "dataclass" => (n.func)(interp, args),
+        // Built-in method calls (e.g. `"hello".format(name="x")`). The NativeFn
+        // named "method" is the closure returned by `get_attr` for any built-in
+        // type receiver. We forward kwargs by appending a sentinel dict keyed on
+        // `__typhon_kwargs_dict__` = True, plus the individual kwarg entries.
+        // The `str_format` implementation in str_method detects this sentinel.
+        "method" => {
+            let mut extended_args = args;
+            // Build a sentinel dict: { "__typhon_kwargs_dict__": True, key: val, ... }
+            let mut kw_dict: DictMap = IndexMap::new();
+            kw_dict.insert(
+                HashKey::Str(Rc::new("__typhon_kwargs_dict__".to_owned())),
+                Value::Bool(true),
+            );
+            for (k, v) in kwargs {
+                kw_dict.insert(HashKey::Str(Rc::new(k.clone())), v.clone());
+            }
+            extended_args.push(Value::Dict(Rc::new(RefCell::new(kw_dict))));
+            (n.func)(interp, extended_args)
+        }
         _ => {
             if kwargs.is_empty() {
                 (n.func)(interp, args)
