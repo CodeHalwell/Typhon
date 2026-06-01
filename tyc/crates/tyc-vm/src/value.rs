@@ -556,6 +556,13 @@ impl Value {
             }
             (ResultOk(a), ResultOk(b)) => a.py_eq(b),
             (ResultErr(a), ResultErr(b)) => a.py_eq(b),
+            // Type objects (from `type(x)`) compare by identity-or-name, so
+            // `type(a) == type(b)` and `type(inst) == SomeClass` both work.
+            (Class(a), Class(b)) => Rc::ptr_eq(a, b) || a.name == b.name,
+            // `type(5) == int`: the RHS `int` is the builtin constructor
+            // (a native named "int"); match it against the type object's name.
+            (Class(c), Native(n)) | (Native(n), Class(c)) => c.name == n.name,
+            (Native(a), Native(b)) => Rc::ptr_eq(a, b),
             _ => false,
         }
     }

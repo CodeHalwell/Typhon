@@ -278,7 +278,15 @@ pub fn install(interp: &mut Interpreter) {
 
     native!("type", |_i, args| {
         let v = single(&args, "type")?;
-        Ok(Value::Str(Rc::new(v.type_name().to_owned())))
+        // Return a real type object so `type(x).__name__`, `str(type(x))`
+        // (→ `<class 'int'>`), and `type(x) == int` / `== SomeClass` all work.
+        // User instances map to their declaring class; builtins map to a
+        // lightweight class object named after the type.
+        Ok(match v {
+            Value::Instance(i) => Value::Class(i.class.clone()),
+            Value::Class(_) => make_builtin_type("type"),
+            other => make_builtin_type(other.type_name()),
+        })
     });
 
     native!("isinstance", |_i, args| {
@@ -4491,6 +4499,21 @@ pub fn call_with_kwargs(
             }
         }
     }
+}
+
+/// A lightweight type object for a built-in type (`int`, `str`, …) — an empty
+/// `Class` whose only meaningful attribute is its `name`. Used by `type(x)`
+/// so type comparisons and `.__name__` work uniformly with user classes.
+fn make_builtin_type(name: &str) -> Value {
+    Value::Class(Rc::new(crate::value::Class {
+        name: name.to_owned(),
+        methods: std::cell::RefCell::new(HashMap::new()),
+        fields: vec![],
+        class_attrs: std::cell::RefCell::new(HashMap::new()),
+        bases: vec![],
+        properties: std::cell::RefCell::new(std::collections::HashSet::new()),
+        classmethods: std::cell::RefCell::new(std::collections::HashSet::new()),
+    }))
 }
 
 fn is_title_case(s: &str) -> bool {

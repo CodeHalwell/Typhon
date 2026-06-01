@@ -454,6 +454,37 @@ print(list(filter(lambda x: x > 1, [1, 2, 3])))
     }
 
     #[test]
+    fn type_object_model() {
+        // type(x) is a real type object: .__name__, str(), and == all work
+        // for both builtins and user classes.
+        let src = r#"
+class Foo:
+    x: int
+
+def main() -> None:
+    if type(5).__name__ != "int":
+        raise ValueError("builtin __name__ wrong")
+    if type([1]).__name__ != "list":
+        raise ValueError("list __name__ wrong")
+    if not (type(5) == int):
+        raise ValueError("type(5) == int failed")
+    if type(5) == str:
+        raise ValueError("type(5) == str should be False")
+    if str(type(5)) != "<class 'int'>":
+        raise ValueError("str(type) wrong")
+    let f: Foo = Foo(x=1)
+    if type(f).__name__ != "Foo":
+        raise ValueError("user class __name__ wrong")
+    if not (type(f) == Foo):
+        raise ValueError("type(inst) == Class failed")
+    if type(5) != type(6):
+        raise ValueError("type(5) == type(6) failed")
+main()
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    #[test]
     fn str_strip_honours_chars_argument() {
         let src = r#"
 def main() -> None:

@@ -1867,6 +1867,10 @@ impl Interpreter {
                 )))
             }
             Value::Class(class) => {
+                // `Cls.__name__` / `type(x).__name__`.
+                if attr == "__name__" || attr == "__qualname__" {
+                    return Ok(Value::Str(Rc::new(class.name.clone())));
+                }
                 if let Some(v) = class.class_attrs.borrow().get(attr) {
                     return Ok(v.clone());
                 }
