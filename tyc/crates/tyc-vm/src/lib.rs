@@ -454,6 +454,33 @@ print(list(filter(lambda x: x > 1, [1, 2, 3])))
     }
 
     #[test]
+    fn generators_run_eagerly() {
+        // `yield` / `yield from` generators iterate correctly under the VM's
+        // eager-collection model.
+        let src = r#"
+from typing import Iterator
+
+def squares(n: int) -> Iterator[int]:
+    for i in range(n):
+        yield i * i
+
+def flatten(rows: list[list[int]]) -> Iterator[int]:
+    for row in rows:
+        yield from row
+
+def main() -> None:
+    if list(squares(4)) != [0, 1, 4, 9]:
+        raise ValueError("squares generator wrong")
+    if sum(squares(4)) != 14:
+        raise ValueError("sum over generator wrong")
+    if list(flatten([[1, 2], [3]])) != [1, 2, 3]:
+        raise ValueError("yield from wrong")
+main()
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    #[test]
     fn type_object_model() {
         // type(x) is a real type object: .__name__, str(), and == all work
         // for both builtins and user classes.

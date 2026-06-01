@@ -46,7 +46,19 @@ pub struct Interpreter {
     /// name (e.g. "repo" or "sub.util"). Lets the same module be imported
     /// from multiple files without re-evaluating its body.
     pub module_cache: HashMap<String, Value>,
+    /// Stack of value buffers for generator functions. The VM has no way to
+    /// suspend a tree-walk mid-frame, so a `yield`-bearing function is run
+    /// eagerly to completion with each yielded value pushed onto the top
+    /// buffer; the call then returns an iterator over the collected values.
+    /// A stack supports nested/recursive generators. See `GENERATOR_CAP`.
+    pub gen_buffers: Vec<Vec<Value>>,
 }
+
+/// Upper bound on values an eagerly-evaluated generator may yield before the
+/// VM gives up. Bounds the worst case (an unbounded `while True: yield`) to a
+/// clear error instead of an unbounded hang; `tyc build` runs such generators
+/// lazily on CPython.
+const GENERATOR_CAP: usize = 1_000_000;
 
 impl Default for Interpreter {
     fn default() -> Self {
@@ -73,6 +85,7 @@ impl Interpreter {
             script_argv: Vec::new(),
             source_root: None,
             module_cache: HashMap::new(),
+            gen_buffers: Vec::new(),
         };
         crate::builtins::install(&mut interp);
         interp
@@ -838,9 +851,27 @@ impl Interpreter {
                 self.eval_listcomp(&listy, env)
             }
             Expr::Await(_) => Err(vm_unsupported_use_compile("await expressions")),
-            Expr::Yield(_) | Expr::YieldFrom(_) => Err(vm_unsupported_use_compile(
-                "generators (`yield` / `yield from`)",
-            )),
+            Expr::Yield(y) => {
+                let v = match &y.value {
+                    Some(e) => self.eval_expr(e, env)?,
+                    None => Value::None,
+                };
+                self.push_yield(v)?;
+                // `send()` is unsupported in eager mode — a yield expression
+                // evaluates to None (the common `yield x`-as-statement case).
+                Ok(Value::None)
+            }
+            Expr::YieldFrom(y) => {
+                let iterable = self.eval_expr(&y.value, env)?;
+                let it = self.make_iter(iterable)?;
+                loop {
+                    match self.iter_next(&it)? {
+                        Some(v) => self.push_yield(v)?,
+                        None => break,
+                    }
+                }
+                Ok(Value::None)
+            }
             Expr::TString(_) => Err(not_implemented("template strings")),
             Expr::IpyEscapeCommand(_) => Err(not_implemented("IPython escape commands")),
         }
@@ -1210,6 +1241,33 @@ impl Interpreter {
         }
     }
 
+    /// Append a yielded value to the current generator's buffer, enforcing the
+    /// eager-evaluation cap. Errors if no generator frame is active (a `yield`
+    /// the detector missed) or the cap is exceeded.
+    fn push_yield(&mut self, v: Value) -> Result<(), Unwind> {
+        match self.gen_buffers.last_mut() {
+            Some(buf) => {
+                if buf.len() >= GENERATOR_CAP {
+                    return Err(Unwind::Exception(VmException::new(
+                        "RuntimeError",
+                        format!(
+                            "generator exceeded the VM's eager-evaluation limit ({} values); \
+                             the tree-walking VM materialises generators eagerly — run unbounded \
+                             or lazily-consumed generators with `tyc build` then `python`",
+                            GENERATOR_CAP
+                        ),
+                    )));
+                }
+                buf.push(v);
+                Ok(())
+            }
+            None => Err(Unwind::Exception(VmException::new(
+                "RuntimeError",
+                "`yield` outside of a generator function",
+            ))),
+        }
+    }
+
     fn call_function(
         &mut self,
         f: &Function,
@@ -1227,8 +1285,27 @@ impl Interpreter {
         // Wrap the body in a closure so every early `return` decrements the
         // counter on the way out — including a failure in `bind_args`.
         let call_env = Env::new_child(&f.closure);
+        let is_generator = body_is_generator(&f.body);
         let result = (|| -> Result<Value, Unwind> {
             self.bind_args(f, args, kwargs, receiver, &call_env)?;
+            if is_generator {
+                // Eager-collection generator: run the body to completion with
+                // `yield`s captured into a fresh buffer, then hand back an
+                // iterator over the collected values. `return` (with or without
+                // a value) ends collection, matching a generator's StopIteration.
+                self.gen_buffers.push(Vec::new());
+                let outcome = self.exec_block(&f.body, &call_env);
+                let buffer = self.gen_buffers.pop().unwrap_or_default();
+                return match outcome {
+                    Ok(()) | Err(Unwind::Return(_)) => Ok(Value::Iter(Rc::new(RefCell::new(
+                        IterState::List {
+                            items: Rc::new(RefCell::new(buffer)),
+                            index: 0,
+                        },
+                    )))),
+                    Err(other) => Err(other),
+                };
+            }
             match self.exec_block(&f.body, &call_env) {
                 Ok(()) => Ok(Value::None),
                 Err(Unwind::Return(v)) => Ok(v),
@@ -2510,6 +2587,17 @@ impl Interpreter {
         let mut entered: Vec<Value> = Vec::with_capacity(w.items.len());
         for item in &w.items {
             let cm = self.eval_expr(&item.context_expr, env)?;
+            // A `@contextmanager`-decorated generator can't act as a context
+            // manager under eager evaluation: the VM runs the whole generator
+            // body (setup *and* teardown) at call time, so there's no point at
+            // which to run the `with` body between them. Surface a clear hint
+            // rather than a cryptic missing-`__enter__` AttributeError.
+            if matches!(cm, Value::Iter(_)) {
+                return Err(vm_unsupported_use_compile(
+                    "`@contextmanager` generators as context managers (the VM evaluates \
+                     generators eagerly); run with `tyc build` then `python`",
+                ));
+            }
             // Strict context-manager protocol: __enter__ must exist. The
             // file shim in `ffi.rs` returns the file object itself from
             // __enter__, so a `with open(...) as f:` block binds `f` to
@@ -2951,6 +3039,89 @@ fn values_identical(a: &Value, b: &Value) -> bool {
 /// * `Ok.and_then(h)` → `h(value)` (which itself must return a `Result`);
 ///   `Err.and_then(_)` → identity.
 /// * `Ok.or_else(_)` → identity; `Err.or_else(k)` → `k(error)`.
+/// Whether a function body is a generator — i.e. contains a `yield` /
+/// `yield from` reachable without crossing a nested function/lambda boundary.
+fn body_is_generator(body: &[Stmt]) -> bool {
+    body.iter().any(stmt_has_yield)
+}
+
+fn stmt_has_yield(s: &Stmt) -> bool {
+    use ruff_python_ast::Stmt::*;
+    match s {
+        // Nested function / class scopes own their own yields.
+        FunctionDef(_) | ClassDef(_) => false,
+        Expr(e) => expr_has_yield(&e.value),
+        Return(r) => r.value.as_deref().is_some_and(expr_has_yield),
+        Assign(a) => expr_has_yield(&a.value),
+        AugAssign(a) => expr_has_yield(&a.value),
+        AnnAssign(a) => a.value.as_deref().is_some_and(expr_has_yield),
+        If(x) => {
+            expr_has_yield(&x.test)
+                || body_is_generator(&x.body)
+                || x.elif_else_clauses
+                    .iter()
+                    .any(|c| body_is_generator(&c.body))
+        }
+        While(x) => {
+            expr_has_yield(&x.test)
+                || body_is_generator(&x.body)
+                || body_is_generator(&x.orelse)
+        }
+        For(x) => {
+            expr_has_yield(&x.iter)
+                || body_is_generator(&x.body)
+                || body_is_generator(&x.orelse)
+        }
+        With(x) => {
+            x.items.iter().any(|i| expr_has_yield(&i.context_expr))
+                || body_is_generator(&x.body)
+        }
+        Match(x) => {
+            expr_has_yield(&x.subject) || x.cases.iter().any(|c| body_is_generator(&c.body))
+        }
+        Try(x) => {
+            body_is_generator(&x.body)
+                || x.handlers.iter().any(|h| {
+                    let ruff_python_ast::ExceptHandler::ExceptHandler(h) = h;
+                    body_is_generator(&h.body)
+                })
+                || body_is_generator(&x.orelse)
+                || body_is_generator(&x.finalbody)
+        }
+        _ => false,
+    }
+}
+
+fn expr_has_yield(e: &Expr) -> bool {
+    use ruff_python_ast::Expr::*;
+    match e {
+        Yield(_) | YieldFrom(_) => true,
+        // A lambda is its own scope — its (rare) yields aren't ours.
+        Lambda(_) => false,
+        BoolOp(x) => x.values.iter().any(expr_has_yield),
+        BinOp(x) => expr_has_yield(&x.left) || expr_has_yield(&x.right),
+        UnaryOp(x) => expr_has_yield(&x.operand),
+        Compare(x) => expr_has_yield(&x.left) || x.comparators.iter().any(expr_has_yield),
+        Call(x) => {
+            expr_has_yield(&x.func)
+                || x.arguments.args.iter().any(expr_has_yield)
+                || x.arguments.keywords.iter().any(|k| expr_has_yield(&k.value))
+        }
+        Tuple(x) => x.elts.iter().any(expr_has_yield),
+        List(x) => x.elts.iter().any(expr_has_yield),
+        Set(x) => x.elts.iter().any(expr_has_yield),
+        Starred(x) => expr_has_yield(&x.value),
+        If(x) => {
+            expr_has_yield(&x.test) || expr_has_yield(&x.body) || expr_has_yield(&x.orelse)
+        }
+        Named(x) => expr_has_yield(&x.value),
+        Await(x) => expr_has_yield(&x.value),
+        Subscript(x) => expr_has_yield(&x.value) || expr_has_yield(&x.slice),
+        Attribute(x) => expr_has_yield(&x.value),
+        _ => false,
+    }
+}
+
 /// The dunder method name a binary operator dispatches to on its left operand.
 fn binop_dunder(op: Operator) -> Option<&'static str> {
     Some(match op {
@@ -3588,19 +3759,25 @@ result = f(xs)
     /// the error message must point users at the `tyc build && python`
     /// workaround.
     #[test]
-    fn yield_error_mentions_tyc_build_fallback() {
+    fn generator_eager_collection_runs() {
+        // Generators are materialised eagerly: iterating one yields its values,
+        // including `yield from`.
         let src = r#"
 def gen():
-    yield 1
-gen()
+    for i in range(3):
+        yield i * i
+
+def flat():
+    yield from [1, 2]
+    yield 3
+
+squares = list(gen())
+flattened = list(flat())
 "#;
-        let (_interp, res) = parse_and_run(src);
-        let err = res.expect_err("yield should error");
-        let msg = format!("{:?}", err);
-        assert!(
-            msg.contains("tyc build") && msg.contains("python"),
-            "yield error should mention `tyc build` + `python` fallback, got: {msg}"
-        );
+        let (interp, res) = parse_and_run(src);
+        res.expect("generator should run");
+        assert_eq!(interp.root.get("squares").unwrap().py_str(), "[0, 1, 4]");
+        assert_eq!(interp.root.get("flattened").unwrap().py_str(), "[1, 2, 3]");
     }
 
     #[test]
