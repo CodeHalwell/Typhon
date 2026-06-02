@@ -19,6 +19,7 @@ auto-parallel = false
 parallel-min-size = 64
 pgo-memoise = false
 pgo-min-calls = 100
+allow-secret-comptime = false
 ```
 
 | Key | Type | Default | Description |
@@ -33,6 +34,7 @@ pgo-min-calls = 100
 | `parallel-min-size` | int | `64` | Minimum iterable size for `auto-parallel` to fire. When the size can't be statically inferred, treated as zero. |
 | `pgo-memoise` | bool | `false` | Promote hot pure functions to `@functools.cache` based on `typhon-profile.json` from a prior `tyc profile` run. |
 | `pgo-min-calls` | int | `100` | Threshold for `pgo-memoise`. |
+| `allow-secret-comptime` | bool | `false` | When true, silences the `tyc::contains_secret_literal` warning that flags hardcoded secrets or environment variables mapped at build time. |
 
 ## `no-implicit-any`
 
@@ -114,6 +116,14 @@ When `true`, pure list comprehensions whose element is a pure call are rewritten
 When `true`, `tyc build` reads `typhon-profile.json` (from a prior [`tyc profile`](/Typhon/cli/profile/) run) and promotes every pure function whose observed call count meets `pgo-min-calls` to `@functools.cache`, even if the user did not write `@memo`. Complements `auto-memoise` (which caches every pure function regardless of profile data).
 
 Missing profile file is not an error — PGO is best-effort.
+
+## `allow-secret-comptime`
+
+**Off by default.** When `true`, this knob silences the `tyc::contains_secret_literal` diagnostic.
+
+That diagnostic flags hardcoded credentials (like `let API_KEY = "test"`) or sensitive environmental variables mapped using `comptime let API_KEY = env("API_KEY")`. While `comptime` substitution is useful, mapping secrets at build time embeds the literal secret directly into the compiled `.py` output, exposing it to anyone who can read the build artifacts.
+
+Setting this to `true` disables the warning, which is useful when the literal is intentionally public or part of a test suite, allowing you to document and silence expected findings.
 
 ## Where next
 
