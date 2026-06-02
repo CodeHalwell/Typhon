@@ -10,3 +10,9 @@
 ## 2026-06-01 - [Improve keyboard shortcut `<kbd>` styling]
 **Learning:** Found that inline keyboard shortcuts (`<kbd>` elements) inside Starlight markdown content blended too much with regular text and lacked the standard "key" appearance, making instructions like `Cmd + C` harder to read quickly.
 **Action:** Added targeted CSS to `custom.css` for `.sl-markdown-content kbd` to provide a subtle background, border, border-bottom, and shadow. This gives the keys a 3D, pressable appearance, making keyboard shortcuts stand out intuitively.
+## 2026-06-02 - [High Contrast Mode Support for Boundaries and Gradients]
+**Learning:** Found that elements relying purely on background colors (like tags and inline code) lose their boundaries in Windows High Contrast Mode (Forced Colors Mode), making them indistinguishable from plain text. Also discovered that gradient text using `-webkit-text-fill-color: transparent` becomes completely invisible when the OS strips the background gradient.
+**Action:** Added `border: 1px solid transparent` to `.tag` and `:not(pre) > code` so the OS can render a border color in High Contrast Mode. Used `@media (forced-colors: active)` to reset `-webkit-text-fill-color: currentcolor` on `.hero h1` to ensure hero text remains visible.
+## 2026-06-02 - [Card hover state interaction enhancement]
+**Learning:** Adding a subtle, contextual drop shadow on hover to cards makes the UI feel more tactile, responding better to user intent.
+**Action:** Added `box-shadow: 0 4px 12px color-mix(in srgb, var(--sl-color-accent) 20%, transparent);` to `.card:hover` to complement the existing `transform: translateY(-2px)` animation.

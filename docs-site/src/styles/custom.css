@@ -54,6 +54,12 @@
   -webkit-text-fill-color: transparent;
 }
 
+@media (forced-colors: active) {
+  .hero h1 {
+    -webkit-text-fill-color: currentcolor;
+  }
+}
+
 .hero p.lede {
   font-size: 1.2rem;
   color: var(--sl-color-gray-2);
@@ -80,6 +86,7 @@
 .card:hover {
   border-color: var(--sl-color-accent);
   transform: translateY(-2px);
+  box-shadow: 0 4px 12px color-mix(in srgb, var(--sl-color-accent) 20%, transparent);
 }
 
 .card h3 {
@@ -104,6 +111,7 @@
   font-weight: 600;
   letter-spacing: 0.04em;
   text-transform: uppercase;
+  border: 1px solid transparent;
 }
 
 /* Inline code feels slightly lighter */
@@ -112,6 +120,7 @@
   padding: 0.1rem 0.35rem;
   border-radius: 0.35rem;
   font-size: 0.9em;
+  border: 1px solid transparent;
 }
 
 /* Tables read better with a softer divider */
