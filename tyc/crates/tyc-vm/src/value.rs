@@ -908,8 +908,7 @@ impl Value {
                 // Sort by the collision-safe `canonical_sort_key` so the
                 // repr is stable across runs and matches CPython for the
                 // common all-numeric / all-string cases (FINDINGS H4).
-                let mut keys: Vec<&HashKey> =
-                    s.iter().filter(|k| **k != frozen_key).collect();
+                let mut keys: Vec<&HashKey> = s.iter().filter(|k| **k != frozen_key).collect();
                 keys.sort_by_key(|k| k.canonical_sort_key());
                 let items: Vec<String> = keys
                     .into_iter()
@@ -1309,9 +1308,18 @@ mod tests {
     #[test]
     fn instance_value_equality_and_repr() {
         let p = mk_class("P", &["x", "y"]);
-        let a = mk_instance(&p, &[("x", Value::Int(1.into())), ("y", Value::Int(2.into()))]);
-        let b = mk_instance(&p, &[("y", Value::Int(2.into())), ("x", Value::Int(1.into()))]);
-        let c = mk_instance(&p, &[("x", Value::Int(3.into())), ("y", Value::Int(4.into()))]);
+        let a = mk_instance(
+            &p,
+            &[("x", Value::Int(1.into())), ("y", Value::Int(2.into()))],
+        );
+        let b = mk_instance(
+            &p,
+            &[("y", Value::Int(2.into())), ("x", Value::Int(1.into()))],
+        );
+        let c = mk_instance(
+            &p,
+            &[("x", Value::Int(3.into())), ("y", Value::Int(4.into()))],
+        );
         assert!(a.py_eq(&b)); // same class, equal fields (order-independent)
         assert!(!a.py_eq(&c));
         // repr is in declared field order regardless of insertion order.
@@ -1322,8 +1330,14 @@ mod tests {
     #[test]
     fn instance_hash_key_equal_for_equal_fields() {
         let p = mk_class("P", &["x", "y"]);
-        let a = mk_instance(&p, &[("x", Value::Int(1.into())), ("y", Value::Int(2.into()))]);
-        let b = mk_instance(&p, &[("y", Value::Int(2.into())), ("x", Value::Int(1.into()))]);
+        let a = mk_instance(
+            &p,
+            &[("x", Value::Int(1.into())), ("y", Value::Int(2.into()))],
+        );
+        let b = mk_instance(
+            &p,
+            &[("y", Value::Int(2.into())), ("x", Value::Int(1.into()))],
+        );
         let ka = a.to_hash_key().unwrap();
         let kb = b.to_hash_key().unwrap();
         assert_eq!(ka, kb);

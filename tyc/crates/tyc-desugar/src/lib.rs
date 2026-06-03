@@ -2828,10 +2828,9 @@ impl ruff_python_ast::visitor::transformer::Transformer for SuperRewriter {
         // Recurse into children first, then rewrite this node if it is `super()`.
         ruff_python_ast::visitor::transformer::walk_expr(self, expr);
         if let Expr::Call(call) = expr {
-            let is_bare_super =
-                matches!(call.func.as_ref(), Expr::Name(n) if n.id.as_str() == "super")
-                    && call.arguments.args.is_empty()
-                    && call.arguments.keywords.is_empty();
+            let is_bare_super = matches!(call.func.as_ref(), Expr::Name(n) if n.id.as_str() == "super")
+                && call.arguments.args.is_empty()
+                && call.arguments.keywords.is_empty();
             if is_bare_super {
                 call.arguments.args = Box::new([
                     make_bare_name_expr(&self.class_name),
@@ -3385,8 +3384,7 @@ mod tests {
 
     #[test]
     fn explicit_two_arg_super_left_untouched() {
-        let src =
-            "class B(A):\n    def m(self) -> str:\n        return super(B, self).m()\n";
+        let src = "class B(A):\n    def m(self) -> str:\n        return super(B, self).m()\n";
         let parsed = tyc_syntax::parse_module(src).expect("parse failed");
         let module = parsed.into_syntax();
         let out = desugar_module_with(&module, DesugarOptions::default());

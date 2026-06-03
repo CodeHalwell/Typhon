@@ -3853,14 +3853,21 @@ fn printf_format(fmt: &str, values: &[Value]) -> Result<String, Unwind> {
                     Value::Str(s) => s.chars().next().map(String::from).unwrap_or_default(),
                     other => {
                         let n = other.to_int()?;
-                        char::from_u32(n as u32).map(String::from).unwrap_or_default()
+                        char::from_u32(n as u32)
+                            .map(String::from)
+                            .unwrap_or_default()
                     }
                 }
             }
             'd' | 'i' => {
                 let v = next_arg(&mut arg)?;
                 let iv = v.to_bigint()?;
-                printf_signed(&iv.abs().to_str_radix(10), iv.is_negative(), flag_plus, flag_space)
+                printf_signed(
+                    &iv.abs().to_str_radix(10),
+                    iv.is_negative(),
+                    flag_plus,
+                    flag_space,
+                )
             }
             'x' | 'X' | 'o' => {
                 let v = next_arg(&mut arg)?;
@@ -3933,7 +3940,10 @@ fn pad_printf(body: &str, width: Option<usize>, left: bool, zero: bool, conv: ch
         let p: String = std::iter::repeat_n(' ', pad).collect();
         format!("{body}{p}")
     } else if zero
-        && matches!(conv, 'd' | 'i' | 'f' | 'F' | 'e' | 'E' | 'g' | 'G' | 'x' | 'X' | 'o')
+        && matches!(
+            conv,
+            'd' | 'i' | 'f' | 'F' | 'e' | 'E' | 'g' | 'G' | 'x' | 'X' | 'o'
+        )
     {
         // Zero-pad after an optional sign.
         let (sign, rest) = match body.strip_prefix(['-', '+', ' ']) {
@@ -5162,10 +5172,7 @@ sfx = Path("file.tar.gz").suffixes
         let (interp, res) = parse_and_run(src);
         res.unwrap();
         assert_eq!(interp.root.get("joined").unwrap().py_str(), "c.txt");
-        assert_eq!(
-            interp.root.get("sfx").unwrap().py_str(),
-            "['.tar', '.gz']"
-        );
+        assert_eq!(interp.root.get("sfx").unwrap().py_str(), "['.tar', '.gz']");
     }
 
     /// M17 — `complex()` constructor, `abs(complex)`, and `.real` / `.imag`.
@@ -5201,9 +5208,15 @@ it = d.items()
         res.unwrap();
         assert!(matches!(
             interp.root.get("k").unwrap(),
-            Value::DictView { kind: crate::value::DictViewKind::Keys, .. }
+            Value::DictView {
+                kind: crate::value::DictViewKind::Keys,
+                ..
+            }
         ));
-        assert_eq!(interp.root.get("k").unwrap().py_str(), "dict_keys(['a', 'b'])");
+        assert_eq!(
+            interp.root.get("k").unwrap().py_str(),
+            "dict_keys(['a', 'b'])"
+        );
         assert_eq!(
             interp.root.get("v").unwrap().py_str(),
             "dict_values([1, 2])"

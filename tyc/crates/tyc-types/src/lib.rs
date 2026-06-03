@@ -9453,13 +9453,7 @@ fn is_known_primitive_attr(prim: &str, attr: &str) -> bool {
         ),
         "float" => matches!(
             attr,
-            "as_integer_ratio"
-                | "conjugate"
-                | "fromhex"
-                | "hex"
-                | "imag"
-                | "is_integer"
-                | "real"
+            "as_integer_ratio" | "conjugate" | "fromhex" | "hex" | "imag" | "is_integer" | "real"
         ),
         "str" | "bytes" => is_known_builtin_generic_attr(prim, attr),
         _ => false,
@@ -9489,12 +9483,7 @@ fn emit_builtin_attr_not_found(
         .saturating_sub(attr_start)
         .max(1);
     c.diagnostics.push_error(TycError::attribute_not_found(
-        attr_name,
-        type_name,
-        &c.path,
-        c.source,
-        attr_start,
-        attr_len,
+        attr_name, type_name, &c.path, c.source, attr_start, attr_len,
     ));
 }
 
@@ -9930,9 +9919,7 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
             // regardless of the RHS shape (`"%.2f and %s" % (3.14, "x")`,
             // `"%d" % n`, `"%(name)s" % d`, …). Return early so the
             // numeric-only `%` compatibility check below never fires.
-            if matches!(b.op, Operator::Mod)
-                && matches!(l_stripped, Type::Str | Type::LitStr(_))
-            {
+            if matches!(b.op, Operator::Mod) && matches!(l_stripped, Type::Str | Type::LitStr(_)) {
                 return Type::Str;
             }
             if let Some(op_str) = arithmetic_op_str(b.op) {
@@ -11283,8 +11270,10 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
                             && !is_dynamic_type(&slice_ty)
                             && !c.is_assignable(key_ty, &slice_ty)
                         {
-                            let span =
-                                (s.slice.range().start().to_usize(), s.slice.range().end().to_usize());
+                            let span = (
+                                s.slice.range().start().to_usize(),
+                                s.slice.range().end().to_usize(),
+                            );
                             c.mismatch(key_ty, &slice_ty, span);
                             return args[1].clone();
                         }

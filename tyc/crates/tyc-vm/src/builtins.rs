@@ -4291,11 +4291,7 @@ fn bytes_method(b: &Rc<Vec<u8>>, name: &str, args: &[Value]) -> Result<Value, Un
             match enc_norm.as_str() {
                 "" | "utf8" | "ascii" => match std::str::from_utf8(b) {
                     Ok(s) => Value::Str(Rc::new(s.to_owned())),
-                    Err(_) => {
-                        return Err(value_error(
-                            "'utf-8' codec can't decode byte sequence",
-                        ))
-                    }
+                    Err(_) => return Err(value_error("'utf-8' codec can't decode byte sequence")),
                 },
                 "latin1" | "iso88591" => {
                     Value::Str(Rc::new(b.iter().map(|&c| c as char).collect::<String>()))
@@ -5360,7 +5356,12 @@ pub fn call_with_kwargs(
                             args[0] = v.clone();
                         }
                     }
-                    _ => return Err(type_error(format!("groupby() got unexpected keyword: '{}'", k))),
+                    _ => {
+                        return Err(type_error(format!(
+                            "groupby() got unexpected keyword: '{}'",
+                            k
+                        )))
+                    }
                 }
             }
             (n.func)(interp, args)
