@@ -1201,6 +1201,8 @@ mod tests {
                 .collect(),
             class_attrs: RefCell::new(HashMap::new()),
             bases: vec![],
+            properties: RefCell::new(std::collections::HashSet::new()),
+            classmethods: RefCell::new(std::collections::HashSet::new()),
         })
     }
 

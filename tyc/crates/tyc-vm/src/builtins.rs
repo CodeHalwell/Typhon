@@ -3490,7 +3490,7 @@ fn str_method(
     s: &Rc<String>,
     name: &str,
     args: &[Value],
-    kwargs: &HashMap<String, Value>,
+    _kwargs: &HashMap<String, Value>,
 ) -> Result<Value, Unwind> {
     Ok(match name {
         "upper" => Value::Str(Rc::new(s.to_uppercase())),
@@ -3512,12 +3512,23 @@ fn str_method(
             None => Value::Str(Rc::new(s.trim_end().to_owned())),
         },
         "split" | "rsplit" => {
-            // Separator: positional arg 0 (None ⇒ whitespace split).
-            let sep_arg = args.first().filter(|v| !matches!(v, Value::None));
+            // Keyword arguments (`maxsplit=`, `sep=`) arrive via the trailing
+            // sentinel that `call_value` appends for bound builtin methods.
+            // `dispatch_method` does not populate the `kwargs` map for str
+            // methods (its `split_kwargs_map` uses a different marker), so we
+            // unpack the sentinel here the same way `str.format` does.
+            let (args, kw) = split_kwargs(args);
+            let kw_get = |name: &str| kw.iter().rev().find(|(k, _)| k == name).map(|(_, v)| v);
+            // Separator: positional arg 0 or keyword `sep` (None ⇒ whitespace).
+            let sep_kw = kw_get("sep");
+            let sep_arg = args
+                .first()
+                .or(sep_kw)
+                .filter(|v| !matches!(v, Value::None));
             // maxsplit: positional arg 1 or keyword `maxsplit` (-1 ⇒ no limit).
             let maxsplit = match args.get(1) {
                 Some(v) if !matches!(v, Value::None) => v.to_int()?,
-                _ => match kwargs.get("maxsplit") {
+                _ => match kw_get("maxsplit") {
                     Some(v) if !matches!(v, Value::None) => v.to_int()?,
                     _ => -1,
                 },

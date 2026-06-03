@@ -52,6 +52,17 @@ pub struct Interpreter {
     /// buffer; the call then returns an iterator over the collected values.
     /// A stack supports nested/recursive generators. See `GENERATOR_CAP`.
     pub gen_buffers: Vec<Vec<Value>>,
+    /// Names of modules currently being loaded via `try_load_typhon_module`.
+    /// Guards against a module that imports itself (directly or through a
+    /// cycle) re-entering the loader and overflowing the host stack — e.g.
+    /// a file named `enum.ty` that does `from enum import Enum` would
+    /// otherwise try to load itself forever.
+    pub loading_modules: std::collections::HashSet<String>,
+    /// Stack of `(defining_class, self_value)` frames for in-flight method
+    /// calls. Lets zero-arg `super()` resolve the next method up the MRO
+    /// and bind `self`. Pushed when a bound method / `__call__` /
+    /// `__post_init__` is invoked, popped on the way out.
+    pub method_stack: Vec<(Rc<Class>, Value)>,
 }
 
 /// Upper bound on values an eagerly-evaluated generator may yield before the
@@ -86,6 +97,8 @@ impl Interpreter {
             source_root: None,
             module_cache: HashMap::new(),
             gen_buffers: Vec::new(),
+            loading_modules: std::collections::HashSet::new(),
+            method_stack: Vec::new(),
         };
         crate::builtins::install(&mut interp);
         interp
@@ -519,6 +532,13 @@ impl Interpreter {
                 methods.entry(name.clone()).or_insert_with(|| m.clone());
             }
             for (name, v) in base.class_attrs.borrow().iter() {
+                // Don't inherit the internal enum sentinels — a subclass
+                // should not be treated as the enum base marker, and each
+                // enum owns its own member list (materialised after this
+                // class is built).
+                if is_enum_sentinel(name) {
+                    continue;
+                }
                 class_attrs.entry(name.clone()).or_insert_with(|| v.clone());
             }
             for name in base.properties.borrow().iter() {
@@ -533,7 +553,27 @@ impl Interpreter {
             }
         }
 
-        Ok(Rc::new(Class {
+        // Accumulate annotated fields across the FULL inheritance chain so a
+        // synthesised constructor for `C(B(A))` knows about A's and B's
+        // fields too — not just the single nearest hop. Base fields come
+        // first (matching dataclass field order); a field redeclared on a
+        // subclass keeps the subclass's position/default.
+        let mut inherited: Vec<ClassField> = Vec::new();
+        let mut seen: std::collections::HashSet<String> =
+            fields.iter().map(|f| f.name.clone()).collect();
+        for base in &bases {
+            for bf in Self::collect_mro_fields(base) {
+                if seen.insert(bf.name.clone()) {
+                    inherited.push(bf);
+                }
+            }
+        }
+        // Prepend inherited fields (parents before children).
+        let mut all_fields = inherited;
+        all_fields.extend(fields);
+        let fields = all_fields;
+
+        let class = Rc::new(Class {
             name: c.name.as_str().to_owned(),
             methods: RefCell::new(methods),
             fields,
@@ -541,7 +581,23 @@ impl Interpreter {
             bases,
             properties: RefCell::new(properties),
             classmethods: RefCell::new(classmethods),
-        }))
+        });
+
+        // Enum subclass: convert simple class-level assignments (`RED = 1`)
+        // into singleton member instances carrying `.name` / `.value`, and
+        // record their definition order so `for c in Color` iterates them.
+        // Done after the `Class` exists so each member can be an `Instance`
+        // of it; skipped for the bare base marker itself.
+        if Self::is_enum_class(&class)
+            && !class
+                .class_attrs
+                .borrow()
+                .contains_key("__typhon_enum_base__")
+        {
+            self.materialise_enum_members(&class, c);
+        }
+
+        Ok(class)
     }
 
     fn apply_decorator(
@@ -595,6 +651,17 @@ impl Interpreter {
         if let Some(cached) = self.module_cache.get(name).cloned() {
             return Ok(cached);
         }
+        // `enum` is provided natively so that `from enum import Enum`
+        // resolves to a real `Enum` base class with member/value/name
+        // semantics — and crucially never falls through to loading a
+        // sibling `enum.ty` (which, for the repro file literally named
+        // `enum.ty`, would recursively import itself and overflow the
+        // host stack).
+        if name == "enum" {
+            let m = self.make_enum_module();
+            self.module_cache.insert(name.to_owned(), m.clone());
+            return Ok(m);
+        }
         // Try the host stdlib / typhon_runtime first so user code can't
         // accidentally shadow `import json` with a sibling json.ty (the
         // stdlib_module_shadow lint already nudges users away from this
@@ -634,7 +701,27 @@ impl Interpreter {
             return Ok(None);
         };
 
-        let source = std::fs::read_to_string(&path).map_err(|e| {
+        // Guard against a self-importing module (a file that imports its
+        // own module name, directly or via a cycle). Without this the
+        // loader recurses until the host stack overflows.
+        if self.loading_modules.contains(name) {
+            return Err(crate::error::Unwind::Exception(VmException::new(
+                "ImportError",
+                format!("cannot import '{name}': circular import"),
+            )));
+        }
+        self.loading_modules.insert(name.to_owned());
+        let result = self.try_load_typhon_module_inner(name, &path);
+        self.loading_modules.remove(name);
+        result
+    }
+
+    fn try_load_typhon_module_inner(
+        &mut self,
+        name: &str,
+        path: &std::path::Path,
+    ) -> Result<Option<Value>, Unwind> {
+        let source = std::fs::read_to_string(path).map_err(|e| {
             crate::error::Unwind::Exception(crate::error::VmException::new(
                 "ImportError",
                 format!("cannot read '{}': {e}", path.display()),
@@ -690,6 +777,148 @@ impl Interpreter {
             name: name.to_owned(),
             members: RefCell::new(members),
         }))))
+    }
+
+    /// Build a native `enum` module exposing `Enum` (and the common
+    /// variants) as base classes. Each carries a sentinel class attr
+    /// (`__typhon_enum_base__`) so `build_class` can recognise a subclass
+    /// and convert its simple class-level assignments (`RED = 1`) into
+    /// singleton member instances with `.name` / `.value`.
+    fn make_enum_module(&mut self) -> Value {
+        use crate::value::Module;
+        let mut members: HashMap<String, Value> = HashMap::new();
+        for base_name in ["Enum", "IntEnum", "StrEnum", "Flag", "IntFlag"] {
+            let mut class_attrs: HashMap<String, Value> = HashMap::new();
+            class_attrs.insert("__typhon_enum_base__".to_owned(), Value::Bool(true));
+            let cls = Rc::new(Class {
+                name: base_name.to_owned(),
+                methods: RefCell::new(HashMap::new()),
+                fields: vec![],
+                class_attrs: RefCell::new(class_attrs),
+                bases: vec![],
+                properties: RefCell::new(std::collections::HashSet::new()),
+                classmethods: RefCell::new(std::collections::HashSet::new()),
+            });
+            members.insert(base_name.to_owned(), Value::Class(cls));
+        }
+        // `enum.auto()` — returns a sentinel that `materialise_enum_members`
+        // replaces with a sequential integer (1, 2, 3, …) in member order,
+        // matching CPython's `auto()`.
+        let auto = NativeFn::new("enum.auto", |_i, _args| {
+            Ok(Value::Tuple(Rc::new(vec![Value::Str(Rc::new(
+                "__typhon_enum_auto__".to_owned(),
+            ))])))
+        });
+        members.insert("auto".to_owned(), Value::Native(Rc::new(auto)));
+        Value::Module(Rc::new(Module {
+            name: "enum".to_owned(),
+            members: RefCell::new(members),
+        }))
+    }
+
+    /// True when `v` is the `enum.auto()` sentinel.
+    fn is_enum_auto(v: &Value) -> bool {
+        matches!(v, Value::Tuple(t) if t.len() == 1
+            && matches!(&t[0], Value::Str(s) if s.as_str() == "__typhon_enum_auto__"))
+    }
+
+    /// True when `class` (or any base) is the native `enum.Enum` marker
+    /// base class.
+    fn is_enum_class(class: &Rc<Class>) -> bool {
+        if class
+            .class_attrs
+            .borrow()
+            .contains_key("__typhon_enum_base__")
+        {
+            return true;
+        }
+        class.bases.iter().any(Self::is_enum_class)
+    }
+
+    /// True when `value` is an enum *member* instance (an `Instance` of an
+    /// enum class carrying the synthesised `_name_` field).
+    fn is_enum_member(value: &Value) -> bool {
+        if let Value::Instance(i) = value {
+            return Self::is_enum_class(&i.class) && i.fields.borrow().contains_key("_name_");
+        }
+        false
+    }
+
+    /// Replace an enum subclass's plain value attributes with member
+    /// instances. The source order is taken from the class body so
+    /// iteration matches CPython.
+    fn materialise_enum_members(&mut self, class: &Rc<Class>, c: &ast::StmtClassDef) {
+        // Collect member names in source order (each `NAME = value`
+        // assignment in the class body, excluding dunders).
+        let mut order: Vec<String> = Vec::new();
+        for stmt in &c.body {
+            if let Stmt::Assign(a) = stmt {
+                for t in &a.targets {
+                    if let Expr::Name(n) = t {
+                        let name = n.id.as_str();
+                        if !name.starts_with("__") {
+                            order.push(name.to_owned());
+                        }
+                    }
+                }
+            }
+        }
+        let mut member_list: Vec<Value> = Vec::with_capacity(order.len());
+        {
+            let mut attrs = class.class_attrs.borrow_mut();
+            let mut auto_counter: i64 = 0;
+            for name in &order {
+                let Some(raw) = attrs.get(name).cloned() else {
+                    continue;
+                };
+                // Already a member (e.g. inherited) — skip.
+                if matches!(&raw, Value::Instance(i) if Rc::ptr_eq(&i.class, class)) {
+                    continue;
+                }
+                // `enum.auto()` → next sequential integer (1-based).
+                let raw = if Self::is_enum_auto(&raw) {
+                    auto_counter += 1;
+                    Value::Int(BigInt::from(auto_counter))
+                } else {
+                    raw
+                };
+                let mut fields: HashMap<String, Value> = HashMap::new();
+                fields.insert("name".to_owned(), Value::Str(Rc::new(name.clone())));
+                fields.insert("_name_".to_owned(), Value::Str(Rc::new(name.clone())));
+                fields.insert("value".to_owned(), raw.clone());
+                fields.insert("_value_".to_owned(), raw.clone());
+                let member = Value::Instance(Rc::new(Instance {
+                    class: class.clone(),
+                    fields: RefCell::new(fields),
+                }));
+                attrs.insert(name.clone(), member.clone());
+                member_list.push(member);
+            }
+            attrs.insert(
+                "__typhon_enum_members__".to_owned(),
+                Value::List(Rc::new(RefCell::new(member_list))),
+            );
+        }
+    }
+
+    /// Fields of `class` including everything it inherited. `build_class`
+    /// already accumulates ancestor fields onto each class, so this is
+    /// normally the class's own (merged) field list — but we recurse
+    /// defensively for any base built without merging.
+    fn collect_mro_fields(class: &Rc<Class>) -> Vec<ClassField> {
+        if !class.fields.is_empty() {
+            return class.fields.clone();
+        }
+        let mut out = Vec::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for base in &class.bases {
+            for f in Self::collect_mro_fields(base) {
+                if seen.insert(f.name.clone()) {
+                    out.push(f);
+                }
+            }
+        }
+        out
     }
 
     // ── Expression evaluation ──────────────────────────────────────────────
@@ -938,11 +1167,28 @@ impl Interpreter {
                             InterpolatedStringElement::Literal(lit) => out.push_str(&lit.value),
                             InterpolatedStringElement::Interpolation(interp) => {
                                 let v = self.eval_expr(&interp.expression, env)?;
+                                // PEP 501 self-documenting `=` debug
+                                // specifier: `f"{val=}"` emits the verbatim
+                                // source text (the expression, `=`, and any
+                                // surrounding whitespace, stored on
+                                // `debug_text`) before the value. With no
+                                // explicit conversion or format spec the
+                                // value renders via `repr`, matching CPython.
+                                let has_debug = interp.debug_text.is_some();
+                                if let Some(dt) = &interp.debug_text {
+                                    out.push_str(dt.as_str());
+                                }
                                 let s = match interp.conversion {
                                     ast::ConversionFlag::Repr => self.repr_of(&v)?,
-                                    ast::ConversionFlag::Str
-                                    | ast::ConversionFlag::None
-                                    | ast::ConversionFlag::Ascii => self.str_of(&v)?,
+                                    ast::ConversionFlag::Ascii => self.repr_of(&v)?,
+                                    ast::ConversionFlag::Str => self.str_of(&v)?,
+                                    ast::ConversionFlag::None => {
+                                        if has_debug && interp.format_spec.is_none() {
+                                            self.repr_of(&v)?
+                                        } else {
+                                            self.str_of(&v)?
+                                        }
+                                    }
                                 };
                                 // Format spec: limited support — width / precision for floats only.
                                 if let Some(spec) = &interp.format_spec {
@@ -1184,6 +1430,14 @@ impl Interpreter {
     }
 
     fn eval_call(&mut self, c: &ast::ExprCall, env: &EnvRef) -> Result<Value, Unwind> {
+        // `super().method(...)` / `super(Cls, self).method(...)` — resolve
+        // the next method up the MRO and bind `self`. Handled here (rather
+        // than via a `Value::Super`) because the VM has no super-proxy type.
+        if let Expr::Attribute(a) = c.func.as_ref() {
+            if let Some(sup) = Self::as_super_call(&a.value) {
+                return self.eval_super_method_call(sup, a.attr.as_str(), c, env);
+            }
+        }
         let func = self.eval_expr(&c.func, env)?;
         let mut args = Vec::with_capacity(c.arguments.args.len());
         for arg in c.arguments.args.iter() {
@@ -1224,6 +1478,132 @@ impl Interpreter {
         self.call_value(func, args, &kwargs)
     }
 
+    /// Recognise an expression that is a call to `super(...)`. Returns that
+    /// call when matched.
+    fn as_super_call(expr: &Expr) -> Option<&ast::ExprCall> {
+        if let Expr::Call(call) = expr {
+            if let Expr::Name(n) = call.func.as_ref() {
+                if n.id.as_str() == "super" {
+                    return Some(call);
+                }
+            }
+        }
+        None
+    }
+
+    /// Resolve `super(...).attr(args)`. Supports zero-arg `super()` (uses the
+    /// in-flight method frame) and two-arg `super(Cls, self)`.
+    fn eval_super_method_call(
+        &mut self,
+        sup: &ast::ExprCall,
+        attr: &str,
+        outer: &ast::ExprCall,
+        env: &EnvRef,
+    ) -> Result<Value, Unwind> {
+        // Determine the class to search *above* and the bound `self`.
+        let (start_class, self_val) = if sup.arguments.args.is_empty() {
+            // Zero-arg: pull from the current method frame.
+            self.method_stack
+                .last()
+                .cloned()
+                .ok_or_else(|| type_error("super(): no arguments and no enclosing method"))?
+        } else {
+            // Two-arg form `super(Cls, obj)`.
+            let cls_v = self.eval_expr(&sup.arguments.args[0], env)?;
+            let obj_v = if sup.arguments.args.len() >= 2 {
+                self.eval_expr(&sup.arguments.args[1], env)?
+            } else {
+                return Err(type_error("super() takes 0 or 2 arguments"));
+            };
+            match cls_v {
+                Value::Class(c) => (c, obj_v),
+                _ => return Err(type_error("super() argument 1 must be a class")),
+            }
+        };
+
+        // Resolve the method starting from the bases of `start_class`.
+        let method = start_class
+            .bases
+            .iter()
+            .find_map(|b| self.find_method(b, attr));
+        let Some(method) = method else {
+            // `super().__init__()` against a base with no such method (e.g.
+            // the implicit `object`) is a no-op, matching CPython for the
+            // synthesised dataclass constructors.
+            if attr == "__init__" {
+                return Ok(Value::None);
+            }
+            return Err(attribute_error(format!(
+                "'super' object has no attribute '{}'",
+                attr
+            )));
+        };
+
+        // Evaluate the call arguments.
+        let mut args = Vec::with_capacity(outer.arguments.args.len());
+        for arg in outer.arguments.args.iter() {
+            if let Expr::Starred(s) = arg {
+                let v = self.eval_expr(&s.value, env)?;
+                let iter = self.make_iter(v)?;
+                while let Some(x) = self.iter_next(&iter)? {
+                    args.push(x);
+                }
+            } else {
+                args.push(self.eval_expr(arg, env)?);
+            }
+        }
+        let mut kwargs: Vec<(String, Value)> = Vec::with_capacity(outer.arguments.keywords.len());
+        for kw in outer.arguments.keywords.iter() {
+            if let Some(name) = &kw.arg {
+                kwargs.push((name.as_str().to_owned(), self.eval_expr(&kw.value, env)?));
+            }
+        }
+
+        // Find the class that actually owns `method` so a chained
+        // `super()` inside it resolves the *next* level up, not itself.
+        let owner = start_class
+            .bases
+            .iter()
+            .find_map(|b| self.method_owner(b, &method))
+            .unwrap_or_else(|| start_class.clone());
+        self.call_method_with_frame(&method, owner, self_val, args, &kwargs)
+    }
+
+    /// Walk `class`'s MRO and return the class whose method table holds
+    /// `func` (by pointer identity).
+    fn method_owner(&self, class: &Rc<Class>, func: &Rc<Function>) -> Option<Rc<Class>> {
+        if let Some(m) = class.methods.borrow().get(&func.name) {
+            if Rc::ptr_eq(m, func) {
+                return Some(class.clone());
+            }
+        }
+        for base in &class.bases {
+            if let Some(c) = self.method_owner(base, func) {
+                return Some(c);
+            }
+        }
+        None
+    }
+
+    /// Call `method` bound to `self_val`, pushing a `(owner, self)` frame so
+    /// a zero-arg `super()` inside it can climb the MRO.
+    fn call_method_with_frame(
+        &mut self,
+        method: &Rc<Function>,
+        owner: Rc<Class>,
+        self_val: Value,
+        args: Vec<Value>,
+        kwargs: &[(String, Value)],
+    ) -> Result<Value, Unwind> {
+        self.method_stack.push((owner, self_val.clone()));
+        let mut full_args = Vec::with_capacity(args.len() + 1);
+        full_args.push(self_val);
+        full_args.extend(args);
+        let result = self.call_function(method, full_args, kwargs, None);
+        self.method_stack.pop();
+        result
+    }
+
     pub fn call_value(
         &mut self,
         func: Value,
@@ -1250,12 +1630,39 @@ impl Interpreter {
             }
             Value::Function(f) => self.call_function(&f, args, kwargs, None),
             Value::BoundMethod { receiver, function } => {
-                let mut full_args = Vec::with_capacity(args.len() + 1);
-                full_args.push(*receiver);
-                full_args.extend(args);
-                self.call_function(&function, full_args, kwargs, None)
+                // Push a `(defining_class, self)` frame so a zero-arg
+                // `super()` in the body can climb the MRO. The owning class
+                // is found by walking the receiver instance's MRO for this
+                // exact function; non-instance receivers (e.g. a classmethod
+                // bound to the class object) skip the frame.
+                let owner = match receiver.as_ref() {
+                    Value::Instance(inst) => self.method_owner(&inst.class, &function),
+                    _ => None,
+                };
+                if let Some(owner) = owner {
+                    self.call_method_with_frame(&function, owner, *receiver, args, kwargs)
+                } else {
+                    let mut full_args = Vec::with_capacity(args.len() + 1);
+                    full_args.push(*receiver);
+                    full_args.extend(args);
+                    self.call_function(&function, full_args, kwargs, None)
+                }
             }
             Value::Class(c) => self.instantiate(&c, args, kwargs),
+            // An instance is callable when its class defines `__call__`.
+            Value::Instance(ref inst) => {
+                if let Some(call) = self.find_method(&inst.class, "__call__") {
+                    let owner = self
+                        .method_owner(&inst.class, &call)
+                        .unwrap_or_else(|| inst.class.clone());
+                    self.call_method_with_frame(&call, owner, func.clone(), args, kwargs)
+                } else {
+                    Err(type_error(format!(
+                        "'{}' object is not callable",
+                        inst.class.name
+                    )))
+                }
+            }
             other => Err(type_error(format!(
                 "'{}' object is not callable",
                 other.type_name()
@@ -1446,8 +1853,12 @@ impl Interpreter {
             class: class.clone(),
             fields: RefCell::new(HashMap::new()),
         });
-        // Initialise class-level attributes that aren't methods.
+        // Initialise class-level attributes that aren't methods. Skip the
+        // internal enum sentinels so they don't leak onto instances.
         for (k, v) in class.class_attrs.borrow().iter() {
+            if is_enum_sentinel(k) {
+                continue;
+            }
             instance.fields.borrow_mut().insert(k.clone(), v.clone());
         }
         // Custom __init__ wins.
@@ -1511,6 +1922,21 @@ impl Interpreter {
                 extras.join(", ")
             )));
         }
+        // Dataclass `__post_init__` hook — invoked right after field
+        // initialisation when the constructor is auto-generated (matching
+        // dataclasses, where the generated `__init__` calls it).
+        if let Some(post) = self.find_method(class, "__post_init__") {
+            let owner = self
+                .method_owner(class, &post)
+                .unwrap_or_else(|| class.clone());
+            self.call_method_with_frame(
+                &post,
+                owner,
+                Value::Instance(instance.clone()),
+                vec![],
+                &[],
+            )?;
+        }
         Ok(Value::Instance(instance))
     }
 
@@ -1546,6 +1972,9 @@ impl Interpreter {
 
     /// `str(v)` honouring a user `__str__` (then `__repr__`) on instances.
     pub fn str_of(&mut self, v: &Value) -> Result<String, Unwind> {
+        if let Some(s) = self.enum_member_repr(v) {
+            return Ok(s);
+        }
         if let Some(r) = self.call_dunder0(v, "__str__")? {
             return require_str_return(r, "__str__");
         }
@@ -1557,10 +1986,27 @@ impl Interpreter {
 
     /// `repr(v)` honouring a user `__repr__` on instances.
     pub fn repr_of(&mut self, v: &Value) -> Result<String, Unwind> {
+        if let Some(s) = self.enum_member_repr(v) {
+            return Ok(s);
+        }
         if let Some(r) = self.call_dunder0(v, "__repr__")? {
             return require_str_return(r, "__repr__");
         }
         Ok(v.py_repr())
+    }
+
+    /// `ClassName.MEMBER` rendering for an enum member instance, matching
+    /// CPython's default `str(Color.RED)` / `repr` (both `Color.RED`).
+    fn enum_member_repr(&self, v: &Value) -> Option<String> {
+        if !Self::is_enum_member(v) {
+            return None;
+        }
+        if let Value::Instance(i) = v {
+            if let Some(Value::Str(name)) = i.fields.borrow().get("_name_") {
+                return Some(format!("{}.{}", i.class.name, name));
+            }
+        }
+        None
     }
 
     // ── Operators ──────────────────────────────────────────────────────────
@@ -1639,6 +2085,18 @@ impl Interpreter {
             let a = l.to_bigint()?;
             let b = r.to_bigint()?;
             return self.binop(&Int(a), op, &Int(b));
+        }
+
+        // printf-style `%` formatting: `"%.2f and %s" % (3.14, "x")`. The
+        // checker already accepts `str % args`; the VM implements the
+        // common conversions. A single non-tuple value is treated as one
+        // positional argument.
+        if let (Str(fmt), Mod, _) = (l, op, r) {
+            let values: Vec<Value> = match r {
+                Tuple(t) => t.as_ref().clone(),
+                other => vec![other.clone()],
+            };
+            return Ok(Str(Rc::new(printf_format(fmt, &values)?)));
         }
 
         // Strings.
@@ -2061,6 +2519,16 @@ impl Interpreter {
             | Value::Float(_)
             | Value::Bool(_)
             | Value::Bytes(_) => {
+                // H5b — accessing an unknown (non-method, non-dunder)
+                // attribute on a built-in value must raise `AttributeError`
+                // rather than returning a bogus bound-method object.
+                if !builtin_has_attr(value, attr) {
+                    return Err(attribute_error(format!(
+                        "'{}' object has no attribute '{}'",
+                        value.type_name(),
+                        attr
+                    )));
+                }
                 // Return a native fn whose first arg is the receiver — the
                 // method registry in `builtins` does the actual dispatch.
                 let r = value.clone();
@@ -2272,6 +2740,17 @@ impl Interpreter {
                 IterState::Set { keys, index: 0 }
             }
             Value::Iter(it) => return Ok(Value::Iter(it)),
+            // Iterating an enum class yields its members in definition order.
+            Value::Class(ref c) if Self::is_enum_class(c) => {
+                let members = match c.class_attrs.borrow().get("__typhon_enum_members__") {
+                    Some(Value::List(l)) => l.borrow().clone(),
+                    _ => Vec::new(),
+                };
+                IterState::List {
+                    items: Rc::new(RefCell::new(members)),
+                    index: 0,
+                }
+            }
             other => {
                 return Err(type_error(format!(
                     "'{}' object is not iterable",
@@ -3016,6 +3495,320 @@ fn decorator_simple_name(e: &Expr) -> Option<String> {
     }
 }
 
+/// Internal enum bookkeeping class-attr names that must not be inherited by
+/// subclasses or leak onto instances.
+fn is_enum_sentinel(name: &str) -> bool {
+    matches!(name, "__typhon_enum_base__" | "__typhon_enum_members__")
+}
+
+/// Whether a built-in value actually has the named attribute/method. Mirrors
+/// the method tables in `builtins.rs` (which this crate may not edit). Any
+/// dunder name passes through so internal probing paths keep working; only
+/// plain unknown names are rejected, which is what makes `(5).foo` raise
+/// `AttributeError` (H5b) instead of returning a bogus bound method.
+fn builtin_has_attr(value: &Value, attr: &str) -> bool {
+    if attr.starts_with("__") && attr.ends_with("__") {
+        return true;
+    }
+    match value {
+        Value::Str(_) => matches!(
+            attr,
+            "capitalize"
+                | "casefold"
+                | "center"
+                | "count"
+                | "encode"
+                | "endswith"
+                | "expandtabs"
+                | "find"
+                | "format"
+                | "index"
+                | "isalnum"
+                | "isalpha"
+                | "isdecimal"
+                | "isdigit"
+                | "islower"
+                | "isnumeric"
+                | "isspace"
+                | "istitle"
+                | "isupper"
+                | "join"
+                | "ljust"
+                | "lower"
+                | "lstrip"
+                | "partition"
+                | "removeprefix"
+                | "removesuffix"
+                | "replace"
+                | "rfind"
+                | "rindex"
+                | "rjust"
+                | "rpartition"
+                | "rsplit"
+                | "rstrip"
+                | "split"
+                | "splitlines"
+                | "startswith"
+                | "strip"
+                | "swapcase"
+                | "title"
+                | "upper"
+                | "zfill"
+        ),
+        Value::Bytes(_) => matches!(attr, "decode" | "hex" | "lower" | "upper"),
+        Value::List(_) => matches!(
+            attr,
+            "append"
+                | "appendleft"
+                | "clear"
+                | "copy"
+                | "count"
+                | "extend"
+                | "extendleft"
+                | "index"
+                | "insert"
+                | "pop"
+                | "popleft"
+                | "remove"
+                | "reverse"
+                | "rotate"
+                | "sort"
+        ),
+        Value::Dict(_) => matches!(
+            attr,
+            "clear"
+                | "copy"
+                | "elements"
+                | "get"
+                | "items"
+                | "keys"
+                | "most_common"
+                | "pop"
+                | "popitem"
+                | "setdefault"
+                | "update"
+                | "values"
+        ),
+        Value::Set(_) => matches!(
+            attr,
+            "add"
+                | "clear"
+                | "copy"
+                | "difference"
+                | "discard"
+                | "intersection"
+                | "isdisjoint"
+                | "issubset"
+                | "issuperset"
+                | "pop"
+                | "remove"
+                | "symmetric_difference"
+                | "union"
+                | "update"
+        ),
+        Value::Tuple(_) => matches!(attr, "count" | "index"),
+        Value::Float(_) => matches!(attr, "is_integer"),
+        Value::Int(_) | Value::Bool(_) => matches!(attr, "bit_length" | "is_integer"),
+        _ => false,
+    }
+}
+
+/// printf-style `%` string formatting (`"%.2f and %s" % (3.14, "x")`).
+/// Supports `%s %r %d %i %f %e %E %g %G %x %X %o %c %%` with optional
+/// flags (`-`, `+`, ` `, `0`, `#`), width, and `.precision`. Enough to
+/// cover the common cases; matches CPython for those conversions.
+fn printf_format(fmt: &str, values: &[Value]) -> Result<String, Unwind> {
+    let chars: Vec<char> = fmt.chars().collect();
+    let mut out = String::new();
+    let mut i = 0usize;
+    let mut arg = 0usize;
+    let next_arg = |arg: &mut usize| -> Result<&Value, Unwind> {
+        let v = values
+            .get(*arg)
+            .ok_or_else(|| type_error("not enough arguments for format string"))?;
+        *arg += 1;
+        Ok(v)
+    };
+    while i < chars.len() {
+        if chars[i] != '%' {
+            out.push(chars[i]);
+            i += 1;
+            continue;
+        }
+        i += 1; // consume '%'
+        if i >= chars.len() {
+            return Err(value_error("incomplete format"));
+        }
+        if chars[i] == '%' {
+            out.push('%');
+            i += 1;
+            continue;
+        }
+        // Flags.
+        let mut flag_minus = false;
+        let mut flag_plus = false;
+        let mut flag_space = false;
+        let mut flag_zero = false;
+        let mut flag_alt = false;
+        loop {
+            match chars.get(i) {
+                Some('-') => flag_minus = true,
+                Some('+') => flag_plus = true,
+                Some(' ') => flag_space = true,
+                Some('0') => flag_zero = true,
+                Some('#') => flag_alt = true,
+                _ => break,
+            }
+            i += 1;
+        }
+        // Width.
+        let mut width: Option<usize> = None;
+        while let Some(c) = chars.get(i) {
+            if let Some(d) = c.to_digit(10) {
+                width = Some(width.unwrap_or(0) * 10 + d as usize);
+                i += 1;
+            } else {
+                break;
+            }
+        }
+        // Precision.
+        let mut precision: Option<usize> = None;
+        if chars.get(i) == Some(&'.') {
+            i += 1;
+            let mut p = 0usize;
+            while let Some(c) = chars.get(i) {
+                if let Some(d) = c.to_digit(10) {
+                    p = p * 10 + d as usize;
+                    i += 1;
+                } else {
+                    break;
+                }
+            }
+            precision = Some(p);
+        }
+        let conv = *chars
+            .get(i)
+            .ok_or_else(|| value_error("incomplete format"))?;
+        i += 1;
+
+        let body: String = match conv {
+            's' => {
+                let v = next_arg(&mut arg)?;
+                let mut s = v.py_str();
+                if let Some(p) = precision {
+                    s = s.chars().take(p).collect();
+                }
+                s
+            }
+            'r' => {
+                let v = next_arg(&mut arg)?;
+                let mut s = v.py_repr();
+                if let Some(p) = precision {
+                    s = s.chars().take(p).collect();
+                }
+                s
+            }
+            'c' => {
+                let v = next_arg(&mut arg)?;
+                match v {
+                    Value::Str(s) => s.chars().next().map(String::from).unwrap_or_default(),
+                    other => {
+                        let n = other.to_int()?;
+                        char::from_u32(n as u32).map(String::from).unwrap_or_default()
+                    }
+                }
+            }
+            'd' | 'i' => {
+                let v = next_arg(&mut arg)?;
+                let iv = v.to_bigint()?;
+                printf_signed(&iv.abs().to_str_radix(10), iv.is_negative(), flag_plus, flag_space)
+            }
+            'x' | 'X' | 'o' => {
+                let v = next_arg(&mut arg)?;
+                let iv = v.to_bigint()?;
+                let neg = iv.is_negative();
+                let abs = iv.abs();
+                let mut digits = match conv {
+                    'x' => abs.to_str_radix(16),
+                    'X' => abs.to_str_radix(16).to_uppercase(),
+                    _ => abs.to_str_radix(8),
+                };
+                if flag_alt {
+                    let prefix = match conv {
+                        'x' => "0x",
+                        'X' => "0X",
+                        _ => "0o",
+                    };
+                    digits = format!("{prefix}{digits}");
+                }
+                printf_signed(&digits, neg, flag_plus, flag_space)
+            }
+            'f' | 'F' | 'e' | 'E' | 'g' | 'G' => {
+                let v = next_arg(&mut arg)?;
+                let x = v.to_float()?;
+                let p = precision.unwrap_or(6);
+                let neg = x.is_sign_negative() && x != 0.0;
+                let abs = x.abs();
+                let digits = match conv {
+                    'e' => normalise_exp_notation(format!("{:.*e}", p, abs), false),
+                    'E' => normalise_exp_notation(format!("{:.*e}", p, abs), true),
+                    'g' | 'G' => format_g(abs, if p == 0 { 1 } else { p }, conv == 'G'),
+                    _ => format!("{:.*}", p, abs),
+                };
+                printf_signed(&digits, neg, flag_plus, flag_space)
+            }
+            other => {
+                return Err(value_error(format!(
+                    "unsupported format character '{other}'"
+                )))
+            }
+        };
+
+        out.push_str(&pad_printf(&body, width, flag_minus, flag_zero, conv));
+    }
+    Ok(out)
+}
+
+fn printf_signed(magnitude: &str, neg: bool, plus: bool, space: bool) -> String {
+    if neg {
+        format!("-{magnitude}")
+    } else if plus {
+        format!("+{magnitude}")
+    } else if space {
+        format!(" {magnitude}")
+    } else {
+        magnitude.to_owned()
+    }
+}
+
+fn pad_printf(body: &str, width: Option<usize>, left: bool, zero: bool, conv: char) -> String {
+    let Some(w) = width else {
+        return body.to_owned();
+    };
+    let len = body.chars().count();
+    if len >= w {
+        return body.to_owned();
+    }
+    let pad = w - len;
+    if left {
+        let p: String = std::iter::repeat_n(' ', pad).collect();
+        format!("{body}{p}")
+    } else if zero
+        && matches!(conv, 'd' | 'i' | 'f' | 'F' | 'e' | 'E' | 'g' | 'G' | 'x' | 'X' | 'o')
+    {
+        // Zero-pad after an optional sign.
+        let (sign, rest) = match body.strip_prefix(['-', '+', ' ']) {
+            Some(r) => (&body[..1], r),
+            None => ("", body),
+        };
+        let p: String = std::iter::repeat_n('0', pad).collect();
+        format!("{sign}{p}{rest}")
+    } else {
+        let p: String = std::iter::repeat_n(' ', pad).collect();
+        format!("{p}{body}")
+    }
+}
+
 fn overflow() -> Unwind {
     Unwind::Exception(VmException::new("OverflowError", "int overflow"))
 }
@@ -3512,6 +4305,46 @@ fn format_with_spec(value: &Value, default: &str, spec: &str) -> Result<String, 
     let buf: String;
     let mut prefix = String::new();
     let mut explicit_sign = String::new();
+
+    // Percentage type `%` (M3): multiply by 100, format with the given
+    // precision (default 6), append `%`. Works for any numeric value
+    // (e.g. `f"{1:.2%}"` → `100.00%`).
+    if typ == Some('%') && is_numeric {
+        let x = value.to_float()?;
+        let scaled = x * 100.0;
+        let p = precision.unwrap_or(6);
+        let (abs, neg) = (scaled.abs(), scaled.is_sign_negative());
+        let body = format!("{:.*}%", p, abs);
+        if neg {
+            explicit_sign.push('-');
+        } else if let Some('+') = sign {
+            explicit_sign.push('+');
+        } else if let Some(' ') = sign {
+            explicit_sign.push(' ');
+        }
+        if let Some(w) = width {
+            let total_len = explicit_sign.chars().count() + body.chars().count();
+            if total_len < w {
+                let pad = w - total_len;
+                let eff_align = align.unwrap_or('>');
+                let p_str: String = std::iter::repeat_n(fill, pad).collect();
+                return Ok(match eff_align {
+                    '<' => format!("{explicit_sign}{body}{p_str}"),
+                    '^' => {
+                        let lo = pad / 2;
+                        let hi = pad - lo;
+                        let lo_s: String = std::iter::repeat_n(fill, lo).collect();
+                        let hi_s: String = std::iter::repeat_n(fill, hi).collect();
+                        format!("{lo_s}{explicit_sign}{body}{hi_s}")
+                    }
+                    '=' => format!("{explicit_sign}{p_str}{body}"),
+                    _ => format!("{p_str}{explicit_sign}{body}"),
+                });
+            }
+        }
+        return Ok(format!("{explicit_sign}{body}"));
+    }
+
     match value {
         Value::Float(x) => {
             let p = precision.unwrap_or(6);
