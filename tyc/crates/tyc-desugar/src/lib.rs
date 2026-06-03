@@ -2720,18 +2720,6 @@ fn collect_sealed_union_aliases(body: &[Stmt]) -> HashMap<String, Vec<String>> {
     out
 }
 
-/// Merge Typhon `impl` pseudo-classes into their target classes.
-///
-/// The preprocessor rewrites `impl ClassName:` to `class __typhon_impl_ClassName(object):`.
-/// This function:
-/// 1. Finds all such pseudo-classes in `body`.
-/// 2. Injects `self` as the first parameter of every method defined inside them.
-/// 3. Appends those methods to the corresponding target class body.
-/// 4. Removes the pseudo-classes from the statement list.
-///
-/// Returns the modified statement list and `true` when at least one impl block
-/// was found.  Missing target classes are silently skipped (the type checker
-/// surfaces a better diagnostic for that case).
 // ── H0: bare `super()` rewrite ─────────────────────────────────────────────
 
 /// Rewrite every bare zero-argument `super()` call appearing inside a method
@@ -2853,6 +2841,18 @@ fn first_parameter_name(params: &Parameters) -> Option<String> {
     None
 }
 
+/// Merge Typhon `impl` pseudo-classes into their target classes.
+///
+/// The preprocessor rewrites `impl ClassName:` to `class __typhon_impl_ClassName(object):`.
+/// This function:
+/// 1. Finds all such pseudo-classes in `body`.
+/// 2. Injects `self` as the first parameter of every method defined inside them.
+/// 3. Appends those methods to the corresponding target class body.
+/// 4. Removes the pseudo-classes from the statement list.
+///
+/// Returns the modified statement list and `true` when at least one impl block
+/// was found.  Missing target classes are silently skipped (the type checker
+/// surfaces a better diagnostic for that case).
 fn merge_impl_blocks(body: Vec<Stmt>) -> (Vec<Stmt>, bool) {
     // R2-3: collect sealed-union aliases first so an `impl Union:` block
     // (where `Union` is `type Union = A | B | …`) distributes its methods

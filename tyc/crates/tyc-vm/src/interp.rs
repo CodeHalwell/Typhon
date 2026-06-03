@@ -866,7 +866,10 @@ impl Interpreter {
         let mut member_list: Vec<Value> = Vec::with_capacity(order.len());
         {
             let mut attrs = class.class_attrs.borrow_mut();
-            let mut auto_counter: i64 = 0;
+            // Tracks the last assigned integer value so a bare `auto()`
+            // continues from it (CPython: `A = 10; B = auto()` ⇒ `B == 11`).
+            // Starts at 0 so a leading `auto()` yields 1.
+            let mut last_value: i64 = 0;
             for name in &order {
                 let Some(raw) = attrs.get(name).cloned() else {
                     continue;
@@ -875,11 +878,18 @@ impl Interpreter {
                 if matches!(&raw, Value::Instance(i) if Rc::ptr_eq(&i.class, class)) {
                     continue;
                 }
-                // `enum.auto()` → next sequential integer (1-based).
+                // `enum.auto()` → previous value + 1; an explicit integer
+                // value advances the counter so following `auto()`s continue
+                // from it.
                 let raw = if Self::is_enum_auto(&raw) {
-                    auto_counter += 1;
-                    Value::Int(BigInt::from(auto_counter))
+                    last_value += 1;
+                    Value::Int(BigInt::from(last_value))
                 } else {
+                    if let Value::Int(i) = &raw {
+                        if let Some(v) = i.to_i64() {
+                            last_value = v;
+                        }
+                    }
                     raw
                 };
                 let mut fields: HashMap<String, Value> = HashMap::new();
@@ -1517,13 +1527,14 @@ impl Interpreter {
                 .cloned()
                 .ok_or_else(|| type_error("super(): no arguments and no enclosing method"))?
         } else {
-            // Two-arg form `super(Cls, obj)`.
-            let cls_v = self.eval_expr(&sup.arguments.args[0], env)?;
-            let obj_v = if sup.arguments.args.len() >= 2 {
-                self.eval_expr(&sup.arguments.args[1], env)?
-            } else {
+            // Two-arg form `super(Cls, obj)`. Any other arity is a `TypeError`
+            // in CPython (`super(A, b, c)`); reject it rather than silently
+            // ignoring the extra arguments.
+            if sup.arguments.args.len() != 2 {
                 return Err(type_error("super() takes 0 or 2 arguments"));
-            };
+            }
+            let cls_v = self.eval_expr(&sup.arguments.args[0], env)?;
+            let obj_v = self.eval_expr(&sup.arguments.args[1], env)?;
             match cls_v {
                 Value::Class(c) => (c, obj_v),
                 _ => return Err(type_error("super() argument 1 must be a class")),

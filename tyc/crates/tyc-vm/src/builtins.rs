@@ -4070,33 +4070,6 @@ fn str_method(
                 Value::Str(Rc::new(out))
             }
         }
-        "rsplit" => {
-            let maxsplit = args.get(1).and_then(|v| v.to_int().ok()).unwrap_or(-1);
-            let parts: Vec<Value> = match args.first() {
-                Some(v) => {
-                    let sep = v.py_str();
-                    let mut collected: Vec<String> = if maxsplit < 0 {
-                        s.split(&sep).map(|p| p.to_owned()).collect()
-                    } else {
-                        s.rsplitn((maxsplit + 1) as usize, &sep)
-                            .map(|p| p.to_owned())
-                            .collect::<Vec<_>>()
-                            .into_iter()
-                            .rev()
-                            .collect()
-                    };
-                    collected
-                        .drain(..)
-                        .map(|p| Value::Str(Rc::new(p)))
-                        .collect()
-                }
-                None => s
-                    .split_whitespace()
-                    .map(|p| Value::Str(Rc::new(p.to_owned())))
-                    .collect(),
-            };
-            Value::List(Rc::new(RefCell::new(parts)))
-        }
         "partition" | "rpartition" => {
             let sep = single(args, name)?.py_str();
             let found = if name == "partition" {

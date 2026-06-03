@@ -193,6 +193,16 @@ impl Type {
     }
 }
 
+/// `true` when `ty` is Python's universal base type `object`. Every value
+/// (including `None`) is an instance of `object`, so a slot typed `object`
+/// must accept any actual type — including the `None` singleton. This is
+/// consulted by the nullable-into-non-nullable call-argument guard so that
+/// `f(None)` into `def f(x: object)` is NOT mistaken for a null-safety
+/// violation (M13).
+pub fn is_object_type(ty: &Type) -> bool {
+    matches!(ty, Type::Class(name) if name == "object")
+}
+
 /// Check whether a value of type `actual` is assignable to a target of
 /// type `expected`.
 ///
@@ -210,16 +220,6 @@ impl Type {
 ///   `list[T]` (mutable container) stays invariant while
 ///   `Sequence[T]` / `Iterable[T]` (read-only view) flow covariantly.
 /// - Otherwise structural equality.
-/// `true` when `ty` is Python's universal base type `object`. Every value
-/// (including `None`) is an instance of `object`, so a slot typed `object`
-/// must accept any actual type — including the `None` singleton. This is
-/// consulted by the nullable-into-non-nullable call-argument guard so that
-/// `f(None)` into `def f(x: object)` is NOT mistaken for a null-safety
-/// violation (M13).
-pub fn is_object_type(ty: &Type) -> bool {
-    matches!(ty, Type::Class(name) if name == "object")
-}
-
 pub fn assignable(expected: &Type, actual: &Type) -> bool {
     match (expected, actual) {
         (Type::Any, _) | (_, Type::Any) => true,

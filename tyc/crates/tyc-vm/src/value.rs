@@ -43,6 +43,10 @@ pub enum HashKey {
     Bool(bool),
     Int(BigInt),
     Float(u64),
+    /// A complex number stored as the bit patterns of its real and
+    /// imaginary `f64` parts (bitwise, like `Float`). Python's `complex`
+    /// is hashable, so `{1j: ...}` / `set([1j])` work.
+    Complex(u64, u64),
     Str(RcStr),
     Tuple(Rc<Vec<HashKey>>),
     /// A `frozenset` used as a dict key. The elements are stored sorted by
@@ -106,6 +110,11 @@ impl HashKey {
                 out.push(3);
                 out.extend_from_slice(&bits.to_be_bytes());
             }
+            HashKey::Complex(re, im) => {
+                out.push(8);
+                out.extend_from_slice(&re.to_be_bytes());
+                out.extend_from_slice(&im.to_be_bytes());
+            }
             HashKey::Str(s) => {
                 out.push(4);
                 out.extend_from_slice(&(s.len() as u32).to_be_bytes());
@@ -155,6 +164,7 @@ impl HashKey {
             HashKey::Bool(b) => Value::Bool(b),
             HashKey::Int(i) => Value::Int(i),
             HashKey::Float(bits) => Value::Float(f64::from_bits(bits)),
+            HashKey::Complex(re, im) => Value::Complex(f64::from_bits(re), f64::from_bits(im)),
             HashKey::Str(s) => Value::Str(s),
             HashKey::Tuple(items) => Value::Tuple(Rc::new(
                 items.iter().cloned().map(HashKey::into_value).collect(),
@@ -187,6 +197,7 @@ impl PartialEq for HashKey {
             }
             (HashKey::Int(a), HashKey::Int(b)) => a == b,
             (HashKey::Float(a), HashKey::Float(b)) => a == b,
+            (HashKey::Complex(ar, ai), HashKey::Complex(br, bi)) => ar == br && ai == bi,
             (HashKey::Str(a), HashKey::Str(b)) => a == b,
             (HashKey::Tuple(a), HashKey::Tuple(b)) => a == b,
             (HashKey::FrozenSet(a), HashKey::FrozenSet(b)) => {
@@ -216,6 +227,10 @@ impl std::hash::Hash for HashKey {
             HashKey::Bool(b) => BigInt::from(*b as i64).hash(state),
             HashKey::Int(i) => i.hash(state),
             HashKey::Float(bits) => bits.hash(state),
+            HashKey::Complex(re, im) => {
+                re.hash(state);
+                im.hash(state);
+            }
             HashKey::Str(s) => s.hash(state),
             HashKey::Tuple(items) => items.hash(state),
             HashKey::FrozenSet(items) => items.hash(state),
@@ -568,6 +583,7 @@ impl Value {
             Value::Bool(b) => Ok(HashKey::Bool(*b)),
             Value::Int(i) => Ok(HashKey::Int(i.clone())),
             Value::Float(x) => Ok(HashKey::Float(x.to_bits())),
+            Value::Complex(re, im) => Ok(HashKey::Complex(re.to_bits(), im.to_bits())),
             Value::Str(s) => Ok(HashKey::Str(s.clone())),
             Value::Tuple(items) => {
                 let mut keys = Vec::with_capacity(items.len());
@@ -1212,7 +1228,7 @@ fn format_float(x: f64) -> String {
     let mag = x.abs();
     let exp10 = mag.log10().floor() as i32;
 
-    if exp10 < -4 || exp10 >= 16 {
+    if !(-4..16).contains(&exp10) {
         return format_float_scientific(x);
     }
 
@@ -1378,7 +1394,7 @@ mod tests {
         assert_eq!(format_float(0.0001), "0.0001");
         assert_eq!(format_float(0.00001), "1e-05");
         assert_eq!(format_float(1.0), "1.0");
-        assert_eq!(format_float(3.14), "3.14");
+        assert_eq!(format_float(3.25), "3.25");
         assert_eq!(format_float(1.0 / 3.0), "0.3333333333333333");
         assert_eq!(format_float(0.1 + 0.2), "0.30000000000000004");
         assert_eq!(format_float(f64::INFINITY), "inf");
