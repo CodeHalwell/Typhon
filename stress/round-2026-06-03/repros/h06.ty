@@ -1,0 +1,6 @@
+def main() -> None:
+    let s: str = "x"
+    print(s.frobnicate())
+
+if __name__ == "__main__":
+    main()

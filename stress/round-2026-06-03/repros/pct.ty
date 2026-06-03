@@ -1,0 +1,7 @@
+def main() -> None:
+    print(f"{0.5:.0%}")
+    print(f"{0.1234:.1%}")
+    print(f"{1:.2%}")
+    print(f"{0.5:%}")
+if __name__ == "__main__":
+    main()

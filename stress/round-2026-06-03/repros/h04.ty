@@ -1,0 +1,7 @@
+def main() -> None:
+    let n: int = 5
+    for x in n:
+        print(x)
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,10 @@
+def main() -> None:
+    let n: int = 5
+    let x = n.anything_at_all
+    print(x)
+    let s: str = "hi"
+    print(s.nonexistent_attr)
+    let xs: list[int] = [1,2,3]
+    print(xs.bogus)
+if __name__ == "__main__":
+    main()

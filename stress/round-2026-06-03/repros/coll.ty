@@ -1,0 +1,11 @@
+from collections import Counter, defaultdict
+def main() -> None:
+    let words: list[str] = ["a","b","a","c","a","b"]
+    let c = Counter(words)
+    print(c.most_common(2))
+    mut groups: dict[str, list[int]] = defaultdict(list)
+    groups["even"].append(2)
+    groups["even"].append(4)
+    print(dict(groups))
+if __name__ == "__main__":
+    main()
