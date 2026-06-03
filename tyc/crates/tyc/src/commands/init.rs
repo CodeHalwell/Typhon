@@ -164,6 +164,7 @@ auto-gather = false             # fold consecutive awaits into asyncio.TaskGroup
 pgo-memoise = false             # promote hot pure fns from typhon-profile.json
 require-with = "warn"           # "error" / "off" — open()/socket()/connect() outside `with` is a leak
 blocking-in-async = "warn"      # "error" / "off" — time.sleep / requests.get inside async def
+allow-secret-comptime = false   # silence `tyc::contains_secret_literal` warnings
 
 # Run `tyc migrate path/to/foo.py` to convert typed Python to Typhon.
 "#,
@@ -318,6 +319,21 @@ mod tests {
         assert!(
             line.contains("dataclass") && line.contains("pydantic"),
             "class-default comment should mention both accepted values: {line}"
+        );
+    }
+
+    #[test]
+    fn scaffold_typhon_toml_includes_allow_secret_comptime() {
+        let tmp = tempfile::tempdir().unwrap();
+        run(InitArgs {
+            name: Some("docs".into()),
+            dir: tmp.path().to_path_buf(),
+        })
+        .unwrap();
+        let toml = std::fs::read_to_string(tmp.path().join("docs/typhon.toml")).unwrap();
+        assert!(
+            toml.contains("allow-secret-comptime = false"),
+            "allow-secret-comptime missing from generated typhon.toml:\n{toml}"
         );
     }
 }
