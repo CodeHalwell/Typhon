@@ -297,6 +297,79 @@ runner-ergonomics gap.
   descent (converged to x=3.0000), 2×2 matmul, agent tool-dispatch
   loop, HTTP routing API with newtype IDs.
 
+## Round 2 — second sweep (stdlib breadth, match patterns, formatter)
+
+### H6 — Regex capture groups are broken in the VM  (VM)
+
+`repros/regrp.ty`, `repros/re1.ty`. Every positional capture group
+returns the **whole match** instead of the group:
+
+```python
+m = re.match(r"(\w+)@(\w+)\.(\w+)", "user@example.com")
+m.group(1)  # VM: "user@example.com"   CPython: "user"
+m.groups()  # VM: ("user@example.com",) CPython: ("user","example","com")
+```
+
+Silent wrong answers in any parse/validate/extract code — regex with
+groups is ubiquitous. `re.findall` / `re.sub` / `re.split` /
+`compile().findall` all work; only group extraction is wrong.
+
+### M13 — `None` is not assignable to `object`  (CHK — false positive)
+
+`repros/obj.ty`. Both `f(None)` where `f(x: object)` and
+`let y: object = None` are rejected with
+`type mismatch: expected object, found None`. `object` is the top type
+and includes `None` in Python; this is a false positive. The help text
+("widen to `object | None`") is also misleading. Found because it
+blocked an otherwise-correct `match` program from running.
+
+### M14 — `itertools.groupby(key=...)` rejects its keyword argument  (VM)
+
+`repros/it1.ty`. `groupby(data, key=lambda p: p[0])` →
+`TypeError: groupby() does not accept keyword arguments`. `chain`,
+`islice`, `count`, `accumulate`, `product`, `combinations`,
+`functools.reduce` / `partial` all work.
+
+### M15 — `datetime` unimportable in the VM  (VM gap)
+
+`repros/dt1.ty`. `from datetime import datetime` →
+`ImportError: tyc-vm cannot import 'datetime'`. Graceful, but
+`datetime` is core and missing from the VM's native stdlib.
+
+### M16 — `pathlib.Path` `/` join + `.suffixes` unsupported in the VM  (VM)
+
+`repros/path1.ty`. `Path("/a") / "b"` →
+`TypeError: unsupported operand type(s) for /: 'instance' and 'str'`.
+`.name` / `.parent` / `.suffix` work; the `/` operator (the idiomatic
+join) and `.suffixes` do not.
+
+### M17 — `complex` numbers unsupported in the VM  (VM gap)
+
+`repros/num1.ty`. `complex(3, 4)` → `NameError: name 'complex' is not
+defined`; `j` literals likely too. Integer literal forms (`0x`, `0o`,
+`0b`, `1_000_000`) and float forms all work.
+
+### L3 — `dict.keys()` / `dict.values()` repr as plain lists  (VM)
+
+`repros/coll2.ty`. VM prints `['a', 'b'] [1, 2]`; CPython prints
+`dict_keys(['a', 'b']) dict_values([1, 2])`. Iterating / `list()`-ing
+them works; only the view repr diverges. Every other list/dict method
+verified correct (sort, insert, extend, remove, pop, index, reverse,
+count, setdefault, update, get-with-default, membership).
+
+### Round-2 non-bugs / notes
+
+- **Match patterns are flawless in the VM**: sequence-with-star
+  (`[1, 2, *rest]`), mapping-with-`**rest`, `case str() as s if …`,
+  OR patterns (`int() | float()`), wildcard — output matches CPython
+  exactly (`repros/m1.ty`).
+- `tyc fmt` normalises token spacing but does **not** re-indent
+  over-indented blocks when `ruff` is absent from PATH (only the
+  internal whitespace pass runs). Not a correctness bug.
+- The 13-file `examples/apps/01-task-scheduler` checks clean and
+  builds to 13 `.py` files + `typhon_runtime/`; only fails to *run*
+  here because `uvicorn` isn't installed (not a Typhon issue).
+
 ## Strong points confirmed this round (regression anchors)
 
 - Bounded TypeVars enforce their bound: `max_of[T: int]("a", "b")` →

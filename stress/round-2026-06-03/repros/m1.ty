@@ -1,0 +1,23 @@
+def classify(x: object) -> str:
+    match x:
+        case [1, 2, *rest]:
+            return f"list starting 1,2 rest={rest}"
+        case {"type": t, **extra}:
+            return f"dict type={t} extra={extra}"
+        case (a, b, c):
+            return f"triple {a},{b},{c}"
+        case str() as s if len(s) > 3:
+            return f"long str {s}"
+        case int() | float():
+            return "number"
+        case _:
+            return "other"
+def main() -> None:
+    print(classify([1, 2, 3, 4]))
+    print(classify({"type": "x", "k": 1}))
+    print(classify((1, 2, 3)))
+    print(classify("hello"))
+    print(classify(42))
+    print(classify(None))
+if __name__ == "__main__":
+    main()

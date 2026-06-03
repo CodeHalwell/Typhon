@@ -1,0 +1,12 @@
+import re
+def main() -> None:
+    let m = re.match(r"(\d+)-(\d+)", "12-34")
+    if m is not None:
+        print(m.group(1), m.group(2))
+    print(re.findall(r"\d+", "a1b22c333"))
+    print(re.sub(r"\s+", "_", "a  b   c"))
+    print(re.split(r",", "a,b,c"))
+    let p = re.compile(r"[aeiou]")
+    print(p.findall("hello world"))
+if __name__ == "__main__":
+    main()

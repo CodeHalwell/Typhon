@@ -1,0 +1,9 @@
+def main() -> None:
+    let c: complex = complex(3, 4)
+    print(abs(c))
+    print(c.real, c.imag)
+    print((1+2j) * (3+4j))
+    print(0x1F, 0o17, 0b1010, 1_000_000)
+    print(1.5e3, .5, 5.)
+if __name__ == "__main__":
+    main()

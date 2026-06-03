@@ -1,0 +1,10 @@
+from pathlib import Path
+def main() -> None:
+    let p: Path = Path("/usr/local/bin")
+    print(p.name)
+    print(p.parent)
+    print(p.suffix)
+    print((Path("/a") / "b" / "c.txt").name)
+    print(Path("file.tar.gz").suffixes)
+if __name__ == "__main__":
+    main()

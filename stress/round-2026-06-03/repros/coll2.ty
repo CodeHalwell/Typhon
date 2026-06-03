@@ -1,0 +1,21 @@
+def main() -> None:
+    mut xs: list[int] = [3, 1, 2]
+    xs.sort()
+    print(xs)
+    xs.insert(0, 0)
+    xs.extend([4, 5])
+    print(xs)
+    xs.remove(3)
+    print(xs, xs.pop(), xs.index(4))
+    xs.reverse()
+    print(xs)
+    print(xs.count(1))
+    mut d: dict[str, int] = {"a": 1, "b": 2}
+    print(d.keys(), d.values())
+    print(d.pop("a"), d.setdefault("c", 3))
+    d.update({"x": 9})
+    print(sorted(d.items()))
+    print(list(d))
+    print("a" in d, d.get("z", -1))
+if __name__ == "__main__":
+    main()
