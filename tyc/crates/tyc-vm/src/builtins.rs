@@ -214,6 +214,11 @@ pub fn install(interp: &mut Interpreter) {
     });
 
     native!("int", |_i, args| {
+        // `int()` with no argument is 0 (matches CPython; used by
+        // `defaultdict(int)` as a zero-factory).
+        if args.is_empty() {
+            return Ok(Value::Int(num_bigint::BigInt::from(0)));
+        }
         let v = single(&args, "int")?;
         // `int(str, base)` — parse a string in the given radix.
         if let (Value::Str(s), Some(base_v)) = (v, args.get(1)) {
@@ -464,6 +469,23 @@ pub fn install(interp: &mut Interpreter) {
             if let Value::Dict(d) = &v {
                 return Ok(Value::Dict(Rc::new(RefCell::new(d.borrow().clone()))));
             }
+            // `dict(mapping_instance)` — a synthesised mapping (e.g. the
+            // `defaultdict` shim) exposes the mapping protocol via a `keys`
+            // method; copy key→value pairs through `__getitem__`.
+            if let Value::Instance(inst) = &v {
+                if i.find_method(&inst.class, "keys").is_some()
+                    && i.find_method(&inst.class, "__getitem__").is_some()
+                {
+                    let keys_view = i.get_attr(&v, "keys")?;
+                    let keys = i.call_value(keys_view, vec![], &[])?;
+                    let kit = i.make_iter(keys)?;
+                    while let Some(k) = i.iter_next(&kit)? {
+                        let val = i.subscript(&v, &k)?;
+                        map.insert(k.to_hash_key()?, val);
+                    }
+                    return Ok(Value::Dict(Rc::new(RefCell::new(map))));
+                }
+            }
             let it = i.make_iter(v)?;
             while let Some(pair) = i.iter_next(&it)? {
                 match pair {
@@ -522,7 +544,36 @@ pub fn install(interp: &mut Interpreter) {
         Value::Int(i) => Ok(Value::Int(num_traits::Signed::abs(i))),
         Value::Float(x) => Ok(Value::Float(x.abs())),
         Value::Bool(b) => Ok(Value::Int(num_bigint::BigInt::from(*b as i64))),
+        // `abs(complex)` is the Euclidean magnitude (a float), matching CPython.
+        Value::Complex(re, im) => Ok(Value::Float((re * re + im * im).sqrt())),
         _ => Err(type_error("bad operand type for abs()")),
+    });
+
+    // `complex()` / `complex(re)` / `complex(re, im)` constructor. Accepts
+    // int/float/bool numeric components (and a `Complex` first arg).
+    native!("complex", |_i, args| {
+        fn part(v: &Value, what: &str) -> Result<f64, Unwind> {
+            match v {
+                Value::Int(n) => Ok(crate::value::bigint_to_f64(n)),
+                Value::Float(x) => Ok(*x),
+                Value::Bool(b) => Ok(*b as i64 as f64),
+                _ => Err(type_error(format!(
+                    "complex() {what} argument must be a number, not '{}'",
+                    v.type_name()
+                ))),
+            }
+        }
+        match args.as_slice() {
+            [] => Ok(Value::Complex(0.0, 0.0)),
+            [Value::Complex(re, im)] => Ok(Value::Complex(*re, *im)),
+            [x] => Ok(Value::Complex(part(x, "first")?, 0.0)),
+            [Value::Complex(re, im), y] => {
+                // complex(c, n) → c + n*1j (imag part adds).
+                Ok(Value::Complex(*re, *im + part(y, "second")?))
+            }
+            [x, y] => Ok(Value::Complex(part(x, "first")?, part(y, "second")?)),
+            _ => Err(type_error("complex() takes at most 2 arguments")),
+        }
     });
 
     native!("min", |i, args| reduce_minmax(i, args, true));
@@ -1101,6 +1152,249 @@ fn reduce_minmax(
     Ok(best)
 }
 
+// ── Helper-class compilation ────────────────────────────────────────────────
+//
+// Several stdlib shims (`defaultdict`, `datetime`, `pathlib.Path`) need real
+// dunder methods (`__getitem__`, `__missing__`, `__setitem__`, `__add__`,
+// `__sub__`, `__truediv__`) that the interpreter dispatches through
+// `find_method` — which only consults `class.methods` (AST-backed
+// `value::Function`s), not instance fields holding native closures. Rather
+// than hand-build AST `Function`s, we compile a small Python source snippet
+// through the same parse + desugar pipeline the VM uses for user modules and
+// pull the resulting `Value::Class` objects out of a throwaway scope. This
+// reuses every bit of the real method-call/dunder machinery.
+
+/// Compile `source` in a fresh child of `interp.root` and return the named
+/// top-level bindings (classes / functions) it produced.
+fn compile_helpers(interp: &mut Interpreter, source: &str) -> Result<Vec<(String, Value)>, Unwind> {
+    use tyc_syntax::preprocess;
+    let expanded = preprocess::expand_question_ops(&preprocess::expand_pipes(
+        &preprocess::expand_with_chains(&preprocess::expand_go_calls(
+            &preprocess::expand_gather_blocks(&preprocess::expand_multiline_guards(
+                &preprocess::expand_typed_let_unpack(&preprocess::expand_lazy_lets(source)),
+            )),
+        )),
+    ));
+    let prep = preprocess::preprocess(&expanded);
+    let parsed = tyc_syntax::parse_module(&prep.python_source).map_err(|e| {
+        crate::error::Unwind::Exception(crate::error::VmException::new(
+            "ImportError",
+            format!("internal stdlib shim parse error: {e}"),
+        ))
+    })?;
+    let mut module = parsed.into_syntax();
+    let desugar_out = tyc_desugar::desugar_module(&module);
+    module = desugar_out.module;
+
+    let env = crate::env::Env::new_child(&interp.root);
+    interp.exec_block(&module.body, &env)?;
+    Ok(env.snapshot())
+}
+
+/// Compile `source`, then look up a single named binding from it.
+fn compile_helper(interp: &mut Interpreter, source: &str, name: &str) -> Result<Value, Unwind> {
+    compile_helpers(interp, source)?
+        .into_iter()
+        .find(|(k, _)| k == name)
+        .map(|(_, v)| v)
+        .ok_or_else(|| type_error(format!("stdlib shim did not define '{name}'")))
+}
+
+/// Compile (once, memoised in `module_cache`) and return a synthesised helper
+/// class by `cache_key`, defined by `source` under `name`.
+fn cached_helper_class(
+    interp: &mut Interpreter,
+    cache_key: &str,
+    source: &str,
+    name: &str,
+) -> Result<Value, Unwind> {
+    if let Some(v) = interp.module_cache.get(cache_key) {
+        return Ok(v.clone());
+    }
+    let v = compile_helper(interp, source, name)?;
+    interp.module_cache.insert(cache_key.to_owned(), v.clone());
+    Ok(v)
+}
+
+/// Source for the `defaultdict` shim class. Backing store lives in `_data`;
+/// the missing-key path runs `__missing__`, which the foundation's subscript
+/// hook invokes when `__getitem__` raises `KeyError`.
+const DEFAULTDICT_SRC: &str = r#"
+class _DefaultDict:
+    def __init__(self, default_factory, initial):
+        self._data = {}
+        self._factory = default_factory
+        if initial is not None:
+            for k in initial:
+                self._data[k] = initial[k]
+    def __getitem__(self, key):
+        if key in self._data:
+            return self._data[key]
+        raise KeyError(key)
+    def __setitem__(self, key, value):
+        self._data[key] = value
+    def __missing__(self, key):
+        if self._factory is None:
+            raise KeyError(key)
+        return self._factory()
+    def __contains__(self, key):
+        return key in self._data
+    def __len__(self):
+        return len(self._data)
+    def __iter__(self):
+        return iter(self._data)
+    def keys(self):
+        return self._data.keys()
+    def values(self):
+        return self._data.values()
+    def items(self):
+        return self._data.items()
+    def get(self, key, default=None):
+        if key in self._data:
+            return self._data[key]
+        return default
+"#;
+
+fn defaultdict_class(interp: &mut Interpreter) -> Result<Value, Unwind> {
+    cached_helper_class(
+        interp,
+        "__shim_defaultdict__",
+        DEFAULTDICT_SRC,
+        "_DefaultDict",
+    )
+}
+
+/// Source for the native `datetime` module: `date`, `datetime`, `timedelta`.
+/// Date math uses a proleptic-Gregorian ordinal (`_ordinal`) so `date - date`
+/// and `datetime + timedelta(days=…)` are exact. Arithmetic flows through the
+/// `__add__` / `__sub__` dunders the foundation dispatches on instances.
+const DATETIME_SRC: &str = r#"
+def _is_leap(y):
+    return y % 4 == 0 and (y % 100 != 0 or y % 400 == 0)
+
+def _days_in_month(y, m):
+    if m == 2:
+        if _is_leap(y):
+            return 29
+        return 28
+    if m == 1 or m == 3 or m == 5 or m == 7 or m == 8 or m == 10 or m == 12:
+        return 31
+    return 30
+
+def _to_ordinal(y, m, d):
+    n = 0
+    yy = 1
+    while yy < y:
+        if _is_leap(yy):
+            n = n + 366
+        else:
+            n = n + 365
+        yy = yy + 1
+    mm = 1
+    while mm < m:
+        n = n + _days_in_month(y, mm)
+        mm = mm + 1
+    return n + d
+
+def _from_ordinal(n):
+    y = 1
+    while True:
+        if _is_leap(y):
+            ydays = 366
+        else:
+            ydays = 365
+        if n > ydays:
+            n = n - ydays
+            y = y + 1
+        else:
+            break
+    m = 1
+    while n > _days_in_month(y, m):
+        n = n - _days_in_month(y, m)
+        m = m + 1
+    return (y, m, n)
+
+def _pad2(n):
+    s = str(n)
+    if len(s) < 2:
+        return "0" + s
+    return s
+
+class timedelta:
+    def __init__(self, days=0, seconds=0, minutes=0, hours=0, weeks=0):
+        self.days = days + weeks * 7
+        self.seconds = seconds + minutes * 60 + hours * 3600
+    def total_seconds(self):
+        return self.days * 86400 + self.seconds
+    def __repr__(self):
+        return "datetime.timedelta(days=" + str(self.days) + ")"
+
+class date:
+    def __init__(self, year, month, day):
+        self.year = year
+        self.month = month
+        self.day = day
+    def _ordinal(self):
+        return _to_ordinal(self.year, self.month, self.day)
+    def isoformat(self):
+        return str(self.year) + "-" + _pad2(self.month) + "-" + _pad2(self.day)
+    def __sub__(self, other):
+        return timedelta(days=self._ordinal() - other._ordinal())
+    def __add__(self, other):
+        ymd = _from_ordinal(self._ordinal() + other.days)
+        return date(ymd[0], ymd[1], ymd[2])
+    def __repr__(self):
+        return "datetime.date(" + str(self.year) + ", " + str(self.month) + ", " + str(self.day) + ")"
+    def __str__(self):
+        return self.isoformat()
+
+class datetime:
+    def __init__(self, year, month, day, hour=0, minute=0, second=0, microsecond=0):
+        self.year = year
+        self.month = month
+        self.day = day
+        self.hour = hour
+        self.minute = minute
+        self.second = second
+        self.microsecond = microsecond
+    def date(self):
+        return date(self.year, self.month, self.day)
+    def _ordinal(self):
+        return _to_ordinal(self.year, self.month, self.day)
+    def isoformat(self):
+        return (str(self.year) + "-" + _pad2(self.month) + "-" + _pad2(self.day)
+                + "T" + _pad2(self.hour) + ":" + _pad2(self.minute) + ":" + _pad2(self.second))
+    def __add__(self, other):
+        total_secs = self.hour * 3600 + self.minute * 60 + self.second + other.seconds
+        extra_days = total_secs // 86400
+        rem = total_secs % 86400
+        ymd = _from_ordinal(self._ordinal() + other.days + extra_days)
+        return datetime(ymd[0], ymd[1], ymd[2], rem // 3600, (rem % 3600) // 60, rem % 60)
+    def __sub__(self, other):
+        d = self._ordinal() - other._ordinal()
+        s = (self.hour * 3600 + self.minute * 60 + self.second
+             - other.hour * 3600 - other.minute * 60 - other.second)
+        return timedelta(days=d, seconds=s)
+    def __repr__(self):
+        return ("datetime.datetime(" + str(self.year) + ", " + str(self.month) + ", "
+                + str(self.day) + ", " + str(self.hour) + ", " + str(self.minute) + ")")
+"#;
+
+fn make_datetime_module(interp: &mut Interpreter) -> Result<Value, Unwind> {
+    let members = compile_helpers(interp, DATETIME_SRC)?;
+    let wanted = ["date", "datetime", "timedelta"];
+    let entries: Vec<(&str, Value)> = wanted
+        .iter()
+        .filter_map(|&n| {
+            members
+                .iter()
+                .find(|(k, _)| k == n)
+                .map(|(_, v)| (n, v.clone()))
+        })
+        .collect();
+    Ok(make_module("datetime", entries))
+}
+
 // ── Module resolution ──────────────────────────────────────────────────────
 
 pub fn resolve_module(interp: &mut Interpreter, name: &str) -> Result<Value, Unwind> {
@@ -1118,7 +1412,8 @@ pub fn resolve_module(interp: &mut Interpreter, name: &str) -> Result<Value, Unw
         "functools" => Ok(make_functools_module()),
         "itertools" => Ok(make_itertools_module()),
         "dataclasses" => Ok(make_dataclasses_module()),
-        "pathlib" => Ok(make_pathlib_module()),
+        "pathlib" => make_pathlib_module(interp),
+        "datetime" => make_datetime_module(interp),
         "heapq" => Ok(make_heapq_module()),
         "contextlib" => Ok(make_contextlib_module()),
         "pydantic" => Ok(make_pydantic_module()),
@@ -2431,12 +2726,19 @@ fn make_collections_module() -> Value {
         }
         Ok(Value::Dict(Rc::new(RefCell::new(counts))))
     });
-    let defaultdict = nf("defaultdict", |_i, _args| {
-        // The factory argument is discarded — accessing a missing key
-        // raises KeyError just like a plain dict in this shim. Users
-        // that need the auto-default behaviour should fall back to
-        // compile mode.
-        Ok(Value::Dict(Rc::new(RefCell::new(IndexMap::new()))))
+    let defaultdict = nf("defaultdict", |i, mut args| {
+        // `defaultdict(factory[, mapping])` constructs a synthesised mapping
+        // instance whose `__missing__` calls `factory()` to materialise a
+        // default for absent keys (foundation `__missing__` hook). The
+        // backing store is a plain dict held in `self._data`.
+        let factory = if args.is_empty() {
+            Value::None
+        } else {
+            args.remove(0)
+        };
+        let cls = defaultdict_class(i)?;
+        let initial = args.into_iter().next().unwrap_or(Value::None);
+        i.call_value(cls, vec![factory, initial], &[])
     });
     let ordered_dict = nf("OrderedDict", |i, args| {
         // CPython's `dict` preserves insertion order since 3.7, so this
@@ -3302,26 +3604,45 @@ fn make_dataclasses_module() -> Value {
 ///
 /// Implements a `Path` callable that returns an instance with the
 /// following surface: `__truediv__`, `read_text`, `write_text`,
-/// `exists`, `is_file`, `is_dir`, `name`, `parent`, `suffix`, `stem`,
-/// and `__str__`. Internally a Path instance is an `Instance` value
+/// `exists`, `is_file`, `is_dir`, `name`, `parent`, `suffix`, `suffixes`,
+/// `stem`, and `__str__`. Internally a Path instance is an `Instance` value
 /// whose `fields` map holds the resolved path string under `__path__`.
-fn make_pathlib_module() -> Value {
-    use crate::value::{Class, Instance};
-    fn path_class() -> Rc<Class> {
-        Rc::new(Class {
-            name: "Path".into(),
-            methods: RefCell::new(HashMap::new()),
-            fields: vec![],
-            class_attrs: RefCell::new(HashMap::new()),
-            bases: vec![],
-            properties: std::cell::RefCell::new(std::collections::HashSet::new()),
-            classmethods: std::cell::RefCell::new(std::collections::HashSet::new()),
-        })
+///
+/// Source for the `pathlib.Path` dunder shim. Holds the path string in
+/// `_path`; `__truediv__` defers the actual join to the native `_join` field
+/// (so all the OS-aware part computation stays in Rust). `__str__` /
+/// `__repr__` / `__fspath__` surface the string form.
+const PATH_SRC: &str = r#"
+class _Path:
+    def __truediv__(self, other):
+        return self._join(other)
+    def __str__(self):
+        return self._path
+    def __repr__(self):
+        return "PosixPath('" + self._path + "')"
+    def __fspath__(self):
+        return self._path
+    def __eq__(self, other):
+        return self._path == str(other)
+"#;
+
+fn path_class(interp: &mut Interpreter) -> Result<Rc<crate::value::Class>, Unwind> {
+    let cls = cached_helper_class(interp, "__shim_path__", PATH_SRC, "_Path")?;
+    match cls {
+        Value::Class(c) => Ok(c),
+        _ => Err(type_error("internal: _Path shim is not a class")),
     }
-    fn make_path(s: String) -> Value {
-        let cls = path_class();
+}
+
+fn make_pathlib_module(interp: &mut Interpreter) -> Result<Value, Unwind> {
+    use crate::value::Instance;
+    let cls = path_class(interp)?;
+    fn make_path(cls: Rc<crate::value::Class>, s: String) -> Value {
         let mut fields: HashMap<String, Value> = HashMap::new();
         fields.insert("__path__".into(), Value::Str(Rc::new(s.clone())));
+        // `_path` mirrors `__path__` for the compiled `_Path` dunder methods,
+        // which reference `self._path`.
+        fields.insert("_path".into(), Value::Str(Rc::new(s.clone())));
         // Cache derived parts as fields so attribute access (`p.name`,
         // `p.suffix`, `p.stem`, `p.parent`) works without descriptors.
         let p = std::path::Path::new(&s);
@@ -3349,6 +3670,45 @@ fn make_pathlib_module() -> Value {
         // This sidesteps an infinite recursion when `parent` of `/` is
         // itself `/`.
         fields.insert("parent".into(), Value::Str(Rc::new(parent)));
+        // `.suffixes` — every dotted extension on the final component, e.g.
+        // `Path("file.tar.gz").suffixes == ['.tar', '.gz']`. A leading dot
+        // (dotfile like `.bashrc`) does NOT start a suffix, matching CPython.
+        let suffixes: Vec<Value> = {
+            let name = std::path::Path::new(&s)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("");
+            let trimmed = name.trim_start_matches('.');
+            if trimmed.contains('.') {
+                trimmed
+                    .split('.')
+                    .skip(1)
+                    .map(|part| Value::Str(Rc::new(format!(".{part}"))))
+                    .collect()
+            } else {
+                Vec::new()
+            }
+        };
+        fields.insert(
+            "suffixes".into(),
+            Value::List(Rc::new(RefCell::new(suffixes))),
+        );
+        // `_join` backs `__truediv__`: append `other` as a path component and
+        // return a fresh `_Path` instance.
+        let s_for_join = s.clone();
+        let cls_for_join = cls.clone();
+        fields.insert(
+            "_join".into(),
+            Value::Native(Rc::new(NativeFn::new("_join", move |_i, args| {
+                let other = single(&args, "_join")?.py_str();
+                let joined = std::path::Path::new(&s_for_join)
+                    .join(&other)
+                    .to_str()
+                    .unwrap_or("")
+                    .to_owned();
+                Ok(make_path(cls_for_join.clone(), joined))
+            }))),
+        );
         // Methods.
         let s_for_read = s.clone();
         fields.insert(
@@ -3405,14 +3765,15 @@ fn make_pathlib_module() -> Value {
             fields: RefCell::new(fields),
         }))
     }
-    let path = nf("Path", |_i, args| {
+    let cls_for_ctor = cls.clone();
+    let path = nf("Path", move |_i, args| {
         let s = args
             .first()
             .map(|v| v.py_str())
             .unwrap_or_else(|| ".".to_string());
-        Ok(make_path(s))
+        Ok(make_path(cls_for_ctor.clone(), s))
     });
-    make_module("pathlib", vec![("Path", path)])
+    Ok(make_module("pathlib", vec![("Path", path)]))
 }
 
 // ── Method dispatch on built-in types ──────────────────────────────────────
@@ -4192,28 +4553,34 @@ fn dict_method(
             let default = args.get(1).cloned().unwrap_or(Value::None);
             Ok(d.borrow().get(&k).cloned().unwrap_or(default))
         }
-        "keys" => Ok(Value::List(Rc::new(RefCell::new(
-            d.borrow()
+        "keys" => Ok(Value::DictView {
+            kind: crate::value::DictViewKind::Keys,
+            items: d
+                .borrow()
                 .keys()
                 .filter(|k| !matches!(k, HashKey::Str(s) if s.as_str() == "__typhon_frozen__"))
                 .cloned()
                 .map(HashKey::into_value)
                 .collect(),
-        )))),
-        "values" => Ok(Value::List(Rc::new(RefCell::new(
-            d.borrow()
+        }),
+        "values" => Ok(Value::DictView {
+            kind: crate::value::DictViewKind::Values,
+            items: d
+                .borrow()
                 .iter()
                 .filter(|(k, _)| !matches!(k, HashKey::Str(s) if s.as_str() == "__typhon_frozen__"))
                 .map(|(_, v)| v.clone())
                 .collect(),
-        )))),
-        "items" => Ok(Value::List(Rc::new(RefCell::new(
-            d.borrow()
+        }),
+        "items" => Ok(Value::DictView {
+            kind: crate::value::DictViewKind::Items,
+            items: d
+                .borrow()
                 .iter()
                 .filter(|(k, _)| !matches!(k, HashKey::Str(s) if s.as_str() == "__typhon_frozen__"))
                 .map(|(k, v)| Value::Tuple(Rc::new(vec![k.clone().into_value(), v.clone()])))
                 .collect(),
-        )))),
+        }),
         "pop" => {
             let k = single(args, "pop")?.to_hash_key()?;
             let default = args.get(1).cloned();

@@ -2461,6 +2461,22 @@ impl Interpreter {
     }
 
     pub fn get_attr(&mut self, value: &Value, attr: &str) -> Result<Value, Unwind> {
+        // `complex` exposes `.real` / `.imag` / `.conjugate()` (FINDINGS: complex
+        // ctor shim). Components are floats, matching CPython.
+        if let Value::Complex(re, im) = value {
+            match attr {
+                "real" => return Ok(Value::Float(*re)),
+                "imag" => return Ok(Value::Float(*im)),
+                "conjugate" => {
+                    let (re, im) = (*re, *im);
+                    return Ok(Value::Native(Rc::new(NativeFn::new(
+                        "conjugate",
+                        move |_i, _args| Ok(Value::Complex(re, -im)),
+                    ))));
+                }
+                _ => {}
+            }
+        }
         // Try instance fields first, then class methods.
         match value {
             Value::Instance(inst) => {
@@ -2851,6 +2867,26 @@ impl Interpreter {
                     items: Rc::new(RefCell::new(members)),
                     index: 0,
                 }
+            }
+            // A user/synthesised instance defining `__iter__` delegates to it
+            // (used by the `defaultdict` shim so `for k in dd` / `list(dd)`
+            // iterate the backing mapping's keys).
+            Value::Instance(ref inst) => {
+                if let Some(m) = self.find_method(&inst.class, "__iter__") {
+                    let iter_val = self.call_value(
+                        Value::BoundMethod {
+                            receiver: Box::new(v.clone()),
+                            function: m,
+                        },
+                        vec![],
+                        &[],
+                    )?;
+                    return self.make_iter(iter_val);
+                }
+                return Err(type_error(format!(
+                    "'{}' object is not iterable",
+                    v.type_name()
+                )));
             }
             other => {
                 return Err(type_error(format!(
@@ -5062,5 +5098,119 @@ e = (1+2j) - (3+1j)
         assert!(!interp
             .contains(&keys, &Value::Str(Rc::new("z".into())))
             .unwrap());
+    }
+
+    // ── builtins agent: stdlib shims ───────────────────────────────────────
+
+    /// M5 — `defaultdict(list)` auto-creates a default for a missing key via
+    /// the `__missing__` hook, and `dict(dd)` materialises the mapping.
+    #[test]
+    fn defaultdict_factory_auto_default() {
+        let src = r#"
+from collections import defaultdict
+groups = defaultdict(list)
+groups["even"].append(2)
+groups["even"].append(4)
+out = dict(groups)
+n = len(groups)
+present = "even" in groups
+keys = list(groups)
+ic = defaultdict(int)
+ic["x"] += 5
+iv = ic["x"]
+"#;
+        let (interp, res) = parse_and_run(src);
+        res.unwrap();
+        assert_eq!(interp.root.get("out").unwrap().py_str(), "{'even': [2, 4]}");
+        assert_eq!(interp.root.get("n").unwrap().py_str(), "1");
+        assert_eq!(interp.root.get("present").unwrap().py_str(), "True");
+        assert_eq!(interp.root.get("keys").unwrap().py_str(), "['even']");
+        assert_eq!(interp.root.get("iv").unwrap().py_str(), "5");
+    }
+
+    /// M15 — `datetime` arithmetic: `datetime + timedelta` and `date - date`.
+    #[test]
+    fn datetime_arithmetic() {
+        let src = r#"
+from datetime import datetime, timedelta, date
+d = date(2026, 6, 3)
+iso = d.isoformat()
+dt = datetime(2026, 1, 1, 12, 30)
+later = dt + timedelta(days=10)
+day = later.day
+delta = (date(2026, 6, 3) - date(2026, 1, 1)).days
+hh = dt.hour
+mm = dt.minute
+"#;
+        let (interp, res) = parse_and_run(src);
+        res.unwrap();
+        assert_eq!(interp.root.get("iso").unwrap().py_str(), "2026-06-03");
+        assert_eq!(interp.root.get("day").unwrap().py_str(), "11");
+        assert_eq!(interp.root.get("delta").unwrap().py_str(), "153");
+        assert_eq!(interp.root.get("hh").unwrap().py_str(), "12");
+        assert_eq!(interp.root.get("mm").unwrap().py_str(), "30");
+    }
+
+    /// M16 — `pathlib.Path` `/` join + `.suffixes`.
+    #[test]
+    fn pathlib_join_and_suffixes() {
+        let src = r#"
+from pathlib import Path
+joined = (Path("/a") / "b" / "c.txt").name
+sfx = Path("file.tar.gz").suffixes
+"#;
+        let (interp, res) = parse_and_run(src);
+        res.unwrap();
+        assert_eq!(interp.root.get("joined").unwrap().py_str(), "c.txt");
+        assert_eq!(
+            interp.root.get("sfx").unwrap().py_str(),
+            "['.tar', '.gz']"
+        );
+    }
+
+    /// M17 — `complex()` constructor, `abs(complex)`, and `.real` / `.imag`.
+    #[test]
+    fn complex_constructor_and_attrs() {
+        let src = r#"
+c = complex(3, 4)
+mag = abs(c)
+re = c.real
+im = c.imag
+z = complex()
+one = complex(7)
+"#;
+        let (interp, res) = parse_and_run(src);
+        res.unwrap();
+        assert_eq!(interp.root.get("mag").unwrap().py_str(), "5.0");
+        assert_eq!(interp.root.get("re").unwrap().py_str(), "3.0");
+        assert_eq!(interp.root.get("im").unwrap().py_str(), "4.0");
+        assert_eq!(interp.root.get("z").unwrap().py_str(), "0j");
+        assert_eq!(interp.root.get("one").unwrap().py_str(), "(7+0j)");
+    }
+
+    /// L3 — `dict.keys()/.values()/.items()` return dict-views (not lists).
+    #[test]
+    fn dict_methods_return_dict_views() {
+        let src = r#"
+d = {"a": 1, "b": 2}
+k = d.keys()
+v = d.values()
+it = d.items()
+"#;
+        let (interp, res) = parse_and_run(src);
+        res.unwrap();
+        assert!(matches!(
+            interp.root.get("k").unwrap(),
+            Value::DictView { kind: crate::value::DictViewKind::Keys, .. }
+        ));
+        assert_eq!(interp.root.get("k").unwrap().py_str(), "dict_keys(['a', 'b'])");
+        assert_eq!(
+            interp.root.get("v").unwrap().py_str(),
+            "dict_values([1, 2])"
+        );
+        assert_eq!(
+            interp.root.get("it").unwrap().py_str(),
+            "dict_items([('a', 1), ('b', 2)])"
+        );
     }
 }
