@@ -125,6 +125,39 @@ fixed with `IndexMap` in v0.8.0; sets/frozensets need the same
 `IndexSet` treatment. Today any program that prints/iterates a set is
 non-reproducible and never matches build output.
 
+**H4b — set equality is order-sensitive in the VM.** `repros/eq2.ty`.
+`{1,2,3} == {3,2,1}` → VM `False`, CPython `True`. Set `==` ignores
+set semantics (same underlying order-sensitive representation as H4).
+list / dict / tuple / nested equality all compare correctly — the bug
+is specific to sets and to dataclass instances (H1).
+
+### H0 — `@dataclass(slots=True)` + zero-arg `super()` crashes at runtime  (BUILD — production output)
+
+`repros/cls.ty`. The single most serious finding, because it is in the
+**emitted production code**, not the VM. Typhon emits
+`@dataclass(slots=True)` for every `class`, and `slots=True` rebuilds
+the class object, orphaning the `__class__` closure cell that a bare
+`super()` relies on:
+
+```python
+@dataclasses.dataclass(slots=True)
+class Derived(Base):
+    def describe(self) -> str:
+        parent: str = super().describe()   # TypeError at runtime
+        return ...
+```
+
+```
+TypeError: super(type, obj): obj must be an instance or subtype of type
+```
+
+Any Typhon program combining the default `class` form + inheritance +
+`super()` ships broken. **Fix:** emit the explicit two-argument form
+`super(Derived, self)` whenever a method body uses `super()` (verified
+workaround — two-arg `super` does not depend on the `__class__` cell).
+`super()` is also broken in the VM (`AttributeError: module '<super>'
+has no attribute 'describe'`), separately.
+
 ### H5 — Checker doesn't validate attributes/methods on built-in types  (CHK + VM)
 
 `repros/h03.ty`, `repros/h06.ty`, `repros/vmattr.ty`.
@@ -249,14 +282,33 @@ runner-ergonomics gap.
   descent (converged to x=3.0000), 2×2 matmul, agent tool-dispatch
   loop, HTTP routing API with newtype IDs.
 
+## Strong points confirmed this round (regression anchors)
+
+- Bounded TypeVars enforce their bound: `max_of[T: int]("a", "b")` →
+  `tyc::typevar_bound` (docs undersell this as "partial").
+- `while cur is not None:` narrows attribute chains across the loop;
+  nested optional `guard` chains; guarded exhaustive `match`; generic
+  inference into recursive generics (`Tree[T].size()`) — all clean and
+  correct, and the recursive generic runs in the VM.
+- All int/float format specs verified correct in the VM: binary/octal/
+  hex, sign, fill+align, width, `.Nf`, `.Ne`. (The `%` percent type
+  M3 and large-float repr M4 are the only format exceptions.)
+- super() aside, `@property`, `@staticmethod`, `@classmethod` work in
+  the VM.
+
 ## Suggested fix priority
 
-1. **C1** enum VM crash (and ship the `enum` keyword).
-2. **H1/H2/H3** synthesize dataclass `__eq__`/`__repr__`/`__hash__`
+1. **H0** emit two-arg `super(Cls, self)` — production output is broken
+   today for the default class + inheritance + `super()` combo.
+2. **C1** enum VM crash (and ship the `enum` keyword).
+3. **H1/H2/H3** synthesize dataclass `__eq__`/`__repr__`/`__hash__`
    in the VM — biggest parity win.
-3. **H4** `IndexSet` for deterministic, CPython-matching set order.
-4. **H5/M6** extend attribute/subscript/iter/key validation to
+4. **H4/H4b** `IndexSet` for deterministic, CPython-matching set order
+   and set equality.
+5. **H5/M6** extend attribute/subscript/iter/key validation to
    built-in types; fix the VM's bogus-attribute fallback to raise.
-5. **M1** `str %` formatting.
-6. **M2–M5** VM numeric/format faithfulness.
-7. **L1/L2** CLI ergonomics.
+6. **M1** `str %` formatting; **M7** `split(maxsplit=)`; **M8**
+   `__call__`; **M9** f-string `{x=}`; **M10** `bytes` methods.
+7. **M2–M5** VM numeric/format faithfulness (round, percent, float
+   repr, defaultdict).
+8. **L1/L2** CLI ergonomics.
