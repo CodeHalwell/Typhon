@@ -1,5 +1,44 @@
 # Stress-test corpus — 2026-06-03 fresh round (v0.10.0)
 
+## RESOLUTION STATUS (fixed in this branch)
+
+The findings below were triaged and fixed by five parallel work-streams,
+then integrated onto v0.10.0. Full workspace `cargo test` green
+(550+ tests, 0 failures); zero `tyc check` regressions across all 29
+`examples/` exercises and 15 `examples/apps/`.
+
+| ID | Status | Where |
+|----|--------|-------|
+| H0 slots+`super()` (prod crash) | ✅ fixed | desugar emits two-arg `super(Cls, self)` |
+| C1 enum VM crash + `enum` keyword | ✅ fixed | syntax/desugar (keyword) + vm (members, no crash) |
+| H1/H2/H3 dataclass eq/repr/hash | ✅ fixed | vm value.rs |
+| H4/H4b set order + equality | ✅ fixed | vm value.rs |
+| H5/M6 builtin attr/subscript/iter/key | ✅ fixed | types (check) + vm (raise) |
+| H6 regex capture groups | ✅ fixed | vm builtins.rs |
+| M1 `str %` (check + runtime) | ✅ fixed | types + vm |
+| M2 banker's `round` | ✅ fixed | vm builtins.rs |
+| M3 f-string `%` percent | ✅ fixed | vm interp.rs |
+| M4 float repr (sci notation) | ✅ fixed | vm value.rs |
+| M7 `split(maxsplit=)` | ✅ fixed | vm builtins.rs (+kw path) |
+| M8 `__call__` | ✅ fixed | vm interp.rs |
+| M9 f-string `{x=}` | ✅ fixed | vm interp.rs |
+| M10 `bytes` methods | ✅ fixed | vm builtins.rs |
+| M11 `__post_init__` | ✅ fixed | vm interp.rs |
+| M12 multi-level MRO fields | ✅ fixed | vm interp.rs |
+| M13 `None`→`object` | ✅ fixed | types |
+| M14 `groupby(key=)` | ✅ fixed | vm builtins.rs |
+| L3 dict-view repr | ⏳ deferred | needs `DictView` value variant |
+| M5 defaultdict factory | ⏳ deferred | needs subscript-dunder hook in interp |
+| M15 datetime module | ⏳ deferred | needs instance operator-overload dispatch |
+| M16 pathlib `/` join | ⏳ deferred | needs instance `__truediv__` dispatch |
+| M17 `complex` numbers | ⏳ deferred | needs a `Value::Complex` variant |
+
+The four deferred items each need a cross-cutting `Value`/operator-dispatch
+change and are tracked as a follow-up.
+
+---
+
+
 Adversarial sweep against `tyc 0.10.0` (built from source). Python 3.11
 was the only interpreter available, so the **in-process VM (`tyc run`)
 was the primary runner** and most findings are VM-vs-CPython parity
