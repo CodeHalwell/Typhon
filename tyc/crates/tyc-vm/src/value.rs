@@ -232,6 +232,10 @@ pub enum Value {
     Bool(bool),
     Int(BigInt),
     Float(f64),
+    /// A complex number `(real, imag)`. Constructed from imaginary literals
+    /// (`2j` → `Complex(0.0, 2.0)`) and the builtins agent's `complex(re, im)`
+    /// constructor.
+    Complex(f64, f64),
     Str(RcStr),
     Bytes(Rc<Vec<u8>>),
     List(RcList),
@@ -266,6 +270,23 @@ pub enum Value {
     },
     /// Iterator state — opaque to the AST walker; consumed by `next`.
     Iter(Rc<RefCell<IterState>>),
+    /// A dict view produced by `dict.keys()` / `.values()` / `.items()`.
+    /// The builtins agent materialises the `items` vector (already containing
+    /// the keys, values, or `(k, v)` tuples respectively) and tags it with the
+    /// matching `kind`. The VM provides repr, iteration, `len()`, and `in`.
+    DictView {
+        kind: DictViewKind,
+        items: Vec<Value>,
+    },
+}
+
+/// Which flavour of dict view a `Value::DictView` represents. Controls the
+/// repr prefix (`dict_keys` / `dict_values` / `dict_items`) and `type_name`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum DictViewKind {
+    Keys,
+    Values,
+    Items,
 }
 
 pub type NativeFnImpl =
@@ -397,6 +418,7 @@ impl fmt::Debug for Value {
             Value::Bool(b) => write!(f, "{b:?}"),
             Value::Int(i) => write!(f, "{}", i.to_str_radix(10)),
             Value::Float(x) => write!(f, "{x:?}"),
+            Value::Complex(re, im) => write!(f, "{}", format_complex(*re, *im)),
             Value::Str(s) => write!(f, "{:?}", s.as_str()),
             Value::Bytes(b) => write!(f, "{}", python_repr_bytes(b)),
             Value::List(l) => write!(f, "{:?}", l.borrow()),
@@ -458,6 +480,7 @@ impl fmt::Debug for Value {
                 }
             }
             Value::Iter(_) => write!(f, "<iterator>"),
+            Value::DictView { .. } => write!(f, "{}", self.py_str()),
         }
     }
 }
@@ -471,6 +494,7 @@ impl Value {
             Value::Bool(_) => "bool",
             Value::Int(_) => "int",
             Value::Float(_) => "float",
+            Value::Complex(..) => "complex",
             Value::Str(_) => "str",
             Value::Bytes(_) => "bytes",
             Value::List(_) => "list",
@@ -490,6 +514,11 @@ impl Value {
             Value::Module(_) => "module",
             Value::Exception { .. } => "Exception",
             Value::Iter(_) => "iterator",
+            Value::DictView { kind, .. } => match kind {
+                DictViewKind::Keys => "dict_keys",
+                DictViewKind::Values => "dict_values",
+                DictViewKind::Items => "dict_items",
+            },
         }
     }
 
@@ -499,6 +528,7 @@ impl Value {
             Value::Bool(b) => *b,
             Value::Int(i) => !i.is_zero(),
             Value::Float(x) => *x != 0.0,
+            Value::Complex(re, im) => *re != 0.0 || *im != 0.0,
             Value::Str(s) => !s.is_empty(),
             Value::Bytes(b) => !b.is_empty(),
             Value::List(l) => !l.borrow().is_empty(),
@@ -525,6 +555,7 @@ impl Value {
                     false
                 }
             }
+            Value::DictView { items, .. } => !items.is_empty(),
             _ => true,
         }
     }
@@ -614,6 +645,16 @@ impl Value {
             (Int(a), Int(b)) => a == b,
             (Float(a), Float(b)) => a == b,
             (Int(a), Float(b)) | (Float(b), Int(a)) => bigint_eq_f64(a, *b),
+            (Complex(ar, ai), Complex(br, bi)) => ar == br && ai == bi,
+            // `complex == float` / `complex == int` only when the imaginary
+            // part is zero (matching CPython).
+            (Complex(re, im), Float(f)) | (Float(f), Complex(re, im)) => *im == 0.0 && re == f,
+            (Complex(re, im), Int(i)) | (Int(i), Complex(re, im)) => {
+                *im == 0.0 && bigint_eq_f64(i, *re)
+            }
+            (Complex(re, im), Bool(b)) | (Bool(b), Complex(re, im)) => {
+                *im == 0.0 && *re == (*b as i64 as f64)
+            }
             (Str(a), Str(b)) => a == b,
             (Bytes(a), Bytes(b)) => a == b,
             (List(a), List(b)) => {
@@ -793,6 +834,7 @@ impl Value {
             Value::Bool(false) => "False".into(),
             Value::Int(i) => i.to_str_radix(10),
             Value::Float(x) => format_float(*x),
+            Value::Complex(re, im) => format_complex(*re, *im),
             Value::Str(s) => (**s).clone(),
             Value::Bytes(b) => python_repr_bytes(b),
             Value::List(l) => {
@@ -916,6 +958,15 @@ impl Value {
                 }
             }
             Value::Iter(_) => "<iterator>".into(),
+            Value::DictView { kind, items } => {
+                let prefix = match kind {
+                    DictViewKind::Keys => "dict_keys",
+                    DictViewKind::Values => "dict_values",
+                    DictViewKind::Items => "dict_items",
+                };
+                let body: Vec<String> = items.iter().map(|v| v.py_repr()).collect();
+                format!("{prefix}([{}])", body.join(", "))
+            }
         }
     }
 
@@ -1100,6 +1151,44 @@ fn instance_repr(inst: &Instance) -> String {
 /// `>= 16` uses `e+NN` / `e-NN` with at least two exponent digits;
 /// everything else uses fixed notation. Whole-valued floats keep a
 /// trailing `.0`.
+/// Format a single component of a complex number the way CPython does inside
+/// `repr(complex)`: like `repr(float)` but trailing `.0` is dropped (so `3.0`
+/// → `3`) and signed zero shows as `0` / `-0`.
+fn format_complex_part(x: f64) -> String {
+    if x.is_nan() {
+        return "nan".into();
+    }
+    if x.is_infinite() {
+        return if x > 0.0 { "inf".into() } else { "-inf".into() };
+    }
+    let s = format_float(x);
+    // Drop a trailing `.0` (CPython prints `3+4j`, not `3.0+4.0j`).
+    if let Some(stripped) = s.strip_suffix(".0") {
+        stripped.to_owned()
+    } else {
+        s
+    }
+}
+
+/// CPython-exact `repr(complex)`. Bare `4j` when the real part is `+0.0`;
+/// otherwise parenthesised `(a+bj)` / `(a-bj)`.
+fn format_complex(re: f64, im: f64) -> String {
+    // Bare imaginary form only when the real part is positive zero.
+    if re == 0.0 && re.is_sign_positive() {
+        return format!("{}j", format_complex_part(im));
+    }
+    let real = format_complex_part(re);
+    let imag = format_complex_part(im);
+    // The imaginary part always carries an explicit sign separator in the
+    // parenthesised form. `format_complex_part` already emits a leading `-`
+    // for negatives (and for `-0`), so prepend `+` only for the rest.
+    if imag.starts_with('-') {
+        format!("({real}{imag}j)")
+    } else {
+        format!("({real}+{imag}j)")
+    }
+}
+
 fn format_float(x: f64) -> String {
     if x.is_nan() {
         return "nan".into();

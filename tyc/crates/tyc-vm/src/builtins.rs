@@ -1003,6 +1003,8 @@ fn value_len(v: &Value) -> Result<usize, Unwind> {
                 0
             }
         }
+        // A dict-view's length is the number of items it exposes.
+        Value::DictView { items, .. } => items.len(),
         other => {
             return Err(type_error(format!(
                 "object of type '{}' has no len()",
@@ -2713,6 +2715,7 @@ fn deep_freeze_value(v: Value) -> Result<Value, Unwind> {
         | Value::Bool(_)
         | Value::Int(_)
         | Value::Float(_)
+        | Value::Complex(..)
         | Value::Str(_)
         | Value::Bytes(_)
         | Value::Range { .. }
@@ -2783,6 +2786,10 @@ fn deep_freeze_value(v: Value) -> Result<Value, Unwind> {
         }
         Value::ResultOk(v) => Ok(Value::ResultOk(Box::new(deep_freeze_value(*v)?))),
         Value::ResultErr(v) => Ok(Value::ResultErr(Box::new(deep_freeze_value(*v)?))),
+        // TODO(builtins agent): a dict-view is an ephemeral, already-read-only
+        // value; freezing it is a no-op here. Revisit if `freeze let v = d.keys()`
+        // ever needs view-specific semantics.
+        Value::DictView { .. } => Ok(v),
         Value::Iter(_) | Value::BoundMethod { .. } => Err(crate::error::Unwind::Exception(
             crate::error::VmException::new(
                 "TypeError",

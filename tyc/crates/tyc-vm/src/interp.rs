@@ -1404,6 +1404,15 @@ impl Interpreter {
                 }
                 _ => Ok(false),
             },
+            Value::DictView { items, .. } => {
+                let items = items.clone();
+                for v in &items {
+                    if self.cmp_op(CmpOp::Eq, v, item)? {
+                        return Ok(true);
+                    }
+                }
+                Ok(false)
+            }
             Value::Instance(i) => {
                 // `x in obj` → obj.__contains__(x).
                 if let Some(m) = self.find_method(&i.class, "__contains__") {
@@ -2087,6 +2096,21 @@ impl Interpreter {
             return self.binop(&Int(a), op, &Int(b));
         }
 
+        // Complex arithmetic. Any operand being a `Complex` promotes a numeric
+        // (int / float / bool) other operand to `Complex(_, 0.0)`. Supports
+        // `+ - * /` (CPython raises for `//`, `%`, `**`-with-complex in the
+        // ways we don't need here — those fall through to the dunder/error
+        // path, matching "unsupported" for the unsupported ops).
+        if matches!(l, Complex(..)) || matches!(r, Complex(..)) {
+            let lc = value_as_complex(l);
+            let rc = value_as_complex(r);
+            if let (Some((ar, ai)), Some((br, bi))) = (lc, rc) {
+                return complex_binop(op, ar, ai, br, bi);
+            }
+            // One side is complex, the other isn't numeric — fall through to
+            // the dunder/error path below.
+        }
+
         // printf-style `%` formatting: `"%.2f and %s" % (3.14, "x")`. The
         // checker already accepts `str % args`; the VM implements the
         // common conversions. A single non-tuple value is treated as one
@@ -2251,6 +2275,10 @@ impl Interpreter {
                 Ok(Value::Str(Rc::new(chars[idx].to_string())))
             }
             Value::Dict(d) => {
+                // A plain `Value::Dict` has no associated class, so the
+                // `__missing__` hook (mechanism #2) lives on the `Instance`
+                // arm below — the builtins agent's `defaultdict` is an
+                // Instance, not a bare Dict. A bare dict still raises KeyError.
                 let k = key.to_hash_key()?;
                 d.borrow()
                     .get(&k)
@@ -2264,8 +2292,23 @@ impl Interpreter {
                 Ok(Value::Int(BigInt::from(b[idx] as i64)))
             }
             Value::Instance(i) => {
-                if let Some(m) = self.find_method(&i.class, "__getitem__") {
-                    return self.call_value(
+                // Missing-key hook (mechanism #2). The builtins agent's
+                // `defaultdict` is an `Instance` whose class defines
+                // `__missing__(self, key)`. CPython's contract: when a key
+                // lookup misses, call `__missing__(key)`, STORE the returned
+                // value under `key`, and return it. We model storage by
+                // dispatching the instance's own `__setitem__` (if any), then
+                // returning the produced default.
+                //
+                // Dispatch order, matching CPython's `dict.__getitem__`:
+                //   1. `__getitem__(key)` — if it succeeds, return it.
+                //   2. If `__getitem__` raised `KeyError` (or is absent) and
+                //      `__missing__` exists, call `__missing__(key)`, store via
+                //      `__setitem__(key, value)`, and return `value`.
+                let getitem = self.find_method(&i.class, "__getitem__");
+                let missing = self.find_method(&i.class, "__missing__");
+                if let Some(m) = getitem {
+                    let res = self.call_value(
                         Value::BoundMethod {
                             receiver: Box::new(target.clone()),
                             function: m,
@@ -2273,6 +2316,37 @@ impl Interpreter {
                         vec![key.clone()],
                         &[],
                     );
+                    match res {
+                        Ok(v) => return Ok(v),
+                        Err(Unwind::Exception(ref e))
+                            if missing.is_some() && e.kind == "KeyError" =>
+                        {
+                            // fall through to __missing__ below
+                        }
+                        Err(e) => return Err(e),
+                    }
+                }
+                if let Some(m) = missing {
+                    let value = self.call_value(
+                        Value::BoundMethod {
+                            receiver: Box::new(target.clone()),
+                            function: m,
+                        },
+                        vec![key.clone()],
+                        &[],
+                    )?;
+                    // Store the default under the key (CPython semantics).
+                    if let Some(setitem) = self.find_method(&i.class, "__setitem__") {
+                        self.call_value(
+                            Value::BoundMethod {
+                                receiver: Box::new(target.clone()),
+                                function: setitem,
+                            },
+                            vec![key.clone(), value.clone()],
+                            &[],
+                        )?;
+                    }
+                    return Ok(value);
                 }
                 Err(type_error(format!(
                     "'{}' object is not subscriptable",
@@ -2696,6 +2770,27 @@ impl Interpreter {
                 d.borrow_mut().insert(k, value);
                 Ok(())
             }
+            // `obj[key] = value` → `obj.__setitem__(key, value)` when the
+            // instance's class defines it. Needed by the builtins agent's
+            // `defaultdict` (and any user mapping type) so subscript-assignment
+            // round-trips with the `__missing__` read path (mechanism #2).
+            Value::Instance(i) => {
+                if let Some(m) = self.find_method(&i.class, "__setitem__") {
+                    self.call_value(
+                        Value::BoundMethod {
+                            receiver: Box::new(target.clone()),
+                            function: m,
+                        },
+                        vec![key.clone(), value],
+                        &[],
+                    )?;
+                    return Ok(());
+                }
+                Err(type_error(format!(
+                    "'{}' object does not support item assignment",
+                    target.type_name()
+                )))
+            }
             other => Err(type_error(format!(
                 "'{}' object does not support item assignment",
                 other.type_name()
@@ -2740,6 +2835,12 @@ impl Interpreter {
                 IterState::Set { keys, index: 0 }
             }
             Value::Iter(it) => return Ok(Value::Iter(it)),
+            // A dict-view iterates over its materialised items, so
+            // `for k in d.keys()`, `list(d.values())`, `set(d.items())` work.
+            Value::DictView { items, .. } => IterState::List {
+                items: Rc::new(RefCell::new(items)),
+                index: 0,
+            },
             // Iterating an enum class yields its members in definition order.
             Value::Class(ref c) if Self::is_enum_class(c) => {
                 let members = match c.class_attrs.borrow().get("__typhon_enum_members__") {
@@ -3482,7 +3583,9 @@ fn number_to_value(n: &Number) -> Value {
             }
         }
         Number::Float(x) => Value::Float(*x),
-        Number::Complex { .. } => Value::None, // not supported
+        // Imaginary literal, e.g. `2j` → `Complex(0.0, 2.0)`, `3+4j` is parsed
+        // as `Int(3) + Complex(0.0, 4.0)` so only the `imag` part is set here.
+        Number::Complex { real, imag } => Value::Complex(*real, *imag),
     }
 }
 
@@ -4016,6 +4119,44 @@ fn require_str_return(v: Value, dunder: &str) -> Result<String, Unwind> {
 }
 
 /// The dunder method name a binary operator dispatches to on its left operand.
+/// View a numeric `Value` as a complex `(real, imag)` pair, or `None` if it
+/// isn't a number. `int` / `float` / `bool` map to a zero imaginary part.
+fn value_as_complex(v: &Value) -> Option<(f64, f64)> {
+    match v {
+        Value::Complex(re, im) => Some((*re, *im)),
+        Value::Float(x) => Some((*x, 0.0)),
+        Value::Int(i) => Some((bigint_to_f64(i), 0.0)),
+        Value::Bool(b) => Some((*b as i64 as f64, 0.0)),
+        _ => None,
+    }
+}
+
+/// Complex arithmetic for `+ - * /`. Other operators return the standard
+/// "unsupported operand" error.
+fn complex_binop(op: Operator, ar: f64, ai: f64, br: f64, bi: f64) -> Result<Value, Unwind> {
+    use Operator::*;
+    match op {
+        Add => Ok(Value::Complex(ar + br, ai + bi)),
+        Sub => Ok(Value::Complex(ar - br, ai - bi)),
+        Mult => Ok(Value::Complex(ar * br - ai * bi, ar * bi + ai * br)),
+        Div => {
+            // (a / b) = (a * conj(b)) / |b|^2
+            let denom = br * br + bi * bi;
+            if denom == 0.0 {
+                return Err(zero_division());
+            }
+            Ok(Value::Complex(
+                (ar * br + ai * bi) / denom,
+                (ai * br - ar * bi) / denom,
+            ))
+        }
+        _ => Err(type_error(format!(
+            "unsupported operand type(s) for {}: 'complex' and 'complex'",
+            op.as_str()
+        ))),
+    }
+}
+
 fn binop_dunder(op: Operator) -> Option<&'static str> {
     Some(match op {
         Operator::Add => "__add__",
@@ -4761,5 +4902,165 @@ d = {"a": 1, "b": 2, "c": 3, "d": 4, "e": 5}
             Value::Dict(d).py_str(),
             "{'a': 1, 'b': 2, 'c': 3, 'd': 4, 'e': 5}"
         );
+    }
+
+    /// Mechanism #1 — instance operator-overload dispatch: `a + b` on two
+    /// `Vec2` instances must invoke `__add__` and walk the MRO / bind self.
+    #[test]
+    fn instance_add_dunder_dispatch() {
+        let src = r#"
+class Vec2:
+    def __init__(self, x, y):
+        self.x = x
+        self.y = y
+    def __add__(self, other):
+        return Vec2(self.x + other.x, self.y + other.y)
+
+a = Vec2(1, 2)
+b = Vec2(3, 4)
+c = a + b
+rx = c.x
+ry = c.y
+"#;
+        let (interp, res) = parse_and_run(src);
+        res.unwrap();
+        assert_eq!(interp.root.get("rx").unwrap().py_str(), "4");
+        assert_eq!(interp.root.get("ry").unwrap().py_str(), "6");
+    }
+
+    /// Mechanism #1 (reflected) — `2 * v` with no `__mul__` on int falls back
+    /// to the right operand's `__rmul__`.
+    #[test]
+    fn instance_reflected_dunder_dispatch() {
+        let src = r#"
+class Scalar:
+    def __init__(self, v):
+        self.v = v
+    def __rmul__(self, other):
+        return Scalar(self.v * other)
+
+s = 3 * Scalar(4)
+r = s.v
+"#;
+        let (interp, res) = parse_and_run(src);
+        res.unwrap();
+        assert_eq!(interp.root.get("r").unwrap().py_str(), "12");
+    }
+
+    /// Mechanism #2 — `__missing__` is invoked on a missing key and the
+    /// returned default is stored under the key.
+    #[test]
+    fn subscript_missing_hook_stores_default() {
+        let src = r#"
+class DefaultMap:
+    def __init__(self):
+        self.store = {}
+    def __getitem__(self, key):
+        if key in self.store:
+            return self.store[key]
+        raise KeyError(key)
+    def __setitem__(self, key, value):
+        self.store[key] = value
+    def __missing__(self, key):
+        return 99
+
+d = DefaultMap()
+first = d["absent"]
+again = d["absent"]
+"#;
+        let (interp, res) = parse_and_run(src);
+        res.unwrap();
+        assert_eq!(interp.root.get("first").unwrap().py_str(), "99");
+        // Second read hits the stored value, not __missing__ again.
+        assert_eq!(interp.root.get("again").unwrap().py_str(), "99");
+    }
+
+    /// Mechanism #3 — complex arithmetic and CPython-exact repr.
+    #[test]
+    fn complex_arithmetic_and_repr() {
+        // repr forms
+        assert_eq!(Value::Complex(3.0, 4.0).py_str(), "(3+4j)");
+        assert_eq!(Value::Complex(0.0, 4.0).py_str(), "4j");
+        assert_eq!(Value::Complex(1.0, -2.0).py_str(), "(1-2j)");
+        assert_eq!(Value::Complex(3.0, 0.0).py_str(), "(3+0j)");
+        assert_eq!(Value::Complex(1.5, 2.5).py_str(), "(1.5+2.5j)");
+        assert_eq!(Value::Complex(0.0, -1.0).py_str(), "-1j");
+
+        let src = r#"
+a = 1 + 2j
+b = (1+2j) * (3+4j)
+c = 4j
+d = 10j / 2j
+e = (1+2j) - (3+1j)
+"#;
+        let (interp, res) = parse_and_run(src);
+        res.unwrap();
+        assert_eq!(interp.root.get("a").unwrap().py_str(), "(1+2j)");
+        assert_eq!(interp.root.get("b").unwrap().py_str(), "(-5+10j)");
+        assert_eq!(interp.root.get("c").unwrap().py_str(), "4j");
+        assert_eq!(interp.root.get("d").unwrap().py_str(), "(5+0j)");
+        assert_eq!(interp.root.get("e").unwrap().py_str(), "(-2+1j)");
+    }
+
+    /// Mechanism #3 — complex equality across int/float when imag == 0.
+    #[test]
+    fn complex_equality() {
+        assert!(Value::Complex(3.0, 0.0).py_eq(&Value::Int(BigInt::from(3))));
+        assert!(Value::Complex(3.0, 0.0).py_eq(&Value::Float(3.0)));
+        assert!(!Value::Complex(3.0, 1.0).py_eq(&Value::Int(BigInt::from(3))));
+        assert!(Value::Complex(1.0, 2.0).py_eq(&Value::Complex(1.0, 2.0)));
+    }
+
+    /// Mechanism #4 — dict-view repr, len, iteration, and membership.
+    #[test]
+    fn dict_view_repr_iter_len_contains() {
+        use crate::value::DictViewKind;
+        let keys = Value::DictView {
+            kind: DictViewKind::Keys,
+            items: vec![
+                Value::Str(Rc::new("a".into())),
+                Value::Str(Rc::new("b".into())),
+            ],
+        };
+        assert_eq!(keys.py_str(), "dict_keys(['a', 'b'])");
+        assert_eq!(keys.type_name(), "dict_keys");
+
+        let values = Value::DictView {
+            kind: DictViewKind::Values,
+            items: vec![Value::Int(BigInt::from(1)), Value::Int(BigInt::from(2))],
+        };
+        assert_eq!(values.py_str(), "dict_values([1, 2])");
+
+        let items = Value::DictView {
+            kind: DictViewKind::Items,
+            items: vec![
+                Value::Tuple(Rc::new(vec![
+                    Value::Str(Rc::new("a".into())),
+                    Value::Int(BigInt::from(1)),
+                ])),
+                Value::Tuple(Rc::new(vec![
+                    Value::Str(Rc::new("b".into())),
+                    Value::Int(BigInt::from(2)),
+                ])),
+            ],
+        };
+        assert_eq!(items.py_str(), "dict_items([('a', 1), ('b', 2)])");
+
+        // Iteration via make_iter / iter_next.
+        let mut interp = Interpreter::new();
+        let it = interp.make_iter(keys.clone()).unwrap();
+        let mut out = Vec::new();
+        while let Some(v) = interp.iter_next(&it).unwrap() {
+            out.push(v.py_str());
+        }
+        assert_eq!(out, vec!["a", "b"]);
+
+        // Membership.
+        assert!(interp
+            .contains(&keys, &Value::Str(Rc::new("a".into())))
+            .unwrap());
+        assert!(!interp
+            .contains(&keys, &Value::Str(Rc::new("z".into())))
+            .unwrap());
     }
 }
