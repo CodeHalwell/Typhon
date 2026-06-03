@@ -177,6 +177,43 @@ runtime:
 - `for x in int_val` — iterating a non-iterable
 - `d[5]` where `d: dict[str, int]` — wrong subscript key type
 
+### M7 — `str.split(maxsplit=...)` ignores the maxsplit argument  (VM)
+
+`repros/split2.ty`. `"a b c".split(" ", 1)` → VM `['a', 'b', 'c']`
+(CPython `['a', 'b c']`). Both positional and keyword `maxsplit` are
+dropped; `split()` / `split(sep)` without maxsplit are correct.
+
+### M8 — Callable instances (`__call__`) unsupported in the VM  (VM)
+
+`repros/dunder.ty`. An instance of a class with `def __call__(self, …)`
+raises `TypeError: 'instance' object is not callable` in the VM. The
+checker accepts it (it is valid Python). Common for functors /
+decorator objects. `@property` does work in the VM.
+
+### M9 — f-string `{x=}` debug specifier drops the `name=` prefix  (VM)
+
+`repros/misc.ty`. `f"{val=}"` → VM `42`, CPython `val=42`. The
+self-documenting-expression form (3.8+) is widely used in debugging.
+
+### M10 — `bytes` methods (`decode`, `hex`, …) unsupported in the VM  (VM)
+
+`repros/by.ty`. `b"hello".decode()` →
+`AttributeError: 'bytes' object has no method 'decode'`, halting the
+program. `repr` / `len` / indexing work, but the method surface is
+mostly missing. Checker accepts (valid).
+
+### Notes / non-bugs
+
+- `@contextmanager` generator-based context managers raise a **graceful**
+  `NotImplementedError` in the VM ("the VM evaluates generators
+  eagerly") rather than crashing — but this contradicts the v0.9.0
+  changelog claim that the `contextlib` shim works under `tyc run`.
+  `repros/cm.ty`.
+- Plain generators (`yield`, `while`+`yield`, `list(gen())`, `next()`,
+  comprehensions over a generator) all work correctly. (An earlier
+  "first value dropped" alarm was a `tail -n` truncation artifact, not
+  a bug.)
+
 ### L1 — `tyc build file.ty` rejects single files  (CLI)
 
 `tyc build foo.ty` treats the arg as a project dir

@@ -1,0 +1,14 @@
+from typing import Iterator
+def count_up(n: int) -> Iterator[int]:
+    mut i: int = 0
+    while i < n:
+        yield i
+        i = i + 1
+def main() -> None:
+    print("A: for loop over count_up(4)")
+    for x in count_up(4):
+        print(x)
+    print("B: list(count_up(4))")
+    print(list(count_up(4)))
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,7 @@
+def main() -> None:
+    print("a b c".split(maxsplit=1))
+    print("a b c".split(None, 1))
+    print("a b c".split())
+    print("a b c".split(" ", 1))
+if __name__ == "__main__":
+    main()

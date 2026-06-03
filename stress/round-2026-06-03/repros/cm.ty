@@ -1,0 +1,12 @@
+from contextlib import contextmanager
+from typing import Iterator
+@contextmanager
+def tag(name: str) -> Iterator[str]:
+    print(f"<{name}>")
+    yield name
+    print(f"</{name}>")
+def main() -> None:
+    with tag("div") as t:
+        print(f"  body of {t}")
+if __name__ == "__main__":
+    main()
