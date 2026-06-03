@@ -235,6 +235,21 @@ self-documenting-expression form (3.8+) is widely used in debugging.
 program. `repr` / `len` / indexing work, but the method surface is
 mostly missing. Checker accepts (valid).
 
+### M11 — `__post_init__` is never called in the VM  (VM)
+
+`repros/pi.ty`. A dataclass with `def __post_init__(self)` that derives
+a field has that hook honoured by `tyc build` + CPython (`area` →
+12.57) but ignored by the VM (`area` stays 0.0). Silent wrong answer.
+
+### M12 — Multi-level inheritance drops grandparent fields in the VM  (VM)
+
+`repros/lvl.ty`. With `class A` → `class B(A)` → `class C(B)`,
+constructing `C(x=…, y=…, z=…)` raises
+`TypeError: C() got unexpected keyword argument(s): x` in the VM — the
+grandparent field `x` is not accumulated. 2-level inheritance
+(`B(x=…, y=…)`) works; only 3+ levels break. The v0.8.0 "subclass
+constructors inherit fields" fix evidently only walks one MRO hop.
+
 ### Notes / non-bugs
 
 - `@contextmanager` generator-based context managers raise a **graceful**
