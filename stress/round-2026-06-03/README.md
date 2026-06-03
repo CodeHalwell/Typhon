@@ -27,14 +27,19 @@ then integrated onto v0.10.0. Full workspace `cargo test` green
 | M12 multi-level MRO fields | ✅ fixed | vm interp.rs |
 | M13 `None`→`object` | ✅ fixed | types |
 | M14 `groupby(key=)` | ✅ fixed | vm builtins.rs |
-| L3 dict-view repr | ⏳ deferred | needs `DictView` value variant |
-| M5 defaultdict factory | ⏳ deferred | needs subscript-dunder hook in interp |
-| M15 datetime module | ⏳ deferred | needs instance operator-overload dispatch |
-| M16 pathlib `/` join | ⏳ deferred | needs instance `__truediv__` dispatch |
-| M17 `complex` numbers | ⏳ deferred | needs a `Value::Complex` variant |
+| L3 dict-view repr | ✅ fixed | `Value::DictView` + builtins keys/values/items |
+| M5 defaultdict factory | ✅ fixed | subscript `__missing__` hook + Instance-backed defaultdict |
+| M15 datetime module | ✅ fixed | instance operator dunders + native datetime shim |
+| M16 pathlib `/` join | ✅ fixed | `__truediv__` dispatch + `_Path` shim, `.suffixes` |
+| M17 `complex` numbers | ✅ fixed | `Value::Complex` + arithmetic + `complex()` ctor |
 
-The four deferred items each need a cross-cutting `Value`/operator-dispatch
-change and are tracked as a follow-up.
+The deferred items were closed by a two-stage VM pass: a foundation
+commit (`Value::Complex`, dict-view kind, generic instance operator-dunder
+dispatch in `binop`, subscript `__missing__` hook) followed by the stdlib
+shims that build on it (defaultdict, datetime, pathlib, `complex()`,
+dict-view-returning `keys`/`values`/`items`). All 22 findings from this
+round are now resolved; `cargo test -p tyc-vm` is at 65 tests, full
+workspace green, zero `tyc check` regressions across `examples/`.
 
 ---
 
