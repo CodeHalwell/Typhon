@@ -17,6 +17,123 @@ use crate::interp::{normalize_index, Interpreter};
 use crate::value::{DictMap, HashKey, IterState, Module, NativeFn, Value};
 use num_traits::ToPrimitive as _;
 
+/// Round a float to the nearest integer value using round-half-to-even
+/// (banker's rounding), matching CPython's `round()`.
+fn round_half_even(x: f64) -> f64 {
+    let floor = x.floor();
+    let diff = x - floor;
+    if diff < 0.5 {
+        floor
+    } else if diff > 0.5 {
+        floor + 1.0
+    } else {
+        // Exactly halfway: round to the even neighbour.
+        if (floor as i64) % 2 == 0 {
+            floor
+        } else {
+            floor + 1.0
+        }
+    }
+}
+
+/// `str.split(sep, maxsplit)` with an explicit separator. `maxsplit < 0`
+/// means unlimited. `from_right` selects `rsplit` behaviour.
+fn split_with_sep(s: &str, sep: &str, maxsplit: i64, from_right: bool) -> Vec<String> {
+    if maxsplit < 0 {
+        let mut v: Vec<String> = s.split(sep).map(|p| p.to_owned()).collect();
+        if from_right {
+            // splitn-from-right unlimited is the same set of pieces.
+            let _ = &mut v;
+        }
+        return v;
+    }
+    let limit = (maxsplit as usize) + 1;
+    if from_right {
+        let mut parts: Vec<String> = s.rsplitn(limit, sep).map(|p| p.to_owned()).collect();
+        parts.reverse();
+        parts
+    } else {
+        s.splitn(limit, sep).map(|p| p.to_owned()).collect()
+    }
+}
+
+/// `str.split()` / `str.split(None, maxsplit)` — whitespace split that
+/// collapses runs of whitespace and drops leading/trailing empties.
+fn split_whitespace_max(s: &str, maxsplit: i64, from_right: bool) -> Vec<String> {
+    if maxsplit < 0 {
+        return s.split_whitespace().map(|p| p.to_owned()).collect();
+    }
+    let max = maxsplit as usize;
+    if from_right {
+        // Collect words with their byte ranges, then split from the right.
+        let words: Vec<(usize, usize)> = {
+            let mut v = Vec::new();
+            let mut start: Option<usize> = None;
+            for (i, c) in s.char_indices() {
+                if c.is_whitespace() {
+                    if let Some(st) = start.take() {
+                        v.push((st, i));
+                    }
+                } else if start.is_none() {
+                    start = Some(i);
+                }
+            }
+            if let Some(st) = start {
+                v.push((st, s.len()));
+            }
+            v
+        };
+        if words.len() <= max {
+            return words.iter().map(|(a, b)| s[*a..*b].to_owned()).collect();
+        }
+        // Keep the last `max` words as separate pieces; everything before
+        // them stays joined (interior whitespace preserved) as the first
+        // piece.
+        let split_point = words.len() - max;
+        let head_start = words[0].0;
+        let head_end = words[split_point - 1].1;
+        let mut out = vec![s[head_start..head_end].to_owned()];
+        for (a, b) in &words[split_point..] {
+            out.push(s[*a..*b].to_owned());
+        }
+        out
+    } else {
+        let mut out: Vec<String> = Vec::new();
+        let mut chars = s.char_indices().peekable();
+        let bytes = s;
+        loop {
+            // Skip leading whitespace.
+            while let Some(&(_, c)) = chars.peek() {
+                if c.is_whitespace() {
+                    chars.next();
+                } else {
+                    break;
+                }
+            }
+            let Some(&(start, _)) = chars.peek() else {
+                break;
+            };
+            if out.len() == max {
+                // Remaining text (stripped of trailing whitespace) is the
+                // final piece, with interior whitespace preserved.
+                out.push(bytes[start..].trim_end().to_owned());
+                break;
+            }
+            // Consume the word.
+            let mut end = bytes.len();
+            while let Some(&(i, c)) = chars.peek() {
+                if c.is_whitespace() {
+                    end = i;
+                    break;
+                }
+                chars.next();
+            }
+            out.push(bytes[start..end].to_owned());
+        }
+        out
+    }
+}
+
 pub fn install(interp: &mut Interpreter) {
     let root = interp.root.clone();
 
@@ -301,6 +418,34 @@ pub fn install(interp: &mut Interpreter) {
         Ok(Value::Tuple(Rc::new(out)))
     });
 
+    native!("bytes", |i, args| {
+        match args.into_iter().next() {
+            None => Ok(Value::Bytes(Rc::new(Vec::new()))),
+            Some(Value::Bytes(b)) => Ok(Value::Bytes(b)),
+            // bytes(int) -> that many zero bytes.
+            Some(Value::Int(n)) => {
+                let n = num_traits::ToPrimitive::to_usize(&n)
+                    .ok_or_else(|| value_error("negative count"))?;
+                Ok(Value::Bytes(Rc::new(vec![0u8; n])))
+            }
+            // bytes(str) requires an encoding in Python; not supported here.
+            Some(Value::Str(_)) => Err(type_error("string argument without an encoding")),
+            // bytes(iterable_of_ints).
+            Some(v) => {
+                let it = i.make_iter(v)?;
+                let mut out: Vec<u8> = Vec::new();
+                while let Some(x) = i.iter_next(&it)? {
+                    let n = x.to_int()?;
+                    if !(0..=255).contains(&n) {
+                        return Err(value_error("bytes must be in range(0, 256)"));
+                    }
+                    out.push(n as u8);
+                }
+                Ok(Value::Bytes(Rc::new(out)))
+            }
+        }
+    });
+
     native!("set", |i, args| {
         let mut out = HashSet::new();
         if let Some(v) = args.into_iter().next() {
@@ -565,15 +710,42 @@ pub fn install(interp: &mut Interpreter) {
     });
 
     native!("round", |_i, args| match args.first() {
+        // round(int) and round(int, ndigits) return the int unchanged
+        // (Python rounds to the given decimal place; for ints with
+        // non-negative ndigits that's a no-op, and these are the only
+        // cases the shim handles).
         Some(Value::Int(i)) => Ok(Value::Int(i.clone())),
-        Some(Value::Float(x)) => match args.get(1) {
-            Some(n) => {
-                let n = n.to_int()? as i32;
-                let p = 10f64.powi(n);
-                Ok(Value::Float((x * p).round() / p))
+        Some(Value::Float(x)) => {
+            let x = *x;
+            match args.get(1) {
+                // round(x, ndigits) -> float, round-half-to-even on the
+                // actual f64 value. Rust's float formatting uses
+                // round-ties-to-even, matching CPython (so 2.675, which is
+                // really 2.67499..., rounds to 2.67).
+                Some(n) if !matches!(n, Value::None) => {
+                    let n = n.to_int()? as i32;
+                    if !x.is_finite() {
+                        return Ok(Value::Float(x));
+                    }
+                    if n >= 0 {
+                        let s = format!("{:.*}", n as usize, x);
+                        Ok(Value::Float(s.parse::<f64>().unwrap_or(x)))
+                    } else {
+                        // Round to a negative decimal place (tens, hundreds…).
+                        let p = 10f64.powi(-n);
+                        Ok(Value::Float(round_half_even(x / p) * p))
+                    }
+                }
+                // round(x) -> int, round-half-to-even.
+                _ => {
+                    let r = round_half_even(x);
+                    Ok(Value::Int(
+                        <num_bigint::BigInt as num_traits::FromPrimitive>::from_f64(r)
+                            .unwrap_or_else(|| num_bigint::BigInt::from(r as i64)),
+                    ))
+                }
             }
-            None => Ok(Value::Int(num_bigint::BigInt::from(x.round() as i64))),
-        },
+        }
         _ => Err(type_error("round() expected a number")),
     });
 
@@ -1935,7 +2107,8 @@ fn make_re_module() -> Value {
             "match".into(),
             Value::Native(Rc::new(NativeFn::new("match", move |_i, args| {
                 let s = single(&args, "match")?.py_str();
-                Ok(match_to_value(p1.find(&s), &s))
+                let caps = p1.captures(&s).filter(|c| c.get(0).unwrap().start() == 0);
+                Ok(captures_to_value(caps))
             }))),
         );
         let p2 = p_rc.clone();
@@ -1943,7 +2116,7 @@ fn make_re_module() -> Value {
             "search".into(),
             Value::Native(Rc::new(NativeFn::new("search", move |_i, args| {
                 let s = single(&args, "search")?.py_str();
-                Ok(match_to_value(p2.find(&s), &s))
+                Ok(captures_to_value(p2.captures(&s)))
             }))),
         );
         let p3 = p_rc.clone();
@@ -2002,26 +2175,59 @@ fn make_re_module() -> Value {
             fields: RefCell::new(attrs),
         }))
     }
-    fn match_to_value(m: Option<regex::Match<'_>>, _s: &str) -> Value {
-        let Some(m) = m else { return Value::None };
-        let captured = m.as_str().to_owned();
-        let start = m.start() as i64;
-        let end = m.end() as i64;
+    // Build a match object from a `regex::Captures`. Group 0 is the whole
+    // match; groups 1.. are the capture groups. Non-participating optional
+    // groups are represented as `None`.
+    fn captures_to_value(caps: Option<regex::Captures<'_>>) -> Value {
+        let Some(caps) = caps else { return Value::None };
+        let whole = caps.get(0).expect("group 0 always present");
+        let start = whole.start() as i64;
+        let end = whole.end() as i64;
+        // Collect each group's optional captured text by index.
+        let group_texts: Vec<Option<String>> = (0..caps.len())
+            .map(|i| caps.get(i).map(|m| m.as_str().to_owned()))
+            .collect();
         let mut attrs: HashMap<String, Value> = HashMap::new();
-        let cap = captured.clone();
+        // `.group()`/`.group(n)`/`.group(a, b, ...)`.
+        let gt = group_texts.clone();
         attrs.insert(
             "group".into(),
-            Value::Native(Rc::new(NativeFn::new("group", move |_i, _args| {
-                Ok(Value::Str(Rc::new(cap.clone())))
+            Value::Native(Rc::new(NativeFn::new("group", move |_i, args| {
+                let pick = |idx: usize| -> Result<Value, Unwind> {
+                    match gt.get(idx) {
+                        None => Err(index_error("no such group")),
+                        Some(None) => Ok(Value::None),
+                        Some(Some(s)) => Ok(Value::Str(Rc::new(s.clone()))),
+                    }
+                };
+                if args.is_empty() {
+                    return pick(0);
+                }
+                if args.len() == 1 {
+                    return pick(args[0].to_int()? as usize);
+                }
+                let mut out = Vec::with_capacity(args.len());
+                for a in &args {
+                    out.push(pick(a.to_int()? as usize)?);
+                }
+                Ok(Value::Tuple(Rc::new(out)))
             }))),
         );
-        let cap2 = captured.clone();
+        // `.groups()` returns groups 1.. (not group 0).
+        let gt2 = group_texts.clone();
         attrs.insert(
             "groups".into(),
-            Value::Native(Rc::new(NativeFn::new("groups", move |_i, _args| {
-                Ok(Value::Tuple(Rc::new(vec![Value::Str(Rc::new(
-                    cap2.clone(),
-                ))])))
+            Value::Native(Rc::new(NativeFn::new("groups", move |_i, args| {
+                let default = args.first().cloned().unwrap_or(Value::None);
+                let out: Vec<Value> = gt2
+                    .iter()
+                    .skip(1)
+                    .map(|g| match g {
+                        Some(s) => Value::Str(Rc::new(s.clone())),
+                        None => default.clone(),
+                    })
+                    .collect();
+                Ok(Value::Tuple(Rc::new(out)))
             }))),
         );
         attrs.insert(
@@ -2086,8 +2292,8 @@ fn make_re_module() -> Value {
                     // string (unlike `re.search`). The Rust `regex` crate
                     // returns the leftmost match anywhere, so anchor by
                     // requiring `start() == 0`.
-                    let m = r.find(&s).filter(|m| m.start() == 0);
-                    Ok(match_to_value(m, &s))
+                    let caps = r.captures(&s).filter(|c| c.get(0).unwrap().start() == 0);
+                    Ok(captures_to_value(caps))
                 }),
             ),
             (
@@ -2102,7 +2308,7 @@ fn make_re_module() -> Value {
                         .ok_or_else(|| type_error("search() needs string"))?
                         .py_str();
                     let r = compile_one(&p)?;
-                    Ok(match_to_value(r.find(&s), &s))
+                    Ok(captures_to_value(r.captures(&s)))
                 }),
             ),
             (
@@ -2118,7 +2324,7 @@ fn make_re_module() -> Value {
                         .py_str();
                     let anchored = format!("^(?:{p})$");
                     let r = compile_one(&anchored)?;
-                    Ok(match_to_value(r.find(&s), &s))
+                    Ok(captures_to_value(r.captures(&s)))
                 }),
             ),
             (
@@ -3209,6 +3415,29 @@ pub fn method_for(_value: &Value, _attr: &str) -> Option<()> {
     None
 }
 
+/// Peel a trailing keyword-argument sentinel (built by `call_with_kwargs`)
+/// off a method's positional args, returning the remaining positional args
+/// and the keyword map. Methods that don't care about kwargs simply ignore
+/// the returned map.
+fn split_kwargs_map(args: &[Value]) -> (&[Value], HashMap<String, Value>) {
+    if let Some(Value::Tuple(t)) = args.last() {
+        if t.len() == 2 {
+            if let (Value::Str(tag), Value::Dict(d)) = (&t[0], &t[1]) {
+                if tag.as_str() == "__typhon_kwargs__" {
+                    let mut map = HashMap::new();
+                    for (k, v) in d.borrow().iter() {
+                        if let HashKey::Str(s) = k {
+                            map.insert((**s).clone(), v.clone());
+                        }
+                    }
+                    return (&args[..args.len() - 1], map);
+                }
+            }
+        }
+    }
+    (args, HashMap::new())
+}
+
 pub fn dispatch_method(
     interp: &mut Interpreter,
     name: &str,
@@ -3218,21 +3447,22 @@ pub fn dispatch_method(
         .first()
         .cloned()
         .ok_or_else(|| type_error("method called without receiver"))?;
+    let (rest, kwargs) = split_kwargs_map(&args[1..]);
     match (&receiver, name) {
         // ── str methods ────────────────────────────────────────────────────
-        (Value::Str(s), m) => str_method(interp, s, m, &args[1..]),
+        (Value::Str(s), m) => str_method(interp, s, m, rest, &kwargs),
+        // ── bytes methods ──────────────────────────────────────────────────
+        (Value::Bytes(b), m) => bytes_method(b, m, rest),
         // ── list methods ───────────────────────────────────────────────────
-        (Value::List(l), m) => list_method(interp, l, m, &args[1..]),
+        (Value::List(l), m) => list_method(interp, l, m, rest),
         // ── dict methods ───────────────────────────────────────────────────
-        (Value::Dict(d), m) => dict_method(interp, d, m, &args[1..]),
+        (Value::Dict(d), m) => dict_method(interp, d, m, rest),
         // ── set methods ────────────────────────────────────────────────────
-        (Value::Set(s), m) => set_method(s, m, &args[1..]),
+        (Value::Set(s), m) => set_method(s, m, rest),
         // ── tuple methods ──────────────────────────────────────────────────
-        (Value::Tuple(t), m) => tuple_method(t, m, &args[1..]),
+        (Value::Tuple(t), m) => tuple_method(t, m, rest),
         // ── int/float/bool method calls ────────────────────────────────────
-        (Value::Int(_) | Value::Float(_) | Value::Bool(_), m) => {
-            num_method(&receiver, m, &args[1..])
-        }
+        (Value::Int(_) | Value::Float(_) | Value::Bool(_), m) => num_method(&receiver, m, rest),
         _ => Err(attribute_error(format!(
             "'{}' object has no method '{}'",
             receiver.type_name(),
@@ -3260,6 +3490,7 @@ fn str_method(
     s: &Rc<String>,
     name: &str,
     args: &[Value],
+    kwargs: &HashMap<String, Value>,
 ) -> Result<Value, Unwind> {
     Ok(match name {
         "upper" => Value::Str(Rc::new(s.to_uppercase())),
@@ -3280,20 +3511,28 @@ fn str_method(
             )),
             None => Value::Str(Rc::new(s.trim_end().to_owned())),
         },
-        "split" => {
-            let parts: Vec<Value> = match args.first() {
+        "split" | "rsplit" => {
+            // Separator: positional arg 0 (None ⇒ whitespace split).
+            let sep_arg = args.first().filter(|v| !matches!(v, Value::None));
+            // maxsplit: positional arg 1 or keyword `maxsplit` (-1 ⇒ no limit).
+            let maxsplit = match args.get(1) {
+                Some(v) if !matches!(v, Value::None) => v.to_int()?,
+                _ => match kwargs.get("maxsplit") {
+                    Some(v) if !matches!(v, Value::None) => v.to_int()?,
+                    _ => -1,
+                },
+            };
+            let from_right = name == "rsplit";
+            let pieces: Vec<String> = match sep_arg {
                 Some(v) => {
                     let sep = v.py_str();
-                    s.split(&sep)
-                        .map(|p| Value::Str(Rc::new(p.to_owned())))
-                        .collect()
+                    split_with_sep(s, &sep, maxsplit, from_right)
                 }
-                None => s
-                    .split_whitespace()
-                    .map(|p| Value::Str(Rc::new(p.to_owned())))
-                    .collect(),
+                None => split_whitespace_max(s, maxsplit, from_right),
             };
-            Value::List(Rc::new(RefCell::new(parts)))
+            Value::List(Rc::new(RefCell::new(
+                pieces.into_iter().map(|p| Value::Str(Rc::new(p))).collect(),
+            )))
         }
         "splitlines" => Value::List(Rc::new(RefCell::new(
             s.lines()
@@ -3661,6 +3900,42 @@ fn str_format(
         }
     }
     Ok(Value::Str(Rc::new(out)))
+}
+
+fn bytes_method(b: &Rc<Vec<u8>>, name: &str, args: &[Value]) -> Result<Value, Unwind> {
+    Ok(match name {
+        // `.decode()` / `.decode("utf-8")` -> str. Only UTF-8/ASCII handled;
+        // other encodings fall back to a lossy UTF-8 decode.
+        "decode" => {
+            let enc = args.first().map(|v| v.py_str()).unwrap_or_default();
+            let enc_norm = enc.to_ascii_lowercase().replace(['-', '_'], "");
+            match enc_norm.as_str() {
+                "" | "utf8" | "ascii" => match std::str::from_utf8(b) {
+                    Ok(s) => Value::Str(Rc::new(s.to_owned())),
+                    Err(_) => {
+                        return Err(value_error(
+                            "'utf-8' codec can't decode byte sequence",
+                        ))
+                    }
+                },
+                "latin1" | "iso88591" => {
+                    Value::Str(Rc::new(b.iter().map(|&c| c as char).collect::<String>()))
+                }
+                _ => Value::Str(Rc::new(String::from_utf8_lossy(b).into_owned())),
+            }
+        }
+        // `.hex()` -> lowercase hex string with no separators.
+        "hex" => {
+            let mut out = String::with_capacity(b.len() * 2);
+            for byte in b.iter() {
+                out.push_str(&format!("{:02x}", byte));
+            }
+            Value::Str(Rc::new(out))
+        }
+        "upper" => Value::Bytes(Rc::new(b.iter().map(|c| c.to_ascii_uppercase()).collect())),
+        "lower" => Value::Bytes(Rc::new(b.iter().map(|c| c.to_ascii_lowercase()).collect())),
+        _ => return Err(attribute_error(format!("bytes has no method '{}'", name))),
+    })
 }
 
 fn list_method(
@@ -4680,6 +4955,31 @@ pub fn call_with_kwargs(
         // Text-IO helpers accept an `encoding=` (and `errors=`) kwarg the VM
         // doesn't model (it is always UTF-8). Drop the kwargs and run.
         "write_text" | "read_text" | "open" => (n.func)(interp, args),
+        // `itertools.groupby(iterable, key=…)` — fold the `key` keyword into
+        // the second positional slot the native already understands.
+        "groupby" => {
+            let mut args = args;
+            for (k, v) in kwargs {
+                match k.as_str() {
+                    "key" => {
+                        if args.len() < 2 {
+                            args.push(v.clone());
+                        } else {
+                            args[1] = v.clone();
+                        }
+                    }
+                    "iterable" => {
+                        if args.is_empty() {
+                            args.push(v.clone());
+                        } else {
+                            args[0] = v.clone();
+                        }
+                    }
+                    _ => return Err(type_error(format!("groupby() got unexpected keyword: '{}'", k))),
+                }
+            }
+            (n.func)(interp, args)
+        }
         // Bound builtin methods (the "method" native) never reach here — they
         // are intercepted in `call_value`, which forwards kwargs via the
         // tuple sentinel (`make_kwargs_sentinel` / `split_kwargs`).
