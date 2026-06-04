@@ -32,12 +32,12 @@
   },
   "wordPattern": "(-?\\d*\\.\\d\\w*)|([^\\`\\~\\!\\@\\#\\%\\^\\&\\*\\(\\)\\-\\=\\+\\[\\{\\]\\}\\\\\\|\\;\\:\\'\\\"\\,\\.\\<\\>\\/\\?\\s]+)",
   "indentationRules": {
-    "increaseIndentPattern": "^\\s*(class|def|async\\s+def|if|elif|else|for|while|try|except|finally|with|match|case|impl|interface|model|extend|gather|comptime|unsafe|guard)\\b.*:\\s*(#.*)?$",
+    "increaseIndentPattern": "^\\s*(?:(?:pub|plain)\\s+){0,2}(class|def|async\\s+def|if|elif|else|for|while|try|except|finally|with|match|case|impl|interface|model|enum|extend|gather|comptime|unsafe|guard)\\b.*:\\s*(#.*)?$",
     "decreaseIndentPattern": "^\\s*(elif|else|except|finally|case)\\b.*:\\s*(#.*)?$"
   },
   "onEnterRules": [
     {
-      "beforeText": "^\\s*(class|def|async\\s+def|if|elif|else|for|while|try|except|finally|with|match|case|impl|interface|model|extend|gather|comptime|unsafe|guard)\\b.*:\\s*(#.*)?$",
+      "beforeText": "^\\s*(?:(?:pub|plain)\\s+){0,2}(class|def|async\\s+def|if|elif|else|for|while|try|except|finally|with|match|case|impl|interface|model|enum|extend|gather|comptime|unsafe|guard)\\b.*:\\s*(#.*)?$",
       "action": { "indent": "indent" }
     }
   ]
