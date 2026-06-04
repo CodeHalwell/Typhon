@@ -6,6 +6,37 @@ Realistic milestones for one person plus AI assistance. The headline target is a
 
 ## Current release
 
+**[v0.11.0](https://github.com/CodeHalwell/Typhon/releases/tag/v0.11.0) — 2026-06-04.**
+VM parity sweep + `enum` keyword. A fresh adversarial stress round
+against v0.10.0 surfaced 22 findings — almost entirely in the VM, with
+a handful of type-checker coherence gaps. This release closes every
+finding from the round, lands the proposed `enum` keyword as a
+first-class declaration form (`enum Shape: CIRCLE / SQUARE`, sugaring
+over `enum.Enum` with `enum.auto()` for bare members), and adds two
+new VM value kinds: `Value::Complex` for native complex arithmetic
+(with promotion across int / float and hashable for set / dict keys)
+and a dict-view kind backing `dict.keys()` / `.values()` / `.items()`
+so they repr and behave like CPython. Bare `super()` is now rewritten
+to the explicit two-arg form so `@dataclass(slots=True)` no longer
+crashes emitted code, `__call__` / `__post_init__` dispatch on
+instances, multi-level inheritance accumulates fields across the full
+MRO, and the long tail of stdlib parity lands: native `enum` /
+`datetime` (naïve / UTC) / `pathlib` / `collections.defaultdict`
+shims, real `re.Match` capture groups, banker's `round`, `bytes`
+methods, `itertools.groupby(key=)`, `str.split(maxsplit=)` as a
+pure-keyword arg, f-string `{x=}` debug conversion, and `str %`
+runtime formatting. VM value semantics now match CPython: dataclass
+instance eq / repr / hash is value-based, set equality is
+order-independent, and float repr matches CPython's shortest
+round-tripping form. Type-checker tightening: `None` flows into
+`object`, `str %` is type-checked, and `(5).items()` / `5["a"]` /
+`for x in 5:` fire at check time. `tyc init` seeds
+`allow-secret-comptime = false` in the generated `typhon.toml`. **22
+of 22** stress-round findings closed; additive on the accepted
+surface except where the VM was returning wrong values
+(dataclass-instance equality, set equality, float repr) — those are
+now correct.
+
 **[v0.10.0](https://github.com/CodeHalwell/Typhon/releases/tag/v0.10.0) — 2026-06-01.**
 VM completeness release. Stress-testing the tree-walking VM past v0.9.2
 surfaced a batch of correctness and coverage gaps that stopped `tyc run`
