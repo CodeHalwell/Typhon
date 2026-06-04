@@ -231,3 +231,14 @@ textarea:focus-visible {
     transform: none;
   }
 }
+
+/* Accessibility: Ensure links in markdown content do not rely on color alone (WCAG 1.4.1) */
+.sl-markdown-content a:not(:where(.not-content *)) {
+  text-decoration: underline;
+  text-decoration-color: color-mix(in srgb, var(--sl-color-accent) 50%, transparent);
+  text-underline-offset: 3px;
+  text-decoration-thickness: 1px;
+}
+.sl-markdown-content a:hover:not(:where(.not-content *)) {
+  text-decoration-color: var(--sl-color-accent);
+}

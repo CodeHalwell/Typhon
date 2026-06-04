@@ -16,3 +16,6 @@
 ## 2026-06-02 - [Card hover state interaction enhancement]
 **Learning:** Adding a subtle, contextual drop shadow on hover to cards makes the UI feel more tactile, responding better to user intent.
 **Action:** Added `box-shadow: 0 4px 12px color-mix(in srgb, var(--sl-color-accent) 20%, transparent);` to `.card:hover` to complement the existing `transform: translateY(-2px)` animation.
+## 2026-06-03 - [Ensure markdown links do not rely purely on color]
+**Learning:** Discovered that inline links within `.sl-markdown-content` paragraphs only relied on a different text color (`var(--sl-color-text-accent)`) to differentiate themselves from regular text, which violates WCAG 1.4.1 (Use of Color). This makes it harder for users with color vision deficiencies to spot interactive links.
+**Action:** Added a subtle `text-decoration: underline` to markdown links in `custom.css` with a semi-transparent `text-decoration-color` that turns solid on hover. This ensures links are visually distinct through multiple channels (color + underline) while maintaining a clean aesthetic.
