@@ -106,13 +106,16 @@ hashing.
 | `json` | `dumps`, `loads` (full JSON 7159 surface). v0.10.0: `dumps(indent=…)` pretty-prints |
 | `time` | `time()`, `sleep()`, `monotonic()`. v0.10.0: `perf_counter()`, `process_time()` |
 | `random` | `random()`, `randint(a, b)`, `seed(n)` — xorshift PRNG, NOT cryptographic |
+| `enum` (v0.11.0) | `enum.Enum`, `enum.auto()` — backs the `enum Name:` keyword. Members materialise in declaration order, iteration is ordered, `ClassName.MEMBER` repr matches CPython (`<Shape.CIRCLE: 1>`) |
+| `datetime` (v0.11.0) | `datetime.datetime(y, mo, d, ...)`, `.now()`, `.fromisoformat(...)`, `.isoformat()`, `+ timedelta`, comparisons, `timedelta(seconds=...)` arithmetic. Naïve / UTC only; tz-aware arithmetic needs `--compile` |
 | `re` (v0.8.0) | `match`, `search`, `findall`, `sub`, `split`, `compile`. `match` is anchored at the start of the string. Some flag arguments (`re.MULTILINE`, etc.) are accepted but ignored — `tyc::python_semantic_drift` warns when the impact would change behaviour |
 | `typing` (v0.8.0) | Generic constructors used at runtime are no-ops; `Callable`, `List`, etc. are accepted in import position and ignored at runtime. Type-only imports are stripped by the desugar pre-pass |
-| `collections` (v0.8.0) | `OrderedDict`, `defaultdict` (no auto-default — explicit `default_factory` argument is recorded but not invoked), `Counter`, `namedtuple` |
+| `collections` (v0.8.0, defaultdict in v0.11.0) | `OrderedDict`, `defaultdict` (v0.11.0: `factory` is actually invoked on missing-key access via the subscript `__missing__` hook, so `dd[k] += 1` works), `Counter`, `namedtuple` |
 | `functools` (v0.8.0) | `lru_cache`, `cache`, `cached_property`, `reduce`, `partial` |
 | `itertools` (v0.8.0) | `chain`, `count`, `cycle` (materialise a bounded prefix), `accumulate`, `combinations`, `permutations`, `product`, `islice`, `takewhile`, `dropwhile`, `groupby` |
 | `dataclasses` (v0.8.0) | `dataclass`, `field`, `fields`, `asdict`, `astuple`. v0.9.0: `field(default_factory=list)` actually invokes the factory per instance — `tags: list[str] = []` no longer shares one list across every instance |
-| `pathlib` (v0.8.0) | `Path` with `exists`, `read_text`, `write_text`, `parent`, `name`, `stem`, `suffix`, `with_suffix`, `joinpath` / `/` |
+| `pathlib` (v0.8.0, expanded v0.11.0) | `Path` with `exists`, `read_text`, `write_text`, `parent`, `name`, `stem`, `suffix`, `with_suffix`, `joinpath` / `/`. v0.11.0: `__truediv__` dispatch (`Path("a") / "b"`), `.suffixes`, `.parts`, and `str(Path(...))` / `repr(Path(...))` match CPython |
+| `re` capture groups (v0.11.0) | `re.Match.group(n)` / `.groups()` / `.groupdict()` return the actual capture groups (prior shim returned the whole match for every index) |
 | `collections.deque` (v0.9.0) | Rides on `Value::List` via new `popleft` / `appendleft` / `extendleft` / `rotate` list methods. Graph / BFS / queue algorithms work end-to-end |
 | `heapq` (v0.9.0) | `heappush`, `heappop`, `heapify`, `heappushpop`, `heapreplace`, `nsmallest`, `nlargest` |
 | `contextlib` (v0.9.0) | `@contextmanager` identity decorator and `contextmanager`-decorated factories. `with` block honours the wrapped `__enter__` / `__exit__` shape |
@@ -149,7 +152,14 @@ Any other module raises `ImportError` with a pointer to `--compile`.
 - `tuple`: `count`, `index`.
 - `int`: `bit_length`. `float`: `is_integer`.
 - `bytes`: `repr` matches CPython byte-for-byte (`b'hi'` by default,
-  `b"with 'embedded'"` fallback, `\xNN` for non-printable bytes).
+  `b"with 'embedded'"` fallback, `\xNN` for non-printable bytes). Since
+  v0.11.0 also `decode`, `hex`, `fromhex`, `count`, `find`, `rfind`,
+  `startswith`, `endswith`, `split`, `strip`.
+- `complex` (v0.11.0): `Value::Complex(re, im)` is a real VM value.
+  `complex(re, im)` / `complex("1+2j")` construct it, the
+  reflected dunders (`__radd__` / `__rmul__` / …) dispatch, arithmetic
+  promotes from int / float, and `complex` is hashable so it works as
+  a dict / set key.
 
 ### Dunder dispatch on user instances (v0.10.0)
 
@@ -236,6 +246,59 @@ message:
   nested dict stays a dict; deeply-nested models need `tyc build`.
 
 If your program needs any of these, run with `--compile` for now.
+
+**Behaviour additions in v0.11.0** (vs v0.10.0):
+
+- `enum Name:` is a first-class keyword. Bare members auto-fill with
+  `enum.auto()`; explicit `MEMBER = value` is preserved. The class
+  body materialises members in declaration order and
+  `Shape.CIRCLE` repr matches CPython.
+- Bare `super()` inside a method is rewritten by `tyc-desugar` to the
+  explicit `super(EnclosingClass, self)` form, so
+  `@dataclass(slots=True)` (which orphans the `__class__` cell) no
+  longer crashes emitted code. Explicit `super(X, y)` calls are left
+  untouched.
+- `Value::Complex(re, im)` is a real VM value with arithmetic
+  promotion across `int` / `float`, reflected dunders, and hash
+  support.
+- `Value::DictView` backs `dict.keys()` / `.values()` / `.items()`.
+  Repr matches CPython (`dict_keys([...])`), iterate, support `len`,
+  membership-test with `in`, re-iterable.
+- `__call__` dispatches on callable instances; `__post_init__` fires
+  after auto-generated construction; multi-level inheritance
+  accumulates fields across the full MRO.
+- Subscript `__missing__` hook backs `defaultdict`: `dd[k] += 1` works
+  via the new `collections.defaultdict` shim.
+- Native `datetime` (naïve / UTC) and expanded `pathlib` (with
+  `__truediv__` / `.suffixes` / `.parts`).
+- `re.Match.group(n)` / `.groups()` / `.groupdict()` return real
+  capture groups (prior shim returned the whole match for every
+  index).
+- `builtins.round` uses banker's rounding (half-to-even).
+- `bytes` gains `decode` / `hex` / `fromhex` / `count` / `find` /
+  `rfind` / `startswith` / `endswith` / `split` / `strip`.
+- `itertools.groupby` honours `key=` instead of grouping by identity;
+  `str.split(maxsplit=…)` accepts the pure-keyword form.
+- f-string `{x=}` debug conversion renders `x=<repr>`; `str %` and
+  f-string `%` percent format types work at runtime.
+
+**Behaviour changes in v0.11.0 — VM value semantics align with CPython**
+(these were silent-wrong outputs under v0.10.0; programs that relied
+on the old behaviour will see different — correct — results):
+
+- Dataclass instance equality is value-based (same class + all fields
+  equal recursively). Class identity uses the underlying `Class`
+  pointer so distinct same-named classes from different modules no
+  longer collide.
+- Dataclass `repr` is `Name(field=value, ...)` in declared field
+  order (was `<Name instance>`).
+- Dataclass instances are hashable via `HashKey::Instance` (class
+  identity + fields sorted by name).
+- Set / frozenset equality is order-independent; repr sorts elements
+  by canonical key.
+- Float `repr` matches CPython's shortest round-tripping form, with
+  scientific notation for exp < -4 or ≥ 16 (`e+NN` / `e-NN`, ≥ 2
+  exponent digits), `-0.0` preserved.
 
 **Behaviour additions in v0.10.0** (vs v0.9.x):
 

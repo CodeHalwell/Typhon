@@ -4,6 +4,210 @@ All notable changes to Typhon are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely; the
 canonical phase-by-phase status lives in `docs/roadmap.md`.
 
+## 0.11.0 — 2026-06-04
+
+VM parity sweep + `enum` keyword. A fresh adversarial stress round
+against v0.10.0 surfaced 22 findings — almost entirely in the VM, with
+a handful of type-checker coherence gaps. The language frontend and
+the build path (`tyc build` → CPython) held up; this release closes
+every finding from the round, lands the proposed `enum` keyword as a
+first-class declaration form, and introduces two new VM value kinds
+(`Value::Complex` for native complex arithmetic, and a dict-view kind
+behind `dict.keys()` / `.values()` / `.items()` so they repr and
+behave like CPython).
+
+### Added — `enum` keyword
+
+`enum Name:` is now a first-class declaration that sugars over
+`enum.Enum`, mirroring how `model` sugars over `pydantic.BaseModel`
+and `class!` sugars over a framework base. Bare members (`CIRCLE`,
+`SQUARE`) auto-fill with `enum.auto()`; explicit `RED = 1` is
+preserved. `tyc-syntax` preprocesses the header / body, `tyc-emit`
+injects `import enum` when an `enum.*` base is present, `tyc-resolve`
+adds `enum` to the builtin prelude so `tyc check` accepts it before
+the import is injected, and `tyc fmt` round-trips the header and
+members. Mixed forms work too — `enum.auto()` continues numbering
+from the last explicit value.
+
+```typhon
+enum Shape:
+    CIRCLE
+    SQUARE
+    TRIANGLE
+
+enum Color:
+    RED = 1
+    GREEN = 2
+    BLUE = 4
+```
+
+### Added — VM `Value::Complex` and dict-view kind
+
+- **`Value::Complex(f64, f64)`** is a real VM value. `complex(re, im)`
+  / `complex("1+2j")` construct it, the `complex` literal form parses,
+  arithmetic between complex / int / float promotes correctly, the
+  reflected dunders (`__radd__` / `__rmul__` / …) dispatch, and
+  `complex` instances are hashable for dict / set keys. Previously
+  every complex-typed expression panicked at the VM boundary.
+- **`Value::DictView`** backs the iterators returned by `dict.keys()`
+  / `.values()` / `.items()`. They repr as
+  `dict_keys([...])` / `dict_values([...])` / `dict_items([...])`,
+  iterate, support `len`, are membership-testable with `in`, and are
+  re-iterable. Previously each method materialised a fresh list, so
+  `d.keys() == d.keys()` was identity-false and `repr(d.keys())`
+  printed `[...]`.
+
+### Added — VM enum runtime and bare-`super()` rewrite
+
+- **`enum` module is native.** `enum.Enum` / `enum.auto()` resolve under
+  `tyc run`, members materialise on first class-body execution, the
+  class iterates in declaration order, and `ClassName.MEMBER` repr
+  matches CPython (`<Shape.CIRCLE: 1>`). A `loading_modules` recursion
+  guard prevents the enum module from re-entering itself.
+- **Bare `super()` rewritten to two-arg form** in `tyc-desugar`. The
+  zero-arg `super()` crashed emitted code under
+  `@dataclass(slots=True)` (which orphans the `__class__` cell). A new
+  `rewrite_bare_super` pass runs after the impl / extend merge and
+  rewrites every bare `super()` inside a method body to the explicit
+  `super(EnclosingClass, self)` form, stopping at nested def / class
+  scopes. Explicit `super(X, y)` calls are left untouched.
+- **`__call__` dispatch on callable instances.** `inst(args)` for a
+  class that defines `__call__` now dispatches the dunder instead of
+  raising `TypeError: object is not callable`.
+- **`__post_init__` invoked after auto-generated construction.** The
+  build path already did this; the VM was silently skipping it, so a
+  dataclass with `__post_init__` produced a half-initialised instance.
+- **Multi-level inheritance field accumulation.** A subclass three or
+  more levels deep now accumulates fields from every ancestor in MRO
+  order, not just the immediate base.
+
+### Added — instance operator dunders + subscript `__missing__`
+
+Builds on v0.10.0's dunder dispatch. The generic operator handler in
+`binop` now reaches every numeric / bitwise / matmul slot
+(`__add__` / `__sub__` / `__mul__` / `__truediv__` / `__floordiv__` /
+`__mod__` / `__pow__` / `__matmul__` / `__lshift__` / `__rshift__` /
+`__and__` / `__or__` / `__xor__`) with reflected fallback, on every
+instance pair regardless of class — this is what unblocks
+`pathlib._Path / "subdir"` and the new datetime arithmetic shims.
+Subscript `__missing__` fires when `__getitem__` doesn't find the key,
+which is what backs the new `defaultdict` factory.
+
+### Added — VM stdlib expansion
+
+- **`collections.defaultdict(factory)`** materialises as an
+  Instance-backed dict that consults `factory()` on missing-key
+  access (`subscript __missing__`). `dd[k] += 1` works.
+- **`datetime` module shim.** `datetime.datetime(y, mo, d, ...)`,
+  `.now()`, `.fromisoformat(...)`, `.isoformat()`, `+ timedelta`,
+  comparisons, and `timedelta(seconds=...)` arithmetic resolve
+  natively. Naïve / UTC only; tz-aware arithmetic still needs
+  `--compile`.
+- **`pathlib` module shim.** `Path("a") / "b"` joins via `__truediv__`,
+  `.parent` / `.name` / `.stem` / `.suffix` / `.suffixes` / `.parts`
+  resolve, and `str(Path(...))` / `repr(Path(...))` match CPython.
+  `.read_text` / `.write_text` are already wired through v0.10.0's
+  `open()` plumbing.
+- **`functools.reduce` with `key=` / `default=` parity**, **bytes**
+  methods (`decode` / `hex` / `fromhex` / `count` / `find` / `rfind` /
+  `startswith` / `endswith` / `split` / `strip`), **`itertools.groupby`**
+  honours `key=` instead of grouping by identity, **`re.Match.group(n)` /
+  `.groups()` / `.groupdict()`** return the real capture groups (the
+  prior shim returned the whole match for every group index),
+  **`str.split(maxsplit=…)`** as a pure-keyword arg, **f-string
+  `{x=}`** debug conversion renders `x=<repr>`, and **`str %`** /
+  **f-string `%`** percent format types work at runtime.
+- **`builtins.round`** uses banker's rounding (half-to-even) instead of
+  away-from-zero, matching CPython.
+
+### Changed — VM value semantics align with CPython
+
+These were silent-wrong outcomes under v0.10.0 (`tyc run` returned a
+different value than `tyc build` + `python`) and are now fixed in
+`tyc-vm/src/value.rs`. Programs that relied on the old behaviour will
+see different (correct) results:
+
+- **Dataclass instance equality is value-based** (same class + all
+  fields equal recursively) instead of identity. The class identity
+  test uses the underlying `Class` pointer, not the name, so distinct
+  same-named classes from different modules no longer collide.
+- **Dataclass instance `repr` is `Name(field=value, ...)`** in declared
+  field order. Previously printed `<Name instance>` for every
+  dataclass.
+- **Dataclass instances are hashable** via a new `HashKey::Instance`
+  variant (class identity + fields sorted by name), so frozen-dataclass
+  dict / set keys work and equal-field instances collide as keys.
+- **Set / frozenset equality is order-independent**, matching CPython
+  set semantics. Two sets with the same members in different insertion
+  order now compare equal.
+- **Set / frozenset repr** sorts elements by a canonical key for
+  deterministic, CPython-matching order.
+- **Float `repr`** matches CPython's `repr(float)` — shortest
+  round-tripping form, scientific notation for exp < -4 or ≥ 16
+  (`e+NN` / `e-NN`, ≥ 2 exponent digits), `-0.0` preserved.
+
+### Added — type checker tightening
+
+- **`None` flows into `object`.** A `None`-valued expression now
+  satisfies an `object` parameter / annotation, matching CPython's
+  `None: object` invariant. The prior rejection blocked common
+  defaulting patterns (`def log(msg: object = None)`).
+- **`str %` is type-checked.** `"x=%d" % "not an int"` now fires
+  `tyc::operator_type_mismatch` against the inferred conversion-spec
+  shape, matching the existing `str.format` check.
+- **Builtin scalar attribute / subscript / iteration validated.**
+  `(5).items()`, `5["a"]`, and `for x in 5:` now fire the appropriate
+  diagnostic at check time instead of crashing at run time.
+
+### Fixed — instance equality / hashing key on class identity
+
+`__eq__` / `__hash__` on user instances were keyed on the class name,
+so two distinct classes named `Point` from different modules compared
+equal and shared a hash bucket. The dispatch now keys on the
+underlying `Class` pointer (identity-equal in the VM's interned class
+registry), so cross-module same-name collisions are gone.
+
+### Fixed — generated `typhon.toml` includes `allow-secret-comptime`
+
+`tyc init` now seeds `allow-secret-comptime = false` in the generated
+`typhon.toml` under `[strict]`, matching the documented default and
+making the escape hatch self-discoverable. Existing projects are
+unaffected; the knob continues to be opt-in by setting it to `true`.
+
+### Fixed — docs-site high-contrast / card-hover a11y
+
+High-contrast mode lifts card text contrast, normalises focus rings on
+hover transitions, and keeps card interactivity legible when
+`prefers-contrast: more` is set. Card-hover animations remain wrapped
+by `prefers-reduced-motion`.
+
+### Fixed — venv batch introspection retries transient fork failures
+
+`tyc-introspect` retries up to 4 times with exponential backoff
+(2s / 4s / 8s / 16s) when a venv-introspection subprocess fails with a
+transient fork / clone error, so CI environments with constrained
+process tables don't see spurious `tyc::attribute_not_found` cascades.
+
+### Changed — emit hot path: decorator matching + complex emission
+
+`tyc-desugar`'s decorator-list matching no longer heap-allocates per
+visited decorator, and complex-number literal emission in `tyc-emit`
+shares a stack buffer with the `itoa` / `ryu` paths. Continues the
+v0.10.0 emit hot-path effort.
+
+### Known limitations carried forward from v0.10.0
+
+- Lazy / unbounded VM generators still need `tyc build` (eager
+  collection caps at 1M items).
+- `@contextmanager` generators inside `with` blocks still need
+  `tyc build` under the VM.
+- Nested-model `pydantic.model_validate` is not type-directed in the
+  VM; deeply-nested models still need `tyc build`.
+- Tz-aware `datetime` arithmetic still needs `tyc build` (the native
+  shim is naïve / UTC only).
+- Preprocess line-number leakage (B15) for `impl Alias:` distribution
+  over sealed unions — unchanged from v0.9.0.
+
 ## 0.10.0 — 2026-06-01
 
 VM completeness release. Stress-testing the tree-walking VM past v0.9.2

@@ -292,6 +292,49 @@ When to reach for which class form:
 | `interface Foo:` | `Protocol` | Structural contract you check against, not a concrete type. |
 | `plain class Foo:` | bare `class Foo:` (no decorator, no synthesised `__init__`) | Metaclass-driven libraries, descriptor-based models, anything that owns its own attribute layout. |
 | `class! Foo(Base):` | bare `class Foo(Base):` + synthesised or hand-written `__init__` | Subclassing a framework base that owns its own `__init__`. |
+| `enum Foo:` (v0.11.0) | `class Foo(enum.Enum):` with `enum.auto()` for bare members | A fixed set of named members, sugar over `enum.Enum`. |
+
+### `enum` keyword (v0.11.0)
+
+`enum Name:` declares an `enum.Enum` subclass. Bare members
+auto-number via `enum.auto()`; explicit `MEMBER = value` is preserved
+and `enum.auto()` continues numbering from the last explicit value.
+`tyc-syntax` preprocesses the header / body, `tyc-emit` injects
+`import enum`, and `tyc-resolve` adds `enum` to the builtin prelude so
+the form type-checks before the import is rewritten in. `tyc fmt`
+round-trips the header and members.
+
+```typhon
+enum Shape:
+    CIRCLE
+    SQUARE
+    TRIANGLE
+
+enum Color:
+    RED = 1
+    GREEN = 2
+    BLUE = 4
+```
+
+Emits:
+
+```python
+import enum
+
+class Shape(enum.Enum):
+    CIRCLE = enum.auto()
+    SQUARE = enum.auto()
+    TRIANGLE = enum.auto()
+
+class Color(enum.Enum):
+    RED = 1
+    GREEN = 2
+    BLUE = 4
+```
+
+Under `tyc run` the native `enum` module materialises members on first
+class-body execution, iteration is in declaration order, and
+`Shape.CIRCLE` repr matches CPython (`<Shape.CIRCLE: 1>`).
 
 ## Error handling
 
