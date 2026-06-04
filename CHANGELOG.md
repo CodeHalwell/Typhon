@@ -108,9 +108,9 @@ which is what backs the new `defaultdict` factory.
   resolve, and `str(Path(...))` / `repr(Path(...))` match CPython.
   `.read_text` / `.write_text` are already wired through v0.10.0's
   `open()` plumbing.
-- **`functools.reduce` with `key=` / `default=` parity**, **bytes**
-  methods (`decode` / `hex` / `fromhex` / `count` / `find` / `rfind` /
-  `startswith` / `endswith` / `split` / `strip`), **`itertools.groupby`**
+- **`bytes` methods** (`decode` / `hex` / `fromhex` / `count` / `find` /
+  `rfind` / `startswith` / `endswith` / `split` / `strip`),
+  **`itertools.groupby`**
   honours `key=` instead of grouping by identity, **`re.Match.group(n)` /
   `.groups()` / `.groupdict()`** return the real capture groups (the
   prior shim returned the whole match for every group index),
