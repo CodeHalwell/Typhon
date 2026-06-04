@@ -1639,14 +1639,21 @@ fn build_source_map_v2(source_rel: &str, preprocessed: &str, line_offsets: &[usi
         .iter()
         .map(|&offset| offset_to_line(preprocessed, offset))
         .collect();
-    let lines_json = lines
-        .iter()
-        .map(|n| n.to_string())
-        .collect::<Vec<_>>()
-        .join(",");
-    format!(
-        "{{\"version\":2,\"source\":\"{source_rel}\",\"line_strategy\":\"table\",\"lines\":[{lines_json}]}}\n"
-    )
+    let mut out = String::with_capacity(64 + lines.len() * 4);
+    out.push_str("{\"version\":2,\"source\":\"");
+    out.push_str(source_rel);
+    out.push_str("\",\"line_strategy\":\"table\",\"lines\":[");
+
+    use std::fmt::Write;
+    for (i, &n) in lines.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        let _ = write!(&mut out, "{}", n);
+    }
+
+    out.push_str("]}\n");
+    out
 }
 
 // ── Comptime literal substitution ─────────────────────────────────────────────
