@@ -19,6 +19,12 @@ pub enum TyphonKeyword {
     Mut,
     /// `model` — declares a Pydantic `BaseModel` class instead of a dataclass.
     Model,
+    /// `enum` — declares a Python `enum.Enum` subclass. The preprocessor
+    /// rewrites `enum Name:` to `class Name(enum.Enum):`, rewrites each bare
+    /// member line `MEMBER` to `MEMBER = enum.auto()` (members with an
+    /// explicit `= value` keep it), and injects `import enum`. The class is in
+    /// the auto-skip-decoration base list, so it receives no `@dataclass`.
+    Enum,
     /// `comptime` — marks a binding whose RHS is evaluated at build time and
     /// inlined as a literal in the emitted Python.
     Comptime,
@@ -120,6 +126,7 @@ impl TyphonKeyword {
             Self::Let => "let",
             Self::Mut => "mut",
             Self::Model => "model",
+            Self::Enum => "enum",
             Self::Comptime => "comptime",
             Self::Impl => "impl",
             Self::Extend => "extend",
@@ -144,6 +151,7 @@ impl TyphonKeyword {
             "let" => Some(Self::Let),
             "mut" => Some(Self::Mut),
             "model" => Some(Self::Model),
+            "enum" => Some(Self::Enum),
             "comptime" => Some(Self::Comptime),
             "impl" => Some(Self::Impl),
             "extend" => Some(Self::Extend),

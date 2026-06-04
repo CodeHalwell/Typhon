@@ -1,0 +1,12 @@
+from datetime import datetime, timedelta, date
+def main() -> None:
+    let d: date = date(2026, 6, 3)
+    print(d.year, d.month, d.day)
+    print(d.isoformat())
+    let dt: datetime = datetime(2026, 1, 1, 12, 30)
+    print(dt.hour, dt.minute)
+    let later: datetime = dt + timedelta(days=10)
+    print(later.day)
+    print((date(2026,6,3) - date(2026,1,1)).days)
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,16 @@
+class Tree[T]:
+    value: T
+    children: list[Tree[T]]
+impl[T] Tree[T]:
+    def size(self) -> int:
+        mut total: int = 1
+        for c in self.children:
+            total = total + c.size()
+        return total
+def main() -> None:
+    let leaf: Tree[int] = Tree(value=1, children=[])
+    let root: Tree[int] = Tree(value=0, children=[leaf, leaf])
+    print(root.size())
+
+if __name__ == "__main__":
+    main()

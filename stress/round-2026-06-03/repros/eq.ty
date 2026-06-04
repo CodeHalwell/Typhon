@@ -1,0 +1,14 @@
+class P:
+    x: int
+    y: int
+def main() -> None:
+    let a: P = P(x=1, y=2)
+    let b: P = P(x=1, y=2)
+    let c: P = P(x=3, y=4)
+    print(a == b)
+    print(a == c)
+    print(a)
+    let s: set[int] = {1,2,3}
+    print(2 in s, 9 in s)
+if __name__ == "__main__":
+    main()

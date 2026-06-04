@@ -1,0 +1,18 @@
+def main() -> None:
+    let s: str = "Hello, World"
+    print(s.find("o"), s.rfind("o"), s.count("l"))
+    print(s.replace("l", "L"))
+    print("  pad  ".strip(), "x".ljust(5, "."), "x".rjust(5, "."), "x".center(5, "."))
+    print("a,b,,c".split(","))
+    print("a-b-c".rsplit("-", 1))
+    print("Hello".startswith("He"), "Hello".endswith("lo"))
+    print("AbC".swapcase(), "hello world".title(), "Hello".casefold())
+    print("42".zfill(5), "abc".encode())
+    print("a\tb".expandtabs(4))
+    print(",".join(str(x) for x in [1,2,3]))
+    print("hello".index("l"), "Hello World".split(maxsplit=1))
+    print("test123".isalnum(), "test".isalpha(), "123".isdigit())
+    print("Line1\nLine2".splitlines())
+    print(s.partition(","))
+if __name__ == "__main__":
+    main()

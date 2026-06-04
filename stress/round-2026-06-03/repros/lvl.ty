@@ -1,0 +1,13 @@
+class A:
+    x: int
+class B(A):
+    y: int
+class C(B):
+    z: int
+def main() -> None:
+    let b: B = B(x=1, y=2)
+    print("2-level ok:", b.x, b.y)
+    let c: C = C(x=1, y=2, z=3)
+    print("3-level ok:", c.x, c.y, c.z)
+if __name__ == "__main__":
+    main()

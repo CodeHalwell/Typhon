@@ -1,0 +1,22 @@
+def main() -> None:
+    print([1,2,3] == [1,2,3])       # True
+    print({"a":1} == {"a":1})       # True
+    print((1,2) == (1,2))           # True
+    print([1,[2,3]] == [1,[2,3]])   # True nested
+    print({1,2,3} == {3,2,1})       # True set eq
+    print([1,2] == [1,2,3])         # False
+    # comparison
+    print([1,2,3] < [1,2,4])        # True lexicographic
+    print((1,2) < (1,3))            # True
+    print("abc" < "abd")            # True
+    # min/max with key
+    print(max(["a","bbb","cc"], key=len))
+    print(min([(1,"z"),(1,"a"),(2,"b")]))
+    # sorted stability
+    print(sorted([(1,"b"),(1,"a"),(2,"c")], key=lambda p: p[0]))
+    # int formatting
+    print(f"{42:08b}", f"{255:o}", f"{3735928559:x}")
+    print(f"{-5:+d}", f"{42:>6}", f"{42:<6}|", f"{42:^6}|")
+    print(f"{1234567.891:.2f}", f"{0.000123:.2e}")
+if __name__ == "__main__":
+    main()

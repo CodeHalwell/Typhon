@@ -1,0 +1,16 @@
+class A:
+    x: int
+impl A:
+    def m(self) -> str: return "A"
+class B(A):
+    y: int
+impl B:
+    def m(self) -> str: return "B->" + super().m()
+class C(B):
+    z: int
+impl C:
+    def m(self) -> str: return "C->" + super().m()
+def main() -> None:
+    print(C(x=1, y=2, z=3).m())
+if __name__ == "__main__":
+    main()

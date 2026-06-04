@@ -17,6 +17,123 @@ use crate::interp::{normalize_index, Interpreter};
 use crate::value::{DictMap, HashKey, IterState, Module, NativeFn, Value};
 use num_traits::ToPrimitive as _;
 
+/// Round a float to the nearest integer value using round-half-to-even
+/// (banker's rounding), matching CPython's `round()`.
+fn round_half_even(x: f64) -> f64 {
+    let floor = x.floor();
+    let diff = x - floor;
+    if diff < 0.5 {
+        floor
+    } else if diff > 0.5 {
+        floor + 1.0
+    } else {
+        // Exactly halfway: round to the even neighbour.
+        if (floor as i64) % 2 == 0 {
+            floor
+        } else {
+            floor + 1.0
+        }
+    }
+}
+
+/// `str.split(sep, maxsplit)` with an explicit separator. `maxsplit < 0`
+/// means unlimited. `from_right` selects `rsplit` behaviour.
+fn split_with_sep(s: &str, sep: &str, maxsplit: i64, from_right: bool) -> Vec<String> {
+    if maxsplit < 0 {
+        let mut v: Vec<String> = s.split(sep).map(|p| p.to_owned()).collect();
+        if from_right {
+            // splitn-from-right unlimited is the same set of pieces.
+            let _ = &mut v;
+        }
+        return v;
+    }
+    let limit = (maxsplit as usize) + 1;
+    if from_right {
+        let mut parts: Vec<String> = s.rsplitn(limit, sep).map(|p| p.to_owned()).collect();
+        parts.reverse();
+        parts
+    } else {
+        s.splitn(limit, sep).map(|p| p.to_owned()).collect()
+    }
+}
+
+/// `str.split()` / `str.split(None, maxsplit)` — whitespace split that
+/// collapses runs of whitespace and drops leading/trailing empties.
+fn split_whitespace_max(s: &str, maxsplit: i64, from_right: bool) -> Vec<String> {
+    if maxsplit < 0 {
+        return s.split_whitespace().map(|p| p.to_owned()).collect();
+    }
+    let max = maxsplit as usize;
+    if from_right {
+        // Collect words with their byte ranges, then split from the right.
+        let words: Vec<(usize, usize)> = {
+            let mut v = Vec::new();
+            let mut start: Option<usize> = None;
+            for (i, c) in s.char_indices() {
+                if c.is_whitespace() {
+                    if let Some(st) = start.take() {
+                        v.push((st, i));
+                    }
+                } else if start.is_none() {
+                    start = Some(i);
+                }
+            }
+            if let Some(st) = start {
+                v.push((st, s.len()));
+            }
+            v
+        };
+        if words.len() <= max {
+            return words.iter().map(|(a, b)| s[*a..*b].to_owned()).collect();
+        }
+        // Keep the last `max` words as separate pieces; everything before
+        // them stays joined (interior whitespace preserved) as the first
+        // piece.
+        let split_point = words.len() - max;
+        let head_start = words[0].0;
+        let head_end = words[split_point - 1].1;
+        let mut out = vec![s[head_start..head_end].to_owned()];
+        for (a, b) in &words[split_point..] {
+            out.push(s[*a..*b].to_owned());
+        }
+        out
+    } else {
+        let mut out: Vec<String> = Vec::new();
+        let mut chars = s.char_indices().peekable();
+        let bytes = s;
+        loop {
+            // Skip leading whitespace.
+            while let Some(&(_, c)) = chars.peek() {
+                if c.is_whitespace() {
+                    chars.next();
+                } else {
+                    break;
+                }
+            }
+            let Some(&(start, _)) = chars.peek() else {
+                break;
+            };
+            if out.len() == max {
+                // Remaining text (stripped of trailing whitespace) is the
+                // final piece, with interior whitespace preserved.
+                out.push(bytes[start..].trim_end().to_owned());
+                break;
+            }
+            // Consume the word.
+            let mut end = bytes.len();
+            while let Some(&(i, c)) = chars.peek() {
+                if c.is_whitespace() {
+                    end = i;
+                    break;
+                }
+                chars.next();
+            }
+            out.push(bytes[start..end].to_owned());
+        }
+        out
+    }
+}
+
 pub fn install(interp: &mut Interpreter) {
     let root = interp.root.clone();
 
@@ -97,6 +214,11 @@ pub fn install(interp: &mut Interpreter) {
     });
 
     native!("int", |_i, args| {
+        // `int()` with no argument is 0 (matches CPython; used by
+        // `defaultdict(int)` as a zero-factory).
+        if args.is_empty() {
+            return Ok(Value::Int(num_bigint::BigInt::from(0)));
+        }
         let v = single(&args, "int")?;
         // `int(str, base)` — parse a string in the given radix.
         if let (Value::Str(s), Some(base_v)) = (v, args.get(1)) {
@@ -301,6 +423,34 @@ pub fn install(interp: &mut Interpreter) {
         Ok(Value::Tuple(Rc::new(out)))
     });
 
+    native!("bytes", |i, args| {
+        match args.into_iter().next() {
+            None => Ok(Value::Bytes(Rc::new(Vec::new()))),
+            Some(Value::Bytes(b)) => Ok(Value::Bytes(b)),
+            // bytes(int) -> that many zero bytes.
+            Some(Value::Int(n)) => {
+                let n = num_traits::ToPrimitive::to_usize(&n)
+                    .ok_or_else(|| value_error("negative count"))?;
+                Ok(Value::Bytes(Rc::new(vec![0u8; n])))
+            }
+            // bytes(str) requires an encoding in Python; not supported here.
+            Some(Value::Str(_)) => Err(type_error("string argument without an encoding")),
+            // bytes(iterable_of_ints).
+            Some(v) => {
+                let it = i.make_iter(v)?;
+                let mut out: Vec<u8> = Vec::new();
+                while let Some(x) = i.iter_next(&it)? {
+                    let n = x.to_int()?;
+                    if !(0..=255).contains(&n) {
+                        return Err(value_error("bytes must be in range(0, 256)"));
+                    }
+                    out.push(n as u8);
+                }
+                Ok(Value::Bytes(Rc::new(out)))
+            }
+        }
+    });
+
     native!("set", |i, args| {
         let mut out = HashSet::new();
         if let Some(v) = args.into_iter().next() {
@@ -318,6 +468,23 @@ pub fn install(interp: &mut Interpreter) {
             // `dict(other_dict)` — shallow copy of an existing mapping.
             if let Value::Dict(d) = &v {
                 return Ok(Value::Dict(Rc::new(RefCell::new(d.borrow().clone()))));
+            }
+            // `dict(mapping_instance)` — a synthesised mapping (e.g. the
+            // `defaultdict` shim) exposes the mapping protocol via a `keys`
+            // method; copy key→value pairs through `__getitem__`.
+            if let Value::Instance(inst) = &v {
+                if i.find_method(&inst.class, "keys").is_some()
+                    && i.find_method(&inst.class, "__getitem__").is_some()
+                {
+                    let keys_view = i.get_attr(&v, "keys")?;
+                    let keys = i.call_value(keys_view, vec![], &[])?;
+                    let kit = i.make_iter(keys)?;
+                    while let Some(k) = i.iter_next(&kit)? {
+                        let val = i.subscript(&v, &k)?;
+                        map.insert(k.to_hash_key()?, val);
+                    }
+                    return Ok(Value::Dict(Rc::new(RefCell::new(map))));
+                }
             }
             let it = i.make_iter(v)?;
             while let Some(pair) = i.iter_next(&it)? {
@@ -377,7 +544,36 @@ pub fn install(interp: &mut Interpreter) {
         Value::Int(i) => Ok(Value::Int(num_traits::Signed::abs(i))),
         Value::Float(x) => Ok(Value::Float(x.abs())),
         Value::Bool(b) => Ok(Value::Int(num_bigint::BigInt::from(*b as i64))),
+        // `abs(complex)` is the Euclidean magnitude (a float), matching CPython.
+        Value::Complex(re, im) => Ok(Value::Float((re * re + im * im).sqrt())),
         _ => Err(type_error("bad operand type for abs()")),
+    });
+
+    // `complex()` / `complex(re)` / `complex(re, im)` constructor. Accepts
+    // int/float/bool numeric components (and a `Complex` first arg).
+    native!("complex", |_i, args| {
+        fn part(v: &Value, what: &str) -> Result<f64, Unwind> {
+            match v {
+                Value::Int(n) => Ok(crate::value::bigint_to_f64(n)),
+                Value::Float(x) => Ok(*x),
+                Value::Bool(b) => Ok(*b as i64 as f64),
+                _ => Err(type_error(format!(
+                    "complex() {what} argument must be a number, not '{}'",
+                    v.type_name()
+                ))),
+            }
+        }
+        match args.as_slice() {
+            [] => Ok(Value::Complex(0.0, 0.0)),
+            [Value::Complex(re, im)] => Ok(Value::Complex(*re, *im)),
+            [x] => Ok(Value::Complex(part(x, "first")?, 0.0)),
+            [Value::Complex(re, im), y] => {
+                // complex(c, n) → c + n*1j (imag part adds).
+                Ok(Value::Complex(*re, *im + part(y, "second")?))
+            }
+            [x, y] => Ok(Value::Complex(part(x, "first")?, part(y, "second")?)),
+            _ => Err(type_error("complex() takes at most 2 arguments")),
+        }
     });
 
     native!("min", |i, args| reduce_minmax(i, args, true));
@@ -565,15 +761,42 @@ pub fn install(interp: &mut Interpreter) {
     });
 
     native!("round", |_i, args| match args.first() {
+        // round(int) and round(int, ndigits) return the int unchanged
+        // (Python rounds to the given decimal place; for ints with
+        // non-negative ndigits that's a no-op, and these are the only
+        // cases the shim handles).
         Some(Value::Int(i)) => Ok(Value::Int(i.clone())),
-        Some(Value::Float(x)) => match args.get(1) {
-            Some(n) => {
-                let n = n.to_int()? as i32;
-                let p = 10f64.powi(n);
-                Ok(Value::Float((x * p).round() / p))
+        Some(Value::Float(x)) => {
+            let x = *x;
+            match args.get(1) {
+                // round(x, ndigits) -> float, round-half-to-even on the
+                // actual f64 value. Rust's float formatting uses
+                // round-ties-to-even, matching CPython (so 2.675, which is
+                // really 2.67499..., rounds to 2.67).
+                Some(n) if !matches!(n, Value::None) => {
+                    let n = n.to_int()? as i32;
+                    if !x.is_finite() {
+                        return Ok(Value::Float(x));
+                    }
+                    if n >= 0 {
+                        let s = format!("{:.*}", n as usize, x);
+                        Ok(Value::Float(s.parse::<f64>().unwrap_or(x)))
+                    } else {
+                        // Round to a negative decimal place (tens, hundreds…).
+                        let p = 10f64.powi(-n);
+                        Ok(Value::Float(round_half_even(x / p) * p))
+                    }
+                }
+                // round(x) -> int, round-half-to-even.
+                _ => {
+                    let r = round_half_even(x);
+                    Ok(Value::Int(
+                        <num_bigint::BigInt as num_traits::FromPrimitive>::from_f64(r)
+                            .unwrap_or_else(|| num_bigint::BigInt::from(r as i64)),
+                    ))
+                }
             }
-            None => Ok(Value::Int(num_bigint::BigInt::from(x.round() as i64))),
-        },
+        }
         _ => Err(type_error("round() expected a number")),
     });
 
@@ -831,6 +1054,8 @@ fn value_len(v: &Value) -> Result<usize, Unwind> {
                 0
             }
         }
+        // A dict-view's length is the number of items it exposes.
+        Value::DictView { items, .. } => items.len(),
         other => {
             return Err(type_error(format!(
                 "object of type '{}' has no len()",
@@ -927,6 +1152,249 @@ fn reduce_minmax(
     Ok(best)
 }
 
+// ── Helper-class compilation ────────────────────────────────────────────────
+//
+// Several stdlib shims (`defaultdict`, `datetime`, `pathlib.Path`) need real
+// dunder methods (`__getitem__`, `__missing__`, `__setitem__`, `__add__`,
+// `__sub__`, `__truediv__`) that the interpreter dispatches through
+// `find_method` — which only consults `class.methods` (AST-backed
+// `value::Function`s), not instance fields holding native closures. Rather
+// than hand-build AST `Function`s, we compile a small Python source snippet
+// through the same parse + desugar pipeline the VM uses for user modules and
+// pull the resulting `Value::Class` objects out of a throwaway scope. This
+// reuses every bit of the real method-call/dunder machinery.
+
+/// Compile `source` in a fresh child of `interp.root` and return the named
+/// top-level bindings (classes / functions) it produced.
+fn compile_helpers(interp: &mut Interpreter, source: &str) -> Result<Vec<(String, Value)>, Unwind> {
+    use tyc_syntax::preprocess;
+    let expanded = preprocess::expand_question_ops(&preprocess::expand_pipes(
+        &preprocess::expand_with_chains(&preprocess::expand_go_calls(
+            &preprocess::expand_gather_blocks(&preprocess::expand_multiline_guards(
+                &preprocess::expand_typed_let_unpack(&preprocess::expand_lazy_lets(source)),
+            )),
+        )),
+    ));
+    let prep = preprocess::preprocess(&expanded);
+    let parsed = tyc_syntax::parse_module(&prep.python_source).map_err(|e| {
+        crate::error::Unwind::Exception(crate::error::VmException::new(
+            "ImportError",
+            format!("internal stdlib shim parse error: {e}"),
+        ))
+    })?;
+    let mut module = parsed.into_syntax();
+    let desugar_out = tyc_desugar::desugar_module(&module);
+    module = desugar_out.module;
+
+    let env = crate::env::Env::new_child(&interp.root);
+    interp.exec_block(&module.body, &env)?;
+    Ok(env.snapshot())
+}
+
+/// Compile `source`, then look up a single named binding from it.
+fn compile_helper(interp: &mut Interpreter, source: &str, name: &str) -> Result<Value, Unwind> {
+    compile_helpers(interp, source)?
+        .into_iter()
+        .find(|(k, _)| k == name)
+        .map(|(_, v)| v)
+        .ok_or_else(|| type_error(format!("stdlib shim did not define '{name}'")))
+}
+
+/// Compile (once, memoised in `module_cache`) and return a synthesised helper
+/// class by `cache_key`, defined by `source` under `name`.
+fn cached_helper_class(
+    interp: &mut Interpreter,
+    cache_key: &str,
+    source: &str,
+    name: &str,
+) -> Result<Value, Unwind> {
+    if let Some(v) = interp.module_cache.get(cache_key) {
+        return Ok(v.clone());
+    }
+    let v = compile_helper(interp, source, name)?;
+    interp.module_cache.insert(cache_key.to_owned(), v.clone());
+    Ok(v)
+}
+
+/// Source for the `defaultdict` shim class. Backing store lives in `_data`;
+/// the missing-key path runs `__missing__`, which the foundation's subscript
+/// hook invokes when `__getitem__` raises `KeyError`.
+const DEFAULTDICT_SRC: &str = r#"
+class _DefaultDict:
+    def __init__(self, default_factory, initial):
+        self._data = {}
+        self._factory = default_factory
+        if initial is not None:
+            for k in initial:
+                self._data[k] = initial[k]
+    def __getitem__(self, key):
+        if key in self._data:
+            return self._data[key]
+        raise KeyError(key)
+    def __setitem__(self, key, value):
+        self._data[key] = value
+    def __missing__(self, key):
+        if self._factory is None:
+            raise KeyError(key)
+        return self._factory()
+    def __contains__(self, key):
+        return key in self._data
+    def __len__(self):
+        return len(self._data)
+    def __iter__(self):
+        return iter(self._data)
+    def keys(self):
+        return self._data.keys()
+    def values(self):
+        return self._data.values()
+    def items(self):
+        return self._data.items()
+    def get(self, key, default=None):
+        if key in self._data:
+            return self._data[key]
+        return default
+"#;
+
+fn defaultdict_class(interp: &mut Interpreter) -> Result<Value, Unwind> {
+    cached_helper_class(
+        interp,
+        "__shim_defaultdict__",
+        DEFAULTDICT_SRC,
+        "_DefaultDict",
+    )
+}
+
+/// Source for the native `datetime` module: `date`, `datetime`, `timedelta`.
+/// Date math uses a proleptic-Gregorian ordinal (`_ordinal`) so `date - date`
+/// and `datetime + timedelta(days=…)` are exact. Arithmetic flows through the
+/// `__add__` / `__sub__` dunders the foundation dispatches on instances.
+const DATETIME_SRC: &str = r#"
+def _is_leap(y):
+    return y % 4 == 0 and (y % 100 != 0 or y % 400 == 0)
+
+def _days_in_month(y, m):
+    if m == 2:
+        if _is_leap(y):
+            return 29
+        return 28
+    if m == 1 or m == 3 or m == 5 or m == 7 or m == 8 or m == 10 or m == 12:
+        return 31
+    return 30
+
+def _to_ordinal(y, m, d):
+    n = 0
+    yy = 1
+    while yy < y:
+        if _is_leap(yy):
+            n = n + 366
+        else:
+            n = n + 365
+        yy = yy + 1
+    mm = 1
+    while mm < m:
+        n = n + _days_in_month(y, mm)
+        mm = mm + 1
+    return n + d
+
+def _from_ordinal(n):
+    y = 1
+    while True:
+        if _is_leap(y):
+            ydays = 366
+        else:
+            ydays = 365
+        if n > ydays:
+            n = n - ydays
+            y = y + 1
+        else:
+            break
+    m = 1
+    while n > _days_in_month(y, m):
+        n = n - _days_in_month(y, m)
+        m = m + 1
+    return (y, m, n)
+
+def _pad2(n):
+    s = str(n)
+    if len(s) < 2:
+        return "0" + s
+    return s
+
+class timedelta:
+    def __init__(self, days=0, seconds=0, minutes=0, hours=0, weeks=0):
+        self.days = days + weeks * 7
+        self.seconds = seconds + minutes * 60 + hours * 3600
+    def total_seconds(self):
+        return self.days * 86400 + self.seconds
+    def __repr__(self):
+        return "datetime.timedelta(days=" + str(self.days) + ")"
+
+class date:
+    def __init__(self, year, month, day):
+        self.year = year
+        self.month = month
+        self.day = day
+    def _ordinal(self):
+        return _to_ordinal(self.year, self.month, self.day)
+    def isoformat(self):
+        return str(self.year) + "-" + _pad2(self.month) + "-" + _pad2(self.day)
+    def __sub__(self, other):
+        return timedelta(days=self._ordinal() - other._ordinal())
+    def __add__(self, other):
+        ymd = _from_ordinal(self._ordinal() + other.days)
+        return date(ymd[0], ymd[1], ymd[2])
+    def __repr__(self):
+        return "datetime.date(" + str(self.year) + ", " + str(self.month) + ", " + str(self.day) + ")"
+    def __str__(self):
+        return self.isoformat()
+
+class datetime:
+    def __init__(self, year, month, day, hour=0, minute=0, second=0, microsecond=0):
+        self.year = year
+        self.month = month
+        self.day = day
+        self.hour = hour
+        self.minute = minute
+        self.second = second
+        self.microsecond = microsecond
+    def date(self):
+        return date(self.year, self.month, self.day)
+    def _ordinal(self):
+        return _to_ordinal(self.year, self.month, self.day)
+    def isoformat(self):
+        return (str(self.year) + "-" + _pad2(self.month) + "-" + _pad2(self.day)
+                + "T" + _pad2(self.hour) + ":" + _pad2(self.minute) + ":" + _pad2(self.second))
+    def __add__(self, other):
+        total_secs = self.hour * 3600 + self.minute * 60 + self.second + other.seconds
+        extra_days = total_secs // 86400
+        rem = total_secs % 86400
+        ymd = _from_ordinal(self._ordinal() + other.days + extra_days)
+        return datetime(ymd[0], ymd[1], ymd[2], rem // 3600, (rem % 3600) // 60, rem % 60)
+    def __sub__(self, other):
+        d = self._ordinal() - other._ordinal()
+        s = (self.hour * 3600 + self.minute * 60 + self.second
+             - other.hour * 3600 - other.minute * 60 - other.second)
+        return timedelta(days=d, seconds=s)
+    def __repr__(self):
+        return ("datetime.datetime(" + str(self.year) + ", " + str(self.month) + ", "
+                + str(self.day) + ", " + str(self.hour) + ", " + str(self.minute) + ")")
+"#;
+
+fn make_datetime_module(interp: &mut Interpreter) -> Result<Value, Unwind> {
+    let members = compile_helpers(interp, DATETIME_SRC)?;
+    let wanted = ["date", "datetime", "timedelta"];
+    let entries: Vec<(&str, Value)> = wanted
+        .iter()
+        .filter_map(|&n| {
+            members
+                .iter()
+                .find(|(k, _)| k == n)
+                .map(|(_, v)| (n, v.clone()))
+        })
+        .collect();
+    Ok(make_module("datetime", entries))
+}
+
 // ── Module resolution ──────────────────────────────────────────────────────
 
 pub fn resolve_module(interp: &mut Interpreter, name: &str) -> Result<Value, Unwind> {
@@ -944,7 +1412,8 @@ pub fn resolve_module(interp: &mut Interpreter, name: &str) -> Result<Value, Unw
         "functools" => Ok(make_functools_module()),
         "itertools" => Ok(make_itertools_module()),
         "dataclasses" => Ok(make_dataclasses_module()),
-        "pathlib" => Ok(make_pathlib_module()),
+        "pathlib" => make_pathlib_module(interp),
+        "datetime" => make_datetime_module(interp),
         "heapq" => Ok(make_heapq_module()),
         "contextlib" => Ok(make_contextlib_module()),
         "pydantic" => Ok(make_pydantic_module()),
@@ -1935,7 +2404,8 @@ fn make_re_module() -> Value {
             "match".into(),
             Value::Native(Rc::new(NativeFn::new("match", move |_i, args| {
                 let s = single(&args, "match")?.py_str();
-                Ok(match_to_value(p1.find(&s), &s))
+                let caps = p1.captures(&s).filter(|c| c.get(0).unwrap().start() == 0);
+                Ok(captures_to_value(caps))
             }))),
         );
         let p2 = p_rc.clone();
@@ -1943,7 +2413,7 @@ fn make_re_module() -> Value {
             "search".into(),
             Value::Native(Rc::new(NativeFn::new("search", move |_i, args| {
                 let s = single(&args, "search")?.py_str();
-                Ok(match_to_value(p2.find(&s), &s))
+                Ok(captures_to_value(p2.captures(&s)))
             }))),
         );
         let p3 = p_rc.clone();
@@ -2002,26 +2472,59 @@ fn make_re_module() -> Value {
             fields: RefCell::new(attrs),
         }))
     }
-    fn match_to_value(m: Option<regex::Match<'_>>, _s: &str) -> Value {
-        let Some(m) = m else { return Value::None };
-        let captured = m.as_str().to_owned();
-        let start = m.start() as i64;
-        let end = m.end() as i64;
+    // Build a match object from a `regex::Captures`. Group 0 is the whole
+    // match; groups 1.. are the capture groups. Non-participating optional
+    // groups are represented as `None`.
+    fn captures_to_value(caps: Option<regex::Captures<'_>>) -> Value {
+        let Some(caps) = caps else { return Value::None };
+        let whole = caps.get(0).expect("group 0 always present");
+        let start = whole.start() as i64;
+        let end = whole.end() as i64;
+        // Collect each group's optional captured text by index.
+        let group_texts: Vec<Option<String>> = (0..caps.len())
+            .map(|i| caps.get(i).map(|m| m.as_str().to_owned()))
+            .collect();
         let mut attrs: HashMap<String, Value> = HashMap::new();
-        let cap = captured.clone();
+        // `.group()`/`.group(n)`/`.group(a, b, ...)`.
+        let gt = group_texts.clone();
         attrs.insert(
             "group".into(),
-            Value::Native(Rc::new(NativeFn::new("group", move |_i, _args| {
-                Ok(Value::Str(Rc::new(cap.clone())))
+            Value::Native(Rc::new(NativeFn::new("group", move |_i, args| {
+                let pick = |idx: usize| -> Result<Value, Unwind> {
+                    match gt.get(idx) {
+                        None => Err(index_error("no such group")),
+                        Some(None) => Ok(Value::None),
+                        Some(Some(s)) => Ok(Value::Str(Rc::new(s.clone()))),
+                    }
+                };
+                if args.is_empty() {
+                    return pick(0);
+                }
+                if args.len() == 1 {
+                    return pick(args[0].to_int()? as usize);
+                }
+                let mut out = Vec::with_capacity(args.len());
+                for a in &args {
+                    out.push(pick(a.to_int()? as usize)?);
+                }
+                Ok(Value::Tuple(Rc::new(out)))
             }))),
         );
-        let cap2 = captured.clone();
+        // `.groups()` returns groups 1.. (not group 0).
+        let gt2 = group_texts.clone();
         attrs.insert(
             "groups".into(),
-            Value::Native(Rc::new(NativeFn::new("groups", move |_i, _args| {
-                Ok(Value::Tuple(Rc::new(vec![Value::Str(Rc::new(
-                    cap2.clone(),
-                ))])))
+            Value::Native(Rc::new(NativeFn::new("groups", move |_i, args| {
+                let default = args.first().cloned().unwrap_or(Value::None);
+                let out: Vec<Value> = gt2
+                    .iter()
+                    .skip(1)
+                    .map(|g| match g {
+                        Some(s) => Value::Str(Rc::new(s.clone())),
+                        None => default.clone(),
+                    })
+                    .collect();
+                Ok(Value::Tuple(Rc::new(out)))
             }))),
         );
         attrs.insert(
@@ -2086,8 +2589,8 @@ fn make_re_module() -> Value {
                     // string (unlike `re.search`). The Rust `regex` crate
                     // returns the leftmost match anywhere, so anchor by
                     // requiring `start() == 0`.
-                    let m = r.find(&s).filter(|m| m.start() == 0);
-                    Ok(match_to_value(m, &s))
+                    let caps = r.captures(&s).filter(|c| c.get(0).unwrap().start() == 0);
+                    Ok(captures_to_value(caps))
                 }),
             ),
             (
@@ -2102,7 +2605,7 @@ fn make_re_module() -> Value {
                         .ok_or_else(|| type_error("search() needs string"))?
                         .py_str();
                     let r = compile_one(&p)?;
-                    Ok(match_to_value(r.find(&s), &s))
+                    Ok(captures_to_value(r.captures(&s)))
                 }),
             ),
             (
@@ -2118,7 +2621,7 @@ fn make_re_module() -> Value {
                         .py_str();
                     let anchored = format!("^(?:{p})$");
                     let r = compile_one(&anchored)?;
-                    Ok(match_to_value(r.find(&s), &s))
+                    Ok(captures_to_value(r.captures(&s)))
                 }),
             ),
             (
@@ -2223,12 +2726,19 @@ fn make_collections_module() -> Value {
         }
         Ok(Value::Dict(Rc::new(RefCell::new(counts))))
     });
-    let defaultdict = nf("defaultdict", |_i, _args| {
-        // The factory argument is discarded — accessing a missing key
-        // raises KeyError just like a plain dict in this shim. Users
-        // that need the auto-default behaviour should fall back to
-        // compile mode.
-        Ok(Value::Dict(Rc::new(RefCell::new(IndexMap::new()))))
+    let defaultdict = nf("defaultdict", |i, mut args| {
+        // `defaultdict(factory[, mapping])` constructs a synthesised mapping
+        // instance whose `__missing__` calls `factory()` to materialise a
+        // default for absent keys (foundation `__missing__` hook). The
+        // backing store is a plain dict held in `self._data`.
+        let factory = if args.is_empty() {
+            Value::None
+        } else {
+            args.remove(0)
+        };
+        let cls = defaultdict_class(i)?;
+        let initial = args.into_iter().next().unwrap_or(Value::None);
+        i.call_value(cls, vec![factory, initial], &[])
     });
     let ordered_dict = nf("OrderedDict", |i, args| {
         // CPython's `dict` preserves insertion order since 3.7, so this
@@ -2507,6 +3017,7 @@ fn deep_freeze_value(v: Value) -> Result<Value, Unwind> {
         | Value::Bool(_)
         | Value::Int(_)
         | Value::Float(_)
+        | Value::Complex(..)
         | Value::Str(_)
         | Value::Bytes(_)
         | Value::Range { .. }
@@ -2577,6 +3088,10 @@ fn deep_freeze_value(v: Value) -> Result<Value, Unwind> {
         }
         Value::ResultOk(v) => Ok(Value::ResultOk(Box::new(deep_freeze_value(*v)?))),
         Value::ResultErr(v) => Ok(Value::ResultErr(Box::new(deep_freeze_value(*v)?))),
+        // TODO(builtins agent): a dict-view is an ephemeral, already-read-only
+        // value; freezing it is a no-op here. Revisit if `freeze let v = d.keys()`
+        // ever needs view-specific semantics.
+        Value::DictView { .. } => Ok(v),
         Value::Iter(_) | Value::BoundMethod { .. } => Err(crate::error::Unwind::Exception(
             crate::error::VmException::new(
                 "TypeError",
@@ -3089,26 +3604,45 @@ fn make_dataclasses_module() -> Value {
 ///
 /// Implements a `Path` callable that returns an instance with the
 /// following surface: `__truediv__`, `read_text`, `write_text`,
-/// `exists`, `is_file`, `is_dir`, `name`, `parent`, `suffix`, `stem`,
-/// and `__str__`. Internally a Path instance is an `Instance` value
+/// `exists`, `is_file`, `is_dir`, `name`, `parent`, `suffix`, `suffixes`,
+/// `stem`, and `__str__`. Internally a Path instance is an `Instance` value
 /// whose `fields` map holds the resolved path string under `__path__`.
-fn make_pathlib_module() -> Value {
-    use crate::value::{Class, Instance};
-    fn path_class() -> Rc<Class> {
-        Rc::new(Class {
-            name: "Path".into(),
-            methods: RefCell::new(HashMap::new()),
-            fields: vec![],
-            class_attrs: RefCell::new(HashMap::new()),
-            bases: vec![],
-            properties: std::cell::RefCell::new(std::collections::HashSet::new()),
-            classmethods: std::cell::RefCell::new(std::collections::HashSet::new()),
-        })
+///
+/// Source for the `pathlib.Path` dunder shim. Holds the path string in
+/// `_path`; `__truediv__` defers the actual join to the native `_join` field
+/// (so all the OS-aware part computation stays in Rust). `__str__` /
+/// `__repr__` / `__fspath__` surface the string form.
+const PATH_SRC: &str = r#"
+class _Path:
+    def __truediv__(self, other):
+        return self._join(other)
+    def __str__(self):
+        return self._path
+    def __repr__(self):
+        return "PosixPath('" + self._path + "')"
+    def __fspath__(self):
+        return self._path
+    def __eq__(self, other):
+        return self._path == str(other)
+"#;
+
+fn path_class(interp: &mut Interpreter) -> Result<Rc<crate::value::Class>, Unwind> {
+    let cls = cached_helper_class(interp, "__shim_path__", PATH_SRC, "_Path")?;
+    match cls {
+        Value::Class(c) => Ok(c),
+        _ => Err(type_error("internal: _Path shim is not a class")),
     }
-    fn make_path(s: String) -> Value {
-        let cls = path_class();
+}
+
+fn make_pathlib_module(interp: &mut Interpreter) -> Result<Value, Unwind> {
+    use crate::value::Instance;
+    let cls = path_class(interp)?;
+    fn make_path(cls: Rc<crate::value::Class>, s: String) -> Value {
         let mut fields: HashMap<String, Value> = HashMap::new();
         fields.insert("__path__".into(), Value::Str(Rc::new(s.clone())));
+        // `_path` mirrors `__path__` for the compiled `_Path` dunder methods,
+        // which reference `self._path`.
+        fields.insert("_path".into(), Value::Str(Rc::new(s.clone())));
         // Cache derived parts as fields so attribute access (`p.name`,
         // `p.suffix`, `p.stem`, `p.parent`) works without descriptors.
         let p = std::path::Path::new(&s);
@@ -3136,6 +3670,45 @@ fn make_pathlib_module() -> Value {
         // This sidesteps an infinite recursion when `parent` of `/` is
         // itself `/`.
         fields.insert("parent".into(), Value::Str(Rc::new(parent)));
+        // `.suffixes` — every dotted extension on the final component, e.g.
+        // `Path("file.tar.gz").suffixes == ['.tar', '.gz']`. A leading dot
+        // (dotfile like `.bashrc`) does NOT start a suffix, matching CPython.
+        let suffixes: Vec<Value> = {
+            let name = std::path::Path::new(&s)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("");
+            let trimmed = name.trim_start_matches('.');
+            if trimmed.contains('.') {
+                trimmed
+                    .split('.')
+                    .skip(1)
+                    .map(|part| Value::Str(Rc::new(format!(".{part}"))))
+                    .collect()
+            } else {
+                Vec::new()
+            }
+        };
+        fields.insert(
+            "suffixes".into(),
+            Value::List(Rc::new(RefCell::new(suffixes))),
+        );
+        // `_join` backs `__truediv__`: append `other` as a path component and
+        // return a fresh `_Path` instance.
+        let s_for_join = s.clone();
+        let cls_for_join = cls.clone();
+        fields.insert(
+            "_join".into(),
+            Value::Native(Rc::new(NativeFn::new("_join", move |_i, args| {
+                let other = single(&args, "_join")?.py_str();
+                let joined = std::path::Path::new(&s_for_join)
+                    .join(&other)
+                    .to_str()
+                    .unwrap_or("")
+                    .to_owned();
+                Ok(make_path(cls_for_join.clone(), joined))
+            }))),
+        );
         // Methods.
         let s_for_read = s.clone();
         fields.insert(
@@ -3192,14 +3765,15 @@ fn make_pathlib_module() -> Value {
             fields: RefCell::new(fields),
         }))
     }
-    let path = nf("Path", |_i, args| {
+    let cls_for_ctor = cls.clone();
+    let path = nf("Path", move |_i, args| {
         let s = args
             .first()
             .map(|v| v.py_str())
             .unwrap_or_else(|| ".".to_string());
-        Ok(make_path(s))
+        Ok(make_path(cls_for_ctor.clone(), s))
     });
-    make_module("pathlib", vec![("Path", path)])
+    Ok(make_module("pathlib", vec![("Path", path)]))
 }
 
 // ── Method dispatch on built-in types ──────────────────────────────────────
@@ -3207,6 +3781,29 @@ fn make_pathlib_module() -> Value {
 pub fn method_for(_value: &Value, _attr: &str) -> Option<()> {
     // Stub — actual dispatch happens through `dispatch_method`.
     None
+}
+
+/// Peel a trailing keyword-argument sentinel (built by `call_with_kwargs`)
+/// off a method's positional args, returning the remaining positional args
+/// and the keyword map. Methods that don't care about kwargs simply ignore
+/// the returned map.
+fn split_kwargs_map(args: &[Value]) -> (&[Value], HashMap<String, Value>) {
+    if let Some(Value::Tuple(t)) = args.last() {
+        if t.len() == 2 {
+            if let (Value::Str(tag), Value::Dict(d)) = (&t[0], &t[1]) {
+                if tag.as_str() == "__typhon_kwargs__" {
+                    let mut map = HashMap::new();
+                    for (k, v) in d.borrow().iter() {
+                        if let HashKey::Str(s) = k {
+                            map.insert((**s).clone(), v.clone());
+                        }
+                    }
+                    return (&args[..args.len() - 1], map);
+                }
+            }
+        }
+    }
+    (args, HashMap::new())
 }
 
 pub fn dispatch_method(
@@ -3218,21 +3815,22 @@ pub fn dispatch_method(
         .first()
         .cloned()
         .ok_or_else(|| type_error("method called without receiver"))?;
+    let (rest, kwargs) = split_kwargs_map(&args[1..]);
     match (&receiver, name) {
         // ── str methods ────────────────────────────────────────────────────
-        (Value::Str(s), m) => str_method(interp, s, m, &args[1..]),
+        (Value::Str(s), m) => str_method(interp, s, m, rest, &kwargs),
+        // ── bytes methods ──────────────────────────────────────────────────
+        (Value::Bytes(b), m) => bytes_method(b, m, rest),
         // ── list methods ───────────────────────────────────────────────────
-        (Value::List(l), m) => list_method(interp, l, m, &args[1..]),
+        (Value::List(l), m) => list_method(interp, l, m, rest),
         // ── dict methods ───────────────────────────────────────────────────
-        (Value::Dict(d), m) => dict_method(interp, d, m, &args[1..]),
+        (Value::Dict(d), m) => dict_method(interp, d, m, rest),
         // ── set methods ────────────────────────────────────────────────────
-        (Value::Set(s), m) => set_method(s, m, &args[1..]),
+        (Value::Set(s), m) => set_method(s, m, rest),
         // ── tuple methods ──────────────────────────────────────────────────
-        (Value::Tuple(t), m) => tuple_method(t, m, &args[1..]),
+        (Value::Tuple(t), m) => tuple_method(t, m, rest),
         // ── int/float/bool method calls ────────────────────────────────────
-        (Value::Int(_) | Value::Float(_) | Value::Bool(_), m) => {
-            num_method(&receiver, m, &args[1..])
-        }
+        (Value::Int(_) | Value::Float(_) | Value::Bool(_), m) => num_method(&receiver, m, rest),
         _ => Err(attribute_error(format!(
             "'{}' object has no method '{}'",
             receiver.type_name(),
@@ -3260,6 +3858,7 @@ fn str_method(
     s: &Rc<String>,
     name: &str,
     args: &[Value],
+    _kwargs: &HashMap<String, Value>,
 ) -> Result<Value, Unwind> {
     Ok(match name {
         "upper" => Value::Str(Rc::new(s.to_uppercase())),
@@ -3280,20 +3879,39 @@ fn str_method(
             )),
             None => Value::Str(Rc::new(s.trim_end().to_owned())),
         },
-        "split" => {
-            let parts: Vec<Value> = match args.first() {
+        "split" | "rsplit" => {
+            // Keyword arguments (`maxsplit=`, `sep=`) arrive via the trailing
+            // sentinel that `call_value` appends for bound builtin methods.
+            // `dispatch_method` does not populate the `kwargs` map for str
+            // methods (its `split_kwargs_map` uses a different marker), so we
+            // unpack the sentinel here the same way `str.format` does.
+            let (args, kw) = split_kwargs(args);
+            let kw_get = |name: &str| kw.iter().rev().find(|(k, _)| k == name).map(|(_, v)| v);
+            // Separator: positional arg 0 or keyword `sep` (None ⇒ whitespace).
+            let sep_kw = kw_get("sep");
+            let sep_arg = args
+                .first()
+                .or(sep_kw)
+                .filter(|v| !matches!(v, Value::None));
+            // maxsplit: positional arg 1 or keyword `maxsplit` (-1 ⇒ no limit).
+            let maxsplit = match args.get(1) {
+                Some(v) if !matches!(v, Value::None) => v.to_int()?,
+                _ => match kw_get("maxsplit") {
+                    Some(v) if !matches!(v, Value::None) => v.to_int()?,
+                    _ => -1,
+                },
+            };
+            let from_right = name == "rsplit";
+            let pieces: Vec<String> = match sep_arg {
                 Some(v) => {
                     let sep = v.py_str();
-                    s.split(&sep)
-                        .map(|p| Value::Str(Rc::new(p.to_owned())))
-                        .collect()
+                    split_with_sep(s, &sep, maxsplit, from_right)
                 }
-                None => s
-                    .split_whitespace()
-                    .map(|p| Value::Str(Rc::new(p.to_owned())))
-                    .collect(),
+                None => split_whitespace_max(s, maxsplit, from_right),
             };
-            Value::List(Rc::new(RefCell::new(parts)))
+            Value::List(Rc::new(RefCell::new(
+                pieces.into_iter().map(|p| Value::Str(Rc::new(p))).collect(),
+            )))
         }
         "splitlines" => Value::List(Rc::new(RefCell::new(
             s.lines()
@@ -3451,33 +4069,6 @@ fn str_method(
                 };
                 Value::Str(Rc::new(out))
             }
-        }
-        "rsplit" => {
-            let maxsplit = args.get(1).and_then(|v| v.to_int().ok()).unwrap_or(-1);
-            let parts: Vec<Value> = match args.first() {
-                Some(v) => {
-                    let sep = v.py_str();
-                    let mut collected: Vec<String> = if maxsplit < 0 {
-                        s.split(&sep).map(|p| p.to_owned()).collect()
-                    } else {
-                        s.rsplitn((maxsplit + 1) as usize, &sep)
-                            .map(|p| p.to_owned())
-                            .collect::<Vec<_>>()
-                            .into_iter()
-                            .rev()
-                            .collect()
-                    };
-                    collected
-                        .drain(..)
-                        .map(|p| Value::Str(Rc::new(p)))
-                        .collect()
-                }
-                None => s
-                    .split_whitespace()
-                    .map(|p| Value::Str(Rc::new(p.to_owned())))
-                    .collect(),
-            };
-            Value::List(Rc::new(RefCell::new(parts)))
         }
         "partition" | "rpartition" => {
             let sep = single(args, name)?.py_str();
@@ -3661,6 +4252,38 @@ fn str_format(
         }
     }
     Ok(Value::Str(Rc::new(out)))
+}
+
+fn bytes_method(b: &Rc<Vec<u8>>, name: &str, args: &[Value]) -> Result<Value, Unwind> {
+    Ok(match name {
+        // `.decode()` / `.decode("utf-8")` -> str. Only UTF-8/ASCII handled;
+        // other encodings fall back to a lossy UTF-8 decode.
+        "decode" => {
+            let enc = args.first().map(|v| v.py_str()).unwrap_or_default();
+            let enc_norm = enc.to_ascii_lowercase().replace(['-', '_'], "");
+            match enc_norm.as_str() {
+                "" | "utf8" | "ascii" => match std::str::from_utf8(b) {
+                    Ok(s) => Value::Str(Rc::new(s.to_owned())),
+                    Err(_) => return Err(value_error("'utf-8' codec can't decode byte sequence")),
+                },
+                "latin1" | "iso88591" => {
+                    Value::Str(Rc::new(b.iter().map(|&c| c as char).collect::<String>()))
+                }
+                _ => Value::Str(Rc::new(String::from_utf8_lossy(b).into_owned())),
+            }
+        }
+        // `.hex()` -> lowercase hex string with no separators.
+        "hex" => {
+            let mut out = String::with_capacity(b.len() * 2);
+            for byte in b.iter() {
+                out.push_str(&format!("{:02x}", byte));
+            }
+            Value::Str(Rc::new(out))
+        }
+        "upper" => Value::Bytes(Rc::new(b.iter().map(|c| c.to_ascii_uppercase()).collect())),
+        "lower" => Value::Bytes(Rc::new(b.iter().map(|c| c.to_ascii_lowercase()).collect())),
+        _ => return Err(attribute_error(format!("bytes has no method '{}'", name))),
+    })
 }
 
 fn list_method(
@@ -3899,28 +4522,34 @@ fn dict_method(
             let default = args.get(1).cloned().unwrap_or(Value::None);
             Ok(d.borrow().get(&k).cloned().unwrap_or(default))
         }
-        "keys" => Ok(Value::List(Rc::new(RefCell::new(
-            d.borrow()
+        "keys" => Ok(Value::DictView {
+            kind: crate::value::DictViewKind::Keys,
+            items: d
+                .borrow()
                 .keys()
                 .filter(|k| !matches!(k, HashKey::Str(s) if s.as_str() == "__typhon_frozen__"))
                 .cloned()
                 .map(HashKey::into_value)
                 .collect(),
-        )))),
-        "values" => Ok(Value::List(Rc::new(RefCell::new(
-            d.borrow()
+        }),
+        "values" => Ok(Value::DictView {
+            kind: crate::value::DictViewKind::Values,
+            items: d
+                .borrow()
                 .iter()
                 .filter(|(k, _)| !matches!(k, HashKey::Str(s) if s.as_str() == "__typhon_frozen__"))
                 .map(|(_, v)| v.clone())
                 .collect(),
-        )))),
-        "items" => Ok(Value::List(Rc::new(RefCell::new(
-            d.borrow()
+        }),
+        "items" => Ok(Value::DictView {
+            kind: crate::value::DictViewKind::Items,
+            items: d
+                .borrow()
                 .iter()
                 .filter(|(k, _)| !matches!(k, HashKey::Str(s) if s.as_str() == "__typhon_frozen__"))
                 .map(|(k, v)| Value::Tuple(Rc::new(vec![k.clone().into_value(), v.clone()])))
                 .collect(),
-        )))),
+        }),
         "pop" => {
             let k = single(args, "pop")?.to_hash_key()?;
             let default = args.get(1).cloned();
@@ -4680,6 +5309,36 @@ pub fn call_with_kwargs(
         // Text-IO helpers accept an `encoding=` (and `errors=`) kwarg the VM
         // doesn't model (it is always UTF-8). Drop the kwargs and run.
         "write_text" | "read_text" | "open" => (n.func)(interp, args),
+        // `itertools.groupby(iterable, key=…)` — fold the `key` keyword into
+        // the second positional slot the native already understands.
+        "groupby" => {
+            let mut args = args;
+            for (k, v) in kwargs {
+                match k.as_str() {
+                    "key" => {
+                        if args.len() < 2 {
+                            args.push(v.clone());
+                        } else {
+                            args[1] = v.clone();
+                        }
+                    }
+                    "iterable" => {
+                        if args.is_empty() {
+                            args.push(v.clone());
+                        } else {
+                            args[0] = v.clone();
+                        }
+                    }
+                    _ => {
+                        return Err(type_error(format!(
+                            "groupby() got unexpected keyword: '{}'",
+                            k
+                        )))
+                    }
+                }
+            }
+            (n.func)(interp, args)
+        }
         // Bound builtin methods (the "method" native) never reach here — they
         // are intercepted in `call_value`, which forwards kwargs via the
         // tuple sentinel (`make_kwargs_sentinel` / `split_kwargs`).

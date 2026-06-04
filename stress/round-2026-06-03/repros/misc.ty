@@ -1,0 +1,30 @@
+import math
+def main() -> None:
+    print(math.sqrt(2), math.pi, math.floor(3.7), math.ceil(3.2))
+    print(math.gcd(12, 18), math.factorial(5))
+    print(pow(2, 10), pow(2, 10, 1000))
+    # f-string debug
+    let val: int = 42
+    print(f"{val=}")
+    # nested unpack
+    let ((a, b), c) = ((1, 2), 3)
+    print(a, b, c)
+    # star unpack
+    let first, *rest = [1, 2, 3, 4]
+    print(first, rest)
+    # dict/list aliasing
+    let xs: list[int] = [1, 2, 3]
+    let ys: list[int] = xs
+    ys.append(4)
+    print(xs)   # [1,2,3,4] aliased
+    # bytes
+    let data: bytes = b"hello"
+    print(data, len(data), data[0])
+    print(data.decode().upper())
+    # tuple methods
+    let t: tuple[int, int, int] = (1, 2, 2)
+    print(t.count(2), t.index(2))
+    # chained
+    print("  Hello World  ".strip().lower().replace(" ", "_"))
+if __name__ == "__main__":
+    main()

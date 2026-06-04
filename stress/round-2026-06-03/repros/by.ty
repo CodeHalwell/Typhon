@@ -1,0 +1,10 @@
+def main() -> None:
+    let data: bytes = b"hello"
+    print(data.decode())
+    print(data.decode("utf-8"))
+    print(data.hex())
+    print(b"\x00\x01".hex())
+    print(bytes([104, 105]))
+    print("hi".encode().decode())
+if __name__ == "__main__":
+    main()

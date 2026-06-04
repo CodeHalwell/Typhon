@@ -1,0 +1,11 @@
+class Circle:
+    radius: float
+    area: float = 0.0
+impl Circle:
+    def __post_init__(self) -> None:
+        self.area = 3.14159 * self.radius * self.radius
+def main() -> None:
+    let c: Circle = Circle(radius=2.0)
+    print(f"{c.area:.2f}")
+if __name__ == "__main__":
+    main()

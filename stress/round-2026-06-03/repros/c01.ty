@@ -1,0 +1,31 @@
+def main() -> None:
+    print(-7 // 2)         # floor div: -4
+    print(-7 % 3)          # 2 (python)
+    print(7 % -3)          # -2
+    print(2 ** 10)
+    print(10 / 4)          # 2.5
+    print(round(2.5))      # banker's: 2
+    print(round(3.5))      # 4
+    print(round(2.675, 2)) # 2.67 (float repr)
+    print(abs(-5))
+    print(sorted([3,1,2], reverse=True))
+    print(sorted(["bb","a","ccc"], key=len))
+    let s: str = "Hello, World"
+    print(s[::-1])
+    print(s[2:5])
+    print(s[-3:])
+    print(s.upper().split(","))
+    print("|".join(["a","b","c"]))
+    print(list(range(0, 10, 3)))
+    print({1,2,3} & {2,3,4})
+    print({1,2,3} | {3,4})
+    print({1,2,3} - {2})
+    print(sum([1.5, 2.5, 3]))
+    print(max([1,2,3]), min([1,2,3]))
+    print(divmod(17, 5))
+    let d: dict[str,int] = {"b":2,"a":1,"c":3}
+    print(sorted(d.items()))
+    print(any([False, True]), all([True, False]))
+
+if __name__ == "__main__":
+    main()

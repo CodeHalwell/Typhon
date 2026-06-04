@@ -1,0 +1,27 @@
+class Base:
+    name: str
+impl Base:
+    def describe(self) -> str:
+        return f"Base({self.name})"
+class Derived(Base):
+    level: int
+impl Derived:
+    def describe(self) -> str:
+        let parent: str = super().describe()
+        return f"{parent} level={self.level}"
+class MathUtil:
+    pass
+impl MathUtil:
+    @staticmethod
+    def square(x: int) -> int:
+        return x * x
+    @classmethod
+    def name(cls) -> str:
+        return "MathUtil"
+def main() -> None:
+    let d: Derived = Derived(name="x", level=3)
+    print(d.describe())
+    print(MathUtil.square(5))
+    print(MathUtil.name())
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,18 @@
+class Adder:
+    base: int
+impl Adder:
+    def __call__(self, x: int) -> int:
+        return self.base + x
+class Temp:
+    celsius: float
+impl Temp:
+    @property
+    def fahrenheit(self) -> float:
+        return self.celsius * 9.0 / 5.0 + 32.0
+def main() -> None:
+    let add5 = Adder(base=5)
+    print(add5(10))
+    let t: Temp = Temp(celsius=100.0)
+    print(t.fahrenheit)
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,12 @@
+class Point frozen:
+    x: int
+    y: int
+def main() -> None:
+    let seen: dict[Point, str] = {}
+    let p1: Point = Point(x=1, y=2)
+    let p2: Point = Point(x=1, y=2)
+    seen[p1] = "first"
+    print(p2 in seen)        # should be True (value hash/eq)
+    print(len(seen))
+if __name__ == "__main__":
+    main()

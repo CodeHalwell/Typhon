@@ -192,6 +192,11 @@ pub fn desugar_module_with(module: &ModModule, options: DesugarOptions) -> Desug
     let needs_asyncio = stmts_use_asyncio_qualified(&desugared_mod.body);
     let inject_asyncio = needs_asyncio && !has_asyncio_import(&desugared_mod.body);
 
+    // `enum Name:` lowers to `class Name(enum.Enum):` with members assigned
+    // `enum.auto()` — ensure `import enum` is in scope.
+    let needs_enum = stmts_use_enum_base(&desugared_mod.body);
+    let inject_enum = needs_enum && !has_enum_import(&desugared_mod.body);
+
     // `go` and `lazy` lower to `typhon_runtime.tasks.spawn(...)` /
     // `typhon_runtime.lazy.…` — ensure a bare `import typhon_runtime`
     // is in scope when the user hasn't already arranged one.
@@ -224,6 +229,9 @@ pub fn desugar_module_with(module: &ModModule, options: DesugarOptions) -> Desug
     };
     if inject_runtime_module {
         inject(&mut body, make_bare_typhon_runtime_import());
+    }
+    if inject_enum {
+        inject(&mut body, make_enum_import());
     }
     if inject_asyncio {
         inject(&mut body, make_asyncio_import());
@@ -597,6 +605,71 @@ fn make_asyncio_import() -> Stmt {
         names: vec![make_alias("asyncio")],
         is_lazy: false,
     })
+}
+
+/// Build `import enum`.
+fn make_enum_import() -> Stmt {
+    Stmt::Import(StmtImport {
+        range: TextRange::default(),
+        node_index: AtomicNodeIndex::NONE,
+        names: vec![make_alias("enum")],
+        is_lazy: false,
+    })
+}
+
+/// `true` when `body` already has a bare `import enum` (no alias, or aliased to
+/// `enum`). `import enum as e` doesn't satisfy the `enum.Enum` / `enum.auto()`
+/// references produced by the `enum` lowering.
+fn has_enum_import(body: &[Stmt]) -> bool {
+    body.iter().any(|stmt| match stmt {
+        Stmt::Import(i) => i.names.iter().any(|a| {
+            a.name.as_str() == "enum"
+                && matches!(a.asname.as_ref().map(|n| n.as_str()), None | Some("enum"))
+        }),
+        _ => false,
+    })
+}
+
+/// `true` when any class in `body` (recursively) inherits from an `enum.*`
+/// base — the shape produced by the `enum Name:` lowering
+/// (`class Name(enum.Enum):`). Drives `import enum` injection.
+fn stmts_use_enum_base(body: &[Stmt]) -> bool {
+    body.iter().any(|stmt| match stmt {
+        Stmt::ClassDef(c) => {
+            c.bases().iter().any(is_enum_qualified_base) || stmts_use_enum_base(&c.body)
+        }
+        Stmt::If(s) => {
+            stmts_use_enum_base(&s.body)
+                || s.elif_else_clauses
+                    .iter()
+                    .any(|cl| stmts_use_enum_base(&cl.body))
+        }
+        Stmt::For(s) => stmts_use_enum_base(&s.body) || stmts_use_enum_base(&s.orelse),
+        Stmt::While(s) => stmts_use_enum_base(&s.body) || stmts_use_enum_base(&s.orelse),
+        Stmt::With(s) => stmts_use_enum_base(&s.body),
+        Stmt::Try(s) => {
+            stmts_use_enum_base(&s.body)
+                || stmts_use_enum_base(&s.orelse)
+                || stmts_use_enum_base(&s.finalbody)
+        }
+        Stmt::FunctionDef(s) => stmts_use_enum_base(&s.body),
+        _ => false,
+    })
+}
+
+/// `true` when `base` is a dotted `enum.<Family>` reference where `<Family>` is
+/// one of the standard enum bases.
+fn is_enum_qualified_base(base: &Expr) -> bool {
+    if let Expr::Attribute(a) = base {
+        if let Expr::Name(n) = a.value.as_ref() {
+            return n.id.as_str() == "enum"
+                && matches!(
+                    a.attr.as_str(),
+                    "Enum" | "IntEnum" | "StrEnum" | "Flag" | "IntFlag"
+                );
+        }
+    }
+    false
 }
 
 /// Build `from typing import Protocol`.
@@ -1057,6 +1130,15 @@ fn desugar_mod_module_with(m: &ModModule, options: &DesugarOptions) -> ModModule
 
     // Merge `impl` pseudo-classes into their target classes and remove the stubs.
     let (merged_body, _) = merge_impl_blocks(new_body);
+
+    // H0: rewrite bare zero-argument `super()` inside methods into the explicit
+    // two-argument `super(EnclosingClass, self)` form. The bare form relies on
+    // the `__class__` closure cell, which `@dataclass(slots=True)` orphans when
+    // it rebuilds the class object — so `super()` crashes at runtime. The
+    // two-arg form does not depend on `__class__`. Runs after `merge_impl_blocks`
+    // so methods brought in from `impl`/`extend` blocks (already inside their
+    // target class) are covered too.
+    let merged_body = rewrite_bare_super(merged_body);
 
     // FINDINGS #22: propagate parent field annotations into subclass bodies
     // so the VM's auto-`__init__` synthesiser (which reads `class.fields`
@@ -2638,6 +2720,127 @@ fn collect_sealed_union_aliases(body: &[Stmt]) -> HashMap<String, Vec<String>> {
     out
 }
 
+// ── H0: bare `super()` rewrite ─────────────────────────────────────────────
+
+/// Rewrite every bare zero-argument `super()` call appearing inside a method
+/// into the explicit two-argument form `super(EnclosingClass, self)`.
+///
+/// Background: Typhon emits `@dataclasses.dataclass(slots=True)` on every
+/// `class`. With `slots=True` the decorator rebuilds the class object, which
+/// orphans the `__class__` closure cell a bare `super()` relies on. The result
+/// is a runtime `TypeError` for any inheritance + `super()` program. The
+/// two-argument form does not depend on `__class__`, so it works under
+/// `slots=True`.
+///
+/// Runs after `merge_impl_blocks`, so methods brought in from `impl`/`extend`
+/// blocks (now sitting inside their target class) are covered as well. Only
+/// calls of the exact shape `super()` (zero args, zero keywords) are touched;
+/// `super(X, y)` calls are left intact.
+use ruff_python_ast::visitor::transformer::Transformer as _SuperTransformer;
+
+fn rewrite_bare_super(mut body: Vec<Stmt>) -> Vec<Stmt> {
+    for stmt in &mut body {
+        rewrite_bare_super_stmt(stmt);
+    }
+    body
+}
+
+/// Visit a statement looking for class definitions. When one is found, every
+/// method in its body is scanned for bare `super()` using that class's name and
+/// the method's first parameter as the two `super` arguments. Recurses through
+/// compound statements so a class nested inside an `if`/`try`/etc. is reached.
+fn rewrite_bare_super_stmt(stmt: &mut Stmt) {
+    match stmt {
+        Stmt::ClassDef(c) => {
+            let class_name = c.name.as_str().to_owned();
+            for member in &mut c.body {
+                // First, recurse: a class nested inside this one (directly or
+                // inside a method) gets its own enclosing-class context.
+                rewrite_bare_super_stmt(member);
+                // Then, if this member is a method, rewrite its bare `super()`.
+                if let Stmt::FunctionDef(f) = member {
+                    if let Some(self_name) = first_parameter_name(&f.parameters) {
+                        let rewriter = SuperRewriter {
+                            class_name: class_name.clone(),
+                            self_name,
+                        };
+                        for body_stmt in &mut f.body {
+                            rewriter.visit_stmt(body_stmt);
+                        }
+                    }
+                }
+            }
+        }
+        // Descend into compound statements (if / for / while / with / try /
+        // match / module-level def bodies) so nested classes are still handled.
+        _ => {
+            ruff_python_ast::visitor::transformer::walk_stmt(&StmtClassDescender, stmt);
+        }
+    }
+}
+
+/// A no-op `Transformer` whose only job is to drive `walk_stmt`'s recursion into
+/// child statements, re-dispatching each through [`rewrite_bare_super_stmt`] so
+/// class definitions anywhere in the tree are discovered.
+struct StmtClassDescender;
+
+impl ruff_python_ast::visitor::transformer::Transformer for StmtClassDescender {
+    fn visit_stmt(&self, stmt: &mut Stmt) {
+        rewrite_bare_super_stmt(stmt);
+    }
+}
+
+/// Rewrites bare `super()` → `super(class_name, self_name)` within a single
+/// method body. Stops at nested `def`/`class` boundaries: those establish a
+/// fresh `super()` scope, so rewriting them with this method's class/self would
+/// be wrong. Nested classes are still discovered (and their own methods
+/// rewritten) by re-dispatching through [`rewrite_bare_super_stmt`].
+struct SuperRewriter {
+    class_name: String,
+    self_name: String,
+}
+
+impl ruff_python_ast::visitor::transformer::Transformer for SuperRewriter {
+    fn visit_stmt(&self, stmt: &mut Stmt) {
+        match stmt {
+            // A nested function defines its own `super()` scope; don't rewrite
+            // bare `super()` inside it with this method's class/self.
+            Stmt::FunctionDef(_) => {}
+            // A nested class restarts class discovery.
+            Stmt::ClassDef(_) => rewrite_bare_super_stmt(stmt),
+            _ => ruff_python_ast::visitor::transformer::walk_stmt(self, stmt),
+        }
+    }
+
+    fn visit_expr(&self, expr: &mut Expr) {
+        // Recurse into children first, then rewrite this node if it is `super()`.
+        ruff_python_ast::visitor::transformer::walk_expr(self, expr);
+        if let Expr::Call(call) = expr {
+            let is_bare_super = matches!(call.func.as_ref(), Expr::Name(n) if n.id.as_str() == "super")
+                && call.arguments.args.is_empty()
+                && call.arguments.keywords.is_empty();
+            if is_bare_super {
+                call.arguments.args = Box::new([
+                    make_bare_name_expr(&self.class_name),
+                    make_bare_name_expr(&self.self_name),
+                ]);
+            }
+        }
+    }
+}
+
+/// First parameter name of a function (positional-only or regular). Returns
+/// `None` when the function has no positional parameters at all.
+fn first_parameter_name(params: &Parameters) -> Option<String> {
+    if let Some(p) = params.posonlyargs.first() {
+        return Some(p.parameter.name.as_str().to_owned());
+    }
+    if let Some(p) = params.args.first() {
+        return Some(p.parameter.name.as_str().to_owned());
+    }
+    None
+}
+
 /// Merge Typhon `impl` pseudo-classes into their target classes.
 ///
 /// The preprocessor rewrites `impl ClassName:` to `class __typhon_impl_ClassName(object):`.
@@ -2981,9 +3184,12 @@ mod tests {
             emitted.contains("def __init__(self, layer: int, dropout: float) -> None:"),
             "expected synthesised __init__ signature:\n{emitted}"
         );
+        // The synthesised bare `super().__init__()` is rewritten to the
+        // explicit two-argument form by the H0 `super()` pass (correct and
+        // equivalent; works whether or not the class is `@dataclass`).
         assert!(
-            emitted.contains("super().__init__()"),
-            "expected super() call:\n{emitted}"
+            emitted.contains("super(Net, self).__init__()"),
+            "expected two-arg super() call:\n{emitted}"
         );
         assert!(
             emitted.contains("self.layer = layer"),
@@ -3154,6 +3360,58 @@ mod tests {
         assert!(
             !emitted.contains("@dataclasses.dataclass"),
             "raw class must still skip @dataclass:\n{emitted}"
+        );
+    }
+
+    #[test]
+    fn bare_super_rewritten_to_two_arg_form() {
+        // A user-written bare `super()` inside a method becomes
+        // `super(ClassName, self)` so it survives `@dataclass(slots=True)`.
+        let src = "class B(A):\n    def m(self) -> str:\n        return super().m()\n";
+        let parsed = tyc_syntax::parse_module(src).expect("parse failed");
+        let module = parsed.into_syntax();
+        let out = desugar_module_with(&module, DesugarOptions::default());
+        let emitted = emit(&out.module);
+        assert!(
+            emitted.contains("super(B, self).m()"),
+            "bare super() should become super(B, self):\n{emitted}"
+        );
+        assert!(
+            !emitted.contains("super().m()"),
+            "no bare super().m() should remain:\n{emitted}"
+        );
+    }
+
+    #[test]
+    fn explicit_two_arg_super_left_untouched() {
+        let src = "class B(A):\n    def m(self) -> str:\n        return super(B, self).m()\n";
+        let parsed = tyc_syntax::parse_module(src).expect("parse failed");
+        let module = parsed.into_syntax();
+        let out = desugar_module_with(&module, DesugarOptions::default());
+        let emitted = emit(&out.module);
+        // Still exactly one super(B, self) — not double-rewritten.
+        assert_eq!(
+            emitted.matches("super(B, self)").count(),
+            1,
+            "explicit super(B, self) must be left as-is:\n{emitted}"
+        );
+    }
+
+    #[test]
+    fn enum_class_gets_enum_import_and_no_dataclass() {
+        // Simulate the `enum` preprocessor output.
+        let src = "class Shape(enum.Enum):\n    CIRCLE = enum.auto()\n    SQUARE = enum.auto()\n";
+        let parsed = tyc_syntax::parse_module(src).expect("parse failed");
+        let module = parsed.into_syntax();
+        let out = desugar_module_with(&module, DesugarOptions::default());
+        let emitted = emit(&out.module);
+        assert!(
+            emitted.contains("import enum"),
+            "enum class must trigger `import enum`:\n{emitted}"
+        );
+        assert!(
+            !emitted.contains("@dataclasses.dataclass"),
+            "enum.Enum subclass must skip @dataclass:\n{emitted}"
         );
     }
 

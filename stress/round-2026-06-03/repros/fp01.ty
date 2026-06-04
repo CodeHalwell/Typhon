@@ -1,0 +1,6 @@
+def main() -> None:
+    let s: str = "%.2f and %s" % (3.14159, "x")
+    print(s)
+
+if __name__ == "__main__":
+    main()

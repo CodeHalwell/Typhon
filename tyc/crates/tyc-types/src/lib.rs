@@ -193,6 +193,16 @@ impl Type {
     }
 }
 
+/// `true` when `ty` is Python's universal base type `object`. Every value
+/// (including `None`) is an instance of `object`, so a slot typed `object`
+/// must accept any actual type — including the `None` singleton. This is
+/// consulted by the nullable-into-non-nullable call-argument guard so that
+/// `f(None)` into `def f(x: object)` is NOT mistaken for a null-safety
+/// violation (M13).
+pub fn is_object_type(ty: &Type) -> bool {
+    matches!(ty, Type::Class(name) if name == "object")
+}
+
 /// Check whether a value of type `actual` is assignable to a target of
 /// type `expected`.
 ///
@@ -721,6 +731,14 @@ fn builtin_satisfies_interface(actual: &Type, shape: &InterfaceShape) -> bool {
 
 fn is_typevar(t: &Type) -> bool {
     matches!(t, Type::TypeVar(_))
+}
+
+/// Return `true` when `t` carries no usable static information for a
+/// strict compatibility check — `Any`, `Unknown`, and unbound PEP 695
+/// type parameters. Used to keep the dict key-type check (H5/M6) quiet
+/// on generic / dynamically-typed code so it never false-positives.
+fn is_dynamic_type(t: &Type) -> bool {
+    matches!(t, Type::Any | Type::Unknown | Type::TypeVar(_))
 }
 
 /// Return `true` when this call targets one of the well-known
@@ -2716,6 +2734,25 @@ impl<'a> Checker<'a> {
         self.diagnostics.push_error(TycError::type_mismatch(
             expected.display(),
             actual.display(),
+            &self.path,
+            self.source,
+            span.0,
+            length,
+        ));
+    }
+
+    /// Emit a `tyc::type_mismatch` with pre-rendered `expected` / `actual`
+    /// strings. Used where the "expected" side isn't a concrete `Type`
+    /// — e.g. the not-iterable check renders "an iterable" as the
+    /// expectation (H5/M6).
+    fn mismatch_with(&mut self, expected: String, actual: String, span: (usize, usize)) {
+        if self.unsafe_depth > 0 {
+            return;
+        }
+        let length = span.1.saturating_sub(span.0).max(1);
+        self.diagnostics.push_error(TycError::type_mismatch(
+            expected,
+            actual,
             &self.path,
             self.source,
             span.0,
@@ -6998,7 +7035,22 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
             }
         }
         Stmt::For(f) => {
-            let _ = infer_expr(c, &f.iter);
+            let iter_ty = infer_expr(c, &f.iter);
+            // H5/M6: `for x in <non-iterable>` over a statically-known
+            // scalar (`int`, `float`, `bool`, `None`) is a runtime
+            // `TypeError`. str/bytes/list/dict/set/tuple and anything
+            // dynamic (`Unknown`/`Any`/TypeVar) or user-defined (which may
+            // implement `__iter__`) are left alone to avoid false positives.
+            // `Bool` is excluded for the same reason as the attribute
+            // check: a comparison result inferred as `bool` may be an
+            // operator-overloaded value (e.g. a numpy mask) at runtime.
+            if c.unsafe_depth == 0 && matches!(iter_ty, Type::Int | Type::Float | Type::None) {
+                let span = (
+                    f.iter.range().start().to_usize(),
+                    f.iter.range().end().to_usize(),
+                );
+                c.mismatch_with("an iterable".to_string(), iter_ty.display(), span);
+            }
             if let Expr::Name(n) = f.target.as_ref() {
                 let span = (
                     n.range.start().to_usize(),
@@ -9374,6 +9426,67 @@ fn is_known_builtin_generic_attr(head: &str, attr: &str) -> bool {
     }
 }
 
+/// Return `true` when `attr` is a known public method/attribute on a
+/// CPython *primitive* scalar (`int`, `float`, `bool`, `bytes`, `str`).
+/// `bool` is a subclass of `int`, so it shares `int`'s surface. The
+/// names mirror `dir(int)` / `dir(float)` minus the dunders. Used to
+/// validate attribute access on statically-known primitive receivers
+/// (`n: int; n.foo` → `attribute_not_found`) without false-positiving on
+/// real methods like `n.bit_length()` or `x.is_integer()`. Conservative:
+/// `str`/`bytes` reuse the container table in
+/// [`is_known_builtin_generic_attr`].
+fn is_known_primitive_attr(prim: &str, attr: &str) -> bool {
+    match prim {
+        // `int` and `bool` (a subclass of `int`).
+        "int" | "bool" => matches!(
+            attr,
+            "as_integer_ratio"
+                | "bit_count"
+                | "bit_length"
+                | "conjugate"
+                | "denominator"
+                | "from_bytes"
+                | "imag"
+                | "numerator"
+                | "real"
+                | "to_bytes"
+        ),
+        "float" => matches!(
+            attr,
+            "as_integer_ratio" | "conjugate" | "fromhex" | "hex" | "imag" | "is_integer" | "real"
+        ),
+        "str" | "bytes" => is_known_builtin_generic_attr(prim, attr),
+        _ => false,
+    }
+}
+
+/// Emit `tyc::attribute_not_found` for a missing attribute on a
+/// statically-known builtin type, using the attribute-name token span.
+/// Shared by the primitive-scalar arms. Honours the same conservative
+/// rails as the class/generic emit sites: skip inside `unsafe:`, skip
+/// dunder/underscore names.
+fn emit_builtin_attr_not_found(
+    c: &mut Checker,
+    type_name: &str,
+    a: &ruff_python_ast::ExprAttribute,
+) {
+    let attr_name = a.attr.as_str();
+    if c.unsafe_depth != 0 || attr_name.starts_with('_') {
+        return;
+    }
+    let attr_start = a.attr.range.start().to_usize();
+    let attr_len = a
+        .attr
+        .range
+        .end()
+        .to_usize()
+        .saturating_sub(attr_start)
+        .max(1);
+    c.diagnostics.push_error(TycError::attribute_not_found(
+        attr_name, type_name, &c.path, c.source, attr_start, attr_len,
+    ));
+}
+
 fn builtin_generic_method(recv: &Type, attr: &str) -> Option<Type> {
     let Type::Generic(head, args) = recv else {
         return None;
@@ -9800,6 +9913,15 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
             }
             let l_stripped = l.strip_none();
             let r_stripped = r.strip_none();
+            // M1: `str % args` is the printf-style string-formatting
+            // operator, not modulo. When the LHS is statically `str`
+            // (or a `str`-literal singleton), the result is always `str`
+            // regardless of the RHS shape (`"%.2f and %s" % (3.14, "x")`,
+            // `"%d" % n`, `"%(name)s" % d`, …). Return early so the
+            // numeric-only `%` compatibility check below never fires.
+            if matches!(b.op, Operator::Mod) && matches!(l_stripped, Type::Str | Type::LitStr(_)) {
+                return Type::Str;
+            }
             if let Some(op_str) = arithmetic_op_str(b.op) {
                 if !operator_operands_compatible(b.op, &l_stripped, &r_stripped) {
                     let span = (b.range.start().to_usize(), b.range.end().to_usize());
@@ -10370,7 +10492,8 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
                         let expected_unwrapped_nullable = c.unwrap_alias(&expected).is_nullable();
                         let nullable_into_non_nullable = !expected_unwrapped_nullable
                             && actual.is_nullable()
-                            && !matches!(expected, Type::TypeVar(_));
+                            && !matches!(expected, Type::TypeVar(_))
+                            && !is_object_type(&expected);
                         if nullable_into_non_nullable {
                             if let Expr::Name(n) = arg {
                                 let span = (
@@ -10420,7 +10543,9 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
                             }
                             let actual = infer_expr_ctx(c, &kw.value, Some(&params[idx]));
                             let nullable_into_non_nullable =
-                                !c.unwrap_alias(&params[idx]).is_nullable() && actual.is_nullable();
+                                !c.unwrap_alias(&params[idx]).is_nullable()
+                                    && actual.is_nullable()
+                                    && !is_object_type(&params[idx]);
                             if nullable_into_non_nullable {
                                 if let Expr::Name(n) = &kw.value {
                                     let span = (
@@ -11030,12 +11155,70 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
                     }
                     Type::Unknown
                 }
+                // H5: attribute / method existence on statically-known
+                // builtin *scalar* types. These never reach the
+                // `Type::Generic` builtin path above (they're not
+                // parameterised), so without these arms `n.foo` on an
+                // `int` or `"hi".frobnicate()` on a `str` type-checks
+                // clean and crashes at runtime. We only flag names that
+                // are not in the type's real CPython method table and
+                // are not user-added via `extend <type>:`. Valid methods
+                // still resolve to `Type::Unknown` (unchanged behaviour),
+                // so no downstream inference regresses.
+                // NOTE: only the genuine `Type::Str` is checked here, NOT
+                // `Type::LitStr`. A `LitStr` can originate from a quoted
+                // *forward-reference* type annotation (e.g. a field typed
+                // `"asyncio.Queue[T]"`), which the annotation resolver
+                // currently lowers to a string-literal type. Flagging
+                // method access on those would be a false positive on
+                // perfectly valid code, so literal-string receivers are
+                // left permissive.
+                Type::Str => {
+                    if !is_known_primitive_attr("str", attr_name)
+                        && !is_user_builtin_extension(c, "str", attr_name)
+                    {
+                        emit_builtin_attr_not_found(c, "str", a);
+                    }
+                    Type::Unknown
+                }
+                Type::Bytes => {
+                    if !is_known_primitive_attr("bytes", attr_name)
+                        && !is_user_builtin_extension(c, "bytes", attr_name)
+                    {
+                        emit_builtin_attr_not_found(c, "bytes", a);
+                    }
+                    Type::Unknown
+                }
+                Type::Int => {
+                    if !is_known_primitive_attr("int", attr_name)
+                        && !is_user_builtin_extension(c, "int", attr_name)
+                    {
+                        emit_builtin_attr_not_found(c, "int", a);
+                    }
+                    Type::Unknown
+                }
+                Type::Float => {
+                    if !is_known_primitive_attr("float", attr_name)
+                        && !is_user_builtin_extension(c, "float", attr_name)
+                    {
+                        emit_builtin_attr_not_found(c, "float", a);
+                    }
+                    Type::Unknown
+                }
+                // NOTE: `Type::Bool` is deliberately NOT attribute-checked.
+                // Comparison operators (`==`, `<`, `in`, …) and boolean
+                // combinators infer to `bool` in the checker, but on
+                // operator-overloaded receivers (e.g. a numpy array
+                // comparison `(a == b).mean()`) the runtime result is NOT
+                // a `bool`. Flagging method access on a `bool` receiver
+                // would therefore false-positive on valid code, so bool
+                // receivers stay permissive.
                 _ => Type::Unknown,
             }
         }
         Expr::Subscript(s) => {
             let value_ty = infer_expr(c, &s.value);
-            let _ = infer_expr(c, &s.slice);
+            let slice_ty = infer_expr(c, &s.slice);
             if let Type::Generic(head, elts) = &value_ty {
                 if head == "tuple" && !elts.is_empty() {
                     if let Some(idx) = const_int_index(&s.slice) {
@@ -11055,6 +11238,44 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
                                 c.tuple_index_out_of_range(arity, idx, span);
                                 return Type::Unknown;
                             }
+                        }
+                    }
+                }
+            }
+            // H5/M6: subscripting a statically-known *non-subscriptable*
+            // scalar (`int`, `float`, `bool`, `None`) is a runtime
+            // `TypeError`. Flag it at check time using the operator
+            // diagnostic (op `[]`). str / bytes / list / tuple / dict
+            // are subscriptable and untouched; `Unknown` / `Any` /
+            // TypeVar / user classes fall through silently to avoid
+            // false positives on `__getitem__`-defining classes.
+            // `Bool` is excluded for the same reason as the attribute /
+            // iteration checks (comparison results may be overloaded).
+            if c.unsafe_depth == 0 && matches!(value_ty, Type::Int | Type::Float | Type::None) {
+                let span = (s.range.start().to_usize(), s.range.end().to_usize());
+                c.operator_type_mismatch("[]", &value_ty, &slice_ty, span);
+                return Type::Unknown;
+            }
+            // dict key-type check: `d[k]` where `d: dict[K, V]` and the
+            // index `k` has a statically-known type incompatible with
+            // `K`. Skip slice syntax (`d[a:b]` is itself a runtime error
+            // but that's a separate concern) and skip when either side is
+            // dynamic/typevar so generic code stays quiet. Key lookup is
+            // invariant — the runtime hashes/compares against the slot.
+            if c.unsafe_depth == 0 && !matches!(s.slice.as_ref(), Expr::Slice(_)) {
+                if let Type::Generic(head, args) = &value_ty {
+                    if head == "dict" && args.len() == 2 {
+                        let key_ty = &args[0];
+                        if !is_dynamic_type(key_ty)
+                            && !is_dynamic_type(&slice_ty)
+                            && !c.is_assignable(key_ty, &slice_ty)
+                        {
+                            let span = (
+                                s.slice.range().start().to_usize(),
+                                s.slice.range().end().to_usize(),
+                            );
+                            c.mismatch(key_ty, &slice_ty, span);
+                            return args[1].clone();
                         }
                     }
                 }
@@ -17902,6 +18123,178 @@ def main() -> None:
         assert!(
             !d.has_errors(),
             "list.append must still resolve; got: {:?}",
+            d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    // ── M13: `None` (and anything) is assignable to `object` ─────────────
+
+    /// M13: passing `None` to a parameter typed `object` must NOT fire a
+    /// nullable-into-non-nullable error — `object` is the top type and
+    /// includes `None`.
+    #[test]
+    fn m13_none_argument_into_object_param_is_clean() {
+        let src = "\
+def f(x: object) -> str:
+    return str(x)
+
+def main() -> None:
+    print(f(None))
+    print(f(42))
+    print(f(\"hi\"))
+";
+        let d = check(src);
+        assert!(
+            !d.has_errors(),
+            "None/int/str into object param must be clean; got: {:?}",
+            d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    // ── M1: `str % args` printf formatting yields `str` ──────────────────
+
+    /// M1 (checker side): the `%` operator with a `str` left operand is
+    /// string formatting and yields `str` regardless of the RHS.
+    #[test]
+    fn m1_str_percent_formatting_is_clean() {
+        let src = "\
+def main() -> None:
+    let s: str = \"%.2f and %s\" % (3.14159, \"x\")
+    print(s)
+";
+        let d = check(src);
+        assert!(
+            !d.has_errors(),
+            "str % (tuple) formatting must type-check clean; got: {:?}",
+            d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    // ── H5/M6: builtin scalar attribute / subscript / iteration checks ───
+
+    /// H5: a missing attribute on a statically-known `int` must fire
+    /// `attribute_not_found`.
+    #[test]
+    fn h5_int_unknown_attribute_fires() {
+        let src = "\
+def main() -> None:
+    let n: int = 5
+    print(n.foo)
+";
+        let d = check(src);
+        assert!(
+            d.errors().iter().any(|e| e.to_string().contains("foo")),
+            "int.foo must fire attribute_not_found; got: {:?}",
+            d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    /// H5: a missing method on a statically-known `str` must fire.
+    #[test]
+    fn h5_str_unknown_method_fires() {
+        let src = "\
+def main() -> None:
+    let s: str = \"x\"
+    print(s.frobnicate())
+";
+        let d = check(src);
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| e.to_string().contains("frobnicate")),
+            "str.frobnicate must fire attribute_not_found; got: {:?}",
+            d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    /// H5: real builtin scalar methods must still resolve cleanly.
+    #[test]
+    fn h5_real_int_and_str_methods_unaffected() {
+        let src = "\
+def main() -> None:
+    let n: int = 255
+    print(n.bit_length())
+    let s: str = \"Hello\"
+    print(s.upper())
+    print(s.split(\",\"))
+";
+        let d = check(src);
+        assert!(
+            !d.has_errors(),
+            "int.bit_length / str.upper / str.split must resolve; got: {:?}",
+            d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    /// M6: subscripting a statically-known `int` must fire.
+    #[test]
+    fn m6_int_subscript_fires() {
+        let src = "\
+def main() -> None:
+    let n: int = 5
+    print(n[0])
+";
+        let d = check(src);
+        assert!(
+            d.has_errors(),
+            "int[0] must be flagged as not subscriptable; got no errors"
+        );
+    }
+
+    /// M6: iterating a statically-known `int` must fire.
+    #[test]
+    fn m6_int_iteration_fires() {
+        let src = "\
+def main() -> None:
+    let n: int = 5
+    for x in n:
+        print(x)
+";
+        let d = check(src);
+        assert!(
+            d.has_errors(),
+            "for x in <int> must be flagged as not iterable; got no errors"
+        );
+    }
+
+    /// M6: a `dict[str, int]` indexed with an `int` key must fire a
+    /// key-type mismatch.
+    #[test]
+    fn m6_dict_wrong_key_type_fires() {
+        let src = "\
+def main() -> None:
+    let d: dict[str, int] = {\"a\": 1}
+    print(d[5])
+";
+        let diags = check(src);
+        assert!(
+            diags.has_errors(),
+            "dict[str,int][5] must flag a key-type mismatch; got no errors"
+        );
+    }
+
+    /// M6: valid uses around the new checks must stay clean — string
+    /// repetition, list repetition, slicing, negative indices, correct
+    /// dict keys, and string-literal-typed values (forward-ref guard).
+    #[test]
+    fn m6_valid_builtin_uses_stay_clean() {
+        let src = "\
+def main() -> None:
+    let a: str = \"x\" * 3
+    let b: list[int] = [0] * 5
+    let s: str = \"hello\"
+    let c: str = s[1:3]
+    let r: str = s[::-1]
+    let last: str = s[-1]
+    let d: dict[str, int] = {\"a\": 1}
+    let v: int = d[\"a\"]
+    for ch in s:
+        print(ch)
+";
+        let d = check(src);
+        assert!(
+            !d.has_errors(),
+            "valid builtin operations must stay clean; got: {:?}",
             d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
         );
     }

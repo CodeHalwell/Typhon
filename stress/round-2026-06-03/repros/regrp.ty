@@ -1,0 +1,11 @@
+import re
+def main() -> None:
+    let m = re.match(r"(\w+)@(\w+)\.(\w+)", "user@example.com")
+    if m is not None:
+        print("g0:", m.group(0))
+        print("g1:", m.group(1))
+        print("g2:", m.group(2))
+        print("g3:", m.group(3))
+        print("groups:", m.groups())
+if __name__ == "__main__":
+    main()

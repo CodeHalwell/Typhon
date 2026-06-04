@@ -1,0 +1,4 @@
+def main() -> None:
+    print(set(range(8)))
+if __name__ == "__main__":
+    main()

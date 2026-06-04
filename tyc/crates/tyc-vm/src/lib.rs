@@ -13,6 +13,14 @@
 //! catalog in `docs/vm.md`. Features that aren't supported yet surface as
 //! `NotImplementedError` at runtime with a feature-name pointer.
 
+// `HashKey::Instance` retains an `Rc<Instance>` (which has interior
+// mutability) so a frozen-dataclass key can round-trip back to its value.
+// Its `Hash`/`Eq`/`Ord` derive solely from the precomputed, immutable
+// `InstanceKey` projection — never from the mutable fields — so using
+// `HashKey` as a map/set key is sound. Silence the (here false-positive)
+// `mutable_key_type` lint crate-wide rather than at ~17 call sites.
+#![allow(clippy::mutable_key_type)]
+
 pub mod builtins;
 pub mod env;
 pub mod error;

@@ -1462,7 +1462,7 @@ fn raw_class_with_base_no_fields_synthesises_passthrough_init() {
         "fieldless `class!` with a base should synthesise a *args/**kwargs init; got:\n{out}",
     );
     assert!(
-        out.contains("super().__init__(*args, **kwargs)"),
+        out.contains("super(AppError, self).__init__(*args, **kwargs)"),
         "synthesised passthrough init must forward to super; got:\n{out}",
     );
 }

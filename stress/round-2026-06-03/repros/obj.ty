@@ -1,0 +1,8 @@
+def f(x: object) -> str:
+    return str(x)
+def main() -> None:
+    print(f(None))
+    print(f(42))
+    print(f("hi"))
+    let y: object = None
+    print(y)

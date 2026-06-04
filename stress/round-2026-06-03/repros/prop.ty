@@ -1,0 +1,11 @@
+class Temp:
+    celsius: float
+impl Temp:
+    @property
+    def fahrenheit(self) -> float:
+        return self.celsius * 9.0 / 5.0 + 32.0
+def main() -> None:
+    let t: Temp = Temp(celsius=100.0)
+    print(t.fahrenheit)
+if __name__ == "__main__":
+    main()

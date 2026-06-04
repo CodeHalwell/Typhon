@@ -2830,6 +2830,10 @@ fn builtin_names() -> std::collections::HashSet<&'static str> {
         // the resolver still sees references before that injection runs.
         "asyncio",
         "typhon_runtime",
+        // `enum` module — referenced by the desugared `enum Name:` form
+        // (`class Name(enum.Enum):` with members `= enum.auto()`) before the
+        // desugar pass injects `import enum`.
+        "enum",
         // Decorators that may appear without an import in user code.
         "pure",
         "memo",

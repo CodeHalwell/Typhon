@@ -1,0 +1,17 @@
+from itertools import chain, count, islice, accumulate, groupby, product, combinations
+from functools import reduce, partial
+def add(a: int, b: int) -> int: return a + b
+def main() -> None:
+    print(list(chain([1,2],[3,4])))
+    print(list(islice(count(10), 3)))
+    print(list(accumulate([1,2,3,4])))
+    print(reduce(add, [1,2,3,4], 0))
+    let inc = partial(add, 1)
+    print(inc(10))
+    print(list(product([1,2],["a","b"])))
+    print(list(combinations([1,2,3], 2)))
+    let data: list[tuple[str,int]] = [("a",1),("a",2),("b",3)]
+    for k, grp in groupby(data, key=lambda p: p[0]):
+        print(k, [p[1] for p in grp])
+if __name__ == "__main__":
+    main()

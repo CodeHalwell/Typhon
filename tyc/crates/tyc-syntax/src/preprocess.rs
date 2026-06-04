@@ -305,6 +305,15 @@ pub fn preprocess_opts(source: &str, opts: PreprocessOptions) -> PreprocessResul
     // zero we close the call by appending `)` to the current line.
     let mut freeze_let_depth: i32 = 0;
 
+    // ── `enum Name:` body tracking ────────────────────────────────────────
+    // When an `enum Name:` header is seen we record the header's indent. Every
+    // subsequent more-indented, non-blank line is treated as an enum member:
+    // a bare `MEMBER` (no `=`) is rewritten to `MEMBER = enum.auto()`, while
+    // `MEMBER = value` is left as-is. The body ends at the first non-blank line
+    // indented at or below the header. `import enum` injection is handled by
+    // the desugar pass, which detects the lowered `class Name(enum.Enum):`.
+    let mut enum_header_indent: Option<usize> = None;
+
     for (line_index, line) in source.split_inclusive('\n').enumerate() {
         // Keyword stripping only applies outside of string content.
         let line_after_keyword = if in_string.is_none() {
@@ -313,6 +322,51 @@ pub fn preprocess_opts(source: &str, opts: PreprocessOptions) -> PreprocessResul
                 .unwrap_or(line.len());
             let indent = &line[..indent_len];
             let rest = &line[indent_len..];
+
+            // ── enum body member rewriting ─────────────────────────────────
+            // If we are inside an `enum` body (header indent recorded) decide
+            // whether this line is a member, a blank line, or the line that
+            // closes the body. A blank line (indent_len == line.len()) neither
+            // closes the body nor is a member — emit it verbatim and continue.
+            if let Some(header_indent) = enum_header_indent {
+                let is_blank = rest.trim_end_matches(['\n', '\r']).is_empty();
+                if is_blank {
+                    python_source.push_str(line);
+                    continue;
+                }
+                if indent_len > header_indent {
+                    // Member line. Bare `MEMBER` → `MEMBER = enum.auto()`;
+                    // `MEMBER = value` and any non-member statement (e.g. a
+                    // docstring or `pass`) are left untouched.
+                    let body = rest.trim_end_matches(['\n', '\r']);
+                    let trailing = &rest[body.len()..];
+                    let is_bare_member = !body.contains('=')
+                        && !body.contains(':')
+                        && !body.contains('(')
+                        && body
+                            .chars()
+                            .next()
+                            .map(|c| c.is_ascii_alphabetic() || c == '_')
+                            .unwrap_or(false)
+                        && body.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+                    if is_bare_member {
+                        stripped.push(StrippedKeyword {
+                            line_index,
+                            keyword: TyphonKeyword::Enum,
+                        });
+                        python_source.push_str(indent);
+                        python_source.push_str(body);
+                        python_source.push_str(" = enum.auto()");
+                        python_source.push_str(trailing);
+                    } else {
+                        python_source.push_str(line);
+                    }
+                    continue;
+                }
+                // Dedented to/below the header — the enum body has ended.
+                enum_header_indent = None;
+                // Fall through so this line is processed normally.
+            }
 
             // ── `freeze let NAME[: T] = EXPR` → `let NAME[: T] = __typhon_freeze__(EXPR)` ─
             // Wraps the RHS in a runtime deep-freeze call. Module-level
@@ -677,6 +731,36 @@ pub fn preprocess_opts(source: &str, opts: PreprocessOptions) -> PreprocessResul
             if rest.starts_with("guard ") {
                 if let Some(rewritten) = expand_guard_one_liner(rest, indent, line_index) {
                     let (rewritten, marks) = rewrite_optionals(&rewritten, &mut in_string);
+                    for col in marks {
+                        optionals.push(StrippedOptional {
+                            line_index,
+                            python_col: col,
+                        });
+                    }
+                    python_source.push_str(&rewritten);
+                    continue;
+                }
+            }
+
+            // ── `enum ClassName:` → `class ClassName(enum.Enum):` ───────────
+            // The header is rewritten and the body indent recorded so the
+            // member-rewriting branch above can convert bare members into
+            // `MEMBER = enum.auto()`. `import enum` is injected by the build
+            // (via the synthesised marker import) when any enum is present.
+            if rest.starts_with("enum ")
+                && rest.len() > "enum ".len()
+                && (rest.as_bytes()["enum ".len()].is_ascii_alphanumeric()
+                    || rest.as_bytes()["enum ".len()] == b'_')
+            {
+                let after_enum = &rest["enum ".len()..]; // e.g. "Shape:\n"
+                if let Some(class_body) = make_enum_class_line(after_enum) {
+                    stripped.push(StrippedKeyword {
+                        line_index,
+                        keyword: TyphonKeyword::Enum,
+                    });
+                    enum_header_indent = Some(indent_len);
+                    let new_line = format!("{}class {}", indent, class_body);
+                    let (rewritten, marks) = rewrite_optionals(&new_line, &mut in_string);
                     for col in marks {
                         optionals.push(StrippedOptional {
                             line_index,
@@ -2282,6 +2366,42 @@ fn rewrite_unsafe_block_line(rest: &str) -> Option<String> {
 /// Rewrite the body of `lazy import X = expr` into a Python assignment that
 /// uses the typhon_runtime lazy-loader helper. Returns `None` if the import
 /// body doesn't match the supported shape.
+/// Build the class-header portion of an `enum` line, converting
+/// `ClassName:\n` (or `ClassName :\n`) into `ClassName(enum.Enum):\n`.
+///
+/// Returns `None` when the line doesn't look like a class header (no `:`).
+/// An explicit base list (`enum X(int):`) is preserved by appending
+/// `enum.Enum` — but the canonical form has no bases.
+fn make_enum_class_line(after_enum: &str) -> Option<String> {
+    let mut depth = 0i32;
+    let mut colon_pos = None;
+    for (i, c) in after_enum.char_indices() {
+        match c {
+            '(' | '[' => depth += 1,
+            ')' | ']' => depth -= 1,
+            ':' if depth == 0 => {
+                colon_pos = Some(i);
+                break;
+            }
+            _ => {}
+        }
+    }
+    let colon_pos = colon_pos?;
+    let name = after_enum[..colon_pos].trim_end();
+    let tail = &after_enum[colon_pos..]; // ":\n" or ":"
+    let new_name = if let Some(stripped) = name.strip_suffix(')') {
+        let trimmed = stripped.trim_end();
+        if trimmed.ends_with('(') {
+            format!("{trimmed}enum.Enum)")
+        } else {
+            format!("{trimmed}, enum.Enum)")
+        }
+    } else {
+        format!("{}(enum.Enum)", name)
+    };
+    Some(format!("{}{}", new_name, tail))
+}
+
 /// Build the class-header portion of a `model` line, converting
 /// `ClassName:\n` (or `ClassName :\n`) into `ClassName(BaseModel):\n`.
 ///
@@ -2544,6 +2664,28 @@ pub fn postprocess_full(
                     format!("model {}", tail)
                 } else {
                     format!("model {}", content)
+                };
+                lines[line_idx] = format!("{}{}", &line[..indent_len], restored);
+            }
+            TyphonKeyword::Enum => {
+                // Two shapes are recorded under `Enum`:
+                //   • the header `class Name(enum.Enum):` → `enum Name:`
+                //   • a member `MEMBER = enum.auto()` → `MEMBER`
+                let line = &lines[line_idx];
+                let indent_len = line
+                    .find(|c: char| !c.is_whitespace())
+                    .unwrap_or(line.len());
+                let content = &line[indent_len..];
+                let restored = if let Some(tail) = content.strip_prefix("class ") {
+                    let tail = tail
+                        .replacen("(enum.Enum)", "", 1)
+                        .replacen("(enum.Enum, ", "(", 1)
+                        .replacen(", enum.Enum)", ")", 1);
+                    format!("enum {}", tail)
+                } else if let Some(member) = content.strip_suffix(" = enum.auto()") {
+                    member.to_owned()
+                } else {
+                    content.to_owned()
                 };
                 lines[line_idx] = format!("{}{}", &line[..indent_len], restored);
             }
@@ -7314,6 +7456,67 @@ mod tests {
     #[test]
     fn model_keyword_round_trips_via_postprocess() {
         let src = "model User:\n    id: int\n";
+        let prep = preprocess(src);
+        let out = postprocess(&prep.python_source, &prep.stripped, &prep.optionals);
+        assert_eq!(out, src);
+    }
+
+    // ── enum keyword ────────────────────────────────────────────────────────
+
+    #[test]
+    fn enum_keyword_becomes_enum_class_and_autos_bare_members() {
+        let result = preprocess("enum Shape:\n    CIRCLE\n    SQUARE\n");
+        assert!(
+            result.python_source.contains("class Shape(enum.Enum):"),
+            "output: {}",
+            result.python_source
+        );
+        assert!(
+            result.python_source.contains("CIRCLE = enum.auto()"),
+            "bare member should get enum.auto(): {}",
+            result.python_source
+        );
+        assert!(
+            result.python_source.contains("SQUARE = enum.auto()"),
+            "bare member should get enum.auto(): {}",
+            result.python_source
+        );
+    }
+
+    #[test]
+    fn enum_keyword_preserves_explicit_values() {
+        let result = preprocess("enum Color:\n    RED = 1\n    GREEN = 2\n");
+        assert!(
+            result.python_source.contains("RED = 1"),
+            "explicit value preserved: {}",
+            result.python_source
+        );
+        assert!(
+            !result.python_source.contains("RED = enum.auto()"),
+            "explicit value must not be replaced: {}",
+            result.python_source
+        );
+    }
+
+    #[test]
+    fn enum_body_ends_at_dedent() {
+        // A bare module-level name after the enum body must NOT be rewritten.
+        let result = preprocess("enum Shape:\n    CIRCLE\nx = 1\n");
+        assert!(
+            result.python_source.contains("CIRCLE = enum.auto()"),
+            "output: {}",
+            result.python_source
+        );
+        assert!(
+            result.python_source.contains("\nx = 1"),
+            "post-enum line must be untouched: {}",
+            result.python_source
+        );
+    }
+
+    #[test]
+    fn enum_keyword_round_trips_via_postprocess() {
+        let src = "enum Color:\n    RED = 1\n    GREEN\n";
         let prep = preprocess(src);
         let out = postprocess(&prep.python_source, &prep.stripped, &prep.optionals);
         assert_eq!(out, src);
