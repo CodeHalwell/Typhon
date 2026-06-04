@@ -246,8 +246,8 @@
     },
 
     "class-declaration": {
-      "comment": "Matches every supported class form: bare `class Foo`, `pub class Foo`, `plain class Bag`, `class! MyModel` (raw / framework-base marker), `model ApiUser`, with optional `[T, U]` generics after the name and an optional trailing `frozen` modifier (`class P frozen:` -> dataclass(frozen=True)). Capture group 5 picks up the name; capture group 6 catches the `frozen` keyword.",
-      "begin": "\\b(?:(pub)\\s+)?(?:(plain)\\s+)?(class|model)(!)?\\s+([\\p{L}_][\\p{L}\\p{N}_]*)(?:\\s+(frozen))?",
+      "comment": "Matches every supported class form: bare `class Foo`, `pub class Foo`, `plain class Bag`, `class! MyModel` (raw / framework-base marker), `model ApiUser`, `enum Color` (v0.11.0 — sugars over `enum.Enum`), with optional `[T, U]` generics after the name and an optional trailing `frozen` modifier (`class P frozen:` -> dataclass(frozen=True)). Capture group 5 picks up the name; capture group 6 catches the `frozen` keyword. `!` and `frozen` are accepted by the regex but don't combine with `enum` in real source — the compiler rejects those forms.",
+      "begin": "\\b(?:(pub)\\s+)?(?:(plain)\\s+)?(class|model|enum)(!)?\\s+([\\p{L}_][\\p{L}\\p{N}_]*)(?:\\s+(frozen))?",
       "beginCaptures": {
         "1": { "name": "storage.modifier.pub.typhon" },
         "2": { "name": "storage.modifier.plain.typhon" },
@@ -473,7 +473,7 @@
         },
         {
           "name": "keyword.control.typhon.typhon",
-          "match": "\\b(impl|interface|model|extend|gather|go|guard|with)\\b"
+          "match": "\\b(impl|interface|model|enum|extend|gather|go|guard|with)\\b"
         }
       ]
     },
