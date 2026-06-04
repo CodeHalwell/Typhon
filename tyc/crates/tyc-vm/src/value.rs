@@ -68,10 +68,18 @@ pub enum HashKey {
 }
 
 /// Canonical, hashable projection of a dataclass instance: the class
-/// name and the fields sorted by name with each value lowered to a
-/// `HashKey`. Drives `Eq` / `Hash` / ordering for `HashKey::Instance`.
+/// identity, name, and the fields sorted by name with each value lowered
+/// to a `HashKey`. Drives `Eq` / `Hash` / ordering for `HashKey::Instance`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct InstanceKey {
+    /// Address of the class's single cached `Rc<Class>`, used as the
+    /// class *identity* for `Eq`/`Hash`. Two distinct classes that happen
+    /// to share a name have different addresses, so their instances never
+    /// collide as dict/set keys (CPython only treats same-class instances
+    /// as equal keys). Stable for the lifetime of the program — classes
+    /// are never dropped. NOT used by `canonical_sort_key`, which keys on
+    /// `class_name` to keep set/frozenset ordering deterministic.
+    pub class_id: usize,
     pub class_name: String,
     pub fields: Vec<(String, HashKey)>,
 }
@@ -634,6 +642,7 @@ impl Value {
                 // keys (the VM stores fields in an unordered HashMap).
                 fields.sort_by(|a, b| a.0.cmp(&b.0));
                 let key = InstanceKey {
+                    class_id: Rc::as_ptr(&inst.class) as usize,
                     class_name: inst.class.name.clone(),
                     fields,
                 };
@@ -702,12 +711,14 @@ impl Value {
             (Class(c), Native(n)) | (Native(n), Class(c)) => c.name == n.name,
             (Native(a), Native(b)) => Rc::ptr_eq(a, b),
             // Dataclass instances compare by value: same class and all
-            // fields equal (recursively). CPython's generated
-            // `__eq__` compares the field tuple only when the two
-            // operands are of the same class; otherwise it returns
-            // `NotImplemented` → `False`.
+            // fields equal (recursively). CPython's generated `__eq__`
+            // compares the field tuple only when the two operands are of
+            // the same class; otherwise it returns `NotImplemented` →
+            // `False`. Same-class is object identity (the single cached
+            // `Rc<Class>` per definition), NOT name equality — two distinct
+            // classes that share a name must not compare equal.
             (Instance(a), Instance(b)) => {
-                if !Rc::ptr_eq(&a.class, &b.class) && a.class.name != b.class.name {
+                if !Rc::ptr_eq(&a.class, &b.class) {
                     return false;
                 }
                 let fa = a.fields.borrow();
@@ -1358,6 +1369,25 @@ mod tests {
         let kb = b.to_hash_key().unwrap();
         assert_eq!(ka, kb);
         assert!(matches!(ka.into_value(), Value::Instance(_)));
+    }
+
+    #[test]
+    fn distinct_same_named_classes_do_not_collide() {
+        // Two separate `class P` definitions (distinct `Rc<Class>`) with
+        // identical fields must NOT compare equal nor share a dict/set key —
+        // class identity is the cached `Rc`, not the name.
+        let p1 = mk_class("P", &["x"]);
+        let p2 = mk_class("P", &["x"]);
+        let a = mk_instance(&p1, &[("x", Value::Int(1.into()))]);
+        let b = mk_instance(&p2, &[("x", Value::Int(1.into()))]);
+        // Value equality: different classes ⇒ not equal.
+        assert!(!a.py_eq(&b));
+        // Hash-key identity: different classes ⇒ distinct keys.
+        assert_ne!(a.to_hash_key().unwrap(), b.to_hash_key().unwrap());
+        // Same class, equal fields ⇒ still equal / same key (regression).
+        let a2 = mk_instance(&p1, &[("x", Value::Int(1.into()))]);
+        assert!(a.py_eq(&a2));
+        assert_eq!(a.to_hash_key().unwrap(), a2.to_hash_key().unwrap());
     }
 
     #[test]
