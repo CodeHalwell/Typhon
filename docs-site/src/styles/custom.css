@@ -121,6 +121,9 @@
   border-radius: 0.35rem;
   font-size: 0.9em;
   border: 1px solid transparent;
+  -webkit-box-decoration-break: clone;
+  box-decoration-break: clone;
+  overflow-wrap: break-word;
 }
 
 /* Tables read better with a softer divider */
