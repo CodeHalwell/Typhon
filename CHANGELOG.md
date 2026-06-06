@@ -113,6 +113,15 @@ mismatch, and interface conformance were all correctly rejected).
 - **A complex base raised to a non-negative integer power** is computed by
   repeated multiplication for an exact result (`(1j) ** 2` → `-1+0j`).
 
+### Fixed — VM exception args
+
+- **Builtin exceptions keep all constructor arguments.** `Value::Exception`
+  gained an `args` tuple, so `ValueError("a", "b", 3).args` is `('a', 'b',
+  3)` (was `('a',)`), `str(e)` of a multi-arg exception is the tuple form,
+  and the args survive through `raise` into an `except ... as e` handler.
+  `e.__cause__` / `e.__context__` read as `None` (exception chaining storage
+  is still a backlog item).
+
 ### Fixed — comptime operators
 
 - **`comptime` now supports `//`, `%`, and `**`** (floor-division, modulo,

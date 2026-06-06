@@ -1161,6 +1161,7 @@ pub fn install(interp: &mut Interpreter) {
             Ok(Value::Exception {
                 kind: Rc::new(n.clone()),
                 message: Rc::new(msg),
+                args: Rc::new(args),
             })
         });
         root.set(name, Value::Native(Rc::new(ctor)));

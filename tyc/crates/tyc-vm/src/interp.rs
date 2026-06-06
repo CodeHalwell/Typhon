@@ -3143,9 +3143,22 @@ impl Interpreter {
                 });
                 Ok(Value::Native(Rc::new(m)))
             }
-            Value::Exception { kind, message } => match attr {
-                "args" => Ok(Value::Tuple(Rc::new(vec![Value::Str(message.clone())]))),
+            Value::Exception {
+                kind,
+                message,
+                args,
+            } => match attr {
+                "args" => {
+                    if args.is_empty() && !message.is_empty() {
+                        Ok(Value::Tuple(Rc::new(vec![Value::Str(message.clone())])))
+                    } else {
+                        Ok(Value::Tuple(args.clone()))
+                    }
+                }
                 "kind" => Ok(Value::Str(kind.clone())),
+                // `__cause__` / `__context__` are not tracked yet; expose None
+                // so the common introspection (`e.__cause__ is None`) works.
+                "__cause__" | "__context__" => Ok(Value::None),
                 _ => Err(attribute_error(format!(
                     "'{}' has no attribute '{}'",
                     kind, attr
@@ -3829,10 +3842,11 @@ impl Interpreter {
                         // `e.code` / `e.message` work. Otherwise fall back
                         // to the bare `Value::Exception` summary.
                         let value = match &exc.value {
-                            Some(v @ Value::Instance(_)) => v.clone(),
+                            Some(v @ (Value::Instance(_) | Value::Exception { .. })) => v.clone(),
                             _ => Value::Exception {
                                 kind: Rc::new(exc.kind.clone()),
                                 message: Rc::new(exc.message.clone()),
+                                args: Rc::new(exc_fallback_args(&exc.message)),
                             },
                         };
                         if let Some(name) = &h.name {
@@ -3922,8 +3936,15 @@ impl Interpreter {
 
     fn value_to_exception(&self, v: Value) -> Unwind {
         match v {
-            Value::Exception { kind, message } => {
-                Unwind::Exception(VmException::new((*kind).clone(), (*message).clone()))
+            Value::Exception {
+                ref kind,
+                ref message,
+                ..
+            } => {
+                // Keep the full value (carrying `args`) attached so the
+                // handler can bind it and `e.args` survives.
+                let (k, m) = ((**kind).clone(), (**message).clone());
+                Unwind::Exception(VmException::new(k, m).with_value(v))
             }
             Value::Instance(i) => {
                 // Prefer `args` (Python convention), fall back to `message`,
@@ -3994,6 +4015,7 @@ impl Interpreter {
                             None => Value::Exception {
                                 kind: Rc::new(exc.kind.clone()),
                                 message: Rc::new(exc.message.clone()),
+                                args: Rc::new(exc_fallback_args(&exc.message)),
                             },
                         };
                         let etype = match &exc.value {
@@ -5048,6 +5070,16 @@ fn bind_result_combinator(receiver: Value, attr: &str) -> Value {
 /// match everything except the two bare base-only kinds handled by the
 /// caller. Returns false for unknown names (user exceptions go through the
 /// instance-MRO path instead).
+/// The `args` tuple for an exception reconstructed from a `VmException` that
+/// carries only a message string: a 1-tuple of the message, or empty.
+fn exc_fallback_args(message: &str) -> Vec<Value> {
+    if message.is_empty() {
+        Vec::new()
+    } else {
+        vec![Value::Str(Rc::new(message.to_owned()))]
+    }
+}
+
 fn builtin_exc_is_a(kind: &str, target: &str) -> bool {
     if target == "BaseException" {
         return true;

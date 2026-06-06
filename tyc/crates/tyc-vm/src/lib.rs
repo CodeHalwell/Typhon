@@ -782,6 +782,29 @@ if math.perm(5, 2) != 20:
     }
 
     #[test]
+    fn vm_exception_args() {
+        let src = r#"
+def main() -> None:
+    let e: ValueError = ValueError("a", "b", 3)
+    if str(e.args) != "('a', 'b', 3)":
+        raise ValueError("multi args wrong")
+    if str(e) != "('a', 'b', 3)":
+        raise ValueError("multi str wrong")
+    let e2: ValueError = ValueError("solo")
+    if str(e2.args) != "('solo',)" or str(e2) != "solo":
+        raise ValueError("single arg wrong")
+    try:
+        raise TypeError("x", "y")
+    except TypeError as ex:
+        if str(ex.args) != "('x', 'y')" or ex.__cause__ is not None:
+            raise ValueError("handler args wrong")
+
+main()
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    #[test]
     fn vm_property_setter_and_dir() {
         let src = r#"
 class Temp:

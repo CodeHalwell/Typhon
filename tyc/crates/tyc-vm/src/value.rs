@@ -287,9 +287,13 @@ pub enum Value {
     /// A module — a namespace dictionary.
     Module(Rc<Module>),
     /// An exception instance — held when a Python-style `except X as e` binds it.
+    /// `message` is the str-form of the first arg (kept for cheap display);
+    /// `args` is the full constructor argument tuple so `e.args` and the
+    /// multi-arg `str(e)` / `repr(e)` forms match CPython.
     Exception {
         kind: RcStr,
         message: RcStr,
+        args: Rc<Vec<Value>>,
     },
     /// Iterator state — opaque to the AST walker; consumed by `next`.
     Iter(Rc<RefCell<IterState>>),
@@ -495,11 +499,16 @@ impl fmt::Debug for Value {
             Value::ResultOk(v) => write!(f, "Ok(value={:?})", v),
             Value::ResultErr(v) => write!(f, "Err(error={:?})", v),
             Value::Module(m) => write!(f, "<module {}>", m.name),
-            Value::Exception { kind, message } => {
-                if message.is_empty() {
-                    write!(f, "{kind}()")
+            Value::Exception { kind, message, args } => {
+                if args.is_empty() {
+                    if message.is_empty() {
+                        write!(f, "{kind}()")
+                    } else {
+                        write!(f, "{kind}({:?})", message.as_str())
+                    }
                 } else {
-                    write!(f, "{kind}({:?})", message.as_str())
+                    let parts: Vec<String> = args.iter().map(|a| a.py_repr()).collect();
+                    write!(f, "{kind}({})", parts.join(", "))
                 }
             }
             Value::Iter(_) => write!(f, "<iterator>"),
@@ -976,13 +985,21 @@ impl Value {
             Value::ResultOk(v) => format!("Ok(value={})", v.py_repr()),
             Value::ResultErr(v) => format!("Err(error={})", v.py_repr()),
             Value::Module(m) => format!("<module '{}'>", m.name),
-            Value::Exception { kind, message } => {
-                if message.is_empty() {
-                    format!("{kind}()")
-                } else {
-                    (**message).clone()
+            Value::Exception { kind, message, args } => match args.len() {
+                // `str(ValueError("a", "b"))` is the tuple `('a', 'b')`.
+                n if n >= 2 => {
+                    let parts: Vec<String> = args.iter().map(|a| a.py_repr()).collect();
+                    format!("({})", parts.join(", "))
                 }
-            }
+                1 => args[0].py_str(),
+                _ => {
+                    if message.is_empty() {
+                        format!("{kind}()")
+                    } else {
+                        (**message).clone()
+                    }
+                }
+            },
             Value::Iter(_) => "<iterator>".into(),
             Value::DictView { kind, items } => {
                 let prefix = match kind {
