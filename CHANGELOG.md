@@ -72,18 +72,45 @@ mismatch, and interface conformance were all correctly rejected).
   which CPython rejects as a `SyntaxError` (`255.` parses as a float).
   Applies to attribute access and subscript.
 
+### Fixed — third stress round (`re` module + container repr)
+
+- **`re.sub` / `Pattern.sub` honour a callable replacement.** The VM
+  previously stringified the function (`<function repl>`) instead of
+  calling it per match. Callable replacements now receive a real Match
+  object and their return value is substituted.
+- **`re.sub` replacement templates use Python syntax.** `\1`…`\9`,
+  `\g<name>`, `\g<N>`, and `\\` are expanded against the captures (the VM
+  previously passed the template through Rust's `$1` engine, so `\g<name>`
+  came out literally).
+- **`re.split` with a capturing group includes the captured text**
+  (`re.split(r"(\d)", "a1b2")` → `['a', '1', 'b', '2', '']`), matching
+  CPython.
+- **`Match.group("name")` and `Match.groupdict()`** resolve named groups
+  (the VM previously `int()`-cast every group argument and crashed on a
+  name).
+- **`re.finditer` / `Pattern.finditer` and `re.subn` / `Pattern.subn`**
+  added.
+- **`count` / `maxsplit` arguments** on `re.sub` / `re.split` are honoured.
+- **Container elements dispatch user `__repr__` / `__str__`.** Objects with
+  a custom `__repr__` inside a list/tuple/set/frozenset/dict now render via
+  that method (`[<1>, <2>]`) instead of the default dataclass repr. Enum
+  members (`[<Color.RED: 1>]`), `Ok`/`Err`, frozensets-of-frozensets, and
+  mappingproxy frozen dicts all render correctly; a depth cap guards
+  self-referential containers.
+
 ### Known gaps documented (not yet fixed)
 
 - `@contextmanager` generators used as `with` context managers still raise
   `NotImplementedError` under `tyc run` (the tree-walking VM materialises
   generators eagerly). Use `tyc build` + CPython.
-- The VM's seeded `random` does not reproduce CPython's Mersenne Twister,
-  so seeded programs diverge between `tyc run` and `tyc build`.
+- The VM's seeded `random` does not reproduce CPython's Mersenne Twister.
 - `set`/`dict` keying still uses a structural hash key rather than a user
-  `__hash__`/`__eq__` (only the `hash()` builtin and `!=` were fixed this
-  round); `re` callable/`\g<name>` replacements, capturing-group `re.split`,
-  Counter/defaultdict/OrderedDict repr, and `Path.parent` returning a
-  `Path` remain on the backlog.
+  `__hash__`/`__eq__` (the `hash()` builtin and `!=` were fixed; the keying
+  path is deeper). Regex backreferences-in-pattern (`(\w+) \1`) and
+  lookaround remain unsupported by the underlying finite-automaton engine.
+  Counter/defaultdict/OrderedDict repr, `Path.parent` returning a `Path`,
+  `float.hex()`, and `decimal`/`fractions`/`statistics` modules remain on
+  the backlog.
 - The generic-class constructor soundness hole (`let b: Box[int] =
   Box("hello")` not type-checked) remains open in `tyc-types`.
 

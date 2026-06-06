@@ -2475,6 +2475,147 @@ fn make_re_module() -> Value {
         regex::Regex::new(&to_rust_pattern(p))
             .map_err(|e| value_error(format!("invalid regex: {e}")))
     }
+    // name -> group index for a compiled pattern's named groups.
+    fn name_indices(re: &regex::Regex) -> HashMap<String, usize> {
+        let mut m = HashMap::new();
+        for (i, n) in re.capture_names().enumerate() {
+            if let Some(n) = n {
+                m.insert(n.to_owned(), i);
+            }
+        }
+        m
+    }
+    // Expand a Python replacement template (`\1`, `\g<name>`, `\g<N>`, `\\`,
+    // `\n`/`\t`/`\r`) against a captures.
+    fn expand_template(
+        tpl: &str,
+        caps: &regex::Captures,
+        names: &HashMap<String, usize>,
+    ) -> String {
+        let ch: Vec<char> = tpl.chars().collect();
+        let mut out = String::new();
+        let mut i = 0;
+        while i < ch.len() {
+            if ch[i] == '\\' && i + 1 < ch.len() {
+                let n = ch[i + 1];
+                if n.is_ascii_digit() {
+                    let mut j = i + 1;
+                    let mut num = String::new();
+                    while j < ch.len() && ch[j].is_ascii_digit() && num.len() < 2 {
+                        num.push(ch[j]);
+                        j += 1;
+                    }
+                    if let Ok(idx) = num.parse::<usize>() {
+                        if let Some(m) = caps.get(idx) {
+                            out.push_str(m.as_str());
+                        }
+                    }
+                    i = j;
+                    continue;
+                } else if n == 'g' && i + 2 < ch.len() && ch[i + 2] == '<' {
+                    let mut j = i + 3;
+                    let mut nm = String::new();
+                    while j < ch.len() && ch[j] != '>' {
+                        nm.push(ch[j]);
+                        j += 1;
+                    }
+                    if j < ch.len() {
+                        j += 1; // consume '>'
+                    }
+                    let idx = nm.parse::<usize>().ok().or_else(|| names.get(&nm).copied());
+                    if let Some(idx) = idx {
+                        if let Some(m) = caps.get(idx) {
+                            out.push_str(m.as_str());
+                        }
+                    }
+                    i = j;
+                    continue;
+                } else if n == '\\' {
+                    out.push('\\');
+                    i += 2;
+                    continue;
+                } else if n == 'n' {
+                    out.push('\n');
+                    i += 2;
+                    continue;
+                } else if n == 't' {
+                    out.push('\t');
+                    i += 2;
+                    continue;
+                } else if n == 'r' {
+                    out.push('\r');
+                    i += 2;
+                    continue;
+                }
+            }
+            out.push(ch[i]);
+            i += 1;
+        }
+        out
+    }
+    // `re.sub` honouring a callable replacement (called with each Match) or a
+    // Python-syntax template string. `count == 0` means replace all.
+    fn re_sub_apply(
+        interp: &mut crate::interp::Interpreter,
+        re: &regex::Regex,
+        repl: &Value,
+        s: &str,
+        count: usize,
+    ) -> Result<(String, usize), Unwind> {
+        let names = name_indices(re);
+        let callable = matches!(
+            repl,
+            Value::Function(_) | Value::Native(_) | Value::BoundMethod { .. } | Value::Class(_)
+        );
+        let mut out = String::new();
+        let mut last = 0usize;
+        let mut n = 0usize;
+        for caps in re.captures_iter(s) {
+            if count != 0 && n >= count {
+                break;
+            }
+            let m0 = caps.get(0).unwrap();
+            let (ms, me) = (m0.start(), m0.end());
+            out.push_str(&s[last..ms]);
+            if callable {
+                let mv = captures_to_value(Some(caps), &names);
+                let r = interp.call_value(repl.clone(), vec![mv], &[])?;
+                out.push_str(&r.py_str());
+            } else {
+                let tpl = repl.py_str();
+                out.push_str(&expand_template(&tpl, &caps, &names));
+            }
+            last = me;
+            n += 1;
+        }
+        out.push_str(&s[last..]);
+        Ok((out, n))
+    }
+    // `re.split` — includes captured groups between splits (CPython semantics).
+    // `maxsplit == 0` means unlimited.
+    fn re_split_apply(re: &regex::Regex, s: &str, maxsplit: usize) -> Vec<Value> {
+        let ngroups = re.captures_len().saturating_sub(1);
+        let mut out: Vec<Value> = Vec::new();
+        let mut last = 0usize;
+        let mut n = 0usize;
+        for caps in re.captures_iter(s) {
+            if maxsplit != 0 && n >= maxsplit {
+                break;
+            }
+            let m0 = caps.get(0).unwrap();
+            out.push(Value::Str(Rc::new(s[last..m0.start()].to_owned())));
+            for gi in 1..=ngroups {
+                match caps.get(gi) {
+                    Some(m) => out.push(Value::Str(Rc::new(m.as_str().to_owned()))),
+                    None => out.push(Value::None),
+                }
+            }
+            last = m0.end();
+            n += 1;
+        }
+        out.push(Value::Str(Rc::new(s[last..].to_owned())));
+        out
+    }
     // A Pattern object holding a compiled regex plus a thin method table
     // so `pattern.match(s)` etc. work.
     fn pattern_value(p: regex::Regex) -> Value {
@@ -2486,7 +2627,7 @@ fn make_re_module() -> Value {
             Value::Native(Rc::new(NativeFn::new("match", move |_i, args| {
                 let s = single(&args, "match")?.py_str();
                 let caps = p1.captures(&s).filter(|c| c.get(0).unwrap().start() == 0);
-                Ok(captures_to_value(caps))
+                Ok(captures_to_value(caps, &name_indices(&p1)))
             }))),
         );
         let p2 = p_rc.clone();
@@ -2494,7 +2635,20 @@ fn make_re_module() -> Value {
             "search".into(),
             Value::Native(Rc::new(NativeFn::new("search", move |_i, args| {
                 let s = single(&args, "search")?.py_str();
-                Ok(captures_to_value(p2.captures(&s)))
+                Ok(captures_to_value(p2.captures(&s), &name_indices(&p2)))
+            }))),
+        );
+        let p2f = p_rc.clone();
+        attrs.insert(
+            "finditer".into(),
+            Value::Native(Rc::new(NativeFn::new("finditer", move |_i, args| {
+                let s = single(&args, "finditer")?.py_str();
+                let names = name_indices(&p2f);
+                let out: Vec<Value> = p2f
+                    .captures_iter(&s)
+                    .map(|c| captures_to_value(Some(c), &names))
+                    .collect();
+                Ok(Value::List(Rc::new(RefCell::new(out))))
             }))),
         );
         let p3 = p_rc.clone();
@@ -2512,16 +2666,40 @@ fn make_re_module() -> Value {
         let p4 = p_rc.clone();
         attrs.insert(
             "sub".into(),
-            Value::Native(Rc::new(NativeFn::new("sub", move |_i, args| {
+            Value::Native(Rc::new(NativeFn::new("sub", move |i, args| {
                 let repl = args
                     .first()
                     .ok_or_else(|| type_error("sub() needs replacement"))?
-                    .py_str();
+                    .clone();
                 let s = args
                     .get(1)
                     .ok_or_else(|| type_error("sub() needs string"))?
                     .py_str();
-                Ok(Value::Str(Rc::new(p4.replace_all(&s, repl).into_owned())))
+                let count = match args.get(2) {
+                    Some(c) if !matches!(c, Value::None) => c.to_int()?.max(0) as usize,
+                    _ => 0,
+                };
+                let (out, _) = re_sub_apply(i, &p4, &repl, &s, count)?;
+                Ok(Value::Str(Rc::new(out)))
+            }))),
+        );
+        let p4n = p_rc.clone();
+        attrs.insert(
+            "subn".into(),
+            Value::Native(Rc::new(NativeFn::new("subn", move |i, args| {
+                let repl = args
+                    .first()
+                    .ok_or_else(|| type_error("subn() needs replacement"))?
+                    .clone();
+                let s = args
+                    .get(1)
+                    .ok_or_else(|| type_error("subn() needs string"))?
+                    .py_str();
+                let (out, n) = re_sub_apply(i, &p4n, &repl, &s, 0)?;
+                Ok(Value::Tuple(Rc::new(vec![
+                    Value::Str(Rc::new(out)),
+                    Value::Int(num_bigint::BigInt::from(n as i64)),
+                ])))
             }))),
         );
         let p5 = p_rc.clone();
@@ -2529,11 +2707,7 @@ fn make_re_module() -> Value {
             "split".into(),
             Value::Native(Rc::new(NativeFn::new("split", move |_i, args| {
                 let s = single(&args, "split")?.py_str();
-                let parts: Vec<Value> = p5
-                    .split(&s)
-                    .map(|p| Value::Str(Rc::new(p.to_owned())))
-                    .collect();
-                Ok(Value::List(Rc::new(RefCell::new(parts))))
+                Ok(Value::List(Rc::new(RefCell::new(re_split_apply(&p5, &s, 0)))))
             }))),
         );
         // Wrap the attrs in a Class-shaped value with an Instance.
@@ -2556,7 +2730,7 @@ fn make_re_module() -> Value {
     // Build a match object from a `regex::Captures`. Group 0 is the whole
     // match; groups 1.. are the capture groups. Non-participating optional
     // groups are represented as `None`.
-    fn captures_to_value(caps: Option<regex::Captures<'_>>) -> Value {
+    fn captures_to_value(caps: Option<regex::Captures<'_>>, names: &HashMap<String, usize>) -> Value {
         let Some(caps) = caps else { return Value::None };
         let whole = caps.get(0).expect("group 0 always present");
         let start = whole.start() as i64;
@@ -2565,12 +2739,25 @@ fn make_re_module() -> Value {
         let group_texts: Vec<Option<String>> = (0..caps.len())
             .map(|i| caps.get(i).map(|m| m.as_str().to_owned()))
             .collect();
+        let names = names.clone();
         let mut attrs: HashMap<String, Value> = HashMap::new();
-        // `.group()`/`.group(n)`/`.group(a, b, ...)`.
+        // `.group()`/`.group(n)`/`.group("name")`/`.group(a, b, ...)`.
         let gt = group_texts.clone();
+        let names_g = names.clone();
         attrs.insert(
             "group".into(),
             Value::Native(Rc::new(NativeFn::new("group", move |_i, args| {
+                // Resolve an int index or a string group name.
+                let resolve = |a: &Value| -> Result<usize, Unwind> {
+                    if let Value::Str(s) = a {
+                        names_g
+                            .get(s.as_str())
+                            .copied()
+                            .ok_or_else(|| index_error(format!("no such group: '{}'", s)))
+                    } else {
+                        Ok(a.to_int()? as usize)
+                    }
+                };
                 let pick = |idx: usize| -> Result<Value, Unwind> {
                     match gt.get(idx) {
                         None => Err(index_error("no such group")),
@@ -2582,13 +2769,30 @@ fn make_re_module() -> Value {
                     return pick(0);
                 }
                 if args.len() == 1 {
-                    return pick(args[0].to_int()? as usize);
+                    return pick(resolve(&args[0])?);
                 }
                 let mut out = Vec::with_capacity(args.len());
                 for a in &args {
-                    out.push(pick(a.to_int()? as usize)?);
+                    out.push(pick(resolve(a)?)?);
                 }
                 Ok(Value::Tuple(Rc::new(out)))
+            }))),
+        );
+        // `.groupdict()` — {name: text} for every named group.
+        let gt_d = group_texts.clone();
+        let names_d = names.clone();
+        attrs.insert(
+            "groupdict".into(),
+            Value::Native(Rc::new(NativeFn::new("groupdict", move |_i, _args| {
+                let mut d: DictMap = IndexMap::new();
+                for (name, idx) in &names_d {
+                    let v = match gt_d.get(*idx) {
+                        Some(Some(s)) => Value::Str(Rc::new(s.clone())),
+                        _ => Value::None,
+                    };
+                    d.insert(HashKey::Str(Rc::new(name.clone())), v);
+                }
+                Ok(Value::Dict(Rc::new(RefCell::new(d))))
             }))),
         );
         // `.groups()` returns groups 1.. (not group 0).
@@ -2671,7 +2875,8 @@ fn make_re_module() -> Value {
                     // returns the leftmost match anywhere, so anchor by
                     // requiring `start() == 0`.
                     let caps = r.captures(&s).filter(|c| c.get(0).unwrap().start() == 0);
-                    Ok(captures_to_value(caps))
+                    let names = name_indices(&r);
+                    Ok(captures_to_value(caps, &names))
                 }),
             ),
             (
@@ -2686,7 +2891,8 @@ fn make_re_module() -> Value {
                         .ok_or_else(|| type_error("search() needs string"))?
                         .py_str();
                     let r = compile_one(&p)?;
-                    Ok(captures_to_value(r.captures(&s)))
+                    let names = name_indices(&r);
+                    Ok(captures_to_value(r.captures(&s), &names))
                 }),
             ),
             (
@@ -2702,12 +2908,13 @@ fn make_re_module() -> Value {
                         .py_str();
                     let anchored = format!("^(?:{p})$");
                     let r = compile_one(&anchored)?;
-                    Ok(captures_to_value(r.captures(&s)))
+                    let names = name_indices(&r);
+                    Ok(captures_to_value(r.captures(&s), &names))
                 }),
             ),
             (
                 "sub",
-                nf("sub", move |_i, args| {
+                nf("sub", move |i, args| {
                     let p = args
                         .first()
                         .ok_or_else(|| type_error("sub() needs pattern"))?
@@ -2715,13 +2922,61 @@ fn make_re_module() -> Value {
                     let repl = args
                         .get(1)
                         .ok_or_else(|| type_error("sub() needs replacement"))?
-                        .py_str();
+                        .clone();
                     let s = args
                         .get(2)
                         .ok_or_else(|| type_error("sub() needs string"))?
                         .py_str();
+                    let count = match args.get(3) {
+                        Some(c) if !matches!(c, Value::None) => c.to_int()?.max(0) as usize,
+                        _ => 0,
+                    };
                     let r = compile_one(&p)?;
-                    Ok(Value::Str(Rc::new(r.replace_all(&s, repl).into_owned())))
+                    let (out, _) = re_sub_apply(i, &r, &repl, &s, count)?;
+                    Ok(Value::Str(Rc::new(out)))
+                }),
+            ),
+            (
+                "subn",
+                nf("subn", move |i, args| {
+                    let p = args
+                        .first()
+                        .ok_or_else(|| type_error("subn() needs pattern"))?
+                        .py_str();
+                    let repl = args
+                        .get(1)
+                        .ok_or_else(|| type_error("subn() needs replacement"))?
+                        .clone();
+                    let s = args
+                        .get(2)
+                        .ok_or_else(|| type_error("subn() needs string"))?
+                        .py_str();
+                    let r = compile_one(&p)?;
+                    let (out, n) = re_sub_apply(i, &r, &repl, &s, 0)?;
+                    Ok(Value::Tuple(Rc::new(vec![
+                        Value::Str(Rc::new(out)),
+                        Value::Int(num_bigint::BigInt::from(n as i64)),
+                    ])))
+                }),
+            ),
+            (
+                "finditer",
+                nf("finditer", move |_i, args| {
+                    let p = args
+                        .first()
+                        .ok_or_else(|| type_error("finditer() needs pattern"))?
+                        .py_str();
+                    let s = args
+                        .get(1)
+                        .ok_or_else(|| type_error("finditer() needs string"))?
+                        .py_str();
+                    let r = compile_one(&p)?;
+                    let names = name_indices(&r);
+                    let out: Vec<Value> = r
+                        .captures_iter(&s)
+                        .map(|c| captures_to_value(Some(c), &names))
+                        .collect();
+                    Ok(Value::List(Rc::new(RefCell::new(out))))
                 }),
             ),
             (
@@ -2754,12 +3009,14 @@ fn make_re_module() -> Value {
                         .get(1)
                         .ok_or_else(|| type_error("split() needs string"))?
                         .py_str();
+                    let maxsplit = match args.get(2) {
+                        Some(c) if !matches!(c, Value::None) => c.to_int()?.max(0) as usize,
+                        _ => 0,
+                    };
                     let r = compile_one(&p)?;
-                    let parts: Vec<Value> = r
-                        .split(&s)
-                        .map(|p| Value::Str(Rc::new(p.to_owned())))
-                        .collect();
-                    Ok(Value::List(Rc::new(RefCell::new(parts))))
+                    Ok(Value::List(Rc::new(RefCell::new(re_split_apply(
+                        &r, &s, maxsplit,
+                    )))))
                 }),
             ),
             (

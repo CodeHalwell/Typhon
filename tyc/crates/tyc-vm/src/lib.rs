@@ -758,6 +758,42 @@ if math.perm(5, 2) != 20:
     }
 
     #[test]
+    fn re_module_parity_fixes() {
+        // Stress-round `re` findings: callable sub, Python backref templates,
+        // capturing-group split, named group access, finditer, subn.
+        let src = r#"
+import re
+
+def dbl(mo: re.Match[str]) -> str:
+    return str(int(mo.group(0)) * 2)
+
+def main() -> None:
+    if re.sub(r"\d", dbl, "1 2 3") != "2 4 6":
+        raise ValueError("callable sub wrong")
+    if re.split(r"(\d)", "a1b2") != ["a", "1", "b", "2", ""]:
+        raise ValueError("capturing split wrong")
+    if re.sub(r"(?P<w>\w+)@(?P<d>\w+)", r"\g<d>:\g<w>", "u@h") != "h:u":
+        raise ValueError("named backref wrong")
+    if re.sub(r"(\w+) (\w+)", r"\2 \1", "hello world") != "world hello":
+        raise ValueError("numbered backref wrong")
+    let m: re.Match[str]? = re.search(r"(?P<y>\d{4})-(?P<m>\d{2})", "2024-06")
+    if m is None:
+        raise ValueError("search failed")
+    if m.group("y") != "2024" or m.group("m") != "06":
+        raise ValueError("named group wrong")
+    if re.subn(r"o", "0", "foo")[1] != 2:
+        raise ValueError("subn count wrong")
+    if [mo.group(0) for mo in re.finditer(r"\d+", "a12b3")] != ["12", "3"]:
+        raise ValueError("finditer wrong")
+    if re.sub(r"a", "X", "aaaa", 2) != "XXaa":
+        raise ValueError("sub count wrong")
+
+main()
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    #[test]
     fn stress_round_two_vm_parity_fixes() {
         // Second adversarial stress round (sub-agent findings):
         //   * enum repr `<Name.MEMBER: value>` + value/name lookup
@@ -855,6 +891,79 @@ def main() -> None:
 
     if f"{42:.2f}" != "42.00" or f"{1000000:e}" != "1.000000e+06":
         raise ValueError("int operand float-format ignored")
+
+main()
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    #[test]
+    fn container_elements_dispatch_user_repr() {
+        // Regression: an object with a custom `__repr__` that is an ELEMENT of
+        // a list / tuple / set / dict (key or value) must be rendered via the
+        // user dunder, not the default dataclass repr. Enum members in a
+        // container keep the CPython `<Class.NAME: value>` form, and Result
+        // Ok/Err values keep their `Ok(value=...)` shape.
+        let src = r#"
+from typhon_runtime import Ok, Err
+
+class Pt:
+    x: int
+
+impl Pt:
+    def __repr__(self) -> str:
+        return f"<{self.x}>"
+
+class FP frozen:
+    n: int
+
+impl FP:
+    def __repr__(self) -> str:
+        return f"FP[{self.n}]"
+
+class Plain:
+    a: int
+
+enum Color:
+    RED
+    GREEN
+
+def main() -> None:
+    if repr([Pt(1), Pt(2)]) != "[<1>, <2>]":
+        raise ValueError("list element repr")
+    if repr((Pt(1),)) != "(<1>,)":
+        raise ValueError("single-tuple element repr")
+    if repr((Pt(1), Pt(2))) != "(<1>, <2>)":
+        raise ValueError("tuple element repr")
+    if repr({"k": Pt(1)}) != "{'k': <1>}":
+        raise ValueError("dict value repr")
+    if repr({FP(1), FP(2)}) not in ("{FP[1], FP[2]}", "{FP[2], FP[1]}"):
+        raise ValueError("set element repr")
+    if repr({FP(9): Pt(1)}) != "{FP[9]: <1>}":
+        raise ValueError("instance dict-key repr")
+    # str() of a container renders elements via repr()
+    if str([Pt(1)]) != "[<1>]":
+        raise ValueError("str of list uses element repr")
+    # nested
+    if repr([[Pt(1)], [Pt(2)]]) != "[[<1>], [<2>]]":
+        raise ValueError("nested list repr")
+    # enum members keep the CPython <Class.NAME: value> form
+    if repr([Color.RED, Color.GREEN]) != "[<Color.RED: 1>, <Color.GREEN: 2>]":
+        raise ValueError("enum member in list repr")
+    # Result values keep the dataclass shape
+    if repr([Ok(1), Err("x")]) != "[Ok(value=1), Err(error='x')]":
+        raise ValueError("Result in list repr")
+    # plain dataclass without custom repr matches CPython default
+    if repr([Plain(a=1)]) != "[Plain(a=1)]":
+        raise ValueError("plain dataclass in list repr")
+    # empty containers
+    if repr([]) != "[]" or repr(()) != "()" or repr({}) != "{}":
+        raise ValueError("empty container repr")
+    if repr(set()) != "set()":
+        raise ValueError("empty set repr")
+    # strings as elements are quoted via repr
+    if repr(["a"]) != "['a']":
+        raise ValueError("string element quoting")
 
 main()
 "#;

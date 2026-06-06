@@ -2067,9 +2067,16 @@ impl Interpreter {
     }
 
     /// `str(v)` honouring a user `__str__` (then `__repr__`) on instances.
+    ///
+    /// For containers, Python's `str()` renders elements via `repr()`, so a
+    /// container delegates to `repr_of` (which recurses through user dunders
+    /// on each element). Scalars keep their dedicated `__str__` path.
     pub fn str_of(&mut self, v: &Value) -> Result<String, Unwind> {
         if let Some(s) = self.enum_member_repr(v) {
             return Ok(s);
+        }
+        if Self::is_container(v) {
+            return self.repr_of(v);
         }
         if let Some(r) = self.call_dunder0(v, "__str__")? {
             return require_str_return(r, "__str__");
@@ -2084,10 +2091,160 @@ impl Interpreter {
     /// flow through to `py_repr` → `instance_repr`, which renders the
     /// CPython `<Class.NAME: value>` form.
     pub fn repr_of(&mut self, v: &Value) -> Result<String, Unwind> {
-        if let Some(r) = self.call_dunder0(v, "__repr__")? {
-            return require_str_return(r, "__repr__");
+        self.repr_of_depth(v, 0)
+    }
+
+    /// Whether a value is a container whose elements must be rendered through
+    /// the interpreter so user `__repr__` / `__str__` dunders dispatch.
+    fn is_container(v: &Value) -> bool {
+        matches!(
+            v,
+            Value::List(_) | Value::Tuple(_) | Value::Dict(_) | Value::Set(_)
+        )
+    }
+
+    /// `repr(v)` with a recursion-depth guard. Containers render each element
+    /// via `repr_of` (so user `__repr__` dunders dispatch on elements), with
+    /// EXACT CPython formatting replicated from `Value::py_str`. Scalars and
+    /// every other `Value` kind delegate to the existing dunder / `py_repr`
+    /// path unchanged. The depth cap falls back to `[...]` (CPython prints
+    /// the same for direct self-reference) so self-referential containers
+    /// don't blow the stack.
+    fn repr_of_depth(&mut self, v: &Value, depth: usize) -> Result<String, Unwind> {
+        const MAX_REPR_DEPTH: usize = 100;
+        if depth >= MAX_REPR_DEPTH {
+            return Ok("[...]".to_string());
         }
-        Ok(v.py_repr())
+        match v {
+            Value::List(l) => {
+                // Clone the element handles out before recursing so the
+                // RefCell borrow isn't held across `repr_of` calls (which
+                // may themselves touch the same list, e.g. self-reference).
+                let items: Vec<Value> = l.borrow().iter().cloned().collect();
+                let mut s = String::from("[");
+                for (i, elem) in items.iter().enumerate() {
+                    if i > 0 {
+                        s.push_str(", ");
+                    }
+                    s.push_str(&self.repr_of_depth(elem, depth + 1)?);
+                }
+                s.push(']');
+                Ok(s)
+            }
+            Value::Tuple(t) => {
+                let items: Vec<Value> = t.iter().cloned().collect();
+                let mut s = String::from("(");
+                for (i, elem) in items.iter().enumerate() {
+                    if i > 0 {
+                        s.push_str(", ");
+                    }
+                    s.push_str(&self.repr_of_depth(elem, depth + 1)?);
+                }
+                if items.len() == 1 {
+                    s.push(',');
+                }
+                s.push(')');
+                Ok(s)
+            }
+            Value::Dict(d) => {
+                let frozen_key = HashKey::Str(Rc::new("__typhon_frozen__".to_owned()));
+                let is_frozen =
+                    matches!(d.borrow().get(&frozen_key), Some(Value::Bool(true)));
+                // Snapshot (key, value) pairs, filtering the synthetic
+                // `__typhon_frozen__` sentinel, before recursing.
+                let pairs: Vec<(HashKey, Value)> = d
+                    .borrow()
+                    .iter()
+                    .filter(|(k, _)| {
+                        !matches!(k, HashKey::Str(name) if name.as_str() == "__typhon_frozen__")
+                    })
+                    .map(|(k, val)| (k.clone(), val.clone()))
+                    .collect();
+                let mut s = String::new();
+                if is_frozen {
+                    s.push_str("mappingproxy({");
+                } else {
+                    s.push('{');
+                }
+                for (i, (k, val)) in pairs.iter().enumerate() {
+                    if i > 0 {
+                        s.push_str(", ");
+                    }
+                    s.push_str(&self.repr_hashkey(k, depth + 1)?);
+                    s.push_str(": ");
+                    s.push_str(&self.repr_of_depth(val, depth + 1)?);
+                }
+                if is_frozen {
+                    s.push_str("})");
+                } else {
+                    s.push('}');
+                }
+                Ok(s)
+            }
+            Value::Set(set) => {
+                let frozen_key = HashKey::Str(Rc::new("__typhon_frozen__".to_owned()));
+                let is_frozen = set.borrow().contains(&frozen_key);
+                // Match `Value::py_str`'s ordering EXACTLY: sort by the
+                // collision-safe `canonical_sort_key` so the repr is stable
+                // and matches CPython for all-numeric / all-string cases.
+                let mut keys: Vec<HashKey> = set
+                    .borrow()
+                    .iter()
+                    .filter(|k| **k != frozen_key)
+                    .cloned()
+                    .collect();
+                keys.sort_by_key(|k| k.canonical_sort_key());
+                if keys.is_empty() {
+                    return Ok(if is_frozen {
+                        "frozenset()".to_string()
+                    } else {
+                        "set()".to_string()
+                    });
+                }
+                let mut parts: Vec<String> = Vec::with_capacity(keys.len());
+                for k in &keys {
+                    parts.push(self.repr_hashkey(k, depth + 1)?);
+                }
+                let body = parts.join(", ");
+                Ok(if is_frozen {
+                    format!("frozenset({{{body}}})")
+                } else {
+                    format!("{{{body}}}")
+                })
+            }
+            // Scalars, instances (incl. enum members → `instance_repr`),
+            // Result Ok/Err, etc. keep the existing dunder / `py_repr` path.
+            _ => {
+                if let Some(r) = self.call_dunder0(v, "__repr__")? {
+                    return require_str_return(r, "__repr__");
+                }
+                Ok(v.py_repr())
+            }
+        }
+    }
+
+    /// Render a `HashKey` (dict key / set element) to its CPython repr,
+    /// recursing through `repr_of_depth` so user `__repr__` dunders dispatch
+    /// on instance keys. `FrozenSet` keys keep the `frozenset({...})` wrapper
+    /// that the plain `HashKey::into_value` round-trip would otherwise drop
+    /// (it surfaces a frozenset as an untagged `Value::Set`).
+    fn repr_hashkey(&mut self, k: &HashKey, depth: usize) -> Result<String, Unwind> {
+        match k {
+            HashKey::FrozenSet(items) => {
+                if items.is_empty() {
+                    return Ok("frozenset()".to_string());
+                }
+                // Match `Value::py_str` set ordering: sort by canonical key.
+                let mut sorted: Vec<HashKey> = items.iter().cloned().collect();
+                sorted.sort_by_key(|k| k.canonical_sort_key());
+                let mut parts: Vec<String> = Vec::with_capacity(sorted.len());
+                for inner in &sorted {
+                    parts.push(self.repr_hashkey(inner, depth + 1)?);
+                }
+                Ok(format!("frozenset({{{}}})", parts.join(", ")))
+            }
+            other => self.repr_of_depth(&other.clone().into_value(), depth),
+        }
     }
 
     /// `ClassName.MEMBER` rendering for an enum member instance, matching
