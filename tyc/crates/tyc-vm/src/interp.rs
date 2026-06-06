@@ -883,6 +883,72 @@ impl Interpreter {
         for (k, v) in module_env.snapshot().into_iter() {
             members.insert(k, v);
         }
+
+        // `pub *` in a package's `__init__.ty` aggregates every sibling
+        // module's `pub` names (and direct sub-packages) into the package
+        // namespace, so `from pkg import f` resolves under `tyc run` the same
+        // way it does after `tyc build`.
+        if path.file_name().and_then(|n| n.to_str()) == Some("__init__.ty")
+            && !prep.pub_star_lines.is_empty()
+        {
+            if let Some(pkg_dir) = path.parent().map(|p| p.to_path_buf()) {
+                let prefix = if name.is_empty() {
+                    String::new()
+                } else {
+                    format!("{name}.")
+                };
+                let mut entries: Vec<std::path::PathBuf> = std::fs::read_dir(&pkg_dir)
+                    .into_iter()
+                    .flatten()
+                    .flatten()
+                    .map(|e| e.path())
+                    .collect();
+                entries.sort();
+                for p in entries {
+                    // Sibling module `pkg/mod.ty`, or sub-package
+                    // `pkg/sub/__init__.ty`.
+                    let sub_name = if p.extension().and_then(|e| e.to_str()) == Some("ty") {
+                        let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+                        if stem == "__init__" || stem.is_empty() {
+                            continue;
+                        }
+                        stem.to_owned()
+                    } else if p.is_dir() && p.join("__init__.ty").exists() {
+                        p.file_name()
+                            .and_then(|s| s.to_str())
+                            .unwrap_or("")
+                            .to_owned()
+                    } else {
+                        continue;
+                    };
+                    if sub_name.is_empty() {
+                        continue;
+                    }
+                    // The sibling's public surface: its `pub` names (for a
+                    // sub-package, whatever its own `__init__` exposes).
+                    let pub_names = read_pub_names(&p);
+                    let submod = self.import_module(&format!("{prefix}{sub_name}"))?;
+                    if pub_names.is_empty() {
+                        // A sub-package with `pub *` exposes everything it
+                        // aggregated — re-export all its members.
+                        if p.is_dir() {
+                            if let Value::Module(m) = &submod {
+                                for (k, v) in m.members.borrow().iter() {
+                                    members.entry(k.clone()).or_insert_with(|| v.clone());
+                                }
+                            }
+                        }
+                        continue;
+                    }
+                    for pn in pub_names {
+                        if let Ok(v) = self.get_attr(&submod, &pn) {
+                            members.entry(pn).or_insert(v);
+                        }
+                    }
+                }
+            }
+        }
+
         Ok(Some(Value::Module(Rc::new(Module {
             name: name.to_owned(),
             members: RefCell::new(members),
@@ -5070,6 +5136,22 @@ fn bind_result_combinator(receiver: Value, attr: &str) -> Value {
 /// match everything except the two bare base-only kinds handled by the
 /// caller. Returns false for unknown names (user exceptions go through the
 /// instance-MRO path instead).
+/// The `pub` names a module file (or a sub-package's `__init__.ty`) exports,
+/// read via the preprocessor. Returns an empty vec for a file that has no
+/// `pub` declarations (e.g. a sub-package whose `__init__.ty` is `pub *`).
+fn read_pub_names(path: &std::path::Path) -> Vec<String> {
+    use tyc_syntax::preprocess;
+    let file = if path.is_dir() {
+        path.join("__init__.ty")
+    } else {
+        path.to_path_buf()
+    };
+    let Ok(source) = std::fs::read_to_string(&file) else {
+        return Vec::new();
+    };
+    preprocess::preprocess(&source).pub_names
+}
+
 /// The `args` tuple for an exception reconstructed from a `VmException` that
 /// carries only a message string: a 1-tuple of the message, or empty.
 fn exc_fallback_args(message: &str) -> Vec<Value> {

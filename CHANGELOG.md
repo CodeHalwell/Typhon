@@ -113,6 +113,15 @@ mismatch, and interface conformance were all correctly rejected).
 - **A complex base raised to a non-negative integer power** is computed by
   repeated multiplication for an exact result (`(1j) ** 2` → `-1+0j`).
 
+### Fixed — VM nested-package `pub *`
+
+- **`pub *` in a package's `__init__.ty` is aggregated under `tyc run`.**
+  The VM module loader now scans the package directory when an `__init__.ty`
+  contains `pub *`, loading each sibling module / sub-package and
+  re-exporting its `pub` names — so `from pkg import f` resolves in the VM
+  the same way it does after `tyc build` (previously `AttributeError:
+  module 'pkg' has no attribute 'f'`).
+
 ### Fixed — type-checker soundness (union member access)
 
 - **Operations on a union type must be valid for every member.** The
