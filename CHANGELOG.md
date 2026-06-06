@@ -4,6 +4,56 @@ All notable changes to Typhon are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely; the
 canonical phase-by-phase status lives in `docs/roadmap.md`.
 
+## Unreleased
+
+Adversarial stress-round follow-up against v0.11.0. A fresh sweep across
+simple scripts, file/JSON I/O, ML-shaped numerics, agent/tool-dispatch
+loops, SDK patterns, and multi-file projects surfaced six defects where
+`tyc run` (the VM) silently diverged from `tyc build` + CPython, plus one
+type-checker resolution gap. The build path and the type checker were
+otherwise solid across the sweep (soundness probes for nullable misuse,
+list invariance, newtype bypass, frozen reassignment, Result error-type
+mismatch, and interface conformance were all correctly rejected).
+
+### Fixed — VM / CPython parity
+
+- **`str.replace(old, new, count)` honours the third `count` argument.**
+  The VM ignored it entirely, so `"aaaa".replace("a", "b", 2)` returned
+  `"bbbb"` instead of `"bbaa"` (and `count=0` was not the documented
+  no-op). A negative count means "replace all", matching CPython.
+- **`sorted(..., reverse=True)` and `list.sort(reverse=True)` are stable.**
+  Both lowered to a stable ascending sort followed by an unconditional
+  `.reverse()`, which flips the order of equal-key elements. They now
+  reverse the *comparator* instead of the list, so equal keys keep their
+  original relative order as CPython guarantees.
+- **`json.dumps(obj, sort_keys=True)` sorts keys.** The kwarg was parsed
+  and discarded; output stayed in insertion order. `sort_keys` now
+  threads through both the compact and `indent=` serialisers recursively.
+- **`math.isnan` / `math.isinf` / `math.isfinite` exist.** They were
+  absent from the VM's `math` shim and raised `AttributeError`.
+- **Float-presentation format types coerce int/bool operands.** `f"{42:.2f}"`
+  printed `42` (the spec was dropped); `f"{n:e}"` on an int printed the
+  bare integer. `e`/`E`/`f`/`F`/`g`/`G` now promote an int/bool operand to
+  float before formatting, matching CPython.
+
+### Fixed — resolver
+
+- **Dict comprehensions bind tuple-unpack targets.** `{k: v for k, v in
+  d.items()}` reported `k` and `v` as unknown names — the dict-comp arm
+  only declared single-`Name` targets, while list/set comps used the
+  recursive `declare_loop_target`. Dict comps now use the same helper.
+
+### Known gaps documented (not yet fixed)
+
+- The `enum` keyword's VM runtime is under-baked: `repr(Color.RED)` yields
+  `Color.RED` rather than `<Color.RED: 1>`, enum members in a container
+  repr as their backing dataclass fields, and value/name lookups
+  (`Color(2)`, `Color["RED"]`) are unsupported. The `tyc build` path is
+  correct in all these cases.
+- `@contextmanager` generators used as `with` context managers still raise
+  `NotImplementedError` under `tyc run` (the tree-walking VM materialises
+  generators eagerly). Use `tyc build` + CPython.
+
 ## 0.11.0 — 2026-06-04
 
 VM parity sweep + `enum` keyword. A fresh adversarial stress round

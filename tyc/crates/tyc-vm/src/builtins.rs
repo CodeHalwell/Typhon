@@ -1656,6 +1656,29 @@ fn make_math_module() -> Value {
             ("tau", Value::Float(std::f64::consts::TAU)),
             ("inf", Value::Float(f64::INFINITY)),
             ("nan", Value::Float(f64::NAN)),
+            // ── floating-point predicates ─────────────────────────────────────
+            (
+                "isnan",
+                nf("isnan", |_i, args| {
+                    Ok(Value::Bool(single(&args, "isnan")?.to_float()?.is_nan()))
+                }),
+            ),
+            (
+                "isinf",
+                nf("isinf", |_i, args| {
+                    Ok(Value::Bool(
+                        single(&args, "isinf")?.to_float()?.is_infinite(),
+                    ))
+                }),
+            ),
+            (
+                "isfinite",
+                nf("isfinite", |_i, args| {
+                    Ok(Value::Bool(
+                        single(&args, "isfinite")?.to_float()?.is_finite(),
+                    ))
+                }),
+            ),
             // ── floating-point basic ──────────────────────────────────────────
             (
                 "sqrt",
@@ -2098,7 +2121,7 @@ fn make_json_module() -> Value {
             (
                 "dumps",
                 nf("dumps", |_i, args| {
-                    Ok(Value::Str(Rc::new(json_dumps(single(&args, "dumps")?))))
+                    Ok(Value::Str(Rc::new(json_dumps(single(&args, "dumps")?, false))))
                 }),
             ),
             (
@@ -2124,7 +2147,7 @@ fn make_json_module() -> Value {
                     if args.len() < 2 {
                         return Err(crate::error::type_error("dump() requires (obj, fp)"));
                     }
-                    let serialised = json_dumps(&args[0]);
+                    let serialised = json_dumps(&args[0], false);
                     let fp = args[1].clone();
                     let write = interp.get_attr(&fp, "write")?;
                     interp.call_value(write, vec![Value::Str(Rc::new(serialised))], &[])?;
@@ -3942,7 +3965,20 @@ fn str_method(
                 .get(1)
                 .ok_or_else(|| type_error("str.replace requires args"))?
                 .py_str();
-            Value::Str(Rc::new(s.replace(&from, &to)))
+            // Optional third `count` arg: replace at most `count` occurrences
+            // (a negative count means "replace all", matching CPython).
+            let replaced = match args.get(2) {
+                Some(c) => {
+                    let count = c.to_int()?;
+                    if count < 0 {
+                        s.replace(&from, &to)
+                    } else {
+                        s.replacen(&from, &to, count as usize)
+                    }
+                }
+                None => s.replace(&from, &to),
+            };
+            Value::Str(Rc::new(replaced))
         }
         "startswith" => Value::Bool(s.starts_with(&single(args, "startswith")?.py_str())),
         "endswith" => Value::Bool(s.ends_with(&single(args, "endswith")?.py_str())),
@@ -4410,7 +4446,10 @@ fn list_method(
                         return std::cmp::Ordering::Equal;
                     }
                     match interp.value_cmp(&a.0, &b.0) {
-                        Ok(o) => o,
+                        // Reverse the comparator (not the sorted list) so equal
+                        // keys keep their original relative order — CPython's
+                        // `sort(reverse=True)` is stable.
+                        Ok(o) => if reverse { o.reverse() } else { o },
                         Err(e) => {
                             sort_error = Some(e);
                             std::cmp::Ordering::Equal
@@ -4419,9 +4458,6 @@ fn list_method(
                 });
                 if let Some(e) = sort_error {
                     return Err(e);
-                }
-                if reverse {
-                    keyed.reverse();
                 }
                 items = keyed.into_iter().map(|(_, v)| v).collect();
             } else {
@@ -4430,7 +4466,8 @@ fn list_method(
                         return std::cmp::Ordering::Equal;
                     }
                     match interp.value_cmp(a, b) {
-                        Ok(o) => o,
+                        // Stable reverse: flip the comparator, not the list.
+                        Ok(o) => if reverse { o.reverse() } else { o },
                         Err(e) => {
                             sort_error = Some(e);
                             std::cmp::Ordering::Equal
@@ -4439,9 +4476,6 @@ fn list_method(
                 });
                 if let Some(e) = sort_error {
                     return Err(e);
-                }
-                if reverse {
-                    items.reverse();
                 }
             }
             *l.borrow_mut() = items;
@@ -4806,7 +4840,7 @@ fn num_method(v: &Value, name: &str, _args: &[Value]) -> Result<Value, Unwind> {
 // ── JSON ───────────────────────────────────────────────────────────────────
 
 /// `json.dumps(v, indent=n)` — pretty-printed with `n`-space indentation.
-fn json_dumps_indent(v: &Value, indent: usize, level: usize) -> String {
+fn json_dumps_indent(v: &Value, indent: usize, level: usize, sort: bool) -> String {
     let pad = " ".repeat(indent * (level + 1));
     let close_pad = " ".repeat(indent * level);
     match v {
@@ -4817,7 +4851,7 @@ fn json_dumps_indent(v: &Value, indent: usize, level: usize) -> String {
             }
             let body: Vec<String> = items
                 .iter()
-                .map(|x| format!("{}{}", pad, json_dumps_indent(x, indent, level + 1)))
+                .map(|x| format!("{}{}", pad, json_dumps_indent(x, indent, level + 1, sort)))
                 .collect();
             format!("[\n{}\n{}]", body.join(",\n"), close_pad)
         }
@@ -4827,7 +4861,7 @@ fn json_dumps_indent(v: &Value, indent: usize, level: usize) -> String {
             }
             let body: Vec<String> = t
                 .iter()
-                .map(|x| format!("{}{}", pad, json_dumps_indent(x, indent, level + 1)))
+                .map(|x| format!("{}{}", pad, json_dumps_indent(x, indent, level + 1, sort)))
                 .collect();
             format!("[\n{}\n{}]", body.join(",\n"), close_pad)
         }
@@ -4841,29 +4875,34 @@ fn json_dumps_indent(v: &Value, indent: usize, level: usize) -> String {
             if entries.is_empty() {
                 return "{}".into();
             }
-            let body: Vec<String> = entries
+            let mut body: Vec<(String, String)> = entries
                 .iter()
                 .map(|(k, val)| {
-                    format!(
-                        "{}{}: {}",
-                        pad,
-                        json_dumps(&k.clone().into_value()),
-                        json_dumps_indent(val, indent, level + 1)
+                    (
+                        json_dumps(&k.clone().into_value(), sort),
+                        json_dumps_indent(val, indent, level + 1, sort),
                     )
                 })
                 .collect();
+            if sort {
+                body.sort_by(|a, b| a.0.cmp(&b.0));
+            }
+            let body: Vec<String> = body
+                .iter()
+                .map(|(k, val)| format!("{}{}: {}", pad, k, val))
+                .collect();
             format!("{{\n{}\n{}}}", body.join(",\n"), close_pad)
         }
-        other => json_dumps(other),
+        other => json_dumps(other, sort),
     }
 }
 
 /// Public wrapper so `interp.rs` (`model_dump_json`) can reuse the serializer.
 pub fn json_dumps_pub(v: &Value) -> String {
-    json_dumps(v)
+    json_dumps(v, false)
 }
 
-fn json_dumps(v: &Value) -> String {
+fn json_dumps(v: &Value, sort: bool) -> String {
     match v {
         Value::None => "null".into(),
         Value::Bool(b) => if *b { "true" } else { "false" }.into(),
@@ -4871,11 +4910,11 @@ fn json_dumps(v: &Value) -> String {
         Value::Float(x) => format!("{}", x),
         Value::Str(s) => json_string(s),
         Value::List(l) => {
-            let items: Vec<String> = l.borrow().iter().map(json_dumps).collect();
+            let items: Vec<String> = l.borrow().iter().map(|x| json_dumps(x, sort)).collect();
             format!("[{}]", items.join(", "))
         }
         Value::Tuple(t) => {
-            let items: Vec<String> = t.iter().map(json_dumps).collect();
+            let items: Vec<String> = t.iter().map(|x| json_dumps(x, sort)).collect();
             format!("[{}]", items.join(", "))
         }
         Value::Dict(d) => {
@@ -4883,12 +4922,22 @@ fn json_dumps(v: &Value) -> String {
             // inserts (review thread copilot on PR #147 — otherwise
             // `json.dump(frozen_dict, fp)` leaks the marker into the
             // emitted JSON).
-            let items: Vec<String> = d
+            let mut pairs: Vec<(String, String)> = d
                 .borrow()
                 .iter()
                 .filter(|(k, _)| !matches!(k, HashKey::Str(s) if s.as_str() == "__typhon_frozen__"))
-                .map(|(k, v)| format!("{}: {}", json_dumps(&k.clone().into_value()), json_dumps(v)))
+                .map(|(k, v)| {
+                    (
+                        json_dumps(&k.clone().into_value(), sort),
+                        json_dumps(v, sort),
+                    )
+                })
                 .collect();
+            if sort {
+                pairs.sort_by(|a, b| a.0.cmp(&b.0));
+            }
+            let items: Vec<String> =
+                pairs.iter().map(|(k, v)| format!("{}: {}", k, v)).collect();
             format!("{{{}}}", items.join(", "))
         }
         other => json_string(&other.py_repr()),
@@ -5231,18 +5280,19 @@ pub fn call_with_kwargs(
                     let k = interp.call_value(key.clone(), vec![v.clone()], &[])?;
                     keyed.push((k, v));
                 }
-                keyed.sort_by(|a, b| a.0.py_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
-                if reverse {
-                    keyed.reverse();
-                }
+                keyed.sort_by(|a, b| {
+                    // Stable reverse: flip the comparator, not the list.
+                    let o = a.0.py_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal);
+                    if reverse { o.reverse() } else { o }
+                });
                 Ok(Value::List(Rc::new(RefCell::new(
                     keyed.into_iter().map(|(_, v)| v).collect(),
                 ))))
             } else {
-                out.sort_by(|a, b| a.py_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-                if reverse {
-                    out.reverse();
-                }
+                out.sort_by(|a, b| {
+                    let o = a.py_cmp(b).unwrap_or(std::cmp::Ordering::Equal);
+                    if reverse { o.reverse() } else { o }
+                });
                 Ok(Value::List(Rc::new(RefCell::new(out))))
             }
         }
@@ -5279,16 +5329,19 @@ pub fn call_with_kwargs(
                 .first()
                 .ok_or_else(|| type_error("dumps() missing argument"))?;
             let mut indent: Option<usize> = None;
+            let mut sort_keys = false;
             for (k, v) in kwargs {
                 if k == "indent" {
                     if let Value::Int(_) = v {
                         indent = v.to_int().ok().filter(|n| *n > 0).map(|n| n as usize);
                     }
+                } else if k == "sort_keys" {
+                    sort_keys = v.truthy();
                 }
             }
             match indent {
-                Some(n) => Ok(Value::Str(Rc::new(json_dumps_indent(obj, n, 0)))),
-                None => Ok(Value::Str(Rc::new(json_dumps(obj)))),
+                Some(n) => Ok(Value::Str(Rc::new(json_dumps_indent(obj, n, 0, sort_keys)))),
+                None => Ok(Value::Str(Rc::new(json_dumps(obj, sort_keys)))),
             }
         }
         // `dict(a=1, b=2)` and `dict(other, c=3)` — keyword pairs become entries.

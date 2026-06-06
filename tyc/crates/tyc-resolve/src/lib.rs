@@ -2559,19 +2559,11 @@ fn walk_expr(r: &mut Resolver, scope: ScopeId, expr: &Expr) {
             let scope2 = r.push_scope(ScopeKind::Comprehension, scope, range_to_span(c.range));
             for gen in &c.generators {
                 walk_expr(r, scope2, &gen.iter);
-                if let Expr::Name(n) = &gen.target {
-                    let span = (
-                        n.range.start().to_usize(),
-                        n.range.start().to_usize() + n.id.as_str().len(),
-                    );
-                    r.declare(
-                        scope2,
-                        n.id.as_str(),
-                        BindingKind::Loop,
-                        Mutability::Mut,
-                        span,
-                    );
-                }
+                // Dict-comp targets share the recursive shape of `for`/`with`
+                // targets — e.g. `{k: v for k, v in d.items()}` binds both
+                // `k` and `v`. Use the same helper as list/set comps so tuple
+                // unpacking works.
+                declare_loop_target(r, scope2, &gen.target);
                 for cond in &gen.ifs {
                     walk_expr(r, scope2, cond);
                 }
@@ -3795,6 +3787,17 @@ def foo():
         assert_eq!(d.warning_count(), 1);
         let msg = format!("{}", d.warnings()[0]);
         assert!(msg.contains("path"), "got: {msg}");
+    }
+
+    #[test]
+    fn dict_comprehension_tuple_target_binds() {
+        // Stress-round finding: `{k: v for k, v in d.items()}` reported
+        // `k`/`v` as unknown — the dict-comp arm only declared single-Name
+        // targets, unlike list/set comps which used `declare_loop_target`.
+        let src = "let d: dict[str, int] = {\"a\": 1}\n\
+                   let swapped: dict[int, str] = {v: k for k, v in d.items()}\n";
+        let (_m, dg) = resolve(src);
+        assert!(!dg.has_errors(), "{:?}", dg.errors());
     }
 
     #[test]

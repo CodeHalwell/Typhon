@@ -4543,6 +4543,18 @@ fn format_with_spec(value: &Value, default: &str, spec: &str) -> Result<String, 
         return Ok(format!("{explicit_sign}{body}"));
     }
 
+    // Float-presentation types (`e`/`E`/`f`/`F`/`g`/`G`) coerce an int or
+    // bool operand to float, matching CPython (`f"{42:.2f}"` → "42.00").
+    let coerced;
+    let value: &Value = if matches!(typ, Some('e' | 'E' | 'f' | 'F' | 'g' | 'G'))
+        && matches!(value, Value::Int(_) | Value::Bool(_))
+    {
+        coerced = Value::Float(value.to_float()?);
+        &coerced
+    } else {
+        value
+    };
+
     match value {
         Value::Float(x) => {
             let p = precision.unwrap_or(6);

@@ -758,6 +758,46 @@ if math.perm(5, 2) != 20:
     }
 
     #[test]
+    fn stress_round_vm_parity_fixes() {
+        // Adversarial stress-round findings (VM diverged from CPython):
+        //   * str.replace honours the third `count` argument
+        //   * sorted/list.sort with reverse=True stay stable for equal keys
+        //   * json.dumps honours sort_keys=
+        //   * math.isnan/isinf/isfinite exist
+        //   * float-presentation format types (f/e/g) coerce int operands
+        let src = r#"
+import json
+import math
+
+def main() -> None:
+    if "aaaa".replace("a", "b", 2) != "bbaa":
+        raise ValueError("str.replace count ignored")
+    if "xy".replace("x", "z", 0) != "xy":
+        raise ValueError("str.replace count=0 should be a no-op")
+
+    let data: list[tuple[int, str]] = [(1, "a"), (1, "b"), (2, "c"), (1, "d")]
+    if sorted(data, key=lambda p: p[0], reverse=True) != [(2, "c"), (1, "a"), (1, "b"), (1, "d")]:
+        raise ValueError("sorted(reverse=True) not stable")
+    mut m: list[int] = [3, 1, 2, 1, 3]
+    m.sort(reverse=True)
+    if m != [3, 3, 2, 1, 1]:
+        raise ValueError("list.sort(reverse=True) wrong")
+
+    if json.dumps({"b": 1, "a": 2}, sort_keys=True) != '{"a": 2, "b": 1}':
+        raise ValueError("json.dumps sort_keys ignored")
+
+    if not math.isnan(math.nan) or not math.isinf(math.inf) or not math.isfinite(1.0):
+        raise ValueError("math predicates broken")
+
+    if f"{42:.2f}" != "42.00" or f"{1000000:e}" != "1.000000e+06":
+        raise ValueError("int operand float-format ignored")
+
+main()
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    #[test]
     fn math_float_functions_and_constants() {
         // gap 1: tau, trunc, copysign, hypot, degrees, radians, expm1, log1p, atan2.
         let src = r#"
