@@ -98,6 +98,23 @@ mismatch, and interface conformance were all correctly rejected).
   mappingproxy frozen dicts all render correctly; a depth cap guards
   self-referential containers.
 
+### Fixed — fourth stress round (bytes / int / complex stdlib gaps)
+
+- **bytes / bytearray methods** `split`, `rsplit`, `strip`, `lstrip`,
+  `rstrip`, `startswith`, `endswith`, `find`, `index`, `replace`, `join`
+  added to the VM (previously `AttributeError`).
+- **`int.to_bytes(length, byteorder)`** and **`int.bit_count()`** added.
+- **`complex("1+2j")`** (and `"3j"`, `"-1"`, `"2-3j"`, `"j"`) string parsing.
+
+### Fixed — type-checker soundness
+
+- **Generic-class constructor arguments are validated against the bound
+  type parameters.** `let b: Box[int] = Box("hello")` (and `Box[int](...)`
+  / `Pair[int, str](...)`) now raise `tyc::type_mismatch` instead of
+  type-checking clean and crashing at runtime. The check is conservative —
+  pure inference (`Box(5)`), `int`→`float` widening, and `None` into a `T?`
+  field still pass.
+
 ### Known gaps documented (not yet fixed)
 
 - `@contextmanager` generators used as `with` context managers still raise
@@ -111,8 +128,6 @@ mismatch, and interface conformance were all correctly rejected).
   Counter/defaultdict/OrderedDict repr, `Path.parent` returning a `Path`,
   `float.hex()`, and `decimal`/`fractions`/`statistics` modules remain on
   the backlog.
-- The generic-class constructor soundness hole (`let b: Box[int] =
-  Box("hello")` not type-checked) remains open in `tyc-types`.
 
 ## 0.11.0 — 2026-06-04
 

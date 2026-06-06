@@ -3972,7 +3972,25 @@ fn builtin_has_attr(value: &Value, attr: &str) -> bool {
                 | "upper"
                 | "zfill"
         ),
-        Value::Bytes(_) => matches!(attr, "decode" | "hex" | "lower" | "upper"),
+        Value::Bytes(_) => matches!(
+            attr,
+            "decode"
+                | "hex"
+                | "lower"
+                | "upper"
+                | "split"
+                | "rsplit"
+                | "strip"
+                | "lstrip"
+                | "rstrip"
+                | "startswith"
+                | "endswith"
+                | "find"
+                | "index"
+                | "count"
+                | "replace"
+                | "join"
+        ),
         Value::List(_) => matches!(
             attr,
             "append"
@@ -4025,7 +4043,9 @@ fn builtin_has_attr(value: &Value, attr: &str) -> bool {
         ),
         Value::Tuple(_) => matches!(attr, "count" | "index"),
         Value::Float(_) => matches!(attr, "is_integer"),
-        Value::Int(_) | Value::Bool(_) => matches!(attr, "bit_length" | "is_integer"),
+        Value::Int(_) | Value::Bool(_) => {
+            matches!(attr, "bit_length" | "bit_count" | "to_bytes" | "is_integer")
+        }
         _ => false,
     }
 }

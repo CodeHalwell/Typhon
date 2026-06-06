@@ -820,6 +820,225 @@ fn bind_field_typevars(field_ty: &Type, arg_ty: &Type, out: &mut HashMap<String,
     }
 }
 
+/// Return `true` when `ty` mentions any `TypeVar` (or bare
+/// `TypeConstructor`) anywhere in its structure. Used by the generic
+/// constructor-argument check to stay conservative: a field type that
+/// still contains an unbound type parameter after substitution means
+/// the parameter wasn't pinned (pure inference, e.g. `Box(5)` with no
+/// annotation), so we must NOT emit a mismatch against it.
+fn contains_free_typevar(ty: &Type) -> bool {
+    match ty {
+        Type::TypeVar(_) | Type::TypeConstructor(_, _) => true,
+        Type::Union(xs) => xs.iter().any(contains_free_typevar),
+        Type::Generic(_, args) => args.iter().any(contains_free_typevar),
+        Type::Function { params, ret, .. } => {
+            params.iter().any(contains_free_typevar) || contains_free_typevar(ret)
+        }
+        _ => false,
+    }
+}
+
+/// Validate the arguments of a user-defined GENERIC class constructor
+/// against the class's field types with the bound type parameters
+/// substituted in. Closes the soundness hole where
+/// `let b: Box[int] = Box("hello")` (with `class Box[T]: value: T`)
+/// passed `tyc check` but crashed at runtime: the `Box[int]` annotation
+/// pins `T = int`, so the `value` field is `int`, but `"hello"` is `str`.
+///
+/// Conservative by construction — a per-argument mismatch is only
+/// emitted when the field's substituted type contains NO remaining free
+/// type parameter (i.e. `T` was actually pinned from the annotation or
+/// an explicit `Box[int](...)`). Inference-only construction (`Box(5)`,
+/// `let b = Box(5)`) leaves the field type as a bare `TypeVar` after
+/// substitution and is left untouched, as are non-TypeVar fields (those
+/// are the non-generic constructor path's responsibility, out of scope
+/// here). Assignability uses the normal [`Checker::is_assignable`] rule
+/// so int→float widening, None→optional, and subclassing still pass.
+fn check_generic_constructor_args(
+    c: &mut Checker,
+    shape: &InterfaceShape,
+    bindings: &HashMap<String, Type>,
+    pos_args: &[Expr],
+    kw_args: &[ruff_python_ast::Keyword],
+) {
+    // Positional args bind to fields in declaration order.
+    for (idx, arg) in pos_args.iter().enumerate() {
+        if matches!(arg, Expr::Starred(_)) {
+            // `*iter` unpack — can't map to a specific field.
+            continue;
+        }
+        let Some(field_name) = shape.field_order.get(idx) else {
+            continue;
+        };
+        let Some(field_ty) = shape.fields.get(field_name) else {
+            continue;
+        };
+        let span = (arg.range().start().to_usize(), arg.range().end().to_usize());
+        check_one_generic_ctor_arg(c, field_ty, bindings, arg, span);
+    }
+    // Keyword args bind to fields by name.
+    for kw in kw_args {
+        let Some(ident) = &kw.arg else { continue };
+        let Some(field_ty) = shape.fields.get(ident.as_str()) else {
+            continue;
+        };
+        let span = (
+            kw.value.range().start().to_usize(),
+            kw.value.range().end().to_usize(),
+        );
+        let field_ty = field_ty.clone();
+        check_one_generic_ctor_arg(c, &field_ty, bindings, &kw.value, span);
+    }
+}
+
+/// Check a single constructor argument against `field_ty` with `bindings`
+/// substituted. Shared by the positional and keyword loops of
+/// [`check_generic_constructor_args`].
+fn check_one_generic_ctor_arg(
+    c: &mut Checker,
+    field_ty: &Type,
+    bindings: &HashMap<String, Type>,
+    arg: &Expr,
+    span: (usize, usize),
+) {
+    // Only fields that actually mention a type parameter are in scope
+    // for this check — non-generic fields are handled (or intentionally
+    // not handled) elsewhere.
+    if !contains_free_typevar(field_ty) {
+        return;
+    }
+    let expected = substitute_typevars(field_ty, bindings);
+    // After substitution the parameter must be fully pinned; a leftover
+    // free TypeVar means inference, not a concrete expectation — stay
+    // quiet to avoid false positives on `Box(5)` etc.
+    if contains_free_typevar(&expected) || is_dynamic_type(&expected) {
+        return;
+    }
+    let actual = infer_expr_ctx(c, arg, Some(&expected));
+    if is_dynamic_type(&actual) {
+        return;
+    }
+    if !c.is_assignable(&expected, &actual) {
+        c.mismatch(&expected, &actual, span);
+    }
+}
+
+/// Handle a constructor call whose callee carries explicit type
+/// arguments — `Box[int]("hello")`, `Pair[int, str](...)`. Returns
+/// `Some(Generic(name, pinned_args))` when the callee is a subscripted
+/// user-defined generic class, having validated arity, unknown kwargs,
+/// and (the soundness fix) each argument against its field type with
+/// the explicit type parameters substituted in. Returns `None` for any
+/// other callee so the normal call-inference path takes over.
+fn check_explicit_typearg_constructor(
+    c: &mut Checker,
+    call: &ruff_python_ast::ExprCall,
+    pos_args: &[Expr],
+    kw_args: &[ruff_python_ast::Keyword],
+) -> Option<Type> {
+    let Expr::Subscript(sub) = call.func.as_ref() else {
+        return None;
+    };
+    let Expr::Name(n) = sub.value.as_ref() else {
+        return None;
+    };
+    let name = n.id.as_str().to_owned();
+    // Must be a user-defined generic class we know the shape of. Builtin
+    // generics (`dict[str, int]({...})`) are handled by their own path.
+    let tparams = c.class_type_params.get(&name).cloned()?;
+    let shape = effective_class_shape(&name, &c.class_shapes)?;
+
+    // Parse the explicit `[...]` slice into concrete types. A single
+    // type-arg is a bare expression; multiple are a tuple.
+    let arg_exprs: Vec<&Expr> = match sub.slice.as_ref() {
+        Expr::Tuple(t) => t.elts.iter().collect(),
+        other => vec![other],
+    };
+    // Arity mismatch between `[...]` count and the class's type params —
+    // bail out conservatively and let the rest of the pipeline report.
+    if arg_exprs.len() != tparams.len() {
+        return None;
+    }
+    let classes = c.classes.clone();
+    let pinned: Vec<Type> = arg_exprs
+        .iter()
+        .map(|e| type_from_annotation(e, &classes))
+        .collect();
+    let mut bindings: HashMap<String, Type> = HashMap::new();
+    for (tp, arg) in tparams.iter().zip(pinned.iter()) {
+        bindings.insert(tp.clone(), arg.clone());
+    }
+
+    let call_span = (call.range.start().to_usize(), call.range.end().to_usize());
+
+    // Unknown-kwarg check (mirrors the `Type::Class` arm).
+    let candidates: Vec<String> = shape.fields.keys().cloned().collect();
+    for kw in kw_args {
+        let Some(ident) = &kw.arg else { continue };
+        let kw_name = ident.as_str();
+        if !shape.fields.contains_key(kw_name) {
+            let suggestion = suggest_candidate(kw_name, &candidates);
+            let span = (
+                ident.range.start().to_usize(),
+                ident.range.start().to_usize() + kw_name.len(),
+            );
+            c.unknown_kwarg(&name, kw_name, suggestion, span);
+        }
+    }
+    // Constructor-arity check (mirrors the `Type::Class` arm).
+    let info = class_constructor_arity(&shape);
+    if !info.param_names.is_empty() {
+        match check_arity_with_info(&info, pos_args, kw_args) {
+            ArityCheck::Ok | ArityCheck::UnknownKwarg { .. } => {}
+            ArityCheck::Other => {
+                let missing = missing_required_fields(&shape, pos_args, kw_args);
+                if !missing.is_empty() {
+                    c.missing_argument(&name, missing, call_span);
+                } else {
+                    let supplied =
+                        pos_args.len() + kw_args.iter().filter(|k| k.arg.is_some()).count();
+                    c.wrong_args(&name, info.min_positional, supplied, call_span);
+                }
+            }
+        }
+    }
+
+    // SOUNDNESS: validate each argument against its substituted field
+    // type. This also infers each typevar-bound arg; remaining
+    // (non-typevar-field) args are inferred here so nested expressions
+    // still surface their own diagnostics.
+    let typevar_field_idxs: std::collections::HashSet<usize> = shape
+        .field_order
+        .iter()
+        .enumerate()
+        .filter(|(_, f)| {
+            shape
+                .fields
+                .get(f.as_str())
+                .is_some_and(contains_free_typevar)
+        })
+        .map(|(i, _)| i)
+        .collect();
+    check_generic_constructor_args(c, &shape, &bindings, pos_args, kw_args);
+    for (i, arg) in pos_args.iter().enumerate() {
+        if !typevar_field_idxs.contains(&i) {
+            let _ = infer_expr(c, arg);
+        }
+    }
+    for kw in kw_args {
+        let is_typevar_field = kw
+            .arg
+            .as_ref()
+            .and_then(|id| shape.fields.get(id.as_str()))
+            .is_some_and(contains_free_typevar);
+        if !is_typevar_field {
+            let _ = infer_expr(c, &kw.value);
+        }
+    }
+
+    Some(Type::Generic(name, pinned))
+}
+
 /// Return `true` if `name` is a built-in container type whose bare
 /// (unparameterised) form should be treated as accepting any
 /// parameterisation (`list` ≡ `list[Any]`, etc.).
@@ -10157,6 +10376,20 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
                     }
                 }
             }
+            // SOUNDNESS: explicit-type-arg constructor `Box[int](...)`.
+            // The callee `Box[int]` is a `Subscript` whose inference
+            // yields `Unknown`, so the call would otherwise land in the
+            // permissive `Type::Unknown` arm and skip all checking. Pin
+            // the type parameters from the explicit `[...]` args and run
+            // the generic constructor-argument validation directly, then
+            // return the constructed `Generic` type. Mirrors how the
+            // annotation-pinned path (`let b: Box[int] = Box(...)`) is
+            // handled in the `Type::Class` arm below.
+            if let Some(generic) =
+                check_explicit_typearg_constructor(c, call, &call.arguments.args, &call.arguments.keywords)
+            {
+                return generic;
+            }
             // Ruff folds positional and keyword arguments into `call.arguments`.
             let pos_args = &call.arguments.args;
             let kw_args = &call.arguments.keywords;
@@ -10766,12 +10999,25 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
                                 bindings.insert(tp.clone(), arg.clone());
                             }
                         }
-                        // Forward: read each kwarg, match it to the
-                        // class's field annotation, and if the field's
-                        // type is a TypeVar, bind it from the arg's
-                        // inferred type.
+                        // Forward: read each positional / keyword arg,
+                        // match it to the class's field annotation, and
+                        // if the field's type is a TypeVar, bind it from
+                        // the arg's inferred type. Annotation-pinned
+                        // bindings (inserted above) win because
+                        // `bind_field_typevars` only fills vacant slots.
                         let class_shape = c.class_shapes.get(&name).cloned();
-                        if let Some(shape) = class_shape {
+                        if let Some(shape) = class_shape.clone() {
+                            for (idx, arg) in pos_args.iter().enumerate() {
+                                if matches!(arg, Expr::Starred(_)) {
+                                    continue;
+                                }
+                                if let Some(field_name) = shape.field_order.get(idx) {
+                                    if let Some(field_ty) = shape.fields.get(field_name).cloned() {
+                                        let arg_ty = infer_expr(c, arg);
+                                        bind_field_typevars(&field_ty, &arg_ty, &mut bindings);
+                                    }
+                                }
+                            }
                             for kw in kw_args {
                                 if let Some(ident) = &kw.arg {
                                     if let Some(field_ty) =
@@ -10782,6 +11028,15 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
                                     }
                                 }
                             }
+                        }
+                        // SOUNDNESS: validate each constructor argument
+                        // against its (substituted) field type. Only
+                        // fires when a type parameter is actually pinned
+                        // — see `check_generic_constructor_args`.
+                        if let Some(shape) = class_shape {
+                            check_generic_constructor_args(
+                                c, &shape, &bindings, pos_args, kw_args,
+                            );
                         }
                         let args: Vec<Type> = tparams
                             .iter()
@@ -14383,6 +14638,149 @@ def main() -> None:
                 .iter()
                 .any(|e| matches!(e, TycError::TypeMismatch { .. })),
             "generic field access must propagate T: int field should fail to assign to str: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn generic_ctor_arg_rejected_str_into_int_from_annotation() {
+        // SOUNDNESS HOLE regression: `let b: Box[int] = Box("hello")`
+        // pins T=int from the annotation, so the `value` field is int.
+        // Passing `"hello"` (str) must fire `tyc::type_mismatch` instead
+        // of leaking through and crashing at `b.value + 1` at runtime.
+        let src = "\
+class Box[T]:
+    value: T
+
+def main() -> None:
+    let b: Box[int] = Box(\"hello\")
+";
+        let d = check(src);
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::TypeMismatch { .. })),
+            "str into Box[int] constructor must be rejected: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn generic_ctor_arg_rejected_explicit_typeargs() {
+        // Explicit `Box[int]("hello")` form pins T=int via the
+        // subscripted callee and must reject the str argument.
+        let src = "\
+class Box[T]:
+    value: T
+
+def main() -> None:
+    let b = Box[int](\"hello\")
+";
+        let d = check(src);
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::TypeMismatch { .. })),
+            "str into explicit Box[int](...) must be rejected: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn generic_ctor_arg_rejected_multiparam_pair() {
+        // Multi-param generic: `Pair[int, str] = Pair("wrong", 99)` must
+        // reject both args (str→int and int→str) against the pinned
+        // type parameters.
+        let src = "\
+class Pair[A, B]:
+    first: A
+    second: B
+
+def main() -> None:
+    let p: Pair[int, str] = Pair(\"wrong\", 99)
+";
+        let d = check(src);
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::TypeMismatch { .. })),
+            "wrong-typed Pair[int, str] construction must be rejected: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn generic_ctor_arg_correct_passes() {
+        // No false positive: matching annotation and argument types.
+        let src = "\
+class Box[T]:
+    value: T
+
+def main() -> None:
+    let b: Box[int] = Box(5)
+";
+        let d = check(src);
+        assert!(
+            !d.has_errors(),
+            "correctly-typed Box[int] = Box(5) must pass: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn generic_ctor_arg_inferred_passes() {
+        // No false positive: pure inference with no annotation must not
+        // fire — `T` is unbound, so there is no concrete expectation to
+        // violate.
+        let src = "\
+class Box[T]:
+    value: T
+
+def main() -> None:
+    let b = Box(5)
+    let _x: int = b.value
+";
+        let d = check(src);
+        assert!(
+            !d.has_errors(),
+            "inferred Box(5) must pass: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn generic_ctor_arg_int_into_float_field_passes() {
+        // No false positive: Typhon widens int → float, so `Box(3)` into
+        // a `Box[float]` field is fine even though 3 is an int literal.
+        let src = "\
+class Box[T]:
+    value: T
+
+def main() -> None:
+    let f: Box[float] = Box(3)
+";
+        let d = check(src);
+        assert!(
+            !d.has_errors(),
+            "int into Box[float] must pass (int→float widening): {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn generic_ctor_arg_none_into_optional_field_passes() {
+        // No false positive: a `T?` field accepts None even when T=int.
+        let src = "\
+class Box[T]:
+    value: T?
+
+def main() -> None:
+    let b: Box[int] = Box(None)
+";
+        let d = check(src);
+        assert!(
+            !d.has_errors(),
+            "None into Box[int] with T? field must pass: {:?}",
             d.errors()
         );
     }

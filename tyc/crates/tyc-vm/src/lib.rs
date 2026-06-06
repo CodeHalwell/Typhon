@@ -758,6 +758,34 @@ if math.perm(5, 2) != 20:
     }
 
     #[test]
+    fn bytes_int_complex_parity_fixes() {
+        // Stress-round stdlib gaps: bytes methods, int.to_bytes/.bit_count,
+        // complex-from-string.
+        let src = r#"
+def main() -> None:
+    if b"a,b,c".split(b",") != [b"a", b"b", b"c"]:
+        raise ValueError("bytes split wrong")
+    if b"  x  ".strip() != b"x":
+        raise ValueError("bytes strip wrong")
+    if not b"hi".startswith(b"h") or not b"hi".endswith(b"i"):
+        raise ValueError("bytes starts/ends wrong")
+    if b"hello".replace(b"l", b"L") != b"heLLo":
+        raise ValueError("bytes replace wrong")
+    if b",".join([b"a", b"b"]) != b"a,b":
+        raise ValueError("bytes join wrong")
+    if (255).to_bytes(4, "big") != b"\x00\x00\x00\xff":
+        raise ValueError("to_bytes wrong")
+    if (7).bit_count() != 3:
+        raise ValueError("bit_count wrong")
+    if complex("1+2j") != complex(1, 2) or complex("3j") != complex(0, 3):
+        raise ValueError("complex str wrong")
+
+main()
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    #[test]
     fn re_module_parity_fixes() {
         // Stress-round `re` findings: callable sub, Python backref templates,
         // capturing-group split, named group access, finditer, subn.

@@ -566,6 +566,12 @@ pub fn install(interp: &mut Interpreter) {
         match args.as_slice() {
             [] => Ok(Value::Complex(0.0, 0.0)),
             [Value::Complex(re, im)] => Ok(Value::Complex(*re, *im)),
+            // complex("1+2j") / complex("3j") / complex("-1") string parse.
+            [Value::Str(s)] => {
+                let (re, im) = parse_complex_str(s.trim())
+                    .ok_or_else(|| value_error("complex() arg is a malformed string"))?;
+                Ok(Value::Complex(re, im))
+            }
             [x] => Ok(Value::Complex(part(x, "first")?, 0.0)),
             [Value::Complex(re, im), y] => {
                 // complex(c, n) → c + n*1j (imag part adds).
@@ -4633,8 +4639,183 @@ fn bytes_method(b: &Rc<Vec<u8>>, name: &str, args: &[Value]) -> Result<Value, Un
         }
         "upper" => Value::Bytes(Rc::new(b.iter().map(|c| c.to_ascii_uppercase()).collect())),
         "lower" => Value::Bytes(Rc::new(b.iter().map(|c| c.to_ascii_lowercase()).collect())),
+        // `.split(sep=None)` — on whitespace when no separator, else on the
+        // separator bytes. Returns a list of bytes.
+        "split" | "rsplit" => {
+            let parts: Vec<Vec<u8>> = match args.first() {
+                None | Some(Value::None) => {
+                    // Split on ASCII whitespace runs, dropping empties.
+                    b.split(|c| c.is_ascii_whitespace())
+                        .filter(|p| !p.is_empty())
+                        .map(|p| p.to_vec())
+                        .collect()
+                }
+                Some(sep) => {
+                    let sep = bytes_arg(sep)?;
+                    if sep.is_empty() {
+                        return Err(value_error("empty separator"));
+                    }
+                    split_bytes(b, &sep)
+                }
+            };
+            Value::List(Rc::new(RefCell::new(
+                parts.into_iter().map(|p| Value::Bytes(Rc::new(p))).collect(),
+            )))
+        }
+        "strip" | "lstrip" | "rstrip" => {
+            let pred: Box<dyn Fn(u8) -> bool> = match args.first() {
+                None | Some(Value::None) => Box::new(|c: u8| c.is_ascii_whitespace()),
+                Some(chars) => {
+                    let set = bytes_arg(chars)?;
+                    Box::new(move |c: u8| set.contains(&c))
+                }
+            };
+            let mut start = 0;
+            let mut end = b.len();
+            if name != "rstrip" {
+                while start < end && pred(b[start]) {
+                    start += 1;
+                }
+            }
+            if name != "lstrip" {
+                while end > start && pred(b[end - 1]) {
+                    end -= 1;
+                }
+            }
+            Value::Bytes(Rc::new(b[start..end].to_vec()))
+        }
+        "startswith" => {
+            let pre = bytes_arg(single(args, "startswith")?)?;
+            Value::Bool(b.starts_with(&pre))
+        }
+        "endswith" => {
+            let suf = bytes_arg(single(args, "endswith")?)?;
+            Value::Bool(b.ends_with(&suf))
+        }
+        "find" | "index" if !args.is_empty() => {
+            let needle = bytes_arg(single(args, name)?)?;
+            match find_subslice(b, &needle) {
+                Some(i) => Value::Int(num_bigint::BigInt::from(i as i64)),
+                None if name == "find" => Value::Int(num_bigint::BigInt::from(-1)),
+                None => return Err(value_error("subsection not found")),
+            }
+        }
+        "replace" => {
+            let from = bytes_arg(args.first().ok_or_else(|| type_error("replace needs args"))?)?;
+            let to = bytes_arg(args.get(1).ok_or_else(|| type_error("replace needs args"))?)?;
+            Value::Bytes(Rc::new(replace_bytes(b, &from, &to)))
+        }
+        "join" => {
+            // b",".join([b"a", b"b"]) -> b"a,b"
+            let it = single(args, "join")?;
+            let mut out: Vec<u8> = Vec::new();
+            if let Value::List(l) = it {
+                for (i, part) in l.borrow().iter().enumerate() {
+                    if i > 0 {
+                        out.extend_from_slice(b);
+                    }
+                    out.extend_from_slice(&bytes_arg(part)?);
+                }
+            }
+            Value::Bytes(Rc::new(out))
+        }
         _ => return Err(attribute_error(format!("bytes has no method '{}'", name))),
     })
+}
+
+/// Parse a Python complex-literal string like `"1+2j"`, `"3j"`, `"-1"`,
+/// `"2-3J"`, `"j"`. Returns `(real, imag)`.
+fn parse_complex_str(s: &str) -> Option<(f64, f64)> {
+    let s = s.trim().trim_start_matches('(').trim_end_matches(')');
+    if s.is_empty() {
+        return None;
+    }
+    let lower = s.to_ascii_lowercase();
+    // Pure imaginary if it ends in `j` and has no internal sign splitting
+    // real/imag.
+    let ends_j = lower.ends_with('j');
+    // Find a `+`/`-` that splits real and imaginary (not the leading sign,
+    // not part of an exponent `e+`/`e-`).
+    let bytes = lower.as_bytes();
+    let mut split: Option<usize> = None;
+    for i in 1..bytes.len() {
+        let c = bytes[i] as char;
+        if (c == '+' || c == '-') && bytes[i - 1] as char != 'e' {
+            split = Some(i);
+        }
+    }
+    let parse_imag = |t: &str| -> Option<f64> {
+        let t = t.trim_end_matches('j');
+        match t {
+            "" | "+" => Some(1.0),
+            "-" => Some(-1.0),
+            _ => t.parse::<f64>().ok(),
+        }
+    };
+    if let Some(i) = split {
+        let (a, b) = lower.split_at(i);
+        if ends_j {
+            // real = a, imag = b (b includes its sign and trailing j)
+            let re = a.parse::<f64>().ok()?;
+            let im = parse_imag(b)?;
+            Some((re, im))
+        } else {
+            None // a real with an internal sign but no j is malformed here
+        }
+    } else if ends_j {
+        Some((0.0, parse_imag(&lower)?))
+    } else {
+        Some((lower.parse::<f64>().ok()?, 0.0))
+    }
+}
+
+/// Coerce a `bytes`/`bytearray` (or a single int) argument into a byte vec.
+fn bytes_arg(v: &Value) -> Result<Vec<u8>, Unwind> {
+    match v {
+        Value::Bytes(b) => Ok((**b).clone()),
+        Value::Int(i) => {
+            let n = i.to_u32().and_then(|n| u8::try_from(n).ok());
+            n.map(|b| vec![b])
+                .ok_or_else(|| value_error("byte must be in range(0, 256)"))
+        }
+        _ => Err(type_error(format!(
+            "a bytes-like object is required, not '{}'",
+            v.type_name()
+        ))),
+    }
+}
+
+fn find_subslice(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() {
+        return Some(0);
+    }
+    hay.windows(needle.len()).position(|w| w == needle)
+}
+
+fn split_bytes(hay: &[u8], sep: &[u8]) -> Vec<Vec<u8>> {
+    let mut out = Vec::new();
+    let mut rest = hay;
+    while let Some(i) = find_subslice(rest, sep) {
+        out.push(rest[..i].to_vec());
+        rest = &rest[i + sep.len()..];
+    }
+    out.push(rest.to_vec());
+    out
+}
+
+fn replace_bytes(hay: &[u8], from: &[u8], to: &[u8]) -> Vec<u8> {
+    if from.is_empty() {
+        return hay.to_vec();
+    }
+    let mut out = Vec::with_capacity(hay.len());
+    let mut rest = hay;
+    while let Some(i) = find_subslice(rest, from) {
+        out.extend_from_slice(&rest[..i]);
+        out.extend_from_slice(to);
+        rest = &rest[i + from.len()..];
+    }
+    out.extend_from_slice(rest);
+    out
 }
 
 fn list_method(
@@ -5140,10 +5321,42 @@ fn tuple_method(t: &Rc<Vec<Value>>, name: &str, args: &[Value]) -> Result<Value,
     }
 }
 
-fn num_method(v: &Value, name: &str, _args: &[Value]) -> Result<Value, Unwind> {
+fn num_method(v: &Value, name: &str, args: &[Value]) -> Result<Value, Unwind> {
     match (v, name) {
         (Value::Float(x), "is_integer") => Ok(Value::Bool(x.fract() == 0.0 && x.is_finite())),
         (Value::Int(i), "bit_length") => Ok(Value::Int(num_bigint::BigInt::from(i.bits() as i64))),
+        // `(n).bit_count()` — number of set bits in the absolute value.
+        (Value::Int(i), "bit_count") => {
+            let (_, bytes) = i.to_bytes_be();
+            let count: u32 = bytes.iter().map(|b| b.count_ones()).sum();
+            Ok(Value::Int(num_bigint::BigInt::from(count)))
+        }
+        // `(n).to_bytes(length, byteorder="big")` — non-negative ints.
+        (Value::Int(i), "to_bytes") => {
+            use num_traits::Signed;
+            if i.is_negative() {
+                return Err(value_error("to_bytes: negative ints not supported"));
+            }
+            let length = match args.first() {
+                Some(n) => n.to_int()?.max(0) as usize,
+                None => 1,
+            };
+            let big_endian = match args.get(1) {
+                Some(Value::Str(s)) => s.as_str() != "little",
+                _ => true,
+            };
+            let (_, mut raw) = i.to_bytes_be();
+            if raw.len() > length {
+                return Err(value_error("int too big to convert"));
+            }
+            // Left-pad with zero bytes to the requested length.
+            let mut out = vec![0u8; length - raw.len()];
+            out.append(&mut raw);
+            if !big_endian {
+                out.reverse();
+            }
+            Ok(Value::Bytes(Rc::new(out)))
+        }
         _ => Err(attribute_error(format!(
             "'{}' object has no method '{}'",
             v.type_name(),
