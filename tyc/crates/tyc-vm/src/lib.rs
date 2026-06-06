@@ -758,6 +758,70 @@ if math.perm(5, 2) != 20:
     }
 
     #[test]
+    fn stress_round_two_vm_parity_fixes() {
+        // Second adversarial stress round (sub-agent findings):
+        //   * enum repr `<Name.MEMBER: value>` + value/name lookup
+        //   * round(int, negative ndigits) rounds to tens/hundreds (half-even)
+        //   * f-string `:c` int→char
+        //   * `!=` derives from a user `__eq__` when `__ne__` is absent
+        //   * math.prod
+        //   * hash() dispatches a user `__hash__`
+        //   * range indexing, bytes iteration, enumerate(start=), zip(strict=)
+        let src = r#"
+import math
+
+enum Color:
+    RED
+    GREEN
+    BLUE
+
+class CI:
+    s: str
+
+impl CI:
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, CI) and self.s == other.s
+    def __hash__(self) -> int:
+        return 7
+
+def main() -> None:
+    if repr(Color.RED) != "<Color.RED: 1>":
+        raise ValueError("enum repr wrong")
+    if repr([Color.GREEN]) != "[<Color.GREEN: 2>]":
+        raise ValueError("enum container repr wrong")
+    if Color(2) != Color.GREEN or Color["BLUE"] != Color.BLUE:
+        raise ValueError("enum lookup wrong")
+
+    if round(123456, -2) != 123500 or round(15, -1) != 20 or round(25, -1) != 20:
+        raise ValueError("round negative ndigits wrong")
+
+    if f"{65:c}" != "A":
+        raise ValueError("format :c wrong")
+
+    if (CI(s="a") != CI(s="a")) or not (CI(s="a") != CI(s="b")):
+        raise ValueError("__ne__ from __eq__ wrong")
+
+    if hash(CI(s="x")) != 7:
+        raise ValueError("hash __hash__ ignored")
+
+    if math.prod([1, 2, 3, 4]) != 24:
+        raise ValueError("math.prod wrong")
+
+    if range(0, 20, 3)[2] != 6 or range(10)[-1] != 9:
+        raise ValueError("range index wrong")
+    if list(b"\x01\x02\x03") != [1, 2, 3]:
+        raise ValueError("bytes iteration wrong")
+    if list(enumerate(["a", "b"], start=10)) != [(10, "a"), (11, "b")]:
+        raise ValueError("enumerate start wrong")
+    if list(zip([1, 2], ["a", "b"], strict=True)) != [(1, "a"), (2, "b")]:
+        raise ValueError("zip strict wrong")
+
+main()
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    #[test]
     fn stress_round_vm_parity_fixes() {
         // Adversarial stress-round findings (VM diverged from CPython):
         //   * str.replace honours the third `count` argument

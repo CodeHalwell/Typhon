@@ -1149,8 +1149,26 @@ pub fn bigint_eq_f64(a: &BigInt, b: f64) -> bool {
 /// order) to recover the order; any field not declared on the class
 /// (dynamically assigned) is appended afterwards, sorted by name for
 /// determinism.
+/// Whether `class` is an enum class — its own `class_attrs` carry the
+/// `__typhon_enum_base__` sentinel, or one of its bases does (the user's
+/// `Color(Enum)` inherits the flag from the synthetic `Enum` base).
+fn class_is_enum(class: &Class) -> bool {
+    class
+        .class_attrs
+        .borrow()
+        .contains_key("__typhon_enum_base__")
+        || class.bases.iter().any(|b| class_is_enum(b))
+}
+
 fn instance_repr(inst: &Instance) -> String {
     let fields = inst.fields.borrow();
+    // Enum members repr as `<Class.NAME: value>` (CPython default), not as
+    // their backing dataclass fields.
+    if class_is_enum(&inst.class) {
+        if let (Some(Value::Str(name)), Some(val)) = (fields.get("_name_"), fields.get("_value_")) {
+            return format!("<{}.{}: {}>", inst.class.name, name, val.py_repr());
+        }
+    }
     let mut parts: Vec<String> = Vec::with_capacity(fields.len());
     let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
     for cf in &inst.class.fields {

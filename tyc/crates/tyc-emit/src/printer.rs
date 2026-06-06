@@ -1857,6 +1857,16 @@ fn expr_precedence(expr: &Expr) -> u8 {
 /// a few more forms that `expr_precedence` ignores because they can't
 /// appear as a `BinOp` child without already being a syntax error.
 fn needs_paren_for_postfix(expr: &Expr) -> bool {
+    // An integer literal immediately followed by `.attr` is misparsed by
+    // CPython: `255.to_bytes(...)` reads `255.` as a float, raising a
+    // SyntaxError. Wrapping the literal in parens — `(255).to_bytes(...)` —
+    // fixes it. Float/complex literals already contain a `.`/`j` and are
+    // valid as-is, so only the integer case needs parens.
+    if let Expr::NumberLiteral(n) = expr {
+        if matches!(n.value, Number::Int(_)) {
+            return true;
+        }
+    }
     matches!(
         expr,
         Expr::BoolOp(_)
@@ -2263,6 +2273,42 @@ mod tests {
         assert!(
             out.contains("(\"a\" + \"b\").upper()"),
             "BinOp before attribute must keep parens, got: {}",
+            out
+        );
+    }
+
+    #[test]
+    fn int_literal_before_attribute_parenthesised() {
+        // `(255).to_bytes(...)` must NOT emit as `255.to_bytes(...)` — CPython
+        // parses `255.` as a float literal and raises a SyntaxError.
+        let src = "y = (255).to_bytes(4, \"big\")\n";
+        let out = round_trip(src);
+        assert!(
+            out.contains("(255).to_bytes(4, \"big\")"),
+            "int literal before attribute must keep parens, got: {}",
+            out
+        );
+        assert!(
+            !out.contains("255.to_bytes"),
+            "int literal before attribute must not be bare, got: {}",
+            out
+        );
+    }
+
+    #[test]
+    fn float_literal_before_attribute_not_parenthesised() {
+        // A float literal already contains a `.`, so `(1.5).hex()` is valid
+        // without extra parens — we must NOT over-parenthesise it.
+        let src = "y = 1.5.hex()\n";
+        let out = round_trip(src);
+        assert!(
+            out.contains("1.5.hex()"),
+            "float literal before attribute should not be parenthesised, got: {}",
+            out
+        );
+        assert!(
+            !out.contains("(1.5)"),
+            "float literal before attribute must not be parenthesised, got: {}",
             out
         );
     }

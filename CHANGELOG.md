@@ -43,16 +43,49 @@ mismatch, and interface conformance were all correctly rejected).
   only declared single-`Name` targets, while list/set comps used the
   recursive `declare_loop_target`. Dict comps now use the same helper.
 
+### Fixed — second stress round (sub-agent sweep across text/regex, numerics, and the object model)
+
+- **`enum` keyword VM runtime.** `repr(Color.RED)` now renders
+  `<Color.RED: 1>` (and enum members inside a container repr the same way,
+  not as their backing dataclass fields). Value lookup `Color(2)` and name
+  lookup `Color["RED"]` work, returning the singleton member and raising
+  `ValueError` / `KeyError` on a miss, matching CPython.
+- **`round(int, ndigits)` with negative `ndigits`** rounds to
+  tens/hundreds/… (banker's rounding, staying an int) instead of returning
+  the integer unchanged. `round(123456, -2)` → `123500`.
+- **f-string `:c`** converts an int to its Unicode character (`f"{65:c}"` →
+  `"A"`).
+- **`!=` derives from a user `__eq__`** when the class defines no `__ne__`,
+  instead of falling back to identity.
+- **`hash()` dispatches a user `__hash__`** method on instances.
+- **`math.prod`** added to the VM `math` shim.
+- **`range(...)[i]`** integer indexing (with Python negative indexing).
+- **bytes / bytearray are iterable** — `list(b"\x01\x02")` → `[1, 2]`, and
+  `sum`/comprehensions over bytes work.
+- **`enumerate(iterable, start=N)`** and **`zip(*iterables, strict=True)`**
+  honour their keyword arguments (the VM previously rejected both).
+
+### Fixed — emit path
+
+- **Method/attribute access on an integer literal** is now parenthesised:
+  `(255).to_bytes(4, "big")` instead of the invalid `255.to_bytes(...)`,
+  which CPython rejects as a `SyntaxError` (`255.` parses as a float).
+  Applies to attribute access and subscript.
+
 ### Known gaps documented (not yet fixed)
 
-- The `enum` keyword's VM runtime is under-baked: `repr(Color.RED)` yields
-  `Color.RED` rather than `<Color.RED: 1>`, enum members in a container
-  repr as their backing dataclass fields, and value/name lookups
-  (`Color(2)`, `Color["RED"]`) are unsupported. The `tyc build` path is
-  correct in all these cases.
 - `@contextmanager` generators used as `with` context managers still raise
   `NotImplementedError` under `tyc run` (the tree-walking VM materialises
   generators eagerly). Use `tyc build` + CPython.
+- The VM's seeded `random` does not reproduce CPython's Mersenne Twister,
+  so seeded programs diverge between `tyc run` and `tyc build`.
+- `set`/`dict` keying still uses a structural hash key rather than a user
+  `__hash__`/`__eq__` (only the `hash()` builtin and `!=` were fixed this
+  round); `re` callable/`\g<name>` replacements, capturing-group `re.split`,
+  Counter/defaultdict/OrderedDict repr, and `Path.parent` returning a
+  `Path` remain on the backlog.
+- The generic-class constructor soundness hole (`let b: Box[int] =
+  Box("hello")` not type-checked) remains open in `tyc-types`.
 
 ## 0.11.0 — 2026-06-04
 

@@ -761,11 +761,37 @@ pub fn install(interp: &mut Interpreter) {
     });
 
     native!("round", |_i, args| match args.first() {
-        // round(int) and round(int, ndigits) return the int unchanged
-        // (Python rounds to the given decimal place; for ints with
-        // non-negative ndigits that's a no-op, and these are the only
-        // cases the shim handles).
-        Some(Value::Int(i)) => Ok(Value::Int(i.clone())),
+        // round(int, ndigits): non-negative ndigits is a no-op; a negative
+        // ndigits rounds to tens/hundreds/… (half-to-even, staying an int).
+        Some(Value::Int(i)) => {
+            use num_integer::Integer;
+            use num_traits::Zero;
+            match args.get(1) {
+                Some(n) if !matches!(n, Value::None) => {
+                    let nd = n.to_int()?;
+                    if nd >= 0 {
+                        Ok(Value::Int(i.clone()))
+                    } else {
+                        let p = num_bigint::BigInt::from(10).pow((-nd) as u32);
+                        // Floor-divide so the remainder is always in [0, p).
+                        let q = i.div_floor(&p);
+                        let r = i - &q * &p;
+                        let two_r = &r * 2;
+                        let rounded = if two_r < p {
+                            q
+                        } else if two_r > p {
+                            q + 1
+                        } else if (&q % num_bigint::BigInt::from(2)).is_zero() {
+                            q
+                        } else {
+                            q + 1
+                        };
+                        Ok(Value::Int(rounded * &p))
+                    }
+                }
+                _ => Ok(Value::Int(i.clone())),
+            }
+        }
         Some(Value::Float(x)) => {
             let x = *x;
             match args.get(1) {
@@ -823,8 +849,28 @@ pub fn install(interp: &mut Interpreter) {
         Ok(Value::Str(Rc::new(s)))
     });
 
-    native!("hash", |_i, args| {
+    native!("hash", |i, args| {
         let v = single(&args, "hash")?;
+        // A user-defined `__hash__` wins over the structural hash key.
+        if let Value::Instance(inst) = v {
+            if let Some(m) = i.find_method(&inst.class, "__hash__") {
+                let r = i.call_value(
+                    Value::BoundMethod {
+                        receiver: Box::new(v.clone()),
+                        function: m,
+                    },
+                    vec![],
+                    &[],
+                )?;
+                return match r {
+                    Value::Int(_) => Ok(r),
+                    other => Err(type_error(format!(
+                        "__hash__ method should return an integer, not {}",
+                        other.type_name()
+                    ))),
+                };
+            }
+        }
         let key = v.to_hash_key()?;
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -1729,6 +1775,18 @@ fn make_math_module() -> Value {
                         .ok_or_else(|| type_error("copysign() needs args"))?
                         .to_float()?;
                     Ok(Value::Float(x.copysign(y)))
+                }),
+            ),
+            (
+                "prod",
+                nf("prod", |i, args| {
+                    // math.prod(iterable, *, start=1) — multiply all elements.
+                    let it = i.make_iter(single(&args, "prod")?.clone())?;
+                    let mut acc = Value::Int(num_bigint::BigInt::from(1));
+                    while let Some(v) = i.iter_next(&it)? {
+                        acc = i.binop(&acc, ruff_python_ast::Operator::Mult, &v)?;
+                    }
+                    Ok(acc)
                 }),
             ),
             (
@@ -5199,6 +5257,85 @@ pub fn call_with_kwargs(
     kwargs: &[(String, Value)],
 ) -> Result<Value, Unwind> {
     match n.name {
+        // enumerate(iterable, start=N)
+        "enumerate" => {
+            let mut start: i64 = 0;
+            for (k, v) in kwargs {
+                if k == "start" {
+                    start = v.to_int()?;
+                } else {
+                    return Err(type_error(format!(
+                        "enumerate() got unexpected keyword: '{}'",
+                        k
+                    )));
+                }
+            }
+            let iterable = args
+                .into_iter()
+                .next()
+                .ok_or_else(|| type_error("enumerate() requires an iterable"))?;
+            if let Value::Iter(it) = interp.make_iter(iterable)? {
+                Ok(Value::Iter(Rc::new(RefCell::new(IterState::Enumerate {
+                    inner: it,
+                    index: start,
+                }))))
+            } else {
+                unreachable!()
+            }
+        }
+        // zip(*iterables, strict=True): error if lengths differ.
+        "zip" => {
+            let mut strict = false;
+            for (k, v) in kwargs {
+                if k == "strict" {
+                    strict = v.truthy();
+                } else {
+                    return Err(type_error(format!(
+                        "zip() got unexpected keyword: '{}'",
+                        k
+                    )));
+                }
+            }
+            if !strict {
+                let mut inners = Vec::new();
+                for a in args {
+                    if let Value::Iter(it) = interp.make_iter(a)? {
+                        inners.push(it);
+                    }
+                }
+                return Ok(Value::Iter(Rc::new(RefCell::new(IterState::Zip {
+                    inners,
+                }))));
+            }
+            // Strict mode: materialise each iterable so we can check that
+            // every column has the same length (CPython raises ValueError).
+            let columns: Vec<Vec<Value>> = args
+                .into_iter()
+                .map(|a| -> Result<Vec<Value>, Unwind> {
+                    let it = interp.make_iter(a)?;
+                    let mut out = Vec::new();
+                    while let Some(v) = interp.iter_next(&it)? {
+                        out.push(v);
+                    }
+                    Ok(out)
+                })
+                .collect::<Result<_, _>>()?;
+            let len = columns.first().map(|c| c.len()).unwrap_or(0);
+            if columns.iter().any(|c| c.len() != len) {
+                return Err(value_error(
+                    "zip() argument lengths differ (strict=True)",
+                ));
+            }
+            let mut rows: Vec<Value> = Vec::with_capacity(len);
+            for row in 0..len {
+                let tup: Vec<Value> = columns.iter().map(|c| c[row].clone()).collect();
+                rows.push(Value::Tuple(Rc::new(tup)));
+            }
+            Ok(Value::Iter(Rc::new(RefCell::new(IterState::List {
+                items: Rc::new(RefCell::new(rows)),
+                index: 0,
+            }))))
+        }
         "min" | "max" => {
             let want_min = n.name == "min";
             // Gather candidates: a single iterable, or multiple positional args.

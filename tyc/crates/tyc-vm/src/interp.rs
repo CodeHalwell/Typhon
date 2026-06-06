@@ -837,6 +837,71 @@ impl Interpreter {
 
     /// True when `value` is an enum *member* instance (an `Instance` of an
     /// enum class carrying the synthesised `_name_` field).
+    /// The materialised member list for an enum class, if any.
+    fn enum_members(class: &Rc<Class>) -> Option<Vec<Value>> {
+        match class.class_attrs.borrow().get("__typhon_enum_members__") {
+            Some(Value::List(l)) => Some(l.borrow().clone()),
+            _ => None,
+        }
+    }
+
+    /// `Color(value)` — look an enum member up by its value (CPython
+    /// semantics: returns the existing singleton, or raises `ValueError`).
+    /// Passing an existing member of the same enum returns it unchanged.
+    fn enum_lookup_by_value(
+        &mut self,
+        class: &Rc<Class>,
+        args: Vec<Value>,
+        kwargs: &[(String, Value)],
+    ) -> Result<Value, Unwind> {
+        if !kwargs.is_empty() || args.len() != 1 {
+            return Err(type_error(format!(
+                "{}() takes exactly 1 argument ({} given)",
+                class.name,
+                args.len()
+            )));
+        }
+        let needle = &args[0];
+        // An existing member of this enum is returned as-is.
+        if let Value::Instance(i) = needle {
+            if Rc::ptr_eq(&i.class, class) {
+                return Ok(needle.clone());
+            }
+        }
+        if let Some(members) = Self::enum_members(class) {
+            for m in &members {
+                if let Value::Instance(i) = m {
+                    if let Some(v) = i.fields.borrow().get("_value_") {
+                        if v.py_eq(needle) {
+                            return Ok(m.clone());
+                        }
+                    }
+                }
+            }
+        }
+        Err(value_error(format!(
+            "{} is not a valid {}",
+            needle.py_repr(),
+            class.name
+        )))
+    }
+
+    /// `Color["RED"]` — look an enum member up by name (raises `KeyError`).
+    fn enum_lookup_by_name(&self, class: &Rc<Class>, name: &str) -> Result<Value, Unwind> {
+        if let Some(members) = Self::enum_members(class) {
+            for m in &members {
+                if let Value::Instance(i) = m {
+                    if let Some(Value::Str(n)) = i.fields.borrow().get("_name_") {
+                        if n.as_str() == name {
+                            return Ok(m.clone());
+                        }
+                    }
+                }
+            }
+        }
+        Err(key_error(format!("'{}'", name)))
+    }
+
     fn is_enum_member(value: &Value) -> bool {
         if let Value::Instance(i) = value {
             return Self::is_enum_class(&i.class) && i.fields.borrow().contains_key("_name_");
@@ -1318,6 +1383,12 @@ impl Interpreter {
         if matches!(l, Value::Instance(_)) || matches!(r, Value::Instance(_)) {
             if let Some(b) = self.cmp_dunder(op, l, r)? {
                 return Ok(b);
+            }
+            // Python derives `!=` from `__eq__` when `__ne__` is absent.
+            if op == CmpOp::NotEq {
+                if let Some(b) = self.cmp_dunder(CmpOp::Eq, l, r)? {
+                    return Ok(!b);
+                }
             }
         }
         Ok(match op {
@@ -1869,6 +1940,11 @@ impl Interpreter {
         args: Vec<Value>,
         kwargs: &[(String, Value)],
     ) -> Result<Value, Unwind> {
+        // Calling an enum class is value-lookup, not construction:
+        // `Color(2)` → the member whose value is 2 (CPython semantics).
+        if Self::is_enum_class(class) {
+            return self.enum_lookup_by_value(class, args, kwargs);
+        }
         let instance = Rc::new(Instance {
             class: class.clone(),
             fields: RefCell::new(HashMap::new()),
@@ -2004,11 +2080,10 @@ impl Interpreter {
         Ok(v.py_str())
     }
 
-    /// `repr(v)` honouring a user `__repr__` on instances.
+    /// `repr(v)` honouring a user `__repr__` on instances. Enum members
+    /// flow through to `py_repr` → `instance_repr`, which renders the
+    /// CPython `<Class.NAME: value>` form.
     pub fn repr_of(&mut self, v: &Value) -> Result<String, Unwind> {
-        if let Some(s) = self.enum_member_repr(v) {
-            return Ok(s);
-        }
         if let Some(r) = self.call_dunder0(v, "__repr__")? {
             return require_str_return(r, "__repr__");
         }
@@ -2265,12 +2340,35 @@ impl Interpreter {
             }
         }
         match target {
+            // `Color["RED"]` — enum member lookup by name.
+            Value::Class(c) if Self::is_enum_class(c) => {
+                let name = match key {
+                    Value::Str(s) => s.as_str().to_owned(),
+                    _ => {
+                        return Err(key_error(key.py_repr()));
+                    }
+                };
+                self.enum_lookup_by_name(c, &name)
+            }
             Value::List(l) => {
                 let i = key.to_int()?;
                 let l = l.borrow();
                 let idx = normalize_index(i, l.len())
                     .ok_or_else(|| index_error("list index out of range"))?;
                 Ok(l[idx].clone())
+            }
+            // `range(...)[i]` — compute the i-th element arithmetically
+            // (supports Python negative indexing).
+            Value::Range { start, stop, step } => {
+                let len = if *step > 0 {
+                    ((stop - start).max(0) + step - 1) / step
+                } else {
+                    ((start - stop).max(0) - step - 1) / -step
+                };
+                let i = key.to_int()?;
+                let idx = normalize_index(i, len as usize)
+                    .ok_or_else(|| index_error("range object index out of range"))?;
+                Ok(Value::Int(BigInt::from(start + idx as i64 * step)))
             }
             Value::Tuple(t) => {
                 let i = key.to_int()?;
@@ -2839,6 +2937,18 @@ impl Interpreter {
             Value::Str(s) => {
                 let chars = s.chars().collect();
                 IterState::Str { chars, index: 0 }
+            }
+            // Iterating bytes/bytearray yields each byte as an int
+            // (`list(b"\x01\x02")` → `[1, 2]`).
+            Value::Bytes(b) => {
+                let items: Vec<Value> = b
+                    .iter()
+                    .map(|byte| Value::Int(BigInt::from(*byte)))
+                    .collect();
+                IterState::List {
+                    items: Rc::new(RefCell::new(items)),
+                    index: 0,
+                }
             }
             Value::Dict(d) => {
                 let keys: Vec<HashKey> = d
@@ -4627,6 +4737,14 @@ fn format_with_spec(value: &Value, default: &str, spec: &str) -> Result<String, 
                     if alternate {
                         prefix.push_str("0o");
                     }
+                }
+                Some('c') => {
+                    // `{n:c}` → the Unicode character at codepoint n.
+                    let cp = i_val
+                        .to_u32()
+                        .and_then(char::from_u32)
+                        .ok_or_else(|| value_error("%c arg not in range(0x110000)"))?;
+                    buf = cp.to_string();
                 }
                 _ => {
                     buf = if comma {
