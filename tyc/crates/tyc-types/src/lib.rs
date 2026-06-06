@@ -2946,13 +2946,10 @@ impl<'a> Checker<'a> {
                     // User-defined generic class: resolve method/field,
                     // but stay lenient when the hierarchy isn't fully
                     // known or the class defines `__getattr__`.
-                    if !self.class_hierarchy_fully_known(head)
-                        || self.class_defines_getattr(head)
-                    {
+                    if !self.class_hierarchy_fully_known(head) || self.class_defines_getattr(head) {
                         return true;
                     }
-                    self.find_method(head, attr).is_some()
-                        || self.find_field(head, attr).is_some()
+                    self.find_method(head, attr).is_some() || self.find_field(head, attr).is_some()
                 }
             }
             Type::Class(name) => {
@@ -6071,7 +6068,9 @@ fn collect_class_shape(cd: &ruff_python_ast::StmtClassDef, classes: &[String]) -
 /// `self`-assigned attribute is initialised inside the body, never passed
 /// to a synthesised constructor). Kept off `InterfaceShape` for exactly
 /// that reason, and so the public shape struct stays unchanged.
-fn collect_self_assigned_attrs(cd: &ruff_python_ast::StmtClassDef) -> std::collections::HashSet<String> {
+fn collect_self_assigned_attrs(
+    cd: &ruff_python_ast::StmtClassDef,
+) -> std::collections::HashSet<String> {
     fn register(out: &mut std::collections::HashSet<String>, target: &Expr) {
         if let Expr::Attribute(attr) = target {
             if let Expr::Name(base) = attr.value.as_ref() {
@@ -10506,10 +10505,10 @@ fn iterable_element_type(ty: &Type) -> Option<Type> {
         Type::Generic(head, args) => match head.as_str() {
             // Single-parameter sequences / read-only views / sets — element
             // type is the sole parameter, preserved verbatim.
-            "list" | "set" | "frozenset" | "Sequence" | "Iterable" | "Iterator"
-            | "Collection" | "Container" | "Reversible" | "deque" | "Generator"
-            | "AsyncIterable" | "AsyncIterator" | "AsyncGenerator" | "tuple_variadic"
-            | "KeysView" | "ValuesView" | "ItemsView"
+            "list" | "set" | "frozenset" | "Sequence" | "Iterable" | "Iterator" | "Collection"
+            | "Container" | "Reversible" | "deque" | "Generator" | "AsyncIterable"
+            | "AsyncIterator" | "AsyncGenerator" | "tuple_variadic" | "KeysView" | "ValuesView"
+            | "ItemsView"
                 if args.len() == 1 =>
             {
                 Some(args[0].clone())
@@ -10865,9 +10864,12 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
             // return the constructed `Generic` type. Mirrors how the
             // annotation-pinned path (`let b: Box[int] = Box(...)`) is
             // handled in the `Type::Class` arm below.
-            if let Some(generic) =
-                check_explicit_typearg_constructor(c, call, &call.arguments.args, &call.arguments.keywords)
-            {
+            if let Some(generic) = check_explicit_typearg_constructor(
+                c,
+                call,
+                &call.arguments.args,
+                &call.arguments.keywords,
+            ) {
                 return generic;
             }
             // Ruff folds positional and keyword arguments into `call.arguments`.
@@ -10973,12 +10975,7 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
                                 pos_args[0].range().start().to_usize(),
                                 pos_args[0].range().end().to_usize(),
                             );
-                            c.operator_type_mismatch(
-                                "len()",
-                                &arg_ty,
-                                bad,
-                                span,
-                            );
+                            c.operator_type_mismatch("len()", &arg_ty, bad, span);
                         }
                     }
                 }
@@ -11320,8 +11317,7 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
                                     .and_then(|ki| kwonly_types.get(ki).cloned())
                                     .or_else(|| kwarg_value_type.clone());
                                 if let Some(expected_kw) = expected_kw {
-                                    let actual =
-                                        infer_expr_ctx(c, &kw.value, Some(&expected_kw));
+                                    let actual = infer_expr_ctx(c, &kw.value, Some(&expected_kw));
                                     let nullable_into_non_nullable =
                                         !c.unwrap_alias(&expected_kw).is_nullable()
                                             && actual.is_nullable()
@@ -11613,9 +11609,7 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
                         // fires when a type parameter is actually pinned
                         // — see `check_generic_constructor_args`.
                         if let Some(shape) = class_shape {
-                            check_generic_constructor_args(
-                                c, &shape, &bindings, pos_args, kw_args,
-                            );
+                            check_generic_constructor_args(c, &shape, &bindings, pos_args, kw_args);
                         }
                         let args: Vec<Type> = tparams
                             .iter()
@@ -12452,8 +12446,7 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
         Expr::Generator(comp) => {
             let elt_expected = match expected {
                 Some(Type::Generic(h, a))
-                    if (h == "Iterator" || h == "Iterable" || h == "Generator")
-                        && a.len() == 1 =>
+                    if (h == "Iterator" || h == "Iterable" || h == "Generator") && a.len() == 1 =>
                 {
                     Some(a[0].clone())
                 }
@@ -12495,10 +12488,7 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
 /// checked against the honest (pre-narrowing) element type. Apply
 /// narrowing-implying `if` filters here so `[x for x in src if x is not
 /// None]` keeps working without a false positive downstream.
-fn infer_comprehension_generators(
-    c: &mut Checker,
-    generators: &[ruff_python_ast::Comprehension],
-) {
+fn infer_comprehension_generators(c: &mut Checker, generators: &[ruff_python_ast::Comprehension]) {
     for gen in generators {
         let iter_ty = infer_expr(c, &gen.iter);
         let elem_ty = iterable_element_type(&iter_ty).unwrap_or(Type::Unknown);
@@ -12718,14 +12708,10 @@ fn operator_operands_compatible(op: Operator, l: &Type, r: &Type) -> bool {
     // flaggable primitive, so an unnarrowed `T?` operand is correctly
     // rejected here too.
     if let Type::Union(ls) = l {
-        return ls
-            .iter()
-            .all(|lm| operator_operands_compatible(op, lm, r));
+        return ls.iter().all(|lm| operator_operands_compatible(op, lm, r));
     }
     if let Type::Union(rs) = r {
-        return rs
-            .iter()
-            .all(|rm| operator_operands_compatible(op, l, rm));
+        return rs.iter().all(|rm| operator_operands_compatible(op, l, rm));
     }
     match op {
         Operator::Add => {

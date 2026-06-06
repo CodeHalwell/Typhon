@@ -461,7 +461,9 @@ pub fn install(interp: &mut Interpreter) {
                 }
                 Ok(Value::None)
             }
-            _ => Err(type_error("delattr() target does not support attribute deletion")),
+            _ => Err(type_error(
+                "delattr() target does not support attribute deletion",
+            )),
         }
     });
     native!("dir", |_i, args| {
@@ -518,7 +520,9 @@ pub fn install(interp: &mut Interpreter) {
                 "vars() argument must have __dict__, not '{}'",
                 other.type_name()
             ))),
-            None => Err(type_error("vars() with no argument is unsupported in the VM")),
+            None => Err(type_error(
+                "vars() with no argument is unsupported in the VM",
+            )),
         }
     });
     native!("list", |i, args| {
@@ -2309,7 +2313,10 @@ fn make_json_module() -> Value {
             (
                 "dumps",
                 nf("dumps", |_i, args| {
-                    Ok(Value::Str(Rc::new(json_dumps(single(&args, "dumps")?, false))))
+                    Ok(Value::Str(Rc::new(json_dumps(
+                        single(&args, "dumps")?,
+                        false,
+                    ))))
                 }),
             ),
             (
@@ -2837,7 +2844,9 @@ fn make_re_module() -> Value {
             "split".into(),
             Value::Native(Rc::new(NativeFn::new("split", move |_i, args| {
                 let s = single(&args, "split")?.py_str();
-                Ok(Value::List(Rc::new(RefCell::new(re_split_apply(&p5, &s, 0)))))
+                Ok(Value::List(Rc::new(RefCell::new(re_split_apply(
+                    &p5, &s, 0,
+                )))))
             }))),
         );
         // Wrap the attrs in a Class-shaped value with an Instance.
@@ -2860,7 +2869,10 @@ fn make_re_module() -> Value {
     // Build a match object from a `regex::Captures`. Group 0 is the whole
     // match; groups 1.. are the capture groups. Non-participating optional
     // groups are represented as `None`.
-    fn captures_to_value(caps: Option<regex::Captures<'_>>, names: &HashMap<String, usize>) -> Value {
+    fn captures_to_value(
+        caps: Option<regex::Captures<'_>>,
+        names: &HashMap<String, usize>,
+    ) -> Value {
         let Some(caps) = caps else { return Value::None };
         let whole = caps.get(0).expect("group 0 always present");
         let start = whole.start() as i64;
@@ -4783,7 +4795,10 @@ fn bytes_method(b: &Rc<Vec<u8>>, name: &str, args: &[Value]) -> Result<Value, Un
                 }
             };
             Value::List(Rc::new(RefCell::new(
-                parts.into_iter().map(|p| Value::Bytes(Rc::new(p))).collect(),
+                parts
+                    .into_iter()
+                    .map(|p| Value::Bytes(Rc::new(p)))
+                    .collect(),
             )))
         }
         "strip" | "lstrip" | "rstrip" => {
@@ -4825,8 +4840,14 @@ fn bytes_method(b: &Rc<Vec<u8>>, name: &str, args: &[Value]) -> Result<Value, Un
             }
         }
         "replace" => {
-            let from = bytes_arg(args.first().ok_or_else(|| type_error("replace needs args"))?)?;
-            let to = bytes_arg(args.get(1).ok_or_else(|| type_error("replace needs args"))?)?;
+            let from = bytes_arg(
+                args.first()
+                    .ok_or_else(|| type_error("replace needs args"))?,
+            )?;
+            let to = bytes_arg(
+                args.get(1)
+                    .ok_or_else(|| type_error("replace needs args"))?,
+            )?;
             Value::Bytes(Rc::new(replace_bytes(b, &from, &to)))
         }
         "join" => {
@@ -5069,7 +5090,13 @@ fn list_method(
                         // Reverse the comparator (not the sorted list) so equal
                         // keys keep their original relative order — CPython's
                         // `sort(reverse=True)` is stable.
-                        Ok(o) => if reverse { o.reverse() } else { o },
+                        Ok(o) => {
+                            if reverse {
+                                o.reverse()
+                            } else {
+                                o
+                            }
+                        }
                         Err(e) => {
                             sort_error = Some(e);
                             std::cmp::Ordering::Equal
@@ -5087,7 +5114,13 @@ fn list_method(
                     }
                     match interp.value_cmp(a, b) {
                         // Stable reverse: flip the comparator, not the list.
-                        Ok(o) => if reverse { o.reverse() } else { o },
+                        Ok(o) => {
+                            if reverse {
+                                o.reverse()
+                            } else {
+                                o
+                            }
+                        }
                         Err(e) => {
                             sort_error = Some(e);
                             std::cmp::Ordering::Equal
@@ -5588,8 +5621,7 @@ fn json_dumps(v: &Value, sort: bool) -> String {
             if sort {
                 pairs.sort_by(|a, b| a.0.cmp(&b.0));
             }
-            let items: Vec<String> =
-                pairs.iter().map(|(k, v)| format!("{}: {}", k, v)).collect();
+            let items: Vec<String> = pairs.iter().map(|(k, v)| format!("{}: {}", k, v)).collect();
             format!("{{{}}}", items.join(", "))
         }
         other => json_string(&other.py_repr()),
@@ -5884,10 +5916,7 @@ pub fn call_with_kwargs(
                 if k == "strict" {
                     strict = v.truthy();
                 } else {
-                    return Err(type_error(format!(
-                        "zip() got unexpected keyword: '{}'",
-                        k
-                    )));
+                    return Err(type_error(format!("zip() got unexpected keyword: '{}'", k)));
                 }
             }
             if !strict {
@@ -5916,9 +5945,7 @@ pub fn call_with_kwargs(
                 .collect::<Result<_, _>>()?;
             let len = columns.first().map(|c| c.len()).unwrap_or(0);
             if columns.iter().any(|c| c.len() != len) {
-                return Err(value_error(
-                    "zip() argument lengths differ (strict=True)",
-                ));
+                return Err(value_error("zip() argument lengths differ (strict=True)"));
             }
             let mut rows: Vec<Value> = Vec::with_capacity(len);
             for row in 0..len {
@@ -6014,7 +6041,11 @@ pub fn call_with_kwargs(
                 keyed.sort_by(|a, b| {
                     // Stable reverse: flip the comparator, not the list.
                     let o = a.0.py_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal);
-                    if reverse { o.reverse() } else { o }
+                    if reverse {
+                        o.reverse()
+                    } else {
+                        o
+                    }
                 });
                 Ok(Value::List(Rc::new(RefCell::new(
                     keyed.into_iter().map(|(_, v)| v).collect(),
@@ -6022,7 +6053,11 @@ pub fn call_with_kwargs(
             } else {
                 out.sort_by(|a, b| {
                     let o = a.py_cmp(b).unwrap_or(std::cmp::Ordering::Equal);
-                    if reverse { o.reverse() } else { o }
+                    if reverse {
+                        o.reverse()
+                    } else {
+                        o
+                    }
                 });
                 Ok(Value::List(Rc::new(RefCell::new(out))))
             }

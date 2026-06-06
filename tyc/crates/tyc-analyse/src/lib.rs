@@ -1503,9 +1503,8 @@ fn eval_binop(
                 // Negative exponent → float, matching Python.
                 Ok(ComptimeValue::Float((*a as f64).powi(*b as i32)))
             } else {
-                let exp = u32::try_from(*b).map_err(|_| {
-                    "exponent too large in comptime power".to_string()
-                })?;
+                let exp = u32::try_from(*b)
+                    .map_err(|_| "exponent too large in comptime power".to_string())?;
                 a.checked_pow(exp)
                     .map(ComptimeValue::Int)
                     .ok_or_else(|| "integer overflow in comptime power".to_string())
@@ -1804,7 +1803,10 @@ comptime def fdiv(a: int, b: int) -> int:
 comptime let X: int = fdiv(17, 0)
 ";
         let (_, diags) = eval(src);
-        assert!(diags.has_errors(), "floor-division by zero must be an error");
+        assert!(
+            diags.has_errors(),
+            "floor-division by zero must be an error"
+        );
     }
 
     #[test]

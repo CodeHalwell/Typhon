@@ -499,7 +499,11 @@ impl fmt::Debug for Value {
             Value::ResultOk(v) => write!(f, "Ok(value={:?})", v),
             Value::ResultErr(v) => write!(f, "Err(error={:?})", v),
             Value::Module(m) => write!(f, "<module {}>", m.name),
-            Value::Exception { kind, message, args } => {
+            Value::Exception {
+                kind,
+                message,
+                args,
+            } => {
                 if args.is_empty() {
                     if message.is_empty() {
                         write!(f, "{kind}()")
@@ -985,7 +989,11 @@ impl Value {
             Value::ResultOk(v) => format!("Ok(value={})", v.py_repr()),
             Value::ResultErr(v) => format!("Err(error={})", v.py_repr()),
             Value::Module(m) => format!("<module '{}'>", m.name),
-            Value::Exception { kind, message, args } => match args.len() {
+            Value::Exception {
+                kind,
+                message,
+                args,
+            } => match args.len() {
                 // `str(ValueError("a", "b"))` is the tuple `('a', 'b')`.
                 n if n >= 2 => {
                     let parts: Vec<String> = args.iter().map(|a| a.py_repr()).collect();

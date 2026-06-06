@@ -427,12 +427,7 @@ impl Interpreter {
                             let recv = self.eval_expr(&a.value, env)?;
                             match recv {
                                 Value::Instance(inst) => {
-                                    if inst
-                                        .fields
-                                        .borrow_mut()
-                                        .remove(a.attr.as_str())
-                                        .is_none()
-                                    {
+                                    if inst.fields.borrow_mut().remove(a.attr.as_str()).is_none() {
                                         return Err(attribute_error(format!(
                                             "{}",
                                             a.attr.as_str()
@@ -2352,8 +2347,7 @@ impl Interpreter {
             }
             Value::Dict(d) => {
                 let frozen_key = HashKey::Str(Rc::new("__typhon_frozen__".to_owned()));
-                let is_frozen =
-                    matches!(d.borrow().get(&frozen_key), Some(Value::Bool(true)));
+                let is_frozen = matches!(d.borrow().get(&frozen_key), Some(Value::Bool(true)));
                 // Snapshot (key, value) pairs, filtering the synthetic
                 // `__typhon_frozen__` sentinel, before recursing.
                 let pairs: Vec<(HashKey, Value)> = d
@@ -2729,9 +2723,7 @@ impl Interpreter {
         let key_owned;
         let key = match key {
             Value::Instance(i) if self.find_method(&i.class, "__index__").is_some() => {
-                key_owned = self
-                    .call_dunder0(key, "__index__")?
-                    .unwrap_or(Value::None);
+                key_owned = self.call_dunder0(key, "__index__")?.unwrap_or(Value::None);
                 &key_owned
             }
             _ => key,
@@ -3138,9 +3130,7 @@ impl Interpreter {
             Value::Native(n) if attr == "__name__" || attr == "__qualname__" => {
                 Ok(Value::Str(Rc::new(n.name.to_string())))
             }
-            Value::BoundMethod { function, .. }
-                if attr == "__name__" || attr == "__qualname__" =>
-            {
+            Value::BoundMethod { function, .. } if attr == "__name__" || attr == "__qualname__" => {
                 Ok(Value::Str(Rc::new(function.name.clone())))
             }
             Value::ResultOk(v) => match attr {
@@ -3370,9 +3360,7 @@ impl Interpreter {
         let key_owned;
         let key = match key {
             Value::Instance(i) if self.find_method(&i.class, "__index__").is_some() => {
-                key_owned = self
-                    .call_dunder0(key, "__index__")?
-                    .unwrap_or(Value::None);
+                key_owned = self.call_dunder0(key, "__index__")?.unwrap_or(Value::None);
                 &key_owned
             }
             _ => key,
@@ -3591,9 +3579,7 @@ impl Interpreter {
                                 match self.call_dunder0(&iter_val, "__next__") {
                                     Ok(Some(item)) => items.push(item),
                                     Ok(None) => break,
-                                    Err(Unwind::Exception(e)) if e.kind == "StopIteration" => {
-                                        break
-                                    }
+                                    Err(Unwind::Exception(e)) if e.kind == "StopIteration" => break,
                                     Err(e) => return Err(e),
                                 }
                             }
@@ -4093,8 +4079,7 @@ impl Interpreter {
                     _ => (Value::None, Value::None),
                 };
                 let raised = matches!(&body_res, Err(Unwind::Exception(_)));
-                let suppressed =
-                    self.call_value(exit, vec![et, ev, Value::None], &[])?;
+                let suppressed = self.call_value(exit, vec![et, ev, Value::None], &[])?;
                 if raised && self.is_truthy(&suppressed)? {
                     body_res = Ok(());
                 }
@@ -4118,7 +4103,10 @@ impl Interpreter {
             let scope = Env::new_child(env);
             if self.pattern_matches(&case.pattern, &subject, &scope)? {
                 let ok = match &case.guard {
-                    Some(g) => { let gv = self.eval_expr(g, &scope)?; self.is_truthy(&gv)? }
+                    Some(g) => {
+                        let gv = self.eval_expr(g, &scope)?;
+                        self.is_truthy(&gv)?
+                    }
                     None => true,
                 };
                 if ok {
@@ -5184,7 +5172,9 @@ fn builtin_exc_is_a(kind: &str, target: &str) -> bool {
             "FileNotFoundError" | "FileExistsError" | "PermissionError" | "IsADirectoryError"
             | "NotADirectoryError" | "InterruptedError" | "TimeoutError" | "BlockingIOError"
             | "ChildProcessError" | "ProcessLookupError" | "ConnectionError" => "OSError",
-            "BrokenPipeError" | "ConnectionResetError" | "ConnectionRefusedError"
+            "BrokenPipeError"
+            | "ConnectionResetError"
+            | "ConnectionRefusedError"
             | "ConnectionAbortedError" => "ConnectionError",
             _ => return None,
         })
@@ -5268,10 +5258,7 @@ fn collect_walrus_names(e: &Expr, out: &mut Vec<String>) {
 /// Walrus target names from a comprehension's element expression(s) plus the
 /// `if` filters on every generator (the bound-iterable expressions are
 /// evaluated in the enclosing scope already, so their walruses leak anyway).
-fn comprehension_walrus_names(
-    parts: &[&Expr],
-    generators: &[ast::Comprehension],
-) -> Vec<String> {
+fn comprehension_walrus_names(parts: &[&Expr], generators: &[ast::Comprehension]) -> Vec<String> {
     let mut out = Vec::new();
     for p in parts {
         collect_walrus_names(p, &mut out);
