@@ -113,6 +113,24 @@ mismatch, and interface conformance were all correctly rejected).
 - **A complex base raised to a non-negative integer power** is computed by
   repeated multiplication for an exact result (`(1j) ** 2` → `-1+0j`).
 
+### Fixed — type-checker false-rejects (valid code wrongly rejected)
+
+- **`plain class` and `class!` may define a hand-written `__init__`.**
+  `tyc::manual_init` no longer fires on them (a `plain class` generates no
+  constructor and `class!` preserves the user's `__init__` verbatim). It
+  still fires for a normal `class` / `model`. (The `class!` half also
+  needed the resolver to recognise raw classes in the `tyc check` path,
+  which doesn't thread the `ClassKind::Raw` line markers — `class!` names
+  are now scraped from source like `plain class` names.)
+- **`tyc::class_attr_shadows_slot` no longer fires on `plain class`** (its
+  class-level defaults are real class attributes, not slot descriptors).
+- **A class defining `__getattr__`** suppresses `tyc::attribute_not_found`
+  for attribute access on its instances.
+- **Attributes assigned via `self.x = ...` in a method** are tracked, so
+  `self.d[k]` no longer false-positives `attribute_not_found`.
+- **A walrus binding in a comprehension** (`[y for x in xs if (y := f(x))]`)
+  leaks to the enclosing scope, matching Python.
+
 ### Fixed — sixth stress round (VM data model, part 2)
 
 - **List slice assignment** `xs[1:3] = [...]` (contiguous and extended-step).

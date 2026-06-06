@@ -1951,6 +1951,13 @@ struct Checker<'a> {
     /// as written in the source (`class Dog(Animal):` → `{"Dog": ["Animal"]}`).
     /// Used by `class_inherits_from` to resolve nominal subtype relationships.
     class_parents: HashMap<String, Vec<String>>,
+    /// Per-class set of attribute names assigned through `self`
+    /// (`self.NAME = ...`) inside a method body but NOT declared as a
+    /// class-level annotated field. Consulted by `find_field` so reads of
+    /// such attributes resolve (typed `Unknown`) instead of firing
+    /// `tyc::attribute_not_found`. Populated alongside `class_shapes` and
+    /// merged across `impl` / `extend` pseudo-classes the same way.
+    self_attrs: HashMap<String, std::collections::HashSet<String>>,
     env: TypeEnv,
     diagnostics: Diagnostics,
     /// Return type of the function whose body we are currently checking
@@ -2245,6 +2252,7 @@ impl<'a> Checker<'a> {
             class_type_params: HashMap::new(),
             frozen_classes: std::collections::HashSet::new(),
             class_parents: HashMap::new(),
+            self_attrs: HashMap::new(),
             unsafe_depth: 0,
             unsafe_origin_bindings: HashMap::new(),
             unsafe_line_starts: Vec::new(),
@@ -2268,6 +2276,48 @@ impl<'a> Checker<'a> {
     fn is_unsafe_marker(&self, range: TextRange) -> bool {
         let start = u32::from(range.start());
         self.unsafe_line_starts.binary_search(&start).is_ok()
+    }
+
+    /// True iff `name` was declared with `plain class NAME:`. A plain class
+    /// emits a bare `class` (no `@dataclass`, no synthesised `__init__`),
+    /// so its class-level defaults are real class attributes and a
+    /// hand-written `__init__` is legal — both `tyc::class_attr_shadows_slot`
+    /// and `tyc::manual_init` must be suppressed for it.
+    fn is_plain_class(&self, name: &str) -> bool {
+        self.resolved.plain_classes.contains(name)
+    }
+
+    /// True iff `name` was declared with `class! NAME(...):` (raw class).
+    /// Like a plain class, a raw class emits without a `@dataclass`
+    /// decorator and may carry a hand-written `__init__` preserved
+    /// verbatim — so `tyc::manual_init` must not fire on it.
+    fn is_raw_class(&self, name: &str) -> bool {
+        self.resolved.raw_classes.contains(name)
+    }
+
+    /// True iff `name` (or any of its known base classes) defines a
+    /// `__getattr__` method. Such a class can resolve arbitrary attributes
+    /// at runtime, so `tyc::attribute_not_found` must be suppressed for
+    /// attribute access on its instances.
+    fn class_defines_getattr(&self, name: &str) -> bool {
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut stack: Vec<String> = vec![name.to_owned()];
+        while let Some(cur) = stack.pop() {
+            if !seen.insert(cur.clone()) {
+                continue;
+            }
+            if let Some(shape) = self.class_shapes.get(&cur) {
+                if shape.methods.contains_key("__getattr__") {
+                    return true;
+                }
+            }
+            if let Some(parents) = self.class_parents.get(&cur) {
+                for p in parents {
+                    stack.push(p.clone());
+                }
+            }
+        }
+        false
     }
 
     /// Assignment compatibility check that accounts for sealed-union subtyping
@@ -2739,6 +2789,9 @@ impl<'a> Checker<'a> {
     /// directly declared on the queried class.  Returns the first matching
     /// field type found, or `None` when no class in the hierarchy defines it.
     fn find_field<'b>(&'b self, cls_name: &str, field_name: &str) -> Option<&'b Type> {
+        // Shared `Unknown` so `self`-assigned attributes (which carry no
+        // declared type) can be returned by reference.
+        static UNKNOWN: Type = Type::Unknown;
         let mut stack: Vec<&str> = vec![cls_name];
         let mut visited: std::collections::HashSet<&str> = std::collections::HashSet::new();
         while let Some(name) = stack.pop() {
@@ -2748,6 +2801,13 @@ impl<'a> Checker<'a> {
             if let Some(shape) = self.class_shapes.get(name) {
                 if let Some(ty) = shape.fields.get(field_name) {
                     return Some(ty);
+                }
+            }
+            // Attributes assigned via `self.NAME = ...` in a method body
+            // resolve as instance attributes (typed `Unknown`).
+            if let Some(attrs) = self.self_attrs.get(name) {
+                if attrs.contains(field_name) {
+                    return Some(&UNKNOWN);
                 }
             }
             if let Some(parents) = self.class_parents.get(name) {
@@ -5044,6 +5104,12 @@ fn collect_classes_and_functions(c: &mut Checker, body: &[Stmt]) {
                 );
             }
             c.class_shapes.insert(name.clone(), shape);
+            // Track `self.NAME = ...` attributes from this class's method
+            // bodies so reads of body-initialised attributes resolve.
+            let attrs = collect_self_assigned_attrs(cd);
+            if !attrs.is_empty() {
+                c.self_attrs.entry(name.clone()).or_default().extend(attrs);
+            }
             // Record PEP 695 type-parameter names so call-site
             // inference can return `Type::Generic(name, [...])` for
             // generic classes (FINDINGS #46).
@@ -5095,6 +5161,15 @@ fn collect_classes_and_functions(c: &mut Checker, body: &[Stmt]) {
                                 }
                             }
                         }
+                    }
+                    // Fold `self.NAME = ...` attributes from the impl /
+                    // extend block's method bodies onto the target class.
+                    let impl_self_attrs = collect_self_assigned_attrs(cd);
+                    if !impl_self_attrs.is_empty() {
+                        c.self_attrs
+                            .entry(target.to_owned())
+                            .or_default()
+                            .extend(impl_self_attrs);
                     }
                     let target_shape = c.class_shapes.get_mut(target).expect("checked above");
                     for (m, sig) in impl_shape.methods {
@@ -5795,6 +5870,92 @@ fn collect_class_shape(cd: &ruff_python_ast::StmtClassDef, classes: &[String]) -
         }
     }
     shape
+}
+
+/// Walk every method body of a class declaration and return the set of
+/// attribute names assigned through `self` (`self.NAME = ...`,
+/// `self.NAME: T = ...`, `self.NAME += ...`). Recurses into nested
+/// control-flow blocks (`if` / `for` / `while` / `with` / `try` /
+/// `match`) so an attribute first assigned inside a branch is still
+/// discovered, but NOT into nested function / class definitions (a `self`
+/// there is a different binding's concern).
+///
+/// These are real instance attributes for attribute-resolution purposes —
+/// `find_field` consults the result so `self.NAME` / `obj.NAME` reads
+/// don't false-positive `tyc::attribute_not_found` — but they deliberately
+/// do NOT participate in constructor-arity / kwarg checking (a
+/// `self`-assigned attribute is initialised inside the body, never passed
+/// to a synthesised constructor). Kept off `InterfaceShape` for exactly
+/// that reason, and so the public shape struct stays unchanged.
+fn collect_self_assigned_attrs(cd: &ruff_python_ast::StmtClassDef) -> std::collections::HashSet<String> {
+    fn register(out: &mut std::collections::HashSet<String>, target: &Expr) {
+        if let Expr::Attribute(attr) = target {
+            if let Expr::Name(base) = attr.value.as_ref() {
+                if base.id.as_str() == "self" {
+                    out.insert(attr.attr.as_str().to_owned());
+                }
+            }
+        }
+    }
+    fn walk(out: &mut std::collections::HashSet<String>, body: &[Stmt]) {
+        for stmt in body {
+            match stmt {
+                Stmt::Assign(a) => {
+                    for target in &a.targets {
+                        register(out, target);
+                        if let Expr::Tuple(t) = target {
+                            for e in &t.elts {
+                                register(out, e);
+                            }
+                        } else if let Expr::List(l) = target {
+                            for e in &l.elts {
+                                register(out, e);
+                            }
+                        }
+                    }
+                }
+                Stmt::AnnAssign(a) => register(out, a.target.as_ref()),
+                Stmt::AugAssign(a) => register(out, a.target.as_ref()),
+                Stmt::If(s) => {
+                    walk(out, &s.body);
+                    for clause in &s.elif_else_clauses {
+                        walk(out, &clause.body);
+                    }
+                }
+                Stmt::For(s) => {
+                    walk(out, &s.body);
+                    walk(out, &s.orelse);
+                }
+                Stmt::While(s) => {
+                    walk(out, &s.body);
+                    walk(out, &s.orelse);
+                }
+                Stmt::With(s) => walk(out, &s.body),
+                Stmt::Try(s) => {
+                    walk(out, &s.body);
+                    for handler in &s.handlers {
+                        let ruff_python_ast::ExceptHandler::ExceptHandler(h) = handler;
+                        walk(out, &h.body);
+                    }
+                    walk(out, &s.orelse);
+                    walk(out, &s.finalbody);
+                }
+                Stmt::Match(s) => {
+                    for case in &s.cases {
+                        walk(out, &case.body);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut out = std::collections::HashSet::new();
+    for stmt in &cd.body {
+        if let Stmt::FunctionDef(f) = stmt {
+            walk(&mut out, &f.body);
+        }
+    }
+    out
 }
 
 /// Compute the *effective* shape of a class for constructor-arity
@@ -6994,11 +7155,19 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                     // constants.
                     all_ann_assigns_defaulted = false;
                 }
+                // A `plain class` emits a bare `class` with NO
+                // `@dataclass(slots=True)`, so its class-level defaults are
+                // real class attributes, not slot descriptors that a
+                // class-level constant would shadow. The
+                // `class_attr_shadows_slot` warning (and the reasoning that
+                // backs it) does not apply — suppress it for plain classes.
+                let is_plain = c.is_plain_class(class_name);
                 if has_ann_assign
                     && all_ann_assigns_defaulted
                     && only_ann_assigns
                     && !body_has_function
                     && merged_methods_empty
+                    && !is_plain
                 {
                     if let Some((ann, field_name)) = first_defaulted {
                         let value_hint = ann
@@ -7050,7 +7219,19 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                         // `tyc::manual_init` error here rather than
                         // falling through to the softer
                         // `method_in_class_body` warning.
+                        //
+                        // A `plain class` emits a bare class with NO
+                        // generated constructor, and a `class!` raw class
+                        // "preserves a hand-written `__init__` verbatim"
+                        // (REFERENCE.md §3.5). Neither generates a
+                        // constructor that a user `__init__` would conflict
+                        // with, so `manual_init` must NOT fire for them — it
+                        // only applies to a normal `class` / `model` whose
+                        // constructor IS generated.
                         if method == "__init__" {
+                            if c.is_plain_class(class_name) || c.is_raw_class(class_name) {
+                                continue;
+                            }
                             c.diagnostics.push_error(TycError::manual_init(
                                 class_name.to_owned(),
                                 c.path.clone(),
@@ -11330,9 +11511,13 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
                     // foreign by `class_hierarchy_fully_known` so this stays
                     // quiet on `fastapi.Request.body(...)` etc. v0.8.0
                     // carry-over.
+                    // A class (or any base) that defines `__getattr__` can
+                    // resolve arbitrary attribute names at runtime, so a
+                    // statically-missing attribute is NOT an error there.
                     if c.unsafe_depth == 0
                         && !attr_name.starts_with('_')
                         && c.class_hierarchy_fully_known(class_name.as_str())
+                        && !c.class_defines_getattr(class_name.as_str())
                     {
                         let attr_start = a.attr.range.start().to_usize();
                         let attr_len = a
@@ -11434,6 +11619,7 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
                         && c.unsafe_depth == 0
                         && !attr_name.starts_with('_')
                         && c.class_hierarchy_fully_known(class_name.as_str())
+                        && !c.class_defines_getattr(class_name.as_str())
                     {
                         let attr_start = a.attr.range.start().to_usize();
                         let attr_len = a
@@ -12576,6 +12762,37 @@ mod tests {
             .unwrap()
             .into_syntax();
         let (resolved, _) = resolve_module("<test>".to_owned(), &prep.python_source, &module);
+        check_module_with(
+            "<test>",
+            &prep.python_source,
+            &resolved,
+            &module,
+            &prep.unsafe_lines,
+            &prep.frozen_class_lines,
+        )
+    }
+
+    /// Like `check`, but feeds the resolver the same `ResolveOptions`
+    /// metadata the CLI does (`original_source` so `plain class` names are
+    /// recorded, `raw_class_byte_starts` so `class!` bindings are tagged
+    /// `ClassKind::Raw`). Required for any test exercising plain-/raw-class
+    /// awareness in the checker (manual_init / class_attr_shadows_slot /
+    /// attribute_not_found suppression).
+    fn check_class_kinds(src: &str) -> Diagnostics {
+        use tyc_resolve::{resolve_module_with, ResolveOptions};
+        let prep = preprocess(src);
+        let module = tyc_syntax::parse_module(&prep.python_source)
+            .unwrap()
+            .into_syntax();
+        let raw_class_byte_starts =
+            tyc_syntax::preprocess::line_byte_starts(&prep.python_source, &prep.raw_class_lines);
+        let options = ResolveOptions {
+            raw_class_byte_starts,
+            original_source: Some(src.to_owned()),
+            ..ResolveOptions::default()
+        };
+        let (resolved, _) =
+            resolve_module_with("<test>".to_owned(), &prep.python_source, &module, options);
         check_module_with(
             "<test>",
             &prep.python_source,
