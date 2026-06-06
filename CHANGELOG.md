@@ -113,6 +113,14 @@ mismatch, and interface conformance were all correctly rejected).
 - **A complex base raised to a non-negative integer power** is computed by
   repeated multiplication for an exact result (`(1j) ** 2` → `-1+0j`).
 
+### Fixed — VM property setters and `dir`
+
+- **`@<prop>.setter`** is honoured: `obj.prop = v` invokes the setter
+  (previously the `@c.setter` decorator crashed with `NameError` and the
+  assignment bypassed the setter).
+- **`dir(x)`** returns the sorted attribute names of an instance / class /
+  module (was `NameError`).
+
 ### Fixed — VM parity with the checker false-reject fixes
 
 - **`__getattr__` resolves missing attributes** under `tyc run` (was

@@ -782,6 +782,39 @@ if math.perm(5, 2) != 20:
     }
 
     #[test]
+    fn vm_property_setter_and_dir() {
+        let src = r#"
+class Temp:
+    _c: float
+impl Temp:
+    @property
+    def celsius(self) -> float:
+        return self._c
+    @celsius.setter
+    def celsius(self, v: float) -> None:
+        self._c = v
+
+class Foo:
+    a: int
+impl Foo:
+    def m(self) -> int:
+        return self.a
+
+def main() -> None:
+    let t: Temp = Temp(_c=0.0)
+    t.celsius = 100.0
+    if t.celsius != 100.0:
+        raise ValueError("property setter broken")
+    let d: list[str] = dir(Foo(a=1))
+    if not ("a" in d) or not ("m" in d):
+        raise ValueError("dir broken")
+
+main()
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    #[test]
     fn vm_getattr_and_comprehension_walrus() {
         // VM gaps that paired with the checker false-reject fixes: a user
         // __getattr__ resolves missing attributes, and a walrus binding in a

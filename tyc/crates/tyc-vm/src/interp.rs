@@ -546,6 +546,28 @@ impl Interpreter {
             match stmt {
                 Stmt::FunctionDef(f) => {
                     let func = self.build_function(f, &body_env)?;
+                    // `@prop.setter` / `@prop.deleter` register the decorated
+                    // function as the property's setter/deleter (under a
+                    // sentinel class-attr key) rather than overriding the
+                    // getter method. Evaluating `prop.setter` directly would
+                    // fail (`prop` isn't bound during class-body execution).
+                    let mut setter_target: Option<String> = None;
+                    for deco in f.decorator_list.iter() {
+                        if let Expr::Attribute(a) = &deco.expression {
+                            if a.attr.as_str() == "setter" {
+                                if let Expr::Name(prop) = a.value.as_ref() {
+                                    setter_target = Some(prop.id.as_str().to_owned());
+                                }
+                            }
+                        }
+                    }
+                    if let Some(prop) = setter_target {
+                        class_attrs.insert(
+                            format!("__typhon_setter__{}", prop),
+                            Value::Function(Rc::new(func)),
+                        );
+                        continue;
+                    }
                     let mut v = Value::Function(Rc::new(func));
                     let has_deco = |want: &str| {
                         f.decorator_list.iter().any(
@@ -2049,7 +2071,7 @@ impl Interpreter {
         // Initialise class-level attributes that aren't methods. Skip the
         // internal enum sentinels so they don't leak onto instances.
         for (k, v) in class.class_attrs.borrow().iter() {
-            if is_enum_sentinel(k) {
+            if is_enum_sentinel(k) || k.starts_with("__typhon_setter__") {
                 continue;
             }
             instance.fields.borrow_mut().insert(k.clone(), v.clone());
@@ -3217,6 +3239,25 @@ impl Interpreter {
     pub fn set_attr(&mut self, receiver: &Value, attr: &str, value: Value) -> Result<(), Unwind> {
         match receiver {
             Value::Instance(i) => {
+                // A `@prop.setter` registered for this name intercepts the
+                // assignment (`obj.prop = v` → setter(self, v)).
+                let setter = i
+                    .class
+                    .class_attrs
+                    .borrow()
+                    .get(&format!("__typhon_setter__{}", attr))
+                    .cloned();
+                if let Some(Value::Function(setter)) = setter {
+                    self.call_value(
+                        Value::BoundMethod {
+                            receiver: Box::new(receiver.clone()),
+                            function: setter,
+                        },
+                        vec![value],
+                        &[],
+                    )?;
+                    return Ok(());
+                }
                 i.fields.borrow_mut().insert(attr.to_owned(), value);
                 Ok(())
             }

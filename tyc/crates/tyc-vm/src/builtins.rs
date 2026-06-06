@@ -464,6 +464,47 @@ pub fn install(interp: &mut Interpreter) {
             _ => Err(type_error("delattr() target does not support attribute deletion")),
         }
     });
+    native!("dir", |_i, args| {
+        fn internal(k: &str) -> bool {
+            matches!(k, "__typhon_enum_base__" | "__typhon_enum_members__")
+                || k.starts_with("__typhon_setter__")
+        }
+        let mut names: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        match args.first() {
+            Some(Value::Instance(inst)) => {
+                for k in inst.fields.borrow().keys() {
+                    names.insert(k.clone());
+                }
+                for k in inst.class.methods.borrow().keys() {
+                    names.insert(k.clone());
+                }
+                for k in inst.class.class_attrs.borrow().keys() {
+                    if !internal(k) {
+                        names.insert(k.clone());
+                    }
+                }
+            }
+            Some(Value::Module(m)) => {
+                for k in m.members.borrow().keys() {
+                    names.insert(k.clone());
+                }
+            }
+            Some(Value::Class(c)) => {
+                for k in c.methods.borrow().keys() {
+                    names.insert(k.clone());
+                }
+                for k in c.class_attrs.borrow().keys() {
+                    if !internal(k) {
+                        names.insert(k.clone());
+                    }
+                }
+            }
+            _ => {}
+        }
+        Ok(Value::List(Rc::new(RefCell::new(
+            names.into_iter().map(|s| Value::Str(Rc::new(s))).collect(),
+        ))))
+    });
     native!("vars", |_i, args| {
         match args.first() {
             Some(Value::Instance(inst)) => {
