@@ -782,6 +782,71 @@ if math.perm(5, 2) != 20:
     }
 
     #[test]
+    fn vm_data_model_round_two() {
+        // Sixth round, part 2: slice assignment, __index__, __delitem__,
+        // del obj.attr, cached_property, __iter__ returning self, function
+        // __name__, set star-unpack, bare-class raise.
+        let src = r#"
+from functools import cached_property
+
+class Idx:
+    v: int
+impl Idx:
+    def __index__(self) -> int:
+        return self.v
+
+class Circle:
+    r: float
+impl Circle:
+    @cached_property
+    def area(self) -> float:
+        return self.r * self.r
+
+class Counter:
+    n: int
+impl Counter:
+    def __iter__(self) -> Counter:
+        return self
+    def __next__(self) -> int:
+        if self.n <= 0:
+            raise StopIteration
+        self.n = self.n - 1
+        return self.n
+
+class Bag:
+    x: int
+    y: int
+
+def f(z: int) -> int:
+    return z
+
+def main() -> None:
+    mut xs: list[int] = [1, 2, 3, 4, 5]
+    xs[1:3] = [99]
+    if xs != [1, 99, 4, 5]:
+        raise ValueError("slice assign")
+    if [10, 20, 30][Idx(v=2)] != 30:
+        raise ValueError("__index__")
+    if Circle(r=3.0).area != 9.0:
+        raise ValueError("cached_property")
+    if list(Counter(n=3)) != [2, 1, 0]:
+        raise ValueError("__iter__ self")
+    let b: Bag = Bag(x=1, y=2)
+    del b.x
+    if hasattr(b, "x") or b.y != 2:
+        raise ValueError("del attr")
+    if f.__name__ != "f":
+        raise ValueError("__name__")
+    let ys: list[int] = [1, 2]
+    if sorted({*ys, 9}) != [1, 2, 9]:
+        raise ValueError("set star")
+
+main()
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    #[test]
     fn exception_model_fixes() {
         // Sixth stress round: builtin exception hierarchy catching, bare
         // re-raise, finally-replaces-exception, type(exc).__name__, and

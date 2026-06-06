@@ -113,6 +113,22 @@ mismatch, and interface conformance were all correctly rejected).
 - **A complex base raised to a non-negative integer power** is computed by
   repeated multiplication for an exact result (`(1j) ** 2` → `-1+0j`).
 
+### Fixed — sixth stress round (VM data model, part 2)
+
+- **List slice assignment** `xs[1:3] = [...]` (contiguous and extended-step).
+- **`__index__`** is honoured for subscripting (`xs[idx]` / `xs[idx] = v`).
+- **`del obj[key]`** dispatches `__delitem__`; **`del obj.attr`** removes an
+  instance attribute.
+- **`@cached_property`** is invoked on read (returns the value, not the bound
+  method); class-level `lazy let` rides on the same path.
+- **`__iter__` returning `self`** (the standard iterator idiom) no longer
+  stack-overflows — the VM drives `__next__` to `StopIteration`.
+- **Function `__name__` / `__qualname__`** (also on natives and bound
+  methods).
+- **Set literal star-unpack** `{*xs, 9}`.
+- **Bare-class `raise`** (`raise StopIteration` / `raise SomeError`)
+  instantiates the exception, matching Python.
+
 ### Fixed — sixth stress round (VM exception model)
 
 - **Builtin exception hierarchy catching.** `except ArithmeticError` now

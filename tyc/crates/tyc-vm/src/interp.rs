@@ -360,7 +360,18 @@ impl Interpreter {
             }
             Stmt::Raise(r) => {
                 let exc = match &r.exc {
-                    Some(e) => self.eval_expr(e, env)?,
+                    Some(e) => {
+                        let v = self.eval_expr(e, env)?;
+                        // `raise SomeError` (a bare class / builtin exception
+                        // constructor) instantiates it, matching Python — so
+                        // `raise StopIteration` yields a StopIteration value,
+                        // not the constructor function.
+                        match v {
+                            Value::Native(_) => self.call_value(v, vec![], &[])?,
+                            Value::Class(ref c) => self.instantiate(c, vec![], &[])?,
+                            other => other,
+                        }
+                    }
                     None => {
                         // Bare `raise` re-raises the exception currently being
                         // handled by the innermost enclosing `except` block.
@@ -410,6 +421,30 @@ impl Interpreter {
                             let target = self.eval_expr(&sub.value, env)?;
                             let key = self.eval_expr(&sub.slice, env)?;
                             self.del_subscript(&target, &key)?;
+                        }
+                        // `del obj.attr` removes an instance attribute.
+                        Expr::Attribute(a) => {
+                            let recv = self.eval_expr(&a.value, env)?;
+                            match recv {
+                                Value::Instance(inst) => {
+                                    if inst
+                                        .fields
+                                        .borrow_mut()
+                                        .remove(a.attr.as_str())
+                                        .is_none()
+                                    {
+                                        return Err(attribute_error(format!(
+                                            "{}",
+                                            a.attr.as_str()
+                                        )));
+                                    }
+                                }
+                                _ => {
+                                    return Err(type_error(
+                                        "cannot delete attribute on this object",
+                                    ))
+                                }
+                            }
                         }
                         _ => return Err(not_implemented("complex delete targets")),
                     }
@@ -517,7 +552,10 @@ impl Interpreter {
                             |d| matches!(&d.expression, Expr::Name(n) if n.id.as_str() == want),
                         )
                     };
-                    let is_property = has_deco("property");
+                    // `@cached_property` behaves like a property on read (the
+                    // VM invokes it lazily). True per-instance caching is not
+                    // modelled, but the observable value is correct.
+                    let is_property = has_deco("property") || has_deco("cached_property");
                     let is_classmethod = has_deco("classmethod");
                     for deco in f.decorator_list.iter().rev() {
                         v = self.apply_decorator(deco, v, &body_env)?;
@@ -1127,8 +1165,17 @@ impl Interpreter {
             Expr::Set(s) => {
                 let mut set = std::collections::HashSet::new();
                 for e in &s.elts {
-                    let v = self.eval_expr(e, env)?;
-                    set.insert(v.to_hash_key()?);
+                    // `{*xs, 9}` — splat an iterable's elements into the set.
+                    if let Expr::Starred(st) = e {
+                        let it = self.eval_expr(&st.value, env)?;
+                        let it = self.make_iter(it)?;
+                        while let Some(v) = self.iter_next(&it)? {
+                            set.insert(v.to_hash_key()?);
+                        }
+                    } else {
+                        let v = self.eval_expr(e, env)?;
+                        set.insert(v.to_hash_key()?);
+                    }
                 }
                 Ok(Value::Set(Rc::new(RefCell::new(set))))
             }
@@ -2589,6 +2636,18 @@ impl Interpreter {
                 }
             }
         }
+        // Honour a user `__index__` on the subscript key (e.g. `xs[idx]`
+        // where `idx` is a class defining `__index__`).
+        let key_owned;
+        let key = match key {
+            Value::Instance(i) if self.find_method(&i.class, "__index__").is_some() => {
+                key_owned = self
+                    .call_dunder0(key, "__index__")?
+                    .unwrap_or(Value::None);
+                &key_owned
+            }
+            _ => key,
+        };
         match target {
             // `Color["RED"]` — enum member lookup by name.
             Value::Class(c) if Self::is_enum_class(c) => {
@@ -2815,6 +2874,24 @@ impl Interpreter {
                     .map(|_| ())
                     .ok_or_else(|| key_error(key.py_repr()))
             }
+            // `del obj[key]` → `obj.__delitem__(key)`.
+            Value::Instance(i) => {
+                if let Some(m) = self.find_method(&i.class, "__delitem__") {
+                    self.call_value(
+                        Value::BoundMethod {
+                            receiver: Box::new(target.clone()),
+                            function: m,
+                        },
+                        vec![key.clone()],
+                        &[],
+                    )?;
+                    return Ok(());
+                }
+                Err(type_error(format!(
+                    "'{}' object does not support item deletion",
+                    i.class.name
+                )))
+            }
             _ => Err(type_error("delete on unsupported target")),
         }
     }
@@ -2952,6 +3029,18 @@ impl Interpreter {
             Value::Module(m) => m.members.borrow().get(attr).cloned().ok_or_else(|| {
                 attribute_error(format!("module '{}' has no attribute '{}'", m.name, attr))
             }),
+            // `func.__name__` / `func.__qualname__`.
+            Value::Function(f) if attr == "__name__" || attr == "__qualname__" => {
+                Ok(Value::Str(Rc::new(f.name.clone())))
+            }
+            Value::Native(n) if attr == "__name__" || attr == "__qualname__" => {
+                Ok(Value::Str(Rc::new(n.name.to_string())))
+            }
+            Value::BoundMethod { function, .. }
+                if attr == "__name__" || attr == "__qualname__" =>
+            {
+                Ok(Value::Str(Rc::new(function.name.clone())))
+            }
             Value::ResultOk(v) => match attr {
                 "value" => Ok((**v).clone()),
                 "map" | "map_err" | "and_then" | "or_else" => {
@@ -3133,6 +3222,27 @@ impl Interpreter {
     }
 
     fn set_subscript(&mut self, target: &Value, key: &Value, value: Value) -> Result<(), Unwind> {
+        // Slice assignment: `xs[1:3] = [...]`.
+        if let Value::Tuple(t) = key {
+            if t.len() == 4 {
+                if let Value::Str(tag) = &t[0] {
+                    if tag.as_str() == "__slice__" {
+                        return self.set_slice(target, &t[1], &t[2], &t[3], value);
+                    }
+                }
+            }
+        }
+        // Honour a user `__index__` on the subscript key.
+        let key_owned;
+        let key = match key {
+            Value::Instance(i) if self.find_method(&i.class, "__index__").is_some() => {
+                key_owned = self
+                    .call_dunder0(key, "__index__")?
+                    .unwrap_or(Value::None);
+                &key_owned
+            }
+            _ => key,
+        };
         match target {
             Value::List(l) => {
                 let i = key.to_int()?;
@@ -3177,6 +3287,77 @@ impl Interpreter {
                 "'{}' object does not support item assignment",
                 other.type_name()
             ))),
+        }
+    }
+
+    /// `xs[a:b:c] = iterable` — list slice assignment.
+    fn set_slice(
+        &mut self,
+        target: &Value,
+        lower: &Value,
+        upper: &Value,
+        step: &Value,
+        value: Value,
+    ) -> Result<(), Unwind> {
+        let Value::List(l) = target else {
+            return Err(type_error(format!(
+                "'{}' object does not support slice assignment",
+                target.type_name()
+            )));
+        };
+        let len = l.borrow().len();
+        let step_i = match step {
+            Value::None => 1,
+            v => v.to_int()?,
+        };
+        if step_i == 0 {
+            return Err(value_error("slice step cannot be zero"));
+        }
+        // Materialise the RHS.
+        let it = self.make_iter(value)?;
+        let mut repl: Vec<Value> = Vec::new();
+        while let Some(v) = self.iter_next(&it)? {
+            repl.push(v);
+        }
+        let (start, stop, step_i) = compute_slice(lower, upper, step_i, len)?;
+        if step_i == 1 {
+            let s = start.max(0) as usize;
+            let e = (stop.max(0) as usize).clamp(s, len);
+            l.borrow_mut().splice(s..e, repl);
+            Ok(())
+        } else {
+            // Extended slice: the replacement length must match exactly.
+            let mut indices: Vec<usize> = Vec::new();
+            let mut idx = start;
+            if step_i > 0 {
+                while idx < stop {
+                    if idx >= 0 {
+                        indices.push(idx as usize);
+                    }
+                    idx += step_i;
+                }
+            } else {
+                while idx > stop {
+                    if idx >= 0 {
+                        indices.push(idx as usize);
+                    }
+                    idx += step_i;
+                }
+            }
+            if indices.len() != repl.len() {
+                return Err(value_error(format!(
+                    "attempt to assign sequence of size {} to extended slice of size {}",
+                    repl.len(),
+                    indices.len()
+                )));
+            }
+            let mut b = l.borrow_mut();
+            for (i, v) in indices.into_iter().zip(repl) {
+                if i < b.len() {
+                    b[i] = v;
+                }
+            }
+            Ok(())
         }
     }
 
@@ -3259,6 +3440,35 @@ impl Interpreter {
                         vec![],
                         &[],
                     )?;
+                    // If `__iter__` returns an object that drives iteration via
+                    // `__next__` (commonly `return self`), step it eagerly via
+                    // `__next__` rather than recursing into `make_iter` — which
+                    // would loop forever for `return self` (FINDINGS G4).
+                    if let Value::Instance(ret) = &iter_val {
+                        if self.find_method(&ret.class, "__next__").is_some() {
+                            let mut items: Vec<Value> = Vec::new();
+                            loop {
+                                if items.len() >= GENERATOR_CAP {
+                                    return Err(Unwind::Exception(VmException::new(
+                                        "RuntimeError",
+                                        "iterator exceeded the VM's eager-evaluation limit",
+                                    )));
+                                }
+                                match self.call_dunder0(&iter_val, "__next__") {
+                                    Ok(Some(item)) => items.push(item),
+                                    Ok(None) => break,
+                                    Err(Unwind::Exception(e)) if e.kind == "StopIteration" => {
+                                        break
+                                    }
+                                    Err(e) => return Err(e),
+                                }
+                            }
+                            return Ok(Value::Iter(Rc::new(RefCell::new(IterState::List {
+                                items: Rc::new(RefCell::new(items)),
+                                index: 0,
+                            }))));
+                        }
+                    }
                     return self.make_iter(iter_val);
                 }
                 return Err(type_error(format!(
