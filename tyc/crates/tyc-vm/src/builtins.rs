@@ -396,11 +396,154 @@ pub fn install(interp: &mut Interpreter) {
         Ok(Value::Float(v.to_float()?))
     });
 
-    native!("bool", |_i, args| Ok(Value::Bool(match args.first() {
-        Some(v) => v.truthy(),
+    native!("bool", |i, args| Ok(Value::Bool(match args.first() {
+        Some(v) => i.is_truthy(v)?,
         None => false,
     })));
 
+    native!("getattr", |i, args| {
+        let obj = args
+            .first()
+            .ok_or_else(|| type_error("getattr() requires arguments"))?
+            .clone();
+        let name = args
+            .get(1)
+            .ok_or_else(|| type_error("getattr() requires a name"))?
+            .py_str();
+        match i.get_attr(&obj, &name) {
+            Ok(v) => Ok(v),
+            // Only a *missing* attribute falls back to the default; a real
+            // error from a property/__getattr__ propagates (review: codex).
+            Err(e) => match args.get(2) {
+                Some(default) if is_attribute_error(&e) => Ok(default.clone()),
+                _ => Err(e),
+            },
+        }
+    });
+    native!("hasattr", |i, args| {
+        let obj = args
+            .first()
+            .ok_or_else(|| type_error("hasattr() requires arguments"))?
+            .clone();
+        let name = args
+            .get(1)
+            .ok_or_else(|| type_error("hasattr() requires a name"))?
+            .py_str();
+        // True if present, False only for a genuine AttributeError; any other
+        // exception from a descriptor/__getattr__ propagates (review: codex).
+        match i.get_attr(&obj, &name) {
+            Ok(_) => Ok(Value::Bool(true)),
+            Err(e) if is_attribute_error(&e) => Ok(Value::Bool(false)),
+            Err(e) => Err(e),
+        }
+    });
+    native!("setattr", |i, args| {
+        let obj = args
+            .first()
+            .ok_or_else(|| type_error("setattr() requires arguments"))?
+            .clone();
+        let name = args
+            .get(1)
+            .ok_or_else(|| type_error("setattr() requires a name"))?
+            .py_str();
+        let val = args
+            .get(2)
+            .ok_or_else(|| type_error("setattr() requires a value"))?
+            .clone();
+        i.set_attr(&obj, &name, val)?;
+        Ok(Value::None)
+    });
+    native!("delattr", |_i, args| {
+        let obj = args
+            .first()
+            .ok_or_else(|| type_error("delattr() requires arguments"))?
+            .clone();
+        let name = args
+            .get(1)
+            .ok_or_else(|| type_error("delattr() requires a name"))?
+            .py_str();
+        match &obj {
+            Value::Instance(inst) => {
+                if inst.fields.borrow_mut().remove(name.as_str()).is_none() {
+                    return Err(attribute_error(format!(
+                        "'{}' object has no attribute '{}'",
+                        inst.class.name, name
+                    )));
+                }
+                Ok(Value::None)
+            }
+            _ => Err(type_error(
+                "delattr() target does not support attribute deletion",
+            )),
+        }
+    });
+    native!("dir", |_i, args| {
+        fn internal(k: &str) -> bool {
+            matches!(k, "__typhon_enum_base__" | "__typhon_enum_members__")
+                || k.starts_with("__typhon_setter__")
+        }
+        let mut names: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        match args.first() {
+            Some(Value::Instance(inst)) => {
+                for k in inst.fields.borrow().keys() {
+                    names.insert(k.clone());
+                }
+                for k in inst.class.methods.borrow().keys() {
+                    names.insert(k.clone());
+                }
+                for k in inst.class.class_attrs.borrow().keys() {
+                    if !internal(k) {
+                        names.insert(k.clone());
+                    }
+                }
+            }
+            Some(Value::Module(m)) => {
+                for k in m.members.borrow().keys() {
+                    names.insert(k.clone());
+                }
+            }
+            Some(Value::Class(c)) => {
+                for k in c.methods.borrow().keys() {
+                    names.insert(k.clone());
+                }
+                for k in c.class_attrs.borrow().keys() {
+                    if !internal(k) {
+                        names.insert(k.clone());
+                    }
+                }
+            }
+            _ => {}
+        }
+        Ok(Value::List(Rc::new(RefCell::new(
+            names.into_iter().map(|s| Value::Str(Rc::new(s))).collect(),
+        ))))
+    });
+    native!("vars", |_i, args| {
+        match args.first() {
+            Some(Value::Instance(inst)) => {
+                let mut m: DictMap = IndexMap::new();
+                for (k, v) in inst.fields.borrow().iter() {
+                    m.insert(HashKey::Str(Rc::new(k.clone())), v.clone());
+                }
+                Ok(Value::Dict(Rc::new(RefCell::new(m))))
+            }
+            // `vars(module)` returns the module namespace (review: gemini).
+            Some(Value::Module(md)) => {
+                let mut m: DictMap = IndexMap::new();
+                for (k, v) in md.members.borrow().iter() {
+                    m.insert(HashKey::Str(Rc::new(k.clone())), v.clone());
+                }
+                Ok(Value::Dict(Rc::new(RefCell::new(m))))
+            }
+            Some(other) => Err(type_error(format!(
+                "vars() argument must have __dict__, not '{}'",
+                other.type_name()
+            ))),
+            None => Err(type_error(
+                "vars() with no argument is unsupported in the VM",
+            )),
+        }
+    });
     native!("list", |i, args| {
         let mut out = Vec::new();
         if let Some(v) = args.into_iter().next() {
@@ -527,6 +670,9 @@ pub fn install(interp: &mut Interpreter) {
         Ok(match v {
             Value::Instance(i) => Value::Class(i.class.clone()),
             Value::Class(_) => make_builtin_type("type"),
+            // `type(some_exception).__name__` should be the concrete kind
+            // (e.g. `TypeError`), not the generic `Exception`.
+            Value::Exception { kind, .. } => make_builtin_type(kind.as_str()),
             other => make_builtin_type(other.type_name()),
         })
     });
@@ -566,6 +712,12 @@ pub fn install(interp: &mut Interpreter) {
         match args.as_slice() {
             [] => Ok(Value::Complex(0.0, 0.0)),
             [Value::Complex(re, im)] => Ok(Value::Complex(*re, *im)),
+            // complex("1+2j") / complex("3j") / complex("-1") string parse.
+            [Value::Str(s)] => {
+                let (re, im) = parse_complex_str(s.trim())
+                    .ok_or_else(|| value_error("complex() arg is a malformed string"))?;
+                Ok(Value::Complex(re, im))
+            }
             [x] => Ok(Value::Complex(part(x, "first")?, 0.0)),
             [Value::Complex(re, im), y] => {
                 // complex(c, n) → c + n*1j (imag part adds).
@@ -761,11 +913,42 @@ pub fn install(interp: &mut Interpreter) {
     });
 
     native!("round", |_i, args| match args.first() {
-        // round(int) and round(int, ndigits) return the int unchanged
-        // (Python rounds to the given decimal place; for ints with
-        // non-negative ndigits that's a no-op, and these are the only
-        // cases the shim handles).
-        Some(Value::Int(i)) => Ok(Value::Int(i.clone())),
+        // round(int, ndigits): non-negative ndigits is a no-op; a negative
+        // ndigits rounds to tens/hundreds/… (half-to-even, staying an int).
+        Some(Value::Int(i)) => {
+            use num_integer::Integer;
+            use num_traits::Zero;
+            match args.get(1) {
+                Some(n) if !matches!(n, Value::None) => {
+                    let nd = n.to_int()?;
+                    if nd >= 0 {
+                        Ok(Value::Int(i.clone()))
+                    } else if -nd > 10_000 {
+                        // Any in-memory integer rounds to 0 once the place
+                        // value exceeds its digit count; cap to avoid an
+                        // OOM/DoS building 10**(huge) (review: gemini).
+                        Ok(Value::Int(num_bigint::BigInt::zero()))
+                    } else {
+                        let p = num_bigint::BigInt::from(10).pow((-nd) as u32);
+                        // Floor-divide so the remainder is always in [0, p).
+                        let q = i.div_floor(&p);
+                        let r = i - &q * &p;
+                        let two_r = &r * 2;
+                        let rounded = if two_r < p {
+                            q
+                        } else if two_r > p {
+                            q + 1
+                        } else if (&q % num_bigint::BigInt::from(2)).is_zero() {
+                            q
+                        } else {
+                            q + 1
+                        };
+                        Ok(Value::Int(rounded * &p))
+                    }
+                }
+                _ => Ok(Value::Int(i.clone())),
+            }
+        }
         Some(Value::Float(x)) => {
             let x = *x;
             match args.get(1) {
@@ -823,8 +1006,28 @@ pub fn install(interp: &mut Interpreter) {
         Ok(Value::Str(Rc::new(s)))
     });
 
-    native!("hash", |_i, args| {
+    native!("hash", |i, args| {
         let v = single(&args, "hash")?;
+        // A user-defined `__hash__` wins over the structural hash key.
+        if let Value::Instance(inst) = v {
+            if let Some(m) = i.find_method(&inst.class, "__hash__") {
+                let r = i.call_value(
+                    Value::BoundMethod {
+                        receiver: Box::new(v.clone()),
+                        function: m,
+                    },
+                    vec![],
+                    &[],
+                )?;
+                return match r {
+                    Value::Int(_) => Ok(r),
+                    other => Err(type_error(format!(
+                        "__hash__ method should return an integer, not {}",
+                        other.type_name()
+                    ))),
+                };
+            }
+        }
         let key = v.to_hash_key()?;
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -986,6 +1189,7 @@ pub fn install(interp: &mut Interpreter) {
             Ok(Value::Exception {
                 kind: Rc::new(n.clone()),
                 message: Rc::new(msg),
+                args: Rc::new(args),
             })
         });
         root.set(name, Value::Native(Rc::new(ctor)));
@@ -1656,6 +1860,29 @@ fn make_math_module() -> Value {
             ("tau", Value::Float(std::f64::consts::TAU)),
             ("inf", Value::Float(f64::INFINITY)),
             ("nan", Value::Float(f64::NAN)),
+            // ── floating-point predicates ─────────────────────────────────────
+            (
+                "isnan",
+                nf("isnan", |_i, args| {
+                    Ok(Value::Bool(single(&args, "isnan")?.to_float()?.is_nan()))
+                }),
+            ),
+            (
+                "isinf",
+                nf("isinf", |_i, args| {
+                    Ok(Value::Bool(
+                        single(&args, "isinf")?.to_float()?.is_infinite(),
+                    ))
+                }),
+            ),
+            (
+                "isfinite",
+                nf("isfinite", |_i, args| {
+                    Ok(Value::Bool(
+                        single(&args, "isfinite")?.to_float()?.is_finite(),
+                    ))
+                }),
+            ),
             // ── floating-point basic ──────────────────────────────────────────
             (
                 "sqrt",
@@ -1706,6 +1933,18 @@ fn make_math_module() -> Value {
                         .ok_or_else(|| type_error("copysign() needs args"))?
                         .to_float()?;
                     Ok(Value::Float(x.copysign(y)))
+                }),
+            ),
+            (
+                "prod",
+                nf("prod", |i, args| {
+                    // math.prod(iterable, *, start=1) — multiply all elements.
+                    let it = i.make_iter(single(&args, "prod")?.clone())?;
+                    let mut acc = Value::Int(num_bigint::BigInt::from(1));
+                    while let Some(v) = i.iter_next(&it)? {
+                        acc = i.binop(&acc, ruff_python_ast::Operator::Mult, &v)?;
+                    }
+                    Ok(acc)
                 }),
             ),
             (
@@ -2098,7 +2337,10 @@ fn make_json_module() -> Value {
             (
                 "dumps",
                 nf("dumps", |_i, args| {
-                    Ok(Value::Str(Rc::new(json_dumps(single(&args, "dumps")?))))
+                    Ok(Value::Str(Rc::new(json_dumps(
+                        single(&args, "dumps")?,
+                        false,
+                    ))))
                 }),
             ),
             (
@@ -2124,7 +2366,7 @@ fn make_json_module() -> Value {
                     if args.len() < 2 {
                         return Err(crate::error::type_error("dump() requires (obj, fp)"));
                     }
-                    let serialised = json_dumps(&args[0]);
+                    let serialised = json_dumps(&args[0], false);
                     let fp = args[1].clone();
                     let write = interp.get_attr(&fp, "write")?;
                     interp.call_value(write, vec![Value::Str(Rc::new(serialised))], &[])?;
@@ -2394,6 +2636,145 @@ fn make_re_module() -> Value {
         regex::Regex::new(&to_rust_pattern(p))
             .map_err(|e| value_error(format!("invalid regex: {e}")))
     }
+    // name -> group index for a compiled pattern's named groups.
+    fn name_indices(re: &regex::Regex) -> HashMap<String, usize> {
+        let mut m = HashMap::new();
+        for (i, n) in re.capture_names().enumerate() {
+            if let Some(n) = n {
+                m.insert(n.to_owned(), i);
+            }
+        }
+        m
+    }
+    // Expand a Python replacement template (`\1`, `\g<name>`, `\g<N>`, `\\`,
+    // `\n`/`\t`/`\r`) against a captures.
+    fn expand_template(
+        tpl: &str,
+        caps: &regex::Captures,
+        names: &HashMap<String, usize>,
+    ) -> String {
+        let ch: Vec<char> = tpl.chars().collect();
+        let mut out = String::new();
+        let mut i = 0;
+        while i < ch.len() {
+            if ch[i] == '\\' && i + 1 < ch.len() {
+                let n = ch[i + 1];
+                if n.is_ascii_digit() {
+                    let mut j = i + 1;
+                    let mut num = String::new();
+                    while j < ch.len() && ch[j].is_ascii_digit() && num.len() < 2 {
+                        num.push(ch[j]);
+                        j += 1;
+                    }
+                    if let Ok(idx) = num.parse::<usize>() {
+                        if let Some(m) = caps.get(idx) {
+                            out.push_str(m.as_str());
+                        }
+                    }
+                    i = j;
+                    continue;
+                } else if n == 'g' && i + 2 < ch.len() && ch[i + 2] == '<' {
+                    let mut j = i + 3;
+                    let mut nm = String::new();
+                    while j < ch.len() && ch[j] != '>' {
+                        nm.push(ch[j]);
+                        j += 1;
+                    }
+                    if j < ch.len() {
+                        j += 1; // consume '>'
+                    }
+                    let idx = nm.parse::<usize>().ok().or_else(|| names.get(&nm).copied());
+                    if let Some(idx) = idx {
+                        if let Some(m) = caps.get(idx) {
+                            out.push_str(m.as_str());
+                        }
+                    }
+                    i = j;
+                    continue;
+                } else if n == '\\' {
+                    out.push('\\');
+                    i += 2;
+                    continue;
+                } else if n == 'n' {
+                    out.push('\n');
+                    i += 2;
+                    continue;
+                } else if n == 't' {
+                    out.push('\t');
+                    i += 2;
+                    continue;
+                } else if n == 'r' {
+                    out.push('\r');
+                    i += 2;
+                    continue;
+                }
+            }
+            out.push(ch[i]);
+            i += 1;
+        }
+        out
+    }
+    // `re.sub` honouring a callable replacement (called with each Match) or a
+    // Python-syntax template string. `count == 0` means replace all.
+    fn re_sub_apply(
+        interp: &mut crate::interp::Interpreter,
+        re: &regex::Regex,
+        repl: &Value,
+        s: &str,
+        count: usize,
+    ) -> Result<(String, usize), Unwind> {
+        let names = name_indices(re);
+        let callable = matches!(
+            repl,
+            Value::Function(_) | Value::Native(_) | Value::BoundMethod { .. } | Value::Class(_)
+        );
+        let mut out = String::new();
+        let mut last = 0usize;
+        let mut n = 0usize;
+        for caps in re.captures_iter(s) {
+            if count != 0 && n >= count {
+                break;
+            }
+            let m0 = caps.get(0).unwrap();
+            let (ms, me) = (m0.start(), m0.end());
+            out.push_str(&s[last..ms]);
+            if callable {
+                let mv = captures_to_value(Some(caps), &names);
+                let r = interp.call_value(repl.clone(), vec![mv], &[])?;
+                out.push_str(&r.py_str());
+            } else {
+                let tpl = repl.py_str();
+                out.push_str(&expand_template(&tpl, &caps, &names));
+            }
+            last = me;
+            n += 1;
+        }
+        out.push_str(&s[last..]);
+        Ok((out, n))
+    }
+    // `re.split` — includes captured groups between splits (CPython semantics).
+    // `maxsplit == 0` means unlimited.
+    fn re_split_apply(re: &regex::Regex, s: &str, maxsplit: usize) -> Vec<Value> {
+        let ngroups = re.captures_len().saturating_sub(1);
+        let mut out: Vec<Value> = Vec::new();
+        let mut last = 0usize;
+        for (n, caps) in re.captures_iter(s).enumerate() {
+            if maxsplit != 0 && n >= maxsplit {
+                break;
+            }
+            let m0 = caps.get(0).unwrap();
+            out.push(Value::Str(Rc::new(s[last..m0.start()].to_owned())));
+            for gi in 1..=ngroups {
+                match caps.get(gi) {
+                    Some(m) => out.push(Value::Str(Rc::new(m.as_str().to_owned()))),
+                    None => out.push(Value::None),
+                }
+            }
+            last = m0.end();
+        }
+        out.push(Value::Str(Rc::new(s[last..].to_owned())));
+        out
+    }
     // A Pattern object holding a compiled regex plus a thin method table
     // so `pattern.match(s)` etc. work.
     fn pattern_value(p: regex::Regex) -> Value {
@@ -2405,7 +2786,7 @@ fn make_re_module() -> Value {
             Value::Native(Rc::new(NativeFn::new("match", move |_i, args| {
                 let s = single(&args, "match")?.py_str();
                 let caps = p1.captures(&s).filter(|c| c.get(0).unwrap().start() == 0);
-                Ok(captures_to_value(caps))
+                Ok(captures_to_value(caps, &name_indices(&p1)))
             }))),
         );
         let p2 = p_rc.clone();
@@ -2413,7 +2794,20 @@ fn make_re_module() -> Value {
             "search".into(),
             Value::Native(Rc::new(NativeFn::new("search", move |_i, args| {
                 let s = single(&args, "search")?.py_str();
-                Ok(captures_to_value(p2.captures(&s)))
+                Ok(captures_to_value(p2.captures(&s), &name_indices(&p2)))
+            }))),
+        );
+        let p2f = p_rc.clone();
+        attrs.insert(
+            "finditer".into(),
+            Value::Native(Rc::new(NativeFn::new("finditer", move |_i, args| {
+                let s = single(&args, "finditer")?.py_str();
+                let names = name_indices(&p2f);
+                let out: Vec<Value> = p2f
+                    .captures_iter(&s)
+                    .map(|c| captures_to_value(Some(c), &names))
+                    .collect();
+                Ok(Value::List(Rc::new(RefCell::new(out))))
             }))),
         );
         let p3 = p_rc.clone();
@@ -2431,16 +2825,40 @@ fn make_re_module() -> Value {
         let p4 = p_rc.clone();
         attrs.insert(
             "sub".into(),
-            Value::Native(Rc::new(NativeFn::new("sub", move |_i, args| {
+            Value::Native(Rc::new(NativeFn::new("sub", move |i, args| {
                 let repl = args
                     .first()
                     .ok_or_else(|| type_error("sub() needs replacement"))?
-                    .py_str();
+                    .clone();
                 let s = args
                     .get(1)
                     .ok_or_else(|| type_error("sub() needs string"))?
                     .py_str();
-                Ok(Value::Str(Rc::new(p4.replace_all(&s, repl).into_owned())))
+                let count = match args.get(2) {
+                    Some(c) if !matches!(c, Value::None) => c.to_int()?.max(0) as usize,
+                    _ => 0,
+                };
+                let (out, _) = re_sub_apply(i, &p4, &repl, &s, count)?;
+                Ok(Value::Str(Rc::new(out)))
+            }))),
+        );
+        let p4n = p_rc.clone();
+        attrs.insert(
+            "subn".into(),
+            Value::Native(Rc::new(NativeFn::new("subn", move |i, args| {
+                let repl = args
+                    .first()
+                    .ok_or_else(|| type_error("subn() needs replacement"))?
+                    .clone();
+                let s = args
+                    .get(1)
+                    .ok_or_else(|| type_error("subn() needs string"))?
+                    .py_str();
+                let (out, n) = re_sub_apply(i, &p4n, &repl, &s, 0)?;
+                Ok(Value::Tuple(Rc::new(vec![
+                    Value::Str(Rc::new(out)),
+                    Value::Int(num_bigint::BigInt::from(n as i64)),
+                ])))
             }))),
         );
         let p5 = p_rc.clone();
@@ -2448,11 +2866,9 @@ fn make_re_module() -> Value {
             "split".into(),
             Value::Native(Rc::new(NativeFn::new("split", move |_i, args| {
                 let s = single(&args, "split")?.py_str();
-                let parts: Vec<Value> = p5
-                    .split(&s)
-                    .map(|p| Value::Str(Rc::new(p.to_owned())))
-                    .collect();
-                Ok(Value::List(Rc::new(RefCell::new(parts))))
+                Ok(Value::List(Rc::new(RefCell::new(re_split_apply(
+                    &p5, &s, 0,
+                )))))
             }))),
         );
         // Wrap the attrs in a Class-shaped value with an Instance.
@@ -2475,7 +2891,10 @@ fn make_re_module() -> Value {
     // Build a match object from a `regex::Captures`. Group 0 is the whole
     // match; groups 1.. are the capture groups. Non-participating optional
     // groups are represented as `None`.
-    fn captures_to_value(caps: Option<regex::Captures<'_>>) -> Value {
+    fn captures_to_value(
+        caps: Option<regex::Captures<'_>>,
+        names: &HashMap<String, usize>,
+    ) -> Value {
         let Some(caps) = caps else { return Value::None };
         let whole = caps.get(0).expect("group 0 always present");
         let start = whole.start() as i64;
@@ -2484,12 +2903,25 @@ fn make_re_module() -> Value {
         let group_texts: Vec<Option<String>> = (0..caps.len())
             .map(|i| caps.get(i).map(|m| m.as_str().to_owned()))
             .collect();
+        let names = names.clone();
         let mut attrs: HashMap<String, Value> = HashMap::new();
-        // `.group()`/`.group(n)`/`.group(a, b, ...)`.
+        // `.group()`/`.group(n)`/`.group("name")`/`.group(a, b, ...)`.
         let gt = group_texts.clone();
+        let names_g = names.clone();
         attrs.insert(
             "group".into(),
             Value::Native(Rc::new(NativeFn::new("group", move |_i, args| {
+                // Resolve an int index or a string group name.
+                let resolve = |a: &Value| -> Result<usize, Unwind> {
+                    if let Value::Str(s) = a {
+                        names_g
+                            .get(s.as_str())
+                            .copied()
+                            .ok_or_else(|| index_error(format!("no such group: '{}'", s)))
+                    } else {
+                        Ok(a.to_int()? as usize)
+                    }
+                };
                 let pick = |idx: usize| -> Result<Value, Unwind> {
                     match gt.get(idx) {
                         None => Err(index_error("no such group")),
@@ -2501,13 +2933,30 @@ fn make_re_module() -> Value {
                     return pick(0);
                 }
                 if args.len() == 1 {
-                    return pick(args[0].to_int()? as usize);
+                    return pick(resolve(&args[0])?);
                 }
                 let mut out = Vec::with_capacity(args.len());
                 for a in &args {
-                    out.push(pick(a.to_int()? as usize)?);
+                    out.push(pick(resolve(a)?)?);
                 }
                 Ok(Value::Tuple(Rc::new(out)))
+            }))),
+        );
+        // `.groupdict()` — {name: text} for every named group.
+        let gt_d = group_texts.clone();
+        let names_d = names.clone();
+        attrs.insert(
+            "groupdict".into(),
+            Value::Native(Rc::new(NativeFn::new("groupdict", move |_i, _args| {
+                let mut d: DictMap = IndexMap::new();
+                for (name, idx) in &names_d {
+                    let v = match gt_d.get(*idx) {
+                        Some(Some(s)) => Value::Str(Rc::new(s.clone())),
+                        _ => Value::None,
+                    };
+                    d.insert(HashKey::Str(Rc::new(name.clone())), v);
+                }
+                Ok(Value::Dict(Rc::new(RefCell::new(d))))
             }))),
         );
         // `.groups()` returns groups 1.. (not group 0).
@@ -2590,7 +3039,8 @@ fn make_re_module() -> Value {
                     // returns the leftmost match anywhere, so anchor by
                     // requiring `start() == 0`.
                     let caps = r.captures(&s).filter(|c| c.get(0).unwrap().start() == 0);
-                    Ok(captures_to_value(caps))
+                    let names = name_indices(&r);
+                    Ok(captures_to_value(caps, &names))
                 }),
             ),
             (
@@ -2605,7 +3055,8 @@ fn make_re_module() -> Value {
                         .ok_or_else(|| type_error("search() needs string"))?
                         .py_str();
                     let r = compile_one(&p)?;
-                    Ok(captures_to_value(r.captures(&s)))
+                    let names = name_indices(&r);
+                    Ok(captures_to_value(r.captures(&s), &names))
                 }),
             ),
             (
@@ -2621,12 +3072,13 @@ fn make_re_module() -> Value {
                         .py_str();
                     let anchored = format!("^(?:{p})$");
                     let r = compile_one(&anchored)?;
-                    Ok(captures_to_value(r.captures(&s)))
+                    let names = name_indices(&r);
+                    Ok(captures_to_value(r.captures(&s), &names))
                 }),
             ),
             (
                 "sub",
-                nf("sub", move |_i, args| {
+                nf("sub", move |i, args| {
                     let p = args
                         .first()
                         .ok_or_else(|| type_error("sub() needs pattern"))?
@@ -2634,13 +3086,61 @@ fn make_re_module() -> Value {
                     let repl = args
                         .get(1)
                         .ok_or_else(|| type_error("sub() needs replacement"))?
-                        .py_str();
+                        .clone();
                     let s = args
                         .get(2)
                         .ok_or_else(|| type_error("sub() needs string"))?
                         .py_str();
+                    let count = match args.get(3) {
+                        Some(c) if !matches!(c, Value::None) => c.to_int()?.max(0) as usize,
+                        _ => 0,
+                    };
                     let r = compile_one(&p)?;
-                    Ok(Value::Str(Rc::new(r.replace_all(&s, repl).into_owned())))
+                    let (out, _) = re_sub_apply(i, &r, &repl, &s, count)?;
+                    Ok(Value::Str(Rc::new(out)))
+                }),
+            ),
+            (
+                "subn",
+                nf("subn", move |i, args| {
+                    let p = args
+                        .first()
+                        .ok_or_else(|| type_error("subn() needs pattern"))?
+                        .py_str();
+                    let repl = args
+                        .get(1)
+                        .ok_or_else(|| type_error("subn() needs replacement"))?
+                        .clone();
+                    let s = args
+                        .get(2)
+                        .ok_or_else(|| type_error("subn() needs string"))?
+                        .py_str();
+                    let r = compile_one(&p)?;
+                    let (out, n) = re_sub_apply(i, &r, &repl, &s, 0)?;
+                    Ok(Value::Tuple(Rc::new(vec![
+                        Value::Str(Rc::new(out)),
+                        Value::Int(num_bigint::BigInt::from(n as i64)),
+                    ])))
+                }),
+            ),
+            (
+                "finditer",
+                nf("finditer", move |_i, args| {
+                    let p = args
+                        .first()
+                        .ok_or_else(|| type_error("finditer() needs pattern"))?
+                        .py_str();
+                    let s = args
+                        .get(1)
+                        .ok_or_else(|| type_error("finditer() needs string"))?
+                        .py_str();
+                    let r = compile_one(&p)?;
+                    let names = name_indices(&r);
+                    let out: Vec<Value> = r
+                        .captures_iter(&s)
+                        .map(|c| captures_to_value(Some(c), &names))
+                        .collect();
+                    Ok(Value::List(Rc::new(RefCell::new(out))))
                 }),
             ),
             (
@@ -2673,12 +3173,14 @@ fn make_re_module() -> Value {
                         .get(1)
                         .ok_or_else(|| type_error("split() needs string"))?
                         .py_str();
+                    let maxsplit = match args.get(2) {
+                        Some(c) if !matches!(c, Value::None) => c.to_int()?.max(0) as usize,
+                        _ => 0,
+                    };
                     let r = compile_one(&p)?;
-                    let parts: Vec<Value> = r
-                        .split(&s)
-                        .map(|p| Value::Str(Rc::new(p.to_owned())))
-                        .collect();
-                    Ok(Value::List(Rc::new(RefCell::new(parts))))
+                    Ok(Value::List(Rc::new(RefCell::new(re_split_apply(
+                        &r, &s, maxsplit,
+                    )))))
                 }),
             ),
             (
@@ -3942,7 +4444,20 @@ fn str_method(
                 .get(1)
                 .ok_or_else(|| type_error("str.replace requires args"))?
                 .py_str();
-            Value::Str(Rc::new(s.replace(&from, &to)))
+            // Optional third `count` arg: replace at most `count` occurrences
+            // (a negative count means "replace all", matching CPython).
+            let replaced = match args.get(2) {
+                Some(c) => {
+                    let count = c.to_int()?;
+                    if count < 0 {
+                        s.replace(&from, &to)
+                    } else {
+                        s.replacen(&from, &to, count as usize)
+                    }
+                }
+                None => s.replace(&from, &to),
+            };
+            Value::Str(Rc::new(replaced))
         }
         "startswith" => Value::Bool(s.starts_with(&single(args, "startswith")?.py_str())),
         "endswith" => Value::Bool(s.ends_with(&single(args, "endswith")?.py_str())),
@@ -4282,8 +4797,219 @@ fn bytes_method(b: &Rc<Vec<u8>>, name: &str, args: &[Value]) -> Result<Value, Un
         }
         "upper" => Value::Bytes(Rc::new(b.iter().map(|c| c.to_ascii_uppercase()).collect())),
         "lower" => Value::Bytes(Rc::new(b.iter().map(|c| c.to_ascii_lowercase()).collect())),
+        // `.split(sep=None)` — on whitespace when no separator, else on the
+        // separator bytes. Returns a list of bytes.
+        "split" | "rsplit" => {
+            let parts: Vec<Vec<u8>> = match args.first() {
+                None | Some(Value::None) => {
+                    // Split on ASCII whitespace runs, dropping empties.
+                    b.split(|c| c.is_ascii_whitespace())
+                        .filter(|p| !p.is_empty())
+                        .map(|p| p.to_vec())
+                        .collect()
+                }
+                Some(sep) => {
+                    let sep = bytes_arg(sep)?;
+                    if sep.is_empty() {
+                        return Err(value_error("empty separator"));
+                    }
+                    split_bytes(b, &sep)
+                }
+            };
+            Value::List(Rc::new(RefCell::new(
+                parts
+                    .into_iter()
+                    .map(|p| Value::Bytes(Rc::new(p)))
+                    .collect(),
+            )))
+        }
+        "strip" | "lstrip" | "rstrip" => {
+            let pred: Box<dyn Fn(u8) -> bool> = match args.first() {
+                None | Some(Value::None) => Box::new(|c: u8| c.is_ascii_whitespace()),
+                Some(chars) => {
+                    let set = bytes_arg(chars)?;
+                    Box::new(move |c: u8| set.contains(&c))
+                }
+            };
+            let mut start = 0;
+            let mut end = b.len();
+            if name != "rstrip" {
+                while start < end && pred(b[start]) {
+                    start += 1;
+                }
+            }
+            if name != "lstrip" {
+                while end > start && pred(b[end - 1]) {
+                    end -= 1;
+                }
+            }
+            Value::Bytes(Rc::new(b[start..end].to_vec()))
+        }
+        "startswith" => {
+            let pre = bytes_arg(single(args, "startswith")?)?;
+            Value::Bool(b.starts_with(&pre))
+        }
+        "endswith" => {
+            let suf = bytes_arg(single(args, "endswith")?)?;
+            Value::Bool(b.ends_with(&suf))
+        }
+        "find" | "index" if !args.is_empty() => {
+            let needle = bytes_arg(single(args, name)?)?;
+            match find_subslice(b, &needle) {
+                Some(i) => Value::Int(num_bigint::BigInt::from(i as i64)),
+                None if name == "find" => Value::Int(num_bigint::BigInt::from(-1)),
+                None => return Err(value_error("subsection not found")),
+            }
+        }
+        "replace" => {
+            let from = bytes_arg(
+                args.first()
+                    .ok_or_else(|| type_error("replace needs args"))?,
+            )?;
+            let to = bytes_arg(
+                args.get(1)
+                    .ok_or_else(|| type_error("replace needs args"))?,
+            )?;
+            // Optional third `count` arg (negative = replace all), matching
+            // bytes.replace in CPython.
+            let max = match args.get(2) {
+                Some(c) => {
+                    let n = c.to_int()?;
+                    if n < 0 {
+                        usize::MAX
+                    } else {
+                        n as usize
+                    }
+                }
+                None => usize::MAX,
+            };
+            Value::Bytes(Rc::new(replace_bytes(b, &from, &to, max)))
+        }
+        "join" => {
+            // b",".join([b"a", b"b"]) -> b"a,b"
+            let it = single(args, "join")?;
+            let mut out: Vec<u8> = Vec::new();
+            if let Value::List(l) = it {
+                for (i, part) in l.borrow().iter().enumerate() {
+                    if i > 0 {
+                        out.extend_from_slice(b);
+                    }
+                    out.extend_from_slice(&bytes_arg(part)?);
+                }
+            }
+            Value::Bytes(Rc::new(out))
+        }
         _ => return Err(attribute_error(format!("bytes has no method '{}'", name))),
     })
+}
+
+/// Parse a Python complex-literal string like `"1+2j"`, `"3j"`, `"-1"`,
+/// `"2-3J"`, `"j"`. Returns `(real, imag)`.
+fn parse_complex_str(s: &str) -> Option<(f64, f64)> {
+    let s = s.trim().trim_start_matches('(').trim_end_matches(')');
+    if s.is_empty() {
+        return None;
+    }
+    let lower = s.to_ascii_lowercase();
+    // Pure imaginary if it ends in `j` and has no internal sign splitting
+    // real/imag.
+    let ends_j = lower.ends_with('j');
+    // Find a `+`/`-` that splits real and imaginary (not the leading sign,
+    // not part of an exponent `e+`/`e-`).
+    let bytes = lower.as_bytes();
+    let mut split: Option<usize> = None;
+    for i in 1..bytes.len() {
+        let c = bytes[i] as char;
+        if (c == '+' || c == '-') && bytes[i - 1] as char != 'e' {
+            split = Some(i);
+        }
+    }
+    let parse_imag = |t: &str| -> Option<f64> {
+        let t = t.trim_end_matches('j');
+        match t {
+            "" | "+" => Some(1.0),
+            "-" => Some(-1.0),
+            _ => t.parse::<f64>().ok(),
+        }
+    };
+    if let Some(i) = split {
+        let (a, b) = lower.split_at(i);
+        if ends_j {
+            // real = a, imag = b (b includes its sign and trailing j)
+            let re = a.parse::<f64>().ok()?;
+            let im = parse_imag(b)?;
+            Some((re, im))
+        } else {
+            None // a real with an internal sign but no j is malformed here
+        }
+    } else if ends_j {
+        Some((0.0, parse_imag(&lower)?))
+    } else {
+        Some((lower.parse::<f64>().ok()?, 0.0))
+    }
+}
+
+/// Coerce a `bytes`/`bytearray` (or a single int) argument into a byte vec.
+/// Whether an unwind is a raised `AttributeError` (vs. some other exception
+/// or control-flow). Lets `getattr`/`hasattr` distinguish a genuinely
+/// missing attribute from an error raised inside a descriptor / `__getattr__`.
+fn is_attribute_error(u: &Unwind) -> bool {
+    matches!(u, Unwind::Exception(e) if e.kind == "AttributeError")
+}
+
+fn bytes_arg(v: &Value) -> Result<Vec<u8>, Unwind> {
+    match v {
+        Value::Bytes(b) => Ok((**b).clone()),
+        Value::Int(i) => {
+            let n = i.to_u32().and_then(|n| u8::try_from(n).ok());
+            n.map(|b| vec![b])
+                .ok_or_else(|| value_error("byte must be in range(0, 256)"))
+        }
+        _ => Err(type_error(format!(
+            "a bytes-like object is required, not '{}'",
+            v.type_name()
+        ))),
+    }
+}
+
+fn find_subslice(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() {
+        return Some(0);
+    }
+    hay.windows(needle.len()).position(|w| w == needle)
+}
+
+fn split_bytes(hay: &[u8], sep: &[u8]) -> Vec<Vec<u8>> {
+    let mut out = Vec::new();
+    let mut rest = hay;
+    while let Some(i) = find_subslice(rest, sep) {
+        out.push(rest[..i].to_vec());
+        rest = &rest[i + sep.len()..];
+    }
+    out.push(rest.to_vec());
+    out
+}
+
+fn replace_bytes(hay: &[u8], from: &[u8], to: &[u8], max: usize) -> Vec<u8> {
+    if from.is_empty() || max == 0 {
+        return hay.to_vec();
+    }
+    let mut out = Vec::with_capacity(hay.len());
+    let mut rest = hay;
+    let mut done = 0usize;
+    while done < max {
+        match find_subslice(rest, from) {
+            Some(i) => {
+                out.extend_from_slice(&rest[..i]);
+                out.extend_from_slice(to);
+                rest = &rest[i + from.len()..];
+                done += 1;
+            }
+            None => break,
+        }
+    }
+    out.extend_from_slice(rest);
+    out
 }
 
 fn list_method(
@@ -4410,7 +5136,16 @@ fn list_method(
                         return std::cmp::Ordering::Equal;
                     }
                     match interp.value_cmp(&a.0, &b.0) {
-                        Ok(o) => o,
+                        // Reverse the comparator (not the sorted list) so equal
+                        // keys keep their original relative order — CPython's
+                        // `sort(reverse=True)` is stable.
+                        Ok(o) => {
+                            if reverse {
+                                o.reverse()
+                            } else {
+                                o
+                            }
+                        }
                         Err(e) => {
                             sort_error = Some(e);
                             std::cmp::Ordering::Equal
@@ -4419,9 +5154,6 @@ fn list_method(
                 });
                 if let Some(e) = sort_error {
                     return Err(e);
-                }
-                if reverse {
-                    keyed.reverse();
                 }
                 items = keyed.into_iter().map(|(_, v)| v).collect();
             } else {
@@ -4430,7 +5162,14 @@ fn list_method(
                         return std::cmp::Ordering::Equal;
                     }
                     match interp.value_cmp(a, b) {
-                        Ok(o) => o,
+                        // Stable reverse: flip the comparator, not the list.
+                        Ok(o) => {
+                            if reverse {
+                                o.reverse()
+                            } else {
+                                o
+                            }
+                        }
                         Err(e) => {
                             sort_error = Some(e);
                             std::cmp::Ordering::Equal
@@ -4439,9 +5178,6 @@ fn list_method(
                 });
                 if let Some(e) = sort_error {
                     return Err(e);
-                }
-                if reverse {
-                    items.reverse();
                 }
             }
             *l.borrow_mut() = items;
@@ -4791,10 +5527,42 @@ fn tuple_method(t: &Rc<Vec<Value>>, name: &str, args: &[Value]) -> Result<Value,
     }
 }
 
-fn num_method(v: &Value, name: &str, _args: &[Value]) -> Result<Value, Unwind> {
+fn num_method(v: &Value, name: &str, args: &[Value]) -> Result<Value, Unwind> {
     match (v, name) {
         (Value::Float(x), "is_integer") => Ok(Value::Bool(x.fract() == 0.0 && x.is_finite())),
         (Value::Int(i), "bit_length") => Ok(Value::Int(num_bigint::BigInt::from(i.bits() as i64))),
+        // `(n).bit_count()` — number of set bits in the absolute value.
+        (Value::Int(i), "bit_count") => {
+            let (_, bytes) = i.to_bytes_be();
+            let count: u32 = bytes.iter().map(|b| b.count_ones()).sum();
+            Ok(Value::Int(num_bigint::BigInt::from(count)))
+        }
+        // `(n).to_bytes(length, byteorder="big")` — non-negative ints.
+        (Value::Int(i), "to_bytes") => {
+            use num_traits::Signed;
+            if i.is_negative() {
+                return Err(value_error("to_bytes: negative ints not supported"));
+            }
+            let length = match args.first() {
+                Some(n) => n.to_int()?.max(0) as usize,
+                None => 1,
+            };
+            let big_endian = match args.get(1) {
+                Some(Value::Str(s)) => s.as_str() != "little",
+                _ => true,
+            };
+            let (_, mut raw) = i.to_bytes_be();
+            if raw.len() > length {
+                return Err(value_error("int too big to convert"));
+            }
+            // Left-pad with zero bytes to the requested length.
+            let mut out = vec![0u8; length - raw.len()];
+            out.append(&mut raw);
+            if !big_endian {
+                out.reverse();
+            }
+            Ok(Value::Bytes(Rc::new(out)))
+        }
         _ => Err(attribute_error(format!(
             "'{}' object has no method '{}'",
             v.type_name(),
@@ -4806,7 +5574,7 @@ fn num_method(v: &Value, name: &str, _args: &[Value]) -> Result<Value, Unwind> {
 // ── JSON ───────────────────────────────────────────────────────────────────
 
 /// `json.dumps(v, indent=n)` — pretty-printed with `n`-space indentation.
-fn json_dumps_indent(v: &Value, indent: usize, level: usize) -> String {
+fn json_dumps_indent(v: &Value, indent: usize, level: usize, sort: bool) -> String {
     let pad = " ".repeat(indent * (level + 1));
     let close_pad = " ".repeat(indent * level);
     match v {
@@ -4817,7 +5585,7 @@ fn json_dumps_indent(v: &Value, indent: usize, level: usize) -> String {
             }
             let body: Vec<String> = items
                 .iter()
-                .map(|x| format!("{}{}", pad, json_dumps_indent(x, indent, level + 1)))
+                .map(|x| format!("{}{}", pad, json_dumps_indent(x, indent, level + 1, sort)))
                 .collect();
             format!("[\n{}\n{}]", body.join(",\n"), close_pad)
         }
@@ -4827,7 +5595,7 @@ fn json_dumps_indent(v: &Value, indent: usize, level: usize) -> String {
             }
             let body: Vec<String> = t
                 .iter()
-                .map(|x| format!("{}{}", pad, json_dumps_indent(x, indent, level + 1)))
+                .map(|x| format!("{}{}", pad, json_dumps_indent(x, indent, level + 1, sort)))
                 .collect();
             format!("[\n{}\n{}]", body.join(",\n"), close_pad)
         }
@@ -4841,29 +5609,34 @@ fn json_dumps_indent(v: &Value, indent: usize, level: usize) -> String {
             if entries.is_empty() {
                 return "{}".into();
             }
-            let body: Vec<String> = entries
+            let mut body: Vec<(String, String)> = entries
                 .iter()
                 .map(|(k, val)| {
-                    format!(
-                        "{}{}: {}",
-                        pad,
-                        json_dumps(&k.clone().into_value()),
-                        json_dumps_indent(val, indent, level + 1)
+                    (
+                        json_dumps(&k.clone().into_value(), sort),
+                        json_dumps_indent(val, indent, level + 1, sort),
                     )
                 })
                 .collect();
+            if sort {
+                body.sort_by(|a, b| a.0.cmp(&b.0));
+            }
+            let body: Vec<String> = body
+                .iter()
+                .map(|(k, val)| format!("{}{}: {}", pad, k, val))
+                .collect();
             format!("{{\n{}\n{}}}", body.join(",\n"), close_pad)
         }
-        other => json_dumps(other),
+        other => json_dumps(other, sort),
     }
 }
 
 /// Public wrapper so `interp.rs` (`model_dump_json`) can reuse the serializer.
 pub fn json_dumps_pub(v: &Value) -> String {
-    json_dumps(v)
+    json_dumps(v, false)
 }
 
-fn json_dumps(v: &Value) -> String {
+fn json_dumps(v: &Value, sort: bool) -> String {
     match v {
         Value::None => "null".into(),
         Value::Bool(b) => if *b { "true" } else { "false" }.into(),
@@ -4871,11 +5644,11 @@ fn json_dumps(v: &Value) -> String {
         Value::Float(x) => format!("{}", x),
         Value::Str(s) => json_string(s),
         Value::List(l) => {
-            let items: Vec<String> = l.borrow().iter().map(json_dumps).collect();
+            let items: Vec<String> = l.borrow().iter().map(|x| json_dumps(x, sort)).collect();
             format!("[{}]", items.join(", "))
         }
         Value::Tuple(t) => {
-            let items: Vec<String> = t.iter().map(json_dumps).collect();
+            let items: Vec<String> = t.iter().map(|x| json_dumps(x, sort)).collect();
             format!("[{}]", items.join(", "))
         }
         Value::Dict(d) => {
@@ -4883,12 +5656,21 @@ fn json_dumps(v: &Value) -> String {
             // inserts (review thread copilot on PR #147 — otherwise
             // `json.dump(frozen_dict, fp)` leaks the marker into the
             // emitted JSON).
-            let items: Vec<String> = d
+            let mut pairs: Vec<(String, String)> = d
                 .borrow()
                 .iter()
                 .filter(|(k, _)| !matches!(k, HashKey::Str(s) if s.as_str() == "__typhon_frozen__"))
-                .map(|(k, v)| format!("{}: {}", json_dumps(&k.clone().into_value()), json_dumps(v)))
+                .map(|(k, v)| {
+                    (
+                        json_dumps(&k.clone().into_value(), sort),
+                        json_dumps(v, sort),
+                    )
+                })
                 .collect();
+            if sort {
+                pairs.sort_by(|a, b| a.0.cmp(&b.0));
+            }
+            let items: Vec<String> = pairs.iter().map(|(k, v)| format!("{}: {}", k, v)).collect();
             format!("{{{}}}", items.join(", "))
         }
         other => json_string(&other.py_repr()),
@@ -5150,6 +5932,80 @@ pub fn call_with_kwargs(
     kwargs: &[(String, Value)],
 ) -> Result<Value, Unwind> {
     match n.name {
+        // enumerate(iterable, start=N)
+        "enumerate" => {
+            let mut start: i64 = 0;
+            for (k, v) in kwargs {
+                if k == "start" {
+                    start = v.to_int()?;
+                } else {
+                    return Err(type_error(format!(
+                        "enumerate() got unexpected keyword: '{}'",
+                        k
+                    )));
+                }
+            }
+            let iterable = args
+                .into_iter()
+                .next()
+                .ok_or_else(|| type_error("enumerate() requires an iterable"))?;
+            if let Value::Iter(it) = interp.make_iter(iterable)? {
+                Ok(Value::Iter(Rc::new(RefCell::new(IterState::Enumerate {
+                    inner: it,
+                    index: start,
+                }))))
+            } else {
+                unreachable!()
+            }
+        }
+        // zip(*iterables, strict=True): error if lengths differ.
+        "zip" => {
+            let mut strict = false;
+            for (k, v) in kwargs {
+                if k == "strict" {
+                    strict = interp.is_truthy(v)?;
+                } else {
+                    return Err(type_error(format!("zip() got unexpected keyword: '{}'", k)));
+                }
+            }
+            if !strict {
+                let mut inners = Vec::new();
+                for a in args {
+                    if let Value::Iter(it) = interp.make_iter(a)? {
+                        inners.push(it);
+                    }
+                }
+                return Ok(Value::Iter(Rc::new(RefCell::new(IterState::Zip {
+                    inners,
+                }))));
+            }
+            // Strict mode: materialise each iterable so we can check that
+            // every column has the same length (CPython raises ValueError).
+            let columns: Vec<Vec<Value>> = args
+                .into_iter()
+                .map(|a| -> Result<Vec<Value>, Unwind> {
+                    let it = interp.make_iter(a)?;
+                    let mut out = Vec::new();
+                    while let Some(v) = interp.iter_next(&it)? {
+                        out.push(v);
+                    }
+                    Ok(out)
+                })
+                .collect::<Result<_, _>>()?;
+            let len = columns.first().map(|c| c.len()).unwrap_or(0);
+            if columns.iter().any(|c| c.len() != len) {
+                return Err(value_error("zip() argument lengths differ (strict=True)"));
+            }
+            let mut rows: Vec<Value> = Vec::with_capacity(len);
+            for row in 0..len {
+                let tup: Vec<Value> = columns.iter().map(|c| c[row].clone()).collect();
+                rows.push(Value::Tuple(Rc::new(tup)));
+            }
+            Ok(Value::Iter(Rc::new(RefCell::new(IterState::List {
+                items: Rc::new(RefCell::new(rows)),
+                index: 0,
+            }))))
+        }
         "min" | "max" => {
             let want_min = n.name == "min";
             // Gather candidates: a single iterable, or multiple positional args.
@@ -5231,18 +6087,27 @@ pub fn call_with_kwargs(
                     let k = interp.call_value(key.clone(), vec![v.clone()], &[])?;
                     keyed.push((k, v));
                 }
-                keyed.sort_by(|a, b| a.0.py_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
-                if reverse {
-                    keyed.reverse();
-                }
+                keyed.sort_by(|a, b| {
+                    // Stable reverse: flip the comparator, not the list.
+                    let o = a.0.py_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal);
+                    if reverse {
+                        o.reverse()
+                    } else {
+                        o
+                    }
+                });
                 Ok(Value::List(Rc::new(RefCell::new(
                     keyed.into_iter().map(|(_, v)| v).collect(),
                 ))))
             } else {
-                out.sort_by(|a, b| a.py_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-                if reverse {
-                    out.reverse();
-                }
+                out.sort_by(|a, b| {
+                    let o = a.py_cmp(b).unwrap_or(std::cmp::Ordering::Equal);
+                    if reverse {
+                        o.reverse()
+                    } else {
+                        o
+                    }
+                });
                 Ok(Value::List(Rc::new(RefCell::new(out))))
             }
         }
@@ -5279,16 +6144,19 @@ pub fn call_with_kwargs(
                 .first()
                 .ok_or_else(|| type_error("dumps() missing argument"))?;
             let mut indent: Option<usize> = None;
+            let mut sort_keys = false;
             for (k, v) in kwargs {
                 if k == "indent" {
                     if let Value::Int(_) = v {
                         indent = v.to_int().ok().filter(|n| *n > 0).map(|n| n as usize);
                     }
+                } else if k == "sort_keys" {
+                    sort_keys = interp.is_truthy(v)?;
                 }
             }
             match indent {
-                Some(n) => Ok(Value::Str(Rc::new(json_dumps_indent(obj, n, 0)))),
-                None => Ok(Value::Str(Rc::new(json_dumps(obj)))),
+                Some(n) => Ok(Value::Str(Rc::new(json_dumps_indent(obj, n, 0, sort_keys)))),
+                None => Ok(Value::Str(Rc::new(json_dumps(obj, sort_keys)))),
             }
         }
         // `dict(a=1, b=2)` and `dict(other, c=3)` — keyword pairs become entries.
@@ -5358,7 +6226,7 @@ pub fn call_with_kwargs(
 /// A lightweight type object for a built-in type (`int`, `str`, …) — an empty
 /// `Class` whose only meaningful attribute is its `name`. Used by `type(x)`
 /// so type comparisons and `.__name__` work uniformly with user classes.
-fn make_builtin_type(name: &str) -> Value {
+pub fn make_builtin_type(name: &str) -> Value {
     // Cache one canonical `Class` object per builtin type name so repeated
     // `type(x)` calls return the *same* object — `type(5) == type(6)` then
     // holds by identity (Class equality is identity-based; see `py_eq`).

@@ -206,6 +206,23 @@ pub struct LazyImportRemap {
 pub struct ResolvedModule {
     pub scopes: Vec<Scope>,
     pub references: Vec<Reference>,
+    /// Names of classes the user declared with the `plain class NAME:`
+    /// keyword. A `plain class` emits a bare `class` (no `@dataclass`,
+    /// no synthesised `__init__`), so its class-level defaults are real
+    /// class attributes and a hand-written `__init__` is legal. The type
+    /// checker consults this set to suppress `tyc::manual_init` and
+    /// `tyc::class_attr_shadows_slot` for these classes.
+    ///
+    /// Populated by name (not byte offset) from the original Typhon
+    /// source so the set stays correct even when secondary preprocess
+    /// passes shift line numbers in the emitted Python view.
+    pub plain_classes: std::collections::HashSet<String>,
+    /// Names of classes the user declared with the `class! NAME(...):`
+    /// keyword (raw classes). Like `plain class`, these emit without a
+    /// `@dataclass` decorator and may carry a hand-written `__init__`
+    /// (preserved verbatim) — so `tyc::manual_init` must not fire on
+    /// them. Populated from the resolver's `ClassKind::Raw` tagging.
+    pub raw_classes: std::collections::HashSet<String>,
 }
 
 /// Curated list of Python stdlib top-level module names (root names only;
@@ -1305,13 +1322,80 @@ pub fn resolve_module_with(
     r.report_unused_imports();
     r.report_main_not_called();
 
+    // Collect class-kind metadata for the type checker. `plain class`
+    // names are scraped by name from the original Typhon source (robust
+    // against preprocess line shifts); raw (`class!`) names are read off
+    // the `ClassKind::Raw` markers the resolver already tagged.
+    let plain_classes = r
+        .original_source
+        .as_deref()
+        .map(plain_class_names)
+        .unwrap_or_default();
+    let mut raw_classes = r
+        .original_source
+        .as_deref()
+        .map(raw_class_names)
+        .unwrap_or_default();
+    for scope in &r.scopes {
+        for b in &scope.bindings {
+            if matches!(b.kind, BindingKind::Class) && b.class_kind == ClassKind::Raw {
+                raw_classes.insert(b.name.clone());
+            }
+        }
+    }
+
     let resolved = ResolvedModule {
         scopes: std::mem::take(&mut r.scopes),
         references: std::mem::take(&mut r.references),
+        plain_classes,
+        raw_classes,
     };
     let mut diagnostics = r.diagnostics;
     diagnostics.dedup();
     (resolved, diagnostics)
+}
+
+/// Scan original Typhon source for `plain class NAME ...` (and
+/// `pub plain class NAME ...`) declarations and return the set of class
+/// NAMEs. Matching is purely lexical and line-based, ignoring lines that
+/// fall inside triple-quoted strings is not attempted — class
+/// declarations cannot legally live inside string literals, and the only
+/// false-positive risk (the exact text `plain class X:` inside a
+/// docstring) is benign: at worst it suppresses two lint diagnostics on a
+/// class that does not exist.
+fn plain_class_names(original: &str) -> std::collections::HashSet<String> {
+    scrape_class_names(original, "plain class ")
+}
+
+/// Names declared with `class! NAME(...):` (raw classes), scraped from the
+/// original Typhon source. Mirrors `plain_class_names` so the type checker
+/// recognises raw classes even where the `ClassKind::Raw` line markers
+/// aren't wired into a resolve entry point (the `tyc check` path doesn't
+/// thread them) — keeping `tyc::manual_init` from firing on a `class!` with
+/// a hand-written `__init__`.
+fn raw_class_names(original: &str) -> std::collections::HashSet<String> {
+    scrape_class_names(original, "class! ")
+}
+
+fn scrape_class_names(original: &str, prefix: &str) -> std::collections::HashSet<String> {
+    let mut names = std::collections::HashSet::new();
+    for line in original.lines() {
+        let trimmed = line.trim_start();
+        let rest = trimmed
+            .strip_prefix("pub ")
+            .map(str::trim_start)
+            .unwrap_or(trimmed);
+        if let Some(after) = rest.strip_prefix(prefix) {
+            let name: String = after
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '_')
+                .collect();
+            if !name.is_empty() {
+                names.insert(name);
+            }
+        }
+    }
+    names
 }
 
 /// Search for `name` as a whole-word ASCII identifier in `source` starting
@@ -2559,19 +2643,11 @@ fn walk_expr(r: &mut Resolver, scope: ScopeId, expr: &Expr) {
             let scope2 = r.push_scope(ScopeKind::Comprehension, scope, range_to_span(c.range));
             for gen in &c.generators {
                 walk_expr(r, scope2, &gen.iter);
-                if let Expr::Name(n) = &gen.target {
-                    let span = (
-                        n.range.start().to_usize(),
-                        n.range.start().to_usize() + n.id.as_str().len(),
-                    );
-                    r.declare(
-                        scope2,
-                        n.id.as_str(),
-                        BindingKind::Loop,
-                        Mutability::Mut,
-                        span,
-                    );
-                }
+                // Dict-comp targets share the recursive shape of `for`/`with`
+                // targets — e.g. `{k: v for k, v in d.items()}` binds both
+                // `k` and `v`. Use the same helper as list/set comps so tuple
+                // unpacking works.
+                declare_loop_target(r, scope2, &gen.target);
                 for cond in &gen.ifs {
                     walk_expr(r, scope2, cond);
                 }
@@ -2580,6 +2656,16 @@ fn walk_expr(r: &mut Resolver, scope: ScopeId, expr: &Expr) {
                 walk_expr(r, scope2, key);
             }
             walk_expr(r, scope2, &c.value);
+            // Leak walrus targets to the enclosing scope (see `walk_comp`).
+            for gen in &c.generators {
+                for cond in &gen.ifs {
+                    declare_walrus_leaks(r, scope, cond);
+                }
+            }
+            if let Some(key) = &c.key {
+                declare_walrus_leaks(r, scope, key);
+            }
+            declare_walrus_leaks(r, scope, &c.value);
         }
         // Literal-shaped expressions with no embedded references.
         Expr::NumberLiteral(_)
@@ -2647,6 +2733,129 @@ fn walk_comp(
         }
     }
     walk_expr(r, scope2, elt);
+    // CPython leaks assignment-expression (`:=`) targets written inside a
+    // comprehension out into the comprehension's *enclosing* scope, not the
+    // implicit comprehension scope. Re-declare every walrus target found in
+    // the element and the `if` conditions in `scope` so a later reference
+    // (`[y for x in xs if (y := f(x)) > 0]; use(y)`) resolves cleanly. The
+    // generator `iter`/`target` themselves are real comprehension-local
+    // bindings and are intentionally not leaked.
+    for gen in generators {
+        for cond in &gen.ifs {
+            declare_walrus_leaks(r, scope, cond);
+        }
+    }
+    declare_walrus_leaks(r, scope, elt);
+}
+
+/// Walk `expr` and declare every assignment-expression (`name := value`)
+/// target in `scope`. Used to model CPython's rule that walrus targets in
+/// a comprehension leak to the enclosing scope. Recurses through the
+/// expression structure but deliberately does NOT descend into nested
+/// comprehensions — those manage their own leak semantics relative to the
+/// same enclosing scope and are walked separately.
+fn declare_walrus_leaks(r: &mut Resolver, scope: ScopeId, expr: &Expr) {
+    match expr {
+        Expr::Named(n) => {
+            if let Expr::Name(name) = n.target.as_ref() {
+                let span = (
+                    name.range.start().to_usize(),
+                    name.range.start().to_usize() + name.id.as_str().len(),
+                );
+                r.declare(
+                    scope,
+                    name.id.as_str(),
+                    BindingKind::Value,
+                    Mutability::Mut,
+                    span,
+                );
+            }
+            declare_walrus_leaks(r, scope, &n.value);
+        }
+        Expr::BoolOp(b) => {
+            for v in &b.values {
+                declare_walrus_leaks(r, scope, v);
+            }
+        }
+        Expr::BinOp(b) => {
+            declare_walrus_leaks(r, scope, &b.left);
+            declare_walrus_leaks(r, scope, &b.right);
+        }
+        Expr::UnaryOp(u) => declare_walrus_leaks(r, scope, &u.operand),
+        Expr::Compare(c) => {
+            declare_walrus_leaks(r, scope, &c.left);
+            for cmp in c.comparators.iter() {
+                declare_walrus_leaks(r, scope, cmp);
+            }
+        }
+        Expr::If(i) => {
+            declare_walrus_leaks(r, scope, &i.test);
+            declare_walrus_leaks(r, scope, &i.body);
+            declare_walrus_leaks(r, scope, &i.orelse);
+        }
+        Expr::Call(c) => {
+            declare_walrus_leaks(r, scope, &c.func);
+            for a in c.arguments.args.iter() {
+                declare_walrus_leaks(r, scope, a);
+            }
+            for kw in c.arguments.keywords.iter() {
+                declare_walrus_leaks(r, scope, &kw.value);
+            }
+        }
+        Expr::Tuple(t) => {
+            for e in &t.elts {
+                declare_walrus_leaks(r, scope, e);
+            }
+        }
+        Expr::List(l) => {
+            for e in &l.elts {
+                declare_walrus_leaks(r, scope, e);
+            }
+        }
+        Expr::Set(s) => {
+            for e in &s.elts {
+                declare_walrus_leaks(r, scope, e);
+            }
+        }
+        Expr::Subscript(s) => {
+            declare_walrus_leaks(r, scope, &s.value);
+            declare_walrus_leaks(r, scope, &s.slice);
+        }
+        Expr::Attribute(a) => declare_walrus_leaks(r, scope, &a.value),
+        Expr::Starred(s) => declare_walrus_leaks(r, scope, &s.value),
+        Expr::Slice(s) => {
+            if let Some(lo) = &s.lower {
+                declare_walrus_leaks(r, scope, lo);
+            }
+            if let Some(hi) = &s.upper {
+                declare_walrus_leaks(r, scope, hi);
+            }
+            if let Some(step) = &s.step {
+                declare_walrus_leaks(r, scope, step);
+            }
+        }
+        // `{k: (v := ...)}` — dict literal keys/values can carry a walrus.
+        Expr::Dict(d) => {
+            for item in &d.items {
+                if let Some(k) = &item.key {
+                    declare_walrus_leaks(r, scope, k);
+                }
+                declare_walrus_leaks(r, scope, &item.value);
+            }
+        }
+        // `f"{(x := ...)}"` — walrus inside an f-string interpolation.
+        Expr::FString(fs) => {
+            for elem in fs.value.elements() {
+                if let ast::InterpolatedStringElement::Interpolation(interp) = elem {
+                    declare_walrus_leaks(r, scope, &interp.expression);
+                }
+            }
+        }
+        // Other expression heads either bind no names (literals, plain
+        // names) or open a fresh scope (lambda, nested comprehensions);
+        // nothing to leak from them here.
+        _ => {}
+    }
 }
 
 /// A conservative list of Python built-in names that the resolver treats
@@ -2875,6 +3084,85 @@ mod tests {
             .unwrap()
             .into_syntax();
         resolve_module_with("<test>".to_owned(), &prep.python_source, &module, options)
+    }
+
+    fn resolve_with_orig(src: &str) -> (ResolvedModule, Diagnostics) {
+        let prep = preprocess(src);
+        let raw_class_byte_starts =
+            tyc_syntax::preprocess::line_byte_starts(&prep.python_source, &prep.raw_class_lines);
+        let options = ResolveOptions {
+            raw_class_byte_starts,
+            original_source: Some(src.to_owned()),
+            ..ResolveOptions::default()
+        };
+        let module = tyc_syntax::parse_module(&prep.python_source)
+            .unwrap()
+            .into_syntax();
+        resolve_module_with("<test>".to_owned(), &prep.python_source, &module, options)
+    }
+
+    #[test]
+    fn plain_class_names_recorded_in_resolved_module() {
+        let src = "plain class Bag:\n    x: int\nclass Normal:\n    y: int\n";
+        let (m, _) = resolve_with_orig(src);
+        assert!(m.plain_classes.contains("Bag"));
+        assert!(!m.plain_classes.contains("Normal"));
+    }
+
+    #[test]
+    fn pub_plain_class_name_recorded() {
+        let src = "pub plain class Widget:\n    pass\n";
+        let (m, _) = resolve_with_orig(src);
+        assert!(m.plain_classes.contains("Widget"));
+    }
+
+    #[test]
+    fn raw_class_names_recorded_in_resolved_module() {
+        let src = "class! Net(Exception):\n    pass\n";
+        let (m, _) = resolve_with_orig(src);
+        assert!(m.raw_classes.contains("Net"));
+        assert!(m.plain_classes.is_empty());
+    }
+
+    #[test]
+    fn walrus_in_comprehension_leaks_to_enclosing_scope() {
+        // CPython leaks assignment-expression targets out of a
+        // comprehension. After the comprehension, `y` must be resolvable —
+        // no `unknown_name` diagnostic.
+        let src = "\
+def main() -> None:
+    let ys: list[int] = [y for x in [1, 2, 3] if (y := x * x) > 1]
+    print(y)
+    print(ys)
+";
+        let (_, diags) = resolve(src);
+        assert!(
+            !diags
+                .errors()
+                .iter()
+                .any(|e| matches!(e, TycError::UnknownName { name, .. } if name == "y")),
+            "walrus target `y` should leak out of the comprehension; got: {:?}",
+            diags.errors()
+        );
+    }
+
+    #[test]
+    fn walrus_in_comprehension_elt_leaks() {
+        let src = "\
+def main() -> None:
+    let xs: list[int] = [(z := n * 2) for n in [1, 2, 3]]
+    print(z)
+    print(xs)
+";
+        let (_, diags) = resolve(src);
+        assert!(
+            !diags
+                .errors()
+                .iter()
+                .any(|e| matches!(e, TycError::UnknownName { name, .. } if name == "z")),
+            "walrus target `z` in elt should leak; got: {:?}",
+            diags.errors()
+        );
     }
 
     #[test]
@@ -3795,6 +4083,17 @@ def foo():
         assert_eq!(d.warning_count(), 1);
         let msg = format!("{}", d.warnings()[0]);
         assert!(msg.contains("path"), "got: {msg}");
+    }
+
+    #[test]
+    fn dict_comprehension_tuple_target_binds() {
+        // Stress-round finding: `{k: v for k, v in d.items()}` reported
+        // `k`/`v` as unknown — the dict-comp arm only declared single-Name
+        // targets, unlike list/set comps which used `declare_loop_target`.
+        let src = "let d: dict[str, int] = {\"a\": 1}\n\
+                   let swapped: dict[int, str] = {v: k for k, v in d.items()}\n";
+        let (_m, dg) = resolve(src);
+        assert!(!dg.has_errors(), "{:?}", dg.errors());
     }
 
     #[test]

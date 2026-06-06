@@ -63,6 +63,9 @@ pub struct Interpreter {
     /// and bind `self`. Pushed when a bound method / `__call__` /
     /// `__post_init__` is invoked, popped on the way out.
     pub method_stack: Vec<(Rc<Class>, Value)>,
+    /// Stack of exceptions currently being handled (one frame per active
+    /// `except` body). A bare `raise` re-raises the top of this stack.
+    pub active_exceptions: Vec<VmException>,
 }
 
 /// Upper bound on values an eagerly-evaluated generator may yield before the
@@ -99,6 +102,7 @@ impl Interpreter {
             gen_buffers: Vec::new(),
             loading_modules: std::collections::HashSet::new(),
             method_stack: Vec::new(),
+            active_exceptions: Vec::new(),
         };
         crate::builtins::install(&mut interp);
         interp
@@ -171,14 +175,14 @@ impl Interpreter {
             }
             Stmt::If(s) => {
                 let cond = self.eval_expr(&s.test, env)?;
-                if cond.truthy() {
+                if self.is_truthy(&cond)? {
                     self.exec_block(&s.body, env)?;
                 } else {
                     for clause in &s.elif_else_clauses {
                         match &clause.test {
                             Some(test) => {
                                 let c = self.eval_expr(test, env)?;
-                                if c.truthy() {
+                                if self.is_truthy(&c)? {
                                     self.exec_block(&clause.body, env)?;
                                     return Ok(());
                                 }
@@ -196,7 +200,7 @@ impl Interpreter {
                 let mut completed = true;
                 loop {
                     let cond = self.eval_expr(&s.test, env)?;
-                    if !cond.truthy() {
+                    if !self.is_truthy(&cond)? {
                         break;
                     }
                     match self.exec_block(&s.body, env) {
@@ -356,12 +360,28 @@ impl Interpreter {
             }
             Stmt::Raise(r) => {
                 let exc = match &r.exc {
-                    Some(e) => self.eval_expr(e, env)?,
+                    Some(e) => {
+                        let v = self.eval_expr(e, env)?;
+                        // `raise SomeError` (a bare class / builtin exception
+                        // constructor) instantiates it, matching Python — so
+                        // `raise StopIteration` yields a StopIteration value,
+                        // not the constructor function.
+                        match v {
+                            Value::Native(_) => self.call_value(v, vec![], &[])?,
+                            Value::Class(ref c) => self.instantiate(c, vec![], &[])?,
+                            other => other,
+                        }
+                    }
                     None => {
-                        return Err(Unwind::Exception(VmException::new(
-                            "RuntimeError",
-                            "No active exception to re-raise",
-                        )))
+                        // Bare `raise` re-raises the exception currently being
+                        // handled by the innermost enclosing `except` block.
+                        return match self.active_exceptions.last() {
+                            Some(active) => Err(Unwind::Exception(active.clone())),
+                            None => Err(Unwind::Exception(VmException::new(
+                                "RuntimeError",
+                                "No active exception to re-raise",
+                            ))),
+                        };
                     }
                 };
                 Err(self.value_to_exception(exc))
@@ -370,7 +390,7 @@ impl Interpreter {
             Stmt::Match(m) => self.exec_match(m, env),
             Stmt::Assert(a) => {
                 let cond = self.eval_expr(&a.test, env)?;
-                if !cond.truthy() {
+                if !self.is_truthy(&cond)? {
                     let msg = match &a.msg {
                         Some(m) => self.eval_expr(m, env)?.py_str(),
                         None => "".to_string(),
@@ -401,6 +421,26 @@ impl Interpreter {
                             let target = self.eval_expr(&sub.value, env)?;
                             let key = self.eval_expr(&sub.slice, env)?;
                             self.del_subscript(&target, &key)?;
+                        }
+                        // `del obj.attr` removes an instance attribute.
+                        Expr::Attribute(a) => {
+                            let recv = self.eval_expr(&a.value, env)?;
+                            match recv {
+                                Value::Instance(inst) => {
+                                    if inst.fields.borrow_mut().remove(a.attr.as_str()).is_none() {
+                                        return Err(attribute_error(format!(
+                                            "'{}' object has no attribute '{}'",
+                                            inst.class.name,
+                                            a.attr.as_str()
+                                        )));
+                                    }
+                                }
+                                _ => {
+                                    return Err(type_error(
+                                        "cannot delete attribute on this object",
+                                    ))
+                                }
+                            }
                         }
                         _ => return Err(not_implemented("complex delete targets")),
                     }
@@ -462,6 +502,36 @@ impl Interpreter {
         // (constants, comprehensions used as defaults) get evaluated.
         let body_env = Env::new_child(env);
 
+        // A class is dataclass-shaped (annotated assigns are instance fields)
+        // when it carries a `@dataclass` decorator. A `plain class` emits a
+        // bare class with no decorator, so its annotated assigns with a
+        // default are class attributes, not slots. `ClassVar[...]` is always
+        // a class attribute regardless of class kind.
+        let rightmost_name = |e: &Expr| -> Option<String> {
+            match e {
+                Expr::Name(n) => Some(n.id.as_str().to_owned()),
+                Expr::Attribute(a) => Some(a.attr.as_str().to_owned()),
+                Expr::Call(call) => match call.func.as_ref() {
+                    Expr::Name(n) => Some(n.id.as_str().to_owned()),
+                    Expr::Attribute(a) => Some(a.attr.as_str().to_owned()),
+                    _ => None,
+                },
+                _ => None,
+            }
+        };
+        let is_dataclass = c
+            .decorator_list
+            .iter()
+            .any(|d| rightmost_name(&d.expression).as_deref() == Some("dataclass"));
+        let is_classvar = |ann: &Expr| -> bool {
+            let head = match ann {
+                Expr::Subscript(s) => s.value.as_ref(),
+                other => other,
+            };
+            matches!(head, Expr::Name(n) if n.id.as_str() == "ClassVar")
+                || matches!(head, Expr::Attribute(a) if a.attr.as_str() == "ClassVar")
+        };
+
         let mut fields = Vec::new();
         let mut methods: HashMap<String, Rc<Function>> = HashMap::new();
         let mut class_attrs: HashMap<String, Value> = HashMap::new();
@@ -472,13 +542,38 @@ impl Interpreter {
             match stmt {
                 Stmt::FunctionDef(f) => {
                     let func = self.build_function(f, &body_env)?;
+                    // `@prop.setter` / `@prop.deleter` register the decorated
+                    // function as the property's setter/deleter (under a
+                    // sentinel class-attr key) rather than overriding the
+                    // getter method. Evaluating `prop.setter` directly would
+                    // fail (`prop` isn't bound during class-body execution).
+                    let mut setter_target: Option<String> = None;
+                    for deco in f.decorator_list.iter() {
+                        if let Expr::Attribute(a) = &deco.expression {
+                            if a.attr.as_str() == "setter" {
+                                if let Expr::Name(prop) = a.value.as_ref() {
+                                    setter_target = Some(prop.id.as_str().to_owned());
+                                }
+                            }
+                        }
+                    }
+                    if let Some(prop) = setter_target {
+                        class_attrs.insert(
+                            format!("__typhon_setter__{}", prop),
+                            Value::Function(Rc::new(func)),
+                        );
+                        continue;
+                    }
                     let mut v = Value::Function(Rc::new(func));
                     let has_deco = |want: &str| {
                         f.decorator_list.iter().any(
                             |d| matches!(&d.expression, Expr::Name(n) if n.id.as_str() == want),
                         )
                     };
-                    let is_property = has_deco("property");
+                    // `@cached_property` behaves like a property on read (the
+                    // VM invokes it lazily). True per-instance caching is not
+                    // modelled, but the observable value is correct.
+                    let is_property = has_deco("property") || has_deco("cached_property");
                     let is_classmethod = has_deco("classmethod");
                     for deco in f.decorator_list.iter().rev() {
                         v = self.apply_decorator(deco, v, &body_env)?;
@@ -501,10 +596,21 @@ impl Interpreter {
                             Some(e) => Some(self.eval_expr(e, &body_env)?),
                             None => None,
                         };
-                        fields.push(ClassField {
-                            name: n.id.as_str().to_owned(),
-                            default,
-                        });
+                        let classvar = is_classvar(&a.annotation);
+                        // ClassVar is always a class attribute. In a non-
+                        // dataclass (`plain class`) an annotated assign with a
+                        // default is also a class attribute, not an instance
+                        // slot. Everything else is a dataclass field.
+                        if classvar || (!is_dataclass && default.is_some()) {
+                            if let Some(v) = default {
+                                class_attrs.insert(n.id.as_str().to_owned(), v);
+                            }
+                        } else {
+                            fields.push(ClassField {
+                                name: n.id.as_str().to_owned(),
+                                default,
+                            });
+                        }
                     }
                 }
                 Stmt::Assign(a) => {
@@ -773,6 +879,72 @@ impl Interpreter {
         for (k, v) in module_env.snapshot().into_iter() {
             members.insert(k, v);
         }
+
+        // `pub *` in a package's `__init__.ty` aggregates every sibling
+        // module's `pub` names (and direct sub-packages) into the package
+        // namespace, so `from pkg import f` resolves under `tyc run` the same
+        // way it does after `tyc build`.
+        if path.file_name().and_then(|n| n.to_str()) == Some("__init__.ty")
+            && !prep.pub_star_lines.is_empty()
+        {
+            if let Some(pkg_dir) = path.parent().map(|p| p.to_path_buf()) {
+                let prefix = if name.is_empty() {
+                    String::new()
+                } else {
+                    format!("{name}.")
+                };
+                let mut entries: Vec<std::path::PathBuf> = std::fs::read_dir(&pkg_dir)
+                    .into_iter()
+                    .flatten()
+                    .flatten()
+                    .map(|e| e.path())
+                    .collect();
+                entries.sort();
+                for p in entries {
+                    // Sibling module `pkg/mod.ty`, or sub-package
+                    // `pkg/sub/__init__.ty`.
+                    let sub_name = if p.extension().and_then(|e| e.to_str()) == Some("ty") {
+                        let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+                        if stem == "__init__" || stem.is_empty() {
+                            continue;
+                        }
+                        stem.to_owned()
+                    } else if p.is_dir() && p.join("__init__.ty").exists() {
+                        p.file_name()
+                            .and_then(|s| s.to_str())
+                            .unwrap_or("")
+                            .to_owned()
+                    } else {
+                        continue;
+                    };
+                    if sub_name.is_empty() {
+                        continue;
+                    }
+                    // The sibling's public surface: its `pub` names (for a
+                    // sub-package, whatever its own `__init__` exposes).
+                    let pub_names = read_pub_names(&p);
+                    let submod = self.import_module(&format!("{prefix}{sub_name}"))?;
+                    if pub_names.is_empty() {
+                        // A sub-package with `pub *` exposes everything it
+                        // aggregated — re-export all its members.
+                        if p.is_dir() {
+                            if let Value::Module(m) = &submod {
+                                for (k, v) in m.members.borrow().iter() {
+                                    members.entry(k.clone()).or_insert_with(|| v.clone());
+                                }
+                            }
+                        }
+                        continue;
+                    }
+                    for pn in pub_names {
+                        if let Ok(v) = self.get_attr(&submod, &pn) {
+                            members.entry(pn).or_insert(v);
+                        }
+                    }
+                }
+            }
+        }
+
         Ok(Some(Value::Module(Rc::new(Module {
             name: name.to_owned(),
             members: RefCell::new(members),
@@ -837,6 +1009,71 @@ impl Interpreter {
 
     /// True when `value` is an enum *member* instance (an `Instance` of an
     /// enum class carrying the synthesised `_name_` field).
+    /// The materialised member list for an enum class, if any.
+    fn enum_members(class: &Rc<Class>) -> Option<Vec<Value>> {
+        match class.class_attrs.borrow().get("__typhon_enum_members__") {
+            Some(Value::List(l)) => Some(l.borrow().clone()),
+            _ => None,
+        }
+    }
+
+    /// `Color(value)` — look an enum member up by its value (CPython
+    /// semantics: returns the existing singleton, or raises `ValueError`).
+    /// Passing an existing member of the same enum returns it unchanged.
+    fn enum_lookup_by_value(
+        &mut self,
+        class: &Rc<Class>,
+        args: Vec<Value>,
+        kwargs: &[(String, Value)],
+    ) -> Result<Value, Unwind> {
+        if !kwargs.is_empty() || args.len() != 1 {
+            return Err(type_error(format!(
+                "{}() takes exactly 1 argument ({} given)",
+                class.name,
+                args.len()
+            )));
+        }
+        let needle = &args[0];
+        // An existing member of this enum is returned as-is.
+        if let Value::Instance(i) = needle {
+            if Rc::ptr_eq(&i.class, class) {
+                return Ok(needle.clone());
+            }
+        }
+        if let Some(members) = Self::enum_members(class) {
+            for m in &members {
+                if let Value::Instance(i) = m {
+                    if let Some(v) = i.fields.borrow().get("_value_") {
+                        if v.py_eq(needle) {
+                            return Ok(m.clone());
+                        }
+                    }
+                }
+            }
+        }
+        Err(value_error(format!(
+            "{} is not a valid {}",
+            needle.py_repr(),
+            class.name
+        )))
+    }
+
+    /// `Color["RED"]` — look an enum member up by name (raises `KeyError`).
+    fn enum_lookup_by_name(&self, class: &Rc<Class>, name: &str) -> Result<Value, Unwind> {
+        if let Some(members) = Self::enum_members(class) {
+            for m in &members {
+                if let Value::Instance(i) = m {
+                    if let Some(Value::Str(n)) = i.fields.borrow().get("_name_") {
+                        if n.as_str() == name {
+                            return Ok(m.clone());
+                        }
+                    }
+                }
+            }
+        }
+        Err(key_error(format!("'{}'", name)))
+    }
+
     fn is_enum_member(value: &Value) -> bool {
         if let Value::Instance(i) = value {
             return Self::is_enum_class(&i.class) && i.fields.borrow().contains_key("_name_");
@@ -966,13 +1203,13 @@ impl Interpreter {
                     let val = self.eval_expr(v, env)?;
                     match b.op {
                         BoolOp::And => {
-                            if !val.truthy() {
+                            if !self.is_truthy(&val)? {
                                 return Ok(val);
                             }
                             last = val;
                         }
                         BoolOp::Or => {
-                            if val.truthy() {
+                            if self.is_truthy(&val)? {
                                 return Ok(val);
                             }
                             last = val;
@@ -1012,8 +1249,17 @@ impl Interpreter {
             Expr::Set(s) => {
                 let mut set = std::collections::HashSet::new();
                 for e in &s.elts {
-                    let v = self.eval_expr(e, env)?;
-                    set.insert(v.to_hash_key()?);
+                    // `{*xs, 9}` — splat an iterable's elements into the set.
+                    if let Expr::Starred(st) = e {
+                        let it = self.eval_expr(&st.value, env)?;
+                        let it = self.make_iter(it)?;
+                        while let Some(v) = self.iter_next(&it)? {
+                            set.insert(v.to_hash_key()?);
+                        }
+                    } else {
+                        let v = self.eval_expr(e, env)?;
+                        set.insert(v.to_hash_key()?);
+                    }
                 }
                 Ok(Value::Set(Rc::new(RefCell::new(set))))
             }
@@ -1043,7 +1289,7 @@ impl Interpreter {
             }
             Expr::If(t) => {
                 let cond = self.eval_expr(&t.test, env)?;
-                if cond.truthy() {
+                if self.is_truthy(&cond)? {
                     self.eval_expr(&t.body, env)
                 } else {
                     self.eval_expr(&t.orelse, env)
@@ -1318,6 +1564,12 @@ impl Interpreter {
         if matches!(l, Value::Instance(_)) || matches!(r, Value::Instance(_)) {
             if let Some(b) = self.cmp_dunder(op, l, r)? {
                 return Ok(b);
+            }
+            // Python derives `!=` from `__eq__` when `__ne__` is absent.
+            if op == CmpOp::NotEq {
+                if let Some(b) = self.cmp_dunder(CmpOp::Eq, l, r)? {
+                    return Ok(!b);
+                }
             }
         }
         Ok(match op {
@@ -1869,6 +2121,11 @@ impl Interpreter {
         args: Vec<Value>,
         kwargs: &[(String, Value)],
     ) -> Result<Value, Unwind> {
+        // Calling an enum class is value-lookup, not construction:
+        // `Color(2)` → the member whose value is 2 (CPython semantics).
+        if Self::is_enum_class(class) {
+            return self.enum_lookup_by_value(class, args, kwargs);
+        }
         let instance = Rc::new(Instance {
             class: class.clone(),
             fields: RefCell::new(HashMap::new()),
@@ -1876,7 +2133,7 @@ impl Interpreter {
         // Initialise class-level attributes that aren't methods. Skip the
         // internal enum sentinels so they don't leak onto instances.
         for (k, v) in class.class_attrs.borrow().iter() {
-            if is_enum_sentinel(k) {
+            if is_enum_sentinel(k) || k.starts_with("__typhon_setter__") {
                 continue;
             }
             instance.fields.borrow_mut().insert(k.clone(), v.clone());
@@ -1990,10 +2247,43 @@ impl Interpreter {
         Ok(None)
     }
 
+    /// Python truthiness honouring a user `__bool__` then `__len__` on
+    /// instances (CPython's `object.__bool__` protocol). Falls back to the
+    /// structural `Value::truthy` for everything else.
+    pub fn is_truthy(&mut self, v: &Value) -> Result<bool, Unwind> {
+        if let Value::Instance(i) = v {
+            if self.find_method(&i.class, "__bool__").is_some() {
+                if let Some(r) = self.call_dunder0(v, "__bool__")? {
+                    // CPython requires `__bool__` to return an actual bool.
+                    return match r {
+                        Value::Bool(b) => Ok(b),
+                        other => Err(type_error(format!(
+                            "__bool__ should return bool, returned {}",
+                            other.type_name()
+                        ))),
+                    };
+                }
+            }
+            if self.find_method(&i.class, "__len__").is_some() {
+                if let Some(r) = self.call_dunder0(v, "__len__")? {
+                    return Ok(r.to_int()? != 0);
+                }
+            }
+        }
+        Ok(v.truthy())
+    }
+
     /// `str(v)` honouring a user `__str__` (then `__repr__`) on instances.
+    ///
+    /// For containers, Python's `str()` renders elements via `repr()`, so a
+    /// container delegates to `repr_of` (which recurses through user dunders
+    /// on each element). Scalars keep their dedicated `__str__` path.
     pub fn str_of(&mut self, v: &Value) -> Result<String, Unwind> {
         if let Some(s) = self.enum_member_repr(v) {
             return Ok(s);
+        }
+        if Self::is_container(v) {
+            return self.repr_of(v);
         }
         if let Some(r) = self.call_dunder0(v, "__str__")? {
             return require_str_return(r, "__str__");
@@ -2004,15 +2294,171 @@ impl Interpreter {
         Ok(v.py_str())
     }
 
-    /// `repr(v)` honouring a user `__repr__` on instances.
+    /// `repr(v)` honouring a user `__repr__` on instances. Enum members
+    /// flow through to `py_repr` → `instance_repr`, which renders the
+    /// CPython `<Class.NAME: value>` form.
     pub fn repr_of(&mut self, v: &Value) -> Result<String, Unwind> {
-        if let Some(s) = self.enum_member_repr(v) {
-            return Ok(s);
+        self.repr_of_depth(v, 0)
+    }
+
+    /// Whether a value is a container whose elements must be rendered through
+    /// the interpreter so user `__repr__` / `__str__` dunders dispatch.
+    fn is_container(v: &Value) -> bool {
+        matches!(
+            v,
+            Value::List(_) | Value::Tuple(_) | Value::Dict(_) | Value::Set(_)
+        )
+    }
+
+    /// `repr(v)` with a recursion-depth guard. Containers render each element
+    /// via `repr_of` (so user `__repr__` dunders dispatch on elements), with
+    /// EXACT CPython formatting replicated from `Value::py_str`. Scalars and
+    /// every other `Value` kind delegate to the existing dunder / `py_repr`
+    /// path unchanged. The depth cap falls back to `[...]` (CPython prints
+    /// the same for direct self-reference) so self-referential containers
+    /// don't blow the stack.
+    fn repr_of_depth(&mut self, v: &Value, depth: usize) -> Result<String, Unwind> {
+        const MAX_REPR_DEPTH: usize = 100;
+        if depth >= MAX_REPR_DEPTH {
+            // CPython renders a self-referential container with a kind-specific
+            // ellipsis: `[...]` for lists, `{...}` for dicts/sets, `(...)` for
+            // tuples.
+            return Ok(match v {
+                Value::Tuple(_) => "(...)",
+                Value::Dict(_) | Value::Set(_) => "{...}",
+                _ => "[...]",
+            }
+            .to_string());
         }
-        if let Some(r) = self.call_dunder0(v, "__repr__")? {
-            return require_str_return(r, "__repr__");
+        match v {
+            Value::List(l) => {
+                // Clone the element handles out before recursing so the
+                // RefCell borrow isn't held across `repr_of` calls (which
+                // may themselves touch the same list, e.g. self-reference).
+                let items: Vec<Value> = l.borrow().iter().cloned().collect();
+                let mut s = String::from("[");
+                for (i, elem) in items.iter().enumerate() {
+                    if i > 0 {
+                        s.push_str(", ");
+                    }
+                    s.push_str(&self.repr_of_depth(elem, depth + 1)?);
+                }
+                s.push(']');
+                Ok(s)
+            }
+            Value::Tuple(t) => {
+                let items: Vec<Value> = t.iter().cloned().collect();
+                let mut s = String::from("(");
+                for (i, elem) in items.iter().enumerate() {
+                    if i > 0 {
+                        s.push_str(", ");
+                    }
+                    s.push_str(&self.repr_of_depth(elem, depth + 1)?);
+                }
+                if items.len() == 1 {
+                    s.push(',');
+                }
+                s.push(')');
+                Ok(s)
+            }
+            Value::Dict(d) => {
+                let frozen_key = HashKey::Str(Rc::new("__typhon_frozen__".to_owned()));
+                let is_frozen = matches!(d.borrow().get(&frozen_key), Some(Value::Bool(true)));
+                // Snapshot (key, value) pairs, filtering the synthetic
+                // `__typhon_frozen__` sentinel, before recursing.
+                let pairs: Vec<(HashKey, Value)> = d
+                    .borrow()
+                    .iter()
+                    .filter(|(k, _)| {
+                        !matches!(k, HashKey::Str(name) if name.as_str() == "__typhon_frozen__")
+                    })
+                    .map(|(k, val)| (k.clone(), val.clone()))
+                    .collect();
+                let mut s = String::new();
+                if is_frozen {
+                    s.push_str("mappingproxy({");
+                } else {
+                    s.push('{');
+                }
+                for (i, (k, val)) in pairs.iter().enumerate() {
+                    if i > 0 {
+                        s.push_str(", ");
+                    }
+                    s.push_str(&self.repr_hashkey(k, depth + 1)?);
+                    s.push_str(": ");
+                    s.push_str(&self.repr_of_depth(val, depth + 1)?);
+                }
+                if is_frozen {
+                    s.push_str("})");
+                } else {
+                    s.push('}');
+                }
+                Ok(s)
+            }
+            Value::Set(set) => {
+                let frozen_key = HashKey::Str(Rc::new("__typhon_frozen__".to_owned()));
+                let is_frozen = set.borrow().contains(&frozen_key);
+                // Match `Value::py_str`'s ordering EXACTLY: sort by the
+                // collision-safe `canonical_sort_key` so the repr is stable
+                // and matches CPython for all-numeric / all-string cases.
+                let mut keys: Vec<HashKey> = set
+                    .borrow()
+                    .iter()
+                    .filter(|k| **k != frozen_key)
+                    .cloned()
+                    .collect();
+                keys.sort_by_key(|k| k.canonical_sort_key());
+                if keys.is_empty() {
+                    return Ok(if is_frozen {
+                        "frozenset()".to_string()
+                    } else {
+                        "set()".to_string()
+                    });
+                }
+                let mut parts: Vec<String> = Vec::with_capacity(keys.len());
+                for k in &keys {
+                    parts.push(self.repr_hashkey(k, depth + 1)?);
+                }
+                let body = parts.join(", ");
+                Ok(if is_frozen {
+                    format!("frozenset({{{body}}})")
+                } else {
+                    format!("{{{body}}}")
+                })
+            }
+            // Scalars, instances (incl. enum members → `instance_repr`),
+            // Result Ok/Err, etc. keep the existing dunder / `py_repr` path.
+            _ => {
+                if let Some(r) = self.call_dunder0(v, "__repr__")? {
+                    return require_str_return(r, "__repr__");
+                }
+                Ok(v.py_repr())
+            }
         }
-        Ok(v.py_repr())
+    }
+
+    /// Render a `HashKey` (dict key / set element) to its CPython repr,
+    /// recursing through `repr_of_depth` so user `__repr__` dunders dispatch
+    /// on instance keys. `FrozenSet` keys keep the `frozenset({...})` wrapper
+    /// that the plain `HashKey::into_value` round-trip would otherwise drop
+    /// (it surfaces a frozenset as an untagged `Value::Set`).
+    fn repr_hashkey(&mut self, k: &HashKey, depth: usize) -> Result<String, Unwind> {
+        match k {
+            HashKey::FrozenSet(items) => {
+                if items.is_empty() {
+                    return Ok("frozenset()".to_string());
+                }
+                // Match `Value::py_str` set ordering: sort by canonical key.
+                let mut sorted: Vec<HashKey> = items.iter().cloned().collect();
+                sorted.sort_by_key(|k| k.canonical_sort_key());
+                let mut parts: Vec<String> = Vec::with_capacity(sorted.len());
+                for inner in &sorted {
+                    parts.push(self.repr_hashkey(inner, depth + 1)?);
+                }
+                Ok(format!("frozenset({{{}}})", parts.join(", ")))
+            }
+            other => self.repr_of_depth(&other.clone().into_value(), depth),
+        }
     }
 
     /// `ClassName.MEMBER` rendering for an enum member instance, matching
@@ -2087,7 +2533,40 @@ impl Interpreter {
             }
             (Float(a), FloorDiv, Float(b)) => return Ok(Float((a / b).floor())),
             (Float(a), Mod, Float(b)) => return Ok(Float(a.rem_euclid(*b))),
-            (Float(a), Pow, Float(b)) => return Ok(Float(a.powf(*b))),
+            (Float(a), Pow, Float(b)) => {
+                // A negative base raised to a non-integer power is complex in
+                // Python (`(-8) ** (1/3)` → ~`1+1.732j`), not `nan`.
+                if *a < 0.0 && b.fract() != 0.0 {
+                    let r = (-a).powf(*b);
+                    let theta = std::f64::consts::PI * b;
+                    return Ok(Complex(r * theta.cos(), r * theta.sin()));
+                }
+                return Ok(Float(a.powf(*b)));
+            }
+            // Complex base raised to a non-negative integer power — repeated
+            // multiplication for an exact result (`(1j) ** 2` → `-1+0j`),
+            // matching CPython's special-casing of integer exponents.
+            (Complex(ar, ai), Pow, Int(b)) if !b.is_negative() => {
+                // Exponentiation by squaring — O(log exp), so a huge exponent
+                // can't freeze the VM with an O(exp) loop (review: gemini).
+                let mut exp = b.to_u32().ok_or_else(overflow)?;
+                let (mut rr, mut ri) = (1.0f64, 0.0f64);
+                let (mut br, mut bi) = (*ar, *ai);
+                while exp > 0 {
+                    if exp & 1 == 1 {
+                        let nr = rr * br - ri * bi;
+                        let ni = rr * bi + ri * br;
+                        rr = nr;
+                        ri = ni;
+                    }
+                    let nbr = br * br - bi * bi;
+                    let nbi = 2.0 * br * bi;
+                    br = nbr;
+                    bi = nbi;
+                    exp >>= 1;
+                }
+                return Ok(Complex(rr, ri));
+            }
             _ => {}
         }
 
@@ -2228,7 +2707,7 @@ impl Interpreter {
 
     fn unop(&mut self, op: UnaryOp, v: &Value) -> Result<Value, Unwind> {
         match op {
-            UnaryOp::Not => Ok(Value::Bool(!v.truthy())),
+            UnaryOp::Not => Ok(Value::Bool(!self.is_truthy(v)?)),
             UnaryOp::USub => match v {
                 Value::Int(i) => Ok(Value::Int(-i)),
                 Value::Float(x) => Ok(Value::Float(-*x)),
@@ -2264,13 +2743,46 @@ impl Interpreter {
                 }
             }
         }
+        // Honour a user `__index__` on the subscript key (e.g. `xs[idx]`
+        // where `idx` is a class defining `__index__`).
+        let key_owned;
+        let key = match key {
+            Value::Instance(i) if self.find_method(&i.class, "__index__").is_some() => {
+                key_owned = self.call_dunder0(key, "__index__")?.unwrap_or(Value::None);
+                &key_owned
+            }
+            _ => key,
+        };
         match target {
+            // `Color["RED"]` — enum member lookup by name.
+            Value::Class(c) if Self::is_enum_class(c) => {
+                let name = match key {
+                    Value::Str(s) => s.as_str().to_owned(),
+                    _ => {
+                        return Err(key_error(key.py_repr()));
+                    }
+                };
+                self.enum_lookup_by_name(c, &name)
+            }
             Value::List(l) => {
                 let i = key.to_int()?;
                 let l = l.borrow();
                 let idx = normalize_index(i, l.len())
                     .ok_or_else(|| index_error("list index out of range"))?;
                 Ok(l[idx].clone())
+            }
+            // `range(...)[i]` — compute the i-th element arithmetically
+            // (supports Python negative indexing).
+            Value::Range { start, stop, step } => {
+                let len = if *step > 0 {
+                    ((stop - start).max(0) + step - 1) / step
+                } else {
+                    ((start - stop).max(0) - step - 1) / -step
+                };
+                let i = key.to_int()?;
+                let idx = normalize_index(i, len as usize)
+                    .ok_or_else(|| index_error("range object index out of range"))?;
+                Ok(Value::Int(BigInt::from(start + idx as i64 * step)))
             }
             Value::Tuple(t) => {
                 let i = key.to_int()?;
@@ -2467,6 +2979,24 @@ impl Interpreter {
                     .map(|_| ())
                     .ok_or_else(|| key_error(key.py_repr()))
             }
+            // `del obj[key]` → `obj.__delitem__(key)`.
+            Value::Instance(i) => {
+                if let Some(m) = self.find_method(&i.class, "__delitem__") {
+                    self.call_value(
+                        Value::BoundMethod {
+                            receiver: Box::new(target.clone()),
+                            function: m,
+                        },
+                        vec![key.clone()],
+                        &[],
+                    )?;
+                    return Ok(());
+                }
+                Err(type_error(format!(
+                    "'{}' object does not support item deletion",
+                    i.class.name
+                )))
+            }
             _ => Err(type_error("delete on unsupported target")),
         }
     }
@@ -2541,6 +3071,27 @@ impl Interpreter {
                     });
                     return Ok(Value::Native(Rc::new(nf)));
                 }
+                // Fall back to class-level attributes (ClassVar / plain-class
+                // constants) — `instance.K` reads `type(instance).K`.
+                if let Some(v) = inst.class.class_attrs.borrow().get(attr) {
+                    if !is_enum_sentinel(attr) {
+                        return Ok(v.clone());
+                    }
+                }
+                // Last resort: a user `__getattr__(self, name)` resolves
+                // otherwise-missing attributes (CPython protocol).
+                if attr != "__getattr__" {
+                    if let Some(m) = self.find_method(&inst.class, "__getattr__") {
+                        return self.call_value(
+                            Value::BoundMethod {
+                                receiver: Box::new(value.clone()),
+                                function: m,
+                            },
+                            vec![Value::Str(Rc::new(attr.to_owned()))],
+                            &[],
+                        );
+                    }
+                }
                 Err(attribute_error(format!(
                     "'{}' object has no attribute '{}'",
                     inst.class.name, attr
@@ -2597,6 +3148,16 @@ impl Interpreter {
             Value::Module(m) => m.members.borrow().get(attr).cloned().ok_or_else(|| {
                 attribute_error(format!("module '{}' has no attribute '{}'", m.name, attr))
             }),
+            // `func.__name__` / `func.__qualname__`.
+            Value::Function(f) if attr == "__name__" || attr == "__qualname__" => {
+                Ok(Value::Str(Rc::new(f.name.clone())))
+            }
+            Value::Native(n) if attr == "__name__" || attr == "__qualname__" => {
+                Ok(Value::Str(Rc::new(n.name.to_string())))
+            }
+            Value::BoundMethod { function, .. } if attr == "__name__" || attr == "__qualname__" => {
+                Ok(Value::Str(Rc::new(function.name.clone())))
+            }
             Value::ResultOk(v) => match attr {
                 "value" => Ok((**v).clone()),
                 "map" | "map_err" | "and_then" | "or_else" => {
@@ -2663,9 +3224,22 @@ impl Interpreter {
                 });
                 Ok(Value::Native(Rc::new(m)))
             }
-            Value::Exception { kind, message } => match attr {
-                "args" => Ok(Value::Tuple(Rc::new(vec![Value::Str(message.clone())]))),
+            Value::Exception {
+                kind,
+                message,
+                args,
+            } => match attr {
+                "args" => {
+                    if args.is_empty() && !message.is_empty() {
+                        Ok(Value::Tuple(Rc::new(vec![Value::Str(message.clone())])))
+                    } else {
+                        Ok(Value::Tuple(args.clone()))
+                    }
+                }
                 "kind" => Ok(Value::Str(kind.clone())),
+                // `__cause__` / `__context__` are not tracked yet; expose None
+                // so the common introspection (`e.__cause__ is None`) works.
+                "__cause__" | "__context__" => Ok(Value::None),
                 _ => Err(attribute_error(format!(
                     "'{}' has no attribute '{}'",
                     kind, attr
@@ -2756,9 +3330,28 @@ impl Interpreter {
         }
     }
 
-    fn set_attr(&mut self, receiver: &Value, attr: &str, value: Value) -> Result<(), Unwind> {
+    pub fn set_attr(&mut self, receiver: &Value, attr: &str, value: Value) -> Result<(), Unwind> {
         match receiver {
             Value::Instance(i) => {
+                // A `@prop.setter` registered for this name intercepts the
+                // assignment (`obj.prop = v` → setter(self, v)).
+                let setter = i
+                    .class
+                    .class_attrs
+                    .borrow()
+                    .get(&format!("__typhon_setter__{}", attr))
+                    .cloned();
+                if let Some(Value::Function(setter)) = setter {
+                    self.call_value(
+                        Value::BoundMethod {
+                            receiver: Box::new(receiver.clone()),
+                            function: setter,
+                        },
+                        vec![value],
+                        &[],
+                    )?;
+                    return Ok(());
+                }
                 i.fields.borrow_mut().insert(attr.to_owned(), value);
                 Ok(())
             }
@@ -2778,6 +3371,25 @@ impl Interpreter {
     }
 
     fn set_subscript(&mut self, target: &Value, key: &Value, value: Value) -> Result<(), Unwind> {
+        // Slice assignment: `xs[1:3] = [...]`.
+        if let Value::Tuple(t) = key {
+            if t.len() == 4 {
+                if let Value::Str(tag) = &t[0] {
+                    if tag.as_str() == "__slice__" {
+                        return self.set_slice(target, &t[1], &t[2], &t[3], value);
+                    }
+                }
+            }
+        }
+        // Honour a user `__index__` on the subscript key.
+        let key_owned;
+        let key = match key {
+            Value::Instance(i) if self.find_method(&i.class, "__index__").is_some() => {
+                key_owned = self.call_dunder0(key, "__index__")?.unwrap_or(Value::None);
+                &key_owned
+            }
+            _ => key,
+        };
         match target {
             Value::List(l) => {
                 let i = key.to_int()?;
@@ -2825,6 +3437,77 @@ impl Interpreter {
         }
     }
 
+    /// `xs[a:b:c] = iterable` — list slice assignment.
+    fn set_slice(
+        &mut self,
+        target: &Value,
+        lower: &Value,
+        upper: &Value,
+        step: &Value,
+        value: Value,
+    ) -> Result<(), Unwind> {
+        let Value::List(l) = target else {
+            return Err(type_error(format!(
+                "'{}' object does not support slice assignment",
+                target.type_name()
+            )));
+        };
+        let len = l.borrow().len();
+        let step_i = match step {
+            Value::None => 1,
+            v => v.to_int()?,
+        };
+        if step_i == 0 {
+            return Err(value_error("slice step cannot be zero"));
+        }
+        // Materialise the RHS.
+        let it = self.make_iter(value)?;
+        let mut repl: Vec<Value> = Vec::new();
+        while let Some(v) = self.iter_next(&it)? {
+            repl.push(v);
+        }
+        let (start, stop, step_i) = compute_slice(lower, upper, step_i, len)?;
+        if step_i == 1 {
+            let s = start.max(0) as usize;
+            let e = (stop.max(0) as usize).clamp(s, len);
+            l.borrow_mut().splice(s..e, repl);
+            Ok(())
+        } else {
+            // Extended slice: the replacement length must match exactly.
+            let mut indices: Vec<usize> = Vec::new();
+            let mut idx = start;
+            if step_i > 0 {
+                while idx < stop {
+                    if idx >= 0 {
+                        indices.push(idx as usize);
+                    }
+                    idx += step_i;
+                }
+            } else {
+                while idx > stop {
+                    if idx >= 0 {
+                        indices.push(idx as usize);
+                    }
+                    idx += step_i;
+                }
+            }
+            if indices.len() != repl.len() {
+                return Err(value_error(format!(
+                    "attempt to assign sequence of size {} to extended slice of size {}",
+                    repl.len(),
+                    indices.len()
+                )));
+            }
+            let mut b = l.borrow_mut();
+            for (i, v) in indices.into_iter().zip(repl) {
+                if i < b.len() {
+                    b[i] = v;
+                }
+            }
+            Ok(())
+        }
+    }
+
     // ── Iteration ──────────────────────────────────────────────────────────
 
     pub fn make_iter(&mut self, v: Value) -> Result<Value, Unwind> {
@@ -2839,6 +3522,18 @@ impl Interpreter {
             Value::Str(s) => {
                 let chars = s.chars().collect();
                 IterState::Str { chars, index: 0 }
+            }
+            // Iterating bytes/bytearray yields each byte as an int
+            // (`list(b"\x01\x02")` → `[1, 2]`).
+            Value::Bytes(b) => {
+                let items: Vec<Value> = b
+                    .iter()
+                    .map(|byte| Value::Int(BigInt::from(*byte)))
+                    .collect();
+                IterState::List {
+                    items: Rc::new(RefCell::new(items)),
+                    index: 0,
+                }
             }
             Value::Dict(d) => {
                 let keys: Vec<HashKey> = d
@@ -2892,6 +3587,33 @@ impl Interpreter {
                         vec![],
                         &[],
                     )?;
+                    // If `__iter__` returns an object that drives iteration via
+                    // `__next__` (commonly `return self`), step it eagerly via
+                    // `__next__` rather than recursing into `make_iter` — which
+                    // would loop forever for `return self` (FINDINGS G4).
+                    if let Value::Instance(ret) = &iter_val {
+                        if self.find_method(&ret.class, "__next__").is_some() {
+                            let mut items: Vec<Value> = Vec::new();
+                            loop {
+                                if items.len() >= GENERATOR_CAP {
+                                    return Err(Unwind::Exception(VmException::new(
+                                        "RuntimeError",
+                                        "iterator exceeded the VM's eager-evaluation limit",
+                                    )));
+                                }
+                                match self.call_dunder0(&iter_val, "__next__") {
+                                    Ok(Some(item)) => items.push(item),
+                                    Ok(None) => break,
+                                    Err(Unwind::Exception(e)) if e.kind == "StopIteration" => break,
+                                    Err(e) => return Err(e),
+                                }
+                            }
+                            return Ok(Value::Iter(Rc::new(RefCell::new(IterState::List {
+                                items: Rc::new(RefCell::new(items)),
+                                index: 0,
+                            }))));
+                        }
+                    }
                     return self.make_iter(iter_val);
                 }
                 return Err(type_error(format!(
@@ -3036,9 +3758,8 @@ impl Interpreter {
             Recurse::Filter(func, inner) => loop {
                 match self.iter_next(&Value::Iter(inner.clone()))? {
                     Some(v) => {
-                        let keep = self
-                            .call_value(func.clone(), vec![v.clone()], &[])?
-                            .truthy();
+                        let kv = self.call_value(func.clone(), vec![v.clone()], &[])?;
+                        let keep = self.is_truthy(&kv)?;
                         if keep {
                             return Ok(Some(v));
                         }
@@ -3051,17 +3772,28 @@ impl Interpreter {
 
     // ── Comprehensions ─────────────────────────────────────────────────────
 
-    fn run_comprehension<F>(
+    /// Runs a comprehension and, after it finishes, copies
+    /// any walrus (`:=`) target named in `leak_names` from the comprehension's
+    /// private scope out into the enclosing `env` — Python leaks the LAST
+    /// value of a comprehension walrus target into the containing scope.
+    fn run_comprehension_leaking<F>(
         &mut self,
         generators: &[ast::Comprehension],
+        leak_names: &[String],
         env: &EnvRef,
-        mut emit: F,
+        emit: &mut F,
     ) -> Result<(), Unwind>
     where
         F: FnMut(&mut Self, &EnvRef) -> Result<(), Unwind>,
     {
         let scope = Env::new_child(env);
-        self.run_comp_recurse(generators, 0, &scope, &mut emit)
+        let res = self.run_comp_recurse(generators, 0, &scope, emit);
+        for name in leak_names {
+            if let Some(v) = scope.get(name) {
+                env.assign_or_create(name, v);
+            }
+        }
+        res
     }
 
     fn run_comp_recurse<F>(
@@ -3084,7 +3816,8 @@ impl Interpreter {
             self.assign_target(&g.target, v, env, None)?;
             let mut ok = true;
             for cond in &g.ifs {
-                if !self.eval_expr(cond, env)?.truthy() {
+                let __ac = self.eval_expr(cond, env)?;
+                if !self.is_truthy(&__ac)? {
                     ok = false;
                     break;
                 }
@@ -3100,7 +3833,8 @@ impl Interpreter {
         let out = Rc::new(RefCell::new(Vec::new()));
         let elt = c.elt.clone();
         let out_clone = out.clone();
-        self.run_comprehension(&c.generators, env, move |this, scope| {
+        let leaks = comprehension_walrus_names(&[&c.elt], &c.generators);
+        self.run_comprehension_leaking(&c.generators, &leaks, env, &mut move |this, scope| {
             let v = this.eval_expr(&elt, scope)?;
             out_clone.borrow_mut().push(v);
             Ok(())
@@ -3113,7 +3847,8 @@ impl Interpreter {
         let out = Rc::new(RefCell::new(std::collections::HashSet::new()));
         let elt = c.elt.clone();
         let out_clone = out.clone();
-        self.run_comprehension(&c.generators, env, move |this, scope| {
+        let leaks = comprehension_walrus_names(&[&c.elt], &c.generators);
+        self.run_comprehension_leaking(&c.generators, &leaks, env, &mut move |this, scope| {
             let v = this.eval_expr(&elt, scope)?;
             out_clone.borrow_mut().insert(v.to_hash_key()?);
             Ok(())
@@ -3130,7 +3865,12 @@ impl Interpreter {
             .ok_or_else(|| type_error("dict comprehension missing key"))?;
         let value_expr = c.value.clone();
         let out_clone = out.clone();
-        self.run_comprehension(&c.generators, env, move |this, scope| {
+        let mut parts: Vec<&Expr> = vec![&c.value];
+        if let Some(k) = c.key.as_deref() {
+            parts.push(k);
+        }
+        let leaks = comprehension_walrus_names(&parts, &c.generators);
+        self.run_comprehension_leaking(&c.generators, &leaks, env, &mut move |this, scope| {
             let k = this.eval_expr(&key_expr, scope)?.to_hash_key()?;
             let v = this.eval_expr(&value_expr, scope)?;
             out_clone.borrow_mut().insert(k, v);
@@ -3167,36 +3907,42 @@ impl Interpreter {
                         // `e.code` / `e.message` work. Otherwise fall back
                         // to the bare `Value::Exception` summary.
                         let value = match &exc.value {
-                            Some(v @ Value::Instance(_)) => v.clone(),
+                            Some(v @ (Value::Instance(_) | Value::Exception { .. })) => v.clone(),
                             _ => Value::Exception {
                                 kind: Rc::new(exc.kind.clone()),
                                 message: Rc::new(exc.message.clone()),
+                                args: Rc::new(exc_fallback_args(&exc.message)),
                             },
                         };
                         if let Some(name) = &h.name {
                             env.set(name.as_str(), value.clone());
                         }
                         handled_exc = Some(value);
+                        // Make this exception the active one so a bare `raise`
+                        // inside the handler re-raises it.
+                        self.active_exceptions.push(exc.clone());
                         let result = self.exec_block(&h.body, env);
+                        self.active_exceptions.pop();
                         if let Some(name) = &h.name {
                             env.delete(name.as_str());
                         }
                         if let Err(e) = result {
-                            // finally still runs.
-                            let _ = self.exec_block(&t.finalbody, env);
+                            // An error escaping the handler: finally still runs,
+                            // and if finally itself raises, that wins (D5).
+                            self.exec_block(&t.finalbody, env)?;
                             return Err(e);
                         }
                         break;
                     }
                 }
                 if !found {
-                    let _ = self.exec_block(&t.finalbody, env);
+                    self.exec_block(&t.finalbody, env)?;
                     return Err(Unwind::Exception(exc));
                 }
                 Ok(())
             }
             Err(other) => {
-                let _ = self.exec_block(&t.finalbody, env);
+                self.exec_block(&t.finalbody, env)?;
                 return Err(other);
             }
         };
@@ -3224,8 +3970,11 @@ impl Interpreter {
         // accept any name match against the exception's `kind`.
         if let Expr::Name(n) = type_expr {
             let name = n.id.as_str();
-            // Direct name match against the exception's kind.
-            if name == exc.kind || name == "Exception" || name == "BaseException" {
+            // Direct name match, or a builtin-exception-hierarchy match
+            // (e.g. `except ArithmeticError` catching `ZeroDivisionError`,
+            // `except LookupError` catching `KeyError`/`IndexError`,
+            // `except OSError` catching `FileNotFoundError`).
+            if name == exc.kind || builtin_exc_is_a(&exc.kind, name) {
                 return Ok(true);
             }
             // Class-hierarchy match: if the exception carries a user
@@ -3246,8 +3995,15 @@ impl Interpreter {
 
     fn value_to_exception(&self, v: Value) -> Unwind {
         match v {
-            Value::Exception { kind, message } => {
-                Unwind::Exception(VmException::new((*kind).clone(), (*message).clone()))
+            Value::Exception {
+                ref kind,
+                ref message,
+                ..
+            } => {
+                // Keep the full value (carrying `args`) attached so the
+                // handler can bind it and `e.args` survives.
+                let (k, m) = ((**kind).clone(), (**message).clone());
+                Unwind::Exception(VmException::new(k, m).with_value(v))
             }
             Value::Instance(i) => {
                 // Prefer `args` (Python convention), fall back to `message`,
@@ -3305,11 +4061,35 @@ impl Interpreter {
             }
             entered.push(cm);
         }
-        let body_res = self.exec_block(&w.body, env);
-        // Call __exit__ on each, in reverse order.
+        let mut body_res = self.exec_block(&w.body, env);
+        // Call __exit__ on each, in reverse order. When the body raised, pass
+        // the exception info `(exc_type, exc_value, None)` and honour a truthy
+        // return value by SUPPRESSING the exception (CPython protocol).
         for cm in entered.into_iter().rev() {
             if let Ok(exit) = self.get_attr(&cm, "__exit__") {
-                let _ = self.call_value(exit, vec![Value::None, Value::None, Value::None], &[]);
+                let (et, ev) = match &body_res {
+                    Err(Unwind::Exception(exc)) => {
+                        let value = match &exc.value {
+                            Some(v) => v.clone(),
+                            None => Value::Exception {
+                                kind: Rc::new(exc.kind.clone()),
+                                message: Rc::new(exc.message.clone()),
+                                args: Rc::new(exc_fallback_args(&exc.message)),
+                            },
+                        };
+                        let etype = match &exc.value {
+                            Some(Value::Instance(i)) => Value::Class(i.class.clone()),
+                            _ => crate::builtins::make_builtin_type(&exc.kind),
+                        };
+                        (etype, value)
+                    }
+                    _ => (Value::None, Value::None),
+                };
+                let raised = matches!(&body_res, Err(Unwind::Exception(_)));
+                let suppressed = self.call_value(exit, vec![et, ev, Value::None], &[])?;
+                if raised && self.is_truthy(&suppressed)? {
+                    body_res = Ok(());
+                }
             }
         }
         body_res
@@ -3330,7 +4110,10 @@ impl Interpreter {
             let scope = Env::new_child(env);
             if self.pattern_matches(&case.pattern, &subject, &scope)? {
                 let ok = match &case.guard {
-                    Some(g) => self.eval_expr(g, &scope)?.truthy(),
+                    Some(g) => {
+                        let gv = self.eval_expr(g, &scope)?;
+                        self.is_truthy(&gv)?
+                    }
                     None => true,
                 };
                 if ok {
@@ -3705,7 +4488,25 @@ fn builtin_has_attr(value: &Value, attr: &str) -> bool {
                 | "upper"
                 | "zfill"
         ),
-        Value::Bytes(_) => matches!(attr, "decode" | "hex" | "lower" | "upper"),
+        Value::Bytes(_) => matches!(
+            attr,
+            "decode"
+                | "hex"
+                | "lower"
+                | "upper"
+                | "split"
+                | "rsplit"
+                | "strip"
+                | "lstrip"
+                | "rstrip"
+                | "startswith"
+                | "endswith"
+                | "find"
+                | "index"
+                | "count"
+                | "replace"
+                | "join"
+        ),
         Value::List(_) => matches!(
             attr,
             "append"
@@ -3758,7 +4559,9 @@ fn builtin_has_attr(value: &Value, attr: &str) -> bool {
         ),
         Value::Tuple(_) => matches!(attr, "count" | "index"),
         Value::Float(_) => matches!(attr, "is_integer"),
-        Value::Int(_) | Value::Bool(_) => matches!(attr, "bit_length" | "is_integer"),
+        Value::Int(_) | Value::Bool(_) => {
+            matches!(attr, "bit_length" | "bit_count" | "to_bytes" | "is_integer")
+        }
         _ => false,
     }
 }
@@ -4323,6 +5126,175 @@ fn bind_result_combinator(receiver: Value, attr: &str) -> Value {
     Value::Native(Rc::new(nf))
 }
 
+/// The `pub` names a module file (or a sub-package's `__init__.ty`) exports,
+/// read via the preprocessor. Returns an empty vec for a file that has no
+/// `pub` declarations (e.g. a sub-package whose `__init__.ty` is `pub *`).
+fn read_pub_names(path: &std::path::Path) -> Vec<String> {
+    use tyc_syntax::preprocess;
+    let file = if path.is_dir() {
+        path.join("__init__.ty")
+    } else {
+        path.to_path_buf()
+    };
+    let Ok(source) = std::fs::read_to_string(&file) else {
+        return Vec::new();
+    };
+    preprocess::preprocess(&source).pub_names
+}
+
+/// The `args` tuple for an exception reconstructed from a `VmException` that
+/// carries only a message string: a 1-tuple of the message, or empty.
+fn exc_fallback_args(message: &str) -> Vec<Value> {
+    if message.is_empty() {
+        Vec::new()
+    } else {
+        vec![Value::Str(Rc::new(message.to_owned()))]
+    }
+}
+
+/// Whether builtin exception `kind` is `target` or one of its subclasses in
+/// the standard CPython exception hierarchy. `Exception` / `BaseException`
+/// match everything except the bare base-only kinds. Returns false for
+/// unknown names (user exceptions go through the instance-MRO path instead).
+fn builtin_exc_is_a(kind: &str, target: &str) -> bool {
+    if target == "BaseException" {
+        return true;
+    }
+    if target == "Exception" {
+        // Everything except the BaseException-only siblings.
+        return !matches!(kind, "KeyboardInterrupt" | "SystemExit" | "GeneratorExit");
+    }
+    // Direct parent in the standard hierarchy (subset covering the common
+    // intermediate bases programs actually catch).
+    fn parent(name: &str) -> Option<&'static str> {
+        Some(match name {
+            "ZeroDivisionError" | "OverflowError" | "FloatingPointError" => "ArithmeticError",
+            "IndexError" | "KeyError" => "LookupError",
+            "ModuleNotFoundError" => "ImportError",
+            "RecursionError" | "NotImplementedError" => "RuntimeError",
+            "UnboundLocalError" => "NameError",
+            "UnicodeError" => "ValueError",
+            "UnicodeDecodeError" | "UnicodeEncodeError" | "UnicodeTranslateError" => "UnicodeError",
+            "FileNotFoundError" | "FileExistsError" | "PermissionError" | "IsADirectoryError"
+            | "NotADirectoryError" | "InterruptedError" | "TimeoutError" | "BlockingIOError"
+            | "ChildProcessError" | "ProcessLookupError" | "ConnectionError" => "OSError",
+            "BrokenPipeError"
+            | "ConnectionResetError"
+            | "ConnectionRefusedError"
+            | "ConnectionAbortedError" => "ConnectionError",
+            _ => return None,
+        })
+    }
+    let mut cur = kind;
+    while let Some(p) = parent(cur) {
+        if p == target {
+            return true;
+        }
+        cur = p;
+    }
+    false
+}
+
+/// Collect the names of walrus (`:=`) assignment targets appearing anywhere
+/// in `e`. Used so a walrus inside a comprehension leaks its target into the
+/// enclosing scope (Python semantics).
+fn collect_walrus_names(e: &Expr, out: &mut Vec<String>) {
+    match e {
+        Expr::Named(n) => {
+            if let Expr::Name(name) = n.target.as_ref() {
+                out.push(name.id.as_str().to_owned());
+            }
+            collect_walrus_names(&n.value, out);
+        }
+        // `{k: (v := ...)}` — a dict literal can carry a walrus in its
+        // keys/values (review: gemini).
+        Expr::Dict(d) => {
+            for item in &d.items {
+                if let Some(k) = &item.key {
+                    collect_walrus_names(k, out);
+                }
+                collect_walrus_names(&item.value, out);
+            }
+        }
+        // `f"{(x := ...)}"` — walrus inside an f-string interpolation.
+        Expr::FString(fs) => {
+            for elem in fs.value.elements() {
+                if let ast::InterpolatedStringElement::Interpolation(interp) = elem {
+                    collect_walrus_names(&interp.expression, out);
+                }
+            }
+        }
+        Expr::BoolOp(b) => {
+            for v in &b.values {
+                collect_walrus_names(v, out);
+            }
+        }
+        Expr::BinOp(b) => {
+            collect_walrus_names(&b.left, out);
+            collect_walrus_names(&b.right, out);
+        }
+        Expr::UnaryOp(u) => collect_walrus_names(&u.operand, out),
+        Expr::Compare(c) => {
+            collect_walrus_names(&c.left, out);
+            for c2 in c.comparators.iter() {
+                collect_walrus_names(c2, out);
+            }
+        }
+        Expr::Call(c) => {
+            collect_walrus_names(&c.func, out);
+            for a in c.arguments.args.iter() {
+                collect_walrus_names(a, out);
+            }
+            for kw in c.arguments.keywords.iter() {
+                collect_walrus_names(&kw.value, out);
+            }
+        }
+        Expr::If(t) => {
+            collect_walrus_names(&t.test, out);
+            collect_walrus_names(&t.body, out);
+            collect_walrus_names(&t.orelse, out);
+        }
+        Expr::Subscript(s) => {
+            collect_walrus_names(&s.value, out);
+            collect_walrus_names(&s.slice, out);
+        }
+        Expr::Attribute(a) => collect_walrus_names(&a.value, out),
+        Expr::Starred(s) => collect_walrus_names(&s.value, out),
+        Expr::Tuple(t) => {
+            for x in &t.elts {
+                collect_walrus_names(x, out);
+            }
+        }
+        Expr::List(l) => {
+            for x in &l.elts {
+                collect_walrus_names(x, out);
+            }
+        }
+        Expr::Set(s) => {
+            for x in &s.elts {
+                collect_walrus_names(x, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Walrus target names from a comprehension's element expression(s) plus the
+/// `if` filters on every generator (the bound-iterable expressions are
+/// evaluated in the enclosing scope already, so their walruses leak anyway).
+fn comprehension_walrus_names(parts: &[&Expr], generators: &[ast::Comprehension]) -> Vec<String> {
+    let mut out = Vec::new();
+    for p in parts {
+        collect_walrus_names(p, &mut out);
+    }
+    for g in generators {
+        for cond in &g.ifs {
+            collect_walrus_names(cond, &mut out);
+        }
+    }
+    out
+}
+
 fn class_is_subclass(c: &Rc<Class>, target: &Rc<Class>) -> bool {
     if Rc::ptr_eq(c, target) {
         return true;
@@ -4543,6 +5515,18 @@ fn format_with_spec(value: &Value, default: &str, spec: &str) -> Result<String, 
         return Ok(format!("{explicit_sign}{body}"));
     }
 
+    // Float-presentation types (`e`/`E`/`f`/`F`/`g`/`G`) coerce an int or
+    // bool operand to float, matching CPython (`f"{42:.2f}"` → "42.00").
+    let coerced;
+    let value: &Value = if matches!(typ, Some('e' | 'E' | 'f' | 'F' | 'g' | 'G'))
+        && matches!(value, Value::Int(_) | Value::Bool(_))
+    {
+        coerced = Value::Float(value.to_float()?);
+        &coerced
+    } else {
+        value
+    };
+
     match value {
         Value::Float(x) => {
             let p = precision.unwrap_or(6);
@@ -4615,6 +5599,14 @@ fn format_with_spec(value: &Value, default: &str, spec: &str) -> Result<String, 
                     if alternate {
                         prefix.push_str("0o");
                     }
+                }
+                Some('c') => {
+                    // `{n:c}` → the Unicode character at codepoint n.
+                    let cp = i_val
+                        .to_u32()
+                        .and_then(char::from_u32)
+                        .ok_or_else(|| value_error("%c arg not in range(0x110000)"))?;
+                    buf = cp.to_string();
                 }
                 _ => {
                     buf = if comma {

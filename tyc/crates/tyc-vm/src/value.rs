@@ -287,9 +287,13 @@ pub enum Value {
     /// A module — a namespace dictionary.
     Module(Rc<Module>),
     /// An exception instance — held when a Python-style `except X as e` binds it.
+    /// `message` is the str-form of the first arg (kept for cheap display);
+    /// `args` is the full constructor argument tuple so `e.args` and the
+    /// multi-arg `str(e)` / `repr(e)` forms match CPython.
     Exception {
         kind: RcStr,
         message: RcStr,
+        args: Rc<Vec<Value>>,
     },
     /// Iterator state — opaque to the AST walker; consumed by `next`.
     Iter(Rc<RefCell<IterState>>),
@@ -495,11 +499,20 @@ impl fmt::Debug for Value {
             Value::ResultOk(v) => write!(f, "Ok(value={:?})", v),
             Value::ResultErr(v) => write!(f, "Err(error={:?})", v),
             Value::Module(m) => write!(f, "<module {}>", m.name),
-            Value::Exception { kind, message } => {
-                if message.is_empty() {
-                    write!(f, "{kind}()")
+            Value::Exception {
+                kind,
+                message,
+                args,
+            } => {
+                if args.is_empty() {
+                    if message.is_empty() {
+                        write!(f, "{kind}()")
+                    } else {
+                        write!(f, "{kind}({:?})", message.as_str())
+                    }
                 } else {
-                    write!(f, "{kind}({:?})", message.as_str())
+                    let parts: Vec<String> = args.iter().map(|a| a.py_repr()).collect();
+                    write!(f, "{kind}({})", parts.join(", "))
                 }
             }
             Value::Iter(_) => write!(f, "<iterator>"),
@@ -976,13 +989,25 @@ impl Value {
             Value::ResultOk(v) => format!("Ok(value={})", v.py_repr()),
             Value::ResultErr(v) => format!("Err(error={})", v.py_repr()),
             Value::Module(m) => format!("<module '{}'>", m.name),
-            Value::Exception { kind, message } => {
-                if message.is_empty() {
-                    format!("{kind}()")
-                } else {
-                    (**message).clone()
+            Value::Exception {
+                kind,
+                message,
+                args,
+            } => match args.len() {
+                // `str(ValueError("a", "b"))` is the tuple `('a', 'b')`.
+                n if n >= 2 => {
+                    let parts: Vec<String> = args.iter().map(|a| a.py_repr()).collect();
+                    format!("({})", parts.join(", "))
                 }
-            }
+                1 => args[0].py_str(),
+                _ => {
+                    if message.is_empty() {
+                        format!("{kind}()")
+                    } else {
+                        (**message).clone()
+                    }
+                }
+            },
             Value::Iter(_) => "<iterator>".into(),
             Value::DictView { kind, items } => {
                 let prefix = match kind {
@@ -1149,8 +1174,26 @@ pub fn bigint_eq_f64(a: &BigInt, b: f64) -> bool {
 /// order) to recover the order; any field not declared on the class
 /// (dynamically assigned) is appended afterwards, sorted by name for
 /// determinism.
+/// Whether `class` is an enum class — its own `class_attrs` carry the
+/// `__typhon_enum_base__` sentinel, or one of its bases does (the user's
+/// `Color(Enum)` inherits the flag from the synthetic `Enum` base).
+fn class_is_enum(class: &Class) -> bool {
+    class
+        .class_attrs
+        .borrow()
+        .contains_key("__typhon_enum_base__")
+        || class.bases.iter().any(|b| class_is_enum(b))
+}
+
 fn instance_repr(inst: &Instance) -> String {
     let fields = inst.fields.borrow();
+    // Enum members repr as `<Class.NAME: value>` (CPython default), not as
+    // their backing dataclass fields.
+    if class_is_enum(&inst.class) {
+        if let (Some(Value::Str(name)), Some(val)) = (fields.get("_name_"), fields.get("_value_")) {
+            return format!("<{}.{}: {}>", inst.class.name, name, val.py_repr());
+        }
+    }
     let mut parts: Vec<String> = Vec::with_capacity(fields.len());
     let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
     for cf in &inst.class.fields {

@@ -47,7 +47,8 @@ def parse_response(text: str, expect_id: RequestId) -> Result[Response, JsonRpcE
     if raw.get("jsonrpc") != "2.0":
         return Err(JsonRpcError(code=-32600, message="not a jsonrpc 2.0 response"))
     if "error" in raw:
-        let err_dict: dict[str, object] = raw["error"]
+        unsafe:
+            let err_dict: dict[str, object] = raw["error"]
         let err: JsonRpcError = JsonRpcError(
             code=int(err_dict["code"]),
             message=str(err_dict["message"]),

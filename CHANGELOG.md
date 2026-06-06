@@ -4,6 +4,285 @@ All notable changes to Typhon are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely; the
 canonical phase-by-phase status lives in `docs/roadmap.md`.
 
+## Unreleased
+
+Adversarial stress-round follow-up against v0.11.0. A fresh sweep across
+simple scripts, file/JSON I/O, ML-shaped numerics, agent/tool-dispatch
+loops, SDK patterns, and multi-file projects surfaced six defects where
+`tyc run` (the VM) silently diverged from `tyc build` + CPython, plus one
+type-checker resolution gap. The build path and the type checker were
+otherwise solid across the sweep (soundness probes for nullable misuse,
+list invariance, newtype bypass, frozen reassignment, Result error-type
+mismatch, and interface conformance were all correctly rejected).
+
+### Fixed — VM / CPython parity
+
+- **`str.replace(old, new, count)` honours the third `count` argument.**
+  The VM ignored it entirely, so `"aaaa".replace("a", "b", 2)` returned
+  `"bbbb"` instead of `"bbaa"` (and `count=0` was not the documented
+  no-op). A negative count means "replace all", matching CPython.
+- **`sorted(..., reverse=True)` and `list.sort(reverse=True)` are stable.**
+  Both lowered to a stable ascending sort followed by an unconditional
+  `.reverse()`, which flips the order of equal-key elements. They now
+  reverse the *comparator* instead of the list, so equal keys keep their
+  original relative order as CPython guarantees.
+- **`json.dumps(obj, sort_keys=True)` sorts keys.** The kwarg was parsed
+  and discarded; output stayed in insertion order. `sort_keys` now
+  threads through both the compact and `indent=` serialisers recursively.
+- **`math.isnan` / `math.isinf` / `math.isfinite` exist.** They were
+  absent from the VM's `math` shim and raised `AttributeError`.
+- **Float-presentation format types coerce int/bool operands.** `f"{42:.2f}"`
+  printed `42` (the spec was dropped); `f"{n:e}"` on an int printed the
+  bare integer. `e`/`E`/`f`/`F`/`g`/`G` now promote an int/bool operand to
+  float before formatting, matching CPython.
+
+### Fixed — resolver
+
+- **Dict comprehensions bind tuple-unpack targets.** `{k: v for k, v in
+  d.items()}` reported `k` and `v` as unknown names — the dict-comp arm
+  only declared single-`Name` targets, while list/set comps used the
+  recursive `declare_loop_target`. Dict comps now use the same helper.
+
+### Fixed — second stress round (sub-agent sweep across text/regex, numerics, and the object model)
+
+- **`enum` keyword VM runtime.** `repr(Color.RED)` now renders
+  `<Color.RED: 1>` (and enum members inside a container repr the same way,
+  not as their backing dataclass fields). Value lookup `Color(2)` and name
+  lookup `Color["RED"]` work, returning the singleton member and raising
+  `ValueError` / `KeyError` on a miss, matching CPython.
+- **`round(int, ndigits)` with negative `ndigits`** rounds to
+  tens/hundreds/… (banker's rounding, staying an int) instead of returning
+  the integer unchanged. `round(123456, -2)` → `123500`.
+- **f-string `:c`** converts an int to its Unicode character (`f"{65:c}"` →
+  `"A"`).
+- **`!=` derives from a user `__eq__`** when the class defines no `__ne__`,
+  instead of falling back to identity.
+- **`hash()` dispatches a user `__hash__`** method on instances.
+- **`math.prod`** added to the VM `math` shim.
+- **`range(...)[i]`** integer indexing (with Python negative indexing).
+- **bytes / bytearray are iterable** — `list(b"\x01\x02")` → `[1, 2]`, and
+  `sum`/comprehensions over bytes work.
+- **`enumerate(iterable, start=N)`** and **`zip(*iterables, strict=True)`**
+  honour their keyword arguments (the VM previously rejected both).
+
+### Fixed — emit path
+
+- **Method/attribute access on an integer literal** is now parenthesised:
+  `(255).to_bytes(4, "big")` instead of the invalid `255.to_bytes(...)`,
+  which CPython rejects as a `SyntaxError` (`255.` parses as a float).
+  Applies to attribute access and subscript.
+
+### Fixed — third stress round (`re` module + container repr)
+
+- **`re.sub` / `Pattern.sub` honour a callable replacement.** The VM
+  previously stringified the function (`<function repl>`) instead of
+  calling it per match. Callable replacements now receive a real Match
+  object and their return value is substituted.
+- **`re.sub` replacement templates use Python syntax.** `\1`…`\9`,
+  `\g<name>`, `\g<N>`, and `\\` are expanded against the captures (the VM
+  previously passed the template through Rust's `$1` engine, so `\g<name>`
+  came out literally).
+- **`re.split` with a capturing group includes the captured text**
+  (`re.split(r"(\d)", "a1b2")` → `['a', '1', 'b', '2', '']`), matching
+  CPython.
+- **`Match.group("name")` and `Match.groupdict()`** resolve named groups
+  (the VM previously `int()`-cast every group argument and crashed on a
+  name).
+- **`re.finditer` / `Pattern.finditer` and `re.subn` / `Pattern.subn`**
+  added.
+- **`count` / `maxsplit` arguments** on `re.sub` / `re.split` are honoured.
+- **Container elements dispatch user `__repr__` / `__str__`.** Objects with
+  a custom `__repr__` inside a list/tuple/set/frozenset/dict now render via
+  that method (`[<1>, <2>]`) instead of the default dataclass repr. Enum
+  members (`[<Color.RED: 1>]`), `Ok`/`Err`, frozensets-of-frozensets, and
+  mappingproxy frozen dicts all render correctly; a depth cap guards
+  self-referential containers.
+
+### Fixed — fourth stress round (bytes / int / complex stdlib gaps)
+
+- **bytes / bytearray methods** `split`, `rsplit`, `strip`, `lstrip`,
+  `rstrip`, `startswith`, `endswith`, `find`, `index`, `replace`, `join`
+  added to the VM (previously `AttributeError`).
+- **`int.to_bytes(length, byteorder)`** and **`int.bit_count()`** added.
+- **`complex("1+2j")`** (and `"3j"`, `"-1"`, `"2-3j"`, `"j"`) string parsing.
+
+### Fixed — power operator complex results
+
+- **A negative base raised to a non-integer power returns a complex number**
+  (`(-8) ** (1/3)` → ~`1+1.732j`) instead of `nan`, matching CPython.
+- **A complex base raised to a non-negative integer power** is computed by
+  repeated multiplication for an exact result (`(1j) ** 2` → `-1+0j`).
+
+### Fixed — checker soundness + a false-reject (third batch)
+
+- **`**kwargs: T` value typing.** Keyword-argument values absorbed by a
+  `**kwargs: T` parameter are checked against `T` — `f(a=1, b="oops")` for
+  `def f(**kwargs: int)` is now rejected (was unchecked; crashed at
+  runtime). `**kwargs: object` accepts anything. (Covers free/local
+  functions; method/cross-module `**kwargs` value-checking is still open.)
+- **Contravariant `Callable` parameters.** Passing a function with a
+  more-general parameter type where a more-specific one is expected is sound
+  and now accepted: `Callable[[Animal], str]` is assignable to
+  `Callable[[Dog], str]` (params contravariant via the inheritance-aware
+  `is_assignable`); the unsound reverse stays rejected.
+- **`unsafe:` value leak into an annotated assignment.** A value produced
+  inside an `unsafe:` block that flows into a concrete-typed `let n: T = v`
+  now fires `tyc::unsafe_value_leak` (previously only audited on `return`);
+  re-asserting inside the block or targeting `object`/`T?` is exempt.
+
+### Fixed — VM nested-package `pub *`
+
+- **`pub *` in a package's `__init__.ty` is aggregated under `tyc run`.**
+  The VM module loader now scans the package directory when an `__init__.ty`
+  contains `pub *`, loading each sibling module / sub-package and
+  re-exporting its `pub` names — so `from pkg import f` resolves in the VM
+  the same way it does after `tyc build` (previously `AttributeError:
+  module 'pkg' has no attribute 'f'`).
+
+### Fixed — type-checker soundness (union member access)
+
+- **Operations on a union type must be valid for every member.** The
+  checker previously accepted an operation if *any* member supported it, so
+  `let x: int | str = "two"; x + 1` type-checked clean then crashed with a
+  runtime `TypeError`. Now binary operators, attribute/method access, and
+  `len()` are checked against *all* members of a union (`x + 1` on `int |
+  str` → `operator_type_mismatch`; `x.upper()` → `attribute_not_found` on
+  `int`). Conservative: members that are user classes with unknown
+  hierarchy, `__getattr__`, `Unknown`, `TypeVar`, or `Any` stay permissive,
+  so legitimate duck-typed unions and narrowed uses still pass. Corpus
+  unchanged; no example needed a fix.
+
+### Fixed — VM exception args
+
+- **Builtin exceptions keep all constructor arguments.** `Value::Exception`
+  gained an `args` tuple, so `ValueError("a", "b", 3).args` is `('a', 'b',
+  3)` (was `('a',)`), `str(e)` of a multi-arg exception is the tuple form,
+  and the args survive through `raise` into an `except ... as e` handler.
+  `e.__cause__` / `e.__context__` read as `None` (exception chaining storage
+  is still a backlog item).
+
+### Fixed — comptime operators
+
+- **`comptime` now supports `//`, `%`, and `**`** (floor-division, modulo,
+  power), matching the documented arithmetic surface and Python semantics
+  (`-7 // 2 == -4`, `-7 % 2 == 1`, `2 ** 10 == 1024`, `2 ** -2 == 0.25`).
+  Division/modulo by a zero divisor produces a clean comptime error.
+
+### Fixed — VM property setters and `dir`
+
+- **`@<prop>.setter`** is honoured: `obj.prop = v` invokes the setter
+  (previously the `@c.setter` decorator crashed with `NameError` and the
+  assignment bypassed the setter).
+- **`dir(x)`** returns the sorted attribute names of an instance / class /
+  module (was `NameError`).
+
+### Fixed — VM parity with the checker false-reject fixes
+
+- **`__getattr__` resolves missing attributes** under `tyc run` (was
+  `AttributeError`), matching the build path.
+- **A walrus binding in a comprehension leaks its last value** to the
+  enclosing scope under `tyc run` (was `NameError`).
+
+### Fixed — type-checker false-rejects (valid code wrongly rejected)
+
+- **`plain class` and `class!` may define a hand-written `__init__`.**
+  `tyc::manual_init` no longer fires on them (a `plain class` generates no
+  constructor and `class!` preserves the user's `__init__` verbatim). It
+  still fires for a normal `class` / `model`. (The `class!` half also
+  needed the resolver to recognise raw classes in the `tyc check` path,
+  which doesn't thread the `ClassKind::Raw` line markers — `class!` names
+  are now scraped from source like `plain class` names.)
+- **`tyc::class_attr_shadows_slot` no longer fires on `plain class`** (its
+  class-level defaults are real class attributes, not slot descriptors).
+- **A class defining `__getattr__`** suppresses `tyc::attribute_not_found`
+  for attribute access on its instances.
+- **Attributes assigned via `self.x = ...` in a method** are tracked, so
+  `self.d[k]` no longer false-positives `attribute_not_found`.
+- **A walrus binding in a comprehension** (`[y for x in xs if (y := f(x))]`)
+  leaks to the enclosing scope, matching Python.
+
+### Fixed — sixth stress round (VM data model, part 2)
+
+- **List slice assignment** `xs[1:3] = [...]` (contiguous and extended-step).
+- **`__index__`** is honoured for subscripting (`xs[idx]` / `xs[idx] = v`).
+- **`del obj[key]`** dispatches `__delitem__`; **`del obj.attr`** removes an
+  instance attribute.
+- **`@cached_property`** is invoked on read (returns the value, not the bound
+  method); class-level `lazy let` rides on the same path.
+- **`__iter__` returning `self`** (the standard iterator idiom) no longer
+  stack-overflows — the VM drives `__next__` to `StopIteration`.
+- **Function `__name__` / `__qualname__`** (also on natives and bound
+  methods).
+- **Set literal star-unpack** `{*xs, 9}`.
+- **Bare-class `raise`** (`raise StopIteration` / `raise SomeError`)
+  instantiates the exception, matching Python.
+
+### Fixed — sixth stress round (VM exception model)
+
+- **Builtin exception hierarchy catching.** `except ArithmeticError` now
+  catches `ZeroDivisionError`, `except LookupError` catches
+  `KeyError`/`IndexError`, `except OSError` catches `FileNotFoundError`,
+  etc. Previously only the exact type and `Exception`/`BaseException`
+  matched, so intermediate-base handlers silently let exceptions escape.
+- **Bare `raise` (re-raise)** inside an `except` handler re-raises the
+  active exception instead of erroring with "No active exception".
+- **An exception raised in a `finally` replaces the in-flight exception**
+  (CPython semantics) instead of being discarded.
+- **`type(exc).__name__`** reports the concrete kind (`TypeError`) instead
+  of the generic `Exception`.
+- **`__exit__` receives `(exc_type, exc_value, None)`** when the `with`
+  body raised, and **a truthy return value suppresses the exception**.
+  Previously `__exit__` always got `(None, None, None)` and could not
+  suppress.
+
+### Fixed — fifth stress round (VM data model + a second soundness hole)
+
+VM:
+- **`__bool__` / `__len__` are consulted for truthiness** (`bool(x)`, `if x`,
+  `and`/`or`/`not`, ternaries, comprehension filters, match guards, `assert`).
+  An empty `__len__` object is now falsy.
+- **Dynamic-attribute builtins** `getattr` (with default), `setattr`,
+  `hasattr`, `delattr`, `vars` added to the VM.
+- **Class-level attribute access** — `ClassVar[T]` fields and `plain class`
+  constants are readable as `Cls.X` and `instance.X` (the VM was treating
+  every annotated class-body assignment as an instance slot). Root cause:
+  the VM's `run` path never passed the preprocessor's plain/raw/frozen
+  class-kind markers to the desugarer, so `plain class` / `class!` /
+  `class … frozen` were desugared differently from `tyc build`; the markers
+  are now threaded through.
+
+Type-checker soundness:
+- **Optional element types are preserved on extraction.** Indexing,
+  iterating, or comprehending a `list[T?]` / `dict[K, V?]` / set yields `T?`,
+  not `T`. Previously every extraction dropped the `?`, so `let a: Animal =
+  src[0]` (with `src: list[Animal?]`) type-checked clean then crashed with
+  `AttributeError: 'NoneType'`. Comprehensions are now type-checked at all
+  (they previously inferred `Unknown`). The fix surfaced and corrected one
+  genuine latent unsoundness in `examples/68-json-rpc-builder`.
+
+### Fixed — type-checker soundness
+
+- **Generic-class constructor arguments are validated against the bound
+  type parameters.** `let b: Box[int] = Box("hello")` (and `Box[int](...)`
+  / `Pair[int, str](...)`) now raise `tyc::type_mismatch` instead of
+  type-checking clean and crashing at runtime. The check is conservative —
+  pure inference (`Box(5)`), `int`→`float` widening, and `None` into a `T?`
+  field still pass.
+
+### Known gaps documented (not yet fixed)
+
+- `@contextmanager` generators used as `with` context managers still raise
+  `NotImplementedError` under `tyc run` (the tree-walking VM materialises
+  generators eagerly). Use `tyc build` + CPython.
+- The VM's seeded `random` does not reproduce CPython's Mersenne Twister.
+- `set`/`dict` keying still uses a structural hash key rather than a user
+  `__hash__`/`__eq__` (the `hash()` builtin and `!=` were fixed; the keying
+  path is deeper). Regex backreferences-in-pattern (`(\w+) \1`) and
+  lookaround remain unsupported by the underlying finite-automaton engine.
+  Counter/defaultdict/OrderedDict repr, `Path.parent` returning a `Path`,
+  `float.hex()`, and `decimal`/`fractions`/`statistics` modules remain on
+  the backlog.
+
 ## 0.11.0 — 2026-06-04
 
 VM parity sweep + `enum` keyword. A fresh adversarial stress round

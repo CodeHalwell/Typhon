@@ -820,6 +820,225 @@ fn bind_field_typevars(field_ty: &Type, arg_ty: &Type, out: &mut HashMap<String,
     }
 }
 
+/// Return `true` when `ty` mentions any `TypeVar` (or bare
+/// `TypeConstructor`) anywhere in its structure. Used by the generic
+/// constructor-argument check to stay conservative: a field type that
+/// still contains an unbound type parameter after substitution means
+/// the parameter wasn't pinned (pure inference, e.g. `Box(5)` with no
+/// annotation), so we must NOT emit a mismatch against it.
+fn contains_free_typevar(ty: &Type) -> bool {
+    match ty {
+        Type::TypeVar(_) | Type::TypeConstructor(_, _) => true,
+        Type::Union(xs) => xs.iter().any(contains_free_typevar),
+        Type::Generic(_, args) => args.iter().any(contains_free_typevar),
+        Type::Function { params, ret, .. } => {
+            params.iter().any(contains_free_typevar) || contains_free_typevar(ret)
+        }
+        _ => false,
+    }
+}
+
+/// Validate the arguments of a user-defined GENERIC class constructor
+/// against the class's field types with the bound type parameters
+/// substituted in. Closes the soundness hole where
+/// `let b: Box[int] = Box("hello")` (with `class Box[T]: value: T`)
+/// passed `tyc check` but crashed at runtime: the `Box[int]` annotation
+/// pins `T = int`, so the `value` field is `int`, but `"hello"` is `str`.
+///
+/// Conservative by construction — a per-argument mismatch is only
+/// emitted when the field's substituted type contains NO remaining free
+/// type parameter (i.e. `T` was actually pinned from the annotation or
+/// an explicit `Box[int](...)`). Inference-only construction (`Box(5)`,
+/// `let b = Box(5)`) leaves the field type as a bare `TypeVar` after
+/// substitution and is left untouched, as are non-TypeVar fields (those
+/// are the non-generic constructor path's responsibility, out of scope
+/// here). Assignability uses the normal [`Checker::is_assignable`] rule
+/// so int→float widening, None→optional, and subclassing still pass.
+fn check_generic_constructor_args(
+    c: &mut Checker,
+    shape: &InterfaceShape,
+    bindings: &HashMap<String, Type>,
+    pos_args: &[Expr],
+    kw_args: &[ruff_python_ast::Keyword],
+) {
+    // Positional args bind to fields in declaration order.
+    for (idx, arg) in pos_args.iter().enumerate() {
+        if matches!(arg, Expr::Starred(_)) {
+            // `*iter` unpack — can't map to a specific field.
+            continue;
+        }
+        let Some(field_name) = shape.field_order.get(idx) else {
+            continue;
+        };
+        let Some(field_ty) = shape.fields.get(field_name) else {
+            continue;
+        };
+        let span = (arg.range().start().to_usize(), arg.range().end().to_usize());
+        check_one_generic_ctor_arg(c, field_ty, bindings, arg, span);
+    }
+    // Keyword args bind to fields by name.
+    for kw in kw_args {
+        let Some(ident) = &kw.arg else { continue };
+        let Some(field_ty) = shape.fields.get(ident.as_str()) else {
+            continue;
+        };
+        let span = (
+            kw.value.range().start().to_usize(),
+            kw.value.range().end().to_usize(),
+        );
+        let field_ty = field_ty.clone();
+        check_one_generic_ctor_arg(c, &field_ty, bindings, &kw.value, span);
+    }
+}
+
+/// Check a single constructor argument against `field_ty` with `bindings`
+/// substituted. Shared by the positional and keyword loops of
+/// [`check_generic_constructor_args`].
+fn check_one_generic_ctor_arg(
+    c: &mut Checker,
+    field_ty: &Type,
+    bindings: &HashMap<String, Type>,
+    arg: &Expr,
+    span: (usize, usize),
+) {
+    // Only fields that actually mention a type parameter are in scope
+    // for this check — non-generic fields are handled (or intentionally
+    // not handled) elsewhere.
+    if !contains_free_typevar(field_ty) {
+        return;
+    }
+    let expected = substitute_typevars(field_ty, bindings);
+    // After substitution the parameter must be fully pinned; a leftover
+    // free TypeVar means inference, not a concrete expectation — stay
+    // quiet to avoid false positives on `Box(5)` etc.
+    if contains_free_typevar(&expected) || is_dynamic_type(&expected) {
+        return;
+    }
+    let actual = infer_expr_ctx(c, arg, Some(&expected));
+    if is_dynamic_type(&actual) {
+        return;
+    }
+    if !c.is_assignable(&expected, &actual) {
+        c.mismatch(&expected, &actual, span);
+    }
+}
+
+/// Handle a constructor call whose callee carries explicit type
+/// arguments — `Box[int]("hello")`, `Pair[int, str](...)`. Returns
+/// `Some(Generic(name, pinned_args))` when the callee is a subscripted
+/// user-defined generic class, having validated arity, unknown kwargs,
+/// and (the soundness fix) each argument against its field type with
+/// the explicit type parameters substituted in. Returns `None` for any
+/// other callee so the normal call-inference path takes over.
+fn check_explicit_typearg_constructor(
+    c: &mut Checker,
+    call: &ruff_python_ast::ExprCall,
+    pos_args: &[Expr],
+    kw_args: &[ruff_python_ast::Keyword],
+) -> Option<Type> {
+    let Expr::Subscript(sub) = call.func.as_ref() else {
+        return None;
+    };
+    let Expr::Name(n) = sub.value.as_ref() else {
+        return None;
+    };
+    let name = n.id.as_str().to_owned();
+    // Must be a user-defined generic class we know the shape of. Builtin
+    // generics (`dict[str, int]({...})`) are handled by their own path.
+    let tparams = c.class_type_params.get(&name).cloned()?;
+    let shape = effective_class_shape(&name, &c.class_shapes)?;
+
+    // Parse the explicit `[...]` slice into concrete types. A single
+    // type-arg is a bare expression; multiple are a tuple.
+    let arg_exprs: Vec<&Expr> = match sub.slice.as_ref() {
+        Expr::Tuple(t) => t.elts.iter().collect(),
+        other => vec![other],
+    };
+    // Arity mismatch between `[...]` count and the class's type params —
+    // bail out conservatively and let the rest of the pipeline report.
+    if arg_exprs.len() != tparams.len() {
+        return None;
+    }
+    let classes = c.classes.clone();
+    let pinned: Vec<Type> = arg_exprs
+        .iter()
+        .map(|e| type_from_annotation(e, &classes))
+        .collect();
+    let mut bindings: HashMap<String, Type> = HashMap::new();
+    for (tp, arg) in tparams.iter().zip(pinned.iter()) {
+        bindings.insert(tp.clone(), arg.clone());
+    }
+
+    let call_span = (call.range.start().to_usize(), call.range.end().to_usize());
+
+    // Unknown-kwarg check (mirrors the `Type::Class` arm).
+    let candidates: Vec<String> = shape.fields.keys().cloned().collect();
+    for kw in kw_args {
+        let Some(ident) = &kw.arg else { continue };
+        let kw_name = ident.as_str();
+        if !shape.fields.contains_key(kw_name) {
+            let suggestion = suggest_candidate(kw_name, &candidates);
+            let span = (
+                ident.range.start().to_usize(),
+                ident.range.start().to_usize() + kw_name.len(),
+            );
+            c.unknown_kwarg(&name, kw_name, suggestion, span);
+        }
+    }
+    // Constructor-arity check (mirrors the `Type::Class` arm).
+    let info = class_constructor_arity(&shape);
+    if !info.param_names.is_empty() {
+        match check_arity_with_info(&info, pos_args, kw_args) {
+            ArityCheck::Ok | ArityCheck::UnknownKwarg { .. } => {}
+            ArityCheck::Other => {
+                let missing = missing_required_fields(&shape, pos_args, kw_args);
+                if !missing.is_empty() {
+                    c.missing_argument(&name, missing, call_span);
+                } else {
+                    let supplied =
+                        pos_args.len() + kw_args.iter().filter(|k| k.arg.is_some()).count();
+                    c.wrong_args(&name, info.min_positional, supplied, call_span);
+                }
+            }
+        }
+    }
+
+    // SOUNDNESS: validate each argument against its substituted field
+    // type. This also infers each typevar-bound arg; remaining
+    // (non-typevar-field) args are inferred here so nested expressions
+    // still surface their own diagnostics.
+    let typevar_field_idxs: std::collections::HashSet<usize> = shape
+        .field_order
+        .iter()
+        .enumerate()
+        .filter(|(_, f)| {
+            shape
+                .fields
+                .get(f.as_str())
+                .is_some_and(contains_free_typevar)
+        })
+        .map(|(i, _)| i)
+        .collect();
+    check_generic_constructor_args(c, &shape, &bindings, pos_args, kw_args);
+    for (i, arg) in pos_args.iter().enumerate() {
+        if !typevar_field_idxs.contains(&i) {
+            let _ = infer_expr(c, arg);
+        }
+    }
+    for kw in kw_args {
+        let is_typevar_field = kw
+            .arg
+            .as_ref()
+            .and_then(|id| shape.fields.get(id.as_str()))
+            .is_some_and(contains_free_typevar);
+        if !is_typevar_field {
+            let _ = infer_expr(c, &kw.value);
+        }
+    }
+
+    Some(Type::Generic(name, pinned))
+}
+
 /// Return `true` if `name` is a built-in container type whose bare
 /// (unparameterised) form should be treated as accepting any
 /// parameterisation (`list` ≡ `list[Any]`, etc.).
@@ -1649,6 +1868,17 @@ struct Checker<'a> {
     /// honour default values, `*args`, `**kwargs`, and keyword arguments
     /// without rejecting valid calls (FINDINGS #44).
     function_arity_info: HashMap<String, ArityInfo>,
+    /// ITEM 1: declared VALUE type of each function's `**kwargs`
+    /// parameter, keyed identically to `function_arity_info`
+    /// (bare function name, or `module.attr` for dotted callees).
+    /// Stored in a side map rather than on `ArityInfo` so external
+    /// crates that build `ArityInfo` via full struct literals
+    /// (`tyc-vm`, the `tyc` binary's venv introspection) keep
+    /// compiling unchanged. `Type::Unknown` when the `**kwargs` is
+    /// unannotated; absent when the function has no `**kwargs`. Used at
+    /// call sites to type-check keyword arguments absorbed by
+    /// `**kwargs: T` against `T`.
+    function_kwarg_types: HashMap<String, Type>,
     /// Names of `async def` functions declared at module top level.
     /// Used by the call-site arm to emit `tyc::missing_await`
     /// (FINDINGS #49) when a sync context calls one without `await`.
@@ -1732,6 +1962,13 @@ struct Checker<'a> {
     /// as written in the source (`class Dog(Animal):` → `{"Dog": ["Animal"]}`).
     /// Used by `class_inherits_from` to resolve nominal subtype relationships.
     class_parents: HashMap<String, Vec<String>>,
+    /// Per-class set of attribute names assigned through `self`
+    /// (`self.NAME = ...`) inside a method body but NOT declared as a
+    /// class-level annotated field. Consulted by `find_field` so reads of
+    /// such attributes resolve (typed `Unknown`) instead of firing
+    /// `tyc::attribute_not_found`. Populated alongside `class_shapes` and
+    /// merged across `impl` / `extend` pseudo-classes the same way.
+    self_attrs: HashMap<String, std::collections::HashSet<String>>,
     env: TypeEnv,
     diagnostics: Diagnostics,
     /// Return type of the function whose body we are currently checking
@@ -2014,6 +2251,7 @@ impl<'a> Checker<'a> {
             classes: Vec::new(),
             function_signatures: HashMap::new(),
             function_arity_info: HashMap::new(),
+            function_kwarg_types: HashMap::new(),
             async_functions: std::collections::HashSet::new(),
             inside_await: 0,
             in_sync_function: false,
@@ -2026,6 +2264,7 @@ impl<'a> Checker<'a> {
             class_type_params: HashMap::new(),
             frozen_classes: std::collections::HashSet::new(),
             class_parents: HashMap::new(),
+            self_attrs: HashMap::new(),
             unsafe_depth: 0,
             unsafe_origin_bindings: HashMap::new(),
             unsafe_line_starts: Vec::new(),
@@ -2051,6 +2290,48 @@ impl<'a> Checker<'a> {
         self.unsafe_line_starts.binary_search(&start).is_ok()
     }
 
+    /// True iff `name` was declared with `plain class NAME:`. A plain class
+    /// emits a bare `class` (no `@dataclass`, no synthesised `__init__`),
+    /// so its class-level defaults are real class attributes and a
+    /// hand-written `__init__` is legal — both `tyc::class_attr_shadows_slot`
+    /// and `tyc::manual_init` must be suppressed for it.
+    fn is_plain_class(&self, name: &str) -> bool {
+        self.resolved.plain_classes.contains(name)
+    }
+
+    /// True iff `name` was declared with `class! NAME(...):` (raw class).
+    /// Like a plain class, a raw class emits without a `@dataclass`
+    /// decorator and may carry a hand-written `__init__` preserved
+    /// verbatim — so `tyc::manual_init` must not fire on it.
+    fn is_raw_class(&self, name: &str) -> bool {
+        self.resolved.raw_classes.contains(name)
+    }
+
+    /// True iff `name` (or any of its known base classes) defines a
+    /// `__getattr__` method. Such a class can resolve arbitrary attributes
+    /// at runtime, so `tyc::attribute_not_found` must be suppressed for
+    /// attribute access on its instances.
+    fn class_defines_getattr(&self, name: &str) -> bool {
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut stack: Vec<String> = vec![name.to_owned()];
+        while let Some(cur) = stack.pop() {
+            if !seen.insert(cur.clone()) {
+                continue;
+            }
+            if let Some(shape) = self.class_shapes.get(&cur) {
+                if shape.methods.contains_key("__getattr__") {
+                    return true;
+                }
+            }
+            if let Some(parents) = self.class_parents.get(&cur) {
+                for p in parents {
+                    stack.push(p.clone());
+                }
+            }
+        }
+        false
+    }
+
     /// Assignment compatibility check that accounts for sealed-union subtyping
     /// and structural conformance against `interface` declarations.
     ///
@@ -2071,6 +2352,47 @@ impl<'a> Checker<'a> {
     fn is_assignable(&self, expected: &Type, actual: &Type) -> bool {
         if assignable(expected, actual) {
             return true;
+        }
+        // ITEM 2: structural Callable / function assignability with
+        // class-aware variance. The standalone `assignable` already
+        // implements contravariant params + covariant return, but it
+        // recurses through the plain `assignable` helper which doesn't
+        // know about class inheritance, interfaces, or newtypes. So
+        // `Callable[[Animal], str]` was wrongly rejected where
+        // `Callable[[Dog], str]` is expected, even though `Animal` is a
+        // supertype of `Dog` (function params are contravariant: a
+        // handler that accepts any `Animal` can stand in for one that
+        // only needs to accept a `Dog`). Re-run the structural check
+        // through `self.is_assignable` so the nominal rules apply to the
+        // parameter and return slots.
+        if let (
+            Type::Function {
+                params: ep,
+                ret: er,
+                variadic: ev,
+            },
+            Type::Function {
+                params: ap,
+                ret: ar,
+                variadic: _av,
+            },
+        ) = (expected, actual)
+        {
+            // `Callable[..., R]` (empty params + variadic) accepts any
+            // function with an assignable (covariant) return type.
+            if *ev && ep.is_empty() {
+                return self.is_assignable(er, ar);
+            }
+            if ep.len() != ap.len() {
+                return false;
+            }
+            // Params contravariant: each expected param type must be
+            // assignable INTO the corresponding actual param type
+            // (`is_assignable(actual_param, expected_param)`). Return
+            // covariant: actual's return must be assignable to expected's
+            // return.
+            let params_ok = ep.iter().zip(ap).all(|(e, a)| self.is_assignable(a, e));
+            return params_ok && self.is_assignable(er, ar);
         }
         // Canonicalize module aliases on both sides and retry. An
         // annotation `let c: f.Cls` (where `import foo as f`) produces
@@ -2520,6 +2842,9 @@ impl<'a> Checker<'a> {
     /// directly declared on the queried class.  Returns the first matching
     /// field type found, or `None` when no class in the hierarchy defines it.
     fn find_field<'b>(&'b self, cls_name: &str, field_name: &str) -> Option<&'b Type> {
+        // Shared `Unknown` so `self`-assigned attributes (which carry no
+        // declared type) can be returned by reference.
+        static UNKNOWN: Type = Type::Unknown;
         let mut stack: Vec<&str> = vec![cls_name];
         let mut visited: std::collections::HashSet<&str> = std::collections::HashSet::new();
         while let Some(name) = stack.pop() {
@@ -2529,6 +2854,13 @@ impl<'a> Checker<'a> {
             if let Some(shape) = self.class_shapes.get(name) {
                 if let Some(ty) = shape.fields.get(field_name) {
                     return Some(ty);
+                }
+            }
+            // Attributes assigned via `self.NAME = ...` in a method body
+            // resolve as instance attributes (typed `Unknown`).
+            if let Some(attrs) = self.self_attrs.get(name) {
+                if attrs.contains(field_name) {
+                    return Some(&UNKNOWN);
                 }
             }
             if let Some(parents) = self.class_parents.get(name) {
@@ -2562,6 +2894,108 @@ impl<'a> Checker<'a> {
             }
         }
         true
+    }
+
+    /// SOUNDNESS (union use sites): return `true` when attribute / method
+    /// `attr` is definitely supported by member type `member`, or when
+    /// `member` is foreign / dynamic enough that we can't soundly flag it
+    /// (foreign classes, `Unknown`, `Any`, `TypeVar`, partial shapes, …).
+    /// Used by the union arm of attribute access so `x.upper()` on
+    /// `int | str` is rejected (the `int` member has no `upper`) while an
+    /// attribute present on EVERY member passes. Conservative by design:
+    /// anything we can't fully reason about returns `true` so legitimate
+    /// duck-typed unions don't false-positive.
+    fn member_supports_attr(&self, member: &Type, attr: &str) -> bool {
+        // Dunder / private names are never flagged (matches the
+        // single-receiver attribute paths).
+        if attr.starts_with('_') {
+            return true;
+        }
+        match member {
+            // Dynamic / foreign — can't soundly flag.
+            Type::Any | Type::Unknown | Type::TypeVar(_) | Type::TypeConstructor(_, _) => true,
+            Type::Function { .. } | Type::Module(_) => true,
+            // A literal-string singleton behaves like `str`. Forward-ref
+            // string types also land here; stay permissive (matches the
+            // single-receiver path which never flags `LitStr`).
+            Type::LitStr(_) => true,
+            Type::Str => {
+                is_known_primitive_attr("str", attr) || is_user_builtin_extension(self, "str", attr)
+            }
+            Type::Bytes => {
+                is_known_primitive_attr("bytes", attr)
+                    || is_user_builtin_extension(self, "bytes", attr)
+            }
+            Type::Int => {
+                is_known_primitive_attr("int", attr) || is_user_builtin_extension(self, "int", attr)
+            }
+            Type::Float => {
+                is_known_primitive_attr("float", attr)
+                    || is_user_builtin_extension(self, "float", attr)
+            }
+            // `bool` / `None`: matches the single-receiver policy of NOT
+            // attribute-checking these (overloaded comparison results,
+            // etc.). Treat as permissive so we don't regress.
+            Type::Bool | Type::None => true,
+            Type::Generic(head, _) => {
+                if is_builtin_generic_head(head) {
+                    builtin_generic_method(member, attr).is_some()
+                        || is_known_builtin_generic_attr(head, attr)
+                        || is_user_builtin_extension(self, head, attr)
+                } else {
+                    // User-defined generic class: resolve method/field,
+                    // but stay lenient when the hierarchy isn't fully
+                    // known or the class defines `__getattr__`.
+                    if !self.class_hierarchy_fully_known(head) || self.class_defines_getattr(head) {
+                        return true;
+                    }
+                    self.find_method(head, attr).is_some() || self.find_field(head, attr).is_some()
+                }
+            }
+            Type::Class(name) => {
+                if !self.class_hierarchy_fully_known(name) || self.class_defines_getattr(name) {
+                    return true;
+                }
+                self.find_method(name, attr).is_some() || self.find_field(name, attr).is_some()
+            }
+            // Nested union — recurse (every member must support it).
+            Type::Union(ms) => ms.iter().all(|m| self.member_supports_attr(m, attr)),
+        }
+    }
+
+    /// SOUNDNESS (union use sites): return `true` when `member` is a
+    /// `len()`-able (`Sized`) type, or foreign / dynamic enough that we
+    /// can't soundly flag it. Used by the `len(union)` check so
+    /// `len(x)` on `int | str` is rejected (`int` isn't sized) while
+    /// `len(s)` on `str | bytes` passes. Conservative: dynamic / foreign
+    /// members return `true`.
+    fn member_is_sized(&self, member: &Type) -> bool {
+        match member {
+            Type::Any | Type::Unknown | Type::TypeVar(_) | Type::TypeConstructor(_, _) => true,
+            Type::Function { .. } | Type::Module(_) => true,
+            // Definitely not sized.
+            Type::Int | Type::Float | Type::Bool | Type::None => false,
+            // Sized built-ins.
+            Type::Str | Type::Bytes | Type::LitStr(_) => true,
+            Type::Generic(head, _) => {
+                // All built-in container heads are sized; user generic
+                // classes are sized iff they define `__len__` (lenient
+                // when the hierarchy isn't fully known).
+                if is_builtin_generic_head(head) || !self.class_hierarchy_fully_known(head) {
+                    true
+                } else {
+                    self.find_method(head, "__len__").is_some()
+                }
+            }
+            Type::Class(name) => {
+                if !self.class_hierarchy_fully_known(name) {
+                    true
+                } else {
+                    self.find_method(name, "__len__").is_some()
+                }
+            }
+            Type::Union(ms) => ms.iter().all(|m| self.member_is_sized(m)),
+        }
     }
 
     /// Return the missing-member text for a failed interface conformance check.
@@ -3946,10 +4380,29 @@ fn audit_check_escape(c: &mut Checker, expr: &Expr) {
 /// future work — Rule 5 enforcement only needs the bare-name escape
 /// path to land for the spec text to hold. O14 / FINDINGS #107.
 fn check_unsafe_return_leak(c: &mut Checker, expr: &Expr) {
+    let Some(ret_ty) = c.current_return.clone() else {
+        return;
+    };
+    check_unsafe_leak_into(c, expr, &ret_ty);
+}
+
+/// Shared core of the `unsafe:` value-leak audit (Rule 5 / SKILL §5.9):
+/// fire `tyc::unsafe_value_leak` when a bare `Name` whose binding was
+/// first introduced inside an `unsafe:` block flows OUT into a
+/// concrete-typed `target_ty` context — a `return` whose function
+/// declares a concrete return type, or an annotated assignment
+/// `let n: T = v` — without a safe-scope re-assertion.
+///
+/// `target_ty` is the concrete type the value is being committed to:
+/// the function's return type for `return v`, or the annotation for
+/// `let n: T = v`. Deeper data-flow (expressions over unsafe values,
+/// indexing, attribute access) remains future work; the bare-name
+/// escape path is what the spec text requires. O14 / FINDINGS #107.
+fn check_unsafe_leak_into(c: &mut Checker, expr: &Expr, target_ty: &Type) {
     // Inside an `unsafe:` block, every diagnostic is suppressed — the
     // user is explicitly opting out of the static check. The leak
     // diagnostic only fires when the binding *crosses* the boundary,
-    // i.e. we are *outside* the block by the time we see the `return`.
+    // i.e. we are *outside* the block by the time we see the escape.
     if c.unsafe_depth > 0 {
         return;
     }
@@ -3978,20 +4431,17 @@ fn check_unsafe_return_leak(c: &mut Checker, expr: &Expr) {
         Some(t) => t,
         None => return,
     };
-    let Some(ret_ty) = c.current_return.clone() else {
-        return;
-    };
-    // Skip when the return type permits "no value" — those slots are
-    // already lax enough that an unsafe-origin value isn't a real
-    // surprise to the caller.
-    if !return_type_requires_value(&ret_ty) {
+    // Skip when the target permits "no value" / accepts anything
+    // (`None`, `T?`, `object`, `Unknown`) — those slots are already
+    // lax enough that an unsafe-origin value isn't a real surprise.
+    if !return_type_requires_value(target_ty) || is_object_type(target_ty) {
         return;
     }
     // If the binding's declared type is *already* assignable to the
-    // return type via the normal nominal/structural rules (i.e. the
-    // user annotated the unsafe binding with a concrete type and the
-    // check passed), the cross is sound — no diagnostic needed.
-    if c.is_assignable(&ret_ty, &declared) && !matches!(declared, Type::Unknown) {
+    // target via the normal nominal/structural rules (i.e. the user
+    // annotated the unsafe binding with a concrete type and the check
+    // passed), the cross is sound — no diagnostic needed.
+    if c.is_assignable(target_ty, &declared) && !matches!(declared, Type::Unknown) {
         return;
     }
     let span = (
@@ -3999,10 +4449,10 @@ fn check_unsafe_return_leak(c: &mut Checker, expr: &Expr) {
         expr.range().end().to_usize(),
     );
     let length = span.1.saturating_sub(span.0).max(1);
-    let ret_display = ret_ty.display();
+    let target_display = target_ty.display();
     c.diagnostics.push_error(TycError::unsafe_value_leak(
         name,
-        ret_display,
+        target_display,
         &c.path,
         c.source,
         span.0,
@@ -4825,6 +5275,12 @@ fn collect_classes_and_functions(c: &mut Checker, body: &[Stmt]) {
                 );
             }
             c.class_shapes.insert(name.clone(), shape);
+            // Track `self.NAME = ...` attributes from this class's method
+            // bodies so reads of body-initialised attributes resolve.
+            let attrs = collect_self_assigned_attrs(cd);
+            if !attrs.is_empty() {
+                c.self_attrs.entry(name.clone()).or_default().extend(attrs);
+            }
             // Record PEP 695 type-parameter names so call-site
             // inference can return `Type::Generic(name, [...])` for
             // generic classes (FINDINGS #46).
@@ -4876,6 +5332,15 @@ fn collect_classes_and_functions(c: &mut Checker, body: &[Stmt]) {
                                 }
                             }
                         }
+                    }
+                    // Fold `self.NAME = ...` attributes from the impl /
+                    // extend block's method bodies onto the target class.
+                    let impl_self_attrs = collect_self_assigned_attrs(cd);
+                    if !impl_self_attrs.is_empty() {
+                        c.self_attrs
+                            .entry(target.to_owned())
+                            .or_default()
+                            .extend(impl_self_attrs);
                     }
                     let target_shape = c.class_shapes.get_mut(target).expect("checked above");
                     for (m, sig) in impl_shape.methods {
@@ -4997,6 +5462,14 @@ fn collect_classes_and_functions(c: &mut Checker, body: &[Stmt]) {
                 f.name.as_str().to_owned(),
                 arity_info_from_parameters(f.parameters.as_ref(), &classes, &tps),
             );
+            // ITEM 1: stash the `**kwargs` value type alongside, so the
+            // call site can type-check absorbed keyword-argument values.
+            if let Some(kw_ty) =
+                kwarg_value_type_from_parameters(f.parameters.as_ref(), &classes, &tps)
+            {
+                c.function_kwarg_types
+                    .insert(f.name.as_str().to_owned(), kw_ty);
+            }
             // Record `async def` names so the call-site arm can emit
             // `tyc::missing_await` for sync calls (FINDINGS #49). The
             // `async_without_await` warning is emitted from
@@ -5576,6 +6049,94 @@ fn collect_class_shape(cd: &ruff_python_ast::StmtClassDef, classes: &[String]) -
         }
     }
     shape
+}
+
+/// Walk every method body of a class declaration and return the set of
+/// attribute names assigned through `self` (`self.NAME = ...`,
+/// `self.NAME: T = ...`, `self.NAME += ...`). Recurses into nested
+/// control-flow blocks (`if` / `for` / `while` / `with` / `try` /
+/// `match`) so an attribute first assigned inside a branch is still
+/// discovered, but NOT into nested function / class definitions (a `self`
+/// there is a different binding's concern).
+///
+/// These are real instance attributes for attribute-resolution purposes —
+/// `find_field` consults the result so `self.NAME` / `obj.NAME` reads
+/// don't false-positive `tyc::attribute_not_found` — but they deliberately
+/// do NOT participate in constructor-arity / kwarg checking (a
+/// `self`-assigned attribute is initialised inside the body, never passed
+/// to a synthesised constructor). Kept off `InterfaceShape` for exactly
+/// that reason, and so the public shape struct stays unchanged.
+fn collect_self_assigned_attrs(
+    cd: &ruff_python_ast::StmtClassDef,
+) -> std::collections::HashSet<String> {
+    fn register(out: &mut std::collections::HashSet<String>, target: &Expr) {
+        if let Expr::Attribute(attr) = target {
+            if let Expr::Name(base) = attr.value.as_ref() {
+                if base.id.as_str() == "self" {
+                    out.insert(attr.attr.as_str().to_owned());
+                }
+            }
+        }
+    }
+    fn walk(out: &mut std::collections::HashSet<String>, body: &[Stmt]) {
+        for stmt in body {
+            match stmt {
+                Stmt::Assign(a) => {
+                    for target in &a.targets {
+                        register(out, target);
+                        if let Expr::Tuple(t) = target {
+                            for e in &t.elts {
+                                register(out, e);
+                            }
+                        } else if let Expr::List(l) = target {
+                            for e in &l.elts {
+                                register(out, e);
+                            }
+                        }
+                    }
+                }
+                Stmt::AnnAssign(a) => register(out, a.target.as_ref()),
+                Stmt::AugAssign(a) => register(out, a.target.as_ref()),
+                Stmt::If(s) => {
+                    walk(out, &s.body);
+                    for clause in &s.elif_else_clauses {
+                        walk(out, &clause.body);
+                    }
+                }
+                Stmt::For(s) => {
+                    walk(out, &s.body);
+                    walk(out, &s.orelse);
+                }
+                Stmt::While(s) => {
+                    walk(out, &s.body);
+                    walk(out, &s.orelse);
+                }
+                Stmt::With(s) => walk(out, &s.body),
+                Stmt::Try(s) => {
+                    walk(out, &s.body);
+                    for handler in &s.handlers {
+                        let ruff_python_ast::ExceptHandler::ExceptHandler(h) = handler;
+                        walk(out, &h.body);
+                    }
+                    walk(out, &s.orelse);
+                    walk(out, &s.finalbody);
+                }
+                Stmt::Match(s) => {
+                    for case in &s.cases {
+                        walk(out, &case.body);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut out = std::collections::HashSet::new();
+    for stmt in &cd.body {
+        if let Stmt::FunctionDef(f) = stmt {
+            walk(&mut out, &f.body);
+        }
+    }
+    out
 }
 
 /// Compute the *effective* shape of a class for constructor-arity
@@ -6294,6 +6855,24 @@ fn arity_info_from_parameters(
     arity_info_from_parameters_with_returns(parameters, None, classes, type_params)
 }
 
+/// ITEM 1: declared VALUE type of a function's `**kwargs` parameter.
+/// `Some(Type::Unknown)` for an unannotated `**kwargs`, `None` when the
+/// function has no `**kwargs`. Kept in a Checker-side map (not on
+/// `ArityInfo`) so external crates' full-literal `ArityInfo`
+/// constructions stay source-compatible.
+fn kwarg_value_type_from_parameters(
+    parameters: &ruff_python_ast::Parameters,
+    classes: &[String],
+    type_params: &[String],
+) -> Option<Type> {
+    parameters.kwarg.as_ref().map(|kw| {
+        kw.annotation
+            .as_ref()
+            .map(|ann| type_from_annotation_with_params(ann, classes, type_params))
+            .unwrap_or(Type::Unknown)
+    })
+}
+
 /// Variant of [`arity_info_from_parameters`] that also records the
 /// declared parameter / return types on the resulting [`ArityInfo`].
 /// Used by the cross-module shape extractor so consumers see real
@@ -6484,6 +7063,15 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                     );
                     c.mismatch(&ann_type, &value_type, span);
                 }
+                // ITEM 3 / Rule 5: an `unsafe:`-origin value flowing into
+                // a concrete-typed annotated binding (`let n: int = v`
+                // where `v` is `Unsafe[str]`) must be re-asserted at the
+                // boundary; otherwise it leaks. The unsafe-origin value's
+                // inferred type is typically `Unknown`, which slips past
+                // `is_assignable` above, so audit the bare-name escape
+                // explicitly here. `let n: object = v` and `let n: T? = v`
+                // are exempt (handled inside the helper).
+                check_unsafe_leak_into(c, value, &ann_type);
                 // Audit hook: an annotated assignment with a bypass-
                 // constructed instance on the RHS counts as an escape
                 // — the value is being stored under an explicit type
@@ -6775,11 +7363,19 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                     // constants.
                     all_ann_assigns_defaulted = false;
                 }
+                // A `plain class` emits a bare `class` with NO
+                // `@dataclass(slots=True)`, so its class-level defaults are
+                // real class attributes, not slot descriptors that a
+                // class-level constant would shadow. The
+                // `class_attr_shadows_slot` warning (and the reasoning that
+                // backs it) does not apply — suppress it for plain classes.
+                let is_plain = c.is_plain_class(class_name);
                 if has_ann_assign
                     && all_ann_assigns_defaulted
                     && only_ann_assigns
                     && !body_has_function
                     && merged_methods_empty
+                    && !is_plain
                 {
                     if let Some((ann, field_name)) = first_defaulted {
                         let value_hint = ann
@@ -6831,7 +7427,19 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                         // `tyc::manual_init` error here rather than
                         // falling through to the softer
                         // `method_in_class_body` warning.
+                        //
+                        // A `plain class` emits a bare class with NO
+                        // generated constructor, and a `class!` raw class
+                        // "preserves a hand-written `__init__` verbatim"
+                        // (REFERENCE.md §3.5). Neither generates a
+                        // constructor that a user `__init__` would conflict
+                        // with, so `manual_init` must NOT fire for them — it
+                        // only applies to a normal `class` / `model` whose
+                        // constructor IS generated.
                         if method == "__init__" {
+                            if c.is_plain_class(class_name) || c.is_raw_class(class_name) {
+                                continue;
+                            }
                             c.diagnostics.push_error(TycError::manual_init(
                                 class_name.to_owned(),
                                 c.path.clone(),
@@ -7051,6 +7659,10 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                 );
                 c.mismatch_with("an iterable".to_string(), iter_ty.display(), span);
             }
+            // Element type of the iterable, with `?` preserved. For
+            // unmodelled shapes (`Unknown`, user classes, bare containers)
+            // fall back to `Unknown` so we stay permissive.
+            let elem_ty = iterable_element_type(&iter_ty).unwrap_or(Type::Unknown);
             if let Expr::Name(n) = f.target.as_ref() {
                 let span = (
                     n.range.start().to_usize(),
@@ -7058,8 +7670,8 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                 );
                 c.env.declare(TypeBinding {
                     name: n.id.as_str().to_owned(),
-                    declared: Type::Unknown,
-                    narrowed: Type::Unknown,
+                    declared: elem_ty.clone(),
+                    narrowed: elem_ty,
                     span,
                     from_unsafe: c.unsafe_depth > 0,
                 });
@@ -9593,6 +10205,28 @@ fn builtin_generic_method(recv: &Type, attr: &str) -> Option<Type> {
             )),
             variadic: false,
         }),
+        // Mapping views — preserve the element type (with `?`) so iterating
+        // `d.values()` over a `dict[K, V?]` yields `V?`, not `V`. Returning
+        // a parameterised view (rather than `Unknown`) is what closes the
+        // soundness hole on `for v in d.values(): v.attr`.
+        ("dict", "keys", [k, _v]) => Some(Type::Function {
+            params: vec![],
+            ret: Box::new(Type::Generic("KeysView".into(), vec![k.clone()])),
+            variadic: false,
+        }),
+        ("dict", "values", [_k, v]) => Some(Type::Function {
+            params: vec![],
+            ret: Box::new(Type::Generic("ValuesView".into(), vec![v.clone()])),
+            variadic: false,
+        }),
+        ("dict", "items", [k, v]) => Some(Type::Function {
+            params: vec![],
+            ret: Box::new(Type::Generic(
+                "ItemsView".into(),
+                vec![Type::Generic("tuple".into(), vec![k.clone(), v.clone()])],
+            )),
+            variadic: false,
+        }),
         _ => None,
     }
 }
@@ -9844,6 +10478,68 @@ fn truthy(t: &Type) -> Option<Type> {
         Type::Bool => Some(Type::Bool),
         Type::Union(_) if t.is_nullable() => Some(t.strip_none()),
         other => Some(other.clone()),
+    }
+}
+
+/// Element type produced by *iterating* `ty` (the binding type of `x` in
+/// `for x in ty:` and `[... for x in ty]`).
+///
+/// CRITICAL for soundness: when the container's element type is optional
+/// (`list[T?]`), iterating it must yield `T?`, NOT `T` — otherwise the
+/// `None` inhabitant is silently dropped and `x.attr` type-checks clean
+/// then crashes at runtime. We return the declared element type verbatim,
+/// `?` and all; any narrowing (`if x is not None:`) is applied afterwards
+/// by the separate flow-narrowing pass.
+///
+/// Returns `None` for shapes we don't model (user classes that may define
+/// `__iter__`, `Unknown` / `Any` / `TypeVar`, bare un-parameterised
+/// containers) so the caller keeps its permissive `Unknown` fallback and
+/// we don't introduce false positives.
+fn iterable_element_type(ty: &Type) -> Option<Type> {
+    match ty {
+        // `str` iterates to `str` (one-char strings); `bytes` to `int`.
+        Type::Str => Some(Type::Str),
+        Type::Bytes => Some(Type::Int),
+        Type::Generic(head, args) => match head.as_str() {
+            // Single-parameter sequences / read-only views / sets — element
+            // type is the sole parameter, preserved verbatim.
+            "list" | "set" | "frozenset" | "Sequence" | "Iterable" | "Iterator" | "Collection"
+            | "Container" | "Reversible" | "deque" | "Generator" | "AsyncIterable"
+            | "AsyncIterator" | "AsyncGenerator" | "tuple_variadic" | "KeysView" | "ValuesView"
+            | "ItemsView"
+                if args.len() == 1 =>
+            {
+                Some(args[0].clone())
+            }
+            // Iterating a mapping yields its KEYS.
+            "dict" | "Mapping" | "MutableMapping" if args.len() == 2 => Some(args[0].clone()),
+            // Fixed-arity tuple — iteration yields the union of every slot.
+            "tuple" if !args.is_empty() => Some(Type::union_of(args.clone())),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Element type produced by *subscripting* `ty` with a single integer-ish
+/// index (`x[i]` where `x: list[T]` etc.). Same soundness contract as
+/// [`iterable_element_type`]: the optional element type is preserved.
+///
+/// Tuple and dict subscript are handled inline at the call site (tuple
+/// needs the literal-index slot, dict needs the key-type diagnostic), so
+/// this helper only covers the homogeneous-sequence forms. Returns `None`
+/// for everything else to keep the permissive fallback.
+fn subscript_element_type(ty: &Type) -> Option<Type> {
+    match ty {
+        Type::Str => Some(Type::Str),
+        Type::Bytes => Some(Type::Int),
+        Type::Generic(head, args) => match head.as_str() {
+            "list" | "Sequence" | "deque" | "tuple_variadic" if args.len() == 1 => {
+                Some(args[0].clone())
+            }
+            _ => None,
+        },
+        _ => None,
     }
 }
 
@@ -10157,6 +10853,23 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
                     }
                 }
             }
+            // SOUNDNESS: explicit-type-arg constructor `Box[int](...)`.
+            // The callee `Box[int]` is a `Subscript` whose inference
+            // yields `Unknown`, so the call would otherwise land in the
+            // permissive `Type::Unknown` arm and skip all checking. Pin
+            // the type parameters from the explicit `[...]` args and run
+            // the generic constructor-argument validation directly, then
+            // return the constructed `Generic` type. Mirrors how the
+            // annotation-pinned path (`let b: Box[int] = Box(...)`) is
+            // handled in the `Type::Class` arm below.
+            if let Some(generic) = check_explicit_typearg_constructor(
+                c,
+                call,
+                &call.arguments.args,
+                &call.arguments.keywords,
+            ) {
+                return generic;
+            }
             // Ruff folds positional and keyword arguments into `call.arguments`.
             let pos_args = &call.arguments.args;
             let kw_args = &call.arguments.keywords;
@@ -10236,6 +10949,31 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
                                 );
                                 c.interface_isinstance(t.id.as_str(), span);
                             }
+                        }
+                    }
+                }
+                // SOUNDNESS (union use sites): `len(x)` where `x` is a
+                // union is valid only when EVERY member is `Sized`.
+                // `len(x)` on `int | str` is rejected (`int` has no
+                // `__len__`); `len(s)` on `str | bytes` passes. Only the
+                // union case is flagged here so this stays narrowly scoped
+                // to the union soundness hole — single-type `len(5)` misuse
+                // is out of scope. The `len` name must resolve to the
+                // builtin (not shadowed by a user binding).
+                if fn_name.id.as_str() == "len"
+                    && pos_args.len() == 1
+                    && kw_args.is_empty()
+                    && c.unsafe_depth == 0
+                    && c.env.lookup("len").is_none()
+                {
+                    let arg_ty = infer_expr(c, &pos_args[0]);
+                    if let Type::Union(members) = &arg_ty {
+                        if let Some(bad) = members.iter().find(|m| !c.member_is_sized(m)) {
+                            let span = (
+                                pos_args[0].range().start().to_usize(),
+                                pos_args[0].range().end().to_usize(),
+                            );
+                            c.operator_type_mismatch("len()", &arg_ty, bad, span);
                         }
                     }
                 }
@@ -10531,11 +11269,79 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
                     // would keep alive across the loop.
                     let kwarg_param_names: Option<Vec<String>> =
                         arity_info.as_ref().map(|info| info.param_names.clone());
+                    // ITEM 1: kw-only parameter names/types and the
+                    // `**kwargs` value type, so a keyword argument that
+                    // doesn't match a positional parameter is still
+                    // type-checked — against its matching kw-only
+                    // parameter's type, or (when absorbed by `**kwargs: T`)
+                    // against `T`. The `**kwargs` value type lives in the
+                    // Checker-side `function_kwarg_types` map (keyed like
+                    // `function_arity_info`); only consulted when the
+                    // function actually declares `**kwargs` (`has_kwarg`),
+                    // so an unmatched keyword on a function WITHOUT
+                    // `**kwargs` still flows to the arity unknown-kwarg path.
+                    let kwonly_names: Vec<String> = arity_info
+                        .as_ref()
+                        .map(|info| info.kwonly_names.clone())
+                        .unwrap_or_default();
+                    let kwonly_types: Vec<Type> = arity_info
+                        .as_ref()
+                        .map(|info| info.kwonly_types.clone())
+                        .unwrap_or_default();
+                    let has_kwarg = arity_info
+                        .as_ref()
+                        .map(|info| info.has_kwarg)
+                        .unwrap_or(false);
+                    let kwarg_value_type: Option<Type> = if has_kwarg {
+                        fn_name
+                            .as_deref()
+                            .and_then(|n| c.function_kwarg_types.get(n))
+                            .cloned()
+                    } else {
+                        None
+                    };
                     if let Some(param_names) = kwarg_param_names {
                         for kw in kw_args {
                             let Some(ident) = &kw.arg else { continue };
                             let Some(idx) = param_names.iter().position(|p| p == ident.as_str())
                             else {
+                                // No positional parameter matches this name.
+                                // Try a kw-only parameter; failing that, the
+                                // argument is absorbed by `**kwargs: T` and
+                                // must have a value assignable to `T`.
+                                let expected_kw: Option<Type> = kwonly_names
+                                    .iter()
+                                    .position(|p| p == ident.as_str())
+                                    .and_then(|ki| kwonly_types.get(ki).cloned())
+                                    .or_else(|| kwarg_value_type.clone());
+                                if let Some(expected_kw) = expected_kw {
+                                    let actual = infer_expr_ctx(c, &kw.value, Some(&expected_kw));
+                                    let nullable_into_non_nullable =
+                                        !c.unwrap_alias(&expected_kw).is_nullable()
+                                            && actual.is_nullable()
+                                            && !is_object_type(&expected_kw);
+                                    if nullable_into_non_nullable {
+                                        if let Expr::Name(n) = &kw.value {
+                                            let span = (
+                                                n.range.start().to_usize(),
+                                                n.range.start().to_usize() + n.id.as_str().len(),
+                                            );
+                                            c.nullable_use(n.id.as_str(), &expected_kw, span);
+                                        } else {
+                                            let span = (
+                                                kw.value.range().start().to_usize(),
+                                                kw.value.range().end().to_usize(),
+                                            );
+                                            c.mismatch(&expected_kw, &actual, span);
+                                        }
+                                    } else if !c.is_assignable(&expected_kw, &actual) {
+                                        let span = (
+                                            kw.value.range().start().to_usize(),
+                                            kw.value.range().end().to_usize(),
+                                        );
+                                        c.mismatch(&expected_kw, &actual, span);
+                                    }
+                                }
                                 continue;
                             };
                             if idx >= params.len() {
@@ -10766,12 +11572,25 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
                                 bindings.insert(tp.clone(), arg.clone());
                             }
                         }
-                        // Forward: read each kwarg, match it to the
-                        // class's field annotation, and if the field's
-                        // type is a TypeVar, bind it from the arg's
-                        // inferred type.
+                        // Forward: read each positional / keyword arg,
+                        // match it to the class's field annotation, and
+                        // if the field's type is a TypeVar, bind it from
+                        // the arg's inferred type. Annotation-pinned
+                        // bindings (inserted above) win because
+                        // `bind_field_typevars` only fills vacant slots.
                         let class_shape = c.class_shapes.get(&name).cloned();
-                        if let Some(shape) = class_shape {
+                        if let Some(shape) = class_shape.clone() {
+                            for (idx, arg) in pos_args.iter().enumerate() {
+                                if matches!(arg, Expr::Starred(_)) {
+                                    continue;
+                                }
+                                if let Some(field_name) = shape.field_order.get(idx) {
+                                    if let Some(field_ty) = shape.fields.get(field_name).cloned() {
+                                        let arg_ty = infer_expr(c, arg);
+                                        bind_field_typevars(&field_ty, &arg_ty, &mut bindings);
+                                    }
+                                }
+                            }
                             for kw in kw_args {
                                 if let Some(ident) = &kw.arg {
                                     if let Some(field_ty) =
@@ -10782,6 +11601,13 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
                                     }
                                 }
                             }
+                        }
+                        // SOUNDNESS: validate each constructor argument
+                        // against its (substituted) field type. Only
+                        // fires when a type parameter is actually pinned
+                        // — see `check_generic_constructor_args`.
+                        if let Some(shape) = class_shape {
+                            check_generic_constructor_args(c, &shape, &bindings, pos_args, kw_args);
                         }
                         let args: Vec<Type> = tparams
                             .iter()
@@ -10987,9 +11813,13 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
                     // foreign by `class_hierarchy_fully_known` so this stays
                     // quiet on `fastapi.Request.body(...)` etc. v0.8.0
                     // carry-over.
+                    // A class (or any base) that defines `__getattr__` can
+                    // resolve arbitrary attribute names at runtime, so a
+                    // statically-missing attribute is NOT an error there.
                     if c.unsafe_depth == 0
                         && !attr_name.starts_with('_')
                         && c.class_hierarchy_fully_known(class_name.as_str())
+                        && !c.class_defines_getattr(class_name.as_str())
                     {
                         let attr_start = a.attr.range.start().to_usize();
                         let attr_len = a
@@ -11091,6 +11921,7 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
                         && c.unsafe_depth == 0
                         && !attr_name.starts_with('_')
                         && c.class_hierarchy_fully_known(class_name.as_str())
+                        && !c.class_defines_getattr(class_name.as_str())
                     {
                         let attr_start = a.attr.range.start().to_usize();
                         let attr_len = a
@@ -11173,6 +12004,44 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
                 // method access on those would be a false positive on
                 // perfectly valid code, so literal-string receivers are
                 // left permissive.
+                // SOUNDNESS (union use sites): an attribute / method on a
+                // union value is valid only when EVERY member supports it.
+                // `x.upper()` on `int | str` is rejected (the `int` member
+                // has no `upper`), while an attribute present on every
+                // member (a shared field/method across a union of user
+                // classes, or `s: str | bytes; s.find(...)`) passes.
+                // Conservative: `member_supports_attr` returns `true` for
+                // foreign / dynamic members, so duck-typed unions stay
+                // permissive. Nullable receivers already emit
+                // `nullable_use` above; the `None` member is treated as
+                // permissive here so we don't double-report.
+                Type::Union(members) => {
+                    if c.unsafe_depth == 0 && !attr_name.starts_with('_') {
+                        if let Some(bad) = members
+                            .iter()
+                            .find(|m| !c.member_supports_attr(m, attr_name))
+                        {
+                            let bad_display = bad.display();
+                            let attr_start = a.attr.range.start().to_usize();
+                            let attr_len = a
+                                .attr
+                                .range
+                                .end()
+                                .to_usize()
+                                .saturating_sub(attr_start)
+                                .max(1);
+                            c.diagnostics.push_error(TycError::attribute_not_found(
+                                attr_name,
+                                &bad_display,
+                                &c.path,
+                                c.source,
+                                attr_start,
+                                attr_len,
+                            ));
+                        }
+                    }
+                    Type::Unknown
+                }
                 Type::Str => {
                     if !is_known_primitive_attr("str", attr_name)
                         && !is_user_builtin_extension(c, "str", attr_name)
@@ -11277,7 +12146,25 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
                             c.mismatch(key_ty, &slice_ty, span);
                             return args[1].clone();
                         }
+                        // No key-type diagnostic — but `d[k]` still yields
+                        // the value type V (with `?` preserved). Skip when
+                        // the index is slice syntax (`d[a:b]` is a runtime
+                        // error on dicts, handled elsewhere).
+                        if !matches!(s.slice.as_ref(), Expr::Slice(_)) {
+                            return args[1].clone();
+                        }
                     }
+                }
+            }
+            // Homogeneous-sequence indexing (`list[T]`, `Sequence[T]`,
+            // `str`, `bytes`). Preserve the full element type — including a
+            // trailing `?` — so extracting from a `list[T?]` honestly
+            // yields `T?` rather than silently dropping the `None`
+            // (the soundness hole). A slice index (`xs[a:b]`) yields the
+            // container itself, not an element, so leave it permissive.
+            if !matches!(s.slice.as_ref(), Expr::Slice(_)) {
+                if let Some(elem) = subscript_element_type(&value_ty) {
+                    return elem;
                 }
             }
             Type::Unknown
@@ -11520,7 +12407,136 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
             // tracks async functions as returning `T` directly.
             unwrap_awaitable(&inner).unwrap_or(inner)
         }
+        // Comprehensions / generator expressions. Each introduces its own
+        // scope; we bind every `for` target to the iterable's element type
+        // (with `?` preserved — the soundness contract) so the element /
+        // key / value expressions are type-checked against an HONEST
+        // element type. `[x.name for x in src]` where `src: list[Animal?]`
+        // therefore surfaces the nullable use just like the loop form.
+        Expr::ListComp(comp) => {
+            // Propagate the expected element type (`list[E]`) into the
+            // element expression so a literal body (`{...}`) converges on
+            // the annotated element type instead of widening to a union
+            // that trips invariant assignability.
+            let elt_expected = match expected {
+                Some(Type::Generic(h, a)) if (h == "list" || h == "Sequence") && a.len() == 1 => {
+                    Some(a[0].clone())
+                }
+                _ => None,
+            };
+            c.env.enter();
+            infer_comprehension_generators(c, &comp.generators);
+            let elt = infer_expr_ctx(c, &comp.elt, elt_expected.as_ref());
+            c.env.leave();
+            Type::Generic("list".into(), vec![elt])
+        }
+        Expr::SetComp(comp) => {
+            let elt_expected = match expected {
+                Some(Type::Generic(h, a)) if h == "set" && a.len() == 1 => Some(a[0].clone()),
+                _ => None,
+            };
+            c.env.enter();
+            infer_comprehension_generators(c, &comp.generators);
+            let elt = infer_expr_ctx(c, &comp.elt, elt_expected.as_ref());
+            c.env.leave();
+            Type::Generic("set".into(), vec![elt])
+        }
+        Expr::Generator(comp) => {
+            let elt_expected = match expected {
+                Some(Type::Generic(h, a))
+                    if (h == "Iterator" || h == "Iterable" || h == "Generator") && a.len() == 1 =>
+                {
+                    Some(a[0].clone())
+                }
+                _ => None,
+            };
+            c.env.enter();
+            infer_comprehension_generators(c, &comp.generators);
+            let elt = infer_expr_ctx(c, &comp.elt, elt_expected.as_ref());
+            c.env.leave();
+            // A generator expression is an `Iterator[T]`.
+            Type::Generic("Iterator".into(), vec![elt])
+        }
+        Expr::DictComp(comp) => {
+            let (k_expected, v_expected) = match expected {
+                Some(Type::Generic(h, a)) if h == "dict" && a.len() == 2 => {
+                    (Some(a[0].clone()), Some(a[1].clone()))
+                }
+                _ => (None, None),
+            };
+            c.env.enter();
+            infer_comprehension_generators(c, &comp.generators);
+            let k = match comp.key.as_ref() {
+                Some(key) => infer_expr_ctx(c, key, k_expected.as_ref()),
+                None => Type::Unknown,
+            };
+            let v = infer_expr_ctx(c, &comp.value, v_expected.as_ref());
+            c.env.leave();
+            Type::Generic("dict".into(), vec![k, v])
+        }
         _ => Type::Unknown,
+    }
+}
+
+/// Bind each comprehension `for` target to the iterable's element type and
+/// type-check the filter (`if`) clauses. Assumes a fresh scope has already
+/// been entered by the caller; the caller is responsible for `leave()`.
+///
+/// The element type carries any trailing `?` so the comprehension body is
+/// checked against the honest (pre-narrowing) element type. Apply
+/// narrowing-implying `if` filters here so `[x for x in src if x is not
+/// None]` keeps working without a false positive downstream.
+fn infer_comprehension_generators(c: &mut Checker, generators: &[ruff_python_ast::Comprehension]) {
+    for gen in generators {
+        let iter_ty = infer_expr(c, &gen.iter);
+        let elem_ty = iterable_element_type(&iter_ty).unwrap_or(Type::Unknown);
+        bind_comprehension_target(c, &gen.target, &elem_ty);
+        // Type-check / apply narrowing from each `if` filter so that
+        // `[x for x in src if x is not None]` strips the `?` from `x` for
+        // the element expression and stays a false-positive-free pass.
+        for cond in &gen.ifs {
+            let _ = infer_expr(c, cond);
+            let pos = collect_narrowings(c, cond, /*negate=*/ false);
+            apply_narrowings(c, &pos);
+        }
+    }
+}
+
+/// Recursively bind a comprehension `for` target to `elem_ty`. A bare
+/// `Name` binds directly; a tuple/list target (`for k, v in items`)
+/// distributes a fixed-arity tuple element type across its slots, falling
+/// back to `Unknown` per-slot when the element type isn't a matching tuple.
+fn bind_comprehension_target(c: &mut Checker, target: &Expr, elem_ty: &Type) {
+    match target {
+        Expr::Name(n) => {
+            let span = (
+                n.range.start().to_usize(),
+                n.range.start().to_usize() + n.id.as_str().len(),
+            );
+            c.env.declare(TypeBinding {
+                name: n.id.as_str().to_owned(),
+                declared: elem_ty.clone(),
+                narrowed: elem_ty.clone(),
+                span,
+                from_unsafe: c.unsafe_depth > 0,
+            });
+        }
+        Expr::Tuple(t) => {
+            let slots: Option<&Vec<Type>> = match elem_ty {
+                Type::Generic(h, a) if h == "tuple" && a.len() == t.elts.len() => Some(a),
+                _ => None,
+            };
+            for (i, sub) in t.elts.iter().enumerate() {
+                let sub_ty = slots.map(|a| a[i].clone()).unwrap_or(Type::Unknown);
+                bind_comprehension_target(c, sub, &sub_ty);
+            }
+        }
+        Expr::List(l) => {
+            for sub in &l.elts {
+                bind_comprehension_target(c, sub, &Type::Unknown);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -11601,16 +12617,26 @@ fn arithmetic_op_str(op: Operator) -> Option<&'static str> {
 
 /// True if either side is something we shouldn't flag at all — values
 /// of `Any`/`Unknown`/`TypeVar`, a user-defined class (which might
-/// implement `__add__` / `__mul__` / …), any composite type that
-/// embeds one of those, or any union (we don't know which variant the
-/// value actually holds at this point, and even all-primitive unions
-/// like `int | str` may be valid for some variant).
+/// implement `__add__` / `__mul__` / …), or any composite type that
+/// embeds one of those.
+///
+/// SOUNDNESS (union use sites): a union is unflaggable only when *some*
+/// member is itself unflaggable (a user class that might overload the
+/// operator, an `Unknown`, a `TypeVar`, …). A union whose members are
+/// ALL concrete built-in primitives (`int | str`, `int | None`, …) is
+/// flaggable — `operator_operands_compatible` distributes the operator
+/// across every member and rejects the operation unless it is valid for
+/// EVERY member. Without this, `x: int | str; x + 1` slipped past the
+/// checker (the `int` member supports `+`) and crashed at runtime on the
+/// `str` member. We stay conservative: any duck-typed union containing a
+/// user class or dynamic type remains permissive, so legitimate
+/// duck-typed unions don't false-positive.
 fn operand_is_unflaggable(t: &Type) -> bool {
     match t {
         Type::Any | Type::Unknown | Type::TypeVar(_) => true,
         Type::Class(_) => true,
         Type::Function { .. } => true,
-        Type::Union(_) => true,
+        Type::Union(members) => members.iter().any(operand_is_unflaggable),
         Type::Generic(_, args) => args.iter().any(operand_is_unflaggable),
         Type::Int | Type::Str | Type::Bool | Type::Float | Type::Bytes | Type::None => false,
         // `Type::LitStr` is a string-singleton — same operand semantics as
@@ -11669,6 +12695,21 @@ fn base_accepts_operand(base: &Type, other: &Type) -> bool {
 fn operator_operands_compatible(op: Operator, l: &Type, r: &Type) -> bool {
     if operand_is_unflaggable(l) || operand_is_unflaggable(r) {
         return true;
+    }
+    // SOUNDNESS (union use sites): when either operand is a union (and it
+    // reached here, so it is an all-flaggable-primitive union — see
+    // `operand_is_unflaggable`), the operation is valid only when it is
+    // valid for EVERY member-vs-member combination. `int | str + int` is
+    // rejected because the `str + int` pairing is invalid even though
+    // `int + int` is fine. `int | float + int` passes because both
+    // pairings are numeric. The `None` member of a `T?` is itself a
+    // flaggable primitive, so an unnarrowed `T?` operand is correctly
+    // rejected here too.
+    if let Type::Union(ls) = l {
+        return ls.iter().all(|lm| operator_operands_compatible(op, lm, r));
+    }
+    if let Type::Union(rs) = r {
+        return rs.iter().all(|rm| operator_operands_compatible(op, l, rm));
     }
     match op {
         Operator::Add => {
@@ -12082,6 +13123,37 @@ mod tests {
             .unwrap()
             .into_syntax();
         let (resolved, _) = resolve_module("<test>".to_owned(), &prep.python_source, &module);
+        check_module_with(
+            "<test>",
+            &prep.python_source,
+            &resolved,
+            &module,
+            &prep.unsafe_lines,
+            &prep.frozen_class_lines,
+        )
+    }
+
+    /// Like `check`, but feeds the resolver the same `ResolveOptions`
+    /// metadata the CLI does (`original_source` so `plain class` names are
+    /// recorded, `raw_class_byte_starts` so `class!` bindings are tagged
+    /// `ClassKind::Raw`). Required for any test exercising plain-/raw-class
+    /// awareness in the checker (manual_init / class_attr_shadows_slot /
+    /// attribute_not_found suppression).
+    fn check_class_kinds(src: &str) -> Diagnostics {
+        use tyc_resolve::{resolve_module_with, ResolveOptions};
+        let prep = preprocess(src);
+        let module = tyc_syntax::parse_module(&prep.python_source)
+            .unwrap()
+            .into_syntax();
+        let raw_class_byte_starts =
+            tyc_syntax::preprocess::line_byte_starts(&prep.python_source, &prep.raw_class_lines);
+        let options = ResolveOptions {
+            raw_class_byte_starts,
+            original_source: Some(src.to_owned()),
+            ..ResolveOptions::default()
+        };
+        let (resolved, _) =
+            resolve_module_with("<test>".to_owned(), &prep.python_source, &module, options);
         check_module_with(
             "<test>",
             &prep.python_source,
@@ -14383,6 +15455,149 @@ def main() -> None:
                 .iter()
                 .any(|e| matches!(e, TycError::TypeMismatch { .. })),
             "generic field access must propagate T: int field should fail to assign to str: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn generic_ctor_arg_rejected_str_into_int_from_annotation() {
+        // SOUNDNESS HOLE regression: `let b: Box[int] = Box("hello")`
+        // pins T=int from the annotation, so the `value` field is int.
+        // Passing `"hello"` (str) must fire `tyc::type_mismatch` instead
+        // of leaking through and crashing at `b.value + 1` at runtime.
+        let src = "\
+class Box[T]:
+    value: T
+
+def main() -> None:
+    let b: Box[int] = Box(\"hello\")
+";
+        let d = check(src);
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::TypeMismatch { .. })),
+            "str into Box[int] constructor must be rejected: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn generic_ctor_arg_rejected_explicit_typeargs() {
+        // Explicit `Box[int]("hello")` form pins T=int via the
+        // subscripted callee and must reject the str argument.
+        let src = "\
+class Box[T]:
+    value: T
+
+def main() -> None:
+    let b = Box[int](\"hello\")
+";
+        let d = check(src);
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::TypeMismatch { .. })),
+            "str into explicit Box[int](...) must be rejected: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn generic_ctor_arg_rejected_multiparam_pair() {
+        // Multi-param generic: `Pair[int, str] = Pair("wrong", 99)` must
+        // reject both args (str→int and int→str) against the pinned
+        // type parameters.
+        let src = "\
+class Pair[A, B]:
+    first: A
+    second: B
+
+def main() -> None:
+    let p: Pair[int, str] = Pair(\"wrong\", 99)
+";
+        let d = check(src);
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::TypeMismatch { .. })),
+            "wrong-typed Pair[int, str] construction must be rejected: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn generic_ctor_arg_correct_passes() {
+        // No false positive: matching annotation and argument types.
+        let src = "\
+class Box[T]:
+    value: T
+
+def main() -> None:
+    let b: Box[int] = Box(5)
+";
+        let d = check(src);
+        assert!(
+            !d.has_errors(),
+            "correctly-typed Box[int] = Box(5) must pass: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn generic_ctor_arg_inferred_passes() {
+        // No false positive: pure inference with no annotation must not
+        // fire — `T` is unbound, so there is no concrete expectation to
+        // violate.
+        let src = "\
+class Box[T]:
+    value: T
+
+def main() -> None:
+    let b = Box(5)
+    let _x: int = b.value
+";
+        let d = check(src);
+        assert!(
+            !d.has_errors(),
+            "inferred Box(5) must pass: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn generic_ctor_arg_int_into_float_field_passes() {
+        // No false positive: Typhon widens int → float, so `Box(3)` into
+        // a `Box[float]` field is fine even though 3 is an int literal.
+        let src = "\
+class Box[T]:
+    value: T
+
+def main() -> None:
+    let f: Box[float] = Box(3)
+";
+        let d = check(src);
+        assert!(
+            !d.has_errors(),
+            "int into Box[float] must pass (int→float widening): {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn generic_ctor_arg_none_into_optional_field_passes() {
+        // No false positive: a `T?` field accepts None even when T=int.
+        let src = "\
+class Box[T]:
+    value: T?
+
+def main() -> None:
+    let b: Box[int] = Box(None)
+";
+        let d = check(src);
+        assert!(
+            !d.has_errors(),
+            "None into Box[int] with T? field must pass: {:?}",
             d.errors()
         );
     }
@@ -17866,6 +19081,192 @@ def f() -> int:
         );
     }
 
+    #[test]
+    fn unsafe_leak_fires_on_annotated_assignment() {
+        // ITEM 3 / Rule 5: an `unsafe:`-origin value flowing into a
+        // concrete-typed annotated binding (`let n: int = v`) without a
+        // re-assertion must fire `tyc::unsafe_value_leak`. Previously the
+        // audit only covered `return v`, so this assignment leak passed
+        // `tyc check` and crashed at runtime.
+        let src = "\
+def main() -> None:
+    unsafe:
+        let v = \"not a number\"
+    let n: int = v
+    print(n + 1)
+";
+        let d = check(src);
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::UnsafeValueLeak { .. })),
+            "unsafe value leaking into `let n: int = v` must fire; got {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn unsafe_leak_assignment_silenced_by_object_target() {
+        // `let n: object = v` is a sound widening — `object` accepts any
+        // value — so the assignment leak audit must stay silent.
+        let src = "\
+def main() -> None:
+    unsafe:
+        let v = \"not a number\"
+    let n: object = v
+    print(n)
+";
+        let d = check(src);
+        assert!(
+            !d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::UnsafeValueLeak { .. })),
+            "object target must not trigger the assignment leak; got {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn unsafe_leak_assignment_silenced_by_inner_annotation() {
+        // Re-asserting the type inside the `unsafe:` block (or via a
+        // safe-scope binding) defeats the assignment-leak audit.
+        let src = "\
+def main() -> None:
+    unsafe:
+        let v = \"not a number\"
+        let checked: int = int(v)
+    let n: int = checked
+    print(n + 1)
+";
+        let d = check(src);
+        assert!(
+            !d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::UnsafeValueLeak { .. })),
+            "re-asserted unsafe value must not trigger the assignment leak; got {:?}",
+            d.errors()
+        );
+    }
+
+    // ── ITEM 1: `**kwargs: T` value type-checking ────────────────────────
+
+    #[test]
+    fn kwargs_value_type_mismatch_is_rejected() {
+        // A keyword argument absorbed by `**kwargs: int` must have a
+        // value assignable to `int`. Pre-fix this was unchecked and the
+        // bad `str` value only crashed at runtime.
+        let src = "\
+def f(**kwargs: int) -> None:
+    print(len(kwargs))
+def main() -> None:
+    f(a=1, b=\"oops\")
+";
+        let d = check(src);
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::TypeMismatch { expected, .. } if expected == "int")),
+            "**kwargs: int must reject a str value; got {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn kwargs_value_type_match_is_clean() {
+        // Every kwarg value assignable to the `**kwargs` element type
+        // must pass cleanly.
+        let src = "\
+def f(**kwargs: int) -> None:
+    print(len(kwargs))
+def main() -> None:
+    f(a=1, b=2)
+";
+        let d = check(src);
+        assert!(
+            !d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::TypeMismatch { .. })),
+            "**kwargs: int must accept int values; got {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn kwargs_object_value_accepts_anything() {
+        // `**kwargs: object` is the canonical "accept anything" idiom.
+        let src = "\
+def f(**kwargs: object) -> None:
+    print(len(kwargs))
+def main() -> None:
+    f(a=1, b=\"oops\", c=3.0)
+";
+        let d = check(src);
+        assert!(
+            !d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::TypeMismatch { .. })),
+            "**kwargs: object must accept any value; got {:?}",
+            d.errors()
+        );
+    }
+
+    // ── ITEM 2: contravariant Callable parameters ────────────────────────
+
+    #[test]
+    fn callable_param_contravariance_is_accepted() {
+        // Passing a function with a MORE GENERAL parameter type where a
+        // more specific one is expected is sound (params contravariant):
+        // `Callable[[Animal], str]` is assignable to `Callable[[Dog], str]`.
+        let src = "\
+class Animal:
+    name: str
+class Dog(Animal):
+    breed: str
+def apply(f: Callable[[Dog], str], d: Dog) -> str:
+    return f(d)
+def animal_name(a: Animal) -> str:
+    return a.name
+def main() -> None:
+    print(apply(animal_name, Dog(name=\"Rex\", breed=\"Lab\")))
+";
+        let d = check(src);
+        assert!(
+            !d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::TypeMismatch { .. })),
+            "contravariant Callable param must be accepted; got {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn callable_param_covariance_is_rejected() {
+        // The unsound direction must still be rejected: a function that
+        // only accepts `Dog` cannot stand in where any `Animal` may be
+        // passed (`Callable[[Dog], str]` is NOT assignable to
+        // `Callable[[Animal], str]`).
+        let src = "\
+class Animal:
+    name: str
+class Dog(Animal):
+    breed: str
+def apply(f: Callable[[Animal], str], a: Animal) -> str:
+    return f(a)
+def dog_breed(d: Dog) -> str:
+    return d.breed
+def main() -> None:
+    print(apply(dog_breed, Animal(name=\"Rex\")))
+";
+        let d = check(src);
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::TypeMismatch { .. })),
+            "covariant Callable param must be rejected; got {:?}",
+            d.errors()
+        );
+    }
+
     // ── Higher-Kinded Types (HKT) tests ──────────────────────────────────
 
     #[test]
@@ -18869,6 +20270,662 @@ def label(p: Point) -> float:
                 .any(|e| e.to_string().contains("totally_bogus_attr")),
             "must still flag bogus attr on a fully-known cross-module class; got: {:?}",
             d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    // ── Optional-element extraction soundness (`list[T?]` etc.) ────────────────
+    //
+    // The systemic hole: extracting an element from a collection whose
+    // element type is optional (`T?`) used to drop the `?`, yielding `T`.
+    // Each extraction site below must now preserve the `?` so the resulting
+    // nullable use is caught, while honest optional annotations / narrowing
+    // / non-optional collections keep passing.
+
+    /// REJECT: `src[0]` where `src: list[Animal?]` is `Animal?`, not
+    /// `Animal`. Assigning it to `Animal` must fire `type_mismatch`.
+    #[test]
+    fn opt_elem_list_index_into_nonopt_rejected() {
+        let src = "\
+class Animal:
+    name: str
+
+def main() -> None:
+    let src: list[Animal | None] = [None]
+    let a: Animal = src[0]
+    print(a.name)
+";
+        let d = check(src);
+        assert!(
+            d.has_errors(),
+            "list[Animal?] indexed into Animal must be rejected; got no errors"
+        );
+    }
+
+    /// REJECT: indexing `list[int]` yields `int`, not `Unknown` — a
+    /// concrete mismatch against `str` must now fire.
+    #[test]
+    fn list_index_yields_element_type() {
+        let src = "\
+def main() -> None:
+    let xs: list[int] = [1]
+    let a: str = xs[0]
+    print(a)
+";
+        let d = check(src);
+        assert!(
+            d.has_errors(),
+            "list[int][0] is int and must not assign to str; got no errors"
+        );
+    }
+
+    /// REJECT: iterating `list[Animal?]` binds `x: Animal?`; `x.name`
+    /// must fire `nullable_use`.
+    #[test]
+    fn opt_elem_for_iteration_rejected() {
+        let src = "\
+class Animal:
+    name: str
+
+def main() -> None:
+    let src: list[Animal | None] = [None]
+    for x in src:
+        print(x.name)
+";
+        let d = check(src);
+        assert!(
+            d.has_errors(),
+            "iterating list[Animal?] must keep x nullable; got no errors"
+        );
+    }
+
+    /// REJECT: comprehension element expression is checked against the
+    /// nullable element type — `[x.name for x in src]` must fire.
+    #[test]
+    fn opt_elem_comprehension_rejected() {
+        let src = "\
+class Animal:
+    name: str
+
+def main() -> None:
+    let src: list[Animal | None] = [None]
+    let names: list[str] = [x.name for x in src]
+    print(names)
+";
+        let d = check(src);
+        assert!(
+            d.has_errors(),
+            "comprehension over list[Animal?] must flag x.name; got no errors"
+        );
+    }
+
+    /// REJECT: nested `m[0][0]` where `m: list[list[Animal?]]` is
+    /// `Animal?`.
+    #[test]
+    fn opt_elem_nested_index_rejected() {
+        let src = "\
+class Animal:
+    name: str
+
+def main() -> None:
+    let m: list[list[Animal | None]] = [[None]]
+    let a: Animal = m[0][0]
+    print(a.name)
+";
+        let d = check(src);
+        assert!(
+            d.has_errors(),
+            "nested list[list[Animal?]] index must stay nullable; got no errors"
+        );
+    }
+
+    /// REJECT: `dict[str, int?]` indexed yields `int?` — using it as a
+    /// non-optional `int` must fire.
+    #[test]
+    fn opt_elem_dict_index_rejected() {
+        let src = "\
+def main() -> None:
+    let d: dict[str, int | None] = {\"a\": None}
+    let n: int = d[\"a\"]
+    print(n)
+";
+        let d = check(src);
+        assert!(
+            d.has_errors(),
+            "dict[str, int?] index must yield int?, not int; got no errors"
+        );
+    }
+
+    /// REJECT: iterating `dict.values()` over `dict[str, Animal?]` yields
+    /// `Animal?`; `v.name` must fire.
+    #[test]
+    fn opt_elem_dict_values_iteration_rejected() {
+        let src = "\
+class Animal:
+    name: str
+
+def main() -> None:
+    let d: dict[str, Animal | None] = {\"a\": None}
+    for v in d.values():
+        print(v.name)
+";
+        let d = check(src);
+        assert!(
+            d.has_errors(),
+            "iterating dict.values() must keep v nullable; got no errors"
+        );
+    }
+
+    // ── Must-pass: honest annotations / narrowing / non-optional ──────────────
+
+    /// PASS: assigning `src[0]` to the correct `Animal?` annotation.
+    #[test]
+    fn opt_elem_list_index_into_optional_ok() {
+        let src = "\
+class Animal:
+    name: str
+
+def main() -> None:
+    let src: list[Animal | None] = [None]
+    let a: Animal | None = src[0]
+    print(a)
+";
+        let d = check(src);
+        assert!(
+            !d.has_errors(),
+            "src[0] assigned to Animal? must pass; got: {:?}",
+            d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    /// PASS: narrowing inside a `for` loop body restores non-nullability.
+    #[test]
+    fn opt_elem_for_iteration_narrowed_ok() {
+        let src = "\
+class Animal:
+    name: str
+
+def main() -> None:
+    let src: list[Animal | None] = [None]
+    for x in src:
+        if x is not None:
+            print(x.name)
+";
+        let d = check(src);
+        assert!(
+            !d.has_errors(),
+            "narrowed loop body must pass; got: {:?}",
+            d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    /// PASS: comprehension `if x is not None` filter narrows the element.
+    #[test]
+    fn opt_elem_comprehension_narrowed_ok() {
+        let src = "\
+class Animal:
+    name: str
+
+def main() -> None:
+    let src: list[Animal | None] = [None]
+    let names: list[str] = [x.name for x in src if x is not None]
+    print(names)
+";
+        let d = check(src);
+        assert!(
+            !d.has_errors(),
+            "comprehension with narrowing filter must pass; got: {:?}",
+            d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    /// PASS: non-optional `list[int]` indexed and used as `int`.
+    #[test]
+    fn nonopt_list_index_used_as_int_ok() {
+        let src = "\
+def main() -> None:
+    let xs: list[int] = [1, 2]
+    let a: int = xs[0]
+    print(a)
+";
+        let d = check(src);
+        assert!(
+            !d.has_errors(),
+            "list[int][0] used as int must pass; got: {:?}",
+            d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    /// PASS: fixed-arity tuple subscript stays precise (the reference
+    /// behaviour we model the fix after).
+    #[test]
+    fn tuple_subscript_precise_still_ok() {
+        let src = "\
+def main() -> None:
+    let t: tuple[int, str] = (1, \"x\")
+    let a: int = t[0]
+    let b: str = t[1]
+    print(a, b)
+";
+        let d = check(src);
+        assert!(
+            !d.has_errors(),
+            "tuple subscript must remain precise; got: {:?}",
+            d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    /// PASS: `dict.get(k)` still yields `V?` (unchanged) and assigns to
+    /// `int?`.
+    #[test]
+    fn dict_get_still_optional_ok() {
+        let src = "\
+def main() -> None:
+    let d: dict[str, int] = {\"a\": 1}
+    let v: int | None = d.get(\"a\")
+    print(v)
+";
+        let d = check(src);
+        assert!(
+            !d.has_errors(),
+            "dict.get must still be V?; got: {:?}",
+            d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    /// PASS: `for k, v in d.items()` unpacks the tuple element type so the
+    /// key/value methods resolve.
+    #[test]
+    fn dict_items_unpack_typed_ok() {
+        let src = "\
+def main() -> None:
+    let d: dict[str, int] = {\"a\": 1}
+    for k, v in d.items():
+        print(k.upper(), v + 1)
+";
+        let d = check(src);
+        assert!(
+            !d.has_errors(),
+            "dict.items() unpack must type k/v; got: {:?}",
+            d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    // ── plain class / class! / __getattr__ / self-attr regression tests ──
+
+    /// PASS: a `plain class` emits a bare class with NO generated
+    /// constructor, so a hand-written `__init__` is legal — `manual_init`
+    /// must not fire.
+    #[test]
+    fn plain_class_manual_init_allowed() {
+        let src = "\
+plain class Bag:
+    def __init__(self, x: int) -> None:
+        self.x = x
+";
+        let d = check_class_kinds(src);
+        assert!(
+            !d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::ManualInit { .. })),
+            "plain class manual __init__ must be allowed; got: {:?}",
+            d.errors()
+        );
+    }
+
+    /// PASS: a `class!` raw class preserves a hand-written `__init__`
+    /// verbatim — `manual_init` must not fire.
+    #[test]
+    fn raw_class_manual_init_allowed() {
+        let src = "\
+class! Net(Exception):
+    code: int
+    def __init__(self, code: int) -> None:
+        super().__init__()
+        self.code = code
+";
+        let d = check_class_kinds(src);
+        assert!(
+            !d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::ManualInit { .. })),
+            "class! manual __init__ must be allowed; got: {:?}",
+            d.errors()
+        );
+    }
+
+    /// STILL-REJECTS: a normal `class` generates a constructor, so a
+    /// hand-written `__init__` still fires `manual_init`.
+    #[test]
+    fn normal_class_manual_init_still_rejected() {
+        let src = "\
+class Foo:
+    x: int
+    def __init__(self, x: int) -> None:
+        self.x = x
+";
+        let d = check_class_kinds(src);
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::ManualInit { .. })),
+            "normal class manual __init__ must still be rejected; got: {:?}",
+            d.errors()
+        );
+    }
+
+    /// PASS: a `plain class` emits no `@dataclass(slots=True)`, so its
+    /// class-level defaults are real class attributes — the
+    /// `class_attr_shadows_slot` warning must not fire.
+    #[test]
+    fn plain_class_attr_shadows_slot_suppressed() {
+        let src = "\
+plain class Config:
+    DEBUG: bool = True
+    NAME: str = \"app\"
+";
+        let d = check_class_kinds(src);
+        assert!(
+            !d.warnings()
+                .iter()
+                .any(|e| matches!(e, TycError::ClassAttrShadowsSlot { .. })),
+            "plain class must not warn class_attr_shadows_slot; got: {:?}",
+            d.warnings()
+        );
+    }
+
+    /// STILL-WARNS: a normal `class` that reads as a constants namespace
+    /// still fires `class_attr_shadows_slot`.
+    #[test]
+    fn normal_class_attr_shadows_slot_still_warns() {
+        let src = "\
+class Config:
+    DEBUG: bool = True
+    NAME: str = \"app\"
+";
+        let d = check_class_kinds(src);
+        assert!(
+            d.warnings()
+                .iter()
+                .any(|e| matches!(e, TycError::ClassAttrShadowsSlot { .. })),
+            "normal constants-namespace class must still warn; got: {:?}",
+            d.warnings()
+        );
+    }
+
+    /// PASS: a class defining `__getattr__` resolves arbitrary attributes
+    /// at runtime, so `attribute_not_found` must be suppressed.
+    #[test]
+    fn getattr_suppresses_attribute_not_found() {
+        let src = "\
+plain class Proxy:
+    def __getattr__(self, name: str) -> str:
+        return name
+
+def main() -> None:
+    let p: Proxy = Proxy()
+    print(p.anything)
+";
+        let d = check_class_kinds(src);
+        assert!(
+            !d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::AttributeNotFound { .. })),
+            "__getattr__ must suppress attribute_not_found; got: {:?}",
+            d.errors()
+        );
+    }
+
+    /// STILL-REJECTS: a class WITHOUT `__getattr__` still fires
+    /// `attribute_not_found` on a genuine typo.
+    #[test]
+    fn no_getattr_attribute_not_found_still_fires() {
+        let src = "\
+class Point:
+    x: int
+    y: int
+
+def main() -> None:
+    let p: Point = Point(x=1, y=2)
+    print(p.z)
+";
+        let d = check_class_kinds(src);
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::AttributeNotFound { .. })),
+            "typo attribute on a class without __getattr__ must still fire; got: {:?}",
+            d.errors()
+        );
+    }
+
+    /// PASS: an attribute first assigned via `self.NAME = ...` inside a
+    /// method body resolves on a later read — no `attribute_not_found`.
+    #[test]
+    fn self_assigned_attr_resolves() {
+        let src = "\
+plain class Grid:
+    def __init__(self) -> None:
+        self.d = {}
+    def get(self, k: int) -> int:
+        return self.d[k]
+";
+        let d = check_class_kinds(src);
+        assert!(
+            !d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::AttributeNotFound { .. })),
+            "self.d assigned in __init__ must resolve in get(); got: {:?}",
+            d.errors()
+        );
+    }
+
+    /// STILL-REJECTS: a `self`-attr that is never assigned anywhere still
+    /// fires `attribute_not_found` (the heuristic doesn't over-broaden).
+    #[test]
+    fn unassigned_self_attr_still_fires() {
+        let src = "\
+class Counter:
+    n: int
+
+def main() -> None:
+    let c: Counter = Counter(n=0)
+    print(c.never_assigned)
+";
+        let d = check_class_kinds(src);
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::AttributeNotFound { .. })),
+            "an attribute never assigned must still fire; got: {:?}",
+            d.errors()
+        );
+    }
+
+    // ── Union use-site soundness (SOUNDNESS) ─────────────────────────────────
+    // An operation / attribute / `len` on an *unnarrowed* union value is only
+    // sound when it is valid for EVERY member. Each reject test has a
+    // must-pass twin so the rule isn't over-aggressive.
+
+    /// `x: int | str; x + 1` — the `str` member doesn't support `+ int`,
+    /// so this must fire `operator_type_mismatch` (was silently accepted).
+    #[test]
+    fn union_binop_reject_int_str_plus_int() {
+        let d = check(
+            "def main() -> None:\n\
+             \x20   let x: int | str = \"two\"\n\
+             \x20   print(x + 1)\n",
+        );
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::OperatorTypeMismatch { .. })),
+            "int|str + int must fire OperatorTypeMismatch; got {:?}",
+            d.errors()
+        );
+    }
+
+    /// `a: int | float; a + 1` — both members are numeric, so `+` is valid
+    /// for every member and this must stay clean.
+    #[test]
+    fn union_binop_pass_int_float_plus_int() {
+        let d = check(
+            "def main() -> None:\n\
+             \x20   let a: int | float = 3\n\
+             \x20   print(a + 1)\n",
+        );
+        assert!(
+            !d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::OperatorTypeMismatch { .. })),
+            "int|float + int must NOT fire OperatorTypeMismatch; got {:?}",
+            d.errors()
+        );
+    }
+
+    /// Generic widening: `pick(1, "two")` widens `T` to `int | str`, then
+    /// `x + 1` must be rejected just like the explicit-annotation case.
+    #[test]
+    fn union_binop_reject_generic_widening() {
+        let d = check(
+            "def pick[T](a: T, b: T) -> T:\n\
+             \x20   return b\n\
+             def main() -> None:\n\
+             \x20   let x = pick(1, \"two\")\n\
+             \x20   print(x + 1)\n",
+        );
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::OperatorTypeMismatch { .. })),
+            "widened int|str + int must fire OperatorTypeMismatch; got {:?}",
+            d.errors()
+        );
+    }
+
+    /// `x: int | str; x.upper()` — the `int` member has no `upper`, so this
+    /// must fire `attribute_not_found`.
+    #[test]
+    fn union_attr_reject_upper_on_int_str() {
+        let d = check(
+            "def main() -> None:\n\
+             \x20   let x: int | str = \"two\"\n\
+             \x20   print(x.upper())\n",
+        );
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::AttributeNotFound { .. })),
+            "int|str .upper() must fire AttributeNotFound; got {:?}",
+            d.errors()
+        );
+    }
+
+    /// A method present on EVERY member of a union (`str | bytes` both have
+    /// `.find`) must stay clean.
+    #[test]
+    fn union_attr_pass_method_on_all_members() {
+        let d = check(
+            "def main() -> None:\n\
+             \x20   let s: str | bytes = \"hi\"\n\
+             \x20   print(s.find(\"h\"))\n",
+        );
+        assert!(
+            !d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::AttributeNotFound { .. })),
+            "str|bytes .find() must NOT fire AttributeNotFound; got {:?}",
+            d.errors()
+        );
+    }
+
+    /// A field present on every member of a union of user classes must pass;
+    /// a field present on only one member must be rejected.
+    #[test]
+    fn union_attr_user_class_field() {
+        let pass = check(
+            "class Cat:\n\
+             \x20   name: str\n\
+             class Dog:\n\
+             \x20   name: str\n\
+             def main() -> None:\n\
+             \x20   let a: Cat | Dog = Cat(name=\"x\")\n\
+             \x20   print(a.name)\n",
+        );
+        assert!(
+            !pass
+                .errors()
+                .iter()
+                .any(|e| matches!(e, TycError::AttributeNotFound { .. })),
+            "shared field across union must NOT fire AttributeNotFound; got {:?}",
+            pass.errors()
+        );
+        let reject = check(
+            "class Cat:\n\
+             \x20   name: str\n\
+             class Dog:\n\
+             \x20   age: int\n\
+             def main() -> None:\n\
+             \x20   let a: Cat | Dog = Cat(name=\"x\")\n\
+             \x20   print(a.name)\n",
+        );
+        assert!(
+            reject
+                .errors()
+                .iter()
+                .any(|e| matches!(e, TycError::AttributeNotFound { .. })),
+            "field on only one union member must fire AttributeNotFound; got {:?}",
+            reject.errors()
+        );
+    }
+
+    /// `len(x)` on `int | str` — the `int` member isn't `Sized`, so this
+    /// must fire; `len(s)` on `str | bytes` must stay clean.
+    #[test]
+    fn union_len_reject_unsized_member() {
+        let reject = check(
+            "def main() -> None:\n\
+             \x20   let x: int | str = \"two\"\n\
+             \x20   print(len(x))\n",
+        );
+        assert!(
+            reject
+                .errors()
+                .iter()
+                .any(|e| matches!(e, TycError::OperatorTypeMismatch { .. })),
+            "len(int|str) must fire OperatorTypeMismatch; got {:?}",
+            reject.errors()
+        );
+        let pass = check(
+            "def main() -> None:\n\
+             \x20   let s: str | bytes = \"hi\"\n\
+             \x20   print(len(s))\n",
+        );
+        assert!(
+            !pass
+                .errors()
+                .iter()
+                .any(|e| matches!(e, TycError::OperatorTypeMismatch { .. })),
+            "len(str|bytes) must NOT fire; got {:?}",
+            pass.errors()
+        );
+    }
+
+    /// Narrowing out the non-supporting member with `isinstance` must make
+    /// the operation pass (narrowing already works; we must not regress it).
+    #[test]
+    fn union_narrowed_use_passes() {
+        let d = check(
+            "def main() -> None:\n\
+             \x20   let x: int | str = \"two\"\n\
+             \x20   if isinstance(x, int):\n\
+             \x20       print(x + 1)\n",
+        );
+        assert!(
+            !d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::OperatorTypeMismatch { .. })),
+            "narrowed int member + 1 must NOT fire; got {:?}",
+            d.errors()
         );
     }
 }

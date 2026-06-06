@@ -104,7 +104,31 @@ pub fn run_source(
     // Running the full desugar pass also rewrites \`extend\` user-classes
     // into method merges; the builtin-extension rewrite below handles the
     // \`extend str:\` / \`extend list:\` shape that desugar leaves alone.
-    let desugar_out = tyc_desugar::desugar_module(&module);
+    //
+    // Pass the preprocessor's class-kind markers (plain / raw / frozen) so
+    // the VM desugars `plain class` / `class!` / `class … frozen` exactly
+    // like `tyc build` — otherwise a `plain class` would be wrongly
+    // decorated as a `@dataclass` and its class-level constants treated as
+    // slots.
+    let desugar_out = tyc_desugar::desugar_module_with(
+        &module,
+        tyc_desugar::DesugarOptions {
+            raw_class_line_starts: preprocess::line_byte_starts(
+                &prep.python_source,
+                &prep.raw_class_lines,
+            ),
+            frozen_class_line_starts: preprocess::line_byte_starts(
+                &prep.python_source,
+                &prep.frozen_class_lines,
+            ),
+            plain_class_line_starts: preprocess::line_byte_starts(
+                &prep.python_source,
+                &prep.plain_class_lines,
+            ),
+            pub_names: prep.pub_names.clone(),
+            ..Default::default()
+        },
+    );
     module = desugar_out.module;
 
     // FINDINGS #21: rewrite \`x.method(args)\` to \`__typhon_ext_TYPE__method
@@ -753,6 +777,505 @@ if math.comb(5, 2) != 10:
     raise ValueError("comb wrong")
 if math.perm(5, 2) != 20:
     raise ValueError("perm wrong")
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    #[test]
+    fn vm_exception_args() {
+        let src = r#"
+def main() -> None:
+    let e: ValueError = ValueError("a", "b", 3)
+    if str(e.args) != "('a', 'b', 3)":
+        raise ValueError("multi args wrong")
+    if str(e) != "('a', 'b', 3)":
+        raise ValueError("multi str wrong")
+    let e2: ValueError = ValueError("solo")
+    if str(e2.args) != "('solo',)" or str(e2) != "solo":
+        raise ValueError("single arg wrong")
+    try:
+        raise TypeError("x", "y")
+    except TypeError as ex:
+        if str(ex.args) != "('x', 'y')" or ex.__cause__ is not None:
+            raise ValueError("handler args wrong")
+
+main()
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    #[test]
+    fn vm_property_setter_and_dir() {
+        let src = r#"
+class Temp:
+    _c: float
+impl Temp:
+    @property
+    def celsius(self) -> float:
+        return self._c
+    @celsius.setter
+    def celsius(self, v: float) -> None:
+        self._c = v
+
+class Foo:
+    a: int
+impl Foo:
+    def m(self) -> int:
+        return self.a
+
+def main() -> None:
+    let t: Temp = Temp(_c=0.0)
+    t.celsius = 100.0
+    if t.celsius != 100.0:
+        raise ValueError("property setter broken")
+    let d: list[str] = dir(Foo(a=1))
+    if not ("a" in d) or not ("m" in d):
+        raise ValueError("dir broken")
+
+main()
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    #[test]
+    fn vm_getattr_and_comprehension_walrus() {
+        // VM gaps that paired with the checker false-reject fixes: a user
+        // __getattr__ resolves missing attributes, and a walrus binding in a
+        // comprehension leaks its last value to the enclosing scope.
+        let src = r#"
+plain class Proxy:
+    def __getattr__(self, name: str) -> str:
+        return f"attr:{name}"
+
+def main() -> None:
+    let p: Proxy = Proxy()
+    if p.foo != "attr:foo" or p.bar != "attr:bar":
+        raise ValueError("__getattr__ broken")
+    let ys: list[int] = [y for x in [1, 2, 3] if (y := x * x) > 1]
+    if ys != [4, 9] or y != 9:
+        raise ValueError("walrus leak broken")
+
+main()
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    #[test]
+    fn vm_data_model_round_two() {
+        // Sixth round, part 2: slice assignment, __index__, __delitem__,
+        // del obj.attr, cached_property, __iter__ returning self, function
+        // __name__, set star-unpack, bare-class raise.
+        let src = r#"
+from functools import cached_property
+
+class Idx:
+    v: int
+impl Idx:
+    def __index__(self) -> int:
+        return self.v
+
+class Circle:
+    r: float
+impl Circle:
+    @cached_property
+    def area(self) -> float:
+        return self.r * self.r
+
+class Counter:
+    n: int
+impl Counter:
+    def __iter__(self) -> Counter:
+        return self
+    def __next__(self) -> int:
+        if self.n <= 0:
+            raise StopIteration
+        self.n = self.n - 1
+        return self.n
+
+class Bag:
+    x: int
+    y: int
+
+def f(z: int) -> int:
+    return z
+
+def main() -> None:
+    mut xs: list[int] = [1, 2, 3, 4, 5]
+    xs[1:3] = [99]
+    if xs != [1, 99, 4, 5]:
+        raise ValueError("slice assign")
+    if [10, 20, 30][Idx(v=2)] != 30:
+        raise ValueError("__index__")
+    if Circle(r=3.0).area != 9.0:
+        raise ValueError("cached_property")
+    if list(Counter(n=3)) != [2, 1, 0]:
+        raise ValueError("__iter__ self")
+    let b: Bag = Bag(x=1, y=2)
+    del b.x
+    if hasattr(b, "x") or b.y != 2:
+        raise ValueError("del attr")
+    if f.__name__ != "f":
+        raise ValueError("__name__")
+    let ys: list[int] = [1, 2]
+    if sorted({*ys, 9}) != [1, 2, 9]:
+        raise ValueError("set star")
+
+main()
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    #[test]
+    fn exception_model_fixes() {
+        // Sixth stress round: builtin exception hierarchy catching, bare
+        // re-raise, finally-replaces-exception, type(exc).__name__, and
+        // __exit__ exception-info + suppression.
+        let src = r#"
+class Sup:
+    n: int
+impl Sup:
+    def __enter__(self) -> int:
+        return self.n
+    def __exit__(self, et: object, ev: object, tb: object) -> bool:
+        return True
+
+mut log: list[str] = []
+
+def main() -> None:
+    try:
+        raise ZeroDivisionError("d")
+    except ArithmeticError:
+        log.append("arith")
+    try:
+        let d: dict[str, int] = {}
+        let _ = d["x"]
+    except LookupError:
+        log.append("lookup")
+    try:
+        try:
+            raise ValueError("v")
+        except ValueError:
+            raise
+    except ValueError:
+        log.append("reraise")
+    try:
+        try:
+            raise ValueError("a")
+        finally:
+            raise TypeError("b")
+    except Exception as e:
+        log.append(type(e).__name__)
+    with Sup(n=1):
+        raise ValueError("hidden")
+    log.append("survived")
+    if log != ["arith", "lookup", "reraise", "TypeError", "survived"]:
+        raise ValueError(f"wrong: {log}")
+
+main()
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    #[test]
+    fn truthiness_attrs_and_classvars() {
+        // Fifth stress round: __bool__/__len__ truthiness, dynamic-attribute
+        // builtins, ClassVar / plain-class class-level attribute access.
+        let src = r#"
+from typing import ClassVar
+
+class Bag:
+    items: list[int]
+impl Bag:
+    def __len__(self) -> int:
+        return len(self.items)
+
+class Flag:
+    on: bool
+impl Flag:
+    def __bool__(self) -> bool:
+        return self.on
+
+class C:
+    K: ClassVar[int] = 42
+    v: int
+
+plain class Reg:
+    VERSION: str = "1.0"
+
+def main() -> None:
+    if bool(Bag(items=[])) or not bool(Bag(items=[1])):
+        raise ValueError("__len__ truthiness wrong")
+    if bool(Flag(on=False)) or not bool(Flag(on=True)):
+        raise ValueError("__bool__ truthiness wrong")
+    let b: Bag = Bag(items=[1])
+    if getattr(b, "items") != [1] or not hasattr(b, "items") or hasattr(b, "nope"):
+        raise ValueError("getattr/hasattr wrong")
+    if C.K != 42 or C(v=1).K != 42:
+        raise ValueError("ClassVar access wrong")
+    if Reg.VERSION != "1.0":
+        raise ValueError("plain class const access wrong")
+
+main()
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    #[test]
+    fn power_complex_results() {
+        // Negative base to a fractional power is complex (not nan); a complex
+        // base to an integer power is exact.
+        let src = r#"
+def main() -> None:
+    let z: complex = (-8) ** (1.0 / 3.0)
+    if abs(z.real - 1.0) > 1e-9 or abs(z.imag - 1.7320508075688772) > 1e-9:
+        raise ValueError("neg base frac pow wrong")
+    if (1j) ** 2 != complex(-1, 0):
+        raise ValueError("complex int pow wrong")
+    if complex(2, 0) ** 3 != complex(8, 0):
+        raise ValueError("complex cube wrong")
+
+main()
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    #[test]
+    fn bytes_int_complex_parity_fixes() {
+        // Stress-round stdlib gaps: bytes methods, int.to_bytes/.bit_count,
+        // complex-from-string.
+        let src = r#"
+def main() -> None:
+    if b"a,b,c".split(b",") != [b"a", b"b", b"c"]:
+        raise ValueError("bytes split wrong")
+    if b"  x  ".strip() != b"x":
+        raise ValueError("bytes strip wrong")
+    if not b"hi".startswith(b"h") or not b"hi".endswith(b"i"):
+        raise ValueError("bytes starts/ends wrong")
+    if b"hello".replace(b"l", b"L") != b"heLLo":
+        raise ValueError("bytes replace wrong")
+    if b",".join([b"a", b"b"]) != b"a,b":
+        raise ValueError("bytes join wrong")
+    if (255).to_bytes(4, "big") != b"\x00\x00\x00\xff":
+        raise ValueError("to_bytes wrong")
+    if (7).bit_count() != 3:
+        raise ValueError("bit_count wrong")
+    if complex("1+2j") != complex(1, 2) or complex("3j") != complex(0, 3):
+        raise ValueError("complex str wrong")
+
+main()
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    #[test]
+    fn re_module_parity_fixes() {
+        // Stress-round `re` findings: callable sub, Python backref templates,
+        // capturing-group split, named group access, finditer, subn.
+        let src = r#"
+import re
+
+def dbl(mo: re.Match[str]) -> str:
+    return str(int(mo.group(0)) * 2)
+
+def main() -> None:
+    if re.sub(r"\d", dbl, "1 2 3") != "2 4 6":
+        raise ValueError("callable sub wrong")
+    if re.split(r"(\d)", "a1b2") != ["a", "1", "b", "2", ""]:
+        raise ValueError("capturing split wrong")
+    if re.sub(r"(?P<w>\w+)@(?P<d>\w+)", r"\g<d>:\g<w>", "u@h") != "h:u":
+        raise ValueError("named backref wrong")
+    if re.sub(r"(\w+) (\w+)", r"\2 \1", "hello world") != "world hello":
+        raise ValueError("numbered backref wrong")
+    let m: re.Match[str]? = re.search(r"(?P<y>\d{4})-(?P<m>\d{2})", "2024-06")
+    if m is None:
+        raise ValueError("search failed")
+    if m.group("y") != "2024" or m.group("m") != "06":
+        raise ValueError("named group wrong")
+    if re.subn(r"o", "0", "foo")[1] != 2:
+        raise ValueError("subn count wrong")
+    if [mo.group(0) for mo in re.finditer(r"\d+", "a12b3")] != ["12", "3"]:
+        raise ValueError("finditer wrong")
+    if re.sub(r"a", "X", "aaaa", 2) != "XXaa":
+        raise ValueError("sub count wrong")
+
+main()
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    #[test]
+    fn stress_round_two_vm_parity_fixes() {
+        // Second adversarial stress round (sub-agent findings):
+        //   * enum repr `<Name.MEMBER: value>` + value/name lookup
+        //   * round(int, negative ndigits) rounds to tens/hundreds (half-even)
+        //   * f-string `:c` int→char
+        //   * `!=` derives from a user `__eq__` when `__ne__` is absent
+        //   * math.prod
+        //   * hash() dispatches a user `__hash__`
+        //   * range indexing, bytes iteration, enumerate(start=), zip(strict=)
+        let src = r#"
+import math
+
+enum Color:
+    RED
+    GREEN
+    BLUE
+
+class CI:
+    s: str
+
+impl CI:
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, CI) and self.s == other.s
+    def __hash__(self) -> int:
+        return 7
+
+def main() -> None:
+    if repr(Color.RED) != "<Color.RED: 1>":
+        raise ValueError("enum repr wrong")
+    if repr([Color.GREEN]) != "[<Color.GREEN: 2>]":
+        raise ValueError("enum container repr wrong")
+    if Color(2) != Color.GREEN or Color["BLUE"] != Color.BLUE:
+        raise ValueError("enum lookup wrong")
+
+    if round(123456, -2) != 123500 or round(15, -1) != 20 or round(25, -1) != 20:
+        raise ValueError("round negative ndigits wrong")
+
+    if f"{65:c}" != "A":
+        raise ValueError("format :c wrong")
+
+    if (CI(s="a") != CI(s="a")) or not (CI(s="a") != CI(s="b")):
+        raise ValueError("__ne__ from __eq__ wrong")
+
+    if hash(CI(s="x")) != 7:
+        raise ValueError("hash __hash__ ignored")
+
+    if math.prod([1, 2, 3, 4]) != 24:
+        raise ValueError("math.prod wrong")
+
+    if range(0, 20, 3)[2] != 6 or range(10)[-1] != 9:
+        raise ValueError("range index wrong")
+    if list(b"\x01\x02\x03") != [1, 2, 3]:
+        raise ValueError("bytes iteration wrong")
+    if list(enumerate(["a", "b"], start=10)) != [(10, "a"), (11, "b")]:
+        raise ValueError("enumerate start wrong")
+    if list(zip([1, 2], ["a", "b"], strict=True)) != [(1, "a"), (2, "b")]:
+        raise ValueError("zip strict wrong")
+
+main()
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    #[test]
+    fn stress_round_vm_parity_fixes() {
+        // Adversarial stress-round findings (VM diverged from CPython):
+        //   * str.replace honours the third `count` argument
+        //   * sorted/list.sort with reverse=True stay stable for equal keys
+        //   * json.dumps honours sort_keys=
+        //   * math.isnan/isinf/isfinite exist
+        //   * float-presentation format types (f/e/g) coerce int operands
+        let src = r#"
+import json
+import math
+
+def main() -> None:
+    if "aaaa".replace("a", "b", 2) != "bbaa":
+        raise ValueError("str.replace count ignored")
+    if "xy".replace("x", "z", 0) != "xy":
+        raise ValueError("str.replace count=0 should be a no-op")
+
+    let data: list[tuple[int, str]] = [(1, "a"), (1, "b"), (2, "c"), (1, "d")]
+    if sorted(data, key=lambda p: p[0], reverse=True) != [(2, "c"), (1, "a"), (1, "b"), (1, "d")]:
+        raise ValueError("sorted(reverse=True) not stable")
+    mut m: list[int] = [3, 1, 2, 1, 3]
+    m.sort(reverse=True)
+    if m != [3, 3, 2, 1, 1]:
+        raise ValueError("list.sort(reverse=True) wrong")
+
+    if json.dumps({"b": 1, "a": 2}, sort_keys=True) != '{"a": 2, "b": 1}':
+        raise ValueError("json.dumps sort_keys ignored")
+
+    if not math.isnan(math.nan) or not math.isinf(math.inf) or not math.isfinite(1.0):
+        raise ValueError("math predicates broken")
+
+    if f"{42:.2f}" != "42.00" or f"{1000000:e}" != "1.000000e+06":
+        raise ValueError("int operand float-format ignored")
+
+main()
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    #[test]
+    fn container_elements_dispatch_user_repr() {
+        // Regression: an object with a custom `__repr__` that is an ELEMENT of
+        // a list / tuple / set / dict (key or value) must be rendered via the
+        // user dunder, not the default dataclass repr. Enum members in a
+        // container keep the CPython `<Class.NAME: value>` form, and Result
+        // Ok/Err values keep their `Ok(value=...)` shape.
+        let src = r#"
+from typhon_runtime import Ok, Err
+
+class Pt:
+    x: int
+
+impl Pt:
+    def __repr__(self) -> str:
+        return f"<{self.x}>"
+
+class FP frozen:
+    n: int
+
+impl FP:
+    def __repr__(self) -> str:
+        return f"FP[{self.n}]"
+
+class Plain:
+    a: int
+
+enum Color:
+    RED
+    GREEN
+
+def main() -> None:
+    if repr([Pt(1), Pt(2)]) != "[<1>, <2>]":
+        raise ValueError("list element repr")
+    if repr((Pt(1),)) != "(<1>,)":
+        raise ValueError("single-tuple element repr")
+    if repr((Pt(1), Pt(2))) != "(<1>, <2>)":
+        raise ValueError("tuple element repr")
+    if repr({"k": Pt(1)}) != "{'k': <1>}":
+        raise ValueError("dict value repr")
+    if repr({FP(1), FP(2)}) not in ("{FP[1], FP[2]}", "{FP[2], FP[1]}"):
+        raise ValueError("set element repr")
+    if repr({FP(9): Pt(1)}) != "{FP[9]: <1>}":
+        raise ValueError("instance dict-key repr")
+    # str() of a container renders elements via repr()
+    if str([Pt(1)]) != "[<1>]":
+        raise ValueError("str of list uses element repr")
+    # nested
+    if repr([[Pt(1)], [Pt(2)]]) != "[[<1>], [<2>]]":
+        raise ValueError("nested list repr")
+    # enum members keep the CPython <Class.NAME: value> form
+    if repr([Color.RED, Color.GREEN]) != "[<Color.RED: 1>, <Color.GREEN: 2>]":
+        raise ValueError("enum member in list repr")
+    # Result values keep the dataclass shape
+    if repr([Ok(1), Err("x")]) != "[Ok(value=1), Err(error='x')]":
+        raise ValueError("Result in list repr")
+    # plain dataclass without custom repr matches CPython default
+    if repr([Plain(a=1)]) != "[Plain(a=1)]":
+        raise ValueError("plain dataclass in list repr")
+    # empty containers
+    if repr([]) != "[]" or repr(()) != "()" or repr({}) != "{}":
+        raise ValueError("empty container repr")
+    if repr(set()) != "set()":
+        raise ValueError("empty set repr")
+    # strings as elements are quoted via repr
+    if repr(["a"]) != "['a']":
+        raise ValueError("string element quoting")
+
+main()
 "#;
         assert_eq!(run_capturing(src).unwrap(), 0);
     }
