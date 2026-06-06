@@ -1356,6 +1356,15 @@ fn eval_env_call(call: &ExprCall, ctx: &mut EvalContext<'_>) -> Result<ComptimeV
     }
 }
 
+/// Coerce a numeric comptime value to `f64`. Only call on `Int`/`Float`.
+fn comptime_as_f64(v: &ComptimeValue) -> f64 {
+    match v {
+        ComptimeValue::Int(n) => *n as f64,
+        ComptimeValue::Float(f) => *f,
+        _ => f64::NAN,
+    }
+}
+
 fn eval_binop(
     op: ruff_python_ast::Operator,
     lhs: ComptimeValue,
@@ -1430,6 +1439,85 @@ fn eval_binop(
             } else {
                 Ok(ComptimeValue::Float(a / *b as f64))
             }
+        }
+        // ── FloorDiv (`//`) — Python floors toward negative infinity ─────────
+        (FloorDiv, ComptimeValue::Int(a), ComptimeValue::Int(b)) => {
+            if *b == 0 {
+                Err("integer division or modulo by zero in comptime floor division".to_string())
+            } else {
+                // Rust's `/` truncates toward zero; Python floors toward -inf.
+                let q = a / b;
+                let r = a % b;
+                let q = if (r != 0) && ((r < 0) != (*b < 0)) {
+                    q - 1
+                } else {
+                    q
+                };
+                Ok(ComptimeValue::Int(q))
+            }
+        }
+        (FloorDiv, _, _)
+            if matches!(lhs, ComptimeValue::Int(_) | ComptimeValue::Float(_))
+                && matches!(rhs, ComptimeValue::Int(_) | ComptimeValue::Float(_)) =>
+        {
+            let a = comptime_as_f64(&lhs);
+            let b = comptime_as_f64(&rhs);
+            if b == 0.0 {
+                Err("float floor division by zero in comptime floor division".to_string())
+            } else {
+                Ok(ComptimeValue::Float((a / b).floor()))
+            }
+        }
+        // ── Mod (`%`) — Python modulo, sign follows the divisor ──────────────
+        (Mod, ComptimeValue::Int(a), ComptimeValue::Int(b)) => {
+            if *b == 0 {
+                Err("integer division or modulo by zero in comptime modulo".to_string())
+            } else {
+                // Python's `%` result has the same sign as the divisor.
+                let r = a % b;
+                let r = if (r != 0) && ((r < 0) != (*b < 0)) {
+                    r + b
+                } else {
+                    r
+                };
+                Ok(ComptimeValue::Int(r))
+            }
+        }
+        (Mod, _, _)
+            if matches!(lhs, ComptimeValue::Int(_) | ComptimeValue::Float(_))
+                && matches!(rhs, ComptimeValue::Int(_) | ComptimeValue::Float(_)) =>
+        {
+            let a = comptime_as_f64(&lhs);
+            let b = comptime_as_f64(&rhs);
+            if b == 0.0 {
+                Err("float modulo by zero in comptime modulo".to_string())
+            } else {
+                // Python `%` for floats: result has the sign of the divisor.
+                let r = a - (a / b).floor() * b;
+                Ok(ComptimeValue::Float(r))
+            }
+        }
+        // ── Pow (`**`) ───────────────────────────────────────────────────────
+        (Pow, ComptimeValue::Int(a), ComptimeValue::Int(b)) => {
+            if *b < 0 {
+                // Negative exponent → float, matching Python.
+                Ok(ComptimeValue::Float((*a as f64).powi(*b as i32)))
+            } else {
+                let exp = u32::try_from(*b).map_err(|_| {
+                    "exponent too large in comptime power".to_string()
+                })?;
+                a.checked_pow(exp)
+                    .map(ComptimeValue::Int)
+                    .ok_or_else(|| "integer overflow in comptime power".to_string())
+            }
+        }
+        (Pow, _, _)
+            if matches!(lhs, ComptimeValue::Int(_) | ComptimeValue::Float(_))
+                && matches!(rhs, ComptimeValue::Int(_) | ComptimeValue::Float(_)) =>
+        {
+            let a = comptime_as_f64(&lhs);
+            let b = comptime_as_f64(&rhs);
+            Ok(ComptimeValue::Float(a.powf(b)))
         }
         _ => Err(format!(
             "operator is not supported between these comptime value types: {:?} {:?} {:?}",
@@ -1611,6 +1699,138 @@ mod tests {
         let (values, diags) = eval("comptime let N: int = int(\"42\")\n");
         assert!(!diags.has_errors());
         assert!(matches!(values.get("N"), Some(ComptimeValue::Int(42))));
+    }
+
+    // ── Floor-division `//`, modulo `%`, power `**` (arithmetic operators) ────
+
+    #[test]
+    fn comptime_int_floor_division() {
+        let (values, diags) = eval("comptime let Q: int = 17 // 5\n");
+        assert!(!diags.has_errors(), "{:?}", diags.errors());
+        assert!(matches!(values.get("Q"), Some(ComptimeValue::Int(3))));
+    }
+
+    #[test]
+    fn comptime_int_modulo() {
+        let (values, diags) = eval("comptime let R: int = 17 % 5\n");
+        assert!(!diags.has_errors(), "{:?}", diags.errors());
+        assert!(matches!(values.get("R"), Some(ComptimeValue::Int(2))));
+    }
+
+    #[test]
+    fn comptime_int_power() {
+        let (values, diags) = eval("comptime let P: int = 2 ** 10\n");
+        assert!(!diags.has_errors(), "{:?}", diags.errors());
+        assert!(matches!(values.get("P"), Some(ComptimeValue::Int(1024))));
+    }
+
+    #[test]
+    fn comptime_int_floor_division_floors_toward_negative_infinity() {
+        // Python: -7 // 2 == -4 (floors toward -inf, not toward zero).
+        let (values, diags) = eval("comptime let Q: int = -7 // 2\n");
+        assert!(!diags.has_errors(), "{:?}", diags.errors());
+        assert!(matches!(values.get("Q"), Some(ComptimeValue::Int(-4))));
+    }
+
+    #[test]
+    fn comptime_int_modulo_sign_follows_divisor() {
+        // Python: -7 % 2 == 1 (result sign follows the divisor).
+        let (values, diags) = eval("comptime let R: int = -7 % 2\n");
+        assert!(!diags.has_errors(), "{:?}", diags.errors());
+        assert!(matches!(values.get("R"), Some(ComptimeValue::Int(1))));
+        // And 7 % -2 == -1.
+        let (values, diags) = eval("comptime let R: int = 7 % -2\n");
+        assert!(!diags.has_errors(), "{:?}", diags.errors());
+        assert!(matches!(values.get("R"), Some(ComptimeValue::Int(-1))));
+    }
+
+    #[test]
+    fn comptime_power_with_negative_exponent_is_float() {
+        // Python: 2 ** -2 == 0.25 (negative exponent promotes to float).
+        let (values, diags) = eval("comptime let F: float = 2 ** -2\n");
+        assert!(!diags.has_errors(), "{:?}", diags.errors());
+        match values.get("F") {
+            Some(ComptimeValue::Float(f)) => assert!((f - 0.25).abs() < 1e-12),
+            other => panic!("expected Float(0.25), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn comptime_power_with_float_exponent_is_float() {
+        // 2 ** 0.5 == sqrt(2).
+        let (values, diags) = eval("comptime let C: float = 2 ** 0.5\n");
+        assert!(!diags.has_errors(), "{:?}", diags.errors());
+        match values.get("C") {
+            Some(ComptimeValue::Float(f)) => assert!((f - 2.0_f64.sqrt()).abs() < 1e-12),
+            other => panic!("expected Float(sqrt 2), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn comptime_float_floor_division_and_modulo() {
+        let (values, diags) = eval("comptime let D: float = 7.0 // 2.0\n");
+        assert!(!diags.has_errors(), "{:?}", diags.errors());
+        match values.get("D") {
+            Some(ComptimeValue::Float(f)) => assert!((f - 3.0).abs() < 1e-12),
+            other => panic!("expected Float(3.0), got {:?}", other),
+        }
+        let (values, diags) = eval("comptime let E: float = 5.5 % 2.0\n");
+        assert!(!diags.has_errors(), "{:?}", diags.errors());
+        match values.get("E") {
+            Some(ComptimeValue::Float(f)) => assert!((f - 1.5).abs() < 1e-12),
+            other => panic!("expected Float(1.5), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn comptime_mixed_int_float_floor_division_promotes() {
+        let (values, diags) = eval("comptime let D: float = 7 // 2.0\n");
+        assert!(!diags.has_errors(), "{:?}", diags.errors());
+        match values.get("D") {
+            Some(ComptimeValue::Float(f)) => assert!((f - 3.0).abs() < 1e-12),
+            other => panic!("expected Float(3.0), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn comptime_floor_division_by_zero_is_a_clean_error() {
+        // A non-literal zero divisor reaches the evaluator (literal `// 0` is
+        // caught earlier by `div_by_zero_literal`). Must be a diagnostic, not
+        // a panic.
+        let src = "\
+comptime def fdiv(a: int, b: int) -> int:
+    return a // b
+
+comptime let X: int = fdiv(17, 0)
+";
+        let (_, diags) = eval(src);
+        assert!(diags.has_errors(), "floor-division by zero must be an error");
+    }
+
+    #[test]
+    fn comptime_modulo_by_zero_is_a_clean_error() {
+        let src = "\
+comptime def m(a: int, b: int) -> int:
+    return a % b
+
+comptime let X: int = m(17, 0)
+";
+        let (_, diags) = eval(src);
+        assert!(diags.has_errors(), "modulo by zero must be an error");
+    }
+
+    #[test]
+    fn comptime_power_in_function_body() {
+        let src = "\
+comptime def calc(n: int) -> int:
+    return (n % 3) + (n // 2) + (2 ** n)
+
+comptime let G: int = calc(5)
+";
+        let (values, diags) = eval(src);
+        assert!(!diags.has_errors(), "{:?}", diags.errors());
+        // (5 % 3) + (5 // 2) + (2 ** 5) == 2 + 2 + 32 == 36
+        assert!(matches!(values.get("G"), Some(ComptimeValue::Int(36))));
     }
 
     #[test]

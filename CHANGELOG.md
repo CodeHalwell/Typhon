@@ -113,6 +113,13 @@ mismatch, and interface conformance were all correctly rejected).
 - **A complex base raised to a non-negative integer power** is computed by
   repeated multiplication for an exact result (`(1j) ** 2` → `-1+0j`).
 
+### Fixed — comptime operators
+
+- **`comptime` now supports `//`, `%`, and `**`** (floor-division, modulo,
+  power), matching the documented arithmetic surface and Python semantics
+  (`-7 // 2 == -4`, `-7 % 2 == 1`, `2 ** 10 == 1024`, `2 ** -2 == 0.25`).
+  Division/modulo by a zero divisor produces a clean comptime error.
+
 ### Fixed — VM property setters and `dir`
 
 - **`@<prop>.setter`** is honoured: `obj.prop = v` invokes the setter
