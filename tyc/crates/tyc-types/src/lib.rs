@@ -20002,4 +20002,195 @@ def main() -> None:
             d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
         );
     }
+
+    // ── plain class / class! / __getattr__ / self-attr regression tests ──
+
+    /// PASS: a `plain class` emits a bare class with NO generated
+    /// constructor, so a hand-written `__init__` is legal — `manual_init`
+    /// must not fire.
+    #[test]
+    fn plain_class_manual_init_allowed() {
+        let src = "\
+plain class Bag:
+    def __init__(self, x: int) -> None:
+        self.x = x
+";
+        let d = check_class_kinds(src);
+        assert!(
+            !d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::ManualInit { .. })),
+            "plain class manual __init__ must be allowed; got: {:?}",
+            d.errors()
+        );
+    }
+
+    /// PASS: a `class!` raw class preserves a hand-written `__init__`
+    /// verbatim — `manual_init` must not fire.
+    #[test]
+    fn raw_class_manual_init_allowed() {
+        let src = "\
+class! Net(Exception):
+    code: int
+    def __init__(self, code: int) -> None:
+        super().__init__()
+        self.code = code
+";
+        let d = check_class_kinds(src);
+        assert!(
+            !d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::ManualInit { .. })),
+            "class! manual __init__ must be allowed; got: {:?}",
+            d.errors()
+        );
+    }
+
+    /// STILL-REJECTS: a normal `class` generates a constructor, so a
+    /// hand-written `__init__` still fires `manual_init`.
+    #[test]
+    fn normal_class_manual_init_still_rejected() {
+        let src = "\
+class Foo:
+    x: int
+    def __init__(self, x: int) -> None:
+        self.x = x
+";
+        let d = check_class_kinds(src);
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::ManualInit { .. })),
+            "normal class manual __init__ must still be rejected; got: {:?}",
+            d.errors()
+        );
+    }
+
+    /// PASS: a `plain class` emits no `@dataclass(slots=True)`, so its
+    /// class-level defaults are real class attributes — the
+    /// `class_attr_shadows_slot` warning must not fire.
+    #[test]
+    fn plain_class_attr_shadows_slot_suppressed() {
+        let src = "\
+plain class Config:
+    DEBUG: bool = True
+    NAME: str = \"app\"
+";
+        let d = check_class_kinds(src);
+        assert!(
+            !d.warnings()
+                .iter()
+                .any(|e| matches!(e, TycError::ClassAttrShadowsSlot { .. })),
+            "plain class must not warn class_attr_shadows_slot; got: {:?}",
+            d.warnings()
+        );
+    }
+
+    /// STILL-WARNS: a normal `class` that reads as a constants namespace
+    /// still fires `class_attr_shadows_slot`.
+    #[test]
+    fn normal_class_attr_shadows_slot_still_warns() {
+        let src = "\
+class Config:
+    DEBUG: bool = True
+    NAME: str = \"app\"
+";
+        let d = check_class_kinds(src);
+        assert!(
+            d.warnings()
+                .iter()
+                .any(|e| matches!(e, TycError::ClassAttrShadowsSlot { .. })),
+            "normal constants-namespace class must still warn; got: {:?}",
+            d.warnings()
+        );
+    }
+
+    /// PASS: a class defining `__getattr__` resolves arbitrary attributes
+    /// at runtime, so `attribute_not_found` must be suppressed.
+    #[test]
+    fn getattr_suppresses_attribute_not_found() {
+        let src = "\
+plain class Proxy:
+    def __getattr__(self, name: str) -> str:
+        return name
+
+def main() -> None:
+    let p: Proxy = Proxy()
+    print(p.anything)
+";
+        let d = check_class_kinds(src);
+        assert!(
+            !d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::AttributeNotFound { .. })),
+            "__getattr__ must suppress attribute_not_found; got: {:?}",
+            d.errors()
+        );
+    }
+
+    /// STILL-REJECTS: a class WITHOUT `__getattr__` still fires
+    /// `attribute_not_found` on a genuine typo.
+    #[test]
+    fn no_getattr_attribute_not_found_still_fires() {
+        let src = "\
+class Point:
+    x: int
+    y: int
+
+def main() -> None:
+    let p: Point = Point(x=1, y=2)
+    print(p.z)
+";
+        let d = check_class_kinds(src);
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::AttributeNotFound { .. })),
+            "typo attribute on a class without __getattr__ must still fire; got: {:?}",
+            d.errors()
+        );
+    }
+
+    /// PASS: an attribute first assigned via `self.NAME = ...` inside a
+    /// method body resolves on a later read — no `attribute_not_found`.
+    #[test]
+    fn self_assigned_attr_resolves() {
+        let src = "\
+plain class Grid:
+    def __init__(self) -> None:
+        self.d = {}
+    def get(self, k: int) -> int:
+        return self.d[k]
+";
+        let d = check_class_kinds(src);
+        assert!(
+            !d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::AttributeNotFound { .. })),
+            "self.d assigned in __init__ must resolve in get(); got: {:?}",
+            d.errors()
+        );
+    }
+
+    /// STILL-REJECTS: a `self`-attr that is never assigned anywhere still
+    /// fires `attribute_not_found` (the heuristic doesn't over-broaden).
+    #[test]
+    fn unassigned_self_attr_still_fires() {
+        let src = "\
+class Counter:
+    n: int
+
+def main() -> None:
+    let c: Counter = Counter(n=0)
+    print(c.never_assigned)
+";
+        let d = check_class_kinds(src);
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::AttributeNotFound { .. })),
+            "an attribute never assigned must still fire; got: {:?}",
+            d.errors()
+        );
+    }
 }
