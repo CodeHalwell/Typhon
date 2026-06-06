@@ -63,6 +63,9 @@ pub struct Interpreter {
     /// and bind `self`. Pushed when a bound method / `__call__` /
     /// `__post_init__` is invoked, popped on the way out.
     pub method_stack: Vec<(Rc<Class>, Value)>,
+    /// Stack of exceptions currently being handled (one frame per active
+    /// `except` body). A bare `raise` re-raises the top of this stack.
+    pub active_exceptions: Vec<VmException>,
 }
 
 /// Upper bound on values an eagerly-evaluated generator may yield before the
@@ -99,6 +102,7 @@ impl Interpreter {
             gen_buffers: Vec::new(),
             loading_modules: std::collections::HashSet::new(),
             method_stack: Vec::new(),
+            active_exceptions: Vec::new(),
         };
         crate::builtins::install(&mut interp);
         interp
@@ -358,10 +362,15 @@ impl Interpreter {
                 let exc = match &r.exc {
                     Some(e) => self.eval_expr(e, env)?,
                     None => {
-                        return Err(Unwind::Exception(VmException::new(
-                            "RuntimeError",
-                            "No active exception to re-raise",
-                        )))
+                        // Bare `raise` re-raises the exception currently being
+                        // handled by the innermost enclosing `except` block.
+                        return match self.active_exceptions.last() {
+                            Some(active) => Err(Unwind::Exception(active.clone())),
+                            None => Err(Unwind::Exception(VmException::new(
+                                "RuntimeError",
+                                "No active exception to re-raise",
+                            ))),
+                        };
                     }
                 };
                 Err(self.value_to_exception(exc))
@@ -3535,26 +3544,37 @@ impl Interpreter {
                             env.set(name.as_str(), value.clone());
                         }
                         handled_exc = Some(value);
+                        // Make this exception the active one so a bare `raise`
+                        // inside the handler re-raises it.
+                        self.active_exceptions.push(exc.clone());
                         let result = self.exec_block(&h.body, env);
+                        self.active_exceptions.pop();
                         if let Some(name) = &h.name {
                             env.delete(name.as_str());
                         }
                         if let Err(e) = result {
-                            // finally still runs.
-                            let _ = self.exec_block(&t.finalbody, env);
+                            // An error escaping the handler: finally still runs,
+                            // and if finally itself raises, that wins (D5).
+                            if let Err(fin) = self.exec_block(&t.finalbody, env) {
+                                return Err(fin);
+                            }
                             return Err(e);
                         }
                         break;
                     }
                 }
                 if !found {
-                    let _ = self.exec_block(&t.finalbody, env);
+                    if let Err(fin) = self.exec_block(&t.finalbody, env) {
+                        return Err(fin);
+                    }
                     return Err(Unwind::Exception(exc));
                 }
                 Ok(())
             }
             Err(other) => {
-                let _ = self.exec_block(&t.finalbody, env);
+                if let Err(fin) = self.exec_block(&t.finalbody, env) {
+                    return Err(fin);
+                }
                 return Err(other);
             }
         };
@@ -3582,8 +3602,11 @@ impl Interpreter {
         // accept any name match against the exception's `kind`.
         if let Expr::Name(n) = type_expr {
             let name = n.id.as_str();
-            // Direct name match against the exception's kind.
-            if name == exc.kind || name == "Exception" || name == "BaseException" {
+            // Direct name match, or a builtin-exception-hierarchy match
+            // (e.g. `except ArithmeticError` catching `ZeroDivisionError`,
+            // `except LookupError` catching `KeyError`/`IndexError`,
+            // `except OSError` catching `FileNotFoundError`).
+            if name == exc.kind || builtin_exc_is_a(&exc.kind, name) {
                 return Ok(true);
             }
             // Class-hierarchy match: if the exception carries a user
@@ -3663,11 +3686,35 @@ impl Interpreter {
             }
             entered.push(cm);
         }
-        let body_res = self.exec_block(&w.body, env);
-        // Call __exit__ on each, in reverse order.
+        let mut body_res = self.exec_block(&w.body, env);
+        // Call __exit__ on each, in reverse order. When the body raised, pass
+        // the exception info `(exc_type, exc_value, None)` and honour a truthy
+        // return value by SUPPRESSING the exception (CPython protocol).
         for cm in entered.into_iter().rev() {
             if let Ok(exit) = self.get_attr(&cm, "__exit__") {
-                let _ = self.call_value(exit, vec![Value::None, Value::None, Value::None], &[]);
+                let (et, ev) = match &body_res {
+                    Err(Unwind::Exception(exc)) => {
+                        let value = match &exc.value {
+                            Some(v) => v.clone(),
+                            None => Value::Exception {
+                                kind: Rc::new(exc.kind.clone()),
+                                message: Rc::new(exc.message.clone()),
+                            },
+                        };
+                        let etype = match &exc.value {
+                            Some(Value::Instance(i)) => Value::Class(i.class.clone()),
+                            _ => crate::builtins::make_builtin_type(&exc.kind),
+                        };
+                        (etype, value)
+                    }
+                    _ => (Value::None, Value::None),
+                };
+                let raised = matches!(&body_res, Err(Unwind::Exception(_)));
+                let suppressed =
+                    self.call_value(exit, vec![et, ev, Value::None], &[])?;
+                if raised && self.is_truthy(&suppressed)? {
+                    body_res = Ok(());
+                }
             }
         }
         body_res
@@ -4699,6 +4746,48 @@ fn bind_result_combinator(receiver: Value, attr: &str) -> Value {
         }
     });
     Value::Native(Rc::new(nf))
+}
+
+/// Whether builtin exception `kind` is `target` or one of its subclasses in
+/// the standard CPython exception hierarchy. `Exception` / `BaseException`
+/// match everything except the two bare base-only kinds handled by the
+/// caller. Returns false for unknown names (user exceptions go through the
+/// instance-MRO path instead).
+fn builtin_exc_is_a(kind: &str, target: &str) -> bool {
+    if target == "BaseException" {
+        return true;
+    }
+    if target == "Exception" {
+        // Everything except the BaseException-only siblings.
+        return !matches!(kind, "KeyboardInterrupt" | "SystemExit" | "GeneratorExit");
+    }
+    // Direct parent in the standard hierarchy (subset covering the common
+    // intermediate bases programs actually catch).
+    fn parent(name: &str) -> Option<&'static str> {
+        Some(match name {
+            "ZeroDivisionError" | "OverflowError" | "FloatingPointError" => "ArithmeticError",
+            "IndexError" | "KeyError" => "LookupError",
+            "ModuleNotFoundError" => "ImportError",
+            "RecursionError" | "NotImplementedError" => "RuntimeError",
+            "UnboundLocalError" => "NameError",
+            "UnicodeError" => "ValueError",
+            "UnicodeDecodeError" | "UnicodeEncodeError" | "UnicodeTranslateError" => "UnicodeError",
+            "FileNotFoundError" | "FileExistsError" | "PermissionError" | "IsADirectoryError"
+            | "NotADirectoryError" | "InterruptedError" | "TimeoutError" | "BlockingIOError"
+            | "ChildProcessError" | "ProcessLookupError" | "ConnectionError" => "OSError",
+            "BrokenPipeError" | "ConnectionResetError" | "ConnectionRefusedError"
+            | "ConnectionAbortedError" => "ConnectionError",
+            _ => return None,
+        })
+    }
+    let mut cur = kind;
+    while let Some(p) = parent(cur) {
+        if p == target {
+            return true;
+        }
+        cur = p;
+    }
+    false
 }
 
 fn class_is_subclass(c: &Rc<Class>, target: &Rc<Class>) -> bool {

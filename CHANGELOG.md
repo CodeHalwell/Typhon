@@ -113,6 +113,24 @@ mismatch, and interface conformance were all correctly rejected).
 - **A complex base raised to a non-negative integer power** is computed by
   repeated multiplication for an exact result (`(1j) ** 2` → `-1+0j`).
 
+### Fixed — sixth stress round (VM exception model)
+
+- **Builtin exception hierarchy catching.** `except ArithmeticError` now
+  catches `ZeroDivisionError`, `except LookupError` catches
+  `KeyError`/`IndexError`, `except OSError` catches `FileNotFoundError`,
+  etc. Previously only the exact type and `Exception`/`BaseException`
+  matched, so intermediate-base handlers silently let exceptions escape.
+- **Bare `raise` (re-raise)** inside an `except` handler re-raises the
+  active exception instead of erroring with "No active exception".
+- **An exception raised in a `finally` replaces the in-flight exception**
+  (CPython semantics) instead of being discarded.
+- **`type(exc).__name__`** reports the concrete kind (`TypeError`) instead
+  of the generic `Exception`.
+- **`__exit__` receives `(exc_type, exc_value, None)`** when the `with`
+  body raised, and **a truthy return value suppresses the exception**.
+  Previously `__exit__` always got `(None, None, None)` and could not
+  suppress.
+
 ### Fixed — fifth stress round (VM data model + a second soundness hole)
 
 VM:

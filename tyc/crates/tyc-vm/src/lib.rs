@@ -782,6 +782,57 @@ if math.perm(5, 2) != 20:
     }
 
     #[test]
+    fn exception_model_fixes() {
+        // Sixth stress round: builtin exception hierarchy catching, bare
+        // re-raise, finally-replaces-exception, type(exc).__name__, and
+        // __exit__ exception-info + suppression.
+        let src = r#"
+class Sup:
+    n: int
+impl Sup:
+    def __enter__(self) -> int:
+        return self.n
+    def __exit__(self, et: object, ev: object, tb: object) -> bool:
+        return True
+
+mut log: list[str] = []
+
+def main() -> None:
+    try:
+        raise ZeroDivisionError("d")
+    except ArithmeticError:
+        log.append("arith")
+    try:
+        let d: dict[str, int] = {}
+        let _ = d["x"]
+    except LookupError:
+        log.append("lookup")
+    try:
+        try:
+            raise ValueError("v")
+        except ValueError:
+            raise
+    except ValueError:
+        log.append("reraise")
+    try:
+        try:
+            raise ValueError("a")
+        finally:
+            raise TypeError("b")
+    except Exception as e:
+        log.append(type(e).__name__)
+    with Sup(n=1):
+        raise ValueError("hidden")
+    log.append("survived")
+    if log != ["arith", "lookup", "reraise", "TypeError", "survived"]:
+        raise ValueError(f"wrong: {log}")
+
+main()
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    #[test]
     fn truthiness_attrs_and_classvars() {
         // Fifth stress round: __bool__/__len__ truthiness, dynamic-attribute
         // builtins, ClassVar / plain-class class-level attribute access.

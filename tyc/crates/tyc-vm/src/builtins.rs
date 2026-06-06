@@ -606,6 +606,9 @@ pub fn install(interp: &mut Interpreter) {
         Ok(match v {
             Value::Instance(i) => Value::Class(i.class.clone()),
             Value::Class(_) => make_builtin_type("type"),
+            // `type(some_exception).__name__` should be the concrete kind
+            // (e.g. `TypeError`), not the generic `Exception`.
+            Value::Exception { kind, .. } => make_builtin_type(kind.as_str()),
             other => make_builtin_type(other.type_name()),
         })
     });
@@ -6097,7 +6100,7 @@ pub fn call_with_kwargs(
 /// A lightweight type object for a built-in type (`int`, `str`, …) — an empty
 /// `Class` whose only meaningful attribute is its `name`. Used by `type(x)`
 /// so type comparisons and `.__name__` work uniformly with user classes.
-fn make_builtin_type(name: &str) -> Value {
+pub fn make_builtin_type(name: &str) -> Value {
     // Cache one canonical `Class` object per builtin type name so repeated
     // `type(x)` calls return the *same* object — `type(5) == type(6)` then
     // holds by identity (Class equality is identity-based; see `py_eq`).
