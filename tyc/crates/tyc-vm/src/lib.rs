@@ -758,6 +758,25 @@ if math.perm(5, 2) != 20:
     }
 
     #[test]
+    fn power_complex_results() {
+        // Negative base to a fractional power is complex (not nan); a complex
+        // base to an integer power is exact.
+        let src = r#"
+def main() -> None:
+    let z: complex = (-8) ** (1.0 / 3.0)
+    if abs(z.real - 1.0) > 1e-9 or abs(z.imag - 1.7320508075688772) > 1e-9:
+        raise ValueError("neg base frac pow wrong")
+    if (1j) ** 2 != complex(-1, 0):
+        raise ValueError("complex int pow wrong")
+    if complex(2, 0) ** 3 != complex(8, 0):
+        raise ValueError("complex cube wrong")
+
+main()
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    #[test]
     fn bytes_int_complex_parity_fixes() {
         // Stress-round stdlib gaps: bytes methods, int.to_bytes/.bit_count,
         // complex-from-string.

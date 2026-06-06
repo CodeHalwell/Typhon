@@ -106,6 +106,13 @@ mismatch, and interface conformance were all correctly rejected).
 - **`int.to_bytes(length, byteorder)`** and **`int.bit_count()`** added.
 - **`complex("1+2j")`** (and `"3j"`, `"-1"`, `"2-3j"`, `"j"`) string parsing.
 
+### Fixed — power operator complex results
+
+- **A negative base raised to a non-integer power returns a complex number**
+  (`(-8) ** (1/3)` → ~`1+1.732j`) instead of `nan`, matching CPython.
+- **A complex base raised to a non-negative integer power** is computed by
+  repeated multiplication for an exact result (`(1j) ** 2` → `-1+0j`).
+
 ### Fixed — type-checker soundness
 
 - **Generic-class constructor arguments are validated against the bound

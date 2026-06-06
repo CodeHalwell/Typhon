@@ -2319,7 +2319,31 @@ impl Interpreter {
             }
             (Float(a), FloorDiv, Float(b)) => return Ok(Float((a / b).floor())),
             (Float(a), Mod, Float(b)) => return Ok(Float(a.rem_euclid(*b))),
-            (Float(a), Pow, Float(b)) => return Ok(Float(a.powf(*b))),
+            (Float(a), Pow, Float(b)) => {
+                // A negative base raised to a non-integer power is complex in
+                // Python (`(-8) ** (1/3)` → ~`1+1.732j`), not `nan`.
+                if *a < 0.0 && b.fract() != 0.0 {
+                    let r = (-a).powf(*b);
+                    let theta = std::f64::consts::PI * b;
+                    return Ok(Complex(r * theta.cos(), r * theta.sin()));
+                }
+                return Ok(Float(a.powf(*b)));
+            }
+            // Complex base raised to a non-negative integer power — repeated
+            // multiplication for an exact result (`(1j) ** 2` → `-1+0j`),
+            // matching CPython's special-casing of integer exponents.
+            (Complex(ar, ai), Pow, Int(b)) if !b.is_negative() => {
+                let exp = b.to_u32().ok_or_else(overflow)?;
+                let (mut rr, mut ri) = (1.0f64, 0.0f64);
+                let (br, bi) = (*ar, *ai);
+                for _ in 0..exp {
+                    let nr = rr * br - ri * bi;
+                    let ni = rr * bi + ri * br;
+                    rr = nr;
+                    ri = ni;
+                }
+                return Ok(Complex(rr, ri));
+            }
             _ => {}
         }
 
