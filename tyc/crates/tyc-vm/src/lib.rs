@@ -782,6 +782,29 @@ if math.perm(5, 2) != 20:
     }
 
     #[test]
+    fn vm_getattr_and_comprehension_walrus() {
+        // VM gaps that paired with the checker false-reject fixes: a user
+        // __getattr__ resolves missing attributes, and a walrus binding in a
+        // comprehension leaks its last value to the enclosing scope.
+        let src = r#"
+plain class Proxy:
+    def __getattr__(self, name: str) -> str:
+        return f"attr:{name}"
+
+def main() -> None:
+    let p: Proxy = Proxy()
+    if p.foo != "attr:foo" or p.bar != "attr:bar":
+        raise ValueError("__getattr__ broken")
+    let ys: list[int] = [y for x in [1, 2, 3] if (y := x * x) > 1]
+    if ys != [4, 9] or y != 9:
+        raise ValueError("walrus leak broken")
+
+main()
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    #[test]
     fn vm_data_model_round_two() {
         // Sixth round, part 2: slice assignment, __index__, __delitem__,
         // del obj.attr, cached_property, __iter__ returning self, function

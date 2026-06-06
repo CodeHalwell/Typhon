@@ -2973,6 +2973,20 @@ impl Interpreter {
                         return Ok(v.clone());
                     }
                 }
+                // Last resort: a user `__getattr__(self, name)` resolves
+                // otherwise-missing attributes (CPython protocol).
+                if attr != "__getattr__" {
+                    if let Some(m) = self.find_method(&inst.class, "__getattr__") {
+                        return self.call_value(
+                            Value::BoundMethod {
+                                receiver: Box::new(value.clone()),
+                                function: m,
+                            },
+                            vec![Value::Str(Rc::new(attr.to_owned()))],
+                            &[],
+                        );
+                    }
+                }
                 Err(attribute_error(format!(
                     "'{}' object has no attribute '{}'",
                     inst.class.name, attr
@@ -3636,8 +3650,31 @@ impl Interpreter {
     where
         F: FnMut(&mut Self, &EnvRef) -> Result<(), Unwind>,
     {
+        self.run_comprehension_leaking(generators, &[], env, &mut emit)
+    }
+
+    /// Like `run_comprehension`, but after the comprehension finishes, copies
+    /// any walrus (`:=`) target named in `leak_names` from the comprehension's
+    /// private scope out into the enclosing `env` — Python leaks the LAST
+    /// value of a comprehension walrus target into the containing scope.
+    fn run_comprehension_leaking<F>(
+        &mut self,
+        generators: &[ast::Comprehension],
+        leak_names: &[String],
+        env: &EnvRef,
+        emit: &mut F,
+    ) -> Result<(), Unwind>
+    where
+        F: FnMut(&mut Self, &EnvRef) -> Result<(), Unwind>,
+    {
         let scope = Env::new_child(env);
-        self.run_comp_recurse(generators, 0, &scope, &mut emit)
+        let res = self.run_comp_recurse(generators, 0, &scope, emit);
+        for name in leak_names {
+            if let Some(v) = scope.get(name) {
+                env.assign_or_create(name, v);
+            }
+        }
+        res
     }
 
     fn run_comp_recurse<F>(
@@ -3677,7 +3714,8 @@ impl Interpreter {
         let out = Rc::new(RefCell::new(Vec::new()));
         let elt = c.elt.clone();
         let out_clone = out.clone();
-        self.run_comprehension(&c.generators, env, move |this, scope| {
+        let leaks = comprehension_walrus_names(&[&c.elt], &c.generators);
+        self.run_comprehension_leaking(&c.generators, &leaks, env, &mut move |this, scope| {
             let v = this.eval_expr(&elt, scope)?;
             out_clone.borrow_mut().push(v);
             Ok(())
@@ -3690,7 +3728,8 @@ impl Interpreter {
         let out = Rc::new(RefCell::new(std::collections::HashSet::new()));
         let elt = c.elt.clone();
         let out_clone = out.clone();
-        self.run_comprehension(&c.generators, env, move |this, scope| {
+        let leaks = comprehension_walrus_names(&[&c.elt], &c.generators);
+        self.run_comprehension_leaking(&c.generators, &leaks, env, &mut move |this, scope| {
             let v = this.eval_expr(&elt, scope)?;
             out_clone.borrow_mut().insert(v.to_hash_key()?);
             Ok(())
@@ -3707,7 +3746,12 @@ impl Interpreter {
             .ok_or_else(|| type_error("dict comprehension missing key"))?;
         let value_expr = c.value.clone();
         let out_clone = out.clone();
-        self.run_comprehension(&c.generators, env, move |this, scope| {
+        let mut parts: Vec<&Expr> = vec![&c.value];
+        if let Some(k) = c.key.as_deref() {
+            parts.push(k);
+        }
+        let leaks = comprehension_walrus_names(&parts, &c.generators);
+        self.run_comprehension_leaking(&c.generators, &leaks, env, &mut move |this, scope| {
             let k = this.eval_expr(&key_expr, scope)?.to_hash_key()?;
             let v = this.eval_expr(&value_expr, scope)?;
             out_clone.borrow_mut().insert(k, v);
@@ -4998,6 +5042,91 @@ fn builtin_exc_is_a(kind: &str, target: &str) -> bool {
         cur = p;
     }
     false
+}
+
+/// Collect the names of walrus (`:=`) assignment targets appearing anywhere
+/// in `e`. Used so a walrus inside a comprehension leaks its target into the
+/// enclosing scope (Python semantics).
+fn collect_walrus_names(e: &Expr, out: &mut Vec<String>) {
+    match e {
+        Expr::Named(n) => {
+            if let Expr::Name(name) = n.target.as_ref() {
+                out.push(name.id.as_str().to_owned());
+            }
+            collect_walrus_names(&n.value, out);
+        }
+        Expr::BoolOp(b) => {
+            for v in &b.values {
+                collect_walrus_names(v, out);
+            }
+        }
+        Expr::BinOp(b) => {
+            collect_walrus_names(&b.left, out);
+            collect_walrus_names(&b.right, out);
+        }
+        Expr::UnaryOp(u) => collect_walrus_names(&u.operand, out),
+        Expr::Compare(c) => {
+            collect_walrus_names(&c.left, out);
+            for c2 in c.comparators.iter() {
+                collect_walrus_names(c2, out);
+            }
+        }
+        Expr::Call(c) => {
+            collect_walrus_names(&c.func, out);
+            for a in c.arguments.args.iter() {
+                collect_walrus_names(a, out);
+            }
+            for kw in c.arguments.keywords.iter() {
+                collect_walrus_names(&kw.value, out);
+            }
+        }
+        Expr::If(t) => {
+            collect_walrus_names(&t.test, out);
+            collect_walrus_names(&t.body, out);
+            collect_walrus_names(&t.orelse, out);
+        }
+        Expr::Subscript(s) => {
+            collect_walrus_names(&s.value, out);
+            collect_walrus_names(&s.slice, out);
+        }
+        Expr::Attribute(a) => collect_walrus_names(&a.value, out),
+        Expr::Starred(s) => collect_walrus_names(&s.value, out),
+        Expr::Tuple(t) => {
+            for x in &t.elts {
+                collect_walrus_names(x, out);
+            }
+        }
+        Expr::List(l) => {
+            for x in &l.elts {
+                collect_walrus_names(x, out);
+            }
+        }
+        Expr::Set(s) => {
+            for x in &s.elts {
+                collect_walrus_names(x, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Walrus target names from a comprehension's element expression(s) plus the
+/// `if` filters on every generator (the bound-iterable expressions are
+/// evaluated in the enclosing scope already, so their walruses leak anyway).
+fn comprehension_walrus_names(
+    parts: &[&Expr],
+    generators: &[ast::Comprehension],
+) -> Vec<String> {
+    let mut out = Vec::new();
+    for p in parts {
+        collect_walrus_names(p, &mut out);
+    }
+    for g in generators {
+        for cond in &g.ifs {
+            collect_walrus_names(cond, &mut out);
+        }
+    }
+    out
 }
 
 fn class_is_subclass(c: &Rc<Class>, target: &Rc<Class>) -> bool {

@@ -113,6 +113,13 @@ mismatch, and interface conformance were all correctly rejected).
 - **A complex base raised to a non-negative integer power** is computed by
   repeated multiplication for an exact result (`(1j) ** 2` → `-1+0j`).
 
+### Fixed — VM parity with the checker false-reject fixes
+
+- **`__getattr__` resolves missing attributes** under `tyc run` (was
+  `AttributeError`), matching the build path.
+- **A walrus binding in a comprehension leaks its last value** to the
+  enclosing scope under `tyc run` (was `NameError`).
+
 ### Fixed — type-checker false-rejects (valid code wrongly rejected)
 
 - **`plain class` and `class!` may define a hand-written `__init__`.**
