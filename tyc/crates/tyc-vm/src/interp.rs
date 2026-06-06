@@ -2254,7 +2254,14 @@ impl Interpreter {
         if let Value::Instance(i) = v {
             if self.find_method(&i.class, "__bool__").is_some() {
                 if let Some(r) = self.call_dunder0(v, "__bool__")? {
-                    return Ok(r.truthy());
+                    // CPython requires `__bool__` to return an actual bool.
+                    return match r {
+                        Value::Bool(b) => Ok(b),
+                        other => Err(type_error(format!(
+                            "__bool__ should return bool, returned {}",
+                            other.type_name()
+                        ))),
+                    };
                 }
             }
             if self.find_method(&i.class, "__len__").is_some() {
@@ -2313,7 +2320,15 @@ impl Interpreter {
     fn repr_of_depth(&mut self, v: &Value, depth: usize) -> Result<String, Unwind> {
         const MAX_REPR_DEPTH: usize = 100;
         if depth >= MAX_REPR_DEPTH {
-            return Ok("[...]".to_string());
+            // CPython renders a self-referential container with a kind-specific
+            // ellipsis: `[...]` for lists, `{...}` for dicts/sets, `(...)` for
+            // tuples.
+            return Ok(match v {
+                Value::Tuple(_) => "(...)",
+                Value::Dict(_) | Value::Set(_) => "{...}",
+                _ => "[...]",
+            }
+            .to_string());
         }
         match v {
             Value::List(l) => {
@@ -2532,14 +2547,23 @@ impl Interpreter {
             // multiplication for an exact result (`(1j) ** 2` → `-1+0j`),
             // matching CPython's special-casing of integer exponents.
             (Complex(ar, ai), Pow, Int(b)) if !b.is_negative() => {
-                let exp = b.to_u32().ok_or_else(overflow)?;
+                // Exponentiation by squaring — O(log exp), so a huge exponent
+                // can't freeze the VM with an O(exp) loop (review: gemini).
+                let mut exp = b.to_u32().ok_or_else(overflow)?;
                 let (mut rr, mut ri) = (1.0f64, 0.0f64);
-                let (br, bi) = (*ar, *ai);
-                for _ in 0..exp {
-                    let nr = rr * br - ri * bi;
-                    let ni = rr * bi + ri * br;
-                    rr = nr;
-                    ri = ni;
+                let (mut br, mut bi) = (*ar, *ai);
+                while exp > 0 {
+                    if exp & 1 == 1 {
+                        let nr = rr * br - ri * bi;
+                        let ni = rr * bi + ri * br;
+                        rr = nr;
+                        ri = ni;
+                    }
+                    let nbr = br * br - bi * bi;
+                    let nbi = 2.0 * br * bi;
+                    br = nbr;
+                    bi = nbi;
+                    exp >>= 1;
                 }
                 return Ok(Complex(rr, ri));
             }
@@ -5102,11 +5126,6 @@ fn bind_result_combinator(receiver: Value, attr: &str) -> Value {
     Value::Native(Rc::new(nf))
 }
 
-/// Whether builtin exception `kind` is `target` or one of its subclasses in
-/// the standard CPython exception hierarchy. `Exception` / `BaseException`
-/// match everything except the two bare base-only kinds handled by the
-/// caller. Returns false for unknown names (user exceptions go through the
-/// instance-MRO path instead).
 /// The `pub` names a module file (or a sub-package's `__init__.ty`) exports,
 /// read via the preprocessor. Returns an empty vec for a file that has no
 /// `pub` declarations (e.g. a sub-package whose `__init__.ty` is `pub *`).
@@ -5133,6 +5152,10 @@ fn exc_fallback_args(message: &str) -> Vec<Value> {
     }
 }
 
+/// Whether builtin exception `kind` is `target` or one of its subclasses in
+/// the standard CPython exception hierarchy. `Exception` / `BaseException`
+/// match everything except the bare base-only kinds. Returns false for
+/// unknown names (user exceptions go through the instance-MRO path instead).
 fn builtin_exc_is_a(kind: &str, target: &str) -> bool {
     if target == "BaseException" {
         return true;
@@ -5182,6 +5205,24 @@ fn collect_walrus_names(e: &Expr, out: &mut Vec<String>) {
                 out.push(name.id.as_str().to_owned());
             }
             collect_walrus_names(&n.value, out);
+        }
+        // `{k: (v := ...)}` — a dict literal can carry a walrus in its
+        // keys/values (review: gemini).
+        Expr::Dict(d) => {
+            for item in &d.items {
+                if let Some(k) = &item.key {
+                    collect_walrus_names(k, out);
+                }
+                collect_walrus_names(&item.value, out);
+            }
+        }
+        // `f"{(x := ...)}"` — walrus inside an f-string interpolation.
+        Expr::FString(fs) => {
+            for elem in fs.value.elements() {
+                if let ast::InterpolatedStringElement::Interpolation(interp) = elem {
+                    collect_walrus_names(&interp.expression, out);
+                }
+            }
         }
         Expr::BoolOp(b) => {
             for v in &b.values {

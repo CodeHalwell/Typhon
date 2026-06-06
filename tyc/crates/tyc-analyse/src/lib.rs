@@ -1500,8 +1500,9 @@ fn eval_binop(
         // ── Pow (`**`) ───────────────────────────────────────────────────────
         (Pow, ComptimeValue::Int(a), ComptimeValue::Int(b)) => {
             if *b < 0 {
-                // Negative exponent → float, matching Python.
-                Ok(ComptimeValue::Float((*a as f64).powi(*b as i32)))
+                // Negative exponent → float, matching Python. Use `powf` (not
+                // `powi(*b as i32)`, which truncates a very negative exponent).
+                Ok(ComptimeValue::Float((*a as f64).powf(*b as f64)))
             } else {
                 let exp = u32::try_from(*b)
                     .map_err(|_| "exponent too large in comptime power".to_string())?;

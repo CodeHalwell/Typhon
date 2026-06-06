@@ -2834,6 +2834,23 @@ fn declare_walrus_leaks(r: &mut Resolver, scope: ScopeId, expr: &Expr) {
                 declare_walrus_leaks(r, scope, step);
             }
         }
+        // `{k: (v := ...)}` — dict literal keys/values can carry a walrus.
+        Expr::Dict(d) => {
+            for item in &d.items {
+                if let Some(k) = &item.key {
+                    declare_walrus_leaks(r, scope, k);
+                }
+                declare_walrus_leaks(r, scope, &item.value);
+            }
+        }
+        // `f"{(x := ...)}"` — walrus inside an f-string interpolation.
+        Expr::FString(fs) => {
+            for elem in fs.value.elements() {
+                if let ast::InterpolatedStringElement::Interpolation(interp) = elem {
+                    declare_walrus_leaks(r, scope, &interp.expression);
+                }
+            }
+        }
         // Other expression heads either bind no names (literals, plain
         // names) or open a fresh scope (lambda, nested comprehensions);
         // nothing to leak from them here.

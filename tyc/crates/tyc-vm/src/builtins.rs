@@ -412,9 +412,11 @@ pub fn install(interp: &mut Interpreter) {
             .py_str();
         match i.get_attr(&obj, &name) {
             Ok(v) => Ok(v),
+            // Only a *missing* attribute falls back to the default; a real
+            // error from a property/__getattr__ propagates (review: codex).
             Err(e) => match args.get(2) {
-                Some(default) => Ok(default.clone()),
-                None => Err(e),
+                Some(default) if is_attribute_error(&e) => Ok(default.clone()),
+                _ => Err(e),
             },
         }
     });
@@ -427,7 +429,13 @@ pub fn install(interp: &mut Interpreter) {
             .get(1)
             .ok_or_else(|| type_error("hasattr() requires a name"))?
             .py_str();
-        Ok(Value::Bool(i.get_attr(&obj, &name).is_ok()))
+        // True if present, False only for a genuine AttributeError; any other
+        // exception from a descriptor/__getattr__ propagates (review: codex).
+        match i.get_attr(&obj, &name) {
+            Ok(_) => Ok(Value::Bool(true)),
+            Err(e) if is_attribute_error(&e) => Ok(Value::Bool(false)),
+            Err(e) => Err(e),
+        }
     });
     native!("setattr", |i, args| {
         let obj = args
@@ -515,6 +523,14 @@ pub fn install(interp: &mut Interpreter) {
             Some(Value::Instance(inst)) => {
                 let mut m: DictMap = IndexMap::new();
                 for (k, v) in inst.fields.borrow().iter() {
+                    m.insert(HashKey::Str(Rc::new(k.clone())), v.clone());
+                }
+                Ok(Value::Dict(Rc::new(RefCell::new(m))))
+            }
+            // `vars(module)` returns the module namespace (review: gemini).
+            Some(Value::Module(md)) => {
+                let mut m: DictMap = IndexMap::new();
+                for (k, v) in md.members.borrow().iter() {
                     m.insert(HashKey::Str(Rc::new(k.clone())), v.clone());
                 }
                 Ok(Value::Dict(Rc::new(RefCell::new(m))))
@@ -907,6 +923,11 @@ pub fn install(interp: &mut Interpreter) {
                     let nd = n.to_int()?;
                     if nd >= 0 {
                         Ok(Value::Int(i.clone()))
+                    } else if -nd > 10_000 {
+                        // Any in-memory integer rounds to 0 once the place
+                        // value exceeds its digit count; cap to avoid an
+                        // OOM/DoS building 10**(huge) (review: gemini).
+                        Ok(Value::Int(num_bigint::BigInt::zero()))
                     } else {
                         let p = num_bigint::BigInt::from(10).pow((-nd) as u32);
                         // Floor-divide so the remainder is always in [0, p).
@@ -4849,7 +4870,20 @@ fn bytes_method(b: &Rc<Vec<u8>>, name: &str, args: &[Value]) -> Result<Value, Un
                 args.get(1)
                     .ok_or_else(|| type_error("replace needs args"))?,
             )?;
-            Value::Bytes(Rc::new(replace_bytes(b, &from, &to)))
+            // Optional third `count` arg (negative = replace all), matching
+            // bytes.replace in CPython.
+            let max = match args.get(2) {
+                Some(c) => {
+                    let n = c.to_int()?;
+                    if n < 0 {
+                        usize::MAX
+                    } else {
+                        n as usize
+                    }
+                }
+                None => usize::MAX,
+            };
+            Value::Bytes(Rc::new(replace_bytes(b, &from, &to, max)))
         }
         "join" => {
             // b",".join([b"a", b"b"]) -> b"a,b"
@@ -4916,6 +4950,13 @@ fn parse_complex_str(s: &str) -> Option<(f64, f64)> {
 }
 
 /// Coerce a `bytes`/`bytearray` (or a single int) argument into a byte vec.
+/// Whether an unwind is a raised `AttributeError` (vs. some other exception
+/// or control-flow). Lets `getattr`/`hasattr` distinguish a genuinely
+/// missing attribute from an error raised inside a descriptor / `__getattr__`.
+fn is_attribute_error(u: &Unwind) -> bool {
+    matches!(u, Unwind::Exception(e) if e.kind == "AttributeError")
+}
+
 fn bytes_arg(v: &Value) -> Result<Vec<u8>, Unwind> {
     match v {
         Value::Bytes(b) => Ok((**b).clone()),
@@ -4949,16 +4990,23 @@ fn split_bytes(hay: &[u8], sep: &[u8]) -> Vec<Vec<u8>> {
     out
 }
 
-fn replace_bytes(hay: &[u8], from: &[u8], to: &[u8]) -> Vec<u8> {
-    if from.is_empty() {
+fn replace_bytes(hay: &[u8], from: &[u8], to: &[u8], max: usize) -> Vec<u8> {
+    if from.is_empty() || max == 0 {
         return hay.to_vec();
     }
     let mut out = Vec::with_capacity(hay.len());
     let mut rest = hay;
-    while let Some(i) = find_subslice(rest, from) {
-        out.extend_from_slice(&rest[..i]);
-        out.extend_from_slice(to);
-        rest = &rest[i + from.len()..];
+    let mut done = 0usize;
+    while done < max {
+        match find_subslice(rest, from) {
+            Some(i) => {
+                out.extend_from_slice(&rest[..i]);
+                out.extend_from_slice(to);
+                rest = &rest[i + from.len()..];
+                done += 1;
+            }
+            None => break,
+        }
     }
     out.extend_from_slice(rest);
     out
@@ -5915,7 +5963,7 @@ pub fn call_with_kwargs(
             let mut strict = false;
             for (k, v) in kwargs {
                 if k == "strict" {
-                    strict = v.truthy();
+                    strict = interp.is_truthy(v)?;
                 } else {
                     return Err(type_error(format!("zip() got unexpected keyword: '{}'", k)));
                 }
@@ -6103,7 +6151,7 @@ pub fn call_with_kwargs(
                         indent = v.to_int().ok().filter(|n| *n > 0).map(|n| n as usize);
                     }
                 } else if k == "sort_keys" {
-                    sort_keys = v.truthy();
+                    sort_keys = interp.is_truthy(v)?;
                 }
             }
             match indent {
