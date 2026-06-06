@@ -2843,6 +2843,113 @@ impl<'a> Checker<'a> {
         true
     }
 
+    /// SOUNDNESS (union use sites): return `true` when attribute / method
+    /// `attr` is definitely supported by member type `member`, or when
+    /// `member` is foreign / dynamic enough that we can't soundly flag it
+    /// (foreign classes, `Unknown`, `Any`, `TypeVar`, partial shapes, …).
+    /// Used by the union arm of attribute access so `x.upper()` on
+    /// `int | str` is rejected (the `int` member has no `upper`) while an
+    /// attribute present on EVERY member passes. Conservative by design:
+    /// anything we can't fully reason about returns `true` so legitimate
+    /// duck-typed unions don't false-positive.
+    fn member_supports_attr(&self, member: &Type, attr: &str) -> bool {
+        // Dunder / private names are never flagged (matches the
+        // single-receiver attribute paths).
+        if attr.starts_with('_') {
+            return true;
+        }
+        match member {
+            // Dynamic / foreign — can't soundly flag.
+            Type::Any | Type::Unknown | Type::TypeVar(_) | Type::TypeConstructor(_, _) => true,
+            Type::Function { .. } | Type::Module(_) => true,
+            // A literal-string singleton behaves like `str`. Forward-ref
+            // string types also land here; stay permissive (matches the
+            // single-receiver path which never flags `LitStr`).
+            Type::LitStr(_) => true,
+            Type::Str => {
+                is_known_primitive_attr("str", attr) || is_user_builtin_extension(self, "str", attr)
+            }
+            Type::Bytes => {
+                is_known_primitive_attr("bytes", attr)
+                    || is_user_builtin_extension(self, "bytes", attr)
+            }
+            Type::Int => {
+                is_known_primitive_attr("int", attr) || is_user_builtin_extension(self, "int", attr)
+            }
+            Type::Float => {
+                is_known_primitive_attr("float", attr)
+                    || is_user_builtin_extension(self, "float", attr)
+            }
+            // `bool` / `None`: matches the single-receiver policy of NOT
+            // attribute-checking these (overloaded comparison results,
+            // etc.). Treat as permissive so we don't regress.
+            Type::Bool | Type::None => true,
+            Type::Generic(head, _) => {
+                if is_builtin_generic_head(head) {
+                    builtin_generic_method(member, attr).is_some()
+                        || is_known_builtin_generic_attr(head, attr)
+                        || is_user_builtin_extension(self, head, attr)
+                } else {
+                    // User-defined generic class: resolve method/field,
+                    // but stay lenient when the hierarchy isn't fully
+                    // known or the class defines `__getattr__`.
+                    if !self.class_hierarchy_fully_known(head)
+                        || self.class_defines_getattr(head)
+                    {
+                        return true;
+                    }
+                    self.find_method(head, attr).is_some()
+                        || self.find_field(head, attr).is_some()
+                }
+            }
+            Type::Class(name) => {
+                if !self.class_hierarchy_fully_known(name) || self.class_defines_getattr(name) {
+                    return true;
+                }
+                self.find_method(name, attr).is_some() || self.find_field(name, attr).is_some()
+            }
+            // Nested union — recurse (every member must support it).
+            Type::Union(ms) => ms.iter().all(|m| self.member_supports_attr(m, attr)),
+        }
+    }
+
+    /// SOUNDNESS (union use sites): return `true` when `member` is a
+    /// `len()`-able (`Sized`) type, or foreign / dynamic enough that we
+    /// can't soundly flag it. Used by the `len(union)` check so
+    /// `len(x)` on `int | str` is rejected (`int` isn't sized) while
+    /// `len(s)` on `str | bytes` passes. Conservative: dynamic / foreign
+    /// members return `true`.
+    fn member_is_sized(&self, member: &Type) -> bool {
+        match member {
+            Type::Any | Type::Unknown | Type::TypeVar(_) | Type::TypeConstructor(_, _) => true,
+            Type::Function { .. } | Type::Module(_) => true,
+            // Definitely not sized.
+            Type::Int | Type::Float | Type::Bool | Type::None => false,
+            // Sized built-ins.
+            Type::Str | Type::Bytes | Type::LitStr(_) => true,
+            Type::Generic(head, _) => {
+                // All built-in container heads are sized; user generic
+                // classes are sized iff they define `__len__` (lenient
+                // when the hierarchy isn't fully known).
+                if is_builtin_generic_head(head) {
+                    true
+                } else if !self.class_hierarchy_fully_known(head) {
+                    true
+                } else {
+                    self.find_method(head, "__len__").is_some()
+                }
+            }
+            Type::Class(name) => {
+                if !self.class_hierarchy_fully_known(name) {
+                    true
+                } else {
+                    self.find_method(name, "__len__").is_some()
+                }
+            }
+            Type::Union(ms) => ms.iter().all(|m| self.member_is_sized(m)),
+        }
+    }
+
     /// Return the missing-member text for a failed interface conformance check.
     /// Returns `None` when the class actually conforms (caller should use
     /// `class_conforms_to_interface` to gate this call).
@@ -10741,6 +10848,36 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
                         }
                     }
                 }
+                // SOUNDNESS (union use sites): `len(x)` where `x` is a
+                // union is valid only when EVERY member is `Sized`.
+                // `len(x)` on `int | str` is rejected (`int` has no
+                // `__len__`); `len(s)` on `str | bytes` passes. Only the
+                // union case is flagged here so this stays narrowly scoped
+                // to the union soundness hole — single-type `len(5)` misuse
+                // is out of scope. The `len` name must resolve to the
+                // builtin (not shadowed by a user binding).
+                if fn_name.id.as_str() == "len"
+                    && pos_args.len() == 1
+                    && kw_args.is_empty()
+                    && c.unsafe_depth == 0
+                    && c.env.lookup("len").is_none()
+                {
+                    let arg_ty = infer_expr(c, &pos_args[0]);
+                    if let Type::Union(members) = &arg_ty {
+                        if let Some(bad) = members.iter().find(|m| !c.member_is_sized(m)) {
+                            let span = (
+                                pos_args[0].range().start().to_usize(),
+                                pos_args[0].range().end().to_usize(),
+                            );
+                            c.operator_type_mismatch(
+                                "len()",
+                                &arg_ty,
+                                bad,
+                                span,
+                            );
+                        }
+                    }
+                }
             }
 
             // Phase E: blocking-in-async call detection. When the
@@ -11702,6 +11839,44 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
                 // method access on those would be a false positive on
                 // perfectly valid code, so literal-string receivers are
                 // left permissive.
+                // SOUNDNESS (union use sites): an attribute / method on a
+                // union value is valid only when EVERY member supports it.
+                // `x.upper()` on `int | str` is rejected (the `int` member
+                // has no `upper`), while an attribute present on every
+                // member (a shared field/method across a union of user
+                // classes, or `s: str | bytes; s.find(...)`) passes.
+                // Conservative: `member_supports_attr` returns `true` for
+                // foreign / dynamic members, so duck-typed unions stay
+                // permissive. Nullable receivers already emit
+                // `nullable_use` above; the `None` member is treated as
+                // permissive here so we don't double-report.
+                Type::Union(members) => {
+                    if c.unsafe_depth == 0 && !attr_name.starts_with('_') {
+                        if let Some(bad) = members
+                            .iter()
+                            .find(|m| !c.member_supports_attr(m, attr_name))
+                        {
+                            let bad_display = bad.display();
+                            let attr_start = a.attr.range.start().to_usize();
+                            let attr_len = a
+                                .attr
+                                .range
+                                .end()
+                                .to_usize()
+                                .saturating_sub(attr_start)
+                                .max(1);
+                            c.diagnostics.push_error(TycError::attribute_not_found(
+                                attr_name,
+                                &bad_display,
+                                &c.path,
+                                c.source,
+                                attr_start,
+                                attr_len,
+                            ));
+                        }
+                    }
+                    Type::Unknown
+                }
                 Type::Str => {
                     if !is_known_primitive_attr("str", attr_name)
                         && !is_user_builtin_extension(c, "str", attr_name)
@@ -12281,16 +12456,26 @@ fn arithmetic_op_str(op: Operator) -> Option<&'static str> {
 
 /// True if either side is something we shouldn't flag at all — values
 /// of `Any`/`Unknown`/`TypeVar`, a user-defined class (which might
-/// implement `__add__` / `__mul__` / …), any composite type that
-/// embeds one of those, or any union (we don't know which variant the
-/// value actually holds at this point, and even all-primitive unions
-/// like `int | str` may be valid for some variant).
+/// implement `__add__` / `__mul__` / …), or any composite type that
+/// embeds one of those.
+///
+/// SOUNDNESS (union use sites): a union is unflaggable only when *some*
+/// member is itself unflaggable (a user class that might overload the
+/// operator, an `Unknown`, a `TypeVar`, …). A union whose members are
+/// ALL concrete built-in primitives (`int | str`, `int | None`, …) is
+/// flaggable — `operator_operands_compatible` distributes the operator
+/// across every member and rejects the operation unless it is valid for
+/// EVERY member. Without this, `x: int | str; x + 1` slipped past the
+/// checker (the `int` member supports `+`) and crashed at runtime on the
+/// `str` member. We stay conservative: any duck-typed union containing a
+/// user class or dynamic type remains permissive, so legitimate
+/// duck-typed unions don't false-positive.
 fn operand_is_unflaggable(t: &Type) -> bool {
     match t {
         Type::Any | Type::Unknown | Type::TypeVar(_) => true,
         Type::Class(_) => true,
         Type::Function { .. } => true,
-        Type::Union(_) => true,
+        Type::Union(members) => members.iter().any(operand_is_unflaggable),
         Type::Generic(_, args) => args.iter().any(operand_is_unflaggable),
         Type::Int | Type::Str | Type::Bool | Type::Float | Type::Bytes | Type::None => false,
         // `Type::LitStr` is a string-singleton — same operand semantics as
@@ -12349,6 +12534,25 @@ fn base_accepts_operand(base: &Type, other: &Type) -> bool {
 fn operator_operands_compatible(op: Operator, l: &Type, r: &Type) -> bool {
     if operand_is_unflaggable(l) || operand_is_unflaggable(r) {
         return true;
+    }
+    // SOUNDNESS (union use sites): when either operand is a union (and it
+    // reached here, so it is an all-flaggable-primitive union — see
+    // `operand_is_unflaggable`), the operation is valid only when it is
+    // valid for EVERY member-vs-member combination. `int | str + int` is
+    // rejected because the `str + int` pairing is invalid even though
+    // `int + int` is fine. `int | float + int` passes because both
+    // pairings are numeric. The `None` member of a `T?` is itself a
+    // flaggable primitive, so an unnarrowed `T?` operand is correctly
+    // rejected here too.
+    if let Type::Union(ls) = l {
+        return ls
+            .iter()
+            .all(|lm| operator_operands_compatible(op, lm, r));
+    }
+    if let Type::Union(rs) = r {
+        return rs
+            .iter()
+            .all(|rm| operator_operands_compatible(op, l, rm));
     }
     match op {
         Operator::Add => {
@@ -20190,6 +20394,194 @@ def main() -> None:
                 .iter()
                 .any(|e| matches!(e, TycError::AttributeNotFound { .. })),
             "an attribute never assigned must still fire; got: {:?}",
+            d.errors()
+        );
+    }
+
+    // ── Union use-site soundness (SOUNDNESS) ─────────────────────────────────
+    // An operation / attribute / `len` on an *unnarrowed* union value is only
+    // sound when it is valid for EVERY member. Each reject test has a
+    // must-pass twin so the rule isn't over-aggressive.
+
+    /// `x: int | str; x + 1` — the `str` member doesn't support `+ int`,
+    /// so this must fire `operator_type_mismatch` (was silently accepted).
+    #[test]
+    fn union_binop_reject_int_str_plus_int() {
+        let d = check(
+            "def main() -> None:\n\
+             \x20   let x: int | str = \"two\"\n\
+             \x20   print(x + 1)\n",
+        );
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::OperatorTypeMismatch { .. })),
+            "int|str + int must fire OperatorTypeMismatch; got {:?}",
+            d.errors()
+        );
+    }
+
+    /// `a: int | float; a + 1` — both members are numeric, so `+` is valid
+    /// for every member and this must stay clean.
+    #[test]
+    fn union_binop_pass_int_float_plus_int() {
+        let d = check(
+            "def main() -> None:\n\
+             \x20   let a: int | float = 3\n\
+             \x20   print(a + 1)\n",
+        );
+        assert!(
+            !d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::OperatorTypeMismatch { .. })),
+            "int|float + int must NOT fire OperatorTypeMismatch; got {:?}",
+            d.errors()
+        );
+    }
+
+    /// Generic widening: `pick(1, "two")` widens `T` to `int | str`, then
+    /// `x + 1` must be rejected just like the explicit-annotation case.
+    #[test]
+    fn union_binop_reject_generic_widening() {
+        let d = check(
+            "def pick[T](a: T, b: T) -> T:\n\
+             \x20   return b\n\
+             def main() -> None:\n\
+             \x20   let x = pick(1, \"two\")\n\
+             \x20   print(x + 1)\n",
+        );
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::OperatorTypeMismatch { .. })),
+            "widened int|str + int must fire OperatorTypeMismatch; got {:?}",
+            d.errors()
+        );
+    }
+
+    /// `x: int | str; x.upper()` — the `int` member has no `upper`, so this
+    /// must fire `attribute_not_found`.
+    #[test]
+    fn union_attr_reject_upper_on_int_str() {
+        let d = check(
+            "def main() -> None:\n\
+             \x20   let x: int | str = \"two\"\n\
+             \x20   print(x.upper())\n",
+        );
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::AttributeNotFound { .. })),
+            "int|str .upper() must fire AttributeNotFound; got {:?}",
+            d.errors()
+        );
+    }
+
+    /// A method present on EVERY member of a union (`str | bytes` both have
+    /// `.find`) must stay clean.
+    #[test]
+    fn union_attr_pass_method_on_all_members() {
+        let d = check(
+            "def main() -> None:\n\
+             \x20   let s: str | bytes = \"hi\"\n\
+             \x20   print(s.find(\"h\"))\n",
+        );
+        assert!(
+            !d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::AttributeNotFound { .. })),
+            "str|bytes .find() must NOT fire AttributeNotFound; got {:?}",
+            d.errors()
+        );
+    }
+
+    /// A field present on every member of a union of user classes must pass;
+    /// a field present on only one member must be rejected.
+    #[test]
+    fn union_attr_user_class_field() {
+        let pass = check(
+            "class Cat:\n\
+             \x20   name: str\n\
+             class Dog:\n\
+             \x20   name: str\n\
+             def main() -> None:\n\
+             \x20   let a: Cat | Dog = Cat(name=\"x\")\n\
+             \x20   print(a.name)\n",
+        );
+        assert!(
+            !pass
+                .errors()
+                .iter()
+                .any(|e| matches!(e, TycError::AttributeNotFound { .. })),
+            "shared field across union must NOT fire AttributeNotFound; got {:?}",
+            pass.errors()
+        );
+        let reject = check(
+            "class Cat:\n\
+             \x20   name: str\n\
+             class Dog:\n\
+             \x20   age: int\n\
+             def main() -> None:\n\
+             \x20   let a: Cat | Dog = Cat(name=\"x\")\n\
+             \x20   print(a.name)\n",
+        );
+        assert!(
+            reject
+                .errors()
+                .iter()
+                .any(|e| matches!(e, TycError::AttributeNotFound { .. })),
+            "field on only one union member must fire AttributeNotFound; got {:?}",
+            reject.errors()
+        );
+    }
+
+    /// `len(x)` on `int | str` — the `int` member isn't `Sized`, so this
+    /// must fire; `len(s)` on `str | bytes` must stay clean.
+    #[test]
+    fn union_len_reject_unsized_member() {
+        let reject = check(
+            "def main() -> None:\n\
+             \x20   let x: int | str = \"two\"\n\
+             \x20   print(len(x))\n",
+        );
+        assert!(
+            reject
+                .errors()
+                .iter()
+                .any(|e| matches!(e, TycError::OperatorTypeMismatch { .. })),
+            "len(int|str) must fire OperatorTypeMismatch; got {:?}",
+            reject.errors()
+        );
+        let pass = check(
+            "def main() -> None:\n\
+             \x20   let s: str | bytes = \"hi\"\n\
+             \x20   print(len(s))\n",
+        );
+        assert!(
+            !pass
+                .errors()
+                .iter()
+                .any(|e| matches!(e, TycError::OperatorTypeMismatch { .. })),
+            "len(str|bytes) must NOT fire; got {:?}",
+            pass.errors()
+        );
+    }
+
+    /// Narrowing out the non-supporting member with `isinstance` must make
+    /// the operation pass (narrowing already works; we must not regress it).
+    #[test]
+    fn union_narrowed_use_passes() {
+        let d = check(
+            "def main() -> None:\n\
+             \x20   let x: int | str = \"two\"\n\
+             \x20   if isinstance(x, int):\n\
+             \x20       print(x + 1)\n",
+        );
+        assert!(
+            !d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::OperatorTypeMismatch { .. })),
+            "narrowed int member + 1 must NOT fire; got {:?}",
             d.errors()
         );
     }

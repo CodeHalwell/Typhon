@@ -113,6 +113,19 @@ mismatch, and interface conformance were all correctly rejected).
 - **A complex base raised to a non-negative integer power** is computed by
   repeated multiplication for an exact result (`(1j) ** 2` → `-1+0j`).
 
+### Fixed — type-checker soundness (union member access)
+
+- **Operations on a union type must be valid for every member.** The
+  checker previously accepted an operation if *any* member supported it, so
+  `let x: int | str = "two"; x + 1` type-checked clean then crashed with a
+  runtime `TypeError`. Now binary operators, attribute/method access, and
+  `len()` are checked against *all* members of a union (`x + 1` on `int |
+  str` → `operator_type_mismatch`; `x.upper()` → `attribute_not_found` on
+  `int`). Conservative: members that are user classes with unknown
+  hierarchy, `__getattr__`, `Unknown`, `TypeVar`, or `Any` stay permissive,
+  so legitimate duck-typed unions and narrowed uses still pass. Corpus
+  unchanged; no example needed a fix.
+
 ### Fixed — VM exception args
 
 - **Builtin exceptions keep all constructor arguments.** `Value::Exception`
