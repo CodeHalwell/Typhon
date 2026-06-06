@@ -457,7 +457,10 @@ pub fn install(interp: &mut Interpreter) {
         match &obj {
             Value::Instance(inst) => {
                 if inst.fields.borrow_mut().remove(name.as_str()).is_none() {
-                    return Err(attribute_error(format!("'{}'", name)));
+                    return Err(attribute_error(format!(
+                        "'{}' object has no attribute '{}'",
+                        inst.class.name, name
+                    )));
                 }
                 Ok(Value::None)
             }
@@ -2734,8 +2737,7 @@ fn make_re_module() -> Value {
         let ngroups = re.captures_len().saturating_sub(1);
         let mut out: Vec<Value> = Vec::new();
         let mut last = 0usize;
-        let mut n = 0usize;
-        for caps in re.captures_iter(s) {
+        for (n, caps) in re.captures_iter(s).enumerate() {
             if maxsplit != 0 && n >= maxsplit {
                 break;
             }
@@ -2748,7 +2750,6 @@ fn make_re_module() -> Value {
                 }
             }
             last = m0.end();
-            n += 1;
         }
         out.push(Value::Str(Rc::new(s[last..].to_owned())));
         out

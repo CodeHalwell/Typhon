@@ -429,7 +429,8 @@ impl Interpreter {
                                 Value::Instance(inst) => {
                                     if inst.fields.borrow_mut().remove(a.attr.as_str()).is_none() {
                                         return Err(attribute_error(format!(
-                                            "{}",
+                                            "'{}' object has no attribute '{}'",
+                                            inst.class.name,
                                             a.attr.as_str()
                                         )));
                                     }
@@ -3747,19 +3748,7 @@ impl Interpreter {
 
     // ── Comprehensions ─────────────────────────────────────────────────────
 
-    fn run_comprehension<F>(
-        &mut self,
-        generators: &[ast::Comprehension],
-        env: &EnvRef,
-        mut emit: F,
-    ) -> Result<(), Unwind>
-    where
-        F: FnMut(&mut Self, &EnvRef) -> Result<(), Unwind>,
-    {
-        self.run_comprehension_leaking(generators, &[], env, &mut emit)
-    }
-
-    /// Like `run_comprehension`, but after the comprehension finishes, copies
+    /// Runs a comprehension and, after it finishes, copies
     /// any walrus (`:=`) target named in `leak_names` from the comprehension's
     /// private scope out into the enclosing `env` — Python leaks the LAST
     /// value of a comprehension walrus target into the containing scope.
@@ -3916,26 +3905,20 @@ impl Interpreter {
                         if let Err(e) = result {
                             // An error escaping the handler: finally still runs,
                             // and if finally itself raises, that wins (D5).
-                            if let Err(fin) = self.exec_block(&t.finalbody, env) {
-                                return Err(fin);
-                            }
+                            self.exec_block(&t.finalbody, env)?;
                             return Err(e);
                         }
                         break;
                     }
                 }
                 if !found {
-                    if let Err(fin) = self.exec_block(&t.finalbody, env) {
-                        return Err(fin);
-                    }
+                    self.exec_block(&t.finalbody, env)?;
                     return Err(Unwind::Exception(exc));
                 }
                 Ok(())
             }
             Err(other) => {
-                if let Err(fin) = self.exec_block(&t.finalbody, env) {
-                    return Err(fin);
-                }
+                self.exec_block(&t.finalbody, env)?;
                 return Err(other);
             }
         };

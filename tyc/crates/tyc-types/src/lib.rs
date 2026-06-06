@@ -2981,9 +2981,7 @@ impl<'a> Checker<'a> {
                 // All built-in container heads are sized; user generic
                 // classes are sized iff they define `__len__` (lenient
                 // when the hierarchy isn't fully known).
-                if is_builtin_generic_head(head) {
-                    true
-                } else if !self.class_hierarchy_fully_known(head) {
+                if is_builtin_generic_head(head) || !self.class_hierarchy_fully_known(head) {
                     true
                 } else {
                     self.find_method(head, "__len__").is_some()
