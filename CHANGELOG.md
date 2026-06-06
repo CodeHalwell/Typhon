@@ -113,6 +113,23 @@ mismatch, and interface conformance were all correctly rejected).
 - **A complex base raised to a non-negative integer power** is computed by
   repeated multiplication for an exact result (`(1j) ** 2` → `-1+0j`).
 
+### Fixed — checker soundness + a false-reject (third batch)
+
+- **`**kwargs: T` value typing.** Keyword-argument values absorbed by a
+  `**kwargs: T` parameter are checked against `T` — `f(a=1, b="oops")` for
+  `def f(**kwargs: int)` is now rejected (was unchecked; crashed at
+  runtime). `**kwargs: object` accepts anything. (Covers free/local
+  functions; method/cross-module `**kwargs` value-checking is still open.)
+- **Contravariant `Callable` parameters.** Passing a function with a
+  more-general parameter type where a more-specific one is expected is sound
+  and now accepted: `Callable[[Animal], str]` is assignable to
+  `Callable[[Dog], str]` (params contravariant via the inheritance-aware
+  `is_assignable`); the unsound reverse stays rejected.
+- **`unsafe:` value leak into an annotated assignment.** A value produced
+  inside an `unsafe:` block that flows into a concrete-typed `let n: T = v`
+  now fires `tyc::unsafe_value_leak` (previously only audited on `return`);
+  re-asserting inside the block or targeting `object`/`T?` is exempt.
+
 ### Fixed — VM nested-package `pub *`
 
 - **`pub *` in a package's `__init__.ty` is aggregated under `tyc run`.**

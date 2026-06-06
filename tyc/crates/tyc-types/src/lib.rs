@@ -1868,6 +1868,17 @@ struct Checker<'a> {
     /// honour default values, `*args`, `**kwargs`, and keyword arguments
     /// without rejecting valid calls (FINDINGS #44).
     function_arity_info: HashMap<String, ArityInfo>,
+    /// ITEM 1: declared VALUE type of each function's `**kwargs`
+    /// parameter, keyed identically to `function_arity_info`
+    /// (bare function name, or `module.attr` for dotted callees).
+    /// Stored in a side map rather than on `ArityInfo` so external
+    /// crates that build `ArityInfo` via full struct literals
+    /// (`tyc-vm`, the `tyc` binary's venv introspection) keep
+    /// compiling unchanged. `Type::Unknown` when the `**kwargs` is
+    /// unannotated; absent when the function has no `**kwargs`. Used at
+    /// call sites to type-check keyword arguments absorbed by
+    /// `**kwargs: T` against `T`.
+    function_kwarg_types: HashMap<String, Type>,
     /// Names of `async def` functions declared at module top level.
     /// Used by the call-site arm to emit `tyc::missing_await`
     /// (FINDINGS #49) when a sync context calls one without `await`.
@@ -2240,6 +2251,7 @@ impl<'a> Checker<'a> {
             classes: Vec::new(),
             function_signatures: HashMap::new(),
             function_arity_info: HashMap::new(),
+            function_kwarg_types: HashMap::new(),
             async_functions: std::collections::HashSet::new(),
             inside_await: 0,
             in_sync_function: false,
@@ -2340,6 +2352,47 @@ impl<'a> Checker<'a> {
     fn is_assignable(&self, expected: &Type, actual: &Type) -> bool {
         if assignable(expected, actual) {
             return true;
+        }
+        // ITEM 2: structural Callable / function assignability with
+        // class-aware variance. The standalone `assignable` already
+        // implements contravariant params + covariant return, but it
+        // recurses through the plain `assignable` helper which doesn't
+        // know about class inheritance, interfaces, or newtypes. So
+        // `Callable[[Animal], str]` was wrongly rejected where
+        // `Callable[[Dog], str]` is expected, even though `Animal` is a
+        // supertype of `Dog` (function params are contravariant: a
+        // handler that accepts any `Animal` can stand in for one that
+        // only needs to accept a `Dog`). Re-run the structural check
+        // through `self.is_assignable` so the nominal rules apply to the
+        // parameter and return slots.
+        if let (
+            Type::Function {
+                params: ep,
+                ret: er,
+                variadic: ev,
+            },
+            Type::Function {
+                params: ap,
+                ret: ar,
+                variadic: _av,
+            },
+        ) = (expected, actual)
+        {
+            // `Callable[..., R]` (empty params + variadic) accepts any
+            // function with an assignable (covariant) return type.
+            if *ev && ep.is_empty() {
+                return self.is_assignable(er, ar);
+            }
+            if ep.len() != ap.len() {
+                return false;
+            }
+            // Params contravariant: each expected param type must be
+            // assignable INTO the corresponding actual param type
+            // (`is_assignable(actual_param, expected_param)`). Return
+            // covariant: actual's return must be assignable to expected's
+            // return.
+            let params_ok = ep.iter().zip(ap).all(|(e, a)| self.is_assignable(a, e));
+            return params_ok && self.is_assignable(er, ar);
         }
         // Canonicalize module aliases on both sides and retry. An
         // annotation `let c: f.Cls` (where `import foo as f`) produces
@@ -4332,10 +4385,29 @@ fn audit_check_escape(c: &mut Checker, expr: &Expr) {
 /// future work — Rule 5 enforcement only needs the bare-name escape
 /// path to land for the spec text to hold. O14 / FINDINGS #107.
 fn check_unsafe_return_leak(c: &mut Checker, expr: &Expr) {
+    let Some(ret_ty) = c.current_return.clone() else {
+        return;
+    };
+    check_unsafe_leak_into(c, expr, &ret_ty);
+}
+
+/// Shared core of the `unsafe:` value-leak audit (Rule 5 / SKILL §5.9):
+/// fire `tyc::unsafe_value_leak` when a bare `Name` whose binding was
+/// first introduced inside an `unsafe:` block flows OUT into a
+/// concrete-typed `target_ty` context — a `return` whose function
+/// declares a concrete return type, or an annotated assignment
+/// `let n: T = v` — without a safe-scope re-assertion.
+///
+/// `target_ty` is the concrete type the value is being committed to:
+/// the function's return type for `return v`, or the annotation for
+/// `let n: T = v`. Deeper data-flow (expressions over unsafe values,
+/// indexing, attribute access) remains future work; the bare-name
+/// escape path is what the spec text requires. O14 / FINDINGS #107.
+fn check_unsafe_leak_into(c: &mut Checker, expr: &Expr, target_ty: &Type) {
     // Inside an `unsafe:` block, every diagnostic is suppressed — the
     // user is explicitly opting out of the static check. The leak
     // diagnostic only fires when the binding *crosses* the boundary,
-    // i.e. we are *outside* the block by the time we see the `return`.
+    // i.e. we are *outside* the block by the time we see the escape.
     if c.unsafe_depth > 0 {
         return;
     }
@@ -4364,20 +4436,17 @@ fn check_unsafe_return_leak(c: &mut Checker, expr: &Expr) {
         Some(t) => t,
         None => return,
     };
-    let Some(ret_ty) = c.current_return.clone() else {
-        return;
-    };
-    // Skip when the return type permits "no value" — those slots are
-    // already lax enough that an unsafe-origin value isn't a real
-    // surprise to the caller.
-    if !return_type_requires_value(&ret_ty) {
+    // Skip when the target permits "no value" / accepts anything
+    // (`None`, `T?`, `object`, `Unknown`) — those slots are already
+    // lax enough that an unsafe-origin value isn't a real surprise.
+    if !return_type_requires_value(target_ty) || is_object_type(target_ty) {
         return;
     }
     // If the binding's declared type is *already* assignable to the
-    // return type via the normal nominal/structural rules (i.e. the
-    // user annotated the unsafe binding with a concrete type and the
-    // check passed), the cross is sound — no diagnostic needed.
-    if c.is_assignable(&ret_ty, &declared) && !matches!(declared, Type::Unknown) {
+    // target via the normal nominal/structural rules (i.e. the user
+    // annotated the unsafe binding with a concrete type and the check
+    // passed), the cross is sound — no diagnostic needed.
+    if c.is_assignable(target_ty, &declared) && !matches!(declared, Type::Unknown) {
         return;
     }
     let span = (
@@ -4385,10 +4454,10 @@ fn check_unsafe_return_leak(c: &mut Checker, expr: &Expr) {
         expr.range().end().to_usize(),
     );
     let length = span.1.saturating_sub(span.0).max(1);
-    let ret_display = ret_ty.display();
+    let target_display = target_ty.display();
     c.diagnostics.push_error(TycError::unsafe_value_leak(
         name,
-        ret_display,
+        target_display,
         &c.path,
         c.source,
         span.0,
@@ -5398,6 +5467,14 @@ fn collect_classes_and_functions(c: &mut Checker, body: &[Stmt]) {
                 f.name.as_str().to_owned(),
                 arity_info_from_parameters(f.parameters.as_ref(), &classes, &tps),
             );
+            // ITEM 1: stash the `**kwargs` value type alongside, so the
+            // call site can type-check absorbed keyword-argument values.
+            if let Some(kw_ty) =
+                kwarg_value_type_from_parameters(f.parameters.as_ref(), &classes, &tps)
+            {
+                c.function_kwarg_types
+                    .insert(f.name.as_str().to_owned(), kw_ty);
+            }
             // Record `async def` names so the call-site arm can emit
             // `tyc::missing_await` for sync calls (FINDINGS #49). The
             // `async_without_await` warning is emitted from
@@ -6781,6 +6858,24 @@ fn arity_info_from_parameters(
     arity_info_from_parameters_with_returns(parameters, None, classes, type_params)
 }
 
+/// ITEM 1: declared VALUE type of a function's `**kwargs` parameter.
+/// `Some(Type::Unknown)` for an unannotated `**kwargs`, `None` when the
+/// function has no `**kwargs`. Kept in a Checker-side map (not on
+/// `ArityInfo`) so external crates' full-literal `ArityInfo`
+/// constructions stay source-compatible.
+fn kwarg_value_type_from_parameters(
+    parameters: &ruff_python_ast::Parameters,
+    classes: &[String],
+    type_params: &[String],
+) -> Option<Type> {
+    parameters.kwarg.as_ref().map(|kw| {
+        kw.annotation
+            .as_ref()
+            .map(|ann| type_from_annotation_with_params(ann, classes, type_params))
+            .unwrap_or(Type::Unknown)
+    })
+}
+
 /// Variant of [`arity_info_from_parameters`] that also records the
 /// declared parameter / return types on the resulting [`ArityInfo`].
 /// Used by the cross-module shape extractor so consumers see real
@@ -6971,6 +7066,15 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                     );
                     c.mismatch(&ann_type, &value_type, span);
                 }
+                // ITEM 3 / Rule 5: an `unsafe:`-origin value flowing into
+                // a concrete-typed annotated binding (`let n: int = v`
+                // where `v` is `Unsafe[str]`) must be re-asserted at the
+                // boundary; otherwise it leaks. The unsafe-origin value's
+                // inferred type is typically `Unknown`, which slips past
+                // `is_assignable` above, so audit the bare-name escape
+                // explicitly here. `let n: object = v` and `let n: T? = v`
+                // are exempt (handled inside the helper).
+                check_unsafe_leak_into(c, value, &ann_type);
                 // Audit hook: an annotated assignment with a bypass-
                 // constructed instance on the RHS counts as an escape
                 // — the value is being stored under an explicit type
@@ -11170,11 +11274,80 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
                     // would keep alive across the loop.
                     let kwarg_param_names: Option<Vec<String>> =
                         arity_info.as_ref().map(|info| info.param_names.clone());
+                    // ITEM 1: kw-only parameter names/types and the
+                    // `**kwargs` value type, so a keyword argument that
+                    // doesn't match a positional parameter is still
+                    // type-checked — against its matching kw-only
+                    // parameter's type, or (when absorbed by `**kwargs: T`)
+                    // against `T`. The `**kwargs` value type lives in the
+                    // Checker-side `function_kwarg_types` map (keyed like
+                    // `function_arity_info`); only consulted when the
+                    // function actually declares `**kwargs` (`has_kwarg`),
+                    // so an unmatched keyword on a function WITHOUT
+                    // `**kwargs` still flows to the arity unknown-kwarg path.
+                    let kwonly_names: Vec<String> = arity_info
+                        .as_ref()
+                        .map(|info| info.kwonly_names.clone())
+                        .unwrap_or_default();
+                    let kwonly_types: Vec<Type> = arity_info
+                        .as_ref()
+                        .map(|info| info.kwonly_types.clone())
+                        .unwrap_or_default();
+                    let has_kwarg = arity_info
+                        .as_ref()
+                        .map(|info| info.has_kwarg)
+                        .unwrap_or(false);
+                    let kwarg_value_type: Option<Type> = if has_kwarg {
+                        fn_name
+                            .as_deref()
+                            .and_then(|n| c.function_kwarg_types.get(n))
+                            .cloned()
+                    } else {
+                        None
+                    };
                     if let Some(param_names) = kwarg_param_names {
                         for kw in kw_args {
                             let Some(ident) = &kw.arg else { continue };
                             let Some(idx) = param_names.iter().position(|p| p == ident.as_str())
                             else {
+                                // No positional parameter matches this name.
+                                // Try a kw-only parameter; failing that, the
+                                // argument is absorbed by `**kwargs: T` and
+                                // must have a value assignable to `T`.
+                                let expected_kw: Option<Type> = kwonly_names
+                                    .iter()
+                                    .position(|p| p == ident.as_str())
+                                    .and_then(|ki| kwonly_types.get(ki).cloned())
+                                    .or_else(|| kwarg_value_type.clone());
+                                if let Some(expected_kw) = expected_kw {
+                                    let actual =
+                                        infer_expr_ctx(c, &kw.value, Some(&expected_kw));
+                                    let nullable_into_non_nullable =
+                                        !c.unwrap_alias(&expected_kw).is_nullable()
+                                            && actual.is_nullable()
+                                            && !is_object_type(&expected_kw);
+                                    if nullable_into_non_nullable {
+                                        if let Expr::Name(n) = &kw.value {
+                                            let span = (
+                                                n.range.start().to_usize(),
+                                                n.range.start().to_usize() + n.id.as_str().len(),
+                                            );
+                                            c.nullable_use(n.id.as_str(), &expected_kw, span);
+                                        } else {
+                                            let span = (
+                                                kw.value.range().start().to_usize(),
+                                                kw.value.range().end().to_usize(),
+                                            );
+                                            c.mismatch(&expected_kw, &actual, span);
+                                        }
+                                    } else if !c.is_assignable(&expected_kw, &actual) {
+                                        let span = (
+                                            kw.value.range().start().to_usize(),
+                                            kw.value.range().end().to_usize(),
+                                        );
+                                        c.mismatch(&expected_kw, &actual, span);
+                                    }
+                                }
                                 continue;
                             };
                             if idx >= params.len() {
@@ -18920,6 +19093,192 @@ def f() -> int:
                 .iter()
                 .any(|e| matches!(e, TycError::UnsafeValueLeak { .. })),
             "inner-annotated unsafe binding must not trigger the leak; got {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn unsafe_leak_fires_on_annotated_assignment() {
+        // ITEM 3 / Rule 5: an `unsafe:`-origin value flowing into a
+        // concrete-typed annotated binding (`let n: int = v`) without a
+        // re-assertion must fire `tyc::unsafe_value_leak`. Previously the
+        // audit only covered `return v`, so this assignment leak passed
+        // `tyc check` and crashed at runtime.
+        let src = "\
+def main() -> None:
+    unsafe:
+        let v = \"not a number\"
+    let n: int = v
+    print(n + 1)
+";
+        let d = check(src);
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::UnsafeValueLeak { .. })),
+            "unsafe value leaking into `let n: int = v` must fire; got {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn unsafe_leak_assignment_silenced_by_object_target() {
+        // `let n: object = v` is a sound widening — `object` accepts any
+        // value — so the assignment leak audit must stay silent.
+        let src = "\
+def main() -> None:
+    unsafe:
+        let v = \"not a number\"
+    let n: object = v
+    print(n)
+";
+        let d = check(src);
+        assert!(
+            !d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::UnsafeValueLeak { .. })),
+            "object target must not trigger the assignment leak; got {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn unsafe_leak_assignment_silenced_by_inner_annotation() {
+        // Re-asserting the type inside the `unsafe:` block (or via a
+        // safe-scope binding) defeats the assignment-leak audit.
+        let src = "\
+def main() -> None:
+    unsafe:
+        let v = \"not a number\"
+        let checked: int = int(v)
+    let n: int = checked
+    print(n + 1)
+";
+        let d = check(src);
+        assert!(
+            !d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::UnsafeValueLeak { .. })),
+            "re-asserted unsafe value must not trigger the assignment leak; got {:?}",
+            d.errors()
+        );
+    }
+
+    // ── ITEM 1: `**kwargs: T` value type-checking ────────────────────────
+
+    #[test]
+    fn kwargs_value_type_mismatch_is_rejected() {
+        // A keyword argument absorbed by `**kwargs: int` must have a
+        // value assignable to `int`. Pre-fix this was unchecked and the
+        // bad `str` value only crashed at runtime.
+        let src = "\
+def f(**kwargs: int) -> None:
+    print(len(kwargs))
+def main() -> None:
+    f(a=1, b=\"oops\")
+";
+        let d = check(src);
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::TypeMismatch { expected, .. } if expected == "int")),
+            "**kwargs: int must reject a str value; got {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn kwargs_value_type_match_is_clean() {
+        // Every kwarg value assignable to the `**kwargs` element type
+        // must pass cleanly.
+        let src = "\
+def f(**kwargs: int) -> None:
+    print(len(kwargs))
+def main() -> None:
+    f(a=1, b=2)
+";
+        let d = check(src);
+        assert!(
+            !d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::TypeMismatch { .. })),
+            "**kwargs: int must accept int values; got {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn kwargs_object_value_accepts_anything() {
+        // `**kwargs: object` is the canonical "accept anything" idiom.
+        let src = "\
+def f(**kwargs: object) -> None:
+    print(len(kwargs))
+def main() -> None:
+    f(a=1, b=\"oops\", c=3.0)
+";
+        let d = check(src);
+        assert!(
+            !d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::TypeMismatch { .. })),
+            "**kwargs: object must accept any value; got {:?}",
+            d.errors()
+        );
+    }
+
+    // ── ITEM 2: contravariant Callable parameters ────────────────────────
+
+    #[test]
+    fn callable_param_contravariance_is_accepted() {
+        // Passing a function with a MORE GENERAL parameter type where a
+        // more specific one is expected is sound (params contravariant):
+        // `Callable[[Animal], str]` is assignable to `Callable[[Dog], str]`.
+        let src = "\
+class Animal:
+    name: str
+class Dog(Animal):
+    breed: str
+def apply(f: Callable[[Dog], str], d: Dog) -> str:
+    return f(d)
+def animal_name(a: Animal) -> str:
+    return a.name
+def main() -> None:
+    print(apply(animal_name, Dog(name=\"Rex\", breed=\"Lab\")))
+";
+        let d = check(src);
+        assert!(
+            !d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::TypeMismatch { .. })),
+            "contravariant Callable param must be accepted; got {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn callable_param_covariance_is_rejected() {
+        // The unsound direction must still be rejected: a function that
+        // only accepts `Dog` cannot stand in where any `Animal` may be
+        // passed (`Callable[[Dog], str]` is NOT assignable to
+        // `Callable[[Animal], str]`).
+        let src = "\
+class Animal:
+    name: str
+class Dog(Animal):
+    breed: str
+def apply(f: Callable[[Animal], str], a: Animal) -> str:
+    return f(a)
+def dog_breed(d: Dog) -> str:
+    return d.breed
+def main() -> None:
+    print(apply(dog_breed, Animal(name=\"Rex\")))
+";
+        let d = check(src);
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::TypeMismatch { .. })),
+            "covariant Callable param must be rejected; got {:?}",
             d.errors()
         );
     }
