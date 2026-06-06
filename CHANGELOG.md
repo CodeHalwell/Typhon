@@ -113,6 +113,31 @@ mismatch, and interface conformance were all correctly rejected).
 - **A complex base raised to a non-negative integer power** is computed by
   repeated multiplication for an exact result (`(1j) ** 2` → `-1+0j`).
 
+### Fixed — fifth stress round (VM data model + a second soundness hole)
+
+VM:
+- **`__bool__` / `__len__` are consulted for truthiness** (`bool(x)`, `if x`,
+  `and`/`or`/`not`, ternaries, comprehension filters, match guards, `assert`).
+  An empty `__len__` object is now falsy.
+- **Dynamic-attribute builtins** `getattr` (with default), `setattr`,
+  `hasattr`, `delattr`, `vars` added to the VM.
+- **Class-level attribute access** — `ClassVar[T]` fields and `plain class`
+  constants are readable as `Cls.X` and `instance.X` (the VM was treating
+  every annotated class-body assignment as an instance slot). Root cause:
+  the VM's `run` path never passed the preprocessor's plain/raw/frozen
+  class-kind markers to the desugarer, so `plain class` / `class!` /
+  `class … frozen` were desugared differently from `tyc build`; the markers
+  are now threaded through.
+
+Type-checker soundness:
+- **Optional element types are preserved on extraction.** Indexing,
+  iterating, or comprehending a `list[T?]` / `dict[K, V?]` / set yields `T?`,
+  not `T`. Previously every extraction dropped the `?`, so `let a: Animal =
+  src[0]` (with `src: list[Animal?]`) type-checked clean then crashed with
+  `AttributeError: 'NoneType'`. Comprehensions are now type-checked at all
+  (they previously inferred `Unknown`). The fix surfaced and corrected one
+  genuine latent unsoundness in `examples/68-json-rpc-builder`.
+
 ### Fixed — type-checker soundness
 
 - **Generic-class constructor arguments are validated against the bound

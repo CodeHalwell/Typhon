@@ -171,14 +171,14 @@ impl Interpreter {
             }
             Stmt::If(s) => {
                 let cond = self.eval_expr(&s.test, env)?;
-                if cond.truthy() {
+                if self.is_truthy(&cond)? {
                     self.exec_block(&s.body, env)?;
                 } else {
                     for clause in &s.elif_else_clauses {
                         match &clause.test {
                             Some(test) => {
                                 let c = self.eval_expr(test, env)?;
-                                if c.truthy() {
+                                if self.is_truthy(&c)? {
                                     self.exec_block(&clause.body, env)?;
                                     return Ok(());
                                 }
@@ -196,7 +196,7 @@ impl Interpreter {
                 let mut completed = true;
                 loop {
                     let cond = self.eval_expr(&s.test, env)?;
-                    if !cond.truthy() {
+                    if !self.is_truthy(&cond)? {
                         break;
                     }
                     match self.exec_block(&s.body, env) {
@@ -370,7 +370,7 @@ impl Interpreter {
             Stmt::Match(m) => self.exec_match(m, env),
             Stmt::Assert(a) => {
                 let cond = self.eval_expr(&a.test, env)?;
-                if !cond.truthy() {
+                if !self.is_truthy(&cond)? {
                     let msg = match &a.msg {
                         Some(m) => self.eval_expr(m, env)?.py_str(),
                         None => "".to_string(),
@@ -462,6 +462,36 @@ impl Interpreter {
         // (constants, comprehensions used as defaults) get evaluated.
         let body_env = Env::new_child(env);
 
+        // A class is dataclass-shaped (annotated assigns are instance fields)
+        // when it carries a `@dataclass` decorator. A `plain class` emits a
+        // bare class with no decorator, so its annotated assigns with a
+        // default are class attributes, not slots. `ClassVar[...]` is always
+        // a class attribute regardless of class kind.
+        let rightmost_name = |e: &Expr| -> Option<String> {
+            match e {
+                Expr::Name(n) => Some(n.id.as_str().to_owned()),
+                Expr::Attribute(a) => Some(a.attr.as_str().to_owned()),
+                Expr::Call(call) => match call.func.as_ref() {
+                    Expr::Name(n) => Some(n.id.as_str().to_owned()),
+                    Expr::Attribute(a) => Some(a.attr.as_str().to_owned()),
+                    _ => None,
+                },
+                _ => None,
+            }
+        };
+        let is_dataclass = c
+            .decorator_list
+            .iter()
+            .any(|d| rightmost_name(&d.expression).as_deref() == Some("dataclass"));
+        let is_classvar = |ann: &Expr| -> bool {
+            let head = match ann {
+                Expr::Subscript(s) => s.value.as_ref(),
+                other => other,
+            };
+            matches!(head, Expr::Name(n) if n.id.as_str() == "ClassVar")
+                || matches!(head, Expr::Attribute(a) if a.attr.as_str() == "ClassVar")
+        };
+
         let mut fields = Vec::new();
         let mut methods: HashMap<String, Rc<Function>> = HashMap::new();
         let mut class_attrs: HashMap<String, Value> = HashMap::new();
@@ -501,10 +531,21 @@ impl Interpreter {
                             Some(e) => Some(self.eval_expr(e, &body_env)?),
                             None => None,
                         };
-                        fields.push(ClassField {
-                            name: n.id.as_str().to_owned(),
-                            default,
-                        });
+                        let classvar = is_classvar(&a.annotation);
+                        // ClassVar is always a class attribute. In a non-
+                        // dataclass (`plain class`) an annotated assign with a
+                        // default is also a class attribute, not an instance
+                        // slot. Everything else is a dataclass field.
+                        if classvar || (!is_dataclass && default.is_some()) {
+                            if let Some(v) = default {
+                                class_attrs.insert(n.id.as_str().to_owned(), v);
+                            }
+                        } else {
+                            fields.push(ClassField {
+                                name: n.id.as_str().to_owned(),
+                                default,
+                            });
+                        }
                     }
                 }
                 Stmt::Assign(a) => {
@@ -1031,13 +1072,13 @@ impl Interpreter {
                     let val = self.eval_expr(v, env)?;
                     match b.op {
                         BoolOp::And => {
-                            if !val.truthy() {
+                            if !self.is_truthy(&val)? {
                                 return Ok(val);
                             }
                             last = val;
                         }
                         BoolOp::Or => {
-                            if val.truthy() {
+                            if self.is_truthy(&val)? {
                                 return Ok(val);
                             }
                             last = val;
@@ -1108,7 +1149,7 @@ impl Interpreter {
             }
             Expr::If(t) => {
                 let cond = self.eval_expr(&t.test, env)?;
-                if cond.truthy() {
+                if self.is_truthy(&cond)? {
                     self.eval_expr(&t.body, env)
                 } else {
                     self.eval_expr(&t.orelse, env)
@@ -2066,6 +2107,25 @@ impl Interpreter {
         Ok(None)
     }
 
+    /// Python truthiness honouring a user `__bool__` then `__len__` on
+    /// instances (CPython's `object.__bool__` protocol). Falls back to the
+    /// structural `Value::truthy` for everything else.
+    pub fn is_truthy(&mut self, v: &Value) -> Result<bool, Unwind> {
+        if let Value::Instance(i) = v {
+            if self.find_method(&i.class, "__bool__").is_some() {
+                if let Some(r) = self.call_dunder0(v, "__bool__")? {
+                    return Ok(r.truthy());
+                }
+            }
+            if self.find_method(&i.class, "__len__").is_some() {
+                if let Some(r) = self.call_dunder0(v, "__len__")? {
+                    return Ok(r.to_int()? != 0);
+                }
+            }
+        }
+        Ok(v.truthy())
+    }
+
     /// `str(v)` honouring a user `__str__` (then `__repr__`) on instances.
     ///
     /// For containers, Python's `str()` renders elements via `repr()`, so a
@@ -2484,7 +2544,7 @@ impl Interpreter {
 
     fn unop(&mut self, op: UnaryOp, v: &Value) -> Result<Value, Unwind> {
         match op {
-            UnaryOp::Not => Ok(Value::Bool(!v.truthy())),
+            UnaryOp::Not => Ok(Value::Bool(!self.is_truthy(v)?)),
             UnaryOp::USub => match v {
                 Value::Int(i) => Ok(Value::Int(-i)),
                 Value::Float(x) => Ok(Value::Float(-*x)),
@@ -2820,6 +2880,13 @@ impl Interpreter {
                     });
                     return Ok(Value::Native(Rc::new(nf)));
                 }
+                // Fall back to class-level attributes (ClassVar / plain-class
+                // constants) — `instance.K` reads `type(instance).K`.
+                if let Some(v) = inst.class.class_attrs.borrow().get(attr) {
+                    if !is_enum_sentinel(attr) {
+                        return Ok(v.clone());
+                    }
+                }
                 Err(attribute_error(format!(
                     "'{}' object has no attribute '{}'",
                     inst.class.name, attr
@@ -3035,7 +3102,7 @@ impl Interpreter {
         }
     }
 
-    fn set_attr(&mut self, receiver: &Value, attr: &str, value: Value) -> Result<(), Unwind> {
+    pub fn set_attr(&mut self, receiver: &Value, attr: &str, value: Value) -> Result<(), Unwind> {
         match receiver {
             Value::Instance(i) => {
                 i.fields.borrow_mut().insert(attr.to_owned(), value);
@@ -3327,9 +3394,8 @@ impl Interpreter {
             Recurse::Filter(func, inner) => loop {
                 match self.iter_next(&Value::Iter(inner.clone()))? {
                     Some(v) => {
-                        let keep = self
-                            .call_value(func.clone(), vec![v.clone()], &[])?
-                            .truthy();
+                        let kv = self.call_value(func.clone(), vec![v.clone()], &[])?;
+                        let keep = self.is_truthy(&kv)?;
                         if keep {
                             return Ok(Some(v));
                         }
@@ -3375,7 +3441,8 @@ impl Interpreter {
             self.assign_target(&g.target, v, env, None)?;
             let mut ok = true;
             for cond in &g.ifs {
-                if !self.eval_expr(cond, env)?.truthy() {
+                let __ac = self.eval_expr(cond, env)?;
+                if !self.is_truthy(&__ac)? {
                     ok = false;
                     break;
                 }
@@ -3621,7 +3688,7 @@ impl Interpreter {
             let scope = Env::new_child(env);
             if self.pattern_matches(&case.pattern, &subject, &scope)? {
                 let ok = match &case.guard {
-                    Some(g) => self.eval_expr(g, &scope)?.truthy(),
+                    Some(g) => { let gv = self.eval_expr(g, &scope)?; self.is_truthy(&gv)? }
                     None => true,
                 };
                 if ok {

@@ -7270,6 +7270,10 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                 );
                 c.mismatch_with("an iterable".to_string(), iter_ty.display(), span);
             }
+            // Element type of the iterable, with `?` preserved. For
+            // unmodelled shapes (`Unknown`, user classes, bare containers)
+            // fall back to `Unknown` so we stay permissive.
+            let elem_ty = iterable_element_type(&iter_ty).unwrap_or(Type::Unknown);
             if let Expr::Name(n) = f.target.as_ref() {
                 let span = (
                     n.range.start().to_usize(),
@@ -7277,8 +7281,8 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                 );
                 c.env.declare(TypeBinding {
                     name: n.id.as_str().to_owned(),
-                    declared: Type::Unknown,
-                    narrowed: Type::Unknown,
+                    declared: elem_ty.clone(),
+                    narrowed: elem_ty,
                     span,
                     from_unsafe: c.unsafe_depth > 0,
                 });
@@ -9812,6 +9816,28 @@ fn builtin_generic_method(recv: &Type, attr: &str) -> Option<Type> {
             )),
             variadic: false,
         }),
+        // Mapping views — preserve the element type (with `?`) so iterating
+        // `d.values()` over a `dict[K, V?]` yields `V?`, not `V`. Returning
+        // a parameterised view (rather than `Unknown`) is what closes the
+        // soundness hole on `for v in d.values(): v.attr`.
+        ("dict", "keys", [k, _v]) => Some(Type::Function {
+            params: vec![],
+            ret: Box::new(Type::Generic("KeysView".into(), vec![k.clone()])),
+            variadic: false,
+        }),
+        ("dict", "values", [_k, v]) => Some(Type::Function {
+            params: vec![],
+            ret: Box::new(Type::Generic("ValuesView".into(), vec![v.clone()])),
+            variadic: false,
+        }),
+        ("dict", "items", [k, v]) => Some(Type::Function {
+            params: vec![],
+            ret: Box::new(Type::Generic(
+                "ItemsView".into(),
+                vec![Type::Generic("tuple".into(), vec![k.clone(), v.clone()])],
+            )),
+            variadic: false,
+        }),
         _ => None,
     }
 }
@@ -10063,6 +10089,68 @@ fn truthy(t: &Type) -> Option<Type> {
         Type::Bool => Some(Type::Bool),
         Type::Union(_) if t.is_nullable() => Some(t.strip_none()),
         other => Some(other.clone()),
+    }
+}
+
+/// Element type produced by *iterating* `ty` (the binding type of `x` in
+/// `for x in ty:` and `[... for x in ty]`).
+///
+/// CRITICAL for soundness: when the container's element type is optional
+/// (`list[T?]`), iterating it must yield `T?`, NOT `T` — otherwise the
+/// `None` inhabitant is silently dropped and `x.attr` type-checks clean
+/// then crashes at runtime. We return the declared element type verbatim,
+/// `?` and all; any narrowing (`if x is not None:`) is applied afterwards
+/// by the separate flow-narrowing pass.
+///
+/// Returns `None` for shapes we don't model (user classes that may define
+/// `__iter__`, `Unknown` / `Any` / `TypeVar`, bare un-parameterised
+/// containers) so the caller keeps its permissive `Unknown` fallback and
+/// we don't introduce false positives.
+fn iterable_element_type(ty: &Type) -> Option<Type> {
+    match ty {
+        // `str` iterates to `str` (one-char strings); `bytes` to `int`.
+        Type::Str => Some(Type::Str),
+        Type::Bytes => Some(Type::Int),
+        Type::Generic(head, args) => match head.as_str() {
+            // Single-parameter sequences / read-only views / sets — element
+            // type is the sole parameter, preserved verbatim.
+            "list" | "set" | "frozenset" | "Sequence" | "Iterable" | "Iterator"
+            | "Collection" | "Container" | "Reversible" | "deque" | "Generator"
+            | "AsyncIterable" | "AsyncIterator" | "AsyncGenerator" | "tuple_variadic"
+            | "KeysView" | "ValuesView" | "ItemsView"
+                if args.len() == 1 =>
+            {
+                Some(args[0].clone())
+            }
+            // Iterating a mapping yields its KEYS.
+            "dict" | "Mapping" | "MutableMapping" if args.len() == 2 => Some(args[0].clone()),
+            // Fixed-arity tuple — iteration yields the union of every slot.
+            "tuple" if !args.is_empty() => Some(Type::union_of(args.clone())),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Element type produced by *subscripting* `ty` with a single integer-ish
+/// index (`x[i]` where `x: list[T]` etc.). Same soundness contract as
+/// [`iterable_element_type`]: the optional element type is preserved.
+///
+/// Tuple and dict subscript are handled inline at the call site (tuple
+/// needs the literal-index slot, dict needs the key-type diagnostic), so
+/// this helper only covers the homogeneous-sequence forms. Returns `None`
+/// for everything else to keep the permissive fallback.
+fn subscript_element_type(ty: &Type) -> Option<Type> {
+    match ty {
+        Type::Str => Some(Type::Str),
+        Type::Bytes => Some(Type::Int),
+        Type::Generic(head, args) => match head.as_str() {
+            "list" | "Sequence" | "deque" | "tuple_variadic" if args.len() == 1 => {
+                Some(args[0].clone())
+            }
+            _ => None,
+        },
+        _ => None,
     }
 }
 
@@ -11532,7 +11620,25 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
                             c.mismatch(key_ty, &slice_ty, span);
                             return args[1].clone();
                         }
+                        // No key-type diagnostic — but `d[k]` still yields
+                        // the value type V (with `?` preserved). Skip when
+                        // the index is slice syntax (`d[a:b]` is a runtime
+                        // error on dicts, handled elsewhere).
+                        if !matches!(s.slice.as_ref(), Expr::Slice(_)) {
+                            return args[1].clone();
+                        }
                     }
+                }
+            }
+            // Homogeneous-sequence indexing (`list[T]`, `Sequence[T]`,
+            // `str`, `bytes`). Preserve the full element type — including a
+            // trailing `?` — so extracting from a `list[T?]` honestly
+            // yields `T?` rather than silently dropping the `None`
+            // (the soundness hole). A slice index (`xs[a:b]`) yields the
+            // container itself, not an element, so leave it permissive.
+            if !matches!(s.slice.as_ref(), Expr::Slice(_)) {
+                if let Some(elem) = subscript_element_type(&value_ty) {
+                    return elem;
                 }
             }
             Type::Unknown
@@ -11775,7 +11881,140 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
             // tracks async functions as returning `T` directly.
             unwrap_awaitable(&inner).unwrap_or(inner)
         }
+        // Comprehensions / generator expressions. Each introduces its own
+        // scope; we bind every `for` target to the iterable's element type
+        // (with `?` preserved — the soundness contract) so the element /
+        // key / value expressions are type-checked against an HONEST
+        // element type. `[x.name for x in src]` where `src: list[Animal?]`
+        // therefore surfaces the nullable use just like the loop form.
+        Expr::ListComp(comp) => {
+            // Propagate the expected element type (`list[E]`) into the
+            // element expression so a literal body (`{...}`) converges on
+            // the annotated element type instead of widening to a union
+            // that trips invariant assignability.
+            let elt_expected = match expected {
+                Some(Type::Generic(h, a)) if (h == "list" || h == "Sequence") && a.len() == 1 => {
+                    Some(a[0].clone())
+                }
+                _ => None,
+            };
+            c.env.enter();
+            infer_comprehension_generators(c, &comp.generators);
+            let elt = infer_expr_ctx(c, &comp.elt, elt_expected.as_ref());
+            c.env.leave();
+            Type::Generic("list".into(), vec![elt])
+        }
+        Expr::SetComp(comp) => {
+            let elt_expected = match expected {
+                Some(Type::Generic(h, a)) if h == "set" && a.len() == 1 => Some(a[0].clone()),
+                _ => None,
+            };
+            c.env.enter();
+            infer_comprehension_generators(c, &comp.generators);
+            let elt = infer_expr_ctx(c, &comp.elt, elt_expected.as_ref());
+            c.env.leave();
+            Type::Generic("set".into(), vec![elt])
+        }
+        Expr::Generator(comp) => {
+            let elt_expected = match expected {
+                Some(Type::Generic(h, a))
+                    if (h == "Iterator" || h == "Iterable" || h == "Generator")
+                        && a.len() == 1 =>
+                {
+                    Some(a[0].clone())
+                }
+                _ => None,
+            };
+            c.env.enter();
+            infer_comprehension_generators(c, &comp.generators);
+            let elt = infer_expr_ctx(c, &comp.elt, elt_expected.as_ref());
+            c.env.leave();
+            // A generator expression is an `Iterator[T]`.
+            Type::Generic("Iterator".into(), vec![elt])
+        }
+        Expr::DictComp(comp) => {
+            let (k_expected, v_expected) = match expected {
+                Some(Type::Generic(h, a)) if h == "dict" && a.len() == 2 => {
+                    (Some(a[0].clone()), Some(a[1].clone()))
+                }
+                _ => (None, None),
+            };
+            c.env.enter();
+            infer_comprehension_generators(c, &comp.generators);
+            let k = match comp.key.as_ref() {
+                Some(key) => infer_expr_ctx(c, key, k_expected.as_ref()),
+                None => Type::Unknown,
+            };
+            let v = infer_expr_ctx(c, &comp.value, v_expected.as_ref());
+            c.env.leave();
+            Type::Generic("dict".into(), vec![k, v])
+        }
         _ => Type::Unknown,
+    }
+}
+
+/// Bind each comprehension `for` target to the iterable's element type and
+/// type-check the filter (`if`) clauses. Assumes a fresh scope has already
+/// been entered by the caller; the caller is responsible for `leave()`.
+///
+/// The element type carries any trailing `?` so the comprehension body is
+/// checked against the honest (pre-narrowing) element type. Apply
+/// narrowing-implying `if` filters here so `[x for x in src if x is not
+/// None]` keeps working without a false positive downstream.
+fn infer_comprehension_generators(
+    c: &mut Checker,
+    generators: &[ruff_python_ast::Comprehension],
+) {
+    for gen in generators {
+        let iter_ty = infer_expr(c, &gen.iter);
+        let elem_ty = iterable_element_type(&iter_ty).unwrap_or(Type::Unknown);
+        bind_comprehension_target(c, &gen.target, &elem_ty);
+        // Type-check / apply narrowing from each `if` filter so that
+        // `[x for x in src if x is not None]` strips the `?` from `x` for
+        // the element expression and stays a false-positive-free pass.
+        for cond in &gen.ifs {
+            let _ = infer_expr(c, cond);
+            let pos = collect_narrowings(c, cond, /*negate=*/ false);
+            apply_narrowings(c, &pos);
+        }
+    }
+}
+
+/// Recursively bind a comprehension `for` target to `elem_ty`. A bare
+/// `Name` binds directly; a tuple/list target (`for k, v in items`)
+/// distributes a fixed-arity tuple element type across its slots, falling
+/// back to `Unknown` per-slot when the element type isn't a matching tuple.
+fn bind_comprehension_target(c: &mut Checker, target: &Expr, elem_ty: &Type) {
+    match target {
+        Expr::Name(n) => {
+            let span = (
+                n.range.start().to_usize(),
+                n.range.start().to_usize() + n.id.as_str().len(),
+            );
+            c.env.declare(TypeBinding {
+                name: n.id.as_str().to_owned(),
+                declared: elem_ty.clone(),
+                narrowed: elem_ty.clone(),
+                span,
+                from_unsafe: c.unsafe_depth > 0,
+            });
+        }
+        Expr::Tuple(t) => {
+            let slots: Option<&Vec<Type>> = match elem_ty {
+                Type::Generic(h, a) if h == "tuple" && a.len() == t.elts.len() => Some(a),
+                _ => None,
+            };
+            for (i, sub) in t.elts.iter().enumerate() {
+                let sub_ty = slots.map(|a| a[i].clone()).unwrap_or(Type::Unknown);
+                bind_comprehension_target(c, sub, &sub_ty);
+            }
+        }
+        Expr::List(l) => {
+            for sub in &l.elts {
+                bind_comprehension_target(c, sub, &Type::Unknown);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -19266,6 +19505,283 @@ def label(p: Point) -> float:
                 .iter()
                 .any(|e| e.to_string().contains("totally_bogus_attr")),
             "must still flag bogus attr on a fully-known cross-module class; got: {:?}",
+            d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    // ── Optional-element extraction soundness (`list[T?]` etc.) ────────────────
+    //
+    // The systemic hole: extracting an element from a collection whose
+    // element type is optional (`T?`) used to drop the `?`, yielding `T`.
+    // Each extraction site below must now preserve the `?` so the resulting
+    // nullable use is caught, while honest optional annotations / narrowing
+    // / non-optional collections keep passing.
+
+    /// REJECT: `src[0]` where `src: list[Animal?]` is `Animal?`, not
+    /// `Animal`. Assigning it to `Animal` must fire `type_mismatch`.
+    #[test]
+    fn opt_elem_list_index_into_nonopt_rejected() {
+        let src = "\
+class Animal:
+    name: str
+
+def main() -> None:
+    let src: list[Animal | None] = [None]
+    let a: Animal = src[0]
+    print(a.name)
+";
+        let d = check(src);
+        assert!(
+            d.has_errors(),
+            "list[Animal?] indexed into Animal must be rejected; got no errors"
+        );
+    }
+
+    /// REJECT: indexing `list[int]` yields `int`, not `Unknown` — a
+    /// concrete mismatch against `str` must now fire.
+    #[test]
+    fn list_index_yields_element_type() {
+        let src = "\
+def main() -> None:
+    let xs: list[int] = [1]
+    let a: str = xs[0]
+    print(a)
+";
+        let d = check(src);
+        assert!(
+            d.has_errors(),
+            "list[int][0] is int and must not assign to str; got no errors"
+        );
+    }
+
+    /// REJECT: iterating `list[Animal?]` binds `x: Animal?`; `x.name`
+    /// must fire `nullable_use`.
+    #[test]
+    fn opt_elem_for_iteration_rejected() {
+        let src = "\
+class Animal:
+    name: str
+
+def main() -> None:
+    let src: list[Animal | None] = [None]
+    for x in src:
+        print(x.name)
+";
+        let d = check(src);
+        assert!(
+            d.has_errors(),
+            "iterating list[Animal?] must keep x nullable; got no errors"
+        );
+    }
+
+    /// REJECT: comprehension element expression is checked against the
+    /// nullable element type — `[x.name for x in src]` must fire.
+    #[test]
+    fn opt_elem_comprehension_rejected() {
+        let src = "\
+class Animal:
+    name: str
+
+def main() -> None:
+    let src: list[Animal | None] = [None]
+    let names: list[str] = [x.name for x in src]
+    print(names)
+";
+        let d = check(src);
+        assert!(
+            d.has_errors(),
+            "comprehension over list[Animal?] must flag x.name; got no errors"
+        );
+    }
+
+    /// REJECT: nested `m[0][0]` where `m: list[list[Animal?]]` is
+    /// `Animal?`.
+    #[test]
+    fn opt_elem_nested_index_rejected() {
+        let src = "\
+class Animal:
+    name: str
+
+def main() -> None:
+    let m: list[list[Animal | None]] = [[None]]
+    let a: Animal = m[0][0]
+    print(a.name)
+";
+        let d = check(src);
+        assert!(
+            d.has_errors(),
+            "nested list[list[Animal?]] index must stay nullable; got no errors"
+        );
+    }
+
+    /// REJECT: `dict[str, int?]` indexed yields `int?` — using it as a
+    /// non-optional `int` must fire.
+    #[test]
+    fn opt_elem_dict_index_rejected() {
+        let src = "\
+def main() -> None:
+    let d: dict[str, int | None] = {\"a\": None}
+    let n: int = d[\"a\"]
+    print(n)
+";
+        let d = check(src);
+        assert!(
+            d.has_errors(),
+            "dict[str, int?] index must yield int?, not int; got no errors"
+        );
+    }
+
+    /// REJECT: iterating `dict.values()` over `dict[str, Animal?]` yields
+    /// `Animal?`; `v.name` must fire.
+    #[test]
+    fn opt_elem_dict_values_iteration_rejected() {
+        let src = "\
+class Animal:
+    name: str
+
+def main() -> None:
+    let d: dict[str, Animal | None] = {\"a\": None}
+    for v in d.values():
+        print(v.name)
+";
+        let d = check(src);
+        assert!(
+            d.has_errors(),
+            "iterating dict.values() must keep v nullable; got no errors"
+        );
+    }
+
+    // ── Must-pass: honest annotations / narrowing / non-optional ──────────────
+
+    /// PASS: assigning `src[0]` to the correct `Animal?` annotation.
+    #[test]
+    fn opt_elem_list_index_into_optional_ok() {
+        let src = "\
+class Animal:
+    name: str
+
+def main() -> None:
+    let src: list[Animal | None] = [None]
+    let a: Animal | None = src[0]
+    print(a)
+";
+        let d = check(src);
+        assert!(
+            !d.has_errors(),
+            "src[0] assigned to Animal? must pass; got: {:?}",
+            d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    /// PASS: narrowing inside a `for` loop body restores non-nullability.
+    #[test]
+    fn opt_elem_for_iteration_narrowed_ok() {
+        let src = "\
+class Animal:
+    name: str
+
+def main() -> None:
+    let src: list[Animal | None] = [None]
+    for x in src:
+        if x is not None:
+            print(x.name)
+";
+        let d = check(src);
+        assert!(
+            !d.has_errors(),
+            "narrowed loop body must pass; got: {:?}",
+            d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    /// PASS: comprehension `if x is not None` filter narrows the element.
+    #[test]
+    fn opt_elem_comprehension_narrowed_ok() {
+        let src = "\
+class Animal:
+    name: str
+
+def main() -> None:
+    let src: list[Animal | None] = [None]
+    let names: list[str] = [x.name for x in src if x is not None]
+    print(names)
+";
+        let d = check(src);
+        assert!(
+            !d.has_errors(),
+            "comprehension with narrowing filter must pass; got: {:?}",
+            d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    /// PASS: non-optional `list[int]` indexed and used as `int`.
+    #[test]
+    fn nonopt_list_index_used_as_int_ok() {
+        let src = "\
+def main() -> None:
+    let xs: list[int] = [1, 2]
+    let a: int = xs[0]
+    print(a)
+";
+        let d = check(src);
+        assert!(
+            !d.has_errors(),
+            "list[int][0] used as int must pass; got: {:?}",
+            d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    /// PASS: fixed-arity tuple subscript stays precise (the reference
+    /// behaviour we model the fix after).
+    #[test]
+    fn tuple_subscript_precise_still_ok() {
+        let src = "\
+def main() -> None:
+    let t: tuple[int, str] = (1, \"x\")
+    let a: int = t[0]
+    let b: str = t[1]
+    print(a, b)
+";
+        let d = check(src);
+        assert!(
+            !d.has_errors(),
+            "tuple subscript must remain precise; got: {:?}",
+            d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    /// PASS: `dict.get(k)` still yields `V?` (unchanged) and assigns to
+    /// `int?`.
+    #[test]
+    fn dict_get_still_optional_ok() {
+        let src = "\
+def main() -> None:
+    let d: dict[str, int] = {\"a\": 1}
+    let v: int | None = d.get(\"a\")
+    print(v)
+";
+        let d = check(src);
+        assert!(
+            !d.has_errors(),
+            "dict.get must still be V?; got: {:?}",
+            d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    /// PASS: `for k, v in d.items()` unpacks the tuple element type so the
+    /// key/value methods resolve.
+    #[test]
+    fn dict_items_unpack_typed_ok() {
+        let src = "\
+def main() -> None:
+    let d: dict[str, int] = {\"a\": 1}
+    for k, v in d.items():
+        print(k.upper(), v + 1)
+";
+        let d = check(src);
+        assert!(
+            !d.has_errors(),
+            "dict.items() unpack must type k/v; got: {:?}",
             d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
         );
     }

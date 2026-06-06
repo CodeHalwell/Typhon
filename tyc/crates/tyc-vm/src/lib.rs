@@ -104,7 +104,31 @@ pub fn run_source(
     // Running the full desugar pass also rewrites \`extend\` user-classes
     // into method merges; the builtin-extension rewrite below handles the
     // \`extend str:\` / \`extend list:\` shape that desugar leaves alone.
-    let desugar_out = tyc_desugar::desugar_module(&module);
+    //
+    // Pass the preprocessor's class-kind markers (plain / raw / frozen) so
+    // the VM desugars `plain class` / `class!` / `class … frozen` exactly
+    // like `tyc build` — otherwise a `plain class` would be wrongly
+    // decorated as a `@dataclass` and its class-level constants treated as
+    // slots.
+    let desugar_out = tyc_desugar::desugar_module_with(
+        &module,
+        tyc_desugar::DesugarOptions {
+            raw_class_line_starts: preprocess::line_byte_starts(
+                &prep.python_source,
+                &prep.raw_class_lines,
+            ),
+            frozen_class_line_starts: preprocess::line_byte_starts(
+                &prep.python_source,
+                &prep.frozen_class_lines,
+            ),
+            plain_class_line_starts: preprocess::line_byte_starts(
+                &prep.python_source,
+                &prep.plain_class_lines,
+            ),
+            pub_names: prep.pub_names.clone(),
+            ..Default::default()
+        },
+    );
     module = desugar_out.module;
 
     // FINDINGS #21: rewrite \`x.method(args)\` to \`__typhon_ext_TYPE__method
@@ -753,6 +777,50 @@ if math.comb(5, 2) != 10:
     raise ValueError("comb wrong")
 if math.perm(5, 2) != 20:
     raise ValueError("perm wrong")
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    #[test]
+    fn truthiness_attrs_and_classvars() {
+        // Fifth stress round: __bool__/__len__ truthiness, dynamic-attribute
+        // builtins, ClassVar / plain-class class-level attribute access.
+        let src = r#"
+from typing import ClassVar
+
+class Bag:
+    items: list[int]
+impl Bag:
+    def __len__(self) -> int:
+        return len(self.items)
+
+class Flag:
+    on: bool
+impl Flag:
+    def __bool__(self) -> bool:
+        return self.on
+
+class C:
+    K: ClassVar[int] = 42
+    v: int
+
+plain class Reg:
+    VERSION: str = "1.0"
+
+def main() -> None:
+    if bool(Bag(items=[])) or not bool(Bag(items=[1])):
+        raise ValueError("__len__ truthiness wrong")
+    if bool(Flag(on=False)) or not bool(Flag(on=True)):
+        raise ValueError("__bool__ truthiness wrong")
+    let b: Bag = Bag(items=[1])
+    if getattr(b, "items") != [1] or not hasattr(b, "items") or hasattr(b, "nope"):
+        raise ValueError("getattr/hasattr wrong")
+    if C.K != 42 or C(v=1).K != 42:
+        raise ValueError("ClassVar access wrong")
+    if Reg.VERSION != "1.0":
+        raise ValueError("plain class const access wrong")
+
+main()
 "#;
         assert_eq!(run_capturing(src).unwrap(), 0);
     }

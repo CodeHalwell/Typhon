@@ -396,11 +396,90 @@ pub fn install(interp: &mut Interpreter) {
         Ok(Value::Float(v.to_float()?))
     });
 
-    native!("bool", |_i, args| Ok(Value::Bool(match args.first() {
-        Some(v) => v.truthy(),
+    native!("bool", |i, args| Ok(Value::Bool(match args.first() {
+        Some(v) => i.is_truthy(v)?,
         None => false,
     })));
 
+    native!("getattr", |i, args| {
+        let obj = args
+            .first()
+            .ok_or_else(|| type_error("getattr() requires arguments"))?
+            .clone();
+        let name = args
+            .get(1)
+            .ok_or_else(|| type_error("getattr() requires a name"))?
+            .py_str();
+        match i.get_attr(&obj, &name) {
+            Ok(v) => Ok(v),
+            Err(e) => match args.get(2) {
+                Some(default) => Ok(default.clone()),
+                None => Err(e),
+            },
+        }
+    });
+    native!("hasattr", |i, args| {
+        let obj = args
+            .first()
+            .ok_or_else(|| type_error("hasattr() requires arguments"))?
+            .clone();
+        let name = args
+            .get(1)
+            .ok_or_else(|| type_error("hasattr() requires a name"))?
+            .py_str();
+        Ok(Value::Bool(i.get_attr(&obj, &name).is_ok()))
+    });
+    native!("setattr", |i, args| {
+        let obj = args
+            .first()
+            .ok_or_else(|| type_error("setattr() requires arguments"))?
+            .clone();
+        let name = args
+            .get(1)
+            .ok_or_else(|| type_error("setattr() requires a name"))?
+            .py_str();
+        let val = args
+            .get(2)
+            .ok_or_else(|| type_error("setattr() requires a value"))?
+            .clone();
+        i.set_attr(&obj, &name, val)?;
+        Ok(Value::None)
+    });
+    native!("delattr", |_i, args| {
+        let obj = args
+            .first()
+            .ok_or_else(|| type_error("delattr() requires arguments"))?
+            .clone();
+        let name = args
+            .get(1)
+            .ok_or_else(|| type_error("delattr() requires a name"))?
+            .py_str();
+        match &obj {
+            Value::Instance(inst) => {
+                if inst.fields.borrow_mut().remove(name.as_str()).is_none() {
+                    return Err(attribute_error(format!("'{}'", name)));
+                }
+                Ok(Value::None)
+            }
+            _ => Err(type_error("delattr() target does not support attribute deletion")),
+        }
+    });
+    native!("vars", |_i, args| {
+        match args.first() {
+            Some(Value::Instance(inst)) => {
+                let mut m: DictMap = IndexMap::new();
+                for (k, v) in inst.fields.borrow().iter() {
+                    m.insert(HashKey::Str(Rc::new(k.clone())), v.clone());
+                }
+                Ok(Value::Dict(Rc::new(RefCell::new(m))))
+            }
+            Some(other) => Err(type_error(format!(
+                "vars() argument must have __dict__, not '{}'",
+                other.type_name()
+            ))),
+            None => Err(type_error("vars() with no argument is unsupported in the VM")),
+        }
+    });
     native!("list", |i, args| {
         let mut out = Vec::new();
         if let Some(v) = args.into_iter().next() {
