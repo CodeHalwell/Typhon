@@ -222,7 +222,7 @@ enum HttpStatus:
     SERVER_ERROR = 500
 ```
 
-Bare members auto-number with `enum.auto()`; explicit `MEMBER = value` is preserved, and `enum.auto()` continues counting from the last explicit value if you mix the two. The emitted Python is exactly what you'd write by hand:
+Bare members auto-number with `enum.auto()`; explicit `MEMBER = value` is preserved, and a subsequent bare member resumes `enum.auto()` counting from the last value — standard CPython `enum` semantics (e.g. `A = 10` then a bare `B` yields `B = 11`, not `2`). The emitted Python is exactly what you'd write by hand:
 
 ```python
 import enum

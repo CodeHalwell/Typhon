@@ -491,7 +491,7 @@ Last identifier segment in `Enum`, `IntEnum`, `StrEnum`, `Flag`, `IntFlag`, `ABC
 
 ### 3.12 `enum` keyword (v0.11.0)
 
-`enum Name:` is the idiomatic declaration form for a fixed set of named members — sugar over `enum.Enum`, the same way `model` is sugar over `pydantic.BaseModel`. Bare members auto-number with `enum.auto()`; explicit `MEMBER = value` is preserved, and `enum.auto()` continues numbering from the last explicit value (so mixed forms work).
+`enum Name:` is the idiomatic declaration form for a fixed set of named members — sugar over `enum.Enum`, the same way `model` is sugar over `pydantic.BaseModel`. Bare members auto-number with `enum.auto()`; explicit `MEMBER = value` is preserved, and a subsequent bare member resumes `enum.auto()` numbering from the last value — standard CPython `enum` semantics (e.g. `A = 10` then a bare `B` yields `B = 11`, not `2`).
 
 ```python
 # Typhon

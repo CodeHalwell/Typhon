@@ -1409,11 +1409,12 @@ def timer() -> Iterator[None]:
 ## 79. A wrong-*typed* argument to a third-party call now fails `tyc check` (v0.12.0)
 
 ```python
-import requests
-let r = requests.get(12345)      # ❌ tyc::type_mismatch: expected str, found int (v0.12.0)
+import sdk                        # a dependency that ships INLINE type hints (PEP 561 + annotations)
+let r = sdk.fetch(12345)         # ❌ tyc::type_mismatch: expected str, found int (v0.12.0)
+                                 #    sdk.fetch is `def fetch(url: str, ...) -> Response`
 ```
 
-**Trigger:** passing the wrong type to a fully-typed pure-Python dependency. Before v0.12.0 only *arity* was checked, so this passed `tyc check` and failed at runtime. Now venv signature introspection (`tyc-venv`) recovers the parameter *types* and checks them — for **functions and constructors**. **Fix:** pass the right type. **Corollary:** if the dependency *can't* be introspected (no `.venv`, not installed, C-extension-only), you'll see the `unintrospectable-dependency` warning instead of silent skipping — clear it with `uv sync`, a `.dty` stub, or `[checker] external = "ty"` (the typeshed path catches what introspection can't). Tune severity via `[strictness] unintrospectable-dependency`.
+**Trigger:** passing the wrong type to a fully-typed pure-Python dependency *that ships inline annotations*. Before v0.12.0 only *arity* was checked, so this passed `tyc check` and failed at runtime. Now venv signature introspection (`tyc-venv`) recovers the parameter *types* via `inspect.signature` and checks them — for **functions and constructors**. **Note:** the annotations must be *inline* in the package's own source. A stub-only library like `requests` (typed via typeshed's `types-requests`, not in its source) degrades to `Unknown` under this layer — catch those with `[checker] external = "ty"` (typeshed) or a `.dty` stub. **Fix:** pass the right type. **Corollary:** if the dependency *can't* be introspected at all (no `.venv`, not installed, C-extension-only), you'll see the `unintrospectable-dependency` warning instead of silent skipping — clear it with `uv sync`, a `.dty` stub, or `[checker] external = "ty"`. Tune severity via `[strictness] unintrospectable-dependency`.
 
 ## 80. Relying on the VM's old (identity-based) value semantics (v0.11.0 behaviour change)
 
