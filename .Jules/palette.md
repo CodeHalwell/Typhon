@@ -22,3 +22,9 @@
 ## 2024-06-05 - [Improve inline code visual breaking and mobile layout]
 **Learning:** Found that long inline code snippets (`:not(pre) > code`) could either break mobile responsive layouts horizontally if they didn't wrap, or look visually broken when they did wrap, because the border radius and padding wouldn't apply to the line breaks.
 **Action:** Added `overflow-wrap: break-word` to ensure long strings (like paths or URLs in code tags) break to prevent horizontal scrolling on mobile. Added `box-decoration-break: clone` (and `-webkit-` prefix) so that padding and border radius are cleanly applied to both the end of the first line and the start of the next line when inline code wraps.
+## 2026-06-06 - [Link hover transitions and abbreviation semantics]
+**Learning:** Adding a transition to `text-decoration-color` on markdown links makes the hover interaction feel significantly smoother and more deliberate than an abrupt color snap. Also, standard `<abbr>` elements lacked a visual indicator that they can be hovered for a title expansion, hiding valuable context.
+**Action:** Added `transition: text-decoration-color 150ms ease;` to markdown links. Added `text-decoration: underline dotted;` and `cursor: help;` to `abbr[title]` to clearly signal interactivity.
+## 2026-06-06 - [Themed text selection for visual polish]
+**Learning:** Default browser text selection colors (usually stark blue) often clash with custom themes, making the site feel less cohesive.
+**Action:** Implemented `::selection` to match the site's `var(--sl-color-accent)` at 25% opacity, preserving contrast while harmonizing the selection experience with the overall design.
