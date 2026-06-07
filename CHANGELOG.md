@@ -80,17 +80,27 @@ now documented rather than fixed — see `docs/vm.md` and
   return annotation) and maps the unambiguous scalar builtins (`int` /
   `str` / `bool` / `float` / `bytes` / `None`) to Typhon types. A
   fully-typed pure-Python dependency now gets argument-*type* checking for
-  **free-function** calls through the same `tyc::type_mismatch` machinery
-  project functions use — e.g. calling a `def fetch(url: str, ...)` with an
-  `int` is rejected at compile time. Conservative by design: containers,
-  `Optional`/unions, typing constructs, and foreign classes all degrade to
-  a permissive `Unknown`, so the change can only *add* true positives,
-  never reject valid code on a shape it can't model.
+  both **free-function** and **constructor** calls through the same
+  `tyc::type_mismatch` machinery project functions use — e.g. calling a
+  `def fetch(url: str, ...)` with an `int`, or constructing a
+  `Client(host: str, port: int)` with `port="oops"`, is rejected at compile
+  time. Conservative by design: containers, `Optional`/unions, typing
+  constructs, and foreign classes all degrade to a permissive `Unknown`, so
+  the change can only *add* true positives, never reject valid code on a
+  shape it can't model. Verified against the full 256-file example corpus
+  with zero false positives.
+- **Constructor arguments are now type-checked (closes an in-project
+  soundness hole too).** The non-generic constructor path previously
+  validated only arity, so `C(host="x", port="not-an-int")` for a project
+  `class C: host: str; port: int` passed `tyc check` and crashed at
+  runtime. A new `check_concrete_constructor_args` validates each
+  positional / keyword argument against its concrete field type (the
+  type-parameter fields of a generic class stay the job of the existing
+  `check_generic_constructor_args`, so the two never double-report).
 - **Scope / limits** (documented in `docs/diagnostics/missing_argument.md`):
-  constructor-argument *types*, C-extension callables, and typeshed-only
-  (non-inline) annotations are still out of scope — the genuine "every
-  library" answer remains the typeshed-backed `ty` integration
-  (`docs/ty-integration.md`).
+  C-extension callables and typeshed-only (non-inline) annotations remain
+  out of scope — the genuine "every library" answer is still the
+  typeshed-backed `ty` integration (`docs/ty-integration.md`).
 
 ### Fixed — resolver
 

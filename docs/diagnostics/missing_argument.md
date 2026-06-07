@@ -82,8 +82,9 @@ boundaries worth knowing:
 | Missing required argument (function or constructor) | ✅ |
 | Unknown keyword when the target has no `**kwargs` | ✅ |
 | **Wrong *type* of a free-function argument** (e.g. `int` where `str` is annotated) | ✅ since the annotation-capture pass — *for fully type-annotated, pure-Python libraries* |
-| Wrong *type* of a **constructor** argument | ❌ field types are recorded but the constructor call-checker compares arity only (follow-up) |
-| Too many positional args to a **constructor** | ❌ (follow-up) |
+| **Wrong *type* of a constructor argument** (e.g. `port="oops"` where `port: int`) | ✅ since the annotation-capture pass (same scalar-type caveat) |
+| Too many positional args to a **constructor with ≥1 field** | ✅ via the constructor arity check |
+| Too many positional args to a **zero-field constructor** (`Session(1)`) | ❌ — the arity check is skipped when the class has no fields (follow-up) |
 | Unknown keyword when the target has `**kwargs` | ❌ — correct: `**kwargs` legitimately absorbs it |
 | **C-extension / built-in callables** (numpy, pandas, pydantic-core, torch, …) | ❌ — `inspect.signature` raises, so the symbol is skipped (a missing check is safer than a wrong one) |
 | Anything when the package is **not installed in a reachable venv** | ❌ — introspection silently degrades to "no info" |
