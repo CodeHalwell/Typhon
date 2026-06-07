@@ -120,28 +120,44 @@ pub fn run(args: TyArgs) -> Result<()> {
         })?;
     }
 
-    // Anchor the subprocess at the project root so `ty` discovers any
-    // `pyproject.toml` / `ty.toml` / virtualenv from the project, not from
-    // whatever directory the user happened to invoke `tyc ty` from. The
-    // output directory is passed as an absolute path so this doesn't
-    // double-anchor it.
-    let mut cmd = Command::new(&args.ty_bin);
-    cmd.current_dir(&args.path);
-    cmd.arg("check").arg(&out_dir);
-    for extra in &args.ty_args {
+    run_ty_check(&args.path, &out_dir, &args.ty_bin, args.raw, &args.ty_args)
+}
+
+/// Run `ty check <out_dir>` anchored at `project_dir`, remap its
+/// `path.py:line[:col]` diagnostics back to the originating `.ty` source via
+/// the `.py.map` sidecars in `out_dir`, and print them. Returns `Err` when
+/// the `ty` binary is missing or `ty` reported type errors.
+///
+/// Shared by the `tyc ty` command and the `[checker] external = "ty"` /
+/// `--with-ty` hook on `tyc build` and `tyc check`. Anchoring the subprocess
+/// at the project root lets `ty` discover the project's `pyproject.toml` /
+/// virtualenv (so installed third-party packages and their typeshed stubs
+/// resolve); the output directory is passed absolute so it isn't
+/// double-anchored.
+pub fn run_ty_check(
+    project_dir: &Path,
+    out_dir: &Path,
+    ty_bin: &str,
+    raw: bool,
+    extra_args: &[String],
+) -> Result<()> {
+    let mut cmd = Command::new(ty_bin);
+    cmd.current_dir(project_dir);
+    cmd.arg("check").arg(out_dir);
+    for extra in extra_args {
         cmd.arg(extra);
     }
 
-    if args.raw {
+    if raw {
         // Forward verbatim — no capture, no remapping.
         let status = cmd.status().map_err(|e| match e.kind() {
-            std::io::ErrorKind::NotFound => missing_ty_binary_error(&args.ty_bin),
-            _ => miette!("failed to run `{} check`: {e}", args.ty_bin),
+            std::io::ErrorKind::NotFound => missing_ty_binary_error(ty_bin),
+            _ => miette!("failed to run `{} check`: {e}", ty_bin),
         })?;
         if !status.success() {
             return Err(miette!(
                 "`{}` reported type errors (exit {})",
-                args.ty_bin,
+                ty_bin,
                 status.code().unwrap_or(-1)
             ));
         }
@@ -154,21 +170,21 @@ pub fn run(args: TyArgs) -> Result<()> {
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
     let output = cmd.output().map_err(|e| match e.kind() {
-        std::io::ErrorKind::NotFound => missing_ty_binary_error(&args.ty_bin),
-        _ => miette!("failed to run `{} check`: {e}", args.ty_bin),
+        std::io::ErrorKind::NotFound => missing_ty_binary_error(ty_bin),
+        _ => miette!("failed to run `{} check`: {e}", ty_bin),
     })?;
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    let mapped_stdout = remap_ty_diagnostics(&stdout, Some(&out_dir));
-    let mapped_stderr = remap_ty_diagnostics(&stderr, Some(&out_dir));
+    let mapped_stdout = remap_ty_diagnostics(&stdout, Some(out_dir));
+    let mapped_stderr = remap_ty_diagnostics(&stderr, Some(out_dir));
     print!("{mapped_stdout}");
     eprint!("{mapped_stderr}");
 
     if !output.status.success() {
         return Err(miette!(
             "`{}` reported type errors (exit {})",
-            args.ty_bin,
+            ty_bin,
             output.status.code().unwrap_or(-1)
         ));
     }

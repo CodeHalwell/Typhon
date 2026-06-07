@@ -99,8 +99,27 @@ now documented rather than fixed — see `docs/vm.md` and
   `check_generic_constructor_args`, so the two never double-report).
 - **Scope / limits** (documented in `docs/diagnostics/missing_argument.md`):
   C-extension callables and typeshed-only (non-inline) annotations remain
-  out of scope — the genuine "every library" answer is still the
-  typeshed-backed `ty` integration (`docs/ty-integration.md`).
+  out of scope for the runtime-introspection path — those are covered by the
+  new `ty` typeshed integration below.
+
+### Added — `ty` typeshed integration (`[checker] external = "ty"`)
+
+- **`tyc build` can run Astral's `ty` as a second-stage checker over the
+  emitted Python**, gated by a new `[checker] external = "ty"` config key
+  (`"none"` by default). This is Phase 1 of the long-documented plan in
+  `docs/ty-integration.md`, and it's the genuine "works for every library"
+  answer: `ty` checks against **typeshed**, so it catches misuse of
+  C-extension and stdlib APIs that runtime venv introspection fundamentally
+  can't see. Example: `os.path.join(1, 2)` passes `tyc check` (no inline
+  signature) but is now caught at build time —
+  `error[no-matching-overload]: No overload of function 'join' matches` —
+  with the diagnostic re-attributed to the originating `.ty` line via the
+  existing `.py.map` source maps. `ty` errors fail the build (CI-gating).
+- The shared `run_ty_check` helper is factored out of the `tyc ty` command
+  so the standalone command and the build-time hook use one code path.
+  `[checker] external-args = [...]` forwards extra flags to `ty` verbatim.
+  (`tyc check --with-ty` and the embedded-library option remain the next
+  steps in the plan.)
 
 ### Fixed — resolver
 

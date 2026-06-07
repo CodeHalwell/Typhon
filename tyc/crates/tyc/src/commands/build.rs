@@ -1022,6 +1022,23 @@ pub fn run(args: BuildArgs) -> Result<()> {
             pub_star_collision_count
         ));
     }
+
+    // `[checker] external = "ty"`: run Astral's typeshed-backed checker over
+    // the emitted Python as a second stage and re-attribute its diagnostics
+    // back to the `.ty` source. Skipped in `--check` dry-run mode (no `.py`
+    // was written to check). This is the only path that type-checks against
+    // typeshed — covering C-extension libraries runtime introspection can't
+    // see. See `docs/ty-integration.md`.
+    if !check_mode && config.checker.external == "ty" {
+        println!("running `ty` over emitted Python ([checker] external = \"ty\")…");
+        crate::commands::ty::run_ty_check(
+            &project_root,
+            &out_dir,
+            "ty",
+            false,
+            &config.checker.external_args,
+        )?;
+    }
     Ok(())
 }
 

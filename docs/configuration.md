@@ -110,3 +110,25 @@ pytest = "8.2"              # bare version → ==8.2
 | Key | Type | Description |
 |-----|------|-------------|
 | `required` | list of strings | Environment variables that **must** resolve at build time. Any `comptime env()` lookup on a missing required variable fails the build. |
+
+### `[checker]`
+
+A second-stage type checker that runs over the **emitted Python** after a
+successful `tyc build`, complementing `tyc-types`'s Typhon-specific rules.
+This is the only path that type-checks against **typeshed**, so it covers
+C-extension and stdlib APIs (numpy, pandas, `os.path`, …) that runtime venv
+introspection can't model. See [`ty-integration.md`](ty-integration.md).
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `external` | string | `"none"` | `"ty"` runs Astral's [`ty`](https://github.com/astral-sh/ty) (`ty check`) over the build output and re-attributes its diagnostics back to the `.ty` source via the `.py.map` sidecars. `ty` errors fail the build. Requires `ty` on `PATH` (`pip install ty` / `uv tool install ty`). |
+| `external-args` | list of strings | `[]` | Extra arguments forwarded verbatim to the external checker. |
+
+```toml
+[checker]
+external = "ty"
+external-args = []
+```
+
+> `ty` is most useful with the project's dependencies installed in a venv,
+> so it can resolve third-party imports and their typeshed stubs.
