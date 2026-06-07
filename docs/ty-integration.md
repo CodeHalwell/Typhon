@@ -218,34 +218,34 @@ and points back at the originating `.ty` line.
 
 **Estimated effort: 1–1.5 days.**
 
-### Phase 2 — Embedded library (option A) — ✅ IMPLEMENTED (feature-gated)
+### Phase 2 — Embedded library (option A) — prototyped, **not shipped**
 
-> **Status:** shipped behind the `embedded-ty` cargo feature (off by
-> default). Build `tyc` with `--features embedded-ty` and the
-> `[checker] external = "ty"` / `--with-ty` hook runs `ty` in-process
-> instead of spawning the CLI. See `crates/tyc-typecheck-ext`.
+> **Status:** proven feasible end-to-end in a prototype, then **reverted and
+> not merged.** Embedding `ty` requires a **git** dependency on
+> `astral-sh/ruff` (its crates aren't published to crates.io), which the
+> repo's `cargo deny` policy disallows (`[sources] unknown-git = "deny"`).
+> Since the embedded path offers **no capability** over the shipped
+> subprocess path (it's purely a perf optimisation), it wasn't worth
+> relaxing the supply-chain policy for. Revisit by **vendoring** `ty` into
+> `tyc/vendor/` (a path dep — no git source), per the recipe below.
 
-**This did NOT require the Ruff vendor migration.** The original blocker —
-"`ty` consumes `ruff_python_ast`, which would clash with Typhon's vendored
-fork" — turned out to be false. Typhon's vendored crates carry a distinct
-version (`0.0.0-typhon-vendor`) from `ty`'s upstream `ruff_python_ast`
-(`0.0.0`), so cargo keeps **both** in one dependency graph without conflict
-(verified empirically before implementing). No fork rename or upstream
-migration was needed.
+**It does NOT require the Ruff vendor migration to *compile*.** The original
+blocker — "`ty` consumes `ruff_python_ast`, which would clash with Typhon's
+vendored fork" — is false: Typhon's vendored crates carry a distinct version
+(`0.0.0-typhon-vendor`) from `ty`'s upstream `ruff_python_ast` (`0.0.0`), so
+cargo keeps **both** in one dependency graph without conflict (verified
+empirically). The real gate is the git-source supply-chain policy, not a
+crate-name conflict.
 
-#### How it was actually done
+#### What the prototype showed (for whoever ships this later)
 
-Rather than vendoring `ty_python_semantic` into the tree, the
-`tyc-typecheck-ext` crate takes `ty_project` + `ruff_db` as **optional git
-dependencies** pinned to a `ruff` revision, gated behind its `embedded`
-feature. With the feature off (the default), neither is compiled and the
-crate is a stub — the standard `tyc` build pulls zero `ty`/`ruff` deps.
-
-The check itself mirrors `ty`'s own CLI: `OsSystem::new(dir)` →
-`ProjectMetadata::discover` → `ProjectDatabase::fallible(...)` →
-`db.check() -> Vec<Diagnostic>`, rendered via `DisplayDiagnostics` in the
-CLI's text format so the existing `.py.map` remapper rewrites the diagnostics
-to `.ty` source unchanged.
+The check mirrors `ty`'s own CLI and is a small amount of code:
+`OsSystem::new(dir)` → `ProjectMetadata::discover` →
+`ProjectDatabase::fallible(...)` → `db.check() -> Vec<Diagnostic>`, rendered
+via `DisplayDiagnostics` in the CLI's text format so the existing `.py.map`
+remapper rewrites the diagnostics to `.ty` source unchanged. The remaining
+work to ship it is the **vendoring** (Step 2.1 above) so the `ty` crates
+enter via a path dependency rather than a git source.
 
 #### Original plan (kept for reference)
 
@@ -350,11 +350,15 @@ Salsa caching.
 
 ## Decision
 
-**Both phases shipped (v0.12.0).** Phase 1 (subprocess `ty check`) is the
-default path, exposed via `[checker] external = "ty"` and `--with-ty`.
-Phase 2 (embedded, in-process `ty`) shipped behind the `embedded-ty` cargo
-feature in `crates/tyc-typecheck-ext` — and notably did **not** require the
-Ruff-vendor migration this doc originally assumed (the vendored fork and
-upstream `ruff_python_ast` coexist by version). The embedded path is opt-in
-at build time so the default binary stays lean; when compiled in, it's
-preferred over the subprocess automatically.
+**Phase 1 (subprocess `ty check`) shipped in v0.12.0** as the integration —
+exposed via `[checker] external = "ty"` and `--with-ty`, with diagnostics
+re-attributed to `.ty` source through `.py.map`.
+
+**Phase 2 (embedded, in-process `ty`) was prototyped and proven feasible but
+not shipped.** It needs a git dependency on `astral-sh/ruff` (the `ty` crates
+aren't on crates.io), which the repo's `cargo deny` `[sources]` policy
+disallows, and it adds no capability over the subprocess path. Notably it
+does **not** require the Ruff-vendor migration this doc originally assumed —
+the vendored fork and upstream `ruff_python_ast` coexist by version — so the
+real prerequisite to shipping it is **vendoring `ty` into `tyc/vendor/`**
+(a path dep, not a git source), per Step 2.1.

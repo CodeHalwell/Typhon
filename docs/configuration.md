@@ -134,9 +134,8 @@ external-args = []
 > `ty` is most useful with the project's dependencies installed in a venv,
 > so it can resolve third-party imports and their typeshed stubs.
 
-By default `external = "ty"` spawns the `ty` CLI as a subprocess. If `tyc`
-was built with the `embedded-ty` cargo feature (`cargo build --features
-embedded-ty`), the same setting runs `ty` **in-process** instead — no
-subprocess, no `ty` binary required on `PATH`. The feature is off by default
-so the standard build stays lean; behaviour and output are otherwise
-identical. See [`ty-integration.md`](ty-integration.md).
+`external = "ty"` spawns the `ty` CLI as a subprocess and re-attributes its
+diagnostics to the `.ty` source. (An embedded, in-process variant was
+prototyped — see [`ty-integration.md`](ty-integration.md) — but isn't shipped:
+it needs a git dependency on `astral-sh/ruff`, which the repo's `cargo deny`
+policy disallows, and offers no capability the subprocess path lacks.)

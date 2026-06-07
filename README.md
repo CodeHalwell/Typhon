@@ -324,7 +324,6 @@ tyc/
 │   ├── tyc-lsp/                LSP backend
 │   ├── tyc-vm/                 In-process tree-walking interpreter (default for `tyc run`)
 │   ├── tyc-venv/               Venv signature introspection → ModuleShapes (shared by CLI + LSP)
-│   ├── tyc-typecheck-ext/      Optional embedded `ty` checker (feature `embedded`)
 │   └── tyc/                    CLI binary
 └── vendor/                     Vendored crates — Typhon's fork of Ruff
     ├── ruff_text_size/         TextSize/TextRange newtypes

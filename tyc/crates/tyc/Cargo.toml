@@ -32,17 +32,9 @@ tyc-analyse     = { workspace = true }
 tyc-desugar     = { workspace = true }
 tyc-lsp         = { workspace = true }
 tyc-vm          = { workspace = true }
-tyc-typecheck-ext = { path = "../tyc-typecheck-ext" }
 tyc-venv          = { path = "../tyc-venv" }
 tempfile        = { workspace = true }
 notify          = { workspace = true }
-
-[features]
-default = []
-# Compile Astral's `ty` into the binary for in-process second-stage checking
-# (`[checker] external = "ty"` / `--with-ty` then prefer the embedded path
-# over spawning `ty`). Off by default — pulls the whole ruff/ty workspace.
-embedded-ty = ["tyc-typecheck-ext/embedded"]
 
 [dev-dependencies]
 tempfile   = { workspace = true }

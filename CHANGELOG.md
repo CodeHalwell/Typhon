@@ -135,26 +135,28 @@ now documented rather than fixed — see `docs/vm.md` and
   --with-ty` checks the emitted output directly; `tyc check --with-ty`
   (normally emit-free) builds to a throwaway directory first.
 
-### Added — embedded `ty` checker (Phase 2, feature-gated `embedded-ty`)
+### `ty` Phase 2 (embedded) — prototyped and proven feasible, **not shipped**
 
-- **`ty` can now run *in-process*** over the emitted Python — no subprocess
-  spawn, no text round-trip. New `tyc-typecheck-ext` crate calls
-  `ProjectDatabase::check()` directly and renders `ty`'s diagnostics in its
-  CLI format, so the existing `.py.map` remapper rewrites them to `.ty`.
-  Enabled by building `tyc` with `--features embedded-ty`; off by default,
-  so the standard build pulls **zero** `ty`/`ruff` dependencies and stays
-  lean. When compiled in, the `[checker] external = "ty"` / `--with-ty`
-  hook prefers the embedded path and falls back to the subprocess otherwise.
-- **Correction:** `docs/ty-integration.md` (and earlier notes) claimed Phase 2
-  was blocked until Typhon migrated off its vendored Ruff fork, because `ty`
-  consumes `ruff_python_ast`. That's **not** true — proven empirically:
-  Typhon's vendored `ruff_python_ast` (`0.0.0-typhon-vendor`) and `ty`'s
-  upstream `ruff_python_ast` (`0.0.0`) coexist in one dependency graph,
-  kept apart by version. No fork migration was required.
-- A `.py.map` resolver fix landed alongside: `load_map_for` now resolves
-  **build-relative** `.py` references (`main.py`, `pkg/mod.py` — the form the
-  embedded renderer emits) against `<map_dir>/.sourcemaps/<rel>.py.map`,
-  not just the absolute-path / adjacent layouts.
+- The embedded, in-process `ty` checker (calling `ProjectDatabase::check()`
+  directly instead of spawning the CLI) was prototyped end-to-end and works.
+  It is **not shipped**: it requires a git dependency on `astral-sh/ruff`,
+  which the repo's `cargo deny` policy disallows (`[sources] unknown-git =
+  "deny"`), and it offers **no capability** the subprocess path lacks (it's a
+  perf optimisation). The subprocess integration (`[checker] external = "ty"`
+  / `--with-ty`) remains the shipped path.
+- **Correction worth recording:** `docs/ty-integration.md` (and earlier
+  notes) claimed Phase 2 was blocked until Typhon migrated off its vendored
+  Ruff fork, because `ty` consumes `ruff_python_ast`. That's **not** true —
+  proven empirically: Typhon's vendored `ruff_python_ast`
+  (`0.0.0-typhon-vendor`) and `ty`'s upstream `ruff_python_ast` (`0.0.0`)
+  coexist in one dependency graph, kept apart by version. The real gate is
+  the git-source supply-chain policy, not a crate-name conflict. Vendoring
+  `ty` into `tyc/vendor/` (a path dep, no git source) is the path to shipping
+  it later.
+- A `.py.map` resolver fix landed alongside and is kept: `load_map_for` now
+  resolves **build-relative** `.py` references (`main.py`, `pkg/mod.py`)
+  against `<map_dir>/.sourcemaps/<rel>.py.map`, not just the absolute-path /
+  adjacent layouts.
 
 ### Added — live third-party arg/type diagnostics in the editor (LSP)
 
