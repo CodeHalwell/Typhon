@@ -241,7 +241,7 @@ pub fn run(args: BuildArgs) -> Result<()> {
     // `crate::venv_signatures` for the implementation and the
     // allow-list rules. Skipped silently when no Python / venv is
     // reachable — the worst case is the existing behaviour.
-    {
+    let unintrospectable_deps: Vec<String> = {
         let project_module_set: std::collections::HashSet<String> = sources
             .iter()
             .map(|(path, _)| crate::commands::util::path_to_dotted(path, src_root))
@@ -258,7 +258,19 @@ pub fn run(args: BuildArgs) -> Result<()> {
             &project_module_set,
             allowed_top_level,
             &mut project_shapes,
-        );
+        )
+    };
+    // Surface declared dependencies that couldn't be introspected so their
+    // skipped third-party checks are visible rather than silently passing.
+    // `"error"` severity fails the build (already reported by the helper).
+    if crate::venv_signatures::report_unintrospectable_dependencies(
+        &unintrospectable_deps,
+        &config.strictness.unintrospectable_dependency,
+    ) {
+        return Err(miette!(
+            "declared dependencies could not be introspected (see warning above); \
+             failing because `[strictness] unintrospectable-dependency = \"error\"`"
+        ));
     }
     // Wrap the registry in `Arc` so each per-file `ExternalShapes`
     // snapshot is a cheap refcount bump instead of an O(modules)

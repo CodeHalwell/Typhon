@@ -215,6 +215,7 @@ pub fn run(args: CheckArgs) -> Result<()> {
     // argument: 'client'`. Skipped when no `typhon.toml` is found
     // (standalone-file mode) or when no allow-listed top-level
     // packages exist.
+    let mut unintrospectable_deps: Vec<String> = Vec::new();
     if has_project_config {
         let project_module_set: std::collections::HashSet<String> =
             project_modules.iter().cloned().collect();
@@ -222,7 +223,7 @@ pub fn run(args: CheckArgs) -> Result<()> {
             .iter()
             .map(|m| m.split('.').next().unwrap_or(m).to_owned())
             .collect();
-        crate::venv_signatures::enrich_project_shapes_with_venv(
+        unintrospectable_deps = crate::venv_signatures::enrich_project_shapes_with_venv(
             &args.paths,
             &project_root,
             &project_module_set,
@@ -230,6 +231,15 @@ pub fn run(args: CheckArgs) -> Result<()> {
             &mut shape_map,
         );
     }
+    // Surface declared dependencies that couldn't be introspected so their
+    // skipped third-party checks are visible rather than silently passing.
+    // Gated on `!quiet_success` so `tyc run`'s internal check gate stays
+    // quiet. `"error"` severity escalates to a check failure below.
+    let unintrospectable_fatal = !args.quiet_success
+        && crate::venv_signatures::report_unintrospectable_dependencies(
+            &unintrospectable_deps,
+            &config.strictness.unintrospectable_dependency,
+        );
     let project_shapes = std::sync::Arc::new(shape_map);
 
     for root in &args.paths {
@@ -463,6 +473,15 @@ pub fn run(args: CheckArgs) -> Result<()> {
             } else {
                 String::new()
             },
+        ));
+    }
+
+    // `[strictness] unintrospectable-dependency = "error"` escalates a
+    // skipped third-party check into a hard failure (already reported above).
+    if unintrospectable_fatal {
+        return Err(miette!(
+            "declared dependencies could not be introspected (see warning above); \
+             failing because `[strictness] unintrospectable-dependency = \"error\"`"
         ));
     }
 

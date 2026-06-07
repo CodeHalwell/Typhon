@@ -549,8 +549,32 @@ fn annotation_to_type(ann: &str) -> Type {
     {
         s = inner;
     }
+    s = s.trim();
+
+    // `Optional[X]` (optionally `typing.`-qualified) → `X | None`.
+    let unqualified = s.strip_prefix("typing.").unwrap_or(s);
+    if let Some(inner) = unqualified
+        .strip_prefix("Optional[")
+        .and_then(|r| r.strip_suffix(']'))
+    {
+        return nullable_of(annotation_to_type(inner));
+    }
+
+    // `X | None` / `None | X` (PEP 604) — the 2-member nullable form. Richer
+    // unions stay permissive (`Unknown`) so we never false-positive.
+    if let Some((a, b)) = split_top_level_union(s) {
+        let (a, b) = (a.trim(), b.trim());
+        if b == "None" || b == "NoneType" {
+            return nullable_of(annotation_to_type(a));
+        }
+        if a == "None" || a == "NoneType" {
+            return nullable_of(annotation_to_type(b));
+        }
+        return Type::Unknown;
+    }
+
     // Drop a module qualifier on a bare dotted name (`builtins.int`), but
-    // leave parametric / union forms untouched so we don't mangle them.
+    // leave parametric forms untouched so we don't mangle them.
     let bare = if !s.contains('[') && !s.contains('|') && !s.contains(' ') {
         s.rsplit('.').next().unwrap_or(s)
     } else {
@@ -565,6 +589,33 @@ fn annotation_to_type(ann: &str) -> Type {
         "None" | "NoneType" => Type::None,
         _ => Type::Unknown,
     }
+}
+
+/// Wrap `inner` as nullable (`inner | None`). A non-mappable inner collapses
+/// to `Unknown` (a nullable-`Unknown` is just `Unknown` — still permissive).
+fn nullable_of(inner: Type) -> Type {
+    match inner {
+        Type::Unknown | Type::Any => Type::Unknown,
+        Type::None => Type::None,
+        other => Type::Union(vec![other, Type::None]),
+    }
+}
+
+/// Split `s` on a single top-level `|` (ignoring pipes nested inside
+/// `[...]` / `(...)`), returning the two halves. Used to recognise the
+/// `X | None` nullable form. `None` when there is no top-level pipe.
+fn split_top_level_union(s: &str) -> Option<(&str, &str)> {
+    let bytes = s.as_bytes();
+    let mut depth = 0i32;
+    for (i, &b) in bytes.iter().enumerate() {
+        match b {
+            b'[' | b'(' => depth += 1,
+            b']' | b')' => depth -= 1,
+            b'|' if depth == 0 => return Some((&s[..i], &s[i + 1..])),
+            _ => {}
+        }
+    }
+    None
 }
 
 /// Build an [`ArityInfo`] for an introspected free function. `returns` is
@@ -755,30 +806,107 @@ pub fn enrich_project_shapes_with_venv(
     project_module_set: &HashSet<String>,
     allowed_top_level: HashSet<String>,
     project_shapes: &mut HashMap<String, ModuleShapes>,
-) {
+) -> Vec<String> {
     if allowed_top_level.is_empty() {
-        return;
-    }
-    let mut cache = VenvSignatures::for_project_root(project_root, allowed_top_level);
-    if cache.python_bin.is_none() {
-        return;
+        return Vec::new();
     }
     let imports = collect_imported_modules(paths);
     // Filter once, then batch the whole list into a single subprocess
     // (see `VenvSignatures::preload`). The earlier per-module loop
     // dominated `tyc check` time on projects with many declared deps —
     // each `import requests.X` was costing a fresh Python startup.
+    // Only modules whose top-level package is a declared dependency are
+    // candidates (the allow-list); stdlib / project modules are excluded.
     let needed: Vec<String> = imports
         .iter()
         .filter(|m| !project_shapes.contains_key(*m) && !project_module_set.contains(*m))
+        .filter(|m| allowed_top_level.contains(top_level(m)))
         .cloned()
         .collect();
+    if needed.is_empty() {
+        return Vec::new();
+    }
+
+    let mut cache = VenvSignatures::for_project_root(project_root, allowed_top_level);
+
+    // No reachable `.venv`/`python3`: every needed declared-dependency
+    // module is unintrospectable. Report each top-level package so the
+    // caller can warn that third-party checks were skipped rather than
+    // silently passing (the most dangerous failure mode for this feature).
+    if cache.python_bin.is_none() {
+        let mut tops: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for m in &needed {
+            tops.insert(top_level(m).to_owned());
+        }
+        return tops.into_iter().collect();
+    }
+
     cache.preload(&needed);
+    // Track per-top-level success so a package whose root introspected
+    // fine isn't reported just because one submodule (`requests.adapters`)
+    // failed.
+    let mut ok_tops: HashSet<String> = HashSet::new();
+    let mut failed_tops: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for module in needed {
-        if let Some(shapes) = cache.module_shapes(&module) {
-            project_shapes.insert(module, shapes.clone());
+        let top = top_level(&module).to_owned();
+        // Clone the recovered shapes (if any) so the `cache` borrow is
+        // released before we mutate `project_shapes`. A module that failed
+        // to import yields an *empty* `ModuleShapes` (the embedded Python
+        // returns `{"members": []}` on `ImportError`), and a module whose
+        // members are all C-extension callables introspects to nothing —
+        // both mean "no signatures recovered", so treat an empty result the
+        // same as a miss for the purpose of the warning.
+        let recovered = cache.module_shapes(&module).cloned();
+        match recovered {
+            Some(shapes)
+                if !(shapes.class_shapes.is_empty() && shapes.function_arities.is_empty()) =>
+            {
+                project_shapes.insert(module, shapes);
+                ok_tops.insert(top);
+            }
+            _ => {
+                failed_tops.insert(top);
+            }
         }
     }
+    failed_tops
+        .into_iter()
+        .filter(|t| !ok_tops.contains(t))
+        .collect()
+}
+
+/// First dotted component of a module path (`requests.adapters` → `requests`).
+fn top_level(module: &str) -> &str {
+    module.split('.').next().unwrap_or(module)
+}
+
+/// Surface the un-introspectable declared dependencies returned by
+/// [`enrich_project_shapes_with_venv`], honouring the
+/// `[strictness] unintrospectable-dependency` severity (`"warn"` default /
+/// `"error"` / `"off"`). Returns `true` when the severity is `"error"` and
+/// there were offenders, so the caller can fail the build/check. Keeping the
+/// missed checks visible is the whole point — a silently-skipped third-party
+/// check looks identical to a clean pass.
+pub fn report_unintrospectable_dependencies(packages: &[String], severity: &str) -> bool {
+    if packages.is_empty() || severity == "off" {
+        return false;
+    }
+    let is_error = severity == "error";
+    let label = if is_error { "error" } else { "warning" };
+    eprintln!(
+        "{label}: declared {} could not be introspected: {}\n  \
+         third-party argument/type checks for {} were skipped. Install the project's \
+         dependencies (e.g. `uv sync`) so `tyc` can read their signatures, add a `.dty` \
+         stub, or set `[strictness] unintrospectable-dependency = \"off\"` to silence.",
+        if packages.len() == 1 {
+            "dependency"
+        } else {
+            "dependencies"
+        },
+        packages.join(", "),
+        if packages.len() == 1 { "it" } else { "them" },
+    );
+    is_error
 }
 
 #[cfg(test)]
@@ -911,11 +1039,29 @@ mod tests {
         assert_eq!(annotation_to_type("bytes"), Type::Bytes);
         assert_eq!(annotation_to_type("None"), Type::None);
         assert_eq!(annotation_to_type("NoneType"), Type::None);
+        // Nullable scalar forms map to `T | None`.
+        assert_eq!(
+            annotation_to_type("Optional[str]"),
+            Type::Union(vec![Type::Str, Type::None])
+        );
+        assert_eq!(
+            annotation_to_type("typing.Optional[int]"),
+            Type::Union(vec![Type::Int, Type::None])
+        );
+        assert_eq!(
+            annotation_to_type("int | None"),
+            Type::Union(vec![Type::Int, Type::None])
+        );
+        assert_eq!(
+            annotation_to_type("None | bytes"),
+            Type::Union(vec![Type::Bytes, Type::None])
+        );
         // Anything we don't confidently model degrades to Unknown so the
         // checker never false-positives on a shape we can't represent.
         assert_eq!(annotation_to_type("list[int]"), Type::Unknown);
-        assert_eq!(annotation_to_type("Optional[str]"), Type::Unknown);
-        assert_eq!(annotation_to_type("int | None"), Type::Unknown);
+        assert_eq!(annotation_to_type("Optional[list[int]]"), Type::Unknown);
+        assert_eq!(annotation_to_type("int | str | None"), Type::Unknown);
+        assert_eq!(annotation_to_type("int | str"), Type::Unknown);
         assert_eq!(annotation_to_type("requests.Session"), Type::Unknown);
     }
 

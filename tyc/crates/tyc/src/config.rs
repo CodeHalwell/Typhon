@@ -203,6 +203,12 @@ pub struct StrictnessConfig {
     ///   use only when `--stubs` is run opportunistically.
     #[serde(default = "default_stub_check")]
     pub stub_check: String,
+    /// Severity when a declared dependency is imported but could not be
+    /// introspected for signatures (no reachable `.venv`/`python3`, or the
+    /// package isn't installed) — so its third-party arity/type checks are
+    /// silently skipped. `"warn"` (default) surfaces it, `"error"` fails the
+    /// build/check (CI-gating), `"off"` restores the old silent behaviour.
+    pub unintrospectable_dependency: String,
 }
 
 impl Default for StrictnessConfig {
@@ -222,6 +228,7 @@ impl Default for StrictnessConfig {
             blocking_in_async: "warn".into(),
             allow_secret_comptime: false,
             stub_check: "error".into(),
+            unintrospectable_dependency: "warn".into(),
         }
     }
 }

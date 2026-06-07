@@ -78,7 +78,8 @@ now documented rather than fixed — see `docs/vm.md` and
   kind / has-default, so every third-party parameter became `Type::Unknown`
   and only *arity* was checked. It now also reads `p.annotation` (and the
   return annotation) and maps the unambiguous scalar builtins (`int` /
-  `str` / `bool` / `float` / `bytes` / `None`) to Typhon types. A
+  `str` / `bool` / `float` / `bytes` / `None`) — plus the nullable forms
+  `Optional[X]` and `X | None` — to Typhon types. A
   fully-typed pure-Python dependency now gets argument-*type* checking for
   both **free-function** and **constructor** calls through the same
   `tyc::type_mismatch` machinery project functions use — e.g. calling a
@@ -120,6 +121,20 @@ now documented rather than fixed — see `docs/vm.md` and
   `[checker] external-args = [...]` forwards extra flags to `ty` verbatim.
   (`tyc check --with-ty` and the embedded-library option remain the next
   steps in the plan.)
+
+### Added — `unintrospectable-dependency` warning (no more silent misses)
+
+- **A declared dependency that's imported but can't be introspected now
+  surfaces a warning** instead of silently skipping its third-party checks —
+  the most dangerous failure mode for this feature (a skipped check looked
+  identical to a clean pass). Fires when there's no reachable `.venv` /
+  `python3`, or the package isn't installed, or it exposes no introspectable
+  signatures. New `[strictness] unintrospectable-dependency` knob:
+  `"warn"` (default) surfaces it, `"error"` fails the build/check (CI-gating),
+  `"off"` restores the old silent behaviour. Per-top-level success tracking
+  means a package whose root introspects fine isn't flagged just because one
+  submodule failed; an installed, introspectable dependency produces no
+  warning.
 
 ### Fixed — resolver
 
