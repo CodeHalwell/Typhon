@@ -1054,14 +1054,34 @@ pub fn run(args: BuildArgs) -> Result<()> {
         } else {
             "[checker] external = \"ty\""
         };
-        println!("running `ty` over emitted Python ({reason})…");
-        crate::commands::ty::run_ty_check(
-            &project_root,
-            &out_dir,
-            "ty",
-            false,
-            &config.checker.external_args,
-        )?;
+        if tyc_typecheck_ext::is_available() {
+            // Phase 2: `ty` is compiled in — run it in-process over the
+            // emitted Python (no subprocess, no JSON round-trip). Its
+            // diagnostics render in the CLI's own format, so the same
+            // `.py.map` remapper rewrites them to `.ty` source.
+            println!("running embedded `ty` over emitted Python ({reason})…");
+            let result = tyc_typecheck_ext::check_emitted_dir(&out_dir)
+                .map_err(|e| miette!("embedded `ty` check failed: {e}"))?;
+            let remapped =
+                crate::commands::ty::remap_ty_diagnostics(&result.rendered, Some(&out_dir));
+            print!("{remapped}");
+            if result.error_count > 0 {
+                return Err(miette!(
+                    "`ty` (embedded) reported {} type error(s)",
+                    result.error_count
+                ));
+            }
+        } else {
+            // Phase 1: spawn the `ty` CLI over the emitted directory.
+            println!("running `ty` over emitted Python ({reason})…");
+            crate::commands::ty::run_ty_check(
+                &project_root,
+                &out_dir,
+                "ty",
+                false,
+                &config.checker.external_args,
+            )?;
+        }
     }
     Ok(())
 }

@@ -1,0 +1,26 @@
+[package]
+name = "tyc-typecheck-ext"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# Optional second-stage type checking by embedding Astral's `ty`
+# (`ty_project` + `ruff_db`) in-process over the emitted Python. The `ty`
+# crates pull the whole ruff/ty workspace, so they're gated behind the
+# `embedded` feature (OFF by default) — the standard `tyc` build stays lean
+# and uses the subprocess `ty check` path. See `docs/ty-integration.md`.
+[features]
+default = []
+embedded = ["dep:ty_project", "dep:ruff_db"]
+
+[dependencies]
+anyhow = "1"
+
+# Pinned to a specific ruff revision: ty's API is pre-1.0 and unstable, so
+# each bump is a deliberate sync (same model as the vendored Ruff fork).
+# These coexist with Typhon's vendored `ruff_python_ast` fork — cargo keeps
+# them apart by version (`0.0.0` upstream vs `0.0.0-typhon-vendor`).
+ty_project = { git = "https://github.com/astral-sh/ruff", rev = "5ac2a53ee108f23dc40a63d5378a0d6b21d821c3", optional = true }
+ruff_db = { git = "https://github.com/astral-sh/ruff", rev = "5ac2a53ee108f23dc40a63d5378a0d6b21d821c3", features = ["os"], optional = true }
