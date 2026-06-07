@@ -218,19 +218,40 @@ and points back at the originating `.ty` line.
 
 **Estimated effort: 1–1.5 days.**
 
-### Phase 2 — Embedded library (option A)
+### Phase 2 — Embedded library (option A) — prototyped, **not shipped**
 
-Depends on the Ruff vendor (Steps 1–10 in `tyc/vendor/README.md`).
-After that lands:
+> **Status:** proven feasible end-to-end in a prototype, then **reverted and
+> not merged.** Embedding `ty` requires a **git** dependency on
+> `astral-sh/ruff` (its crates aren't published to crates.io), which the
+> repo's `cargo deny` policy disallows (`[sources] unknown-git = "deny"`).
+> Since the embedded path offers **no capability** over the shipped
+> subprocess path (it's purely a perf optimisation), it wasn't worth
+> relaxing the supply-chain policy for. Revisit by **vendoring** `ty` into
+> `tyc/vendor/` (a path dep — no git source), per the recipe below.
 
-#### Step 2.1 — Vendor `ty_python_semantic`
+**It does NOT require the Ruff vendor migration to *compile*.** The original
+blocker — "`ty` consumes `ruff_python_ast`, which would clash with Typhon's
+vendored fork" — is false: Typhon's vendored crates carry a distinct version
+(`0.0.0-typhon-vendor`) from `ty`'s upstream `ruff_python_ast` (`0.0.0`), so
+cargo keeps **both** in one dependency graph without conflict (verified
+empirically). The real gate is the git-source supply-chain policy, not a
+crate-name conflict.
 
-Same recipe as vendoring `ruff_python_parser`: copy
-`crates/ty_python_semantic/` from upstream into
-`tyc/vendor/ty_python_semantic/`, add to workspace members. Vendor
-the helper crates it pulls in (`red_knot_workspace`,
-`red_knot_python_semantic`, etc.) one at a time until
-`cargo build -p ty_python_semantic` is green.
+#### What the prototype showed (for whoever ships this later)
+
+The check mirrors `ty`'s own CLI and is a small amount of code:
+`OsSystem::new(dir)` → `ProjectMetadata::discover` →
+`ProjectDatabase::fallible(...)` → `db.check() -> Vec<Diagnostic>`, rendered
+via `DisplayDiagnostics` in the CLI's text format so the existing `.py.map`
+remapper rewrites the diagnostics to `.ty` source unchanged. The remaining
+work to ship it is the **vendoring** (Step 2.1 above) so the `ty` crates
+enter via a path dependency rather than a git source.
+
+#### Original plan (kept for reference)
+
+The steps below described vendoring `ty_python_semantic` directly. The
+optional-git-dependency approach above supersedes them, but they remain a
+valid alternative if a fully in-tree vendor is ever preferred.
 
 Pin the upstream `ty` revision in `vendor/UPSTREAM` next to the
 pinned Ruff revision.
@@ -329,8 +350,15 @@ Salsa caching.
 
 ## Decision
 
-Implement **Phase 1 (subprocess `ty check`)** next: both
-prerequisites — the Ruff vendor migration and the `.py.map` v2
-line table — have already landed. Schedule **Phase 2 (embedded
-library)** afterwards once the subprocess path has shaken out the
-diagnostic-translation work.
+**Phase 1 (subprocess `ty check`) shipped in v0.12.0** as the integration —
+exposed via `[checker] external = "ty"` and `--with-ty`, with diagnostics
+re-attributed to `.ty` source through `.py.map`.
+
+**Phase 2 (embedded, in-process `ty`) was prototyped and proven feasible but
+not shipped.** It needs a git dependency on `astral-sh/ruff` (the `ty` crates
+aren't on crates.io), which the repo's `cargo deny` `[sources]` policy
+disallows, and it adds no capability over the subprocess path. Notably it
+does **not** require the Ruff-vendor migration this doc originally assumed —
+the vendored fork and upstream `ruff_python_ast` coexist by version — so the
+real prerequisite to shipping it is **vendoring `ty` into `tyc/vendor/`**
+(a path dep, not a git source), per Step 2.1.

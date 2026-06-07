@@ -1542,7 +1542,8 @@ impl Interpreter {
     }
 
     /// Total ordering honouring a user `__lt__` / `__eq__` on instances (used
-    /// by `list.sort` / `sorted` so custom comparison dunders take effect).
+    /// by `list.sort` / `sorted` / `min` / `max` so custom comparison dunders
+    /// take effect).
     pub fn value_cmp(&mut self, a: &Value, b: &Value) -> Result<std::cmp::Ordering, Unwind> {
         use std::cmp::Ordering;
         if matches!(a, Value::Instance(_)) || matches!(b, Value::Instance(_)) {
@@ -3201,6 +3202,21 @@ impl Interpreter {
                 });
                 Ok(Value::Native(Rc::new(nf)))
             }
+            // Static / class methods on builtin type objects. The generic
+            // unbound-method dispatcher below routes `T.m(x)` to `x.m(...)`,
+            // which is wrong for these: `dict.fromkeys(iterable, v)` and
+            // `str.maketrans(a, b)` take their arguments as data, not as the
+            // value the method runs on. Intercept them before the fallthrough.
+            Value::Native(nf) if nf.name == "dict" && attr == "fromkeys" => Ok(Value::Native(
+                Rc::new(NativeFn::new("dict.fromkeys", |interp, args| {
+                    crate::builtins::dict_fromkeys(interp, args)
+                })),
+            )),
+            Value::Native(nf) if nf.name == "str" && attr == "maketrans" => Ok(Value::Native(
+                Rc::new(NativeFn::new("str.maketrans", |_interp, args| {
+                    crate::builtins::str_maketrans(&args)
+                })),
+            )),
             // Unbound builtin-type methods: `str.strip(x)`, `list.append(xs, v)`,
             // `dict.get(d, k)`. The type constructors are registered as natives
             // named after the type; accessing a method on one yields a function
@@ -4485,6 +4501,7 @@ fn builtin_has_attr(value: &Value, attr: &str) -> bool {
                 | "strip"
                 | "swapcase"
                 | "title"
+                | "translate"
                 | "upper"
                 | "zfill"
         ),

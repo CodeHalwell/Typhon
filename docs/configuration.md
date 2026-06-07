@@ -104,9 +104,38 @@ pytest = "8.2"              # bare version → ==8.2
 | `pgo-memoise` | bool | When `true`, `tyc build` reads `typhon-profile.json` (produced by a prior `tyc profile` run) and promotes every pure function whose observed call count meets `pgo-min-calls` to `@functools.cache`, even if the user did not write `@memo`. Complements `auto-memoise` (which caches every pure function regardless of profile data). Missing profile file is not an error — PGO is best-effort. Default `false`. |
 | `pgo-min-calls` | int | Minimum observed call count for a function to be promoted by `pgo-memoise`. Default `100` — high enough that one-off entry points stay un-cached, low enough that an inner-loop helper qualifies after a single representative run. |
 | `stub-check` | `"error"` \| `"warn"` \| `"off"` | Severity for `tyc::stub_mismatch` produced by `tyc check --stubs`. `"error"` (default) breaks CI on stub drift. `"warn"` surfaces drift without blocking merges. `"off"` silently drops stub mismatches — useful when running `--stubs` opportunistically. |
+| `unintrospectable-dependency` | `"warn"` \| `"error"` \| `"off"` | Severity when a declared dependency is imported but its signatures can't be recovered (no reachable `.venv`/`python3`, the package isn't installed, or it exposes no introspectable signatures) — so its third-party arity/type checks are skipped. `"warn"` (default) surfaces the skipped coverage; `"error"` fails the build/check (CI-gating); `"off"` restores the prior silent behaviour. Install the project's dependencies (`uv sync`) or ship a `.dty` stub to clear it. |
 
 ### `[env]`
 
 | Key | Type | Description |
 |-----|------|-------------|
 | `required` | list of strings | Environment variables that **must** resolve at build time. Any `comptime env()` lookup on a missing required variable fails the build. |
+
+### `[checker]`
+
+A second-stage type checker that runs over the **emitted Python** after a
+successful `tyc build`, complementing `tyc-types`'s Typhon-specific rules.
+This is the only path that type-checks against **typeshed**, so it covers
+C-extension and stdlib APIs (numpy, pandas, `os.path`, …) that runtime venv
+introspection can't model. See [`ty-integration.md`](ty-integration.md).
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `external` | string | `"none"` | `"ty"` runs Astral's [`ty`](https://github.com/astral-sh/ty) (`ty check`) over the build output and re-attributes its diagnostics back to the `.ty` source via the `.py.map` sidecars. `ty` errors fail the build. Requires `ty` on `PATH` (`pip install ty` / `uv tool install ty`). |
+| `external-args` | list of strings | `[]` | Extra arguments forwarded verbatim to the external checker. |
+
+```toml
+[checker]
+external = "ty"
+external-args = []
+```
+
+> `ty` is most useful with the project's dependencies installed in a venv,
+> so it can resolve third-party imports and their typeshed stubs.
+
+`external = "ty"` spawns the `ty` CLI as a subprocess and re-attributes its
+diagnostics to the `.ty` source. (An embedded, in-process variant was
+prototyped — see [`ty-integration.md`](ty-integration.md) — but isn't shipped:
+it needs a git dependency on `astral-sh/ruff`, which the repo's `cargo deny`
+policy disallows, and offers no capability the subprocess path lacks.)

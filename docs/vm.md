@@ -231,6 +231,12 @@ message:
   (`while True: yield`) hits the `GENERATOR_CAP = 1_000_000` ceiling and
   raises a clear `RuntimeError` instead of streaming. Truly lazy /
   unbounded generators still need `tyc build`.
+- **`generator.send()` / coroutine-style generators.** Because generators
+  are materialised eagerly (above), the VM has no live frame to resume, so
+  `gen.send(value)`, `gen.throw(...)`, and the `value = yield x` two-way
+  protocol are unsupported — the generator runs to its cap before the
+  first `send` could ever reach it. Bidirectional generators need
+  `tyc build`. (Plain forward iteration is unaffected.)
 - **`@contextmanager` generators inside `with` blocks.** Eager collection
   runs the generator's setup and teardown at call time, so the `with`
   body can't run between them; the VM emits a clear "use `tyc build`"

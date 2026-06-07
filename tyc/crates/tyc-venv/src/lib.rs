@@ -30,11 +30,18 @@
 //! their existing channels (stdlib stubs in `tyc-lsp`, project
 //! `.ty`/`.dty` files in `collect_project_shapes`).
 //!
-//! `enrich_project_shapes_with_venv` is the CLI entry point: it walks
-//! every `.ty` file's import statements, looks up each dotted module
-//! that isn't already a known project module, and folds the
-//! introspection result into the project shape registry that the
-//! checker consumes.
+//! This is a shared crate consumed by **both** entry points so third-party
+//! checks behave identically on the CLI and in the editor:
+//!
+//! - The `tyc` binary (`tyc check` / `tyc build`) calls the one-shot
+//!   [`enrich_project_shapes_with_venv`], which builds a throwaway
+//!   [`VenvSignatures`] cache, folds recovered shapes into the project
+//!   registry, and reports any un-introspectable declared dependencies.
+//! - `tyc-lsp` holds a persistent [`VenvSignatures`] per project root and
+//!   calls [`VenvSignatures::enrich_into`] on each check, so wrong-typed /
+//!   wrong-arity third-party calls surface as live editor diagnostics. The
+//!   cache reuses per-module results across keystrokes and invalidates on a
+//!   `.venv/pyvenv.cfg` mtime change (a `uv sync`).
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -54,6 +61,13 @@ struct IntrospectedParam {
     /// `"var_keyword"` (i.e. `**kwargs`).
     kind: String,
     has_default: bool,
+    /// The parameter's annotation rendered to a string (`"int"`, `"str"`,
+    /// `"Optional[int]"`, `"<class 'requests.Session'>"`, …) or `None` when
+    /// unannotated. Mapped to a Typhon [`Type`] by [`annotation_to_type`];
+    /// anything not confidently recognised degrades to [`Type::Unknown`] so
+    /// the checker never false-positives on a shape it can't model yet.
+    #[serde(default)]
+    annotation: Option<String>,
 }
 
 /// One public symbol of an introspected module — what `dir(module)`
@@ -68,6 +82,10 @@ struct IntrospectedMember {
     /// shape info for these — a missing signature is less surprising
     /// than a wrong one.
     params: Option<Vec<IntrospectedParam>>,
+    /// The return annotation rendered to a string, or `None` when the
+    /// function has none. Only meaningful for `"function"` members.
+    #[serde(default)]
+    returns: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -100,6 +118,11 @@ pub struct VenvSignatures {
     /// repeated lookup doesn't keep re-spawning Python for the same
     /// broken module.
     cache: HashMap<String, Option<ModuleShapes>>,
+    /// `.venv/pyvenv.cfg` mtime captured when the cache was last (re)built.
+    /// Used to invalidate the whole cache when the venv changes underneath a
+    /// long-lived holder (e.g. the LSP across `uv sync`) — the one-shot CLI
+    /// callers never observe a change mid-run, so this is a no-op for them.
+    venv_stamp: Option<std::time::SystemTime>,
 }
 
 impl VenvSignatures {
@@ -108,17 +131,34 @@ impl VenvSignatures {
     /// the caller is willing to introspect — typically the project's
     /// declared dependencies' top-level packages.
     pub fn for_project_root(project_root: &Path, allowed_top_level: HashSet<String>) -> Self {
-        let venv_python = project_root.join(".venv").join("bin").join("python");
-        let python_bin = if venv_python.is_file() {
-            Some(venv_python)
-        } else {
-            which_python3()
-        };
+        let python_bin = discover_python(project_root);
         Self {
             python_bin,
             cwd: project_root.to_path_buf(),
             allowed_top_level,
             cache: HashMap::new(),
+            venv_stamp: stat_pyvenv_cfg(project_root),
+        }
+    }
+
+    /// Replace the allow-list (the project's declared dependencies may have
+    /// changed since this cache was created — e.g. the user edited
+    /// `typhon.toml`). Cheap; leaves the per-module cache intact since a
+    /// wider/narrower allow-list only gates *which* modules are fetched.
+    pub fn set_allowed_top_level(&mut self, allowed: HashSet<String>) {
+        self.allowed_top_level = allowed;
+    }
+
+    /// Re-stat `.venv/pyvenv.cfg`; if it changed since the cache was built
+    /// (a `uv sync` / venv recreate), drop every cached result and
+    /// re-discover the Python binary so the next lookup reflects the new
+    /// environment. Mirrors the completion-introspection cache's policy.
+    fn refresh_if_venv_changed(&mut self) {
+        let current = stat_pyvenv_cfg(&self.cwd);
+        if current != self.venv_stamp {
+            self.cache.clear();
+            self.python_bin = discover_python(&self.cwd);
+            self.venv_stamp = current;
         }
     }
 
@@ -145,6 +185,7 @@ impl VenvSignatures {
     /// misses, regressing checker accuracy versus the prior
     /// per-module flow. (See codex review of PR #98.)
     pub fn preload(&mut self, dotted_names: &[String]) {
+        self.refresh_if_venv_changed();
         let Some(python) = self.python_bin.as_ref() else {
             return;
         };
@@ -214,10 +255,29 @@ impl VenvSignatures {
 
 /// Resolve `python3` on PATH for tests that need to skip when no
 /// Python is available. Mirrors [`which_python3`] but is callable
-/// from sibling modules.
-#[cfg(test)]
+/// from sibling crates' tests.
 pub fn which_python3_for_test() -> Option<PathBuf> {
     which_python3()
+}
+
+/// The Python a project's introspection should use: prefer the project's
+/// own `.venv/bin/python`, falling back to a `python3` on PATH.
+fn discover_python(project_root: &Path) -> Option<PathBuf> {
+    let venv_python = project_root.join(".venv").join("bin").join("python");
+    if venv_python.is_file() {
+        Some(venv_python)
+    } else {
+        which_python3()
+    }
+}
+
+/// mtime of `.venv/pyvenv.cfg` — the file `uv`/`venv` writes when
+/// materialising an environment. Its mtime is the cleanest single signal
+/// that the venv changed (sync, recreate, package add/remove).
+fn stat_pyvenv_cfg(project_root: &Path) -> Option<std::time::SystemTime> {
+    std::fs::metadata(project_root.join(".venv").join("pyvenv.cfg"))
+        .and_then(|m| m.modified())
+        .ok()
 }
 
 /// Resolve `python3` on the user's PATH. Returns `None` when nothing
@@ -269,6 +329,21 @@ def kind_of(obj):
         return "function"
     return "value"
 
+def ann_to_str(ann):
+    # Render an annotation to a stable string the Rust side can map to a
+    # Typhon type. Type objects -> their bare name ("int", "Session");
+    # stringised annotations (PEP 563 `from __future__ import annotations`)
+    # pass through as-is; everything else falls back to `str()`. Anything
+    # the Rust mapper doesn't recognise degrades to `Unknown`, so being
+    # approximate here is safe.
+    if ann is inspect.Parameter.empty or ann is None:
+        return None
+    if isinstance(ann, type):
+        return getattr(ann, "__name__", None) or str(ann)
+    if isinstance(ann, str):
+        return ann
+    return str(ann)
+
 def params_of(obj):
     try:
         sig = inspect.signature(obj)
@@ -280,8 +355,16 @@ def params_of(obj):
             "name": p.name,
             "kind": PARAM_KIND_MAP.get(p.kind, "positional_or_keyword"),
             "has_default": p.default is not inspect.Parameter.empty,
+            "annotation": ann_to_str(p.annotation),
         })
     return out
+
+def returns_of(obj):
+    try:
+        sig = inspect.signature(obj)
+    except (TypeError, ValueError):
+        return None
+    return ann_to_str(sig.return_annotation)
 
 def introspect_one(mod_name):
     try:
@@ -301,6 +384,7 @@ def introspect_one(mod_name):
             "name": name,
             "kind": kind,
             "params": params_of(obj) if kind in ("class", "function") else None,
+            "returns": returns_of(obj) if kind == "function" else None,
         })
     return {"members": members}
 
@@ -420,7 +504,7 @@ fn shapes_from_introspected(intro: &IntrospectedModule) -> ModuleShapes {
                 }
             }
             "function" => {
-                if let Some(info) = arity_info_from_params(params) {
+                if let Some(info) = arity_info_from_params(params, member.returns.as_deref()) {
                     function_arities.insert(member.name.clone(), info);
                 }
             }
@@ -462,7 +546,13 @@ fn class_shape_from_params(params: &[IntrospectedParam]) -> Option<InterfaceShap
             field_defaults.insert(p.name.clone());
         }
         field_order.push(p.name.clone());
-        fields.insert(p.name.clone(), Type::Unknown);
+        fields.insert(
+            p.name.clone(),
+            p.annotation
+                .as_deref()
+                .map(annotation_to_type)
+                .unwrap_or(Type::Unknown),
+        );
     }
     if field_order.is_empty() {
         // A zero-arg constructor still benefits from being modelled —
@@ -490,26 +580,216 @@ fn class_shape_from_params(params: &[IntrospectedParam]) -> Option<InterfaceShap
     })
 }
 
-/// Build an [`ArityInfo`] for an introspected free function.
-fn arity_info_from_params(params: &[IntrospectedParam]) -> Option<ArityInfo> {
+/// Map an introspected annotation string to a Typhon [`Type`].
+///
+/// Conservative by design — only forms we can model precisely are
+/// recognised:
+/// - scalar built-ins (`int` / `str` / `bool` / `float` / `bytes` / `None`);
+/// - the nullable forms `Optional[X]` and the 2-member `X | None`;
+/// - fully-concrete parametric containers `list[X]` / `set[X]` /
+///   `frozenset[X]` / `dict[K, V]` and fixed-arity `tuple[T1, …]`
+///   (recursively — a container whose element doesn't resolve degrades the
+///   whole thing).
+///
+/// Everything else — multi-member unions, `tuple[T, ...]`, `Callable`,
+/// foreign classes, unknown typing constructs — degrades to
+/// [`Type::Unknown`] (which accepts anything). So annotation capture can
+/// only ever *add* true positives; it never rejects valid code on a shape
+/// we can't represent.
+fn annotation_to_type(ann: &str) -> Type {
+    let mut s = ann.trim();
+    // Unwrap the `<class 'X'>` form that `str(type_object)` produces.
+    if let Some(inner) = s
+        .strip_prefix("<class '")
+        .and_then(|r| r.strip_suffix("'>"))
+    {
+        s = inner;
+    }
+    s = s.trim();
+
+    // `Optional[X]` (optionally `typing.`-qualified) → `X | None`.
+    let unqualified = s.strip_prefix("typing.").unwrap_or(s);
+    if let Some(inner) = unqualified
+        .strip_prefix("Optional[")
+        .and_then(|r| r.strip_suffix(']'))
+    {
+        return nullable_of(annotation_to_type(inner));
+    }
+
+    // `X | None` / `None | X` (PEP 604) — the 2-member nullable form. Richer
+    // unions stay permissive (`Unknown`) so we never false-positive.
+    if let Some((a, b)) = split_top_level_union(s) {
+        let (a, b) = (a.trim(), b.trim());
+        if b == "None" || b == "NoneType" {
+            return nullable_of(annotation_to_type(a));
+        }
+        if a == "None" || a == "NoneType" {
+            return nullable_of(annotation_to_type(b));
+        }
+        return Type::Unknown;
+    }
+
+    // Parametric containers: `list[X]` / `set[X]` / `frozenset[X]` /
+    // `dict[K, V]` (and their `typing.`-qualified or capitalised aliases).
+    // Inner types map recursively; if ANY inner doesn't resolve to a concrete
+    // type the whole container degrades to `Unknown` (permissive), so we only
+    // ever emit a fully-known container shape — never `list[Unknown]`. The
+    // checker does bidirectional element widening (`[1, 2]` into `list[float]`
+    // is fine), so a concrete container shape adds true positives only.
+    if let Some((head, inner)) = split_generic(s) {
+        let head = head.rsplit('.').next().unwrap_or(head);
+        // Single-element (`list`/`set`/`frozenset`), two-element (`dict`), and
+        // fixed-arity `tuple` containers map element-wise. A fully-mapped
+        // `Generic(head, [..])` matches what the checker builds from the same
+        // annotation, so it integrates with the existing assignability rules.
+        let arity_ok: Option<(&str, bool)> = match head {
+            "list" | "List" => Some(("list", true)),
+            "set" | "Set" => Some(("set", true)),
+            "frozenset" | "FrozenSet" => Some(("frozenset", true)),
+            "dict" | "Dict" => Some(("dict", false)),
+            "tuple" | "Tuple" => Some(("tuple", false)),
+            _ => None,
+        };
+        if let Some((name, single)) = arity_ok {
+            let parts = split_top_level_commas(inner);
+            // Homogeneous `tuple[X, ...]` (Ellipsis) and degenerate shapes
+            // stay permissive — only fixed-arity element lists are mapped.
+            let shape_ok = match name {
+                "dict" => parts.len() == 2,
+                "tuple" => !parts.is_empty() && !parts.iter().any(|p| p.trim() == "..."),
+                _ if single => parts.len() == 1,
+                _ => false,
+            };
+            if shape_ok {
+                let mapped: Vec<Type> =
+                    parts.iter().map(|p| annotation_to_type(p.trim())).collect();
+                if mapped
+                    .iter()
+                    .any(|t| matches!(t, Type::Unknown | Type::Any))
+                {
+                    return Type::Unknown;
+                }
+                return Type::Generic(name.to_owned(), mapped);
+            }
+        }
+        // Foreign generic class, `Callable[...]`, `tuple[X, ...]`, etc. — stay
+        // permissive rather than guess.
+        return Type::Unknown;
+    }
+
+    // Drop a module qualifier on a bare dotted name (`builtins.int`), but
+    // leave parametric forms untouched so we don't mangle them.
+    let bare = if !s.contains('[') && !s.contains('|') && !s.contains(' ') {
+        s.rsplit('.').next().unwrap_or(s)
+    } else {
+        s
+    };
+    match bare {
+        "int" => Type::Int,
+        "str" => Type::Str,
+        "bool" => Type::Bool,
+        "float" => Type::Float,
+        "bytes" => Type::Bytes,
+        "None" | "NoneType" => Type::None,
+        _ => Type::Unknown,
+    }
+}
+
+/// Split a `Head[inner]` annotation into `(head, inner)` — the text inside the
+/// outermost brackets. `None` when `s` isn't of that form.
+fn split_generic(s: &str) -> Option<(&str, &str)> {
+    let open = s.find('[')?;
+    if !s.ends_with(']') {
+        return None;
+    }
+    let head = s[..open].trim();
+    if head.is_empty() {
+        return None;
+    }
+    Some((head, &s[open + 1..s.len() - 1]))
+}
+
+/// Split `s` on top-level commas (ignoring commas nested inside `[...]` /
+/// `(...)`). Used to separate container type arguments.
+fn split_top_level_commas(s: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut depth = 0i32;
+    let mut start = 0;
+    for (i, &b) in s.as_bytes().iter().enumerate() {
+        match b {
+            b'[' | b'(' => depth += 1,
+            b']' | b')' => depth -= 1,
+            b',' if depth == 0 => {
+                parts.push(&s[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    parts.push(&s[start..]);
+    parts
+}
+
+/// Wrap `inner` as nullable (`inner | None`). A non-mappable inner collapses
+/// to `Unknown` (a nullable-`Unknown` is just `Unknown` — still permissive).
+fn nullable_of(inner: Type) -> Type {
+    match inner {
+        Type::Unknown | Type::Any => Type::Unknown,
+        Type::None => Type::None,
+        other => Type::Union(vec![other, Type::None]),
+    }
+}
+
+/// Split `s` on a single top-level `|` (ignoring pipes nested inside
+/// `[...]` / `(...)`), returning the two halves. Used to recognise the
+/// `X | None` nullable form. `None` when there is no top-level pipe.
+fn split_top_level_union(s: &str) -> Option<(&str, &str)> {
+    let bytes = s.as_bytes();
+    let mut depth = 0i32;
+    for (i, &b) in bytes.iter().enumerate() {
+        match b {
+            b'[' | b'(' => depth += 1,
+            b']' | b')' => depth -= 1,
+            b'|' if depth == 0 => return Some((&s[..i], &s[i + 1..])),
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Build an [`ArityInfo`] for an introspected free function. `returns` is
+/// the function's return annotation (or `None`).
+fn arity_info_from_params(
+    params: &[IntrospectedParam],
+    returns: Option<&str>,
+) -> Option<ArityInfo> {
     let mut param_names: Vec<String> = Vec::new();
+    let mut param_types: Vec<Type> = Vec::new();
     let mut required_positional: Vec<bool> = Vec::new();
     let mut kwonly_names: Vec<String> = Vec::new();
+    let mut kwonly_types: Vec<Type> = Vec::new();
     let mut kwonly_required: Vec<String> = Vec::new();
     let mut has_kwarg = false;
     let mut has_vararg = false;
     for p in params {
+        let ty = p
+            .annotation
+            .as_deref()
+            .map(annotation_to_type)
+            .unwrap_or(Type::Unknown);
         match p.kind.as_str() {
             "var_positional" => has_vararg = true,
             "var_keyword" => has_kwarg = true,
             "keyword_only" => {
                 kwonly_names.push(p.name.clone());
+                kwonly_types.push(ty);
                 if !p.has_default {
                     kwonly_required.push(p.name.clone());
                 }
             }
             _ => {
                 param_names.push(p.name.clone());
+                param_types.push(ty);
                 required_positional.push(!p.has_default);
             }
         }
@@ -520,8 +800,7 @@ fn arity_info_from_params(params: &[IntrospectedParam]) -> Option<ArityInfo> {
         Some(param_names.len())
     };
     let min_positional = required_positional.iter().filter(|r| **r).count();
-    let param_types = vec![tyc_types::Type::Unknown; param_names.len()];
-    let kwonly_types = vec![tyc_types::Type::Unknown; kwonly_names.len()];
+    let return_type = returns.map(annotation_to_type).unwrap_or(Type::Unknown);
     Some(ArityInfo {
         param_names,
         min_positional,
@@ -533,7 +812,7 @@ fn arity_info_from_params(params: &[IntrospectedParam]) -> Option<ArityInfo> {
         vararg_type: None,
         param_types,
         kwonly_types,
-        return_type: tyc_types::Type::Unknown,
+        return_type,
     })
 }
 
@@ -666,41 +945,381 @@ pub fn enrich_project_shapes_with_venv(
     project_module_set: &HashSet<String>,
     allowed_top_level: HashSet<String>,
     project_shapes: &mut HashMap<String, ModuleShapes>,
-) {
+) -> Vec<String> {
     if allowed_top_level.is_empty() {
-        return;
+        return Vec::new();
     }
     let mut cache = VenvSignatures::for_project_root(project_root, allowed_top_level);
-    if cache.python_bin.is_none() {
-        return;
+    cache.enrich_into(paths, project_module_set, project_shapes)
+}
+
+impl VenvSignatures {
+    /// Fold recovered third-party shapes for every allow-listed module
+    /// imported under `paths` into `project_shapes`, reusing this cache's
+    /// per-module results. The CLI builds a throwaway cache via
+    /// [`enrich_project_shapes_with_venv`]; the LSP holds one across edits so
+    /// repeated checks only shell to Python when a genuinely new dependency
+    /// module appears (or the venv changed — see [`Self::refresh_if_venv_changed`]).
+    /// Returns the top-level declared dependencies that couldn't be
+    /// introspected (for the unintrospectable-dependency warning).
+    pub fn enrich_into(
+        &mut self,
+        paths: &[PathBuf],
+        project_module_set: &HashSet<String>,
+        project_shapes: &mut HashMap<String, ModuleShapes>,
+    ) -> Vec<String> {
+        if self.allowed_top_level.is_empty() {
+            return Vec::new();
+        }
+        let imports = collect_imported_modules(paths);
+        // Only modules whose top-level package is a declared dependency are
+        // candidates (the allow-list); stdlib / project modules are excluded.
+        let needed: Vec<String> = imports
+            .iter()
+            .filter(|m| !project_shapes.contains_key(*m) && !project_module_set.contains(*m))
+            .filter(|m| self.allowed_top_level.contains(top_level(m)))
+            .cloned()
+            .collect();
+        if needed.is_empty() {
+            return Vec::new();
+        }
+
+        self.refresh_if_venv_changed();
+
+        // No reachable `.venv`/`python3`: every needed declared-dependency
+        // module is unintrospectable. Report each top-level package so the
+        // caller can warn that third-party checks were skipped rather than
+        // silently passing (the most dangerous failure mode for this feature).
+        if self.python_bin.is_none() {
+            let mut tops: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+            for m in &needed {
+                tops.insert(top_level(m).to_owned());
+            }
+            return tops.into_iter().collect();
+        }
+
+        self.preload(&needed);
+        // Track per-top-level success so a package whose root introspected
+        // fine isn't reported just because one submodule (`requests.adapters`)
+        // failed.
+        let mut ok_tops: HashSet<String> = HashSet::new();
+        let mut failed_tops: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for module in needed {
+            let top = top_level(&module).to_owned();
+            // A module that failed to import yields an *empty* `ModuleShapes`
+            // (the embedded Python returns `{"members": []}` on `ImportError`),
+            // and a module whose members are all C-extension callables
+            // introspects to nothing — both mean "no signatures recovered", so
+            // treat an empty result the same as a miss for the warning.
+            let recovered = self.module_shapes(&module).cloned();
+            match recovered {
+                Some(shapes)
+                    if !(shapes.class_shapes.is_empty() && shapes.function_arities.is_empty()) =>
+                {
+                    project_shapes.insert(module, shapes);
+                    ok_tops.insert(top);
+                }
+                _ => {
+                    failed_tops.insert(top);
+                }
+            }
+        }
+        failed_tops
+            .into_iter()
+            .filter(|t| !ok_tops.contains(t))
+            .collect()
     }
-    let imports = collect_imported_modules(paths);
-    // Filter once, then batch the whole list into a single subprocess
-    // (see `VenvSignatures::preload`). The earlier per-module loop
-    // dominated `tyc check` time on projects with many declared deps —
-    // each `import requests.X` was costing a fresh Python startup.
-    let needed: Vec<String> = imports
-        .iter()
-        .filter(|m| !project_shapes.contains_key(*m) && !project_module_set.contains(*m))
-        .cloned()
-        .collect();
-    cache.preload(&needed);
-    for module in needed {
-        if let Some(shapes) = cache.module_shapes(&module) {
-            project_shapes.insert(module, shapes.clone());
+}
+
+/// First dotted component of a module path (`requests.adapters` → `requests`).
+fn top_level(module: &str) -> &str {
+    module.split('.').next().unwrap_or(module)
+}
+
+/// Compute the introspection allow-list — the declared dependencies'
+/// top-level import names — from a project's `typhon.toml`. Mirrors the set
+/// the CLI builds from `[dependencies]` + `[dev-dependencies]` keys, so the
+/// LSP introspects exactly the same modules `tyc check` would. Empty when
+/// there's no `typhon.toml` or it declares no dependencies.
+pub fn allowed_top_level_from_project(project_root: &Path) -> HashSet<String> {
+    let mut out = HashSet::new();
+    let Ok(text) = std::fs::read_to_string(project_root.join("typhon.toml")) else {
+        return out;
+    };
+    let Ok(value) = text.parse::<toml::Value>() else {
+        return out;
+    };
+    let mut declared_normalised: HashSet<String> = HashSet::new();
+    for table in ["dependencies", "dev-dependencies"] {
+        if let Some(toml::Value::Table(deps)) = value.get(table) {
+            for name in deps.keys() {
+                // The distribution name's first segment — a reasonable guess
+                // for the import root, correct for most packages.
+                out.insert(top_level(name).to_owned());
+                declared_normalised.insert(pep503_normalise(name));
+            }
         }
     }
+    // Expand via installed `.dist-info` metadata so packages whose import
+    // root differs from the PyPI name (`beautifulsoup4` → `bs4`,
+    // `agent-framework-core` → `agent_framework`) are allow-listed too —
+    // keeping `tyc build` and the LSP consistent with `tyc check`, which
+    // already performs this expansion. A no-op without a `.venv`.
+    for import_root in top_level_imports_from_venv(project_root, &declared_normalised) {
+        out.insert(top_level(&import_root).to_owned());
+    }
+    out
+}
+
+/// Surface the un-introspectable declared dependencies returned by
+/// [`enrich_project_shapes_with_venv`], honouring the
+/// `[strictness] unintrospectable-dependency` severity (`"warn"` default /
+/// `"error"` / `"off"`). Returns `true` when the severity is `"error"` and
+/// there were offenders, so the caller can fail the build/check. Keeping the
+/// missed checks visible is the whole point — a silently-skipped third-party
+/// check looks identical to a clean pass.
+pub fn report_unintrospectable_dependencies(packages: &[String], severity: &str) -> bool {
+    if packages.is_empty() || severity == "off" {
+        return false;
+    }
+    let is_error = severity == "error";
+    let label = if is_error { "error" } else { "warning" };
+    eprintln!(
+        "{label}: declared {} could not be introspected: {}\n  \
+         third-party argument/type checks for {} were skipped. Install the project's \
+         dependencies (e.g. `uv sync`) so `tyc` can read their signatures, add a `.dty` \
+         stub, or set `[strictness] unintrospectable-dependency = \"off\"` to silence.",
+        if packages.len() == 1 {
+            "dependency"
+        } else {
+            "dependencies"
+        },
+        packages.join(", "),
+        if packages.len() == 1 { "it" } else { "them" },
+    );
+    is_error
+}
+
+// ── dist→import name resolution (shared by `tyc check` / `tyc build` /
+// LSP, so all three allow-list the same set of third-party imports) ──
+
+/// Normalise a PyPI distribution name per PEP 503: replace runs of
+/// `[-_.]+` with a single `-` and lowercase. `tyc` uses this to match
+/// `[dependencies]` keys against `.dist-info` directory names regardless
+/// of casing or separator drift (`Agent-Framework-Core`,
+/// `agent_framework_core`, `agent.framework.core` all normalise the
+/// same).
+pub fn pep503_normalise(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    let mut prev_sep = false;
+    for ch in name.chars() {
+        if ch == '-' || ch == '_' || ch == '.' {
+            if !prev_sep && !out.is_empty() {
+                out.push('-');
+                prev_sep = true;
+            }
+        } else {
+            out.push(ch.to_ascii_lowercase());
+            prev_sep = false;
+        }
+    }
+    if out.ends_with('-') {
+        out.pop();
+    }
+    out
+}
+
+/// Scan the project's local virtualenv for installed Python
+/// distributions and return the top-level import names each one
+/// provides — restricted to distributions actually declared in
+/// `[dependencies]` / `[dev-dependencies]`. Used by `tyc check` to vet
+/// imports whose package name differs from the PyPI distribution name
+/// (e.g. `agent-framework-core` -> `agent_framework`,
+/// `beautifulsoup4` -> `bs4`).
+///
+/// Looks for a venv at `<project_root>/.venv` — the default `uv` /
+/// `tyc sync` location — and reads `<dist>-<ver>.dist-info/top_level.txt`
+/// from each declared distribution's metadata. If `top_level.txt` is
+/// absent (newer wheels often omit it) we fall back to scanning the
+/// `RECORD` manifest for top-level `<pkg>/__init__.py` paths.
+///
+/// `declared` is a set of PEP 503-normalised distribution names; only
+/// `.dist-info` directories whose dist-name normalises into that set
+/// contribute import roots. This keeps `tyc check` reproducible across
+/// machines: a developer with extra packages in their local venv
+/// won't accidentally pass imports that would fail on a fresh clone.
+///
+/// Returns an empty list when no venv exists.
+pub fn top_level_imports_from_venv(
+    project_root: &std::path::Path,
+    declared: &std::collections::HashSet<String>,
+) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    if declared.is_empty() {
+        return out;
+    }
+    let venv_root = project_root.join(".venv");
+    if !venv_root.is_dir() {
+        return out;
+    }
+    // `site-packages` lives under `lib/pythonX.Y` on POSIX,
+    // `Lib/site-packages` on Windows. Probe both.
+    let mut site_dirs: Vec<PathBuf> = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(venv_root.join("lib")) {
+        for entry in entries.flatten() {
+            let p = entry.path().join("site-packages");
+            if p.is_dir() {
+                site_dirs.push(p);
+            }
+        }
+    }
+    let win_site = venv_root.join("Lib").join("site-packages");
+    if win_site.is_dir() {
+        site_dirs.push(win_site);
+    }
+    for site in site_dirs {
+        let Ok(entries) = std::fs::read_dir(&site) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let dir_name = path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or_default();
+            let Some(stem) = dir_name.strip_suffix(".dist-info") else {
+                continue;
+            };
+            // `<dist>-<version>.dist-info` — the dist-name is the part
+            // before the LAST `-<version>` segment. Strip the trailing
+            // `-…` component (versions are PEP 440 and don't contain `/`
+            // or whitespace, so trimming the rightmost `-` block is safe).
+            let dist_name = stem.rsplit_once('-').map(|(d, _)| d).unwrap_or(stem);
+            let normalised = pep503_normalise(dist_name);
+            if !declared.contains(&normalised) {
+                continue;
+            }
+            // Prefer top_level.txt — one package name per line.
+            let tlt = path.join("top_level.txt");
+            if let Ok(content) = std::fs::read_to_string(&tlt) {
+                for line in content.lines() {
+                    let line = line.trim();
+                    // Filter out empty lines and namespace-package markers.
+                    // top_level.txt may also list dotted paths for
+                    // sub-packages; we only need the root component.
+                    if line.is_empty() {
+                        continue;
+                    }
+                    let root = line.split('/').next().unwrap_or(line);
+                    let root = root.split('.').next().unwrap_or(root);
+                    if !root.is_empty() && !root.starts_with('_') {
+                        out.push(root.to_owned());
+                    }
+                }
+                continue;
+            }
+            // Fallback: derive top-level packages from RECORD.
+            // Each entry is `<path>,<hash>,<size>`; the path may be
+            // double-quoted (PEP 376) if it contains commas, may be a
+            // relative `../bin/script` for installed-outside-site
+            // files, or absolute. We accept only paths that point at
+            // a Python module (`<name>.py`) or at a Python source file
+            // inside a top-level directory (`<name>/.../*.py(i)`) — the
+            // narrower filter avoids picking up shipped `bin/`,
+            // `docs/`, or `tests/` directories.
+            if let Ok(record) = std::fs::read_to_string(path.join("RECORD")) {
+                for line in record.lines() {
+                    let raw = line.split(',').next().unwrap_or("").trim();
+                    let path_field = raw.trim_matches('"');
+                    if path_field.is_empty()
+                        || path_field.starts_with("../")
+                        || path_field.starts_with("..\\")
+                        || path_field.starts_with('/')
+                        || path_field.starts_with('\\')
+                    {
+                        continue;
+                    }
+                    let head = path_field.split('/').next().unwrap_or(path_field);
+                    if head.is_empty()
+                        || head == "."
+                        || head == ".."
+                        || head.starts_with('_')
+                        || head.ends_with(".dist-info")
+                        || head.ends_with(".data")
+                    {
+                        continue;
+                    }
+                    let import_name = if let Some(stem) = head.strip_suffix(".py") {
+                        // Top-level single-file module (`foo.py`).
+                        stem
+                    } else if head.ends_with(".pyi") {
+                        // Pure-stub package — uncommon but valid.
+                        head.strip_suffix(".pyi").unwrap_or(head)
+                    } else if path_field.contains('/')
+                        && (path_field.ends_with(".py") || path_field.ends_with(".pyi"))
+                    {
+                        // Python source nested under a top-level
+                        // directory — treat the directory as a package.
+                        head
+                    } else {
+                        continue;
+                    };
+                    if !import_name.is_empty() && !import_name.starts_with('_') {
+                        out.push(import_name.to_owned());
+                    }
+                }
+            }
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    #[test]
+    fn allowed_top_level_reads_declared_dependencies() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("typhon.toml"),
+            "[project]\nname = \"x\"\n\n[dependencies]\nrequests = \">=2\"\n\n[dev-dependencies]\npytest = \"8\"\n",
+        )
+        .unwrap();
+        let allowed = allowed_top_level_from_project(tmp.path());
+        assert!(allowed.contains("requests"), "got {allowed:?}");
+        assert!(
+            allowed.contains("pytest"),
+            "dev-deps count too: {allowed:?}"
+        );
+        // A project with no typhon.toml yields an empty allow-list (enrichment
+        // is then a no-op), never a panic.
+        let empty = tempfile::tempdir().unwrap();
+        assert!(allowed_top_level_from_project(empty.path()).is_empty());
+    }
+
     fn p(name: &str, kind: &str, has_default: bool) -> IntrospectedParam {
         IntrospectedParam {
             name: name.into(),
             kind: kind.into(),
             has_default,
+            annotation: None,
+        }
+    }
+
+    /// Like [`p`] but carries an annotation string, for the
+    /// annotation-capture tests.
+    fn p_ann(name: &str, kind: &str, has_default: bool, annotation: &str) -> IntrospectedParam {
+        IntrospectedParam {
+            name: name.into(),
+            kind: kind.into(),
+            has_default,
+            annotation: Some(annotation.into()),
         }
     }
 
@@ -753,7 +1372,7 @@ mod tests {
             p("c", "keyword_only", false),
             p("d", "keyword_only", true),
         ];
-        let info = arity_info_from_params(&params).expect("info");
+        let info = arity_info_from_params(&params, None).expect("info");
         assert_eq!(info.param_names, vec!["a", "b"]);
         assert_eq!(info.required_positional, vec![true, false]);
         assert_eq!(info.min_positional, 1);
@@ -770,7 +1389,7 @@ mod tests {
             p("args", "var_positional", false),
             p("kwargs", "var_keyword", false),
         ];
-        let info = arity_info_from_params(&params).expect("info");
+        let info = arity_info_from_params(&params, None).expect("info");
         assert_eq!(info.param_names, vec!["a"]);
         assert_eq!(info.max_positional, None, "vararg uncaps the maximum");
         assert!(info.has_kwarg, "**kwargs accepted");
@@ -786,17 +1405,119 @@ mod tests {
                     name: "VERSION".into(),
                     kind: "value".into(),
                     params: None,
+                    returns: None,
                 },
                 IntrospectedMember {
                     name: "Agent".into(),
                     kind: "class".into(),
                     params: Some(vec![p("name", "keyword_only", false)]),
+                    returns: None,
                 },
             ],
         };
         let shapes = shapes_from_introspected(&intro);
         assert!(shapes.class_shapes.contains_key("Agent"));
         assert!(!shapes.class_shapes.contains_key("VERSION"));
+    }
+
+    #[test]
+    fn annotation_to_type_maps_scalars_and_degrades_safely() {
+        assert_eq!(annotation_to_type("int"), Type::Int);
+        assert_eq!(annotation_to_type("<class 'str'>"), Type::Str);
+        assert_eq!(annotation_to_type("builtins.bool"), Type::Bool);
+        assert_eq!(annotation_to_type("float"), Type::Float);
+        assert_eq!(annotation_to_type("bytes"), Type::Bytes);
+        assert_eq!(annotation_to_type("None"), Type::None);
+        assert_eq!(annotation_to_type("NoneType"), Type::None);
+        // Nullable scalar forms map to `T | None`.
+        assert_eq!(
+            annotation_to_type("Optional[str]"),
+            Type::Union(vec![Type::Str, Type::None])
+        );
+        assert_eq!(
+            annotation_to_type("typing.Optional[int]"),
+            Type::Union(vec![Type::Int, Type::None])
+        );
+        assert_eq!(
+            annotation_to_type("int | None"),
+            Type::Union(vec![Type::Int, Type::None])
+        );
+        assert_eq!(
+            annotation_to_type("None | bytes"),
+            Type::Union(vec![Type::Bytes, Type::None])
+        );
+        // Parametric containers map element-wise.
+        assert_eq!(
+            annotation_to_type("list[int]"),
+            Type::Generic("list".into(), vec![Type::Int])
+        );
+        assert_eq!(
+            annotation_to_type("List[str]"),
+            Type::Generic("list".into(), vec![Type::Str])
+        );
+        assert_eq!(
+            annotation_to_type("dict[str, int]"),
+            Type::Generic("dict".into(), vec![Type::Str, Type::Int])
+        );
+        assert_eq!(
+            annotation_to_type("set[bytes]"),
+            Type::Generic("set".into(), vec![Type::Bytes])
+        );
+        assert_eq!(
+            annotation_to_type("list[list[int]]"),
+            Type::Generic(
+                "list".into(),
+                vec![Type::Generic("list".into(), vec![Type::Int])]
+            )
+        );
+        assert_eq!(
+            annotation_to_type("Optional[list[int]]"),
+            Type::Union(vec![
+                Type::Generic("list".into(), vec![Type::Int]),
+                Type::None
+            ])
+        );
+        // A container whose element doesn't map degrades the whole thing to
+        // Unknown — never `list[Unknown]`.
+        assert_eq!(annotation_to_type("list[requests.Session]"), Type::Unknown);
+        assert_eq!(annotation_to_type("dict[str, Session]"), Type::Unknown);
+        // Fixed-arity tuples map element-wise; homogeneous `tuple[X, ...]`,
+        // Callable, and foreign generics stay permissive.
+        assert_eq!(
+            annotation_to_type("tuple[int, str]"),
+            Type::Generic("tuple".into(), vec![Type::Int, Type::Str])
+        );
+        assert_eq!(annotation_to_type("tuple[int, ...]"), Type::Unknown);
+        assert_eq!(annotation_to_type("Callable[[int], str]"), Type::Unknown);
+        // Anything else we don't confidently model degrades to Unknown.
+        assert_eq!(annotation_to_type("int | str | None"), Type::Unknown);
+        assert_eq!(annotation_to_type("int | str"), Type::Unknown);
+        assert_eq!(annotation_to_type("requests.Session"), Type::Unknown);
+    }
+
+    #[test]
+    fn annotation_capture_populates_param_and_return_types() {
+        // `def get(url: str, timeout: float = ...) -> SomethingForeign`
+        let params = vec![
+            p_ann("url", "positional_or_keyword", false, "str"),
+            p_ann("timeout", "positional_or_keyword", true, "float"),
+        ];
+        let info = arity_info_from_params(&params, Some("Response")).unwrap();
+        assert_eq!(info.param_types, vec![Type::Str, Type::Float]);
+        // Unrecognised return annotation degrades to Unknown.
+        assert_eq!(info.return_type, Type::Unknown);
+    }
+
+    #[test]
+    fn annotation_capture_populates_constructor_field_types() {
+        // `class C: __init__(self, host: str, port: int)`
+        let params = vec![
+            p_ann("host", "positional_or_keyword", false, "str"),
+            p_ann("port", "positional_or_keyword", false, "int"),
+        ];
+        let shape = class_shape_from_params(&params).unwrap();
+        assert_eq!(shape.fields.get("host"), Some(&Type::Str));
+        assert_eq!(shape.fields.get("port"), Some(&Type::Int));
     }
 
     #[test]
@@ -915,6 +1636,7 @@ lazy import np = numpy
             cwd: tmp.path().to_path_buf(),
             allowed_top_level: allowed,
             cache: HashMap::new(),
+            venv_stamp: None,
         };
         let modules: Vec<String> = ["pkg_a", "pkg_b", "pkg_c", "pkg_d", "pkg_e"]
             .iter()
@@ -993,6 +1715,7 @@ lazy import np = numpy
             cwd: tmp.path().to_path_buf(),
             allowed_top_level: allowed,
             cache: HashMap::new(),
+            venv_stamp: None,
         };
         let modules: Vec<String> = ["pkg_a", "pkg_b", "pkg_c"]
             .iter()
@@ -1029,6 +1752,7 @@ lazy import np = numpy
                 name: "WeirdCType".into(),
                 kind: "class".into(),
                 params: None,
+                returns: None,
             }],
         };
         let shapes = shapes_from_introspected(&intro);

@@ -96,8 +96,20 @@ pub fn load_map_for(py_path: &str, map_dir: Option<&Path>) -> Option<String> {
     if adjacent.exists() {
         return std::fs::read_to_string(&adjacent).ok();
     }
-    // 3. Explicit --map-dir override.
+    // 3. Explicit map-dir override. Covers `.py` references that are
+    //    *relative* to the build dir — the form the embedded `ty` renderer
+    //    emits (`main.py`, `pkg/mod.py`). Their `parent()` can't anchor the
+    //    `.sourcemaps/` walk in step 1 (the subprocess path avoids this by
+    //    emitting absolute paths), so resolve them against `map_dir`
+    //    directly: first the `.sourcemaps/<rel>.py.map` layout, then the
+    //    legacy adjacent `<base>.py.map`.
     if let Some(dir) = map_dir {
+        if Path::new(py_path).is_relative() {
+            let in_sourcemaps = dir.join(".sourcemaps").join(format!("{py_path}.map"));
+            if in_sourcemaps.exists() {
+                return std::fs::read_to_string(&in_sourcemaps).ok();
+            }
+        }
         if let Some(base) = Path::new(py_path).file_name() {
             let candidate = dir.join(format!("{}.map", base.to_string_lossy()));
             if candidate.exists() {
@@ -222,6 +234,29 @@ mod tests {
         std::fs::write(nested_map_dir.join("foo.py.map"), body).unwrap();
         let loaded = load_map_for(py.to_str().unwrap(), None).expect("nested map should be found");
         assert!(loaded.contains("sub/foo.ty"));
+    }
+
+    #[test]
+    fn load_map_for_resolves_build_relative_py_via_map_dir() {
+        // The embedded `ty` renderer emits build-*relative* refs (`main.py`,
+        // `pkg/mod.py`) whose `parent()` can't anchor the `.sourcemaps/`
+        // walk. They must resolve against `map_dir/.sourcemaps/<rel>.py.map`.
+        let tmp = tempfile::tempdir().unwrap();
+        let build = tmp.path().join("build");
+        std::fs::create_dir_all(build.join(".sourcemaps").join("pkg")).unwrap();
+        let flat = r#"{"version":2,"source":"main.ty","line_strategy":"identity","lines":[]}"#;
+        std::fs::write(build.join(".sourcemaps").join("main.py.map"), flat).unwrap();
+        let nested = r#"{"version":2,"source":"pkg/mod.ty","line_strategy":"identity","lines":[]}"#;
+        std::fs::write(
+            build.join(".sourcemaps").join("pkg").join("mod.py.map"),
+            nested,
+        )
+        .unwrap();
+
+        let got = load_map_for("main.py", Some(&build)).expect("relative flat map");
+        assert!(got.contains("main.ty"));
+        let got_nested = load_map_for("pkg/mod.py", Some(&build)).expect("relative nested map");
+        assert!(got_nested.contains("pkg/mod.ty"));
     }
 
     #[test]

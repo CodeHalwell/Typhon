@@ -12,6 +12,7 @@ members = [
     "crates/tyc-desugar",
     "crates/tyc-lsp",
     "crates/tyc-vm",
+    "crates/tyc-venv",
     # Vendored Ruff parser/AST — Typhon's in-tree fork.
     # See `vendor/README.md` for the migration plan.
     "vendor/ruff_text_size",
@@ -23,7 +24,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.11.0"
+version = "0.12.0"
 edition = "2021"
 authors = ["Typhon Contributors"]
 license = "MIT"

@@ -13,6 +13,8 @@ pub struct TyphonConfig {
     pub emit: EmitConfig,
     pub strictness: StrictnessConfig,
     pub env: EnvConfig,
+    #[serde(default)]
+    pub checker: CheckerConfig,
     /// Runtime Python dependencies, keyed by package name. The value is a
     /// PEP 440 version specifier (e.g. `"^2.0"`, `">=1.0,<2"`, `"*"`).
     /// Empty when typhon.toml does not declare any dependencies — projects
@@ -201,6 +203,12 @@ pub struct StrictnessConfig {
     ///   use only when `--stubs` is run opportunistically.
     #[serde(default = "default_stub_check")]
     pub stub_check: String,
+    /// Severity when a declared dependency is imported but could not be
+    /// introspected for signatures (no reachable `.venv`/`python3`, or the
+    /// package isn't installed) — so its third-party arity/type checks are
+    /// silently skipped. `"warn"` (default) surfaces it, `"error"` fails the
+    /// build/check (CI-gating), `"off"` restores the old silent behaviour.
+    pub unintrospectable_dependency: String,
 }
 
 impl Default for StrictnessConfig {
@@ -220,6 +228,7 @@ impl Default for StrictnessConfig {
             blocking_in_async: "warn".into(),
             allow_secret_comptime: false,
             stub_check: "error".into(),
+            unintrospectable_dependency: "warn".into(),
         }
     }
 }
@@ -229,6 +238,35 @@ impl Default for StrictnessConfig {
 pub struct EnvConfig {
     /// Env vars that must be resolvable at build time for `comptime env()`.
     pub required: Vec<String>,
+}
+
+/// `[checker]` — second-stage type-checking over the emitted Python.
+///
+/// `tyc-types` enforces Typhon-specific semantics (let/mut, sealed unions,
+/// `Result`/`?`, interface conformance, …). An external checker complements
+/// it by validating the standard Python typing spec against **typeshed** —
+/// the only path that covers C-extension libraries (numpy / pandas / torch)
+/// and typeshed-only annotations that runtime venv introspection cannot see.
+/// See `docs/ty-integration.md`.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(default, rename_all = "kebab-case")]
+pub struct CheckerConfig {
+    /// External checker to run after a successful build/check. `"none"`
+    /// (default) disables it; `"ty"` runs Astral's `ty check` over the
+    /// emitted Python and re-attributes its diagnostics back to the `.ty`
+    /// source via the `.py.map` sidecars.
+    pub external: String,
+    /// Extra arguments forwarded verbatim to the external checker.
+    pub external_args: Vec<String>,
+}
+
+impl Default for CheckerConfig {
+    fn default() -> Self {
+        Self {
+            external: "none".into(),
+            external_args: Vec::new(),
+        }
+    }
 }
 
 impl TyphonConfig {
@@ -440,6 +478,23 @@ mod tests {
             },
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn checker_config_defaults_to_none() {
+        let cfg = TyphonConfig::default();
+        assert_eq!(cfg.checker.external, "none");
+        assert!(cfg.checker.external_args.is_empty());
+    }
+
+    #[test]
+    fn checker_config_parses_external_ty() {
+        let cfg: TyphonConfig = toml::from_str(
+            "[project]\nname = \"x\"\n\n[checker]\nexternal = \"ty\"\nexternal-args = [\"--error-on-warning\"]\n",
+        )
+        .expect("parse");
+        assert_eq!(cfg.checker.external, "ty");
+        assert_eq!(cfg.checker.external_args, vec!["--error-on-warning"]);
     }
 
     #[test]

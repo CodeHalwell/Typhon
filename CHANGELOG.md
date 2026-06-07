@@ -4,7 +4,7 @@ All notable changes to Typhon are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely; the
 canonical phase-by-phase status lives in `docs/roadmap.md`.
 
-## Unreleased
+## 0.12.0 — 2026-06-07 — VM `__lt__` parity, dict/str builtins, and deep library introspection
 
 Adversarial stress-round follow-up against v0.11.0. A fresh sweep across
 simple scripts, file/JSON I/O, ML-shaped numerics, agent/tool-dispatch
@@ -14,6 +14,17 @@ type-checker resolution gap. The build path and the type checker were
 otherwise solid across the sweep (soundness probes for nullable misuse,
 list invariance, newtype bypass, frozen reassignment, Result error-type
 mismatch, and interface conformance were all correctly rejected).
+
+A follow-up VM-vs-CPython differential review found four more parity
+defects — `sorted` / `min` / `max` ignoring a user `__lt__` (silent wrong
+output), and missing `dict.popitem` / `dict.fromkeys` / `str.translate` /
+`str.maketrans` — all fixed below. The same pass widened the third-party
+introspection used by `tyc check` / `tyc build` to capture parameter and
+return *annotations*, so fully-typed pure-Python dependencies now get
+argument-*type* checking (not just arity) at the call site. (The
+remaining VM coroutine-generator limit and the introspection scope are
+now documented rather than fixed — see `docs/vm.md` and
+`docs/diagnostics/missing_argument.md`.)
 
 ### Fixed — VM / CPython parity
 
@@ -35,6 +46,149 @@ mismatch, and interface conformance were all correctly rejected).
   printed `42` (the spec was dropped); `f"{n:e}"` on an int printed the
   bare integer. `e`/`E`/`f`/`F`/`g`/`G` now promote an int/bool operand to
   float before formatting, matching CPython.
+
+### Fixed — VM comparison protocol (`sorted` / `min` / `max`)
+
+- **`sorted()` / `min()` / `max()` honour a user `__lt__`.** They compared
+  via the dunder-blind `Value::py_cmp`, which returns "equal" for class
+  instances — so `sorted([R(1), R(3), R(2)])` with a custom `__lt__`
+  returned the list *unsorted* and `min` returned the first element rather
+  than the smallest. They now route through `Interpreter::value_cmp` (the
+  same path `list.sort()` already used), so a user comparison dunder takes
+  effect and the VM matches CPython. This was a silent-wrong-output defect
+  in the same class as the `sorted(reverse=True)` stability bug fixed
+  earlier this cycle. Covers both the no-kwarg native path and the
+  `key=` / `reverse=` / `default=` keyword path.
+
+### Added — VM builtin methods (`dict` / `str`)
+
+- **`dict.popitem()`** removes and returns the last inserted `(key, value)`
+  pair (LIFO, matching CPython 3.7+); raises `KeyError` on an empty dict.
+  Previously `AttributeError: dict has no method 'popitem'`.
+- **`dict.fromkeys(iterable[, value])`** builds a new dict with each key
+  from `iterable` mapped to `value` (default `None`). Previously crashed.
+- **`str.maketrans(x[, y[, z]])`** and **`str.translate(table)`** build and
+  apply a translation table (dict / two-string / delete-string forms).
+  Previously `AttributeError: 'str' object has no attribute 'translate'`.
+
+### Added — third-party argument-*type* checking (annotation capture)
+
+- **Venv introspection now captures parameter and return annotations.** The
+  `inspect.signature` pass previously recorded only each parameter's name /
+  kind / has-default, so every third-party parameter became `Type::Unknown`
+  and only *arity* was checked. It now also reads `p.annotation` (and the
+  return annotation) and maps the unambiguous scalar builtins (`int` /
+  `str` / `bool` / `float` / `bytes` / `None`), the nullable forms
+  `Optional[X]` / `X | None`, the parametric containers
+  `list[X]` / `set[X]` / `frozenset[X]` / `dict[K, V]`, and fixed-arity
+  `tuple[...]` (mapped recursively; a container whose element doesn't
+  resolve degrades to a permissive `Unknown` rather than `list[Unknown]`)
+  to Typhon types. A
+  fully-typed pure-Python dependency now gets argument-*type* checking for
+  both **free-function** and **constructor** calls through the same
+  `tyc::type_mismatch` machinery project functions use — e.g. calling a
+  `def fetch(url: str, ...)` with an `int`, or constructing a
+  `Client(host: str, port: int)` with `port="oops"`, is rejected at compile
+  time. Conservative by design: containers, `Optional`/unions, typing
+  constructs, and foreign classes all degrade to a permissive `Unknown`, so
+  the change can only *add* true positives, never reject valid code on a
+  shape it can't model. Verified against the full 256-file example corpus
+  with zero false positives.
+- **Constructor arguments are now type-checked (closes an in-project
+  soundness hole too).** The non-generic constructor path previously
+  validated only arity, so `C(host="x", port="not-an-int")` for a project
+  `class C: host: str; port: int` passed `tyc check` and crashed at
+  runtime. A new `check_concrete_constructor_args` validates each
+  positional / keyword argument against its concrete field type (the
+  type-parameter fields of a generic class stay the job of the existing
+  `check_generic_constructor_args`, so the two never double-report).
+- **Too-many-positional is now caught for zero-field constructors** when the
+  shape is authoritative for the constructor — a venv-introspected class
+  (`requests.Session(1)` → "expected 0, got 1") or a normal project class
+  with a fully-known hierarchy. `plain class` / `class!` (which may carry a
+  hand-written `__init__` not reflected in the fields) are deliberately
+  exempt, so the change adds no false positives (verified across the
+  256-file corpus).
+- **Scope / limits** (documented in `docs/diagnostics/missing_argument.md`):
+  C-extension callables and typeshed-only (non-inline) annotations remain
+  out of scope for the runtime-introspection path — those are covered by the
+  new `ty` typeshed integration below.
+
+### Added — `ty` typeshed integration (`[checker] external = "ty"`)
+
+- **`tyc build` can run Astral's `ty` as a second-stage checker over the
+  emitted Python**, gated by a new `[checker] external = "ty"` config key
+  (`"none"` by default). This is Phase 1 of the long-documented plan in
+  `docs/ty-integration.md`, and it's the genuine "works for every library"
+  answer: `ty` checks against **typeshed**, so it catches misuse of
+  C-extension and stdlib APIs that runtime venv introspection fundamentally
+  can't see. Example: `os.path.join(1, 2)` passes `tyc check` (no inline
+  signature) but is now caught at build time —
+  `error[no-matching-overload]: No overload of function 'join' matches` —
+  with the diagnostic re-attributed to the originating `.ty` line via the
+  existing `.py.map` source maps. `ty` errors fail the build (CI-gating).
+- The shared `run_ty_check` helper is factored out of the `tyc ty` command
+  so the standalone command and the build-time hook use one code path.
+  `[checker] external-args = [...]` forwards extra flags to `ty` verbatim.
+- **`--with-ty` flag on `tyc build` and `tyc check`** — runs the `ty` pass
+  for a single invocation without editing `typhon.toml`. `tyc build
+  --with-ty` checks the emitted output directly; `tyc check --with-ty`
+  (normally emit-free) builds to a throwaway directory first.
+
+### `ty` Phase 2 (embedded) — prototyped and proven feasible, **not shipped**
+
+- The embedded, in-process `ty` checker (calling `ProjectDatabase::check()`
+  directly instead of spawning the CLI) was prototyped end-to-end and works.
+  It is **not shipped**: it requires a git dependency on `astral-sh/ruff`,
+  which the repo's `cargo deny` policy disallows (`[sources] unknown-git =
+  "deny"`), and it offers **no capability** the subprocess path lacks (it's a
+  perf optimisation). The subprocess integration (`[checker] external = "ty"`
+  / `--with-ty`) remains the shipped path.
+- **Correction worth recording:** `docs/ty-integration.md` (and earlier
+  notes) claimed Phase 2 was blocked until Typhon migrated off its vendored
+  Ruff fork, because `ty` consumes `ruff_python_ast`. That's **not** true —
+  proven empirically: Typhon's vendored `ruff_python_ast`
+  (`0.0.0-typhon-vendor`) and `ty`'s upstream `ruff_python_ast` (`0.0.0`)
+  coexist in one dependency graph, kept apart by version. The real gate is
+  the git-source supply-chain policy, not a crate-name conflict. Vendoring
+  `ty` into `tyc/vendor/` (a path dep, no git source) is the path to shipping
+  it later.
+- A `.py.map` resolver fix landed alongside and is kept: `load_map_for` now
+  resolves **build-relative** `.py` references (`main.py`, `pkg/mod.py`)
+  against `<map_dir>/.sourcemaps/<rel>.py.map`, not just the absolute-path /
+  adjacent layouts.
+
+### Added — live third-party arg/type diagnostics in the editor (LSP)
+
+- **`tyc lsp` now runs the venv signature introspection**, so a wrong-typed
+  or wrong-arity call to an installed third-party dependency shows up as you
+  type — not only on `tyc check` / `tyc build`. Previously the LSP checked
+  project `.ty`/`.dty` shapes only; `enrich_project_shapes_with_venv` ran
+  exclusively on the CLI, so `requests.get(12345)` had no editor squiggle.
+- The introspection logic moved to a new shared crate **`tyc-venv`** (it was
+  private to the `tyc` binary), now consumed by both the binary and
+  `tyc-lsp`. The LSP holds a **persistent per-project `VenvSignatures` cache**
+  (mirroring the completion-introspection cache), so a keystroke only shells
+  to Python when a genuinely new dependency module appears; the cache
+  invalidates itself on `.venv/pyvenv.cfg` mtime change (a `uv sync`). The
+  allow-list is refreshed from `typhon.toml` each check via the new
+  `allowed_top_level_from_project`. Verified end-to-end by driving the real
+  `tyc lsp` server: `api.fetch(12345)` for `fetch(url: str, …)` publishes
+  `tyc::type_mismatch: expected str, found int`.
+
+### Added — `unintrospectable-dependency` warning (no more silent misses)
+
+- **A declared dependency that's imported but can't be introspected now
+  surfaces a warning** instead of silently skipping its third-party checks —
+  the most dangerous failure mode for this feature (a skipped check looked
+  identical to a clean pass). Fires when there's no reachable `.venv` /
+  `python3`, or the package isn't installed, or it exposes no introspectable
+  signatures. New `[strictness] unintrospectable-dependency` knob:
+  `"warn"` (default) surfaces it, `"error"` fails the build/check (CI-gating),
+  `"off"` restores the old silent behaviour. Per-top-level success tracking
+  means a package whose root introspects fine isn't flagged just because one
+  submodule failed; an installed, introspectable dependency produces no
+  warning.
 
 ### Fixed — resolver
 

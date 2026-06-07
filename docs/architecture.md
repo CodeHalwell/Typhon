@@ -54,6 +54,7 @@ tyc/
 │   ├── tyc-diagnostics/        miette-based diagnostic rendering
 │   ├── tyc-lsp/                tower-lsp-server Backend over tyc-db
 │   ├── tyc-vm/                 tree-walking interpreter (tyc run default)
+│   ├── tyc-venv/               venv signature introspection → ModuleShapes (shared by CLI + LSP)
 │   └── tyc/                    thin CLI binary, clap subcommands
 └── vendor/                     Typhon's in-tree fork of Ruff (pinned via vendor/UPSTREAM)
     ├── ruff_text_size/         TextSize / TextRange newtypes

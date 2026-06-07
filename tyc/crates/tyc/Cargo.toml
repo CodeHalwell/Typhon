@@ -32,6 +32,7 @@ tyc-analyse     = { workspace = true }
 tyc-desugar     = { workspace = true }
 tyc-lsp         = { workspace = true }
 tyc-vm          = { workspace = true }
+tyc-venv          = { path = "../tyc-venv" }
 tempfile        = { workspace = true }
 notify          = { workspace = true }
 

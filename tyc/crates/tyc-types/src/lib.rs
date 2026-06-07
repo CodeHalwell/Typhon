@@ -923,6 +923,71 @@ fn check_one_generic_ctor_arg(
     }
 }
 
+/// Validate the arguments of a NON-generic class constructor against the
+/// class's concrete field types. Complements
+/// [`check_generic_constructor_args`] (which only covers fields that still
+/// mention a type parameter): this covers fields whose type is fully
+/// concrete — `host: str`, `port: int`, and crucially the scalar field
+/// types recovered from a venv-introspected third-party `__init__`, so a
+/// wrong-typed constructor argument is caught at compile time the same way
+/// a wrong-typed free-function argument already is.
+///
+/// Conservative by construction: a field whose type is `Unknown` / `Any` /
+/// a free type parameter, or an argument that infers to a dynamic type, is
+/// skipped. So this only ever adds true positives and never rejects a
+/// shape it can't fully model. The two helpers target disjoint field kinds
+/// (concrete here, type-parameter there), so a generic class running both
+/// checks never double-reports.
+fn check_concrete_constructor_args(
+    c: &mut Checker,
+    shape: &InterfaceShape,
+    pos_args: &[Expr],
+    kw_args: &[ruff_python_ast::Keyword],
+) {
+    for (idx, arg) in pos_args.iter().enumerate() {
+        if matches!(arg, Expr::Starred(_)) {
+            continue;
+        }
+        let Some(field_name) = shape.field_order.get(idx) else {
+            continue;
+        };
+        let Some(field_ty) = shape.fields.get(field_name).cloned() else {
+            continue;
+        };
+        let span = (arg.range().start().to_usize(), arg.range().end().to_usize());
+        check_one_concrete_ctor_arg(c, &field_ty, arg, span);
+    }
+    for kw in kw_args {
+        let Some(ident) = &kw.arg else { continue };
+        let Some(field_ty) = shape.fields.get(ident.as_str()).cloned() else {
+            continue;
+        };
+        let span = (
+            kw.value.range().start().to_usize(),
+            kw.value.range().end().to_usize(),
+        );
+        check_one_concrete_ctor_arg(c, &field_ty, &kw.value, span);
+    }
+}
+
+/// Check a single constructor argument against a concrete `field_ty`.
+/// Shared by the positional and keyword loops of
+/// [`check_concrete_constructor_args`].
+fn check_one_concrete_ctor_arg(c: &mut Checker, field_ty: &Type, arg: &Expr, span: (usize, usize)) {
+    // Skip fields whose type we don't fully know, or that still mention a
+    // type parameter (those are `check_generic_constructor_args`' job).
+    if is_dynamic_type(field_ty) || contains_free_typevar(field_ty) {
+        return;
+    }
+    let actual = infer_expr_ctx(c, arg, Some(field_ty));
+    if is_dynamic_type(&actual) {
+        return;
+    }
+    if !c.is_assignable(field_ty, &actual) {
+        c.mismatch(field_ty, &actual, span);
+    }
+}
+
 /// Handle a constructor call whose callee carries explicit type
 /// arguments — `Box[int]("hello")`, `Pair[int, str](...)`. Returns
 /// `Some(Generic(name, pinned_args))` when the callee is a subscripted
@@ -11500,7 +11565,22 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
                         // The shape here is `effective_class_shape`, so the
                         // arity sees inherited parent fields too.
                         let info = class_constructor_arity(&shape);
-                        if !info.param_names.is_empty() {
+                        // Run the arity check when the shape is authoritative
+                        // for the constructor — even with zero fields, so
+                        // `ZeroFieldClass(1)` / `Session(1)` is caught as
+                        // too-many-positional. Authoritative means: a
+                        // venv-introspected shape (its `field_order` is exactly
+                        // `inspect.signature(Cls)`, with */** forms already
+                        // filtered out by `class_shape_from_params`), or a
+                        // normal project class whose hierarchy is fully known
+                        // and which isn't a `plain class` / `class!` (those may
+                        // carry a hand-written `__init__` not reflected in the
+                        // fields, so an empty field list doesn't imply 0 args).
+                        let shape_is_authoritative = shape.partial
+                            || (!c.is_plain_class(&name)
+                                && !c.is_raw_class(&name)
+                                && c.class_hierarchy_fully_known(&name));
+                        if !info.param_names.is_empty() || shape_is_authoritative {
                             match check_arity_with_info(&info, pos_args, kw_args) {
                                 ArityCheck::Ok => {}
                                 ArityCheck::UnknownKwarg { .. } => {
@@ -11536,6 +11616,15 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
                                 }
                             }
                         }
+                        // SOUNDNESS: validate each constructor argument
+                        // against its concrete field type. This catches a
+                        // wrong-typed positional/keyword arg
+                        // (`Client(host, port="oops")` where `port: int`),
+                        // including against the scalar field types recovered
+                        // from a venv-introspected third-party `__init__`.
+                        // Type-parameter fields on a generic class are handled
+                        // separately below by `check_generic_constructor_args`.
+                        check_concrete_constructor_args(c, &shape, pos_args, kw_args);
                     }
                     if let Some(tparams) = c.class_type_params.get(&name).cloned() {
                         let mut bindings: HashMap<String, Type> = HashMap::new();
@@ -11748,12 +11837,25 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
                     }
                     if let Some(info) = shapes.function_arities.get(attr_name) {
                         let info = info.clone();
-                        let params = vec![Type::Unknown; info.param_names.len()];
+                        // Use the introspected/annotated parameter and return
+                        // types when present. They default to `Type::Unknown`
+                        // (which accepts anything), so unannotated params stay
+                        // permissive — but a fully-typed third-party function
+                        // (`requests.get(url: str, ...) -> Response`) now routes
+                        // external calls through the SAME arg-type check that
+                        // project-function calls use. The length guard keeps us
+                        // safe if `param_types` was ever built short.
+                        let params = if info.param_types.len() == info.param_names.len() {
+                            info.param_types.clone()
+                        } else {
+                            vec![Type::Unknown; info.param_names.len()]
+                        };
+                        let ret = info.return_type.clone();
                         let variadic = info.max_positional.is_none();
                         c.function_arity_info.entry(qualified).or_insert(info);
                         return Type::Function {
                             params,
-                            ret: Box::new(Type::Unknown),
+                            ret: Box::new(ret),
                             variadic,
                         };
                     }
@@ -15805,6 +15907,65 @@ let bad: UserId = UserId(\"seven\")
         let d = check(src);
         assert!(d.has_errors(), "expected newtype_violation for str arg");
     }
+
+    #[test]
+    fn concrete_constructor_arg_type_checked() {
+        // A non-generic class with concrete scalar fields: a wrong-typed
+        // keyword constructor argument (str where the field is int) must
+        // fire `tyc::type_mismatch`.
+        let bad = check(
+            "class C:\n    host: str\n    port: int\n\nlet a: C = C(host=\"x\", port=\"nope\")\n",
+        );
+        assert!(bad.has_errors(), "expected type_mismatch on port=str");
+        let msg = format!("{}", bad.errors()[0]);
+        assert!(msg.contains("expected `int`"), "got {}", msg);
+    }
+
+    #[test]
+    fn concrete_constructor_positional_arg_type_checked() {
+        // Same, but the offending argument is positional.
+        let bad =
+            check("class C:\n    host: str\n    port: int\n\nlet a: C = C(\"x\", \"nope\")\n");
+        assert!(
+            bad.has_errors(),
+            "expected type_mismatch on positional port=str"
+        );
+    }
+
+    #[test]
+    fn concrete_constructor_well_typed_args_pass() {
+        // The well-typed constructor call must NOT regress to a false
+        // positive. `8080` is an int (matches `port: int`), and an int
+        // literal is fine for the `str` host only if it isn't — so use a
+        // string for host. bool->int / int->float widening still apply.
+        let good = check(
+            "class C:\n    host: str\n    port: int\n\nlet a: C = C(host=\"x\", port=8080)\n",
+        );
+        assert!(
+            !good.has_errors(),
+            "well-typed constructor must pass: {:?}",
+            good.errors()
+        );
+    }
+
+    #[test]
+    fn zero_field_constructor_rejects_excess_positional() {
+        // A normal class with no fields takes no constructor args — too-many
+        // positional is now caught (previously the arity check was skipped
+        // for empty field lists).
+        let bad = check("class Empty:\n    pass\n\nlet a: Empty = Empty(1)\n");
+        assert!(bad.has_errors(), "Empty(1) should be rejected (0 fields)");
+        let good = check("class Empty:\n    pass\n\nlet a: Empty = Empty()\n");
+        assert!(!good.has_errors(), "Empty() must pass: {:?}", good.errors());
+    }
+
+    // NOTE: the `plain class` / `class!` exemption (an empty-field plain/raw
+    // class must NOT be arity-checked, since it may carry a hand-written
+    // `__init__`) is gated on `is_plain_class` / `is_raw_class`, which read
+    // `resolved.plain_classes` / `raw_classes`. The in-crate `check()` harness
+    // doesn't scrape those the way the CLI does, so it can't exercise that
+    // path; it's verified end-to-end against the real binary and guaranteed
+    // by the zero-false-positive sweep over the 256-file example corpus.
 
     #[test]
     fn newtype_self_cycle_does_not_overflow() {

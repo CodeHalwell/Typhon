@@ -51,6 +51,13 @@ pub struct CheckArgs {
     /// gate VM execution behind a successful check without spamming stdout.
     #[arg(skip)]
     pub quiet_success: bool,
+
+    /// Build to a temporary directory and run Astral's `ty` over the emitted
+    /// Python as a typeshed-backed second-stage checker (the same behaviour
+    /// as `[checker] external = "ty"`, for a single invocation). Requires
+    /// `ty` on `PATH`.
+    #[arg(long)]
+    pub with_ty: bool,
 }
 
 pub fn run(args: CheckArgs) -> Result<()> {
@@ -135,9 +142,12 @@ pub fn run(args: CheckArgs) -> Result<()> {
             .dependencies
             .keys()
             .chain(config.dev_dependencies.keys())
-            .map(|k| pep503_normalise(k))
+            .map(|k| tyc_venv::pep503_normalise(k))
             .collect();
-        extra_modules.extend(top_level_imports_from_venv(&project_root, &declared));
+        extra_modules.extend(tyc_venv::top_level_imports_from_venv(
+            &project_root,
+            &declared,
+        ));
     }
     extra_modules.sort();
     extra_modules.dedup();
@@ -215,6 +225,7 @@ pub fn run(args: CheckArgs) -> Result<()> {
     // argument: 'client'`. Skipped when no `typhon.toml` is found
     // (standalone-file mode) or when no allow-listed top-level
     // packages exist.
+    let mut unintrospectable_deps: Vec<String> = Vec::new();
     if has_project_config {
         let project_module_set: std::collections::HashSet<String> =
             project_modules.iter().cloned().collect();
@@ -222,7 +233,7 @@ pub fn run(args: CheckArgs) -> Result<()> {
             .iter()
             .map(|m| m.split('.').next().unwrap_or(m).to_owned())
             .collect();
-        crate::venv_signatures::enrich_project_shapes_with_venv(
+        unintrospectable_deps = tyc_venv::enrich_project_shapes_with_venv(
             &args.paths,
             &project_root,
             &project_module_set,
@@ -230,6 +241,15 @@ pub fn run(args: CheckArgs) -> Result<()> {
             &mut shape_map,
         );
     }
+    // Surface declared dependencies that couldn't be introspected so their
+    // skipped third-party checks are visible rather than silently passing.
+    // Gated on `!quiet_success` so `tyc run`'s internal check gate stays
+    // quiet. `"error"` severity escalates to a check failure below.
+    let unintrospectable_fatal = !args.quiet_success
+        && tyc_venv::report_unintrospectable_dependencies(
+            &unintrospectable_deps,
+            &config.strictness.unintrospectable_dependency,
+        );
     let project_shapes = std::sync::Arc::new(shape_map);
 
     for root in &args.paths {
@@ -464,6 +484,39 @@ pub fn run(args: CheckArgs) -> Result<()> {
                 String::new()
             },
         ));
+    }
+
+    // `[strictness] unintrospectable-dependency = "error"` escalates a
+    // skipped third-party check into a hard failure (already reported above).
+    if unintrospectable_fatal {
+        return Err(miette!(
+            "declared dependencies could not be introspected (see message above); \
+             failing because `[strictness] unintrospectable-dependency = \"error\"`"
+        ));
+    }
+
+    // `--with-ty`: the Typhon check passed; now build to a throwaway
+    // directory and run Astral's `ty` over the emitted Python as a
+    // typeshed-backed second stage. `tyc check` is normally emit-free, so
+    // this opts into a one-shot build (the build's own `--with-ty` hook
+    // runs `ty` and re-attributes diagnostics to the `.ty` source).
+    if args.with_ty {
+        if !has_project_config {
+            eprintln!(
+                "warning: --with-ty needs a project (typhon.toml) to build and check; skipping"
+            );
+        } else {
+            let td = tempfile::tempdir()
+                .map_err(|e| miette!("failed to create temp build dir for --with-ty: {e}"))?;
+            crate::commands::build::run(crate::commands::build::BuildArgs {
+                path: project_root.clone(),
+                out: Some(td.path().to_path_buf()),
+                no_format: true,
+                check: false,
+                no_sync: true,
+                with_ty: true,
+            })?;
+        }
     }
 
     if !args.quiet_success {
@@ -1040,182 +1093,6 @@ fn run_secondary_passes(
     diags
 }
 
-/// Normalise a PyPI distribution name per PEP 503: replace runs of
-/// `[-_.]+` with a single `-` and lowercase. `tyc` uses this to match
-/// `[dependencies]` keys against `.dist-info` directory names regardless
-/// of casing or separator drift (`Agent-Framework-Core`,
-/// `agent_framework_core`, `agent.framework.core` all normalise the
-/// same).
-fn pep503_normalise(name: &str) -> String {
-    let mut out = String::with_capacity(name.len());
-    let mut prev_sep = false;
-    for ch in name.chars() {
-        if ch == '-' || ch == '_' || ch == '.' {
-            if !prev_sep && !out.is_empty() {
-                out.push('-');
-                prev_sep = true;
-            }
-        } else {
-            out.push(ch.to_ascii_lowercase());
-            prev_sep = false;
-        }
-    }
-    if out.ends_with('-') {
-        out.pop();
-    }
-    out
-}
-
-/// Scan the project's local virtualenv for installed Python
-/// distributions and return the top-level import names each one
-/// provides — restricted to distributions actually declared in
-/// `[dependencies]` / `[dev-dependencies]`. Used by `tyc check` to vet
-/// imports whose package name differs from the PyPI distribution name
-/// (e.g. `agent-framework-core` -> `agent_framework`,
-/// `beautifulsoup4` -> `bs4`).
-///
-/// Looks for a venv at `<project_root>/.venv` — the default `uv` /
-/// `tyc sync` location — and reads `<dist>-<ver>.dist-info/top_level.txt`
-/// from each declared distribution's metadata. If `top_level.txt` is
-/// absent (newer wheels often omit it) we fall back to scanning the
-/// `RECORD` manifest for top-level `<pkg>/__init__.py` paths.
-///
-/// `declared` is a set of PEP 503-normalised distribution names; only
-/// `.dist-info` directories whose dist-name normalises into that set
-/// contribute import roots. This keeps `tyc check` reproducible across
-/// machines: a developer with extra packages in their local venv
-/// won't accidentally pass imports that would fail on a fresh clone.
-///
-/// Returns an empty list when no venv exists.
-fn top_level_imports_from_venv(
-    project_root: &std::path::Path,
-    declared: &std::collections::HashSet<String>,
-) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
-    if declared.is_empty() {
-        return out;
-    }
-    let venv_root = project_root.join(".venv");
-    if !venv_root.is_dir() {
-        return out;
-    }
-    // `site-packages` lives under `lib/pythonX.Y` on POSIX,
-    // `Lib/site-packages` on Windows. Probe both.
-    let mut site_dirs: Vec<PathBuf> = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(venv_root.join("lib")) {
-        for entry in entries.flatten() {
-            let p = entry.path().join("site-packages");
-            if p.is_dir() {
-                site_dirs.push(p);
-            }
-        }
-    }
-    let win_site = venv_root.join("Lib").join("site-packages");
-    if win_site.is_dir() {
-        site_dirs.push(win_site);
-    }
-    for site in site_dirs {
-        let Ok(entries) = std::fs::read_dir(&site) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if !path.is_dir() {
-                continue;
-            }
-            let dir_name = path
-                .file_name()
-                .and_then(|s| s.to_str())
-                .unwrap_or_default();
-            let Some(stem) = dir_name.strip_suffix(".dist-info") else {
-                continue;
-            };
-            // `<dist>-<version>.dist-info` — the dist-name is the part
-            // before the LAST `-<version>` segment. Strip the trailing
-            // `-…` component (versions are PEP 440 and don't contain `/`
-            // or whitespace, so trimming the rightmost `-` block is safe).
-            let dist_name = stem.rsplit_once('-').map(|(d, _)| d).unwrap_or(stem);
-            let normalised = pep503_normalise(dist_name);
-            if !declared.contains(&normalised) {
-                continue;
-            }
-            // Prefer top_level.txt — one package name per line.
-            let tlt = path.join("top_level.txt");
-            if let Ok(content) = std::fs::read_to_string(&tlt) {
-                for line in content.lines() {
-                    let line = line.trim();
-                    // Filter out empty lines and namespace-package markers.
-                    // top_level.txt may also list dotted paths for
-                    // sub-packages; we only need the root component.
-                    if line.is_empty() {
-                        continue;
-                    }
-                    let root = line.split('/').next().unwrap_or(line);
-                    let root = root.split('.').next().unwrap_or(root);
-                    if !root.is_empty() && !root.starts_with('_') {
-                        out.push(root.to_owned());
-                    }
-                }
-                continue;
-            }
-            // Fallback: derive top-level packages from RECORD.
-            // Each entry is `<path>,<hash>,<size>`; the path may be
-            // double-quoted (PEP 376) if it contains commas, may be a
-            // relative `../bin/script` for installed-outside-site
-            // files, or absolute. We accept only paths that point at
-            // a Python module (`<name>.py`) or at a Python source file
-            // inside a top-level directory (`<name>/.../*.py(i)`) — the
-            // narrower filter avoids picking up shipped `bin/`,
-            // `docs/`, or `tests/` directories.
-            if let Ok(record) = std::fs::read_to_string(path.join("RECORD")) {
-                for line in record.lines() {
-                    let raw = line.split(',').next().unwrap_or("").trim();
-                    let path_field = raw.trim_matches('"');
-                    if path_field.is_empty()
-                        || path_field.starts_with("../")
-                        || path_field.starts_with("..\\")
-                        || path_field.starts_with('/')
-                        || path_field.starts_with('\\')
-                    {
-                        continue;
-                    }
-                    let head = path_field.split('/').next().unwrap_or(path_field);
-                    if head.is_empty()
-                        || head == "."
-                        || head == ".."
-                        || head.starts_with('_')
-                        || head.ends_with(".dist-info")
-                        || head.ends_with(".data")
-                    {
-                        continue;
-                    }
-                    let import_name = if let Some(stem) = head.strip_suffix(".py") {
-                        // Top-level single-file module (`foo.py`).
-                        stem
-                    } else if head.ends_with(".pyi") {
-                        // Pure-stub package — uncommon but valid.
-                        head.strip_suffix(".pyi").unwrap_or(head)
-                    } else if path_field.contains('/')
-                        && (path_field.ends_with(".py") || path_field.ends_with(".pyi"))
-                    {
-                        // Python source nested under a top-level
-                        // directory — treat the directory as a package.
-                        head
-                    } else {
-                        continue;
-                    };
-                    if !import_name.is_empty() && !import_name.starts_with('_') {
-                        out.push(import_name.to_owned());
-                    }
-                }
-            }
-        }
-    }
-    out.sort();
-    out.dedup();
-    out
-}
-
 /// Collect the dotted-name form of every `.ty` file under the given
 /// `paths`. Used by [`run_unknown_module_check`] to vet sibling imports.
 ///
@@ -1455,23 +1332,26 @@ mod tests {
         // `Agent_Framework.Core` matches a wheel filed under
         // `agent-framework-core`.
         assert_eq!(
-            pep503_normalise("Agent-Framework-Core"),
+            tyc_venv::pep503_normalise("Agent-Framework-Core"),
             "agent-framework-core"
         );
         assert_eq!(
-            pep503_normalise("agent_framework_core"),
+            tyc_venv::pep503_normalise("agent_framework_core"),
             "agent-framework-core"
         );
         assert_eq!(
-            pep503_normalise("agent.framework.core"),
+            tyc_venv::pep503_normalise("agent.framework.core"),
             "agent-framework-core"
         );
         assert_eq!(
-            pep503_normalise("Agent_Framework.Core"),
+            tyc_venv::pep503_normalise("Agent_Framework.Core"),
             "agent-framework-core"
         );
-        assert_eq!(pep503_normalise("beautifulsoup4"), "beautifulsoup4");
-        assert_eq!(pep503_normalise("__leading"), "leading");
+        assert_eq!(
+            tyc_venv::pep503_normalise("beautifulsoup4"),
+            "beautifulsoup4"
+        );
+        assert_eq!(tyc_venv::pep503_normalise("__leading"), "leading");
     }
 
     #[test]
@@ -1482,6 +1362,7 @@ mod tests {
             paths: vec![tmp.path().to_path_buf()],
             stubs: false,
             quiet_success: false,
+            with_ty: false,
         };
         run(args).unwrap();
     }
@@ -1494,6 +1375,7 @@ mod tests {
             paths: vec![tmp.path().to_path_buf()],
             stubs: false,
             quiet_success: false,
+            with_ty: false,
         };
         assert!(run(args).is_err(), "type mismatch should be an error");
     }
@@ -1511,6 +1393,7 @@ mod tests {
             paths: vec![dty.clone()],
             stubs: false,
             quiet_success: false,
+            with_ty: false,
         };
         run(args).expect("direct .dty check should succeed");
     }
@@ -1523,6 +1406,7 @@ mod tests {
             paths: vec![tmp.path().to_path_buf()],
             stubs: false,
             quiet_success: false,
+            with_ty: false,
         };
         run(args).unwrap();
     }
@@ -1535,6 +1419,7 @@ mod tests {
             paths: vec![tmp.path().to_path_buf()],
             stubs: false,
             quiet_success: false,
+            with_ty: false,
         };
         assert!(run(args).is_err(), "val reassignment should be an error");
     }
@@ -1560,6 +1445,7 @@ i.name = \"Bob\"
             paths: vec![tmp.path().to_path_buf()],
             stubs: false,
             quiet_success: false,
+            with_ty: false,
         };
         assert!(
             run(args).is_err(),
@@ -1582,6 +1468,7 @@ i.name = \"Bob\"
             paths: vec![tmp.path().to_path_buf()],
             stubs: true,
             quiet_success: false,
+            with_ty: false,
         };
         run(args).unwrap();
     }
@@ -1599,6 +1486,7 @@ i.name = \"Bob\"
             paths: vec![tmp.path().to_path_buf()],
             stubs: true,
             quiet_success: false,
+            with_ty: false,
         };
         assert!(
             run(args).is_err(),
@@ -1619,6 +1507,7 @@ i.name = \"Bob\"
             paths: vec![tmp.path().to_path_buf()],
             stubs: true,
             quiet_success: false,
+            with_ty: false,
         };
         assert!(
             run(args).is_err(),
@@ -1648,6 +1537,7 @@ def fetch(url: str) -> str:
             paths: vec![tmp.path().join("script.ty")],
             stubs: false,
             quiet_success: false,
+            with_ty: false,
         };
         // The check should pass (no unknown_module error) because there is
         // no project config to anchor the dependency check to.
@@ -1665,7 +1555,7 @@ def fetch(url: str) -> str:
         //
         // Requires a Python 3 on PATH; skip silently otherwise so CI
         // runners without Python don't fail the suite.
-        if crate::venv_signatures::which_python3_for_test().is_none() {
+        if tyc_venv::which_python3_for_test().is_none() {
             return;
         }
         let tmp = tempfile::tempdir().unwrap();
@@ -1711,7 +1601,7 @@ class Agent:
             std::collections::HashSet::new();
         let allowed: std::collections::HashSet<String> =
             ["fake_introspect_pkg".to_owned()].into_iter().collect();
-        crate::venv_signatures::enrich_project_shapes_with_venv(
+        tyc_venv::enrich_project_shapes_with_venv(
             std::slice::from_ref(&src),
             project_root,
             &project_module_set,

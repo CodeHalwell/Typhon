@@ -6,6 +6,21 @@ Realistic milestones for one person plus AI assistance. The headline target is a
 
 ## Current release
 
+**[v0.12.0](https://github.com/CodeHalwell/Typhon/releases/tag/v0.12.0) — 2026-06-07.**
+VM comparison-protocol parity + deep compile-time library introspection.
+`sorted()` / `min()` / `max()` now honour a user `__lt__` (a silent-wrong-output
+fix), and `dict.popitem` / `dict.fromkeys` / `str.maketrans` / `str.translate`
+landed in the VM. The headline is third-party argument-*type* checking: venv
+signature introspection captures parameter and return annotations (scalars,
+`Optional` / `X | None`, concrete containers, fixed-arity tuples) so a
+wrong-typed call to a fully-typed dependency — **function or constructor** — is
+caught by `tyc check` / `tyc build`, **and live in the editor via `tyc lsp`**.
+A declared dependency that can't be introspected now surfaces a warning
+(`[strictness] unintrospectable-dependency`) instead of silently passing. Phase 1
+of the typeshed-backed [`ty` integration](ty-integration.md) shipped — `[checker]
+external = "ty"` / `--with-ty` runs Astral's `ty` over the emitted Python with
+diagnostics re-attributed to `.ty` source. Additive on the accepted surface.
+
 **[v0.11.0](https://github.com/CodeHalwell/Typhon/releases/tag/v0.11.0) — 2026-06-04.**
 VM parity sweep + `enum` keyword. A fresh adversarial stress round
 against v0.10.0 surfaced 22 findings — almost entirely in the VM, with
