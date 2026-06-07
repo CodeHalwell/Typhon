@@ -30,11 +30,18 @@
 //! their existing channels (stdlib stubs in `tyc-lsp`, project
 //! `.ty`/`.dty` files in `collect_project_shapes`).
 //!
-//! `enrich_project_shapes_with_venv` is the CLI entry point: it walks
-//! every `.ty` file's import statements, looks up each dotted module
-//! that isn't already a known project module, and folds the
-//! introspection result into the project shape registry that the
-//! checker consumes.
+//! This is a shared crate consumed by **both** entry points so third-party
+//! checks behave identically on the CLI and in the editor:
+//!
+//! - The `tyc` binary (`tyc check` / `tyc build`) calls the one-shot
+//!   [`enrich_project_shapes_with_venv`], which builds a throwaway
+//!   [`VenvSignatures`] cache, folds recovered shapes into the project
+//!   registry, and reports any un-introspectable declared dependencies.
+//! - `tyc-lsp` holds a persistent [`VenvSignatures`] per project root and
+//!   calls [`VenvSignatures::enrich_into`] on each check, so wrong-typed /
+//!   wrong-arity third-party calls surface as live editor diagnostics. The
+//!   cache reuses per-module results across keystrokes and invalidates on a
+//!   `.venv/pyvenv.cfg` mtime change (a `uv sync`).
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -111,6 +118,11 @@ pub struct VenvSignatures {
     /// repeated lookup doesn't keep re-spawning Python for the same
     /// broken module.
     cache: HashMap<String, Option<ModuleShapes>>,
+    /// `.venv/pyvenv.cfg` mtime captured when the cache was last (re)built.
+    /// Used to invalidate the whole cache when the venv changes underneath a
+    /// long-lived holder (e.g. the LSP across `uv sync`) — the one-shot CLI
+    /// callers never observe a change mid-run, so this is a no-op for them.
+    venv_stamp: Option<std::time::SystemTime>,
 }
 
 impl VenvSignatures {
@@ -119,17 +131,34 @@ impl VenvSignatures {
     /// the caller is willing to introspect — typically the project's
     /// declared dependencies' top-level packages.
     pub fn for_project_root(project_root: &Path, allowed_top_level: HashSet<String>) -> Self {
-        let venv_python = project_root.join(".venv").join("bin").join("python");
-        let python_bin = if venv_python.is_file() {
-            Some(venv_python)
-        } else {
-            which_python3()
-        };
+        let python_bin = discover_python(project_root);
         Self {
             python_bin,
             cwd: project_root.to_path_buf(),
             allowed_top_level,
             cache: HashMap::new(),
+            venv_stamp: stat_pyvenv_cfg(project_root),
+        }
+    }
+
+    /// Replace the allow-list (the project's declared dependencies may have
+    /// changed since this cache was created — e.g. the user edited
+    /// `typhon.toml`). Cheap; leaves the per-module cache intact since a
+    /// wider/narrower allow-list only gates *which* modules are fetched.
+    pub fn set_allowed_top_level(&mut self, allowed: HashSet<String>) {
+        self.allowed_top_level = allowed;
+    }
+
+    /// Re-stat `.venv/pyvenv.cfg`; if it changed since the cache was built
+    /// (a `uv sync` / venv recreate), drop every cached result and
+    /// re-discover the Python binary so the next lookup reflects the new
+    /// environment. Mirrors the completion-introspection cache's policy.
+    fn refresh_if_venv_changed(&mut self) {
+        let current = stat_pyvenv_cfg(&self.cwd);
+        if current != self.venv_stamp {
+            self.cache.clear();
+            self.python_bin = discover_python(&self.cwd);
+            self.venv_stamp = current;
         }
     }
 
@@ -156,6 +185,7 @@ impl VenvSignatures {
     /// misses, regressing checker accuracy versus the prior
     /// per-module flow. (See codex review of PR #98.)
     pub fn preload(&mut self, dotted_names: &[String]) {
+        self.refresh_if_venv_changed();
         let Some(python) = self.python_bin.as_ref() else {
             return;
         };
@@ -225,10 +255,29 @@ impl VenvSignatures {
 
 /// Resolve `python3` on PATH for tests that need to skip when no
 /// Python is available. Mirrors [`which_python3`] but is callable
-/// from sibling modules.
-#[cfg(test)]
+/// from sibling crates' tests.
 pub fn which_python3_for_test() -> Option<PathBuf> {
     which_python3()
+}
+
+/// The Python a project's introspection should use: prefer the project's
+/// own `.venv/bin/python`, falling back to a `python3` on PATH.
+fn discover_python(project_root: &Path) -> Option<PathBuf> {
+    let venv_python = project_root.join(".venv").join("bin").join("python");
+    if venv_python.is_file() {
+        Some(venv_python)
+    } else {
+        which_python3()
+    }
+}
+
+/// mtime of `.venv/pyvenv.cfg` — the file `uv`/`venv` writes when
+/// materialising an environment. Its mtime is the cleanest single signal
+/// that the venv changed (sync, recreate, package add/remove).
+fn stat_pyvenv_cfg(project_root: &Path) -> Option<std::time::SystemTime> {
+    std::fs::metadata(project_root.join(".venv").join("pyvenv.cfg"))
+        .and_then(|m| m.modified())
+        .ok()
 }
 
 /// Resolve `python3` on the user's PATH. Returns `None` when nothing
@@ -893,74 +942,114 @@ pub fn enrich_project_shapes_with_venv(
     if allowed_top_level.is_empty() {
         return Vec::new();
     }
-    let imports = collect_imported_modules(paths);
-    // Filter once, then batch the whole list into a single subprocess
-    // (see `VenvSignatures::preload`). The earlier per-module loop
-    // dominated `tyc check` time on projects with many declared deps —
-    // each `import requests.X` was costing a fresh Python startup.
-    // Only modules whose top-level package is a declared dependency are
-    // candidates (the allow-list); stdlib / project modules are excluded.
-    let needed: Vec<String> = imports
-        .iter()
-        .filter(|m| !project_shapes.contains_key(*m) && !project_module_set.contains(*m))
-        .filter(|m| allowed_top_level.contains(top_level(m)))
-        .cloned()
-        .collect();
-    if needed.is_empty() {
-        return Vec::new();
-    }
-
     let mut cache = VenvSignatures::for_project_root(project_root, allowed_top_level);
+    cache.enrich_into(paths, project_module_set, project_shapes)
+}
 
-    // No reachable `.venv`/`python3`: every needed declared-dependency
-    // module is unintrospectable. Report each top-level package so the
-    // caller can warn that third-party checks were skipped rather than
-    // silently passing (the most dangerous failure mode for this feature).
-    if cache.python_bin.is_none() {
-        let mut tops: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-        for m in &needed {
-            tops.insert(top_level(m).to_owned());
+impl VenvSignatures {
+    /// Fold recovered third-party shapes for every allow-listed module
+    /// imported under `paths` into `project_shapes`, reusing this cache's
+    /// per-module results. The CLI builds a throwaway cache via
+    /// [`enrich_project_shapes_with_venv`]; the LSP holds one across edits so
+    /// repeated checks only shell to Python when a genuinely new dependency
+    /// module appears (or the venv changed — see [`Self::refresh_if_venv_changed`]).
+    /// Returns the top-level declared dependencies that couldn't be
+    /// introspected (for the unintrospectable-dependency warning).
+    pub fn enrich_into(
+        &mut self,
+        paths: &[PathBuf],
+        project_module_set: &HashSet<String>,
+        project_shapes: &mut HashMap<String, ModuleShapes>,
+    ) -> Vec<String> {
+        if self.allowed_top_level.is_empty() {
+            return Vec::new();
         }
-        return tops.into_iter().collect();
-    }
+        let imports = collect_imported_modules(paths);
+        // Only modules whose top-level package is a declared dependency are
+        // candidates (the allow-list); stdlib / project modules are excluded.
+        let needed: Vec<String> = imports
+            .iter()
+            .filter(|m| !project_shapes.contains_key(*m) && !project_module_set.contains(*m))
+            .filter(|m| self.allowed_top_level.contains(top_level(m)))
+            .cloned()
+            .collect();
+        if needed.is_empty() {
+            return Vec::new();
+        }
 
-    cache.preload(&needed);
-    // Track per-top-level success so a package whose root introspected
-    // fine isn't reported just because one submodule (`requests.adapters`)
-    // failed.
-    let mut ok_tops: HashSet<String> = HashSet::new();
-    let mut failed_tops: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-    for module in needed {
-        let top = top_level(&module).to_owned();
-        // Clone the recovered shapes (if any) so the `cache` borrow is
-        // released before we mutate `project_shapes`. A module that failed
-        // to import yields an *empty* `ModuleShapes` (the embedded Python
-        // returns `{"members": []}` on `ImportError`), and a module whose
-        // members are all C-extension callables introspects to nothing —
-        // both mean "no signatures recovered", so treat an empty result the
-        // same as a miss for the purpose of the warning.
-        let recovered = cache.module_shapes(&module).cloned();
-        match recovered {
-            Some(shapes)
-                if !(shapes.class_shapes.is_empty() && shapes.function_arities.is_empty()) =>
-            {
-                project_shapes.insert(module, shapes);
-                ok_tops.insert(top);
+        self.refresh_if_venv_changed();
+
+        // No reachable `.venv`/`python3`: every needed declared-dependency
+        // module is unintrospectable. Report each top-level package so the
+        // caller can warn that third-party checks were skipped rather than
+        // silently passing (the most dangerous failure mode for this feature).
+        if self.python_bin.is_none() {
+            let mut tops: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+            for m in &needed {
+                tops.insert(top_level(m).to_owned());
             }
-            _ => {
-                failed_tops.insert(top);
+            return tops.into_iter().collect();
+        }
+
+        self.preload(&needed);
+        // Track per-top-level success so a package whose root introspected
+        // fine isn't reported just because one submodule (`requests.adapters`)
+        // failed.
+        let mut ok_tops: HashSet<String> = HashSet::new();
+        let mut failed_tops: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for module in needed {
+            let top = top_level(&module).to_owned();
+            // A module that failed to import yields an *empty* `ModuleShapes`
+            // (the embedded Python returns `{"members": []}` on `ImportError`),
+            // and a module whose members are all C-extension callables
+            // introspects to nothing — both mean "no signatures recovered", so
+            // treat an empty result the same as a miss for the warning.
+            let recovered = self.module_shapes(&module).cloned();
+            match recovered {
+                Some(shapes)
+                    if !(shapes.class_shapes.is_empty() && shapes.function_arities.is_empty()) =>
+                {
+                    project_shapes.insert(module, shapes);
+                    ok_tops.insert(top);
+                }
+                _ => {
+                    failed_tops.insert(top);
+                }
             }
         }
+        failed_tops
+            .into_iter()
+            .filter(|t| !ok_tops.contains(t))
+            .collect()
     }
-    failed_tops
-        .into_iter()
-        .filter(|t| !ok_tops.contains(t))
-        .collect()
 }
 
 /// First dotted component of a module path (`requests.adapters` → `requests`).
 fn top_level(module: &str) -> &str {
     module.split('.').next().unwrap_or(module)
+}
+
+/// Compute the introspection allow-list — the declared dependencies'
+/// top-level import names — from a project's `typhon.toml`. Mirrors the set
+/// the CLI builds from `[dependencies]` + `[dev-dependencies]` keys, so the
+/// LSP introspects exactly the same modules `tyc check` would. Empty when
+/// there's no `typhon.toml` or it declares no dependencies.
+pub fn allowed_top_level_from_project(project_root: &Path) -> HashSet<String> {
+    let mut out = HashSet::new();
+    let Ok(text) = std::fs::read_to_string(project_root.join("typhon.toml")) else {
+        return out;
+    };
+    let Ok(value) = text.parse::<toml::Value>() else {
+        return out;
+    };
+    for table in ["dependencies", "dev-dependencies"] {
+        if let Some(toml::Value::Table(deps)) = value.get(table) {
+            for name in deps.keys() {
+                out.insert(top_level(name).to_owned());
+            }
+        }
+    }
+    out
 }
 
 /// Surface the un-introspectable declared dependencies returned by
@@ -995,6 +1084,26 @@ pub fn report_unintrospectable_dependencies(packages: &[String], severity: &str)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn allowed_top_level_reads_declared_dependencies() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("typhon.toml"),
+            "[project]\nname = \"x\"\n\n[dependencies]\nrequests = \">=2\"\n\n[dev-dependencies]\npytest = \"8\"\n",
+        )
+        .unwrap();
+        let allowed = allowed_top_level_from_project(tmp.path());
+        assert!(allowed.contains("requests"), "got {allowed:?}");
+        assert!(
+            allowed.contains("pytest"),
+            "dev-deps count too: {allowed:?}"
+        );
+        // A project with no typhon.toml yields an empty allow-list (enrichment
+        // is then a no-op), never a panic.
+        let empty = tempfile::tempdir().unwrap();
+        assert!(allowed_top_level_from_project(empty.path()).is_empty());
+    }
 
     fn p(name: &str, kind: &str, has_default: bool) -> IntrospectedParam {
         IntrospectedParam {
@@ -1329,6 +1438,7 @@ lazy import np = numpy
             cwd: tmp.path().to_path_buf(),
             allowed_top_level: allowed,
             cache: HashMap::new(),
+            venv_stamp: None,
         };
         let modules: Vec<String> = ["pkg_a", "pkg_b", "pkg_c", "pkg_d", "pkg_e"]
             .iter()
@@ -1407,6 +1517,7 @@ lazy import np = numpy
             cwd: tmp.path().to_path_buf(),
             allowed_top_level: allowed,
             cache: HashMap::new(),
+            venv_stamp: None,
         };
         let modules: Vec<String> = ["pkg_a", "pkg_b", "pkg_c"]
             .iter()

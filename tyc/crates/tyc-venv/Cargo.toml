@@ -1,0 +1,21 @@
+[package]
+name = "tyc-venv"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# Venv signature introspection → `ModuleShapes` for the type checker.
+# Shared by the `tyc` binary (`tyc check` / `tyc build`) and `tyc-lsp` (live
+# editor diagnostics), so third-party argument/type checks surface the same
+# way on the CLI and as you type.
+
+[dependencies]
+tyc-types = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

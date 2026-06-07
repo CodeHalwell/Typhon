@@ -156,6 +156,24 @@ now documented rather than fixed — see `docs/vm.md` and
   embedded renderer emits) against `<map_dir>/.sourcemaps/<rel>.py.map`,
   not just the absolute-path / adjacent layouts.
 
+### Added — live third-party arg/type diagnostics in the editor (LSP)
+
+- **`tyc lsp` now runs the venv signature introspection**, so a wrong-typed
+  or wrong-arity call to an installed third-party dependency shows up as you
+  type — not only on `tyc check` / `tyc build`. Previously the LSP checked
+  project `.ty`/`.dty` shapes only; `enrich_project_shapes_with_venv` ran
+  exclusively on the CLI, so `requests.get(12345)` had no editor squiggle.
+- The introspection logic moved to a new shared crate **`tyc-venv`** (it was
+  private to the `tyc` binary), now consumed by both the binary and
+  `tyc-lsp`. The LSP holds a **persistent per-project `VenvSignatures` cache**
+  (mirroring the completion-introspection cache), so a keystroke only shells
+  to Python when a genuinely new dependency module appears; the cache
+  invalidates itself on `.venv/pyvenv.cfg` mtime change (a `uv sync`). The
+  allow-list is refreshed from `typhon.toml` each check via the new
+  `allowed_top_level_from_project`. Verified end-to-end by driving the real
+  `tyc lsp` server: `api.fetch(12345)` for `fetch(url: str, …)` publishes
+  `tyc::type_mismatch: expected str, found int`.
+
 ### Added — `unintrospectable-dependency` warning (no more silent misses)
 
 - **A declared dependency that's imported but can't be introspected now

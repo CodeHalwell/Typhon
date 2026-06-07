@@ -230,7 +230,7 @@ pub fn run(args: CheckArgs) -> Result<()> {
             .iter()
             .map(|m| m.split('.').next().unwrap_or(m).to_owned())
             .collect();
-        unintrospectable_deps = crate::venv_signatures::enrich_project_shapes_with_venv(
+        unintrospectable_deps = tyc_venv::enrich_project_shapes_with_venv(
             &args.paths,
             &project_root,
             &project_module_set,
@@ -243,7 +243,7 @@ pub fn run(args: CheckArgs) -> Result<()> {
     // Gated on `!quiet_success` so `tyc run`'s internal check gate stays
     // quiet. `"error"` severity escalates to a check failure below.
     let unintrospectable_fatal = !args.quiet_success
-        && crate::venv_signatures::report_unintrospectable_dependencies(
+        && tyc_venv::report_unintrospectable_dependencies(
             &unintrospectable_deps,
             &config.strictness.unintrospectable_dependency,
         );
@@ -1725,7 +1725,7 @@ def fetch(url: str) -> str:
         //
         // Requires a Python 3 on PATH; skip silently otherwise so CI
         // runners without Python don't fail the suite.
-        if crate::venv_signatures::which_python3_for_test().is_none() {
+        if tyc_venv::which_python3_for_test().is_none() {
             return;
         }
         let tmp = tempfile::tempdir().unwrap();
@@ -1771,7 +1771,7 @@ class Agent:
             std::collections::HashSet::new();
         let allowed: std::collections::HashSet<String> =
             ["fake_introspect_pkg".to_owned()].into_iter().collect();
-        crate::venv_signatures::enrich_project_shapes_with_venv(
+        tyc_venv::enrich_project_shapes_with_venv(
             std::slice::from_ref(&src),
             project_root,
             &project_module_set,

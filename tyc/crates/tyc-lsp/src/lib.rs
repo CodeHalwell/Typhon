@@ -89,6 +89,16 @@ pub struct Backend {
             HashMap<std::path::PathBuf, Arc<std::sync::Mutex<venv_introspect::IntrospectionCache>>>,
         >,
     >,
+    /// Per-project-root signature caches for *type checking* (distinct from
+    /// `introspection`, which serves member completion). Holds a
+    /// [`tyc_venv::VenvSignatures`] so live diagnostics flag wrong-typed /
+    /// wrong-arity third-party calls — the same enrichment `tyc check` /
+    /// `tyc build` perform, reused across keystrokes (the cache invalidates
+    /// itself on `.venv` change). Same tokio-outer / std-inner locking as
+    /// `introspection`: the enrichment shells to Python inside
+    /// `spawn_blocking`.
+    signature_caches:
+        Arc<Mutex<HashMap<std::path::PathBuf, Arc<std::sync::Mutex<tyc_venv::VenvSignatures>>>>>,
     /// Per-project-root auto-import index. Keyed on the directory
     /// containing the project's `typhon.toml`; value is a Mutex-guarded
     /// `ProjectIndex` that's refreshed lazily on every completion
@@ -206,6 +216,35 @@ impl Backend {
         let workspace = find_workspace_layout(&path_for_root);
         let project_files_arc = Arc::clone(&self.project_files);
 
+        // Resolve (or create) the per-project venv signature cache so the
+        // blocking check below can fold third-party shapes into the project
+        // shape map — surfacing wrong-typed / wrong-arity third-party calls
+        // as live diagnostics, the same way `tyc check` does. Created on the
+        // async side; the (Python-shelling) enrichment runs in the blocking
+        // closure. Skipped when the project declares no dependencies.
+        let signature_cache: Option<Arc<std::sync::Mutex<tyc_venv::VenvSignatures>>> =
+            if let Some((root, _)) = workspace.as_ref() {
+                let allowed = tyc_venv::allowed_top_level_from_project(root);
+                if allowed.is_empty() {
+                    None
+                } else {
+                    let mut caches = self.signature_caches.lock().await;
+                    let entry = caches.entry(root.clone()).or_insert_with(|| {
+                        Arc::new(std::sync::Mutex::new(
+                            tyc_venv::VenvSignatures::for_project_root(root, allowed.clone()),
+                        ))
+                    });
+                    // Keep the allow-list current if `typhon.toml` deps changed
+                    // since this cache was created.
+                    if let Ok(mut vs) = entry.lock() {
+                        vs.set_allowed_top_level(allowed);
+                    }
+                    Some(Arc::clone(entry))
+                }
+            } else {
+                None
+            };
+
         let text_for_check = text.clone();
         let uri_str_for_check = uri_str.clone();
         let result = tokio::task::spawn_blocking(move || {
@@ -228,14 +267,34 @@ impl Backend {
                     .unwrap_or("src")
                     .to_owned();
                 #[allow(clippy::explicit_auto_deref)]
-                std::sync::Arc::new(build_project_shapes_salsa(
+                let mut shapes = build_project_shapes_salsa(
                     &mut *db,
                     &project_files_arc,
                     src_dir,
                     &src_root_name,
                     &uri_str_for_check,
                     &text_for_check,
-                ))
+                );
+                // Fold venv-introspected third-party shapes into the project
+                // map so the cross-module check flags wrong-typed / -arity
+                // calls to installed dependencies live in the editor. Uses the
+                // persistent per-project cache, so a keystroke only shells to
+                // Python when a new dependency module appears or the venv
+                // changed. (`enrich_into`'s import scan reads `.ty` files from
+                // disk — a freshly-typed, unsaved `import` is picked up on the
+                // next save.)
+                if let Some(sig_cache) = signature_cache.as_ref() {
+                    if let Ok(mut vs) = sig_cache.lock() {
+                        let project_module_set: std::collections::HashSet<String> =
+                            shapes.keys().cloned().collect();
+                        let _ = vs.enrich_into(
+                            std::slice::from_ref(src_dir),
+                            &project_module_set,
+                            &mut shapes,
+                        );
+                    }
+                }
+                std::sync::Arc::new(shapes)
             } else {
                 std::sync::Arc::new(std::collections::HashMap::new())
             };
@@ -2150,6 +2209,7 @@ pub fn run_stdio(log_level: LogLevel) {
             documents: Arc::new(Mutex::new(HashMap::new())),
             resolved_cache: Arc::new(Mutex::new(HashMap::new())),
             introspection: Arc::new(Mutex::new(HashMap::new())),
+            signature_caches: Arc::new(Mutex::new(HashMap::new())),
             project_indexes: Arc::new(Mutex::new(HashMap::new())),
             project_files: Arc::new(Mutex::new(HashMap::new())),
             prewarmed_versions: Arc::new(Mutex::new(HashMap::new())),

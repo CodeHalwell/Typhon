@@ -259,7 +259,7 @@ pub fn run(args: BuildArgs) -> Result<()> {
             .chain(config.dev_dependencies.keys())
             .cloned()
             .collect();
-        crate::venv_signatures::enrich_project_shapes_with_venv(
+        tyc_venv::enrich_project_shapes_with_venv(
             std::slice::from_ref(&src_dir),
             &config_dir,
             &project_module_set,
@@ -270,7 +270,7 @@ pub fn run(args: BuildArgs) -> Result<()> {
     // Surface declared dependencies that couldn't be introspected so their
     // skipped third-party checks are visible rather than silently passing.
     // `"error"` severity fails the build (already reported by the helper).
-    if crate::venv_signatures::report_unintrospectable_dependencies(
+    if tyc_venv::report_unintrospectable_dependencies(
         &unintrospectable_deps,
         &config.strictness.unintrospectable_dependency,
     ) {

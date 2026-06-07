@@ -13,6 +13,7 @@ members = [
     "crates/tyc-lsp",
     "crates/tyc-vm",
     "crates/tyc-typecheck-ext",
+    "crates/tyc-venv",
     # Vendored Ruff parser/AST — Typhon's in-tree fork.
     # See `vendor/README.md` for the migration plan.
     "vendor/ruff_text_size",

@@ -6,7 +6,6 @@
 mod cli;
 mod commands;
 mod config;
-mod venv_signatures;
 
 use miette::Result;
 
