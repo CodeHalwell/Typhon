@@ -51,6 +51,13 @@ pub struct CheckArgs {
     /// gate VM execution behind a successful check without spamming stdout.
     #[arg(skip)]
     pub quiet_success: bool,
+
+    /// Build to a temporary directory and run Astral's `ty` over the emitted
+    /// Python as a typeshed-backed second-stage checker (the same behaviour
+    /// as `[checker] external = "ty"`, for a single invocation). Requires
+    /// `ty` on `PATH`.
+    #[arg(long)]
+    pub with_ty: bool,
 }
 
 pub fn run(args: CheckArgs) -> Result<()> {
@@ -483,6 +490,30 @@ pub fn run(args: CheckArgs) -> Result<()> {
             "declared dependencies could not be introspected (see warning above); \
              failing because `[strictness] unintrospectable-dependency = \"error\"`"
         ));
+    }
+
+    // `--with-ty`: the Typhon check passed; now build to a throwaway
+    // directory and run Astral's `ty` over the emitted Python as a
+    // typeshed-backed second stage. `tyc check` is normally emit-free, so
+    // this opts into a one-shot build (the build's own `--with-ty` hook
+    // runs `ty` and re-attributes diagnostics to the `.ty` source).
+    if args.with_ty {
+        if !has_project_config {
+            eprintln!(
+                "warning: --with-ty needs a project (typhon.toml) to build and check; skipping"
+            );
+        } else {
+            let td = tempfile::tempdir()
+                .map_err(|e| miette!("failed to create temp build dir for --with-ty: {e}"))?;
+            crate::commands::build::run(crate::commands::build::BuildArgs {
+                path: project_root.clone(),
+                out: Some(td.path().to_path_buf()),
+                no_format: true,
+                check: false,
+                no_sync: true,
+                with_ty: true,
+            })?;
+        }
     }
 
     if !args.quiet_success {
@@ -1501,6 +1532,7 @@ mod tests {
             paths: vec![tmp.path().to_path_buf()],
             stubs: false,
             quiet_success: false,
+            with_ty: false,
         };
         run(args).unwrap();
     }
@@ -1513,6 +1545,7 @@ mod tests {
             paths: vec![tmp.path().to_path_buf()],
             stubs: false,
             quiet_success: false,
+            with_ty: false,
         };
         assert!(run(args).is_err(), "type mismatch should be an error");
     }
@@ -1530,6 +1563,7 @@ mod tests {
             paths: vec![dty.clone()],
             stubs: false,
             quiet_success: false,
+            with_ty: false,
         };
         run(args).expect("direct .dty check should succeed");
     }
@@ -1542,6 +1576,7 @@ mod tests {
             paths: vec![tmp.path().to_path_buf()],
             stubs: false,
             quiet_success: false,
+            with_ty: false,
         };
         run(args).unwrap();
     }
@@ -1554,6 +1589,7 @@ mod tests {
             paths: vec![tmp.path().to_path_buf()],
             stubs: false,
             quiet_success: false,
+            with_ty: false,
         };
         assert!(run(args).is_err(), "val reassignment should be an error");
     }
@@ -1579,6 +1615,7 @@ i.name = \"Bob\"
             paths: vec![tmp.path().to_path_buf()],
             stubs: false,
             quiet_success: false,
+            with_ty: false,
         };
         assert!(
             run(args).is_err(),
@@ -1601,6 +1638,7 @@ i.name = \"Bob\"
             paths: vec![tmp.path().to_path_buf()],
             stubs: true,
             quiet_success: false,
+            with_ty: false,
         };
         run(args).unwrap();
     }
@@ -1618,6 +1656,7 @@ i.name = \"Bob\"
             paths: vec![tmp.path().to_path_buf()],
             stubs: true,
             quiet_success: false,
+            with_ty: false,
         };
         assert!(
             run(args).is_err(),
@@ -1638,6 +1677,7 @@ i.name = \"Bob\"
             paths: vec![tmp.path().to_path_buf()],
             stubs: true,
             quiet_success: false,
+            with_ty: false,
         };
         assert!(
             run(args).is_err(),
@@ -1667,6 +1707,7 @@ def fetch(url: str) -> str:
             paths: vec![tmp.path().join("script.ty")],
             stubs: false,
             quiet_success: false,
+            with_ty: false,
         };
         // The check should pass (no unknown_module error) because there is
         // no project config to anchor the dependency check to.

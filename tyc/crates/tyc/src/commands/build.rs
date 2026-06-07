@@ -59,6 +59,13 @@ pub struct BuildArgs {
     /// provisioned. Also honoured via `TYC_NO_SYNC=1`.
     #[arg(long)]
     pub no_sync: bool,
+
+    /// After a successful build, run Astral's `ty` over the emitted Python
+    /// as a typeshed-backed second-stage checker — the same behaviour as
+    /// `[checker] external = "ty"` but for a single invocation. Requires
+    /// `ty` on `PATH` (`pip install ty` / `uv tool install ty`).
+    #[arg(long)]
+    pub with_ty: bool,
 }
 
 pub fn run(args: BuildArgs) -> Result<()> {
@@ -1041,8 +1048,13 @@ pub fn run(args: BuildArgs) -> Result<()> {
     // was written to check). This is the only path that type-checks against
     // typeshed — covering C-extension libraries runtime introspection can't
     // see. See `docs/ty-integration.md`.
-    if !check_mode && config.checker.external == "ty" {
-        println!("running `ty` over emitted Python ([checker] external = \"ty\")…");
+    if !check_mode && (args.with_ty || config.checker.external == "ty") {
+        let reason = if args.with_ty {
+            "--with-ty"
+        } else {
+            "[checker] external = \"ty\""
+        };
+        println!("running `ty` over emitted Python ({reason})…");
         crate::commands::ty::run_ty_check(
             &project_root,
             &out_dir,
@@ -2447,6 +2459,7 @@ mod tests {
             no_format: true,
             check: false,
             no_sync: false,
+            with_ty: false,
         })
         .unwrap();
         assert!(
@@ -2466,6 +2479,7 @@ mod tests {
             no_format: true,
             check: false,
             no_sync: false,
+            with_ty: false,
         })
         .unwrap();
         assert!(
@@ -2484,6 +2498,7 @@ mod tests {
             no_format: true,
             check: false,
             no_sync: false,
+            with_ty: false,
         });
         assert!(result.is_err(), "build should fail on type mismatch");
     }
@@ -2525,6 +2540,7 @@ mod tests {
             no_format: true,
             check: false,
             no_sync: false,
+            with_ty: false,
         })
         .unwrap();
         let init_py =
@@ -2571,6 +2587,7 @@ mod tests {
             no_format: true,
             check: false,
             no_sync: false,
+            with_ty: false,
         })
         .unwrap();
         let py = std::fs::read_to_string(out_dir.join("main.py")).unwrap();
@@ -2594,6 +2611,7 @@ mod tests {
             no_format: true,
             check: false,
             no_sync: false,
+            with_ty: false,
         })
         .unwrap();
         // Phase 3 made `typhon_runtime` a package (with submodules `tasks`
@@ -2638,6 +2656,7 @@ async def load(id: int) -> None:
             no_format: true,
             check: false,
             no_sync: false,
+            with_ty: false,
         })
         .unwrap();
         let py = std::fs::read_to_string(out_dir.join("main.py")).unwrap();
@@ -2670,6 +2689,7 @@ let result: int = 3 |> double |> inc
             no_format: true,
             check: false,
             no_sync: false,
+            with_ty: false,
         })
         .unwrap();
         let py = std::fs::read_to_string(out_dir.join("main.py")).unwrap();
@@ -2697,6 +2717,7 @@ let result: int = 3 |> double |> inc
             no_format: true,
             check: false,
             no_sync: false,
+            with_ty: false,
         })
         .unwrap();
         let py = std::fs::read_to_string(out_dir.join("main.py")).unwrap();
@@ -2732,6 +2753,7 @@ class Foo:
             no_format: true,
             check: false,
             no_sync: false,
+            with_ty: false,
         })
         .unwrap();
         let py = std::fs::read_to_string(out_dir.join("main.py")).unwrap();
@@ -2757,6 +2779,7 @@ class Foo:
             no_format: true,
             check: false,
             no_sync: false,
+            with_ty: false,
         })
         .unwrap();
         let py = std::fs::read_to_string(out_dir.join("main.py")).unwrap();
@@ -2816,6 +2839,7 @@ def area(s: Shape) -> float:
             no_format: true,
             check: false,
             no_sync: false,
+            with_ty: false,
         })
         .unwrap();
         let py = std::fs::read_to_string(out_dir.join("main.py")).unwrap();
@@ -2849,6 +2873,7 @@ def area(s: Shape) -> float:
             no_format: true,
             check: false,
             no_sync: false,
+            with_ty: false,
         });
         // Verify the failure is specifically a type-checking error, not a
         // configuration or I/O error, by checking the returned error message.
@@ -2875,6 +2900,7 @@ def fib(n: int) -> int:
             no_format: true,
             check: false,
             no_sync: false,
+            with_ty: false,
         })
         .unwrap();
         let py = std::fs::read_to_string(out_dir.join("main.py")).unwrap();
@@ -2909,6 +2935,7 @@ let pet: Animal = Dog(name=\"Rex\")
             no_format: true,
             check: false,
             no_sync: false,
+            with_ty: false,
         });
         // Verify the failure is specifically a type-checking error (structural
         // conformance failure), not a configuration or I/O error.
@@ -2938,6 +2965,7 @@ def hot(n: int) -> int:
             no_format: true,
             check: false,
             no_sync: false,
+            with_ty: false,
         })
         .unwrap();
         let py = std::fs::read_to_string(out_dir.join("main.py")).unwrap();
@@ -2969,6 +2997,7 @@ def cold(n: int) -> int:
             no_format: true,
             check: false,
             no_sync: false,
+            with_ty: false,
         })
         .unwrap();
         let py = std::fs::read_to_string(out_dir.join("main.py")).unwrap();
@@ -3008,6 +3037,7 @@ def cold(n: int) -> int:
             no_format: true,
             check: false,
             no_sync: false,
+            with_ty: false,
         })
         .unwrap();
         let py = std::fs::read_to_string(out_dir.join("main.py")).unwrap();
@@ -3041,6 +3071,7 @@ async def load() -> int:
             no_format: true,
             check: false,
             no_sync: false,
+            with_ty: false,
         })
         .unwrap();
         let py = std::fs::read_to_string(out_dir.join("main.py")).unwrap();
@@ -3075,6 +3106,7 @@ async def load() -> int:
             no_format: true,
             check: false,
             no_sync: false,
+            with_ty: false,
         })
         .unwrap();
         let py = std::fs::read_to_string(out_dir.join("main.py")).unwrap();
@@ -3111,6 +3143,7 @@ async def load() -> int:
             no_format: true,
             check: false,
             no_sync: false,
+            with_ty: false,
         })
         .unwrap();
         let py = std::fs::read_to_string(out_dir.join("main.py")).unwrap();
@@ -3153,6 +3186,7 @@ async def load() -> int:
             no_format: true,
             check: false,
             no_sync: false,
+            with_ty: false,
         })
         .unwrap();
         let py = std::fs::read_to_string(out_dir.join("main.py")).unwrap();
@@ -3219,6 +3253,7 @@ async def load() -> int:
             no_format: true,
             check: false,
             no_sync: false,
+            with_ty: false,
         })
         .unwrap();
         let map_path = out_dir.join(".sourcemaps").join("main.py.map");
@@ -3266,6 +3301,7 @@ let pet: Animal = Dog(name=\"Rex\")
             no_format: true,
             check: false,
             no_sync: false,
+            with_ty: false,
         })
         .unwrap();
         let py = std::fs::read_to_string(out_dir.join("main.py")).unwrap();
@@ -3293,6 +3329,7 @@ let pet: Animal = Dog(name=\"Rex\")
             no_format: true,
             check: false,
             no_sync: false,
+            with_ty: false,
         })
         .unwrap();
         assert!(
@@ -3328,6 +3365,7 @@ let pet: Animal = Dog(name=\"Rex\")
             no_format: true,
             check: false,
             no_sync: false,
+            with_ty: false,
         })
         .unwrap();
         assert!(
@@ -3352,6 +3390,7 @@ let pet: Animal = Dog(name=\"Rex\")
             no_format: true,
             check: true,
             no_sync: false,
+            with_ty: false,
         })
         .unwrap();
         assert!(
@@ -3374,6 +3413,7 @@ let pet: Animal = Dog(name=\"Rex\")
             no_format: true,
             check: true,
             no_sync: false,
+            with_ty: false,
         })
         .unwrap();
         assert!(!out_dir.join("main.py").exists());
@@ -3390,6 +3430,7 @@ let pet: Animal = Dog(name=\"Rex\")
             no_format: true,
             check: true,
             no_sync: false,
+            with_ty: false,
         });
         assert!(
             result.is_err(),
@@ -3428,6 +3469,7 @@ let pet: Animal = Dog(name=\"Rex\")
             no_format: true,
             check: false,
             no_sync: false,
+            with_ty: false,
         });
         std::env::remove_var("FAKE_API_KEY");
         assert!(

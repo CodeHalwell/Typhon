@@ -4,7 +4,7 @@ All notable changes to Typhon are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely; the
 canonical phase-by-phase status lives in `docs/roadmap.md`.
 
-## Unreleased
+## 0.12.0 — 2026-06-07 — VM `__lt__` parity, dict/str builtins, and deep library introspection
 
 Adversarial stress-round follow-up against v0.11.0. A fresh sweep across
 simple scripts, file/JSON I/O, ML-shaped numerics, agent/tool-dispatch
@@ -119,8 +119,12 @@ now documented rather than fixed — see `docs/vm.md` and
 - The shared `run_ty_check` helper is factored out of the `tyc ty` command
   so the standalone command and the build-time hook use one code path.
   `[checker] external-args = [...]` forwards extra flags to `ty` verbatim.
-  (`tyc check --with-ty` and the embedded-library option remain the next
-  steps in the plan.)
+- **`--with-ty` flag on `tyc build` and `tyc check`** — runs the `ty` pass
+  for a single invocation without editing `typhon.toml`. `tyc build
+  --with-ty` checks the emitted output directly; `tyc check --with-ty`
+  (normally emit-free) builds to a throwaway directory first. (The
+  embedded-library option in `docs/ty-integration.md` remains the eventual
+  Phase 2.)
 
 ### Added — `unintrospectable-dependency` warning (no more silent misses)
 

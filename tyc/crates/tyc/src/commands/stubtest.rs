@@ -122,6 +122,7 @@ pub fn run(args: StubtestArgs) -> Result<()> {
             no_format: false,
             check: false,
             no_sync: false,
+            with_ty: false,
         })?;
     }
 

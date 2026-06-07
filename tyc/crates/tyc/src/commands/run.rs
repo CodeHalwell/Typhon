@@ -153,6 +153,7 @@ pub fn run(args: RunArgs) -> Result<()> {
             no_format: false,
             check: false,
             no_sync: false,
+            with_ty: false,
         })?;
     }
 
@@ -257,6 +258,7 @@ fn run_vm(args: RunArgs) -> Result<()> {
             paths: vec![entry.clone()],
             stubs: false,
             quiet_success: true,
+            with_ty: false,
         })?;
     }
     let code = tyc_vm::run_file(&entry, &args.script_args).map_err(|e| miette!("{e}"))?;
