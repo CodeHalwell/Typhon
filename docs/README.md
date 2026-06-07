@@ -16,7 +16,12 @@ The sub-docs below are extracted from the long-term plan for easier navigation. 
 | [architecture.md](architecture.md) | Compiler pipeline, crate layout, toolchain choices |
 | [language.md](language.md) | Type system, error handling, async, `let`/`mut`, comptime, readability features |
 | [cli.md](cli.md) | The `tyc` binary and its subcommands |
-| [configuration.md](configuration.md) | `typhon.toml` reference |
+| [configuration.md](configuration.md) | `typhon.toml` reference (incl. `[checker]`) |
+| [cheatsheet.md](cheatsheet.md) | 30-second syntax refresher (also `tyc cheatsheet`) |
+| [install.md](install.md) | Installing the `tyc` binary (macOS / Linux / Windows) |
+| [vm.md](vm.md) | The in-process tree-walking VM behind `tyc run` |
+| [ty-integration.md](ty-integration.md) | The `tyc ty` / `[checker] external = "ty"` typeshed checker |
+| [diagnostics/](diagnostics/README.md) | One page per `tyc::` diagnostic code |
 | [roadmap.md](roadmap.md) | Phased delivery plan |
 | [risks.md](risks.md) | Risks and mitigations |
 | [prior-art.md](prior-art.md) | Languages and tools Typhon learns from |

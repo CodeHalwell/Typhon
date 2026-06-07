@@ -3,7 +3,7 @@
 This guide covers installing the `tyc` compiler binary on **macOS,
 Linux, and Windows**. Pre-built binaries ship on every GitHub Release
 since v0.3.0; the current release is
-[v0.11.0](https://github.com/CodeHalwell/Typhon/releases/tag/v0.11.0).
+[v0.12.0](https://github.com/CodeHalwell/Typhon/releases/tag/v0.12.0).
 If your platform isn't listed (FreeBSD, Linux MUSL, Windows ARM64),
 build from source — see the
 [Quick start](../README.md#quick-start) section of the README.

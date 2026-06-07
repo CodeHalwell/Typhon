@@ -60,6 +60,11 @@ Every parameter and every return type carries an annotation:
         name: str
         age: int
 
+    enum Color:                 # class Color(enum.Enum): (v0.11.0)
+        RED                     #   RED = enum.auto()
+        GREEN                   #   GREEN = enum.auto()
+        BLUE = 4                #   BLUE = 4  (explicit values preserved)
+
 ## Methods live in `impl` (Rule 4)
 
     class Point:

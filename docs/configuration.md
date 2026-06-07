@@ -37,6 +37,12 @@ parallel-min-size = 64      # minimum iterable size for auto-parallel to fire
 pgo-memoise = false         # opt-in: promote hot pure fns to @functools.cache from typhon-profile.json
 pgo-min-calls = 100         # minimum profile-recorded call count for pgo-memoise to fire
 stub-check = "error"        # severity for tyc::stub_mismatch from `tyc check --stubs`
+unintrospectable-dependency = "warn"  # "warn" | "error" | "off" — declared dep imported but not introspectable
+allow-secret-comptime = false  # set true to silence tyc::contains_secret_literal
+
+[checker]
+external = "none"           # or "ty" — second-stage check over emitted Python (typeshed-backed)
+external-args = []          # extra flags forwarded verbatim to the external checker
 
 [env]
 required = ["DATABASE_URL"]  # comptime env() lookups must resolve at build time
@@ -105,6 +111,7 @@ pytest = "8.2"              # bare version → ==8.2
 | `pgo-min-calls` | int | Minimum observed call count for a function to be promoted by `pgo-memoise`. Default `100` — high enough that one-off entry points stay un-cached, low enough that an inner-loop helper qualifies after a single representative run. |
 | `stub-check` | `"error"` \| `"warn"` \| `"off"` | Severity for `tyc::stub_mismatch` produced by `tyc check --stubs`. `"error"` (default) breaks CI on stub drift. `"warn"` surfaces drift without blocking merges. `"off"` silently drops stub mismatches — useful when running `--stubs` opportunistically. |
 | `unintrospectable-dependency` | `"warn"` \| `"error"` \| `"off"` | Severity when a declared dependency is imported but its signatures can't be recovered (no reachable `.venv`/`python3`, the package isn't installed, or it exposes no introspectable signatures) — so its third-party arity/type checks are skipped. `"warn"` (default) surfaces the skipped coverage; `"error"` fails the build/check (CI-gating); `"off"` restores the prior silent behaviour. Install the project's dependencies (`uv sync`) or ship a `.dty` stub to clear it. |
+| `allow-secret-comptime` | bool | When `true`, silences `tyc::contains_secret_literal` — the warning that fires when a `comptime let` binding whose name looks like a secret (`*KEY` / `*TOKEN` / `*PASSWORD` / `*SECRET` / `*PASS` / `*PWD`) would inline the resolved env-var value as a string literal into the build artifact. Default `false`; `tyc init` seeds it explicitly. Prefer reading secrets at runtime via `os.environ[...]` over enabling this. |
 
 ### `[env]`
 

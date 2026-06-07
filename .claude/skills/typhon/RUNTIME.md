@@ -184,47 +184,58 @@ All standard literals, including f-strings with `{x:.2f}` width / precision / co
 
 Full `if`/`elif`/`else`/`while`/`for`/`break`/`continue`/`return`/`pass`. `match` with literal / capture / wildcard / sequence / class patterns, including native `Ok(x)` / `Err(e)` matching. Arm bodies execute against the parent env (v0.3.1 N9 fix — pattern captures lift into the parent env on accept, matching CPython).
 
-Functions with positional/keyword/default/`*args`/`**kwargs`/closures, recursion (256-frame default; configurable). Classes with annotated-field constructor synth, explicit `__init__`, methods (in `class` body or sibling `impl Foo:`), single inheritance.
+Functions with positional/keyword/default/`*args`/`**kwargs`/closures, recursion (1000-frame default since v0.8.0; configurable). Classes with annotated-field constructor synth, explicit `__init__`, methods (in `class` body or sibling `impl Foo:`), single and multi-level inheritance (fields accumulate across the full MRO, v0.11.0). `enum Name:` declarations resolve natively against the VM's `enum` shim (v0.11.0).
 
-Decorators recognised: `@pure`, `@dataclass`, `@gatherable`, `@override`, `@final`, `@staticmethod`, `@classmethod` (no-ops); `@memo` / `@cache` / `@lru_cache` (value-keyed memoisation).
+Decorators: `@pure`, `@dataclass`, `@gatherable`, `@override`, `@final`, `@staticmethod` (no-ops); `@memo` / `@cache` / `@lru_cache` (value-keyed memoisation). **`@property` getters fire on attribute read and `@classmethod` binds `cls` (v0.10.0)** — both inherited through bases, with the descriptor marker cleared on override.
 
-`try`/`except T as e`/`else`/`finally`/`raise`. `Result` ADT with native `Ok(...)` / `Err(...)` and `?`. Imports of native stdlib (table below). Comprehensions (eagerly materialised in v1).
+**Dunder dispatch on user instances (v0.10.0 / v0.11.0):** every numeric / bitwise / matmul operator and its reflected form (`__add__` / `__radd__` / … / `__matmul__`), the rich comparisons (`__eq__` / `__ne__` / `__lt__` / `__le__` / `__gt__` / `__ge__`), and `__str__` / `__repr__` / `__len__` / `__getitem__` / `__setitem__` / `__contains__` / `__call__` / `__missing__` / `__post_init__`. `in`, `list.index`, `.count`, `.remove`, and `sorted` / `min` / `max` / `list.sort` use `__eq__` / `__lt__`-aware comparison (the last three fixed in v0.12.0). Bare `super()` is rewritten to the two-arg form at desugar so it works under `@dataclass(slots=True)`.
+
+**`type(x)` is a real type object (v0.10.0):** `type(x).__name__`, `type(x) == int`, `str(type(x))` → `<class 'int'>` all work.
+
+**Generators (v0.10.0):** `yield` / `yield from` work, materialised **eagerly** — a yield-bearing function runs to completion with each yielded value collected, and the call returns an iterator over them (a tree-walk can't suspend a frame; `Rc` values aren't `Send`). `GENERATOR_CAP = 1_000_000` bounds the `while True: yield` worst case to a clear `RuntimeError`. **Lazy / unbounded generators, and `@contextmanager` generators used inside a `with` block, still need `tyc build`** (eager collection runs setup + teardown at call time).
+
+`try`/`except T as e`/`else`/`finally`/`raise` (exception-type matching walks the MRO). `Result` ADT with native `Ok(...)` / `Err(...)`, the `.map` / `.map_err` / `.and_then` / `.or_else` combinators (v0.9.0), and `?`. Imports of native stdlib (table below). Comprehensions (eagerly materialised); dict comprehensions bind tuple-unpack targets (v0.12.0).
 
 A broad built-in surface:
-`print`, `len`, `range`, `str`, `int`, `float`, `bool`, `list`, `tuple`, `dict`, `set`, `frozenset`, `repr`, `type`, `isinstance`, `abs`, `min`, `max`, `sum`, `sorted`, `reversed`, `enumerate`, `zip`, `map`, `filter`, `all`, `any`, `next`, `iter`, `hex`, `bin`, `oct`, `chr`, `ord`, `round`, `input`, `hash`, `id`, `callable`, `open` (text-read only).
+`print`, `len`, `range`, `str`, `int` (incl. `int(s, base)` / `base=0`), `float`, `bool`, `complex` (v0.11.0), `list`, `tuple`, `dict`, `set`, `frozenset`, `repr`, `ascii`, `format`, `type`, `isinstance`, `abs`, `min`, `max`, `sum`, `sorted`, `reversed`, `enumerate`, `zip`, `map`, `filter`, `all`, `any`, `next`, `iter`, `divmod`, `pow` (2- and 3-arg), `hex`, `bin`, `oct`, `chr`, `ord`, `round` (banker's rounding, v0.11.0), `input`, `hash`, `id`, `callable`, `open` (read / write / append / binary modes).
 
-Built-in method dispatch on `str` / `list` / `dict` / `set` / `tuple` / `int.bit_length` / `float.is_integer`. Set operators `|` / `&` / `-` / `^`.
+Built-in method dispatch on `str` / `bytes` (v0.11.0) / `list` / `dict` (incl. `popitem` / `fromkeys`, v0.12.0) / `set` (full algebra) / `tuple` / `int.bit_length` / `float.is_integer`. `dict.keys()` / `.values()` / `.items()` return real view objects (v0.11.0). Set operators `|` / `&` / `-` / `^`. VM value semantics match CPython since v0.11.0 (value-based dataclass equality keyed on class identity, `Name(field=value)` repr, hashable instances, order-independent set equality, shortest-round-trip float repr).
 
 ### 2.4 Native stdlib modules
 
 | Module | Surface |
 |---|---|
-| `math` | `pi`, `e`, `inf`, `nan`, `sqrt`, `floor`, `ceil`, `log` (with base), `log2`, `log10`, `exp`, `sin`, `cos`, `tan`, `pow`, `fabs` |
+| `math` | `pi`, `e`, `inf`, `nan`, `sqrt`, `floor`, `ceil`, `log` (with base), `log2`, `log10`, `exp`, `sin`, `cos`, `tan`, `pow`, `fabs`. v0.10.0: `gcd`, `lcm`, `factorial`, `isqrt`, `comb`, `perm` (reject non-int args). v0.12.0: `isnan`, `isinf`, `isfinite` |
 | `os` | `getenv`, `environ`, `path.exists`, `path.isfile`, `path.isdir` |
 | `sys` | `argv`, `platform`, `version`, `exit(code)` |
-| `json` | `dumps`, `loads` (full JSON 7159 surface). `json.load(f)` / `json.dump(obj, f)` ride on top of `open()` since v0.9.0 |
-| `time` | `time()`, `sleep()`, `monotonic()` |
+| `json` | `dumps`, `loads` (full JSON 7159 surface). `json.load(f)` / `json.dump(obj, f)` ride on top of `open()` since v0.9.0. v0.10.0: `dumps(indent=…)`. v0.12.0: `dumps(sort_keys=True)` |
+| `time` | `time()`, `sleep()`, `monotonic()` (fixed in v0.10.0), `perf_counter()` / `process_time()` (v0.10.0) |
+| `datetime` (v0.11.0) | `datetime(y, mo, d, …)`, `.now()`, `.fromisoformat()`, `.isoformat()`, `+ timedelta`, comparisons; `timedelta(seconds=…)` arithmetic. **Naïve / UTC only** — tz-aware arithmetic still needs `--compile` |
+| `enum` (v0.11.0) | `enum.Enum`, `enum.auto()` — backs the `enum` keyword; members materialise in declaration order, `<Name.MEMBER: val>` repr |
 | `random` | `random()`, `randint(a, b)`, `seed(n)` — xorshift PRNG, **not** cryptographic |
 | `re` (v0.8.0) | `match`, `search`, `findall`, `sub`, `split`, `compile`. `match` is anchored at the start of the string. Some flag arguments accepted but ignored |
 | `typing` (v0.8.0) | Generic constructors are runtime no-ops; type-only imports are stripped by the desugar pre-pass |
-| `collections` (v0.8.0) | `OrderedDict`, `defaultdict`, `Counter`, `namedtuple`. **`collections.deque`** added in v0.9.0 — rides on `Value::List` via new `popleft` / `appendleft` / `extendleft` / `rotate` list methods |
+| `collections` (v0.8.0) | `OrderedDict`, `defaultdict`, `Counter`, `namedtuple`. **`collections.deque`** added in v0.9.0 — rides on `Value::List` via new `popleft` / `appendleft` / `extendleft` / `rotate` list methods. v0.11.0: `defaultdict(factory)` actually invokes the factory on missing-key access via subscript `__missing__` (`dd[k] += 1` works) |
 | `functools` (v0.8.0) | `lru_cache`, `cache`, `cached_property`, `reduce`, `partial` |
-| `itertools` (v0.8.0) | `chain`, `count`, `cycle`, `accumulate`, `combinations`, `permutations`, `product`, `islice`, `takewhile`, `dropwhile`, `groupby` |
+| `itertools` (v0.8.0) | `chain`, `count`, `cycle`, `accumulate`, `combinations`, `permutations`, `product`, `islice`, `takewhile`, `dropwhile`, `groupby` (honours `key=` since v0.11.0) |
 | `dataclasses` (v0.8.0) | `dataclass`, `field`, `fields`, `asdict`, `astuple`. v0.9.0: `field(default_factory=list)` actually invokes the factory per instance |
-| `pathlib` (v0.8.0) | `Path` with `exists`, `read_text`, `write_text`, `parent`, `name`, `stem`, `suffix`, `with_suffix`, `joinpath` / `/` |
+| `pathlib` (v0.8.0) | `Path` with `exists`, `read_text`, `write_text`, `parent`, `name`, `stem`, `suffix`, `with_suffix`, `joinpath` / `/`. v0.11.0: `.suffixes` / `.parts`, `/`-join via `__truediv__`, CPython-matching `str()` / `repr()` |
 | `heapq` (v0.9.0) | `heappush`, `heappop`, `heapify`, `heappushpop`, `heapreplace`, `nsmallest`, `nlargest` |
 | `contextlib` (v0.9.0) | `@contextmanager` identity decorator; `with` block honours the wrapped `__enter__` / `__exit__` shape |
 | `pydantic` (v0.9.0) | `BaseModel` placeholder so declaring a `model` doesn't `ImportError` (full validation still requires `--compile`) |
 | `typhon_runtime` | `Ok`, `Err`, `tasks.spawn` (synchronous shim), `lazy.lazy_let`, `lazy.lazy_import`. `Ok` / `Err` carry bound `.map` / `.map_err` / `.and_then` / `.or_else` combinators since v0.9.0 |
 
-### 2.4a Built-in builtins surface (v0.9.0 additions)
+### 2.4a Built-in builtins surface (v0.9.0 → v0.12.0 additions)
 
-- **`open(p, mode)`** honours `"r"` / `"w"` / `"a"` / `"wb"` / `"r+"` and friends, plus `__enter__` / `__exit__` for `with` blocks. Text and binary modes both work.
-- **`frozenset(...)`** is hashable as a dict key via `HashKey::FrozenSet` with insertion-order-independent hashing.
-- **`@property`, `@classmethod`, `@staticmethod`, `super()`** are present as identity-ish stubs so decorated methods don't crash on import.
-- **f-string `_` thousands separator** emits the same way `,` does.
-- **`bytes` repr matches CPython** byte-for-byte (`b'hi'` by default, `b"with 'embedded'"` fallback, `\xNN` for non-printable).
-- **Class patterns on built-in types** in `match` — `case str() as s:`, `case int() as n:`, etc.
+- **`open(p, mode)`** honours `"r"` / `"w"` / `"a"` / `"wb"` / `"r+"` and friends, plus `__enter__` / `__exit__` for `with` blocks. Text and binary modes both work (v0.9.0). `read_text` / `write_text` / `open` tolerate (and ignore) `encoding=` / `errors=` — the VM is always UTF-8 (v0.10.0).
+- **`frozenset(...)`** is hashable as a dict key via `HashKey::FrozenSet` with insertion-order-independent hashing (v0.9.0).
+- **`@property` getters fire on read, `@classmethod` binds `cls`** (v0.10.0) — both inherited, marker cleared on override. `@staticmethod` is a no-op; bare `super()` is rewritten to the two-arg form so it works under `@dataclass(slots=True)` (v0.11.0).
+- **f-string `_` thousands separator** (v0.9.0), **`{x=}` debug conversion** (v0.11.0), and full format-flag parity (zero-pad / align / sign / width / comma / precision / type, v0.8.0; float-presentation types coerce int/bool operands, v0.12.0).
+- **`bytes` repr matches CPython** byte-for-byte (`b'hi'` by default, `b"with 'embedded'"` fallback, `\xNN` for non-printable, v0.9.0); `bytes` methods `decode` / `hex` / `fromhex` / `count` / `find` / `split` / `strip` / … (v0.11.0).
+- **Class patterns on built-in types** in `match` — `case str() as s:`, `case int() as n:`, mapping patterns (`case {"k": v}`), sequence-with-star (`case [x, *rest, y]`) (v0.8.0–v0.9.0).
+- **v0.10.0 builtins:** `divmod`, `pow` (2- and 3-arg modular), `format`, `ascii`, `int(s, base)` (incl. `base=0`), full set algebra (`union` / `intersection` / `difference` / `symmetric_difference` / `issubset` / `issuperset` / `isdisjoint` / `update`), the missing string methods (`center` / `ljust` / `rjust` / `zfill` / `rsplit` / `partition` / `rpartition` / `removeprefix` / `removesuffix` / `casefold` / `expandtabs` / …, and `strip` / `lstrip` / `rstrip` honour their `chars` arg), `dict(other)` / `dict(**kwargs)`. `max` / `min` / `list.sort` accept `key=` / `reverse=` / `default=` via a kwargs sentinel.
+- **v0.11.0:** `complex(...)` and complex literals (`Value::Complex`), `dict.keys()` / `.values()` / `.items()` view objects (`Value::DictView`), banker's-rounding `round`, `str %` / f-string `%` runtime formatting, real `re.Match.group(n)` / `.groups()` / `.groupdict()`, `str.split(maxsplit=)`.
+- **v0.12.0:** `dict.popitem()`, `dict.fromkeys(iterable[, value])`, `str.maketrans(...)`, `str.translate(table)`, `str.replace(old, new, count)` (honours `count`), stable `sorted(reverse=True)` / `list.sort(reverse=True)`, and `sorted` / `min` / `max` honouring a user `__lt__`.
 
 ### 2.4b Multi-file projects (v0.9.0)
 
@@ -237,7 +248,10 @@ The VM walks the project source root and loads sibling `.ty` modules on demand. 
 ### 2.5 Not supported (surfaces as `NotImplementedError` or `ImportError`)
 
 - **`async def` / `await` / `gather:` / `go`** — VM is synchronous-only today. Since v0.8.0 the VM surfaces a clear `NotImplementedError` pointing at `tyc build && python build/main.py` as the fallback (was: crash).
-- **Real generator functions with `yield`** — generator-expression shape works but materialises eagerly. Same `NotImplementedError` shape as async since v0.8.0.
+- **Lazy / unbounded generators** — `yield` / `yield from` *do* work since v0.10.0, but **eagerly**: a yield-bearing function runs to completion and returns an iterator over the collected values, capped at `GENERATOR_CAP = 1_000_000` (a `while True: yield` raises a clear `RuntimeError`). Genuinely infinite or lazily-consumed generators need `tyc build`.
+- **`@contextmanager` generators used inside a `with` block** — the eager-collection model runs setup + teardown at call time, so the `with` body can't run between them. The decorator is recognised (identity) and `@contextmanager` *factory bodies* are exempt from `resource_not_managed`, but a generator-based context manager driven by a `with` needs `tyc build`.
+- **Nested-model `pydantic.model_validate`** — flat `model` classes work under the VM (v0.10.0: `model_validate` / `model_dump` / `model_dump_json`), but nested-model validation is not type-directed; deeply-nested models need `tyc build`.
+- **Tz-aware `datetime` arithmetic** — the native `datetime` shim (v0.11.0) is naïve / UTC only; tz-aware arithmetic needs `tyc build`.
 - **Template strings** (`t"…"`).
 - **IPython escapes** (`%foo`, `!bar`, etc.).
 - **`with` statements other than `open()` / `@contextmanager`-decorated factories** — basic context-manager protocol covers the common case since v0.9.0; arbitrary user `__enter__` / `__exit__` on plain classes is a follow-up.
@@ -352,7 +366,7 @@ curl -sSL https://raw.githubusercontent.com/codehalwell/typhon/main/install.sh |
 
 The script detects OS+arch, resolves the latest tag via the GitHub API, downloads the tarball + `SHA256SUMS`, verifies with `shasum -a 256 -c` or `sha256sum -c`, extracts, installs `tyc` to `$HOME/.local/bin` (no `sudo`). On macOS it clears `com.apple.quarantine` so Gatekeeper doesn't prompt. Re-running upgrades in place.
 
-Env vars / flags: `TYPHON_VERSION=v0.9.0`, `TYPHON_INSTALL_DIR=/opt/typhon/bin`, or `sh install.sh --version=v0.9.0 --dir=/opt/typhon/bin`.
+Env vars / flags: `TYPHON_VERSION=v0.12.0`, `TYPHON_INSTALL_DIR=/opt/typhon/bin`, or `sh install.sh --version=v0.12.0 --dir=/opt/typhon/bin`.
 
 ### Windows (PowerShell)
 
@@ -360,7 +374,7 @@ Env vars / flags: `TYPHON_VERSION=v0.9.0`, `TYPHON_INSTALL_DIR=/opt/typhon/bin`,
 iwr -useb https://raw.githubusercontent.com/codehalwell/typhon/main/install.ps1 | iex
 ```
 
-Detects arch, downloads zip + `SHA256SUMS`, verifies with `Get-FileHash`, extracts to `%LOCALAPPDATA%\Programs\Typhon\` (no admin), adds the dir to user-level `PATH`. Env vars / flags: `$env:TYPHON_VERSION = 'v0.9.0'`, `$env:TYPHON_INSTALL_DIR = 'C:\Tools\Typhon'`, or `.\install.ps1 -Version v0.9.0 -InstallDir C:\Tools\Typhon -NoPath`.
+Detects arch, downloads zip + `SHA256SUMS`, verifies with `Get-FileHash`, extracts to `%LOCALAPPDATA%\Programs\Typhon\` (no admin), adds the dir to user-level `PATH`. Env vars / flags: `$env:TYPHON_VERSION = 'v0.12.0'`, `$env:TYPHON_INSTALL_DIR = 'C:\Tools\Typhon'`, or `.\install.ps1 -Version v0.12.0 -InstallDir C:\Tools\Typhon -NoPath`.
 
 ### Build from source
 

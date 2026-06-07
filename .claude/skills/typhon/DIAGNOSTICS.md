@@ -147,6 +147,8 @@ An expression of one type used where another was expected (arguments, returns, a
 let result: int = double("3")   # error: expected `int`, found `str`
 ```
 
+**(v0.12.0) Third-party argument types.** This is also the code you'll see when a wrong-*typed* argument is passed to a fully-typed third-party function **or constructor** — venv signature introspection (`tyc-venv`) now recovers parameter/return *annotations* (scalars, `Optional[X]` / `X | None`, parametric containers, fixed-arity tuples), so `requests.get(12345)` against `get(url: str, …)` or `Client(host="x", port="oops")` is rejected at check time, not just on arity. Anything not confidently modelled degrades to a permissive `Unknown`, so the check only adds true positives. A declared dependency that can't be introspected at all surfaces the separate `unintrospectable-dependency` warning (`[strictness] unintrospectable-dependency`, default `"warn"`) rather than silently skipping these checks.
+
 **Fix:** Convert at the boundary, or correct the annotation.
 
 ### `tyc::nullable_use` — error

@@ -2,7 +2,7 @@
 
 The full `tyc` surface. For background and design rationale, see `docs/cli.md` and `docs/long-term-plan.md`.
 
-`tyc` is a single Rust binary built from `tyc/Cargo.toml`. Each subcommand reuses the same Salsa-backed pipeline (`tyc-syntax → tyc-resolve → tyc-types → tyc-analyse → tyc-desugar → tyc-emit → tyc-format`). The current release is **v0.9.0**.
+`tyc` is a single Rust binary built from `tyc/Cargo.toml`. Each subcommand reuses the same Salsa-backed pipeline (`tyc-syntax → tyc-resolve → tyc-types → tyc-analyse → tyc-desugar → tyc-emit → tyc-format`); third-party introspection rides on the side crate `tyc-venv`. The current release is **v0.12.0**.
 
 ```bash
 # One-time: build the compiler
@@ -26,11 +26,14 @@ Parse, resolve, type-check, and analyse — **no emit**. The CI-recommended comm
 tyc check src/
 tyc check src/ tests/
 tyc check --stubs            # also diff every .dty against the module it describes
+tyc check --with-ty          # (v0.12.0) also run Astral's `ty` over a throwaway build
 ```
 
 Exits non-zero on any `tyc::*` diagnostic at `"error"` severity. Diagnostics are formatted via miette.
 
 **v0.3.1: grouped diagnostics by source file** — errors render as `-- errors in ./src/a.ty --` blocks instead of interleaved by analysis phase, with a per-code summary tally and `tyc explain <code>` suggestion at the bottom.
+
+**v0.12.0: third-party argument-type checking.** `tyc check` now consults venv signature introspection (the `tyc-venv` crate) for the *types* of arguments to fully-typed third-party functions / constructors, not just their arity — a wrong-typed argument fires `tyc::type_mismatch`. A declared dependency that's imported but can't be introspected surfaces the `unintrospectable-dependency` warning (`[strictness] unintrospectable-dependency`, default `"warn"`). `--with-ty` (normally emit-free `check` builds to a throwaway directory first) additionally runs the `ty` typeshed pass — see [`tyc ty`](#tyc-ty) and `[checker]` below.
 
 ### `tyc build [PATHS]`
 
@@ -50,6 +53,9 @@ Full pipeline: parse → check → analyse → desugar → emit → format. Writ
 | `--no-format` | Skip `ruff format` post-process |
 | `--check` | Dry-run — list every file that *would* be created/overwritten without touching disk. Full pipeline still runs, so type errors surface |
 | `--no-sync` (env: `TYC_NO_SYNC=1`) | Skip `uv sync` but still merge `pyproject.toml` |
+| `--with-ty` (v0.12.0) | After emit, run Astral's `ty` over the emitted Python (typeshed-backed second-stage check); errors fail the build. Equivalent to `[checker] external = "ty"` for one invocation |
+
+When `[checker] external = "ty"` is set in `typhon.toml` (or `--with-ty` is passed), `tyc build` runs the `ty` pass automatically after a successful emit, re-attributing `ty`'s diagnostics to the originating `.ty` line via the `.py.map` sidecars. This is the only path that type-checks against **typeshed** (C-extension + stdlib APIs that venv introspection can't model). Requires `ty` on `PATH`. `[checker] external-args = [...]` forwards extra flags verbatim.
 
 ### `tyc fmt [PATHS]`
 
@@ -233,6 +239,8 @@ tyc ty --raw                      # disable .ty path attribution
 | `--no-build` | Skip the build step; requires `--out` |
 | `--watch` | Watch source dir and re-run on `.ty` / `.dty` changes |
 | `--raw` | Opt out of `.py:LINE:COL` → `.ty:LINE:COL` rewriting |
+
+**v0.12.0: the same `ty` pass is wired into the build.** Set `[checker] external = "ty"` in `typhon.toml` (or pass `--with-ty` to `tyc build` / `tyc check`) to run `ty` automatically after a successful emit — `ty` errors fail the build, so it's CI-gating. The standalone `tyc ty` command and the build hook share one `run_ty_check` helper. `tyc ty` remains the way to run it ad-hoc (with `--watch`, explicit `--out`, etc.). The embedded in-process `ty` (Phase 2) was prototyped but is **not shipped** — it needs a git dependency the repo's `cargo deny` policy disallows, and adds no capability over the subprocess path.
 
 See `docs/ty-integration.md` for the integration design notes.
 
