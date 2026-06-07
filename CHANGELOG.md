@@ -78,8 +78,11 @@ now documented rather than fixed — see `docs/vm.md` and
   kind / has-default, so every third-party parameter became `Type::Unknown`
   and only *arity* was checked. It now also reads `p.annotation` (and the
   return annotation) and maps the unambiguous scalar builtins (`int` /
-  `str` / `bool` / `float` / `bytes` / `None`) — plus the nullable forms
-  `Optional[X]` and `X | None` — to Typhon types. A
+  `str` / `bool` / `float` / `bytes` / `None`), the nullable forms
+  `Optional[X]` / `X | None`, and the parametric containers
+  `list[X]` / `set[X]` / `frozenset[X]` / `dict[K, V]` (mapped recursively;
+  a container whose element doesn't resolve degrades to a permissive
+  `Unknown` rather than `list[Unknown]`) to Typhon types. A
   fully-typed pure-Python dependency now gets argument-*type* checking for
   both **free-function** and **constructor** calls through the same
   `tyc::type_mismatch` machinery project functions use — e.g. calling a
@@ -98,6 +101,13 @@ now documented rather than fixed — see `docs/vm.md` and
   positional / keyword argument against its concrete field type (the
   type-parameter fields of a generic class stay the job of the existing
   `check_generic_constructor_args`, so the two never double-report).
+- **Too-many-positional is now caught for zero-field constructors** when the
+  shape is authoritative for the constructor — a venv-introspected class
+  (`requests.Session(1)` → "expected 0, got 1") or a normal project class
+  with a fully-known hierarchy. `plain class` / `class!` (which may carry a
+  hand-written `__init__` not reflected in the fields) are deliberately
+  exempt, so the change adds no false positives (verified across the
+  256-file corpus).
 - **Scope / limits** (documented in `docs/diagnostics/missing_argument.md`):
   C-extension callables and typeshed-only (non-inline) annotations remain
   out of scope for the runtime-introspection path — those are covered by the

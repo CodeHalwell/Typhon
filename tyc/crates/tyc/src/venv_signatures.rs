@@ -573,6 +573,46 @@ fn annotation_to_type(ann: &str) -> Type {
         return Type::Unknown;
     }
 
+    // Parametric containers: `list[X]` / `set[X]` / `frozenset[X]` /
+    // `dict[K, V]` (and their `typing.`-qualified or capitalised aliases).
+    // Inner types map recursively; if ANY inner doesn't resolve to a concrete
+    // type the whole container degrades to `Unknown` (permissive), so we only
+    // ever emit a fully-known container shape — never `list[Unknown]`. The
+    // checker does bidirectional element widening (`[1, 2]` into `list[float]`
+    // is fine), so a concrete container shape adds true positives only.
+    if let Some((head, inner)) = split_generic(s) {
+        let head = head.rsplit('.').next().unwrap_or(head);
+        let container = match head {
+            "list" | "List" => Some("list"),
+            "set" | "Set" => Some("set"),
+            "frozenset" | "FrozenSet" => Some("frozenset"),
+            "dict" | "Dict" => Some("dict"),
+            _ => None,
+        };
+        if let Some(name) = container {
+            let parts = split_top_level_commas(inner);
+            let arity_ok = if name == "dict" {
+                parts.len() == 2
+            } else {
+                parts.len() == 1
+            };
+            if arity_ok {
+                let mapped: Vec<Type> =
+                    parts.iter().map(|p| annotation_to_type(p.trim())).collect();
+                if mapped
+                    .iter()
+                    .any(|t| matches!(t, Type::Unknown | Type::Any))
+                {
+                    return Type::Unknown;
+                }
+                return Type::Generic(name.to_owned(), mapped);
+            }
+        }
+        // Foreign generic class, `Callable[...]`, `tuple[...]`, etc. — stay
+        // permissive rather than guess.
+        return Type::Unknown;
+    }
+
     // Drop a module qualifier on a bare dotted name (`builtins.int`), but
     // leave parametric forms untouched so we don't mangle them.
     let bare = if !s.contains('[') && !s.contains('|') && !s.contains(' ') {
@@ -589,6 +629,41 @@ fn annotation_to_type(ann: &str) -> Type {
         "None" | "NoneType" => Type::None,
         _ => Type::Unknown,
     }
+}
+
+/// Split a `Head[inner]` annotation into `(head, inner)` — the text inside the
+/// outermost brackets. `None` when `s` isn't of that form.
+fn split_generic(s: &str) -> Option<(&str, &str)> {
+    let open = s.find('[')?;
+    if !s.ends_with(']') {
+        return None;
+    }
+    let head = s[..open].trim();
+    if head.is_empty() {
+        return None;
+    }
+    Some((head, &s[open + 1..s.len() - 1]))
+}
+
+/// Split `s` on top-level commas (ignoring commas nested inside `[...]` /
+/// `(...)`). Used to separate container type arguments.
+fn split_top_level_commas(s: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut depth = 0i32;
+    let mut start = 0;
+    for (i, &b) in s.as_bytes().iter().enumerate() {
+        match b {
+            b'[' | b'(' => depth += 1,
+            b']' | b')' => depth -= 1,
+            b',' if depth == 0 => {
+                parts.push(&s[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    parts.push(&s[start..]);
+    parts
 }
 
 /// Wrap `inner` as nullable (`inner | None`). A non-mappable inner collapses
@@ -1056,10 +1131,45 @@ mod tests {
             annotation_to_type("None | bytes"),
             Type::Union(vec![Type::Bytes, Type::None])
         );
-        // Anything we don't confidently model degrades to Unknown so the
-        // checker never false-positives on a shape we can't represent.
-        assert_eq!(annotation_to_type("list[int]"), Type::Unknown);
-        assert_eq!(annotation_to_type("Optional[list[int]]"), Type::Unknown);
+        // Parametric containers map element-wise.
+        assert_eq!(
+            annotation_to_type("list[int]"),
+            Type::Generic("list".into(), vec![Type::Int])
+        );
+        assert_eq!(
+            annotation_to_type("List[str]"),
+            Type::Generic("list".into(), vec![Type::Str])
+        );
+        assert_eq!(
+            annotation_to_type("dict[str, int]"),
+            Type::Generic("dict".into(), vec![Type::Str, Type::Int])
+        );
+        assert_eq!(
+            annotation_to_type("set[bytes]"),
+            Type::Generic("set".into(), vec![Type::Bytes])
+        );
+        assert_eq!(
+            annotation_to_type("list[list[int]]"),
+            Type::Generic(
+                "list".into(),
+                vec![Type::Generic("list".into(), vec![Type::Int])]
+            )
+        );
+        assert_eq!(
+            annotation_to_type("Optional[list[int]]"),
+            Type::Union(vec![
+                Type::Generic("list".into(), vec![Type::Int]),
+                Type::None
+            ])
+        );
+        // A container whose element doesn't map degrades the whole thing to
+        // Unknown — never `list[Unknown]`.
+        assert_eq!(annotation_to_type("list[requests.Session]"), Type::Unknown);
+        assert_eq!(annotation_to_type("dict[str, Session]"), Type::Unknown);
+        // tuple / Callable / foreign generics stay permissive.
+        assert_eq!(annotation_to_type("tuple[int, str]"), Type::Unknown);
+        assert_eq!(annotation_to_type("Callable[[int], str]"), Type::Unknown);
+        // Anything else we don't confidently model degrades to Unknown.
         assert_eq!(annotation_to_type("int | str | None"), Type::Unknown);
         assert_eq!(annotation_to_type("int | str"), Type::Unknown);
         assert_eq!(annotation_to_type("requests.Session"), Type::Unknown);

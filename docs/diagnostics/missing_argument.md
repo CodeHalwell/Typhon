@@ -82,9 +82,9 @@ boundaries worth knowing:
 | Missing required argument (function or constructor) | ✅ |
 | Unknown keyword when the target has no `**kwargs` | ✅ |
 | **Wrong *type* of a free-function argument** (e.g. `int` where `str` is annotated) | ✅ since the annotation-capture pass — *for fully type-annotated, pure-Python libraries* |
-| **Wrong *type* of a constructor argument** (e.g. `port="oops"` where `port: int`) | ✅ since the annotation-capture pass (same scalar-type caveat) |
+| **Wrong *type* of a constructor argument** (e.g. `port="oops"` where `port: int`) | ✅ since the annotation-capture pass (same caveat) |
 | Too many positional args to a **constructor with ≥1 field** | ✅ via the constructor arity check |
-| Too many positional args to a **zero-field constructor** (`Session(1)`) | ❌ — the arity check is skipped when the class has no fields (follow-up) |
+| Too many positional args to a **zero-field constructor** (`Session(1)`) | ✅ for venv-introspected and normal fully-known classes; `plain class` / `class!` are exempt (their fields may not reflect a hand-written `__init__`) |
 | Unknown keyword when the target has `**kwargs` | ❌ — correct: `**kwargs` legitimately absorbs it |
 | **C-extension / built-in callables** (numpy, pandas, pydantic-core, torch, …) | ❌ — `inspect.signature` raises, so the symbol is skipped (a missing check is safer than a wrong one) |
 | Anything when the package is **not installed in a reachable venv** | ❌ — introspection silently degrades to "no info" |
@@ -92,11 +92,14 @@ boundaries worth knowing:
 Two consequences follow from how this works:
 
 - **Argument-type checking depends on inline annotations.** The capture
-  pass reads each parameter's `annotation` and maps the unambiguous scalar
-  builtins (`int` / `str` / `bool` / `float` / `bytes` / `None`) to Typhon
-  types; everything else (containers, `Optional`, unions, foreign classes)
-  conservatively degrades to a permissive `Unknown`, so a library you can't
-  fully model never produces a false positive. Libraries whose types live
+  pass reads each parameter's `annotation` and maps the scalar builtins
+  (`int` / `str` / `bool` / `float` / `bytes` / `None`), the nullable forms
+  `Optional[X]` / `X | None`, and the parametric containers `list[X]` /
+  `set[X]` / `frozenset[X]` / `dict[K, V]` (recursively) to Typhon types;
+  everything else (multi-member unions, `tuple`, `Callable`, foreign
+  classes) conservatively degrades to a permissive `Unknown`, so a library
+  you can't fully model never produces a false positive. Libraries whose
+  types live
   only in **typeshed stubs** (rather than inline annotations) — `requests`
   is the classic example — therefore get arity checking but not argument-
   *type* checking from this path.

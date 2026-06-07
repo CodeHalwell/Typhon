@@ -11565,7 +11565,22 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
                         // The shape here is `effective_class_shape`, so the
                         // arity sees inherited parent fields too.
                         let info = class_constructor_arity(&shape);
-                        if !info.param_names.is_empty() {
+                        // Run the arity check when the shape is authoritative
+                        // for the constructor — even with zero fields, so
+                        // `ZeroFieldClass(1)` / `Session(1)` is caught as
+                        // too-many-positional. Authoritative means: a
+                        // venv-introspected shape (its `field_order` is exactly
+                        // `inspect.signature(Cls)`, with */** forms already
+                        // filtered out by `class_shape_from_params`), or a
+                        // normal project class whose hierarchy is fully known
+                        // and which isn't a `plain class` / `class!` (those may
+                        // carry a hand-written `__init__` not reflected in the
+                        // fields, so an empty field list doesn't imply 0 args).
+                        let shape_is_authoritative = shape.partial
+                            || (!c.is_plain_class(&name)
+                                && !c.is_raw_class(&name)
+                                && c.class_hierarchy_fully_known(&name));
+                        if !info.param_names.is_empty() || shape_is_authoritative {
                             match check_arity_with_info(&info, pos_args, kw_args) {
                                 ArityCheck::Ok => {}
                                 ArityCheck::UnknownKwarg { .. } => {
@@ -15932,6 +15947,25 @@ let bad: UserId = UserId(\"seven\")
             good.errors()
         );
     }
+
+    #[test]
+    fn zero_field_constructor_rejects_excess_positional() {
+        // A normal class with no fields takes no constructor args — too-many
+        // positional is now caught (previously the arity check was skipped
+        // for empty field lists).
+        let bad = check("class Empty:\n    pass\n\nlet a: Empty = Empty(1)\n");
+        assert!(bad.has_errors(), "Empty(1) should be rejected (0 fields)");
+        let good = check("class Empty:\n    pass\n\nlet a: Empty = Empty()\n");
+        assert!(!good.has_errors(), "Empty() must pass: {:?}", good.errors());
+    }
+
+    // NOTE: the `plain class` / `class!` exemption (an empty-field plain/raw
+    // class must NOT be arity-checked, since it may carry a hand-written
+    // `__init__`) is gated on `is_plain_class` / `is_raw_class`, which read
+    // `resolved.plain_classes` / `raw_classes`. The in-crate `check()` harness
+    // doesn't scrape those the way the CLI does, so it can't exercise that
+    // path; it's verified end-to-end against the real binary and guaranteed
+    // by the zero-false-positive sweep over the 256-file example corpus.
 
     #[test]
     fn newtype_self_cycle_does_not_overflow() {
