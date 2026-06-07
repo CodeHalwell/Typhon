@@ -147,6 +147,8 @@ An expression of one type used where another was expected (arguments, returns, a
 let result: int = double("3")   # error: expected `int`, found `str`
 ```
 
+**(v0.12.0) Third-party argument types.** This is also the code you'll see when a wrong-*typed* argument is passed to a fully-typed third-party function **or constructor** — venv signature introspection (`tyc-venv`) now recovers parameter/return *annotations* (scalars, `Optional[X]` / `X | None`, parametric containers, fixed-arity tuples), so a dependency exposing `def fetch(url: str, …)` called as `fetch(12345)`, or constructing a `Client(host: str, port: int)` with `port="oops"`, is rejected at check time, not just on arity. Anything not confidently modelled degrades to a permissive `Unknown`, so the check only adds true positives. The dependency must ship **inline** annotations for this path — a stub-only library like `requests` (typed via typeshed's `types-requests`, not in its own source) degrades to `Unknown` here and is instead caught by the `ty`/typeshed pass (`[checker] external = "ty"`) or a `.dty` stub. A declared dependency that can't be introspected at all surfaces the separate `unintrospectable-dependency` warning (`[strictness] unintrospectable-dependency`, default `"warn"`) rather than silently skipping these checks.
+
 **Fix:** Convert at the boundary, or correct the annotation.
 
 ### `tyc::nullable_use` — error

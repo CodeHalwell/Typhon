@@ -7,14 +7,20 @@ description: Write, check, build, debug, and migrate code in the Typhon language
 
 Typhon is **a statically-typed, stricter superset of Python that emits clean CPython 3.13+** with zero runtime dependency on the toolchain. The compiler, language server, formatter, debugger wrapper, REPL, and tree-walking interpreter are all a single Rust binary called `tyc`. Every `.ty` file emits valid, idiomatic `.py`. Not all `.py` is valid Typhon.
 
-**Current release: v0.9.0** (2026-05-27). The language is **additive across the v0.3.0 → v0.9.0 line** — every previously-accepted program continues to type-check identically. v0.9.0 is the stress-test cleanup release closing 32 findings from a v0.8.1 stress sweep: the VM is now usable as the daily-driver runner (`Result` combinators, `open()` write modes, class patterns on built-ins, `frozenset` keys, deep `freeze let`, comptime inlining, `lazy import`, `class!` exception fields, `dataclasses.field(default_factory=...)`, `collections.deque` / `heapq` / `contextlib` / `pydantic` shims, multi-file projects, `@property` / `super()` / `@contextmanager` all work under `tyc run`); the type checker plugs silent-correctness gaps in Sequence covariance, variant-to-parametric-union flow, `while True:` reachability, post-loop narrowing, `assert` narrowing, `*args` annotation policy, `extend list[T]` dispatch, exhaustive match on `T?`, `with`-chain error mismatch, and the `comptime let T: type` alias. v0.8.0 introduced one runtime behaviour change carried into v0.9.0: the VM now uses arbitrary-precision integers (`num_bigint::BigInt`), so programs that relied on silent i64 wrap-around compute mathematically-correct results. Headline frontier work (full HKT unification, general inter-procedural field-init audit, preprocess-line-number remapping for impl-sealed-union diagnostics) is tracked in `TYPE_SYSTEM_FRONTIER.md`.
+**Current release: v0.12.0** (2026-06-07). The language is **additive across the v0.3.0 → v0.12.0 line** — every previously-accepted program continues to type-check identically. The v0.10.0 → v0.12.0 line is dominated by two themes: making the in-process VM a true drop-in for `tyc build && python`, and deepening compile-time type-checking of third-party code. **One new language form** landed since v0.9.0 — the **`enum` keyword** (v0.11.0): `enum Name:` sugars over `enum.Enum`, auto-numbering bare members with `enum.auto()`. Highlights:
+
+- **VM completeness (v0.10.0 / v0.11.0):** the tree-walking VM now dispatches operator / reflected / rich-comparison dunders on user instances, honours `__str__` / `__repr__` / `__len__` / `__getitem__` / `__contains__` / `__call__` / `__post_init__`, runs `@property` / `@classmethod`, materialises finite generators eagerly (`yield` / `yield from`, capped at 1M items), models `type(x)` as a real type object, and ships `Value::Complex`, dict-view kinds (`dict.keys()/.values()/.items()`), native `enum` / `datetime` / `pathlib` / `collections.defaultdict` shims, and a long tail of string / set / math / json / time builtins. VM value semantics now match CPython (value-based dataclass equality keyed on class identity, `Name(field=value)` repr, hashable instances, order-independent set equality, shortest-round-trip float repr).
+- **Deep compile-time library introspection (v0.12.0):** venv signature introspection now captures parameter and **return annotations**, so a wrong-*typed* argument to a fully-typed third-party dependency — **function or constructor** — is caught by `tyc check` / `tyc build` via the same `tyc::type_mismatch` machinery your own code uses (this also closed an in-project constructor-argument soundness hole). A dependency that can't be introspected now **warns** instead of silently skipping its checks (`[strictness] unintrospectable-dependency`, default `warn`). The introspection logic moved into a new shared crate **`tyc-venv`**, consumed by both the CLI and `tyc lsp` (so the editor surfaces third-party arg/type squiggles live).
+- **`ty` typeshed integration (v0.12.0, Phase 1):** `[checker] external = "ty"` (or `--with-ty` on `tyc build` / `tyc check`) runs Astral's `ty` over the emitted Python — the only path that covers C-extension and stdlib APIs runtime introspection can't see (`os.path.join(1, 2)` now caught) — with `ty`'s diagnostics re-attributed to your `.ty` source. The embedded in-process `ty` (Phase 2) was prototyped and proven feasible but is **not shipped** (it needs a git dependency `cargo deny` disallows; it adds no capability the subprocess path lacks).
+
+v0.8.0 introduced one runtime behaviour change carried forward: the VM uses arbitrary-precision integers (`num_bigint::BigInt`), so programs that relied on silent i64 wrap-around compute mathematically-correct results (and from v0.11.0 the VM's value semantics above also produce different — correct — results where they previously diverged). Headline frontier work (full HKT unification, general inter-procedural field-init audit, preprocess-line-number remapping for impl-sealed-union diagnostics) is tracked in `TYPE_SYSTEM_FRONTIER.md`.
 
 LLMs have no prior knowledge of Typhon. This skill is the field reference. **Trust the docs and the compiler over assumptions from Python or any superset.** When this skill and a doc disagree, the doc wins. When the docs and the compiler disagree, the compiler wins — verify with `tyc check`.
 
 The canonical sources are:
 
 - **`README.md`** — pitch, release table, workspace layout, top-level project status.
-- **`CHANGELOG.md`** — every release back to v0.1.0. v0.3.0–v0.9.0 are the live window.
+- **`CHANGELOG.md`** — every release back to v0.1.0. v0.3.0–v0.12.0 are the live window.
 - **`docs/long-term-plan.md`** — source of truth for design decisions.
 - **`docs/language.md`** — the type system, error handling, async, `let`/`mut`, comptime.
 - **`docs/cheatsheet.md`** — 30-second syntax refresher (also `tyc cheatsheet`).
@@ -25,13 +31,15 @@ The canonical sources are:
 - **`docs/diagnostics/*.md`** — one page per `tyc::` code; also surfaced via `tyc explain <code>`.
 - **`docs/guides/01..10-*.md`** — the teaching surface; read in order the first time.
 - **`docs/install.md`** — pre-built binaries (Linux x86_64/aarch64, macOS Apple Silicon/Intel, Windows x86_64) plus source build.
-- **`docs/ty-integration.md`** — how `tyc ty` cooperates with Astral's checker.
+- **`docs/ty-integration.md`** — how `tyc ty` and the `[checker] external = "ty"` build hook cooperate with Astral's checker (Phase 1 shipped; Phase 2 embedded prototyped, not shipped).
 - **`docs/performance-baseline.md`** — measured numbers we don't want to regress.
 - **`docs/roadmap.md`** / **`docs/risks.md`** / **`docs/prior-art.md`** / **`docs/findings.md`** — context.
-- **`examples/01..68-*/`** — 68 stdlib-only exercises.
+- **`examples/NN-*/`** — 29 curated stdlib-only exercises (sparsely numbered `01`–`68`, leaving room between topics).
 - **`examples/apps/01..15-*/`** — 15 production-shaped multi-file projects (event-sourced banking, distributed KV, mini-compiler, search engine, GraphQL server, game ECS, trading engine, ML orchestrator, web crawler, task scheduler, real-time game server, static site generator, vector DB, API gateway, stream processor).
+- The full example corpus is **256 `.ty` files** (exercises + apps + `examples/testing/`); the v0.12.0 third-party-introspection work was verified against it with zero false positives.
 - **`tyc/vendor/README.md`** — Ruff fork rationale.
-- **`editors/vscode/README.md`** — reference VS Code extension (v0.2.0).
+- **`editors/vscode/README.md`** — reference VS Code extension (v0.2.1).
+- **`docs-site/`** — the published Astro + Starlight documentation site (`src/content/docs/*.mdx`); self-contained, not generated from `docs/`. Deployed to GitHub Pages.
 
 This skill ships sibling files for the long-tail detail:
 
@@ -124,6 +132,7 @@ The 30-second mental model. Every later section in this skill is detail under on
 | Frozen class | `class P frozen: x: float` | `@dataclass(slots=True, frozen=True)` |
 | Plain class (no decorator) | `plain class Bag: items: list[str]` | bare `class Bag:` (no `@dataclass`, no synthesised `__init__`) |
 | Raw class (framework base) | `class! M(nn.Module): layer: nn.Linear` | bare `class M(nn.Module):` with synthesised `__init__` calling `super().__init__()` |
+| Enum (v0.11.0) | `enum Color: RED; GREEN` / `enum C: RED = 1` | `class Color(enum.Enum): RED = enum.auto(); ...` (`import enum` injected) |
 | Methods | `impl User: def display(self) -> str: ...` | merged into the class body |
 | Extend foreign class | `extend User: def x(self) -> int: ...` | merged at desugar |
 | Extend built-in | `extend str: def slug(self) -> str: ...` | extracted to `__typhon_ext_str__slug` free fn + call-site rewrites |
@@ -411,7 +420,7 @@ The cheat-sheet form `sealed union Shape: Circle(radius: float); Square(side: fl
 
 The match is statically verified exhaustive. Add `Square` to the alias → every match becomes `tyc::non_exhaustive_match` until handled. Cross-module variant flow works (v0.6.0) — variant `A(...)` flows into an `Event`-typed slot in a consumer module even when the alias is declared in another package.
 
-### 5.7 `class` vs `model` vs `plain class` vs `class!`
+### 5.7 `class` vs `model` vs `plain class` vs `class!` vs `enum`
 
 | Form | Emits | Use when |
 |---|---|---|
@@ -421,6 +430,7 @@ The match is statically verified exhaustive. Add `Square` to the alias → every
 | `interface Foo:` | `class Foo(Protocol):` (bodies `...`) | Structural contract. |
 | `plain class Foo:` | bare `class Foo:` (no decorator, no `__init__`) | Metaclass-driven libs, descriptor-based models (Textual, Django ORM, SQLAlchemy declarative). |
 | `class! Foo(Base):` | bare `class Foo(Base):` + synthesised `__init__` calling `super().__init__()` and assigning fields | Subclassing a framework base that owns its own `__init__` (torch.nn.Module, custom exceptions). |
+| `enum Foo:` (v0.11.0) | `class Foo(enum.Enum):` with `enum.auto()` for bare members | A fixed set of named members. Sugar over `enum.Enum`. |
 
 #### Mutable-default rewrite
 
@@ -447,6 +457,24 @@ A `class Foo(Base):` whose `Base`'s last identifier segment is `Enum`, `IntEnum`
 #### Inheritance
 
 Single inheritance is the supported form (`class Dog(Animal):`). Subclass constructors accept inherited fields (v0.4.0): `Dog(name="Rex", breed="Husky")` works against `class Dog(Animal):` where `name` lives on `Animal`. Dataclass inheritance ordering rules still apply across the MRO — non-defaults before defaults all the way up.
+
+#### `enum` (v0.11.0)
+
+`enum Name:` declares an `enum.Enum` subclass — the same kind of sugar `model` is over `pydantic.BaseModel`. Bare members auto-number via `enum.auto()`; an explicit `MEMBER = value` is preserved, and a subsequent bare member resumes `enum.auto()` numbering from the last value — standard CPython `enum` semantics (e.g. `A = 10` then a bare `B` yields `B = 11`, not `2`). `tyc-syntax` preprocesses the header / body, `tyc-emit` injects `import enum`, `tyc-resolve` adds `enum` to the builtin prelude so the form type-checks before the import is rewritten in, and `tyc fmt` round-trips it. The VM (v0.11.0) resolves `enum.Enum` / `enum.auto()` natively, materialises members in declaration order, and matches CPython's `<Shape.CIRCLE: 1>` member repr.
+
+```python
+enum Shape:                       # → class Shape(enum.Enum):
+    CIRCLE                        #       CIRCLE = enum.auto()
+    SQUARE                        #       SQUARE = enum.auto()
+    TRIANGLE                      #       TRIANGLE = enum.auto()
+
+enum Color:                       # → class Color(enum.Enum):
+    RED = 1                       #       RED = 1
+    GREEN = 2                     #       GREEN = 2
+    BLUE = 4                      #       BLUE = 4
+```
+
+(You can still subclass `enum.Enum` directly via the auto-skip path — `class Suit(enum.Enum):` emits without `@dataclass` — but `enum Suit:` is the idiomatic form.)
 
 ### 5.8 `impl` and `extend`
 
@@ -548,9 +576,68 @@ Plus `tyc::unsafe_value_leak`, `tyc::pattern_shadows_outer`, and `tyc::extend_bu
 
 ---
 
-## 7. v0.9.0 highlights
+## 7. v0.12.0 highlights
 
-The v0.3.0 → v0.9.0 line is **additive**. Every previously-accepted program continues to type-check identically; the one runtime behaviour change is the VM's switch to arbitrary-precision integers in v0.8.0 (programs that relied on silent i64 wrap-around now compute different (correct) results). Highlights since v0.3.0:
+The v0.3.0 → v0.12.0 line is **additive** on the accepted surface. Every previously-accepted program continues to type-check identically, and `enum` (v0.11.0) is the only new language form. The behaviour changes are all in the **VM**: the v0.8.0 switch to arbitrary-precision integers, and the v0.11.0 alignment of VM value semantics with CPython (value-based dataclass equality / repr / hashing, order-independent set equality, CPython-matching float repr) — programs that relied on the old VM behaviour now compute different (correct) results. Highlights newest-first:
+
+### v0.12.0 — VM `__lt__` parity, dict/str builtins, deep library introspection
+
+The headline is **deep compile-time library introspection** plus a VM comparison-protocol fix. See `CHANGELOG.md` for the full list.
+
+**Third-party argument-*type* checking (annotation capture):**
+
+- **Venv introspection captures parameter and return *annotations*** (previously only name / kind / has-default, so every third-party param was `Type::Unknown` and only *arity* was checked). It maps the unambiguous scalar builtins (`int` / `str` / `bool` / `float` / `bytes` / `None`), nullable `Optional[X]` / `X | None`, parametric containers (`list[X]` / `set[X]` / `frozenset[X]` / `dict[K, V]`), and fixed-arity `tuple[...]` (recursively; an unresolvable element degrades to a permissive `Unknown`). A fully-typed pure-Python dependency now gets argument-*type* checking for **free-function and constructor** calls through the same `tyc::type_mismatch` machinery your own code uses — e.g. a dependency exposing `def fetch(url: str, ...)` called as `fetch(12345)`, or constructing a `Client(host: str, port: int)` with `port="oops"`. The dependency must ship **inline** annotations for this to fire — a stub-only library like `requests` (typed via typeshed's `types-requests`, not in its own source) degrades to `Unknown` under venv introspection and is instead caught by Layer 3 (`ty`/typeshed) or a `.dty` stub.
+- **In-project constructor arguments are now type-checked too** (closes a soundness hole): `check_concrete_constructor_args` validates each positional / keyword argument against its concrete field type. Too-many-positional is caught for zero-field constructors when the shape is authoritative; `plain class` / `class!` are exempt (they may carry a hand-written `__init__`).
+- **Conservative by design:** anything not confidently modelled degrades to `Unknown`, so the change can only *add* true positives. Verified across the 256-file corpus with zero false positives.
+- **`[strictness] unintrospectable-dependency`** (default `"warn"`) — a declared dependency that's imported but can't be introspected (no reachable `.venv` / `python3`, not installed, or no introspectable signatures) now *warns* instead of silently skipping its third-party checks. `"error"` CI-gates; `"off"` restores the old silent behaviour.
+- **Live in the editor:** `tyc lsp` now runs the venv introspection (persistent per-project `VenvSignatures` cache, invalidated on `.venv/pyvenv.cfg` mtime change), so wrong-typed / wrong-arity third-party calls squiggle as you type. The introspection logic moved into a new shared crate **`tyc-venv`** (was private to the `tyc` binary), consumed by both the binary and `tyc-lsp`.
+
+**`ty` typeshed integration (Phase 1):**
+
+- **`[checker] external = "ty"`** (default `"none"`) runs Astral's `ty` over the emitted Python after a successful build, the only path that type-checks against **typeshed** (covers C-extension and stdlib APIs venv introspection can't see — `os.path.join(1, 2)` now caught). `ty` errors fail the build. `[checker] external-args = [...]` forwards extra flags. Requires `ty` on `PATH`.
+- **`--with-ty`** on `tyc build` / `tyc check` runs the `ty` pass for one invocation without editing `typhon.toml` (`tyc check --with-ty` builds to a throwaway dir first). The shared `run_ty_check` helper is factored out of the `tyc ty` command so the standalone command and the build hook share one path. Diagnostics are re-attributed to `.ty` via `.py.map`.
+- **Phase 2 (embedded, in-process `ty`) is prototyped and proven feasible but NOT shipped** — it needs a git dependency on `astral-sh/ruff`, which the repo's `cargo deny` policy (`[sources] unknown-git = "deny"`) disallows, and it offers no capability the subprocess path lacks. Correction worth recording: the earlier claim that Phase 2 was blocked by the vendored Ruff fork is *false* — vendored `ruff_python_ast` (`0.0.0-typhon-vendor`) and `ty`'s upstream (`0.0.0`) coexist, kept apart by version; the real gate is the git-source supply-chain policy.
+
+**VM / CPython parity:**
+
+- **`sorted()` / `min()` / `max()` honour a user `__lt__`** — they routed through the dunder-blind `Value::py_cmp` (which calls class instances "equal"), so `sorted([R(1), R(3), R(2)])` returned the list *unsorted*. They now use `Interpreter::value_cmp` (the path `list.sort()` already used). Silent-wrong-output fix.
+- **`str.replace(old, new, count)`** honours the third arg; **`sorted(..., reverse=True)` / `list.sort(reverse=True)`** are stable (reverse the comparator, not the list); **`json.dumps(sort_keys=True)`** sorts; **`math.isnan` / `isinf` / `isfinite`** added; float-presentation format types (`e`/`f`/`g`/…) coerce int/bool operands.
+- **New builtins:** `dict.popitem()`, `dict.fromkeys(iterable[, value])`, `str.maketrans(...)`, `str.translate(table)`.
+
+**Resolver:** dict comprehensions now bind tuple-unpack targets (`{k: v for k, v in d.items()}`).
+
+### v0.11.0 — VM parity sweep + `enum` keyword
+
+Closes 22 findings from an adversarial stress round against v0.10.0 (almost all in the VM).
+
+- **`enum` keyword** — first-class declaration sugaring over `enum.Enum` (see [§5.7](#57-class-vs-model-vs-plain-class-vs-class-vs-enum)). Bare members auto-`enum.auto()`; explicit values preserved; `tyc fmt` round-trips.
+- **`Value::Complex(f64, f64)`** is a real VM value — `complex(...)` / complex literals construct it, arithmetic promotes across int / float, reflected dunders dispatch, hashable for dict / set keys.
+- **`Value::DictView`** backs `dict.keys()` / `.values()` / `.items()` — they repr as `dict_keys([...])`, iterate, support `len`, are `in`-testable, and re-iterable (previously each materialised a fresh list, so `d.keys() == d.keys()` was identity-false).
+- **Bare `super()` rewritten to two-arg `super(EnclosingClass, self)`** in `tyc-desugar` (the zero-arg form crashed under `@dataclass(slots=True)`, which orphans the `__class__` cell). Explicit `super(X, y)` is left untouched.
+- **`__call__` dispatch on callable instances; `__post_init__` invoked after auto-generated construction; multi-level inheritance accumulates fields across the full MRO.** Generic operator handler reaches every numeric / bitwise / matmul slot with reflected fallback; subscript `__missing__` fires (backs `defaultdict`).
+- **VM stdlib expansion:** `collections.defaultdict(factory)`, `datetime` shim (naïve / UTC), `pathlib` shim (`/` join, `.parent` / `.name` / `.stem` / `.suffix` / `.suffixes` / `.parts`), `bytes` methods, `itertools.groupby(key=)`, real `re.Match.group(n)` / `.groups()` / `.groupdict()`, `str.split(maxsplit=)`, f-string `{x=}` debug, `str %` / f-string `%` runtime formatting, banker's-rounding `round`.
+- **VM value semantics now match CPython** (silent-wrong fixes): value-based dataclass equality **keyed on class identity** (distinct same-named classes from different modules no longer collide), `Name(field=value, ...)` repr, hashable instances (`HashKey::Instance`), order-independent set / frozenset equality, canonical-sorted set repr, CPython-matching float `repr` (shortest round-trip).
+- **Type checker tightening:** `None` flows into `object` (`def log(msg: object = None)` now accepted); `str %` is type-checked; `(5).items()` / `5["a"]` / `for x in 5:` fire at check time instead of crashing at run time.
+- **`tyc init` seeds `allow-secret-comptime = false`** in the generated `typhon.toml`.
+
+### v0.10.0 — VM completeness release
+
+Closes the dunder-dispatch and builtins-coverage gaps that stopped `tyc run` from being a drop-in for `tyc build && python` on real-world programs.
+
+- **Operator overloading on instances** — every numeric / bitwise / matmul dunder plus reflected forms; **rich comparisons** (`__eq__` / `__ne__` / `__lt__` / …); `in` / `list.index` / `.count` / `.remove` use `__eq__`-aware comparison. **`__str__` / `__repr__`** honoured by `print` / `str` / `repr` / f-strings; `__len__` / `__getitem__` / `__contains__` dispatch.
+- **`@property` getters** fire on attribute read; **`@classmethod`** binds `cls`; both inherited (and the descriptor marker is cleared on override).
+- **VM generator support** — `yield` / `yield from` work, materialised **eagerly** (a tree-walk can't suspend a frame; `Rc` values aren't `Send`). `GENERATOR_CAP = 1_000_000` bounds `while True: yield` to a clear `RuntimeError`. Lazy / unbounded generators and `@contextmanager` generators inside `with` still need `tyc build`.
+- **`type(x)` is a real type object** — `type(x).__name__`, `type(x) == int`, `str(type(x))` → `<class 'int'>` all work (previously `type(x)` returned a plain string).
+- **VM pydantic `model_validate` / `model_dump` / `model_dump_json`** make flat `model` classes usable under `tyc run` (nested-model validation still needs `tyc build`).
+- **Keyword args to builtin methods** via a kwargs sentinel — `max()` / `min()` take `key=` / `default=`; `list.sort()` takes `reverse=` / `key=`.
+- **Long tail of builtins** — `divmod`, `pow` (2- and 3-arg), `format`, `ascii`, `int(str, base)` (incl. `base=0`), full set algebra, the missing string methods (`center` / `ljust` / `rjust` / `zfill` / `partition` / `removeprefix` / `expandtabs` / …, and `strip`/`lstrip`/`rstrip` now honour their `chars` arg), `dict(other)` / `dict(**kwargs)`, `math.gcd` / `lcm` / `factorial` / `isqrt` / `comb` / `perm`, `json.dumps(indent=…)`, `time.perf_counter` / `process_time` (and `monotonic` fixed).
+- **Type-checker false-positive fixes:** exhaustive `match` over `bool` / string-literal unions / irrefutable fixed-arity tuples no longer fires `missing_return`; augmented assignment on scalar targets (`s += 5`) is type-checked.
+- **`allow-secret-comptime` strictness knob wired through** (was documented but never threaded into the analysis); `tyc-emit` literal-emission hot path de-allocated (`itoa` / `ryu`).
+
+### v0.9.2 / v0.9.1 — bugfix point releases
+
+- **v0.9.2** — cross-module `tyc::attribute_not_found` false-positive on a `class! Sub(Foreign):` (e.g. `class! HttpError(Exception):`) declared in one module and imported by another. The fix seeds `class_parents` from `InterfaceShape.bases` during cross-module shape ingestion so the four hierarchy walkers see the same parent chain across module boundaries. No language / runtime / diagnostic-surface change.
+- **v0.9.1** — four `tyc fmt` round-trip corruption modes (`impl Alias:` for sealed-union aliases, the `frozen` modifier, standalone `pub *` lines, multi-line kwarg `=` respacing — the last one could emit a *silently-empty* file) plus a `pub *`-facade hole where an exhaustive `match` over a facade-imported variant fired `missing_return`. Scoped to `tyc-format` and the shape-map plumbing. No language / runtime / diagnostic-surface change.
 
 ### v0.9.0 — stress-test cleanup release
 
@@ -1054,6 +1141,12 @@ auto-parallel = false            # opt-in; pure list/set/dict comprehensions →
 parallel-min-size = 64
 pgo-memoise = false              # opt-in; promotes hot pure fns from typhon-profile.json
 pgo-min-calls = 100
+unintrospectable-dependency = "warn"  # (v0.12.0) "warn" | "error" | "off" — declared dep imported but not introspectable
+allow-secret-comptime = false    # set true to silence tyc::contains_secret_literal
+
+[checker]                        # (v0.12.0) second-stage checker over the EMITTED Python
+external = "none"                # or "ty" — runs Astral's `ty` against typeshed; errors fail the build
+external-args = []               # extra flags forwarded verbatim to the external checker
 
 [env]
 required = ["DATABASE_URL"]      # comptime env() lookups that must resolve at build
@@ -1071,6 +1164,12 @@ Notes on always-on behaviour:
 - **PEP 561 `.pyi` stubs are always emitted** alongside every `.dty`.
 - **Pydantic emissions inject `model_config = ConfigDict(extra=…)`**, controlled by `model-extra`.
 - **`tyc::stdlib_module_shadow`** is gated on the presence of `typhon.toml` (standalone-file checks skip it).
+
+`[checker] external = "ty"` (v0.12.0) is the only path that type-checks against **typeshed**, so it covers C-extension and stdlib APIs that runtime venv introspection can't model. It spawns `ty check` over the build output and re-attributes diagnostics to `.ty` via `.py.map`. Requires `ty` on `PATH` (`pip install ty` / `uv tool install ty`); most useful with the project's deps installed in a venv. `--with-ty` on `tyc build` / `tyc check` runs the same pass for one invocation without editing `typhon.toml`.
+
+`unintrospectable-dependency` (v0.12.0) covers the most dangerous failure mode of third-party checking: a *skipped* check looked identical to a clean pass. It fires when a declared, imported dependency can't be introspected (no reachable `.venv` / `python3`, not installed, or no introspectable signatures). Clear it by installing deps (`uv sync`) or shipping a `.dty` stub. Per-top-level success tracking means a package whose root introspects fine isn't flagged because one submodule failed.
+
+`allow-secret-comptime` (lives in `[strictness]`; wired through in v0.10.0, seeded into `tyc init`'s scaffold in v0.11.0) silences `tyc::contains_secret_literal` when set `true`.
 
 `auto-gather` independence rules:
 
@@ -1090,12 +1189,12 @@ See [CLI.md](CLI.md) and `docs/cli.md` for the full surface. The most-used comma
 | `tyc build` | full pipeline through emit + ruff format; `--check` for dry-run | local run; produces `build/*.py` + `build/.sourcemaps/*.py.map` |
 | `tyc fmt src/` | in-process whitespace pass + `ruff format` wrap (when on PATH) | pre-commit |
 | `tyc run` | execute a Typhon program in the in-process VM by default; `--compile` (alias `--no-vm`) falls back to build-then-exec for CPython library interop | iterating on pure-Typhon code |
-| `tyc lsp` | LSP on stdio (diagnostics, hover, go-to-def, member completions via venv introspection, from-import members from sibling files, "Remove unused import") | editor |
+| `tyc lsp` | LSP on stdio (diagnostics, hover, go-to-def, member completions via venv introspection, from-import members from sibling files, "Remove unused import"; v0.12.0 also surfaces live third-party arg/type diagnostics via `tyc-venv`) | editor |
 | `tyc init NAME` | scaffold `typhon.toml`, `src/`, `tests/` with a worked `main.ty` (frozen dataclass + `impl` + `Result`/`?`/`match`) | new project |
 | `tyc trace traceback.txt` | map Python frames back to `.ty` via `.py.map` v2 | debugging emitted code |
 | `tyc profile` | instrument top-level fns with call-count + wall-clock; writes `typhon-profile.json` on interpreter exit | feeds `pgo-memoise` |
 | `tyc migrate src/app.py` | typed Python → Typhon: rewrites `Optional[T]`/`T \| None` → `T?`, `Generic[T]` → PEP 695, `NewType` → `newtype`, `Protocol` → `interface`, drops `@dataclass`/`@dataclass(frozen=True)`, adds `let`/`mut` to module-level annotated assigns | `--check` for CI |
-| `tyc ty` | builds, then runs Astral's `ty` checker over emitted Python with `.ty` path attribution via `.py.map` (v0.5.0) | second-opinion type-checking; needs `pip install ty` |
+| `tyc ty` | builds, then runs Astral's `ty` checker over emitted Python with `.ty` path attribution via `.py.map` (v0.5.0). The same pass runs automatically when `[checker] external = "ty"` or `--with-ty` is set on build/check (v0.12.0) | second-opinion type-checking; needs `pip install ty` |
 | `tyc stubtest` | builds, then runs `python -m mypy.stubtest` against every emitted `.pyi` | runtime probe complementing `tyc check --stubs` |
 | `tyc repl` | interactive evaluator; compiles each block through the full pipeline | quick experiments; `:quit` / `:reset` / `:show` |
 | `tyc debug` | builds + execs `python -m pdb build/main.py` with a source-mapping wrapper (v0.5.0) that surfaces `[ty]` paths; `--break <ty-file>:<line>` translates `.ty` coordinates through `.py.map` | step through emitted code; pair with `tyc trace` |
@@ -1106,6 +1205,7 @@ See [CLI.md](CLI.md) and `docs/cli.md` for the full surface. The most-used comma
 Notable flags:
 
 - `tyc check --stubs` — also diff every `.dty` against the runtime module it describes.
+- `tyc check --with-ty` / `tyc build --with-ty` (v0.12.0) — run the `ty` typeshed pass for this one invocation without editing `typhon.toml`. `tyc check --with-ty` (normally emit-free) builds to a throwaway directory first.
 - `tyc build --check` — dry-run, lists every file that would be written without touching disk.
 - `tyc build --no-sync` (or `TYC_NO_SYNC=1`) — skip `uv sync` but still merge `pyproject.toml`.
 - `tyc run --compile` (alias `--no-vm`) — fall back to build-then-exec when the program imports CPython-only libraries.
@@ -1145,6 +1245,16 @@ impl Redis:
 
 **Cross-module shape extraction consumes both `.ty` and `.dty` on equal footing.** When both define the same name, stubs win.
 
+### Three layers of third-party type-checking (v0.12.0)
+
+As of v0.12.0 a third-party call can be type-checked three ways, in increasing coverage:
+
+1. **Authored `.dty` stub** — full Typhon-dialect types, the strongest and most precise. Write these for long-lived dependencies you call a lot.
+2. **Venv signature introspection (`tyc-venv`)** — `inspect.signature` over the *installed* package recovers parameter / return *annotations* (scalars, `Optional[X]` / `X | None`, parametric containers, fixed-arity tuples). Catches wrong-*type* and wrong-*arity* arguments to fully-typed pure-Python deps (function **and** constructor) with zero authoring. Degrades to a permissive `Unknown` on anything it can't model, so it only adds true positives. If a declared, imported dependency can't be introspected, `tyc::` surfaces the `unintrospectable-dependency` warning rather than silently skipping the check.
+3. **`ty` typeshed pass (`[checker] external = "ty"` / `--with-ty`)** — the only path that sees **typeshed**, so it covers C-extension and stdlib APIs introspection can't reach (`os.path.join(1, 2)`, numpy/pandas signatures). Runs as a subprocess over the emitted Python, errors re-attributed to `.ty`.
+
+Layer 1 is precise but manual; layer 2 is automatic for installed pure-Python deps; layer 3 is the catch-all for everything typeshed knows. They compose — a `.dty` still wins on a name it defines.
+
 ---
 
 ## 16. Compiler architecture
@@ -1156,7 +1266,8 @@ The whole pipeline lives in `tyc/crates/`, backed by a Salsa incremental DB.
     │
     ▼ tyc-syntax       lexer + parser (vendored Ruff fork — see tyc/vendor/)
     │                  let/mut soft-keywords with Mutability AST field
-    │                  preprocess.rs expands T?, ?, |>, gather:, go, lazy, with-chains
+    │                  preprocess.rs expands T?, ?, |>, gather:, go, lazy, with-chains,
+    │                  enum/model/class!/plain class headers
     ▼ tyc-db           Salsa queries: preprocessed_text/full, module_decl_names,
     │                  resolved_module, check_diagnostics, module_shapes_query
     ▼ tyc-resolve      name resolution + scope construction; enforces let/mut;
@@ -1172,10 +1283,14 @@ The whole pipeline lives in `tyc/crates/`, backed by a Salsa incremental DB.
     ▼ tyc-format       in-process whitespace pass + ruff format wrap
     ▼
     .py + .sourcemaps/*.py.map (+ generated typhon_runtime/ if used)
+    │
+    ▼ [checker] external = "ty"  (v0.12.0, opt-in / --with-ty)
+                       run `ty` over the emitted .py; re-attribute diagnostics to .ty
 ```
 
 - **`tyc-diagnostics`** uses miette/thiserror for the human-friendly format you see; every code carries a `url(https://typhon.dev/lang/diagnostics/<code>)` deep-link.
-- **`tyc-lsp`** is a `tower-lsp-server` backend reusing the same Salsa DB; serves diagnostics, hover, go-to-definition (cross-file via `resolved_module`), completion (including venv-driven member-access introspection cached per session), semantic tokens, "Remove unused import" code action.
+- **`tyc-venv`** (v0.12.0) is the shared venv-introspection crate (`inspect.signature` over installed third-party packages → `VenvSignatures` of param/return types). Extracted from the `tyc` binary so both the CLI checker and `tyc-lsp` consume it. Powers third-party arity + argument-*type* checking and the `unintrospectable-dependency` warning.
+- **`tyc-lsp`** is a `tower-lsp-server` backend reusing the same Salsa DB; serves diagnostics, hover, go-to-definition (cross-file via `resolved_module`), completion (including venv-driven member-access introspection cached per session), semantic tokens, "Remove unused import" code action, and (v0.12.0) live third-party arg/type diagnostics via a persistent `tyc-venv` cache.
 - **`tyc-vm`** is the in-process tree-walking interpreter that powers `tyc run`. See [RUNTIME.md](RUNTIME.md).
 - **`tyc/`** is the CLI binary that wires it all together with clap v4; subcommands live under `tyc/src/commands/`.
 - **`tyc/vendor/`** holds the Ruff fork — `ruff_text_size`, `ruff_source_file`, `ruff_python_trivia`, `ruff_python_ast` (with the `Mutability` extension on assignment nodes), `ruff_python_parser`. See `tyc/vendor/README.md`.
@@ -1192,10 +1307,12 @@ When investigating a bug, the rule of thumb is:
 | Wrong Python output / source-map wrong line | `tyc-emit` |
 | Diagnostic text / span wrong | `tyc-diagnostics` (and the call site that emitted it) |
 | LSP hover / go-to-def / completion misbehaving | `tyc-lsp` |
+| Wrong third-party arg/type check, or a spurious `unintrospectable-dependency` | `tyc-venv` (introspection) → `tyc-types` (the check) |
+| `ty` / `--with-ty` integration, source-map re-attribution | `tyc/src/commands/ty.rs` (`run_ty_check`) + `tyc/src/commands/source_map.rs` |
 | VM produces wrong answer | `tyc-vm` |
 | CLI flag, exit code, watch loop | `tyc/src/commands/*.rs` |
 
-The pipeline is **strict** — every crate only depends on its upstream neighbours plus `tyc-diagnostics` and `tyc-db`. There are no skip-level dependencies.
+The core pipeline is **strict** — every stage crate only depends on its upstream neighbours plus `tyc-diagnostics` and `tyc-db`; there are no skip-level dependencies. `tyc-venv` sits *beside* the pipeline: it's consumed by the `tyc` binary and `tyc-lsp` to enrich project shapes before `tyc-types` runs, not as a linear stage. The `ty` external checker runs *after* emit, as a subprocess.
 
 ---
 
@@ -1264,7 +1381,8 @@ The recurring diagnostic codes and what they actually mean. **See [DIAGNOSTICS.m
 | `tyc::interface_isinstance` | `isinstance(x, SomeInterface)` | Use static narrowing or refactor to a sealed union |
 | `tyc::interface_not_conforming` | Type missing/incompatible interface members | Add the method or fix the signature |
 | `tyc::stub_mismatch` | `.dty` vs runtime drift detected by `tyc check --stubs` | Update the stub or implementation |
-| `tyc::unused_import` (error) | Severity controlled by `[strictness] unused-import` | Remove the import (LSP "Remove unused import" code-action exists) |
+| `tyc::type_mismatch` | Assignment / argument type mismatch. (v0.12.0) Also fires on wrong-typed args to fully-typed **third-party** function / constructor calls via venv introspection | Fix the value's type, or wrap/convert at the boundary |
+| `tyc::unused_import` (warn) | Severity controlled by `[strictness] unused-import` (default `warn` since v0.8.0) | Remove the import (LSP "Remove unused import" code-action exists) |
 | `tyc::orphan_py_import` (warn) | `.py` outside `src/` referenced from a relative import | Move under `src/` or use an absolute import |
 | `tyc::stdlib_module_shadow` (warn) | (v0.6.0) `.ty` filename matches a Python 3.13 stdlib top-level module | Rename (e.g. `lang_types.ty`, `records.ty`) |
 | `tyc::auto_gather_missed` (advice) | Adjacent awaits look gather-able but a callee lacks `@gatherable` | Decorate the named callee |
@@ -1283,6 +1401,8 @@ The recurring diagnostic codes and what they actually mean. **See [DIAGNOSTICS.m
 | `tyc::cyclic_type_alias` | `type A = B; type B = A` | Anchor one alias to a concrete type |
 | `tyc::class_attr_shadows_slot` (warn) | `class` body with only annotated defaults reads like a constants namespace but emits slot descriptors | Use `ClassVar[T]`, or `pass` body for nullary variants |
 | `tyc::tuple_index_out_of_range` | Constant index out of range for fixed-arity tuple | Use an in-range index or change to homogeneous tuple |
+
+(v0.12.0) A declared dependency that's imported but can't be introspected surfaces the **`unintrospectable-dependency`** warning — severity via `[strictness] unintrospectable-dependency` (`"warn"` default / `"error"` / `"off"`). Install deps (`uv sync`) or ship a `.dty` to clear it.
 
 `tyc explain <code>` and `tyc explain --list` work offline.
 
@@ -1431,6 +1551,7 @@ When you edit the Rust compiler:
 | Frozen class | `class Point frozen:` |
 | Plain class (no decorator) | `plain class Bag:` |
 | Raw class (framework base) | `class! MyModel(nn.Module):` |
+| Enum (v0.11.0) | `enum Color: RED; GREEN; BLUE` |
 | Methods | `impl Foo:` block separate from `class Foo:` |
 | Cross-module method add | `extend Foo:` |
 | Built-in extension | `extend str: def slug(self) -> str: ...` |

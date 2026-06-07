@@ -77,6 +77,11 @@ step required.
 | `--out DIR` / `-o` | Override the `[project] out` directory. Relative paths resolve against the project root. |
 | `--no-format` | Skip the `ruff format` post-process. |
 | `--check` | Dry-run: list every file that *would* be created or overwritten without touching disk. The full pipeline still runs, so type errors continue to surface. |
+| `--with-ty` (v0.12.0) | After a successful emit, run Astral's `ty` over the emitted Python (typeshed-backed second-stage check) and re-attribute its diagnostics to the `.ty` source. `ty` errors fail the build. Equivalent to setting `[checker] external = "ty"` for one invocation; requires `ty` on `PATH`. |
+
+When `[checker] external = "ty"` is set in `typhon.toml` (see [configuration.md](configuration.md#checker)), the same `ty` pass runs automatically after every `tyc build`. `tyc check --with-ty` works too — since `check` is normally emit-free, it builds to a throwaway directory first. This is the only path that type-checks against **typeshed**, so it catches misuse of C-extension and stdlib APIs that runtime venv introspection can't model (e.g. `os.path.join(1, 2)`). See [`tyc ty`](#tyc-ty) and [ty-integration.md](ty-integration.md).
+
+> **Third-party argument-type checking (v0.12.0).** Independently of `ty`, `tyc build` / `tyc check` now type-check the *arguments* to fully-typed third-party functions and constructors via venv signature introspection (not just their arity) — a wrong-typed argument fires `tyc::type_mismatch`. A declared dependency that's imported but can't be introspected surfaces the `unintrospectable-dependency` warning (`[strictness] unintrospectable-dependency`, default `"warn"`).
 
 ## `tyc explain`
 
@@ -156,6 +161,9 @@ tyc ty -- --strict
 | `--ty-bin BIN` | Path to the `ty` executable (default: `ty`) |
 | `--no-build` | Skip the build step; requires `--out` so the directory is known |
 | `--watch` | Watch source directory and re-run on `.ty` / `.dty` changes |
+| `--raw` | Forward `ty`'s output verbatim (opt out of `.py` → `.ty` source-map re-attribution) |
+
+**Build-integrated since v0.12.0.** The same `ty` pass is wired into the build via `[checker] external = "ty"` (or `--with-ty` on `tyc build` / `tyc check`) — see [`tyc build`](#tyc-build). The standalone `tyc ty` command and the build hook share one `run_ty_check` helper, so `tyc ty` stays the way to run it ad-hoc (watch mode, explicit output dir, extra flags). An embedded in-process `ty` checker (Phase 2) was prototyped and proven feasible but is **not shipped**: it requires a git dependency on `astral-sh/ruff` that the repo's `cargo deny` policy disallows, and offers no capability the subprocess path lacks. See [ty-integration.md](ty-integration.md).
 
 ## `tyc stubtest`
 

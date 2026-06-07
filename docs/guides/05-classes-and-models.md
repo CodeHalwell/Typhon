@@ -205,6 +205,52 @@ Two things to notice:
 
 You can mix both freely in one project.
 
+## `enum` — a fixed set of named members (v0.11.0)
+
+When a type is one of a fixed set of named constants, reach for `enum` — it's sugar over `enum.Enum`, the same way `model` is sugar over `pydantic.BaseModel`:
+
+```python
+enum Direction:
+    NORTH
+    EAST
+    SOUTH
+    WEST
+
+enum HttpStatus:
+    OK = 200
+    NOT_FOUND = 404
+    SERVER_ERROR = 500
+```
+
+Bare members auto-number with `enum.auto()`; explicit `MEMBER = value` is preserved, and a subsequent bare member resumes `enum.auto()` counting from the last value — standard CPython `enum` semantics (e.g. `A = 10` then a bare `B` yields `B = 11`, not `2`). The emitted Python is exactly what you'd write by hand:
+
+```python
+import enum
+
+
+class Direction(enum.Enum):
+    NORTH = enum.auto()
+    EAST = enum.auto()
+    SOUTH = enum.auto()
+    WEST = enum.auto()
+
+
+class HttpStatus(enum.Enum):
+    OK = 200
+    NOT_FOUND = 404
+    SERVER_ERROR = 500
+```
+
+`import enum` is injected for you, the form type-checks, and it runs under `tyc run` (the VM has a native `enum` shim). Add behaviour with an `impl` block just like any other class:
+
+```python
+impl HttpStatus:
+    def is_error(self) -> bool:
+        return self.value >= 400
+```
+
+> **`enum` vs sealed union.** Use `enum` for a fixed set of *valueless* (or simple-valued) named constants — days of the week, status codes, directions. Use a [sealed union](07-sealed-unions-and-match.md) when each variant carries its own *fields* (`Circle(radius)` vs `Rectangle(w, h)`). Sealed unions give you exhaustive `match` on the variant *shape*; enums give you a closed set of singletons.
+
 ## `extend` — adding methods to existing classes
 
 `extend` is `impl`'s twin for user-defined classes you don't own (or don't want to mix concerns with):

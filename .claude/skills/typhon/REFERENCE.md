@@ -4,7 +4,7 @@ Every Typhon-specific form, listed side-by-side with the Python it lowers to. Fo
 
 **Convention:** Typhon source on the left or above; emitted Python on the right or below. Where formatting matters, code is shown verbatim from the printer.
 
-**Current release: v0.9.0.** Forms tagged with a version annotation (`(v0.5.0)` etc.) landed in that release; everything else has been in Typhon since v0.1.0 or v0.2.0.
+**Current release: v0.12.0.** Forms tagged with a version annotation (`(v0.5.0)` etc.) landed in that release; everything else has been in Typhon since v0.1.0 or v0.2.0. The only new language *form* since v0.9.0 is the `enum` keyword (v0.11.0); v0.10.0–v0.12.0 are otherwise VM-completeness and compile-time-checking work, not new syntax.
 
 ---
 
@@ -488,6 +488,42 @@ class Color(Enum):
 ```
 
 Last identifier segment in `Enum`, `IntEnum`, `StrEnum`, `Flag`, `IntFlag`, `ABC`, `ABCMeta`, `Protocol`, `TypedDict`, `NamedTuple`, `BaseModel`, `App` — auto-skipped. Extend via `[emit] skip-decoration-bases = ["MyBase", ...]`. Auto-skip drops the decorator only; it does not synthesise `__init__`. Use `class!` when you need both.
+
+### 3.12 `enum` keyword (v0.11.0)
+
+`enum Name:` is the idiomatic declaration form for a fixed set of named members — sugar over `enum.Enum`, the same way `model` is sugar over `pydantic.BaseModel`. Bare members auto-number with `enum.auto()`; explicit `MEMBER = value` is preserved, and a subsequent bare member resumes `enum.auto()` numbering from the last value — standard CPython `enum` semantics (e.g. `A = 10` then a bare `B` yields `B = 11`, not `2`).
+
+```python
+# Typhon
+enum Shape:
+    CIRCLE
+    SQUARE
+    TRIANGLE
+
+enum Color:
+    RED = 1
+    GREEN = 2
+    BLUE = 4
+```
+
+```python
+# Emitted Python
+import enum
+
+
+class Shape(enum.Enum):
+    CIRCLE = enum.auto()
+    SQUARE = enum.auto()
+    TRIANGLE = enum.auto()
+
+
+class Color(enum.Enum):
+    RED = 1
+    GREEN = 2
+    BLUE = 4
+```
+
+`tyc-syntax` preprocesses the `enum` header / body, `tyc-emit` injects `import enum` when an `enum.*` base is present, `tyc-resolve` adds `enum` to the builtin prelude (so the form type-checks before the import is rewritten in), and `tyc fmt` round-trips both the header and the members. The VM (v0.11.0) resolves `enum.Enum` / `enum.auto()` natively, materialises members in declaration order, and matches CPython's `<Shape.CIRCLE: 1>` member repr. (Subclassing `enum.Enum` directly via the §3.11 auto-skip path still works; `enum Name:` is the preferred spelling.)
 
 ---
 

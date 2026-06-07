@@ -4,7 +4,7 @@ The errors and surprises that bite people who try to write Typhon as if it were 
 
 For each entry: **trigger → diagnostic → fix**.
 
-Current release: **v0.9.0**. Pitfalls tagged with a version annotation landed in that release. Pitfalls 61–75 are the v0.9.0 cleanup additions covering the daily-driver VM, type-checker covariance and narrowing gaps, and multi-file project support.
+Current release: **v0.12.0**. Pitfalls tagged with a version annotation landed in that release. Pitfalls 61–75 are the v0.9.0 cleanup additions covering the daily-driver VM, type-checker covariance and narrowing gaps, and multi-file project support; pitfalls 76+ cover the v0.10.0–v0.12.0 VM-completeness, `enum`, and third-party-type-checking surface.
 
 ---
 
@@ -1363,6 +1363,70 @@ src/repo/users.ty:  def load() -> User: ...
 ```
 
 Before v0.9.0 the VM only loaded `main.ty` and crashed on the first `from .X import` with `ImportError`. v0.9.0 walks the project source root, honours relative imports, and caches each module's bindings as a `Value::Module`. `tyc run --compile` now spawns `python -m <pkg>.main` so relative imports in the entry point resolve correctly.
+
+---
+
+## 76. Hand-rolling an enum instead of `enum Name:` (v0.11.0)
+
+```python
+# Works, but verbose — the auto-skip path keeps it as-is:
+class Color(enum.Enum):
+    RED = 1
+    GREEN = 2
+
+# Idiomatic since v0.11.0:
+enum Color:
+    RED                          # auto-numbered via enum.auto()
+    GREEN
+```
+
+**Trigger:** reaching for `class X(enum.Enum):` (or `class!`) for a fixed set of named members. **Fix:** use `enum Name:` — bare members auto-number with `enum.auto()`, explicit `MEMBER = value` is preserved, `import enum` is injected for you, and `tyc fmt` round-trips it. The form parses, type-checks, **and** runs under `tyc run` (the VM has a native `enum` shim as of v0.11.0). `frozen` does not apply to `enum`; methods still go in an `impl Color:` block.
+
+## 77. Expecting an infinite or lazily-consumed generator under `tyc run` (v0.10.0)
+
+```python
+def naturals() -> Iterator[int]:
+    mut n: int = 0
+    while True:
+        yield n                  # ❌ under tyc run: collected eagerly → RuntimeError at 1M
+        n = n + 1
+```
+
+**Trigger:** a `yield` function that never terminates, or one you only want to pull a few values from. **Diagnostic:** `RuntimeError` once `GENERATOR_CAP = 1_000_000` is hit. **Why:** the tree-walking VM can't suspend a frame (`Rc` values aren't `Send`), so generators run to completion and return an iterator over the *collected* values. **Fix:** finite generators are fine under `tyc run`; for genuinely infinite / lazy ones use `tyc build && python build/main.py`, which emits a real Python generator.
+
+## 78. `@contextmanager` generator driven by a `with` under `tyc run` (v0.10.0)
+
+```python
+@contextmanager
+def timer() -> Iterator[None]:
+    let start: float = time.perf_counter()
+    yield                        # ❌ under tyc run: setup+teardown both run at call time
+    print(time.perf_counter() - start)
+```
+
+**Trigger:** a generator-based context manager used in a `with` block. **Why:** eager generator collection runs the setup *and* teardown at call time, so the `with` body can't execute between them. The decorator is recognised and `@contextmanager` *factory bodies* are exempt from `resource_not_managed`, but the driven-by-`with` case needs the real Python coroutine. **Fix:** `tyc build` for these; class-based `__enter__` / `__exit__` and `open()` work under the VM.
+
+## 79. A wrong-*typed* argument to a third-party call now fails `tyc check` (v0.12.0)
+
+```python
+import sdk                        # a dependency that ships INLINE type hints (PEP 561 + annotations)
+let r = sdk.fetch(12345)         # ❌ tyc::type_mismatch: expected str, found int (v0.12.0)
+                                 #    sdk.fetch is `def fetch(url: str, ...) -> Response`
+```
+
+**Trigger:** passing the wrong type to a fully-typed pure-Python dependency *that ships inline annotations*. Before v0.12.0 only *arity* was checked, so this passed `tyc check` and failed at runtime. Now venv signature introspection (`tyc-venv`) recovers the parameter *types* via `inspect.signature` and checks them — for **functions and constructors**. **Note:** the annotations must be *inline* in the package's own source. A stub-only library like `requests` (typed via typeshed's `types-requests`, not in its source) degrades to `Unknown` under this layer — catch those with `[checker] external = "ty"` (typeshed) or a `.dty` stub. **Fix:** pass the right type. **Corollary:** if the dependency *can't* be introspected at all (no `.venv`, not installed, C-extension-only), you'll see the `unintrospectable-dependency` warning instead of silent skipping — clear it with `uv sync`, a `.dty` stub, or `[checker] external = "ty"`. Tune severity via `[strictness] unintrospectable-dependency`.
+
+## 80. Relying on the VM's old (identity-based) value semantics (v0.11.0 behaviour change)
+
+```python
+class Point:
+    x: int
+    y: int
+
+print(Point(1, 2) == Point(1, 2))   # tyc run: False before v0.11.0, True now
+```
+
+**Trigger:** code whose output depended on the VM's pre-v0.11.0 behaviour. **What changed:** dataclass equality is now value-based (keyed on class *identity*, so same-named classes from different modules don't collide), instance `repr` is `Name(field=value, …)`, instances are hashable, set / frozenset equality is order-independent, and float `repr` is CPython's shortest round-tripping form. These now **match `tyc build && python`** — the old VM behaviour was the bug. **Fix:** none needed; just be aware `tyc run` output may differ from a pre-v0.11.0 run (it now agrees with CPython). Same spirit as the v0.8.0 BigInt switch.
 
 ---
 
