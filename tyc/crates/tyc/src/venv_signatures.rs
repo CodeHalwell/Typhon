@@ -54,6 +54,13 @@ struct IntrospectedParam {
     /// `"var_keyword"` (i.e. `**kwargs`).
     kind: String,
     has_default: bool,
+    /// The parameter's annotation rendered to a string (`"int"`, `"str"`,
+    /// `"Optional[int]"`, `"<class 'requests.Session'>"`, …) or `None` when
+    /// unannotated. Mapped to a Typhon [`Type`] by [`annotation_to_type`];
+    /// anything not confidently recognised degrades to [`Type::Unknown`] so
+    /// the checker never false-positives on a shape it can't model yet.
+    #[serde(default)]
+    annotation: Option<String>,
 }
 
 /// One public symbol of an introspected module — what `dir(module)`
@@ -68,6 +75,10 @@ struct IntrospectedMember {
     /// shape info for these — a missing signature is less surprising
     /// than a wrong one.
     params: Option<Vec<IntrospectedParam>>,
+    /// The return annotation rendered to a string, or `None` when the
+    /// function has none. Only meaningful for `"function"` members.
+    #[serde(default)]
+    returns: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -269,6 +280,21 @@ def kind_of(obj):
         return "function"
     return "value"
 
+def ann_to_str(ann):
+    # Render an annotation to a stable string the Rust side can map to a
+    # Typhon type. Type objects -> their bare name ("int", "Session");
+    # stringised annotations (PEP 563 `from __future__ import annotations`)
+    # pass through as-is; everything else falls back to `str()`. Anything
+    # the Rust mapper doesn't recognise degrades to `Unknown`, so being
+    # approximate here is safe.
+    if ann is inspect.Parameter.empty or ann is None:
+        return None
+    if isinstance(ann, type):
+        return getattr(ann, "__name__", None) or str(ann)
+    if isinstance(ann, str):
+        return ann
+    return str(ann)
+
 def params_of(obj):
     try:
         sig = inspect.signature(obj)
@@ -280,8 +306,16 @@ def params_of(obj):
             "name": p.name,
             "kind": PARAM_KIND_MAP.get(p.kind, "positional_or_keyword"),
             "has_default": p.default is not inspect.Parameter.empty,
+            "annotation": ann_to_str(p.annotation),
         })
     return out
+
+def returns_of(obj):
+    try:
+        sig = inspect.signature(obj)
+    except (TypeError, ValueError):
+        return None
+    return ann_to_str(sig.return_annotation)
 
 def introspect_one(mod_name):
     try:
@@ -301,6 +335,7 @@ def introspect_one(mod_name):
             "name": name,
             "kind": kind,
             "params": params_of(obj) if kind in ("class", "function") else None,
+            "returns": returns_of(obj) if kind == "function" else None,
         })
     return {"members": members}
 
@@ -420,7 +455,7 @@ fn shapes_from_introspected(intro: &IntrospectedModule) -> ModuleShapes {
                 }
             }
             "function" => {
-                if let Some(info) = arity_info_from_params(params) {
+                if let Some(info) = arity_info_from_params(params, member.returns.as_deref()) {
                     function_arities.insert(member.name.clone(), info);
                 }
             }
@@ -462,7 +497,13 @@ fn class_shape_from_params(params: &[IntrospectedParam]) -> Option<InterfaceShap
             field_defaults.insert(p.name.clone());
         }
         field_order.push(p.name.clone());
-        fields.insert(p.name.clone(), Type::Unknown);
+        fields.insert(
+            p.name.clone(),
+            p.annotation
+                .as_deref()
+                .map(annotation_to_type)
+                .unwrap_or(Type::Unknown),
+        );
     }
     if field_order.is_empty() {
         // A zero-arg constructor still benefits from being modelled —
@@ -490,26 +531,75 @@ fn class_shape_from_params(params: &[IntrospectedParam]) -> Option<InterfaceShap
     })
 }
 
-/// Build an [`ArityInfo`] for an introspected free function.
-fn arity_info_from_params(params: &[IntrospectedParam]) -> Option<ArityInfo> {
+/// Map an introspected annotation string to a Typhon [`Type`].
+///
+/// Deliberately conservative: only the unambiguous scalar built-ins are
+/// recognised. Containers, `Optional`/unions, typing constructs, and
+/// foreign classes all degrade to [`Type::Unknown`] (which accepts
+/// anything), so enabling annotation capture can only ever *add* true
+/// positives — it can never reject valid code on a shape we don't model.
+/// Widening this to `list[T]` / `dict[K, V]` / `Optional[T]` / foreign
+/// classes is the natural follow-up.
+fn annotation_to_type(ann: &str) -> Type {
+    let mut s = ann.trim();
+    // Unwrap the `<class 'X'>` form that `str(type_object)` produces.
+    if let Some(inner) = s
+        .strip_prefix("<class '")
+        .and_then(|r| r.strip_suffix("'>"))
+    {
+        s = inner;
+    }
+    // Drop a module qualifier on a bare dotted name (`builtins.int`), but
+    // leave parametric / union forms untouched so we don't mangle them.
+    let bare = if !s.contains('[') && !s.contains('|') && !s.contains(' ') {
+        s.rsplit('.').next().unwrap_or(s)
+    } else {
+        s
+    };
+    match bare {
+        "int" => Type::Int,
+        "str" => Type::Str,
+        "bool" => Type::Bool,
+        "float" => Type::Float,
+        "bytes" => Type::Bytes,
+        "None" | "NoneType" => Type::None,
+        _ => Type::Unknown,
+    }
+}
+
+/// Build an [`ArityInfo`] for an introspected free function. `returns` is
+/// the function's return annotation (or `None`).
+fn arity_info_from_params(
+    params: &[IntrospectedParam],
+    returns: Option<&str>,
+) -> Option<ArityInfo> {
     let mut param_names: Vec<String> = Vec::new();
+    let mut param_types: Vec<Type> = Vec::new();
     let mut required_positional: Vec<bool> = Vec::new();
     let mut kwonly_names: Vec<String> = Vec::new();
+    let mut kwonly_types: Vec<Type> = Vec::new();
     let mut kwonly_required: Vec<String> = Vec::new();
     let mut has_kwarg = false;
     let mut has_vararg = false;
     for p in params {
+        let ty = p
+            .annotation
+            .as_deref()
+            .map(annotation_to_type)
+            .unwrap_or(Type::Unknown);
         match p.kind.as_str() {
             "var_positional" => has_vararg = true,
             "var_keyword" => has_kwarg = true,
             "keyword_only" => {
                 kwonly_names.push(p.name.clone());
+                kwonly_types.push(ty);
                 if !p.has_default {
                     kwonly_required.push(p.name.clone());
                 }
             }
             _ => {
                 param_names.push(p.name.clone());
+                param_types.push(ty);
                 required_positional.push(!p.has_default);
             }
         }
@@ -520,8 +610,7 @@ fn arity_info_from_params(params: &[IntrospectedParam]) -> Option<ArityInfo> {
         Some(param_names.len())
     };
     let min_positional = required_positional.iter().filter(|r| **r).count();
-    let param_types = vec![tyc_types::Type::Unknown; param_names.len()];
-    let kwonly_types = vec![tyc_types::Type::Unknown; kwonly_names.len()];
+    let return_type = returns.map(annotation_to_type).unwrap_or(Type::Unknown);
     Some(ArityInfo {
         param_names,
         min_positional,
@@ -533,7 +622,7 @@ fn arity_info_from_params(params: &[IntrospectedParam]) -> Option<ArityInfo> {
         vararg_type: None,
         param_types,
         kwonly_types,
-        return_type: tyc_types::Type::Unknown,
+        return_type,
     })
 }
 
@@ -701,6 +790,18 @@ mod tests {
             name: name.into(),
             kind: kind.into(),
             has_default,
+            annotation: None,
+        }
+    }
+
+    /// Like [`p`] but carries an annotation string, for the
+    /// annotation-capture tests.
+    fn p_ann(name: &str, kind: &str, has_default: bool, annotation: &str) -> IntrospectedParam {
+        IntrospectedParam {
+            name: name.into(),
+            kind: kind.into(),
+            has_default,
+            annotation: Some(annotation.into()),
         }
     }
 
@@ -753,7 +854,7 @@ mod tests {
             p("c", "keyword_only", false),
             p("d", "keyword_only", true),
         ];
-        let info = arity_info_from_params(&params).expect("info");
+        let info = arity_info_from_params(&params, None).expect("info");
         assert_eq!(info.param_names, vec!["a", "b"]);
         assert_eq!(info.required_positional, vec![true, false]);
         assert_eq!(info.min_positional, 1);
@@ -770,7 +871,7 @@ mod tests {
             p("args", "var_positional", false),
             p("kwargs", "var_keyword", false),
         ];
-        let info = arity_info_from_params(&params).expect("info");
+        let info = arity_info_from_params(&params, None).expect("info");
         assert_eq!(info.param_names, vec!["a"]);
         assert_eq!(info.max_positional, None, "vararg uncaps the maximum");
         assert!(info.has_kwarg, "**kwargs accepted");
@@ -786,17 +887,61 @@ mod tests {
                     name: "VERSION".into(),
                     kind: "value".into(),
                     params: None,
+                    returns: None,
                 },
                 IntrospectedMember {
                     name: "Agent".into(),
                     kind: "class".into(),
                     params: Some(vec![p("name", "keyword_only", false)]),
+                    returns: None,
                 },
             ],
         };
         let shapes = shapes_from_introspected(&intro);
         assert!(shapes.class_shapes.contains_key("Agent"));
         assert!(!shapes.class_shapes.contains_key("VERSION"));
+    }
+
+    #[test]
+    fn annotation_to_type_maps_scalars_and_degrades_safely() {
+        assert_eq!(annotation_to_type("int"), Type::Int);
+        assert_eq!(annotation_to_type("<class 'str'>"), Type::Str);
+        assert_eq!(annotation_to_type("builtins.bool"), Type::Bool);
+        assert_eq!(annotation_to_type("float"), Type::Float);
+        assert_eq!(annotation_to_type("bytes"), Type::Bytes);
+        assert_eq!(annotation_to_type("None"), Type::None);
+        assert_eq!(annotation_to_type("NoneType"), Type::None);
+        // Anything we don't confidently model degrades to Unknown so the
+        // checker never false-positives on a shape we can't represent.
+        assert_eq!(annotation_to_type("list[int]"), Type::Unknown);
+        assert_eq!(annotation_to_type("Optional[str]"), Type::Unknown);
+        assert_eq!(annotation_to_type("int | None"), Type::Unknown);
+        assert_eq!(annotation_to_type("requests.Session"), Type::Unknown);
+    }
+
+    #[test]
+    fn annotation_capture_populates_param_and_return_types() {
+        // `def get(url: str, timeout: float = ...) -> SomethingForeign`
+        let params = vec![
+            p_ann("url", "positional_or_keyword", false, "str"),
+            p_ann("timeout", "positional_or_keyword", true, "float"),
+        ];
+        let info = arity_info_from_params(&params, Some("Response")).unwrap();
+        assert_eq!(info.param_types, vec![Type::Str, Type::Float]);
+        // Unrecognised return annotation degrades to Unknown.
+        assert_eq!(info.return_type, Type::Unknown);
+    }
+
+    #[test]
+    fn annotation_capture_populates_constructor_field_types() {
+        // `class C: __init__(self, host: str, port: int)`
+        let params = vec![
+            p_ann("host", "positional_or_keyword", false, "str"),
+            p_ann("port", "positional_or_keyword", false, "int"),
+        ];
+        let shape = class_shape_from_params(&params).unwrap();
+        assert_eq!(shape.fields.get("host"), Some(&Type::Str));
+        assert_eq!(shape.fields.get("port"), Some(&Type::Int));
     }
 
     #[test]
@@ -1029,6 +1174,7 @@ lazy import np = numpy
                 name: "WeirdCType".into(),
                 kind: "class".into(),
                 params: None,
+                returns: None,
             }],
         };
         let shapes = shapes_from_introspected(&intro);

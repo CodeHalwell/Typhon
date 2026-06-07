@@ -69,4 +69,39 @@ matched against the call site the same way as in-project classes —
 so `from agent_framework import Agent; Agent(name=...)` is flagged
 the same as `from local_lib import Agent`.
 
+## Third-party introspection: scope and limits
+
+For an imported third-party package with no `.dty` stub, `tyc check` /
+`tyc build` shell to the project's `.venv/bin/python` (or a `python3` on
+PATH) and run `inspect.signature` over each public class / function. This
+recovers real signatures **without** a hand-written stub, but it has
+boundaries worth knowing:
+
+| Mistake | Caught at compile time? |
+|---|---|
+| Missing required argument (function or constructor) | ✅ |
+| Unknown keyword when the target has no `**kwargs` | ✅ |
+| **Wrong *type* of a free-function argument** (e.g. `int` where `str` is annotated) | ✅ since the annotation-capture pass — *for fully type-annotated, pure-Python libraries* |
+| Wrong *type* of a **constructor** argument | ❌ field types are recorded but the constructor call-checker compares arity only (follow-up) |
+| Too many positional args to a **constructor** | ❌ (follow-up) |
+| Unknown keyword when the target has `**kwargs` | ❌ — correct: `**kwargs` legitimately absorbs it |
+| **C-extension / built-in callables** (numpy, pandas, pydantic-core, torch, …) | ❌ — `inspect.signature` raises, so the symbol is skipped (a missing check is safer than a wrong one) |
+| Anything when the package is **not installed in a reachable venv** | ❌ — introspection silently degrades to "no info" |
+
+Two consequences follow from how this works:
+
+- **Argument-type checking depends on inline annotations.** The capture
+  pass reads each parameter's `annotation` and maps the unambiguous scalar
+  builtins (`int` / `str` / `bool` / `float` / `bytes` / `None`) to Typhon
+  types; everything else (containers, `Optional`, unions, foreign classes)
+  conservatively degrades to a permissive `Unknown`, so a library you can't
+  fully model never produces a false positive. Libraries whose types live
+  only in **typeshed stubs** (rather than inline annotations) — `requests`
+  is the classic example — therefore get arity checking but not argument-
+  *type* checking from this path.
+- **Complete "every library" type checking needs typeshed.** Runtime
+  introspection alone can't see C-extension signatures or typeshed-only
+  annotations. The roadmap item for that is the typeshed-backed `ty`
+  second-stage checker (see `docs/ty-integration.md`).
+
 See https://typhon.dev/lang/diagnostics/missing_argument

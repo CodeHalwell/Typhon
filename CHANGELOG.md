@@ -15,6 +15,17 @@ otherwise solid across the sweep (soundness probes for nullable misuse,
 list invariance, newtype bypass, frozen reassignment, Result error-type
 mismatch, and interface conformance were all correctly rejected).
 
+A follow-up VM-vs-CPython differential review found four more parity
+defects — `sorted` / `min` / `max` ignoring a user `__lt__` (silent wrong
+output), and missing `dict.popitem` / `dict.fromkeys` / `str.translate` /
+`str.maketrans` — all fixed below. The same pass widened the third-party
+introspection used by `tyc check` / `tyc build` to capture parameter and
+return *annotations*, so fully-typed pure-Python dependencies now get
+argument-*type* checking (not just arity) at the call site. (The
+remaining VM coroutine-generator limit and the introspection scope are
+now documented rather than fixed — see `docs/vm.md` and
+`docs/diagnostics/missing_argument.md`.)
+
 ### Fixed — VM / CPython parity
 
 - **`str.replace(old, new, count)` honours the third `count` argument.**
@@ -35,6 +46,51 @@ mismatch, and interface conformance were all correctly rejected).
   printed `42` (the spec was dropped); `f"{n:e}"` on an int printed the
   bare integer. `e`/`E`/`f`/`F`/`g`/`G` now promote an int/bool operand to
   float before formatting, matching CPython.
+
+### Fixed — VM comparison protocol (`sorted` / `min` / `max`)
+
+- **`sorted()` / `min()` / `max()` honour a user `__lt__`.** They compared
+  via the dunder-blind `Value::py_cmp`, which returns "equal" for class
+  instances — so `sorted([R(1), R(3), R(2)])` with a custom `__lt__`
+  returned the list *unsorted* and `min` returned the first element rather
+  than the smallest. They now route through `Interpreter::value_cmp` (the
+  same path `list.sort()` already used), so a user comparison dunder takes
+  effect and the VM matches CPython. This was a silent-wrong-output defect
+  in the same class as the `sorted(reverse=True)` stability bug fixed
+  earlier this cycle. Covers both the no-kwarg native path and the
+  `key=` / `reverse=` / `default=` keyword path.
+
+### Added — VM builtin methods (`dict` / `str`)
+
+- **`dict.popitem()`** removes and returns the last inserted `(key, value)`
+  pair (LIFO, matching CPython 3.7+); raises `KeyError` on an empty dict.
+  Previously `AttributeError: dict has no method 'popitem'`.
+- **`dict.fromkeys(iterable[, value])`** builds a new dict with each key
+  from `iterable` mapped to `value` (default `None`). Previously crashed.
+- **`str.maketrans(x[, y[, z]])`** and **`str.translate(table)`** build and
+  apply a translation table (dict / two-string / delete-string forms).
+  Previously `AttributeError: 'str' object has no attribute 'translate'`.
+
+### Added — third-party argument-*type* checking (annotation capture)
+
+- **Venv introspection now captures parameter and return annotations.** The
+  `inspect.signature` pass previously recorded only each parameter's name /
+  kind / has-default, so every third-party parameter became `Type::Unknown`
+  and only *arity* was checked. It now also reads `p.annotation` (and the
+  return annotation) and maps the unambiguous scalar builtins (`int` /
+  `str` / `bool` / `float` / `bytes` / `None`) to Typhon types. A
+  fully-typed pure-Python dependency now gets argument-*type* checking for
+  **free-function** calls through the same `tyc::type_mismatch` machinery
+  project functions use — e.g. calling a `def fetch(url: str, ...)` with an
+  `int` is rejected at compile time. Conservative by design: containers,
+  `Optional`/unions, typing constructs, and foreign classes all degrade to
+  a permissive `Unknown`, so the change can only *add* true positives,
+  never reject valid code on a shape it can't model.
+- **Scope / limits** (documented in `docs/diagnostics/missing_argument.md`):
+  constructor-argument *types*, C-extension callables, and typeshed-only
+  (non-inline) annotations are still out of scope — the genuine "every
+  library" answer remains the typeshed-backed `ty` integration
+  (`docs/ty-integration.md`).
 
 ### Fixed — resolver
 

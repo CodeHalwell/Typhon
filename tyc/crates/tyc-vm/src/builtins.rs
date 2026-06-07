@@ -754,7 +754,26 @@ pub fn install(interp: &mut Interpreter) {
         while let Some(v) = i.iter_next(&it)? {
             out.push(v);
         }
-        out.sort_by(|a, b| a.py_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        // Honour a user `__lt__` on instances via `value_cmp` (the dunder-blind
+        // `py_cmp` treats every instance pair as equal, leaving the list
+        // unsorted). `sort_by` can't return `Result`, so capture the first
+        // comparison error and surface it after the sort completes.
+        let mut sort_error: Option<Unwind> = None;
+        out.sort_by(|a, b| {
+            if sort_error.is_some() {
+                return std::cmp::Ordering::Equal;
+            }
+            match i.value_cmp(a, b) {
+                Ok(o) => o,
+                Err(e) => {
+                    sort_error = Some(e);
+                    std::cmp::Ordering::Equal
+                }
+            }
+        });
+        if let Some(e) = sort_error {
+            return Err(e);
+        }
         Ok(Value::List(Rc::new(RefCell::new(out))))
     });
 
@@ -1346,7 +1365,11 @@ fn reduce_minmax(
         ))
     })?;
     for v in iter {
-        let cmp = v.py_cmp(&best).unwrap_or(std::cmp::Ordering::Equal);
+        // Route through `value_cmp` (not the dunder-blind `Value::py_cmp`) so a
+        // user-defined `__lt__` on instances is honoured — matching `list.sort`
+        // and CPython. `py_cmp` returns `None` for instances, which collapsed to
+        // `Equal` here and made `min`/`max` return the first element.
+        let cmp = interp.value_cmp(&v, &best)?;
         if (want_min && cmp == std::cmp::Ordering::Less)
             || (!want_min && cmp == std::cmp::Ordering::Greater)
         {
@@ -4355,6 +4378,104 @@ fn strip_chars(args: &[Value], method: &str) -> Result<Option<Vec<char>>, Unwind
     }
 }
 
+/// `dict.fromkeys(iterable[, value])` — a new dict with each key drawn
+/// from `iterable`, all mapped to `value` (default `None`). This is a
+/// classmethod on the `dict` type object, so the unbound-method
+/// dispatcher (which routes `T.m(x)` to `x.m(...)`) can't model it;
+/// `interp.rs` intercepts `dict.fromkeys` and calls here directly.
+pub fn dict_fromkeys(interp: &mut Interpreter, args: Vec<Value>) -> Result<Value, Unwind> {
+    let mut it = args.into_iter();
+    let iterable = it
+        .next()
+        .ok_or_else(|| type_error("fromkeys() expected at least 1 argument, got 0"))?;
+    let fill = it.next().unwrap_or(Value::None);
+    let mut map: DictMap = IndexMap::new();
+    let iter = interp.make_iter(iterable)?;
+    while let Some(k) = interp.iter_next(&iter)? {
+        // Last write wins on a duplicate key, matching CPython.
+        map.insert(k.to_hash_key()?, fill.clone());
+    }
+    Ok(Value::Dict(Rc::new(RefCell::new(map))))
+}
+
+/// `str.maketrans(x[, y[, z]])` — build the translation table dict that
+/// `str.translate` consumes. One-arg form: `x` is a dict keyed by 1-char
+/// strings or int ordinals. Two/three-arg form: equal-length strings `x`
+/// and `y` map char-by-char, and an optional `z` lists characters mapped
+/// to `None` (deleted). A staticmethod on the `str` type object, so
+/// `interp.rs` intercepts it the same way as `dict.fromkeys`.
+pub fn str_maketrans(args: &[Value]) -> Result<Value, Unwind> {
+    use num_bigint::BigInt;
+    let as_str = |v: &Value| -> Result<String, Unwind> {
+        match v {
+            Value::Str(s) => Ok((**s).clone()),
+            other => Err(type_error(format!(
+                "maketrans() arguments must be str, not {}",
+                other.type_name()
+            ))),
+        }
+    };
+    let mut map: DictMap = IndexMap::new();
+    match args.len() {
+        1 => {
+            let Value::Dict(d) = &args[0] else {
+                return Err(type_error(
+                    "if you give only one argument to maketrans it must be a dict",
+                ));
+            };
+            for (k, v) in d.borrow().iter() {
+                let ord = match k {
+                    HashKey::Int(i) => HashKey::Int(i.clone()),
+                    HashKey::Str(s) => {
+                        let mut chars = s.chars();
+                        match (chars.next(), chars.next()) {
+                            (Some(c), None) => HashKey::Int(BigInt::from(c as u32)),
+                            _ => {
+                                return Err(value_error(
+                                    "string keys in translate table must be of length 1",
+                                ))
+                            }
+                        }
+                    }
+                    _ => {
+                        return Err(type_error(
+                            "keys in translate table must be strings or integers",
+                        ))
+                    }
+                };
+                map.insert(ord, v.clone());
+            }
+        }
+        2 | 3 => {
+            let from = as_str(&args[0])?;
+            let to = as_str(&args[1])?;
+            if from.chars().count() != to.chars().count() {
+                return Err(value_error(
+                    "the first two maketrans arguments must have equal length",
+                ));
+            }
+            for (fc, tc) in from.chars().zip(to.chars()) {
+                map.insert(
+                    HashKey::Int(BigInt::from(fc as u32)),
+                    Value::Int(BigInt::from(tc as u32)),
+                );
+            }
+            if let Some(third) = args.get(2) {
+                for dc in as_str(third)?.chars() {
+                    map.insert(HashKey::Int(BigInt::from(dc as u32)), Value::None);
+                }
+            }
+        }
+        n => {
+            return Err(type_error(format!(
+                "maketrans() takes 1 to 3 arguments ({} given)",
+                n
+            )))
+        }
+    }
+    Ok(Value::Dict(Rc::new(RefCell::new(map))))
+}
+
 fn str_method(
     interp: &mut Interpreter,
     s: &Rc<String>,
@@ -4365,6 +4486,39 @@ fn str_method(
     Ok(match name {
         "upper" => Value::Str(Rc::new(s.to_uppercase())),
         "lower" => Value::Str(Rc::new(s.to_lowercase())),
+        "translate" => {
+            // `s.translate(table)` — `table` maps a Unicode ordinal (int key)
+            // to a replacement: an int ordinal, a str, or `None` (delete the
+            // character). Ordinals absent from the table pass through. This is
+            // the dict produced by `str.maketrans(...)`.
+            let Some(Value::Dict(table)) = args.first() else {
+                return Err(type_error(
+                    "translate() argument must be a dict (use str.maketrans to build one)",
+                ));
+            };
+            let table = table.borrow();
+            let mut out = String::with_capacity(s.len());
+            for ch in s.chars() {
+                let key = HashKey::Int(num_bigint::BigInt::from(ch as u32));
+                match table.get(&key) {
+                    None => out.push(ch),
+                    Some(Value::None) => {} // mapped to None → delete
+                    Some(Value::Str(rep)) => out.push_str(rep),
+                    Some(Value::Int(code)) => {
+                        let cp = code.to_u32().and_then(char::from_u32).ok_or_else(|| {
+                            value_error("character mapping must be in range(0x110000)")
+                        })?;
+                        out.push(cp);
+                    }
+                    Some(_) => {
+                        return Err(type_error(
+                            "character mapping must return integer, None or str",
+                        ))
+                    }
+                }
+            }
+            Value::Str(Rc::new(out))
+        }
         "strip" => match strip_chars(args, "strip")? {
             Some(chars) => Value::Str(Rc::new(s.trim_matches(|c| chars.contains(&c)).to_owned())),
             None => Value::Str(Rc::new(s.trim().to_owned())),
@@ -5331,6 +5485,17 @@ fn dict_method(
             Ok(Value::None)
         }
         "copy" => Ok(Value::Dict(Rc::new(RefCell::new(d.borrow().clone())))),
+        "popitem" => {
+            // Remove and return the last inserted (key, value) pair (LIFO),
+            // matching CPython 3.7+. `IndexMap` preserves insertion order, so
+            // `pop()` removes the most-recently-added entry. (Frozen dicts are
+            // rejected earlier by the `is_mutator` guard, so no `__typhon_frozen__`
+            // sentinel can be present here.)
+            match d.borrow_mut().pop() {
+                Some((k, v)) => Ok(Value::Tuple(Rc::new(vec![k.into_value(), v]))),
+                None => Err(key_error("'popitem(): dictionary is empty'")),
+            }
+        }
         // ── Counter-specific methods ──────────────────────────────────────────
         // These are safe to expose on all dicts because:
         //  * `most_common` on an int-value dict is always meaningful.
@@ -6047,7 +6212,8 @@ pub fn call_with_kwargs(
                     Some(f) => interp.call_value(f.clone(), vec![v.clone()], &[])?,
                     None => v.clone(),
                 };
-                let cmp = vk.py_cmp(&best_key).unwrap_or(std::cmp::Ordering::Equal);
+                // `value_cmp` honours a user `__lt__` on the (keyed) operands.
+                let cmp = interp.value_cmp(&vk, &best_key)?;
                 if (want_min && cmp == std::cmp::Ordering::Less)
                     || (!want_min && cmp == std::cmp::Ordering::Greater)
                 {
@@ -6081,6 +6247,10 @@ pub fn call_with_kwargs(
                     }
                 }
             }
+            // `value_cmp` honours a user `__lt__`; the dunder-blind `py_cmp`
+            // left instance lists unsorted. `sort_by` can't return `Result`, so
+            // the first comparison error is captured and surfaced afterwards.
+            let mut sort_error: Option<Unwind> = None;
             if let Some(key) = key_fn {
                 let mut keyed: Vec<(Value, Value)> = Vec::with_capacity(out.len());
                 for v in out {
@@ -6088,26 +6258,52 @@ pub fn call_with_kwargs(
                     keyed.push((k, v));
                 }
                 keyed.sort_by(|a, b| {
+                    if sort_error.is_some() {
+                        return std::cmp::Ordering::Equal;
+                    }
                     // Stable reverse: flip the comparator, not the list.
-                    let o = a.0.py_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal);
-                    if reverse {
-                        o.reverse()
-                    } else {
-                        o
+                    match interp.value_cmp(&a.0, &b.0) {
+                        Ok(o) => {
+                            if reverse {
+                                o.reverse()
+                            } else {
+                                o
+                            }
+                        }
+                        Err(e) => {
+                            sort_error = Some(e);
+                            std::cmp::Ordering::Equal
+                        }
                     }
                 });
+                if let Some(e) = sort_error {
+                    return Err(e);
+                }
                 Ok(Value::List(Rc::new(RefCell::new(
                     keyed.into_iter().map(|(_, v)| v).collect(),
                 ))))
             } else {
                 out.sort_by(|a, b| {
-                    let o = a.py_cmp(b).unwrap_or(std::cmp::Ordering::Equal);
-                    if reverse {
-                        o.reverse()
-                    } else {
-                        o
+                    if sort_error.is_some() {
+                        return std::cmp::Ordering::Equal;
+                    }
+                    match interp.value_cmp(a, b) {
+                        Ok(o) => {
+                            if reverse {
+                                o.reverse()
+                            } else {
+                                o
+                            }
+                        }
+                        Err(e) => {
+                            sort_error = Some(e);
+                            std::cmp::Ordering::Equal
+                        }
                     }
                 });
+                if let Some(e) = sort_error {
+                    return Err(e);
+                }
                 Ok(Value::List(Rc::new(RefCell::new(out))))
             }
         }

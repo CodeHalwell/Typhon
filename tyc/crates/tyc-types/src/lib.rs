@@ -11748,12 +11748,25 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
                     }
                     if let Some(info) = shapes.function_arities.get(attr_name) {
                         let info = info.clone();
-                        let params = vec![Type::Unknown; info.param_names.len()];
+                        // Use the introspected/annotated parameter and return
+                        // types when present. They default to `Type::Unknown`
+                        // (which accepts anything), so unannotated params stay
+                        // permissive — but a fully-typed third-party function
+                        // (`requests.get(url: str, ...) -> Response`) now routes
+                        // external calls through the SAME arg-type check that
+                        // project-function calls use. The length guard keeps us
+                        // safe if `param_types` was ever built short.
+                        let params = if info.param_types.len() == info.param_names.len() {
+                            info.param_types.clone()
+                        } else {
+                            vec![Type::Unknown; info.param_names.len()]
+                        };
+                        let ret = info.return_type.clone();
                         let variadic = info.max_positional.is_none();
                         c.function_arity_info.entry(qualified).or_insert(info);
                         return Type::Function {
                             params,
-                            ret: Box::new(Type::Unknown),
+                            ret: Box::new(ret),
                             variadic,
                         };
                     }
