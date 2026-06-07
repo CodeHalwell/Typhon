@@ -218,19 +218,40 @@ and points back at the originating `.ty` line.
 
 **Estimated effort: 1–1.5 days.**
 
-### Phase 2 — Embedded library (option A)
+### Phase 2 — Embedded library (option A) — ✅ IMPLEMENTED (feature-gated)
 
-Depends on the Ruff vendor (Steps 1–10 in `tyc/vendor/README.md`).
-After that lands:
+> **Status:** shipped behind the `embedded-ty` cargo feature (off by
+> default). Build `tyc` with `--features embedded-ty` and the
+> `[checker] external = "ty"` / `--with-ty` hook runs `ty` in-process
+> instead of spawning the CLI. See `crates/tyc-typecheck-ext`.
 
-#### Step 2.1 — Vendor `ty_python_semantic`
+**This did NOT require the Ruff vendor migration.** The original blocker —
+"`ty` consumes `ruff_python_ast`, which would clash with Typhon's vendored
+fork" — turned out to be false. Typhon's vendored crates carry a distinct
+version (`0.0.0-typhon-vendor`) from `ty`'s upstream `ruff_python_ast`
+(`0.0.0`), so cargo keeps **both** in one dependency graph without conflict
+(verified empirically before implementing). No fork rename or upstream
+migration was needed.
 
-Same recipe as vendoring `ruff_python_parser`: copy
-`crates/ty_python_semantic/` from upstream into
-`tyc/vendor/ty_python_semantic/`, add to workspace members. Vendor
-the helper crates it pulls in (`red_knot_workspace`,
-`red_knot_python_semantic`, etc.) one at a time until
-`cargo build -p ty_python_semantic` is green.
+#### How it was actually done
+
+Rather than vendoring `ty_python_semantic` into the tree, the
+`tyc-typecheck-ext` crate takes `ty_project` + `ruff_db` as **optional git
+dependencies** pinned to a `ruff` revision, gated behind its `embedded`
+feature. With the feature off (the default), neither is compiled and the
+crate is a stub — the standard `tyc` build pulls zero `ty`/`ruff` deps.
+
+The check itself mirrors `ty`'s own CLI: `OsSystem::new(dir)` →
+`ProjectMetadata::discover` → `ProjectDatabase::fallible(...)` →
+`db.check() -> Vec<Diagnostic>`, rendered via `DisplayDiagnostics` in the
+CLI's text format so the existing `.py.map` remapper rewrites the diagnostics
+to `.ty` source unchanged.
+
+#### Original plan (kept for reference)
+
+The steps below described vendoring `ty_python_semantic` directly. The
+optional-git-dependency approach above supersedes them, but they remain a
+valid alternative if a fully in-tree vendor is ever preferred.
 
 Pin the upstream `ty` revision in `vendor/UPSTREAM` next to the
 pinned Ruff revision.
@@ -329,8 +350,11 @@ Salsa caching.
 
 ## Decision
 
-Implement **Phase 1 (subprocess `ty check`)** next: both
-prerequisites — the Ruff vendor migration and the `.py.map` v2
-line table — have already landed. Schedule **Phase 2 (embedded
-library)** afterwards once the subprocess path has shaken out the
-diagnostic-translation work.
+**Both phases shipped (v0.12.0).** Phase 1 (subprocess `ty check`) is the
+default path, exposed via `[checker] external = "ty"` and `--with-ty`.
+Phase 2 (embedded, in-process `ty`) shipped behind the `embedded-ty` cargo
+feature in `crates/tyc-typecheck-ext` — and notably did **not** require the
+Ruff-vendor migration this doc originally assumed (the vendored fork and
+upstream `ruff_python_ast` coexist by version). The embedded path is opt-in
+at build time so the default binary stays lean; when compiled in, it's
+preferred over the subprocess automatically.

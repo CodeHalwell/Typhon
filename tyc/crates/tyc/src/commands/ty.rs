@@ -458,6 +458,16 @@ fn parse_py_ref_with_validator(line: &str, map_dir: Option<&Path>) -> Option<PyR
             return true;
         }
         if let Some(dir) = map_dir {
+            // `.sourcemaps/<rel>.py.map` for build-relative refs (the embedded
+            // `ty` renderer emits these), then the legacy `<dir>/<base>.py.map`.
+            if Path::new(py_path).is_relative()
+                && dir
+                    .join(".sourcemaps")
+                    .join(format!("{py_path}.map"))
+                    .exists()
+            {
+                return true;
+            }
             if let Some(base) = Path::new(py_path).file_name() {
                 let candidate = dir.join(format!("{}.map", base.to_string_lossy()));
                 if candidate.exists() {
