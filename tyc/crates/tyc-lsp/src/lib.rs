@@ -216,34 +216,13 @@ impl Backend {
         let workspace = find_workspace_layout(&path_for_root);
         let project_files_arc = Arc::clone(&self.project_files);
 
-        // Resolve (or create) the per-project venv signature cache so the
-        // blocking check below can fold third-party shapes into the project
-        // shape map — surfacing wrong-typed / wrong-arity third-party calls
-        // as live diagnostics, the same way `tyc check` does. Created on the
-        // async side; the (Python-shelling) enrichment runs in the blocking
-        // closure. Skipped when the project declares no dependencies.
-        let signature_cache: Option<Arc<std::sync::Mutex<tyc_venv::VenvSignatures>>> =
-            if let Some((root, _)) = workspace.as_ref() {
-                let allowed = tyc_venv::allowed_top_level_from_project(root);
-                if allowed.is_empty() {
-                    None
-                } else {
-                    let mut caches = self.signature_caches.lock().await;
-                    let entry = caches.entry(root.clone()).or_insert_with(|| {
-                        Arc::new(std::sync::Mutex::new(
-                            tyc_venv::VenvSignatures::for_project_root(root, allowed.clone()),
-                        ))
-                    });
-                    // Keep the allow-list current if `typhon.toml` deps changed
-                    // since this cache was created.
-                    if let Ok(mut vs) = entry.lock() {
-                        vs.set_allowed_top_level(allowed);
-                    }
-                    Some(Arc::clone(entry))
-                }
-            } else {
-                None
-            };
+        // Per-project venv signature caches, for folding third-party shapes
+        // into the check so wrong-typed / wrong-arity third-party calls show
+        // up as live diagnostics. Only the Arc is cloned here on the async
+        // side; the get-or-create (which reads `typhon.toml` and scans the
+        // venv) and the Python-shelling enrichment all run inside the blocking
+        // closure below, off the async executor.
+        let signature_caches_arc = Arc::clone(&self.signature_caches);
 
         let text_for_check = text.clone();
         let uri_str_for_check = uri_str.clone();
@@ -277,21 +256,42 @@ impl Backend {
                 );
                 // Fold venv-introspected third-party shapes into the project
                 // map so the cross-module check flags wrong-typed / -arity
-                // calls to installed dependencies live in the editor. Uses the
-                // persistent per-project cache, so a keystroke only shells to
-                // Python when a new dependency module appears or the venv
-                // changed. (`enrich_into`'s import scan reads `.ty` files from
-                // disk — a freshly-typed, unsaved `import` is picked up on the
-                // next save.)
-                if let Some(sig_cache) = signature_cache.as_ref() {
-                    if let Ok(mut vs) = sig_cache.lock() {
-                        let project_module_set: std::collections::HashSet<String> =
-                            shapes.keys().cloned().collect();
-                        let _ = vs.enrich_into(
-                            std::slice::from_ref(src_dir),
-                            &project_module_set,
-                            &mut shapes,
-                        );
+                // calls to installed dependencies live in the editor. All of
+                // this — reading `typhon.toml`, scanning the venv, and the
+                // Python-shelling introspection — runs on this blocking thread.
+                // The persistent per-project cache means a keystroke only
+                // shells to Python when a new dependency module appears or the
+                // venv changed. (`enrich_into`'s import scan reads `.ty` files
+                // from disk — a freshly-typed, unsaved `import` is picked up on
+                // the next save.)
+                if let Some(root) = workspace.as_ref().map(|(r, _)| r) {
+                    let allowed = tyc_venv::allowed_top_level_from_project(root);
+                    if !allowed.is_empty() {
+                        let sig_cache = {
+                            let mut caches = signature_caches_arc.blocking_lock();
+                            let entry = caches.entry(root.clone()).or_insert_with(|| {
+                                Arc::new(std::sync::Mutex::new(
+                                    tyc_venv::VenvSignatures::for_project_root(
+                                        root,
+                                        allowed.clone(),
+                                    ),
+                                ))
+                            });
+                            // Keep the allow-list current if deps changed.
+                            if let Ok(mut vs) = entry.lock() {
+                                vs.set_allowed_top_level(allowed);
+                            }
+                            Arc::clone(entry)
+                        };
+                        if let Ok(mut vs) = sig_cache.lock() {
+                            let project_module_set: std::collections::HashSet<String> =
+                                shapes.keys().cloned().collect();
+                            let _ = vs.enrich_into(
+                                std::slice::from_ref(src_dir),
+                                &project_module_set,
+                                &mut shapes,
+                            );
+                        };
                     }
                 }
                 std::sync::Arc::new(shapes)

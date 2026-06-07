@@ -244,21 +244,20 @@ pub fn run(args: BuildArgs) -> Result<()> {
     // function the project imports. Without this, calls like
     // `Agent(name="x")` for a `class Agent(*, name, client, …)`
     // would build clean and crash at runtime with `TypeError:
-    // missing 1 required positional argument: 'client'`. See
-    // `crate::venv_signatures` for the implementation and the
-    // allow-list rules. Skipped silently when no Python / venv is
-    // reachable — the worst case is the existing behaviour.
+    // missing 1 required positional argument: 'client'`. See the
+    // `tyc_venv` crate for the implementation and the allow-list rules.
+    // Skipped silently when no Python / venv is reachable — the worst case
+    // is the existing behaviour.
     let unintrospectable_deps: Vec<String> = {
         let project_module_set: std::collections::HashSet<String> = sources
             .iter()
             .map(|(path, _)| crate::commands::util::path_to_dotted(path, src_root))
             .collect();
-        let allowed_top_level: std::collections::HashSet<String> = config
-            .dependencies
-            .keys()
-            .chain(config.dev_dependencies.keys())
-            .cloned()
-            .collect();
+        // Same allow-list as `tyc check` and the LSP: declared dependency
+        // names expanded through installed `.dist-info` metadata so packages
+        // whose import root differs from the PyPI name (`beautifulsoup4` →
+        // `bs4`) are introspected here too.
+        let allowed_top_level = tyc_venv::allowed_top_level_from_project(&config_dir);
         tyc_venv::enrich_project_shapes_with_venv(
             std::slice::from_ref(&src_dir),
             &config_dir,
@@ -275,7 +274,7 @@ pub fn run(args: BuildArgs) -> Result<()> {
         &config.strictness.unintrospectable_dependency,
     ) {
         return Err(miette!(
-            "declared dependencies could not be introspected (see warning above); \
+            "declared dependencies could not be introspected (see message above); \
              failing because `[strictness] unintrospectable-dependency = \"error\"`"
         ));
     }

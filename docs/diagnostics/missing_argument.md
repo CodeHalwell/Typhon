@@ -87,19 +87,19 @@ boundaries worth knowing:
 | Too many positional args to a **zero-field constructor** (`Session(1)`) | ✅ for venv-introspected and normal fully-known classes; `plain class` / `class!` are exempt (their fields may not reflect a hand-written `__init__`) |
 | Unknown keyword when the target has `**kwargs` | ❌ — correct: `**kwargs` legitimately absorbs it |
 | **C-extension / built-in callables** (numpy, pandas, pydantic-core, torch, …) | ❌ — `inspect.signature` raises, so the symbol is skipped (a missing check is safer than a wrong one) |
-| Anything when the package is **not installed in a reachable venv** | ❌ — introspection silently degrades to "no info" |
+| Anything when the package is **not installed in a reachable venv** | ⚠️ checks are skipped, but **no longer silent** — `[strictness] unintrospectable-dependency` reports each declared dependency that couldn't be introspected (`warn` default / `error` to fail CI / `off`) |
 
 Two consequences follow from how this works:
 
 - **Argument-type checking depends on inline annotations.** The capture
   pass reads each parameter's `annotation` and maps the scalar builtins
   (`int` / `str` / `bool` / `float` / `bytes` / `None`), the nullable forms
-  `Optional[X]` / `X | None`, and the parametric containers `list[X]` /
-  `set[X]` / `frozenset[X]` / `dict[K, V]` (recursively) to Typhon types;
-  everything else (multi-member unions, `tuple`, `Callable`, foreign
-  classes) conservatively degrades to a permissive `Unknown`, so a library
-  you can't fully model never produces a false positive. Libraries whose
-  types live
+  `Optional[X]` / `X | None`, the parametric containers `list[X]` /
+  `set[X]` / `frozenset[X]` / `dict[K, V]`, and fixed-arity `tuple[T1, …]`
+  (recursively) to Typhon types; everything else (multi-member unions,
+  homogeneous `tuple[T, ...]`, `Callable`, foreign classes) conservatively
+  degrades to a permissive `Unknown`, so a library you can't fully model
+  never produces a false positive. Libraries whose types live
   only in **typeshed stubs** (rather than inline annotations) — `requests`
   is the classic example — therefore get arity checking but not argument-
   *type* checking from this path.
