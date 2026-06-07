@@ -582,21 +582,29 @@ fn annotation_to_type(ann: &str) -> Type {
     // is fine), so a concrete container shape adds true positives only.
     if let Some((head, inner)) = split_generic(s) {
         let head = head.rsplit('.').next().unwrap_or(head);
-        let container = match head {
-            "list" | "List" => Some("list"),
-            "set" | "Set" => Some("set"),
-            "frozenset" | "FrozenSet" => Some("frozenset"),
-            "dict" | "Dict" => Some("dict"),
+        // Single-element (`list`/`set`/`frozenset`), two-element (`dict`), and
+        // fixed-arity `tuple` containers map element-wise. A fully-mapped
+        // `Generic(head, [..])` matches what the checker builds from the same
+        // annotation, so it integrates with the existing assignability rules.
+        let arity_ok: Option<(&str, bool)> = match head {
+            "list" | "List" => Some(("list", true)),
+            "set" | "Set" => Some(("set", true)),
+            "frozenset" | "FrozenSet" => Some(("frozenset", true)),
+            "dict" | "Dict" => Some(("dict", false)),
+            "tuple" | "Tuple" => Some(("tuple", false)),
             _ => None,
         };
-        if let Some(name) = container {
+        if let Some((name, single)) = arity_ok {
             let parts = split_top_level_commas(inner);
-            let arity_ok = if name == "dict" {
-                parts.len() == 2
-            } else {
-                parts.len() == 1
+            // Homogeneous `tuple[X, ...]` (Ellipsis) and degenerate shapes
+            // stay permissive — only fixed-arity element lists are mapped.
+            let shape_ok = match name {
+                "dict" => parts.len() == 2,
+                "tuple" => !parts.is_empty() && !parts.iter().any(|p| p.trim() == "..."),
+                _ if single => parts.len() == 1,
+                _ => false,
             };
-            if arity_ok {
+            if shape_ok {
                 let mapped: Vec<Type> =
                     parts.iter().map(|p| annotation_to_type(p.trim())).collect();
                 if mapped
@@ -608,7 +616,7 @@ fn annotation_to_type(ann: &str) -> Type {
                 return Type::Generic(name.to_owned(), mapped);
             }
         }
-        // Foreign generic class, `Callable[...]`, `tuple[...]`, etc. — stay
+        // Foreign generic class, `Callable[...]`, `tuple[X, ...]`, etc. — stay
         // permissive rather than guess.
         return Type::Unknown;
     }
@@ -1166,8 +1174,13 @@ mod tests {
         // Unknown — never `list[Unknown]`.
         assert_eq!(annotation_to_type("list[requests.Session]"), Type::Unknown);
         assert_eq!(annotation_to_type("dict[str, Session]"), Type::Unknown);
-        // tuple / Callable / foreign generics stay permissive.
-        assert_eq!(annotation_to_type("tuple[int, str]"), Type::Unknown);
+        // Fixed-arity tuples map element-wise; homogeneous `tuple[X, ...]`,
+        // Callable, and foreign generics stay permissive.
+        assert_eq!(
+            annotation_to_type("tuple[int, str]"),
+            Type::Generic("tuple".into(), vec![Type::Int, Type::Str])
+        );
+        assert_eq!(annotation_to_type("tuple[int, ...]"), Type::Unknown);
         assert_eq!(annotation_to_type("Callable[[int], str]"), Type::Unknown);
         // Anything else we don't confidently model degrades to Unknown.
         assert_eq!(annotation_to_type("int | str | None"), Type::Unknown);

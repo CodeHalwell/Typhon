@@ -79,10 +79,11 @@ now documented rather than fixed — see `docs/vm.md` and
   and only *arity* was checked. It now also reads `p.annotation` (and the
   return annotation) and maps the unambiguous scalar builtins (`int` /
   `str` / `bool` / `float` / `bytes` / `None`), the nullable forms
-  `Optional[X]` / `X | None`, and the parametric containers
-  `list[X]` / `set[X]` / `frozenset[X]` / `dict[K, V]` (mapped recursively;
-  a container whose element doesn't resolve degrades to a permissive
-  `Unknown` rather than `list[Unknown]`) to Typhon types. A
+  `Optional[X]` / `X | None`, the parametric containers
+  `list[X]` / `set[X]` / `frozenset[X]` / `dict[K, V]`, and fixed-arity
+  `tuple[...]` (mapped recursively; a container whose element doesn't
+  resolve degrades to a permissive `Unknown` rather than `list[Unknown]`)
+  to Typhon types. A
   fully-typed pure-Python dependency now gets argument-*type* checking for
   both **free-function** and **constructor** calls through the same
   `tyc::type_mismatch` machinery project functions use — e.g. calling a
