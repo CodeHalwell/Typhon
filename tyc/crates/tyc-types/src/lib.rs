@@ -10251,7 +10251,7 @@ fn cases_cover_type(c: &Checker, cases: &[MatchCase], ty: &Type) -> bool {
         Type::Class(n) => n.clone(),
         Type::Generic(head, _) => {
             if head == "Result" {
-                let variants = ["Ok".to_string(), "Err".to_string()];
+                let variants = ["Ok", "Err"];
                 let mut covered: HashSet<String> = HashSet::new();
                 for case in cases {
                     if case.guard.is_some() {
@@ -10259,7 +10259,7 @@ fn cases_cover_type(c: &Checker, cases: &[MatchCase], ty: &Type) -> bool {
                     }
                     collect_matched_class_names(&case.pattern, &mut covered);
                 }
-                return variants.iter().all(|v| covered.contains(v));
+                return variants.iter().all(|&v| covered.contains(v));
             }
             head.clone()
         }
