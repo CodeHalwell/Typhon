@@ -1659,15 +1659,6 @@ fn escape_json_path(s: &str) -> String {
 }
 
 /// Convert a byte `offset` in `source` to a 1-indexed line number.
-fn offset_to_line(source: &str, offset: usize) -> u32 {
-    let clamped = offset.min(source.len());
-    source.as_bytes()[..clamped]
-        .iter()
-        .filter(|&&b| b == b'\n')
-        .count() as u32
-        + 1
-}
-
 /// Build a v2 `.py.map` JSON body with a full `lines` table.
 ///
 /// `line_offsets[i]` is the byte offset in `preprocessed` that was "active"
@@ -1675,21 +1666,28 @@ fn offset_to_line(source: &str, offset: usize) -> u32 {
 /// a 1-indexed line number and the array is serialised inline.  Synthesised
 /// lines (offset 0) correctly land on line 1, matching the identity fallback.
 fn build_source_map_v2(source_rel: &str, preprocessed: &str, line_offsets: &[usize]) -> String {
-    let lines: Vec<u32> = line_offsets
-        .iter()
-        .map(|&offset| offset_to_line(preprocessed, offset))
-        .collect();
-    let mut out = String::with_capacity(64 + lines.len() * 4);
+    // Precompute newline indices for fast binary search, replacing the O(N^2)
+    // approach of scanning from the start for every single line offset.
+    let mut newlines = Vec::new();
+    for (i, b) in preprocessed.bytes().enumerate() {
+        if b == b'\n' {
+            newlines.push(i);
+        }
+    }
+
+    let mut out = String::with_capacity(64 + line_offsets.len() * 4);
     out.push_str("{\"version\":2,\"source\":\"");
     out.push_str(source_rel);
     out.push_str("\",\"line_strategy\":\"table\",\"lines\":[");
 
     use std::fmt::Write;
-    for (i, &n) in lines.iter().enumerate() {
+    for (i, &offset) in line_offsets.iter().enumerate() {
         if i > 0 {
             out.push(',');
         }
-        let _ = write!(&mut out, "{}", n);
+        let clamped = offset.min(preprocessed.len());
+        let line = newlines.partition_point(|&idx| idx < clamped) as u32 + 1;
+        let _ = write!(&mut out, "{}", line);
     }
 
     out.push_str("]}\n");
@@ -3200,23 +3198,6 @@ async def load() -> int:
     }
 
     // ── Source map v2 helpers ────────────────────────────────────────────────
-
-    #[test]
-    fn offset_to_line_empty_offset_is_line_one() {
-        assert_eq!(offset_to_line("hello\nworld\n", 0), 1);
-    }
-
-    #[test]
-    fn offset_to_line_after_first_newline() {
-        // "hello\n" is 6 bytes; byte 6 is the start of "world"
-        assert_eq!(offset_to_line("hello\nworld\n", 6), 2);
-    }
-
-    #[test]
-    fn offset_to_line_clamps_past_end() {
-        let src = "a\nb\n";
-        assert_eq!(offset_to_line(src, 999), 3);
-    }
 
     #[test]
     fn build_source_map_v2_produces_correct_json() {
