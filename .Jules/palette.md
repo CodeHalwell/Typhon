@@ -31,3 +31,6 @@
 ## 2024-06-13 - [Focus indicators on scrollable code blocks]
 **Learning:** Discovered that scrollable regions in Astro/Starlight documentation, such as code blocks, utilize `tabindex="0"` to allow keyboard users to scroll through the content. However, these elements lacked an explicit focus indicator, making it confusing for keyboard users to know when they had focused on them.
 **Action:** Added `[tabindex="0"]:focus-visible` to the existing focus ring declarations in `docs-site/src/styles/custom.css` to ensure keyboard navigation accessibility for these regions.
+## 2026-06-09 - [Target highlighting for spatial orientation]
+**Learning:** Found that jumping to an anchor link (like clicking a Table of Contents entry) abruptly changes the scroll position without indicating *which* heading was targeted. This loss of spatial orientation makes it harder for users to immediately find where they are supposed to start reading, especially when multiple headings look similar or the target heading is near the bottom of the page.
+**Action:** Added a `:target` CSS animation that briefly flashes the background and outline of the targeted heading using a faded accent color. Also added a `@media (prefers-reduced-motion: reduce)` fallback that uses a static colored left border instead of a fading animation.
