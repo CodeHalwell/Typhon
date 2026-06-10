@@ -28,3 +28,6 @@
 ## 2026-06-06 - [Themed text selection for visual polish]
 **Learning:** Default browser text selection colors (usually stark blue) often clash with custom themes, making the site feel less cohesive.
 **Action:** Implemented `::selection` to match the site's `var(--sl-color-accent)` at 25% opacity, preserving contrast while harmonizing the selection experience with the overall design.
+## 2026-06-10 - [Focus for scrollable regions and anchor target orientation]
+**Learning:** Found that elements with `tabindex="0"` (like scrollable code blocks in Starlight) lacked the custom explicit focus ring, making keyboard navigation confusing when tabbing through content. Additionally, navigating via Table of Contents or anchor links didn't provide visual feedback on the targeted element, requiring the user to visually search for the heading they just jumped to.
+**Action:** Added `[tabindex="0"]:focus-visible` to the shared focus styles in `custom.css`. Also added a brief `@keyframes` background flash animation for `.sl-markdown-content :target` (wrapped in a reduced-motion query) to cleanly draw the user's eye to the exact target.
