@@ -1658,14 +1658,10 @@ fn escape_json_path(s: &str) -> String {
     out
 }
 
-/// Convert a byte `offset` in `source` to a 1-indexed line number.
-fn offset_to_line(source: &str, offset: usize) -> u32 {
-    let clamped = offset.min(source.len());
-    source.as_bytes()[..clamped]
-        .iter()
-        .filter(|&&b| b == b'\n')
-        .count() as u32
-        + 1
+/// Convert a byte `offset` to a 1-indexed line number using precomputed newlines.
+fn offset_to_line(newlines: &[usize], source_len: usize, offset: usize) -> u32 {
+    let clamped = offset.min(source_len);
+    newlines.partition_point(|&nl| nl < clamped) as u32 + 1
 }
 
 /// Build a v2 `.py.map` JSON body with a full `lines` table.
@@ -1675,9 +1671,16 @@ fn offset_to_line(source: &str, offset: usize) -> u32 {
 /// a 1-indexed line number and the array is serialised inline.  Synthesised
 /// lines (offset 0) correctly land on line 1, matching the identity fallback.
 fn build_source_map_v2(source_rel: &str, preprocessed: &str, line_offsets: &[usize]) -> String {
+    let newlines: Vec<usize> = preprocessed
+        .as_bytes()
+        .iter()
+        .enumerate()
+        .filter_map(|(i, &b)| if b == b'\n' { Some(i) } else { None })
+        .collect();
+
     let lines: Vec<u32> = line_offsets
         .iter()
-        .map(|&offset| offset_to_line(preprocessed, offset))
+        .map(|&offset| offset_to_line(&newlines, preprocessed.len(), offset))
         .collect();
     let mut out = String::with_capacity(64 + lines.len() * 4);
     out.push_str("{\"version\":2,\"source\":\"");
@@ -3201,21 +3204,35 @@ async def load() -> int:
 
     // ── Source map v2 helpers ────────────────────────────────────────────────
 
+    fn get_newlines(source: &str) -> Vec<usize> {
+        source
+            .as_bytes()
+            .iter()
+            .enumerate()
+            .filter_map(|(i, &b)| if b == b'\n' { Some(i) } else { None })
+            .collect()
+    }
+
     #[test]
     fn offset_to_line_empty_offset_is_line_one() {
-        assert_eq!(offset_to_line("hello\nworld\n", 0), 1);
+        let src = "hello\nworld\n";
+        let newlines = get_newlines(src);
+        assert_eq!(offset_to_line(&newlines, src.len(), 0), 1);
     }
 
     #[test]
     fn offset_to_line_after_first_newline() {
         // "hello\n" is 6 bytes; byte 6 is the start of "world"
-        assert_eq!(offset_to_line("hello\nworld\n", 6), 2);
+        let src = "hello\nworld\n";
+        let newlines = get_newlines(src);
+        assert_eq!(offset_to_line(&newlines, src.len(), 6), 2);
     }
 
     #[test]
     fn offset_to_line_clamps_past_end() {
         let src = "a\nb\n";
-        assert_eq!(offset_to_line(src, 999), 3);
+        let newlines = get_newlines(src);
+        assert_eq!(offset_to_line(&newlines, src.len(), 999), 3);
     }
 
     #[test]
