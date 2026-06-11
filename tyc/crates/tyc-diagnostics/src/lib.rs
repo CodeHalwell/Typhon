@@ -1501,6 +1501,25 @@ pub enum TycError {
         #[label("this default is created once and shared")]
         span: SourceSpan,
     },
+
+    /// An `is` / `is not` comparison against a literal (`s is "hello"`,
+    /// `n is 5`). `is` compares object *identity*, not value — whether two
+    /// equal literals are the same object is an interpreter implementation
+    /// detail (small-int caching, string interning), so the result is
+    /// arbitrary. CPython itself emits a SyntaxWarning for this shape.
+    #[error("`is` compares identity, not value — comparing against a literal is unreliable")]
+    #[diagnostic(
+        severity(Warning),
+        code(tyc::is_literal_comparison),
+        url("https://typhon.dev/lang/diagnostics/is_literal_comparison"),
+        help("Use `==` / `!=` for value comparison. Reserve `is` for `None` and sentinel objects.")
+    )]
+    IsLiteralComparison {
+        #[source_code]
+        src: NamedSource<String>,
+        #[label("literal operand — use `==` instead")]
+        span: SourceSpan,
+    },
 }
 
 impl TycError {
@@ -2714,6 +2733,19 @@ impl TycError {
         Self::EmptyCollectionNoAnnotation {
             name: name.into(),
             literal: literal.into(),
+            src: NamedSource::new(path.into(), source.into()),
+            span: SourceSpan::new(SourceOffset::from(offset), length.max(1)),
+        }
+    }
+
+    /// Construct a [`TycError::IsLiteralComparison`] warning.
+    pub fn is_literal_comparison(
+        path: impl Into<String>,
+        source: impl Into<String>,
+        offset: usize,
+        length: usize,
+    ) -> Self {
+        Self::IsLiteralComparison {
             src: NamedSource::new(path.into(), source.into()),
             span: SourceSpan::new(SourceOffset::from(offset), length.max(1)),
         }

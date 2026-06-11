@@ -3513,6 +3513,77 @@ fn walk_mutable_default_stmts(body: &[Stmt], path: &str, source: &str, diags: &m
     }
 }
 
+/// `is` / `is not` against a literal operand (`tyc::is_literal_comparison`):
+/// identity comparison with a fresh literal is interpreter-dependent —
+/// CPython itself SyntaxWarns on it. Walks every comparison expression.
+pub fn analyse_is_literal_comparisons(
+    module: &ModModule,
+    path: &str,
+    source: &str,
+) -> Diagnostics {
+    use ruff_python_ast::visitor::source_order::{walk_expr, SourceOrderVisitor};
+    use ruff_text_size::Ranged;
+    struct V<'a> {
+        path: &'a str,
+        source: &'a str,
+        diags: &'a mut Diagnostics,
+    }
+    fn is_value_literal(e: &Expr) -> bool {
+        matches!(
+            e,
+            Expr::StringLiteral(_)
+                | Expr::NumberLiteral(_)
+                | Expr::BytesLiteral(_)
+                | Expr::FString(_)
+        )
+    }
+    impl<'a, 'b> SourceOrderVisitor<'a> for V<'b> {
+        fn visit_expr(&mut self, e: &'a Expr) {
+            if let Expr::Compare(cmp) = e {
+                let mut left: &Expr = &cmp.left;
+                for (op, right) in cmp.ops.iter().zip(cmp.comparators.iter()) {
+                    if matches!(
+                        op,
+                        ruff_python_ast::CmpOp::Is | ruff_python_ast::CmpOp::IsNot
+                    ) {
+                        let lit = if is_value_literal(left) {
+                            Some(left)
+                        } else if is_value_literal(right) {
+                            Some(right)
+                        } else {
+                            None
+                        };
+                        if let Some(lit) = lit {
+                            let start = lit.range().start().to_usize();
+                            let len = lit.range().end().to_usize() - start;
+                            self.diags.push_warning(TycError::is_literal_comparison(
+                                self.path,
+                                self.source.to_owned(),
+                                start,
+                                len,
+                            ));
+                        }
+                    }
+                    left = right;
+                }
+            }
+            walk_expr(self, e);
+        }
+    }
+    let mut diags = Diagnostics::new();
+    {
+        let mut v = V {
+            path,
+            source,
+            diags: &mut diags,
+        };
+        for stmt in &module.body {
+            v.visit_stmt(stmt);
+        }
+    }
+    diags
+}
+
 /// Names that, when referenced inside a type annotation, indicate the
 /// user is reaching for a deprecated `typing.<Name>` alias even though
 /// the import would have been rejected by `tyc::typing_alias_deprecated`.

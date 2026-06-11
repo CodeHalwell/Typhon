@@ -4516,6 +4516,16 @@ class _Path:
         return self._path
     def __eq__(self, other):
         return self._path == str(other)
+    def __lt__(self, other):
+        return self._path < str(other)
+    def __le__(self, other):
+        return self._path <= str(other)
+    def __gt__(self, other):
+        return self._path > str(other)
+    def __ge__(self, other):
+        return self._path >= str(other)
+    def __hash__(self):
+        return hash(self._path)
 "#;
 
 fn path_class(interp: &mut Interpreter) -> Result<Rc<crate::value::Class>, Unwind> {

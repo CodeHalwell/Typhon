@@ -4,6 +4,122 @@ All notable changes to Typhon are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely; the
 canonical phase-by-phase status lives in `docs/roadmap.md`.
 
+## Unreleased — 2026-06-11 — stress-round fixes: cross-module extend, dict-literal lowering, enum exhaustiveness, Result API
+
+A fresh adversarial sweep (~35 programs across scripts, IO, data
+structures, async, ML, AI/agents, APIs, and SDKs, each run through both
+`tyc run` and `tyc build` + CPython with output diffing) surfaced two
+silent-wrong-output defects on documented features, several type-system
+blind spots, and a batch of VM coverage gaps. All fixed below; the full
+workspace suite and the 254-file example corpus stay green.
+
+### Fixed — silent wrong output
+
+- **Cross-module `extend ClassName:` silently dropped its methods.** The
+  desugar merge only handled same-file targets; an imported target's
+  pseudo-class was removed and the methods discarded, so a clean build
+  crashed with `AttributeError` at first call. Foreign-target blocks now
+  lower in place to module-level functions plus class-attribute patches
+  (`Record.label = __typhon_extend_Record__label`, decorators
+  preserved), which work on `slots=True` / frozen dataclasses and
+  third-party classes alike. The three front-ends also agree again:
+  `check` no longer mislabels the import unused, `run` no longer fires
+  `impl_unknown_class` on imported targets, and the VM binds
+  function-valued class attributes as methods (descriptor semantics).
+- **TypedDict-style dict literals against `class` / `model` annotations
+  never lowered.** `let u: User = {"id": 1, "name": "ada"}` has
+  type-checked since v0.3.0 but emitted the raw dict — `u.name` then
+  crashed at runtime in both modes. A new early desugar pass rewrites
+  the literal to `User(id=1, name="ada")` for local classes/models,
+  recursing into class-typed fields for nested initialisation.
+- **`class! X(enum.StrEnum):` emitted a corrupted enum** (synthesised
+  `__init__` + member definitions stripped as field defaults →
+  import-time `TypeError`). `class!` now skips constructor synthesis
+  for enum-family bases.
+- **VM: `StrEnum` / `IntEnum` members now behave as their value**
+  (CPython 3.11+ semantics): `Status.ACTIVE == "active"` is `True`,
+  ordering/arithmetic unwrap, `str()` renders the value, and dict/set
+  hashing flows through the value. Previously equality was silently
+  `False`.
+- **VM: `@memo` was a no-op** — the desugar pass that lowers it to
+  `@functools.cache` only ran on the build path, so memoised recursion
+  ran exponentially under `tyc run` (`fib(60)` effectively hung; it now
+  returns instantly). Sibling-module loading also now threads the
+  class-kind markers (`frozen` / `plain` / `class!`) and `pub` names.
+
+### Added — language / checker
+
+- **Enum match exhaustiveness.** An enum's member set is a closed set:
+  covering every member with `case Enum.MEMBER:` arms (or `|`
+  or-patterns) satisfies the return-path analysis, and a missing member
+  fires `tyc::non_exhaustive_match` naming it — previously both shapes
+  collapsed into a generic `missing_return`.
+- **Quoted annotations resolve as forward references.** `next: "Node"`,
+  `-> "Tree[T]"`, `"list[Node]"` — the reflexive Python idiom — now
+  parse and resolve (including a trailing `?`); previously they became
+  string-literal singleton types with baffling mismatches. The
+  literal-union form `type Color = "red" | "green"` is unchanged.
+- **Generic interface conformance.** `MemRepo[int]` now structurally
+  satisfies `interface Repo[T]` as `Repo[int]` (pairwise-assignable
+  type arguments; mixed bare/generic arities conform at head level).
+- **Match-arm scrutinee narrowing.** `case Action(_, _):` narrows the
+  subject variable to `Action` inside the arm (or-patterns narrow to
+  the union; builtin patterns to the builtin type), gated on the
+  narrowed type provably flowing back into the declared type.
+- **Exhaustiveness for expression scrutinees.** `match items[-1]:` over
+  a sealed union now runs the same analysis as a plain-name subject
+  (subscript element types resolve through `infer_expr_readonly`).
+- **`Result` unwrap family.** `unwrap()`, `expect(msg)`,
+  `unwrap_or(default)`, `unwrap_or_else(f)`, `ok()` (→ `T?`), `err()`
+  (→ `E?`), `is_ok()`, `is_err()` on `Ok` / `Err` / `Result` — runtime
+  template, VM natives, and receiver-narrowed checker signatures. The
+  Result method surface is now *closed*: an unknown method fires
+  `attribute_not_found` at check time (previously `.unwrap()` passed
+  the checker and crashed at runtime).
+- **Lambda arity checking.** Lambdas infer as `Type::Function` carrying
+  their arity, so `apply(lambda x: x)` against `Callable[[int, int],
+  int]` is a check-time mismatch; defaults / `*args` mark the lambda
+  variadic.
+- **Recursive-type groundwork: sequential-loop `let` carve-out.** Two
+  sibling `for` / `while` loops can re-use the same body-scoped `let`
+  scratch name (mirrors the sibling `if`-arm / `case`-arm carve-outs);
+  shadowing a live outer `let` still errors.
+- **New lint `tyc::mutable_default_param`** (warn): a mutable literal /
+  constructor as a function parameter default is created once and
+  shared across calls — class fields already got the `default_factory`
+  rewrite, parameters now get the warning.
+- **New lint `tyc::is_literal_comparison`** (warn): `s is "x"` compares
+  identity against a literal (CPython itself SyntaxWarns).
+- **Builtin exception table completed.** `TimeoutError`, `EOFError`,
+  `ConnectionResetError`, `BrokenPipeError`, `BlockingIOError`,
+  `IsADirectoryError`, `BufferError`, `ReferenceError`, the warning
+  categories, and friends no longer fire `unknown_name` in `except`
+  clauses.
+
+### Added — CLI / emit / VM
+
+- **`tyc run --compile script.ty`** synthesises a throwaway scaffold
+  (src/main.ty + minimal typhon.toml, `--temp` semantics, `uv sync`
+  skipped) so single-file scripts build-and-execute without `tyc init`;
+  `tyc build script.ty` now errors actionably instead of reporting
+  "'script.ty/src' does not exist".
+- **Emitted Python now imports `collections.abc` names it uses.**
+  Annotations using checker-prelude names (`Iterator`, `Sequence`,
+  `Callable`, …) previously only survived via `from __future__ import
+  annotations`; runtime annotation resolution (`typing.get_type_hints`,
+  FastAPI DI, pydantic) raised `NameError`. The VM also gained a
+  `collections.abc` shim, so the idiomatic import no longer breaks
+  `tyc run`.
+- **VM stdlib fills:** `print(sep= / end= / file=sys.stderr / flush=)`
+  with real `sys.stdout` / `sys.stderr` stream objects; `sum(start=)`;
+  `random.uniform / gauss / randrange / choice / shuffle / sample`;
+  `os.getcwd / remove / unlink / rmdir / mkdir / makedirs / rename /
+  listdir` and `os.path.join / basename / dirname` (IO errors map to
+  the matching Python exception types); `pathlib.Path.iterdir / glob /
+  mkdir(parents=, exist_ok=) / unlink / read_bytes / write_bytes`;
+  `dict.popitem(last=)` and `OrderedDict.move_to_end`; unary dunders
+  (`__neg__` / `__pos__` / `__invert__`, `abs()` → `__abs__`).
+
 ## 0.12.0 — 2026-06-07 — VM `__lt__` parity, dict/str builtins, and deep library introspection
 
 Adversarial stress-round follow-up against v0.11.0. A fresh sweep across

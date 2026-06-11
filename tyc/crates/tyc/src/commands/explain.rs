@@ -82,6 +82,7 @@ fn catalog_codes() -> &'static [&'static str] {
         "missing_argument",
         "missing_await",
         "missing_binding_kind",
+        "is_literal_comparison",
         "missing_initialiser",
         "missing_return",
         "mutable_default_param",
@@ -185,6 +186,9 @@ fn catalog_entry(short_code: &str) -> Option<&'static str> {
         "missing_await" => include_str!("../../../../../docs/diagnostics/missing_await.md"),
         "missing_binding_kind" => {
             include_str!("../../../../../docs/diagnostics/missing_binding_kind.md")
+        }
+        "is_literal_comparison" => {
+            include_str!("../../../../../docs/diagnostics/is_literal_comparison.md")
         }
         "missing_initialiser" => {
             include_str!("../../../../../docs/diagnostics/missing_initialiser.md")
