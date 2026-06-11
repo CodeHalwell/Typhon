@@ -3793,31 +3793,51 @@ pub fn analyse_loop_closure_captures(module: &ModModule, path: &str, source: &st
                     }
                 }
                 Stmt::If(s) => {
+                    // Header use-positions can themselves hold a closure
+                    // (`if (lambda: i)():`), so scan the test expressions too.
+                    scan_expr_for_closures(&s.test, names, path, source, diags);
                     scan_stmts_for_closures(&s.body, names, path, source, diags);
                     for cl in &s.elif_else_clauses {
+                        if let Some(test) = &cl.test {
+                            scan_expr_for_closures(test, names, path, source, diags);
+                        }
                         scan_stmts_for_closures(&cl.body, names, path, source, diags);
                     }
                 }
                 Stmt::While(s) => {
+                    scan_expr_for_closures(&s.test, names, path, source, diags);
                     scan_stmts_for_closures(&s.body, names, path, source, diags);
                     scan_stmts_for_closures(&s.orelse, names, path, source, diags);
                 }
                 Stmt::For(s) => {
+                    scan_expr_for_closures(&s.iter, names, path, source, diags);
                     scan_stmts_for_closures(&s.body, names, path, source, diags);
                     scan_stmts_for_closures(&s.orelse, names, path, source, diags);
                 }
-                Stmt::With(s) => scan_stmts_for_closures(&s.body, names, path, source, diags),
+                Stmt::With(s) => {
+                    for item in &s.items {
+                        scan_expr_for_closures(&item.context_expr, names, path, source, diags);
+                    }
+                    scan_stmts_for_closures(&s.body, names, path, source, diags);
+                }
                 Stmt::Try(t) => {
                     scan_stmts_for_closures(&t.body, names, path, source, diags);
                     for h in &t.handlers {
                         let ruff_python_ast::ExceptHandler::ExceptHandler(h) = h;
+                        if let Some(ty) = &h.type_ {
+                            scan_expr_for_closures(ty, names, path, source, diags);
+                        }
                         scan_stmts_for_closures(&h.body, names, path, source, diags);
                     }
                     scan_stmts_for_closures(&t.orelse, names, path, source, diags);
                     scan_stmts_for_closures(&t.finalbody, names, path, source, diags);
                 }
                 Stmt::Match(m) => {
+                    scan_expr_for_closures(&m.subject, names, path, source, diags);
                     for case in &m.cases {
+                        if let Some(guard) = &case.guard {
+                            scan_expr_for_closures(guard, names, path, source, diags);
+                        }
                         scan_stmts_for_closures(&case.body, names, path, source, diags);
                     }
                 }
@@ -3870,6 +3890,13 @@ pub fn analyse_loop_closure_captures(module: &ModModule, path: &str, source: &st
                 }
             }
             Stmt::With(s) => {
+                // `context_expr` is a use position (`with cm(i) as r:`); the
+                // `optional_vars` target is a binding, so — like assignment
+                // and loop targets — it is deliberately not visited (the
+                // walker only inspects loads; `walk_names` ignores context).
+                for item in &s.items {
+                    f(&item.context_expr);
+                }
                 for st in &s.body {
                     visit_stmt_exprs(st, f);
                 }
@@ -3885,6 +3912,11 @@ pub fn analyse_loop_closure_captures(module: &ModModule, path: &str, source: &st
                 }
                 for h in &t.handlers {
                     let ruff_python_ast::ExceptHandler::ExceptHandler(h) = h;
+                    // The exception-type expression is a use (`except E(i):`);
+                    // the bound name (`as e`) is a binding and is skipped.
+                    if let Some(ty) = &h.type_ {
+                        f(ty);
+                    }
                     for st in &h.body {
                         visit_stmt_exprs(st, f);
                     }
@@ -3893,6 +3925,10 @@ pub fn analyse_loop_closure_captures(module: &ModModule, path: &str, source: &st
             Stmt::Match(m) => {
                 f(&m.subject);
                 for case in &m.cases {
+                    // The case guard is a use position; the pattern binds.
+                    if let Some(guard) = &case.guard {
+                        f(guard);
+                    }
                     for st in &case.body {
                         visit_stmt_exprs(st, f);
                     }

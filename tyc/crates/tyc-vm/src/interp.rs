@@ -523,11 +523,13 @@ impl Interpreter {
         // receiver when read through an instance. Capture them here, at the
         // def site, so the binding decision in `get_attr` works regardless of
         // how the function later reaches a class (normal class body, or a
-        // cross-module `extend` block lowered to `Cls.m = fn`).
-        let has_bare_deco = |want: &str| {
+        // cross-module `extend` block lowered to `Cls.m = fn`). Match the same
+        // decorator forms `apply_decorator` recognises (bare name, attribute
+        // like `@builtins.staticmethod`, or call) via `decorator_simple_name`.
+        let has_deco = |want: &str| {
             f.decorator_list
                 .iter()
-                .any(|d| matches!(&d.expression, ast::Expr::Name(n) if n.id.as_str() == want))
+                .any(|d| decorator_simple_name(&d.expression).as_deref() == Some(want))
         };
         Ok(Function {
             name: f.name.as_str().to_owned(),
@@ -536,8 +538,8 @@ impl Interpreter {
             defaults,
             closure: env.clone(),
             is_async: f.is_async,
-            is_static: has_bare_deco("staticmethod"),
-            is_classmethod: has_bare_deco("classmethod"),
+            is_static: has_deco("staticmethod"),
+            is_classmethod: has_deco("classmethod"),
             source: self.current_source.clone(),
         })
     }

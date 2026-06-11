@@ -1309,21 +1309,6 @@ fn quoted_forward_ref_type(
     }
     let parsed = tyc_syntax::parse_expression(inner).ok()?;
     let expr = &parsed.syntax().body;
-    // A *bare* quoted builtin scalar name (`"int"`, `"str"`, `"None"`, …) is
-    // almost never a real forward reference — you would write the type
-    // unquoted. It is, however, exactly how a literal-singleton union spells
-    // its members (`type Mode = "int" | "str"`). Keep these as `LitStr` so the
-    // literal-union form is not silently reinterpreted as a structural type.
-    // (Class-name and subscripted forms still resolve as forward references,
-    // matching standard Python `"Node"` / `"list[Node]"` semantics.)
-    if let Expr::Name(n) = expr.as_ref() {
-        if matches!(
-            n.id.as_str(),
-            "int" | "str" | "bool" | "float" | "bytes" | "complex" | "None"
-        ) {
-            return None;
-        }
-    }
     if !expr_is_type_shaped(expr, classes, type_params) {
         return None;
     }
@@ -1424,6 +1409,33 @@ fn expr_is_type_shaped(expr: &Expr, classes: &[String], type_params: &[String]) 
 /// Same as [`type_from_annotation`] but treats every name in `type_params`
 /// as `Type::Any` so that PEP 695 generic functions don't trip the
 /// assignability check before we have a real inference engine.
+/// `true` when `expr` is a quoted string literal, or a `|` union whose every
+/// leaf is one. This is Typhon's literal-singleton union form (`"a" | "b"`),
+/// as opposed to a standalone quoted forward reference (`"Node"`) or a mixed
+/// union (`"a" | int`).
+fn is_string_literal_union(expr: &Expr) -> bool {
+    match expr {
+        Expr::StringLiteral(_) => true,
+        Expr::BinOp(b) if matches!(b.op, Operator::BitOr) => {
+            is_string_literal_union(&b.left) && is_string_literal_union(&b.right)
+        }
+        _ => false,
+    }
+}
+
+/// Collect the `LitStr` members of an all-string-literal `|` union (see
+/// [`is_string_literal_union`]) in source order.
+fn collect_string_literal_members(expr: &Expr, out: &mut Vec<Type>) {
+    match expr {
+        Expr::StringLiteral(s) => out.push(Type::LitStr(s.value.to_str().to_owned())),
+        Expr::BinOp(b) if matches!(b.op, Operator::BitOr) => {
+            collect_string_literal_members(&b.left, out);
+            collect_string_literal_members(&b.right, out);
+        }
+        _ => {}
+    }
+}
+
 pub fn type_from_annotation_with_params(
     expr: &Expr,
     classes: &[String],
@@ -1475,6 +1487,19 @@ pub fn type_from_annotation_with_params(
             other => Type::Class(other.to_owned()),
         },
         Expr::BinOp(b) if matches!(b.op, Operator::BitOr) => {
+            // A `|` union whose every leaf is a quoted string literal is
+            // Typhon's literal-singleton union form (`type Mode = "int" |
+            // "str"`, `type Color = "red" | "green"`). Keep each member as a
+            // `LitStr` even when it collides with a builtin / class name,
+            // instead of resolving it as a forward reference — a *standalone*
+            // quoted annotation (`x: "int"`) is still a forward reference and
+            // resolves to the scalar type via the `StringLiteral` arm above.
+            if is_string_literal_union(&b.left) && is_string_literal_union(&b.right) {
+                let mut members = Vec::new();
+                collect_string_literal_members(&b.left, &mut members);
+                collect_string_literal_members(&b.right, &mut members);
+                return Type::union_of(members);
+            }
             let left = type_from_annotation_with_params(&b.left, classes, type_params);
             let right = type_from_annotation_with_params(&b.right, classes, type_params);
             Type::union_of(vec![left, right])
@@ -13651,8 +13676,14 @@ fn check_override_compatibility(c: &mut Checker, body: &[Stmt]) {
                     }
                 }
                 Stmt::With(s) => collect_class_spans(&s.body, spans),
-                Stmt::For(s) => collect_class_spans(&s.body, spans),
-                Stmt::While(s) => collect_class_spans(&s.body, spans),
+                Stmt::For(s) => {
+                    collect_class_spans(&s.body, spans);
+                    collect_class_spans(&s.orelse, spans);
+                }
+                Stmt::While(s) => {
+                    collect_class_spans(&s.body, spans);
+                    collect_class_spans(&s.orelse, spans);
+                }
                 Stmt::Try(t) => {
                     collect_class_spans(&t.body, spans);
                     collect_class_spans(&t.orelse, spans);
@@ -13660,6 +13691,11 @@ fn check_override_compatibility(c: &mut Checker, body: &[Stmt]) {
                     for h in &t.handlers {
                         let ruff_python_ast::ExceptHandler::ExceptHandler(h) = h;
                         collect_class_spans(&h.body, spans);
+                    }
+                }
+                Stmt::Match(m) => {
+                    for case in &m.cases {
+                        collect_class_spans(&case.body, spans);
                     }
                 }
                 _ => {}
