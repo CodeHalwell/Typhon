@@ -6,6 +6,17 @@ Realistic milestones for one person plus AI assistance. The headline target is a
 
 ## Current release
 
+**[v0.13.1](https://github.com/CodeHalwell/Typhon/releases/tag/v0.13.1) — 2026-06-11.**
+A six-fix patch on v0.13.0 from a round of app-building (plus two
+PR-review hardenings): `?` on a bare `async` call now errors with
+`tyc::missing_await` rather than silently miscompiling; `await` unwraps a
+stored `asyncio.Task[T]` / `Future[T]` (skipping same-named user classes);
+`tyc run` resolves the whole project `src` tree before launching the VM;
+the VM binds imported `type` sealed-union aliases (forward-declared ones
+included, matching CPython's lazy `TypeAliasType`); `tyc fmt` is
+string-aware around a `#` inside a `freeze let` value; and `pub enum`
+parses. Additive on the accepted surface.
+
 **[v0.13.0](https://github.com/CodeHalwell/Typhon/releases/tag/v0.13.0) — 2026-06-11.**
 Stress-round fixes (cross-module `extend`, TypedDict-style dict-literal
 lowering, enum-match exhaustiveness, the extended Result API) plus a

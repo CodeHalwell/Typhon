@@ -4,12 +4,14 @@ All notable changes to Typhon are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely; the
 canonical phase-by-phase status lives in `docs/roadmap.md`.
 
-## Unreleased
+## 0.13.1 — 2026-06-11 — playground stress round (async await-propagation, Task await-unwrap, VM project run, fmt, pub enum)
 
 ### Fixed — playground stress round (async `?`, await-unwrap, VM project run, `fmt`, `pub enum`)
 
 A round of app-building against v0.13.0 surfaced six defects, all fixed
-here. The full workspace suite and the example corpus stay green.
+here; a follow-up PR review hardened two of them (see the `await`-unwrap
+and `type`-alias bullets). The full workspace suite and the example corpus
+stay green.
 
 - **`?` on a bare `async` call silently miscompiled instead of erroring.**
   Applying `?` directly to an un-awaited `async def` call
@@ -27,6 +29,9 @@ here. The full workspace suite and the example corpus stay green.
   `list[asyncio.Task[int]]` and awaited in a loop typed `await t` as
   `Task[int]`, firing a false `tyc::type_mismatch`. The await-unwrap table
   now covers `Task[T]` and `Future[T]` alongside `Awaitable` / `Coroutine`.
+  The unwrap is keyed on the bare generic name, so it's **suppressed when
+  the project defines its own class of that name** — a non-awaitable user
+  `Task` / `Future` is left untouched (PR #187 review).
 - **`tyc run` (VM) gating check treated the entry file as standalone.**
   The pre-run `tyc check` ran on `main.ty` alone, so every
   `from sibling import …` fired `tyc::unknown_module` plus knock-on false
@@ -42,6 +47,11 @@ here. The full workspace suite and the example corpus stay green.
   union RHS lowers to a tuple of its member types (a valid `isinstance`
   argument); other shapes evaluate directly; an unevaluable RHS falls
   back to a name placeholder, mirroring CPython's deferred evaluation.
+  **Forward-declared aliases** (written above their variant classes) are
+  re-resolved after the module body runs — so a cross-module
+  `from mod import AB` reads the real value — and forced on demand in
+  `isinstance`, so same-module runtime use during body execution resolves
+  correctly too, matching CPython's lazy `TypeAliasType` (PR #187 review).
 - **`tyc fmt` left desugar syntax in a `freeze let` whose value held a
   `#`.** Restoring `freeze let X = […]` split the line on the first `#`
   without string-awareness, so a `#` *inside a string literal* in the
