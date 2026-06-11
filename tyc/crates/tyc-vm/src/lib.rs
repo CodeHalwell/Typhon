@@ -98,6 +98,16 @@ pub fn run_source(
         &prep.comptime_functions,
     );
 
+    // Collect `@memo` / `@pure(memo=True)` opt-ins exactly like `tyc build`
+    // does, so the desugar pass below injects `@functools.cache` instead of
+    // silently stripping the marker (which left memoised recursion running
+    // exponentially under the VM while the build path returned instantly).
+    let memoise_targets: Vec<String> = tyc_analyse::analyse_purity(&module, false)
+        .into_iter()
+        .filter(|f| f.violation.is_none() && f.memoise)
+        .map(|f| f.name)
+        .collect();
+
     // Hand the VM the desugared module so it sees the same shape as the
     // compile path: dataclass-decorated user classes, merged impl blocks,
     // injected runtime imports, and so on. FINDINGS #21 follow-up.
@@ -113,6 +123,7 @@ pub fn run_source(
     let desugar_out = tyc_desugar::desugar_module_with(
         &module,
         tyc_desugar::DesugarOptions {
+            memoise_functions: memoise_targets,
             raw_class_line_starts: preprocess::line_byte_starts(
                 &prep.python_source,
                 &prep.raw_class_lines,

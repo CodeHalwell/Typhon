@@ -863,7 +863,36 @@ impl Interpreter {
             &comptime_values,
             &prep.comptime_functions,
         );
-        let desugar_out = tyc_desugar::desugar_module(&module);
+        // Mirror the entry-module pipeline (lib.rs): thread the `@memo`
+        // opt-ins and the preprocessor's class-kind markers through to
+        // desugar, so a sibling module's `@memo def` is actually memoised
+        // and its `class X frozen:` / `plain class` / `class!` forms keep
+        // their declared shape under `tyc run`.
+        let memoise_targets: Vec<String> = tyc_analyse::analyse_purity(&module, false)
+            .into_iter()
+            .filter(|f| f.violation.is_none() && f.memoise)
+            .map(|f| f.name)
+            .collect();
+        let desugar_out = tyc_desugar::desugar_module_with(
+            &module,
+            tyc_desugar::DesugarOptions {
+                memoise_functions: memoise_targets,
+                raw_class_line_starts: preprocess::line_byte_starts(
+                    &prep.python_source,
+                    &prep.raw_class_lines,
+                ),
+                frozen_class_line_starts: preprocess::line_byte_starts(
+                    &prep.python_source,
+                    &prep.frozen_class_lines,
+                ),
+                plain_class_line_starts: preprocess::line_byte_starts(
+                    &prep.python_source,
+                    &prep.plain_class_lines,
+                ),
+                pub_names: prep.pub_names.clone(),
+                ..Default::default()
+            },
+        );
         module = desugar_out.module;
         let (registry, _stats) = tyc_analyse::extract_builtin_extensions(&mut module);
         let _ = tyc_analyse::rewrite_builtin_extension_calls(&mut module, &registry);
@@ -2707,26 +2736,49 @@ impl Interpreter {
     }
 
     fn unop(&mut self, op: UnaryOp, v: &Value) -> Result<Value, Unwind> {
+        // Instance dunder dispatch first — `-x` / `+x` / `~x` on a user
+        // class with `__neg__` / `__pos__` / `__invert__` (CPython parity;
+        // the binary slots already dispatched but the unary ones didn't).
+        if matches!(v, Value::Instance(_)) {
+            let dunder = match op {
+                UnaryOp::USub => Some("__neg__"),
+                UnaryOp::UAdd => Some("__pos__"),
+                UnaryOp::Invert => Some("__invert__"),
+                UnaryOp::Not => None, // handled via is_truthy / __bool__ below
+            };
+            if let Some(name) = dunder {
+                if let Some(r) = self.call_dunder0(v, name)? {
+                    return Ok(r);
+                }
+            }
+        }
         match op {
             UnaryOp::Not => Ok(Value::Bool(!self.is_truthy(v)?)),
             UnaryOp::USub => match v {
                 Value::Int(i) => Ok(Value::Int(-i)),
                 Value::Float(x) => Ok(Value::Float(-*x)),
                 Value::Bool(b) => Ok(Value::Int(BigInt::from(-(*b as i64)))),
+                Value::Complex(re, im) => Ok(Value::Complex(-*re, -*im)),
                 _ => Err(type_error(format!(
                     "bad operand for unary -: '{}'",
                     v.type_name()
                 ))),
             },
             UnaryOp::UAdd => match v {
-                Value::Int(_) | Value::Float(_) => Ok(v.clone()),
+                Value::Int(_) | Value::Float(_) | Value::Complex(_, _) => Ok(v.clone()),
                 Value::Bool(b) => Ok(Value::Int(BigInt::from(*b as i64))),
-                _ => Err(type_error("bad operand for unary +")),
+                _ => Err(type_error(format!(
+                    "bad operand for unary +: '{}'",
+                    v.type_name()
+                ))),
             },
             UnaryOp::Invert => match v {
                 Value::Int(i) => Ok(Value::Int(!i)),
                 Value::Bool(b) => Ok(Value::Int(!BigInt::from(*b as i64))),
-                _ => Err(type_error("bad operand for unary ~")),
+                _ => Err(type_error(format!(
+                    "bad operand for unary ~: '{}'",
+                    v.type_name()
+                ))),
             },
         }
     }

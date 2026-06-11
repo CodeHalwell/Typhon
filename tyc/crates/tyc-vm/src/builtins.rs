@@ -686,13 +686,27 @@ pub fn install(interp: &mut Interpreter) {
         Ok(Value::Bool(is_instance_of(val, cls)))
     });
 
-    native!("abs", |_i, args| match single(&args, "abs")? {
-        Value::Int(i) => Ok(Value::Int(num_traits::Signed::abs(i))),
+    native!("abs", |i, args| match single(&args, "abs")? {
+        Value::Int(n) => Ok(Value::Int(num_traits::Signed::abs(n))),
         Value::Float(x) => Ok(Value::Float(x.abs())),
         Value::Bool(b) => Ok(Value::Int(num_bigint::BigInt::from(*b as i64))),
         // `abs(complex)` is the Euclidean magnitude (a float), matching CPython.
         Value::Complex(re, im) => Ok(Value::Float((re * re + im * im).sqrt())),
-        _ => Err(type_error("bad operand type for abs()")),
+        v @ Value::Instance(_) => {
+            // User `__abs__` dunder.
+            if let Some(r) = i.call_dunder0(v, "__abs__")? {
+                Ok(r)
+            } else {
+                Err(type_error(format!(
+                    "bad operand type for abs(): '{}'",
+                    v.type_name()
+                )))
+            }
+        }
+        v => Err(type_error(format!(
+            "bad operand type for abs(): '{}'",
+            v.type_name()
+        ))),
     });
 
     // `complex()` / `complex(re)` / `complex(re, im)` constructor. Accepts
@@ -2312,11 +2326,168 @@ fn make_os_module() -> Value {
                                 Ok(Value::Bool(std::path::Path::new(&path).is_dir()))
                             }),
                         ),
+                        (
+                            "join",
+                            nf("join", |_i, args| {
+                                let mut buf = std::path::PathBuf::new();
+                                for a in &args {
+                                    buf.push(a.py_str());
+                                }
+                                Ok(Value::Str(Rc::new(buf.to_string_lossy().into_owned())))
+                            }),
+                        ),
+                        (
+                            "basename",
+                            nf("basename", |_i, args| {
+                                let path = single(&args, "basename")?.py_str();
+                                let name = std::path::Path::new(&path)
+                                    .file_name()
+                                    .map(|n| n.to_string_lossy().into_owned())
+                                    .unwrap_or_default();
+                                Ok(Value::Str(Rc::new(name)))
+                            }),
+                        ),
+                        (
+                            "dirname",
+                            nf("dirname", |_i, args| {
+                                let path = single(&args, "dirname")?.py_str();
+                                let dir = std::path::Path::new(&path)
+                                    .parent()
+                                    .map(|n| n.to_string_lossy().into_owned())
+                                    .unwrap_or_default();
+                                Ok(Value::Str(Rc::new(dir)))
+                            }),
+                        ),
                     ],
                 ),
             ),
+            (
+                "getcwd",
+                nf("getcwd", |_i, _args| {
+                    let cwd = std::env::current_dir()
+                        .map_err(|e| os_error(format!("getcwd failed: {e}")))?;
+                    Ok(Value::Str(Rc::new(cwd.to_string_lossy().into_owned())))
+                }),
+            ),
+            (
+                "remove",
+                nf("remove", |_i, args| {
+                    let path = single(&args, "remove")?.py_str();
+                    std::fs::remove_file(&path).map_err(|e| fs_unwind(&path, e))?;
+                    Ok(Value::None)
+                }),
+            ),
+            (
+                "unlink",
+                nf("unlink", |_i, args| {
+                    let path = single(&args, "unlink")?.py_str();
+                    std::fs::remove_file(&path).map_err(|e| fs_unwind(&path, e))?;
+                    Ok(Value::None)
+                }),
+            ),
+            (
+                "rmdir",
+                nf("rmdir", |_i, args| {
+                    let path = single(&args, "rmdir")?.py_str();
+                    std::fs::remove_dir(&path).map_err(|e| fs_unwind(&path, e))?;
+                    Ok(Value::None)
+                }),
+            ),
+            (
+                "mkdir",
+                nf("mkdir", |_i, args| {
+                    let path = single(&args, "mkdir")?.py_str();
+                    std::fs::create_dir(&path).map_err(|e| fs_unwind(&path, e))?;
+                    Ok(Value::None)
+                }),
+            ),
+            (
+                "makedirs",
+                nf("makedirs", |_i, args| {
+                    let path = args
+                        .first()
+                        .ok_or_else(|| type_error("makedirs() needs a path"))?
+                        .py_str();
+                    std::fs::create_dir_all(&path).map_err(|e| fs_unwind(&path, e))?;
+                    Ok(Value::None)
+                }),
+            ),
+            (
+                "rename",
+                nf("rename", |_i, args| {
+                    let src = args
+                        .first()
+                        .ok_or_else(|| type_error("rename() needs src and dst"))?
+                        .py_str();
+                    let dst = args
+                        .get(1)
+                        .ok_or_else(|| type_error("rename() needs src and dst"))?
+                        .py_str();
+                    std::fs::rename(&src, &dst).map_err(|e| fs_unwind(&src, e))?;
+                    Ok(Value::None)
+                }),
+            ),
+            (
+                "listdir",
+                nf("listdir", |_i, args| {
+                    let path = args
+                        .first()
+                        .map(|v| v.py_str())
+                        .unwrap_or_else(|| ".".to_owned());
+                    let mut names: Vec<Value> = Vec::new();
+                    for entry in std::fs::read_dir(&path).map_err(|e| fs_unwind(&path, e))? {
+                        let entry = entry.map_err(|e| fs_unwind(&path, e))?;
+                        names.push(Value::Str(Rc::new(
+                            entry.file_name().to_string_lossy().into_owned(),
+                        )));
+                    }
+                    Ok(Value::List(Rc::new(RefCell::new(names))))
+                }),
+            ),
         ],
     )
+}
+
+/// Map an `std::io::Error` from a filesystem builtin onto the matching
+/// Python exception type (`FileNotFoundError` / `PermissionError` /
+/// `FileExistsError` / generic `OSError`) so user `except` arms narrow the
+/// same way they do under CPython.
+fn fs_unwind(path: &str, e: std::io::Error) -> Unwind {
+    use std::io::ErrorKind;
+    let kind = match e.kind() {
+        ErrorKind::NotFound => "FileNotFoundError",
+        ErrorKind::PermissionDenied => "PermissionError",
+        ErrorKind::AlreadyExists => "FileExistsError",
+        _ => "OSError",
+    };
+    Unwind::Exception(crate::error::VmException::new(
+        kind,
+        format!("{e}: '{path}'"),
+    ))
+}
+
+fn os_error(msg: String) -> Unwind {
+    Unwind::Exception(crate::error::VmException::new("OSError", msg))
+}
+
+/// fnmatch-style single-component wildcard match: `*` (any run) and `?`
+/// (single char). Backs the VM `Path.glob` shim.
+fn glob_match(pat: &str, name: &str) -> bool {
+    fn inner(p: &[char], n: &[char]) -> bool {
+        match (p.first(), n.first()) {
+            (None, None) => true,
+            (Some('*'), _) => {
+                // `*` matches empty, or consumes one char of the name.
+                inner(&p[1..], n) || (!n.is_empty() && inner(p, &n[1..]))
+            }
+            (Some('?'), Some(_)) => inner(&p[1..], &n[1..]),
+            (Some(pc), Some(nc)) if pc == nc => inner(&p[1..], &n[1..]),
+            _ => false,
+        }
+    }
+    let p: Vec<char> = pat.chars().collect();
+    let n: Vec<char> = name.chars().collect();
+    inner(&p, &n)
 }
 
 fn make_sys_module(interp: &Interpreter) -> Value {
@@ -2349,6 +2520,38 @@ fn make_sys_module(interp: &Interpreter) -> Value {
                     std::process::exit(code as i32);
                 }),
             ),
+            ("stdout", make_std_stream("sys.stdout", false)),
+            ("stderr", make_std_stream("sys.stderr", true)),
+        ],
+    )
+}
+
+/// A minimal text-stream object for `sys.stdout` / `sys.stderr`: enough
+/// surface (`write`, `flush`) for logging-style code and for
+/// `print(file=sys.stderr)` to route correctly.
+fn make_std_stream(name: &'static str, is_err: bool) -> Value {
+    make_module(
+        name,
+        vec![
+            (
+                "write",
+                nf("write", move |interp, args| {
+                    let text = match args.first() {
+                        Some(v) => interp.str_of(v)?,
+                        None => return Err(type_error("write() requires an argument")),
+                    };
+                    use std::io::Write;
+                    if is_err {
+                        eprint!("{text}");
+                        let _ = std::io::stderr().flush();
+                    } else {
+                        print!("{text}");
+                        let _ = std::io::stdout().flush();
+                    }
+                    Ok(Value::Int(num_bigint::BigInt::from(text.len() as i64)))
+                }),
+            ),
+            ("flush", nf("flush", |_i, _args| Ok(Value::None))),
         ],
     )
 }
@@ -2503,6 +2706,126 @@ fn make_random_module() -> Value {
                     let s = args.first().and_then(|v| v.to_int().ok()).unwrap_or(0);
                     SEED.with(|c| c.set(s as u64 ^ 0x_2545_F491_4F6C_DD1D));
                     Ok(Value::None)
+                }),
+            ),
+            (
+                "uniform",
+                nf("uniform", |_i, args| {
+                    let a = args
+                        .first()
+                        .ok_or_else(|| type_error("uniform() needs 2 args"))?
+                        .to_float()?;
+                    let b = args
+                        .get(1)
+                        .ok_or_else(|| type_error("uniform() needs 2 args"))?
+                        .to_float()?;
+                    let t = (next_u64() as f64) / (u64::MAX as f64);
+                    Ok(Value::Float(a + t * (b - a)))
+                }),
+            ),
+            (
+                "gauss",
+                nf("gauss", |_i, args| {
+                    // Box–Muller transform; mu/sigma default to 0/1.
+                    let mu = args.first().map(|v| v.to_float()).transpose()?.unwrap_or(0.0);
+                    let sigma = args.get(1).map(|v| v.to_float()).transpose()?.unwrap_or(1.0);
+                    let mut u1 = (next_u64() as f64) / (u64::MAX as f64);
+                    if u1 <= f64::MIN_POSITIVE {
+                        u1 = f64::MIN_POSITIVE;
+                    }
+                    let u2 = (next_u64() as f64) / (u64::MAX as f64);
+                    let z = (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos();
+                    Ok(Value::Float(mu + sigma * z))
+                }),
+            ),
+            (
+                "randrange",
+                nf("randrange", |_i, args| {
+                    let (start, stop, step) = match args.len() {
+                        1 => (0, args[0].to_int()?, 1),
+                        2 => (args[0].to_int()?, args[1].to_int()?, 1),
+                        3 => (args[0].to_int()?, args[1].to_int()?, args[2].to_int()?),
+                        _ => return Err(type_error("randrange() takes 1-3 arguments")),
+                    };
+                    if step <= 0 || stop <= start {
+                        return Err(value_error("empty range for randrange()"));
+                    }
+                    let n = ((stop - start) + step - 1) / step;
+                    let pick = (next_u64() % n as u64) as i64;
+                    Ok(Value::Int(num_bigint::BigInt::from(start + pick * step)))
+                }),
+            ),
+            (
+                "choice",
+                nf("choice", |interp, args| {
+                    let seq = args
+                        .first()
+                        .ok_or_else(|| type_error("choice() needs a sequence"))?;
+                    let items: Vec<Value> = {
+                        let it = interp.make_iter(seq.clone())?;
+                        let mut out = Vec::new();
+                        while let Some(v) = interp.iter_next(&it)? {
+                            out.push(v);
+                        }
+                        out
+                    };
+                    if items.is_empty() {
+                        return Err(Unwind::Exception(crate::error::VmException::new(
+                            "IndexError",
+                            "Cannot choose from an empty sequence".to_owned(),
+                        )));
+                    }
+                    let idx = (next_u64() % items.len() as u64) as usize;
+                    Ok(items[idx].clone())
+                }),
+            ),
+            (
+                "shuffle",
+                nf("shuffle", |_i, args| {
+                    let lst = match args.first() {
+                        Some(Value::List(l)) => l.clone(),
+                        _ => return Err(type_error("shuffle() needs a list")),
+                    };
+                    let mut items = lst.borrow_mut();
+                    // Fisher–Yates.
+                    let n = items.len();
+                    for i in (1..n).rev() {
+                        let j = (next_u64() % (i as u64 + 1)) as usize;
+                        items.swap(i, j);
+                    }
+                    Ok(Value::None)
+                }),
+            ),
+            (
+                "sample",
+                nf("sample", |interp, args| {
+                    let seq = args
+                        .first()
+                        .ok_or_else(|| type_error("sample() needs a sequence"))?;
+                    let k = args
+                        .get(1)
+                        .ok_or_else(|| type_error("sample() needs k"))?
+                        .to_int()? as usize;
+                    let mut items: Vec<Value> = {
+                        let it = interp.make_iter(seq.clone())?;
+                        let mut out = Vec::new();
+                        while let Some(v) = interp.iter_next(&it)? {
+                            out.push(v);
+                        }
+                        out
+                    };
+                    if k > items.len() {
+                        return Err(value_error(
+                            "Sample larger than population or is negative",
+                        ));
+                    }
+                    // Partial Fisher–Yates: shuffle the first k slots.
+                    for i in 0..k {
+                        let j = i + (next_u64() % (items.len() - i) as u64) as usize;
+                        items.swap(i, j);
+                    }
+                    items.truncate(k);
+                    Ok(Value::List(Rc::new(RefCell::new(items))))
                 }),
             ),
         ],
@@ -4285,6 +4608,117 @@ fn make_pathlib_module(interp: &mut Interpreter) -> Result<Value, Unwind> {
                 Ok(Value::Bool(std::path::Path::new(&s_for_is_dir).is_dir()))
             }))),
         );
+        let s_for_iter = s.clone();
+        let cls_for_iter = cls.clone();
+        fields.insert(
+            "iterdir".into(),
+            Value::Native(Rc::new(NativeFn::new("iterdir", move |_i, _args| {
+                let mut entries: Vec<Value> = Vec::new();
+                let rd = std::fs::read_dir(&s_for_iter).map_err(|e| {
+                    crate::error::Unwind::Exception(crate::error::VmException::new(
+                        if e.kind() == std::io::ErrorKind::NotFound {
+                            "FileNotFoundError"
+                        } else {
+                            "OSError"
+                        },
+                        format!("{e}: '{s_for_iter}'"),
+                    ))
+                })?;
+                for entry in rd.flatten() {
+                    entries.push(make_path(
+                        cls_for_iter.clone(),
+                        entry.path().to_string_lossy().into_owned(),
+                    ));
+                }
+                Ok(Value::List(Rc::new(RefCell::new(entries))))
+            }))),
+        );
+        let s_for_glob = s.clone();
+        let cls_for_glob = cls.clone();
+        fields.insert(
+            "glob".into(),
+            Value::Native(Rc::new(NativeFn::new("glob", move |_i, args| {
+                // Non-recursive single-component glob: `*`, `*.py`, `data*`.
+                let pat = single(&args, "glob")?.py_str();
+                if pat.contains("**") || pat.contains('/') {
+                    return Err(type_error(
+                        "VM glob() supports single-component patterns only — \
+                         use `tyc run --compile` for recursive globs",
+                    ));
+                }
+                let mut entries: Vec<Value> = Vec::new();
+                if let Ok(rd) = std::fs::read_dir(&s_for_glob) {
+                    for entry in rd.flatten() {
+                        let name = entry.file_name().to_string_lossy().into_owned();
+                        if glob_match(&pat, &name) {
+                            entries.push(make_path(
+                                cls_for_glob.clone(),
+                                entry.path().to_string_lossy().into_owned(),
+                            ));
+                        }
+                    }
+                }
+                Ok(Value::List(Rc::new(RefCell::new(entries))))
+            }))),
+        );
+        let s_for_mkdir = s.clone();
+        fields.insert(
+            "mkdir".into(),
+            Value::Native(Rc::new(NativeFn::new("mkdir", move |_i, args| {
+                // Accept the common kwargs via sentinel: parents=, exist_ok=.
+                let (_pos, kw_vec) = split_kwargs(&args);
+                let kw: HashMap<String, Value> = kw_vec.into_iter().collect();
+                let parents = kw.get("parents").map(|v| v.truthy()).unwrap_or(false);
+                let exist_ok = kw.get("exist_ok").map(|v| v.truthy()).unwrap_or(false);
+                let r = if parents {
+                    std::fs::create_dir_all(&s_for_mkdir)
+                } else {
+                    std::fs::create_dir(&s_for_mkdir)
+                };
+                match r {
+                    Ok(()) => Ok(Value::None),
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && exist_ok => {
+                        Ok(Value::None)
+                    }
+                    Err(e) => Err(fs_unwind(&s_for_mkdir, e)),
+                }
+            }))),
+        );
+        let s_for_unlink = s.clone();
+        fields.insert(
+            "unlink".into(),
+            Value::Native(Rc::new(NativeFn::new("unlink", move |_i, _args| {
+                std::fs::remove_file(&s_for_unlink).map_err(|e| fs_unwind(&s_for_unlink, e))?;
+                Ok(Value::None)
+            }))),
+        );
+        let s_for_read_b = s.clone();
+        fields.insert(
+            "read_bytes".into(),
+            Value::Native(Rc::new(NativeFn::new("read_bytes", move |_i, _args| {
+                std::fs::read(&s_for_read_b)
+                    .map(|b| Value::Bytes(Rc::new(b)))
+                    .map_err(|e| fs_unwind(&s_for_read_b, e))
+            }))),
+        );
+        let s_for_write_b = s.clone();
+        fields.insert(
+            "write_bytes".into(),
+            Value::Native(Rc::new(NativeFn::new("write_bytes", move |_i, args| {
+                let data = match single(&args, "write_bytes")? {
+                    Value::Bytes(b) => b.as_ref().clone(),
+                    other => {
+                        return Err(type_error(format!(
+                            "write_bytes() expects bytes, not {}",
+                            other.type_name()
+                        )))
+                    }
+                };
+                let n = data.len();
+                std::fs::write(&s_for_write_b, data).map_err(|e| fs_unwind(&s_for_write_b, e))?;
+                Ok(Value::Int(num_bigint::BigInt::from(n as i64)))
+            }))),
+        );
         Value::Instance(Rc::new(Instance {
             class: cls,
             fields: RefCell::new(fields),
@@ -5390,6 +5824,9 @@ fn dict_method(
     name: &str,
     args: &[Value],
 ) -> Result<Value, Unwind> {
+    // Strip any trailing keyword-argument sentinel; `popitem` /
+    // `move_to_end` consult `kw`.
+    let (args, kw) = split_kwargs(args);
     // Refuse mutations on a `freeze let`-tagged dict so the VM matches
     // the compile path's `MappingProxyType` semantics: CPython surfaces
     // missing-method calls as `AttributeError` (review thread copilot
@@ -5398,7 +5835,14 @@ fn dict_method(
     // `values`, `items`, `copy`) fall through.
     let is_mutator = matches!(
         name,
-        "pop" | "update" | "setdefault" | "clear" | "popitem" | "__setitem__" | "__delitem__"
+        "pop"
+            | "update"
+            | "setdefault"
+            | "clear"
+            | "popitem"
+            | "move_to_end"
+            | "__setitem__"
+            | "__delitem__"
     );
     if is_mutator && dict_is_frozen(d) {
         return Err(attribute_error(format!(
@@ -5487,14 +5931,55 @@ fn dict_method(
         "copy" => Ok(Value::Dict(Rc::new(RefCell::new(d.borrow().clone())))),
         "popitem" => {
             // Remove and return the last inserted (key, value) pair (LIFO),
-            // matching CPython 3.7+. `IndexMap` preserves insertion order, so
-            // `pop()` removes the most-recently-added entry. (Frozen dicts are
-            // rejected earlier by the `is_mutator` guard, so no `__typhon_frozen__`
-            // sentinel can be present here.)
-            match d.borrow_mut().pop() {
+            // matching CPython 3.7+. `OrderedDict.popitem(last=False)` pops
+            // FIFO instead. `IndexMap` preserves insertion order, so `pop()`
+            // removes the most-recently-added entry and `shift_remove_index(0)`
+            // the oldest. (Frozen dicts are rejected earlier by the
+            // `is_mutator` guard, so no `__typhon_frozen__` sentinel here.)
+            let last = kw
+                .iter()
+                .find(|(k, _)| k == "last")
+                .map(|(_, v)| v.truthy())
+                .unwrap_or(true);
+            let popped = if last {
+                d.borrow_mut().pop()
+            } else {
+                d.borrow_mut().shift_remove_index(0)
+            };
+            match popped {
                 Some((k, v)) => Ok(Value::Tuple(Rc::new(vec![k.into_value(), v]))),
                 None => Err(key_error("'popitem(): dictionary is empty'")),
             }
+        }
+        "move_to_end" => {
+            // OrderedDict.move_to_end(key, last=True): reposition an existing
+            // key at either end, preserving the relative order of the rest
+            // (`shift_remove` keeps order; plain `swap_remove` would not).
+            let key = args
+                .first()
+                .ok_or_else(|| type_error("move_to_end() requires a key"))?
+                .to_hash_key()?;
+            let last = kw
+                .iter()
+                .find(|(k, _)| k == "last")
+                .map(|(_, v)| v.truthy())
+                .unwrap_or(true);
+            let mut m = d.borrow_mut();
+            let Some(v) = m.shift_remove(&key) else {
+                return Err(key_error(format!("{}", key.into_value().py_repr())));
+            };
+            if last {
+                m.insert(key, v);
+            } else {
+                // Re-insert at the front: rebuild with the moved entry first.
+                let mut rebuilt: DictMap = IndexMap::with_capacity(m.len() + 1);
+                rebuilt.insert(key, v);
+                for (k2, v2) in m.drain(..) {
+                    rebuilt.insert(k2, v2);
+                }
+                *m = rebuilt;
+            }
+            Ok(Value::None)
         }
         // ── Counter-specific methods ──────────────────────────────────────────
         // These are safe to expose on all dicts because:
@@ -6401,6 +6886,107 @@ pub fn call_with_kwargs(
                     }
                 }
             }
+            (n.func)(interp, args)
+        }
+        // print(*values, sep=' ', end='\n', file=..., flush=...)
+        "print" => {
+            let mut sep = " ".to_owned();
+            let mut end = "\n".to_owned();
+            let mut to_stderr = false;
+            for (k, v) in kwargs {
+                match k.as_str() {
+                    "sep" => match v {
+                        Value::Str(s) => sep = (**s).clone(),
+                        Value::None => {}
+                        _ => {
+                            return Err(type_error(format!(
+                                "sep must be None or a string, not {}",
+                                v.type_name()
+                            )))
+                        }
+                    },
+                    "end" => match v {
+                        Value::Str(s) => end = (**s).clone(),
+                        Value::None => {}
+                        _ => {
+                            return Err(type_error(format!(
+                                "end must be None or a string, not {}",
+                                v.type_name()
+                            )))
+                        }
+                    },
+                    // `file=` distinguishes the two std streams; arbitrary
+                    // file objects aren't writable sinks in the VM. `flush=`
+                    // is accepted and ignored — the VM writes through.
+                    "file" => match v {
+                        Value::Module(m) if m.name == "sys.stderr" => to_stderr = true,
+                        Value::Module(m) if m.name == "sys.stdout" => to_stderr = false,
+                        Value::None => {}
+                        other => {
+                            return Err(type_error(format!(
+                                "print() file= must be sys.stdout or sys.stderr in the VM, \
+                                 not {} — use `tyc run --compile` for arbitrary file sinks",
+                                other.type_name()
+                            )))
+                        }
+                    },
+                    "flush" => {}
+                    _ => {
+                        return Err(type_error(format!(
+                            "print() got unexpected keyword: '{}'",
+                            k
+                        )))
+                    }
+                }
+            }
+            let mut out = String::new();
+            for (i, a) in args.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(&sep);
+                }
+                out.push_str(&interp.str_of(a)?);
+            }
+            out.push_str(&end);
+            if to_stderr {
+                eprint!("{out}");
+            } else {
+                print!("{out}");
+                if !end.ends_with('\n') {
+                    use std::io::Write;
+                    let _ = std::io::stdout().flush();
+                }
+            }
+            Ok(Value::None)
+        }
+        // sum(iterable, start=X) — keyword form (positional start already
+        // works through the plain native).
+        "sum" => {
+            let mut acc = Value::Int(num_bigint::BigInt::from(0));
+            for (k, v) in kwargs {
+                if k == "start" {
+                    acc = v.clone();
+                } else {
+                    return Err(type_error(format!(
+                        "sum() got unexpected keyword: '{}'",
+                        k
+                    )));
+                }
+            }
+            let it = interp.make_iter(
+                args.into_iter()
+                    .next()
+                    .ok_or_else(|| type_error("sum() requires an iterable"))?,
+            )?;
+            while let Some(v) = interp.iter_next(&it)? {
+                acc = interp.binop(&acc, ruff_python_ast::Operator::Add, &v)?;
+            }
+            Ok(acc)
+        }
+        // Instance-field natives that parse their own kwargs via the
+        // sentinel (`split_kwargs`): forward and let the body peel it.
+        "mkdir" => {
+            let mut args = args;
+            args.push(make_kwargs_sentinel(kwargs));
             (n.func)(interp, args)
         }
         // Bound builtin methods (the "method" native) never reach here — they
