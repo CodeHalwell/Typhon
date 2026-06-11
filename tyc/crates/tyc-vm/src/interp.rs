@@ -267,9 +267,10 @@ impl Interpreter {
                 Ok(())
             }
             Stmt::For(s) => {
-                if s.is_async {
-                    return Err(vm_unsupported_use_compile("async for"));
-                }
+                // `async for` iterates the forced async generator — the VM
+                // materialises generators eagerly either way, so the sync
+                // and async loops share one code path (`make_iter` forces
+                // coroutine values).
                 let iterable = self.eval_expr(&s.iter, env)?;
                 let iter = self.make_iter(iterable)?;
                 let mut completed = true;
@@ -293,9 +294,10 @@ impl Interpreter {
                 Ok(())
             }
             Stmt::FunctionDef(f) => {
-                if f.is_async {
-                    return Err(vm_unsupported_use_compile("async functions"));
-                }
+                // `async def` builds a normal Function with `is_async` set;
+                // calling it produces a `Value::Coroutine` thunk that runs
+                // when awaited (sequential cooperative semantics — see
+                // `force_awaitable`).
                 let func = self.build_function(f, env)?;
                 // Run decorators in reverse order (innermost first), matching Python.
                 let mut value = Value::Function(Rc::new(func));
@@ -1430,7 +1432,10 @@ impl Interpreter {
                 };
                 self.eval_listcomp(&listy, env)
             }
-            Expr::Await(_) => Err(vm_unsupported_use_compile("await expressions")),
+            Expr::Await(a) => {
+                let v = self.eval_expr(&a.value, env)?;
+                self.force_awaitable(v)
+            }
             Expr::Yield(y) => {
                 let v = match &y.value {
                     Some(e) => self.eval_expr(e, env)?,
@@ -2001,8 +2006,29 @@ impl Interpreter {
                 }
                 (n.func)(self, args)
             }
-            Value::Function(f) => self.call_function(&f, args, kwargs, None),
+            Value::Function(f) => {
+                if f.is_async {
+                    return Ok(Value::Coroutine(Rc::new(crate::value::CoroutineThunk {
+                        function: f,
+                        args: std::cell::RefCell::new(args),
+                        kwargs: kwargs.to_vec(),
+                        receiver: None,
+                        forced: std::cell::Cell::new(false),
+                    })));
+                }
+                self.call_function(&f, args, kwargs, None)
+            }
             Value::BoundMethod { receiver, function } => {
+                // Async methods defer exactly like async free functions.
+                if function.is_async {
+                    return Ok(Value::Coroutine(Rc::new(crate::value::CoroutineThunk {
+                        function,
+                        args: std::cell::RefCell::new(args),
+                        kwargs: kwargs.to_vec(),
+                        receiver: Some(*receiver),
+                        forced: std::cell::Cell::new(false),
+                    })));
+                }
                 // Push a `(defining_class, self)` frame so a zero-arg
                 // `super()` in the body can climb the MRO. The owning class
                 // is found by walking the receiver instance's MRO for this
@@ -2365,6 +2391,37 @@ impl Interpreter {
             }
         }
         None
+    }
+
+    /// Drive an awaitable to its value. A `Coroutine` thunk runs its body
+    /// now (sequential cooperative semantics — the VM cannot suspend a
+    /// tree-walk frame, so awaits execute in program order); a Task wrapper
+    /// (from `TaskGroup.create_task` / `spawn`) unwraps its stored result;
+    /// anything else passes through (await on an already-produced value,
+    /// e.g. the async-middleware `Callable[..., Awaitable[T]]` shape).
+    pub fn force_awaitable(&mut self, v: Value) -> Result<Value, Unwind> {
+        match v {
+            Value::Coroutine(thunk) => {
+                if thunk.forced.replace(true) {
+                    return Err(Unwind::Exception(crate::error::VmException::new(
+                        "RuntimeError",
+                        format!("cannot reuse already awaited coroutine {}", thunk.function.name),
+                    )));
+                }
+                let args = thunk.args.borrow_mut().drain(..).collect::<Vec<_>>();
+                self.call_function(
+                    &thunk.function,
+                    args,
+                    &thunk.kwargs,
+                    thunk.receiver.clone(),
+                )
+            }
+            Value::Module(m) if m.name == "Task" => {
+                let r = m.members.borrow().get("__typhon_task_result__").cloned();
+                Ok(r.unwrap_or(Value::None))
+            }
+            other => Ok(other),
+        }
     }
 
     /// Invoke a zero-argument dunder method on an instance, if defined.
@@ -3719,6 +3776,13 @@ impl Interpreter {
     // ── Iteration ──────────────────────────────────────────────────────────
 
     pub fn make_iter(&mut self, v: Value) -> Result<Value, Unwind> {
+        // An async generator call arrives as a coroutine thunk — force it
+        // to its (eagerly materialised) iterator before iterating.
+        let v = if matches!(v, Value::Coroutine(_)) {
+            self.force_awaitable(v)?
+        } else {
+            v
+        };
         let state = match v {
             Value::Range { start, stop, step } => IterState::Range {
                 current: start,
@@ -4238,15 +4302,24 @@ impl Interpreter {
     // ── with ───────────────────────────────────────────────────────────────
 
     fn exec_with(&mut self, w: &ast::StmtWith, env: &EnvRef) -> Result<(), Unwind> {
-        if w.is_async {
-            return Err(vm_unsupported_use_compile("async with"));
-        }
+        // `async with` shares the sync path: `__aenter__` / `__aexit__` are
+        // preferred when present, and awaitable results are forced (the VM
+        // runs awaits sequentially).
+        let is_async = w.is_async;
         // Each context-manager value must support .__enter__ / .__exit__.
         // For v1 we only handle plain values that implement these as native
         // methods (e.g. the file handle from `open()`).
         let mut entered: Vec<Value> = Vec::with_capacity(w.items.len());
         for item in &w.items {
             let cm = self.eval_expr(&item.context_expr, env)?;
+            // An `@asynccontextmanager` factory call arrives as a coroutine
+            // thunk; force it so the Iter check below can surface the clear
+            // eager-generator hint instead of a bare AttributeError.
+            let cm = if matches!(cm, Value::Coroutine(_)) {
+                self.force_awaitable(cm)?
+            } else {
+                cm
+            };
             // A `@contextmanager`-decorated generator can't act as a context
             // manager under eager evaluation: the VM runs the whole generator
             // body (setup *and* teardown) at call time, so there's no point at
@@ -4262,8 +4335,14 @@ impl Interpreter {
             // file shim in `ffi.rs` returns the file object itself from
             // __enter__, so a `with open(...) as f:` block binds `f` to
             // the file.
-            let enter = self.get_attr(&cm, "__enter__")?;
+            let enter = if is_async {
+                self.get_attr(&cm, "__aenter__")
+                    .or_else(|_| self.get_attr(&cm, "__enter__"))?
+            } else {
+                self.get_attr(&cm, "__enter__")?
+            };
             let val = self.call_value(enter, vec![], &[])?;
+            let val = self.force_awaitable(val)?;
             if let Some(t) = &item.optional_vars {
                 self.assign_target(t, val, env, None)?;
             }
@@ -4274,7 +4353,13 @@ impl Interpreter {
         // the exception info `(exc_type, exc_value, None)` and honour a truthy
         // return value by SUPPRESSING the exception (CPython protocol).
         for cm in entered.into_iter().rev() {
-            if let Ok(exit) = self.get_attr(&cm, "__exit__") {
+            let exit_attr = if is_async {
+                self.get_attr(&cm, "__aexit__")
+                    .or_else(|_| self.get_attr(&cm, "__exit__"))
+            } else {
+                self.get_attr(&cm, "__exit__")
+            };
+            if let Ok(exit) = exit_attr {
                 let (et, ev) = match &body_res {
                     Err(Unwind::Exception(exc)) => {
                         let value = match &exc.value {
@@ -4295,6 +4380,7 @@ impl Interpreter {
                 };
                 let raised = matches!(&body_res, Err(Unwind::Exception(_)));
                 let suppressed = self.call_value(exit, vec![et, ev, Value::None], &[])?;
+                let suppressed = self.force_awaitable(suppressed)?;
                 if raised && self.is_truthy(&suppressed)? {
                     body_res = Ok(());
                 }
@@ -5430,7 +5516,7 @@ fn exc_fallback_args(message: &str) -> Vec<Value> {
 /// the standard CPython exception hierarchy. `Exception` / `BaseException`
 /// match everything except the bare base-only kinds. Returns false for
 /// unknown names (user exceptions go through the instance-MRO path instead).
-fn builtin_exc_is_a(kind: &str, target: &str) -> bool {
+pub fn builtin_exc_is_a(kind: &str, target: &str) -> bool {
     if target == "BaseException" {
         return true;
     }
@@ -6185,18 +6271,41 @@ flattened = list(flat())
     }
 
     #[test]
-    fn async_def_error_mentions_tyc_build_fallback() {
+    fn async_def_call_produces_coroutine_thunk_and_await_forces_it() {
+        // Calling an `async def` defers the body (CPython: coroutines run
+        // when driven); awaiting forces it under the VM's sequential
+        // cooperative scheduler.
+        let src = r#"
+import asyncio
+
+async def fetch():
+    return 41
+
+async def main():
+    x = await fetch()
+    return x + 1
+
+result = asyncio.run(main())
+"#;
+        let (interp, res) = parse_and_run(src);
+        res.expect("cooperative async should run");
+        let v = interp.root.get("result").expect("result bound");
+        assert_eq!(format!("{v:?}"), "42");
+    }
+
+    #[test]
+    fn unawaited_coroutine_is_a_value_not_an_error() {
         let src = r#"
 async def fetch():
     return 1
-fetch()
+c = fetch()
 "#;
-        let (_interp, res) = parse_and_run(src);
-        let err = res.expect_err("async should error");
-        let msg = format!("{:?}", err);
+        let (interp, res) = parse_and_run(src);
+        res.expect("creating a coroutine must not run or fail");
+        let v = interp.root.get("c").expect("c bound");
         assert!(
-            msg.contains("tyc build") && msg.contains("python"),
-            "async error should mention `tyc build` + `python` fallback, got: {msg}"
+            format!("{v:?}").contains("coroutine"),
+            "calling an async def must produce a coroutine thunk, got: {v:?}"
         );
     }
 

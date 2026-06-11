@@ -313,6 +313,12 @@ pub enum Value {
     ResultErr(Box<Value>),
     /// A module — a namespace dictionary.
     Module(Rc<Module>),
+    /// A *deferred* call to an `async def` — created when the function is
+    /// called, executed when awaited (matching CPython, where a coroutine's
+    /// body doesn't run until it's driven). The VM executes coroutines
+    /// sequentially at force points (`await`, `asyncio.run`, `gather`,
+    /// `TaskGroup.create_task`, `spawn`).
+    Coroutine(Rc<CoroutineThunk>),
     /// An exception instance — held when a Python-style `except X as e` binds it.
     /// `message` is the str-form of the first arg (kept for cheap display);
     /// `args` is the full constructor argument tuple so `e.args` and the
@@ -413,6 +419,15 @@ impl fmt::Debug for Instance {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", instance_repr(self))
     }
+}
+
+pub struct CoroutineThunk {
+    pub function: Rc<Function>,
+    pub args: std::cell::RefCell<Vec<Value>>,
+    pub kwargs: Vec<(String, Value)>,
+    pub receiver: Option<Value>,
+    /// A coroutine runs at most once (CPython raises on re-await).
+    pub forced: std::cell::Cell<bool>,
 }
 
 pub struct Module {
@@ -526,6 +541,7 @@ impl fmt::Debug for Value {
             Value::ResultOk(v) => write!(f, "Ok(value={:?})", v),
             Value::ResultErr(v) => write!(f, "Err(error={:?})", v),
             Value::Module(m) => write!(f, "<module {}>", m.name),
+            Value::Coroutine(c) => write!(f, "<coroutine {}>", c.function.name),
             Value::Exception {
                 kind,
                 message,
@@ -575,6 +591,7 @@ impl Value {
             Value::ResultOk(_) => "Ok",
             Value::ResultErr(_) => "Err",
             Value::Module(_) => "module",
+            Value::Coroutine(_) => "coroutine",
             Value::Exception { .. } => "Exception",
             Value::Iter(_) => "iterator",
             Value::DictView { kind, .. } => match kind {
@@ -1023,6 +1040,7 @@ impl Value {
             Value::ResultOk(v) => format!("Ok(value={})", v.py_repr()),
             Value::ResultErr(v) => format!("Err(error={})", v.py_repr()),
             Value::Module(m) => format!("<module '{}'>", m.name),
+            Value::Coroutine(c) => format!("<coroutine object {}>", c.function.name),
             Value::Exception {
                 kind,
                 message,

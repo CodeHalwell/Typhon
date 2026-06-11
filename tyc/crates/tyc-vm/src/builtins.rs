@@ -1327,8 +1327,14 @@ fn is_instance_of(val: &Value, cls: &Value) -> bool {
         ("set", Value::Set(_)) => true,
         ("Ok", Value::ResultOk(_)) => true,
         ("Err", Value::ResultErr(_)) => true,
-        // Exception kind match.
-        (k, Value::Exception { kind, .. }) if k == kind.as_str() => true,
+        // Exception kind match — exact, or through the builtin exception
+        // hierarchy (`isinstance(e, Exception)` where e is a ValueError;
+        // the same relation `except` clauses use).
+        (k, Value::Exception { kind, .. })
+            if k == kind.as_str() || crate::interp::builtin_exc_is_a(kind.as_str(), k) =>
+        {
+            true
+        }
         // Class membership.
         (_, Value::Instance(inst)) => class_in_chain(&inst.class, &name),
         _ => {
@@ -1655,6 +1661,11 @@ pub fn resolve_module(interp: &mut Interpreter, name: &str) -> Result<Value, Unw
         // at runtime, so identity natives (mirroring the `typing` shim)
         // are all the VM needs.
         "collections.abc" => Ok(make_collections_abc_module()),
+        // Cooperative (sequential) asyncio: coroutines are thunks forced at
+        // await points, tasks complete at creation, and Queue.get on an
+        // empty queue fails loudly instead of deadlocking. Programs whose
+        // CORRECTNESS depends on interleaving need `tyc run --compile`.
+        "asyncio" => Ok(make_asyncio_module()),
         "functools" => Ok(make_functools_module()),
         "itertools" => Ok(make_itertools_module()),
         "dataclasses" => Ok(make_dataclasses_module()),
@@ -1719,9 +1730,15 @@ fn make_typhon_runtime_module(interp: &Interpreter) -> Value {
         vec![(
             "spawn",
             nf("spawn", |i, args| {
-                // Synchronous "spawn" — just call the value immediately.
-                let f = args.into_iter().next().unwrap_or(Value::None);
-                i.call_value(f, vec![], &[])
+                // Sequential "spawn": force the coroutine now (a bare
+                // callable is invoked, matching the old behaviour) and
+                // wrap the result so `go f(x) -> task; await task` works.
+                let v = args.into_iter().next().unwrap_or(Value::None);
+                let result = match v {
+                    Value::Coroutine(_) => i.force_awaitable(v)?,
+                    other => i.call_value(other, vec![], &[])?,
+                };
+                Ok(make_task_value(result))
             }),
         )],
     );
@@ -3561,6 +3578,256 @@ fn make_re_module() -> Value {
 /// of counts), `namedtuple` (returns a callable that builds a tuple).
 /// `deque` is not implemented; users hitting that case should fall back
 /// to `tyc run --compile`.
+/// A completed-task wrapper: `TaskGroup.create_task` / `spawn` force the
+/// coroutine immediately (sequential semantics) and hand back this module
+/// so `.result()` / `await task` recover the value.
+fn make_task_value(result: Value) -> Value {
+    let result_for_member = result.clone();
+    make_module(
+        "Task",
+        vec![
+            ("__typhon_task_result__", result.clone()),
+            (
+                "result",
+                Value::Native(Rc::new(NativeFn::new("result", move |_i, _args| {
+                    Ok(result_for_member.clone())
+                }))),
+            ),
+            ("done", nf("done", |_i, _args| Ok(Value::Bool(true)))),
+            ("cancel", nf("cancel", |_i, _args| Ok(Value::Bool(false)))),
+            (
+                "cancelled",
+                nf("cancelled", |_i, _args| Ok(Value::Bool(false))),
+            ),
+        ],
+    )
+}
+
+/// The cooperative `asyncio` shim. Semantics: every coroutine runs to
+/// completion at its force point, in program order. That preserves
+/// results for the dominant shapes (sequential awaits, `gather:` over
+/// independent calls, retries, timeouts) and turns genuinely
+/// interleaving-dependent programs (producer/consumer hand-off in the
+/// same gather) into a *loud* RuntimeError instead of a silent hang.
+fn make_asyncio_module() -> Value {
+    let task_group = nf("TaskGroup", |_i, _args| {
+        let tg = make_module("asyncio.TaskGroup", vec![]);
+        let tg_for_enter = tg.clone();
+        if let Value::Module(m) = &tg {
+            let mut members = m.members.borrow_mut();
+            members.insert(
+                "__aenter__".to_owned(),
+                Value::Native(Rc::new(NativeFn::new("__aenter__", move |_i, _args| {
+                    Ok(tg_for_enter.clone())
+                }))),
+            );
+            members.insert(
+                "__aexit__".to_owned(),
+                Value::Native(Rc::new(NativeFn::new("__aexit__", |_i, _args| {
+                    Ok(Value::Bool(false))
+                }))),
+            );
+            members.insert(
+                "create_task".to_owned(),
+                Value::Native(Rc::new(NativeFn::new("create_task", |i, args| {
+                    let coro = args
+                        .into_iter()
+                        .next()
+                        .ok_or_else(|| type_error("create_task() requires a coroutine"))?;
+                    let result = i.force_awaitable(coro)?;
+                    Ok(make_task_value(result))
+                }))),
+            );
+        }
+        Ok(tg)
+    });
+    let timeout_cm = nf("timeout", |_i, args| {
+        // Sequential execution can't interrupt the body mid-await, but the
+        // *observable* control flow converges with CPython by checking the
+        // wall clock at exit: a body that overran the budget raises
+        // TimeoutError there (after its side effects, unlike a real
+        // cancellation — documented divergence).
+        let budget = args.first().and_then(|v| v.to_float().ok()).unwrap_or(0.0);
+        let started = std::time::Instant::now();
+        let cm = make_module("asyncio.timeout", vec![]);
+        let cm_for_enter = cm.clone();
+        if let Value::Module(m) = &cm {
+            let mut members = m.members.borrow_mut();
+            members.insert(
+                "__aenter__".to_owned(),
+                Value::Native(Rc::new(NativeFn::new("__aenter__", move |_i, _args| {
+                    Ok(cm_for_enter.clone())
+                }))),
+            );
+            members.insert(
+                "__aexit__".to_owned(),
+                Value::Native(Rc::new(NativeFn::new("__aexit__", move |_i, args| {
+                    // Re-raising over an in-flight exception would mask it;
+                    // only convert a clean exit into TimeoutError.
+                    let body_raised = !matches!(args.first(), Some(Value::None) | None);
+                    if !body_raised && started.elapsed().as_secs_f64() > budget {
+                        return Err(Unwind::Exception(crate::error::VmException::new(
+                            "TimeoutError",
+                            "",
+                        )));
+                    }
+                    Ok(Value::Bool(false))
+                }))),
+            );
+        }
+        Ok(cm)
+    });
+    let queue = nf("Queue", |_i, args| Ok(make_asyncio_queue(&args, &[])));
+    make_module(
+        "asyncio",
+        vec![
+            (
+                "run",
+                nf("run", |i, args| {
+                    let coro = args
+                        .into_iter()
+                        .next()
+                        .ok_or_else(|| type_error("asyncio.run() requires a coroutine"))?;
+                    i.force_awaitable(coro)
+                }),
+            ),
+            (
+                "sleep",
+                nf("sleep", |_i, args| {
+                    if let Some(v) = args.first() {
+                        let secs = v.to_float().unwrap_or(0.0);
+                        if secs > 0.0 {
+                            std::thread::sleep(std::time::Duration::from_secs_f64(secs));
+                        }
+                    }
+                    Ok(Value::None)
+                }),
+            ),
+            (
+                "gather",
+                nf("gather", |i, args| {
+                    // Positional-only fast path (return_exceptions arrives
+                    // via the kwargs table in `call_with_kwargs`).
+                    let mut out: Vec<Value> = Vec::with_capacity(args.len());
+                    for coro in args {
+                        out.push(i.force_awaitable(coro)?);
+                    }
+                    Ok(Value::List(Rc::new(RefCell::new(out))))
+                }),
+            ),
+            (
+                "wait_for",
+                nf("wait_for", |i, args| {
+                    let coro = args
+                        .into_iter()
+                        .next()
+                        .ok_or_else(|| type_error("wait_for() requires a coroutine"))?;
+                    i.force_awaitable(coro)
+                }),
+            ),
+            ("TaskGroup", task_group),
+            ("timeout", timeout_cm),
+            ("Queue", queue),
+            (
+                "create_task",
+                nf("create_task", |i, args| {
+                    let coro = args
+                        .into_iter()
+                        .next()
+                        .ok_or_else(|| type_error("create_task() requires a coroutine"))?;
+                    let result = i.force_awaitable(coro)?;
+                    Ok(make_task_value(result))
+                }),
+            ),
+        ],
+    )
+}
+
+/// List-backed `asyncio.Queue`. `get` on an empty queue (or `put` past
+/// `maxsize`) would deadlock under sequential semantics — both raise a
+/// RuntimeError naming the fix instead of hanging.
+fn make_asyncio_queue(args: &[Value], kwargs: &[(String, Value)]) -> Value {
+    let maxsize: i64 = kwargs
+        .iter()
+        .find(|(k, _)| k == "maxsize")
+        .and_then(|(_, v)| v.to_int().ok())
+        .or_else(|| args.first().and_then(|v| v.to_int().ok()))
+        .unwrap_or(0);
+    let buf: Rc<RefCell<std::collections::VecDeque<Value>>> =
+        Rc::new(RefCell::new(std::collections::VecDeque::new()));
+    let q = make_module("asyncio.Queue", vec![]);
+    if let Value::Module(m) = &q {
+        let mut members = m.members.borrow_mut();
+        let b = buf.clone();
+        members.insert(
+            "put".to_owned(),
+            Value::Native(Rc::new(NativeFn::new("put", move |_i, args| {
+                if maxsize > 0 && b.borrow().len() as i64 >= maxsize {
+                    return Err(Unwind::Exception(crate::error::VmException::new(
+                        "RuntimeError",
+                        "asyncio.Queue.put on a full queue would deadlock under the VM's \
+                         sequential scheduler — run with `tyc run --compile` for real \
+                         concurrency",
+                    )));
+                }
+                let v = args.into_iter().next().unwrap_or(Value::None);
+                b.borrow_mut().push_back(v);
+                Ok(Value::None)
+            }))),
+        );
+        let b = buf.clone();
+        members.insert(
+            "put_nowait".to_owned(),
+            Value::Native(Rc::new(NativeFn::new("put_nowait", move |_i, args| {
+                let v = args.into_iter().next().unwrap_or(Value::None);
+                b.borrow_mut().push_back(v);
+                Ok(Value::None)
+            }))),
+        );
+        let b = buf.clone();
+        members.insert(
+            "get".to_owned(),
+            Value::Native(Rc::new(NativeFn::new("get", move |_i, _args| {
+                b.borrow_mut().pop_front().ok_or_else(|| {
+                    Unwind::Exception(crate::error::VmException::new(
+                        "RuntimeError",
+                        "asyncio.Queue.get on an empty queue would deadlock under the VM's \
+                         sequential scheduler — run with `tyc run --compile` for real \
+                         concurrency",
+                    ))
+                })
+            }))),
+        );
+        let b = buf.clone();
+        members.insert(
+            "get_nowait".to_owned(),
+            Value::Native(Rc::new(NativeFn::new("get_nowait", move |_i, _args| {
+                b.borrow_mut().pop_front().ok_or_else(|| {
+                    Unwind::Exception(crate::error::VmException::new(
+                        "QueueEmpty",
+                        "queue is empty",
+                    ))
+                })
+            }))),
+        );
+        let b = buf.clone();
+        members.insert(
+            "qsize".to_owned(),
+            Value::Native(Rc::new(NativeFn::new("qsize", move |_i, _args| {
+                Ok(Value::Int(num_bigint::BigInt::from(b.borrow().len() as i64)))
+            }))),
+        );
+        let b = buf.clone();
+        members.insert(
+            "empty".to_owned(),
+            Value::Native(Rc::new(NativeFn::new("empty", move |_i, _args| {
+                Ok(Value::Bool(b.borrow().is_empty()))
+            }))),
+        );
+    }
+    q
+}
+
 /// `collections.abc` shim — every abstract base name maps to an identity
 /// native. These names appear in annotations (evaluated at def time) and
 /// occasionally as bases; nothing in the VM dispatches through them.
@@ -3905,6 +4172,9 @@ pub fn set_is_frozen(s: &Rc<RefCell<std::collections::HashSet<HashKey>>>) -> boo
 /// dispatch table checks before mutating.
 fn deep_freeze_value(v: Value) -> Result<Value, Unwind> {
     match v {
+        Value::Coroutine(_) => Err(type_error(
+            "cannot freeze a coroutine object".to_string(),
+        )),
         Value::None
         | Value::Bool(_)
         | Value::Int(_)
@@ -7036,6 +7306,32 @@ pub fn call_with_kwargs(
             }
             Ok(acc)
         }
+        // asyncio.gather(..., return_exceptions=True): force each
+        // argument, catching exceptions into the result list.
+        "gather" => {
+            let return_exceptions = kwargs
+                .iter()
+                .find(|(k, _)| k == "return_exceptions")
+                .map(|(_, v)| v.truthy())
+                .unwrap_or(false);
+            let mut out: Vec<Value> = Vec::with_capacity(args.len());
+            for coro in args {
+                match interp.force_awaitable(coro) {
+                    Ok(v) => out.push(v),
+                    Err(Unwind::Exception(e)) if return_exceptions => {
+                        let v = e.value.clone().unwrap_or(Value::Exception {
+                            kind: Rc::new(e.kind.clone()),
+                            message: Rc::new(e.message.clone()),
+                            args: Rc::new(vec![Value::Str(Rc::new(e.message.clone()))]),
+                        });
+                        out.push(v);
+                    }
+                    Err(other) => return Err(other),
+                }
+            }
+            Ok(Value::List(Rc::new(RefCell::new(out))))
+        }
+        "Queue" => Ok(make_asyncio_queue(&args, kwargs)),
         // Instance-field natives that parse their own kwargs via the
         // sentinel (`split_kwargs`): forward and let the body peel it.
         "mkdir" => {
