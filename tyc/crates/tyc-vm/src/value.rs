@@ -67,6 +67,33 @@ pub enum HashKey {
     },
 }
 
+/// When `v` is a member of an enum class that mixes in a value type
+/// (`StrEnum`, `IntEnum`, `IntFlag` — detected by walking the base chain
+/// for the VM's `__typhon_enum_base__`-tagged marker classes of those
+/// names), return the member's underlying `value`. CPython makes such
+/// members genuine `str` / `int` subclasses, so equality, ordering,
+/// hashing, and `str()` all flow through the value; plain `Enum` members
+/// intentionally return `None` here (`Color.RED == 1` is False).
+pub fn enum_mixin_value(v: &Value) -> Option<Value> {
+    fn mixin_base(class: &Rc<Class>) -> bool {
+        let is_marker = class
+            .class_attrs
+            .borrow()
+            .contains_key("__typhon_enum_base__")
+            && matches!(class.name.as_str(), "StrEnum" | "IntEnum" | "IntFlag");
+        if is_marker {
+            return true;
+        }
+        class.bases.iter().any(mixin_base)
+    }
+    if let Value::Instance(inst) = v {
+        if mixin_base(&inst.class) {
+            return inst.fields.borrow().get("value").cloned();
+        }
+    }
+    None
+}
+
 /// Canonical, hashable projection of a dataclass instance: the class
 /// identity, name, and the fields sorted by name with each value lowered
 /// to a `HashKey`. Drives `Eq` / `Hash` / ordering for `HashKey::Instance`.
@@ -286,6 +313,12 @@ pub enum Value {
     ResultErr(Box<Value>),
     /// A module — a namespace dictionary.
     Module(Rc<Module>),
+    /// A *deferred* call to an `async def` — created when the function is
+    /// called, executed when awaited (matching CPython, where a coroutine's
+    /// body doesn't run until it's driven). The VM executes coroutines
+    /// sequentially at force points (`await`, `asyncio.run`, `gather`,
+    /// `TaskGroup.create_task`, `spawn`).
+    Coroutine(Rc<CoroutineThunk>),
     /// An exception instance — held when a Python-style `except X as e` binds it.
     /// `message` is the str-form of the first arg (kept for cheap display);
     /// `args` is the full constructor argument tuple so `e.args` and the
@@ -346,6 +379,11 @@ pub struct Function {
     /// Closure scope captured at def-time.
     pub closure: crate::env::EnvRef,
     pub is_async: bool,
+    /// The source the function was defined in, captured at def time so
+    /// traceback frames (and the statement offsets recorded while the body
+    /// runs) attribute to the right file when a function defined in one
+    /// module is called from another.
+    pub source: Option<std::rc::Rc<crate::interp::SourceInfo>>,
 }
 
 pub struct Class {
@@ -386,6 +424,15 @@ impl fmt::Debug for Instance {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", instance_repr(self))
     }
+}
+
+pub struct CoroutineThunk {
+    pub function: Rc<Function>,
+    pub args: std::cell::RefCell<Vec<Value>>,
+    pub kwargs: Vec<(String, Value)>,
+    pub receiver: Option<Value>,
+    /// A coroutine runs at most once (CPython raises on re-await).
+    pub forced: std::cell::Cell<bool>,
 }
 
 pub struct Module {
@@ -499,6 +546,7 @@ impl fmt::Debug for Value {
             Value::ResultOk(v) => write!(f, "Ok(value={:?})", v),
             Value::ResultErr(v) => write!(f, "Err(error={:?})", v),
             Value::Module(m) => write!(f, "<module {}>", m.name),
+            Value::Coroutine(c) => write!(f, "<coroutine {}>", c.function.name),
             Value::Exception {
                 kind,
                 message,
@@ -548,6 +596,7 @@ impl Value {
             Value::ResultOk(_) => "Ok",
             Value::ResultErr(_) => "Err",
             Value::Module(_) => "module",
+            Value::Coroutine(_) => "coroutine",
             Value::Exception { .. } => "Exception",
             Value::Iter(_) => "iterator",
             Value::DictView { kind, .. } => match kind {
@@ -646,6 +695,13 @@ impl Value {
             // CPython but makes frozen-instance dict/set keys work. Equal
             // fields ⇒ equal key ⇒ `p2 in seen` is True.
             Value::Instance(inst) => {
+                // Value-mixin enum members (`StrEnum` / `IntEnum`) hash as
+                // their underlying value so `{"active": 1}[Status.ACTIVE]`
+                // works exactly as it does under CPython (where the member
+                // IS a str / int subclass).
+                if let Some(v) = enum_mixin_value(self) {
+                    return v.to_hash_key();
+                }
                 let mut fields: Vec<(String, HashKey)> = Vec::new();
                 for (name, v) in inst.fields.borrow().iter() {
                     fields.push((name.clone(), v.to_hash_key()?));
@@ -989,6 +1045,7 @@ impl Value {
             Value::ResultOk(v) => format!("Ok(value={})", v.py_repr()),
             Value::ResultErr(v) => format!("Err(error={})", v.py_repr()),
             Value::Module(m) => format!("<module '{}'>", m.name),
+            Value::Coroutine(c) => format!("<coroutine object {}>", c.function.name),
             Value::Exception {
                 kind,
                 message,

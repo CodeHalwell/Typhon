@@ -414,6 +414,15 @@ pub fn assignable(expected: &Type, actual: &Type) -> bool {
             if *ev && ep.is_empty() {
                 return assignable(er, ar);
             }
+            // A variadic actual (defaults / *args / **kwargs) can absorb
+            // any call shape with at least its required parameters — a
+            // `lambda x, y=0: ...` satisfies `Callable[[int, int], R]`.
+            if *_av {
+                if ap.len() <= ep.len() {
+                    return ep.iter().zip(ap).all(|(e, a)| assignable(a, e)) && assignable(er, ar);
+                }
+                return false;
+            }
             if ep.len() != ap.len() {
                 return false;
             }
@@ -1270,6 +1279,133 @@ fn literal_widened_type(expr: &Expr) -> Type {
     }
 }
 
+/// Try to resolve a quoted annotation's content as a forward-referenced
+/// type expression. Returns `None` when the content doesn't look like a
+/// type (so the caller keeps `Type::LitStr` — Typhon's literal-singleton
+/// union form `type Color = "red" | "green"` must keep working).
+///
+/// Resolution requires the *head* of the expression to be provably
+/// type-shaped: a known class, a type parameter, a builtin / prelude type
+/// name, a subscript over one of those (`Tree[T]`, `list[Node]`), a
+/// dotted attribute (`mod.Class`), or a `|` union whose sides resolve.
+/// A bare unknown identifier stays a string literal.
+fn quoted_forward_ref_type(
+    content: &str,
+    classes: &[String],
+    type_params: &[String],
+) -> Option<Type> {
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    // Typhon's `T?` sugar survives inside quotes (the preprocessor can't
+    // see into string literals), so handle one trailing `?` here.
+    let (inner, nullable) = match trimmed.strip_suffix('?') {
+        Some(rest) => (rest.trim_end(), true),
+        None => (trimmed, false),
+    };
+    if inner.is_empty() {
+        return None;
+    }
+    let parsed = tyc_syntax::parse_expression(inner).ok()?;
+    let expr = &parsed.syntax().body;
+    if !expr_is_type_shaped(expr, classes, type_params) {
+        return None;
+    }
+    let mut t = type_from_annotation_with_params(expr, classes, type_params);
+    if nullable {
+        t = Type::optional(t);
+    }
+    Some(t)
+}
+
+/// Conservative "is this expression a type reference?" test backing
+/// [`quoted_forward_ref_type`]. Bare names must be a known class, type
+/// parameter, or recognised builtin/prelude type name; structured forms
+/// recurse.
+fn expr_is_type_shaped(expr: &Expr, classes: &[String], type_params: &[String]) -> bool {
+    const KNOWN_TYPE_HEADS: &[&str] = &[
+        "int",
+        "str",
+        "bool",
+        "float",
+        "bytes",
+        "complex",
+        "object",
+        "type",
+        "list",
+        "dict",
+        "set",
+        "frozenset",
+        "tuple",
+        "range",
+        "bytearray",
+        "memoryview",
+        "None",
+        "Any",
+        "Self",
+        "Optional",
+        "Union",
+        "Literal",
+        "Callable",
+        "Iterable",
+        "Iterator",
+        "Sequence",
+        "Mapping",
+        "MutableMapping",
+        "MutableSequence",
+        "MutableSet",
+        "AbstractSet",
+        "Collection",
+        "Container",
+        "Reversible",
+        "Hashable",
+        "Sized",
+        "Awaitable",
+        "Coroutine",
+        "Generator",
+        "AsyncIterator",
+        "AsyncIterable",
+        "AsyncGenerator",
+        "ContextManager",
+        "AsyncContextManager",
+        "KeysView",
+        "ValuesView",
+        "ItemsView",
+        "Final",
+        "ClassVar",
+        "Annotated",
+        "Result",
+        "Ok",
+        "Err",
+        "Counter",
+        "OrderedDict",
+        "defaultdict",
+        "deque",
+        "Path",
+    ];
+    match expr {
+        Expr::Name(n) => {
+            let name = n.id.as_str();
+            classes.iter().any(|c| c == name)
+                || type_params.iter().any(|p| p == name)
+                || KNOWN_TYPE_HEADS.contains(&name)
+        }
+        Expr::NoneLiteral(_) => true,
+        // `mod.Class` — trust dotted references (string literals never
+        // contain dots-as-attribute-access in the literal-union form).
+        Expr::Attribute(_) => true,
+        // `Head[...]` — the head must itself be type-shaped.
+        Expr::Subscript(s) => expr_is_type_shaped(&s.value, classes, type_params),
+        // `A | B` — both sides must be type-shaped.
+        Expr::BinOp(b) if matches!(b.op, Operator::BitOr) => {
+            expr_is_type_shaped(&b.left, classes, type_params)
+                && expr_is_type_shaped(&b.right, classes, type_params)
+        }
+        _ => false,
+    }
+}
+
 /// Same as [`type_from_annotation`] but treats every name in `type_params`
 /// as `Type::Any` so that PEP 695 generic functions don't trip the
 /// assignability check before we have a real inference engine.
@@ -1279,12 +1415,19 @@ pub fn type_from_annotation_with_params(
     type_params: &[String],
 ) -> Type {
     match expr {
-        // String-literal singletons in type position — e.g.
-        // `type Color = "red" | "green" | "blue"`. The BitOr arm below
-        // recurses through this case for each disjunct, so each literal
-        // becomes a `Type::LitStr` slot in the resulting `Type::Union`.
-        // FINDINGS v0.7.1 #13.
-        Expr::StringLiteral(s) => Type::LitStr(s.value.to_str().to_owned()),
+        // A quoted annotation is a *forward reference* in Python
+        // (`next: "Node"`, `-> "Tree[T]"`, `"list[Node]"`), and Python
+        // developers write the quotes reflexively. Resolve the content as
+        // a type expression whenever it names something type-shaped;
+        // otherwise keep the string-literal-singleton semantics that
+        // back Typhon's `type Color = "red" | "green"` form.
+        Expr::StringLiteral(s) => {
+            let content = s.value.to_str();
+            if let Some(t) = quoted_forward_ref_type(content, classes, type_params) {
+                return t;
+            }
+            Type::LitStr(content.to_owned())
+        }
         Expr::Name(n) => match n.id.as_str() {
             "int" => Type::Int,
             "str" => Type::Str,
@@ -1986,6 +2129,12 @@ struct Checker<'a> {
     /// Sealed union declarations: name → ordered list of variant class names.
     /// Populated from `type Foo = A | B | C` statements in the first pass.
     sealed_unions: HashMap<String, Vec<String>>,
+    /// Enum declarations: class name → ordered member names. Populated for
+    /// every class whose base is an enum-family name (the `enum Name:`
+    /// keyword desugars to `class Name(enum.Enum):`). Drives exhaustive
+    /// `match` over enum members — the member set is closed, exactly like
+    /// a sealed union's variant set.
+    enums: HashMap<String, Vec<String>>,
     /// Transparent type-alias declarations: name → (type-parameter names,
     /// RHS type). Populated from every `type X = ...` statement, including
     /// the sealed-union ones (so an alias to `A | B | C` is *both* a sealed
@@ -2334,6 +2483,7 @@ impl<'a> Checker<'a> {
             unsafe_origin_bindings: HashMap::new(),
             unsafe_line_starts: Vec::new(),
             sealed_unions: HashMap::new(),
+            enums: HashMap::new(),
             type_aliases: HashMap::new(),
             newtypes: HashMap::new(),
             env: TypeEnv::default(),
@@ -2538,6 +2688,36 @@ impl<'a> Checker<'a> {
             {
                 return true;
             }
+        }
+        // Structural conformance for *generic* interfaces:
+        // `MemRepo[int]` satisfies `interface Repo[T]` instantiated as
+        // `Repo[int]` when the class structurally conforms and the type
+        // arguments line up pairwise. Mixed arities (bare class into a
+        // generic interface, generic class into a bare interface) fall
+        // back to head-level conformance — same under-approximation
+        // precedent as the parametric sealed-union arm below.
+        match (expected, actual) {
+            (Type::Generic(exp_name, exp_args), Type::Generic(act_name, act_args)) => {
+                if self.interfaces.contains_key(exp_name.as_str())
+                    && self.class_conforms_to_interface(act_name, exp_name)
+                    && exp_args.len() == act_args.len()
+                    && exp_args
+                        .iter()
+                        .zip(act_args)
+                        .all(|(e, a)| self.is_assignable(e, a))
+                {
+                    return true;
+                }
+            }
+            (Type::Generic(exp_name, _), Type::Class(act_name))
+            | (Type::Class(exp_name), Type::Generic(act_name, _)) => {
+                if self.interfaces.contains_key(exp_name.as_str())
+                    && self.class_conforms_to_interface(act_name, exp_name)
+                {
+                    return true;
+                }
+            }
+            _ => {}
         }
         // Parametric variant → parametric sealed-union: `Cons` /
         // `Cons[T]` into `LinkedList[T]`. The variant name is looked up
@@ -3976,6 +4156,7 @@ pub fn check_module_with_imports(
     // First pass: collect class names + function signatures so forward
     // references work.
     collect_classes_and_functions(&mut c, &module.body);
+    check_override_compatibility(&mut c, &module.body);
     populate_frozen_classes(&mut c, &module.body, &frozen_starts);
     // Cross-function field-init audit pre-pass: identify helper
     // functions whose body is `return X.__new__(X)` (or
@@ -5064,23 +5245,24 @@ fn check_resource_discipline_stmt(c: &mut Checker, stmt: &Stmt) {
 /// header.
 fn detect_cyclic_type_aliases(c: &mut Checker, body: &[Stmt]) {
     use std::collections::HashMap;
-    // Build `name -> set of alias names the RHS references`. We only
-    // chase plain `Name` and `Generic` heads — nothing else can introduce
-    // a self-referential alias cycle.
+    // Build `name -> set of alias names the RHS references through
+    // *unguarded* positions`. A reference inside a type constructor's
+    // argument list (`list[Json]`, `dict[str, Json]`) is GUARDED —
+    // recursion through it is productive and legal (PEP 695 aliases are
+    // lazily evaluated; `type Json = str | list[Json]` is the canonical
+    // recursive-JSON shape). Only a cycle composed entirely of unguarded
+    // edges (`type A = B`, `type B = A`, or `type A = A | int`) has no
+    // base case and is an error.
     fn collect_referenced_aliases(expr: &Expr, into: &mut std::collections::HashSet<String>) {
         match expr {
             Expr::Name(n) => {
                 into.insert(n.id.as_str().to_owned());
             }
             Expr::Subscript(s) => {
+                // Only the HEAD of a subscript is unguarded (`A[int]`
+                // names `A` directly); everything inside the slice is
+                // behind the constructor and therefore guarded.
                 collect_referenced_aliases(&s.value, into);
-                if let Expr::Tuple(t) = s.slice.as_ref() {
-                    for elt in &t.elts {
-                        collect_referenced_aliases(elt, into);
-                    }
-                } else {
-                    collect_referenced_aliases(&s.slice, into);
-                }
             }
             Expr::BinOp(b) => {
                 collect_referenced_aliases(&b.left, into);
@@ -5340,6 +5522,27 @@ fn collect_classes_and_functions(c: &mut Checker, body: &[Stmt]) {
                 );
             }
             c.class_shapes.insert(name.clone(), shape);
+            // Enum classes (`enum Name:` desugars to `class Name(enum.Enum):`)
+            // get their member list recorded — the closed member set powers
+            // exhaustive `match` the same way sealed-union variants do.
+            if class_has_enum_family_base(cd) {
+                let members: Vec<String> = cd
+                    .body
+                    .iter()
+                    .filter_map(|s| match s {
+                        Stmt::Assign(a) => match a.targets.first() {
+                            Some(Expr::Name(n)) if !n.id.as_str().starts_with('_') => {
+                                Some(n.id.as_str().to_owned())
+                            }
+                            _ => None,
+                        },
+                        _ => None,
+                    })
+                    .collect();
+                if !members.is_empty() {
+                    c.enums.insert(name.clone(), members);
+                }
+            }
             // Track `self.NAME = ...` attributes from this class's method
             // bodies so reads of body-initialised attributes resolve.
             let attrs = collect_self_assigned_attrs(cd);
@@ -5355,6 +5558,43 @@ fn collect_classes_and_functions(c: &mut Checker, body: &[Stmt]) {
             }
         }
     }
+    // Names bound by module-level imports. An `extend Foo:` whose target
+    // arrives via `from pkg.mod import Foo` (cross-module extend) is valid —
+    // the desugar pass lowers it to class-attribute patches — so it must
+    // not fire `impl_unknown_class` just because `Foo` isn't declared in
+    // this file. (The project-wide check path also merges the method into
+    // the imported shape, so call sites still type-check.)
+    let imported_names: HashSet<String> = body
+        .iter()
+        .flat_map(|stmt| -> Vec<String> {
+            match stmt {
+                Stmt::ImportFrom(i) => i
+                    .names
+                    .iter()
+                    .map(|a| {
+                        a.asname
+                            .as_ref()
+                            .map(|n| n.as_str().to_owned())
+                            .unwrap_or_else(|| a.name.as_str().to_owned())
+                    })
+                    .collect(),
+                Stmt::Import(i) => i
+                    .names
+                    .iter()
+                    .map(|a| {
+                        a.asname
+                            .as_ref()
+                            .map(|n| n.as_str().to_owned())
+                            .unwrap_or_else(|| {
+                                // `import a.b.c` binds the first segment.
+                                a.name.as_str().split('.').next().unwrap_or("").to_owned()
+                            })
+                    })
+                    .collect(),
+                _ => Vec::new(),
+            }
+        })
+        .collect();
     // Second pass (continued): fold `impl ClassName:` and `extend ClassName:`
     // contributions into the target class's shape. The preprocessor rewrites
     // both forms into a pseudo-class named `__typhon_impl_ClassName`; methods
@@ -5492,6 +5732,13 @@ fn collect_classes_and_functions(c: &mut Checker, body: &[Stmt]) {
                                 .or_insert_with(|| ty.clone());
                         }
                     }
+                } else if imported_names.contains(target) {
+                    // Cross-module `extend Foo:` — the target class is
+                    // imported, not declared here. The desugar pass lowers
+                    // the block to module-level class-attribute patches;
+                    // when the project-wide shape registry knows the class,
+                    // the merge into its shape happened there. Either way
+                    // this is a legal form, not an unknown class.
                 } else {
                     // FINDINGS #78: `impl UnknownClass:` silently produced
                     // dead code. Anchor the diagnostic on the class-name
@@ -6741,6 +6988,34 @@ fn infer_expr_readonly(c: &Checker, e: &Expr) -> Type {
                 _ => Type::Unknown,
             }
         }
+        // `items[i]` — element type of the container, so a `match` over a
+        // subscripted sealed-union slot (`match history[-1]:`) sees the
+        // union and the DA exhaustiveness pass can run (previously the
+        // subject typed as Unknown and every exhaustive match over a
+        // subscript fired missing_return).
+        Expr::Subscript(s) => {
+            let recv = infer_expr_readonly(c, &s.value);
+            match recv {
+                Type::Generic(name, args) => match name.as_str() {
+                    "list" | "Sequence" | "MutableSequence" | "deque" | "set" | "frozenset"
+                    | "Iterable" | "Iterator"
+                        if args.len() == 1 =>
+                    {
+                        args[0].clone()
+                    }
+                    "dict" | "Mapping" | "MutableMapping" | "defaultdict" | "OrderedDict"
+                        if args.len() == 2 =>
+                    {
+                        args[1].clone()
+                    }
+                    "tuple" if !args.is_empty() && args.iter().all(|a| a == &args[0]) => {
+                        args[0].clone()
+                    }
+                    _ => Type::Unknown,
+                },
+                _ => Type::Unknown,
+            }
+        }
         _ => Type::Unknown,
     }
 }
@@ -7829,8 +8104,30 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                 check_pattern_class_fields(c, &case.pattern);
                 // Enter scope and bind pattern names FIRST so guard expressions
                 // (e.g. `case Circle(radius=r) if r > 0:`) can reference them.
+                // A class pattern narrows the *subject variable* inside the
+                // arm (`match step: case Action(_, _): use(step)` sees
+                // `step: Action`) — matching mypy / pyright. The snapshot is
+                // taken BEFORE entering the arm scope and restored AFTER
+                // leaving it, so the narrowing (which mutates the subject's
+                // outer binding in place) stays scoped to this arm.
+                //
+                // Gate: only narrow when the narrowed type provably flows
+                // back into the subject's current type. When the union is
+                // imported and opaque (single-file check of one module of a
+                // project), narrowing would *break* passing the subject to
+                // a `Command`-typed parameter — staying un-narrowed is the
+                // sound conservative choice there.
+                let narrow_to = match m.subject.as_ref() {
+                    Expr::Name(_) => pattern_narrowed_type(&case.pattern)
+                        .filter(|t| c.is_assignable(&subject_type, t)),
+                    _ => None,
+                };
+                let snap = narrow_to.as_ref().map(|_| c.env.snapshot());
                 c.env.enter();
                 bind_pattern_names(c, &case.pattern);
+                if let (Expr::Name(subj), Some(t)) = (m.subject.as_ref(), narrow_to) {
+                    c.env.narrow(subj.id.as_str(), t);
+                }
                 if let Some(guard) = &case.guard {
                     let _ = infer_expr(c, guard);
                 }
@@ -7838,15 +8135,27 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                     check_stmt(c, s);
                 }
                 c.env.leave();
+                if let Some(snap) = snap {
+                    c.env.restore(snap);
+                }
             }
-            // Exhaustiveness check: only applies to sealed unions.
+            // Exhaustiveness check: sealed unions and enums (both are
+            // closed sets).
             if let Type::Class(ref union_name) = subject_type {
+                let subject_span = (
+                    m.subject.range().start().to_usize(),
+                    m.subject.range().end().to_usize(),
+                );
                 if let Some(variants) = c.sealed_unions.get(union_name.as_str()).cloned() {
-                    let subject_span = (
-                        m.subject.range().start().to_usize(),
-                        m.subject.range().end().to_usize(),
-                    );
                     check_match_exhaustiveness(c, &m.cases, union_name, &variants, subject_span);
+                } else if let Some(members) = c.enums.get(union_name.as_str()).cloned() {
+                    check_enum_match_exhaustiveness(
+                        c,
+                        &m.cases,
+                        union_name,
+                        &members,
+                        subject_span,
+                    );
                 }
             }
         }
@@ -8757,6 +9066,26 @@ fn match_is_exhaustive_for_da(c: &Checker, subject: &Expr, cases: &[MatchCase]) 
     }
     // (b) sealed-union subject with full variant coverage.
     let subject_ty = infer_expr_readonly(c, subject);
+    // (b') enum subject: every member covered by `case Enum.MEMBER:` arms
+    // means no implicit fall-through — the member set is closed.
+    if let Type::Class(name) = &subject_ty {
+        if let Some(members) = c.enums.get(name.as_str()) {
+            let mut covered: HashSet<String> = HashSet::new();
+            let mut all_classified = true;
+            for case in cases {
+                if case.guard.is_some() {
+                    continue;
+                }
+                if !enum_pattern_covered_members(&case.pattern, name, &mut covered) {
+                    all_classified = false;
+                    break;
+                }
+            }
+            if all_classified && members.iter().all(|m| covered.contains(m)) {
+                return true;
+            }
+        }
+    }
     let union_variants: Vec<String> = match &subject_ty {
         Type::Class(name) => c
             .sealed_unions
@@ -9328,6 +9657,27 @@ fn match_subject_type(c: &Checker, m: &ruff_python_ast::StmtMatch) -> Option<Typ
 fn cases_cover_type(c: &Checker, cases: &[MatchCase], ty: &Type) -> bool {
     if let Type::Union(variants) = ty {
         return variants.iter().all(|v| cases_cover_type(c, cases, v));
+    }
+    // An enum subject's member set is closed: guardless
+    // `case Enum.MEMBER:` arms covering every member are exhaustive.
+    if let Type::Class(name) = ty {
+        if let Some(members) = c.enums.get(name.as_str()) {
+            let mut covered: HashSet<String> = HashSet::new();
+            for case in cases {
+                if case.guard.is_some() {
+                    continue;
+                }
+                if is_wildcard_pattern(&case.pattern) {
+                    return true;
+                }
+                // Unclassifiable arms are ignored for coverage (they can
+                // only add coverage we can't prove, never remove it).
+                let _ = enum_pattern_covered_members(&case.pattern, name, &mut covered);
+            }
+            if members.iter().all(|m| covered.contains(m)) {
+                return true;
+            }
+        }
     }
     // Fixed-arity tuple subject (`tuple[int, str]` → `Generic("tuple", [..])`).
     // Its length is statically known, so a guardless sequence pattern of the
@@ -9932,6 +10282,11 @@ fn is_builtin_generic_head(head: &str) -> bool {
     matches!(
         head,
         "list" | "dict" | "set" | "tuple" | "str" | "bytes" | "frozenset"
+        // The Result family is Typhon's own closed surface — an unknown
+        // method on Ok/Err/Result is always a runtime AttributeError, so
+        // flag it at check time (closes the `.unwrap()`-before-it-existed
+        // false negative).
+        | "Result" | "Ok" | "Err"
     )
 }
 
@@ -9955,6 +10310,23 @@ fn is_user_builtin_extension(c: &Checker, head: &str, attr: &str) -> bool {
 /// FINDINGS v0.7.1 #1.
 fn is_known_builtin_generic_attr(head: &str, attr: &str) -> bool {
     match head {
+        "Result" | "Ok" | "Err" => matches!(
+            attr,
+            "value"
+                | "error"
+                | "map"
+                | "map_err"
+                | "and_then"
+                | "or_else"
+                | "unwrap"
+                | "expect"
+                | "unwrap_or"
+                | "unwrap_or_else"
+                | "ok"
+                | "err"
+                | "is_ok"
+                | "is_err"
+        ),
         "list" => matches!(
             attr,
             "append"
@@ -10268,6 +10640,88 @@ fn builtin_generic_method(recv: &Type, attr: &str) -> Option<Type> {
                 "Result".into(),
                 vec![Type::Unknown, Type::Unknown],
             )),
+            variadic: false,
+        }),
+        // Unwrap family (R-API). The receiver's static type narrows the
+        // return as far as possible:
+        //   Ok[T].unwrap() / .expect(m) / .unwrap_or(d) / .unwrap_or_else(f) → T
+        //   Ok[T].ok() → T?            Ok[_].err() → None
+        //   Err[E].err() → E           Err[_].ok() → None
+        //   Result[T, E].unwrap()/expect/unwrap_or/unwrap_or_else → T
+        //   Result[T, E].ok() → T?     Result[T, E].err() → E?
+        //   is_ok() / is_err() → bool on all three.
+        ("Ok", "unwrap", [t]) | ("Result", "unwrap", [t, _]) => Some(Type::Function {
+            params: vec![],
+            ret: Box::new(t.clone()),
+            variadic: false,
+        }),
+        ("Ok", "expect", [t]) | ("Result", "expect", [t, _]) => Some(Type::Function {
+            params: vec![Type::Str],
+            ret: Box::new(t.clone()),
+            variadic: false,
+        }),
+        ("Ok", "unwrap_or", [t]) | ("Result", "unwrap_or", [t, _]) => Some(Type::Function {
+            params: vec![t.clone()],
+            ret: Box::new(t.clone()),
+            variadic: false,
+        }),
+        ("Ok", "unwrap_or_else", [t]) | ("Result", "unwrap_or_else", [t, _]) => {
+            Some(Type::Function {
+                params: vec![Type::Unknown],
+                ret: Box::new(t.clone()),
+                variadic: false,
+            })
+        }
+        ("Ok", "ok", [t]) | ("Result", "ok", [t, _]) => Some(Type::Function {
+            params: vec![],
+            ret: Box::new(Type::optional(t.clone())),
+            variadic: false,
+        }),
+        ("Ok", "err", [_t]) => Some(Type::Function {
+            params: vec![],
+            ret: Box::new(Type::None),
+            variadic: false,
+        }),
+        // `unwrap()` takes no arguments even on a statically-known Err
+        // (it always raises); `expect` takes exactly the message.
+        ("Err", "unwrap", [_e]) => Some(Type::Function {
+            params: vec![],
+            ret: Box::new(Type::Unknown),
+            variadic: false,
+        }),
+        ("Err", "expect", [_e]) => Some(Type::Function {
+            params: vec![Type::Str],
+            ret: Box::new(Type::Unknown),
+            variadic: false,
+        }),
+        ("Err", "unwrap_or", [_e]) | ("Err", "unwrap_or_else", [_e]) => Some(Type::Function {
+            params: vec![Type::Unknown],
+            ret: Box::new(Type::Unknown),
+            variadic: false,
+        }),
+        ("Err", "ok", [_e]) => Some(Type::Function {
+            params: vec![],
+            ret: Box::new(Type::None),
+            variadic: false,
+        }),
+        ("Err", "err", [e]) => Some(Type::Function {
+            params: vec![],
+            ret: Box::new(e.clone()),
+            variadic: false,
+        }),
+        ("Result", "err", [_t, e]) => Some(Type::Function {
+            params: vec![],
+            ret: Box::new(Type::optional(e.clone())),
+            variadic: false,
+        }),
+        ("Ok", "is_ok", _)
+        | ("Ok", "is_err", _)
+        | ("Err", "is_ok", _)
+        | ("Err", "is_err", _)
+        | ("Result", "is_ok", _)
+        | ("Result", "is_err", _) => Some(Type::Function {
+            params: vec![],
+            ret: Box::new(Type::Bool),
             variadic: false,
         }),
         // Mapping views — preserve the element type (with `?`) so iterating
@@ -10608,6 +11062,42 @@ fn subscript_element_type(ty: &Type) -> Option<Type> {
     }
 }
 
+/// Resolve the element expectation a container literal should push into
+/// its members: unwrap aliases on the expected type and, when the result
+/// is a union, pick the single member with the requested head and arity.
+/// This is what lets `let doc: Json = {...}` (where `type Json = ... |
+/// list[Json] | dict[str, Json]`) type-check — the literal's values are
+/// inferred against `Json` rather than joined into a one-off union that
+/// invariance then rejects. Returns `None` when the expectation is
+/// absent, not container-shaped, or ambiguous (two members with the
+/// same head).
+fn container_expectation(
+    c: &Checker,
+    expected: Option<&Type>,
+    head: &str,
+    arity: usize,
+) -> Option<Vec<Type>> {
+    let exp = c.unwrap_alias(expected?);
+    match exp {
+        Type::Generic(h, a) if h == head && a.len() == arity => Some(a),
+        Type::Union(vs) => {
+            let mut hit: Option<Vec<Type>> = None;
+            for v in vs {
+                if let Type::Generic(h, a) = v {
+                    if h == head && a.len() == arity {
+                        if hit.is_some() {
+                            return None; // ambiguous — don't guess
+                        }
+                        hit = Some(a);
+                    }
+                }
+            }
+            hit
+        }
+        _ => None,
+    }
+}
+
 /// Infer the type of `expr`, optionally with an expected target type
 /// (the annotation on the enclosing `let`, the function's declared
 /// return type, or a generic parameter's formal type).  Most arms
@@ -10648,6 +11138,39 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
         }
         Expr::BytesLiteral(_) => Type::Bytes,
         Expr::NoneLiteral(_) => Type::None,
+        // Lambdas carry their *arity* into the type so a call site
+        // expecting `Callable[[int, int], int]` rejects `lambda x: x`
+        // at check time instead of TypeError-ing at runtime. Parameter
+        // and return types stay `Unknown` (no annotations on lambdas);
+        // defaults or `*args` / `**kwargs` mark the function variadic so
+        // optional-argument lambdas keep matching any arity.
+        Expr::Lambda(lam) => {
+            let (n, variadic) = match lam.parameters.as_deref() {
+                Some(p) => {
+                    let required = p
+                        .posonlyargs
+                        .iter()
+                        .chain(p.args.iter())
+                        .filter(|a| a.default.is_none())
+                        .count();
+                    let has_optional = p
+                        .posonlyargs
+                        .iter()
+                        .chain(p.args.iter())
+                        .any(|a| a.default.is_some());
+                    (
+                        required,
+                        has_optional || p.vararg.is_some() || p.kwarg.is_some(),
+                    )
+                }
+                None => (0, false),
+            };
+            Type::Function {
+                params: vec![Type::Unknown; n],
+                ret: Box::new(Type::Unknown),
+                variadic,
+            }
+        }
         Expr::Name(n) => {
             if let Some(b) = c.env.lookup(n.id.as_str()) {
                 b.narrowed.clone()
@@ -12284,12 +12807,13 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
                 return Type::Generic("list".into(), vec![Type::Unknown]);
             }
             // Non-empty literal: infer the element type from the union of
-            // the elements'. If we have an expected `list[E]`, propagate `E`
-            // into each element so nested literals (`[[]]`) can converge.
-            let elt_expected = match expected {
-                Some(Type::Generic(h, a)) if h == "list" && a.len() == 1 => Some(&a[0]),
-                _ => None,
-            };
+            // the elements'. If we have an expected `list[E]` — directly,
+            // through an alias, or as the single list member of an expected
+            // union (recursive `Json`-style aliases) — propagate `E` into
+            // each element so nested literals converge.
+            let elt_expected_owned: Option<Type> =
+                container_expectation(c, expected, "list", 1).map(|mut a| a.remove(0));
+            let elt_expected = elt_expected_owned.as_ref();
             let elts: Vec<Type> = l
                 .elts
                 .iter()
@@ -12359,13 +12883,17 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
                     return class_ty;
                 }
             }
-            // Tease apart key/value expected types from `dict[K, V]`.
-            let (key_expected, val_expected) = match expected {
-                Some(Type::Generic(h, a)) if h == "dict" && a.len() == 2 => {
-                    (Some(&a[0]), Some(&a[1]))
-                }
-                _ => (None, None),
-            };
+            // Tease apart key/value expected types from `dict[K, V]` —
+            // directly, through an alias, or as the single dict member of
+            // an expected union (recursive `Json`-style aliases).
+            let kv_expected: Option<(Type, Type)> = container_expectation(c, expected, "dict", 2)
+                .map(|mut a| {
+                    let v = a.remove(1);
+                    let k = a.remove(0);
+                    (k, v)
+                });
+            let key_expected = kv_expected.as_ref().map(|(k, _)| k);
+            let val_expected = kv_expected.as_ref().map(|(_, v)| v);
             if d.items.is_empty() {
                 if let (Some(k), Some(v)) = (key_expected, val_expected) {
                     return Type::Generic("dict".into(), vec![k.clone(), v.clone()]);
@@ -13040,6 +13568,260 @@ fn check_match_exhaustiveness(
     if !missing.is_empty() {
         let missing_str = missing.join(", ");
         c.non_exhaustive_match(union_name, &missing_str, subject_span);
+    }
+}
+
+/// The type a class pattern narrows its match subject to inside the arm:
+/// `case Action(...)` → `Action`; `case A() | B()` → `A | B`;
+/// `case Action() as a` → `Action`. Returns `None` for patterns that
+/// don't pin down a class (wildcards, captures, literals, sequences,
+/// mappings) — the subject keeps its declared type in those arms.
+fn pattern_narrowed_type(pattern: &Pattern) -> Option<Type> {
+    match pattern {
+        Pattern::MatchClass(mc) => match mc.cls.as_ref() {
+            Expr::Name(n) => Some(match n.id.as_str() {
+                // Builtin class patterns narrow to the builtin type, not a
+                // nominal `Class("str")` (which nothing else unifies with).
+                "str" => Type::Str,
+                "int" => Type::Int,
+                "bool" => Type::Bool,
+                "float" => Type::Float,
+                "bytes" => Type::Bytes,
+                // Container patterns would erase element types — skip.
+                "list" | "dict" | "set" | "tuple" | "frozenset" => return None,
+                other => Type::Class(other.to_owned()),
+            }),
+            _ => None,
+        },
+        Pattern::MatchAs(a) => a.pattern.as_deref().and_then(pattern_narrowed_type),
+        Pattern::MatchOr(or) => {
+            let mut variants: Vec<Type> = Vec::with_capacity(or.patterns.len());
+            for p in &or.patterns {
+                variants.push(pattern_narrowed_type(p)?);
+            }
+            Some(Type::union_of(variants))
+        }
+        _ => None,
+    }
+}
+
+/// Liskov-substitution audit: a subclass method overriding a base method
+/// must accept at least the base's parameters (same arity, each parameter
+/// no narrower) and return something assignable to the base's return —
+/// otherwise calls dispatched through the base type break at runtime.
+/// Warn-level; conservative skips: underscore-prefixed names, property /
+/// static / classmethod binding differences, variadic signatures, and
+/// any slot the checker can't type confidently.
+fn check_override_compatibility(c: &mut Checker, body: &[Stmt]) {
+    // Class-name spans to anchor the warning.
+    let mut spans: HashMap<String, (usize, usize)> = HashMap::new();
+    for stmt in body {
+        if let Stmt::ClassDef(cd) = stmt {
+            let start = cd.name.range.start().to_usize();
+            let len = cd.name.range.end().to_usize().saturating_sub(start).max(1);
+            spans.insert(cd.name.as_str().to_owned(), (start, len));
+        }
+    }
+    let parents_map = c.class_parents.clone();
+    let mut findings: Vec<(String, String, String, String)> = Vec::new();
+    for sub in parents_map.keys() {
+        let Some(sub_shape) = c.class_shapes.get(sub.as_str()) else {
+            continue;
+        };
+        // Walk the full ancestor chain.
+        let mut chain: Vec<String> = Vec::new();
+        let mut frontier: Vec<String> = parents_map.get(sub).cloned().unwrap_or_default();
+        let mut seen: HashSet<String> = HashSet::new();
+        while let Some(p) = frontier.pop() {
+            if !seen.insert(p.clone()) {
+                continue;
+            }
+            if let Some(more) = parents_map.get(&p) {
+                frontier.extend(more.iter().cloned());
+            }
+            chain.push(p);
+        }
+        for base in &chain {
+            let Some(base_shape) = c.class_shapes.get(base.as_str()) else {
+                continue;
+            };
+            for (name, base_sig) in &base_shape.methods {
+                if name.starts_with('_') {
+                    continue;
+                }
+                let Some(sub_sig) = sub_shape.methods.get(name) else {
+                    continue;
+                };
+                // Different binding kinds or any decorator semantics: skip.
+                if base_sig.is_property
+                    || sub_sig.is_property
+                    || base_sig.is_static != sub_sig.is_static
+                    || base_sig.is_classmethod != sub_sig.is_classmethod
+                {
+                    continue;
+                }
+                // Variadic on either side absorbs anything: skip.
+                if base_sig.arity_info.max_positional.is_none()
+                    || sub_sig.arity_info.max_positional.is_none()
+                    || base_sig.arity_info.has_kwarg
+                    || sub_sig.arity_info.has_kwarg
+                {
+                    continue;
+                }
+                if base_sig.arity != sub_sig.arity {
+                    findings.push((
+                        sub.clone(),
+                        name.clone(),
+                        base.clone(),
+                        format!(
+                            "takes {} non-self parameter(s); the base takes {}",
+                            sub_sig.arity, base_sig.arity
+                        ),
+                    ));
+                    continue;
+                }
+                let mut flagged = false;
+                for (i, (sub_p, base_p)) in sub_sig
+                    .param_types
+                    .iter()
+                    .zip(base_sig.param_types.iter())
+                    .enumerate()
+                {
+                    if matches!(sub_p, Type::Unknown | Type::Any)
+                        || matches!(base_p, Type::Unknown | Type::Any)
+                    {
+                        continue;
+                    }
+                    // Contravariance: the override must accept everything
+                    // the base accepts.
+                    if !c.is_assignable(sub_p, base_p) {
+                        findings.push((
+                            sub.clone(),
+                            name.clone(),
+                            base.clone(),
+                            format!(
+                                "parameter {} narrows the base's `{}` to `{}`",
+                                i + 1,
+                                base_p.display(),
+                                sub_p.display()
+                            ),
+                        ));
+                        flagged = true;
+                        break;
+                    }
+                }
+                if flagged {
+                    continue;
+                }
+                let (base_ret, sub_ret) = (&base_sig.return_type, &sub_sig.return_type);
+                if !matches!(sub_ret, Type::Unknown | Type::Any)
+                    && !matches!(base_ret, Type::Unknown | Type::Any)
+                    && !c.is_assignable(base_ret, sub_ret)
+                {
+                    findings.push((
+                        sub.clone(),
+                        name.clone(),
+                        base.clone(),
+                        format!(
+                            "returns `{}`, not assignable to the base's `{}`",
+                            sub_ret.display(),
+                            base_ret.display()
+                        ),
+                    ));
+                }
+            }
+        }
+    }
+    for (sub, method, base, reason) in findings {
+        let (start, len) = spans.get(&sub).copied().unwrap_or((0, 1));
+        c.diagnostics.push_warning(TycError::incompatible_override(
+            &sub, &method, &base, &reason, &c.path, c.source, start, len,
+        ));
+    }
+}
+
+/// `true` when any base of `cd` is one of the standard enum bases (bare or
+/// `enum.`-qualified) — the shape the `enum Name:` keyword desugars to.
+fn class_has_enum_family_base(cd: &ruff_python_ast::StmtClassDef) -> bool {
+    fn last_segment(e: &Expr) -> Option<&str> {
+        match e {
+            Expr::Name(n) => Some(n.id.as_str()),
+            Expr::Attribute(a) => Some(a.attr.as_str()),
+            Expr::Subscript(s) => last_segment(&s.value),
+            _ => None,
+        }
+    }
+    cd.bases().iter().any(|b| {
+        matches!(
+            last_segment(b),
+            Some("Enum" | "IntEnum" | "StrEnum" | "Flag" | "IntFlag" | "ReprEnum")
+        )
+    })
+}
+
+/// Collect the enum members covered by a pattern: `case Trend.RISING:` is a
+/// `MatchValue` over an attribute expression whose receiver names the enum
+/// class. Or-patterns recurse. Returns `false` when the pattern is some
+/// shape we can't classify (a literal, a different class, a capture with a
+/// sub-pattern, …) — the caller then skips enforcement entirely rather
+/// than risking a false positive.
+fn enum_pattern_covered_members(
+    pattern: &Pattern,
+    enum_name: &str,
+    covered: &mut HashSet<String>,
+) -> bool {
+    match pattern {
+        Pattern::MatchValue(v) => {
+            if let Expr::Attribute(a) = v.value.as_ref() {
+                if let Expr::Name(n) = a.value.as_ref() {
+                    if n.id.as_str() == enum_name {
+                        covered.insert(a.attr.as_str().to_owned());
+                        return true;
+                    }
+                }
+            }
+            false
+        }
+        Pattern::MatchOr(or) => or
+            .patterns
+            .iter()
+            .all(|p| enum_pattern_covered_members(p, enum_name, covered)),
+        _ => false,
+    }
+}
+
+/// Exhaustiveness for a `match` whose subject is an enum: every member must
+/// be covered by an unguarded `case Enum.MEMBER:` arm (or a wildcard).
+/// Enforcement is conservative — if any unguarded arm has a shape we can't
+/// classify as a member reference, the check is skipped entirely.
+fn check_enum_match_exhaustiveness(
+    c: &mut Checker,
+    cases: &[MatchCase],
+    enum_name: &str,
+    members: &[String],
+    subject_span: (usize, usize),
+) {
+    let mut covered: HashSet<String> = HashSet::new();
+    for case in cases {
+        if case.guard.is_some() {
+            continue;
+        }
+        if is_wildcard_pattern(&case.pattern) {
+            return;
+        }
+        if !enum_pattern_covered_members(&case.pattern, enum_name, &mut covered) {
+            // Unclassifiable arm — stay conservative, no enforcement.
+            return;
+        }
+    }
+    let missing: Vec<&str> = members
+        .iter()
+        .filter(|m| !covered.contains(m.as_str()))
+        .map(String::as_str)
+        .collect();
+    if !missing.is_empty() {
+        let missing_str = missing.join(", ");
+        c.non_exhaustive_match(enum_name, &missing_str, subject_span);
     }
 }
 
@@ -17766,14 +18548,12 @@ def f(head: Node?) -> int:
     }
 
     #[test]
-    fn recursive_type_alias_emits_one_cycle_error_no_cascade() {
+    fn recursive_type_alias_through_constructor_is_legal() {
         // Self-referential aliases through `list[Self]` / `dict[str, Self]`
-        // are the canonical recursive-JSON / AST / tree shape and aren't
-        // yet supported (FINDINGS O4). The diagnostic must fire once
-        // for the cycle itself, and every subsequent use of the alias
-        // must *not* cascade into a flood of `tyc::type_mismatch`
-        // errors — the alias body is rewritten to `Any` so downstream
-        // assignments fall through silently.
+        // are the canonical recursive-JSON / AST / tree shape, and PEP 695
+        // aliases are lazily evaluated, so the recursion is legal. The
+        // checker must accept the alias AND the container-literal uses
+        // (element expectations resolve through the alias/union).
         let src = "\
 type JSON = None | bool | int | float | str | list[JSON] | dict[str, JSON]
 
@@ -17784,25 +18564,28 @@ def main() -> None:
     print(x, y, z)
 ";
         let d = check(src);
-        let errs = d.errors();
-        // Exactly one error: the cycle. Cascading type_mismatch errors
-        // on every alias use are not acceptable — they bury the real
-        // problem.
-        let cycle_errs = errs
-            .iter()
-            .filter(|e| format!("{e}").contains("cycle"))
-            .count();
-        assert_eq!(
-            cycle_errs, 1,
-            "expected exactly one cyclic_type_alias error; got: {errs:?}",
+        assert!(
+            !d.has_errors(),
+            "guarded recursive alias must check cleanly; got: {:?}",
+            d.errors()
         );
-        let mismatch_errs = errs
-            .iter()
-            .filter(|e| format!("{e}").contains("type mismatch"))
-            .count();
-        assert_eq!(
-            mismatch_errs, 0,
-            "recursive alias must not cascade into type_mismatch errors; got: {errs:?}",
+    }
+
+    #[test]
+    fn unguarded_alias_cycle_still_rejected() {
+        // A cycle with no type constructor anywhere has no base case —
+        // `type A = A | int` and the two-alias ping-pong stay errors.
+        let d = check("type A = B\ntype B = A\n");
+        assert!(
+            d.errors().iter().any(|e| format!("{e}").contains("cycle")),
+            "direct two-alias cycle must error; got: {:?}",
+            d.errors()
+        );
+        let d2 = check("type A = A | int\n");
+        assert!(
+            d2.errors().iter().any(|e| format!("{e}").contains("cycle")),
+            "unguarded self-union must error; got: {:?}",
+            d2.errors()
         );
     }
 

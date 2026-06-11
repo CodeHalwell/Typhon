@@ -175,6 +175,15 @@ pub fn desugar_module_with(module: &ModModule, options: DesugarOptions) -> Desug
     let needs_protocol = stmts_use_protocol_base(&desugared_mod.body);
     let inject_protocol = needs_protocol && !has_protocol_import(&desugared_mod.body);
 
+    // The checker's prelude accepts `Iterator` / `Sequence` / `Callable` /
+    // … in annotations without an import, but the emitted Python only
+    // survived because of `from __future__ import annotations` — runtime
+    // annotation resolution (FastAPI DI, `typing.get_type_hints`,
+    // dataclass introspection) would NameError. Inject the
+    // `collections.abc` import for any such name that isn't already
+    // bound at module level.
+    let abc_names_to_import = collect_unimported_abc_annotation_names(&desugared_mod.body);
+
     // `newtype Name = Base` lowers to `Name = NewType("Name", Base)` —
     // ensure `from typing import NewType` is in scope.
     let needs_newtype = stmts_use_newtype_call(&desugared_mod.body);
@@ -238,6 +247,9 @@ pub fn desugar_module_with(module: &ModModule, options: DesugarOptions) -> Desug
     }
     if inject_protocol {
         inject(&mut body, make_protocol_import());
+    }
+    if !abc_names_to_import.is_empty() {
+        inject(&mut body, make_collections_abc_import(&abc_names_to_import));
     }
     if inject_newtype {
         inject(&mut body, make_newtype_import());
@@ -657,6 +669,21 @@ fn stmts_use_enum_base(body: &[Stmt]) -> bool {
     })
 }
 
+/// `true` when any base of `c` is one of the standard enum bases (bare or
+/// `enum.`-qualified). A `class! X(enum.StrEnum):` must NOT get a
+/// synthesised `__init__` — enum bodies are member definitions, not
+/// fields, and injecting a constructor (plus stripping the "defaults")
+/// corrupts the EnumType machinery into a TypeError at import time.
+fn class_has_enum_base(c: &ruff_python_ast::StmtClassDef) -> bool {
+    c.bases().iter().any(|b| {
+        is_enum_qualified_base(b)
+            || matches!(
+                base_last_segment(b),
+                Some("Enum" | "IntEnum" | "StrEnum" | "Flag" | "IntFlag" | "ReprEnum")
+            )
+    })
+}
+
 /// `true` when `base` is a dotted `enum.<Family>` reference where `<Family>` is
 /// one of the standard enum bases.
 fn is_enum_qualified_base(base: &Expr) -> bool {
@@ -670,6 +697,311 @@ fn is_enum_qualified_base(base: &Expr) -> bool {
         }
     }
     false
+}
+
+/// Rewrite the trailing `?` Typhon-nullable marker inside *quoted*
+/// annotations (`items: "Sequence[int]?"`) to `| None`, in every
+/// annotation position. Unquoted `T?` is handled by the preprocessor;
+/// string literals escape it, and the raw `?` is a SyntaxError when the
+/// runtime later evaluates the forward reference.
+fn normalise_quoted_annotation_nullability(body: &mut [Stmt]) {
+    fn fix_expr(e: &mut Expr) {
+        match e {
+            Expr::StringLiteral(lit) => {
+                let content = lit.value.to_str();
+                let trimmed = content.trim_end();
+                if let Some(inner) = trimmed.strip_suffix('?') {
+                    let rewritten = format!("{} | None", inner.trim_end());
+                    *e = make_string_literal_expr(&rewritten);
+                }
+            }
+            Expr::Subscript(s) => {
+                fix_expr(&mut s.value);
+                fix_expr(&mut s.slice);
+            }
+            Expr::BinOp(b) => {
+                fix_expr(&mut b.left);
+                fix_expr(&mut b.right);
+            }
+            Expr::Tuple(t) => {
+                for el in t.elts.iter_mut() {
+                    fix_expr(el);
+                }
+            }
+            _ => {}
+        }
+    }
+    fn walk(stmts: &mut [Stmt]) {
+        for stmt in stmts.iter_mut() {
+            match stmt {
+                Stmt::AnnAssign(a) => fix_expr(&mut a.annotation),
+                Stmt::FunctionDef(f) => {
+                    for p in f
+                        .parameters
+                        .posonlyargs
+                        .iter_mut()
+                        .chain(f.parameters.args.iter_mut())
+                        .chain(f.parameters.kwonlyargs.iter_mut())
+                    {
+                        if let Some(ann) = p.parameter.annotation.as_mut() {
+                            fix_expr(ann);
+                        }
+                    }
+                    if let Some(r) = f.returns.as_mut() {
+                        fix_expr(r);
+                    }
+                    walk(&mut f.body);
+                }
+                Stmt::ClassDef(c) => walk(&mut c.body),
+                Stmt::If(s) => {
+                    walk(&mut s.body);
+                    for cl in s.elif_else_clauses.iter_mut() {
+                        walk(&mut cl.body);
+                    }
+                }
+                Stmt::While(s) => walk(&mut s.body),
+                Stmt::For(s) => walk(&mut s.body),
+                Stmt::With(s) => walk(&mut s.body),
+                Stmt::Try(t) => {
+                    walk(&mut t.body);
+                    for h in t.handlers.iter_mut() {
+                        let ruff_python_ast::ExceptHandler::ExceptHandler(h) = h;
+                        walk(&mut h.body);
+                    }
+                    walk(&mut t.orelse);
+                    walk(&mut t.finalbody);
+                }
+                _ => {}
+            }
+        }
+    }
+    walk(body);
+}
+
+/// The `collections.abc` names the checker's prelude accepts unimported.
+const ABC_PRELUDE_NAMES: &[&str] = &[
+    "Callable",
+    "Iterable",
+    "Iterator",
+    "Generator",
+    "AsyncIterable",
+    "AsyncIterator",
+    "AsyncGenerator",
+    "Awaitable",
+    "Coroutine",
+    "Sequence",
+    "MutableSequence",
+    "Mapping",
+    "MutableMapping",
+    "MutableSet",
+    "Collection",
+    "Container",
+    "Reversible",
+    "Hashable",
+    "Sized",
+    "KeysView",
+    "ValuesView",
+    "ItemsView",
+];
+
+/// Names bound at module level (imports, defs, classes, assignments) —
+/// anything here doesn't need an injected import.
+fn module_level_bound_names(body: &[Stmt]) -> HashSet<String> {
+    let mut bound: HashSet<String> = HashSet::new();
+    for stmt in body {
+        match stmt {
+            Stmt::Import(i) => {
+                for a in &i.names {
+                    let n = a
+                        .asname
+                        .as_ref()
+                        .map(|n| n.as_str().to_owned())
+                        .unwrap_or_else(|| {
+                            a.name.as_str().split('.').next().unwrap_or("").to_owned()
+                        });
+                    bound.insert(n);
+                }
+            }
+            Stmt::ImportFrom(i) => {
+                for a in &i.names {
+                    let n = a
+                        .asname
+                        .as_ref()
+                        .map(|n| n.as_str().to_owned())
+                        .unwrap_or_else(|| a.name.as_str().to_owned());
+                    bound.insert(n);
+                }
+            }
+            Stmt::FunctionDef(f) => {
+                bound.insert(f.name.as_str().to_owned());
+            }
+            Stmt::ClassDef(c) => {
+                bound.insert(c.name.as_str().to_owned());
+            }
+            Stmt::Assign(a) => {
+                for t in &a.targets {
+                    if let Expr::Name(n) = t {
+                        bound.insert(n.id.as_str().to_owned());
+                    }
+                }
+            }
+            Stmt::AnnAssign(a) => {
+                if let Expr::Name(n) = a.target.as_ref() {
+                    bound.insert(n.id.as_str().to_owned());
+                }
+            }
+            Stmt::TypeAlias(ta) => {
+                if let Expr::Name(n) = ta.name.as_ref() {
+                    bound.insert(n.id.as_str().to_owned());
+                }
+            }
+            _ => {}
+        }
+    }
+    bound
+}
+
+/// Collect every `collections.abc` prelude name referenced from an
+/// annotation position anywhere in the module that is NOT bound at module
+/// level. Returned in `ABC_PRELUDE_NAMES` order (deterministic emit).
+fn collect_unimported_abc_annotation_names(body: &[Stmt]) -> Vec<&'static str> {
+    let bound = module_level_bound_names(body);
+    let mut used: HashSet<&'static str> = HashSet::new();
+
+    fn names_in_annotation(e: &Expr, used: &mut HashSet<&'static str>) {
+        match e {
+            Expr::Name(n) => {
+                if let Some(canon) = ABC_PRELUDE_NAMES.iter().find(|c| **c == n.id.as_str()) {
+                    used.insert(canon);
+                }
+            }
+            Expr::Subscript(s) => {
+                names_in_annotation(&s.value, used);
+                names_in_annotation(&s.slice, used);
+            }
+            Expr::BinOp(b) => {
+                names_in_annotation(&b.left, used);
+                names_in_annotation(&b.right, used);
+            }
+            Expr::Tuple(t) => {
+                for el in &t.elts {
+                    names_in_annotation(el, used);
+                }
+            }
+            Expr::List(l) => {
+                for el in &l.elts {
+                    names_in_annotation(el, used);
+                }
+            }
+            // Quoted forward references (`x: "Iterator[int]"`) are
+            // resolved by the checker and evaluated at runtime by
+            // `typing.get_type_hints` — the names inside still need the
+            // import. Word-boundary scan of the literal's content.
+            Expr::StringLiteral(lit) => {
+                let content = lit.value.to_str();
+                for canon in ABC_PRELUDE_NAMES {
+                    let mut rest = content;
+                    while let Some(pos) = rest.find(canon) {
+                        let before_ok = pos == 0
+                            || !rest[..pos]
+                                .chars()
+                                .next_back()
+                                .is_some_and(|c| c.is_alphanumeric() || c == '_');
+                        let after = &rest[pos + canon.len()..];
+                        let after_ok = !after
+                            .chars()
+                            .next()
+                            .is_some_and(|c| c.is_alphanumeric() || c == '_');
+                        if before_ok && after_ok {
+                            used.insert(canon);
+                            break;
+                        }
+                        rest = &rest[pos + canon.len()..];
+                    }
+                }
+            }
+            // Attribute access (`typing.Iterator`) is already qualified —
+            // no injection needed.
+            _ => {}
+        }
+    }
+
+    fn walk(stmts: &[Stmt], used: &mut HashSet<&'static str>) {
+        for stmt in stmts {
+            match stmt {
+                Stmt::FunctionDef(f) => {
+                    for p in f
+                        .parameters
+                        .posonlyargs
+                        .iter()
+                        .chain(f.parameters.args.iter())
+                        .chain(f.parameters.kwonlyargs.iter())
+                    {
+                        if let Some(ann) = &p.parameter.annotation {
+                            names_in_annotation(ann, used);
+                        }
+                    }
+                    for p in [&f.parameters.vararg, &f.parameters.kwarg]
+                        .into_iter()
+                        .flatten()
+                    {
+                        if let Some(ann) = &p.annotation {
+                            names_in_annotation(ann, used);
+                        }
+                    }
+                    if let Some(r) = &f.returns {
+                        names_in_annotation(r, used);
+                    }
+                    walk(&f.body, used);
+                }
+                Stmt::ClassDef(c) => walk(&c.body, used),
+                Stmt::AnnAssign(a) => names_in_annotation(&a.annotation, used),
+                Stmt::If(s) => {
+                    walk(&s.body, used);
+                    for cl in &s.elif_else_clauses {
+                        walk(&cl.body, used);
+                    }
+                }
+                Stmt::While(s) => walk(&s.body, used),
+                Stmt::For(s) => walk(&s.body, used),
+                Stmt::With(s) => walk(&s.body, used),
+                Stmt::Try(t) => {
+                    walk(&t.body, used);
+                    for h in &t.handlers {
+                        let ruff_python_ast::ExceptHandler::ExceptHandler(h) = h;
+                        walk(&h.body, used);
+                    }
+                    walk(&t.orelse, used);
+                    walk(&t.finalbody, used);
+                }
+                Stmt::Match(m) => {
+                    for case in &m.cases {
+                        walk(&case.body, used);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    walk(body, &mut used);
+    ABC_PRELUDE_NAMES
+        .iter()
+        .filter(|n| used.contains(*n) && !bound.contains(**n))
+        .copied()
+        .collect()
+}
+
+/// Build `from collections.abc import <names...>`.
+fn make_collections_abc_import(names: &[&'static str]) -> Stmt {
+    Stmt::ImportFrom(StmtImportFrom {
+        range: TextRange::default(),
+        node_index: AtomicNodeIndex::NONE,
+        module: Some(make_identifier("collections.abc")),
+        names: names.iter().map(|n| make_alias(n)).collect(),
+        level: 0,
+        is_lazy: false,
+    })
 }
 
 /// Build `from typing import Protocol`.
@@ -1111,6 +1443,28 @@ fn expr_uses_asyncio_qualified(expr: &Expr) -> bool {
 // ── module-level desugaring ──────────────────────────────────────────────────
 
 fn desugar_mod_module_with(m: &ModModule, options: &DesugarOptions) -> ModModule {
+    // Lower TypedDict-style literals against local class/model annotations
+    // (`let u: User = {"id": 1, "name": "ada"}`) into constructor calls
+    // (`User(id=1, name="ada")`). The type checker has accepted this form
+    // since v0.3.0, but without this rewrite the emitted Python kept the
+    // plain dict — `u.name` then crashed at runtime with AttributeError.
+    let mut body: Vec<Stmt> = m.body.clone();
+    {
+        let class_fields = collect_local_class_field_annotations(&body);
+        if !class_fields.is_empty() {
+            rewrite_typed_dict_literals_in_stmts(&mut body, &class_fields);
+        }
+    }
+    // Quoted annotations are forward references; Typhon's `?` suffix can
+    // survive inside the string (the preprocessor can't see into
+    // literals). Normalise `"T?"` to `"T | None"` so runtime annotation
+    // evaluation (`typing.get_type_hints`, pydantic, FastAPI) parses it.
+    normalise_quoted_annotation_nullability(&mut body);
+    let m = &ModModule {
+        range: m.range,
+        node_index: ruff_python_ast::AtomicNodeIndex::NONE,
+        body,
+    };
     let multi_base_parents = collect_multi_base_parents(&m.body);
     // Classes whose impl-stub body contains a `cached_property` method (or
     // the aliased `_typhon_cached_property` form emitted by `lazy let` in
@@ -1544,7 +1898,12 @@ fn desugar_stmt(stmt: &Stmt, markers: ClassMarkers<'_>) -> (Stmt, bool) {
             // but allocates real objects for things like `Linear(10, 5)`
             // and confuses libraries that introspect class attributes
             // (e.g. PyTorch parameter registration on subclasses).
-            if is_raw && !is_plain && class_has_any_base(c) && !body_has_init(&new_class.body) {
+            if is_raw
+                && !is_plain
+                && class_has_any_base(c)
+                && !body_has_init(&new_class.body)
+                && !class_has_enum_base(c)
+            {
                 let synthesised = synthesise_raw_class_init(&new_class.body);
                 // Place `__init__` after the leading run of (docstring +
                 // field annotations) so the class reads top-to-bottom:
@@ -2878,6 +3237,26 @@ fn merge_impl_blocks(body: Vec<Stmt>) -> (Vec<Stmt>, bool) {
         return (body, false);
     }
 
+    // Names of classes actually declared in this module. An `impl` /
+    // `extend` whose target is neither a local class nor a local sealed-
+    // union alias refers to an *imported* class (cross-module `extend
+    // Record:`), which can't be merged into a class body we don't own —
+    // those blocks lower to module-level attribute patches instead
+    // (`Record.label = __typhon_extend_Record__label`). Previously they
+    // were silently dropped, so the method vanished from the build output.
+    let local_classes: HashSet<String> = body
+        .iter()
+        .filter_map(|stmt| {
+            if let Stmt::ClassDef(c) = stmt {
+                let n = c.name.as_str();
+                if !n.starts_with(IMPL_PREFIX) {
+                    return Some(n.to_owned());
+                }
+            }
+            None
+        })
+        .collect();
+
     // Phase 2: collect methods (with `self` injected) into a map keyed by
     // target class name.  Multiple impl blocks for the same class accumulate.
     //
@@ -2890,6 +3269,9 @@ fn merge_impl_blocks(body: Vec<Stmt>) -> (Vec<Stmt>, bool) {
     // of writing "the method-on-the-union" once.
     let impl_index_set: HashSet<usize> = impl_indices.iter().map(|(i, _)| *i).collect();
     let mut impl_methods_map: HashMap<String, Vec<Stmt>> = HashMap::new();
+    // Pseudo-class indices whose target is foreign: lowered in place to
+    // `def __typhon_extend_T__m(self, ...)` + `T.m = __typhon_extend_T__m`.
+    let mut foreign_patches: HashMap<usize, Vec<Stmt>> = HashMap::new();
     for (impl_idx, target_name) in &impl_indices {
         if let Stmt::ClassDef(c) = &body[*impl_idx] {
             let methods: Vec<Stmt> = c.body.iter().map(insert_self_param).collect();
@@ -2899,35 +3281,244 @@ fn merge_impl_blocks(body: Vec<Stmt>) -> (Vec<Stmt>, bool) {
                 Some(variants) => variants.clone(),
                 None => vec![target_name.clone()],
             };
-            for target in targets {
-                impl_methods_map
-                    .entry(target)
-                    .or_default()
-                    .extend(methods.iter().cloned());
+            let all_local = targets
+                .iter()
+                .all(|t| local_classes.contains(t) || union_aliases.contains_key(t));
+            if all_local {
+                for target in targets {
+                    impl_methods_map
+                        .entry(target)
+                        .or_default()
+                        .extend(methods.iter().cloned());
+                }
+            } else {
+                foreign_patches.insert(*impl_idx, make_extend_patch_stmts(target_name, &methods));
             }
         }
     }
 
-    // Phase 3: rebuild the body, merging methods into target classes and
-    // dropping the impl pseudo-classes.
-    let new_body: Vec<Stmt> = body
-        .into_iter()
-        .enumerate()
-        .filter(|(i, _)| !impl_index_set.contains(i))
-        .map(|(_, stmt)| {
-            if let Stmt::ClassDef(mut c) = stmt {
-                let name = c.name.as_str().to_owned();
-                if let Some(methods) = impl_methods_map.remove(&name) {
-                    c.body.extend(methods);
-                }
-                Stmt::ClassDef(c)
-            } else {
-                stmt
+    // Phase 3: rebuild the body, merging methods into target classes,
+    // replacing foreign-target pseudo-classes with their attribute patches
+    // (in place, so they run after the import that binds the class), and
+    // dropping the local-target pseudo-classes.
+    let mut new_body: Vec<Stmt> = Vec::with_capacity(body.len());
+    for (i, stmt) in body.into_iter().enumerate() {
+        if let Some(patches) = foreign_patches.remove(&i) {
+            new_body.extend(patches);
+            continue;
+        }
+        if impl_index_set.contains(&i) {
+            continue;
+        }
+        if let Stmt::ClassDef(mut c) = stmt {
+            let name = c.name.as_str().to_owned();
+            if let Some(methods) = impl_methods_map.remove(&name) {
+                c.body.extend(methods);
             }
-        })
-        .collect();
+            new_body.push(Stmt::ClassDef(c));
+        } else {
+            new_body.push(stmt);
+        }
+    }
 
     (new_body, true)
+}
+
+/// Collect, for every top-level class in the module, the map of field name
+/// → bare-`Name` annotation text. Only fields whose annotation is a plain
+/// identifier are recorded with their target name (that's all the nested
+/// dict-literal rewrite needs to recurse); other fields are recorded with
+/// an empty string so presence checks still work. Impl pseudo-classes are
+/// skipped.
+fn collect_local_class_field_annotations(
+    body: &[Stmt],
+) -> HashMap<String, HashMap<String, String>> {
+    let mut out: HashMap<String, HashMap<String, String>> = HashMap::new();
+    for stmt in body {
+        let Stmt::ClassDef(c) = stmt else { continue };
+        if c.name.as_str().starts_with(IMPL_PREFIX) {
+            continue;
+        }
+        let mut fields: HashMap<String, String> = HashMap::new();
+        for member in &c.body {
+            if let Stmt::AnnAssign(a) = member {
+                if let Expr::Name(n) = a.target.as_ref() {
+                    let ann = match a.annotation.as_ref() {
+                        Expr::Name(t) => t.id.as_str().to_owned(),
+                        _ => String::new(),
+                    };
+                    fields.insert(n.id.as_str().to_owned(), ann);
+                }
+            }
+        }
+        out.insert(c.name.as_str().to_owned(), fields);
+    }
+    out
+}
+
+/// `true` when `s` is usable as a Python keyword argument name.
+fn is_py_identifier(s: &str) -> bool {
+    const KEYWORDS: &[&str] = &[
+        "False", "None", "True", "and", "as", "assert", "async", "await", "break", "class",
+        "continue", "def", "del", "elif", "else", "except", "finally", "for", "from", "global",
+        "if", "import", "in", "is", "lambda", "nonlocal", "not", "or", "pass", "raise", "return",
+        "try", "while", "with", "yield",
+    ];
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(c) if c.is_alphabetic() || c == '_' => {}
+        _ => return false,
+    }
+    if !chars.all(|c| c.is_alphanumeric() || c == '_') {
+        return false;
+    }
+    !KEYWORDS.contains(&s)
+}
+
+/// Rewrite `{"k": v, ...}` into `Cls(k=v, ...)` when every key is a
+/// string-literal identifier naming a field of `Cls`. Recurses into a
+/// value that is itself a dict literal when the matching field's
+/// annotation names another local class (nested model initialisation).
+/// Returns `None` (leave the dict untouched) on any shape we can't
+/// prove — the type checker has already validated the match, this pass
+/// only performs the syntactic lowering.
+fn dict_literal_to_ctor_call(
+    d: &ruff_python_ast::ExprDict,
+    class_name: &str,
+    classes: &HashMap<String, HashMap<String, String>>,
+) -> Option<Expr> {
+    let fields = classes.get(class_name)?;
+    let mut keywords: Vec<ruff_python_ast::Keyword> = Vec::with_capacity(d.items.len());
+    for item in &d.items {
+        let key_expr = item.key.as_ref()?; // `**spread` — leave untouched.
+        let key = match key_expr {
+            Expr::StringLiteral(s) => s.value.to_str().to_owned(),
+            _ => return None,
+        };
+        if !is_py_identifier(&key) {
+            return None;
+        }
+        let field_ann = fields.get(&key)?;
+        let mut value = item.value.clone();
+        if let Expr::Dict(nested) = &value {
+            if classes.contains_key(field_ann.as_str()) {
+                if let Some(ctor) = dict_literal_to_ctor_call(nested, field_ann, classes) {
+                    value = ctor;
+                }
+            }
+        }
+        keywords.push(ruff_python_ast::Keyword {
+            range: TextRange::default(),
+            node_index: AtomicNodeIndex::NONE,
+            arg: Some(make_identifier(&key)),
+            value,
+        });
+    }
+    Some(Expr::Call(ruff_python_ast::ExprCall {
+        range: d.range,
+        node_index: AtomicNodeIndex::NONE,
+        func: Box::new(make_bare_name_expr(class_name)),
+        arguments: ruff_python_ast::Arguments {
+            range: TextRange::default(),
+            node_index: AtomicNodeIndex::NONE,
+            args: Box::from([]),
+            keywords: keywords.into_boxed_slice(),
+        },
+    }))
+}
+
+/// Walk every statement (recursing through function bodies and control-flow
+/// blocks) rewriting `x: Cls = {dict literal}` value positions via
+/// [`dict_literal_to_ctor_call`]. Class bodies are skipped — a dict literal
+/// as a *field default* stays a dict.
+fn rewrite_typed_dict_literals_in_stmts(
+    body: &mut [Stmt],
+    classes: &HashMap<String, HashMap<String, String>>,
+) {
+    for stmt in body.iter_mut() {
+        match stmt {
+            Stmt::AnnAssign(a) => {
+                if let (Expr::Name(ann), Some(value)) = (a.annotation.as_ref(), a.value.as_mut()) {
+                    if let Expr::Dict(d) = value.as_ref() {
+                        let class_name = ann.id.as_str();
+                        if classes.contains_key(class_name) {
+                            if let Some(ctor) = dict_literal_to_ctor_call(d, class_name, classes) {
+                                **value = ctor;
+                            }
+                        }
+                    }
+                }
+            }
+            Stmt::FunctionDef(f) => rewrite_typed_dict_literals_in_stmts(&mut f.body, classes),
+            Stmt::If(s) => {
+                rewrite_typed_dict_literals_in_stmts(&mut s.body, classes);
+                for clause in s.elif_else_clauses.iter_mut() {
+                    rewrite_typed_dict_literals_in_stmts(&mut clause.body, classes);
+                }
+            }
+            Stmt::While(s) => {
+                rewrite_typed_dict_literals_in_stmts(&mut s.body, classes);
+                rewrite_typed_dict_literals_in_stmts(&mut s.orelse, classes);
+            }
+            Stmt::For(s) => {
+                rewrite_typed_dict_literals_in_stmts(&mut s.body, classes);
+                rewrite_typed_dict_literals_in_stmts(&mut s.orelse, classes);
+            }
+            Stmt::With(s) => rewrite_typed_dict_literals_in_stmts(&mut s.body, classes),
+            Stmt::Try(s) => {
+                rewrite_typed_dict_literals_in_stmts(&mut s.body, classes);
+                for h in s.handlers.iter_mut() {
+                    let ruff_python_ast::ExceptHandler::ExceptHandler(h) = h;
+                    rewrite_typed_dict_literals_in_stmts(&mut h.body, classes);
+                }
+                rewrite_typed_dict_literals_in_stmts(&mut s.orelse, classes);
+                rewrite_typed_dict_literals_in_stmts(&mut s.finalbody, classes);
+            }
+            Stmt::Match(s) => {
+                for case in s.cases.iter_mut() {
+                    rewrite_typed_dict_literals_in_stmts(&mut case.body, classes);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Lower one cross-module `extend Target:` block into module-level patch
+/// statements: each method becomes a uniquely-named module function (its
+/// decorators preserved, so `@property` and friends still apply) followed
+/// by a class-attribute assignment binding it under the method's own name.
+/// Class-level attribute assignment is legal on `slots=True` and frozen
+/// dataclasses alike — only *instance* attributes are restricted.
+fn make_extend_patch_stmts(target: &str, methods: &[Stmt]) -> Vec<Stmt> {
+    let mut out: Vec<Stmt> = Vec::new();
+    for m in methods {
+        let Stmt::FunctionDef(f) = m else {
+            // Docstrings / `pass` placeholders inside the block carry no
+            // behaviour — drop them.
+            continue;
+        };
+        let method_name = f.name.as_str().to_owned();
+        let module_fn_name = format!("__typhon_extend_{target}__{method_name}");
+        let mut renamed = f.clone();
+        renamed.name = make_identifier(&module_fn_name);
+        out.push(Stmt::FunctionDef(renamed));
+        // `Target.method = __typhon_extend_Target__method`
+        out.push(Stmt::Assign(StmtAssign {
+            node_index: AtomicNodeIndex::NONE,
+            range: TextRange::default(),
+            targets: vec![Expr::Attribute(ExprAttribute {
+                node_index: AtomicNodeIndex::NONE,
+                range: TextRange::default(),
+                value: Box::new(make_bare_name_expr(target)),
+                attr: make_identifier(&method_name),
+                ctx: ExprContext::Store,
+            })],
+            value: Box::new(make_bare_name_expr(&module_fn_name)),
+            mutability: None,
+        }));
+    }
+    out
 }
 
 /// FINDINGS #22: walk every class in `body`, build a `name → field-annotation`
@@ -4089,6 +4680,100 @@ class __typhon_impl_Event(object):
             "output:\n{out}"
         );
         assert_eq!(out.matches("def scale(self):").count(), 1, "output:\n{out}");
+    }
+
+    #[test]
+    fn typed_dict_literal_lowers_to_constructor_call() {
+        // `let u: User = {"id": 1, "name": "ada"}` — the checker accepts the
+        // TypedDict-style match (v0.3.0); the emit must construct the class,
+        // not keep the raw dict (which crashed on first attribute access).
+        let src = "class User:\n    id: int\n    name: str\n\ndef f() -> None:\n    u: User = {\"id\": 1, \"name\": \"ada\"}\n";
+        let out = parse_and_desugar(src);
+        assert!(
+            out.contains("User(id=1, name=") || out.contains("User(id=1, name="),
+            "dict literal must lower to a ctor call; output:\n{out}"
+        );
+    }
+
+    #[test]
+    fn typed_dict_literal_nested_class_field_recurses() {
+        let src = "class Address:\n    city: str\n\nclass Person:\n    name: str\n    address: Address\n\ndef f() -> None:\n    p: Person = {\"name\": \"ada\", \"address\": {\"city\": \"London\"}}\n";
+        let out = parse_and_desugar(src);
+        assert!(
+            out.contains("address=Address(city="),
+            "nested dict against a class-typed field must recurse; output:\n{out}"
+        );
+    }
+
+    #[test]
+    fn untyped_dict_annotation_keeps_dict_literal() {
+        // `dict[str, int]`-annotated literals must stay dicts.
+        let src = "def f() -> None:\n    d: dict = {\"a\": 1}\n";
+        let out = parse_and_desugar(src);
+        assert!(
+            out.contains("{\"a\": 1}") || out.contains("{'a': 1}"),
+            "plain dict annotations must be untouched; output:\n{out}"
+        );
+    }
+
+    #[test]
+    fn dict_literal_with_non_identifier_key_untouched() {
+        // A key that can't be a kwarg (`"not-an-ident"`) must abort the
+        // rewrite even when the annotation names a local class.
+        let src =
+            "class User:\n    id: int\n\ndef f() -> None:\n    u: User = {\"not-an-ident\": 1}\n";
+        let out = parse_and_desugar(src);
+        assert!(
+            !out.contains("User(") || out.contains("class User"),
+            "non-identifier keys must leave the dict untouched; output:\n{out}"
+        );
+        assert!(out.contains("not-an-ident"), "output:\n{out}");
+    }
+
+    #[test]
+    fn cross_module_extend_lowers_to_attribute_patch() {
+        // `extend Record:` where `Record` is imported (not declared here)
+        // must lower to a module-level def + class-attribute assignment —
+        // previously the methods were silently dropped (runtime
+        // AttributeError after a clean build).
+        let src = "from store.records import Record\n\nclass __typhon_impl_Record(object):\n    def label(self):\n        return self.name\n";
+        let out = parse_and_desugar(src);
+        assert!(
+            out.contains("def __typhon_extend_Record__label(self):"),
+            "foreign extend must synthesise a module-level fn; output:\n{out}"
+        );
+        assert!(
+            out.contains("Record.label = __typhon_extend_Record__label"),
+            "foreign extend must patch the class attribute; output:\n{out}"
+        );
+        assert!(
+            !out.contains("__typhon_impl_"),
+            "impl stub must be removed; output:\n{out}"
+        );
+    }
+
+    #[test]
+    fn cross_module_extend_patch_lands_after_import() {
+        let src = "from store.records import Record\n\nclass __typhon_impl_Record(object):\n    def label(self):\n        return self.name\n";
+        let out = parse_and_desugar(src);
+        let import_pos = out.find("from store.records import Record").unwrap();
+        let patch_pos = out.find("Record.label =").unwrap();
+        assert!(
+            import_pos < patch_pos,
+            "patch must execute after the import binds the class; output:\n{out}"
+        );
+    }
+
+    #[test]
+    fn local_extend_still_merges_into_class_body() {
+        // A same-module target keeps the body-merge lowering (no patches).
+        let src = "class Thing:\n    name: str\n\nclass __typhon_impl_Thing(object):\n    def shout(self):\n        return self.name\n";
+        let out = parse_and_desugar(src);
+        assert!(
+            !out.contains("__typhon_extend_"),
+            "local targets must not use the patch form; output:\n{out}"
+        );
+        assert!(out.contains("def shout(self):"), "output:\n{out}");
     }
 
     #[test]

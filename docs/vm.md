@@ -222,10 +222,25 @@ imports in the entry point resolve correctly.
 Surface as `NotImplementedError` at runtime, with the feature name in the
 message:
 
-- `async def` / `await` / `gather:` / `go` — synchronous execution only.
-  v0.8.0 surfaces a clear `NotImplementedError` pointing at `tyc build &&
-  python build/main.py` as the fallback (previously crashed the
-  interpreter).
+- **Real (interleaved) concurrency.** The VM now runs async programs via a
+  *cooperative sequential* scheduler: calling an `async def` produces a
+  coroutine thunk (the body does not run — matching CPython); `await`,
+  `asyncio.run`, `asyncio.gather` (including `return_exceptions=True`),
+  `TaskGroup.create_task`, and `typhon_runtime.tasks.spawn` (the `go`
+  lowering) force it to completion in program order. `gather:` blocks,
+  `go f(x) -> task` + `await task`, `async for` over (eagerly
+  materialised) async generators, `async with`, `asyncio.sleep`
+  (real wall-clock sleep), `asyncio.timeout` (checked at scope exit),
+  and `asyncio.Queue` all work — with results identical to CPython
+  whenever the program's correctness doesn't depend on task
+  *interleaving*. Programs that do depend on it (e.g. producer/consumer
+  pairs that hand off through a queue mid-flight) fail **loudly**:
+  `Queue.get` on an empty queue / `put` past `maxsize` raise a
+  `RuntimeError` naming `tyc run --compile` instead of deadlocking.
+  A body that overruns `asyncio.timeout` raises `TimeoutError` at scope
+  exit — after its side effects, unlike a real cancellation.
+  `@asynccontextmanager` factories share the eager-generator limitation
+  below.
 - **Lazy / unbounded generators.** Finite `yield` / `yield from` work
   since v0.10.0 via eager materialisation, but the worst case
   (`while True: yield`) hits the `GENERATOR_CAP = 1_000_000` ceiling and

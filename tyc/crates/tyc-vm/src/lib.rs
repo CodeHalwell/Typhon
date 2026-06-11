@@ -98,6 +98,16 @@ pub fn run_source(
         &prep.comptime_functions,
     );
 
+    // Collect `@memo` / `@pure(memo=True)` opt-ins exactly like `tyc build`
+    // does, so the desugar pass below injects `@functools.cache` instead of
+    // silently stripping the marker (which left memoised recursion running
+    // exponentially under the VM while the build path returned instantly).
+    let memoise_targets: Vec<String> = tyc_analyse::analyse_purity(&module, false)
+        .into_iter()
+        .filter(|f| f.violation.is_none() && f.memoise)
+        .map(|f| f.name)
+        .collect();
+
     // Hand the VM the desugared module so it sees the same shape as the
     // compile path: dataclass-decorated user classes, merged impl blocks,
     // injected runtime imports, and so on. FINDINGS #21 follow-up.
@@ -113,6 +123,7 @@ pub fn run_source(
     let desugar_out = tyc_desugar::desugar_module_with(
         &module,
         tyc_desugar::DesugarOptions {
+            memoise_functions: memoise_targets,
             raw_class_line_starts: preprocess::line_byte_starts(
                 &prep.python_source,
                 &prep.raw_class_lines,
@@ -140,6 +151,15 @@ pub fn run_source(
     let _ = tyc_analyse::rewrite_builtin_extension_calls(&mut module, &registry);
 
     let mut interp = Interpreter::new();
+    // Source info for traceback frames: file name + line table over the
+    // preprocessed source (line-preserving for ordinary statements, so
+    // frame numbers match the user's .ty lines).
+    interp.current_source = Some(std::rc::Rc::new(interp::SourceInfo::new(
+        origin
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "<source>".to_string()),
+        &prep.python_source,
+    )));
     // Seed sys.argv before any user code (or import sys) can observe it.
     let argv0 = origin
         .map(|p| p.display().to_string())
@@ -172,8 +192,28 @@ pub fn run_source(
         Err(Unwind::Return(_)) => Ok(0),
         Err(Unwind::Exception(exc)) => {
             eprintln!("Traceback (most recent call last):");
-            for frame in &exc.frames {
-                eprintln!("  in {}", frame.function);
+            // Frames accumulate innermost-first as the exception bubbles
+            // through `call_function`; CPython prints outermost-first.
+            // The module-level frame (where the failing call chain
+            // started) renders first, from the interpreter's final
+            // statement offset.
+            if let Some(si) = &interp.current_source {
+                let line = si.line_of(interp.current_offset);
+                eprintln!("  File \"{}\", line {}, in <module>", si.name, line);
+                if let Some(text) = si.line_text(line) {
+                    eprintln!("    {text}");
+                }
+            }
+            for frame in exc.frames.iter().rev() {
+                match (&frame.file, frame.line) {
+                    (Some(file), Some(line)) => {
+                        eprintln!("  File \"{file}\", line {line}, in {}", frame.function);
+                        if let Some(text) = &frame.line_text {
+                            eprintln!("    {text}");
+                        }
+                    }
+                    _ => eprintln!("  in {}", frame.function),
+                }
             }
             if exc.message.is_empty() {
                 eprintln!("{}", exc.kind);

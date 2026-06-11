@@ -1476,6 +1476,94 @@ pub enum TycError {
         #[label("prefer `{suggestion}` here")]
         span: SourceSpan,
     },
+
+    /// A function parameter's default value is a mutable literal
+    /// (`def f(xs: list[int] = [])`). Python evaluates the default ONCE at
+    /// definition time, so every call that omits the argument shares the
+    /// same object — the classic shared-state footgun. Typhon already
+    /// rewrites the identical pattern on class fields to a per-instance
+    /// factory; function parameters get this warning instead (rewriting
+    /// them would change the signature visible to runtime introspection).
+    #[error("mutable default for parameter `{name}` is shared across calls")]
+    #[diagnostic(
+        severity(Warning),
+        code(tyc::mutable_default_param),
+        url("https://typhon.dev/lang/diagnostics/mutable_default_param"),
+        help("Python evaluates the {literal} once, at `def` time — every call that omits `{name}` mutates the same object. Use `{name}: T? = None` and create the value inside the body (`if {name} is None: ...`), or pass the argument explicitly.")
+    )]
+    MutableDefaultParam {
+        name: String,
+        /// Human-readable description of the literal: "list literal `[]`",
+        /// "dict literal `{{}}`", or "set constructor `set()`".
+        literal: String,
+        #[source_code]
+        src: NamedSource<String>,
+        #[label("this default is created once and shared")]
+        span: SourceSpan,
+    },
+
+    /// An `is` / `is not` comparison against a literal (`s is "hello"`,
+    /// `n is 5`). `is` compares object *identity*, not value — whether two
+    /// equal literals are the same object is an interpreter implementation
+    /// detail (small-int caching, string interning), so the result is
+    /// arbitrary. CPython itself emits a SyntaxWarning for this shape.
+    #[error("`is` compares identity, not value — comparing against a literal is unreliable")]
+    #[diagnostic(
+        severity(Warning),
+        code(tyc::is_literal_comparison),
+        url("https://typhon.dev/lang/diagnostics/is_literal_comparison"),
+        help(
+            "Use `==` / `!=` for value comparison. Reserve `is` for `None` and sentinel objects."
+        )
+    )]
+    IsLiteralComparison {
+        #[source_code]
+        src: NamedSource<String>,
+        #[label("literal operand — use `==` instead")]
+        span: SourceSpan,
+    },
+
+    /// A subclass method overrides a base-class method with an
+    /// incompatible signature (different arity, a parameter type narrower
+    /// than the base's, or a return type not assignable to the base's).
+    /// Calls dispatched through the base type can then break at runtime —
+    /// the Liskov substitution principle violation mypy / pyright flag.
+    #[error("`{class_name}.{method}` overrides `{base}.{method}` incompatibly: {reason}")]
+    #[diagnostic(
+        severity(Warning),
+        code(tyc::incompatible_override),
+        url("https://typhon.dev/lang/diagnostics/incompatible_override"),
+        help("Code holding a `{base}` may call `{method}` with the base signature and dispatch to this override at runtime. Match the base signature (parameters may widen, returns may narrow), or rename the method.")
+    )]
+    IncompatibleOverride {
+        class_name: String,
+        method: String,
+        base: String,
+        reason: String,
+        #[source_code]
+        src: NamedSource<String>,
+        #[label("overriding class declared here")]
+        span: SourceSpan,
+    },
+
+    /// A closure (lambda or nested `def`) created inside a loop references
+    /// the loop variable. Python closures capture *variables*, not values
+    /// — every closure sees the final iteration's value once the loop
+    /// ends (`[lambda: i for i in range(3)]` → all return 2).
+    #[error("closure captures loop variable `{name}` by reference, not value")]
+    #[diagnostic(
+        severity(Warning),
+        code(tyc::loop_closure_capture),
+        url("https://typhon.dev/lang/diagnostics/loop_closure_capture"),
+        help("Each closure shares the single `{name}` binding and will observe its value at *call* time — after the loop, that's the last iteration. Bind the current value per closure with a default (`lambda {name}={name}: ...`) or build values eagerly instead of deferring.")
+    )]
+    LoopClosureCapture {
+        name: String,
+        #[source_code]
+        src: NamedSource<String>,
+        #[label("captured by reference here")]
+        span: SourceSpan,
+    },
 }
 
 impl TycError {
@@ -2694,6 +2782,73 @@ impl TycError {
         }
     }
 
+    /// Construct a [`TycError::LoopClosureCapture`] warning.
+    pub fn loop_closure_capture(
+        name: impl Into<String>,
+        path: impl Into<String>,
+        source: impl Into<String>,
+        offset: usize,
+        length: usize,
+    ) -> Self {
+        Self::LoopClosureCapture {
+            name: name.into(),
+            src: NamedSource::new(path.into(), source.into()),
+            span: SourceSpan::new(SourceOffset::from(offset), length.max(1)),
+        }
+    }
+
+    /// Construct a [`TycError::IncompatibleOverride`] warning.
+    #[allow(clippy::too_many_arguments)]
+    pub fn incompatible_override(
+        class_name: impl Into<String>,
+        method: impl Into<String>,
+        base: impl Into<String>,
+        reason: impl Into<String>,
+        path: impl Into<String>,
+        source: impl Into<String>,
+        offset: usize,
+        length: usize,
+    ) -> Self {
+        Self::IncompatibleOverride {
+            class_name: class_name.into(),
+            method: method.into(),
+            base: base.into(),
+            reason: reason.into(),
+            src: NamedSource::new(path.into(), source.into()),
+            span: SourceSpan::new(SourceOffset::from(offset), length.max(1)),
+        }
+    }
+
+    /// Construct a [`TycError::IsLiteralComparison`] warning.
+    pub fn is_literal_comparison(
+        path: impl Into<String>,
+        source: impl Into<String>,
+        offset: usize,
+        length: usize,
+    ) -> Self {
+        Self::IsLiteralComparison {
+            src: NamedSource::new(path.into(), source.into()),
+            span: SourceSpan::new(SourceOffset::from(offset), length.max(1)),
+        }
+    }
+
+    /// Construct a [`TycError::MutableDefaultParam`] warning.
+    pub fn mutable_default_param(
+        name: impl Into<String>,
+        literal: impl Into<String>,
+        path: impl Into<String>,
+        source: impl Into<String>,
+        offset: usize,
+        length: usize,
+    ) -> Self {
+        Self::MutableDefaultParam {
+            name: name.into(),
+            literal: literal.into(),
+            src: NamedSource::new(path.into(), source.into()),
+            span: SourceSpan::new(SourceOffset::from(offset), length.max(1)),
+        }
+    }
+
     /// Construct a [`TycError::TypingAliasInAnnotation`] warning for a
     /// deprecated `typing.<Name>` alias referenced from an annotation.
     pub fn typing_alias_in_annotation(
@@ -3107,6 +3262,39 @@ pub(crate) fn parse_error_hint(message: &str, source: &str, offset: usize) -> Op
                  only needs to be lexically immutable."
                     .to_owned(),
             );
+        }
+    }
+
+    // `?` error-propagation inside an f-string expression part. The
+    // preprocessor's `?` expansion can't reach into string literals, so
+    // the raw `?` hits the Python parser and dies with an opaque parse
+    // error. Detect `{...?...}` inside an f-string on the offending line
+    // and point at the rebind idiom.
+    if let Some(line) = source_line(source, &line_starts, line_idx) {
+        let has_fstring = line.contains("f\"") || line.contains("f'");
+        if has_fstring {
+            let mut depth = 0usize;
+            let mut question_in_braces = false;
+            for ch in line.chars() {
+                match ch {
+                    '{' => depth += 1,
+                    '}' => depth = depth.saturating_sub(1),
+                    '?' if depth > 0 => {
+                        question_in_braces = true;
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            if question_in_braces {
+                return Some(
+                    "the `?` error-propagation operator cannot be used inside an \
+                     f-string expression — the preprocessor cannot rewrite inside \
+                     string literals. Bind the result first: \
+                     `let v: T = fallible()?` then interpolate `{v}`."
+                        .to_owned(),
+                );
+            }
         }
     }
 

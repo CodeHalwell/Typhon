@@ -22,7 +22,7 @@ use ruff_python_ast::{
 use crate::env::{Env, EnvRef};
 use crate::error::{
     attribute_error, index_error, key_error, name_error, not_implemented, type_error, value_error,
-    vm_unsupported_use_compile, zero_division, Unwind, VmException,
+    vm_unsupported_use_compile, zero_division, zero_division_floor_mod, Unwind, VmException,
 };
 use crate::value::{
     bigint_to_f64, Class, ClassField, DictMap, Function, HashKey, Instance, IterState, NativeFn,
@@ -33,6 +33,13 @@ pub struct Interpreter {
     pub root: EnvRef,
     pub stack_depth: usize,
     pub max_stack_depth: usize,
+    /// Byte offset (into the current source) of the statement being
+    /// executed — the raise site for traceback frames.
+    pub current_offset: usize,
+    /// Name + line-start table of the source the interpreter is currently
+    /// executing. Swapped around sibling-module bodies so cross-module
+    /// frames report the right file. `None` only in unit-test harnesses.
+    pub current_source: Option<Rc<SourceInfo>>,
     /// `sys.argv` for the running script. `argv[0]` is conventionally the
     /// script path; `argv[1..]` are the user-supplied arguments. Populated
     /// by `lib::run_*`, not by the host process's own argv.
@@ -80,12 +87,51 @@ impl Default for Interpreter {
     }
 }
 
+/// Filename + per-line byte offsets of a source the VM executes, for
+/// traceback frame rendering. Line starts are sorted; `line_of` is a
+/// binary search.
+pub struct SourceInfo {
+    pub name: String,
+    pub line_starts: Vec<usize>,
+    pub lines: Vec<String>,
+}
+
+impl SourceInfo {
+    pub fn new(name: impl Into<String>, source: &str) -> Self {
+        let mut line_starts = vec![0usize];
+        for (i, b) in source.bytes().enumerate() {
+            if b == b'\n' {
+                line_starts.push(i + 1);
+            }
+        }
+        Self {
+            name: name.into(),
+            line_starts,
+            lines: source.lines().map(|l| l.to_owned()).collect(),
+        }
+    }
+    /// 1-based line number containing `offset`.
+    pub fn line_of(&self, offset: usize) -> u32 {
+        match self.line_starts.binary_search(&offset) {
+            Ok(i) => (i + 1) as u32,
+            Err(i) => i as u32,
+        }
+    }
+    pub fn line_text(&self, line: u32) -> Option<String> {
+        self.lines
+            .get((line as usize).saturating_sub(1))
+            .map(|l| l.trim().to_owned())
+    }
+}
+
 impl Interpreter {
     pub fn new() -> Self {
         let root = Env::new_root();
         let mut interp = Interpreter {
             root: root.clone(),
             stack_depth: 0,
+            current_offset: 0,
+            current_source: None,
             // Match CPython's default `sys.getrecursionlimit()` of 1000
             // (FINDINGS #31). The tree-walking interpreter still pays a
             // real Rust stack frame for each Typhon frame, so values much
@@ -124,6 +170,8 @@ impl Interpreter {
     }
 
     fn exec_stmt(&mut self, stmt: &Stmt, env: &EnvRef) -> Result<(), Unwind> {
+        use ruff_text_size::Ranged;
+        self.current_offset = stmt.range().start().to_usize();
         match stmt {
             Stmt::Expr(e) => {
                 self.eval_expr(&e.value, env)?;
@@ -219,9 +267,10 @@ impl Interpreter {
                 Ok(())
             }
             Stmt::For(s) => {
-                if s.is_async {
-                    return Err(vm_unsupported_use_compile("async for"));
-                }
+                // `async for` iterates the forced async generator — the VM
+                // materialises generators eagerly either way, so the sync
+                // and async loops share one code path (`make_iter` forces
+                // coroutine values).
                 let iterable = self.eval_expr(&s.iter, env)?;
                 let iter = self.make_iter(iterable)?;
                 let mut completed = true;
@@ -245,9 +294,10 @@ impl Interpreter {
                 Ok(())
             }
             Stmt::FunctionDef(f) => {
-                if f.is_async {
-                    return Err(vm_unsupported_use_compile("async functions"));
-                }
+                // `async def` builds a normal Function with `is_async` set;
+                // calling it produces a `Value::Coroutine` thunk that runs
+                // when awaited (sequential cooperative semantics — see
+                // `force_awaitable`).
                 let func = self.build_function(f, env)?;
                 // Run decorators in reverse order (innermost first), matching Python.
                 let mut value = Value::Function(Rc::new(func));
@@ -476,6 +526,7 @@ impl Interpreter {
             defaults,
             closure: env.clone(),
             is_async: f.is_async,
+            source: self.current_source.clone(),
         })
     }
 
@@ -863,7 +914,36 @@ impl Interpreter {
             &comptime_values,
             &prep.comptime_functions,
         );
-        let desugar_out = tyc_desugar::desugar_module(&module);
+        // Mirror the entry-module pipeline (lib.rs): thread the `@memo`
+        // opt-ins and the preprocessor's class-kind markers through to
+        // desugar, so a sibling module's `@memo def` is actually memoised
+        // and its `class X frozen:` / `plain class` / `class!` forms keep
+        // their declared shape under `tyc run`.
+        let memoise_targets: Vec<String> = tyc_analyse::analyse_purity(&module, false)
+            .into_iter()
+            .filter(|f| f.violation.is_none() && f.memoise)
+            .map(|f| f.name)
+            .collect();
+        let desugar_out = tyc_desugar::desugar_module_with(
+            &module,
+            tyc_desugar::DesugarOptions {
+                memoise_functions: memoise_targets,
+                raw_class_line_starts: preprocess::line_byte_starts(
+                    &prep.python_source,
+                    &prep.raw_class_lines,
+                ),
+                frozen_class_line_starts: preprocess::line_byte_starts(
+                    &prep.python_source,
+                    &prep.frozen_class_lines,
+                ),
+                plain_class_line_starts: preprocess::line_byte_starts(
+                    &prep.python_source,
+                    &prep.plain_class_lines,
+                ),
+                pub_names: prep.pub_names.clone(),
+                ..Default::default()
+            },
+        );
         module = desugar_out.module;
         let (registry, _stats) = tyc_analyse::extract_builtin_extensions(&mut module);
         let _ = tyc_analyse::rewrite_builtin_extension_calls(&mut module, &registry);
@@ -871,8 +951,17 @@ impl Interpreter {
         // Evaluate the module body in a fresh child scope of root; copy
         // every named binding into a Module namespace so attribute
         // lookups resolve to user functions / classes / constants.
+        // Swap `current_source` to the sibling's source for the duration
+        // so traceback frames raised inside it report the right file.
         let module_env = Env::new_child(&self.root);
-        self.exec_block(&module.body, &module_env)?;
+        let saved_source = self.current_source.clone();
+        self.current_source = Some(Rc::new(SourceInfo::new(
+            path.display().to_string(),
+            &prep.python_source,
+        )));
+        let body_result = self.exec_block(&module.body, &module_env);
+        self.current_source = saved_source;
+        body_result?;
 
         use crate::value::Module;
         let mut members: HashMap<String, Value> = HashMap::new();
@@ -1328,6 +1417,7 @@ impl Interpreter {
                     defaults: vec![],
                     closure: env.clone(),
                     is_async: false,
+                    source: self.current_source.clone(),
                 };
                 Ok(Value::Function(Rc::new(func)))
             }
@@ -1344,7 +1434,10 @@ impl Interpreter {
                 };
                 self.eval_listcomp(&listy, env)
             }
-            Expr::Await(_) => Err(vm_unsupported_use_compile("await expressions")),
+            Expr::Await(a) => {
+                let v = self.eval_expr(&a.value, env)?;
+                self.force_awaitable(v)
+            }
             Expr::Yield(y) => {
                 let v = match &y.value {
                     Some(e) => self.eval_expr(e, env)?,
@@ -1570,6 +1663,20 @@ impl Interpreter {
             if op == CmpOp::NotEq {
                 if let Some(b) = self.cmp_dunder(CmpOp::Eq, l, r)? {
                     return Ok(!b);
+                }
+            }
+            // Value-mixin enum members (`StrEnum` / `IntEnum` / `IntFlag`)
+            // ARE their value in CPython: `Status.ACTIVE == "active"` is
+            // True, ordering works against raw ints, etc. Unwrap to the
+            // member value and retry. Plain `Enum` members deliberately do
+            // NOT unwrap (CPython: `Color.RED == 1` is False).
+            if !matches!(op, CmpOp::Is | CmpOp::IsNot) {
+                let lu = crate::value::enum_mixin_value(l);
+                let ru = crate::value::enum_mixin_value(r);
+                if lu.is_some() || ru.is_some() {
+                    let l2 = lu.unwrap_or_else(|| l.clone());
+                    let r2 = ru.unwrap_or_else(|| r.clone());
+                    return self.cmp_op(op, &l2, &r2);
                 }
             }
         }
@@ -1901,8 +2008,29 @@ impl Interpreter {
                 }
                 (n.func)(self, args)
             }
-            Value::Function(f) => self.call_function(&f, args, kwargs, None),
+            Value::Function(f) => {
+                if f.is_async {
+                    return Ok(Value::Coroutine(Rc::new(crate::value::CoroutineThunk {
+                        function: f,
+                        args: std::cell::RefCell::new(args),
+                        kwargs: kwargs.to_vec(),
+                        receiver: None,
+                        forced: std::cell::Cell::new(false),
+                    })));
+                }
+                self.call_function(&f, args, kwargs, None)
+            }
             Value::BoundMethod { receiver, function } => {
+                // Async methods defer exactly like async free functions.
+                if function.is_async {
+                    return Ok(Value::Coroutine(Rc::new(crate::value::CoroutineThunk {
+                        function,
+                        args: std::cell::RefCell::new(args),
+                        kwargs: kwargs.to_vec(),
+                        receiver: Some(*receiver),
+                        forced: std::cell::Cell::new(false),
+                    })));
+                }
                 // Push a `(defining_class, self)` frame so a zero-arg
                 // `super()` in the body can climb the MRO. The owning class
                 // is found by walking the receiver instance's MRO for this
@@ -1984,6 +2112,19 @@ impl Interpreter {
             )));
         }
         self.stack_depth += 1;
+        // Remember the caller's statement offset: the callee's body will
+        // overwrite `current_offset`, and if an exception bubbles out we
+        // (a) stamp the callee's frame with the raise-site offset, then
+        // (b) restore the caller's offset so the next frame up records
+        // its own call-site line. The active source swaps to the callee's
+        // *defining* source for the body's duration, so a function defined
+        // in an imported module attributes its frames (and any nested
+        // def-time captures) to its own file, not the caller's.
+        let caller_offset = self.current_offset;
+        let caller_source = self.current_source.clone();
+        if f.source.is_some() {
+            self.current_source = f.source.clone();
+        }
         // Wrap the body in a closure so every early `return` decrements the
         // counter on the way out — including a failure in `bind_args`.
         let call_env = Env::new_child(&f.closure);
@@ -2015,6 +2156,33 @@ impl Interpreter {
             }
         })();
         self.stack_depth -= 1;
+        let result = match result {
+            Err(Unwind::Exception(mut e)) => {
+                // CPython prints every frame; cap ours so deep recursion
+                // doesn't render a megabyte of repeats. The raise-site
+                // offset is read against the source active inside the
+                // body — the callee's defining source.
+                if e.frames.len() < 64 {
+                    let (line, file, line_text) = match &self.current_source {
+                        Some(si) => {
+                            let line = si.line_of(self.current_offset);
+                            (Some(line), Some(si.name.clone()), si.line_text(line))
+                        }
+                        None => (None, None, None),
+                    };
+                    e.frames.push(crate::error::Frame {
+                        function: f.name.clone(),
+                        line,
+                        file,
+                        line_text,
+                    });
+                }
+                Err(Unwind::Exception(e))
+            }
+            other => other,
+        };
+        self.current_offset = caller_offset;
+        self.current_source = caller_source;
         result
     }
 
@@ -2132,9 +2300,16 @@ impl Interpreter {
             fields: RefCell::new(HashMap::new()),
         });
         // Initialise class-level attributes that aren't methods. Skip the
-        // internal enum sentinels so they don't leak onto instances.
+        // internal enum sentinels so they don't leak onto instances, and
+        // skip *functions*: in CPython a function class-attribute is a
+        // descriptor that binds through the class at lookup time (this is
+        // how cross-module `extend` patches dispatch) — snapshotting it
+        // into the instance would freeze an unbound copy.
         for (k, v) in class.class_attrs.borrow().iter() {
-            if is_enum_sentinel(k) || k.starts_with("__typhon_setter__") {
+            if is_enum_sentinel(k)
+                || k.starts_with("__typhon_setter__")
+                || matches!(v, Value::Function(_))
+            {
                 continue;
             }
             instance.fields.borrow_mut().insert(k.clone(), v.clone());
@@ -2228,6 +2403,35 @@ impl Interpreter {
             }
         }
         None
+    }
+
+    /// Drive an awaitable to its value. A `Coroutine` thunk runs its body
+    /// now (sequential cooperative semantics — the VM cannot suspend a
+    /// tree-walk frame, so awaits execute in program order); a Task wrapper
+    /// (from `TaskGroup.create_task` / `spawn`) unwraps its stored result;
+    /// anything else passes through (await on an already-produced value,
+    /// e.g. the async-middleware `Callable[..., Awaitable[T]]` shape).
+    pub fn force_awaitable(&mut self, v: Value) -> Result<Value, Unwind> {
+        match v {
+            Value::Coroutine(thunk) => {
+                if thunk.forced.replace(true) {
+                    return Err(Unwind::Exception(crate::error::VmException::new(
+                        "RuntimeError",
+                        format!(
+                            "cannot reuse already awaited coroutine {}",
+                            thunk.function.name
+                        ),
+                    )));
+                }
+                let args = thunk.args.borrow_mut().drain(..).collect::<Vec<_>>();
+                self.call_function(&thunk.function, args, &thunk.kwargs, thunk.receiver.clone())
+            }
+            Value::Module(m) if m.name == "Task" => {
+                let r = m.members.borrow().get("__typhon_task_result__").cloned();
+                Ok(r.unwrap_or(Value::None))
+            }
+            other => Ok(other),
+        }
     }
 
     /// Invoke a zero-argument dunder method on an instance, if defined.
@@ -2468,6 +2672,12 @@ impl Interpreter {
         if !Self::is_enum_member(v) {
             return None;
         }
+        // Value-mixin members (`StrEnum` / `IntEnum` / `IntFlag`) stringify
+        // through their value in CPython 3.11+ — `print(Status.ACTIVE)`
+        // shows `active`, `print(Level.HIGH)` shows `2`.
+        if let Some(value) = crate::value::enum_mixin_value(v) {
+            return Some(value.py_str());
+        }
         if let Value::Instance(i) = v {
             if let Some(Value::Str(name)) = i.fields.borrow().get("_name_") {
                 return Some(format!("{}.{}", i.class.name, name));
@@ -2490,9 +2700,9 @@ impl Interpreter {
             (Int(a), Mult, Int(b)) => return Ok(Int(a * b)),
             (Int(_), Div, Int(b)) if b.is_zero() => return Err(zero_division()),
             (Int(a), Div, Int(b)) => return Ok(Float(bigint_to_f64(a) / bigint_to_f64(b))),
-            (Int(_), FloorDiv, Int(b)) if b.is_zero() => return Err(zero_division()),
+            (Int(_), FloorDiv, Int(b)) if b.is_zero() => return Err(zero_division_floor_mod()),
             (Int(a), FloorDiv, Int(b)) => return Ok(Int(a.div_floor(b))),
-            (Int(_), Mod, Int(b)) if b.is_zero() => return Err(zero_division()),
+            (Int(_), Mod, Int(b)) if b.is_zero() => return Err(zero_division_floor_mod()),
             (Int(a), Mod, Int(b)) => return Ok(Int(a.mod_floor(b))),
             (Int(a), Pow, Int(b)) => {
                 if b.is_negative() {
@@ -2698,6 +2908,20 @@ impl Interpreter {
             }
         }
 
+        // Value-mixin enum members (`StrEnum` / `IntEnum` / `IntFlag`)
+        // participate in arithmetic / concatenation as their underlying
+        // value (they're genuine str / int subclasses in CPython):
+        // `Level.HIGH + 1`, `"x" + Status.ACTIVE`, `Perm.R | Perm.W`.
+        {
+            let lu = crate::value::enum_mixin_value(l);
+            let ru = crate::value::enum_mixin_value(r);
+            if lu.is_some() || ru.is_some() {
+                let l2 = lu.unwrap_or_else(|| l.clone());
+                let r2 = ru.unwrap_or_else(|| r.clone());
+                return self.binop(&l2, op, &r2);
+            }
+        }
+
         Err(type_error(format!(
             "unsupported operand type(s) for {}: '{}' and '{}'",
             op.as_str(),
@@ -2707,26 +2931,49 @@ impl Interpreter {
     }
 
     fn unop(&mut self, op: UnaryOp, v: &Value) -> Result<Value, Unwind> {
+        // Instance dunder dispatch first — `-x` / `+x` / `~x` on a user
+        // class with `__neg__` / `__pos__` / `__invert__` (CPython parity;
+        // the binary slots already dispatched but the unary ones didn't).
+        if matches!(v, Value::Instance(_)) {
+            let dunder = match op {
+                UnaryOp::USub => Some("__neg__"),
+                UnaryOp::UAdd => Some("__pos__"),
+                UnaryOp::Invert => Some("__invert__"),
+                UnaryOp::Not => None, // handled via is_truthy / __bool__ below
+            };
+            if let Some(name) = dunder {
+                if let Some(r) = self.call_dunder0(v, name)? {
+                    return Ok(r);
+                }
+            }
+        }
         match op {
             UnaryOp::Not => Ok(Value::Bool(!self.is_truthy(v)?)),
             UnaryOp::USub => match v {
                 Value::Int(i) => Ok(Value::Int(-i)),
                 Value::Float(x) => Ok(Value::Float(-*x)),
                 Value::Bool(b) => Ok(Value::Int(BigInt::from(-(*b as i64)))),
+                Value::Complex(re, im) => Ok(Value::Complex(-*re, -*im)),
                 _ => Err(type_error(format!(
                     "bad operand for unary -: '{}'",
                     v.type_name()
                 ))),
             },
             UnaryOp::UAdd => match v {
-                Value::Int(_) | Value::Float(_) => Ok(v.clone()),
+                Value::Int(_) | Value::Float(_) | Value::Complex(_, _) => Ok(v.clone()),
                 Value::Bool(b) => Ok(Value::Int(BigInt::from(*b as i64))),
-                _ => Err(type_error("bad operand for unary +")),
+                _ => Err(type_error(format!(
+                    "bad operand for unary +: '{}'",
+                    v.type_name()
+                ))),
             },
             UnaryOp::Invert => match v {
                 Value::Int(i) => Ok(Value::Int(!i)),
                 Value::Bool(b) => Ok(Value::Int(!BigInt::from(*b as i64))),
-                _ => Err(type_error("bad operand for unary ~")),
+                _ => Err(type_error(format!(
+                    "bad operand for unary ~: '{}'",
+                    v.type_name()
+                ))),
             },
         }
     }
@@ -3073,9 +3320,19 @@ impl Interpreter {
                     return Ok(Value::Native(Rc::new(nf)));
                 }
                 // Fall back to class-level attributes (ClassVar / plain-class
-                // constants) — `instance.K` reads `type(instance).K`.
+                // constants) — `instance.K` reads `type(instance).K`. A
+                // *function* stored as a class attribute is a descriptor in
+                // CPython: reading it through an instance binds `self`. This
+                // is how cross-module `extend Foo:` methods (lowered to
+                // `Foo.m = __typhon_extend_Foo__m`) dispatch.
                 if let Some(v) = inst.class.class_attrs.borrow().get(attr) {
                     if !is_enum_sentinel(attr) {
+                        if let Value::Function(f) = v {
+                            return Ok(Value::BoundMethod {
+                                receiver: Box::new(value.clone()),
+                                function: f.clone(),
+                            });
+                        }
                         return Ok(v.clone());
                     }
                 }
@@ -3161,14 +3418,16 @@ impl Interpreter {
             }
             Value::ResultOk(v) => match attr {
                 "value" => Ok((**v).clone()),
-                "map" | "map_err" | "and_then" | "or_else" => {
+                "map" | "map_err" | "and_then" | "or_else" | "unwrap" | "expect" | "unwrap_or"
+                | "unwrap_or_else" | "ok" | "err" | "is_ok" | "is_err" => {
                     Ok(bind_result_combinator(value.clone(), attr))
                 }
                 _ => Err(attribute_error(format!("Ok has no attribute '{}'", attr))),
             },
             Value::ResultErr(v) => match attr {
                 "value" | "error" => Ok((**v).clone()),
-                "map" | "map_err" | "and_then" | "or_else" => {
+                "map" | "map_err" | "and_then" | "or_else" | "unwrap" | "expect" | "unwrap_or"
+                | "unwrap_or_else" | "ok" | "err" | "is_ok" | "is_err" => {
                     Ok(bind_result_combinator(value.clone(), attr))
                 }
                 _ => Err(attribute_error(format!("Err has no attribute '{}'", attr))),
@@ -3527,6 +3786,13 @@ impl Interpreter {
     // ── Iteration ──────────────────────────────────────────────────────────
 
     pub fn make_iter(&mut self, v: Value) -> Result<Value, Unwind> {
+        // An async generator call arrives as a coroutine thunk — force it
+        // to its (eagerly materialised) iterator before iterating.
+        let v = if matches!(v, Value::Coroutine(_)) {
+            self.force_awaitable(v)?
+        } else {
+            v
+        };
         let state = match v {
             Value::Range { start, stop, step } => IterState::Range {
                 current: start,
@@ -4046,15 +4312,24 @@ impl Interpreter {
     // ── with ───────────────────────────────────────────────────────────────
 
     fn exec_with(&mut self, w: &ast::StmtWith, env: &EnvRef) -> Result<(), Unwind> {
-        if w.is_async {
-            return Err(vm_unsupported_use_compile("async with"));
-        }
+        // `async with` shares the sync path: `__aenter__` / `__aexit__` are
+        // preferred when present, and awaitable results are forced (the VM
+        // runs awaits sequentially).
+        let is_async = w.is_async;
         // Each context-manager value must support .__enter__ / .__exit__.
         // For v1 we only handle plain values that implement these as native
         // methods (e.g. the file handle from `open()`).
         let mut entered: Vec<Value> = Vec::with_capacity(w.items.len());
         for item in &w.items {
             let cm = self.eval_expr(&item.context_expr, env)?;
+            // An `@asynccontextmanager` factory call arrives as a coroutine
+            // thunk; force it so the Iter check below can surface the clear
+            // eager-generator hint instead of a bare AttributeError.
+            let cm = if matches!(cm, Value::Coroutine(_)) {
+                self.force_awaitable(cm)?
+            } else {
+                cm
+            };
             // A `@contextmanager`-decorated generator can't act as a context
             // manager under eager evaluation: the VM runs the whole generator
             // body (setup *and* teardown) at call time, so there's no point at
@@ -4070,8 +4345,14 @@ impl Interpreter {
             // file shim in `ffi.rs` returns the file object itself from
             // __enter__, so a `with open(...) as f:` block binds `f` to
             // the file.
-            let enter = self.get_attr(&cm, "__enter__")?;
+            let enter = if is_async {
+                self.get_attr(&cm, "__aenter__")
+                    .or_else(|_| self.get_attr(&cm, "__enter__"))?
+            } else {
+                self.get_attr(&cm, "__enter__")?
+            };
             let val = self.call_value(enter, vec![], &[])?;
+            let val = self.force_awaitable(val)?;
             if let Some(t) = &item.optional_vars {
                 self.assign_target(t, val, env, None)?;
             }
@@ -4082,7 +4363,13 @@ impl Interpreter {
         // the exception info `(exc_type, exc_value, None)` and honour a truthy
         // return value by SUPPRESSING the exception (CPython protocol).
         for cm in entered.into_iter().rev() {
-            if let Ok(exit) = self.get_attr(&cm, "__exit__") {
+            let exit_attr = if is_async {
+                self.get_attr(&cm, "__aexit__")
+                    .or_else(|_| self.get_attr(&cm, "__exit__"))
+            } else {
+                self.get_attr(&cm, "__exit__")
+            };
+            if let Ok(exit) = exit_attr {
                 let (et, ev) = match &body_res {
                     Err(Unwind::Exception(exc)) => {
                         let value = match &exc.value {
@@ -4103,6 +4390,7 @@ impl Interpreter {
                 };
                 let raised = matches!(&body_res, Err(Unwind::Exception(_)));
                 let suppressed = self.call_value(exit, vec![et, ev, Value::None], &[])?;
+                let suppressed = self.force_awaitable(suppressed)?;
                 if raised && self.is_truthy(&suppressed)? {
                     body_res = Ok(());
                 }
@@ -4547,10 +4835,12 @@ fn builtin_has_attr(value: &Value, attr: &str) -> bool {
             "clear"
                 | "copy"
                 | "elements"
+                | "fromkeys"
                 | "get"
                 | "items"
                 | "keys"
                 | "most_common"
+                | "move_to_end"
                 | "pop"
                 | "popitem"
                 | "setdefault"
@@ -5086,6 +5376,14 @@ fn bind_result_combinator(receiver: Value, attr: &str) -> Value {
         "map_err" => "map_err",
         "and_then" => "and_then",
         "or_else" => "or_else",
+        "unwrap" => "unwrap",
+        "expect" => "expect",
+        "unwrap_or" => "unwrap_or",
+        "unwrap_or_else" => "unwrap_or_else",
+        "ok" => "ok",
+        "err" => "err",
+        "is_ok" => "is_ok",
+        "is_err" => "is_err",
         _ => unreachable!(),
     };
     let name: &'static str = match combinator {
@@ -5093,9 +5391,48 @@ fn bind_result_combinator(receiver: Value, attr: &str) -> Value {
         "map_err" => "Result.map_err",
         "and_then" => "Result.and_then",
         "or_else" => "Result.or_else",
+        "unwrap" => "Result.unwrap",
+        "expect" => "Result.expect",
+        "unwrap_or" => "Result.unwrap_or",
+        "unwrap_or_else" => "Result.unwrap_or_else",
+        "ok" => "Result.ok",
+        "err" => "Result.err",
+        "is_ok" => "Result.is_ok",
+        "is_err" => "Result.is_err",
         _ => unreachable!(),
     };
     let nf = NativeFn::new(name, move |interp, args| {
+        // Zero-argument accessors first.
+        match combinator {
+            "unwrap" | "ok" | "err" | "is_ok" | "is_err" => {
+                if !args.is_empty() {
+                    return Err(type_error(format!(
+                        "{}() takes no arguments ({} given)",
+                        name,
+                        args.len()
+                    )));
+                }
+                return Ok(match (&receiver, combinator) {
+                    (Value::ResultOk(v), "unwrap") => (**v).clone(),
+                    (Value::ResultErr(e), "unwrap") => {
+                        return Err(Unwind::Exception(crate::error::VmException::new(
+                            "RuntimeError",
+                            format!("called unwrap() on Err: {}", e.py_repr()),
+                        )))
+                    }
+                    (Value::ResultOk(v), "ok") => (**v).clone(),
+                    (Value::ResultErr(_), "ok") => Value::None,
+                    (Value::ResultOk(_), "err") => Value::None,
+                    (Value::ResultErr(e), "err") => (**e).clone(),
+                    (Value::ResultOk(_), "is_ok") => Value::Bool(true),
+                    (Value::ResultErr(_), "is_ok") => Value::Bool(false),
+                    (Value::ResultOk(_), "is_err") => Value::Bool(false),
+                    (Value::ResultErr(_), "is_err") => Value::Bool(true),
+                    _ => unreachable!(),
+                });
+            }
+            _ => {}
+        }
         if args.len() != 1 {
             return Err(type_error(format!(
                 "{}() takes exactly 1 argument ({} given)",
@@ -5105,6 +5442,22 @@ fn bind_result_combinator(receiver: Value, attr: &str) -> Value {
         }
         let f = args.into_iter().next().unwrap();
         match (&receiver, combinator) {
+            // `expect(msg)` — unwrap with a caller-supplied panic message.
+            (Value::ResultOk(v), "expect") => Ok((**v).clone()),
+            (Value::ResultErr(e), "expect") => {
+                Err(Unwind::Exception(crate::error::VmException::new(
+                    "RuntimeError",
+                    format!("{}: {}", f.py_str(), e.py_repr()),
+                )))
+            }
+            // `unwrap_or(default)` — value or the default.
+            (Value::ResultOk(v), "unwrap_or") => Ok((**v).clone()),
+            (Value::ResultErr(_), "unwrap_or") => Ok(f),
+            // `unwrap_or_else(f)` — value or `f(error)`.
+            (Value::ResultOk(v), "unwrap_or_else") => Ok((**v).clone()),
+            (Value::ResultErr(e), "unwrap_or_else") => {
+                interp.call_value(f, vec![(**e).clone()], &[])
+            }
             (Value::ResultOk(v), "map") => {
                 let mapped = interp.call_value(f, vec![(**v).clone()], &[])?;
                 Ok(Value::ResultOk(Box::new(mapped)))
@@ -5173,7 +5526,7 @@ fn exc_fallback_args(message: &str) -> Vec<Value> {
 /// the standard CPython exception hierarchy. `Exception` / `BaseException`
 /// match everything except the bare base-only kinds. Returns false for
 /// unknown names (user exceptions go through the instance-MRO path instead).
-fn builtin_exc_is_a(kind: &str, target: &str) -> bool {
+pub fn builtin_exc_is_a(kind: &str, target: &str) -> bool {
     if target == "BaseException" {
         return true;
     }
@@ -5928,18 +6281,41 @@ flattened = list(flat())
     }
 
     #[test]
-    fn async_def_error_mentions_tyc_build_fallback() {
+    fn async_def_call_produces_coroutine_thunk_and_await_forces_it() {
+        // Calling an `async def` defers the body (CPython: coroutines run
+        // when driven); awaiting forces it under the VM's sequential
+        // cooperative scheduler.
+        let src = r#"
+import asyncio
+
+async def fetch():
+    return 41
+
+async def main():
+    x = await fetch()
+    return x + 1
+
+result = asyncio.run(main())
+"#;
+        let (interp, res) = parse_and_run(src);
+        res.expect("cooperative async should run");
+        let v = interp.root.get("result").expect("result bound");
+        assert_eq!(format!("{v:?}"), "42");
+    }
+
+    #[test]
+    fn unawaited_coroutine_is_a_value_not_an_error() {
         let src = r#"
 async def fetch():
     return 1
-fetch()
+c = fetch()
 "#;
-        let (_interp, res) = parse_and_run(src);
-        let err = res.expect_err("async should error");
-        let msg = format!("{:?}", err);
+        let (interp, res) = parse_and_run(src);
+        res.expect("creating a coroutine must not run or fail");
+        let v = interp.root.get("c").expect("c bound");
         assert!(
-            msg.contains("tyc build") && msg.contains("python"),
-            "async error should mention `tyc build` + `python` fallback, got: {msg}"
+            format!("{v:?}").contains("coroutine"),
+            "calling an async def must produce a coroutine thunk, got: {v:?}"
         );
     }
 

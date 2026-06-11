@@ -93,20 +93,51 @@ pub fn run(args: RunArgs) -> Result<()> {
     if !args.compile {
         return run_vm(args);
     }
-    // FINDINGS #40: `tyc run --compile foo.ty` used to fall through to
-    // `tyc build foo.ty`, which would join the path with `src/` and
-    // emit a baffling "source directory 'foo.ty/src' does not exist".
-    // `--compile` mode requires a project layout (it needs to find
-    // `main.py` after the build), so reject a single-file invocation
-    // up-front with a message that points the user at `tyc init` or
-    // the bare-VM mode.
+    let mut args = args;
+    // `tyc run --compile script.ty` — synthesise a throwaway project
+    // around the file so the scripting flow works without `tyc init`:
+    // copy the script to `<tmp>/src/main.ty`, write a minimal
+    // `typhon.toml`, and continue exactly like a project invocation in
+    // `--temp` mode (nothing persists). FINDINGS #40 originally rejected
+    // this shape outright; the scaffold makes it just work.
+    let mut _scaffold_guard: Option<TempDir> = None;
+    let mut scaffold_no_sync = false;
     if args.path.is_file() {
-        return Err(miette!(
-            "tyc run --compile requires a project layout, not a single file. \
-             Use `tyc init` to scaffold one (or pass a directory), or drop \
-             `--compile` to execute `{}` directly in the in-process VM.",
-            args.path.display()
-        ));
+        if args.no_build {
+            return Err(miette!(
+                "--no-build needs an existing project build directory and \
+                 cannot be combined with a single-file path; drop --no-build \
+                 (or run inside a `tyc init` project)."
+            ));
+        }
+        let src_file = args
+            .path
+            .canonicalize()
+            .map_err(|e| miette!("cannot resolve path '{}': {}", args.path.display(), e))?;
+        let scaffold = tempfile::Builder::new()
+            .prefix("tyc-script-")
+            .tempdir()
+            .map_err(|e| miette!("cannot create temp scaffold: {e}"))?;
+        std::fs::create_dir_all(scaffold.path().join("src"))
+            .map_err(|e| miette!("cannot create temp scaffold src/: {e}"))?;
+        std::fs::copy(&src_file, scaffold.path().join("src").join("main.ty"))
+            .map_err(|e| miette!("cannot stage '{}': {}", src_file.display(), e))?;
+        let name = src_file
+            .file_stem()
+            .and_then(|n| n.to_str())
+            .unwrap_or("script")
+            .replace(|c: char| !c.is_alphanumeric() && c != '-' && c != '_', "-");
+        std::fs::write(
+            scaffold.path().join("typhon.toml"),
+            format!(
+                "[project]\nname = \"{name}\"\nversion = \"0.0.0\"\nsrc = \"src\"\nout = \"build\"\n\n[python]\ntarget = \"3.13\"\n"
+            ),
+        )
+        .map_err(|e| miette!("cannot write temp typhon.toml: {e}"))?;
+        args.path = scaffold.path().to_path_buf();
+        args.temp = true;
+        scaffold_no_sync = true;
+        _scaffold_guard = Some(scaffold);
     }
     // 1. Decide where build outputs go.  In `--temp` mode we own a
     //    TempDir guard whose Drop removes the directory; we keep it
@@ -152,7 +183,8 @@ pub fn run(args: RunArgs) -> Result<()> {
             },
             no_format: false,
             check: false,
-            no_sync: false,
+            // Single-file scaffolds have no dependencies — skip `uv sync`.
+            no_sync: scaffold_no_sync,
             with_ty: false,
         })?;
     }
@@ -234,6 +266,10 @@ pub fn run(args: RunArgs) -> Result<()> {
     //    guard first so its Drop runs — process::exit skips destructors.
     let code = status.code().unwrap_or(1);
     drop(_tmp_guard);
+    // `process::exit` skips destructors — release the single-file
+    // scaffold explicitly too, or every `tyc run --compile script.ty`
+    // leaks a temp directory.
+    drop(_scaffold_guard);
     std::process::exit(code);
 }
 
@@ -370,11 +406,11 @@ mod tests {
     }
 
     #[test]
-    fn compile_mode_rejects_single_file_with_actionable_error() {
-        // FINDINGS #40: `tyc run --compile foo.ty` previously cascaded
-        // into the build command which then complained that
-        // 'foo.ty/src' didn't exist. Verify the new pre-flight check
-        // surfaces an actionable message instead.
+    fn compile_mode_single_file_with_no_build_is_rejected() {
+        // `tyc run --compile script.ty` now scaffolds a throwaway project
+        // (the scripting flow), but `--no-build` makes no sense against a
+        // fresh scaffold — verify the combination still fails with an
+        // actionable message (and not the old 'foo.ty/src' build error).
         let tmp = tempfile::tempdir().unwrap();
         let file = tmp.path().join("foo.ty");
         std::fs::write(&file, "let x: int = 1\n").unwrap();
@@ -387,11 +423,11 @@ mod tests {
             no_build: true,
             script_args: vec![],
         };
-        let err = run(args).expect_err("--compile on a single file must fail");
+        let err = run(args).expect_err("--compile --no-build on a single file must fail");
         let msg = format!("{err:?}");
         assert!(
-            msg.contains("project layout"),
-            "error should mention 'project layout', got: {msg}"
+            msg.contains("--no-build"),
+            "error should mention --no-build, got: {msg}"
         );
         assert!(
             !msg.contains("source directory"),

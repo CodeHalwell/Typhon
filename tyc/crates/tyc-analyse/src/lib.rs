@@ -3414,6 +3414,489 @@ fn empty_collection_kind(expr: &Expr) -> Option<&'static str> {
     }
 }
 
+/// Mutable-default-parameter lint (`tyc::mutable_default_param`): a
+/// `def f(xs: list[int] = [])` evaluates the literal once at definition
+/// time, so every defaulted call mutates the same shared object. Walks
+/// every function (including nested ones and methods inside class /
+/// impl bodies) and flags list / dict / set / mutable-constructor
+/// defaults on parameters.
+pub fn analyse_mutable_default_params(module: &ModModule, path: &str, source: &str) -> Diagnostics {
+    let mut diags = Diagnostics::new();
+    walk_mutable_default_stmts(&module.body, path, source, &mut diags);
+    diags
+}
+
+/// What makes a parameter default *mutable*: literal lists / dicts /
+/// sets / comprehensions, and calls to the mutable builtin constructors.
+/// Non-empty literals are just as shared as empty ones, so unlike
+/// [`empty_collection_kind`] this matches any arity.
+fn mutable_default_kind(expr: &Expr) -> Option<&'static str> {
+    match expr {
+        Expr::List(_) => Some("list literal"),
+        Expr::Dict(_) => Some("dict literal"),
+        Expr::Set(_) => Some("set literal"),
+        Expr::ListComp(_) => Some("list comprehension"),
+        Expr::DictComp(_) => Some("dict comprehension"),
+        Expr::SetComp(_) => Some("set comprehension"),
+        Expr::Call(c) => {
+            if let Expr::Name(n) = c.func.as_ref() {
+                match n.id.as_str() {
+                    "list" => Some("`list()` constructor call"),
+                    "dict" => Some("`dict()` constructor call"),
+                    "set" => Some("`set()` constructor call"),
+                    "bytearray" => Some("`bytearray()` constructor call"),
+                    _ => None,
+                }
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+fn walk_mutable_default_stmts(body: &[Stmt], path: &str, source: &str, diags: &mut Diagnostics) {
+    use ruff_text_size::Ranged;
+    for stmt in body {
+        match stmt {
+            Stmt::FunctionDef(f) => {
+                let all_params = f
+                    .parameters
+                    .posonlyargs
+                    .iter()
+                    .chain(f.parameters.args.iter())
+                    .chain(f.parameters.kwonlyargs.iter());
+                for p in all_params {
+                    let Some(default) = p.default.as_deref() else {
+                        continue;
+                    };
+                    if let Some(kind) = mutable_default_kind(default) {
+                        let span_start = default.range().start().to_usize();
+                        let length = default.range().end().to_usize() - span_start;
+                        diags.push_warning(TycError::mutable_default_param(
+                            p.parameter.name.as_str(),
+                            kind,
+                            path,
+                            source.to_owned(),
+                            span_start,
+                            length,
+                        ));
+                    }
+                }
+                walk_mutable_default_stmts(&f.body, path, source, diags);
+            }
+            Stmt::ClassDef(c) => walk_mutable_default_stmts(&c.body, path, source, diags),
+            Stmt::If(s) => {
+                walk_mutable_default_stmts(&s.body, path, source, diags);
+                for clause in &s.elif_else_clauses {
+                    walk_mutable_default_stmts(&clause.body, path, source, diags);
+                }
+            }
+            Stmt::While(s) => walk_mutable_default_stmts(&s.body, path, source, diags),
+            Stmt::For(s) => walk_mutable_default_stmts(&s.body, path, source, diags),
+            Stmt::With(s) => walk_mutable_default_stmts(&s.body, path, source, diags),
+            Stmt::Try(t) => {
+                walk_mutable_default_stmts(&t.body, path, source, diags);
+                for h in &t.handlers {
+                    let ruff_python_ast::ExceptHandler::ExceptHandler(h) = h;
+                    walk_mutable_default_stmts(&h.body, path, source, diags);
+                }
+                walk_mutable_default_stmts(&t.orelse, path, source, diags);
+                walk_mutable_default_stmts(&t.finalbody, path, source, diags);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// `is` / `is not` against a literal operand (`tyc::is_literal_comparison`):
+/// identity comparison with a fresh literal is interpreter-dependent —
+/// CPython itself SyntaxWarns on it. Walks every comparison expression.
+pub fn analyse_is_literal_comparisons(module: &ModModule, path: &str, source: &str) -> Diagnostics {
+    use ruff_python_ast::visitor::source_order::{walk_expr, SourceOrderVisitor};
+    use ruff_text_size::Ranged;
+    struct V<'a> {
+        path: &'a str,
+        source: &'a str,
+        diags: &'a mut Diagnostics,
+    }
+    fn is_value_literal(e: &Expr) -> bool {
+        matches!(
+            e,
+            Expr::StringLiteral(_)
+                | Expr::NumberLiteral(_)
+                | Expr::BytesLiteral(_)
+                | Expr::FString(_)
+        )
+    }
+    impl<'a, 'b> SourceOrderVisitor<'a> for V<'b> {
+        fn visit_expr(&mut self, e: &'a Expr) {
+            if let Expr::Compare(cmp) = e {
+                let mut left: &Expr = &cmp.left;
+                for (op, right) in cmp.ops.iter().zip(cmp.comparators.iter()) {
+                    if matches!(
+                        op,
+                        ruff_python_ast::CmpOp::Is | ruff_python_ast::CmpOp::IsNot
+                    ) {
+                        let lit = if is_value_literal(left) {
+                            Some(left)
+                        } else if is_value_literal(right) {
+                            Some(right)
+                        } else {
+                            None
+                        };
+                        if let Some(lit) = lit {
+                            let start = lit.range().start().to_usize();
+                            let len = lit.range().end().to_usize() - start;
+                            self.diags.push_warning(TycError::is_literal_comparison(
+                                self.path,
+                                self.source.to_owned(),
+                                start,
+                                len,
+                            ));
+                        }
+                    }
+                    left = right;
+                }
+            }
+            walk_expr(self, e);
+        }
+    }
+    let mut diags = Diagnostics::new();
+    {
+        let mut v = V {
+            path,
+            source,
+            diags: &mut diags,
+        };
+        for stmt in &module.body {
+            v.visit_stmt(stmt);
+        }
+    }
+    diags
+}
+
+/// Late-binding closure lint (`tyc::loop_closure_capture`): a lambda or
+/// nested `def` created inside a `for` loop that references the loop
+/// variable captures the *binding*, not the iteration's value — every
+/// deferred call observes the final value. Immediately-invoked lambdas
+/// (`(lambda: i)()`) and parameters that shadow the loop name (the
+/// `lambda i=i:` idiom) are exempt.
+pub fn analyse_loop_closure_captures(module: &ModModule, path: &str, source: &str) -> Diagnostics {
+    let mut diags = Diagnostics::new();
+
+    fn target_names(e: &Expr, into: &mut Vec<String>) {
+        match e {
+            Expr::Name(n) => into.push(n.id.as_str().to_owned()),
+            Expr::Tuple(t) => {
+                for el in &t.elts {
+                    target_names(el, into);
+                }
+            }
+            Expr::List(l) => {
+                for el in &l.elts {
+                    target_names(el, into);
+                }
+            }
+            Expr::Starred(s) => target_names(&s.value, into),
+            _ => {}
+        }
+    }
+
+    /// Collect references to `names` inside a closure body, skipping any
+    /// name shadowed by the closure's own parameters.
+    #[allow(clippy::type_complexity)]
+    fn flag_captures_in_closure(
+        params: Option<&Parameters>,
+        body_exprs: &mut dyn FnMut(&mut dyn FnMut(&Expr)),
+        names: &[String],
+        path: &str,
+        source: &str,
+        diags: &mut Diagnostics,
+    ) {
+        use ruff_text_size::Ranged;
+        let mut shadowed: Vec<&str> = params
+            .map(|p| {
+                p.posonlyargs
+                    .iter()
+                    .chain(p.args.iter())
+                    .chain(p.kwonlyargs.iter())
+                    .map(|a| a.parameter.name.as_str())
+                    .collect()
+            })
+            .unwrap_or_default();
+        // `*args` / `**kwargs` shadow too.
+        if let Some(p) = params {
+            if let Some(va) = &p.vararg {
+                shadowed.push(va.name.as_str());
+            }
+            if let Some(ka) = &p.kwarg {
+                shadowed.push(ka.name.as_str());
+            }
+        }
+        let mut visit = |e: &Expr| {
+            walk_names(e, &mut |n: &ruff_python_ast::ExprName| {
+                let id = n.id.as_str();
+                if names.iter().any(|t| t == id) && !shadowed.contains(&id) {
+                    let start = n.range().start().to_usize();
+                    let len = id.len();
+                    diags.push_warning(TycError::loop_closure_capture(
+                        id,
+                        path,
+                        source.to_owned(),
+                        start,
+                        len,
+                    ));
+                }
+            });
+        };
+        body_exprs(&mut visit);
+    }
+
+    /// Walk an expression tree calling `f` on every Name (load) node,
+    /// without descending into nested lambdas (their own pass handles
+    /// them — and their params may shadow).
+    fn walk_names(e: &Expr, f: &mut dyn FnMut(&ruff_python_ast::ExprName)) {
+        use ruff_python_ast::visitor::source_order::{walk_expr, SourceOrderVisitor};
+        struct V<'a> {
+            f: &'a mut dyn FnMut(&ruff_python_ast::ExprName),
+        }
+        impl<'a, 'b> SourceOrderVisitor<'a> for V<'b> {
+            fn visit_expr(&mut self, e: &'a Expr) {
+                if let Expr::Name(n) = e {
+                    (self.f)(n);
+                    return;
+                }
+                if matches!(e, Expr::Lambda(_)) {
+                    return;
+                }
+                walk_expr(self, e);
+            }
+        }
+        let mut v = V { f };
+        v.visit_expr(e);
+    }
+
+    /// Find closures in an expression tree (skipping immediately-invoked
+    /// ones) and flag loop-name captures inside them.
+    fn scan_expr_for_closures(
+        e: &Expr,
+        names: &[String],
+        path: &str,
+        source: &str,
+        diags: &mut Diagnostics,
+    ) {
+        match e {
+            Expr::Lambda(lam) => {
+                let body = lam.body.clone();
+                flag_captures_in_closure(
+                    lam.parameters.as_deref(),
+                    &mut |visit| visit(&body),
+                    names,
+                    path,
+                    source,
+                    diags,
+                );
+                // Still scan the lambda body for *nested* closures.
+                scan_expr_for_closures(&lam.body, names, path, source, diags);
+            }
+            Expr::Call(c) => {
+                // Immediately-invoked lambda: exempt the lambda itself but
+                // scan its arguments.
+                if matches!(c.func.as_ref(), Expr::Lambda(_)) {
+                    for a in c.arguments.args.iter() {
+                        scan_expr_for_closures(a, names, path, source, diags);
+                    }
+                    for k in c.arguments.keywords.iter() {
+                        scan_expr_for_closures(&k.value, names, path, source, diags);
+                    }
+                    return;
+                }
+                scan_expr_for_closures(&c.func, names, path, source, diags);
+                for a in c.arguments.args.iter() {
+                    scan_expr_for_closures(a, names, path, source, diags);
+                }
+                for k in c.arguments.keywords.iter() {
+                    scan_expr_for_closures(&k.value, names, path, source, diags);
+                }
+            }
+            other => {
+                use ruff_python_ast::visitor::source_order::{walk_expr, SourceOrderVisitor};
+                struct V<'a> {
+                    names: &'a [String],
+                    path: &'a str,
+                    source: &'a str,
+                    diags: &'a mut Diagnostics,
+                }
+                impl<'a, 'b> SourceOrderVisitor<'a> for V<'b> {
+                    fn visit_expr(&mut self, e: &'a Expr) {
+                        if matches!(e, Expr::Lambda(_) | Expr::Call(_)) {
+                            scan_expr_for_closures(
+                                e,
+                                self.names,
+                                self.path,
+                                self.source,
+                                self.diags,
+                            );
+                            return;
+                        }
+                        walk_expr(self, e);
+                    }
+                }
+                let mut v = V {
+                    names,
+                    path,
+                    source,
+                    diags,
+                };
+                v.visit_expr(other);
+            }
+        }
+    }
+
+    fn scan_stmts_for_closures(
+        stmts: &[Stmt],
+        names: &[String],
+        path: &str,
+        source: &str,
+        diags: &mut Diagnostics,
+    ) {
+        for stmt in stmts {
+            match stmt {
+                Stmt::FunctionDef(f) => {
+                    // A nested def in the loop body is a closure too.
+                    let names_owned = names.to_vec();
+                    let body = &f.body;
+                    flag_captures_in_closure(
+                        Some(&f.parameters),
+                        &mut |visit| {
+                            for s in body.iter() {
+                                visit_stmt_exprs(s, visit);
+                            }
+                        },
+                        &names_owned,
+                        path,
+                        source,
+                        diags,
+                    );
+                }
+                Stmt::Expr(e) => scan_expr_for_closures(&e.value, names, path, source, diags),
+                Stmt::Assign(a) => scan_expr_for_closures(&a.value, names, path, source, diags),
+                Stmt::AnnAssign(a) => {
+                    if let Some(v) = &a.value {
+                        scan_expr_for_closures(v, names, path, source, diags);
+                    }
+                }
+                Stmt::Return(r) => {
+                    if let Some(v) = &r.value {
+                        scan_expr_for_closures(v, names, path, source, diags);
+                    }
+                }
+                Stmt::If(s) => {
+                    scan_stmts_for_closures(&s.body, names, path, source, diags);
+                    for cl in &s.elif_else_clauses {
+                        scan_stmts_for_closures(&cl.body, names, path, source, diags);
+                    }
+                }
+                Stmt::While(s) => scan_stmts_for_closures(&s.body, names, path, source, diags),
+                Stmt::For(s) => scan_stmts_for_closures(&s.body, names, path, source, diags),
+                Stmt::With(s) => scan_stmts_for_closures(&s.body, names, path, source, diags),
+                Stmt::Try(t) => {
+                    scan_stmts_for_closures(&t.body, names, path, source, diags);
+                    for h in &t.handlers {
+                        let ruff_python_ast::ExceptHandler::ExceptHandler(h) = h;
+                        scan_stmts_for_closures(&h.body, names, path, source, diags);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Visit every expression in a statement (shallow walk that recurses
+    /// through nested control flow but not into nested defs/lambdas —
+    /// `flag_captures_in_closure` handles shadowing per closure).
+    fn visit_stmt_exprs(stmt: &Stmt, f: &mut dyn FnMut(&Expr)) {
+        match stmt {
+            Stmt::Expr(e) => f(&e.value),
+            Stmt::Assign(a) => f(&a.value),
+            Stmt::AnnAssign(a) => {
+                if let Some(v) = &a.value {
+                    f(v);
+                }
+            }
+            Stmt::Return(r) => {
+                if let Some(v) = &r.value {
+                    f(v);
+                }
+            }
+            Stmt::If(s) => {
+                f(&s.test);
+                for st in &s.body {
+                    visit_stmt_exprs(st, f);
+                }
+                for cl in &s.elif_else_clauses {
+                    if let Some(t) = &cl.test {
+                        f(t);
+                    }
+                    for st in &cl.body {
+                        visit_stmt_exprs(st, f);
+                    }
+                }
+            }
+            Stmt::While(s) => {
+                f(&s.test);
+                for st in &s.body {
+                    visit_stmt_exprs(st, f);
+                }
+            }
+            Stmt::For(s) => {
+                f(&s.iter);
+                for st in &s.body {
+                    visit_stmt_exprs(st, f);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn walk_module(stmts: &[Stmt], path: &str, source: &str, diags: &mut Diagnostics) {
+        for stmt in stmts {
+            match stmt {
+                Stmt::For(s) => {
+                    let mut names: Vec<String> = Vec::new();
+                    target_names(&s.target, &mut names);
+                    if !names.is_empty() {
+                        scan_stmts_for_closures(&s.body, &names, path, source, diags);
+                    }
+                    walk_module(&s.body, path, source, diags);
+                }
+                Stmt::FunctionDef(f) => walk_module(&f.body, path, source, diags),
+                Stmt::ClassDef(c) => walk_module(&c.body, path, source, diags),
+                Stmt::If(s) => {
+                    walk_module(&s.body, path, source, diags);
+                    for cl in &s.elif_else_clauses {
+                        walk_module(&cl.body, path, source, diags);
+                    }
+                }
+                Stmt::While(s) => walk_module(&s.body, path, source, diags),
+                Stmt::With(s) => walk_module(&s.body, path, source, diags),
+                Stmt::Try(t) => {
+                    walk_module(&t.body, path, source, diags);
+                    for h in &t.handlers {
+                        let ruff_python_ast::ExceptHandler::ExceptHandler(h) = h;
+                        walk_module(&h.body, path, source, diags);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    walk_module(&module.body, path, source, &mut diags);
+    diags
+}
+
 /// Names that, when referenced inside a type annotation, indicate the
 /// user is reaching for a deprecated `typing.<Name>` alias even though
 /// the import would have been rejected by `tyc::typing_alias_deprecated`.

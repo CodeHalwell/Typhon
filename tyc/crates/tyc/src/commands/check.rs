@@ -11,8 +11,10 @@ use clap::Args;
 use miette::{miette, Result};
 
 use tyc_analyse::{
-    analyse_empty_collection_bindings, analyse_purity, analyse_secret_literal_bindings,
-    analyse_typing_alias_annotations, evaluate_comptime_with_functions, purity_diagnostics,
+    analyse_empty_collection_bindings, analyse_is_literal_comparisons,
+    analyse_loop_closure_captures, analyse_mutable_default_params, analyse_purity,
+    analyse_secret_literal_bindings, analyse_typing_alias_annotations,
+    evaluate_comptime_with_functions, purity_diagnostics,
 };
 use tyc_db::{check_file_with_imports, extract_shapes_for_path, TycDatabase};
 use tyc_diagnostics::{sanitised_named_source_for, Diagnostics, SanitisedDiagnostic, TycError};
@@ -1066,6 +1068,32 @@ fn run_secondary_passes(
         &prep.python_source,
     ));
 
+    // Mutable-default-parameter lint (`tyc::mutable_default_param`):
+    // `def f(xs: list[int] = [])` shares ONE list across every defaulted
+    // call — the classic Python footgun. Class fields already get the
+    // default_factory rewrite; function parameters get this warning.
+    diags.extend(analyse_mutable_default_params(
+        &module,
+        path,
+        &prep.python_source,
+    ));
+
+    // `is` against a literal (`s is "x"`) compares identity, not value —
+    // interpreter-dependent and CPython SyntaxWarns on it.
+    diags.extend(analyse_is_literal_comparisons(
+        &module,
+        path,
+        &prep.python_source,
+    ));
+
+    // Closures created in a loop capture the loop variable by reference —
+    // every deferred call sees the last iteration's value.
+    diags.extend(analyse_loop_closure_captures(
+        &module,
+        path,
+        &prep.python_source,
+    ));
+
     // Secret-literal lint (`tyc::contains_secret_literal`, inline form):
     // a `let API_TOKEN = "abc"` hard-codes a credential into the source.
     // The existing comptime path inside `tyc build` only caught
@@ -1155,6 +1183,17 @@ fn collect_project_modules(paths: &[PathBuf], src_root: &str) -> Vec<String> {
     let mut modules: Vec<String> = Vec::new();
     for root in paths {
         if let Ok(files) = collect_ty_files(root) {
+            for file in files {
+                let dotted = ty_path_to_dotted(&file, src_root);
+                if !modules.contains(&dotted) {
+                    modules.push(dotted);
+                }
+            }
+        }
+        // `.dty` stubs are project modules too — `from stubs.fakelib
+        // import X` against a `stubs/fakelib.dty` must not warn
+        // `unknown_module` (the stub IS the module's Typhon surface).
+        if let Ok(files) = collect_dty_files(root) {
             for file in files {
                 let dotted = ty_path_to_dotted(&file, src_root);
                 if !modules.contains(&dotted) {
