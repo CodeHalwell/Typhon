@@ -311,6 +311,34 @@ print(isinstance(a, Scalar))
     }
 
     #[test]
+    fn forward_declared_type_alias_resolves_at_runtime() {
+        // A `type` alias written *above* the classes it unions must still
+        // resolve correctly when used at runtime (CPython binds it lazily).
+        // The `isinstance` runs during body execution — before the post-body
+        // resolution pass — so it exercises the on-demand `force_alias` path.
+        // Each `isinstance` is asserted via a `raise`, so a wrong result
+        // (the old string-fallback returning `False`) surfaces as a non-zero
+        // run rather than passing silently.
+        let src = r#"
+type AB = A | B
+
+class A:
+    v: int
+
+class B:
+    v: int
+
+let a = A(v=1)
+if not isinstance(a, AB):
+    raise ValueError("forward alias AB did not match its member A")
+if isinstance(a, B):
+    raise ValueError("A instance wrongly matched B")
+print("ok")
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    #[test]
     fn class_with_method() {
         let src = r#"
 class Point:

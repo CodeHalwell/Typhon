@@ -677,13 +677,17 @@ pub fn install(interp: &mut Interpreter) {
         })
     });
 
-    native!("isinstance", |_i, args| {
+    native!("isinstance", |i, args| {
         if args.len() != 2 {
             return Err(type_error("isinstance() expected 2 arguments"));
         }
         let val = &args[0];
-        let cls = &args[1];
-        Ok(Value::Bool(is_instance_of(val, cls)))
+        // Force a forward-declared `type` alias (`type AB = A | B` written
+        // above `A`/`B`) used at runtime before the post-body resolution
+        // pass has run — otherwise it would still be its name-string
+        // fallback and the test would silently return the wrong result.
+        let cls = i.force_alias(&args[1]);
+        Ok(Value::Bool(is_instance_of(val, &cls)))
     });
 
     native!("abs", |i, args| match single(&args, "abs")? {

@@ -6235,7 +6235,7 @@ fn with_target_type(c: &Checker, ctx_expr: &Expr, ctx_ty: &Type, is_async: bool)
         if let Some(sig) = c.find_method(cls, dunder) {
             let ret = sig.return_type.clone();
             if is_async {
-                return unwrap_awaitable(&ret).unwrap_or(ret);
+                return unwrap_awaitable(&ret, &c.classes).unwrap_or(ret);
             }
             return ret;
         }
@@ -10903,7 +10903,10 @@ fn extract_generator_return_type(typ: &Type) -> Option<Type> {
 ///   so `asyncio.Task[int]` resolves to `Generic("Task", [int])`). The
 ///   implicit `go work() -> task` handle is already await-aware upstream;
 ///   this covers the case where the handle is parked in an explicitly
-///   annotated `list[asyncio.Task[int]]` and awaited in a loop.
+///   annotated `list[asyncio.Task[int]]` and awaited in a loop. Skipped
+///   when `Task` / `Future` names a *user-defined* class — a project type
+///   of the same name isn't necessarily awaitable, so it must not unwrap
+///   purely on a name match (`user_classes` is the checker's class list).
 ///
 /// Returns `None` for anything else so the caller keeps the original
 /// inferred type. This is deliberately conservative — direct
@@ -10911,7 +10914,7 @@ fn extract_generator_return_type(typ: &Type) -> Option<Type> {
 /// checker tracks them as the async function's declared return type,
 /// not as `Awaitable[T]`), so this path is the typed-callable hole that
 /// R3-1 documents.
-fn unwrap_awaitable(typ: &Type) -> Option<Type> {
+fn unwrap_awaitable(typ: &Type, user_classes: &[String]) -> Option<Type> {
     let Type::Generic(name, args) = typ else {
         return None;
     };
@@ -10919,8 +10922,9 @@ fn unwrap_awaitable(typ: &Type) -> Option<Type> {
         ("Awaitable", 1) => Some(args[0].clone()),
         ("Coroutine", 3) => Some(args[2].clone()),
         ("Coroutine", 1) => Some(args[0].clone()),
-        ("Task", 1) => Some(args[0].clone()),
-        ("Future", 1) => Some(args[0].clone()),
+        ("Task", 1) | ("Future", 1) if !user_classes.iter().any(|c| c == name) => {
+            Some(args[0].clone())
+        }
         _ => None,
     }
 }
@@ -13115,7 +13119,7 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
             // `Coroutine[T]` shorthand. The canonical `async def f()
             // -> T:` path is unaffected because the checker already
             // tracks async functions as returning `T` directly.
-            unwrap_awaitable(&inner).unwrap_or(inner)
+            unwrap_awaitable(&inner, &c.classes).unwrap_or(inner)
         }
         // Comprehensions / generator expressions. Each introduces its own
         // scope; we bind every `for` target to the iterable's element type
