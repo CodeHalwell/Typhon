@@ -37,6 +37,11 @@ pub struct VmException {
 pub struct Frame {
     pub function: String,
     pub line: Option<u32>,
+    /// Source file the frame's line refers to (cross-module imports run
+    /// sibling files through the same interpreter).
+    pub file: Option<String>,
+    /// The source line's text, for CPython-style traceback rendering.
+    pub line_text: Option<String>,
 }
 
 impl VmException {
@@ -94,6 +99,14 @@ pub fn index_error(msg: impl Into<String>) -> Unwind {
 }
 pub fn zero_division() -> Unwind {
     Unwind::Exception(VmException::new("ZeroDivisionError", "division by zero"))
+}
+
+/// CPython's message for `//` and `%` by zero differs from true division's.
+pub fn zero_division_floor_mod() -> Unwind {
+    Unwind::Exception(VmException::new(
+        "ZeroDivisionError",
+        "integer division or modulo by zero",
+    ))
 }
 pub fn not_implemented(feature: &str) -> Unwind {
     Unwind::Exception(VmException::new(

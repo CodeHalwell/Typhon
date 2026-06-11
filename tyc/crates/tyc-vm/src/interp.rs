@@ -22,7 +22,7 @@ use ruff_python_ast::{
 use crate::env::{Env, EnvRef};
 use crate::error::{
     attribute_error, index_error, key_error, name_error, not_implemented, type_error, value_error,
-    vm_unsupported_use_compile, zero_division, Unwind, VmException,
+    vm_unsupported_use_compile, zero_division, zero_division_floor_mod, Unwind, VmException,
 };
 use crate::value::{
     bigint_to_f64, Class, ClassField, DictMap, Function, HashKey, Instance, IterState, NativeFn,
@@ -33,6 +33,13 @@ pub struct Interpreter {
     pub root: EnvRef,
     pub stack_depth: usize,
     pub max_stack_depth: usize,
+    /// Byte offset (into the current source) of the statement being
+    /// executed — the raise site for traceback frames.
+    pub current_offset: usize,
+    /// Name + line-start table of the source the interpreter is currently
+    /// executing. Swapped around sibling-module bodies so cross-module
+    /// frames report the right file. `None` only in unit-test harnesses.
+    pub current_source: Option<Rc<SourceInfo>>,
     /// `sys.argv` for the running script. `argv[0]` is conventionally the
     /// script path; `argv[1..]` are the user-supplied arguments. Populated
     /// by `lib::run_*`, not by the host process's own argv.
@@ -80,12 +87,51 @@ impl Default for Interpreter {
     }
 }
 
+/// Filename + per-line byte offsets of a source the VM executes, for
+/// traceback frame rendering. Line starts are sorted; `line_of` is a
+/// binary search.
+pub struct SourceInfo {
+    pub name: String,
+    pub line_starts: Vec<usize>,
+    pub lines: Vec<String>,
+}
+
+impl SourceInfo {
+    pub fn new(name: impl Into<String>, source: &str) -> Self {
+        let mut line_starts = vec![0usize];
+        for (i, b) in source.bytes().enumerate() {
+            if b == b'\n' {
+                line_starts.push(i + 1);
+            }
+        }
+        Self {
+            name: name.into(),
+            line_starts,
+            lines: source.lines().map(|l| l.to_owned()).collect(),
+        }
+    }
+    /// 1-based line number containing `offset`.
+    pub fn line_of(&self, offset: usize) -> u32 {
+        match self.line_starts.binary_search(&offset) {
+            Ok(i) => (i + 1) as u32,
+            Err(i) => i as u32,
+        }
+    }
+    pub fn line_text(&self, line: u32) -> Option<String> {
+        self.lines
+            .get((line as usize).saturating_sub(1))
+            .map(|l| l.trim().to_owned())
+    }
+}
+
 impl Interpreter {
     pub fn new() -> Self {
         let root = Env::new_root();
         let mut interp = Interpreter {
             root: root.clone(),
             stack_depth: 0,
+            current_offset: 0,
+            current_source: None,
             // Match CPython's default `sys.getrecursionlimit()` of 1000
             // (FINDINGS #31). The tree-walking interpreter still pays a
             // real Rust stack frame for each Typhon frame, so values much
@@ -124,6 +170,8 @@ impl Interpreter {
     }
 
     fn exec_stmt(&mut self, stmt: &Stmt, env: &EnvRef) -> Result<(), Unwind> {
+        use ruff_text_size::Ranged;
+        self.current_offset = stmt.range().start().to_usize();
         match stmt {
             Stmt::Expr(e) => {
                 self.eval_expr(&e.value, env)?;
@@ -900,8 +948,17 @@ impl Interpreter {
         // Evaluate the module body in a fresh child scope of root; copy
         // every named binding into a Module namespace so attribute
         // lookups resolve to user functions / classes / constants.
+        // Swap `current_source` to the sibling's source for the duration
+        // so traceback frames raised inside it report the right file.
         let module_env = Env::new_child(&self.root);
-        self.exec_block(&module.body, &module_env)?;
+        let saved_source = self.current_source.clone();
+        self.current_source = Some(Rc::new(SourceInfo::new(
+            path.display().to_string(),
+            &prep.python_source,
+        )));
+        let body_result = self.exec_block(&module.body, &module_env);
+        self.current_source = saved_source;
+        body_result?;
 
         use crate::value::Module;
         let mut members: HashMap<String, Value> = HashMap::new();
@@ -2027,6 +2084,12 @@ impl Interpreter {
             )));
         }
         self.stack_depth += 1;
+        // Remember the caller's statement offset: the callee's body will
+        // overwrite `current_offset`, and if an exception bubbles out we
+        // (a) stamp the callee's frame with the raise-site offset, then
+        // (b) restore the caller's offset so the next frame up records
+        // its own call-site line.
+        let caller_offset = self.current_offset;
         // Wrap the body in a closure so every early `return` decrements the
         // counter on the way out — including a failure in `bind_args`.
         let call_env = Env::new_child(&f.closure);
@@ -2058,6 +2121,30 @@ impl Interpreter {
             }
         })();
         self.stack_depth -= 1;
+        let result = match result {
+            Err(Unwind::Exception(mut e)) => {
+                // CPython prints every frame; cap ours so deep recursion
+                // doesn't render a megabyte of repeats.
+                if e.frames.len() < 64 {
+                    let (line, file, line_text) = match &self.current_source {
+                        Some(si) => {
+                            let line = si.line_of(self.current_offset);
+                            (Some(line), Some(si.name.clone()), si.line_text(line))
+                        }
+                        None => (None, None, None),
+                    };
+                    e.frames.push(crate::error::Frame {
+                        function: f.name.clone(),
+                        line,
+                        file,
+                        line_text,
+                    });
+                }
+                Err(Unwind::Exception(e))
+            }
+            other => other,
+        };
+        self.current_offset = caller_offset;
         result
     }
 
@@ -2546,9 +2633,9 @@ impl Interpreter {
             (Int(a), Mult, Int(b)) => return Ok(Int(a * b)),
             (Int(_), Div, Int(b)) if b.is_zero() => return Err(zero_division()),
             (Int(a), Div, Int(b)) => return Ok(Float(bigint_to_f64(a) / bigint_to_f64(b))),
-            (Int(_), FloorDiv, Int(b)) if b.is_zero() => return Err(zero_division()),
+            (Int(_), FloorDiv, Int(b)) if b.is_zero() => return Err(zero_division_floor_mod()),
             (Int(a), FloorDiv, Int(b)) => return Ok(Int(a.div_floor(b))),
-            (Int(_), Mod, Int(b)) if b.is_zero() => return Err(zero_division()),
+            (Int(_), Mod, Int(b)) if b.is_zero() => return Err(zero_division_floor_mod()),
             (Int(a), Mod, Int(b)) => return Ok(Int(a.mod_floor(b))),
             (Int(a), Pow, Int(b)) => {
                 if b.is_negative() {
