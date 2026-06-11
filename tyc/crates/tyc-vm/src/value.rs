@@ -67,6 +67,33 @@ pub enum HashKey {
     },
 }
 
+/// When `v` is a member of an enum class that mixes in a value type
+/// (`StrEnum`, `IntEnum`, `IntFlag` — detected by walking the base chain
+/// for the VM's `__typhon_enum_base__`-tagged marker classes of those
+/// names), return the member's underlying `value`. CPython makes such
+/// members genuine `str` / `int` subclasses, so equality, ordering,
+/// hashing, and `str()` all flow through the value; plain `Enum` members
+/// intentionally return `None` here (`Color.RED == 1` is False).
+pub fn enum_mixin_value(v: &Value) -> Option<Value> {
+    fn mixin_base(class: &Rc<Class>) -> bool {
+        let is_marker = class
+            .class_attrs
+            .borrow()
+            .contains_key("__typhon_enum_base__")
+            && matches!(class.name.as_str(), "StrEnum" | "IntEnum" | "IntFlag");
+        if is_marker {
+            return true;
+        }
+        class.bases.iter().any(mixin_base)
+    }
+    if let Value::Instance(inst) = v {
+        if mixin_base(&inst.class) {
+            return inst.fields.borrow().get("value").cloned();
+        }
+    }
+    None
+}
+
 /// Canonical, hashable projection of a dataclass instance: the class
 /// identity, name, and the fields sorted by name with each value lowered
 /// to a `HashKey`. Drives `Eq` / `Hash` / ordering for `HashKey::Instance`.
@@ -646,6 +673,13 @@ impl Value {
             // CPython but makes frozen-instance dict/set keys work. Equal
             // fields ⇒ equal key ⇒ `p2 in seen` is True.
             Value::Instance(inst) => {
+                // Value-mixin enum members (`StrEnum` / `IntEnum`) hash as
+                // their underlying value so `{"active": 1}[Status.ACTIVE]`
+                // works exactly as it does under CPython (where the member
+                // IS a str / int subclass).
+                if let Some(v) = enum_mixin_value(self) {
+                    return v.to_hash_key();
+                }
                 let mut fields: Vec<(String, HashKey)> = Vec::new();
                 for (name, v) in inst.fields.borrow().iter() {
                     fields.push((name.clone(), v.to_hash_key()?));

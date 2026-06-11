@@ -1601,6 +1601,20 @@ impl Interpreter {
                     return Ok(!b);
                 }
             }
+            // Value-mixin enum members (`StrEnum` / `IntEnum` / `IntFlag`)
+            // ARE their value in CPython: `Status.ACTIVE == "active"` is
+            // True, ordering works against raw ints, etc. Unwrap to the
+            // member value and retry. Plain `Enum` members deliberately do
+            // NOT unwrap (CPython: `Color.RED == 1` is False).
+            if !matches!(op, CmpOp::Is | CmpOp::IsNot) {
+                let lu = crate::value::enum_mixin_value(l);
+                let ru = crate::value::enum_mixin_value(r);
+                if lu.is_some() || ru.is_some() {
+                    let l2 = lu.unwrap_or_else(|| l.clone());
+                    let r2 = ru.unwrap_or_else(|| r.clone());
+                    return self.cmp_op(op, &l2, &r2);
+                }
+            }
         }
         Ok(match op {
             CmpOp::Eq => l.py_eq(r),
@@ -2504,6 +2518,12 @@ impl Interpreter {
         if !Self::is_enum_member(v) {
             return None;
         }
+        // Value-mixin members (`StrEnum` / `IntEnum` / `IntFlag`) stringify
+        // through their value in CPython 3.11+ — `print(Status.ACTIVE)`
+        // shows `active`, `print(Level.HIGH)` shows `2`.
+        if let Some(value) = crate::value::enum_mixin_value(v) {
+            return Some(value.py_str());
+        }
         if let Value::Instance(i) = v {
             if let Some(Value::Str(name)) = i.fields.borrow().get("_name_") {
                 return Some(format!("{}.{}", i.class.name, name));
@@ -2731,6 +2751,20 @@ impl Interpreter {
                         &[],
                     );
                 }
+            }
+        }
+
+        // Value-mixin enum members (`StrEnum` / `IntEnum` / `IntFlag`)
+        // participate in arithmetic / concatenation as their underlying
+        // value (they're genuine str / int subclasses in CPython):
+        // `Level.HIGH + 1`, `"x" + Status.ACTIVE`, `Perm.R | Perm.W`.
+        {
+            let lu = crate::value::enum_mixin_value(l);
+            let ru = crate::value::enum_mixin_value(r);
+            if lu.is_some() || ru.is_some() {
+                let l2 = lu.unwrap_or_else(|| l.clone());
+                let r2 = ru.unwrap_or_else(|| r.clone());
+                return self.binop(&l2, op, &r2);
             }
         }
 

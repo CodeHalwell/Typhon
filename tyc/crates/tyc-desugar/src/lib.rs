@@ -657,6 +657,21 @@ fn stmts_use_enum_base(body: &[Stmt]) -> bool {
     })
 }
 
+/// `true` when any base of `c` is one of the standard enum bases (bare or
+/// `enum.`-qualified). A `class! X(enum.StrEnum):` must NOT get a
+/// synthesised `__init__` — enum bodies are member definitions, not
+/// fields, and injecting a constructor (plus stripping the "defaults")
+/// corrupts the EnumType machinery into a TypeError at import time.
+fn class_has_enum_base(c: &ruff_python_ast::StmtClassDef) -> bool {
+    c.bases().iter().any(|b| {
+        is_enum_qualified_base(b)
+            || matches!(
+                base_last_segment(b),
+                Some("Enum" | "IntEnum" | "StrEnum" | "Flag" | "IntFlag" | "ReprEnum")
+            )
+    })
+}
+
 /// `true` when `base` is a dotted `enum.<Family>` reference where `<Family>` is
 /// one of the standard enum bases.
 fn is_enum_qualified_base(base: &Expr) -> bool {
@@ -1561,7 +1576,12 @@ fn desugar_stmt(stmt: &Stmt, markers: ClassMarkers<'_>) -> (Stmt, bool) {
             // but allocates real objects for things like `Linear(10, 5)`
             // and confuses libraries that introspect class attributes
             // (e.g. PyTorch parameter registration on subclasses).
-            if is_raw && !is_plain && class_has_any_base(c) && !body_has_init(&new_class.body) {
+            if is_raw
+                && !is_plain
+                && class_has_any_base(c)
+                && !body_has_init(&new_class.body)
+                && !class_has_enum_base(c)
+            {
                 let synthesised = synthesise_raw_class_init(&new_class.body);
                 // Place `__init__` after the leading run of (docstring +
                 // field annotations) so the class reads top-to-bottom:
