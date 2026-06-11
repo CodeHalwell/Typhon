@@ -243,6 +243,371 @@ pub fn migrate_source(source: &str) -> String {
         }
     }
 
+    // Post-passes over the line-rewritten output: modernise `class X(Enum):`
+    // to the `enum` keyword, simplify `field(default_factory=...)` to
+    // Typhon's bare-literal sugar, relocate class-body methods into `impl`
+    // blocks (Rule 4 — previously the migrator's own checker immediately
+    // warned about its output), and drop imports the rewrites orphaned.
+    let out = rewrite_enum_classes(&out);
+    let out = simplify_field_default_factories(&out);
+    let out = move_methods_to_impl(&out);
+    prune_stale_migration_imports(&out)
+}
+
+/// `class X(Enum):` / `class X(enum.Enum):` → `enum X:`. Only the bare
+/// `Enum` base — `IntEnum` / `StrEnum` / `Flag` mixins have no `enum`
+/// keyword spelling and keep their class form (the auto-skip emit path
+/// handles them).
+fn rewrite_enum_classes(source: &str) -> String {
+    let mut out = String::with_capacity(source.len());
+    for line in source.split_inclusive('\n') {
+        let raw = line.trim_end_matches(['\n', '\r']);
+        let terminator = &line[raw.len()..];
+        let trimmed = raw.trim_start();
+        let indent = &raw[..raw.len() - trimmed.len()];
+        let rewritten = (|| -> Option<String> {
+            let rest = trimmed.strip_prefix("class ")?;
+            let open = rest.find('(')?;
+            let name = rest[..open].trim();
+            if name.is_empty() || !is_python_identifier(name) {
+                return None;
+            }
+            let close = rest.find(')')?;
+            let bases = rest[open + 1..close].trim();
+            if bases != "Enum" && bases != "enum.Enum" {
+                return None;
+            }
+            if !rest[close + 1..].trim_start().starts_with(':') {
+                return None;
+            }
+            Some(format!("{indent}enum {name}:"))
+        })();
+        match rewritten {
+            Some(r) => {
+                out.push_str(&r);
+                out.push_str(terminator);
+            }
+            None => out.push_str(line),
+        }
+    }
+    out
+}
+
+/// `name: T = field(default_factory=list)` → `name: T = []` (and dict /
+/// set). Typhon's desugar re-creates the per-instance factory from the
+/// bare literal, so the sugar form is canonical.
+fn simplify_field_default_factories(source: &str) -> String {
+    let mut out = String::with_capacity(source.len());
+    for line in source.split_inclusive('\n') {
+        let raw = line.trim_end_matches(['\n', '\r']);
+        let terminator = &line[raw.len()..];
+        let rewritten = (|| -> Option<String> {
+            let eq = raw.find(" = field(default_factory=")?;
+            let tail = &raw[eq + " = field(default_factory=".len()..];
+            let (literal, rest) = if let Some(r) = tail.strip_prefix("list)") {
+                ("[]", r)
+            } else if let Some(r) = tail.strip_prefix("dict)") {
+                ("{}", r)
+            } else if let Some(r) = tail.strip_prefix("set)") {
+                ("set()", r)
+            } else {
+                return None;
+            };
+            if !rest.trim().is_empty() {
+                return None;
+            }
+            Some(format!("{} = {}", &raw[..eq], literal))
+        })();
+        match rewritten {
+            Some(r) => {
+                out.push_str(&r);
+                out.push_str(terminator);
+            }
+            None => out.push_str(line),
+        }
+    }
+    out
+}
+
+/// Relocate method definitions out of top-level `class` bodies into an
+/// `impl ClassName:` block emitted right after the class — Typhon's Rule
+/// 4 (`tyc::method_in_class_body` is a warning on exactly the output the
+/// migrator used to produce). Skips `enum` / `interface` / `plain class`
+/// blocks (methods belong in their bodies or have different semantics)
+/// and keeps a hand-written `__init__` inside `class!` bodies (where it
+/// is meaningful). Only top-level classes are transformed.
+fn move_methods_to_impl(source: &str) -> String {
+    let lines: Vec<&str> = source.split_inclusive('\n').collect();
+    let mut out = String::with_capacity(source.len());
+    let mut i = 0usize;
+    while i < lines.len() {
+        let raw = lines[i].trim_end_matches(['\n', '\r']);
+        let trimmed = raw.trim_start();
+        let indent = raw.len() - trimmed.len();
+        let is_class_header = indent == 0
+            && (trimmed.starts_with("class ") || trimmed.starts_with("class! "))
+            && trimmed.ends_with(':');
+        if !is_class_header {
+            out.push_str(lines[i]);
+            i += 1;
+            continue;
+        }
+        let is_bang = trimmed.starts_with("class! ");
+        let name_part = trimmed
+            .strip_prefix("class! ")
+            .or_else(|| trimmed.strip_prefix("class "))
+            .unwrap_or(trimmed);
+        let name_end = name_part
+            .find(|c: char| !(c.is_alphanumeric() || c == '_'))
+            .unwrap_or(name_part.len());
+        let class_name = &name_part[..name_end];
+        if class_name.is_empty() {
+            out.push_str(lines[i]);
+            i += 1;
+            continue;
+        }
+        // Block extent: lines until the next non-blank line at indent 0.
+        let mut end = i + 1;
+        while end < lines.len() {
+            let r = lines[end].trim_end_matches(['\n', '\r']);
+            let t = r.trim_start();
+            if !t.is_empty() && r.len() - t.len() == 0 {
+                break;
+            }
+            end += 1;
+        }
+        // Partition body items at indent 4 into methods vs the rest.
+        let mut others: Vec<&str> = Vec::new();
+        let mut methods: Vec<&str> = Vec::new();
+        let mut j = i + 1;
+        while j < end {
+            let r = lines[j].trim_end_matches(['\n', '\r']);
+            let t = r.trim_start();
+            let ind = r.len() - t.len();
+            if t.is_empty() {
+                // Blank lines attach to whatever item follows; buffer by
+                // peeking at the next structural line.
+                let mut k = j + 1;
+                while k < end {
+                    let rk = lines[k].trim_end_matches(['\n', '\r']);
+                    if !rk.trim().is_empty() {
+                        break;
+                    }
+                    k += 1;
+                }
+                let next_is_method = k < end && {
+                    let rk = lines[k].trim_end_matches(['\n', '\r']);
+                    let tk = rk.trim_start();
+                    rk.len() - tk.len() == 4
+                        && (tk.starts_with("def ")
+                            || tk.starts_with("async def ")
+                            || tk.starts_with('@'))
+                };
+                for blank in &lines[j..k.min(end)] {
+                    if next_is_method {
+                        methods.push(blank);
+                    } else {
+                        others.push(blank);
+                    }
+                }
+                j = k;
+                continue;
+            }
+            if ind == 4 && (t.starts_with("def ") || t.starts_with("async def ") || t.starts_with('@')) {
+                // Item extent: this line plus everything indented deeper
+                // (decorators chain through subsequent indent-4 def lines).
+                let start_item = j;
+                j += 1;
+                while j < end {
+                    let r2 = lines[j].trim_end_matches(['\n', '\r']);
+                    let t2 = r2.trim_start();
+                    let ind2 = r2.len() - t2.len();
+                    if t2.is_empty() {
+                        // Blank inside an item only if deeper content follows.
+                        let mut k = j + 1;
+                        while k < end && lines[k].trim().is_empty() {
+                            k += 1;
+                        }
+                        let deeper_follows = k < end && {
+                            let rk = lines[k].trim_end_matches(['\n', '\r']);
+                            let tk = rk.trim_start();
+                            rk.len() - tk.len() > 4
+                        };
+                        if deeper_follows {
+                            j = k;
+                            continue;
+                        }
+                        break;
+                    }
+                    if ind2 <= 4 && !(ind2 == 4 && t.starts_with('@') && (t2.starts_with("def ") || t2.starts_with("async def ") || t2.starts_with('@'))) {
+                        // A decorator item continues through the def it
+                        // decorates; anything else at indent <= 4 ends it.
+                        if ind2 == 4 && (t2.starts_with("def ") || t2.starts_with("async def ")) && t.starts_with('@') {
+                            // covered above
+                        }
+                        break;
+                    }
+                    j += 1;
+                }
+                // Extend through the decorated def's body when the item
+                // started at a decorator.
+                let item = &lines[start_item..j];
+                let is_init = item.iter().any(|l| {
+                    let t = l.trim_start();
+                    t.starts_with("def __init__(") || t.starts_with("async def __init__(")
+                });
+                if is_bang && is_init {
+                    others.extend_from_slice(item);
+                } else {
+                    methods.extend_from_slice(item);
+                }
+                continue;
+            }
+            // Non-method item: extent = this line + deeper lines.
+            others.push(lines[j]);
+            j += 1;
+            while j < end {
+                let r2 = lines[j].trim_end_matches(['\n', '\r']);
+                let t2 = r2.trim_start();
+                if t2.is_empty() || r2.len() - t2.len() > 4 {
+                    others.push(lines[j]);
+                    j += 1;
+                } else {
+                    break;
+                }
+            }
+        }
+        if methods.is_empty() {
+            for l in &lines[i..end] {
+                out.push_str(l);
+            }
+            i = end;
+            continue;
+        }
+        // Re-emit: class header + non-method body (or `pass`), then the
+        // impl block carrying the methods.
+        out.push_str(lines[i]);
+        let mut others_trimmed: Vec<&str> = others.clone();
+        while others_trimmed
+            .last()
+            .is_some_and(|l| l.trim().is_empty())
+        {
+            others_trimmed.pop();
+        }
+        if others_trimmed.is_empty() {
+            out.push_str("    pass\n");
+        } else {
+            for l in &others_trimmed {
+                out.push_str(l);
+            }
+        }
+        out.push('\n');
+        out.push_str(&format!("impl {class_name}:\n"));
+        let mut methods_trimmed: Vec<&str> = methods.clone();
+        while methods_trimmed
+            .first()
+            .is_some_and(|l| l.trim().is_empty())
+        {
+            methods_trimmed.remove(0);
+        }
+        while methods_trimmed
+            .last()
+            .is_some_and(|l| l.trim().is_empty())
+        {
+            methods_trimmed.pop();
+        }
+        let mut prev_blank = false;
+        for l in &methods_trimmed {
+            if l.trim().is_empty() && prev_blank {
+                continue;
+            }
+            prev_blank = l.trim().is_empty();
+            out.push_str(l);
+        }
+        if !out.ends_with('\n') {
+            out.push('\n');
+        }
+        // One blank line after the impl block so the next top-level
+        // definition doesn't butt against it.
+        if end < lines.len() && !lines[end].trim().is_empty() {
+            out.push('\n');
+        }
+        i = end;
+    }
+    out
+}
+
+/// Drop import names the earlier rewrites orphaned: `dataclass` / `field`
+/// from `from dataclasses import ...` and `Enum` from `from enum import
+/// ...` when the name no longer appears anywhere else in the output.
+fn prune_stale_migration_imports(source: &str) -> String {
+    fn referenced_outside_imports(source: &str, name: &str) -> bool {
+        for line in source.lines() {
+            let t = line.trim_start();
+            if t.starts_with("from ") || t.starts_with("import ") {
+                continue;
+            }
+            let mut rest = line;
+            while let Some(pos) = rest.find(name) {
+                let before_ok = pos == 0
+                    || !rest[..pos]
+                        .chars()
+                        .next_back()
+                        .is_some_and(|c| c.is_alphanumeric() || c == '_');
+                let after = &rest[pos + name.len()..];
+                let after_ok = !after
+                    .chars()
+                    .next()
+                    .is_some_and(|c| c.is_alphanumeric() || c == '_');
+                if before_ok && after_ok {
+                    return true;
+                }
+                rest = &rest[pos + name.len()..];
+            }
+        }
+        false
+    }
+    let mut out = String::with_capacity(source.len());
+    for line in source.split_inclusive('\n') {
+        let raw = line.trim_end_matches(['\n', '\r']);
+        let terminator = &line[raw.len()..];
+        let trimmed = raw.trim_start();
+        let module = if trimmed.starts_with("from dataclasses import ") {
+            Some("dataclasses")
+        } else if trimmed.starts_with("from enum import ") {
+            Some("enum")
+        } else {
+            None
+        };
+        let Some(module) = module else {
+            out.push_str(line);
+            continue;
+        };
+        let prefix_len = format!("from {module} import ").len();
+        let names: Vec<&str> = trimmed[prefix_len..]
+            .split(',')
+            .map(|n| n.trim())
+            .filter(|n| !n.is_empty())
+            .collect();
+        let kept: Vec<&str> = names
+            .iter()
+            .copied()
+            .filter(|n| referenced_outside_imports(source, n))
+            .collect();
+        if kept.is_empty() {
+            continue; // whole import is dead
+        }
+        if kept.len() == names.len() {
+            out.push_str(line);
+            continue;
+        }
+        let indent = &raw[..raw.len() - trimmed.len()];
+        out.push_str(&format!(
+            "{indent}from {module} import {}",
+            kept.join(", ")
+        ));
+        out.push_str(terminator);
+    }
     out
 }
 
