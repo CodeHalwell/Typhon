@@ -36,6 +36,15 @@ pub fn parse_module(source: &str) -> Result<Parsed<ModModule>, ParseError> {
     ruff_python_parser::parse_module(source)
 }
 
+/// Parse a single expression — used by the type checker to resolve quoted
+/// forward-reference annotations (`"Node"`, `"Tree[T]"`, `"list[Node]"`)
+/// whose content escaped the surface-sugar preprocessor.
+pub fn parse_expression(
+    source: &str,
+) -> Result<Parsed<ruff_python_ast::ModExpression>, ParseError> {
+    ruff_python_parser::parse_expression(source)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

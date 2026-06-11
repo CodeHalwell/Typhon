@@ -1270,6 +1270,133 @@ fn literal_widened_type(expr: &Expr) -> Type {
     }
 }
 
+/// Try to resolve a quoted annotation's content as a forward-referenced
+/// type expression. Returns `None` when the content doesn't look like a
+/// type (so the caller keeps `Type::LitStr` — Typhon's literal-singleton
+/// union form `type Color = "red" | "green"` must keep working).
+///
+/// Resolution requires the *head* of the expression to be provably
+/// type-shaped: a known class, a type parameter, a builtin / prelude type
+/// name, a subscript over one of those (`Tree[T]`, `list[Node]`), a
+/// dotted attribute (`mod.Class`), or a `|` union whose sides resolve.
+/// A bare unknown identifier stays a string literal.
+fn quoted_forward_ref_type(
+    content: &str,
+    classes: &[String],
+    type_params: &[String],
+) -> Option<Type> {
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    // Typhon's `T?` sugar survives inside quotes (the preprocessor can't
+    // see into string literals), so handle one trailing `?` here.
+    let (inner, nullable) = match trimmed.strip_suffix('?') {
+        Some(rest) => (rest.trim_end(), true),
+        None => (trimmed, false),
+    };
+    if inner.is_empty() {
+        return None;
+    }
+    let parsed = tyc_syntax::parse_expression(inner).ok()?;
+    let expr = &parsed.syntax().body;
+    if !expr_is_type_shaped(expr, classes, type_params) {
+        return None;
+    }
+    let mut t = type_from_annotation_with_params(expr, classes, type_params);
+    if nullable {
+        t = Type::optional(t);
+    }
+    Some(t)
+}
+
+/// Conservative "is this expression a type reference?" test backing
+/// [`quoted_forward_ref_type`]. Bare names must be a known class, type
+/// parameter, or recognised builtin/prelude type name; structured forms
+/// recurse.
+fn expr_is_type_shaped(expr: &Expr, classes: &[String], type_params: &[String]) -> bool {
+    const KNOWN_TYPE_HEADS: &[&str] = &[
+        "int",
+        "str",
+        "bool",
+        "float",
+        "bytes",
+        "complex",
+        "object",
+        "type",
+        "list",
+        "dict",
+        "set",
+        "frozenset",
+        "tuple",
+        "range",
+        "bytearray",
+        "memoryview",
+        "None",
+        "Any",
+        "Self",
+        "Optional",
+        "Union",
+        "Literal",
+        "Callable",
+        "Iterable",
+        "Iterator",
+        "Sequence",
+        "Mapping",
+        "MutableMapping",
+        "MutableSequence",
+        "MutableSet",
+        "AbstractSet",
+        "Collection",
+        "Container",
+        "Reversible",
+        "Hashable",
+        "Sized",
+        "Awaitable",
+        "Coroutine",
+        "Generator",
+        "AsyncIterator",
+        "AsyncIterable",
+        "AsyncGenerator",
+        "ContextManager",
+        "AsyncContextManager",
+        "KeysView",
+        "ValuesView",
+        "ItemsView",
+        "Final",
+        "ClassVar",
+        "Annotated",
+        "Result",
+        "Ok",
+        "Err",
+        "Counter",
+        "OrderedDict",
+        "defaultdict",
+        "deque",
+        "Path",
+    ];
+    match expr {
+        Expr::Name(n) => {
+            let name = n.id.as_str();
+            classes.iter().any(|c| c == name)
+                || type_params.iter().any(|p| p == name)
+                || KNOWN_TYPE_HEADS.contains(&name)
+        }
+        Expr::NoneLiteral(_) => true,
+        // `mod.Class` — trust dotted references (string literals never
+        // contain dots-as-attribute-access in the literal-union form).
+        Expr::Attribute(_) => true,
+        // `Head[...]` — the head must itself be type-shaped.
+        Expr::Subscript(s) => expr_is_type_shaped(&s.value, classes, type_params),
+        // `A | B` — both sides must be type-shaped.
+        Expr::BinOp(b) if matches!(b.op, Operator::BitOr) => {
+            expr_is_type_shaped(&b.left, classes, type_params)
+                && expr_is_type_shaped(&b.right, classes, type_params)
+        }
+        _ => false,
+    }
+}
+
 /// Same as [`type_from_annotation`] but treats every name in `type_params`
 /// as `Type::Any` so that PEP 695 generic functions don't trip the
 /// assignability check before we have a real inference engine.
@@ -1279,12 +1406,19 @@ pub fn type_from_annotation_with_params(
     type_params: &[String],
 ) -> Type {
     match expr {
-        // String-literal singletons in type position — e.g.
-        // `type Color = "red" | "green" | "blue"`. The BitOr arm below
-        // recurses through this case for each disjunct, so each literal
-        // becomes a `Type::LitStr` slot in the resulting `Type::Union`.
-        // FINDINGS v0.7.1 #13.
-        Expr::StringLiteral(s) => Type::LitStr(s.value.to_str().to_owned()),
+        // A quoted annotation is a *forward reference* in Python
+        // (`next: "Node"`, `-> "Tree[T]"`, `"list[Node]"`), and Python
+        // developers write the quotes reflexively. Resolve the content as
+        // a type expression whenever it names something type-shaped;
+        // otherwise keep the string-literal-singleton semantics that
+        // back Typhon's `type Color = "red" | "green"` form.
+        Expr::StringLiteral(s) => {
+            let content = s.value.to_str();
+            if let Some(t) = quoted_forward_ref_type(content, classes, type_params) {
+                return t;
+            }
+            Type::LitStr(content.to_owned())
+        }
         Expr::Name(n) => match n.id.as_str() {
             "int" => Type::Int,
             "str" => Type::Str,
