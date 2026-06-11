@@ -1543,6 +1543,25 @@ pub enum TycError {
         #[label("overriding class declared here")]
         span: SourceSpan,
     },
+
+    /// A closure (lambda or nested `def`) created inside a loop references
+    /// the loop variable. Python closures capture *variables*, not values
+    /// — every closure sees the final iteration's value once the loop
+    /// ends (`[lambda: i for i in range(3)]` → all return 2).
+    #[error("closure captures loop variable `{name}` by reference, not value")]
+    #[diagnostic(
+        severity(Warning),
+        code(tyc::loop_closure_capture),
+        url("https://typhon.dev/lang/diagnostics/loop_closure_capture"),
+        help("Each closure shares the single `{name}` binding and will observe its value at *call* time — after the loop, that's the last iteration. Bind the current value per closure with a default (`lambda {name}={name}: ...`) or build values eagerly instead of deferring.")
+    )]
+    LoopClosureCapture {
+        name: String,
+        #[source_code]
+        src: NamedSource<String>,
+        #[label("captured by reference here")]
+        span: SourceSpan,
+    },
 }
 
 impl TycError {
@@ -2761,6 +2780,21 @@ impl TycError {
         }
     }
 
+    /// Construct a [`TycError::LoopClosureCapture`] warning.
+    pub fn loop_closure_capture(
+        name: impl Into<String>,
+        path: impl Into<String>,
+        source: impl Into<String>,
+        offset: usize,
+        length: usize,
+    ) -> Self {
+        Self::LoopClosureCapture {
+            name: name.into(),
+            src: NamedSource::new(path.into(), source.into()),
+            span: SourceSpan::new(SourceOffset::from(offset), length.max(1)),
+        }
+    }
+
     /// Construct a [`TycError::IncompatibleOverride`] warning.
     #[allow(clippy::too_many_arguments)]
     pub fn incompatible_override(
@@ -3226,6 +3260,39 @@ pub(crate) fn parse_error_hint(message: &str, source: &str, offset: usize) -> Op
                  only needs to be lexically immutable."
                     .to_owned(),
             );
+        }
+    }
+
+    // `?` error-propagation inside an f-string expression part. The
+    // preprocessor's `?` expansion can't reach into string literals, so
+    // the raw `?` hits the Python parser and dies with an opaque parse
+    // error. Detect `{...?...}` inside an f-string on the offending line
+    // and point at the rebind idiom.
+    if let Some(line) = source_line(source, &line_starts, line_idx) {
+        let has_fstring = line.contains("f\"") || line.contains("f'");
+        if has_fstring {
+            let mut depth = 0usize;
+            let mut question_in_braces = false;
+            for ch in line.chars() {
+                match ch {
+                    '{' => depth += 1,
+                    '}' => depth = depth.saturating_sub(1),
+                    '?' if depth > 0 => {
+                        question_in_braces = true;
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            if question_in_braces {
+                return Some(
+                    "the `?` error-propagation operator cannot be used inside an \
+                     f-string expression — the preprocessor cannot rewrite inside \
+                     string literals. Bind the result first: \
+                     `let v: T = fallible()?` then interpolate `{v}`."
+                        .to_owned(),
+                );
+            }
         }
     }
 

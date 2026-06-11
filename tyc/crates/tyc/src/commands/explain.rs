@@ -84,6 +84,7 @@ fn catalog_codes() -> &'static [&'static str] {
         "missing_binding_kind",
         "incompatible_override",
         "is_literal_comparison",
+        "loop_closure_capture",
         "missing_initialiser",
         "missing_return",
         "mutable_default_param",
@@ -193,6 +194,9 @@ fn catalog_entry(short_code: &str) -> Option<&'static str> {
         }
         "is_literal_comparison" => {
             include_str!("../../../../../docs/diagnostics/is_literal_comparison.md")
+        }
+        "loop_closure_capture" => {
+            include_str!("../../../../../docs/diagnostics/loop_closure_capture.md")
         }
         "missing_initialiser" => {
             include_str!("../../../../../docs/diagnostics/missing_initialiser.md")

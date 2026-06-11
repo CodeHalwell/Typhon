@@ -96,6 +96,50 @@ workspace suite and the 254-file example corpus stay green.
   categories, and friends no longer fire `unknown_name` in `except`
   clauses.
 
+### Added — second sweep (closing the remaining items)
+
+- **VM cooperative asyncio.** `async def` calls produce coroutine thunks
+  (the body runs when driven, matching CPython's contract); `await` /
+  `asyncio.run` / `gather` (incl. `return_exceptions=True`) /
+  `TaskGroup.create_task` / `wait_for` / `spawn` (the `go` lowering)
+  force them in program order. `gather:` fan-out, `go ... -> task` +
+  `await task`, `async for` / async comprehensions, `async with`,
+  `asyncio.sleep`, `asyncio.timeout` (wall-clock-checked at scope exit),
+  and `asyncio.Queue` all run — with output identical to CPython unless
+  correctness depends on task *interleaving*, in which case `Queue`
+  operations raise a `RuntimeError` naming `tyc run --compile` instead
+  of deadlocking.
+- **VM traceback frames.** Runtime errors under `tyc run` now render a
+  CPython-style frame chain (`File "x.ty", line N, in fn` + source
+  line) pointing directly at the `.ty` file — previously the traceback
+  carried no frames at all. `//` / `%` by zero match CPython's message.
+- **CPython-exact `random`.** The VM's `random` module is now a faithful
+  MT19937 (CPython seeding, `random()`, `getrandbits` / `_randbelow`,
+  and the exact `gauss` / `shuffle` / `sample` / `choice` algorithms) —
+  seeded programs produce byte-identical sequences across `tyc run` and
+  `tyc build` + CPython.
+- **Recursive type aliases.** `type Json = None | bool | int | float |
+  str | list[Json] | dict[str, Json]` is now legal — `cyclic_type_alias`
+  only fires for cycles with no type constructor anywhere (no base
+  case). Container literals resolve their element expectations through
+  aliases and unions, so nested `Json` literals check.
+- **`tyc::incompatible_override`** (warn): a subclass method overriding
+  a base method with different arity, a narrower parameter, or an
+  unassignable return — the LSP violation mypy/pyright flag.
+- **`tyc::loop_closure_capture`** (warn): a closure created in a loop
+  referencing the loop variable observes the *final* value at call time
+  (`[lambda: i ...]` → `[2, 2, 2]`); the `lambda i=i:` idiom and
+  immediately-invoked closures are exempt.
+- **`tyc migrate`** now relocates class-body methods into `impl` blocks,
+  rewrites `class X(Enum):` to the `enum` keyword, simplifies
+  `field(default_factory=...)` to bare-literal sugar, and prunes the
+  imports those rewrites orphan — migrated output checks with zero
+  errors *and zero warnings*.
+- **`?`-in-f-string** parse failures now carry a targeted hint (bind
+  with `let v = fallible()?` first); `.dty` stubs count as project
+  modules for import vetting; the no-arg `tyc trace` test can no longer
+  hang on an inherited stdin pipe.
+
 ### Added — CLI / emit / VM
 
 - **`tyc run --compile script.ty`** synthesises a throwaway scaffold

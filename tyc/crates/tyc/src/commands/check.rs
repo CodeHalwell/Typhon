@@ -12,8 +12,9 @@ use miette::{miette, Result};
 
 use tyc_analyse::{
     analyse_empty_collection_bindings, analyse_is_literal_comparisons,
-    analyse_mutable_default_params, analyse_purity, analyse_secret_literal_bindings,
-    analyse_typing_alias_annotations, evaluate_comptime_with_functions, purity_diagnostics,
+    analyse_loop_closure_captures, analyse_mutable_default_params, analyse_purity,
+    analyse_secret_literal_bindings, analyse_typing_alias_annotations,
+    evaluate_comptime_with_functions, purity_diagnostics,
 };
 use tyc_db::{check_file_with_imports, extract_shapes_for_path, TycDatabase};
 use tyc_diagnostics::{sanitised_named_source_for, Diagnostics, SanitisedDiagnostic, TycError};
@@ -1080,6 +1081,14 @@ fn run_secondary_passes(
     // `is` against a literal (`s is "x"`) compares identity, not value —
     // interpreter-dependent and CPython SyntaxWarns on it.
     diags.extend(analyse_is_literal_comparisons(
+        &module,
+        path,
+        &prep.python_source,
+    ));
+
+    // Closures created in a loop capture the loop variable by reference —
+    // every deferred call sees the last iteration's value.
+    diags.extend(analyse_loop_closure_captures(
         &module,
         path,
         &prep.python_source,
