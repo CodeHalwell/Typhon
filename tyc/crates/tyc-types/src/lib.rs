@@ -2135,6 +2135,17 @@ struct Checker<'a> {
     /// positive, the call-site arm skips the `missing_await` check so
     /// the user's `await f()` is accepted.
     inside_await: u32,
+    /// True while inferring the right-hand side of a `?`-propagation
+    /// temporary's assignment (`__typhon_q_N__ = <rhs>` /
+    /// `__typhon_with_N__ = <rhs>`, both synthesised by the preprocessor).
+    /// The operand of `?` must be a `Result`, so a *bare* (un-awaited)
+    /// `async def` call there is never valid — it would read `.value`
+    /// off the coroutine at runtime. This flag OR's into the
+    /// `missing_await` call-site gate so the diagnostic fires even inside
+    /// an `async def` body (where `in_sync_function` is false), steering
+    /// the user to the documented `await expr?` idiom. The `inside_await`
+    /// counter still suppresses it for the correct `await expr?` form.
+    in_question_temp_rhs: bool,
     /// True while we are checking a *sync* function body. Only sync
     /// callers trip `tyc::missing_await`; `async def` bodies that
     /// forget to await are flagged separately by `async_without_await`
@@ -2508,6 +2519,7 @@ impl<'a> Checker<'a> {
             function_kwarg_types: HashMap::new(),
             async_functions: std::collections::HashSet::new(),
             inside_await: 0,
+            in_question_temp_rhs: false,
             in_sync_function: false,
             in_async_function: false,
             in_generator: false,
@@ -7528,7 +7540,18 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
             }
         }
         Stmt::Assign(a) => {
+            // `?` / `with`-chain propagation desugars to
+            // `__typhon_q_N__ = <rhs>` (or `__typhon_with_N__ = <rhs>`).
+            // While inferring that RHS, flag the context so a *bare*
+            // (un-awaited) async call lands a `tyc::missing_await` even
+            // inside an `async def` body — the operand of `?` must be a
+            // `Result`, never an un-awaited coroutine, so `expr?` must be
+            // spelled `await expr?`. The `inside_await` counter still
+            // exempts the correct `await expr?` shape.
+            let saved_q = c.in_question_temp_rhs;
+            c.in_question_temp_rhs = a.targets.len() == 1 && is_question_op_temp(&a.targets[0]);
             let value_type = infer_expr(c, &a.value);
+            c.in_question_temp_rhs = saved_q;
             for target in &a.targets {
                 check_attr_assign_not_frozen(c, target);
                 audit_record_field_set(c, target);
@@ -10875,6 +10898,12 @@ fn extract_generator_return_type(typ: &Type) -> Option<Type> {
 /// - `Coroutine[Y, S, T]` → `T` (the third parameter is the send/return
 ///   payload, matching `typing.Coroutine`'s shape)
 /// - `Coroutine[T]` (one-arg shorthand) → `T`
+/// - `Task[T]` / `Future[T]` → `T` — a stored `asyncio.Task[T]` /
+///   `asyncio.Future[T]` handle (the head is the last annotation segment,
+///   so `asyncio.Task[int]` resolves to `Generic("Task", [int])`). The
+///   implicit `go work() -> task` handle is already await-aware upstream;
+///   this covers the case where the handle is parked in an explicitly
+///   annotated `list[asyncio.Task[int]]` and awaited in a loop.
 ///
 /// Returns `None` for anything else so the caller keeps the original
 /// inferred type. This is deliberately conservative — direct
@@ -10890,6 +10919,8 @@ fn unwrap_awaitable(typ: &Type) -> Option<Type> {
         ("Awaitable", 1) => Some(args[0].clone()),
         ("Coroutine", 3) => Some(args[2].clone()),
         ("Coroutine", 1) => Some(args[0].clone()),
+        ("Task", 1) => Some(args[0].clone()),
+        ("Future", 1) => Some(args[0].clone()),
         _ => None,
     }
 }
@@ -11655,7 +11686,16 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
             // `asyncio.ensure_future(...)`, `asyncio.wait(...)`,
             // `asyncio.wait_for(...)` — passing a bare coroutine to
             // any of these is the canonical entry-point pattern.
-            if c.in_sync_function && c.inside_await == 0 {
+            // The sync-context gate (`in_sync_function`) catches a sync
+            // function calling an `async def` without `await`. The
+            // `in_question_temp_rhs` gate extends this into `async def`
+            // bodies for the one position where a bare coroutine is always
+            // a bug: the operand of `?` (which desugars to a
+            // `__typhon_q_N__ = <call>` temp). Without it, `inner(n)?` in an
+            // async function silently read `.value` off the coroutine at
+            // runtime. Either way `inside_await` exempts the `await expr?`
+            // form. (FINDINGS: async-`?` missing-await.)
+            if (c.in_sync_function || c.in_question_temp_rhs) && c.inside_await == 0 {
                 if let Expr::Name(n) = call.func.as_ref() {
                     if c.async_functions.contains(n.id.as_str()) {
                         let span = (n.range.start().to_usize(), n.range.end().to_usize());

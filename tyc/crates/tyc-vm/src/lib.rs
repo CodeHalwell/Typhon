@@ -285,6 +285,32 @@ match result:
     }
 
     #[test]
+    fn type_alias_binds_as_runtime_value() {
+        // A `type` alias must bind a runtime name (CPython binds a lazy
+        // `TypeAliasType`); previously this was a no-op, so an imported
+        // alias raised `AttributeError`/`NameError`. A sealed-union alias
+        // has no first-class VM union value, so it lowers to a tuple of its
+        // member types — a valid `isinstance` argument. Reaching the final
+        // `print` (exit 0) proves `AB` is bound and usable; an unbound name
+        // would raise `NameError` first.
+        let src = r#"
+class A:
+    v: int
+
+class B:
+    v: int
+
+type AB = A | B
+type Scalar = int
+
+let a = A(v=1)
+print(isinstance(a, AB))
+print(isinstance(a, Scalar))
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    #[test]
     fn class_with_method() {
         let src = r#"
 class Point:

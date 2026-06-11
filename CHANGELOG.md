@@ -4,6 +4,59 @@ All notable changes to Typhon are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely; the
 canonical phase-by-phase status lives in `docs/roadmap.md`.
 
+## Unreleased
+
+### Fixed — playground stress round (async `?`, await-unwrap, VM project run, `fmt`, `pub enum`)
+
+A round of app-building against v0.13.0 surfaced six defects, all fixed
+here. The full workspace suite and the example corpus stay green.
+
+- **`?` on a bare `async` call silently miscompiled instead of erroring.**
+  Applying `?` directly to an un-awaited `async def` call
+  (`let v: int = inner(n)?`) desugared to a `.value` read off the
+  *coroutine* — `tyc check` passed, then the program crashed at runtime
+  with `AttributeError: 'coroutine' object has no attribute 'value'`. The
+  checker now fires `tyc::missing_await` on a `?`-propagation temporary
+  whose operand is an un-awaited async call, even inside an `async def`
+  body, steering the user to the documented `await inner(n)?` idiom (which
+  was, and stays, correct). The check is scoped to `?` / with-chain
+  propagation temporaries and exempts anything already inside `await`, so
+  `gather:` / `go` / `asyncio.create_task` patterns are unaffected.
+- **`await` didn't unwrap a stored `asyncio.Task[T]` / `Future[T]`.** A
+  `go work() -> t` handle parked in an explicitly-annotated
+  `list[asyncio.Task[int]]` and awaited in a loop typed `await t` as
+  `Task[int]`, firing a false `tyc::type_mismatch`. The await-unwrap table
+  now covers `Task[T]` and `Future[T]` alongside `Awaitable` / `Coroutine`.
+- **`tyc run` (VM) gating check treated the entry file as standalone.**
+  The pre-run `tyc check` ran on `main.ty` alone, so every
+  `from sibling import …` fired `tyc::unknown_module` plus knock-on false
+  errors (e.g. an exhaustive `match` over an imported sealed union
+  degrading to `tyc::missing_return`) that blocked execution even when
+  `tyc check src/` was green. The pre-run check now resolves the whole
+  project `src` tree when the entry lives inside it.
+- **VM didn't bind a `type` sealed-union alias as a module attribute.**
+  `from mod import Event` for `pub type Event = A | B | C` raised
+  `AttributeError: module '…' has no attribute 'Event'` under `tyc run`
+  (the build path emits the alias and CPython binds it lazily, so
+  `tyc run --compile` already worked). The VM now binds the alias name: a
+  union RHS lowers to a tuple of its member types (a valid `isinstance`
+  argument); other shapes evaluate directly; an unevaluable RHS falls
+  back to a name placeholder, mirroring CPython's deferred evaluation.
+- **`tyc fmt` left desugar syntax in a `freeze let` whose value held a
+  `#`.** Restoring `freeze let X = […]` split the line on the first `#`
+  without string-awareness, so a `#` *inside a string literal* in the
+  value was mistaken for a comment and the `__typhon_freeze__(...)`
+  wrapper failed to strip — leaving non-source syntax in the formatted
+  file (a regression of the 0.9.x `fmt` corruption class). The
+  originally-suspected non-ASCII trigger was a mis-attribution; the
+  operative trigger is the in-string `#`. The reverse comment scan is now
+  string-aware, matching the forward wrap path.
+- **`pub enum` did not parse.** `pub` stacked with every declaration form
+  except `enum` (`pub enum Species:` errored with "Simple statements must
+  be separated by newlines or semicolons"). `enum` is now recognised by
+  the `pub` pre-pass, so `pub enum` parses, contributes to `__all__`, and
+  round-trips through `tyc fmt` like every other `pub`-prefixed form.
+
 ## 0.13.0 — 2026-06-11 — stress-round fixes + post-release code review: cross-module extend, dict-literal lowering, enum exhaustiveness, Result API
 
 A fresh adversarial sweep (~35 programs across scripts, IO, data

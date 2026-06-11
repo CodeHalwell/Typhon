@@ -498,9 +498,51 @@ impl Interpreter {
                 Ok(())
             }
             Stmt::With(w) => self.exec_with(w, env),
-            Stmt::TypeAlias(_) => Ok(()),
+            Stmt::TypeAlias(ta) => {
+                // CPython binds `type X = <expr>` to a (lazy) `TypeAliasType`
+                // module attribute, so `from mod import X` resolves and `X`
+                // is a real name. This was previously a no-op, so importing a
+                // sealed-union alias (`pub type Event = Born | Eaten | Starved`)
+                // raised `AttributeError: module '…' has no attribute 'Event'`
+                // at the import statement. Bind the alias name so the module
+                // attribute exists.
+                if let Expr::Name(n) = ta.name.as_ref() {
+                    let val = self.eval_type_alias_value(n.id.as_str(), &ta.value, env);
+                    env.assign_or_create(n.id.as_str(), val);
+                }
+                Ok(())
+            }
             Stmt::IpyEscapeCommand(_) => Err(not_implemented("IPython escape commands")),
         }
+    }
+
+    /// Compute the runtime value to bind for a `type NAME = <rhs>` alias.
+    ///
+    /// CPython evaluates the RHS lazily (a `TypeAliasType`); the VM has no
+    /// such value and no first-class type-union, so:
+    ///   * a union RHS (`A | B | C`) becomes a tuple of its member types —
+    ///     importable, and a valid `isinstance(x, AB)` second argument
+    ///     (`is_instance_of` matches any tuple member);
+    ///   * any other RHS (`int`, `list[T]`, `tuple[A, B]`) is evaluated
+    ///     directly;
+    ///   * an RHS that can't be evaluated (forward reference, bare type
+    ///     parameter, unsupported type expression) falls back to the alias
+    ///     name as a string so the module attribute still exists — mirroring
+    ///     CPython's deferred evaluation rather than crashing at the `type`
+    ///     statement.
+    fn eval_type_alias_value(&mut self, name: &str, value: &Expr, env: &EnvRef) -> Value {
+        if let Some(members) = union_leaves(value) {
+            let mut vals = Vec::with_capacity(members.len());
+            for m in members {
+                match self.eval_expr(m, env) {
+                    Ok(v) => vals.push(v),
+                    Err(_) => return Value::Str(Rc::new(name.to_owned())),
+                }
+            }
+            return Value::Tuple(Rc::new(vals));
+        }
+        self.eval_expr(value, env)
+            .unwrap_or_else(|_| Value::Str(Rc::new(name.to_owned())))
     }
 
     // ── Function/class construction ────────────────────────────────────────
@@ -5352,6 +5394,26 @@ fn complex_binop(op: Operator, ar: f64, ai: f64, br: f64, bi: f64) -> Result<Val
             op.as_str()
         ))),
     }
+}
+
+/// If `e` is a top-level `X | Y | …` union (a `|` chain of at least two
+/// leaves), return the leaf expressions left-to-right; otherwise `None`.
+/// Used to lower a sealed-union `type` alias to a tuple of its member
+/// types in the VM (which has no first-class union value).
+fn union_leaves(e: &Expr) -> Option<Vec<&Expr>> {
+    fn walk<'a>(e: &'a Expr, out: &mut Vec<&'a Expr>) {
+        if let Expr::BinOp(b) = e {
+            if matches!(b.op, Operator::BitOr) {
+                walk(&b.left, out);
+                walk(&b.right, out);
+                return;
+            }
+        }
+        out.push(e);
+    }
+    let mut out = Vec::new();
+    walk(e, &mut out);
+    (out.len() >= 2).then_some(out)
 }
 
 fn binop_dunder(op: Operator) -> Option<&'static str> {

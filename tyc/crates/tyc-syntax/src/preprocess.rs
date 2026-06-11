@@ -1053,6 +1053,7 @@ pub fn pub_decl_name(body: &str) -> Option<String> {
         "def ",
         "class ",
         "model ",
+        "enum ",
         "interface ",
         "newtype ",
         "type ",
@@ -1094,10 +1095,15 @@ fn ident_prefix(s: &str) -> Option<String> {
 /// Handles a trailing `# comment` symmetrically with [`wrap_freeze_let`]
 /// so a round-trip on `freeze let X = [1, 2]  # note` is exact.
 fn unwrap_freeze_let(content: &str) -> Option<String> {
-    let (code, comment) = match content.find('#') {
-        Some(i) => (&content[..i], &content[i..]),
-        None => (content, ""),
-    };
+    // Split off a trailing `# comment`, but only one that lives OUTSIDE a
+    // string literal. A naive `content.find('#')` mistakes a `#` *inside*
+    // the frozen value (e.g. a list element `"#"`) for a comment, which
+    // mis-splits the line so the `__typhon_freeze__(...)` wrapper fails to
+    // strip — leaving desugar-only syntax in the formatted source (the
+    // 0.9.x fmt-corruption class). Mirror the string-aware comment scan
+    // the forward `wrap_freeze_let_with_depth` path already uses.
+    let code = strip_trailing_comment(content);
+    let comment = content[code.len()..].trim();
     let eq = code.find('=')?;
     let lhs = code[..eq].trim_end();
     let rhs = code[eq + 1..].trim();
@@ -1106,7 +1112,7 @@ fn unwrap_freeze_let(content: &str) -> Option<String> {
     let suffix = if comment.is_empty() {
         String::new()
     } else {
-        format!("  {}", comment.trim_end())
+        format!("  {}", comment)
     };
     Some(format!("{} = {}{}", lhs, inner, suffix))
 }
@@ -7713,6 +7719,63 @@ mod tests {
     #[test]
     fn freeze_let_with_comment_round_trips_via_postprocess() {
         let src = "freeze let TAGS = [1, 2]  # ids\n";
+        let prep = preprocess(src);
+        let out = postprocess(&prep.python_source, &prep.stripped, &prep.optionals);
+        assert_eq!(out, src);
+    }
+
+    #[test]
+    fn freeze_let_with_hash_inside_string_round_trips_via_postprocess() {
+        // Regression: a `#` *inside* a string literal in the frozen value
+        // must not be mistaken for a trailing comment when the
+        // `__typhon_freeze__(...)` wrapper is stripped on the way back. The
+        // naive `find('#')` split left the desugar wrapper in the formatted
+        // source (the 0.9.x fmt-corruption class). A trailing real comment
+        // alongside the in-string `#` must still survive.
+        for src in [
+            "freeze let SYM: list[str] = [\"a\", \"#\", \"b\"]\n",
+            "freeze let SYM: list[str] = [\"a\", \"#\", \"b\"]  # glyphs\n",
+            // Non-ASCII content (the originally-reported, mis-attributed
+            // trigger) alongside the in-string `#`.
+            "freeze let SYM: list[str] = [\" \", \"\u{b7}\", \"#\"]\n",
+        ] {
+            let prep = preprocess(src);
+            let out = postprocess(&prep.python_source, &prep.stripped, &prep.optionals);
+            assert!(
+                !out.contains("__typhon_freeze__"),
+                "wrapper leaked into restored source:\n{out}"
+            );
+            assert_eq!(out, src, "freeze let with in-string `#` must round-trip");
+        }
+    }
+
+    #[test]
+    fn unwrap_freeze_let_ignores_hash_inside_string() {
+        // Direct unit on the reverse path: the comment split must be
+        // string-aware so the `#` element survives the unwrap.
+        let got = unwrap_freeze_let("let SYM = __typhon_freeze__([\"a\", \"#\", \"b\"])");
+        assert_eq!(got.as_deref(), Some("let SYM = [\"a\", \"#\", \"b\"]"));
+        let got = unwrap_freeze_let("let SYM = __typhon_freeze__([\"#\"])  # note");
+        assert_eq!(got.as_deref(), Some("let SYM = [\"#\"]  # note"));
+    }
+
+    #[test]
+    fn pub_enum_records_name() {
+        // `pub` must stack with `enum` like every other declaration form.
+        let result = preprocess("pub enum Species:\n    CAT\n    DOG\n");
+        assert_eq!(result.pub_names, vec!["Species".to_owned()]);
+        assert!(!result.python_source.contains("pub enum"));
+        assert!(result.python_source.contains("class Species(enum.Enum)"));
+    }
+
+    #[test]
+    fn pub_decl_name_recognises_enum() {
+        assert_eq!(pub_decl_name("enum Species:\n").as_deref(), Some("Species"));
+    }
+
+    #[test]
+    fn pub_enum_round_trips_via_postprocess() {
+        let src = "pub enum Species:\n    CAT\n    DOG\n";
         let prep = preprocess(src);
         let out = postprocess(&prep.python_source, &prep.stripped, &prep.optionals);
         assert_eq!(out, src);

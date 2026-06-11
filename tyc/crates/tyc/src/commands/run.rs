@@ -291,7 +291,7 @@ fn run_vm(args: RunArgs) -> Result<()> {
     let entry = resolve_vm_entry(&args.path)?;
     if std::env::var_os("TYC_SKIP_CHECK").is_none() {
         check::run(CheckArgs {
-            paths: vec![entry.clone()],
+            paths: vm_check_scope(&args.path, &entry),
             stubs: false,
             quiet_success: true,
             with_ty: false,
@@ -299,6 +299,46 @@ fn run_vm(args: RunArgs) -> Result<()> {
     }
     let code = tyc_vm::run_file(&entry, &args.script_args).map_err(|e| miette!("{e}"))?;
     std::process::exit(code);
+}
+
+/// Decide which path(s) the pre-run `tyc check` should cover.
+///
+/// The VM loads sibling modules from the project source root, so the
+/// gating check must resolve the *same* module graph the VM will execute.
+/// Checking the entry file in isolation made every `from sibling import …`
+/// trip `tyc::unknown_module`, and the unresolved imports cascaded into
+/// false errors that blocked execution (e.g. an exhaustive `match` over an
+/// imported sealed union degrading to `tyc::missing_return`) — even when
+/// `tyc check src/` was green.
+///
+/// When the entry lives inside the configured `[project] src` tree we check
+/// that whole tree (matching `tyc check src/`). For a bare single-file
+/// invocation with no surrounding project — or an entry outside the src
+/// tree — we keep checking just the entry file.
+fn vm_check_scope(path: &std::path::Path, entry: &std::path::Path) -> Vec<PathBuf> {
+    let probe = if path.is_dir() {
+        path.canonicalize().ok()
+    } else {
+        path.canonicalize()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+    };
+    if let Some(dir) = probe {
+        if let Ok(Some((toml_path, cfg))) = TyphonConfig::load(&dir) {
+            if let Some(root) = toml_path.parent() {
+                let src = root.join(&cfg.project.src);
+                // Only widen to the src tree when the entry is genuinely
+                // inside it; otherwise the entry's own diagnostics would
+                // be skipped entirely.
+                if let (Ok(src_c), Ok(entry_c)) = (src.canonicalize(), entry.canonicalize()) {
+                    if entry_c.starts_with(&src_c) {
+                        return vec![src_c];
+                    }
+                }
+            }
+        }
+    }
+    vec![entry.to_path_buf()]
 }
 
 /// Resolve a Typhon entry point from a user-supplied path. If the path is a
@@ -342,6 +382,43 @@ mod tests {
     struct WrapRun {
         #[command(flatten)]
         args: RunArgs,
+    }
+
+    #[test]
+    fn vm_check_scope_widens_to_project_src_tree() {
+        // A project-directory invocation must check the whole `src` tree so
+        // sibling imports resolve (the bug: checking `main.ty` alone fired a
+        // false `unknown_module` + knock-on errors that blocked `tyc run`).
+        let project = tempfile::tempdir().unwrap();
+        let src = project.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(
+            project.path().join("typhon.toml"),
+            "[project]\nname = \"u\"\nversion = \"0.1.0\"\nsrc = \"src\"\nout = \"build\"\n\
+             [python]\ntarget = \"3.13\"\n",
+        )
+        .unwrap();
+        std::fs::write(src.join("main.ty"), "def main() -> None:\n    pass\n").unwrap();
+        let entry = src.join("main.ty");
+
+        // Directory invocation → check the src tree.
+        let scope = vm_check_scope(project.path(), &entry);
+        assert_eq!(scope, vec![src.canonicalize().unwrap()]);
+
+        // Passing the entry file (inside the project) widens too.
+        let scope = vm_check_scope(&entry, &entry);
+        assert_eq!(scope, vec![src.canonicalize().unwrap()]);
+    }
+
+    #[test]
+    fn vm_check_scope_falls_back_to_entry_for_bare_file() {
+        // A single `.ty` with no surrounding project must check just itself
+        // (no regression from the old behaviour).
+        let dir = tempfile::tempdir().unwrap();
+        let entry = dir.path().join("scratch.ty");
+        std::fs::write(&entry, "let x: int = 1\n").unwrap();
+        let scope = vm_check_scope(&entry, &entry);
+        assert_eq!(scope, vec![entry.clone()]);
     }
 
     #[test]
