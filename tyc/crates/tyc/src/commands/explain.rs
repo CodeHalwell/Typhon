@@ -84,6 +84,7 @@ fn catalog_codes() -> &'static [&'static str] {
         "missing_binding_kind",
         "missing_initialiser",
         "missing_return",
+        "mutable_default_param",
         "newtype_violation",
         "no_block_shadow",
         "non_exhaustive_match",
@@ -189,6 +190,9 @@ fn catalog_entry(short_code: &str) -> Option<&'static str> {
             include_str!("../../../../../docs/diagnostics/missing_initialiser.md")
         }
         "missing_return" => include_str!("../../../../../docs/diagnostics/missing_return.md"),
+        "mutable_default_param" => {
+            include_str!("../../../../../docs/diagnostics/mutable_default_param.md")
+        }
         "newtype_violation" => {
             include_str!("../../../../../docs/diagnostics/newtype_violation.md")
         }

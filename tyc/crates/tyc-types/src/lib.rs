@@ -8063,8 +8063,30 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                 check_pattern_class_fields(c, &case.pattern);
                 // Enter scope and bind pattern names FIRST so guard expressions
                 // (e.g. `case Circle(radius=r) if r > 0:`) can reference them.
+                // A class pattern narrows the *subject variable* inside the
+                // arm (`match step: case Action(_, _): use(step)` sees
+                // `step: Action`) — matching mypy / pyright. The snapshot is
+                // taken BEFORE entering the arm scope and restored AFTER
+                // leaving it, so the narrowing (which mutates the subject's
+                // outer binding in place) stays scoped to this arm.
+                //
+                // Gate: only narrow when the narrowed type provably flows
+                // back into the subject's current type. When the union is
+                // imported and opaque (single-file check of one module of a
+                // project), narrowing would *break* passing the subject to
+                // a `Command`-typed parameter — staying un-narrowed is the
+                // sound conservative choice there.
+                let narrow_to = match m.subject.as_ref() {
+                    Expr::Name(_) => pattern_narrowed_type(&case.pattern)
+                        .filter(|t| c.is_assignable(&subject_type, t)),
+                    _ => None,
+                };
+                let snap = narrow_to.as_ref().map(|_| c.env.snapshot());
                 c.env.enter();
                 bind_pattern_names(c, &case.pattern);
+                if let (Expr::Name(subj), Some(t)) = (m.subject.as_ref(), narrow_to) {
+                    c.env.narrow(subj.id.as_str(), t);
+                }
                 if let Some(guard) = &case.guard {
                     let _ = infer_expr(c, guard);
                 }
@@ -8072,6 +8094,9 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                     check_stmt(c, s);
                 }
                 c.env.leave();
+                if let Some(snap) = snap {
+                    c.env.restore(snap);
+                }
             }
             // Exhaustiveness check: sealed unions and enums (both are
             // closed sets).
@@ -13419,6 +13444,40 @@ fn check_match_exhaustiveness(
     if !missing.is_empty() {
         let missing_str = missing.join(", ");
         c.non_exhaustive_match(union_name, &missing_str, subject_span);
+    }
+}
+
+/// The type a class pattern narrows its match subject to inside the arm:
+/// `case Action(...)` → `Action`; `case A() | B()` → `A | B`;
+/// `case Action() as a` → `Action`. Returns `None` for patterns that
+/// don't pin down a class (wildcards, captures, literals, sequences,
+/// mappings) — the subject keeps its declared type in those arms.
+fn pattern_narrowed_type(pattern: &Pattern) -> Option<Type> {
+    match pattern {
+        Pattern::MatchClass(mc) => match mc.cls.as_ref() {
+            Expr::Name(n) => Some(match n.id.as_str() {
+                // Builtin class patterns narrow to the builtin type, not a
+                // nominal `Class("str")` (which nothing else unifies with).
+                "str" => Type::Str,
+                "int" => Type::Int,
+                "bool" => Type::Bool,
+                "float" => Type::Float,
+                "bytes" => Type::Bytes,
+                // Container patterns would erase element types — skip.
+                "list" | "dict" | "set" | "tuple" | "frozenset" => return None,
+                other => Type::Class(other.to_owned()),
+            }),
+            _ => None,
+        },
+        Pattern::MatchAs(a) => a.pattern.as_deref().and_then(pattern_narrowed_type),
+        Pattern::MatchOr(or) => {
+            let mut variants: Vec<Type> = Vec::with_capacity(or.patterns.len());
+            for p in &or.patterns {
+                variants.push(pattern_narrowed_type(p)?);
+            }
+            Some(Type::union_of(variants))
+        }
+        _ => None,
     }
 }
 

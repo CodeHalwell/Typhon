@@ -850,6 +850,14 @@ struct Resolver<'a> {
     /// Subsequent bareword assignments to the same name in the same
     /// scope are silenced from the v0.7.1 #16 parameter-rebinding check.
     params_with_explicit_rebind: std::collections::HashSet<(ScopeId, String)>,
+    /// Depth of `for` / `while` loop bodies currently being walked. A
+    /// `let` declared while this is non-zero is freshly bound per
+    /// iteration, so a later sequential statement re-declaring the same
+    /// name is not a block shadow (mirrors the sibling `if`-arm and
+    /// `case`-arm carve-outs).
+    loop_body_depth: usize,
+    /// Declaration spans of bindings created inside a loop body.
+    loop_origin_spans: std::collections::HashSet<(usize, usize)>,
 }
 
 impl<'a> Resolver<'a> {
@@ -877,6 +885,8 @@ impl<'a> Resolver<'a> {
             in_pattern: 0,
             uninit_let_spans: std::collections::HashSet::new(),
             params_with_explicit_rebind: std::collections::HashSet::new(),
+            loop_body_depth: 0,
+            loop_origin_spans: std::collections::HashSet::new(),
         }
     }
 
@@ -1028,6 +1038,31 @@ impl<'a> Resolver<'a> {
                 return;
             }
             let _ = kind;
+            // Sequential-loop carve-out: a `let` declared inside a loop
+            // body is freshly bound on every iteration, so a later
+            // sibling statement (typically the next loop) re-declaring
+            // the same scratch name starts a fresh binding rather than
+            // shadowing a live one — the same reasoning as the sibling
+            // `if`-arm and `case`-arm carve-outs. Replace in place.
+            if existing.kind == BindingKind::Value
+                && self.loop_origin_spans.contains(&existing.span)
+            {
+                let old_span = existing.span;
+                if let Some(b) = self.scopes[scope]
+                    .bindings
+                    .iter_mut()
+                    .find(|b| b.name == name)
+                {
+                    b.span = span;
+                    b.mutability = mutability;
+                    b.kind = kind;
+                }
+                self.loop_origin_spans.remove(&old_span);
+                if self.loop_body_depth > 0 {
+                    self.loop_origin_spans.insert(span);
+                }
+                return;
+            }
             if existing.mutability == Mutability::Let || mutability == Mutability::Let {
                 let decl_span = existing.span;
                 // R3-8: the FIRST assignment to an uninitialised `let
@@ -1072,6 +1107,9 @@ impl<'a> Resolver<'a> {
             return;
         }
 
+        if self.loop_body_depth > 0 && kind == BindingKind::Value {
+            self.loop_origin_spans.insert(span);
+        }
         self.scopes[scope].bindings.push(Binding {
             name: name.to_owned(),
             kind,
@@ -1751,7 +1789,9 @@ fn declare_target(
             // separate problem and not what this finding is about.
             if ast_mutability.is_some() {
                 if let Some(existing) = r.lookup_local(scope, n.id.as_str()) {
-                    if existing.kind == BindingKind::Value {
+                    if existing.kind == BindingKind::Value
+                        && !r.loop_origin_spans.contains(&existing.span)
+                    {
                         let decl_span = existing.span;
                         if decl_span != span && r.seen_immutable_redecl.insert((decl_span, span)) {
                             r.diagnostics.push_error(TycError::no_block_shadow(
@@ -2138,12 +2178,20 @@ fn walk_stmt(r: &mut Resolver, scope: ScopeId, stmt: &Stmt) {
         }
         Stmt::While(w) => {
             walk_expr(r, scope, &w.test);
+            // A `let` declared inside a loop body is freshly bound on
+            // every iteration, so a *later sequential* loop re-using the
+            // same scratch name is no more a shadow than sibling
+            // `if` / `elif` arms are. Bindings declared while
+            // `loop_body_depth > 0` are marked loop-origin; the shadow
+            // check skips collisions against loop-origin predecessors.
+            r.loop_body_depth += 1;
             for s in &w.body {
                 walk_stmt(r, scope, s);
             }
             for s in &w.orelse {
                 walk_stmt(r, scope, s);
             }
+            r.loop_body_depth -= 1;
         }
         Stmt::For(f) => {
             walk_expr(r, scope, &f.iter);
@@ -2152,12 +2200,15 @@ fn walk_stmt(r: &mut Resolver, scope: ScopeId, stmt: &Stmt) {
             // forms (`for k, v in d.items():`, `for i, x in enumerate(xs):`,
             // `for (a, *rest) in pairs:`) declare every name they bind.
             declare_loop_target(r, scope, f.target.as_ref());
+            // Same sequential-loop carve-out as `while` above.
+            r.loop_body_depth += 1;
             for s in &f.body {
                 walk_stmt(r, scope, s);
             }
             for s in &f.orelse {
                 walk_stmt(r, scope, s);
             }
+            r.loop_body_depth -= 1;
         }
         Stmt::With(w) => {
             for item in &w.items {
