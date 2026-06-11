@@ -10682,10 +10682,17 @@ fn builtin_generic_method(recv: &Type, attr: &str) -> Option<Type> {
             ret: Box::new(Type::None),
             variadic: false,
         }),
-        ("Err", "unwrap", [_e]) | ("Err", "expect", [_e]) => Some(Type::Function {
-            params: vec![Type::Unknown],
+        // `unwrap()` takes no arguments even on a statically-known Err
+        // (it always raises); `expect` takes exactly the message.
+        ("Err", "unwrap", [_e]) => Some(Type::Function {
+            params: vec![],
             ret: Box::new(Type::Unknown),
-            variadic: true,
+            variadic: false,
+        }),
+        ("Err", "expect", [_e]) => Some(Type::Function {
+            params: vec![Type::Str],
+            ret: Box::new(Type::Unknown),
+            variadic: false,
         }),
         ("Err", "unwrap_or", [_e]) | ("Err", "unwrap_or_else", [_e]) => Some(Type::Function {
             params: vec![Type::Unknown],

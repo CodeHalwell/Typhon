@@ -379,6 +379,11 @@ pub struct Function {
     /// Closure scope captured at def-time.
     pub closure: crate::env::EnvRef,
     pub is_async: bool,
+    /// The source the function was defined in, captured at def time so
+    /// traceback frames (and the statement offsets recorded while the body
+    /// runs) attribute to the right file when a function defined in one
+    /// module is called from another.
+    pub source: Option<std::rc::Rc<crate::interp::SourceInfo>>,
 }
 
 pub struct Class {

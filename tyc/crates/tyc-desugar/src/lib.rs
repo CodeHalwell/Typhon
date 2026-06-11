@@ -699,6 +699,85 @@ fn is_enum_qualified_base(base: &Expr) -> bool {
     false
 }
 
+/// Rewrite the trailing `?` Typhon-nullable marker inside *quoted*
+/// annotations (`items: "Sequence[int]?"`) to `| None`, in every
+/// annotation position. Unquoted `T?` is handled by the preprocessor;
+/// string literals escape it, and the raw `?` is a SyntaxError when the
+/// runtime later evaluates the forward reference.
+fn normalise_quoted_annotation_nullability(body: &mut [Stmt]) {
+    fn fix_expr(e: &mut Expr) {
+        match e {
+            Expr::StringLiteral(lit) => {
+                let content = lit.value.to_str();
+                let trimmed = content.trim_end();
+                if let Some(inner) = trimmed.strip_suffix('?') {
+                    let rewritten = format!("{} | None", inner.trim_end());
+                    *e = make_string_literal_expr(&rewritten);
+                }
+            }
+            Expr::Subscript(s) => {
+                fix_expr(&mut s.value);
+                fix_expr(&mut s.slice);
+            }
+            Expr::BinOp(b) => {
+                fix_expr(&mut b.left);
+                fix_expr(&mut b.right);
+            }
+            Expr::Tuple(t) => {
+                for el in t.elts.iter_mut() {
+                    fix_expr(el);
+                }
+            }
+            _ => {}
+        }
+    }
+    fn walk(stmts: &mut [Stmt]) {
+        for stmt in stmts.iter_mut() {
+            match stmt {
+                Stmt::AnnAssign(a) => fix_expr(&mut a.annotation),
+                Stmt::FunctionDef(f) => {
+                    for p in f
+                        .parameters
+                        .posonlyargs
+                        .iter_mut()
+                        .chain(f.parameters.args.iter_mut())
+                        .chain(f.parameters.kwonlyargs.iter_mut())
+                    {
+                        if let Some(ann) = p.parameter.annotation.as_mut() {
+                            fix_expr(ann);
+                        }
+                    }
+                    if let Some(r) = f.returns.as_mut() {
+                        fix_expr(r);
+                    }
+                    walk(&mut f.body);
+                }
+                Stmt::ClassDef(c) => walk(&mut c.body),
+                Stmt::If(s) => {
+                    walk(&mut s.body);
+                    for cl in s.elif_else_clauses.iter_mut() {
+                        walk(&mut cl.body);
+                    }
+                }
+                Stmt::While(s) => walk(&mut s.body),
+                Stmt::For(s) => walk(&mut s.body),
+                Stmt::With(s) => walk(&mut s.body),
+                Stmt::Try(t) => {
+                    walk(&mut t.body);
+                    for h in t.handlers.iter_mut() {
+                        let ruff_python_ast::ExceptHandler::ExceptHandler(h) = h;
+                        walk(&mut h.body);
+                    }
+                    walk(&mut t.orelse);
+                    walk(&mut t.finalbody);
+                }
+                _ => {}
+            }
+        }
+    }
+    walk(body);
+}
+
 /// The `collections.abc` names the checker's prelude accepts unimported.
 const ABC_PRELUDE_NAMES: &[&str] = &[
     "Callable",
@@ -814,8 +893,35 @@ fn collect_unimported_abc_annotation_names(body: &[Stmt]) -> Vec<&'static str> {
                     names_in_annotation(el, used);
                 }
             }
-            // Attribute access (`typing.Iterator`) is already qualified;
-            // string annotations are deferred — both need no injection.
+            // Quoted forward references (`x: "Iterator[int]"`) are
+            // resolved by the checker and evaluated at runtime by
+            // `typing.get_type_hints` — the names inside still need the
+            // import. Word-boundary scan of the literal's content.
+            Expr::StringLiteral(lit) => {
+                let content = lit.value.to_str();
+                for canon in ABC_PRELUDE_NAMES {
+                    let mut rest = content;
+                    while let Some(pos) = rest.find(canon) {
+                        let before_ok = pos == 0
+                            || !rest[..pos]
+                                .chars()
+                                .next_back()
+                                .is_some_and(|c| c.is_alphanumeric() || c == '_');
+                        let after = &rest[pos + canon.len()..];
+                        let after_ok = !after
+                            .chars()
+                            .next()
+                            .is_some_and(|c| c.is_alphanumeric() || c == '_');
+                        if before_ok && after_ok {
+                            used.insert(canon);
+                            break;
+                        }
+                        rest = &rest[pos + canon.len()..];
+                    }
+                }
+            }
+            // Attribute access (`typing.Iterator`) is already qualified —
+            // no injection needed.
             _ => {}
         }
     }
@@ -1349,6 +1455,11 @@ fn desugar_mod_module_with(m: &ModModule, options: &DesugarOptions) -> ModModule
             rewrite_typed_dict_literals_in_stmts(&mut body, &class_fields);
         }
     }
+    // Quoted annotations are forward references; Typhon's `?` suffix can
+    // survive inside the string (the preprocessor can't see into
+    // literals). Normalise `"T?"` to `"T | None"` so runtime annotation
+    // evaluation (`typing.get_type_hints`, pydantic, FastAPI) parses it.
+    normalise_quoted_annotation_nullability(&mut body);
     let m = &ModModule {
         range: m.range,
         node_index: ruff_python_ast::AtomicNodeIndex::NONE,

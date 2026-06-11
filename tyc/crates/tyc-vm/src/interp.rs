@@ -526,6 +526,7 @@ impl Interpreter {
             defaults,
             closure: env.clone(),
             is_async: f.is_async,
+            source: self.current_source.clone(),
         })
     }
 
@@ -1416,6 +1417,7 @@ impl Interpreter {
                     defaults: vec![],
                     closure: env.clone(),
                     is_async: false,
+                    source: self.current_source.clone(),
                 };
                 Ok(Value::Function(Rc::new(func)))
             }
@@ -2114,8 +2116,15 @@ impl Interpreter {
         // overwrite `current_offset`, and if an exception bubbles out we
         // (a) stamp the callee's frame with the raise-site offset, then
         // (b) restore the caller's offset so the next frame up records
-        // its own call-site line.
+        // its own call-site line. The active source swaps to the callee's
+        // *defining* source for the body's duration, so a function defined
+        // in an imported module attributes its frames (and any nested
+        // def-time captures) to its own file, not the caller's.
         let caller_offset = self.current_offset;
+        let caller_source = self.current_source.clone();
+        if f.source.is_some() {
+            self.current_source = f.source.clone();
+        }
         // Wrap the body in a closure so every early `return` decrements the
         // counter on the way out — including a failure in `bind_args`.
         let call_env = Env::new_child(&f.closure);
@@ -2150,7 +2159,9 @@ impl Interpreter {
         let result = match result {
             Err(Unwind::Exception(mut e)) => {
                 // CPython prints every frame; cap ours so deep recursion
-                // doesn't render a megabyte of repeats.
+                // doesn't render a megabyte of repeats. The raise-site
+                // offset is read against the source active inside the
+                // body — the callee's defining source.
                 if e.frames.len() < 64 {
                     let (line, file, line_text) = match &self.current_source {
                         Some(si) => {
@@ -2171,6 +2182,7 @@ impl Interpreter {
             other => other,
         };
         self.current_offset = caller_offset;
+        self.current_source = caller_source;
         result
     }
 

@@ -1214,6 +1214,16 @@ pub fn install(interp: &mut Interpreter) {
         "StopIteration",
         "OSError",
         "FileNotFoundError",
+        "FileExistsError",
+        "PermissionError",
+        "IsADirectoryError",
+        "NotADirectoryError",
+        "TimeoutError",
+        "EOFError",
+        "LookupError",
+        "ArithmeticError",
+        "OverflowError",
+        "RecursionError",
         "NotImplementedError",
     ] {
         let n = name.to_owned();
@@ -2426,10 +2436,28 @@ fn make_os_module() -> Value {
             (
                 "makedirs",
                 nf("makedirs", |_i, args| {
-                    let path = args
+                    // Kwargs arrive via the sentinel forwarded by
+                    // `call_with_kwargs` ("makedirs" arm).
+                    let (pos, kw) = split_kwargs(&args);
+                    let path = pos
                         .first()
                         .ok_or_else(|| type_error("makedirs() needs a path"))?
                         .py_str();
+                    let exist_ok = kw
+                        .iter()
+                        .find(|(k, _)| k == "exist_ok")
+                        .map(|(_, v)| v.truthy())
+                        // Positional form: makedirs(path, mode, exist_ok).
+                        .or_else(|| pos.get(2).map(|v| v.truthy()))
+                        .unwrap_or(false);
+                    // CPython raises FileExistsError for an existing leaf
+                    // unless exist_ok=True.
+                    if !exist_ok && std::path::Path::new(&path).exists() {
+                        return Err(fs_unwind(
+                            &path,
+                            std::io::Error::from(std::io::ErrorKind::AlreadyExists),
+                        ));
+                    }
                     std::fs::create_dir_all(&path).map_err(|e| fs_unwind(&path, e))?;
                     Ok(Value::None)
                 }),
@@ -2854,7 +2882,27 @@ fn make_random_module() -> Value {
                         Some(Value::Bool(b)) => {
                             with_mt(|m| m.seed_int(&num_bigint::BigInt::from(*b as i64)))
                         }
-                        _ => with_mt(|m| m.seed_int(&num_bigint::BigInt::from(0))),
+                        // CPython's no-arg / None form seeds from OS
+                        // entropy — non-deterministic by design. A wall-
+                        // clock-derived seed preserves that property.
+                        Some(Value::None) | None => {
+                            let now = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| d.as_nanos() as u64)
+                                .unwrap_or(0);
+                            with_mt(|m| m.seed_int(&num_bigint::BigInt::from(now)));
+                        }
+                        // str / bytes / float seeds hash through SHA-512
+                        // in CPython — silently mapping them to a fixed
+                        // seed would LOOK deterministic while diverging.
+                        // Fail loudly instead.
+                        Some(other) => {
+                            return Err(type_error(format!(
+                                "VM random.seed() supports int seeds only (got {}) — \
+                                 use `tyc run --compile` for str/bytes/float seeding",
+                                other.type_name()
+                            )))
+                        }
                     }
                     Ok(Value::None)
                 }),
@@ -3003,10 +3051,14 @@ fn make_random_module() -> Value {
                     let seq = args
                         .first()
                         .ok_or_else(|| type_error("sample() needs a sequence"))?;
-                    let k = args
+                    let k_raw = args
                         .get(1)
                         .ok_or_else(|| type_error("sample() needs k"))?
-                        .to_int()? as usize;
+                        .to_int()?;
+                    if k_raw < 0 {
+                        return Err(value_error("Sample larger than population or is negative"));
+                    }
+                    let k = k_raw as usize;
                     let population: Vec<Value> = {
                         let it = interp.make_iter(seq.clone())?;
                         let mut out = Vec::new();
@@ -7529,7 +7581,7 @@ pub fn call_with_kwargs(
         "Queue" => Ok(make_asyncio_queue(&args, kwargs)),
         // Instance-field natives that parse their own kwargs via the
         // sentinel (`split_kwargs`): forward and let the body peel it.
-        "mkdir" => {
+        "mkdir" | "makedirs" => {
             let mut args = args;
             args.push(make_kwargs_sentinel(kwargs));
             (n.func)(interp, args)

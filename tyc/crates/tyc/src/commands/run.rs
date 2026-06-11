@@ -266,6 +266,10 @@ pub fn run(args: RunArgs) -> Result<()> {
     //    guard first so its Drop runs — process::exit skips destructors.
     let code = status.code().unwrap_or(1);
     drop(_tmp_guard);
+    // `process::exit` skips destructors — release the single-file
+    // scaffold explicitly too, or every `tyc run --compile script.ty`
+    // leaks a temp directory.
+    drop(_scaffold_guard);
     std::process::exit(code);
 }
 

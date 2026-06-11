@@ -3615,7 +3615,7 @@ pub fn analyse_loop_closure_captures(module: &ModModule, path: &str, source: &st
         diags: &mut Diagnostics,
     ) {
         use ruff_text_size::Ranged;
-        let shadowed: Vec<&str> = params
+        let mut shadowed: Vec<&str> = params
             .map(|p| {
                 p.posonlyargs
                     .iter()
@@ -3625,6 +3625,15 @@ pub fn analyse_loop_closure_captures(module: &ModModule, path: &str, source: &st
                     .collect()
             })
             .unwrap_or_default();
+        // `*args` / `**kwargs` shadow too.
+        if let Some(p) = params {
+            if let Some(va) = &p.vararg {
+                shadowed.push(va.name.as_str());
+            }
+            if let Some(ka) = &p.kwarg {
+                shadowed.push(ka.name.as_str());
+            }
+        }
         let mut visit = |e: &Expr| {
             walk_names(e, &mut |n: &ruff_python_ast::ExprName| {
                 let id = n.id.as_str();

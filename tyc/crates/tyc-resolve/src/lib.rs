@@ -2188,10 +2188,12 @@ fn walk_stmt(r: &mut Resolver, scope: ScopeId, stmt: &Stmt) {
             for s in &w.body {
                 walk_stmt(r, scope, s);
             }
+            // The `else` clause runs once, after the loop — its bindings
+            // are NOT per-iteration, so they don't get the carve-out.
+            r.loop_body_depth -= 1;
             for s in &w.orelse {
                 walk_stmt(r, scope, s);
             }
-            r.loop_body_depth -= 1;
         }
         Stmt::For(f) => {
             walk_expr(r, scope, &f.iter);
@@ -2205,10 +2207,11 @@ fn walk_stmt(r: &mut Resolver, scope: ScopeId, stmt: &Stmt) {
             for s in &f.body {
                 walk_stmt(r, scope, s);
             }
+            // `else` runs once after the loop — no per-iteration carve-out.
+            r.loop_body_depth -= 1;
             for s in &f.orelse {
                 walk_stmt(r, scope, s);
             }
-            r.loop_body_depth -= 1;
         }
         Stmt::With(w) => {
             for item in &w.items {

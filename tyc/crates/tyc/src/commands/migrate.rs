@@ -277,10 +277,9 @@ fn rewrite_enum_classes(source: &str) -> String {
             if bases != "Enum" && bases != "enum.Enum" {
                 return None;
             }
-            if !rest[close + 1..].trim_start().starts_with(':') {
-                return None;
-            }
-            Some(format!("{indent}enum {name}:"))
+            let after_colon = rest[close + 1..].trim_start().strip_prefix(':')?;
+            // Preserve trailing content (typically a comment).
+            Some(format!("{indent}enum {name}:{after_colon}"))
         })();
         match rewritten {
             Some(r) => {
