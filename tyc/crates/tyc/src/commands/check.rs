@@ -11,8 +11,9 @@ use clap::Args;
 use miette::{miette, Result};
 
 use tyc_analyse::{
-    analyse_empty_collection_bindings, analyse_purity, analyse_secret_literal_bindings,
-    analyse_typing_alias_annotations, evaluate_comptime_with_functions, purity_diagnostics,
+    analyse_empty_collection_bindings, analyse_mutable_default_params, analyse_purity,
+    analyse_secret_literal_bindings, analyse_typing_alias_annotations,
+    evaluate_comptime_with_functions, purity_diagnostics,
 };
 use tyc_db::{check_file_with_imports, extract_shapes_for_path, TycDatabase};
 use tyc_diagnostics::{sanitised_named_source_for, Diagnostics, SanitisedDiagnostic, TycError};
@@ -1061,6 +1062,16 @@ fn run_secondary_passes(
     // forward-reference names. Walk every annotation and surface the same
     // migration advice.
     diags.extend(analyse_typing_alias_annotations(
+        &module,
+        path,
+        &prep.python_source,
+    ));
+
+    // Mutable-default-parameter lint (`tyc::mutable_default_param`):
+    // `def f(xs: list[int] = [])` shares ONE list across every defaulted
+    // call — the classic Python footgun. Class fields already get the
+    // default_factory rewrite; function parameters get this warning.
+    diags.extend(analyse_mutable_default_params(
         &module,
         path,
         &prep.python_source,

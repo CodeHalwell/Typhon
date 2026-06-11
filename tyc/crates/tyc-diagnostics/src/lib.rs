@@ -1476,6 +1476,31 @@ pub enum TycError {
         #[label("prefer `{suggestion}` here")]
         span: SourceSpan,
     },
+
+    /// A function parameter's default value is a mutable literal
+    /// (`def f(xs: list[int] = [])`). Python evaluates the default ONCE at
+    /// definition time, so every call that omits the argument shares the
+    /// same object — the classic shared-state footgun. Typhon already
+    /// rewrites the identical pattern on class fields to a per-instance
+    /// factory; function parameters get this warning instead (rewriting
+    /// them would change the signature visible to runtime introspection).
+    #[error("mutable default for parameter `{name}` is shared across calls")]
+    #[diagnostic(
+        severity(Warning),
+        code(tyc::mutable_default_param),
+        url("https://typhon.dev/lang/diagnostics/mutable_default_param"),
+        help("Python evaluates the {literal} once, at `def` time — every call that omits `{name}` mutates the same object. Use `{name}: T? = None` and create the value inside the body (`if {name} is None: ...`), or pass the argument explicitly.")
+    )]
+    MutableDefaultParam {
+        name: String,
+        /// Human-readable description of the literal: "list literal `[]`",
+        /// "dict literal `{{}}`", or "set constructor `set()`".
+        literal: String,
+        #[source_code]
+        src: NamedSource<String>,
+        #[label("this default is created once and shared")]
+        span: SourceSpan,
+    },
 }
 
 impl TycError {
@@ -2687,6 +2712,23 @@ impl TycError {
         length: usize,
     ) -> Self {
         Self::EmptyCollectionNoAnnotation {
+            name: name.into(),
+            literal: literal.into(),
+            src: NamedSource::new(path.into(), source.into()),
+            span: SourceSpan::new(SourceOffset::from(offset), length.max(1)),
+        }
+    }
+
+    /// Construct a [`TycError::MutableDefaultParam`] warning.
+    pub fn mutable_default_param(
+        name: impl Into<String>,
+        literal: impl Into<String>,
+        path: impl Into<String>,
+        source: impl Into<String>,
+        offset: usize,
+        length: usize,
+    ) -> Self {
+        Self::MutableDefaultParam {
             name: name.into(),
             literal: literal.into(),
             src: NamedSource::new(path.into(), source.into()),

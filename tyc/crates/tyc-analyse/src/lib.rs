@@ -3414,6 +3414,105 @@ fn empty_collection_kind(expr: &Expr) -> Option<&'static str> {
     }
 }
 
+/// Mutable-default-parameter lint (`tyc::mutable_default_param`): a
+/// `def f(xs: list[int] = [])` evaluates the literal once at definition
+/// time, so every defaulted call mutates the same shared object. Walks
+/// every function (including nested ones and methods inside class /
+/// impl bodies) and flags list / dict / set / mutable-constructor
+/// defaults on parameters.
+pub fn analyse_mutable_default_params(
+    module: &ModModule,
+    path: &str,
+    source: &str,
+) -> Diagnostics {
+    let mut diags = Diagnostics::new();
+    walk_mutable_default_stmts(&module.body, path, source, &mut diags);
+    diags
+}
+
+/// What makes a parameter default *mutable*: literal lists / dicts /
+/// sets / comprehensions, and calls to the mutable builtin constructors.
+/// Non-empty literals are just as shared as empty ones, so unlike
+/// [`empty_collection_kind`] this matches any arity.
+fn mutable_default_kind(expr: &Expr) -> Option<&'static str> {
+    match expr {
+        Expr::List(_) => Some("list literal"),
+        Expr::Dict(_) => Some("dict literal"),
+        Expr::Set(_) => Some("set literal"),
+        Expr::ListComp(_) => Some("list comprehension"),
+        Expr::DictComp(_) => Some("dict comprehension"),
+        Expr::SetComp(_) => Some("set comprehension"),
+        Expr::Call(c) => {
+            if let Expr::Name(n) = c.func.as_ref() {
+                match n.id.as_str() {
+                    "list" => Some("`list()` constructor call"),
+                    "dict" => Some("`dict()` constructor call"),
+                    "set" => Some("`set()` constructor call"),
+                    "bytearray" => Some("`bytearray()` constructor call"),
+                    _ => None,
+                }
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+fn walk_mutable_default_stmts(body: &[Stmt], path: &str, source: &str, diags: &mut Diagnostics) {
+    use ruff_text_size::Ranged;
+    for stmt in body {
+        match stmt {
+            Stmt::FunctionDef(f) => {
+                let all_params = f
+                    .parameters
+                    .posonlyargs
+                    .iter()
+                    .chain(f.parameters.args.iter())
+                    .chain(f.parameters.kwonlyargs.iter());
+                for p in all_params {
+                    let Some(default) = p.default.as_deref() else {
+                        continue;
+                    };
+                    if let Some(kind) = mutable_default_kind(default) {
+                        let span_start = default.range().start().to_usize();
+                        let length = default.range().end().to_usize() - span_start;
+                        diags.push_warning(TycError::mutable_default_param(
+                            p.parameter.name.as_str(),
+                            kind,
+                            path,
+                            source.to_owned(),
+                            span_start,
+                            length,
+                        ));
+                    }
+                }
+                walk_mutable_default_stmts(&f.body, path, source, diags);
+            }
+            Stmt::ClassDef(c) => walk_mutable_default_stmts(&c.body, path, source, diags),
+            Stmt::If(s) => {
+                walk_mutable_default_stmts(&s.body, path, source, diags);
+                for clause in &s.elif_else_clauses {
+                    walk_mutable_default_stmts(&clause.body, path, source, diags);
+                }
+            }
+            Stmt::While(s) => walk_mutable_default_stmts(&s.body, path, source, diags),
+            Stmt::For(s) => walk_mutable_default_stmts(&s.body, path, source, diags),
+            Stmt::With(s) => walk_mutable_default_stmts(&s.body, path, source, diags),
+            Stmt::Try(t) => {
+                walk_mutable_default_stmts(&t.body, path, source, diags);
+                for h in &t.handlers {
+                    let ruff_python_ast::ExceptHandler::ExceptHandler(h) = h;
+                    walk_mutable_default_stmts(&h.body, path, source, diags);
+                }
+                walk_mutable_default_stmts(&t.orelse, path, source, diags);
+                walk_mutable_default_stmts(&t.finalbody, path, source, diags);
+            }
+            _ => {}
+        }
+    }
+}
+
 /// Names that, when referenced inside a type annotation, indicate the
 /// user is reaching for a deprecated `typing.<Name>` alias even though
 /// the import would have been rejected by `tyc::typing_alias_deprecated`.

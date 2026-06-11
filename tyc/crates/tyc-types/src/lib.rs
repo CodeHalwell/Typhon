@@ -2120,6 +2120,12 @@ struct Checker<'a> {
     /// Sealed union declarations: name → ordered list of variant class names.
     /// Populated from `type Foo = A | B | C` statements in the first pass.
     sealed_unions: HashMap<String, Vec<String>>,
+    /// Enum declarations: class name → ordered member names. Populated for
+    /// every class whose base is an enum-family name (the `enum Name:`
+    /// keyword desugars to `class Name(enum.Enum):`). Drives exhaustive
+    /// `match` over enum members — the member set is closed, exactly like
+    /// a sealed union's variant set.
+    enums: HashMap<String, Vec<String>>,
     /// Transparent type-alias declarations: name → (type-parameter names,
     /// RHS type). Populated from every `type X = ...` statement, including
     /// the sealed-union ones (so an alias to `A | B | C` is *both* a sealed
@@ -2468,6 +2474,7 @@ impl<'a> Checker<'a> {
             unsafe_origin_bindings: HashMap::new(),
             unsafe_line_starts: Vec::new(),
             sealed_unions: HashMap::new(),
+            enums: HashMap::new(),
             type_aliases: HashMap::new(),
             newtypes: HashMap::new(),
             env: TypeEnv::default(),
@@ -5474,6 +5481,27 @@ fn collect_classes_and_functions(c: &mut Checker, body: &[Stmt]) {
                 );
             }
             c.class_shapes.insert(name.clone(), shape);
+            // Enum classes (`enum Name:` desugars to `class Name(enum.Enum):`)
+            // get their member list recorded — the closed member set powers
+            // exhaustive `match` the same way sealed-union variants do.
+            if class_has_enum_family_base(cd) {
+                let members: Vec<String> = cd
+                    .body
+                    .iter()
+                    .filter_map(|s| match s {
+                        Stmt::Assign(a) => match a.targets.first() {
+                            Some(Expr::Name(n)) if !n.id.as_str().starts_with('_') => {
+                                Some(n.id.as_str().to_owned())
+                            }
+                            _ => None,
+                        },
+                        _ => None,
+                    })
+                    .collect();
+                if !members.is_empty() {
+                    c.enums.insert(name.clone(), members);
+                }
+            }
             // Track `self.NAME = ...` attributes from this class's method
             // bodies so reads of body-initialised attributes resolve.
             let attrs = collect_self_assigned_attrs(cd);
@@ -6919,6 +6947,34 @@ fn infer_expr_readonly(c: &Checker, e: &Expr) -> Type {
                 _ => Type::Unknown,
             }
         }
+        // `items[i]` — element type of the container, so a `match` over a
+        // subscripted sealed-union slot (`match history[-1]:`) sees the
+        // union and the DA exhaustiveness pass can run (previously the
+        // subject typed as Unknown and every exhaustive match over a
+        // subscript fired missing_return).
+        Expr::Subscript(s) => {
+            let recv = infer_expr_readonly(c, &s.value);
+            match recv {
+                Type::Generic(name, args) => match name.as_str() {
+                    "list" | "Sequence" | "MutableSequence" | "deque" | "set" | "frozenset"
+                    | "Iterable" | "Iterator"
+                        if args.len() == 1 =>
+                    {
+                        args[0].clone()
+                    }
+                    "dict" | "Mapping" | "MutableMapping" | "defaultdict" | "OrderedDict"
+                        if args.len() == 2 =>
+                    {
+                        args[1].clone()
+                    }
+                    "tuple" if !args.is_empty() && args.iter().all(|a| a == &args[0]) => {
+                        args[0].clone()
+                    }
+                    _ => Type::Unknown,
+                },
+                _ => Type::Unknown,
+            }
+        }
         _ => Type::Unknown,
     }
 }
@@ -8017,14 +8073,23 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                 }
                 c.env.leave();
             }
-            // Exhaustiveness check: only applies to sealed unions.
+            // Exhaustiveness check: sealed unions and enums (both are
+            // closed sets).
             if let Type::Class(ref union_name) = subject_type {
+                let subject_span = (
+                    m.subject.range().start().to_usize(),
+                    m.subject.range().end().to_usize(),
+                );
                 if let Some(variants) = c.sealed_unions.get(union_name.as_str()).cloned() {
-                    let subject_span = (
-                        m.subject.range().start().to_usize(),
-                        m.subject.range().end().to_usize(),
-                    );
                     check_match_exhaustiveness(c, &m.cases, union_name, &variants, subject_span);
+                } else if let Some(members) = c.enums.get(union_name.as_str()).cloned() {
+                    check_enum_match_exhaustiveness(
+                        c,
+                        &m.cases,
+                        union_name,
+                        &members,
+                        subject_span,
+                    );
                 }
             }
         }
@@ -8935,6 +9000,26 @@ fn match_is_exhaustive_for_da(c: &Checker, subject: &Expr, cases: &[MatchCase]) 
     }
     // (b) sealed-union subject with full variant coverage.
     let subject_ty = infer_expr_readonly(c, subject);
+    // (b') enum subject: every member covered by `case Enum.MEMBER:` arms
+    // means no implicit fall-through — the member set is closed.
+    if let Type::Class(name) = &subject_ty {
+        if let Some(members) = c.enums.get(name.as_str()) {
+            let mut covered: HashSet<String> = HashSet::new();
+            let mut all_classified = true;
+            for case in cases {
+                if case.guard.is_some() {
+                    continue;
+                }
+                if !enum_pattern_covered_members(&case.pattern, name, &mut covered) {
+                    all_classified = false;
+                    break;
+                }
+            }
+            if all_classified && members.iter().all(|m| covered.contains(m)) {
+                return true;
+            }
+        }
+    }
     let union_variants: Vec<String> = match &subject_ty {
         Type::Class(name) => c
             .sealed_unions
@@ -9506,6 +9591,27 @@ fn match_subject_type(c: &Checker, m: &ruff_python_ast::StmtMatch) -> Option<Typ
 fn cases_cover_type(c: &Checker, cases: &[MatchCase], ty: &Type) -> bool {
     if let Type::Union(variants) = ty {
         return variants.iter().all(|v| cases_cover_type(c, cases, v));
+    }
+    // An enum subject's member set is closed: guardless
+    // `case Enum.MEMBER:` arms covering every member are exhaustive.
+    if let Type::Class(name) = ty {
+        if let Some(members) = c.enums.get(name.as_str()) {
+            let mut covered: HashSet<String> = HashSet::new();
+            for case in cases {
+                if case.guard.is_some() {
+                    continue;
+                }
+                if is_wildcard_pattern(&case.pattern) {
+                    return true;
+                }
+                // Unclassifiable arms are ignored for coverage (they can
+                // only add coverage we can't prove, never remove it).
+                let _ = enum_pattern_covered_members(&case.pattern, name, &mut covered);
+            }
+            if members.iter().all(|m| covered.contains(m)) {
+                return true;
+            }
+        }
     }
     // Fixed-arity tuple subject (`tuple[int, str]` → `Generic("tuple", [..])`).
     // Its length is statically known, so a guardless sequence pattern of the
@@ -13218,6 +13324,91 @@ fn check_match_exhaustiveness(
     if !missing.is_empty() {
         let missing_str = missing.join(", ");
         c.non_exhaustive_match(union_name, &missing_str, subject_span);
+    }
+}
+
+/// `true` when any base of `cd` is one of the standard enum bases (bare or
+/// `enum.`-qualified) — the shape the `enum Name:` keyword desugars to.
+fn class_has_enum_family_base(cd: &ruff_python_ast::StmtClassDef) -> bool {
+    fn last_segment(e: &Expr) -> Option<&str> {
+        match e {
+            Expr::Name(n) => Some(n.id.as_str()),
+            Expr::Attribute(a) => Some(a.attr.as_str()),
+            Expr::Subscript(s) => last_segment(&s.value),
+            _ => None,
+        }
+    }
+    cd.bases().iter().any(|b| {
+        matches!(
+            last_segment(b),
+            Some("Enum" | "IntEnum" | "StrEnum" | "Flag" | "IntFlag" | "ReprEnum")
+        )
+    })
+}
+
+/// Collect the enum members covered by a pattern: `case Trend.RISING:` is a
+/// `MatchValue` over an attribute expression whose receiver names the enum
+/// class. Or-patterns recurse. Returns `false` when the pattern is some
+/// shape we can't classify (a literal, a different class, a capture with a
+/// sub-pattern, …) — the caller then skips enforcement entirely rather
+/// than risking a false positive.
+fn enum_pattern_covered_members(
+    pattern: &Pattern,
+    enum_name: &str,
+    covered: &mut HashSet<String>,
+) -> bool {
+    match pattern {
+        Pattern::MatchValue(v) => {
+            if let Expr::Attribute(a) = v.value.as_ref() {
+                if let Expr::Name(n) = a.value.as_ref() {
+                    if n.id.as_str() == enum_name {
+                        covered.insert(a.attr.as_str().to_owned());
+                        return true;
+                    }
+                }
+            }
+            false
+        }
+        Pattern::MatchOr(or) => or
+            .patterns
+            .iter()
+            .all(|p| enum_pattern_covered_members(p, enum_name, covered)),
+        _ => false,
+    }
+}
+
+/// Exhaustiveness for a `match` whose subject is an enum: every member must
+/// be covered by an unguarded `case Enum.MEMBER:` arm (or a wildcard).
+/// Enforcement is conservative — if any unguarded arm has a shape we can't
+/// classify as a member reference, the check is skipped entirely.
+fn check_enum_match_exhaustiveness(
+    c: &mut Checker,
+    cases: &[MatchCase],
+    enum_name: &str,
+    members: &[String],
+    subject_span: (usize, usize),
+) {
+    let mut covered: HashSet<String> = HashSet::new();
+    for case in cases {
+        if case.guard.is_some() {
+            continue;
+        }
+        if is_wildcard_pattern(&case.pattern) {
+            return;
+        }
+        if !enum_pattern_covered_members(&case.pattern, enum_name, &mut covered) {
+            // Unclassifiable arm — stay conservative, no enforcement.
+            return;
+        }
+    }
+    let missing: Vec<&str> = members
+        .iter()
+        .filter(|m| !covered.contains(m.as_str()))
+        .map(String::as_str)
+        .collect();
+    if !missing.is_empty() {
+        let missing_str = missing.join(", ");
+        c.non_exhaustive_match(enum_name, &missing_str, subject_span);
     }
 }
 
