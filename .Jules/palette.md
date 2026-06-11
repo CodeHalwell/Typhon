@@ -28,3 +28,6 @@
 ## 2026-06-06 - [Themed text selection for visual polish]
 **Learning:** Default browser text selection colors (usually stark blue) often clash with custom themes, making the site feel less cohesive.
 **Action:** Implemented `::selection` to match the site's `var(--sl-color-accent)` at 25% opacity, preserving contrast while harmonizing the selection experience with the overall design.
+## 2024-06-11 - [Focus styles for `tabindex="0"` elements]
+**Learning:** Found that scrollable code blocks and other elements using `tabindex="0"` for keyboard scrollability in Astro/Starlight lack an explicit focus ring, making keyboard navigation less accessible for those regions.
+**Action:** Added `[tabindex="0"]:focus-visible` to the global focus-visible styles in `custom.css` to ensure consistent and visible focus states for scrollable and otherwise focusable regions without semantic tags.
