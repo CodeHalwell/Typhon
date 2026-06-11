@@ -414,6 +414,15 @@ pub fn assignable(expected: &Type, actual: &Type) -> bool {
             if *ev && ep.is_empty() {
                 return assignable(er, ar);
             }
+            // A variadic actual (defaults / *args / **kwargs) can absorb
+            // any call shape with at least its required parameters — a
+            // `lambda x, y=0: ...` satisfies `Callable[[int, int], R]`.
+            if *_av {
+                if ap.len() <= ep.len() {
+                    return ep.iter().zip(ap).all(|(e, a)| assignable(a, e)) && assignable(er, ar);
+                }
+                return false;
+            }
             if ep.len() != ap.len() {
                 return false;
             }
@@ -2679,6 +2688,36 @@ impl<'a> Checker<'a> {
             {
                 return true;
             }
+        }
+        // Structural conformance for *generic* interfaces:
+        // `MemRepo[int]` satisfies `interface Repo[T]` instantiated as
+        // `Repo[int]` when the class structurally conforms and the type
+        // arguments line up pairwise. Mixed arities (bare class into a
+        // generic interface, generic class into a bare interface) fall
+        // back to head-level conformance — same under-approximation
+        // precedent as the parametric sealed-union arm below.
+        match (expected, actual) {
+            (Type::Generic(exp_name, exp_args), Type::Generic(act_name, act_args)) => {
+                if self.interfaces.contains_key(exp_name.as_str())
+                    && self.class_conforms_to_interface(act_name, exp_name)
+                    && exp_args.len() == act_args.len()
+                    && exp_args
+                        .iter()
+                        .zip(act_args)
+                        .all(|(e, a)| self.is_assignable(e, a))
+                {
+                    return true;
+                }
+            }
+            (Type::Generic(exp_name, _), Type::Class(act_name))
+            | (Type::Class(exp_name), Type::Generic(act_name, _)) => {
+                if self.interfaces.contains_key(exp_name.as_str())
+                    && self.class_conforms_to_interface(act_name, exp_name)
+                {
+                    return true;
+                }
+            }
+            _ => {}
         }
         // Parametric variant → parametric sealed-union: `Cons` /
         // `Cons[T]` into `LinkedList[T]`. The variant name is looked up
@@ -11052,6 +11091,39 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
         }
         Expr::BytesLiteral(_) => Type::Bytes,
         Expr::NoneLiteral(_) => Type::None,
+        // Lambdas carry their *arity* into the type so a call site
+        // expecting `Callable[[int, int], int]` rejects `lambda x: x`
+        // at check time instead of TypeError-ing at runtime. Parameter
+        // and return types stay `Unknown` (no annotations on lambdas);
+        // defaults or `*args` / `**kwargs` mark the function variadic so
+        // optional-argument lambdas keep matching any arity.
+        Expr::Lambda(lam) => {
+            let (n, variadic) = match lam.parameters.as_deref() {
+                Some(p) => {
+                    let required = p
+                        .posonlyargs
+                        .iter()
+                        .chain(p.args.iter())
+                        .filter(|a| a.default.is_none())
+                        .count();
+                    let has_optional = p
+                        .posonlyargs
+                        .iter()
+                        .chain(p.args.iter())
+                        .any(|a| a.default.is_some());
+                    (
+                        required,
+                        has_optional || p.vararg.is_some() || p.kwarg.is_some(),
+                    )
+                }
+                None => (0, false),
+            };
+            Type::Function {
+                params: vec![Type::Unknown; n],
+                ret: Box::new(Type::Unknown),
+                variadic,
+            }
+        }
         Expr::Name(n) => {
             if let Some(b) = c.env.lookup(n.id.as_str()) {
                 b.narrowed.clone()
