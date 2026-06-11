@@ -1044,8 +1044,14 @@ impl<'a> Resolver<'a> {
             // the same scratch name starts a fresh binding rather than
             // shadowing a live one — the same reasoning as the sibling
             // `if`-arm and `case`-arm carve-outs. Replace in place.
+            //
+            // Gate on `loop_body_depth > 0`: the carve-out only applies
+            // while we are *inside* a loop body. A redeclaration that
+            // appears after the loop has exited is a genuine shadow of a
+            // still-live binding and must not be silently replaced.
             if existing.kind == BindingKind::Value
                 && self.loop_origin_spans.contains(&existing.span)
+                && self.loop_body_depth > 0
             {
                 let old_span = existing.span;
                 if let Some(b) = self.scopes[scope]
@@ -1789,8 +1795,13 @@ fn declare_target(
             // separate problem and not what this finding is about.
             if ast_mutability.is_some() {
                 if let Some(existing) = r.lookup_local(scope, n.id.as_str()) {
+                    // The loop-origin carve-out only suppresses the shadow
+                    // diagnostic while we are still inside a loop body (the
+                    // "next loop reuses the scratch name" case). Once the loop
+                    // has exited (`loop_body_depth == 0`), re-declaring the
+                    // name is a real block-shadow and is flagged as usual.
                     if existing.kind == BindingKind::Value
-                        && !r.loop_origin_spans.contains(&existing.span)
+                        && !(r.loop_origin_spans.contains(&existing.span) && r.loop_body_depth > 0)
                     {
                         let decl_span = existing.span;
                         if decl_span != span && r.seen_immutable_redecl.insert((decl_span, span)) {

@@ -6,6 +6,17 @@ Realistic milestones for one person plus AI assistance. The headline target is a
 
 ## Current release
 
+**[v0.13.0](https://github.com/CodeHalwell/Typhon/releases/tag/v0.13.0) — 2026-06-11.**
+Stress-round fixes (cross-module `extend`, TypedDict-style dict-literal
+lowering, enum-match exhaustiveness, the extended Result API) plus a
+post-release code review of everything since v0.12.0. The review fixed ten
+issues, headlined by two CPython-divergences in the VM — seeded
+`random.sample` (the selection-set threshold was computed with the wrong
+log base) and `@staticmethod` / `@classmethod` reached through an instance
+(the receiver was wrongly bound) — and a type-checker false positive where
+`incompatible_override` flagged a valid LSP-widening override that merely
+added an optional parameter. Additive on the accepted surface.
+
 **[v0.12.0](https://github.com/CodeHalwell/Typhon/releases/tag/v0.12.0) — 2026-06-07.**
 VM comparison-protocol parity + deep compile-time library introspection.
 `sorted()` / `min()` / `max()` now honour a user `__lt__` (a silent-wrong-output
