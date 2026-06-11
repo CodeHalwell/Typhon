@@ -3264,14 +3264,16 @@ impl Interpreter {
             }
             Value::ResultOk(v) => match attr {
                 "value" => Ok((**v).clone()),
-                "map" | "map_err" | "and_then" | "or_else" => {
+                "map" | "map_err" | "and_then" | "or_else" | "unwrap" | "expect"
+                | "unwrap_or" | "unwrap_or_else" | "ok" | "err" | "is_ok" | "is_err" => {
                     Ok(bind_result_combinator(value.clone(), attr))
                 }
                 _ => Err(attribute_error(format!("Ok has no attribute '{}'", attr))),
             },
             Value::ResultErr(v) => match attr {
                 "value" | "error" => Ok((**v).clone()),
-                "map" | "map_err" | "and_then" | "or_else" => {
+                "map" | "map_err" | "and_then" | "or_else" | "unwrap" | "expect"
+                | "unwrap_or" | "unwrap_or_else" | "ok" | "err" | "is_ok" | "is_err" => {
                     Ok(bind_result_combinator(value.clone(), attr))
                 }
                 _ => Err(attribute_error(format!("Err has no attribute '{}'", attr))),
@@ -5189,6 +5191,14 @@ fn bind_result_combinator(receiver: Value, attr: &str) -> Value {
         "map_err" => "map_err",
         "and_then" => "and_then",
         "or_else" => "or_else",
+        "unwrap" => "unwrap",
+        "expect" => "expect",
+        "unwrap_or" => "unwrap_or",
+        "unwrap_or_else" => "unwrap_or_else",
+        "ok" => "ok",
+        "err" => "err",
+        "is_ok" => "is_ok",
+        "is_err" => "is_err",
         _ => unreachable!(),
     };
     let name: &'static str = match combinator {
@@ -5196,9 +5206,48 @@ fn bind_result_combinator(receiver: Value, attr: &str) -> Value {
         "map_err" => "Result.map_err",
         "and_then" => "Result.and_then",
         "or_else" => "Result.or_else",
+        "unwrap" => "Result.unwrap",
+        "expect" => "Result.expect",
+        "unwrap_or" => "Result.unwrap_or",
+        "unwrap_or_else" => "Result.unwrap_or_else",
+        "ok" => "Result.ok",
+        "err" => "Result.err",
+        "is_ok" => "Result.is_ok",
+        "is_err" => "Result.is_err",
         _ => unreachable!(),
     };
     let nf = NativeFn::new(name, move |interp, args| {
+        // Zero-argument accessors first.
+        match combinator {
+            "unwrap" | "ok" | "err" | "is_ok" | "is_err" => {
+                if !args.is_empty() {
+                    return Err(type_error(format!(
+                        "{}() takes no arguments ({} given)",
+                        name,
+                        args.len()
+                    )));
+                }
+                return Ok(match (&receiver, combinator) {
+                    (Value::ResultOk(v), "unwrap") => (**v).clone(),
+                    (Value::ResultErr(e), "unwrap") => {
+                        return Err(Unwind::Exception(crate::error::VmException::new(
+                            "RuntimeError",
+                            format!("called unwrap() on Err: {}", e.py_repr()),
+                        )))
+                    }
+                    (Value::ResultOk(v), "ok") => (**v).clone(),
+                    (Value::ResultErr(_), "ok") => Value::None,
+                    (Value::ResultOk(_), "err") => Value::None,
+                    (Value::ResultErr(e), "err") => (**e).clone(),
+                    (Value::ResultOk(_), "is_ok") => Value::Bool(true),
+                    (Value::ResultErr(_), "is_ok") => Value::Bool(false),
+                    (Value::ResultOk(_), "is_err") => Value::Bool(false),
+                    (Value::ResultErr(_), "is_err") => Value::Bool(true),
+                    _ => unreachable!(),
+                });
+            }
+            _ => {}
+        }
         if args.len() != 1 {
             return Err(type_error(format!(
                 "{}() takes exactly 1 argument ({} given)",
@@ -5208,6 +5257,22 @@ fn bind_result_combinator(receiver: Value, attr: &str) -> Value {
         }
         let f = args.into_iter().next().unwrap();
         match (&receiver, combinator) {
+            // `expect(msg)` — unwrap with a caller-supplied panic message.
+            (Value::ResultOk(v), "expect") => Ok((**v).clone()),
+            (Value::ResultErr(e), "expect") => Err(Unwind::Exception(
+                crate::error::VmException::new(
+                    "RuntimeError",
+                    format!("{}: {}", f.py_str(), e.py_repr()),
+                ),
+            )),
+            // `unwrap_or(default)` — value or the default.
+            (Value::ResultOk(v), "unwrap_or") => Ok((**v).clone()),
+            (Value::ResultErr(_), "unwrap_or") => Ok(f),
+            // `unwrap_or_else(f)` — value or `f(error)`.
+            (Value::ResultOk(v), "unwrap_or_else") => Ok((**v).clone()),
+            (Value::ResultErr(e), "unwrap_or_else") => {
+                interp.call_value(f, vec![(**e).clone()], &[])
+            }
             (Value::ResultOk(v), "map") => {
                 let mapped = interp.call_value(f, vec![(**v).clone()], &[])?;
                 Ok(Value::ResultOk(Box::new(mapped)))

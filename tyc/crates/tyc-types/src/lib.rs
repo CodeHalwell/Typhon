@@ -10216,6 +10216,11 @@ fn is_builtin_generic_head(head: &str) -> bool {
     matches!(
         head,
         "list" | "dict" | "set" | "tuple" | "str" | "bytes" | "frozenset"
+        // The Result family is Typhon's own closed surface — an unknown
+        // method on Ok/Err/Result is always a runtime AttributeError, so
+        // flag it at check time (closes the `.unwrap()`-before-it-existed
+        // false negative).
+        | "Result" | "Ok" | "Err"
     )
 }
 
@@ -10239,6 +10244,23 @@ fn is_user_builtin_extension(c: &Checker, head: &str, attr: &str) -> bool {
 /// FINDINGS v0.7.1 #1.
 fn is_known_builtin_generic_attr(head: &str, attr: &str) -> bool {
     match head {
+        "Result" | "Ok" | "Err" => matches!(
+            attr,
+            "value"
+                | "error"
+                | "map"
+                | "map_err"
+                | "and_then"
+                | "or_else"
+                | "unwrap"
+                | "expect"
+                | "unwrap_or"
+                | "unwrap_or_else"
+                | "ok"
+                | "err"
+                | "is_ok"
+                | "is_err"
+        ),
         "list" => matches!(
             attr,
             "append"
@@ -10554,6 +10576,79 @@ fn builtin_generic_method(recv: &Type, attr: &str) -> Option<Type> {
             )),
             variadic: false,
         }),
+        // Unwrap family (R-API). The receiver's static type narrows the
+        // return as far as possible:
+        //   Ok[T].unwrap() / .expect(m) / .unwrap_or(d) / .unwrap_or_else(f) → T
+        //   Ok[T].ok() → T?            Ok[_].err() → None
+        //   Err[E].err() → E           Err[_].ok() → None
+        //   Result[T, E].unwrap()/expect/unwrap_or/unwrap_or_else → T
+        //   Result[T, E].ok() → T?     Result[T, E].err() → E?
+        //   is_ok() / is_err() → bool on all three.
+        ("Ok", "unwrap", [t]) | ("Result", "unwrap", [t, _]) => Some(Type::Function {
+            params: vec![],
+            ret: Box::new(t.clone()),
+            variadic: false,
+        }),
+        ("Ok", "expect", [t]) | ("Result", "expect", [t, _]) => Some(Type::Function {
+            params: vec![Type::Str],
+            ret: Box::new(t.clone()),
+            variadic: false,
+        }),
+        ("Ok", "unwrap_or", [t]) | ("Result", "unwrap_or", [t, _]) => Some(Type::Function {
+            params: vec![t.clone()],
+            ret: Box::new(t.clone()),
+            variadic: false,
+        }),
+        ("Ok", "unwrap_or_else", [t]) | ("Result", "unwrap_or_else", [t, _]) => {
+            Some(Type::Function {
+                params: vec![Type::Unknown],
+                ret: Box::new(t.clone()),
+                variadic: false,
+            })
+        }
+        ("Ok", "ok", [t]) | ("Result", "ok", [t, _]) => Some(Type::Function {
+            params: vec![],
+            ret: Box::new(Type::optional(t.clone())),
+            variadic: false,
+        }),
+        ("Ok", "err", [_t]) => Some(Type::Function {
+            params: vec![],
+            ret: Box::new(Type::None),
+            variadic: false,
+        }),
+        ("Err", "unwrap", [_e]) | ("Err", "expect", [_e]) => Some(Type::Function {
+            params: vec![Type::Unknown],
+            ret: Box::new(Type::Unknown),
+            variadic: true,
+        }),
+        ("Err", "unwrap_or", [_e]) | ("Err", "unwrap_or_else", [_e]) => Some(Type::Function {
+            params: vec![Type::Unknown],
+            ret: Box::new(Type::Unknown),
+            variadic: false,
+        }),
+        ("Err", "ok", [_e]) => Some(Type::Function {
+            params: vec![],
+            ret: Box::new(Type::None),
+            variadic: false,
+        }),
+        ("Err", "err", [e]) => Some(Type::Function {
+            params: vec![],
+            ret: Box::new(e.clone()),
+            variadic: false,
+        }),
+        ("Result", "err", [_t, e]) => Some(Type::Function {
+            params: vec![],
+            ret: Box::new(Type::optional(e.clone())),
+            variadic: false,
+        }),
+        ("Ok", "is_ok", _) | ("Ok", "is_err", _) | ("Err", "is_ok", _)
+        | ("Err", "is_err", _) | ("Result", "is_ok", _) | ("Result", "is_err", _) => {
+            Some(Type::Function {
+                params: vec![],
+                ret: Box::new(Type::Bool),
+                variadic: false,
+            })
+        }
         // Mapping views — preserve the element type (with `?`) so iterating
         // `d.values()` over a `dict[K, V?]` yields `V?`, not `V`. Returning
         // a parameterised view (rather than `Unknown`) is what closes the

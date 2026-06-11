@@ -69,6 +69,19 @@ pub struct BuildArgs {
 }
 
 pub fn run(args: BuildArgs) -> Result<()> {
+    // A single `.ty` file is not a project root — without this guard the
+    // path gets joined with `src/` and the user sees the baffling
+    // "source directory 'foo.ty/src' does not exist".
+    if args.path.is_file() {
+        return Err(miette!(
+            "tyc build expects a project directory (with typhon.toml), not a \
+             single file. Run `tyc run --compile {}` to build-and-execute the \
+             file via a throwaway scaffold, `tyc run {}` for the in-process \
+             VM, or `tyc init` to start a project.",
+            args.path.display(),
+            args.path.display()
+        ));
+    }
     let project_root = args
         .path
         .canonicalize()
@@ -1741,6 +1754,30 @@ class Ok(Generic[_T]):
     def or_else(self, f):
         return self
 
+    def unwrap(self):
+        return self.value
+
+    def expect(self, msg):
+        return self.value
+
+    def unwrap_or(self, default):
+        return self.value
+
+    def unwrap_or_else(self, f):
+        return self.value
+
+    def ok(self):
+        return self.value
+
+    def err(self):
+        return None
+
+    def is_ok(self):
+        return True
+
+    def is_err(self):
+        return False
+
 
 @dataclass(slots=True, frozen=True)
 class Err(Generic[_E]):
@@ -1758,6 +1795,30 @@ class Err(Generic[_E]):
 
     def or_else(self, f):
         return f(self.error)
+
+    def unwrap(self):
+        raise RuntimeError(f\"called unwrap() on Err: {self.error!r}\")
+
+    def expect(self, msg):
+        raise RuntimeError(f\"{msg}: {self.error!r}\")
+
+    def unwrap_or(self, default):
+        return default
+
+    def unwrap_or_else(self, f):
+        return f(self.error)
+
+    def ok(self):
+        return None
+
+    def err(self):
+        return self.error
+
+    def is_ok(self):
+        return False
+
+    def is_err(self):
+        return True
 
 
 # Use `typing.Union` rather than PEP 695 `type Result[T, E] = …` so the
