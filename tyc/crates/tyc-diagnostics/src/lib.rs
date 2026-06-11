@@ -1520,6 +1520,29 @@ pub enum TycError {
         #[label("literal operand — use `==` instead")]
         span: SourceSpan,
     },
+
+    /// A subclass method overrides a base-class method with an
+    /// incompatible signature (different arity, a parameter type narrower
+    /// than the base's, or a return type not assignable to the base's).
+    /// Calls dispatched through the base type can then break at runtime —
+    /// the Liskov substitution principle violation mypy / pyright flag.
+    #[error("`{class_name}.{method}` overrides `{base}.{method}` incompatibly: {reason}")]
+    #[diagnostic(
+        severity(Warning),
+        code(tyc::incompatible_override),
+        url("https://typhon.dev/lang/diagnostics/incompatible_override"),
+        help("Code holding a `{base}` may call `{method}` with the base signature and dispatch to this override at runtime. Match the base signature (parameters may widen, returns may narrow), or rename the method.")
+    )]
+    IncompatibleOverride {
+        class_name: String,
+        method: String,
+        base: String,
+        reason: String,
+        #[source_code]
+        src: NamedSource<String>,
+        #[label("overriding class declared here")]
+        span: SourceSpan,
+    },
 }
 
 impl TycError {
@@ -2733,6 +2756,28 @@ impl TycError {
         Self::EmptyCollectionNoAnnotation {
             name: name.into(),
             literal: literal.into(),
+            src: NamedSource::new(path.into(), source.into()),
+            span: SourceSpan::new(SourceOffset::from(offset), length.max(1)),
+        }
+    }
+
+    /// Construct a [`TycError::IncompatibleOverride`] warning.
+    #[allow(clippy::too_many_arguments)]
+    pub fn incompatible_override(
+        class_name: impl Into<String>,
+        method: impl Into<String>,
+        base: impl Into<String>,
+        reason: impl Into<String>,
+        path: impl Into<String>,
+        source: impl Into<String>,
+        offset: usize,
+        length: usize,
+    ) -> Self {
+        Self::IncompatibleOverride {
+            class_name: class_name.into(),
+            method: method.into(),
+            base: base.into(),
+            reason: reason.into(),
             src: NamedSource::new(path.into(), source.into()),
             span: SourceSpan::new(SourceOffset::from(offset), length.max(1)),
         }

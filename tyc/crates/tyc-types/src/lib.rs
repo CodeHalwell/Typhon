@@ -4156,6 +4156,7 @@ pub fn check_module_with_imports(
     // First pass: collect class names + function signatures so forward
     // references work.
     collect_classes_and_functions(&mut c, &module.body);
+    check_override_compatibility(&mut c, &module.body);
     populate_frozen_classes(&mut c, &module.body, &frozen_starts);
     // Cross-function field-init audit pre-pass: identify helper
     // functions whose body is `return X.__new__(X)` (or
@@ -13592,6 +13593,141 @@ fn pattern_narrowed_type(pattern: &Pattern) -> Option<Type> {
             Some(Type::union_of(variants))
         }
         _ => None,
+    }
+}
+
+/// Liskov-substitution audit: a subclass method overriding a base method
+/// must accept at least the base's parameters (same arity, each parameter
+/// no narrower) and return something assignable to the base's return —
+/// otherwise calls dispatched through the base type break at runtime.
+/// Warn-level; conservative skips: underscore-prefixed names, property /
+/// static / classmethod binding differences, variadic signatures, and
+/// any slot the checker can't type confidently.
+fn check_override_compatibility(c: &mut Checker, body: &[Stmt]) {
+    // Class-name spans to anchor the warning.
+    let mut spans: HashMap<String, (usize, usize)> = HashMap::new();
+    for stmt in body {
+        if let Stmt::ClassDef(cd) = stmt {
+            let start = cd.name.range.start().to_usize();
+            let len = cd.name.range.end().to_usize().saturating_sub(start).max(1);
+            spans.insert(cd.name.as_str().to_owned(), (start, len));
+        }
+    }
+    let parents_map = c.class_parents.clone();
+    let mut findings: Vec<(String, String, String, String)> = Vec::new();
+    for (sub, _) in &parents_map {
+        let Some(sub_shape) = c.class_shapes.get(sub.as_str()) else {
+            continue;
+        };
+        // Walk the full ancestor chain.
+        let mut chain: Vec<String> = Vec::new();
+        let mut frontier: Vec<String> = parents_map.get(sub).cloned().unwrap_or_default();
+        let mut seen: HashSet<String> = HashSet::new();
+        while let Some(p) = frontier.pop() {
+            if !seen.insert(p.clone()) {
+                continue;
+            }
+            if let Some(more) = parents_map.get(&p) {
+                frontier.extend(more.iter().cloned());
+            }
+            chain.push(p);
+        }
+        for base in &chain {
+            let Some(base_shape) = c.class_shapes.get(base.as_str()) else {
+                continue;
+            };
+            for (name, base_sig) in &base_shape.methods {
+                if name.starts_with('_') {
+                    continue;
+                }
+                let Some(sub_sig) = sub_shape.methods.get(name) else {
+                    continue;
+                };
+                // Different binding kinds or any decorator semantics: skip.
+                if base_sig.is_property
+                    || sub_sig.is_property
+                    || base_sig.is_static != sub_sig.is_static
+                    || base_sig.is_classmethod != sub_sig.is_classmethod
+                {
+                    continue;
+                }
+                // Variadic on either side absorbs anything: skip.
+                if base_sig.arity_info.max_positional.is_none()
+                    || sub_sig.arity_info.max_positional.is_none()
+                    || base_sig.arity_info.has_kwarg
+                    || sub_sig.arity_info.has_kwarg
+                {
+                    continue;
+                }
+                if base_sig.arity != sub_sig.arity {
+                    findings.push((
+                        sub.clone(),
+                        name.clone(),
+                        base.clone(),
+                        format!(
+                            "takes {} non-self parameter(s); the base takes {}",
+                            sub_sig.arity, base_sig.arity
+                        ),
+                    ));
+                    continue;
+                }
+                let mut flagged = false;
+                for (i, (sub_p, base_p)) in sub_sig
+                    .param_types
+                    .iter()
+                    .zip(base_sig.param_types.iter())
+                    .enumerate()
+                {
+                    if matches!(sub_p, Type::Unknown | Type::Any)
+                        || matches!(base_p, Type::Unknown | Type::Any)
+                    {
+                        continue;
+                    }
+                    // Contravariance: the override must accept everything
+                    // the base accepts.
+                    if !c.is_assignable(sub_p, base_p) {
+                        findings.push((
+                            sub.clone(),
+                            name.clone(),
+                            base.clone(),
+                            format!(
+                                "parameter {} narrows the base's `{}` to `{}`",
+                                i + 1,
+                                base_p.display(),
+                                sub_p.display()
+                            ),
+                        ));
+                        flagged = true;
+                        break;
+                    }
+                }
+                if flagged {
+                    continue;
+                }
+                let (base_ret, sub_ret) = (&base_sig.return_type, &sub_sig.return_type);
+                if !matches!(sub_ret, Type::Unknown | Type::Any)
+                    && !matches!(base_ret, Type::Unknown | Type::Any)
+                    && !c.is_assignable(base_ret, sub_ret)
+                {
+                    findings.push((
+                        sub.clone(),
+                        name.clone(),
+                        base.clone(),
+                        format!(
+                            "returns `{}`, not assignable to the base's `{}`",
+                            sub_ret.display(),
+                            base_ret.display()
+                        ),
+                    ));
+                }
+            }
+        }
+    }
+    for (sub, method, base, reason) in findings {
+        let (start, len) = spans.get(&sub).copied().unwrap_or((0, 1));
+        c.diagnostics.push_warning(TycError::incompatible_override(
+            &sub, &method, &base, &reason, &c.path, c.source, start, len,
+        ));
     }
 }
 

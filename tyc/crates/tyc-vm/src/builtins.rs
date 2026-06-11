@@ -2679,19 +2679,163 @@ fn monotonic_secs() -> f64 {
 }
 
 fn make_random_module() -> Value {
-    use std::cell::Cell;
-    thread_local! {
-        static SEED: Cell<u64> = const { Cell::new(0x_2545_F491_4F6C_DD1D) };
+    use std::cell::RefCell;
+    // CPython-compatible MT19937 so seeded programs produce IDENTICAL
+    // sequences under `tyc run` and `tyc build && python` — random(),
+    // getrandbits/_randbelow (which back randint / randrange / choice /
+    // shuffle / sample), uniform, and gauss all follow CPython's
+    // random.py / _randommodule.c to the letter.
+    struct Mt19937 {
+        mt: [u32; 624],
+        index: usize,
+        gauss_next: Option<f64>,
     }
-    fn next_u64() -> u64 {
-        SEED.with(|s| {
-            let mut x = s.get();
-            x ^= x << 13;
-            x ^= x >> 7;
-            x ^= x << 17;
-            s.set(x);
-            x
-        })
+    impl Mt19937 {
+        fn new() -> Self {
+            let mut s = Self {
+                mt: [0u32; 624],
+                index: 625,
+                gauss_next: None,
+            };
+            // CPython seeds from urandom by default; any fixed default is
+            // fine for unseeded use — reproducibility only matters after
+            // an explicit seed().
+            s.init_genrand(5489);
+            s
+        }
+        fn init_genrand(&mut self, seed: u32) {
+            self.mt[0] = seed;
+            for i in 1..624usize {
+                self.mt[i] = 1812433253u32
+                    .wrapping_mul(self.mt[i - 1] ^ (self.mt[i - 1] >> 30))
+                    .wrapping_add(i as u32);
+            }
+            self.index = 624;
+        }
+        fn init_by_array(&mut self, key: &[u32]) {
+            self.init_genrand(19650218);
+            let mut i: usize = 1;
+            let mut j: usize = 0;
+            let mut k = std::cmp::max(624, key.len());
+            while k > 0 {
+                self.mt[i] = (self.mt[i]
+                    ^ (self.mt[i - 1] ^ (self.mt[i - 1] >> 30)).wrapping_mul(1664525))
+                .wrapping_add(key[j])
+                .wrapping_add(j as u32);
+                i += 1;
+                j += 1;
+                if i >= 624 {
+                    self.mt[0] = self.mt[623];
+                    i = 1;
+                }
+                if j >= key.len() {
+                    j = 0;
+                }
+                k -= 1;
+            }
+            k = 623;
+            while k > 0 {
+                self.mt[i] = (self.mt[i]
+                    ^ (self.mt[i - 1] ^ (self.mt[i - 1] >> 30)).wrapping_mul(1566083941))
+                .wrapping_sub(i as u32);
+                i += 1;
+                if i >= 624 {
+                    self.mt[0] = self.mt[623];
+                    i = 1;
+                }
+                k -= 1;
+            }
+            self.mt[0] = 0x8000_0000;
+            self.index = 624;
+        }
+        fn generate(&mut self) {
+            const M: usize = 397;
+            const MATRIX_A: u32 = 0x9908_b0df;
+            const UPPER: u32 = 0x8000_0000;
+            const LOWER: u32 = 0x7fff_ffff;
+            for i in 0..624usize {
+                let y = (self.mt[i] & UPPER) | (self.mt[(i + 1) % 624] & LOWER);
+                let mut next = self.mt[(i + M) % 624] ^ (y >> 1);
+                if y & 1 != 0 {
+                    next ^= MATRIX_A;
+                }
+                self.mt[i] = next;
+            }
+            self.index = 0;
+        }
+        fn genrand_u32(&mut self) -> u32 {
+            if self.index >= 624 {
+                self.generate();
+            }
+            let mut y = self.mt[self.index];
+            self.index += 1;
+            y ^= y >> 11;
+            y ^= (y << 7) & 0x9d2c_5680;
+            y ^= (y << 15) & 0xefc6_0000;
+            y ^= y >> 18;
+            y
+        }
+        /// `random()` — genrand_res53.
+        fn random(&mut self) -> f64 {
+            let a = (self.genrand_u32() >> 5) as f64;
+            let b = (self.genrand_u32() >> 6) as f64;
+            (a * 67108864.0 + b) / 9007199254740992.0
+        }
+        /// `getrandbits(k)` for k <= 64 (covers every stdlib consumer the
+        /// VM models; Python's small-int fast path uses the same word
+        /// order).
+        fn getrandbits(&mut self, k: u32) -> u64 {
+            if k == 0 {
+                return 0;
+            }
+            if k <= 32 {
+                return (self.genrand_u32() >> (32 - k)) as u64;
+            }
+            // Little-endian words, last word truncated — matches
+            // _random.Random.getrandbits for multi-word sizes.
+            let low = self.genrand_u32() as u64;
+            let hi_bits = k - 32;
+            let high = (self.genrand_u32() >> (32 - hi_bits)) as u64;
+            (high << 32) | low
+        }
+        /// `_randbelow(n)` — rejection sampling, exactly CPython.
+        fn randbelow(&mut self, n: u64) -> u64 {
+            if n == 0 {
+                return 0;
+            }
+            let k = 64 - n.leading_zeros();
+            let mut r = self.getrandbits(k);
+            while r >= n {
+                r = self.getrandbits(k);
+            }
+            r
+        }
+        fn seed_int(&mut self, n: &num_bigint::BigInt) {
+            use num_traits::Signed;
+            // CPython: key = absolute value split into 32-bit words,
+            // little-endian; zero seeds as a single zero word.
+            let mag = n.abs();
+            let (_, bytes) = mag.to_bytes_le();
+            let mut words: Vec<u32> = bytes
+                .chunks(4)
+                .map(|c| {
+                    let mut w = [0u8; 4];
+                    w[..c.len()].copy_from_slice(c);
+                    u32::from_le_bytes(w)
+                })
+                .collect();
+            if words.is_empty() {
+                words.push(0);
+            }
+            self.init_by_array(&words);
+            self.gauss_next = None;
+        }
+    }
+    thread_local! {
+        static MT: RefCell<Mt19937> = RefCell::new(Mt19937::new());
+    }
+    fn with_mt<R>(f: impl FnOnce(&mut Mt19937) -> R) -> R {
+        MT.with(|m| f(&mut m.borrow_mut()))
     }
     make_module(
         "random",
@@ -2699,7 +2843,37 @@ fn make_random_module() -> Value {
             (
                 "random",
                 nf("random", |_i, _args| {
-                    Ok(Value::Float((next_u64() as f64) / (u64::MAX as f64)))
+                    Ok(Value::Float(with_mt(|m| m.random())))
+                }),
+            ),
+            (
+                "seed",
+                nf("seed", |_i, args| {
+                    match args.first() {
+                        Some(Value::Int(n)) => with_mt(|m| m.seed_int(n)),
+                        Some(Value::Bool(b)) => {
+                            with_mt(|m| m.seed_int(&num_bigint::BigInt::from(*b as i64)))
+                        }
+                        _ => with_mt(|m| m.seed_int(&num_bigint::BigInt::from(0))),
+                    }
+                    Ok(Value::None)
+                }),
+            ),
+            (
+                "getrandbits",
+                nf("getrandbits", |_i, args| {
+                    let k = args
+                        .first()
+                        .ok_or_else(|| type_error("getrandbits() needs k"))?
+                        .to_int()? as u32;
+                    if k > 64 {
+                        return Err(value_error(
+                            "VM getrandbits() supports k <= 64 — use `tyc run --compile`",
+                        ));
+                    }
+                    Ok(Value::Int(num_bigint::BigInt::from(with_mt(|m| {
+                        m.getrandbits(k)
+                    }))))
                 }),
             ),
             (
@@ -2717,47 +2891,8 @@ fn make_random_module() -> Value {
                         return Err(value_error("randint(a, b): b must be >= a"));
                     }
                     let span = (b - a + 1) as u64;
-                    Ok(Value::Int(num_bigint::BigInt::from(
-                        a + (next_u64() % span) as i64,
-                    )))
-                }),
-            ),
-            (
-                "seed",
-                nf("seed", |_i, args| {
-                    let s = args.first().and_then(|v| v.to_int().ok()).unwrap_or(0);
-                    SEED.with(|c| c.set(s as u64 ^ 0x_2545_F491_4F6C_DD1D));
-                    Ok(Value::None)
-                }),
-            ),
-            (
-                "uniform",
-                nf("uniform", |_i, args| {
-                    let a = args
-                        .first()
-                        .ok_or_else(|| type_error("uniform() needs 2 args"))?
-                        .to_float()?;
-                    let b = args
-                        .get(1)
-                        .ok_or_else(|| type_error("uniform() needs 2 args"))?
-                        .to_float()?;
-                    let t = (next_u64() as f64) / (u64::MAX as f64);
-                    Ok(Value::Float(a + t * (b - a)))
-                }),
-            ),
-            (
-                "gauss",
-                nf("gauss", |_i, args| {
-                    // Box–Muller transform; mu/sigma default to 0/1.
-                    let mu = args.first().map(|v| v.to_float()).transpose()?.unwrap_or(0.0);
-                    let sigma = args.get(1).map(|v| v.to_float()).transpose()?.unwrap_or(1.0);
-                    let mut u1 = (next_u64() as f64) / (u64::MAX as f64);
-                    if u1 <= f64::MIN_POSITIVE {
-                        u1 = f64::MIN_POSITIVE;
-                    }
-                    let u2 = (next_u64() as f64) / (u64::MAX as f64);
-                    let z = (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos();
-                    Ok(Value::Float(mu + sigma * z))
+                    let pick = with_mt(|m| m.randbelow(span)) as i64;
+                    Ok(Value::Int(num_bigint::BigInt::from(a + pick)))
                 }),
             ),
             (
@@ -2773,8 +2908,44 @@ fn make_random_module() -> Value {
                         return Err(value_error("empty range for randrange()"));
                     }
                     let n = ((stop - start) + step - 1) / step;
-                    let pick = (next_u64() % n as u64) as i64;
+                    let pick = with_mt(|m| m.randbelow(n as u64)) as i64;
                     Ok(Value::Int(num_bigint::BigInt::from(start + pick * step)))
+                }),
+            ),
+            (
+                "uniform",
+                nf("uniform", |_i, args| {
+                    let a = args
+                        .first()
+                        .ok_or_else(|| type_error("uniform() needs 2 args"))?
+                        .to_float()?;
+                    let b = args
+                        .get(1)
+                        .ok_or_else(|| type_error("uniform() needs 2 args"))?
+                        .to_float()?;
+                    let t = with_mt(|m| m.random());
+                    Ok(Value::Float(a + t * (b - a)))
+                }),
+            ),
+            (
+                "gauss",
+                nf("gauss", |_i, args| {
+                    // Exactly CPython's random.py gauss(): a cached
+                    // sin/cos pair per two draws.
+                    let mu = args.first().map(|v| v.to_float()).transpose()?.unwrap_or(0.0);
+                    let sigma = args.get(1).map(|v| v.to_float()).transpose()?.unwrap_or(1.0);
+                    let z = with_mt(|m| {
+                        if let Some(z) = m.gauss_next.take() {
+                            z
+                        } else {
+                            let x2pi = m.random() * std::f64::consts::TAU;
+                            let g2rad = (-2.0 * (1.0 - m.random()).ln()).sqrt();
+                            let z = x2pi.cos() * g2rad;
+                            m.gauss_next = Some(x2pi.sin() * g2rad);
+                            z
+                        }
+                    });
+                    Ok(Value::Float(mu + z * sigma))
                 }),
             ),
             (
@@ -2797,7 +2968,7 @@ fn make_random_module() -> Value {
                             "Cannot choose from an empty sequence".to_owned(),
                         )));
                     }
-                    let idx = (next_u64() % items.len() as u64) as usize;
+                    let idx = with_mt(|m| m.randbelow(items.len() as u64)) as usize;
                     Ok(items[idx].clone())
                 }),
             ),
@@ -2809,10 +2980,10 @@ fn make_random_module() -> Value {
                         _ => return Err(type_error("shuffle() needs a list")),
                     };
                     let mut items = lst.borrow_mut();
-                    // Fisher–Yates.
+                    // CPython: for i in reversed(range(1, len(x))).
                     let n = items.len();
                     for i in (1..n).rev() {
-                        let j = (next_u64() % (i as u64 + 1)) as usize;
+                        let j = with_mt(|m| m.randbelow(i as u64 + 1)) as usize;
                         items.swap(i, j);
                     }
                     Ok(Value::None)
@@ -2828,7 +2999,7 @@ fn make_random_module() -> Value {
                         .get(1)
                         .ok_or_else(|| type_error("sample() needs k"))?
                         .to_int()? as usize;
-                    let mut items: Vec<Value> = {
+                    let population: Vec<Value> = {
                         let it = interp.make_iter(seq.clone())?;
                         let mut out = Vec::new();
                         while let Some(v) = interp.iter_next(&it)? {
@@ -2836,18 +3007,39 @@ fn make_random_module() -> Value {
                         }
                         out
                     };
-                    if k > items.len() {
+                    let n = population.len();
+                    if k > n {
                         return Err(value_error(
                             "Sample larger than population or is negative",
                         ));
                     }
-                    // Partial Fisher–Yates: shuffle the first k slots.
-                    for i in 0..k {
-                        let j = i + (next_u64() % (items.len() - i) as u64) as usize;
-                        items.swap(i, j);
+                    // CPython's selection-set vs pool heuristic, verbatim,
+                    // so seeded sequences match exactly.
+                    let mut result: Vec<Value> = Vec::with_capacity(k);
+                    let mut setsize: usize = 21;
+                    if k > 5 {
+                        setsize += (4.0f64.powf((k as f64).log(3.0).ceil())) as usize;
                     }
-                    items.truncate(k);
-                    Ok(Value::List(Rc::new(RefCell::new(items))))
+                    if n <= setsize {
+                        let mut pool = population.clone();
+                        for i in 0..k {
+                            let j = with_mt(|m| m.randbelow((n - i) as u64)) as usize;
+                            result.push(pool[j].clone());
+                            pool[j] = pool[n - i - 1].clone();
+                        }
+                    } else {
+                        let mut selected: std::collections::HashSet<usize> =
+                            std::collections::HashSet::new();
+                        for _ in 0..k {
+                            let mut j = with_mt(|m| m.randbelow(n as u64)) as usize;
+                            while selected.contains(&j) {
+                                j = with_mt(|m| m.randbelow(n as u64)) as usize;
+                            }
+                            selected.insert(j);
+                            result.push(population[j].clone());
+                        }
+                    }
+                    Ok(Value::List(Rc::new(RefCell::new(result))))
                 }),
             ),
         ],
