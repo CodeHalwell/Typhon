@@ -1181,6 +1181,17 @@ fn collect_project_modules(paths: &[PathBuf], src_root: &str) -> Vec<String> {
                 }
             }
         }
+        // `.dty` stubs are project modules too — `from stubs.fakelib
+        // import X` against a `stubs/fakelib.dty` must not warn
+        // `unknown_module` (the stub IS the module's Typhon surface).
+        if let Ok(files) = collect_dty_files(root) {
+            for file in files {
+                let dotted = ty_path_to_dotted(&file, src_root);
+                if !modules.contains(&dotted) {
+                    modules.push(dotted);
+                }
+            }
+        }
     }
     modules
 }

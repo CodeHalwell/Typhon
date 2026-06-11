@@ -431,7 +431,15 @@ fn build_emits_typhon_runtime_when_result_used() {
 
 #[test]
 fn trace_exits_zero_with_no_input() {
-    let status = tyc().arg("trace").status().unwrap();
+    // `tyc trace` with no path argument reads stdin — close it explicitly
+    // so the test gets EOF immediately instead of hanging forever when the
+    // harness runs with an inherited pipe that never closes (detached
+    // shells, some CI runners).
+    let status = tyc()
+        .arg("trace")
+        .stdin(std::process::Stdio::null())
+        .status()
+        .unwrap();
     assert!(status.success(), "tyc trace should exit 0 with no input");
 }
 

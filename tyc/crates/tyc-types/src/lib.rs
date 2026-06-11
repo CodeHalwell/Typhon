@@ -5244,23 +5244,24 @@ fn check_resource_discipline_stmt(c: &mut Checker, stmt: &Stmt) {
 /// header.
 fn detect_cyclic_type_aliases(c: &mut Checker, body: &[Stmt]) {
     use std::collections::HashMap;
-    // Build `name -> set of alias names the RHS references`. We only
-    // chase plain `Name` and `Generic` heads — nothing else can introduce
-    // a self-referential alias cycle.
+    // Build `name -> set of alias names the RHS references through
+    // *unguarded* positions`. A reference inside a type constructor's
+    // argument list (`list[Json]`, `dict[str, Json]`) is GUARDED —
+    // recursion through it is productive and legal (PEP 695 aliases are
+    // lazily evaluated; `type Json = str | list[Json]` is the canonical
+    // recursive-JSON shape). Only a cycle composed entirely of unguarded
+    // edges (`type A = B`, `type B = A`, or `type A = A | int`) has no
+    // base case and is an error.
     fn collect_referenced_aliases(expr: &Expr, into: &mut std::collections::HashSet<String>) {
         match expr {
             Expr::Name(n) => {
                 into.insert(n.id.as_str().to_owned());
             }
             Expr::Subscript(s) => {
+                // Only the HEAD of a subscript is unguarded (`A[int]`
+                // names `A` directly); everything inside the slice is
+                // behind the constructor and therefore guarded.
                 collect_referenced_aliases(&s.value, into);
-                if let Expr::Tuple(t) = s.slice.as_ref() {
-                    for elt in &t.elts {
-                        collect_referenced_aliases(elt, into);
-                    }
-                } else {
-                    collect_referenced_aliases(&s.slice, into);
-                }
             }
             Expr::BinOp(b) => {
                 collect_referenced_aliases(&b.left, into);
@@ -11062,6 +11063,42 @@ fn subscript_element_type(ty: &Type) -> Option<Type> {
 ///   is empty (no elements to infer from), adopt the expected element
 ///   type so `let xs: list[int] = []` produces `list[int]` rather than
 ///   `list[?]`.
+/// Resolve the element expectation a container literal should push into
+/// its members: unwrap aliases on the expected type and, when the result
+/// is a union, pick the single member with the requested head and arity.
+/// This is what lets `let doc: Json = {...}` (where `type Json = ... |
+/// list[Json] | dict[str, Json]`) type-check — the literal's values are
+/// inferred against `Json` rather than joined into a one-off union that
+/// invariance then rejects. Returns `None` when the expectation is
+/// absent, not container-shaped, or ambiguous (two members with the
+/// same head).
+fn container_expectation(
+    c: &Checker,
+    expected: Option<&Type>,
+    head: &str,
+    arity: usize,
+) -> Option<Vec<Type>> {
+    let exp = c.unwrap_alias(expected?);
+    match exp {
+        Type::Generic(h, a) if h == head && a.len() == arity => Some(a),
+        Type::Union(vs) => {
+            let mut hit: Option<Vec<Type>> = None;
+            for v in vs {
+                if let Type::Generic(h, a) = v {
+                    if h == head && a.len() == arity {
+                        if hit.is_some() {
+                            return None; // ambiguous — don't guess
+                        }
+                        hit = Some(a);
+                    }
+                }
+            }
+            hit
+        }
+        _ => None,
+    }
+}
+
 fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type {
     match expr {
         Expr::BooleanLiteral(_) => Type::Bool,
@@ -12760,12 +12797,13 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
                 return Type::Generic("list".into(), vec![Type::Unknown]);
             }
             // Non-empty literal: infer the element type from the union of
-            // the elements'. If we have an expected `list[E]`, propagate `E`
-            // into each element so nested literals (`[[]]`) can converge.
-            let elt_expected = match expected {
-                Some(Type::Generic(h, a)) if h == "list" && a.len() == 1 => Some(&a[0]),
-                _ => None,
-            };
+            // the elements'. If we have an expected `list[E]` — directly,
+            // through an alias, or as the single list member of an expected
+            // union (recursive `Json`-style aliases) — propagate `E` into
+            // each element so nested literals converge.
+            let elt_expected_owned: Option<Type> =
+                container_expectation(c, expected, "list", 1).map(|mut a| a.remove(0));
+            let elt_expected = elt_expected_owned.as_ref();
             let elts: Vec<Type> = l
                 .elts
                 .iter()
@@ -12835,13 +12873,17 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
                     return class_ty;
                 }
             }
-            // Tease apart key/value expected types from `dict[K, V]`.
-            let (key_expected, val_expected) = match expected {
-                Some(Type::Generic(h, a)) if h == "dict" && a.len() == 2 => {
-                    (Some(&a[0]), Some(&a[1]))
-                }
-                _ => (None, None),
-            };
+            // Tease apart key/value expected types from `dict[K, V]` —
+            // directly, through an alias, or as the single dict member of
+            // an expected union (recursive `Json`-style aliases).
+            let kv_expected: Option<(Type, Type)> =
+                container_expectation(c, expected, "dict", 2).map(|mut a| {
+                    let v = a.remove(1);
+                    let k = a.remove(0);
+                    (k, v)
+                });
+            let key_expected = kv_expected.as_ref().map(|(k, _)| k);
+            let val_expected = kv_expected.as_ref().map(|(_, v)| v);
             if d.items.is_empty() {
                 if let (Some(k), Some(v)) = (key_expected, val_expected) {
                     return Type::Generic("dict".into(), vec![k.clone(), v.clone()]);
@@ -18361,14 +18403,12 @@ def f(head: Node?) -> int:
     }
 
     #[test]
-    fn recursive_type_alias_emits_one_cycle_error_no_cascade() {
+    fn recursive_type_alias_through_constructor_is_legal() {
         // Self-referential aliases through `list[Self]` / `dict[str, Self]`
-        // are the canonical recursive-JSON / AST / tree shape and aren't
-        // yet supported (FINDINGS O4). The diagnostic must fire once
-        // for the cycle itself, and every subsequent use of the alias
-        // must *not* cascade into a flood of `tyc::type_mismatch`
-        // errors — the alias body is rewritten to `Any` so downstream
-        // assignments fall through silently.
+        // are the canonical recursive-JSON / AST / tree shape, and PEP 695
+        // aliases are lazily evaluated, so the recursion is legal. The
+        // checker must accept the alias AND the container-literal uses
+        // (element expectations resolve through the alias/union).
         let src = "\
 type JSON = None | bool | int | float | str | list[JSON] | dict[str, JSON]
 
@@ -18379,25 +18419,28 @@ def main() -> None:
     print(x, y, z)
 ";
         let d = check(src);
-        let errs = d.errors();
-        // Exactly one error: the cycle. Cascading type_mismatch errors
-        // on every alias use are not acceptable — they bury the real
-        // problem.
-        let cycle_errs = errs
-            .iter()
-            .filter(|e| format!("{e}").contains("cycle"))
-            .count();
-        assert_eq!(
-            cycle_errs, 1,
-            "expected exactly one cyclic_type_alias error; got: {errs:?}",
+        assert!(
+            !d.has_errors(),
+            "guarded recursive alias must check cleanly; got: {:?}",
+            d.errors()
         );
-        let mismatch_errs = errs
-            .iter()
-            .filter(|e| format!("{e}").contains("type mismatch"))
-            .count();
-        assert_eq!(
-            mismatch_errs, 0,
-            "recursive alias must not cascade into type_mismatch errors; got: {errs:?}",
+    }
+
+    #[test]
+    fn unguarded_alias_cycle_still_rejected() {
+        // A cycle with no type constructor anywhere has no base case —
+        // `type A = A | int` and the two-alias ping-pong stay errors.
+        let d = check("type A = B\ntype B = A\n");
+        assert!(
+            d.errors().iter().any(|e| format!("{e}").contains("cycle")),
+            "direct two-alias cycle must error; got: {:?}",
+            d.errors()
+        );
+        let d2 = check("type A = A | int\n");
+        assert!(
+            d2.errors().iter().any(|e| format!("{e}").contains("cycle")),
+            "unguarded self-union must error; got: {:?}",
+            d2.errors()
         );
     }
 
