@@ -175,6 +175,15 @@ pub fn desugar_module_with(module: &ModModule, options: DesugarOptions) -> Desug
     let needs_protocol = stmts_use_protocol_base(&desugared_mod.body);
     let inject_protocol = needs_protocol && !has_protocol_import(&desugared_mod.body);
 
+    // The checker's prelude accepts `Iterator` / `Sequence` / `Callable` /
+    // … in annotations without an import, but the emitted Python only
+    // survived because of `from __future__ import annotations` — runtime
+    // annotation resolution (FastAPI DI, `typing.get_type_hints`,
+    // dataclass introspection) would NameError. Inject the
+    // `collections.abc` import for any such name that isn't already
+    // bound at module level.
+    let abc_names_to_import = collect_unimported_abc_annotation_names(&desugared_mod.body);
+
     // `newtype Name = Base` lowers to `Name = NewType("Name", Base)` —
     // ensure `from typing import NewType` is in scope.
     let needs_newtype = stmts_use_newtype_call(&desugared_mod.body);
@@ -238,6 +247,12 @@ pub fn desugar_module_with(module: &ModModule, options: DesugarOptions) -> Desug
     }
     if inject_protocol {
         inject(&mut body, make_protocol_import());
+    }
+    if !abc_names_to_import.is_empty() {
+        inject(
+            &mut body,
+            make_collections_abc_import(&abc_names_to_import),
+        );
     }
     if inject_newtype {
         inject(&mut body, make_newtype_import());
@@ -685,6 +700,205 @@ fn is_enum_qualified_base(base: &Expr) -> bool {
         }
     }
     false
+}
+
+/// The `collections.abc` names the checker's prelude accepts unimported.
+const ABC_PRELUDE_NAMES: &[&str] = &[
+    "Callable",
+    "Iterable",
+    "Iterator",
+    "Generator",
+    "AsyncIterable",
+    "AsyncIterator",
+    "AsyncGenerator",
+    "Awaitable",
+    "Coroutine",
+    "Sequence",
+    "MutableSequence",
+    "Mapping",
+    "MutableMapping",
+    "MutableSet",
+    "Collection",
+    "Container",
+    "Reversible",
+    "Hashable",
+    "Sized",
+    "KeysView",
+    "ValuesView",
+    "ItemsView",
+];
+
+/// Names bound at module level (imports, defs, classes, assignments) —
+/// anything here doesn't need an injected import.
+fn module_level_bound_names(body: &[Stmt]) -> HashSet<String> {
+    let mut bound: HashSet<String> = HashSet::new();
+    for stmt in body {
+        match stmt {
+            Stmt::Import(i) => {
+                for a in &i.names {
+                    let n = a
+                        .asname
+                        .as_ref()
+                        .map(|n| n.as_str().to_owned())
+                        .unwrap_or_else(|| {
+                            a.name.as_str().split('.').next().unwrap_or("").to_owned()
+                        });
+                    bound.insert(n);
+                }
+            }
+            Stmt::ImportFrom(i) => {
+                for a in &i.names {
+                    let n = a
+                        .asname
+                        .as_ref()
+                        .map(|n| n.as_str().to_owned())
+                        .unwrap_or_else(|| a.name.as_str().to_owned());
+                    bound.insert(n);
+                }
+            }
+            Stmt::FunctionDef(f) => {
+                bound.insert(f.name.as_str().to_owned());
+            }
+            Stmt::ClassDef(c) => {
+                bound.insert(c.name.as_str().to_owned());
+            }
+            Stmt::Assign(a) => {
+                for t in &a.targets {
+                    if let Expr::Name(n) = t {
+                        bound.insert(n.id.as_str().to_owned());
+                    }
+                }
+            }
+            Stmt::AnnAssign(a) => {
+                if let Expr::Name(n) = a.target.as_ref() {
+                    bound.insert(n.id.as_str().to_owned());
+                }
+            }
+            Stmt::TypeAlias(ta) => {
+                if let Expr::Name(n) = ta.name.as_ref() {
+                    bound.insert(n.id.as_str().to_owned());
+                }
+            }
+            _ => {}
+        }
+    }
+    bound
+}
+
+/// Collect every `collections.abc` prelude name referenced from an
+/// annotation position anywhere in the module that is NOT bound at module
+/// level. Returned in `ABC_PRELUDE_NAMES` order (deterministic emit).
+fn collect_unimported_abc_annotation_names(body: &[Stmt]) -> Vec<&'static str> {
+    let bound = module_level_bound_names(body);
+    let mut used: HashSet<&'static str> = HashSet::new();
+
+    fn names_in_annotation(e: &Expr, used: &mut HashSet<&'static str>) {
+        match e {
+            Expr::Name(n) => {
+                if let Some(canon) = ABC_PRELUDE_NAMES.iter().find(|c| **c == n.id.as_str()) {
+                    used.insert(canon);
+                }
+            }
+            Expr::Subscript(s) => {
+                names_in_annotation(&s.value, used);
+                names_in_annotation(&s.slice, used);
+            }
+            Expr::BinOp(b) => {
+                names_in_annotation(&b.left, used);
+                names_in_annotation(&b.right, used);
+            }
+            Expr::Tuple(t) => {
+                for el in &t.elts {
+                    names_in_annotation(el, used);
+                }
+            }
+            Expr::List(l) => {
+                for el in &l.elts {
+                    names_in_annotation(el, used);
+                }
+            }
+            // Attribute access (`typing.Iterator`) is already qualified;
+            // string annotations are deferred — both need no injection.
+            _ => {}
+        }
+    }
+
+    fn walk(stmts: &[Stmt], used: &mut HashSet<&'static str>) {
+        for stmt in stmts {
+            match stmt {
+                Stmt::FunctionDef(f) => {
+                    for p in f
+                        .parameters
+                        .posonlyargs
+                        .iter()
+                        .chain(f.parameters.args.iter())
+                        .chain(f.parameters.kwonlyargs.iter())
+                    {
+                        if let Some(ann) = &p.parameter.annotation {
+                            names_in_annotation(ann, used);
+                        }
+                    }
+                    for p in [&f.parameters.vararg, &f.parameters.kwarg]
+                        .into_iter()
+                        .flatten()
+                    {
+                        if let Some(ann) = &p.annotation {
+                            names_in_annotation(ann, used);
+                        }
+                    }
+                    if let Some(r) = &f.returns {
+                        names_in_annotation(r, used);
+                    }
+                    walk(&f.body, used);
+                }
+                Stmt::ClassDef(c) => walk(&c.body, used),
+                Stmt::AnnAssign(a) => names_in_annotation(&a.annotation, used),
+                Stmt::If(s) => {
+                    walk(&s.body, used);
+                    for cl in &s.elif_else_clauses {
+                        walk(&cl.body, used);
+                    }
+                }
+                Stmt::While(s) => walk(&s.body, used),
+                Stmt::For(s) => walk(&s.body, used),
+                Stmt::With(s) => walk(&s.body, used),
+                Stmt::Try(t) => {
+                    walk(&t.body, used);
+                    for h in &t.handlers {
+                        let ruff_python_ast::ExceptHandler::ExceptHandler(h) = h;
+                        walk(&h.body, used);
+                    }
+                    walk(&t.orelse, used);
+                    walk(&t.finalbody, used);
+                }
+                Stmt::Match(m) => {
+                    for case in &m.cases {
+                        walk(&case.body, used);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    walk(body, &mut used);
+    ABC_PRELUDE_NAMES
+        .iter()
+        .filter(|n| used.contains(*n) && !bound.contains(**n))
+        .copied()
+        .collect()
+}
+
+/// Build `from collections.abc import <names...>`.
+fn make_collections_abc_import(names: &[&'static str]) -> Stmt {
+    Stmt::ImportFrom(StmtImportFrom {
+        range: TextRange::default(),
+        node_index: AtomicNodeIndex::NONE,
+        module: Some(make_identifier("collections.abc")),
+        names: names.iter().map(|n| make_alias(n)).collect(),
+        level: 0,
+        is_lazy: false,
+    })
 }
 
 /// Build `from typing import Protocol`.

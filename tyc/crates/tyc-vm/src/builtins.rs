@@ -1650,6 +1650,11 @@ pub fn resolve_module(interp: &mut Interpreter, name: &str) -> Result<Value, Unw
         "typing" => Ok(make_typing_module()),
         "re" => Ok(make_re_module()),
         "collections" => Ok(make_collections_module()),
+        // `from collections.abc import Callable / Iterator / ...` — the
+        // canonical home for the abstract container types. Annotation-only
+        // at runtime, so identity natives (mirroring the `typing` shim)
+        // are all the VM needs.
+        "collections.abc" => Ok(make_collections_abc_module()),
         "functools" => Ok(make_functools_module()),
         "itertools" => Ok(make_itertools_module()),
         "dataclasses" => Ok(make_dataclasses_module()),
@@ -3556,6 +3561,44 @@ fn make_re_module() -> Value {
 /// of counts), `namedtuple` (returns a callable that builds a tuple).
 /// `deque` is not implemented; users hitting that case should fall back
 /// to `tyc run --compile`.
+/// `collections.abc` shim — every abstract base name maps to an identity
+/// native. These names appear in annotations (evaluated at def time) and
+/// occasionally as bases; nothing in the VM dispatches through them.
+fn make_collections_abc_module() -> Value {
+    let mut entries: Vec<(&str, Value)> = Vec::new();
+    for name in [
+        "Callable",
+        "Iterable",
+        "Iterator",
+        "Generator",
+        "AsyncIterable",
+        "AsyncIterator",
+        "AsyncGenerator",
+        "Awaitable",
+        "Coroutine",
+        "Sequence",
+        "MutableSequence",
+        "Mapping",
+        "MutableMapping",
+        "Set",
+        "MutableSet",
+        "Collection",
+        "Container",
+        "Reversible",
+        "Hashable",
+        "Sized",
+        "KeysView",
+        "ValuesView",
+        "ItemsView",
+        "MappingView",
+        "ByteString",
+        "Buffer",
+    ] {
+        entries.push((name, identity_native(name)));
+    }
+    make_module("collections.abc", entries)
+}
+
 fn make_collections_module() -> Value {
     let counter = nf("Counter", |i, args| {
         let mut counts: DictMap = IndexMap::new();
@@ -3657,6 +3700,7 @@ fn make_collections_module() -> Value {
         "collections",
         vec![
             ("OrderedDict", ordered_dict),
+            ("abc", make_collections_abc_module()),
             ("defaultdict", defaultdict),
             ("Counter", counter),
             ("namedtuple", namedtuple),
