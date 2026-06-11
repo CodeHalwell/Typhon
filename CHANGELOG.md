@@ -4,7 +4,7 @@ All notable changes to Typhon are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely; the
 canonical phase-by-phase status lives in `docs/roadmap.md`.
 
-## Unreleased — 2026-06-11 — stress-round fixes: cross-module extend, dict-literal lowering, enum exhaustiveness, Result API
+## 0.13.0 — 2026-06-11 — stress-round fixes + post-release code review: cross-module extend, dict-literal lowering, enum exhaustiveness, Result API
 
 A fresh adversarial sweep (~35 programs across scripts, IO, data
 structures, async, ML, AI/agents, APIs, and SDKs, each run through both
@@ -12,6 +12,66 @@ structures, async, ML, AI/agents, APIs, and SDKs, each run through both
 silent-wrong-output defects on documented features, several type-system
 blind spots, and a batch of VM coverage gaps. All fixed below; the full
 workspace suite and the 254-file example corpus stay green.
+
+### Fixed — post-release code review
+
+A line-by-line review of everything that landed since v0.12.0 turned up
+ten issues, all fixed here:
+
+- **`random.sample` diverged from CPython for seeded runs.** The
+  selection-set-vs-pool threshold computed `4 ** ceil(log3(k))` instead
+  of CPython's `4 ** ceil(log(k*3, 4))` (log base 4 of `3·k`), so for a
+  broad range of `(n, k)` the two implementations took different
+  branches and consumed the MT19937 stream differently — breaking the
+  seeded-reproducibility guarantee against `tyc build` + CPython. Now
+  exact.
+- **`incompatible_override` false-positived on valid LSP widening.** The
+  check compared total parameter counts, so an override that added an
+  *optional* parameter (`def handle(self, event)` →
+  `def handle(self, event, retries=3)`) was wrongly flagged. It now
+  compares required-vs-accepted argument ranges: an override is flagged
+  only when it requires more arguments than the base, accepts fewer, or
+  adds a required keyword-only parameter.
+- **VM injected `self` into `@staticmethod` / `@classmethod` read
+  through an instance.** Static/class methods reaching a class via a
+  cross-module `extend` block (lowered to `Cls.m = fn`) were bound as
+  ordinary instance methods, prepending the instance as a spurious first
+  argument. The `@staticmethod` / `@classmethod` markers are now carried
+  on the function value itself and honoured wherever the function is
+  read, which also fixes the pre-existing case of a static method called
+  through an instance.
+- **`incompatible_override` warnings on nested classes anchored at the
+  start of the file.** The class-name span map only scanned top-level
+  statements; a subclass defined inside a function or another class fell
+  back to byte offset `(0, 1)`. The span scan now recurses through
+  nested bodies.
+- **Quoted literal-singleton union members that collide with a builtin
+  type name lost their meaning.** With quoted annotations now resolved
+  as forward references, `type Mode = "int" | "str"` resolved its
+  members to the structural types `int` / `str`. Bare quoted scalar
+  builtin names (`"int"`, `"str"`, `"None"`, …) now stay literal
+  singletons; class-name and subscripted forms still resolve as forward
+  references, matching standard Python.
+- **`sys.stdout.write()` / `Path.write_text()` returned the UTF-8 byte
+  length** instead of CPython's character count, so the return value
+  diverged for non-ASCII text. Both now return `chars().count()`.
+- **`random.randrange()` rejected descending ranges.** `randrange(10, 0,
+  -1)` raised "empty range" instead of selecting from `10, 9, …, 1`.
+  Negative steps now follow CPython's width computation; a zero step
+  raises "zero step".
+- **`loop_closure_capture` missed late-binding captures in `try`/`else`/
+  `finally` and `match` blocks** nested in a loop. The lint's statement
+  walkers now recurse through those bodies (and loop `else` clauses) too.
+- **The sequential-loop `let` carve-out suppressed legitimate post-loop
+  shadows.** A `let` declared in a loop body was marked loop-origin
+  permanently, so re-declaring the name *after* the loop slipped past
+  `no_block_shadow`. The carve-out now only applies while resolving
+  inside a loop body; the "next loop reuses the scratch name" pattern
+  stays silent as before.
+- **`OrderedDict.move_to_end(key, last=False)` rebuilt the whole map.**
+  Each front-move reallocated and re-inserted every entry (O(n) per
+  call, O(n²) over an LRU loop). It now uses an in-place
+  `shift_insert(0, …)`.
 
 ### Fixed — silent wrong output
 

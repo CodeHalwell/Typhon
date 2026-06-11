@@ -379,6 +379,12 @@ pub struct Function {
     /// Closure scope captured at def-time.
     pub closure: crate::env::EnvRef,
     pub is_async: bool,
+    /// `@staticmethod` — the function takes no implicit receiver, so
+    /// reading it through an instance must not bind `self`.
+    pub is_static: bool,
+    /// `@classmethod` — reading it through an instance binds the class
+    /// object as the first argument, not the instance.
+    pub is_classmethod: bool,
     /// The source the function was defined in, captured at def time so
     /// traceback frames (and the statement offsets recorded while the body
     /// runs) attribute to the right file when a function defined in one

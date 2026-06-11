@@ -4,7 +4,7 @@ Every Typhon-specific form, listed side-by-side with the Python it lowers to. Fo
 
 **Convention:** Typhon source on the left or above; emitted Python on the right or below. Where formatting matters, code is shown verbatim from the printer.
 
-**Current release: v0.12.0.** Forms tagged with a version annotation (`(v0.5.0)` etc.) landed in that release; everything else has been in Typhon since v0.1.0 or v0.2.0. The only new language *form* since v0.9.0 is the `enum` keyword (v0.11.0); v0.10.0–v0.12.0 are otherwise VM-completeness and compile-time-checking work, not new syntax.
+**Current release: v0.13.0.** Forms tagged with a version annotation (`(v0.5.0)` etc.) landed in that release; everything else has been in Typhon since v0.1.0 or v0.2.0. The only new language *form* since v0.9.0 is the `enum` keyword (v0.11.0); v0.10.0–v0.13.0 are otherwise VM-completeness, compile-time-checking, and CPython-parity work, not new syntax.
 
 ---
 

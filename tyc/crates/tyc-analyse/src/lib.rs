@@ -3798,14 +3798,27 @@ pub fn analyse_loop_closure_captures(module: &ModModule, path: &str, source: &st
                         scan_stmts_for_closures(&cl.body, names, path, source, diags);
                     }
                 }
-                Stmt::While(s) => scan_stmts_for_closures(&s.body, names, path, source, diags),
-                Stmt::For(s) => scan_stmts_for_closures(&s.body, names, path, source, diags),
+                Stmt::While(s) => {
+                    scan_stmts_for_closures(&s.body, names, path, source, diags);
+                    scan_stmts_for_closures(&s.orelse, names, path, source, diags);
+                }
+                Stmt::For(s) => {
+                    scan_stmts_for_closures(&s.body, names, path, source, diags);
+                    scan_stmts_for_closures(&s.orelse, names, path, source, diags);
+                }
                 Stmt::With(s) => scan_stmts_for_closures(&s.body, names, path, source, diags),
                 Stmt::Try(t) => {
                     scan_stmts_for_closures(&t.body, names, path, source, diags);
                     for h in &t.handlers {
                         let ruff_python_ast::ExceptHandler::ExceptHandler(h) = h;
                         scan_stmts_for_closures(&h.body, names, path, source, diags);
+                    }
+                    scan_stmts_for_closures(&t.orelse, names, path, source, diags);
+                    scan_stmts_for_closures(&t.finalbody, names, path, source, diags);
+                }
+                Stmt::Match(m) => {
+                    for case in &m.cases {
+                        scan_stmts_for_closures(&case.body, names, path, source, diags);
                     }
                 }
                 _ => {}
@@ -3846,14 +3859,43 @@ pub fn analyse_loop_closure_captures(module: &ModModule, path: &str, source: &st
             }
             Stmt::While(s) => {
                 f(&s.test);
-                for st in &s.body {
+                for st in s.body.iter().chain(s.orelse.iter()) {
                     visit_stmt_exprs(st, f);
                 }
             }
             Stmt::For(s) => {
                 f(&s.iter);
+                for st in s.body.iter().chain(s.orelse.iter()) {
+                    visit_stmt_exprs(st, f);
+                }
+            }
+            Stmt::With(s) => {
                 for st in &s.body {
                     visit_stmt_exprs(st, f);
+                }
+            }
+            Stmt::Try(t) => {
+                for st in t
+                    .body
+                    .iter()
+                    .chain(t.orelse.iter())
+                    .chain(t.finalbody.iter())
+                {
+                    visit_stmt_exprs(st, f);
+                }
+                for h in &t.handlers {
+                    let ruff_python_ast::ExceptHandler::ExceptHandler(h) = h;
+                    for st in &h.body {
+                        visit_stmt_exprs(st, f);
+                    }
+                }
+            }
+            Stmt::Match(m) => {
+                f(&m.subject);
+                for case in &m.cases {
+                    for st in &case.body {
+                        visit_stmt_exprs(st, f);
+                    }
                 }
             }
             _ => {}
@@ -3870,6 +3912,7 @@ pub fn analyse_loop_closure_captures(module: &ModModule, path: &str, source: &st
                         scan_stmts_for_closures(&s.body, &names, path, source, diags);
                     }
                     walk_module(&s.body, path, source, diags);
+                    walk_module(&s.orelse, path, source, diags);
                 }
                 Stmt::FunctionDef(f) => walk_module(&f.body, path, source, diags),
                 Stmt::ClassDef(c) => walk_module(&c.body, path, source, diags),
@@ -3879,13 +3922,23 @@ pub fn analyse_loop_closure_captures(module: &ModModule, path: &str, source: &st
                         walk_module(&cl.body, path, source, diags);
                     }
                 }
-                Stmt::While(s) => walk_module(&s.body, path, source, diags),
+                Stmt::While(s) => {
+                    walk_module(&s.body, path, source, diags);
+                    walk_module(&s.orelse, path, source, diags);
+                }
                 Stmt::With(s) => walk_module(&s.body, path, source, diags),
                 Stmt::Try(t) => {
                     walk_module(&t.body, path, source, diags);
                     for h in &t.handlers {
                         let ruff_python_ast::ExceptHandler::ExceptHandler(h) = h;
                         walk_module(&h.body, path, source, diags);
+                    }
+                    walk_module(&t.orelse, path, source, diags);
+                    walk_module(&t.finalbody, path, source, diags);
+                }
+                Stmt::Match(m) => {
+                    for case in &m.cases {
+                        walk_module(&case.body, path, source, diags);
                     }
                 }
                 _ => {}

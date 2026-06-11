@@ -1309,6 +1309,21 @@ fn quoted_forward_ref_type(
     }
     let parsed = tyc_syntax::parse_expression(inner).ok()?;
     let expr = &parsed.syntax().body;
+    // A *bare* quoted builtin scalar name (`"int"`, `"str"`, `"None"`, …) is
+    // almost never a real forward reference — you would write the type
+    // unquoted. It is, however, exactly how a literal-singleton union spells
+    // its members (`type Mode = "int" | "str"`). Keep these as `LitStr` so the
+    // literal-union form is not silently reinterpreted as a structural type.
+    // (Class-name and subscripted forms still resolve as forward references,
+    // matching standard Python `"Node"` / `"list[Node]"` semantics.)
+    if let Expr::Name(n) = expr.as_ref() {
+        if matches!(
+            n.id.as_str(),
+            "int" | "str" | "bool" | "float" | "bytes" | "complex" | "None"
+        ) {
+            return None;
+        }
+    }
     if !expr_is_type_shaped(expr, classes, type_params) {
         return None;
     }
@@ -13613,15 +13628,45 @@ fn pattern_narrowed_type(pattern: &Pattern) -> Option<Type> {
 /// static / classmethod binding differences, variadic signatures, and
 /// any slot the checker can't type confidently.
 fn check_override_compatibility(c: &mut Checker, body: &[Stmt]) {
-    // Class-name spans to anchor the warning.
+    // Class-name spans to anchor the warning. Walk nested bodies too:
+    // `class_parents` / `class_shapes` register classes defined inside
+    // functions or other classes, so a top-level-only scan would miss them
+    // and the diagnostic would fall back to byte offset (0, 1) — the start
+    // of the file — instead of pointing at the offending class.
     let mut spans: HashMap<String, (usize, usize)> = HashMap::new();
-    for stmt in body {
-        if let Stmt::ClassDef(cd) = stmt {
-            let start = cd.name.range.start().to_usize();
-            let len = cd.name.range.end().to_usize().saturating_sub(start).max(1);
-            spans.insert(cd.name.as_str().to_owned(), (start, len));
+    fn collect_class_spans(body: &[Stmt], spans: &mut HashMap<String, (usize, usize)>) {
+        for stmt in body {
+            match stmt {
+                Stmt::ClassDef(cd) => {
+                    let start = cd.name.range.start().to_usize();
+                    let len = cd.name.range.end().to_usize().saturating_sub(start).max(1);
+                    spans.insert(cd.name.as_str().to_owned(), (start, len));
+                    collect_class_spans(&cd.body, spans);
+                }
+                Stmt::FunctionDef(f) => collect_class_spans(&f.body, spans),
+                Stmt::If(s) => {
+                    collect_class_spans(&s.body, spans);
+                    for clause in &s.elif_else_clauses {
+                        collect_class_spans(&clause.body, spans);
+                    }
+                }
+                Stmt::With(s) => collect_class_spans(&s.body, spans),
+                Stmt::For(s) => collect_class_spans(&s.body, spans),
+                Stmt::While(s) => collect_class_spans(&s.body, spans),
+                Stmt::Try(t) => {
+                    collect_class_spans(&t.body, spans);
+                    collect_class_spans(&t.orelse, spans);
+                    collect_class_spans(&t.finalbody, spans);
+                    for h in &t.handlers {
+                        let ruff_python_ast::ExceptHandler::ExceptHandler(h) = h;
+                        collect_class_spans(&h.body, spans);
+                    }
+                }
+                _ => {}
+            }
         }
     }
+    collect_class_spans(body, &mut spans);
     let parents_map = c.class_parents.clone();
     let mut findings: Vec<(String, String, String, String)> = Vec::new();
     for sub in parents_map.keys() {
@@ -13668,16 +13713,41 @@ fn check_override_compatibility(c: &mut Checker, body: &[Stmt]) {
                 {
                     continue;
                 }
-                if base_sig.arity != sub_sig.arity {
-                    findings.push((
-                        sub.clone(),
-                        name.clone(),
-                        base.clone(),
+                // LSP substitutability, not arity equality: an override may
+                // *widen* (add optional parameters) and stay callable wherever
+                // the base is. It is incompatible only if it requires more
+                // arguments than the base does, or accepts fewer — i.e. it
+                // narrows the set of calls the base accepts. (Both
+                // `max_positional` are `Some` here; the variadic guard above
+                // already skipped the open-ended cases.)
+                let base_min = base_sig.arity_info.min_positional;
+                let sub_min = sub_sig.arity_info.min_positional;
+                let base_max = base_sig.arity_info.max_positional;
+                let sub_max = sub_sig.arity_info.max_positional;
+                // A keyword-only parameter the override makes required, that
+                // the base did not require, also breaks substitutability.
+                let adds_required_kwonly = sub_sig
+                    .arity_info
+                    .kwonly_required
+                    .iter()
+                    .any(|k| !base_sig.arity_info.kwonly_required.contains(k));
+                if sub_min > base_min || sub_max < base_max || adds_required_kwonly {
+                    let reason = if sub_min > base_min {
                         format!(
-                            "takes {} non-self parameter(s); the base takes {}",
-                            sub_sig.arity, base_sig.arity
-                        ),
-                    ));
+                            "requires {sub_min} parameter(s); the base requires only {base_min}"
+                        )
+                    } else if adds_required_kwonly {
+                        "adds a required keyword-only parameter the base does not have".to_owned()
+                    } else {
+                        let sub_max = sub_max.map(|m| m.to_string()).unwrap_or_else(|| "∞".into());
+                        let base_max = base_max
+                            .map(|m| m.to_string())
+                            .unwrap_or_else(|| "∞".into());
+                        format!(
+                            "accepts at most {sub_max} parameter(s); the base accepts {base_max}"
+                        )
+                    };
+                    findings.push((sub.clone(), name.clone(), base.clone(), reason));
                     continue;
                 }
                 let mut flagged = false;

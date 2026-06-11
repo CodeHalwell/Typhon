@@ -2598,7 +2598,11 @@ fn make_std_stream(name: &'static str, is_err: bool) -> Value {
                         print!("{text}");
                         let _ = std::io::stdout().flush();
                     }
-                    Ok(Value::Int(num_bigint::BigInt::from(text.len() as i64)))
+                    // CPython's `write()` returns the number of *characters*
+                    // written, not the UTF-8 byte length.
+                    Ok(Value::Int(num_bigint::BigInt::from(
+                        text.chars().count() as i64
+                    )))
                 }),
             ),
             ("flush", nf("flush", |_i, _args| Ok(Value::None))),
@@ -2952,10 +2956,25 @@ fn make_random_module() -> Value {
                         3 => (args[0].to_int()?, args[1].to_int()?, args[2].to_int()?),
                         _ => return Err(type_error("randrange() takes 1-3 arguments")),
                     };
-                    if step <= 0 || stop <= start {
+                    if step == 0 {
+                        return Err(value_error("zero step for randrange()"));
+                    }
+                    // CPython supports descending ranges (negative step).
+                    let width = stop - start;
+                    let n = if step > 0 {
+                        if width <= 0 {
+                            0
+                        } else {
+                            (width + step - 1) / step
+                        }
+                    } else if width >= 0 {
+                        0
+                    } else {
+                        (width + step + 1) / step
+                    };
+                    if n <= 0 {
                         return Err(value_error("empty range for randrange()"));
                     }
-                    let n = ((stop - start) + step - 1) / step;
                     let pick = with_mt(|m| m.randbelow(n as u64)) as i64;
                     Ok(Value::Int(num_bigint::BigInt::from(start + pick * step)))
                 }),
@@ -3076,7 +3095,12 @@ fn make_random_module() -> Value {
                     let mut result: Vec<Value> = Vec::with_capacity(k);
                     let mut setsize: usize = 21;
                     if k > 5 {
-                        setsize += (4.0f64.powf((k as f64).log(3.0).ceil())) as usize;
+                        // CPython: `setsize += 4 ** _ceil(_log(k * 3, 4))`
+                        // — i.e. log base 4 of (3*k), not log base 3 of k.
+                        // Getting this exact keeps the pool-vs-selection-set
+                        // branch (and thus the MT19937 draw sequence) aligned
+                        // with CPython for seeded `random.sample`.
+                        setsize += 4.0f64.powf(((k * 3) as f64).log(4.0).ceil()) as usize;
                     }
                     if n <= setsize {
                         let mut pool = population.clone();
@@ -5152,7 +5176,8 @@ fn make_pathlib_module(interp: &mut Interpreter) -> Result<Value, Unwind> {
             Value::Native(Rc::new(NativeFn::new("write_text", move |_i, args| {
                 let text = single(&args, "write_text")?.py_str();
                 std::fs::write(&s_for_write, text.as_bytes())
-                    .map(|_| Value::Int(num_bigint::BigInt::from(text.len() as i64)))
+                    // `Path.write_text` returns the number of characters written.
+                    .map(|_| Value::Int(num_bigint::BigInt::from(text.chars().count() as i64)))
                     .map_err(|e| {
                         crate::error::Unwind::Exception(crate::error::VmException::new(
                             "OSError",
@@ -6545,13 +6570,12 @@ fn dict_method(
             if last {
                 m.insert(key, v);
             } else {
-                // Re-insert at the front: rebuild with the moved entry first.
-                let mut rebuilt: DictMap = IndexMap::with_capacity(m.len() + 1);
-                rebuilt.insert(key, v);
-                for (k2, v2) in m.drain(..) {
-                    rebuilt.insert(k2, v2);
-                }
-                *m = rebuilt;
+                // Re-insert at the front in place. `shift_insert(0, ..)` shifts
+                // the existing entries up by one without rebuilding/reallocating
+                // the whole map — O(n) shift, no per-entry clone — so the LRU
+                // idiom `move_to_end(k, last=False)` stays linear rather than
+                // quadratic over a sequence of front-moves.
+                m.shift_insert(0, key, v);
             }
             Ok(Value::None)
         }

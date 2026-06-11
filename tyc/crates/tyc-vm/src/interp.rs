@@ -519,6 +519,16 @@ impl Interpreter {
             };
             defaults.push(v);
         }
+        // `@staticmethod` / `@classmethod` change how the function binds a
+        // receiver when read through an instance. Capture them here, at the
+        // def site, so the binding decision in `get_attr` works regardless of
+        // how the function later reaches a class (normal class body, or a
+        // cross-module `extend` block lowered to `Cls.m = fn`).
+        let has_bare_deco = |want: &str| {
+            f.decorator_list
+                .iter()
+                .any(|d| matches!(&d.expression, ast::Expr::Name(n) if n.id.as_str() == want))
+        };
         Ok(Function {
             name: f.name.as_str().to_owned(),
             params: f.parameters.clone(),
@@ -526,6 +536,8 @@ impl Interpreter {
             defaults,
             closure: env.clone(),
             is_async: f.is_async,
+            is_static: has_bare_deco("staticmethod"),
+            is_classmethod: has_bare_deco("classmethod"),
             source: self.current_source.clone(),
         })
     }
@@ -1417,6 +1429,8 @@ impl Interpreter {
                     defaults: vec![],
                     closure: env.clone(),
                     is_async: false,
+                    is_static: false,
+                    is_classmethod: false,
                     source: self.current_source.clone(),
                 };
                 Ok(Value::Function(Rc::new(func)))
@@ -3286,12 +3300,17 @@ impl Interpreter {
                     }
                 }
                 if let Some(m) = self.find_method(&inst.class, attr) {
+                    // `@staticmethod` takes no implicit receiver: read it raw.
+                    if m.is_static {
+                        return Ok(Value::Function(m));
+                    }
                     // `@classmethod` binds the class object as `cls`, not the instance.
-                    let receiver = if inst.class.classmethods.borrow().contains(attr) {
-                        Box::new(Value::Class(inst.class.clone()))
-                    } else {
-                        Box::new(value.clone())
-                    };
+                    let receiver =
+                        if m.is_classmethod || inst.class.classmethods.borrow().contains(attr) {
+                            Box::new(Value::Class(inst.class.clone()))
+                        } else {
+                            Box::new(value.clone())
+                        };
                     return Ok(Value::BoundMethod {
                         receiver,
                         function: m,
@@ -3328,8 +3347,17 @@ impl Interpreter {
                 if let Some(v) = inst.class.class_attrs.borrow().get(attr) {
                     if !is_enum_sentinel(attr) {
                         if let Value::Function(f) = v {
+                            // `@staticmethod` extension: no receiver bound.
+                            if f.is_static {
+                                return Ok(Value::Function(f.clone()));
+                            }
+                            let receiver = if f.is_classmethod {
+                                Box::new(Value::Class(inst.class.clone()))
+                            } else {
+                                Box::new(value.clone())
+                            };
                             return Ok(Value::BoundMethod {
-                                receiver: Box::new(value.clone()),
+                                receiver,
                                 function: f.clone(),
                             });
                         }
