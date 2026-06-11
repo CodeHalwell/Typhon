@@ -1111,6 +1111,23 @@ fn expr_uses_asyncio_qualified(expr: &Expr) -> bool {
 // ── module-level desugaring ──────────────────────────────────────────────────
 
 fn desugar_mod_module_with(m: &ModModule, options: &DesugarOptions) -> ModModule {
+    // Lower TypedDict-style literals against local class/model annotations
+    // (`let u: User = {"id": 1, "name": "ada"}`) into constructor calls
+    // (`User(id=1, name="ada")`). The type checker has accepted this form
+    // since v0.3.0, but without this rewrite the emitted Python kept the
+    // plain dict — `u.name` then crashed at runtime with AttributeError.
+    let mut body: Vec<Stmt> = m.body.clone();
+    {
+        let class_fields = collect_local_class_field_annotations(&body);
+        if !class_fields.is_empty() {
+            rewrite_typed_dict_literals_in_stmts(&mut body, &class_fields);
+        }
+    }
+    let m = &ModModule {
+        range: m.range,
+        node_index: ruff_python_ast::AtomicNodeIndex::NONE,
+        body,
+    };
     let multi_base_parents = collect_multi_base_parents(&m.body);
     // Classes whose impl-stub body contains a `cached_property` method (or
     // the aliased `_typhon_cached_property` form emitted by `lazy let` in
@@ -2965,6 +2982,168 @@ fn merge_impl_blocks(body: Vec<Stmt>) -> (Vec<Stmt>, bool) {
     (new_body, true)
 }
 
+/// Collect, for every top-level class in the module, the map of field name
+/// → bare-`Name` annotation text. Only fields whose annotation is a plain
+/// identifier are recorded with their target name (that's all the nested
+/// dict-literal rewrite needs to recurse); other fields are recorded with
+/// an empty string so presence checks still work. Impl pseudo-classes are
+/// skipped.
+fn collect_local_class_field_annotations(
+    body: &[Stmt],
+) -> HashMap<String, HashMap<String, String>> {
+    let mut out: HashMap<String, HashMap<String, String>> = HashMap::new();
+    for stmt in body {
+        let Stmt::ClassDef(c) = stmt else { continue };
+        if c.name.as_str().starts_with(IMPL_PREFIX) {
+            continue;
+        }
+        let mut fields: HashMap<String, String> = HashMap::new();
+        for member in &c.body {
+            if let Stmt::AnnAssign(a) = member {
+                if let Expr::Name(n) = a.target.as_ref() {
+                    let ann = match a.annotation.as_ref() {
+                        Expr::Name(t) => t.id.as_str().to_owned(),
+                        _ => String::new(),
+                    };
+                    fields.insert(n.id.as_str().to_owned(), ann);
+                }
+            }
+        }
+        out.insert(c.name.as_str().to_owned(), fields);
+    }
+    out
+}
+
+/// `true` when `s` is usable as a Python keyword argument name.
+fn is_py_identifier(s: &str) -> bool {
+    const KEYWORDS: &[&str] = &[
+        "False", "None", "True", "and", "as", "assert", "async", "await", "break", "class",
+        "continue", "def", "del", "elif", "else", "except", "finally", "for", "from", "global",
+        "if", "import", "in", "is", "lambda", "nonlocal", "not", "or", "pass", "raise", "return",
+        "try", "while", "with", "yield",
+    ];
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(c) if c.is_alphabetic() || c == '_' => {}
+        _ => return false,
+    }
+    if !chars.all(|c| c.is_alphanumeric() || c == '_') {
+        return false;
+    }
+    !KEYWORDS.contains(&s)
+}
+
+/// Rewrite `{"k": v, ...}` into `Cls(k=v, ...)` when every key is a
+/// string-literal identifier naming a field of `Cls`. Recurses into a
+/// value that is itself a dict literal when the matching field's
+/// annotation names another local class (nested model initialisation).
+/// Returns `None` (leave the dict untouched) on any shape we can't
+/// prove — the type checker has already validated the match, this pass
+/// only performs the syntactic lowering.
+fn dict_literal_to_ctor_call(
+    d: &ruff_python_ast::ExprDict,
+    class_name: &str,
+    classes: &HashMap<String, HashMap<String, String>>,
+) -> Option<Expr> {
+    let fields = classes.get(class_name)?;
+    let mut keywords: Vec<ruff_python_ast::Keyword> = Vec::with_capacity(d.items.len());
+    for item in &d.items {
+        let key_expr = item.key.as_ref()?; // `**spread` — leave untouched.
+        let key = match key_expr {
+            Expr::StringLiteral(s) => s.value.to_str().to_owned(),
+            _ => return None,
+        };
+        if !is_py_identifier(&key) {
+            return None;
+        }
+        let field_ann = fields.get(&key)?;
+        let mut value = item.value.clone();
+        if let Expr::Dict(nested) = &value {
+            if classes.contains_key(field_ann.as_str()) {
+                if let Some(ctor) = dict_literal_to_ctor_call(nested, field_ann, classes) {
+                    value = ctor;
+                }
+            }
+        }
+        keywords.push(ruff_python_ast::Keyword {
+            range: TextRange::default(),
+            node_index: AtomicNodeIndex::NONE,
+            arg: Some(make_identifier(&key)),
+            value,
+        });
+    }
+    Some(Expr::Call(ruff_python_ast::ExprCall {
+        range: d.range,
+        node_index: AtomicNodeIndex::NONE,
+        func: Box::new(make_bare_name_expr(class_name)),
+        arguments: ruff_python_ast::Arguments {
+            range: TextRange::default(),
+            node_index: AtomicNodeIndex::NONE,
+            args: Box::from([]),
+            keywords: keywords.into_boxed_slice(),
+        },
+    }))
+}
+
+/// Walk every statement (recursing through function bodies and control-flow
+/// blocks) rewriting `x: Cls = {dict literal}` value positions via
+/// [`dict_literal_to_ctor_call`]. Class bodies are skipped — a dict literal
+/// as a *field default* stays a dict.
+fn rewrite_typed_dict_literals_in_stmts(
+    body: &mut [Stmt],
+    classes: &HashMap<String, HashMap<String, String>>,
+) {
+    for stmt in body.iter_mut() {
+        match stmt {
+            Stmt::AnnAssign(a) => {
+                if let (Expr::Name(ann), Some(value)) = (a.annotation.as_ref(), a.value.as_mut()) {
+                    if let Expr::Dict(d) = value.as_ref() {
+                        let class_name = ann.id.as_str();
+                        if classes.contains_key(class_name) {
+                            if let Some(ctor) = dict_literal_to_ctor_call(d, class_name, classes) {
+                                *value = Box::new(ctor);
+                            }
+                        }
+                    }
+                }
+            }
+            Stmt::FunctionDef(f) => {
+                rewrite_typed_dict_literals_in_stmts(&mut f.body, classes)
+            }
+            Stmt::If(s) => {
+                rewrite_typed_dict_literals_in_stmts(&mut s.body, classes);
+                for clause in s.elif_else_clauses.iter_mut() {
+                    rewrite_typed_dict_literals_in_stmts(&mut clause.body, classes);
+                }
+            }
+            Stmt::While(s) => {
+                rewrite_typed_dict_literals_in_stmts(&mut s.body, classes);
+                rewrite_typed_dict_literals_in_stmts(&mut s.orelse, classes);
+            }
+            Stmt::For(s) => {
+                rewrite_typed_dict_literals_in_stmts(&mut s.body, classes);
+                rewrite_typed_dict_literals_in_stmts(&mut s.orelse, classes);
+            }
+            Stmt::With(s) => rewrite_typed_dict_literals_in_stmts(&mut s.body, classes),
+            Stmt::Try(s) => {
+                rewrite_typed_dict_literals_in_stmts(&mut s.body, classes);
+                for h in s.handlers.iter_mut() {
+                    let ruff_python_ast::ExceptHandler::ExceptHandler(h) = h;
+                    rewrite_typed_dict_literals_in_stmts(&mut h.body, classes);
+                }
+                rewrite_typed_dict_literals_in_stmts(&mut s.orelse, classes);
+                rewrite_typed_dict_literals_in_stmts(&mut s.finalbody, classes);
+            }
+            Stmt::Match(s) => {
+                for case in s.cases.iter_mut() {
+                    rewrite_typed_dict_literals_in_stmts(&mut case.body, classes);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 /// Lower one cross-module `extend Target:` block into module-level patch
 /// statements: each method becomes a uniquely-named module function (its
 /// decorators preserved, so `@property` and friends still apply) followed
@@ -4161,6 +4340,53 @@ class __typhon_impl_Event(object):
             "output:\n{out}"
         );
         assert_eq!(out.matches("def scale(self):").count(), 1, "output:\n{out}");
+    }
+
+    #[test]
+    fn typed_dict_literal_lowers_to_constructor_call() {
+        // `let u: User = {"id": 1, "name": "ada"}` — the checker accepts the
+        // TypedDict-style match (v0.3.0); the emit must construct the class,
+        // not keep the raw dict (which crashed on first attribute access).
+        let src = "class User:\n    id: int\n    name: str\n\ndef f() -> None:\n    u: User = {\"id\": 1, \"name\": \"ada\"}\n";
+        let out = parse_and_desugar(src);
+        assert!(
+            out.contains("User(id=1, name=") || out.contains("User(id=1, name="),
+            "dict literal must lower to a ctor call; output:\n{out}"
+        );
+    }
+
+    #[test]
+    fn typed_dict_literal_nested_class_field_recurses() {
+        let src = "class Address:\n    city: str\n\nclass Person:\n    name: str\n    address: Address\n\ndef f() -> None:\n    p: Person = {\"name\": \"ada\", \"address\": {\"city\": \"London\"}}\n";
+        let out = parse_and_desugar(src);
+        assert!(
+            out.contains("address=Address(city="),
+            "nested dict against a class-typed field must recurse; output:\n{out}"
+        );
+    }
+
+    #[test]
+    fn untyped_dict_annotation_keeps_dict_literal() {
+        // `dict[str, int]`-annotated literals must stay dicts.
+        let src = "def f() -> None:\n    d: dict = {\"a\": 1}\n";
+        let out = parse_and_desugar(src);
+        assert!(
+            out.contains("{\"a\": 1}") || out.contains("{'a': 1}"),
+            "plain dict annotations must be untouched; output:\n{out}"
+        );
+    }
+
+    #[test]
+    fn dict_literal_with_non_identifier_key_untouched() {
+        // A key that can't be a kwarg (`"not-an-ident"`) must abort the
+        // rewrite even when the annotation names a local class.
+        let src = "class User:\n    id: int\n\ndef f() -> None:\n    u: User = {\"not-an-ident\": 1}\n";
+        let out = parse_and_desugar(src);
+        assert!(
+            !out.contains("User(") || out.contains("class User"),
+            "non-identifier keys must leave the dict untouched; output:\n{out}"
+        );
+        assert!(out.contains("not-an-ident"), "output:\n{out}");
     }
 
     #[test]
