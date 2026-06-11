@@ -1982,6 +1982,31 @@ fn walk_stmt(r: &mut Resolver, scope: ScopeId, stmt: &Stmt) {
             }
             collect_top_level(r, cls_scope, &c.body);
             let is_impl_stub = c.name.as_str().starts_with("__typhon_impl_");
+            if let Some(target) = c.name.as_str().strip_prefix("__typhon_impl_") {
+                // `impl Foo:` / `extend Foo:` *use* the name `Foo` — record a
+                // reference so `from mod import Foo` followed only by
+                // `extend Foo:` doesn't fire `unused_import` (the target name
+                // is otherwise hidden inside the synthetic pseudo-class name).
+                // Only when the name actually resolves: an undeclared target
+                // is the type checker's `impl_unknown_class`, not a second
+                // `unknown_name` from here.
+                let resolves = {
+                    let mut current = Some(scope);
+                    let mut found = false;
+                    while let Some(id) = current {
+                        if r.scopes[id].bindings.iter().any(|b| b.name == target) {
+                            found = true;
+                            break;
+                        }
+                        current = r.scopes[id].parent;
+                    }
+                    found
+                };
+                if resolves {
+                    let name_start = c.name.range.start().to_usize() + "__typhon_impl_".len();
+                    r.reference(scope, target, (name_start, name_start + target.len()));
+                }
+            }
             for s in &c.body {
                 if is_impl_stub {
                     walk_impl_method(r, cls_scope, s);

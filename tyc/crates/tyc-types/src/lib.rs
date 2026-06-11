@@ -5355,6 +5355,43 @@ fn collect_classes_and_functions(c: &mut Checker, body: &[Stmt]) {
             }
         }
     }
+    // Names bound by module-level imports. An `extend Foo:` whose target
+    // arrives via `from pkg.mod import Foo` (cross-module extend) is valid —
+    // the desugar pass lowers it to class-attribute patches — so it must
+    // not fire `impl_unknown_class` just because `Foo` isn't declared in
+    // this file. (The project-wide check path also merges the method into
+    // the imported shape, so call sites still type-check.)
+    let imported_names: HashSet<String> = body
+        .iter()
+        .flat_map(|stmt| -> Vec<String> {
+            match stmt {
+                Stmt::ImportFrom(i) => i
+                    .names
+                    .iter()
+                    .map(|a| {
+                        a.asname
+                            .as_ref()
+                            .map(|n| n.as_str().to_owned())
+                            .unwrap_or_else(|| a.name.as_str().to_owned())
+                    })
+                    .collect(),
+                Stmt::Import(i) => i
+                    .names
+                    .iter()
+                    .map(|a| {
+                        a.asname
+                            .as_ref()
+                            .map(|n| n.as_str().to_owned())
+                            .unwrap_or_else(|| {
+                                // `import a.b.c` binds the first segment.
+                                a.name.as_str().split('.').next().unwrap_or("").to_owned()
+                            })
+                    })
+                    .collect(),
+                _ => Vec::new(),
+            }
+        })
+        .collect();
     // Second pass (continued): fold `impl ClassName:` and `extend ClassName:`
     // contributions into the target class's shape. The preprocessor rewrites
     // both forms into a pseudo-class named `__typhon_impl_ClassName`; methods
@@ -5492,6 +5529,13 @@ fn collect_classes_and_functions(c: &mut Checker, body: &[Stmt]) {
                                 .or_insert_with(|| ty.clone());
                         }
                     }
+                } else if imported_names.contains(target) {
+                    // Cross-module `extend Foo:` — the target class is
+                    // imported, not declared here. The desugar pass lowers
+                    // the block to module-level class-attribute patches;
+                    // when the project-wide shape registry knows the class,
+                    // the merge into its shape happened there. Either way
+                    // this is a legal form, not an unknown class.
                 } else {
                     // FINDINGS #78: `impl UnknownClass:` silently produced
                     // dead code. Anchor the diagnostic on the class-name

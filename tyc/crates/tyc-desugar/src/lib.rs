@@ -2878,6 +2878,26 @@ fn merge_impl_blocks(body: Vec<Stmt>) -> (Vec<Stmt>, bool) {
         return (body, false);
     }
 
+    // Names of classes actually declared in this module. An `impl` /
+    // `extend` whose target is neither a local class nor a local sealed-
+    // union alias refers to an *imported* class (cross-module `extend
+    // Record:`), which can't be merged into a class body we don't own —
+    // those blocks lower to module-level attribute patches instead
+    // (`Record.label = __typhon_extend_Record__label`). Previously they
+    // were silently dropped, so the method vanished from the build output.
+    let local_classes: HashSet<String> = body
+        .iter()
+        .filter_map(|stmt| {
+            if let Stmt::ClassDef(c) = stmt {
+                let n = c.name.as_str();
+                if !n.starts_with(IMPL_PREFIX) {
+                    return Some(n.to_owned());
+                }
+            }
+            None
+        })
+        .collect();
+
     // Phase 2: collect methods (with `self` injected) into a map keyed by
     // target class name.  Multiple impl blocks for the same class accumulate.
     //
@@ -2890,6 +2910,9 @@ fn merge_impl_blocks(body: Vec<Stmt>) -> (Vec<Stmt>, bool) {
     // of writing "the method-on-the-union" once.
     let impl_index_set: HashSet<usize> = impl_indices.iter().map(|(i, _)| *i).collect();
     let mut impl_methods_map: HashMap<String, Vec<Stmt>> = HashMap::new();
+    // Pseudo-class indices whose target is foreign: lowered in place to
+    // `def __typhon_extend_T__m(self, ...)` + `T.m = __typhon_extend_T__m`.
+    let mut foreign_patches: HashMap<usize, Vec<Stmt>> = HashMap::new();
     for (impl_idx, target_name) in &impl_indices {
         if let Stmt::ClassDef(c) = &body[*impl_idx] {
             let methods: Vec<Stmt> = c.body.iter().map(insert_self_param).collect();
@@ -2899,35 +2922,84 @@ fn merge_impl_blocks(body: Vec<Stmt>) -> (Vec<Stmt>, bool) {
                 Some(variants) => variants.clone(),
                 None => vec![target_name.clone()],
             };
-            for target in targets {
-                impl_methods_map
-                    .entry(target)
-                    .or_default()
-                    .extend(methods.iter().cloned());
+            let all_local = targets
+                .iter()
+                .all(|t| local_classes.contains(t) || union_aliases.contains_key(t));
+            if all_local {
+                for target in targets {
+                    impl_methods_map
+                        .entry(target)
+                        .or_default()
+                        .extend(methods.iter().cloned());
+                }
+            } else {
+                foreign_patches.insert(*impl_idx, make_extend_patch_stmts(target_name, &methods));
             }
         }
     }
 
-    // Phase 3: rebuild the body, merging methods into target classes and
-    // dropping the impl pseudo-classes.
-    let new_body: Vec<Stmt> = body
-        .into_iter()
-        .enumerate()
-        .filter(|(i, _)| !impl_index_set.contains(i))
-        .map(|(_, stmt)| {
-            if let Stmt::ClassDef(mut c) = stmt {
-                let name = c.name.as_str().to_owned();
-                if let Some(methods) = impl_methods_map.remove(&name) {
-                    c.body.extend(methods);
-                }
-                Stmt::ClassDef(c)
-            } else {
-                stmt
+    // Phase 3: rebuild the body, merging methods into target classes,
+    // replacing foreign-target pseudo-classes with their attribute patches
+    // (in place, so they run after the import that binds the class), and
+    // dropping the local-target pseudo-classes.
+    let mut new_body: Vec<Stmt> = Vec::with_capacity(body.len());
+    for (i, stmt) in body.into_iter().enumerate() {
+        if let Some(patches) = foreign_patches.remove(&i) {
+            new_body.extend(patches);
+            continue;
+        }
+        if impl_index_set.contains(&i) {
+            continue;
+        }
+        if let Stmt::ClassDef(mut c) = stmt {
+            let name = c.name.as_str().to_owned();
+            if let Some(methods) = impl_methods_map.remove(&name) {
+                c.body.extend(methods);
             }
-        })
-        .collect();
+            new_body.push(Stmt::ClassDef(c));
+        } else {
+            new_body.push(stmt);
+        }
+    }
 
     (new_body, true)
+}
+
+/// Lower one cross-module `extend Target:` block into module-level patch
+/// statements: each method becomes a uniquely-named module function (its
+/// decorators preserved, so `@property` and friends still apply) followed
+/// by a class-attribute assignment binding it under the method's own name.
+/// Class-level attribute assignment is legal on `slots=True` and frozen
+/// dataclasses alike — only *instance* attributes are restricted.
+fn make_extend_patch_stmts(target: &str, methods: &[Stmt]) -> Vec<Stmt> {
+    let mut out: Vec<Stmt> = Vec::new();
+    for m in methods {
+        let Stmt::FunctionDef(f) = m else {
+            // Docstrings / `pass` placeholders inside the block carry no
+            // behaviour — drop them.
+            continue;
+        };
+        let method_name = f.name.as_str().to_owned();
+        let module_fn_name = format!("__typhon_extend_{target}__{method_name}");
+        let mut renamed = f.clone();
+        renamed.name = make_identifier(&module_fn_name);
+        out.push(Stmt::FunctionDef(renamed));
+        // `Target.method = __typhon_extend_Target__method`
+        out.push(Stmt::Assign(StmtAssign {
+            node_index: AtomicNodeIndex::NONE,
+            range: TextRange::default(),
+            targets: vec![Expr::Attribute(ExprAttribute {
+                node_index: AtomicNodeIndex::NONE,
+                range: TextRange::default(),
+                value: Box::new(make_bare_name_expr(target)),
+                attr: make_identifier(&method_name),
+                ctx: ExprContext::Store,
+            })],
+            value: Box::new(make_bare_name_expr(&module_fn_name)),
+            mutability: None,
+        }));
+    }
+    out
 }
 
 /// FINDINGS #22: walk every class in `body`, build a `name → field-annotation`
@@ -4089,6 +4161,52 @@ class __typhon_impl_Event(object):
             "output:\n{out}"
         );
         assert_eq!(out.matches("def scale(self):").count(), 1, "output:\n{out}");
+    }
+
+    #[test]
+    fn cross_module_extend_lowers_to_attribute_patch() {
+        // `extend Record:` where `Record` is imported (not declared here)
+        // must lower to a module-level def + class-attribute assignment —
+        // previously the methods were silently dropped (runtime
+        // AttributeError after a clean build).
+        let src = "from store.records import Record\n\nclass __typhon_impl_Record(object):\n    def label(self):\n        return self.name\n";
+        let out = parse_and_desugar(src);
+        assert!(
+            out.contains("def __typhon_extend_Record__label(self):"),
+            "foreign extend must synthesise a module-level fn; output:\n{out}"
+        );
+        assert!(
+            out.contains("Record.label = __typhon_extend_Record__label"),
+            "foreign extend must patch the class attribute; output:\n{out}"
+        );
+        assert!(
+            !out.contains("__typhon_impl_"),
+            "impl stub must be removed; output:\n{out}"
+        );
+    }
+
+    #[test]
+    fn cross_module_extend_patch_lands_after_import() {
+        let src = "from store.records import Record\n\nclass __typhon_impl_Record(object):\n    def label(self):\n        return self.name\n";
+        let out = parse_and_desugar(src);
+        let import_pos = out.find("from store.records import Record").unwrap();
+        let patch_pos = out.find("Record.label =").unwrap();
+        assert!(
+            import_pos < patch_pos,
+            "patch must execute after the import binds the class; output:\n{out}"
+        );
+    }
+
+    #[test]
+    fn local_extend_still_merges_into_class_body() {
+        // A same-module target keeps the body-merge lowering (no patches).
+        let src = "class Thing:\n    name: str\n\nclass __typhon_impl_Thing(object):\n    def shout(self):\n        return self.name\n";
+        let out = parse_and_desugar(src);
+        assert!(
+            !out.contains("__typhon_extend_"),
+            "local targets must not use the patch form; output:\n{out}"
+        );
+        assert!(out.contains("def shout(self):"), "output:\n{out}");
     }
 
     #[test]

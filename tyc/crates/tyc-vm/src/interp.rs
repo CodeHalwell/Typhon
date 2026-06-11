@@ -2161,9 +2161,16 @@ impl Interpreter {
             fields: RefCell::new(HashMap::new()),
         });
         // Initialise class-level attributes that aren't methods. Skip the
-        // internal enum sentinels so they don't leak onto instances.
+        // internal enum sentinels so they don't leak onto instances, and
+        // skip *functions*: in CPython a function class-attribute is a
+        // descriptor that binds through the class at lookup time (this is
+        // how cross-module `extend` patches dispatch) — snapshotting it
+        // into the instance would freeze an unbound copy.
         for (k, v) in class.class_attrs.borrow().iter() {
-            if is_enum_sentinel(k) || k.starts_with("__typhon_setter__") {
+            if is_enum_sentinel(k)
+                || k.starts_with("__typhon_setter__")
+                || matches!(v, Value::Function(_))
+            {
                 continue;
             }
             instance.fields.borrow_mut().insert(k.clone(), v.clone());
@@ -3125,9 +3132,19 @@ impl Interpreter {
                     return Ok(Value::Native(Rc::new(nf)));
                 }
                 // Fall back to class-level attributes (ClassVar / plain-class
-                // constants) — `instance.K` reads `type(instance).K`.
+                // constants) — `instance.K` reads `type(instance).K`. A
+                // *function* stored as a class attribute is a descriptor in
+                // CPython: reading it through an instance binds `self`. This
+                // is how cross-module `extend Foo:` methods (lowered to
+                // `Foo.m = __typhon_extend_Foo__m`) dispatch.
                 if let Some(v) = inst.class.class_attrs.borrow().get(attr) {
                     if !is_enum_sentinel(attr) {
+                        if let Value::Function(f) = v {
+                            return Ok(Value::BoundMethod {
+                                receiver: Box::new(value.clone()),
+                                function: f.clone(),
+                            });
+                        }
                         return Ok(v.clone());
                     }
                 }
