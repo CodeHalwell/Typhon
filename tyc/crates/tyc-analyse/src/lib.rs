@@ -3420,11 +3420,7 @@ fn empty_collection_kind(expr: &Expr) -> Option<&'static str> {
 /// every function (including nested ones and methods inside class /
 /// impl bodies) and flags list / dict / set / mutable-constructor
 /// defaults on parameters.
-pub fn analyse_mutable_default_params(
-    module: &ModModule,
-    path: &str,
-    source: &str,
-) -> Diagnostics {
+pub fn analyse_mutable_default_params(module: &ModModule, path: &str, source: &str) -> Diagnostics {
     let mut diags = Diagnostics::new();
     walk_mutable_default_stmts(&module.body, path, source, &mut diags);
     diags
@@ -3516,11 +3512,7 @@ fn walk_mutable_default_stmts(body: &[Stmt], path: &str, source: &str, diags: &m
 /// `is` / `is not` against a literal operand (`tyc::is_literal_comparison`):
 /// identity comparison with a fresh literal is interpreter-dependent —
 /// CPython itself SyntaxWarns on it. Walks every comparison expression.
-pub fn analyse_is_literal_comparisons(
-    module: &ModModule,
-    path: &str,
-    source: &str,
-) -> Diagnostics {
+pub fn analyse_is_literal_comparisons(module: &ModModule, path: &str, source: &str) -> Diagnostics {
     use ruff_python_ast::visitor::source_order::{walk_expr, SourceOrderVisitor};
     use ruff_text_size::Ranged;
     struct V<'a> {
@@ -3590,12 +3582,7 @@ pub fn analyse_is_literal_comparisons(
 /// deferred call observes the final value. Immediately-invoked lambdas
 /// (`(lambda: i)()`) and parameters that shadow the loop name (the
 /// `lambda i=i:` idiom) are exempt.
-pub fn analyse_loop_closure_captures(
-    module: &ModModule,
-    path: &str,
-    source: &str,
-) -> Diagnostics {
-    use ruff_text_size::Ranged;
+pub fn analyse_loop_closure_captures(module: &ModModule, path: &str, source: &str) -> Diagnostics {
     let mut diags = Diagnostics::new();
 
     fn target_names(e: &Expr, into: &mut Vec<String>) {
@@ -3618,6 +3605,7 @@ pub fn analyse_loop_closure_captures(
 
     /// Collect references to `names` inside a closure body, skipping any
     /// name shadowed by the closure's own parameters.
+    #[allow(clippy::type_complexity)]
     fn flag_captures_in_closure(
         params: Option<&Parameters>,
         body_exprs: &mut dyn FnMut(&mut dyn FnMut(&Expr)),
@@ -3677,7 +3665,6 @@ pub fn analyse_loop_closure_captures(
             }
         }
         let mut v = V { f };
-        use ruff_python_ast::visitor::source_order::SourceOrderVisitor as _;
         v.visit_expr(e);
     }
 
@@ -3753,7 +3740,6 @@ pub fn analyse_loop_closure_captures(
                     source,
                     diags,
                 };
-                use ruff_python_ast::visitor::source_order::SourceOrderVisitor as _;
                 v.visit_expr(other);
             }
         }

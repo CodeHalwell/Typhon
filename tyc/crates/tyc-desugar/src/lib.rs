@@ -249,10 +249,7 @@ pub fn desugar_module_with(module: &ModModule, options: DesugarOptions) -> Desug
         inject(&mut body, make_protocol_import());
     }
     if !abc_names_to_import.is_empty() {
-        inject(
-            &mut body,
-            make_collections_abc_import(&abc_names_to_import),
-        );
+        inject(&mut body, make_collections_abc_import(&abc_names_to_import));
     }
     if inject_newtype {
         inject(&mut body, make_newtype_import());
@@ -3335,15 +3332,13 @@ fn rewrite_typed_dict_literals_in_stmts(
                         let class_name = ann.id.as_str();
                         if classes.contains_key(class_name) {
                             if let Some(ctor) = dict_literal_to_ctor_call(d, class_name, classes) {
-                                *value = Box::new(ctor);
+                                **value = ctor;
                             }
                         }
                     }
                 }
             }
-            Stmt::FunctionDef(f) => {
-                rewrite_typed_dict_literals_in_stmts(&mut f.body, classes)
-            }
+            Stmt::FunctionDef(f) => rewrite_typed_dict_literals_in_stmts(&mut f.body, classes),
             Stmt::If(s) => {
                 rewrite_typed_dict_literals_in_stmts(&mut s.body, classes);
                 for clause in s.elif_else_clauses.iter_mut() {
@@ -4614,7 +4609,8 @@ class __typhon_impl_Event(object):
     fn dict_literal_with_non_identifier_key_untouched() {
         // A key that can't be a kwarg (`"not-an-ident"`) must abort the
         // rewrite even when the annotation names a local class.
-        let src = "class User:\n    id: int\n\ndef f() -> None:\n    u: User = {\"not-an-ident\": 1}\n";
+        let src =
+            "class User:\n    id: int\n\ndef f() -> None:\n    u: User = {\"not-an-ident\": 1}\n";
         let out = parse_and_desugar(src);
         assert!(
             !out.contains("User(") || out.contains("class User"),

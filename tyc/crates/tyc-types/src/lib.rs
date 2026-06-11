@@ -10707,14 +10707,16 @@ fn builtin_generic_method(recv: &Type, attr: &str) -> Option<Type> {
             ret: Box::new(Type::optional(e.clone())),
             variadic: false,
         }),
-        ("Ok", "is_ok", _) | ("Ok", "is_err", _) | ("Err", "is_ok", _)
-        | ("Err", "is_err", _) | ("Result", "is_ok", _) | ("Result", "is_err", _) => {
-            Some(Type::Function {
-                params: vec![],
-                ret: Box::new(Type::Bool),
-                variadic: false,
-            })
-        }
+        ("Ok", "is_ok", _)
+        | ("Ok", "is_err", _)
+        | ("Err", "is_ok", _)
+        | ("Err", "is_err", _)
+        | ("Result", "is_ok", _)
+        | ("Result", "is_err", _) => Some(Type::Function {
+            params: vec![],
+            ret: Box::new(Type::Bool),
+            variadic: false,
+        }),
         // Mapping views — preserve the element type (with `?`) so iterating
         // `d.values()` over a `dict[K, V?]` yields `V?`, not `V`. Returning
         // a parameterised view (rather than `Unknown`) is what closes the
@@ -11053,17 +11055,6 @@ fn subscript_element_type(ty: &Type) -> Option<Type> {
     }
 }
 
-/// Infer the type of `expr`, optionally with an expected target type
-/// (the annotation on the enclosing `let`, the function's declared
-/// return type, or a generic parameter's formal type).  Most arms
-/// ignore `expected`; it's used for:
-///
-/// - **`Expr::Call`** — feeds into PEP 695 bidirectional inference so
-///   call-site annotations can pin otherwise-unbindable TypeVars.
-/// - **`Expr::List` / `Expr::Set` / `Expr::Dict`** — when the literal
-///   is empty (no elements to infer from), adopt the expected element
-///   type so `let xs: list[int] = []` produces `list[int]` rather than
-///   `list[?]`.
 /// Resolve the element expectation a container literal should push into
 /// its members: unwrap aliases on the expected type and, when the result
 /// is a union, pick the single member with the requested head and arity.
@@ -11100,6 +11091,17 @@ fn container_expectation(
     }
 }
 
+/// Infer the type of `expr`, optionally with an expected target type
+/// (the annotation on the enclosing `let`, the function's declared
+/// return type, or a generic parameter's formal type).  Most arms
+/// ignore `expected`; it's used for:
+///
+/// - **`Expr::Call`** — feeds into PEP 695 bidirectional inference so
+///   call-site annotations can pin otherwise-unbindable TypeVars.
+/// - **`Expr::List` / `Expr::Set` / `Expr::Dict`** — when the literal
+///   is empty (no elements to infer from), adopt the expected element
+///   type so `let xs: list[int] = []` produces `list[int]` rather than
+///   `list[?]`.
 fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type {
     match expr {
         Expr::BooleanLiteral(_) => Type::Bool,
@@ -12877,8 +12879,8 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
             // Tease apart key/value expected types from `dict[K, V]` —
             // directly, through an alias, or as the single dict member of
             // an expected union (recursive `Json`-style aliases).
-            let kv_expected: Option<(Type, Type)> =
-                container_expectation(c, expected, "dict", 2).map(|mut a| {
+            let kv_expected: Option<(Type, Type)> = container_expectation(c, expected, "dict", 2)
+                .map(|mut a| {
                     let v = a.remove(1);
                     let k = a.remove(0);
                     (k, v)
@@ -13615,7 +13617,7 @@ fn check_override_compatibility(c: &mut Checker, body: &[Stmt]) {
     }
     let parents_map = c.class_parents.clone();
     let mut findings: Vec<(String, String, String, String)> = Vec::new();
-    for (sub, _) in &parents_map {
+    for sub in parents_map.keys() {
         let Some(sub_shape) = c.class_shapes.get(sub.as_str()) else {
             continue;
         };

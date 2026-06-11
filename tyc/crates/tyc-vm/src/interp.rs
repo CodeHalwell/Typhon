@@ -2405,16 +2405,14 @@ impl Interpreter {
                 if thunk.forced.replace(true) {
                     return Err(Unwind::Exception(crate::error::VmException::new(
                         "RuntimeError",
-                        format!("cannot reuse already awaited coroutine {}", thunk.function.name),
+                        format!(
+                            "cannot reuse already awaited coroutine {}",
+                            thunk.function.name
+                        ),
                     )));
                 }
                 let args = thunk.args.borrow_mut().drain(..).collect::<Vec<_>>();
-                self.call_function(
-                    &thunk.function,
-                    args,
-                    &thunk.kwargs,
-                    thunk.receiver.clone(),
-                )
+                self.call_function(&thunk.function, args, &thunk.kwargs, thunk.receiver.clone())
             }
             Value::Module(m) if m.name == "Task" => {
                 let r = m.members.borrow().get("__typhon_task_result__").cloned();
@@ -3408,16 +3406,16 @@ impl Interpreter {
             }
             Value::ResultOk(v) => match attr {
                 "value" => Ok((**v).clone()),
-                "map" | "map_err" | "and_then" | "or_else" | "unwrap" | "expect"
-                | "unwrap_or" | "unwrap_or_else" | "ok" | "err" | "is_ok" | "is_err" => {
+                "map" | "map_err" | "and_then" | "or_else" | "unwrap" | "expect" | "unwrap_or"
+                | "unwrap_or_else" | "ok" | "err" | "is_ok" | "is_err" => {
                     Ok(bind_result_combinator(value.clone(), attr))
                 }
                 _ => Err(attribute_error(format!("Ok has no attribute '{}'", attr))),
             },
             Value::ResultErr(v) => match attr {
                 "value" | "error" => Ok((**v).clone()),
-                "map" | "map_err" | "and_then" | "or_else" | "unwrap" | "expect"
-                | "unwrap_or" | "unwrap_or_else" | "ok" | "err" | "is_ok" | "is_err" => {
+                "map" | "map_err" | "and_then" | "or_else" | "unwrap" | "expect" | "unwrap_or"
+                | "unwrap_or_else" | "ok" | "err" | "is_ok" | "is_err" => {
                     Ok(bind_result_combinator(value.clone(), attr))
                 }
                 _ => Err(attribute_error(format!("Err has no attribute '{}'", attr))),
@@ -5434,12 +5432,12 @@ fn bind_result_combinator(receiver: Value, attr: &str) -> Value {
         match (&receiver, combinator) {
             // `expect(msg)` — unwrap with a caller-supplied panic message.
             (Value::ResultOk(v), "expect") => Ok((**v).clone()),
-            (Value::ResultErr(e), "expect") => Err(Unwind::Exception(
-                crate::error::VmException::new(
+            (Value::ResultErr(e), "expect") => {
+                Err(Unwind::Exception(crate::error::VmException::new(
                     "RuntimeError",
                     format!("{}: {}", f.py_str(), e.py_repr()),
-                ),
-            )),
+                )))
+            }
             // `unwrap_or(default)` — value or the default.
             (Value::ResultOk(v), "unwrap_or") => Ok((**v).clone()),
             (Value::ResultErr(_), "unwrap_or") => Ok(f),

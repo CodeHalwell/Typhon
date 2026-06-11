@@ -2932,8 +2932,16 @@ fn make_random_module() -> Value {
                 nf("gauss", |_i, args| {
                     // Exactly CPython's random.py gauss(): a cached
                     // sin/cos pair per two draws.
-                    let mu = args.first().map(|v| v.to_float()).transpose()?.unwrap_or(0.0);
-                    let sigma = args.get(1).map(|v| v.to_float()).transpose()?.unwrap_or(1.0);
+                    let mu = args
+                        .first()
+                        .map(|v| v.to_float())
+                        .transpose()?
+                        .unwrap_or(0.0);
+                    let sigma = args
+                        .get(1)
+                        .map(|v| v.to_float())
+                        .transpose()?
+                        .unwrap_or(1.0);
                     let z = with_mt(|m| {
                         if let Some(z) = m.gauss_next.take() {
                             z
@@ -3009,9 +3017,7 @@ fn make_random_module() -> Value {
                     };
                     let n = population.len();
                     if k > n {
-                        return Err(value_error(
-                            "Sample larger than population or is negative",
-                        ));
+                        return Err(value_error("Sample larger than population or is negative"));
                     }
                     // CPython's selection-set vs pool heuristic, verbatim,
                     // so seeded sequences match exactly.
@@ -4006,7 +4012,9 @@ fn make_asyncio_queue(args: &[Value], kwargs: &[(String, Value)]) -> Value {
         members.insert(
             "qsize".to_owned(),
             Value::Native(Rc::new(NativeFn::new("qsize", move |_i, _args| {
-                Ok(Value::Int(num_bigint::BigInt::from(b.borrow().len() as i64)))
+                Ok(Value::Int(
+                    num_bigint::BigInt::from(b.borrow().len() as i64),
+                ))
             }))),
         );
         let b = buf.clone();
@@ -4364,9 +4372,7 @@ pub fn set_is_frozen(s: &Rc<RefCell<std::collections::HashSet<HashKey>>>) -> boo
 /// dispatch table checks before mutating.
 fn deep_freeze_value(v: Value) -> Result<Value, Unwind> {
     match v {
-        Value::Coroutine(_) => Err(type_error(
-            "cannot freeze a coroutine object".to_string(),
-        )),
+        Value::Coroutine(_) => Err(type_error("cannot freeze a coroutine object".to_string())),
         Value::None
         | Value::Bool(_)
         | Value::Int(_)
@@ -6482,7 +6488,7 @@ fn dict_method(
                 .unwrap_or(true);
             let mut m = d.borrow_mut();
             let Some(v) = m.shift_remove(&key) else {
-                return Err(key_error(format!("{}", key.into_value().py_repr())));
+                return Err(key_error(key.into_value().py_repr()));
             };
             if last {
                 m.insert(key, v);
@@ -7482,10 +7488,7 @@ pub fn call_with_kwargs(
                 if k == "start" {
                     acc = v.clone();
                 } else {
-                    return Err(type_error(format!(
-                        "sum() got unexpected keyword: '{}'",
-                        k
-                    )));
+                    return Err(type_error(format!("sum() got unexpected keyword: '{}'", k)));
                 }
             }
             let it = interp.make_iter(

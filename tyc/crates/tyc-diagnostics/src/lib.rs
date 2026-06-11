@@ -1512,7 +1512,9 @@ pub enum TycError {
         severity(Warning),
         code(tyc::is_literal_comparison),
         url("https://typhon.dev/lang/diagnostics/is_literal_comparison"),
-        help("Use `==` / `!=` for value comparison. Reserve `is` for `None` and sentinel objects.")
+        help(
+            "Use `==` / `!=` for value comparison. Reserve `is` for `None` and sentinel objects."
+        )
     )]
     IsLiteralComparison {
         #[source_code]

@@ -413,7 +413,9 @@ fn move_methods_to_impl(source: &str) -> String {
                 j = k;
                 continue;
             }
-            if ind == 4 && (t.starts_with("def ") || t.starts_with("async def ") || t.starts_with('@')) {
+            if ind == 4
+                && (t.starts_with("def ") || t.starts_with("async def ") || t.starts_with('@'))
+            {
                 // Item extent: this line plus everything indented deeper
                 // (decorators chain through subsequent indent-4 def lines).
                 let start_item = j;
@@ -439,10 +441,19 @@ fn move_methods_to_impl(source: &str) -> String {
                         }
                         break;
                     }
-                    if ind2 <= 4 && !(ind2 == 4 && t.starts_with('@') && (t2.starts_with("def ") || t2.starts_with("async def ") || t2.starts_with('@'))) {
+                    if ind2 <= 4
+                        && !(ind2 == 4
+                            && t.starts_with('@')
+                            && (t2.starts_with("def ")
+                                || t2.starts_with("async def ")
+                                || t2.starts_with('@')))
+                    {
                         // A decorator item continues through the def it
                         // decorates; anything else at indent <= 4 ends it.
-                        if ind2 == 4 && (t2.starts_with("def ") || t2.starts_with("async def ")) && t.starts_with('@') {
+                        if ind2 == 4
+                            && (t2.starts_with("def ") || t2.starts_with("async def "))
+                            && t.starts_with('@')
+                        {
                             // covered above
                         }
                         break;
@@ -488,10 +499,7 @@ fn move_methods_to_impl(source: &str) -> String {
         // impl block carrying the methods.
         out.push_str(lines[i]);
         let mut others_trimmed: Vec<&str> = others.clone();
-        while others_trimmed
-            .last()
-            .is_some_and(|l| l.trim().is_empty())
-        {
+        while others_trimmed.last().is_some_and(|l| l.trim().is_empty()) {
             others_trimmed.pop();
         }
         if others_trimmed.is_empty() {
@@ -504,16 +512,10 @@ fn move_methods_to_impl(source: &str) -> String {
         out.push('\n');
         out.push_str(&format!("impl {class_name}:\n"));
         let mut methods_trimmed: Vec<&str> = methods.clone();
-        while methods_trimmed
-            .first()
-            .is_some_and(|l| l.trim().is_empty())
-        {
+        while methods_trimmed.first().is_some_and(|l| l.trim().is_empty()) {
             methods_trimmed.remove(0);
         }
-        while methods_trimmed
-            .last()
-            .is_some_and(|l| l.trim().is_empty())
-        {
+        while methods_trimmed.last().is_some_and(|l| l.trim().is_empty()) {
             methods_trimmed.pop();
         }
         let mut prev_blank = false;
@@ -602,10 +604,7 @@ fn prune_stale_migration_imports(source: &str) -> String {
             continue;
         }
         let indent = &raw[..raw.len() - trimmed.len()];
-        out.push_str(&format!(
-            "{indent}from {module} import {}",
-            kept.join(", ")
-        ));
+        out.push_str(&format!("{indent}from {module} import {}", kept.join(", ")));
         out.push_str(terminator);
     }
     out
