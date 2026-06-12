@@ -4,6 +4,50 @@ All notable changes to Typhon are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely; the
 canonical phase-by-phase status lives in `docs/roadmap.md`.
 
+## 0.14.2 — 2026-06-12 — `gather_opportunity` async-concurrency advice
+
+The single biggest "compile to the faster way" lever for async code is
+concurrency: independent `await`s that run sequentially could run together.
+Typhon could already *do* this (`gather:` / `auto-gather`), but `auto-gather`
+is opt-in, requires a `@gatherable` decorator on every callee, and only
+considers same-module `async def`s — so the most common real
+missed-concurrency shape, two awaited method calls on an imported client,
+was never surfaced. Now the compiler points it out by default.
+
+### Added — `tyc::gather_opportunity` (advice, on by default)
+
+- **`tyc build` flags every run of 2+ adjacent independent awaited calls**
+  inside an `async def` and suggests wrapping them in an explicit `gather:`
+  block so they run concurrently in an `asyncio.TaskGroup`:
+
+  ```ty
+  async def load(client: Client, uid: int) -> tuple[User, list[Post]]:
+      let user = await client.get_user(uid)        # advice: these 2 awaits
+      let posts = await client.get_posts(uid)      # could run concurrently
+      return (user, posts)
+  ```
+
+- **Callee-agnostic**, unlike `tyc::auto_gather_missed`: it fires for awaited
+  **method calls on imported clients** (`await client.get_user(...)`), the
+  shape `auto-gather` never touches, because the suggested fix — an explicit
+  `gather:` block — works for any awaitable with no `@gatherable` decorator
+  or `auto-gather` opt-in.
+- **Sound and conservative.** Independence is decided by static data flow:
+  a run breaks the moment a later await references a name bound earlier —
+  including through the callee's *receiver* (`b = await a.next()`), keyword
+  args, comprehensions, walrus, slices, and f-strings (all reused from the
+  `auto-gather` independence analysis). A single non-matching statement
+  between two awaits ends the run. It **never rewrites** — concurrency is a
+  behaviour change the author opts into, since data-flow independence does
+  not rule out ordering side effects — and it is **advice-level**, so it
+  never blocks a build. Verified to fire zero times across the 15-app
+  example corpus (which already gathers where appropriate), so default-on
+  adds no noise.
+- **Knob:** `[strictness] suggest-gather` (default `true`). Set `false` to
+  silence the nudge project-wide. When `auto-gather` is also on, runs it
+  folds into a `TaskGroup` are gone before this pass runs, so they aren't
+  double-reported. `tyc explain gather_opportunity` documents it offline.
+
 ## 0.14.1 — 2026-06-12 — Cross-module shape propagation completeness
 
 A dogfooding round — a self-hosted API budget tracker built end-to-end on

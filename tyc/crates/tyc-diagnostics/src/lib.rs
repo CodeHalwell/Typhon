@@ -967,6 +967,33 @@ pub enum TycError {
         span: SourceSpan,
     },
 
+    /// Two or more adjacent `NAME = await CALL(...)` statements inside an
+    /// `async def` are independent by data flow (no later await consumes
+    /// an earlier binding), so they run sequentially when they could run
+    /// concurrently. Unlike [`TycError::AutoGatherMissed`], this is
+    /// callee-agnostic — it fires for awaited method calls on imported
+    /// clients (`await client.get_user(id)` then
+    /// `await client.get_posts(id)`), the most common real
+    /// missed-concurrency shape — and suggests the explicit `gather:`
+    /// block, which works for any awaitable without a `@gatherable`
+    /// decorator. Advice-level: concurrency is a behaviour change the
+    /// author opts into (data-flow independence doesn't rule out ordering
+    /// side effects), so this never rewrites and never blocks a build.
+    #[error("{count} adjacent awaits run sequentially but look independent")]
+    #[diagnostic(
+        severity(Advice),
+        code(tyc::gather_opportunity),
+        url("https://typhon.dev/lang/diagnostics/gather_opportunity"),
+        help("if these awaits have no ordering dependency, wrap them in a `gather:` block so they run concurrently in an `asyncio.TaskGroup` instead of one after another")
+    )]
+    GatherOpportunity {
+        count: usize,
+        #[source_code]
+        src: NamedSource<String>,
+        #[label("these {count} awaits could run concurrently")]
+        span: SourceSpan,
+    },
+
     /// A top-level `def main()` is defined but is never called from
     /// the module. Common newcomer mistake — the script's `main`
     /// function never runs, leaving the build apparently successful
@@ -2330,6 +2357,21 @@ impl TycError {
     ) -> Self {
         Self::AutoGatherMissed {
             missing: missing.into(),
+            src: NamedSource::new(path.into(), source.into()),
+            span: SourceSpan::new(SourceOffset::from(offset), length),
+        }
+    }
+
+    /// Construct a [`TycError::GatherOpportunity`] advice diagnostic.
+    pub fn gather_opportunity(
+        count: usize,
+        path: impl Into<String>,
+        source: impl Into<String>,
+        offset: usize,
+        length: usize,
+    ) -> Self {
+        Self::GatherOpportunity {
+            count,
             src: NamedSource::new(path.into(), source.into()),
             span: SourceSpan::new(SourceOffset::from(offset), length),
         }

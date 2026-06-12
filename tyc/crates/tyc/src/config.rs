@@ -154,6 +154,14 @@ pub struct StrictnessConfig {
     /// per-project to apply the rewrite globally. (Phase 4 auto-gather
     /// inference; explicit `gather:` blocks are unaffected.)
     pub auto_gather: bool,
+    /// When true (the default), `tyc build` surfaces a `tyc::gather_opportunity`
+    /// advice for every run of 2+ adjacent independent awaited calls inside an
+    /// `async def` — including awaited method calls on imported clients, which
+    /// `auto-gather` never touches. Advice-only: it suggests wrapping the run
+    /// in an explicit `gather:` block but never rewrites (concurrency is a
+    /// behaviour change the author opts into). Set `false` to silence the
+    /// nudge; it never blocks a build regardless.
+    pub suggest_gather: bool,
     /// When true, `tyc build` consults `typhon-profile.json` (produced by a
     /// prior `tyc profile` run) and promotes every pure function whose call
     /// count meets [`StrictnessConfig::pgo_min_calls`] to `@functools.cache`,
@@ -229,6 +237,7 @@ impl Default for StrictnessConfig {
             methods_in_class_body: "warn".into(),
             auto_memoise: false,
             auto_gather: false,
+            suggest_gather: true,
             pgo_memoise: false,
             pgo_min_calls: 100,
             auto_parallel: false,

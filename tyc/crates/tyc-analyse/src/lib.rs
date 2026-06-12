@@ -61,8 +61,8 @@ const MAX_COMPTIME_DEPTH: usize = 64;
 
 pub mod auto_gather;
 pub use auto_gather::{
-    collect_gatherable_async_fn_names, detect_missed_gathers, rewrite_auto_gather, AutoGatherStats,
-    MissedGather,
+    collect_gatherable_async_fn_names, detect_gather_opportunities, detect_missed_gathers,
+    rewrite_auto_gather, AutoGatherStats, GatherOpportunity, MissedGather,
 };
 
 pub mod pgo;

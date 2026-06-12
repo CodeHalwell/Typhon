@@ -63,6 +63,7 @@ fn catalog_codes() -> &'static [&'static str] {
         "extend_builtin",
         "freeze",
         "frozen_assign",
+        "gather_opportunity",
         "generator_return_type",
         "generic",
         "immutable_assign",
@@ -150,6 +151,9 @@ fn catalog_entry(short_code: &str) -> Option<&'static str> {
         "extend_builtin" => include_str!("../../../../../docs/diagnostics/extend_builtin.md"),
         "freeze" => include_str!("../../../../../docs/diagnostics/freeze.md"),
         "frozen_assign" => include_str!("../../../../../docs/diagnostics/frozen_assign.md"),
+        "gather_opportunity" => {
+            include_str!("../../../../../docs/diagnostics/gather_opportunity.md")
+        }
         "generator_return_type" => {
             include_str!("../../../../../docs/diagnostics/generator_return_type.md")
         }
