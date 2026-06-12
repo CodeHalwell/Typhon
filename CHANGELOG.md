@@ -4,48 +4,77 @@ All notable changes to Typhon are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely; the
 canonical phase-by-phase status lives in `docs/roadmap.md`.
 
-## 0.14.1 — 2026-06-12 — Cross-module newtype widening
+## 0.14.1 — 2026-06-12 — Cross-module shape propagation completeness
 
 A dogfooding round — a self-hosted API budget tracker built end-to-end on
-v0.14.0 — surfaced one compiler defect: a `newtype` declared in one module
-did not widen to its base type when consumed from another module, even
-though the docs promise the asymmetric escape-upward (`Name → Base`) always
-holds. Additive — every previously-accepted program type-checks
-identically, and the full workspace suite plus the 15-app example corpus
-stay green.
+v0.14.0 — surfaced a class of defect: several per-module checker tables were
+never threaded through the cross-module shape registry, so type information
+the in-module checker relies on silently went missing once a declaration was
+consumed from another module. Four maps had the gap — `newtypes`,
+transparent `type_aliases`, `enums`, and `frozen_classes` — all now carried
+through the same path that already propagated `sealed_unions`, `interfaces`,
+and `class_shapes`. Additive — every previously-accepted program type-checks
+identically, the full workspace suite stays green, and all 15 example apps
+(which declare newtypes/enums/frozen classes in a `domain/` module and import
+them widely) check clean.
+
+The shared fix threads each map through the four-stage cross-module path
+(`extract_module_shapes` → `ModuleShapes` → `build_external_shapes` →
+`check_module_with_imports`), seeding the consumer both when the name is
+imported directly (alias-aware) and when it's reached *only* through an
+imported class field / function parameter / return type (the case that
+actually bit in each instance). A local declaration always wins on a name
+collision with an imported one.
 
 ### Fixed — newtype escape-upward across module boundaries
 
-- **An imported `newtype` now widens to its base type**, exactly as a
-  locally-declared one does. `newtype ProjectTag = str` in `models.ty` plus
-  a `let key: str = spend.project` (where `spend.project: ProjectTag`) in a
-  consumer module wrongly fired `tyc::type_mismatch` — the consumer's
-  `newtypes` table was only ever populated from its own module body, so the
-  escape-upward rule in `is_assignable` had no base type to unwrap an
-  imported newtype to. The published `ModuleShapes` now carries each
-  module's newtype → base map, and the consumer seeds it both when the
-  newtype name is imported directly (`from models import ProjectTag`,
-  alias-aware) and — the case that actually bit — when the newtype is
-  reached *only* through an imported class's field / parameter / return type
-  (`from models import AttributedSpend`, where `ProjectTag` is never
-  imported by name). The fix threads `newtypes` through the same four-stage
-  cross-module path (`extract_module_shapes` → `ModuleShapes` →
-  `build_external_shapes` → `check_module_with_imports`) that already
-  carries `sealed_unions` and `interfaces`.
-- **The reverse direction stays sound and is now more precise.** A bare
-  base value flowing into an imported-newtype slot (`f("plain")` where
-  `f(t: ProjectTag)`) still errors — and now surfaces the dedicated
-  `tyc::newtype_violation` ("wrap with `ProjectTag(...)`") rather than a
-  generic `tyc::type_mismatch`, matching the in-module diagnostic. A local
-  declaration still wins on a name collision with an imported newtype.
+- **An imported `newtype` now widens to its base type.** `newtype
+  ProjectTag = str` in `models.ty` plus `let key: str = spend.project`
+  (where `spend.project: ProjectTag`) in a consumer wrongly fired
+  `tyc::type_mismatch` — the consumer's `newtypes` table had no imported
+  base to unwrap to. The reverse direction stays sound and is now *more*
+  precise: a bare base into an imported-newtype slot surfaces the dedicated
+  `tyc::newtype_violation` ("wrap with `ProjectTag(...)`") instead of a
+  generic mismatch, matching the in-module diagnostic.
+
+### Fixed — transparent type aliases across module boundaries
+
+- **An imported `type Report = ReportData` now unwraps in the consumer.**
+  A `ReportData` value flowing into a `Report`-typed slot (or vice-versa)
+  wrongly fired `tyc::type_mismatch` because the consumer's `type_aliases`
+  table never received the imported alias, so `unwrap_alias` had nothing to
+  resolve `Report` through. Sealed-union aliases are excluded (they already
+  ride `sealed_unions`); only transparent aliases are published.
+
+### Fixed — enum exhaustiveness across module boundaries
+
+- **An exhaustive `match` over an imported `enum` no longer fires a false
+  `tyc::missing_return`.** The consumer never saw the enum's closed member
+  set, so it couldn't prove a complete `case Color.RED / GREEN / BLUE:`
+  match exhaustive and assumed a fall-through. The enum's ordered member
+  list is now published and seeded.
+
+### Fixed — frozen-class writes across module boundaries (soundness)
+
+- **A field write on an *imported* `frozen` class now trips
+  `tyc::frozen_assign`.** Previously the consumer silently accepted
+  `c.port = 9999` on an imported `class Config frozen:`, which raises
+  `FrozenInstanceError` at runtime — a cross-module soundness gap.
+  Frozen-ness is preprocessor line-based (the `frozen` modifier is stripped
+  before parsing), so it's filled into `ModuleShapes` by the callers that
+  hold the preprocess metadata via a new `tyc_types::frozen_class_names`
+  helper, rather than from the AST-only `extract_module_shapes`.
 
 ### Tests
 
 - `tyc-types`: `cross_module_newtype_widens_to_base`,
   `cross_module_bare_base_into_newtype_still_rejected`.
-- `tyc-db`: `cross_module_newtype_field_widens_without_importing_newtype`
-  (the newtype reached only through an imported field) and
-  `cross_module_imported_newtype_name_widens_to_base`.
+- `tyc-db` (full-pipeline, via the project shape registry):
+  `cross_module_newtype_field_widens_without_importing_newtype`,
+  `cross_module_imported_newtype_name_widens_to_base`,
+  `cross_module_transparent_type_alias_unwraps`,
+  `cross_module_enum_exhaustive_match_no_false_missing_return`,
+  `cross_module_frozen_class_field_write_errors`.
 
 ## 0.14.0 — 2026-06-12 — `as!` checked boundary cast + auto traceback remap
 

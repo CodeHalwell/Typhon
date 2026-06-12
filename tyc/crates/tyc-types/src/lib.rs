@@ -3825,6 +3825,29 @@ pub struct ModuleShapes {
     /// slot in module B wrongly fired `tyc::type_mismatch`, even though
     /// the docs promise a newtype always widens to its base.
     pub newtypes: HashMap<String, Type>,
+    /// Transparent type aliases (`type Report = ReportData`, `type Vec[T]
+    /// = list[T]`), keyed by alias name and valued by its PEP 695 type
+    /// parameters plus the resolved right-hand-side type. Sealed-union
+    /// aliases are intentionally excluded here (they ride the
+    /// `sealed_unions` table); only the transparent ones — which the
+    /// consumer must `unwrap_alias` through — are published. Without
+    /// this, an imported alias never unwrapped in the consumer, so a
+    /// value of the aliased type flowing into an alias-typed slot wrongly
+    /// fired `tyc::type_mismatch`.
+    pub type_aliases: HashMap<String, (Vec<String>, Type)>,
+    /// Enum declarations (`enum Name:` → `class Name(enum.Enum):`), keyed
+    /// by the enum class name and valued by its ordered member names.
+    /// Seeded into the consumer's `enums` table so an exhaustive `match`
+    /// over an imported enum is recognised as exhaustive (otherwise the
+    /// consumer can't see the closed member set and a complete match
+    /// spuriously fires `tyc::missing_return`).
+    pub enums: HashMap<String, Vec<String>>,
+    /// Classes declared with the `frozen` modifier (`class Foo frozen:`).
+    /// Seeded into the consumer's `frozen_classes` set so a field write
+    /// on an *imported* frozen class trips `tyc::frozen_assign` — without
+    /// it, the consumer silently accepted a mutation that raises
+    /// `FrozenInstanceError` at runtime (a cross-module soundness gap).
+    pub frozen_classes: std::collections::HashSet<String>,
 }
 
 /// Imports resolved to their source modules' [`ModuleShapes`], keyed
@@ -3871,6 +3894,19 @@ pub struct ExternalShapes {
     /// escape-upward rule fires for imported newtypes the same way it
     /// does for locally-declared ones.
     pub newtypes: HashMap<String, Type>,
+    /// Transparent type aliases re-keyed under the local import name,
+    /// seeded into the consumer's `type_aliases` table so an imported
+    /// alias unwraps the same way a locally-declared one does. The RHS
+    /// type keeps the source module's class names (resolved nominally).
+    pub type_aliases: HashMap<String, (Vec<String>, Type)>,
+    /// Enum member lists re-keyed under the local import name, seeded
+    /// into the consumer's `enums` table so an exhaustive `match` over an
+    /// imported enum is recognised as exhaustive.
+    pub enums: HashMap<String, Vec<String>>,
+    /// Imported frozen-class names (re-keyed under the local import
+    /// name), seeded into the consumer's `frozen_classes` set so a field
+    /// write on an imported frozen class fires `tyc::frozen_assign`.
+    pub frozen_classes: std::collections::HashSet<String>,
     /// Bare imports that need attribute-access resolution. Keyed by
     /// the *local* binding name; the value is the dotted module path
     /// the import refers to (e.g. `("np", "numpy")` for
@@ -4039,6 +4075,55 @@ pub fn extract_module_shapes(module: &ModModule) -> ModuleShapes {
         }
     }
 
+    // Transparent type aliases (`type Report = ReportData`, `type Vec[T]
+    // = list[T]`). Mirrors the in-module second pass: resolve each
+    // alias's RHS with the alias's own type params in scope. Sealed-union
+    // aliases (`type E = A | B`) are skipped — they're published via
+    // `sealed_unions` and an `unwrap_alias` over them would only reach a
+    // bare `Union`, never a single concrete head. A consumer unwraps the
+    // published aliases nominally (the RHS keeps source class names).
+    let mut type_aliases: HashMap<String, (Vec<String>, Type)> = HashMap::new();
+    for stmt in &module.body {
+        if let Stmt::TypeAlias(ta) = stmt {
+            if let Expr::Name(n) = ta.name.as_ref() {
+                if extract_sealed_union_variants(&ta.value).is_some() {
+                    continue;
+                }
+                let params = type_param_names_from(ta.type_params.as_deref());
+                let rhs = type_from_annotation_with_params(ta.value.as_ref(), &classes, &params);
+                type_aliases.insert(n.id.as_str().to_owned(), (params, rhs));
+            }
+        }
+    }
+
+    // Enum declarations (`enum Name:` → `class Name(enum.Enum):`). Mirrors
+    // the in-module pass: record the ordered, non-underscore member names
+    // so an exhaustive `match` over an imported enum is recognised as
+    // exhaustive in the consumer.
+    let mut enums: HashMap<String, Vec<String>> = HashMap::new();
+    for stmt in &module.body {
+        if let Stmt::ClassDef(cd) = stmt {
+            if class_has_enum_family_base(cd) {
+                let members: Vec<String> = cd
+                    .body
+                    .iter()
+                    .filter_map(|s| match s {
+                        Stmt::Assign(a) => match a.targets.first() {
+                            Some(Expr::Name(n)) if !n.id.as_str().starts_with('_') => {
+                                Some(n.id.as_str().to_owned())
+                            }
+                            _ => None,
+                        },
+                        _ => None,
+                    })
+                    .collect();
+                if !members.is_empty() {
+                    enums.insert(cd.name.as_str().to_owned(), members);
+                }
+            }
+        }
+    }
+
     ModuleShapes {
         class_shapes,
         class_type_params,
@@ -4046,6 +4131,13 @@ pub fn extract_module_shapes(module: &ModModule) -> ModuleShapes {
         sealed_unions,
         interfaces,
         newtypes,
+        type_aliases,
+        enums,
+        // Frozen-ness is preprocessor line-based, not visible in the
+        // parsed AST this fn walks. The callers that have the preprocess
+        // metadata (`extract_shapes_for_path` / `module_shapes_query`)
+        // fill this in via `frozen_class_names`.
+        frozen_classes: std::collections::HashSet::new(),
     }
 }
 
@@ -4236,6 +4328,35 @@ pub fn check_module_with_imports(
                 c.classes.push(name.clone());
             }
         }
+        // Cross-module transparent type aliases: an imported `type Report
+        // = ReportData` must `unwrap_alias` in this module so a value of
+        // the aliased type flows into an alias-typed slot. Register the
+        // name on `c.classes` too so the annotation resolves.
+        for (name, alias) in &ext.type_aliases {
+            c.type_aliases
+                .entry(name.clone())
+                .or_insert_with(|| alias.clone());
+            if !c.classes.iter().any(|n| n == name) {
+                c.classes.push(name.clone());
+            }
+        }
+        // Cross-module enums: an imported enum's member set makes an
+        // exhaustive `match` over it recognised as exhaustive (otherwise
+        // a complete match spuriously fires `missing_return`).
+        for (name, members) in &ext.enums {
+            c.enums
+                .entry(name.clone())
+                .or_insert_with(|| members.clone());
+            if !c.classes.iter().any(|n| n == name) {
+                c.classes.push(name.clone());
+            }
+        }
+        // Cross-module frozen classes: a field write on an imported
+        // frozen class must trip `frozen_assign` just as a local one
+        // does (the runtime would raise `FrozenInstanceError`).
+        for name in &ext.frozen_classes {
+            c.frozen_classes.insert(name.clone());
+        }
         // Cross-module interfaces: register the local import name as a
         // Protocol-shaped type so `is_assignable` consults the
         // structural-conformance path. The shape itself is already in
@@ -4384,6 +4505,38 @@ fn populate_frozen_classes(c: &mut Checker, body: &[Stmt], frozen_starts: &[u32]
             }
         }
     }
+}
+
+/// Public sibling of [`populate_frozen_classes`] used by cross-module
+/// shape extraction: given a module's source, parsed body, and the
+/// preprocessor's 0-based `frozen_class_lines`, return the set of
+/// top-level class names declared `frozen`. Only the real class names
+/// are returned (no `__typhon_impl_` pseudo-class entries — consumers
+/// never see those). Used by `tyc-db` to fill `ModuleShapes.frozen_classes`
+/// so a field write on an *imported* frozen class trips `frozen_assign`.
+pub fn frozen_class_names(
+    source: &str,
+    body: &[Stmt],
+    frozen_lines: &[usize],
+) -> std::collections::HashSet<String> {
+    let mut names = std::collections::HashSet::new();
+    if frozen_lines.is_empty() {
+        return names;
+    }
+    let frozen_starts = unsafe_byte_starts(source, frozen_lines);
+    for stmt in body {
+        if let Stmt::ClassDef(cd) = stmt {
+            let class_start = u32::from(cd.range.start());
+            let name_start = u32::from(cd.name.range.start());
+            if frozen_starts
+                .iter()
+                .any(|&m| m >= class_start && m <= name_start)
+            {
+                names.insert(cd.name.as_str().to_owned());
+            }
+        }
+    }
+    names
 }
 
 /// Walk an attribute-assignment target and, if its receiver resolves to a
