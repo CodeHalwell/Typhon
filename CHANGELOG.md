@@ -16,9 +16,9 @@ was never surfaced. Now the compiler points it out by default.
 
 ### Added — `tyc::gather_opportunity` (advice, on by default)
 
-- **`tyc build` flags every run of 2+ adjacent independent awaited calls**
-  inside an `async def` and suggests wrapping them in an explicit `gather:`
-  block so they run concurrently in an `asyncio.TaskGroup`:
+- **`tyc check` and `tyc build` flag every run of 2+ adjacent independent
+  awaited calls** inside an `async def` and suggest wrapping them in an
+  explicit `gather:` block so they run concurrently in an `asyncio.TaskGroup`:
 
   ```ty
   async def load(client: Client, uid: int) -> tuple[User, list[Post]]:

@@ -13,7 +13,7 @@ use miette::{miette, Result};
 use tyc_analyse::{
     analyse_empty_collection_bindings, analyse_is_literal_comparisons,
     analyse_loop_closure_captures, analyse_mutable_default_params, analyse_purity,
-    analyse_secret_literal_bindings, analyse_typing_alias_annotations,
+    analyse_secret_literal_bindings, analyse_typing_alias_annotations, detect_gather_opportunities,
     evaluate_comptime_with_functions, purity_diagnostics,
 };
 use tyc_db::{check_file_with_imports, extract_shapes_for_path, TycDatabase};
@@ -358,6 +358,7 @@ pub fn run(args: CheckArgs) -> Result<()> {
                 &source,
                 has_project_config.then_some(&vetting_ctx),
                 config.strictness.allow_secret_comptime,
+                config.strictness.suggest_gather,
             );
             diags.extend(analysis_diags);
         }
@@ -999,6 +1000,7 @@ fn run_secondary_passes(
     source: &str,
     vetting_ctx: Option<&ImportVettingContext>,
     allow_secret_comptime: bool,
+    suggest_gather: bool,
 ) -> Diagnostics {
     let mut diags = Diagnostics::new();
     let expanded = expand_for_check(source);
@@ -1105,6 +1107,30 @@ fn run_secondary_passes(
         &prep.python_source,
         allow_secret_comptime,
     ));
+
+    // Concurrency nudge (`tyc::gather_opportunity`, advice, on by default):
+    // runs of 2+ adjacent independent awaited calls inside an `async def`
+    // could run concurrently in a `gather:` block. Surfacing it here (not
+    // just in `tyc build`) means CI and the terminal `tyc check` flow see
+    // the suggestion too. `[strictness] suggest-gather = false` silences it.
+    if suggest_gather {
+        for opp in detect_gather_opportunities(&module) {
+            let offset = opp.call_range.start().to_usize();
+            let length = opp
+                .call_range
+                .end()
+                .to_usize()
+                .saturating_sub(offset)
+                .max(1);
+            diags.push_warning(TycError::gather_opportunity(
+                opp.count,
+                path,
+                &prep.python_source,
+                offset,
+                length,
+            ));
+        }
+    }
 
     if let Some(ctx) = vetting_ctx {
         // AST node ranges are offsets into the *preprocessed* Python
