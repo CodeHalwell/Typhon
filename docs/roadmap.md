@@ -621,9 +621,13 @@ regress under the Phase 5 churn:
 - ✅ **Automatic `asyncio.gather` inference** (conservative). Runs of two or
   more independent `name = await callee(...)` statements inside an
   `async def` are folded into an `asyncio.TaskGroup` block when the callee
-  is a same-module `async def` and the awaits are statically independent.
-  Opt-in via `[strictness] auto-gather = true`. The desugar pass injects
-  `import asyncio` if missing.
+  is a `@gatherable` `async def` — declared in the same module **or imported
+  from another project module** (v0.14.2) — and the awaits are statically
+  independent. Opt-in via `[strictness] auto-gather = true`. The desugar
+  pass injects `import asyncio` if missing. A default-on
+  `tyc::gather_opportunity` advice (v0.14.2) surfaces the same independent
+  runs for *any* awaited callee (including imported method calls) so the
+  concurrency win is visible even without the opt-in.
 - ✅ **Loop parallelisation for pure list / set / dict comprehensions**.
   `tyc/crates/tyc-analyse/src/parallel.rs` rewrites `[f(x) for x in xs]`,
   `{f(x) for x in xs}`, and `{k: f(v) for k, v in items}` into
