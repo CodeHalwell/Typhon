@@ -323,6 +323,263 @@ fn async_with_await_does_not_warn() {
     );
 }
 
+#[test]
+fn question_op_on_bare_async_call_fires_missing_await() {
+    // `inner(n)?` where `inner` is an `async def` desugars to
+    // `__typhon_q_0__ = inner(n)`; without an `await` the `.value` read
+    // lands on the coroutine at runtime. The check must reject it (the
+    // documented idiom is `await inner(n)?`) instead of silently
+    // miscompiling — even though the enclosing function is itself `async`.
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join("q.ty"),
+        "import asyncio\n\n\
+            async def inner(n: int) -> Result[int, str]:\n    \
+                await asyncio.sleep(0)\n    return Ok(n)\n\n\
+            async def outer(n: int) -> Result[int, str]:\n    \
+                let v: int = inner(n)?\n    return Ok(v + 1)\n",
+    )
+    .unwrap();
+    let out = tyc().arg("check").arg(tmp.path()).output().unwrap();
+    assert!(!out.status.success(), "bare async `?` must fail the check");
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stderr),
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(
+        combined.contains("tyc::missing_await"),
+        "expected tyc::missing_await on bare async `?`, got: {combined}"
+    );
+}
+
+#[test]
+fn question_op_on_awaited_async_call_is_clean() {
+    // Negative case: the documented `await inner(n)?` idiom must keep
+    // checking clean (the `inside_await` guard exempts it).
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join("q.ty"),
+        "import asyncio\n\n\
+            async def inner(n: int) -> Result[int, str]:\n    \
+                await asyncio.sleep(0)\n    return Ok(n)\n\n\
+            async def outer(n: int) -> Result[int, str]:\n    \
+                let v: int = await inner(n)?\n    return Ok(v + 1)\n",
+    )
+    .unwrap();
+    let out = tyc().arg("check").arg(tmp.path()).output().unwrap();
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stderr),
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(
+        out.status.success(),
+        "await inner(n)? must check clean, got: {combined}"
+    );
+    assert!(
+        !combined.contains("tyc::missing_await"),
+        "did not expect missing_await on the awaited form, got: {combined}"
+    );
+}
+
+#[test]
+fn await_on_stored_asyncio_task_unwraps_to_value() {
+    // A `go work() -> t` handle parked in an explicitly-annotated
+    // `list[asyncio.Task[int]]` and awaited in a loop must unwrap to `int`,
+    // not stay typed as `Task[int]` (which fired `tyc::type_mismatch`).
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join("t.ty"),
+        "import asyncio\n\n\
+            async def work(n: int) -> int:\n    \
+                await asyncio.sleep(0)\n    return n * n\n\n\
+            async def run() -> int:\n    \
+                mut tasks: list[asyncio.Task[int]] = []\n    \
+                go work(3) -> t\n    tasks.append(t)\n    \
+                mut total: int = 0\n    \
+                for task in tasks:\n        \
+                    let r: int = await task\n        total = total + r\n    \
+                return total\n",
+    )
+    .unwrap();
+    let out = tyc().arg("check").arg(tmp.path()).output().unwrap();
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stderr),
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(
+        out.status.success(),
+        "await on a stored asyncio.Task[int] must type as int, got: {combined}"
+    );
+}
+
+#[test]
+fn vm_run_resolves_siblings_and_binds_sealed_union_alias() {
+    // Two regressions in one project: (1) the `tyc run` gating check must
+    // resolve sibling modules (not check `main.ty` in isolation, which fired
+    // a false `unknown_module` + knock-on `missing_return`); and (2) the VM
+    // must bind an imported `pub type` sealed-union alias as a module
+    // attribute (else `from shapes import AB` raised `AttributeError`).
+    let project = tempfile::tempdir().unwrap();
+    let src = project.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(
+        project.path().join("typhon.toml"),
+        "[project]\nname = \"u\"\nversion = \"0.1.0\"\nsrc = \"src\"\nout = \"build\"\n\
+         [python]\ntarget = \"3.13\"\n[emit]\nformat = false\n[strictness]\n[env]\n",
+    )
+    .unwrap();
+    std::fs::write(
+        src.join("shapes.ty"),
+        "pub class A frozen:\n    v: int\n\n\
+            pub class B frozen:\n    v: int\n\n\
+            pub type AB = A | B\n",
+    )
+    .unwrap();
+    std::fs::write(
+        src.join("main.ty"),
+        "from shapes import A, AB, B\n\n\
+            def pick(x: AB) -> int:\n    \
+                match x:\n        \
+                    case A(v):\n            return v\n        \
+                    case B(v):\n            return v * 2\n\n\
+            def main() -> None:\n    print(pick(A(v=21)))\n\n\
+            if __name__ == \"__main__\":\n    main()\n",
+    )
+    .unwrap();
+    let out = tyc().arg("run").arg(project.path()).output().unwrap();
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stderr),
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(
+        out.status.success(),
+        "tyc run on a sibling-importing project must succeed, got: {combined}"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("21"),
+        "expected `21` on stdout, got: {combined}"
+    );
+}
+
+#[test]
+fn pub_enum_parses_checks_and_exports() {
+    // `pub enum` must parse (it was a hard parse error), check clean, and
+    // contribute its name to the synthesised `__all__`.
+    let project = tempfile::tempdir().unwrap();
+    scaffold(
+        project.path(),
+        "pub enum Species:\n    CAT\n    DOG\n    BIRD\n\n\
+            def describe(s: Species) -> str:\n    return s.name\n\n\
+            def main() -> None:\n    print(describe(Species.DOG))\n",
+    );
+    let check = tyc().arg("check").arg(project.path()).output().unwrap();
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&check.stderr),
+        String::from_utf8_lossy(&check.stdout)
+    );
+    assert!(
+        check.status.success(),
+        "pub enum must check clean: {combined}"
+    );
+
+    let build = tyc().arg("build").arg(project.path()).output().unwrap();
+    assert!(build.status.success(), "pub enum must build");
+    let main_py = std::fs::read_to_string(project.path().join("build").join("main.py")).unwrap();
+    assert!(
+        main_py.contains("\"Species\""),
+        "Species must appear in __all__, got:\n{main_py}"
+    );
+}
+
+#[test]
+fn vm_run_binds_forward_declared_sealed_union_alias() {
+    // A `pub type AB = A | B` declared *above* its variant classes (a
+    // forward reference the checker accepts) must still bind the real value
+    // for `from shapes import AB` — the eager bind falls back to a name
+    // placeholder, corrected by the post-body resolution pass before the
+    // module's attributes are snapshotted. Regression for the Codex review
+    // on PR #187.
+    let project = tempfile::tempdir().unwrap();
+    let src = project.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(
+        project.path().join("typhon.toml"),
+        "[project]\nname = \"u\"\nversion = \"0.1.0\"\nsrc = \"src\"\nout = \"build\"\n\
+         [python]\ntarget = \"3.13\"\n[emit]\nformat = false\n[strictness]\n[env]\n",
+    )
+    .unwrap();
+    std::fs::write(
+        src.join("shapes.ty"),
+        "pub type AB = A | B\n\n\
+            pub class A frozen:\n    v: int\n\n\
+            pub class B frozen:\n    v: int\n",
+    )
+    .unwrap();
+    std::fs::write(
+        src.join("main.ty"),
+        "from shapes import A, AB, B\n\n\
+            def pick(x: AB) -> int:\n    \
+                match x:\n        \
+                    case A(v):\n            return v\n        \
+                    case B(v):\n            return v * 2\n\n\
+            def main() -> None:\n    \
+                print(pick(B(v=10)))\n    \
+                print(isinstance(A(v=1), AB))\n\n\
+            if __name__ == \"__main__\":\n    main()\n",
+    )
+    .unwrap();
+    let out = tyc().arg("run").arg(project.path()).output().unwrap();
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stderr),
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(
+        out.status.success(),
+        "run with a forward-declared imported alias must succeed: {combined}"
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("20") && stdout.contains("True"),
+        "expected `20` and `True`, got: {combined}"
+    );
+}
+
+#[test]
+fn user_defined_task_type_is_not_await_unwrapped() {
+    // The await-unwrap for `Task[T]` / `Future[T]` is keyed on the bare
+    // name, so it must be suppressed when the project defines its own
+    // (non-awaitable) class of that name — otherwise `await t` would falsely
+    // type as the inner type. Regression for the Codex review on PR #187.
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join("t.ty"),
+        "class Task[T]:\n    payload: T\n\n\
+            async def use(t: Task[int]) -> int:\n    \
+                let r: int = await t\n    return r\n",
+    )
+    .unwrap();
+    let out = tyc().arg("check").arg(tmp.path()).output().unwrap();
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stderr),
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(
+        !out.status.success(),
+        "awaiting a user-defined (non-awaitable) Task must not type-check"
+    );
+    assert!(
+        combined.contains("tyc::type_mismatch"),
+        "expected tyc::type_mismatch, got: {combined}"
+    );
+}
+
 // ── tyc fmt ──────────────────────────────────────────────────────────────────
 
 #[test]

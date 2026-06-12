@@ -73,6 +73,13 @@ pub struct Interpreter {
     /// Stack of exceptions currently being handled (one frame per active
     /// `except` body). A bare `raise` re-raises the top of this stack.
     pub active_exceptions: Vec<VmException>,
+    /// Forward-declared `type` aliases that couldn't be evaluated on their
+    /// first (eager) bind because a referenced class wasn't defined yet —
+    /// keyed by alias name → its RHS expression. They're re-resolved after
+    /// the module body runs (`resolve_type_aliases`) for the import path,
+    /// and forced on demand when used mid-body (`force_alias`), mirroring
+    /// the lazy evaluation CPython gives a `TypeAliasType`.
+    pub unresolved_aliases: HashMap<String, Expr>,
 }
 
 /// Upper bound on values an eagerly-evaluated generator may yield before the
@@ -149,6 +156,7 @@ impl Interpreter {
             loading_modules: std::collections::HashSet::new(),
             method_stack: Vec::new(),
             active_exceptions: Vec::new(),
+            unresolved_aliases: HashMap::new(),
         };
         crate::builtins::install(&mut interp);
         interp
@@ -157,7 +165,13 @@ impl Interpreter {
     /// Entry point — run a parsed module's body in the root scope.
     pub fn run_module(&mut self, module: &ModModule) -> Result<(), Unwind> {
         let env = self.root.clone();
-        self.exec_block(&module.body, &env)
+        self.exec_block(&module.body, &env)?;
+        // Forward-declared `type` aliases (`type AB = A | B` written before
+        // `A`/`B`) fall back to a name placeholder on their first, eager
+        // bind; re-resolve once the whole body has run so they hold their
+        // real value — matching CPython's lazy `TypeAliasType`.
+        self.resolve_type_aliases(&module.body, &env);
+        Ok(())
     }
 
     // ── Statement evaluation ───────────────────────────────────────────────
@@ -498,9 +512,114 @@ impl Interpreter {
                 Ok(())
             }
             Stmt::With(w) => self.exec_with(w, env),
-            Stmt::TypeAlias(_) => Ok(()),
+            Stmt::TypeAlias(ta) => {
+                // CPython binds `type X = <expr>` to a (lazy) `TypeAliasType`
+                // module attribute, so `from mod import X` resolves and `X`
+                // is a real name. This was previously a no-op, so importing a
+                // sealed-union alias (`pub type Event = Born | Eaten | Starved`)
+                // raised `AttributeError: module '…' has no attribute 'Event'`
+                // at the import statement. Bind the alias name so the module
+                // attribute exists.
+                if let Expr::Name(n) = ta.name.as_ref() {
+                    let name = n.id.as_str();
+                    let val = self.eval_type_alias_value(name, &ta.value, env);
+                    // A name-string result is the fallback meaning the RHS
+                    // couldn't be evaluated yet (a forward reference to a
+                    // class defined later, or a bare type parameter). Record
+                    // it for later re-resolution / on-demand forcing.
+                    if alias_is_unresolved(name, &val) {
+                        self.unresolved_aliases
+                            .insert(name.to_owned(), (*ta.value).clone());
+                    } else {
+                        self.unresolved_aliases.remove(name);
+                    }
+                    env.assign_or_create(name, val);
+                }
+                Ok(())
+            }
             Stmt::IpyEscapeCommand(_) => Err(not_implemented("IPython escape commands")),
         }
+    }
+
+    /// Compute the runtime value to bind for a `type NAME = <rhs>` alias.
+    ///
+    /// CPython evaluates the RHS lazily (a `TypeAliasType`); the VM has no
+    /// such value and no first-class type-union, so:
+    ///   * a union RHS (`A | B | C`) becomes a tuple of its member types —
+    ///     importable, and a valid `isinstance(x, AB)` second argument
+    ///     (`is_instance_of` matches any tuple member);
+    ///   * any other RHS (`int`, `list[T]`, `tuple[A, B]`) is evaluated
+    ///     directly;
+    ///   * an RHS that can't be evaluated (forward reference, bare type
+    ///     parameter, unsupported type expression) falls back to the alias
+    ///     name as a string so the module attribute still exists — mirroring
+    ///     CPython's deferred evaluation rather than crashing at the `type`
+    ///     statement.
+    fn eval_type_alias_value(&mut self, name: &str, value: &Expr, env: &EnvRef) -> Value {
+        if let Some(members) = union_leaves(value) {
+            let mut vals = Vec::with_capacity(members.len());
+            for m in members {
+                match self.eval_expr(m, env) {
+                    Ok(v) => vals.push(v),
+                    Err(_) => return Value::Str(Rc::new(name.to_owned())),
+                }
+            }
+            return Value::Tuple(Rc::new(vals));
+        }
+        self.eval_expr(value, env)
+            .unwrap_or_else(|_| Value::Str(Rc::new(name.to_owned())))
+    }
+
+    /// Re-bind every top-level `type` alias after the module body has fully
+    /// executed. The eager bind in `Stmt::TypeAlias` makes an alias usable
+    /// mid-module when its members precede it; this second pass fixes the
+    /// *forward-declared* case — a `type AB = A | B` written above the
+    /// classes it names falls back to a string placeholder on the eager
+    /// pass (the leaves aren't defined yet), which would make a later
+    /// `isinstance(x, AB)` silently wrong. By module end every referenced
+    /// class is defined, so re-evaluation yields the real value. The RHS of
+    /// a `type` alias is a pure type expression, so re-evaluation is
+    /// side-effect-free and idempotent for aliases that already resolved.
+    fn resolve_type_aliases(&mut self, body: &[Stmt], env: &EnvRef) {
+        for stmt in body {
+            if let Stmt::TypeAlias(ta) = stmt {
+                if let Expr::Name(n) = ta.name.as_ref() {
+                    let name = n.id.as_str();
+                    let val = self.eval_type_alias_value(name, &ta.value, env);
+                    if !alias_is_unresolved(name, &val) {
+                        self.unresolved_aliases.remove(name);
+                    }
+                    env.assign_or_create(name, val);
+                }
+            }
+        }
+    }
+
+    /// Resolve a forward-declared `type` alias on demand. When a value used
+    /// as a type (e.g. the second argument of `isinstance`) is the
+    /// name-string fallback of an alias that hasn't resolved yet, re-evaluate
+    /// its recorded RHS against the root module env (where the now-defined
+    /// classes live) and cache the result. This covers the same-module case
+    /// the post-body pass can't — an alias declared above its classes and
+    /// used at runtime *during* body execution (e.g. inside `main()` invoked
+    /// from an `if __name__ == "__main__":` block). Returns the resolved
+    /// value, or the input unchanged when it isn't a pending alias.
+    pub fn force_alias(&mut self, v: &Value) -> Value {
+        let Value::Str(s) = v else {
+            return v.clone();
+        };
+        let Some(expr) = self.unresolved_aliases.get(s.as_str()).cloned() else {
+            return v.clone();
+        };
+        let env = self.root.clone();
+        let name = s.to_string();
+        let real = self.eval_type_alias_value(&name, &expr, &env);
+        if alias_is_unresolved(&name, &real) {
+            return v.clone();
+        }
+        self.unresolved_aliases.remove(&name);
+        env.assign_or_create(&name, real.clone());
+        real
     }
 
     // ── Function/class construction ────────────────────────────────────────
@@ -976,6 +1095,11 @@ impl Interpreter {
         let body_result = self.exec_block(&module.body, &module_env);
         self.current_source = saved_source;
         body_result?;
+        // Correct any forward-declared `type` alias before the module's
+        // attributes are snapshotted, so `from mod import AB` for a
+        // `pub type AB = A | B` declared above `A`/`B` reads the real value
+        // rather than the eager string fallback.
+        self.resolve_type_aliases(&module.body, &module_env);
 
         use crate::value::Module;
         let mut members: HashMap<String, Value> = HashMap::new();
@@ -5352,6 +5476,34 @@ fn complex_binop(op: Operator, ar: f64, ai: f64, br: f64, bi: f64) -> Result<Val
             op.as_str()
         ))),
     }
+}
+
+/// `true` when `val` is the name-string fallback bound for a `type` alias
+/// whose RHS couldn't be evaluated yet (a forward reference to a
+/// later-defined class, or a bare type parameter). Used to decide whether
+/// the alias still needs re-resolution / on-demand forcing.
+fn alias_is_unresolved(name: &str, val: &Value) -> bool {
+    matches!(val, Value::Str(s) if s.as_str() == name)
+}
+
+/// If `e` is a top-level `X | Y | …` union (a `|` chain of at least two
+/// leaves), return the leaf expressions left-to-right; otherwise `None`.
+/// Used to lower a sealed-union `type` alias to a tuple of its member
+/// types in the VM (which has no first-class union value).
+fn union_leaves(e: &Expr) -> Option<Vec<&Expr>> {
+    fn walk<'a>(e: &'a Expr, out: &mut Vec<&'a Expr>) {
+        if let Expr::BinOp(b) = e {
+            if matches!(b.op, Operator::BitOr) {
+                walk(&b.left, out);
+                walk(&b.right, out);
+                return;
+            }
+        }
+        out.push(e);
+    }
+    let mut out = Vec::new();
+    walk(e, &mut out);
+    (out.len() >= 2).then_some(out)
 }
 
 fn binop_dunder(op: Operator) -> Option<&'static str> {
