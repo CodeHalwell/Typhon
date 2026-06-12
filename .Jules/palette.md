@@ -28,3 +28,6 @@
 ## 2026-06-06 - [Themed text selection for visual polish]
 **Learning:** Default browser text selection colors (usually stark blue) often clash with custom themes, making the site feel less cohesive.
 **Action:** Implemented `::selection` to match the site's `var(--sl-color-accent)` at 25% opacity, preserving contrast while harmonizing the selection experience with the overall design.
+## 2026-06-07 - [Scrollable region keyboard accessibility]
+**Learning:** Found that elements utilizing `tabindex="0"` for scrollable regions (like code blocks in Starlight) did not receive the standard focus outline applied to other interactive elements, rendering them inaccessible to keyboard users navigating through the site.
+**Action:** Added `[tabindex="0"]:focus-visible` to the global focus outline rules in `custom.css` so that scrollable content blocks can be visually identified and interacted with via the keyboard.
