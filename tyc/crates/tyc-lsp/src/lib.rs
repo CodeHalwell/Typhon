@@ -133,13 +133,19 @@ pub struct Backend {
     /// untracked file).
     prewarmed_versions: Arc<Mutex<HashMap<String, i32>>>,
     /// Per-project-root cache of the `[strictness]` knobs that gate the
-    /// editor advisory lints (`suggest-gather`, `allow-secret-comptime`).
-    /// Read from `typhon.toml` once per root and reused across keystrokes
-    /// instead of re-parsing the file on every check; invalidated wholesale
-    /// when `did_change_watched_files` reports a `typhon.toml` change, so a
-    /// `[strictness]` edit still takes effect (the file watcher then
-    /// re-checks open documents). Keyed by the project root directory.
-    lint_options_cache: Arc<Mutex<HashMap<std::path::PathBuf, tyc_analyse::LintOptions>>>,
+    /// editor advisory lints (`suggest-gather`, `allow-secret-comptime`),
+    /// keyed by the project root directory and tagged with the
+    /// `typhon.toml` modification time it was read from. A keystroke neither
+    /// re-reads + re-parses the file (the `stat` is far cheaper) nor risks
+    /// going stale: a changed mtime forces a re-read on the very next check,
+    /// so the knobs stay current even for an editor that never sends
+    /// `workspace/didChangeWatchedFiles`. The watcher additionally re-checks
+    /// open documents on a `typhon.toml` edit so the refresh is immediate.
+    lint_options_cache: Arc<
+        Mutex<
+            HashMap<std::path::PathBuf, (Option<std::time::SystemTime>, tyc_analyse::LintOptions)>,
+        >,
+    >,
 }
 
 impl std::fmt::Debug for Backend {
@@ -352,13 +358,30 @@ impl Backend {
                 let opts = workspace
                     .as_ref()
                     .map(|(root, _)| {
-                        // Cache the parsed knobs per root so we don't re-read
-                        // `typhon.toml` on every keystroke; `LintOptions` is
-                        // `Copy`. The watcher clears this on a config change.
-                        *lint_options_cache_arc
+                        // mtime-keyed cache: `stat` the file (cheap) and reuse
+                        // the parsed knobs while the mtime is unchanged. Only a
+                        // real edit triggers the `read_to_string` + toml parse,
+                        // so this is fresh even without a file-watcher event yet
+                        // avoids per-keystroke parsing. Both the `stat` and the
+                        // read run *outside* the lock — holding it across
+                        // `std::fs` I/O would block concurrent checks; a racing
+                        // double-miss just reads twice and stores the same
+                        // value. (PR #192 review.)
+                        let mtime = std::fs::metadata(root.join("typhon.toml"))
+                            .and_then(|m| m.modified())
+                            .ok();
+                        if let Some((cached_mtime, opts)) =
+                            lint_options_cache_arc.blocking_lock().get(root).copied()
+                        {
+                            if cached_mtime == mtime {
+                                return opts;
+                            }
+                        }
+                        let opts = read_lint_options(root);
+                        lint_options_cache_arc
                             .blocking_lock()
-                            .entry(root.clone())
-                            .or_insert_with(|| read_lint_options(root))
+                            .insert(root.clone(), (mtime, opts));
+                        opts
                     })
                     .unwrap_or_default();
                 diags.extend(tyc_analyse::editor_lint_diagnostics(
@@ -591,26 +614,23 @@ impl LanguageServer for Backend {
         // The VS Code client watches `**/typhon.toml`, `**/*.ty`, `**/*.dty`
         // (see `synchronize.fileEvents`). Before this handler existed the
         // notification was a silent no-op, so a `typhon.toml` edit didn't
-        // take effect until the user re-touched a source file.
-
-        // A `typhon.toml` change invalidates the cached `[strictness]` knobs
-        // so the next check re-reads them.
+        // refresh diagnostics until the user re-touched a source file.
+        //
+        // Only a `typhon.toml` change warrants re-checking *open* documents
+        // here: a `.ty` / `.dty` change to the file being edited is already
+        // handled by `did_change`, and the per-root lint cache is mtime-keyed
+        // so the new `[strictness]` is picked up by the re-check below without
+        // an explicit invalidation. `uri_to_path` is the codebase's robust
+        // Uri→PathBuf conversion (percent-decoding, Windows `/C:/…` prefixes).
         let config_changed = params.changes.iter().any(|change| {
-            std::path::Path::new(change.uri.path().as_str())
-                .file_name()
-                .is_some_and(|n| n == "typhon.toml")
+            uri_to_path(&change.uri)
+                .and_then(|p| p.file_name().map(|n| n == "typhon.toml"))
+                .unwrap_or(false)
         });
-        if config_changed {
-            self.lint_options_cache.lock().await.clear();
+        if !config_changed {
+            return;
         }
 
-        // Re-check every open document so the config change (or a sibling
-        // `.ty` edit the cross-module shape registry now re-reads from disk)
-        // refreshes diagnostics without a keystroke in each open file. The
-        // same-file type-check is Salsa-cached on unchanged text, so this is
-        // cheap for the common single-`typhon.toml`-change case; what
-        // actually re-runs is `editor_lint_diagnostics` (with the freshly
-        // read knobs) and the cross-module shape assembly.
         let open: Vec<(String, SourceFile)> = {
             let docs = self.documents.lock().await;
             docs.iter().map(|(uri, sf)| (uri.clone(), *sf)).collect()
@@ -620,8 +640,13 @@ impl LanguageServer for Backend {
                 let db = self.db.lock().await;
                 sf.text(&*db).clone()
             };
+            // Publish with the document's last known version rather than
+            // `None`: an unversioned `publishDiagnostics` can't be superseded
+            // by the client, so a refresh racing the user's typing could
+            // clobber newer, versioned diagnostics. (PR #192 review.)
+            let version = self.prewarmed_versions.lock().await.get(&uri_str).copied();
             if let Ok(uri) = Uri::from_str(&uri_str) {
-                self.check_and_publish(uri, text, None).await;
+                self.check_and_publish(uri, text, version).await;
             }
         }
     }

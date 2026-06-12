@@ -18,10 +18,12 @@ Follow-ups to the 0.14.2 editor work, both flagged in the 0.14.2 PR review.
   `typhon.toml` change and re-checks every open document, so the editor
   reflects the new settings immediately. No VS Code extension change is
   needed — the existing file watcher already sends the notification.
-- **The `[strictness]` lint knobs are now cached per project root** instead
-  of re-parsed from `typhon.toml` on every keystroke (the cache is what the
-  watcher above invalidates), closing the per-check disk-I/O concern raised
-  in review.
+- **The `[strictness]` lint knobs are now cached per project root**, keyed by
+  the `typhon.toml` modification time, instead of re-parsed on every
+  keystroke — closing the per-check disk-I/O concern from review. Because the
+  cache is mtime-validated, the knobs stay fresh on an edit even for an editor
+  that never sends `didChangeWatchedFiles`; the watcher just makes the refresh
+  immediate for those that do.
 
 ### Added — committed end-to-end LSP tests
 
