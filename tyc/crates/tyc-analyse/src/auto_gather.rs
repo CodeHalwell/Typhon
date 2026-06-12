@@ -829,6 +829,7 @@ fn walk_missed_in_stmt(
             );
         }
         Stmt::For(s) => {
+            // `async for` is `StmtFor { is_async: true }` in ruff — covered.
             walk_missed_in_stmts(&s.body, eligible_if_decorated, decorated, inside_async, out);
             walk_missed_in_stmts(
                 &s.orelse,
@@ -839,6 +840,7 @@ fn walk_missed_in_stmt(
             );
         }
         Stmt::With(s) => {
+            // `async with` is `StmtWith { is_async: true }` in ruff — covered.
             walk_missed_in_stmts(&s.body, eligible_if_decorated, decorated, inside_async, out);
         }
         Stmt::Try(s) => {
@@ -877,8 +879,187 @@ fn walk_missed_in_stmt(
     }
 }
 
-// ── tests ────────────────────────────────────────────────────────────────────
+// ── gather-opportunity detection (default-on advice, callee-agnostic) ─────────
 
+/// One run of adjacent, independent awaited *calls* that could run
+/// concurrently if wrapped in an explicit `gather:` block.
+///
+/// Unlike [`MissedGather`] — which is tied to the `auto-gather` rewrite
+/// and therefore only considers bare-name calls to same-module
+/// `async def`s that *could* carry `@gatherable` — this is
+/// callee-agnostic: any `NAME = await CALL(...)` qualifies, including an
+/// awaited **method call on an imported client**
+/// (`await client.get_user(id)` then `await client.get_posts(id)`), which
+/// is the most common real missed-concurrency shape. The suggested fix is
+/// the explicit `gather:` block, which works for *any* awaitable, so no
+/// `@gatherable` decorator or `auto-gather` opt-in is required.
+#[derive(Debug, Clone)]
+pub struct GatherOpportunity {
+    /// Number of awaits in the run (≥ 2).
+    pub count: usize,
+    /// Byte range of the first `await CALL(...)` in the run, so the
+    /// advice anchors at the start of the would-be `gather:` block.
+    pub call_range: TextRange,
+}
+
+/// A single member of a gather-*opportunity* run: any awaited call bound
+/// to a name. Carries the sub-expressions (`callee` + arguments) that a
+/// later member must not reference for the run to stay independent.
+#[derive(Debug)]
+struct OpportunityCandidate {
+    bind: String,
+    /// The callee expression plus every positional / keyword argument —
+    /// every sub-expression whose evaluation could depend on an earlier
+    /// binding in the run. The callee is included so a method call whose
+    /// *receiver* is an earlier binding (`b = await a.next()`) correctly
+    /// breaks the run.
+    deps: Box<[Expr]>,
+    call_range: TextRange,
+}
+
+/// Match `NAME = await CALL(...)` / `NAME: T = await CALL(...)` for *any*
+/// callee (bare name, attribute/method, subscript, …). Returns the
+/// candidate or `None` when the statement isn't an awaited-call binding.
+fn parse_opportunity_candidate(stmt: &Stmt) -> Option<OpportunityCandidate> {
+    let (bind, rhs): (String, &Expr) = match stmt {
+        Stmt::Assign(a) => {
+            if a.targets.len() != 1 {
+                return None;
+            }
+            let bind = match &a.targets[0] {
+                Expr::Name(n) if matches!(n.ctx, ExprContext::Store) => n.id.as_str().to_owned(),
+                _ => return None,
+            };
+            (bind, &*a.value)
+        }
+        Stmt::AnnAssign(a) => {
+            let bind = match &*a.target {
+                Expr::Name(n) if matches!(n.ctx, ExprContext::Store) => n.id.as_str().to_owned(),
+                _ => return None,
+            };
+            (bind, a.value.as_deref()?)
+        }
+        _ => return None,
+    };
+    let await_expr = match rhs {
+        Expr::Await(a) => a,
+        _ => return None,
+    };
+    let call = match &*await_expr.value {
+        Expr::Call(c) => c,
+        _ => return None,
+    };
+    let mut deps: Vec<Expr> = Vec::with_capacity(1 + call.arguments.args.len());
+    deps.push((*call.func).clone());
+    deps.extend(call.arguments.args.iter().cloned());
+    deps.extend(call.arguments.keywords.iter().map(|k| k.value.clone()));
+    Some(OpportunityCandidate {
+        bind,
+        deps: deps.into_boxed_slice(),
+        call_range: call.range,
+    })
+}
+
+/// Longest prefix of `body[start..]` that forms an independent run of
+/// awaited-call bindings. Mirrors [`collect_run`]'s independence and
+/// no-shadowing rules, but accepts any callee and checks the callee
+/// expression for dependencies too.
+fn collect_opportunity_run(body: &[Stmt], start: usize) -> Vec<OpportunityCandidate> {
+    let mut run: Vec<OpportunityCandidate> = Vec::new();
+    let mut bound: HashSet<String> = HashSet::new();
+    for stmt in &body[start..] {
+        let Some(cand) = parse_opportunity_candidate(stmt) else {
+            break;
+        };
+        if cand.deps.iter().any(|e| expr_uses_any(e, &bound)) {
+            break;
+        }
+        if bound.contains(&cand.bind) {
+            break;
+        }
+        bound.insert(cand.bind.clone());
+        run.push(cand);
+    }
+    run
+}
+
+/// Scan `module` for runs of 2+ adjacent independent `NAME = await
+/// CALL(...)` statements inside `async def` bodies. Returns one
+/// [`GatherOpportunity`] per run, in source order. Advice-only: the
+/// caller turns each into a `tyc::gather_opportunity` diagnostic
+/// suggesting an explicit `gather:` block. Does not rewrite anything —
+/// concurrency is a behaviour change the author must opt into, since
+/// data-flow independence doesn't rule out ordering side effects.
+pub fn detect_gather_opportunities(module: &ModModule) -> Vec<GatherOpportunity> {
+    let mut out = Vec::new();
+    walk_opportunities_in_stmts(&module.body, /* inside_async */ false, &mut out);
+    out
+}
+
+fn walk_opportunities_in_stmts(
+    body: &[Stmt],
+    inside_async: bool,
+    out: &mut Vec<GatherOpportunity>,
+) {
+    let mut i = 0;
+    while i < body.len() {
+        if inside_async {
+            let run = collect_opportunity_run(body, i);
+            if run.len() >= 2 {
+                out.push(GatherOpportunity {
+                    count: run.len(),
+                    call_range: run[0].call_range,
+                });
+                i += run.len();
+                continue;
+            }
+        }
+        walk_opportunities_in_stmt(&body[i], inside_async, out);
+        i += 1;
+    }
+}
+
+fn walk_opportunities_in_stmt(stmt: &Stmt, inside_async: bool, out: &mut Vec<GatherOpportunity>) {
+    match stmt {
+        Stmt::FunctionDef(f) => walk_opportunities_in_stmts(&f.body, f.is_async, out),
+        Stmt::ClassDef(c) => walk_opportunities_in_stmts(&c.body, false, out),
+        Stmt::If(s) => {
+            walk_opportunities_in_stmts(&s.body, inside_async, out);
+            for clause in &s.elif_else_clauses {
+                walk_opportunities_in_stmts(&clause.body, inside_async, out);
+            }
+        }
+        Stmt::While(s) => {
+            walk_opportunities_in_stmts(&s.body, inside_async, out);
+            walk_opportunities_in_stmts(&s.orelse, inside_async, out);
+        }
+        Stmt::For(s) => {
+            // ruff models `async for` as `StmtFor { is_async: true }`, so
+            // this arm already covers it (no separate `AsyncFor` variant).
+            walk_opportunities_in_stmts(&s.body, inside_async, out);
+            walk_opportunities_in_stmts(&s.orelse, inside_async, out);
+        }
+        // Likewise `async with` is `StmtWith { is_async: true }` — covered.
+        Stmt::With(s) => walk_opportunities_in_stmts(&s.body, inside_async, out),
+        Stmt::Try(s) => {
+            walk_opportunities_in_stmts(&s.body, inside_async, out);
+            for h in &s.handlers {
+                let ExceptHandler::ExceptHandler(h) = h;
+                walk_opportunities_in_stmts(&h.body, inside_async, out);
+            }
+            walk_opportunities_in_stmts(&s.orelse, inside_async, out);
+            walk_opportunities_in_stmts(&s.finalbody, inside_async, out);
+        }
+        Stmt::Match(s) => {
+            for case in &s.cases {
+                walk_opportunities_in_stmts(&case.body, inside_async, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+// ── tests ────────────────────────────────────────────────────────────────────
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1506,5 +1687,129 @@ class Service:
             names.contains("fetch_a"),
             "class-method gatherable must be collected; got {names:?}"
         );
+    }
+
+    // ── detect_gather_opportunities (default-on advice, callee-agnostic) ──
+
+    #[test]
+    fn opportunity_flags_independent_method_awaits() {
+        // The common real case the missed-gather detector deliberately
+        // ignores: two awaited method calls on an imported client with
+        // no data dependency between them.
+        let src = "\
+async def load(client, uid):
+    a = await client.get_user(uid)
+    b = await client.get_posts(uid)
+    return (a, b)
+";
+        let module = parse_module(src);
+        let ops = detect_gather_opportunities(&module);
+        assert_eq!(ops.len(), 1, "expected 1 opportunity; got {ops:?}");
+        assert_eq!(ops[0].count, 2);
+    }
+
+    #[test]
+    fn opportunity_flags_independent_awaits_inside_async_with() {
+        // ruff models `async with` as `StmtWith { is_async: true }`, so the
+        // `Stmt::With` traversal arm already descends into it. Guard that:
+        // an independent-await run inside an `async with` block is flagged
+        // exactly like one at the function top level. (PR #191 review.)
+        let src = "\
+async def load(client, uid):
+    async with client.session() as s:
+        a = await s.get_user(uid)
+        b = await s.get_posts(uid)
+        return (a, b)
+";
+        let module = parse_module(src);
+        let ops = detect_gather_opportunities(&module);
+        assert_eq!(
+            ops.len(),
+            1,
+            "independent awaits inside `async with` must be flagged; got {ops:?}"
+        );
+        assert_eq!(ops[0].count, 2);
+    }
+
+    #[test]
+    fn opportunity_silent_when_dependent() {
+        // `b`'s argument uses `a`; concurrency is impossible.
+        let src = "\
+async def load(client):
+    a = await client.get_user(1)
+    b = await client.get_posts(a)
+    return (a, b)
+";
+        let module = parse_module(src);
+        assert!(detect_gather_opportunities(&module).is_empty());
+    }
+
+    #[test]
+    fn opportunity_silent_when_receiver_is_earlier_binding() {
+        // `b`'s receiver is `a`, bound by the first await — a dependency
+        // through the callee expression, not the args.
+        let src = "\
+async def load(factory):
+    a = await factory.make()
+    b = await a.next()
+    return b
+";
+        let module = parse_module(src);
+        assert!(detect_gather_opportunities(&module).is_empty());
+    }
+
+    #[test]
+    fn opportunity_silent_for_single_await() {
+        let src = "\
+async def load(client):
+    a = await client.get_user(1)
+    return a
+";
+        let module = parse_module(src);
+        assert!(detect_gather_opportunities(&module).is_empty());
+    }
+
+    #[test]
+    fn opportunity_broken_by_intervening_statement() {
+        let src = "\
+async def load(client):
+    a = await client.get_user(1)
+    print(a)
+    b = await client.get_posts(2)
+    return (a, b)
+";
+        let module = parse_module(src);
+        // The `print(a)` between the awaits breaks the run, and neither
+        // await is part of a 2+ run on its own.
+        assert!(detect_gather_opportunities(&module).is_empty());
+    }
+
+    #[test]
+    fn opportunity_counts_three_in_a_row() {
+        let src = "\
+async def load(client):
+    a = await client.get_a()
+    b = await client.get_b()
+    c = await client.get_c()
+    return (a, b, c)
+";
+        let module = parse_module(src);
+        let ops = detect_gather_opportunities(&module);
+        assert_eq!(ops.len(), 1);
+        assert_eq!(ops[0].count, 3);
+    }
+
+    #[test]
+    fn opportunity_ignored_outside_async() {
+        // A sync function: even adjacent awaited-shaped calls aren't a
+        // gather opportunity (and wouldn't parse as runnable async).
+        let src = "\
+def load(client):
+    a = client.get_user(1)
+    b = client.get_posts(2)
+    return (a, b)
+";
+        let module = parse_module(src);
+        assert!(detect_gather_opportunities(&module).is_empty());
     }
 }

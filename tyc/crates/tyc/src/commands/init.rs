@@ -161,6 +161,7 @@ exhaustive-match = "error"      # require `match` on sealed unions to cover ever
 methods-in-class-body = "warn"  # "error" promotes Rule 4 to a build break
 auto-memoise = false            # cache every pure function via @functools.cache
 auto-gather = false             # fold consecutive awaits into asyncio.TaskGroup
+suggest-gather = true           # advice when independent awaits could run concurrently
 pgo-memoise = false             # promote hot pure fns from typhon-profile.json
 require-with = "warn"           # "error" / "off" — open()/socket()/connect() outside `with` is a leak
 blocking-in-async = "warn"      # "error" / "off" — time.sleep / requests.get inside async def

@@ -517,6 +517,13 @@ fn shapes_from_introspected(intro: &IntrospectedModule) -> ModuleShapes {
         function_arities,
         sealed_unions: HashMap::new(),
         interfaces: HashMap::new(),
+        // Introspected Python modules carry no Typhon newtypes, type
+        // aliases, enums, or `frozen`-modifier classes.
+        newtypes: HashMap::new(),
+        type_aliases: HashMap::new(),
+        enums: HashMap::new(),
+        frozen_classes: std::collections::HashSet::new(),
+        gatherable_async_fns: std::collections::HashSet::new(),
     }
 }
 

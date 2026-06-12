@@ -149,11 +149,23 @@ pub struct StrictnessConfig {
     /// When true, runs of two-or-more consecutive independent `await` calls
     /// inside an `async def` are rewritten into an `asyncio.TaskGroup` block
     /// so they execute concurrently. Independence is determined by static
-    /// data-flow on bound names; runs are only folded when every callee is
-    /// an `async def` declared in the same module. Off by default — flip on
-    /// per-project to apply the rewrite globally. (Phase 4 auto-gather
-    /// inference; explicit `gather:` blocks are unaffected.)
+    /// data-flow on bound names; a run is only folded when every callee is a
+    /// `@gatherable` `async def` — declared in the same module **or imported
+    /// from another project module** (the cross-module eligibility set is
+    /// seeded from each module's published `@gatherable` names). Off by
+    /// default — flip on per-project to apply the rewrite globally. (Phase 4
+    /// auto-gather inference; explicit `gather:` blocks are unaffected.)
     pub auto_gather: bool,
+    /// When true (the default), `tyc check` and `tyc build` surface a
+    /// `tyc::gather_opportunity` advice for every run of 2+ adjacent
+    /// independent awaited calls inside an `async def` — including awaited
+    /// method calls on imported clients, which `auto-gather` never touches —
+    /// and the language server shows the same hint live in the editor.
+    /// Advice-only: it suggests wrapping the run in an explicit `gather:`
+    /// block but never rewrites (concurrency is a behaviour change the author
+    /// opts into). Set `false` to silence the nudge; it never blocks a build
+    /// regardless.
+    pub suggest_gather: bool,
     /// When true, `tyc build` consults `typhon-profile.json` (produced by a
     /// prior `tyc profile` run) and promotes every pure function whose call
     /// count meets [`StrictnessConfig::pgo_min_calls`] to `@functools.cache`,
@@ -229,6 +241,7 @@ impl Default for StrictnessConfig {
             methods_in_class_body: "warn".into(),
             auto_memoise: false,
             auto_gather: false,
+            suggest_gather: true,
             pgo_memoise: false,
             pgo_min_calls: 100,
             auto_parallel: false,

@@ -4,6 +4,177 @@ All notable changes to Typhon are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely; the
 canonical phase-by-phase status lives in `docs/roadmap.md`.
 
+## 0.14.2 — 2026-06-12 — Async concurrency: `gather_opportunity` advice + cross-module auto-gather
+
+The single biggest "compile to the faster way" lever for async code is
+concurrency: independent `await`s that run sequentially could run together.
+Typhon could already *do* this (`gather:` / `auto-gather`), but `auto-gather`
+is opt-in, requires a `@gatherable` decorator on every callee, and only
+considered same-module `async def`s — so the most common real
+missed-concurrency shape, two awaited method calls on an imported client,
+was never surfaced. This release closes both gaps: the compiler now points
+the opportunity out by default, and the `auto-gather` rewrite folds runs
+that call `@gatherable` functions imported from another module.
+
+### Added — `tyc::gather_opportunity` (advice, on by default)
+
+- **`tyc check` and `tyc build` flag every run of 2+ adjacent independent
+  awaited calls** inside an `async def` and suggest wrapping them in an
+  explicit `gather:` block so they run concurrently in an `asyncio.TaskGroup`:
+
+  ```ty
+  async def load(client: Client, uid: int) -> tuple[User, list[Post]]:
+      let user = await client.get_user(uid)        # advice: these 2 awaits
+      let posts = await client.get_posts(uid)      # could run concurrently
+      return (user, posts)
+  ```
+
+- **Callee-agnostic**, unlike `tyc::auto_gather_missed`: it fires for awaited
+  **method calls on imported clients** (`await client.get_user(...)`), the
+  shape `auto-gather` never touches, because the suggested fix — an explicit
+  `gather:` block — works for any awaitable with no `@gatherable` decorator
+  or `auto-gather` opt-in.
+- **Sound and conservative.** Independence is decided by static data flow:
+  a run breaks the moment a later await references a name bound earlier —
+  including through the callee's *receiver* (`b = await a.next()`), keyword
+  args, comprehensions, walrus, slices, and f-strings (all reused from the
+  `auto-gather` independence analysis). A single non-matching statement
+  between two awaits ends the run. It **never rewrites** — concurrency is a
+  behaviour change the author opts into, since data-flow independence does
+  not rule out ordering side effects — and it is **advice-level**, so it
+  never blocks a build. Verified to fire zero times across the 15-app
+  example corpus (which already gathers where appropriate), so default-on
+  adds no noise.
+- **Knob:** `[strictness] suggest-gather` (default `true`). Set `false` to
+  silence the nudge project-wide. When `auto-gather` is also on, runs it
+  folds into a `TaskGroup` are gone before this pass runs, so they aren't
+  double-reported. `tyc explain gather_opportunity` documents it offline.
+
+### Changed — `auto-gather` now folds imported `@gatherable` callees
+
+- **`[strictness] auto-gather` extends across module boundaries.** A run of
+  independent awaits whose callees are `@gatherable` async functions
+  **imported from another project module** now folds into an
+  `asyncio.TaskGroup`, exactly like a same-module run:
+
+  ```ty
+  # services.ty
+  @gatherable
+  pub async def fetch_user(uid: int) -> User: ...
+  @gatherable
+  pub async def fetch_posts(uid: int) -> list[Post]: ...
+
+  # main.ty
+  from services import fetch_user, fetch_posts
+  async def load(uid: int) -> Dashboard:
+      let u = await fetch_user(uid)     # folded into one TaskGroup …
+      let p = await fetch_posts(uid)    # … because both are @gatherable in `services`
+      return Dashboard(u, p)
+  ```
+
+- Each module's set of `@gatherable` async functions is published on
+  `ModuleShapes` (the same cross-module registry that carries class shapes,
+  newtypes, enums, …); the build pass resolves every `from M import name`
+  through the resolver's `import_info` (correct relative / absolute / alias
+  handling, shared with the type checker) and seeds the imported local name
+  into the auto-gather eligibility set.
+- **The safety boundary holds across modules:** the `@gatherable` decorator
+  is still required — an imported async callee *without* it is never folded,
+  so the author's concurrency attestation is respected regardless of which
+  module the function lives in. Mis-resolution can only ever *fail* to fold
+  (a missed optimisation), never fold something un-attested.
+
+### Added — advisory lints surface live in the editor (LSP)
+
+- **The advisory lints now appear as you type, not just in CI.** The pure-AST
+  advisories — `gather_opportunity`, `mutable_default_param`,
+  `empty_collection_no_annotation`, `typing_alias_in_annotation`,
+  `is`-literal, loop-closure-capture, and the inline secret-literal lint —
+  previously only ran inside the `tyc check` / `tyc build` commands, so they
+  were invisible in the editor. They now flow through the language server too.
+- A single shared `editor_lint_diagnostics` is the source of truth for the
+  advisory set, called by both `tyc check` and the LSP, so the editor and CI
+  can never drift. The LSP reads `[strictness] suggest-gather` /
+  `allow-secret-comptime` from the project's `typhon.toml`, so silencing a
+  lint silences it in the editor as well.
+- Advice-severity diagnostics render as unobtrusive **hints** (the editor's
+  faint underline) rather than warnings, matching the terminal's `☞` badge.
+- No editor-side change is required: the VS Code extension is a thin
+  pass-through language client, so updating the `tyc` binary is enough to
+  light the hints up.
+
+## 0.14.1 — 2026-06-12 — Cross-module shape propagation completeness
+
+A dogfooding round — a self-hosted API budget tracker built end-to-end on
+v0.14.0 — surfaced a class of defect: several per-module checker tables were
+never threaded through the cross-module shape registry, so type information
+the in-module checker relies on silently went missing once a declaration was
+consumed from another module. Four maps had the gap — `newtypes`,
+transparent `type_aliases`, `enums`, and `frozen_classes` — all now carried
+through the same path that already propagated `sealed_unions`, `interfaces`,
+and `class_shapes`. Additive — every previously-accepted program type-checks
+identically, the full workspace suite stays green, and all 15 example apps
+(which declare newtypes/enums/frozen classes in a `domain/` module and import
+them widely) check clean.
+
+The shared fix threads each map through the four-stage cross-module path
+(`extract_module_shapes` → `ModuleShapes` → `build_external_shapes` →
+`check_module_with_imports`), seeding the consumer both when the name is
+imported directly (alias-aware) and when it's reached *only* through an
+imported class field / function parameter / return type (the case that
+actually bit in each instance). A local declaration always wins on a name
+collision with an imported one.
+
+### Fixed — newtype escape-upward across module boundaries
+
+- **An imported `newtype` now widens to its base type.** `newtype
+  ProjectTag = str` in `models.ty` plus `let key: str = spend.project`
+  (where `spend.project: ProjectTag`) in a consumer wrongly fired
+  `tyc::type_mismatch` — the consumer's `newtypes` table had no imported
+  base to unwrap to. The reverse direction stays sound and is now *more*
+  precise: a bare base into an imported-newtype slot surfaces the dedicated
+  `tyc::newtype_violation` ("wrap with `ProjectTag(...)`") instead of a
+  generic mismatch, matching the in-module diagnostic.
+
+### Fixed — transparent type aliases across module boundaries
+
+- **An imported `type Report = ReportData` now unwraps in the consumer.**
+  A `ReportData` value flowing into a `Report`-typed slot (or vice-versa)
+  wrongly fired `tyc::type_mismatch` because the consumer's `type_aliases`
+  table never received the imported alias, so `unwrap_alias` had nothing to
+  resolve `Report` through. Sealed-union aliases are excluded (they already
+  ride `sealed_unions`); only transparent aliases are published.
+
+### Fixed — enum exhaustiveness across module boundaries
+
+- **An exhaustive `match` over an imported `enum` no longer fires a false
+  `tyc::missing_return`.** The consumer never saw the enum's closed member
+  set, so it couldn't prove a complete `case Color.RED / GREEN / BLUE:`
+  match exhaustive and assumed a fall-through. The enum's ordered member
+  list is now published and seeded.
+
+### Fixed — frozen-class writes across module boundaries (soundness)
+
+- **A field write on an *imported* `frozen` class now trips
+  `tyc::frozen_assign`.** Previously the consumer silently accepted
+  `c.port = 9999` on an imported `class Config frozen:`, which raises
+  `FrozenInstanceError` at runtime — a cross-module soundness gap.
+  Frozen-ness is preprocessor line-based (the `frozen` modifier is stripped
+  before parsing), so it's filled into `ModuleShapes` by the callers that
+  hold the preprocess metadata via a new `tyc_types::frozen_class_names`
+  helper, rather than from the AST-only `extract_module_shapes`.
+
+### Tests
+
+- `tyc-types`: `cross_module_newtype_widens_to_base`,
+  `cross_module_bare_base_into_newtype_still_rejected`.
+- `tyc-db` (full-pipeline, via the project shape registry):
+  `cross_module_newtype_field_widens_without_importing_newtype`,
+  `cross_module_imported_newtype_name_widens_to_base`,
+  `cross_module_transparent_type_alias_unwraps`,
+  `cross_module_enum_exhaustive_match_no_false_missing_return`,
+  `cross_module_frozen_class_field_write_errors`.
+
 ## 0.14.0 — 2026-06-12 — `as!` checked boundary cast + auto traceback remap
 
 Two ergonomics features motivated by a playground retrospective: the

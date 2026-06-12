@@ -699,8 +699,59 @@ pub fn run(args: BuildArgs) -> Result<()> {
                 );
                 eprintln!("{:?}", miette::Report::new_boxed(Box::new(advice)));
             }
-            let eligible = collect_gatherable_async_fn_names(&module);
+            // Eligible callees = same-module `@gatherable` async defs,
+            // PLUS `@gatherable` async defs imported from another project
+            // module. The cross-module half resolves each `from M import
+            // name` through the resolver's `import_info` (correct relative
+            // / absolute / alias handling, shared with the type checker)
+            // and consults the producer module's published
+            // `gatherable_async_fns` set. So a run of
+            // `await fetch_user(uid)` / `await fetch_posts(uid)` where both
+            // are `@gatherable` in an imported `services` module folds into
+            // an `asyncio.TaskGroup` just like a same-module run.
+            let mut eligible = collect_gatherable_async_fn_names(&module);
+            let (resolved, _) = tyc_resolve::resolve_module(
+                path.display().to_string(),
+                &prep.python_source,
+                &module,
+            );
+            if let Some(scope) = resolved.scopes.first() {
+                for b in &scope.bindings {
+                    let Some(info) = &b.import_info else { continue };
+                    let Some(member) = &info.member else { continue };
+                    if project_shapes
+                        .get(&info.module)
+                        .is_some_and(|s| s.gatherable_async_fns.contains(member))
+                    {
+                        eligible.insert(b.name.clone());
+                    }
+                }
+            }
             let _stats = rewrite_auto_gather(&mut module, &eligible);
+        }
+
+        // Default-on concurrency nudge. Flag every remaining run of 2+
+        // adjacent independent awaited calls inside an `async def` —
+        // most commonly awaited method calls on imported clients
+        // (`await client.get_user(id)` then `await client.get_posts(id)`),
+        // which `auto-gather` never folds — so the user can wrap them in
+        // an explicit `gather:` block and run them concurrently. Runs
+        // already folded by `auto-gather` above are gone from the AST, so
+        // they aren't re-flagged. Advice-only and printed straight through
+        // miette (like the missed-gather advice above); never blocks a
+        // build, and `[strictness] suggest-gather = false` silences it.
+        if config.strictness.suggest_gather {
+            // Same diagnostic construction the `check` command and the LSP
+            // use, so the three surfaces never drift.
+            for advice in tyc_analyse::gather_opportunity_diagnostics(
+                &module,
+                &path.display().to_string(),
+                &prep.python_source,
+            )
+            .warnings()
+            {
+                eprintln!("{:?}", miette::Report::new_boxed(Box::new(advice.clone())));
+            }
         }
 
         // Lower `extend BUILTIN:` blocks (e.g. `extend str:`) into module-
@@ -3494,6 +3545,113 @@ async def load() -> int:
         assert!(
             py.contains("a = await fetch_a") && py.contains("b = await fetch_b(a)"),
             "sequential awaits must be preserved verbatim; got:\n{py}"
+        );
+    }
+
+    /// Scaffold a two-file project (`services.ty` + `main.ty`) with
+    /// `auto-gather = true`, for the cross-module rewrite tests.
+    fn scaffold_auto_gather_xmodule(
+        dir: &std::path::Path,
+        services_src: &str,
+        main_src: &str,
+    ) -> std::path::PathBuf {
+        let src_dir = dir.join("src");
+        let out_dir = dir.join("build");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        std::fs::write(
+            dir.join("typhon.toml"),
+            "[project]\nname = \"test\"\nversion = \"0.1.0\"\nsrc = \"src\"\nout = \"build\"\n\
+             [python]\ntarget = \"3.13\"\n[emit]\nformat = false\n\
+             [strictness]\nauto-gather = true\n[env]\n",
+        )
+        .unwrap();
+        std::fs::write(src_dir.join("services.ty"), services_src).unwrap();
+        std::fs::write(src_dir.join("main.ty"), main_src).unwrap();
+        out_dir
+    }
+
+    #[test]
+    fn build_auto_gather_folds_imported_gatherable_run() {
+        // Both callees are `@gatherable` in an imported module — the run
+        // must fold into a TaskGroup even though neither is declared in
+        // `main.ty`. Exercises the cross-module eligibility seed.
+        let tmp = tempfile::tempdir().unwrap();
+        let services = "\
+@gatherable
+pub async def fetch_user(uid: int) -> int:
+    return uid
+@gatherable
+pub async def fetch_posts(uid: int) -> int:
+    return uid
+";
+        let main = "\
+from services import fetch_user, fetch_posts
+
+async def load(uid: int) -> int:
+    let a = await fetch_user(uid)
+    let b = await fetch_posts(uid)
+    return a + b
+";
+        let out_dir = scaffold_auto_gather_xmodule(tmp.path(), services, main);
+        run(BuildArgs {
+            path: tmp.path().to_path_buf(),
+            out: None,
+            no_format: true,
+            check: false,
+            no_sync: true,
+            with_ty: false,
+        })
+        .unwrap();
+        let py = std::fs::read_to_string(out_dir.join("main.py")).unwrap();
+        assert!(
+            py.contains("asyncio.TaskGroup"),
+            "imported @gatherable run must fold cross-module; got:\n{py}"
+        );
+        assert!(
+            !py.contains("a = await fetch_user"),
+            "original sequential await should be folded away; got:\n{py}"
+        );
+    }
+
+    #[test]
+    fn build_auto_gather_skips_imported_non_gatherable() {
+        // `fetch_posts` is NOT `@gatherable` in the imported module — the
+        // run must stay sequential, preserving the cross-module safety
+        // boundary (the decorator is the author's concurrency attestation).
+        let tmp = tempfile::tempdir().unwrap();
+        let services = "\
+@gatherable
+pub async def fetch_user(uid: int) -> int:
+    return uid
+pub async def fetch_posts(uid: int) -> int:
+    return uid
+";
+        let main = "\
+from services import fetch_user, fetch_posts
+
+async def load(uid: int) -> int:
+    let a = await fetch_user(uid)
+    let b = await fetch_posts(uid)
+    return a + b
+";
+        let out_dir = scaffold_auto_gather_xmodule(tmp.path(), services, main);
+        run(BuildArgs {
+            path: tmp.path().to_path_buf(),
+            out: None,
+            no_format: true,
+            check: false,
+            no_sync: true,
+            with_ty: false,
+        })
+        .unwrap();
+        let py = std::fs::read_to_string(out_dir.join("main.py")).unwrap();
+        assert!(
+            !py.contains("TaskGroup"),
+            "a non-@gatherable imported callee must NOT fold; got:\n{py}"
+        );
+        assert!(
+            py.contains("a = await fetch_user"),
+            "sequential awaits must be preserved; got:\n{py}"
         );
     }
 

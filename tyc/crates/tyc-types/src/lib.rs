@@ -3815,6 +3815,47 @@ pub struct ModuleShapes {
     /// Greeter)` rather than firing `tyc::interface_isinstance` on a
     /// pattern that the source module legitimately authored.
     pub interfaces: HashMap<String, bool>,
+    /// Nominal newtype declarations (`newtype Name = Base`), keyed by
+    /// the newtype name and valued by its (already-resolved) base type.
+    /// Seeded into the consumer's `newtypes` table so the asymmetric
+    /// "escape upward" rule — a `Name` value flows freely into a
+    /// `Base`-typed slot — works across module boundaries exactly as it
+    /// does in-module. Without this, `newtype ProjectTag = str` declared
+    /// in module A and a field typed `ProjectTag` flowing into a `str`
+    /// slot in module B wrongly fired `tyc::type_mismatch`, even though
+    /// the docs promise a newtype always widens to its base.
+    pub newtypes: HashMap<String, Type>,
+    /// Transparent type aliases (`type Report = ReportData`, `type Vec[T]
+    /// = list[T]`), keyed by alias name and valued by its PEP 695 type
+    /// parameters plus the resolved right-hand-side type. Sealed-union
+    /// aliases are intentionally excluded here (they ride the
+    /// `sealed_unions` table); only the transparent ones — which the
+    /// consumer must `unwrap_alias` through — are published. Without
+    /// this, an imported alias never unwrapped in the consumer, so a
+    /// value of the aliased type flowing into an alias-typed slot wrongly
+    /// fired `tyc::type_mismatch`.
+    pub type_aliases: HashMap<String, (Vec<String>, Type)>,
+    /// Enum declarations (`enum Name:` → `class Name(enum.Enum):`), keyed
+    /// by the enum class name and valued by its ordered member names.
+    /// Seeded into the consumer's `enums` table so an exhaustive `match`
+    /// over an imported enum is recognised as exhaustive (otherwise the
+    /// consumer can't see the closed member set and a complete match
+    /// spuriously fires `tyc::missing_return`).
+    pub enums: HashMap<String, Vec<String>>,
+    /// Classes declared with the `frozen` modifier (`class Foo frozen:`).
+    /// Seeded into the consumer's `frozen_classes` set so a field write
+    /// on an *imported* frozen class trips `tyc::frozen_assign` — without
+    /// it, the consumer silently accepted a mutation that raises
+    /// `FrozenInstanceError` at runtime (a cross-module soundness gap).
+    pub frozen_classes: std::collections::HashSet<String>,
+    /// Names of `async def`s carrying the `@gatherable` decorator (the
+    /// author's attestation that the function is safe to run concurrently
+    /// with peers). Published so the `auto-gather` build pass can fold a
+    /// run of independent awaits that call a `@gatherable` function
+    /// **imported from another module**, not just same-module ones —
+    /// `from services import fetch_user` where `fetch_user` is
+    /// `@gatherable` in `services`.
+    pub gatherable_async_fns: std::collections::HashSet<String>,
 }
 
 /// Imports resolved to their source modules' [`ModuleShapes`], keyed
@@ -3855,6 +3896,25 @@ pub struct ExternalShapes {
     /// re-keyed under the local import name so the `isinstance`
     /// check sees the source module's opt-in.
     pub interfaces: HashMap<String, bool>,
+    /// Newtype declarations re-keyed under the local import name of the
+    /// newtype (`from foo import ProjectTag as Tag` → `"Tag" → Str`).
+    /// Seeded into the consumer's `newtypes` table so the asymmetric
+    /// escape-upward rule fires for imported newtypes the same way it
+    /// does for locally-declared ones.
+    pub newtypes: HashMap<String, Type>,
+    /// Transparent type aliases re-keyed under the local import name,
+    /// seeded into the consumer's `type_aliases` table so an imported
+    /// alias unwraps the same way a locally-declared one does. The RHS
+    /// type keeps the source module's class names (resolved nominally).
+    pub type_aliases: HashMap<String, (Vec<String>, Type)>,
+    /// Enum member lists re-keyed under the local import name, seeded
+    /// into the consumer's `enums` table so an exhaustive `match` over an
+    /// imported enum is recognised as exhaustive.
+    pub enums: HashMap<String, Vec<String>>,
+    /// Imported frozen-class names (re-keyed under the local import
+    /// name), seeded into the consumer's `frozen_classes` set so a field
+    /// write on an imported frozen class fires `tyc::frozen_assign`.
+    pub frozen_classes: std::collections::HashSet<String>,
     /// Bare imports that need attribute-access resolution. Keyed by
     /// the *local* binding name; the value is the dotted module path
     /// the import refers to (e.g. `("np", "numpy")` for
@@ -3998,13 +4058,130 @@ pub fn extract_module_shapes(module: &ModModule) -> ModuleShapes {
         }
     }
 
+    // Newtype declarations (`newtype Name = Base`, preprocessed to
+    // `Name = NewType("Name", Base)`). Published so a consumer importing
+    // `Name` can widen a `Name`-typed value into a `Base`-typed slot —
+    // the asymmetric escape-upward rule the in-module checker applies
+    // via its own `newtypes` table. The base is resolved through the
+    // same `type_from_annotation_with_params` path the in-module pass
+    // uses (`classes` doesn't list newtype names, so a primitive base
+    // like `str`/`int` resolves to `Type::Str`/`Type::Int` and any other
+    // identifier degrades to `Type::Class(name)`). Invalid bases
+    // (`newtype X = 42`) are skipped here — the in-module check is the
+    // one place that surfaces `tyc::newtype_invalid_base`; this
+    // surface-extraction pass never emits diagnostics.
+    let mut newtypes: HashMap<String, Type> = HashMap::new();
+    for stmt in &module.body {
+        if let Stmt::Assign(a) = stmt {
+            if let Some((name, base_expr)) = extract_newtype_decl(a) {
+                if non_type_expr_kind(&base_expr).is_some() {
+                    continue;
+                }
+                let base_ty = type_from_annotation_with_params(&base_expr, &classes, &[]);
+                newtypes.insert(name, base_ty);
+            }
+        }
+    }
+
+    // Transparent type aliases (`type Report = ReportData`, `type Vec[T]
+    // = list[T]`). Mirrors the in-module second pass: resolve each
+    // alias's RHS with the alias's own type params in scope. Sealed-union
+    // aliases (`type E = A | B`) are skipped — they're published via
+    // `sealed_unions` and an `unwrap_alias` over them would only reach a
+    // bare `Union`, never a single concrete head. A consumer unwraps the
+    // published aliases nominally (the RHS keeps source class names).
+    let mut type_aliases: HashMap<String, (Vec<String>, Type)> = HashMap::new();
+    for stmt in &module.body {
+        if let Stmt::TypeAlias(ta) = stmt {
+            if let Expr::Name(n) = ta.name.as_ref() {
+                if extract_sealed_union_variants(&ta.value).is_some() {
+                    continue;
+                }
+                let params = type_param_names_from(ta.type_params.as_deref());
+                let rhs = type_from_annotation_with_params(ta.value.as_ref(), &classes, &params);
+                type_aliases.insert(n.id.as_str().to_owned(), (params, rhs));
+            }
+        }
+    }
+
+    // Enum declarations (`enum Name:` → `class Name(enum.Enum):`). Mirrors
+    // the in-module pass: record the ordered, non-underscore member names
+    // so an exhaustive `match` over an imported enum is recognised as
+    // exhaustive in the consumer.
+    let mut enums: HashMap<String, Vec<String>> = HashMap::new();
+    for stmt in &module.body {
+        if let Stmt::ClassDef(cd) = stmt {
+            if class_has_enum_family_base(cd) {
+                let members: Vec<String> = cd
+                    .body
+                    .iter()
+                    .filter_map(|s| match s {
+                        Stmt::Assign(a) => match a.targets.first() {
+                            Some(Expr::Name(n)) if !n.id.as_str().starts_with('_') => {
+                                Some(n.id.as_str().to_owned())
+                            }
+                            _ => None,
+                        },
+                        _ => None,
+                    })
+                    .collect();
+                if !members.is_empty() {
+                    enums.insert(cd.name.as_str().to_owned(), members);
+                }
+            }
+        }
+    }
+
+    // `@gatherable` async functions, so the `auto-gather` build pass can
+    // fold runs that call them across module boundaries. Mirrors
+    // `tyc_analyse::collect_gatherable_async_fn_names` — kept here as a few
+    // lines of AST inspection rather than a dependency edge from
+    // `tyc-types` onto `tyc-analyse`.
+    //
+    // ONLY top-level functions are collected, never class methods: this is
+    // a flat name set consumed by the cross-module rewrite, which folds
+    // bare-name calls to *imported* functions (`from m import fetch`). A
+    // class method can't be imported as a bare name, so adding its name
+    // here would be dead weight at best — and unsound at worst, since a
+    // `@gatherable` method `Service.fetch` would make an *undecorated*
+    // top-level `fetch` in the same module look gather-safe to a consumer
+    // importing it. (PR #191 review — gemini-code-assist.)
+    let mut gatherable_async_fns: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    for stmt in &module.body {
+        if let Stmt::FunctionDef(f) = stmt {
+            if f.is_async && has_gatherable_decorator(&f.decorator_list) {
+                gatherable_async_fns.insert(f.name.as_str().to_owned());
+            }
+        }
+    }
+
     ModuleShapes {
         class_shapes,
         class_type_params,
         function_arities,
         sealed_unions,
         interfaces,
+        newtypes,
+        type_aliases,
+        enums,
+        // Frozen-ness is preprocessor line-based, not visible in the
+        // parsed AST this fn walks. The callers that have the preprocess
+        // metadata (`extract_shapes_for_path` / `module_shapes_query`)
+        // fill this in via `frozen_class_names`.
+        frozen_classes: std::collections::HashSet::new(),
+        gatherable_async_fns,
     }
+}
+
+/// `true` when `decorators` contains `@gatherable` (bare or call form).
+/// Mirrors `tyc_analyse::auto_gather::has_gatherable_decorator`.
+fn has_gatherable_decorator(decorators: &[ruff_python_ast::Decorator]) -> bool {
+    decorators.iter().any(|d| match &d.expression {
+        Expr::Name(n) => n.id.as_str() == "gatherable",
+        Expr::Call(c) => matches!(&*c.func, Expr::Name(n) if n.id.as_str() == "gatherable"),
+        _ => false,
+    })
 }
 
 /// Type-check a module with knowledge of which lines opened an `unsafe:`
@@ -4171,9 +4348,57 @@ pub fn check_module_with_imports(
                 .or_insert_with(|| variants.clone());
             // The classes registry also needs the union name so
             // annotations referring to it resolve to `Type::Class(union)`.
-            if !c.classes.iter().any(|n| n == name) {
+            if !c.classes.contains(name) {
                 c.classes.push(name.clone());
             }
+        }
+        // Cross-module newtypes: an imported `newtype ProjectTag = str`
+        // must allow the asymmetric escape-upward (`ProjectTag` widens
+        // into a `str`-typed slot) at this module's use sites, same as a
+        // locally-declared newtype. Seeding `c.newtypes` also makes the
+        // reverse-direction `tyc::newtype_violation` fire precisely (a
+        // bare base flowing into an imported newtype slot), matching the
+        // in-module diagnostic instead of a generic `type_mismatch`.
+        for (name, base) in &ext.newtypes {
+            c.newtypes
+                .entry(name.clone())
+                .or_insert_with(|| base.clone());
+            // Register the newtype name so annotations referring to it
+            // resolve to `Type::Class(name)`, mirroring the in-module
+            // first pass (which pushes every `newtype` name onto
+            // `c.classes`).
+            if !c.classes.contains(name) {
+                c.classes.push(name.clone());
+            }
+        }
+        // Cross-module transparent type aliases: an imported `type Report
+        // = ReportData` must `unwrap_alias` in this module so a value of
+        // the aliased type flows into an alias-typed slot. Register the
+        // name on `c.classes` too so the annotation resolves.
+        for (name, alias) in &ext.type_aliases {
+            c.type_aliases
+                .entry(name.clone())
+                .or_insert_with(|| alias.clone());
+            if !c.classes.contains(name) {
+                c.classes.push(name.clone());
+            }
+        }
+        // Cross-module enums: an imported enum's member set makes an
+        // exhaustive `match` over it recognised as exhaustive (otherwise
+        // a complete match spuriously fires `missing_return`).
+        for (name, members) in &ext.enums {
+            c.enums
+                .entry(name.clone())
+                .or_insert_with(|| members.clone());
+            if !c.classes.contains(name) {
+                c.classes.push(name.clone());
+            }
+        }
+        // Cross-module frozen classes: a field write on an imported
+        // frozen class must trip `frozen_assign` just as a local one
+        // does (the runtime would raise `FrozenInstanceError`).
+        for name in &ext.frozen_classes {
+            c.frozen_classes.insert(name.clone());
         }
         // Cross-module interfaces: register the local import name as a
         // Protocol-shaped type so `is_assignable` consults the
@@ -4323,6 +4548,38 @@ fn populate_frozen_classes(c: &mut Checker, body: &[Stmt], frozen_starts: &[u32]
             }
         }
     }
+}
+
+/// Public sibling of [`populate_frozen_classes`] used by cross-module
+/// shape extraction: given a module's source, parsed body, and the
+/// preprocessor's 0-based `frozen_class_lines`, return the set of
+/// top-level class names declared `frozen`. Only the real class names
+/// are returned (no `__typhon_impl_` pseudo-class entries — consumers
+/// never see those). Used by `tyc-db` to fill `ModuleShapes.frozen_classes`
+/// so a field write on an *imported* frozen class trips `frozen_assign`.
+pub fn frozen_class_names(
+    source: &str,
+    body: &[Stmt],
+    frozen_lines: &[usize],
+) -> std::collections::HashSet<String> {
+    let mut names = std::collections::HashSet::new();
+    if frozen_lines.is_empty() {
+        return names;
+    }
+    let frozen_starts = unsafe_byte_starts(source, frozen_lines);
+    for stmt in body {
+        if let Stmt::ClassDef(cd) = stmt {
+            let class_start = u32::from(cd.range.start());
+            let name_start = u32::from(cd.name.range.start());
+            if frozen_starts
+                .iter()
+                .any(|&m| m >= class_start && m <= name_start)
+            {
+                names.insert(cd.name.as_str().to_owned());
+            }
+        }
+    }
+    names
 }
 
 /// Walk an attribute-assignment target and, if its receiver resolves to a
@@ -21336,6 +21593,202 @@ def label(s: Sub) -> str:
              producer's hierarchy is fully known but `Base` wasn't \
              explicitly imported; got: {:?}",
             d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    /// `extract_module_shapes` publishes the names of `@gatherable`
+    /// async functions (top-level only) so the cross-module auto-gather
+    /// build pass can fold runs that call them from another module.
+    /// Undecorated async fns, sync fns, and class methods are excluded —
+    /// the last because the set keys bare-name imports, which can never
+    /// resolve to a method (PR #191 review).
+    #[test]
+    fn extract_publishes_gatherable_async_fns() {
+        let src = "\
+@gatherable
+async def fetch_user(uid: int) -> int:
+    return uid
+
+async def fetch_posts(uid: int) -> int:
+    return uid
+
+def helper(x: int) -> int:
+    return x
+
+class Service:
+    @gatherable
+    async def fetch_orders(self, uid: int) -> int:
+        return uid
+";
+        let prep = preprocess(src);
+        let module = tyc_syntax::parse_module(&prep.python_source)
+            .unwrap()
+            .into_syntax();
+        let shapes = extract_module_shapes(&module);
+        assert!(
+            shapes.gatherable_async_fns.contains("fetch_user"),
+            "decorated top-level async fn must be published"
+        );
+        assert!(
+            !shapes.gatherable_async_fns.contains("fetch_orders"),
+            "a @gatherable class method must NOT be published — it can't be \
+             imported as a bare name, and publishing it could shadow an \
+             undecorated top-level fn of the same name"
+        );
+        assert!(
+            !shapes.gatherable_async_fns.contains("fetch_posts"),
+            "undecorated async fn must be excluded"
+        );
+        assert!(
+            !shapes.gatherable_async_fns.contains("helper"),
+            "sync fn must be excluded"
+        );
+    }
+
+    /// Cross-module newtype escape-upward. A `newtype ProjectTag = str`
+    /// declared in a producer module must widen into a `str`-typed slot
+    /// in a consumer module exactly as a locally-declared newtype does.
+    /// Before the fix, the consumer's `newtypes` table was only seeded
+    /// from its own body, so an imported newtype field flowing into its
+    /// base type wrongly fired `tyc::type_mismatch` (the Dead Reckoning
+    /// dogfooding report's `let key: str = spend.project`).
+    #[test]
+    fn cross_module_newtype_widens_to_base() {
+        let producer_src = "\
+newtype ProjectTag = str
+
+class AttributedSpend:
+    project: ProjectTag
+    amount: float
+";
+        let producer_prep = preprocess(producer_src);
+        let producer_module = tyc_syntax::parse_module(&producer_prep.python_source)
+            .unwrap()
+            .into_syntax();
+        let producer_shapes = extract_module_shapes(&producer_module);
+
+        // The newtype must be published on the producer's surface, with
+        // its base already resolved to `str`.
+        let tag_base = producer_shapes
+            .newtypes
+            .get("ProjectTag")
+            .expect("ProjectTag must be exported as a newtype")
+            .clone();
+        assert_eq!(
+            tag_base,
+            Type::Str,
+            "newtype base must resolve to the primitive `str`"
+        );
+        let spend_shape = producer_shapes
+            .class_shapes
+            .get("AttributedSpend")
+            .expect("AttributedSpend must be exported")
+            .clone();
+
+        // Consumer imports the class and widens the newtype-typed field
+        // into a `str` binding.
+        let consumer_src = "\
+def first_key(spend: AttributedSpend) -> str:
+    let key: str = spend.project
+    return key
+";
+        let consumer_prep = preprocess(consumer_src);
+        let consumer_module = tyc_syntax::parse_module(&consumer_prep.python_source)
+            .unwrap()
+            .into_syntax();
+        let (resolved, _) = resolve_module(
+            "<consumer>".to_owned(),
+            &consumer_prep.python_source,
+            &consumer_module,
+        );
+
+        // Mirror `tyc-db::build_external_shapes`: the class shape and the
+        // newtype base both land under their local import names.
+        let mut external = ExternalShapes::default();
+        external
+            .class_shapes
+            .insert("AttributedSpend".to_owned(), spend_shape);
+        external.newtypes.insert("ProjectTag".to_owned(), tag_base);
+
+        let d = check_module_with_imports(
+            "<consumer>",
+            &consumer_prep.python_source,
+            &resolved,
+            &consumer_module,
+            &consumer_prep.unsafe_lines,
+            &consumer_prep.frozen_class_lines,
+            Some(&external),
+        );
+        // The widening must produce a completely clean check — no
+        // `type mismatch` (or any other diagnostic) on the consumer.
+        let errors: Vec<String> = d.errors().iter().map(|e| e.to_string()).collect();
+        assert!(
+            errors.is_empty(),
+            "imported newtype must widen to its base type with no errors; got: {errors:?}"
+        );
+    }
+
+    /// The reverse direction stays sound across modules: a bare `str`
+    /// flowing into an imported-newtype-typed slot is still rejected,
+    /// and now with the precise `tyc::newtype_violation` (not a generic
+    /// `type_mismatch`) because the consumer's `newtypes` table knows
+    /// the base. Locks in that seeding the table didn't open a hole.
+    #[test]
+    fn cross_module_bare_base_into_newtype_still_rejected() {
+        let producer_src = "newtype ProjectTag = str\n";
+        let producer_prep = preprocess(producer_src);
+        let producer_module = tyc_syntax::parse_module(&producer_prep.python_source)
+            .unwrap()
+            .into_syntax();
+        let producer_shapes = extract_module_shapes(&producer_module);
+        let tag_base = producer_shapes
+            .newtypes
+            .get("ProjectTag")
+            .expect("ProjectTag must be exported as a newtype")
+            .clone();
+
+        let consumer_src = "\
+def label(t: ProjectTag) -> str:
+    return str(t)
+
+def bad() -> str:
+    return label(\"plain\")
+";
+        let consumer_prep = preprocess(consumer_src);
+        let consumer_module = tyc_syntax::parse_module(&consumer_prep.python_source)
+            .unwrap()
+            .into_syntax();
+        let (resolved, _) = resolve_module(
+            "<consumer>".to_owned(),
+            &consumer_prep.python_source,
+            &consumer_module,
+        );
+
+        let mut external = ExternalShapes::default();
+        external.newtypes.insert("ProjectTag".to_owned(), tag_base);
+        let d = check_module_with_imports(
+            "<consumer>",
+            &consumer_prep.python_source,
+            &resolved,
+            &consumer_module,
+            &consumer_prep.unsafe_lines,
+            &consumer_prep.frozen_class_lines,
+            Some(&external),
+        );
+        let errors: Vec<String> = d.errors().iter().map(|e| e.to_string()).collect();
+        // The precise diagnostic is `newtype_violation`, whose message
+        // reads "expected `ProjectTag`, found bare `str`" — the word
+        // "bare" is what distinguishes it from a generic "type mismatch:
+        // …". Assert the precise one fired and the generic one did not.
+        assert!(
+            errors.iter().any(|s| s.contains("found bare")),
+            "bare `str` into an imported `ProjectTag` slot must fire the \
+             precise newtype_violation; got: {errors:?}"
+        );
+        assert!(
+            !errors.iter().any(|s| s.contains("type mismatch")),
+            "the generic type_mismatch must not fire for an imported \
+             newtype slot; got: {errors:?}"
         );
     }
 

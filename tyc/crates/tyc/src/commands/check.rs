@@ -11,10 +11,7 @@ use clap::Args;
 use miette::{miette, Result};
 
 use tyc_analyse::{
-    analyse_empty_collection_bindings, analyse_is_literal_comparisons,
-    analyse_loop_closure_captures, analyse_mutable_default_params, analyse_purity,
-    analyse_secret_literal_bindings, analyse_typing_alias_annotations,
-    evaluate_comptime_with_functions, purity_diagnostics,
+    analyse_purity, editor_lint_diagnostics, evaluate_comptime_with_functions, purity_diagnostics,
 };
 use tyc_db::{check_file_with_imports, extract_shapes_for_path, TycDatabase};
 use tyc_diagnostics::{sanitised_named_source_for, Diagnostics, SanitisedDiagnostic, TycError};
@@ -358,6 +355,7 @@ pub fn run(args: CheckArgs) -> Result<()> {
                 &source,
                 has_project_config.then_some(&vetting_ctx),
                 config.strictness.allow_secret_comptime,
+                config.strictness.suggest_gather,
             );
             diags.extend(analysis_diags);
         }
@@ -999,6 +997,7 @@ fn run_secondary_passes(
     source: &str,
     vetting_ctx: Option<&ImportVettingContext>,
     allow_secret_comptime: bool,
+    suggest_gather: bool,
 ) -> Diagnostics {
     let mut diags = Diagnostics::new();
     let expanded = expand_for_check(source);
@@ -1047,63 +1046,20 @@ fn run_secondary_passes(
     let purity_diags = purity_diagnostics(&purity_findings, path, source);
     diags.extend(purity_diags);
 
-    // Empty-literal binding lint (`tyc::empty_collection_no_annotation`):
-    // a `let xs = []` with no annotation defaults to `list[Unknown]` and
-    // silently swallows later element-type mismatches. The pass walks the
-    // already-preprocessed module, so spans line up with `prep.python_source`.
-    diags.extend(analyse_empty_collection_bindings(
+    // The pure-AST advisory lints (empty-collection, typing-alias,
+    // mutable-default, `is`-literal, loop-closure, secret-literal, and the
+    // `gather_opportunity` concurrency nudge) are shared verbatim with the
+    // LSP via `editor_lint_diagnostics`, so the editor and `tyc check`
+    // never drift. Spans are offsets into `prep.python_source`, the
+    // preprocessed module these were parsed from.
+    diags.extend(editor_lint_diagnostics(
         &module,
         path,
         &prep.python_source,
-    ));
-
-    // Typing-alias-in-annotation lint (`tyc::typing_alias_in_annotation`):
-    // the `typing.List` / `typing.Dict` / `Optional` / `Union` aliases are
-    // rejected on import but were silently accepted inside annotations as
-    // forward-reference names. Walk every annotation and surface the same
-    // migration advice.
-    diags.extend(analyse_typing_alias_annotations(
-        &module,
-        path,
-        &prep.python_source,
-    ));
-
-    // Mutable-default-parameter lint (`tyc::mutable_default_param`):
-    // `def f(xs: list[int] = [])` shares ONE list across every defaulted
-    // call — the classic Python footgun. Class fields already get the
-    // default_factory rewrite; function parameters get this warning.
-    diags.extend(analyse_mutable_default_params(
-        &module,
-        path,
-        &prep.python_source,
-    ));
-
-    // `is` against a literal (`s is "x"`) compares identity, not value —
-    // interpreter-dependent and CPython SyntaxWarns on it.
-    diags.extend(analyse_is_literal_comparisons(
-        &module,
-        path,
-        &prep.python_source,
-    ));
-
-    // Closures created in a loop capture the loop variable by reference —
-    // every deferred call sees the last iteration's value.
-    diags.extend(analyse_loop_closure_captures(
-        &module,
-        path,
-        &prep.python_source,
-    ));
-
-    // Secret-literal lint (`tyc::contains_secret_literal`, inline form):
-    // a `let API_TOKEN = "abc"` hard-codes a credential into the source.
-    // The existing comptime path inside `tyc build` only caught
-    // `comptime let X = env(...)`; this pass catches the plain-`let`
-    // form so the check fires in `tyc check` too.
-    diags.extend(analyse_secret_literal_bindings(
-        &module,
-        path,
-        &prep.python_source,
-        allow_secret_comptime,
+        tyc_analyse::LintOptions {
+            allow_secret_comptime,
+            suggest_gather,
+        },
     ));
 
     if let Some(ctx) = vetting_ctx {

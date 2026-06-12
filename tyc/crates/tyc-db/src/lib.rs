@@ -489,7 +489,15 @@ pub fn extract_shapes_for_path(_path: &str, text: &str) -> ModuleShapes {
         Ok(p) => p.into_syntax(),
         Err(_) => return ModuleShapes::default(),
     };
-    extract_module_shapes(&module)
+    let mut shapes = extract_module_shapes(&module);
+    // Frozen-ness is preprocessor line-based (the `frozen` modifier is
+    // stripped before parsing), so it isn't visible to the AST-only
+    // `extract_module_shapes`. Fill it in here where the preprocess
+    // metadata is in scope, so a consumer of an imported frozen class
+    // sees it as frozen.
+    shapes.frozen_classes =
+        tyc_types::frozen_class_names(&prep.python_source, &module.body, &prep.frozen_class_lines);
+    shapes
 }
 
 /// Newtype wrapper around `Arc<ModuleShapes>` so the Salsa-tracked
@@ -769,6 +777,16 @@ fn build_external_shapes(
                     .interfaces
                     .insert(b.name.clone(), *runtime_checkable);
             }
+            // Enum classes and `frozen` classes ARE `class_shapes`
+            // entries, so they're handled here in the class branch (the
+            // `else if` chain below never reaches them). Re-key both
+            // under the local import name.
+            if let Some(members) = module_shapes.enums.get(member) {
+                external.enums.insert(b.name.clone(), members.clone());
+            }
+            if module_shapes.frozen_classes.contains(member) {
+                external.frozen_classes.insert(b.name.clone());
+            }
         } else if let Some(arity) = module_shapes.function_arities.get(member) {
             external
                 .function_arities
@@ -790,6 +808,20 @@ fn build_external_shapes(
                 })
                 .collect();
             external.sealed_unions.insert(b.name.clone(), mapped);
+        } else if let Some(base) = module_shapes.newtypes.get(member) {
+            // Newtype alias imported by name (`from foo import ProjectTag`).
+            // Re-key its base type under the local import name so the
+            // consumer's asymmetric escape-upward rule (`ProjectTag`
+            // widens into a `str` slot) fires the same way it would for a
+            // locally-declared newtype. The base is published
+            // already-resolved (a primitive in the common case), so no
+            // per-variant re-keying is needed.
+            external.newtypes.insert(b.name.clone(), base.clone());
+        } else if let Some(alias) = module_shapes.type_aliases.get(member) {
+            // Transparent type alias imported by name (`from foo import
+            // Report`). Re-key under the local name; the RHS keeps source
+            // class names (resolved nominally by the consumer).
+            external.type_aliases.insert(b.name.clone(), alias.clone());
         }
     }
     // R1-#1 follow-up: variant→union upcasts need the union's variant
@@ -850,6 +882,84 @@ fn build_external_shapes(
                 })
                 .collect();
             external.sealed_unions.insert(union_name.clone(), mapped);
+        }
+        // Same shape of problem for newtypes: an imported class can
+        // expose a field / parameter / return typed as a newtype whose
+        // NAME the consumer never imported (`from models import
+        // AttributedSpend`, where `AttributedSpend.project: ProjectTag`).
+        // The published class shape carries the field type under the
+        // newtype's *source* name, so seed every newtype the touched
+        // module declares under that same source name. Then a
+        // `ProjectTag`-typed field flowing into a `str` slot widens via
+        // the consumer's escape-upward rule. `entry().or_insert` keeps
+        // any alias-keyed entry the per-binding loop already wrote.
+        for (newtype_name, base) in &module_shapes.newtypes {
+            external
+                .newtypes
+                .entry(newtype_name.clone())
+                .or_insert_with(|| base.clone());
+        }
+        // Same reasoning for transparent type aliases, enums, and frozen
+        // classes reached only through an imported signature (a function
+        // returning `Report`, a parameter typed as an imported enum, a
+        // field of an imported frozen class). Seed each touched module's
+        // declarations under their source names; `entry().or_insert`
+        // preserves any alias-keyed entry from the per-binding loop.
+        for (alias_name, alias) in &module_shapes.type_aliases {
+            external
+                .type_aliases
+                .entry(alias_name.clone())
+                .or_insert_with(|| alias.clone());
+        }
+        for (enum_name, members) in &module_shapes.enums {
+            external
+                .enums
+                .entry(enum_name.clone())
+                .or_insert_with(|| members.clone());
+        }
+        for frozen_name in &module_shapes.frozen_classes {
+            external.frozen_classes.insert(frozen_name.clone());
+        }
+    }
+    // Bare module imports (`import models`, then `models.AttributedSpend`)
+    // produce bindings with no `member`, so the per-binding loop above
+    // skips them entirely — yet `models.AttributedSpend.project: ProjectTag`
+    // needs `ProjectTag` in `external.newtypes` to widen into a `str` slot
+    // exactly as the `from models import …` form does. Seed each bare-
+    // imported module's transparent shapes (newtype / alias / enum / frozen)
+    // under their source names. `sealed_unions` stay member-gated — a
+    // variant-to-union upcast isn't reachable without the variant in scope —
+    // and this runs as a separate pass so it can't perturb the
+    // `modules_touched` / variant-remap bookkeeping above. (PR #191 review —
+    // chatgpt-codex-connector.)
+    for b in bindings {
+        let Some(info) = &b.import_info else { continue };
+        if info.member.is_some() {
+            continue;
+        }
+        let Some(module_shapes) = shapes_by_module.get(&info.module) else {
+            continue;
+        };
+        for (newtype_name, base) in &module_shapes.newtypes {
+            external
+                .newtypes
+                .entry(newtype_name.clone())
+                .or_insert_with(|| base.clone());
+        }
+        for (alias_name, alias) in &module_shapes.type_aliases {
+            external
+                .type_aliases
+                .entry(alias_name.clone())
+                .or_insert_with(|| alias.clone());
+        }
+        for (enum_name, members) in &module_shapes.enums {
+            external
+                .enums
+                .entry(enum_name.clone())
+                .or_insert_with(|| members.clone());
+        }
+        for frozen_name in &module_shapes.frozen_classes {
+            external.frozen_classes.insert(frozen_name.clone());
         }
     }
     external
@@ -1436,6 +1546,190 @@ let c: ApiClient = ApiClient(api_key=\"k\", base_url=\"u\")
         let mut db = TycDatabase::new();
         let diags = check_file_with_imports(&mut db, "main.ty".into(), main.into(), &registry);
         assert!(!diags.has_errors(), "{:?}", diags.errors());
+    }
+
+    /// The Dead Reckoning dogfooding report: `models` declares
+    /// `newtype ProjectTag = str` and an `AttributedSpend` whose
+    /// `project` field is typed `ProjectTag`. A consumer that imports
+    /// ONLY `AttributedSpend` (never `ProjectTag` by name) must still
+    /// widen `spend.project` into a `str` slot — the newtype is reached
+    /// through the imported class's field type, so the fix has to seed
+    /// it from `by_module` for every touched module, not just when the
+    /// newtype name itself appears in the import list.
+    #[test]
+    fn cross_module_newtype_field_widens_without_importing_newtype() {
+        let models = "\
+newtype ProjectTag = str
+
+class AttributedSpend:
+    project: ProjectTag
+    amount: float
+";
+        let registry = build_registry(&[("models", models)]);
+        let main = "\
+from models import AttributedSpend
+
+def first_key(spend: AttributedSpend) -> str:
+    let key: str = spend.project
+    return key
+";
+        let mut db = TycDatabase::new();
+        let diags = check_file_with_imports(&mut db, "main.ty".into(), main.into(), &registry);
+        assert!(
+            !diags.has_errors(),
+            "imported newtype field must widen to its base type; got: {:?}",
+            diags.errors()
+        );
+    }
+
+    /// Bare `import models` form of the field-widening case: the binding
+    /// for `models` carries no `member`, so the per-binding seeding loop
+    /// skips it — the dedicated bare-import pass must still seed
+    /// `ProjectTag` so `spend.project` widens. (PR #191 review.)
+    #[test]
+    fn cross_module_newtype_field_widens_via_bare_module_import() {
+        let models = "\
+newtype ProjectTag = str
+
+class AttributedSpend:
+    project: ProjectTag
+    amount: float
+";
+        let registry = build_registry(&[("models", models)]);
+        let main = "\
+import models
+
+def first_key(spend: models.AttributedSpend) -> str:
+    let key: str = spend.project
+    return key
+";
+        let mut db = TycDatabase::new();
+        let diags = check_file_with_imports(&mut db, "main.ty".into(), main.into(), &registry);
+        assert!(
+            !diags.has_errors(),
+            "bare-imported newtype field must widen to its base type; got: {:?}",
+            diags.errors()
+        );
+    }
+
+    /// Companion to the above: importing the newtype by name (`from
+    /// models import ProjectTag`) and constructing a value with it must
+    /// also widen, exercising the per-binding re-keying branch through
+    /// the real db path.
+    #[test]
+    fn cross_module_imported_newtype_name_widens_to_base() {
+        let models = "pub newtype ProjectTag = str\n";
+        let registry = build_registry(&[("models", models)]);
+        let main = "\
+from models import ProjectTag
+
+def label(t: ProjectTag) -> str:
+    let s: str = t
+    return s
+";
+        let mut db = TycDatabase::new();
+        let diags = check_file_with_imports(&mut db, "main.ty".into(), main.into(), &registry);
+        assert!(
+            !diags.has_errors(),
+            "imported newtype name must widen to its base type; got: {:?}",
+            diags.errors()
+        );
+    }
+
+    /// Transparent type alias across modules: `type Report = ReportData`
+    /// must `unwrap_alias` in the consumer so a `ReportData` value flows
+    /// into a `Report`-typed slot. Reached here both by name (the alias
+    /// is imported) and through a return-type-only path.
+    #[test]
+    fn cross_module_transparent_type_alias_unwraps() {
+        let models = "\
+class ReportData:
+    title: str
+
+type Report = ReportData
+";
+        let registry = build_registry(&[("models", models)]);
+        let main = "\
+from models import Report, ReportData
+
+def wrap(d: ReportData) -> Report:
+    return d
+";
+        let mut db = TycDatabase::new();
+        let diags = check_file_with_imports(&mut db, "main.ty".into(), main.into(), &registry);
+        assert!(
+            !diags.has_errors(),
+            "imported transparent type alias must unwrap to its target; got: {:?}",
+            diags.errors()
+        );
+    }
+
+    /// Exhaustive `match` over an imported enum must NOT spuriously fire
+    /// `missing_return` — the consumer needs the enum's closed member set
+    /// (which it never imported by name) to see the match is exhaustive.
+    #[test]
+    fn cross_module_enum_exhaustive_match_no_false_missing_return() {
+        let models = "\
+enum Color:
+    RED
+    GREEN
+    BLUE
+";
+        let registry = build_registry(&[("models", models)]);
+        let main = "\
+from models import Color
+
+def label(c: Color) -> str:
+    match c:
+        case Color.RED:
+            return \"r\"
+        case Color.GREEN:
+            return \"g\"
+        case Color.BLUE:
+            return \"b\"
+";
+        let mut db = TycDatabase::new();
+        let diags = check_file_with_imports(&mut db, "main.ty".into(), main.into(), &registry);
+        assert!(
+            !diags.has_errors(),
+            "exhaustive match over an imported enum must not fire missing_return; got: {:?}",
+            diags.errors()
+        );
+    }
+
+    /// Soundness: a field write on an *imported* `frozen` class must trip
+    /// `frozen_assign` just as a local one does — otherwise the consumer
+    /// silently accepts a mutation that raises `FrozenInstanceError` at
+    /// runtime. (Frozen-ness is preprocessor line-based, so this also
+    /// exercises the `frozen_class_names` plumbing in
+    /// `extract_shapes_for_path`.)
+    #[test]
+    fn cross_module_frozen_class_field_write_errors() {
+        let models = "\
+class Config frozen:
+    port: int
+";
+        let registry = build_registry(&[("models", models)]);
+        let main = "\
+from models import Config
+
+def mutate(c: Config) -> None:
+    c.port = 9999
+";
+        let mut db = TycDatabase::new();
+        let diags = check_file_with_imports(&mut db, "main.ty".into(), main.into(), &registry);
+        assert!(
+            diags
+                .errors()
+                .iter()
+                .any(|e| e.to_string().contains("frozen")),
+            "field write on an imported frozen class must fire frozen_assign; got: {:?}",
+            diags
+                .errors()
+                .iter()
+                .map(|e| e.to_string())
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]
