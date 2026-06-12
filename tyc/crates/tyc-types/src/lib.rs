@@ -7001,7 +7001,22 @@ fn infer_expr_readonly(c: &Checker, e: &Expr) -> Type {
                         if sig.is_property {
                             sig.return_type.clone()
                         } else {
-                            Type::Unknown
+                            // A bound method accessed as a value (`b.fetch`) is
+                            // a callable. Model it as a `Function` carrying the
+                            // method's return type so a wrapping call
+                            // expression (`b.fetch()`) recovers that type in the
+                            // `Expr::Call` arm below — without this a
+                            // `match b.fetch(): case Ok(_)/case Err(_)` subject
+                            // typed as `Unknown`, so the exhaustiveness pass
+                            // skipped it and the missing-return analysis
+                            // false-fired (kilnlog #1). Free-function call
+                            // subjects already worked via the env `Function`
+                            // shape; this brings method calls to parity.
+                            Type::Function {
+                                params: vec![Type::Unknown; sig.arity],
+                                ret: Box::new(sig.return_type.clone()),
+                                variadic: false,
+                            }
                         }
                     } else {
                         Type::Unknown
@@ -15811,6 +15826,41 @@ impl Foo:
                 .iter()
                 .any(|e| matches!(e, TycError::MissingReturn { .. })),
             "exhaustive match on `self.<field>` must not fire missing_return: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn match_on_impl_method_call_returning_result_is_clean() {
+        // kilnlog #1: a `match` whose subject is a direct impl-method call
+        // returning `Result[T, E]`, with `case Ok(_)`/`case Err(_)` arms that
+        // all return/raise, falsely tripped missing_return. The readonly
+        // inference typed a (non-property) bound-method value as Unknown, so
+        // the call's return type never reached the exhaustiveness pass.
+        // Free-function-call and bound-`let` subjects already worked.
+        let src = "\
+class Box:
+    n: int
+
+impl Box:
+    def fetch(self) -> Result[int, str]:
+        if self.n > 0:
+            return Ok(self.n)
+        return Err(\"empty\")
+
+def broken(b: Box) -> int:
+    match b.fetch():
+        case Ok(v):
+            return v
+        case Err(e):
+            raise ValueError(e)
+";
+        let d = check(src);
+        assert!(
+            !d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::MissingReturn { .. })),
+            "exhaustive match on an impl-method call returning Result must not fire missing_return: {:?}",
             d.errors()
         );
     }

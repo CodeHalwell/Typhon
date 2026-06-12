@@ -1405,8 +1405,26 @@ fn stmt_uses_asyncio_qualified(stmt: &Stmt) -> bool {
         }
         Stmt::Try(t) => {
             stmts_use_asyncio_qualified(&t.body)
+                || t.handlers.iter().any(|h| {
+                    let ExceptHandler::ExceptHandler(h) = h;
+                    stmts_use_asyncio_qualified(&h.body)
+                })
                 || stmts_use_asyncio_qualified(&t.orelse)
                 || stmts_use_asyncio_qualified(&t.finalbody)
+        }
+        // A `gather:` lowered to `async with asyncio.TaskGroup()` can sit
+        // inside a `case` arm; without descending into match arms the
+        // `import asyncio` injection was skipped and the emitted module
+        // raised `NameError` at runtime (kilnlog #3). Guards can also carry
+        // qualified `asyncio.*` calls.
+        Stmt::Match(m) => {
+            expr_uses_asyncio_qualified(&m.subject)
+                || m.cases.iter().any(|case| {
+                    case.guard
+                        .as_ref()
+                        .is_some_and(|g| expr_uses_asyncio_qualified(g))
+                        || stmts_use_asyncio_qualified(&case.body)
+                })
         }
         _ => false,
     }
@@ -4275,6 +4293,45 @@ mod tests {
         let src = "x: int = 1\n\ndef f() -> None:\n    pass\n";
         let out = parse_and_desugar(src);
         assert!(!out.contains("dataclass"), "output:\n{out}");
+    }
+
+    #[test]
+    fn asyncio_injected_for_qualified_use_inside_match_arm() {
+        // `gather:` lowers to `async with asyncio.TaskGroup()`; when it sits
+        // inside a `case` arm the import injection skipped it because the
+        // asyncio-usage walker didn't descend into match statements, so the
+        // emitted module raised NameError at runtime (kilnlog #3).
+        let src = "async def both(flag: bool) -> int:\n    \
+                   match flag:\n        \
+                   case True:\n            \
+                   async with asyncio.TaskGroup() as tg:\n                \
+                   t = tg.create_task(one())\n            \
+                   return t.result()\n        \
+                   case False:\n            \
+                   return 0\n";
+        let out = parse_and_desugar(src);
+        assert!(
+            out.contains("import asyncio"),
+            "asyncio use inside a match arm must inject the import:\n{out}"
+        );
+    }
+
+    #[test]
+    fn asyncio_injected_for_qualified_use_inside_except_handler() {
+        // Same omission affected `try` handlers (the `Try` arm only walked
+        // body/orelse/finally) — descend into handlers too.
+        let src = "async def run() -> int:\n    \
+                   try:\n        \
+                   return await one()\n    \
+                   except ValueError:\n        \
+                   async with asyncio.TaskGroup() as tg:\n            \
+                   t = tg.create_task(two())\n        \
+                   return t.result()\n";
+        let out = parse_and_desugar(src);
+        assert!(
+            out.contains("import asyncio"),
+            "asyncio use inside an except handler must inject the import:\n{out}"
+        );
     }
 
     #[test]

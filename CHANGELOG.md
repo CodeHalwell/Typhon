@@ -4,6 +4,59 @@ All notable changes to Typhon are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely; the
 canonical phase-by-phase status lives in `docs/roadmap.md`.
 
+## 0.13.2 — 2026-06-12 — playground stress round (method-call `match`, multi-line `?`, `gather:`-in-`match` import, `fmt` round-trips)
+
+### Fixed — playground stress round (method-call `match`, multi-line `?`, `gather:` import injection, `fmt` round-trips)
+
+A round of app-building against v0.13.1 surfaced four defects, all fixed
+here. The full workspace suite and the example corpus stay green.
+
+- **`tyc::missing_return` false-fired on a `match` over a direct
+  impl-method call returning `Result[T, E]`.** `match b.fetch(): case
+  Ok(v): … case Err(e): …` (with every arm returning or raising) tripped
+  `missing_return`, while the same match over a free-function call or a
+  bound `let` name passed. The read-only inference that feeds the
+  exhaustiveness pass typed a non-`@property` bound-method *value*
+  (`b.fetch`) as `Unknown`, so the wrapping call's `Result` return type
+  never reached the coverage check. A bound method accessed as a value is
+  now modelled as a `Function` carrying the method's return type, so a
+  call expression (`b.fetch()`) recovers it — bringing method-call match
+  subjects to parity with free-function-call subjects.
+- **`?` after a multi-line call expression failed to parse.** A
+  propagation `?` on the physical line that closes a multi-line call —
+  `let total: int = add(` / `    1, 2` / `)?` — lowered the lone `)?` line
+  to `__typhon_q_0__ = )` and surfaced a spurious `tyc::parse`
+  ("Expected `,`, found name"). The `?` lowering now collapses a statement
+  whose trailing `?` sits on a later physical line than the start of its
+  expression onto one logical line first (joining with single spaces so
+  adjacent tokens never fuse, and blanking the consumed continuation lines
+  to keep line indices stable), so the existing single-line logic handles
+  it. Single-line `?`, plain multi-line calls, and `T?` annotations
+  (including multi-line ones) are untouched.
+- **`gather:` inside a `case` arm emitted `asyncio.TaskGroup()` without
+  injecting `import asyncio`.** The desugar pass that decides whether to
+  inject `import asyncio` walked `if` / `for` / `while` / `with` / `try`
+  bodies but not `match` arms, so a `gather:` nested in a `case` produced a
+  module that `NameError`ed at runtime. The asyncio-usage walker now
+  descends into `match` subjects, guards, and arm bodies (and, while there,
+  into the `except` handlers of a `try`, which it had also skipped).
+  Top-level and `if`-nested `gather:` were already correct, and the
+  de-dupe against an existing `import asyncio` is unchanged (no
+  double-injection).
+- **`tyc fmt` diverged from `tyc check`'s grammar and corrupted multi-line
+  `freeze let`.** Two formatter defects: (1) the validation parse rejected
+  the typed tuple-unpack form `let (a: float, b: float) = pair()` that
+  `tyc check` / `tyc build` accept, because the formatter's validation
+  pipeline omitted `expand_typed_let_unpack`; (2) reformatting a
+  **multi-line** `freeze let X = {` … `}` baked the internal
+  `__typhon_freeze__(` lowering wrapper into the `.ty` source — the
+  single-line restorer couldn't reverse the unclosed opener, and the `)`
+  appended to the closing line was never removed. The validation pipeline
+  now expands typed tuple-unpack, and the keyword-restoration pass reverses
+  the multi-line wrapper (stripping the `__typhon_freeze__(` opener and the
+  matching appended `)`, located by a bracket-depth walk). Single-line
+  `freeze let` round-trips and the build/freeze lowering are unchanged.
+
 ## 0.13.1 — 2026-06-11 — playground stress round (async await-propagation, Task await-unwrap, VM project run, fmt, pub enum)
 
 ### Fixed — playground stress round (async `?`, await-unwrap, VM project run, `fmt`, `pub enum`)

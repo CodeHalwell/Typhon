@@ -39,8 +39,8 @@ use tyc_syntax::{
     parse_module,
     preprocess::{
         expand_gather_blocks, expand_go_calls, expand_inline_question_ops, expand_multiline_guards,
-        expand_pipes, expand_question_ops, expand_with_chains, postprocess_full, preprocess_opts,
-        PreprocessOptions, StrippedKeyword, StrippedOptional,
+        expand_pipes, expand_question_ops, expand_typed_let_unpack, expand_with_chains,
+        postprocess_full, preprocess_opts, PreprocessOptions, StrippedKeyword, StrippedOptional,
     },
 };
 
@@ -84,9 +84,9 @@ pub fn format_source(source: &str, path: &str) -> Result<FormatResult, TycError>
     // output below is still derived from `prep.python_source` so the Typhon
     // sugar is preserved when the file is rewritten.
     let validation_input = expand_question_ops(&expand_inline_question_ops(&expand_pipes(
-        &expand_with_chains(&expand_go_calls(&expand_gather_blocks(
-            &expand_multiline_guards(&prep.python_source),
-        ))),
+        &expand_with_chains(&expand_go_calls(&expand_gather_blocks(&expand_multiline_guards(
+            &expand_typed_let_unpack(&prep.python_source),
+        )))),
     )));
     parse_module(&validation_input).map_err(|e| {
         let offset = usize::from(e.location.start());
@@ -1030,6 +1030,21 @@ mod tests {
         assert!(
             result.output.contains("let x"),
             "output should contain 'let x', got: {}",
+            result.output
+        );
+    }
+
+    #[test]
+    fn format_typed_tuple_unpack() {
+        // kilnlog #4: the formatter's validation parse rejected the typed
+        // tuple-unpack form that `tyc check` / `tyc build` accept, because the
+        // validation pipeline omitted `expand_typed_let_unpack`. The form must
+        // both pass validation and survive verbatim in the output.
+        let src = "def use() -> float:\n    let (a: float, b: float) = pair()\n    return a + b\n";
+        let result = format_source(src, "<test>").unwrap();
+        assert!(
+            result.output.contains("let (a: float, b: float) = pair()"),
+            "typed tuple-unpack must round-trip through fmt, got:\n{}",
             result.output
         );
     }
