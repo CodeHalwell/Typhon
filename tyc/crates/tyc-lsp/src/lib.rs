@@ -46,6 +46,13 @@ mod venv_introspect;
 /// Salsa-tracked `resolved_module` query instead.
 type ResolvedCache = Arc<Mutex<HashMap<String, (String, Arc<ResolvedModule>)>>>;
 
+/// Per-project-root cache of the editor lint knobs, tagged with the
+/// `typhon.toml` mtime they were read from (see the field doc on
+/// [`Backend::lint_options_cache`]). Aliased to keep the field type under
+/// clippy's `type_complexity` threshold, matching [`ResolvedCache`].
+type LintOptionsCache =
+    Arc<Mutex<HashMap<std::path::PathBuf, (Option<std::time::SystemTime>, tyc_analyse::LintOptions)>>>;
+
 /// The Typhon LSP backend. Holds a single shared salsa database and the
 /// `Client` handle used to send notifications back to the editor.
 ///
@@ -141,11 +148,7 @@ pub struct Backend {
     /// so the knobs stay current even for an editor that never sends
     /// `workspace/didChangeWatchedFiles`. The watcher additionally re-checks
     /// open documents on a `typhon.toml` edit so the refresh is immediate.
-    lint_options_cache: Arc<
-        Mutex<
-            HashMap<std::path::PathBuf, (Option<std::time::SystemTime>, tyc_analyse::LintOptions)>,
-        >,
-    >,
+    lint_options_cache: LintOptionsCache,
 }
 
 impl std::fmt::Debug for Backend {
