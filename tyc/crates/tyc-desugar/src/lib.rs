@@ -90,6 +90,13 @@ pub struct DesugarOptions {
     /// fields).  Accepted values: `"forbid"`, `"ignore"`, `"allow"`.
     /// Plumbed from `[emit] model-extra` in `typhon.toml`.
     pub model_extra: String,
+    /// When `true`, inject a `typhon_runtime.traceback.install()` call at the
+    /// top of this module's `if __name__ == "__main__":` block so an uncaught
+    /// exception's traceback is rewritten to point at `.ty` source (via the
+    /// emitted `.py.map` sidecars) with no manual `tyc trace` step. Plumbed
+    /// from `[emit] traceback-remap` in `typhon.toml`; default `false` so
+    /// existing projects (and runtime-free entry points) are unaffected.
+    pub traceback_remap: bool,
 }
 
 /// Desugar a Typhon module AST into a plain Python AST.
@@ -120,6 +127,7 @@ impl Default for DesugarOptions {
             skip_decoration_bases: Vec::new(),
             pub_names: Vec::new(),
             model_extra: "forbid".into(),
+            traceback_remap: false,
         }
     }
 }
@@ -134,7 +142,15 @@ pub fn desugar_module(module: &ModModule) -> DesugarOutput {
 /// functions opted into `@memo` and therefore need an injected
 /// `@functools.cache` decorator) through to the desugar pass.
 pub fn desugar_module_with(module: &ModModule, options: DesugarOptions) -> DesugarOutput {
-    let desugared_mod = desugar_mod_module_with(module, &options);
+    let mut desugared_mod = desugar_mod_module_with(module, &options);
+
+    // `[emit] traceback-remap`: prepend `typhon_runtime.traceback.install()`
+    // to the entry module's `if __name__ == "__main__":` block so uncaught
+    // exceptions are reported against `.ty` source automatically. Done before
+    // the runtime-need detection below so the injected import flags the
+    // typhon_runtime package for emission.
+    let injected_traceback =
+        options.traceback_remap && inject_traceback_install(&mut desugared_mod.body);
 
     let has_result_usage = stmts_use_result_names(&module.body);
     let has_any_runtime_import = has_any_typhon_runtime_import(&module.body);
@@ -152,8 +168,11 @@ pub fn desugar_module_with(module: &ModModule, options: DesugarOptions) -> Desug
     // flag here so `tyc build` emits the typhon_runtime/ package even
     // when no other runtime feature is used.
     let needs_freeze_runtime = stmts_use_freeze_call(&desugared_mod.body);
-    let needs_typhon_runtime =
-        has_result_usage || has_any_runtime_import || has_runtime_qualified || needs_freeze_runtime;
+    let needs_typhon_runtime = has_result_usage
+        || has_any_runtime_import
+        || has_runtime_qualified
+        || needs_freeze_runtime
+        || injected_traceback;
     // Only skip injection when an existing `from typhon_runtime
     // import …` already covers all three names. A partial import
     // (e.g. just `Ok`) would leave `Err`/`Result` undefined, so we
@@ -1041,6 +1060,93 @@ fn make_freeze_import() -> Stmt {
         level: 0,
         is_lazy: false,
     })
+}
+
+/// Build the two statements injected at the top of the entry module's
+/// `if __name__ == "__main__":` block when `[emit] traceback-remap` is on:
+///
+/// ```python
+///     from typhon_runtime.traceback import install as __typhon_install_tb__
+///     __typhon_install_tb__()
+/// ```
+///
+/// The installed `sys.excepthook` rewrites an uncaught exception's traceback
+/// to point at `.ty` source via the emitted `.py.map` sidecars — the same
+/// mapping `tyc trace` applies, but automatically and only for the entry
+/// script (library imports never trip the `__main__` guard).
+fn make_traceback_install_stmts() -> Vec<Stmt> {
+    let import = Stmt::ImportFrom(StmtImportFrom {
+        range: TextRange::default(),
+        node_index: AtomicNodeIndex::NONE,
+        module: Some(make_identifier("typhon_runtime.traceback")),
+        names: vec![Alias {
+            range: TextRange::default(),
+            node_index: AtomicNodeIndex::NONE,
+            name: make_identifier("install"),
+            asname: Some(make_identifier("__typhon_install_tb__")),
+        }],
+        level: 0,
+        is_lazy: false,
+    });
+    let call = Expr::Call(ExprCall {
+        range: TextRange::default(),
+        node_index: AtomicNodeIndex::NONE,
+        func: Box::new(Expr::Name(ExprName {
+            range: TextRange::default(),
+            node_index: AtomicNodeIndex::NONE,
+            id: Name::new("__typhon_install_tb__"),
+            ctx: ExprContext::Load,
+        })),
+        arguments: Arguments {
+            range: TextRange::default(),
+            node_index: AtomicNodeIndex::NONE,
+            args: Box::new([]),
+            keywords: Box::new([]),
+        },
+    });
+    let call_stmt = Stmt::Expr(ast::StmtExpr {
+        range: TextRange::default(),
+        node_index: AtomicNodeIndex::NONE,
+        value: Box::new(call),
+    });
+    vec![import, call_stmt]
+}
+
+/// True when `test` is the `__name__ == "__main__"` entry-point guard.
+fn is_main_guard(test: &Expr) -> bool {
+    let Expr::Compare(cmp) = test else {
+        return false;
+    };
+    let Expr::Name(left) = cmp.left.as_ref() else {
+        return false;
+    };
+    if left.id.as_str() != "__name__" || cmp.ops.len() != 1 {
+        return false;
+    }
+    if !matches!(cmp.ops[0], ast::CmpOp::Eq) {
+        return false;
+    }
+    matches!(
+        cmp.comparators.first(),
+        Some(Expr::StringLiteral(s)) if s.value.to_str() == "__main__"
+    )
+}
+
+/// Inject the traceback-installer statements at the top of the first
+/// top-level `if __name__ == "__main__":` block. Returns `true` when an
+/// injection was made (so the caller flags `needs_typhon_runtime`).
+fn inject_traceback_install(body: &mut [Stmt]) -> bool {
+    for stmt in body.iter_mut() {
+        if let Stmt::If(if_stmt) = stmt {
+            if is_main_guard(&if_stmt.test) {
+                let mut stmts = make_traceback_install_stmts();
+                stmts.append(&mut if_stmt.body);
+                if_stmt.body = stmts;
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// `true` when `body` already binds `__typhon_freeze__` as an alias of
@@ -4331,6 +4437,51 @@ mod tests {
         assert!(
             out.contains("import asyncio"),
             "asyncio use inside an except handler must inject the import:\n{out}"
+        );
+    }
+
+    #[test]
+    fn traceback_remap_injects_install_into_main_guard() {
+        let src = "def main() -> None:\n    pass\n\nif __name__ == \"__main__\":\n    main()\n";
+        let module = tyc_syntax::parse_module(src).expect("parse failed").into_syntax();
+        let out = desugar_module_with(
+            &module,
+            DesugarOptions {
+                traceback_remap: true,
+                ..Default::default()
+            },
+        );
+        let emitted = emit(&out.module);
+        assert!(
+            emitted.contains("from typhon_runtime.traceback import install as __typhon_install_tb__"),
+            "the installer import must be injected:\n{emitted}"
+        );
+        assert!(
+            out.needs_typhon_runtime,
+            "the injection must flag the typhon_runtime package for emission"
+        );
+        // The install call must live INSIDE the `__main__` guard so library
+        // imports never trip it.
+        let guard = emitted.find("__main__").expect("guard present");
+        let call = emitted
+            .find("__typhon_install_tb__()")
+            .expect("install call present");
+        assert!(call > guard, "install must be inside the __main__ block:\n{emitted}");
+    }
+
+    #[test]
+    fn traceback_remap_off_by_default_injects_nothing() {
+        let src = "def main() -> None:\n    pass\n\nif __name__ == \"__main__\":\n    main()\n";
+        let module = tyc_syntax::parse_module(src).expect("parse failed").into_syntax();
+        let out = desugar_module_with(&module, DesugarOptions::default());
+        let emitted = emit(&out.module);
+        assert!(
+            !emitted.contains("__typhon_install_tb__"),
+            "the default (off) must not inject the installer:\n{emitted}"
+        );
+        assert!(
+            !out.needs_typhon_runtime,
+            "a runtime-free entry must stay dependency-free"
         );
     }
 

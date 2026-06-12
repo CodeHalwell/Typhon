@@ -927,10 +927,11 @@ fn contains_typhon_only_tokens(source: &str) -> bool {
         {
             return true;
         }
-        // Pipe operator (`|>`) and postfix `?` survive preprocessing but the
-        // stock ruff parser will reject either.  A line-internal `|>` or a
-        // bare `?` that's not inside a string is good enough as a heuristic.
-        if line.contains("|>") || line.contains("?:") {
+        // Pipe operator (`|>`), the `as!` boundary cast, and postfix `?` all
+        // survive preprocessing but the stock ruff parser will reject them.
+        // A line-internal `|>` / `as!` / `?:` not inside a string is good
+        // enough as a heuristic.
+        if line.contains("|>") || line.contains("as!") || line.contains("?:") {
             return true;
         }
     }
@@ -1045,6 +1046,25 @@ mod tests {
         assert!(
             result.output.contains("let (a: float, b: float) = pair()"),
             "typed tuple-unpack must round-trip through fmt, got:\n{}",
+            result.output
+        );
+    }
+
+    #[test]
+    fn format_preserves_checked_cast() {
+        // `tyc fmt` validates via the expanded form but emits the surface
+        // syntax, so the `as!` cast must survive verbatim (not leak the
+        // `__typhon_checked_cast__` lowering).
+        let src = "def f(x: object) -> int:\n    let n = x as! int\n    return n\n";
+        let result = format_source(src, "<test>").unwrap();
+        assert!(
+            result.output.contains("as! int"),
+            "as! cast must survive fmt, got:\n{}",
+            result.output
+        );
+        assert!(
+            !result.output.contains("__typhon_checked_cast__"),
+            "the lowering must not leak into formatted source:\n{}",
             result.output
         );
     }

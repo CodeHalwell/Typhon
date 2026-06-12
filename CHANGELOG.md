@@ -4,6 +4,61 @@ All notable changes to Typhon are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely; the
 canonical phase-by-phase status lives in `docs/roadmap.md`.
 
+## 0.14.0 — 2026-06-12 — `as!` checked boundary cast + auto traceback remap
+
+Two ergonomics features motivated by a playground retrospective: the
+`unsafe:`-block-plus-re-assertion dance at every untyped boundary was the
+sharpest remaining ceremony, and runtime tracebacks pointing at emitted
+`.py` (rather than `.ty`) source was the sharpest debugging tax. Both are
+additive — every previously-accepted program type-checks identically — and
+the full workspace suite plus the example corpus stay green.
+
+### Added — `as!` checked boundary cast
+
+- **`EXPR as! TYPE`** is the one-line, *sound* replacement for the
+  `unsafe:` + re-assert idiom at an untyped boundary:
+
+  ```python
+  let data = resp.json() as! dict[str, int]   # was: unsafe: … then re-assert
+  let uid  = row[0] as! int
+  ```
+
+  The checker types the expression as `TYPE` (so the boundary value — which
+  may be `Any` — is accepted *without* an `unsafe:` block), and the cast
+  lowers to a runtime guard `checked_cast(EXPR, TYPE)` in the generated
+  `typhon_runtime/cast.py` that verifies the value's shape against `TYPE`
+  and raises `TypeError` on a mismatch. Unlike a static-only re-assertion
+  (which trusts the boundary blindly) or TypeScript's unchecked `as`, this
+  is genuinely *checked* — the structural check recurses through
+  parameterised containers (`list[int]`, `dict[str, int]`, `tuple[int, ...]`,
+  unions, `Optional`), so a JSON payload that is a `list` where you claimed
+  `dict[str, int]`, or a `dict[str, str]` where you claimed `dict[str, int]`,
+  is rejected at the boundary. `Any` / `object` targets and shapes the guard
+  can't model fall back to acceptance, so an `as!` can only reject values it
+  can prove wrong.
+- v1 scope: `as!` casts the entire preceding value expression on a single
+  physical line, in a value position (after `=` / `return` / `yield`, or as
+  a bare expression). It rides the existing `tyc-syntax` lowering pipeline
+  (`tyc-types` reads the target via the same path as `type[T]` inference, so
+  no special generic machinery was needed), the in-process VM treats it as
+  an identity passthrough (the authoritative structural check runs on the
+  `tyc build && python` path), and `tyc fmt` preserves the surface syntax.
+  A nested-in-call-arguments or multi-line `as!` is left for the AST-based
+  lowering migration; until then the parser surfaces a clean error.
+
+### Added — `[emit] traceback-remap`
+
+- **`[emit] traceback-remap = true`** (default `false`) injects a
+  `typhon_runtime.traceback.install()` call into the entry module's
+  `if __name__ == "__main__":` block. The installed `sys.excepthook` reads
+  the emitted `.py.map` sidecars and rewrites an uncaught exception's
+  traceback to point at `.ty` source — the same mapping `tyc trace` applies,
+  but automatically and with no manual step. It only touches the entry
+  script (library imports never trip the `__main__` guard) and falls back to
+  the previous hook on any failure, so it can only improve a traceback,
+  never suppress one. Default-off keeps existing projects and runtime-free
+  entry points byte-for-byte unchanged.
+
 ## 0.13.2 — 2026-06-12 — playground stress round (method-call `match`, multi-line `?`, `gather:`-in-`match` import, `fmt` round-trips)
 
 ### Fixed — playground stress round (method-call `match`, multi-line `?`, `gather:` import injection, `fmt` round-trips)

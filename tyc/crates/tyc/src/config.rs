@@ -89,6 +89,14 @@ pub struct EmitConfig {
     /// by [`TyphonConfig::validate`] with `ConfigError::InvalidModelExtra`.
     #[serde(default = "default_model_extra", rename = "model-extra")]
     pub model_extra: String,
+    /// When `true`, inject a `typhon_runtime.traceback.install()` call into
+    /// the entry module's `if __name__ == "__main__":` block so an uncaught
+    /// exception's traceback is rewritten to `.ty` source automatically (the
+    /// same mapping `tyc trace` applies). Defaults to `false` so existing
+    /// projects are unaffected and runtime-free entry points stay
+    /// dependency-free.
+    #[serde(default, rename = "traceback-remap")]
+    pub traceback_remap: bool,
 }
 
 impl Default for EmitConfig {
@@ -98,6 +106,7 @@ impl Default for EmitConfig {
             format: true,
             skip_decoration_bases: Vec::new(),
             model_extra: "forbid".into(),
+            traceback_remap: false,
         }
     }
 }

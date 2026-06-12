@@ -24,6 +24,7 @@ class-default = "dataclass" # or "pydantic"
 format = true               # post-process through ruff format
 skip-decoration-bases = []  # extra base classes that suppress @dataclass injection
 model-extra = "forbid"      # ConfigDict(extra=…) for model classes: "forbid" | "ignore" | "allow"
+traceback-remap = false     # auto-install a .ty-source traceback remapper in the entry __main__
 
 [strictness]
 no-implicit-any = true
@@ -83,6 +84,7 @@ pytest = "8.2"              # bare version → ==8.2
 | `format` | bool | Post-process emitted `.py` through `ruff format`. |
 | `skip-decoration-bases` | list of strings | Extra base-class names that suppress the automatic `@dataclasses.dataclass(slots=True)` decorator and trigger plain-class emission with a synthesised `__init__` calling `super().__init__()`. Matched by *last segment*, so `["BaseModel", "MyCustomBase"]` catches `pydantic.BaseModel` and `mylib.frameworks.MyCustomBase` regardless of how they're imported. Built-in entries (`Protocol`, `Enum`, `IntEnum`, `Flag`, `IntFlag`, `StrEnum`, `ABC`, `NamedTuple`, `BaseModel`, `App`) are auto-skipped without needing to be listed. |
 | `model-extra` | `"forbid"` \| `"ignore"` \| `"allow"` | Value for `ConfigDict(extra=…)` injected into every `model` class. Default `"forbid"` rejects unexpected fields at runtime. `"ignore"` silently drops them; `"allow"` passes them through as extra attributes. Unknown values are rejected at config load. |
+| `traceback-remap` | bool (default `false`) | When `true`, inject `typhon_runtime.traceback.install()` into the entry module's `if __name__ == "__main__":` block so an uncaught exception's traceback is rewritten to point at `.ty` source automatically (the same mapping `tyc trace` applies), with no manual step. Only the entry script is affected — library imports never trip the `__main__` guard — and the hook falls back to the previous behaviour on any failure, so it can only improve a traceback. Default-off keeps existing projects and runtime-free entry points dependency-free. |
 
 > **Always-on behaviour.** Two emit policies that used to be exposed in
 > `typhon.toml` are no longer configurable and run unconditionally:

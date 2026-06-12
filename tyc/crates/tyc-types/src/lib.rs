@@ -7042,6 +7042,16 @@ fn infer_expr_readonly(c: &Checker, e: &Expr) -> Type {
             }
         }
         Expr::Call(call) => {
+            // `__typhon_checked_cast__(EXPR, TYPE)` (the lowering of
+            // `EXPR as! TYPE`) reads as the target `TYPE` here too, so a
+            // `match x as! Shape:` subject or a chained cast resolves.
+            if let Expr::Name(n) = call.func.as_ref() {
+                if n.id.as_str() == "__typhon_checked_cast__"
+                    && call.arguments.args.len() == 2
+                {
+                    return type_from_annotation(&call.arguments.args[1], &c.classes);
+                }
+            }
             // Resolve the callee's return type so chained call
             // expressions (`get_client().method(...)`) can walk
             // through. A constructor call returning `Type::Class(_)`
@@ -11495,6 +11505,24 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
             }
         }
         Expr::Call(call) => {
+            // `EXPR as! TYPE` lowers (in tyc-syntax) to
+            // `__typhon_checked_cast__(EXPR, TYPE)`. The cast's static type
+            // is the target `TYPE` — read the second argument as a type
+            // expression. The value argument is the untyped boundary value
+            // and is accepted as anything, so a boundary cast needs no
+            // `unsafe:` block; at runtime `typhon_runtime.cast.checked_cast`
+            // verifies the shape and raises on a mismatch, so this is a
+            // *checked* cast rather than an unsound escape hatch.
+            if let Expr::Name(n) = call.func.as_ref() {
+                if n.id.as_str() == "__typhon_checked_cast__"
+                    && call.arguments.args.len() == 2
+                {
+                    // Walk the value argument so its own diagnostics still
+                    // surface, then discard its (boundary) type.
+                    let _ = infer_expr(c, &call.arguments.args[0]);
+                    return type_from_annotation(&call.arguments.args[1], &c.classes);
+                }
+            }
             // B2: a call of shape `first[int]([1, 2, 3])` where `first`
             // is a generic function will type-check (the subscript is
             // assumed to be a type-arg hint) but crash at runtime in
@@ -15861,6 +15889,35 @@ def broken(b: Box) -> int:
                 .iter()
                 .any(|e| matches!(e, TycError::MissingReturn { .. })),
             "exhaustive match on an impl-method call returning Result must not fire missing_return: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn checked_cast_types_as_target() {
+        // `x as! int` types as `int`, and the boundary value (`object`) needs
+        // no `unsafe:` block — the cast IS the boundary.
+        let src = "def f(x: object) -> int:\n    let n: int = x as! int\n    return n\n";
+        let d = check_full(src);
+        assert!(
+            d.errors().is_empty(),
+            "an `as!` cast to the bound type must check cleanly: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn checked_cast_target_must_satisfy_annotation() {
+        // The cast's static type is the target, so a mismatched binding
+        // annotation still fires `type_mismatch` (the cast is not a blanket
+        // `Any` escape hatch).
+        let src = "def f(x: object) -> str:\n    let n: str = x as! int\n    return n\n";
+        let d = check_full(src);
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::TypeMismatch { .. })),
+            "casting to `int` then binding as `str` must mismatch: {:?}",
             d.errors()
         );
     }
