@@ -2,3 +2,7 @@
 ## 2024-06-04 - Optimize Source Map Generation string formatting
 **Learning:** `format!` macros inside `build_source_map_v2` to join dynamically allocated strings (`n.to_string()`) causes excessive heap allocations and overhead. Given `lines.len()` could be huge for long files, it negatively impacts compilation speeds in hot paths. Using `itoa::Buffer` was an option but required adding a new dependency which violated the constraints.
 **Action:** Use manual `String::with_capacity` and manual string building using `push_str`/`push` alongside `std::fmt::Write::write_fmt` via the `write!` macro to avoid multiple runtime allocations while retaining correct output format without adding new dependencies.
+
+## 2024-06-12 - Resolve O(N^2) Source Map Generation string traversal bottleneck
+**Learning:** In `build_source_map_v2`, looking up the line number for a source file byte offset using `offset.min(source.len()); source.as_bytes()[..clamped].iter().filter(|&&b| b == b'\n').count()` requires scanning the string from the start every single time. Because this was called in an `O(N)` mapping operation over `line_offsets`, the algorithm degraded into `O(N * L)` complexity, creating severe bottlenecks on larger python source files.
+**Action:** When converting multiple byte offsets to line numbers, precompute an index of newline offsets (which is `O(L)`) and then use binary search via `partition_point` (which is `O(log K)` where `K` is the number of newlines). This reduces the complexity to `O(L + N log K)`.
