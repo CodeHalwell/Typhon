@@ -1,13 +1,13 @@
 ---
 name: typhon
-description: Write, check, build, debug, and migrate code in the Typhon language — a statically-typed, stricter superset of Python that compiles to clean CPython 3.13+ via the `tyc` binary. Use this skill whenever you are editing `.ty` / `.dty` / `typhon.toml` files, invoking any `tyc` subcommand (`build`, `check`, `fmt`, `lsp`, `init`, `run`, `repl`, `debug`, `trace`, `profile`, `explain`, `cheatsheet`, `stubtest`, `migrate`, `ty`, `add`, `remove`, `sync`), translating Python to Typhon, debugging Typhon-specific diagnostics, working on the Rust compiler crates under `tyc/crates/`, or answering any question about the language, the compiler pipeline, the in-process VM, the generated `typhon_runtime`, or the project's docs. Triggers include: file extensions `.ty` / `.dty` / `.py.map` / `typhon.toml`, the words "Typhon" / "tyc" / "let binding" / "mut binding" / "freeze let" / "newtype" / "pub" / "pub *" / "Result[T, E]" / "sealed union" / "interface" / "impl block" / "extend block" / "gather:" / "go f(x)" / "comptime" / "@gatherable" / "@pure" / "@memo" / "T?" / "plain class" / "class!" / "model class" / "lazy import" / "lazy let" / "unsafe:" / "guard" / "|>" / "typhon_runtime" / "tyc-vm" / "tyc-syntax" / "tyc-resolve" / "tyc-types" / "tyc-analyse" / "tyc-desugar" / "tyc-emit" / "tyc-format" / "tyc-db" / "tyc-diagnostics" / "tyc-lsp", and any error code matching `tyc::...`.
+description: Write, check, build, debug, and migrate code in the Typhon language — a statically-typed, stricter superset of Python that compiles to clean CPython 3.13+ via the `tyc` binary. Use this skill whenever you are editing `.ty` / `.dty` / `typhon.toml` files, invoking any `tyc` subcommand (`build`, `check`, `fmt`, `lsp`, `init`, `run`, `repl`, `debug`, `trace`, `profile`, `explain`, `cheatsheet`, `stubtest`, `migrate`, `ty`, `add`, `remove`, `sync`), translating Python to Typhon, debugging Typhon-specific diagnostics, working on the Rust compiler crates under `tyc/crates/`, or answering any question about the language, the compiler pipeline, the in-process VM, the generated `typhon_runtime`, or the project's docs. Triggers include: file extensions `.ty` / `.dty` / `.py.map` / `typhon.toml`, the words "Typhon" / "tyc" / "let binding" / "mut binding" / "freeze let" / "newtype" / "pub" / "pub *" / "Result[T, E]" / "sealed union" / "interface" / "impl block" / "extend block" / "gather:" / "go f(x)" / "comptime" / "@gatherable" / "@pure" / "@memo" / "T?" / "plain class" / "class!" / "model class" / "lazy import" / "lazy let" / "unsafe:" / "as!" / "checked cast" / "guard" / "|>" / "typhon_runtime" / "tyc-vm" / "tyc-syntax" / "tyc-resolve" / "tyc-types" / "tyc-analyse" / "tyc-desugar" / "tyc-emit" / "tyc-format" / "tyc-db" / "tyc-diagnostics" / "tyc-lsp", and any error code matching `tyc::...`.
 ---
 
 # Typhon — Language, Compiler, Runtime, and VM Skill
 
 Typhon is **a statically-typed, stricter superset of Python that emits clean CPython 3.13+** with zero runtime dependency on the toolchain. The compiler, language server, formatter, debugger wrapper, REPL, and tree-walking interpreter are all a single Rust binary called `tyc`. Every `.ty` file emits valid, idiomatic `.py`. Not all `.py` is valid Typhon.
 
-**Current release: v0.13.1** (2026-06-11). The language is **additive across the v0.3.0 → v0.13.1 line** — every previously-accepted program continues to type-check identically. The v0.10.0 → v0.13.x line is dominated by two themes: making the in-process VM a true drop-in for `tyc build && python`, and deepening compile-time type-checking of third-party code. v0.13.0 folds in a post-release code review that fixed ten correctness issues (two VM/CPython divergences — seeded `random.sample`, and `@staticmethod`/`@classmethod` binding `self` when read through an instance — and an `incompatible_override` false positive on valid LSP-widening overrides); v0.13.1 is a six-fix patch from a playground stress round (async-`?` `missing_await`, `await`-unwrap for `asyncio.Task`/`Future`, `tyc run` resolving the whole project tree, the VM binding imported `type` sealed-union aliases, `tyc fmt` string-awareness around `#` in a `freeze let`, and `pub enum` parsing). **One new language form** landed since v0.9.0 — the **`enum` keyword** (v0.11.0): `enum Name:` sugars over `enum.Enum`, auto-numbering bare members with `enum.auto()`. Highlights:
+**Current release: v0.14.0** (2026-06-12). The language is **additive across the v0.3.0 → v0.14.0 line** — every previously-accepted program continues to type-check identically. The v0.10.0 → v0.13.x line is dominated by two themes: making the in-process VM a true drop-in for `tyc build && python`, and deepening compile-time type-checking of third-party code. v0.13.0 folds in a post-release code review that fixed ten correctness issues (two VM/CPython divergences — seeded `random.sample`, and `@staticmethod`/`@classmethod` binding `self` when read through an instance — and an `incompatible_override` false positive on valid LSP-widening overrides); v0.13.1 is a six-fix patch from a playground stress round (async-`?` `missing_await`, `await`-unwrap for `asyncio.Task`/`Future`, `tyc run` resolving the whole project tree, the VM binding imported `type` sealed-union aliases, `tyc fmt` string-awareness around `#` in a `freeze let`, and `pub enum` parsing); v0.13.2 is a four-fix playground patch (`missing_return` false positive on a `match` over an impl-method call returning `Result`, `?` after a multi-line call, `gather:` inside a `case` arm not injecting `import asyncio`, and `tyc fmt` rejecting typed tuple-unpack / corrupting multi-line `freeze let`). **Two new language forms** landed since v0.9.0 — the **`enum` keyword** (v0.11.0): `enum Name:` sugars over `enum.Enum`, auto-numbering bare members with `enum.auto()`; and the **`as!` checked boundary cast** (v0.14.0): `EXPR as! TYPE` types as `TYPE` and lowers to a runtime structural check (`typhon_runtime.cast.checked_cast`), the sound one-line replacement for the `unsafe:`-block + re-assertion dance at an untyped boundary. v0.14.0 also adds the opt-in **`[emit] traceback-remap`** config (injects a `sys.excepthook` into the entry `__main__` that rewrites uncaught tracebacks to `.ty` source via the `.py.map` sidecars). Highlights:
 
 - **VM completeness (v0.10.0 / v0.11.0):** the tree-walking VM now dispatches operator / reflected / rich-comparison dunders on user instances, honours `__str__` / `__repr__` / `__len__` / `__getitem__` / `__contains__` / `__call__` / `__post_init__`, runs `@property` / `@classmethod`, materialises finite generators eagerly (`yield` / `yield from`, capped at 1M items), models `type(x)` as a real type object, and ships `Value::Complex`, dict-view kinds (`dict.keys()/.values()/.items()`), native `enum` / `datetime` / `pathlib` / `collections.defaultdict` shims, and a long tail of string / set / math / json / time builtins. VM value semantics now match CPython (value-based dataclass equality keyed on class identity, `Name(field=value)` repr, hashable instances, order-independent set equality, shortest-round-trip float repr).
 - **Deep compile-time library introspection (v0.12.0):** venv signature introspection now captures parameter and **return annotations**, so a wrong-*typed* argument to a fully-typed third-party dependency — **function or constructor** — is caught by `tyc check` / `tyc build` via the same `tyc::type_mismatch` machinery your own code uses (this also closed an in-project constructor-argument soundness hole). A dependency that can't be introspected now **warns** instead of silently skipping its checks (`[strictness] unintrospectable-dependency`, default `warn`). The introspection logic moved into a new shared crate **`tyc-venv`**, consumed by both the CLI and `tyc lsp` (so the editor surfaces third-party arg/type squiggles live).
@@ -162,6 +162,7 @@ The 30-second mental model. Every later section in this skill is detail under on
 | Memoised | `@memo def fib(n: int) -> int:` | `@functools.cache` |
 | Auto-gather opt-in | `@gatherable async def fetch_x(...) -> X:` | enables auto-gather rewrite |
 | Unsafe boundary | `unsafe: let x = mystery_lib()` | `if True:` (scope-preserving) |
+| Checked boundary cast (v0.14.0) | `let d = resp.json() as! dict[str, int]` | `d = __typhon_checked_cast__(resp.json(), dict[str, int])` (runtime-checked) |
 | `with` as-target typing (v0.7.0) | `with conn() as c:` types `c` from `__enter__` / `@contextmanager` factory's yield | works for async too |
 
 Run `tyc cheatsheet` for the same table at the terminal.
@@ -498,6 +499,22 @@ Inside `unsafe:`, expressions that would otherwise infer `Any` bind freely. Valu
 
 For long-lived dependencies, write a `.dty` stub instead. Common idiom: an `unsafe:` block always ends in `return checked` or `raise RuntimeError("unreachable")` — never let the block be the last thing in a non-`-> None` function.
 
+### 5.10 `as!` — checked boundary cast (v0.14.0)
+
+`EXPR as! TYPE` is the one-line, **sound** alternative to an `unsafe:` block plus re-assertion when you cross a single untyped boundary (a `sqlite3` row, `resp.json()`, a `redis.get` payload):
+
+```python
+let data = resp.json() as! dict[str, int]    # no unsafe: block needed
+let uid  = row[0] as! int
+```
+
+- The checker types the whole expression as `TYPE`, so the boundary value (which may be `Any`) flows in freely — no `unsafe:` region, no `unsafe_value_leak` footgun. It rides the same machinery as `type[T]` generic inference, not a bespoke special case.
+- It lowers (in `tyc-syntax`) to `__typhon_checked_cast__(EXPR, TYPE)`, resolved via an injected `from typhon_runtime.cast import checked_cast as __typhon_checked_cast__`. At runtime `checked_cast` verifies the value's shape against `TYPE` **recursively** (scalars, `list[X]` / `set[X]` / `frozenset[X]`, `dict[K, V]`, fixed- and variadic-`tuple[...]`, unions / `Optional`) and raises `TypeError` on a mismatch. So unlike a static-only re-assertion (which trusts the boundary blindly) or TypeScript's unchecked `as`, an `as!` can only let through values it can't *prove* wrong. `Any` / `object` targets and shapes it can't model fall back to acceptance.
+- `int → float` (and `bool → int`) widening is honoured, so a JSON int cast `as! float` does not spuriously fail.
+- The in-process VM treats `as!` as an identity passthrough (the authoritative structural check runs on the `tyc build && python` path); `tyc fmt` preserves the surface syntax.
+
+**v1 scope:** `as!` casts the entire preceding value expression on a **single physical line**, in a value position — after `=` / augmented `op=` / `return` / `yield`, or as a bare expression. An `as!` nested inside call arguments, or whose value spans multiple lines, is not yet supported (it's slated for the AST-based lowering migration); until then the parser surfaces a clean error rather than miscompiling. Prefer `model X:` for a boundary you validate repeatedly, a `.dty` stub for a long-lived dependency, and `as!` for an ad-hoc one-off shape assertion.
+
 ---
 
 ## 6. v0.3.0 — annoyance-killing language features
@@ -578,7 +595,7 @@ Plus `tyc::unsafe_value_leak`, `tyc::pattern_shadows_outer`, and `tyc::extend_bu
 
 ## 7. v0.12.0 highlights
 
-The v0.3.0 → v0.12.0 line is **additive** on the accepted surface. Every previously-accepted program continues to type-check identically, and `enum` (v0.11.0) is the only new language form. The behaviour changes are all in the **VM**: the v0.8.0 switch to arbitrary-precision integers, and the v0.11.0 alignment of VM value semantics with CPython (value-based dataclass equality / repr / hashing, order-independent set equality, CPython-matching float repr) — programs that relied on the old VM behaviour now compute different (correct) results. Highlights newest-first:
+The v0.3.0 → v0.12.0 line is **additive** on the accepted surface. Every previously-accepted program continues to type-check identically, and `enum` (v0.11.0) is the only new language form **in that window** (the `as!` checked boundary cast landed later, in v0.14.0). The behaviour changes are all in the **VM**: the v0.8.0 switch to arbitrary-precision integers, and the v0.11.0 alignment of VM value semantics with CPython (value-based dataclass equality / repr / hashing, order-independent set equality, CPython-matching float repr) — programs that relied on the old VM behaviour now compute different (correct) results. Highlights newest-first:
 
 ### v0.12.0 — VM `__lt__` parity, dict/str builtins, deep library introspection
 
@@ -1125,6 +1142,7 @@ class-default = "dataclass"      # or "pydantic". Unknown values → tyc::invali
 format = true                    # post-process through ruff format
 model-extra = "forbid"           # "forbid" | "allow" | "ignore"
 skip-decoration-bases = []       # extra base-class names suppressing the auto @dataclass decoration. Matched by last segment.
+traceback-remap = false          # (v0.14.0) inject a `.ty`-source traceback remapper into the entry `__main__`
 # pyi-stubs is always on — every .dty emits a .pyi
 
 [strictness]
@@ -1170,6 +1188,8 @@ Notes on always-on behaviour:
 `unintrospectable-dependency` (v0.12.0) covers the most dangerous failure mode of third-party checking: a *skipped* check looked identical to a clean pass. It fires when a declared, imported dependency can't be introspected (no reachable `.venv` / `python3`, not installed, or no introspectable signatures). Clear it by installing deps (`uv sync`) or shipping a `.dty` stub. Per-top-level success tracking means a package whose root introspects fine isn't flagged because one submodule failed.
 
 `allow-secret-comptime` (lives in `[strictness]`; wired through in v0.10.0, seeded into `tyc init`'s scaffold in v0.11.0) silences `tyc::contains_secret_literal` when set `true`.
+
+`traceback-remap` (v0.14.0, `[emit]`, default `false`) injects `typhon_runtime.traceback.install()` at the top of the entry module's `if __name__ == "__main__":` block. The installed `sys.excepthook` loads the emitted `.py.map` sidecars and rewrites each `File "…​.py", line N` traceback frame to the corresponding `.ty` location — the same mapping `tyc trace` applies, but automatically and only for the entry script (library imports never trip the `__main__` guard). It falls back to the previous hook on any failure, so it can only improve a traceback, never suppress one. Default-off keeps existing projects and runtime-free entry points byte-for-byte unchanged (a project with no other runtime feature stays free of the generated `typhon_runtime/` package).
 
 `auto-gather` independence rules:
 
@@ -1328,6 +1348,8 @@ The core pipeline is **strict** — every stage crate only depends on its upstre
 | `lazy.py` | `_LazyModule` / `lazy_import(name)`; `_LazyValue` / `lazy_let(factory)` |
 | `parallel.py` | `map_pure(fn, iterable)` — `concurrent.futures.ThreadPoolExecutor`-backed parallel map; degrades to sequential on GIL-locked CPython |
 | `freeze.py` | `deep_freeze(obj)` — recursively replaces `list → tuple`, `dict → MappingProxyType`, `set → frozenset`; raises `TypeError` on un-freezable values at startup |
+| `cast.py` (v0.14.0) | `checked_cast(value, tp)` — backs `EXPR as! TYPE`; recursively verifies the value's shape against `tp` (scalars, parametric containers, unions/`Optional`) and raises `TypeError` on a mismatch |
+| `traceback.py` (v0.14.0) | `install()` — sets a `sys.excepthook` that rewrites uncaught-exception frames to `.ty` source via the `.py.map` sidecars; emitted only when `[emit] traceback-remap = true` |
 | `stdlib.py` | Internal helpers used by lowering passes |
 
 **The runtime is generated; users do not edit it and do not `pip install` it.** Regenerated on every `tyc build`. There is no PyPI package — every project ships its own copy alongside the emitted `.py`.
@@ -1519,7 +1541,7 @@ When you edit `.ty` files in this repo or a downstream project:
 10. **`lazy import name = module`** for expensive optional deps; never `lazy from ... import ...`.
 11. **`comptime let` for build-time constants** (especially required env vars). Don't put secrets there — use `os.environ[...]` at runtime.
 12. **`@pure` only when the six conditions hold.** Mark `@memo` separately or use `@pure(memo=True)`. Never silently rely on `auto-memoise` for code others read.
-13. **`unsafe:` is a *lexical* region.** Re-assert types at the boundary, don't smuggle `Unsafe[T]` outward. Always end the block with a re-assertion or an unreachable raise.
+13. **`unsafe:` is a *lexical* region.** Re-assert types at the boundary, don't smuggle `Unsafe[T]` outward. Always end the block with a re-assertion or an unreachable raise. For a *single* one-off boundary value, prefer **`EXPR as! TYPE`** (v0.14.0) — it's one line, needs no block, and is runtime-checked (so it's sound, unlike a bare re-assertion). Reach for `model X:` when you validate the same shape repeatedly, a `.dty` stub for a long-lived dependency.
 14. **For multi-file projects, lean on `pub` + `pub *`.** See [PACKAGING.md](PACKAGING.md).
 15. **After significant edits, run `tyc fmt src/ && tyc check src/`** and read the diagnostics. The checker is the source of truth.
 16. **Read the emitted Python** for any non-trivial feature you haven't seen lower before (`tyc build` then look at `build/*.py`). The lowering is the spec.
@@ -1580,6 +1602,7 @@ When you edit the Rust compiler:
 | Pure assertion | `@pure def f(...) -> T:` |
 | Memoised | `@memo def fib(n: int) -> int:` |
 | Type-check escape | `unsafe: ...` (followed by re-assertion or unreachable raise) |
+| Checked boundary cast | `let d = resp.json() as! dict[str, int]` |
 | Entry guard | `if __name__ == "__main__": main()` |
 
 ---

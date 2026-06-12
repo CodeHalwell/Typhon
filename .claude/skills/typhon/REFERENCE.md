@@ -4,7 +4,7 @@ Every Typhon-specific form, listed side-by-side with the Python it lowers to. Fo
 
 **Convention:** Typhon source on the left or above; emitted Python on the right or below. Where formatting matters, code is shown verbatim from the printer.
 
-**Current release: v0.13.1.** Forms tagged with a version annotation (`(v0.5.0)` etc.) landed in that release; everything else has been in Typhon since v0.1.0 or v0.2.0. The only new language *form* since v0.9.0 is the `enum` keyword (v0.11.0); v0.10.0–v0.13.1 are otherwise VM-completeness, compile-time-checking, and CPython-parity work (v0.13.1 a six-fix bug patch), not new syntax.
+**Current release: v0.14.0.** Forms tagged with a version annotation (`(v0.5.0)` etc.) landed in that release; everything else has been in Typhon since v0.1.0 or v0.2.0. The new language *forms* since v0.9.0 are the `enum` keyword (v0.11.0) and the `as!` checked boundary cast (§13.1, v0.14.0); v0.10.0–v0.13.x are otherwise VM-completeness, compile-time-checking, and CPython-parity work (v0.13.1 / v0.13.2 are bug patches), and v0.14.0 also adds the opt-in `[emit] traceback-remap` config — not new syntax.
 
 ---
 
@@ -1222,6 +1222,38 @@ def parse_node(node: object) -> float:
     raise RuntimeError("unreachable")
 ```
 
+### 13.1 `as!` — checked boundary cast (v0.14.0)
+
+For a single one-off boundary value, `as!` is the lighter, *checked* alternative to an `unsafe:` block:
+
+```python
+# Typhon
+def load(s: str) -> dict[str, int]:
+    let data = json.loads(s) as! dict[str, int]
+    return data
+```
+
+```python
+# Emitted Python
+from typhon_runtime.cast import checked_cast as __typhon_checked_cast__
+
+def load(s: str) -> dict[str, int]:
+    data = __typhon_checked_cast__(json.loads(s), dict[str, int])
+    return data
+```
+
+The checker types `EXPR as! TYPE` as `TYPE`, so the boundary value (here `json.loads` → `Any`) flows in without an `unsafe:` block. At runtime `checked_cast` verifies the value's shape against `TYPE` **recursively** and raises `TypeError` on a mismatch — so unlike a static-only re-assertion it actually enforces the claimed type:
+
+```python
+load('{"port": 8080}')   # → {'port': 8080}
+load('[1, 2, 3]')        # → TypeError: as! cast failed: value of type list does not match dict[str, int]
+load('{"port": "x"}')    # → TypeError (dict[str, str] ≠ dict[str, int]; element check recurses)
+```
+
+Modelled shapes: scalars (`int` / `str` / `bool` / `float` / `bytes` / `None`), `list[X]` / `set[X]` / `frozenset[X]`, `dict[K, V]`, fixed- and variadic-`tuple[...]`, unions / `Optional`. `int → float` and `bool → int` widening is honoured. `Any` / `object` targets and shapes it can't model fall back to acceptance, so `as!` only ever rejects values it can prove wrong. The VM treats it as identity (the build path enforces); `tyc fmt` preserves it.
+
+**v1 scope:** single physical line, value position (after `=` / `op=` / `return` / `yield`, or a bare expression). Nested-in-call-args and multi-line forms error cleanly and await the AST-based lowering migration.
+
 ---
 
 ## 14. Source maps
@@ -1233,3 +1265,4 @@ def parse_node(node: object) -> float:
 - `tyc debug` source-mapping wrapper (v0.5.0) consumes to overload pdb's `do_list`/`do_where`/`format_stack_entry`/`prompt` so the entire debugger UI reads `.ty`
 - `tyc ty` (v0.5.0) consumes to remap `ty`'s `.py:LINE:COL` diagnostics back to `.ty` coordinates
 - `tyc lsp` consumes for go-to-definition across the `.ty` ↔ `.py` boundary
+- `typhon_runtime/traceback.py` (v0.14.0, when `[emit] traceback-remap = true`) consumes them at **runtime**: the installed `sys.excepthook` reads the sidecars from the running script's `.sourcemaps/` dir and rewrites an uncaught exception's frames to `.ty` — the `tyc trace` mapping, applied automatically

@@ -14,8 +14,10 @@ Two things live under "runtime" in Typhon: the **generated `typhon_runtime/` pac
 - `typhon_runtime.lazy.lazy_import` (from `lazy import` lowering)
 - `typhon_runtime.parallel.map_pure` (from `[strictness] auto-parallel`)
 - `typhon_runtime.freeze.deep_freeze` (from `freeze let`)
+- `typhon_runtime.cast.checked_cast` (from `EXPR as! TYPE`) — v0.14.0
+- `typhon_runtime.traceback.install` (from `[emit] traceback-remap = true`) — v0.14.0
 
-The package source is embedded as `const &str` templates in `tyc/src/commands/build.rs` (`TYPHON_RUNTIME_INIT_PY`, `TASKS_PY`, `LAZY_PY`, `STDLIB_PY`, `RESULT_PY`, `PARALLEL_PY`, `FREEZE_PY`).
+The package source is embedded as `const &str` templates in `tyc/src/commands/build.rs` (`TYPHON_RUNTIME_INIT_PY`, `TASKS_PY`, `LAZY_PY`, `STDLIB_PY`, `RESULT_PY`, `PARALLEL_PY`, `FREEZE_PY`, `CAST_PY`, `TRACEBACK_PY`).
 
 ### 1.1 Package layout
 
@@ -27,6 +29,8 @@ The package source is embedded as `const &str` templates in `tyc/src/commands/bu
 | `lazy.py` | `_LazyModule` / `lazy_import(name)` — attribute-proxy with double-checked locking. `_LazyValue` / `lazy_let(factory)` — sentinel-cached single-shot evaluator. |
 | `parallel.py` | `map_pure(fn, iterable)` — `concurrent.futures.ThreadPoolExecutor`-backed parallel map; degrades to sequential on GIL-locked CPython. Used by list/set/dict comprehension rewrites under `auto-parallel`. |
 | `freeze.py` | `deep_freeze(obj)` — recursively replaces `list → tuple`, `dict → MappingProxyType`, `set → frozenset`; raises `TypeError` at startup on un-freezable values (file handles, sockets, generators, non-frozen dataclasses). |
+| `cast.py` (v0.14.0) | `checked_cast(value, tp)` — backs `EXPR as! TYPE`. Recursively verifies `value` against `tp` via `typing.get_origin`/`get_args` (scalars, `list`/`set`/`frozenset`/`dict`/`tuple`, unions/`Optional`), honouring `int → float` widening; raises `TypeError` on a mismatch, returns the value on success. Targets it can't model (`Any`/`object`/TypeVars) pass through. |
+| `traceback.py` (v0.14.0) | `install()` — sets a `sys.excepthook` that loads the running script's `.sourcemaps/*.py.map`, then text-rewrites each `File "…​.py", line N` frame to the `.ty` location. Emitted only when `[emit] traceback-remap = true`; the entry module's `__main__` block calls `install()`. |
 | `stdlib.py` | Internal helpers used by lowering passes |
 
 ### 1.2 User-facing contract
@@ -244,6 +248,8 @@ The VM walks the project source root and loads sibling `.ty` modules on demand. 
 ### 2.4c Freeze / comptime parity with `tyc build` (v0.9.0)
 
 `freeze let CFG = {...}` recursively wraps the value (list → tuple, dict → mappingproxy-tagged dict, set → frozenset) so mutations through aliased references raise the same `TypeError` CPython's `MappingProxy` does. `comptime let X = ...` inlines via the substitution pass shared with `tyc build`, so `comptime let PORT = int(env(...))` no longer crashes with `NameError: env is not defined` under `tyc run`.
+
+`EXPR as! TYPE` (v0.14.0) runs under the VM as an **identity passthrough** — both the root `__typhon_checked_cast__` builtin and the `typhon_runtime.cast.checked_cast` module member return the value unchanged. The static type is already pinned to `TYPE` by the checker; the *recursive structural* runtime check is enforced on the `tyc build && python build/main.py` path (the VM would need to interpret the type descriptor to replicate it), so a deliberately-wrong `as!` passes silently under `tyc run` but is caught by the compiled path. Use `tyc run --compile` when you want the boundary check to fire.
 
 ### 2.5 Not supported (surfaces as `NotImplementedError` or `ImportError`)
 

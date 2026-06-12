@@ -4,7 +4,7 @@ The errors and surprises that bite people who try to write Typhon as if it were 
 
 For each entry: **trigger → diagnostic → fix**.
 
-Current release: **v0.12.0**. Pitfalls tagged with a version annotation landed in that release. Pitfalls 61–75 are the v0.9.0 cleanup additions covering the daily-driver VM, type-checker covariance and narrowing gaps, and multi-file project support; pitfalls 76+ cover the v0.10.0–v0.12.0 VM-completeness, `enum`, and third-party-type-checking surface.
+Current release: **v0.14.0**. Pitfalls tagged with a version annotation landed in that release. Pitfalls 61–75 are the v0.9.0 cleanup additions covering the daily-driver VM, type-checker covariance and narrowing gaps, and multi-file project support; pitfalls 76+ cover the v0.10.0–v0.12.0 VM-completeness, `enum`, and third-party-type-checking surface; pitfalls 81–82 cover the v0.14.0 `as!` checked boundary cast.
 
 ---
 
@@ -1427,6 +1427,33 @@ print(Point(1, 2) == Point(1, 2))   # tyc run: False before v0.11.0, True now
 ```
 
 **Trigger:** code whose output depended on the VM's pre-v0.11.0 behaviour. **What changed:** dataclass equality is now value-based (keyed on class *identity*, so same-named classes from different modules don't collide), instance `repr` is `Name(field=value, …)`, instances are hashable, set / frozenset equality is order-independent, and float `repr` is CPython's shortest round-tripping form. These now **match `tyc build && python`** — the old VM behaviour was the bug. **Fix:** none needed; just be aware `tyc run` output may differ from a pre-v0.11.0 run (it now agrees with CPython). Same spirit as the v0.8.0 BigInt switch.
+
+## 81. `as!` nested in a call argument or spanning multiple lines (v0.14.0)
+
+```python
+let ok = validate(payload as! dict[str, int])      # ❌ v1: as! not supported in call args
+let cfg = load(                                    # ❌ v1: as! must be on one physical line
+    raw
+) as! dict[str, int]
+```
+
+**Trigger:** putting `as!` anywhere other than the top of a single-line value position. **Why:** v1 lowers `as!` line-based in `tyc-syntax` (like the other sugar), and a cast casts the *entire* preceding value on one physical line — a nested or multi-line `as!` isn't recognised, so the `as!` survives to the parser and you get a clean `tyc::parse` error (never a silent miscompile). **Fix:** bind first, then cast on its own line:
+
+```python
+let raw_data = load(raw)                # multi-line / nested expression
+let data = raw_data as! dict[str, int]  # then the cast, one line, top-level
+ok = validate(data)
+```
+
+Supported positions: `let`/`mut` RHS, `x = …`, augmented `x += …`, `return …`, `yield …`, and bare expression statements. (The nested / multi-line forms are slated for the AST-based lowering migration, which lifts the same restriction off multi-line `?`.)
+
+## 82. Expecting `as!` to enforce its check under `tyc run` (v0.14.0)
+
+```python
+let n = some_value as! int    # tyc run: passes even if some_value is a str
+```
+
+**Trigger:** relying on the boundary check to fire in the VM. **Why:** the in-process VM treats `as!` as an identity passthrough — the *recursive structural* runtime check lives in `typhon_runtime/cast.py` and runs on the compiled path. **Fix:** the static type is still pinned to the target everywhere; for the *runtime* enforcement, use `tyc build && python build/main.py` (or `tyc run --compile`). `tyc check` already rejects a target that doesn't satisfy the surrounding annotation, so most mistakes are caught before runtime regardless.
 
 ---
 
