@@ -523,6 +523,7 @@ fn shapes_from_introspected(intro: &IntrospectedModule) -> ModuleShapes {
         type_aliases: HashMap::new(),
         enums: HashMap::new(),
         frozen_classes: std::collections::HashSet::new(),
+        gatherable_async_fns: std::collections::HashSet::new(),
     }
 }
 

@@ -3848,6 +3848,14 @@ pub struct ModuleShapes {
     /// it, the consumer silently accepted a mutation that raises
     /// `FrozenInstanceError` at runtime (a cross-module soundness gap).
     pub frozen_classes: std::collections::HashSet<String>,
+    /// Names of `async def`s carrying the `@gatherable` decorator (the
+    /// author's attestation that the function is safe to run concurrently
+    /// with peers). Published so the `auto-gather` build pass can fold a
+    /// run of independent awaits that call a `@gatherable` function
+    /// **imported from another module**, not just same-module ones —
+    /// `from services import fetch_user` where `fetch_user` is
+    /// `@gatherable` in `services`.
+    pub gatherable_async_fns: std::collections::HashSet<String>,
 }
 
 /// Imports resolved to their source modules' [`ModuleShapes`], keyed
@@ -4124,6 +4132,31 @@ pub fn extract_module_shapes(module: &ModModule) -> ModuleShapes {
         }
     }
 
+    // `@gatherable` async functions (top-level and class methods), so the
+    // `auto-gather` build pass can fold runs that call them across module
+    // boundaries. Mirrors `tyc_analyse::collect_gatherable_async_fn_names`
+    // — kept here as a few lines of AST inspection rather than a
+    // dependency edge from `tyc-types` onto `tyc-analyse`.
+    let mut gatherable_async_fns: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    for stmt in &module.body {
+        match stmt {
+            Stmt::FunctionDef(f) if f.is_async && has_gatherable_decorator(&f.decorator_list) => {
+                gatherable_async_fns.insert(f.name.as_str().to_owned());
+            }
+            Stmt::ClassDef(c) => {
+                for inner in &c.body {
+                    if let Stmt::FunctionDef(f) = inner {
+                        if f.is_async && has_gatherable_decorator(&f.decorator_list) {
+                            gatherable_async_fns.insert(f.name.as_str().to_owned());
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
     ModuleShapes {
         class_shapes,
         class_type_params,
@@ -4138,7 +4171,18 @@ pub fn extract_module_shapes(module: &ModModule) -> ModuleShapes {
         // metadata (`extract_shapes_for_path` / `module_shapes_query`)
         // fill this in via `frozen_class_names`.
         frozen_classes: std::collections::HashSet::new(),
+        gatherable_async_fns,
     }
+}
+
+/// `true` when `decorators` contains `@gatherable` (bare or call form).
+/// Mirrors `tyc_analyse::auto_gather::has_gatherable_decorator`.
+fn has_gatherable_decorator(decorators: &[ruff_python_ast::Decorator]) -> bool {
+    decorators.iter().any(|d| match &d.expression {
+        Expr::Name(n) => n.id.as_str() == "gatherable",
+        Expr::Call(c) => matches!(&*c.func, Expr::Name(n) if n.id.as_str() == "gatherable"),
+        _ => false,
+    })
 }
 
 /// Type-check a module with knowledge of which lines opened an `unsafe:`
@@ -21550,6 +21594,51 @@ def label(s: Sub) -> str:
              producer's hierarchy is fully known but `Base` wasn't \
              explicitly imported; got: {:?}",
             d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    /// `extract_module_shapes` publishes the names of `@gatherable`
+    /// async functions (top-level and class methods) so the cross-module
+    /// auto-gather build pass can fold runs that call them from another
+    /// module. Undecorated async fns and sync fns are excluded.
+    #[test]
+    fn extract_publishes_gatherable_async_fns() {
+        let src = "\
+@gatherable
+async def fetch_user(uid: int) -> int:
+    return uid
+
+async def fetch_posts(uid: int) -> int:
+    return uid
+
+def helper(x: int) -> int:
+    return x
+
+class Service:
+    @gatherable
+    async def fetch_orders(self, uid: int) -> int:
+        return uid
+";
+        let prep = preprocess(src);
+        let module = tyc_syntax::parse_module(&prep.python_source)
+            .unwrap()
+            .into_syntax();
+        let shapes = extract_module_shapes(&module);
+        assert!(
+            shapes.gatherable_async_fns.contains("fetch_user"),
+            "decorated top-level async fn must be published"
+        );
+        assert!(
+            shapes.gatherable_async_fns.contains("fetch_orders"),
+            "decorated async method must be published"
+        );
+        assert!(
+            !shapes.gatherable_async_fns.contains("fetch_posts"),
+            "undecorated async fn must be excluded"
+        );
+        assert!(
+            !shapes.gatherable_async_fns.contains("helper"),
+            "sync fn must be excluded"
         );
     }
 

@@ -4,15 +4,17 @@ All notable changes to Typhon are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely; the
 canonical phase-by-phase status lives in `docs/roadmap.md`.
 
-## 0.14.2 — 2026-06-12 — `gather_opportunity` async-concurrency advice
+## 0.14.2 — 2026-06-12 — Async concurrency: `gather_opportunity` advice + cross-module auto-gather
 
 The single biggest "compile to the faster way" lever for async code is
 concurrency: independent `await`s that run sequentially could run together.
 Typhon could already *do* this (`gather:` / `auto-gather`), but `auto-gather`
 is opt-in, requires a `@gatherable` decorator on every callee, and only
-considers same-module `async def`s — so the most common real
+considered same-module `async def`s — so the most common real
 missed-concurrency shape, two awaited method calls on an imported client,
-was never surfaced. Now the compiler points it out by default.
+was never surfaced. This release closes both gaps: the compiler now points
+the opportunity out by default, and the `auto-gather` rewrite folds runs
+that call `@gatherable` functions imported from another module.
 
 ### Added — `tyc::gather_opportunity` (advice, on by default)
 
@@ -47,6 +49,40 @@ was never surfaced. Now the compiler points it out by default.
   silence the nudge project-wide. When `auto-gather` is also on, runs it
   folds into a `TaskGroup` are gone before this pass runs, so they aren't
   double-reported. `tyc explain gather_opportunity` documents it offline.
+
+### Changed — `auto-gather` now folds imported `@gatherable` callees
+
+- **`[strictness] auto-gather` extends across module boundaries.** A run of
+  independent awaits whose callees are `@gatherable` async functions
+  **imported from another project module** now folds into an
+  `asyncio.TaskGroup`, exactly like a same-module run:
+
+  ```ty
+  # services.ty
+  @gatherable
+  pub async def fetch_user(uid: int) -> User: ...
+  @gatherable
+  pub async def fetch_posts(uid: int) -> list[Post]: ...
+
+  # main.ty
+  from services import fetch_user, fetch_posts
+  async def load(uid: int) -> Dashboard:
+      let u = await fetch_user(uid)     # folded into one TaskGroup …
+      let p = await fetch_posts(uid)    # … because both are @gatherable in `services`
+      return Dashboard(u, p)
+  ```
+
+- Each module's set of `@gatherable` async functions is published on
+  `ModuleShapes` (the same cross-module registry that carries class shapes,
+  newtypes, enums, …); the build pass resolves every `from M import name`
+  through the resolver's `import_info` (correct relative / absolute / alias
+  handling, shared with the type checker) and seeds the imported local name
+  into the auto-gather eligibility set.
+- **The safety boundary holds across modules:** the `@gatherable` decorator
+  is still required — an imported async callee *without* it is never folded,
+  so the author's concurrency attestation is respected regardless of which
+  module the function lives in. Mis-resolution can only ever *fail* to fold
+  (a missed optimisation), never fold something un-attested.
 
 ## 0.14.1 — 2026-06-12 — Cross-module shape propagation completeness
 
