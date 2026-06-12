@@ -1258,6 +1258,22 @@ pub fn install(interp: &mut Interpreter) {
         }))),
     );
 
+    // `EXPR as! TYPE` lowers to `__typhon_checked_cast__(EXPR, TYPE)`,
+    // resolved on the compile path via `from typhon_runtime.cast import
+    // checked_cast as __typhon_checked_cast__`. The VM treats the cast as an
+    // identity passthrough: the static type is already `TYPE` (the checker
+    // enforced that), and the recursive structural runtime check lives in the
+    // generated `typhon_runtime/cast.py`, so the authoritative enforcement is
+    // on the `tyc build && python` path. Returning the value unchanged keeps
+    // `tyc run` working without needing to interpret the type descriptor.
+    root.set(
+        "__typhon_checked_cast__",
+        Value::Native(Rc::new(NativeFn::new(
+            "__typhon_checked_cast__",
+            |_i, args| Ok(args.into_iter().next().unwrap_or(Value::None)),
+        ))),
+    );
+
     // `newtype Foo = int` lowers to `Foo = NewType("Foo", int)`. CPython's
     // `NewType` at runtime is effectively `lambda x: x`, so we mirror that:
     // a two-argument callable that returns a callable identity function.
@@ -1788,6 +1804,20 @@ fn make_typhon_runtime_module(interp: &Interpreter) -> Value {
             }),
         )],
     );
+    // `EXPR as! TYPE` lowers to a call to `checked_cast` imported from
+    // `typhon_runtime.cast`. The VM treats it as an identity passthrough (the
+    // checker already pinned the static type; the recursive structural check
+    // is enforced on the `tyc build && python` path), so the shim just returns
+    // the value unchanged.
+    let cast = make_module(
+        "typhon_runtime.cast",
+        vec![(
+            "checked_cast",
+            nf("checked_cast", |_i, args| {
+                Ok(args.into_iter().next().unwrap_or(Value::None))
+            }),
+        )],
+    );
     // `Result` is exposed as a type marker — the type checker uses
     // `Result[T, E]` as a typing construct; at runtime the desugared
     // module only needs the name to be defined. An identity callable
@@ -1804,6 +1834,7 @@ fn make_typhon_runtime_module(interp: &Interpreter) -> Value {
             ("tasks", tasks),
             ("lazy", lazy),
             ("freeze", freeze),
+            ("cast", cast),
         ],
     )
 }

@@ -4,6 +4,114 @@ All notable changes to Typhon are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely; the
 canonical phase-by-phase status lives in `docs/roadmap.md`.
 
+## 0.14.0 — 2026-06-12 — `as!` checked boundary cast + auto traceback remap
+
+Two ergonomics features motivated by a playground retrospective: the
+`unsafe:`-block-plus-re-assertion dance at every untyped boundary was the
+sharpest remaining ceremony, and runtime tracebacks pointing at emitted
+`.py` (rather than `.ty`) source was the sharpest debugging tax. Both are
+additive — every previously-accepted program type-checks identically — and
+the full workspace suite plus the example corpus stay green.
+
+### Added — `as!` checked boundary cast
+
+- **`EXPR as! TYPE`** is the one-line, *sound* replacement for the
+  `unsafe:` + re-assert idiom at an untyped boundary:
+
+  ```python
+  let data = resp.json() as! dict[str, int]   # was: unsafe: … then re-assert
+  let uid  = row[0] as! int
+  ```
+
+  The checker types the expression as `TYPE` (so the boundary value — which
+  may be `Any` — is accepted *without* an `unsafe:` block), and the cast
+  lowers to a runtime guard `checked_cast(EXPR, TYPE)` in the generated
+  `typhon_runtime/cast.py` that verifies the value's shape against `TYPE`
+  and raises `TypeError` on a mismatch. Unlike a static-only re-assertion
+  (which trusts the boundary blindly) or TypeScript's unchecked `as`, this
+  is genuinely *checked* — the structural check recurses through
+  parameterised containers (`list[int]`, `dict[str, int]`, `tuple[int, ...]`,
+  unions, `Optional`), so a JSON payload that is a `list` where you claimed
+  `dict[str, int]`, or a `dict[str, str]` where you claimed `dict[str, int]`,
+  is rejected at the boundary. `Any` / `object` targets and shapes the guard
+  can't model fall back to acceptance, so an `as!` can only reject values it
+  can prove wrong.
+- v1 scope: `as!` casts the entire preceding value expression on a single
+  physical line, in a value position (after `=` / `return` / `yield`, or as
+  a bare expression). It rides the existing `tyc-syntax` lowering pipeline
+  (`tyc-types` reads the target via the same path as `type[T]` inference, so
+  no special generic machinery was needed), the in-process VM treats it as
+  an identity passthrough (the authoritative structural check runs on the
+  `tyc build && python` path), and `tyc fmt` preserves the surface syntax.
+  A nested-in-call-arguments or multi-line `as!` is left for the AST-based
+  lowering migration; until then the parser surfaces a clean error.
+
+### Added — `[emit] traceback-remap`
+
+- **`[emit] traceback-remap = true`** (default `false`) injects a
+  `typhon_runtime.traceback.install()` call into the entry module's
+  `if __name__ == "__main__":` block. The installed `sys.excepthook` reads
+  the emitted `.py.map` sidecars and rewrites an uncaught exception's
+  traceback to point at `.ty` source — the same mapping `tyc trace` applies,
+  but automatically and with no manual step. It only touches the entry
+  script (library imports never trip the `__main__` guard) and falls back to
+  the previous hook on any failure, so it can only improve a traceback,
+  never suppress one. Default-off keeps existing projects and runtime-free
+  entry points byte-for-byte unchanged.
+
+## 0.13.2 — 2026-06-12 — playground stress round (method-call `match`, multi-line `?`, `gather:`-in-`match` import, `fmt` round-trips)
+
+### Fixed — playground stress round (method-call `match`, multi-line `?`, `gather:` import injection, `fmt` round-trips)
+
+A round of app-building against v0.13.1 surfaced four defects, all fixed
+here. The full workspace suite and the example corpus stay green.
+
+- **`tyc::missing_return` false-fired on a `match` over a direct
+  impl-method call returning `Result[T, E]`.** `match b.fetch(): case
+  Ok(v): … case Err(e): …` (with every arm returning or raising) tripped
+  `missing_return`, while the same match over a free-function call or a
+  bound `let` name passed. The read-only inference that feeds the
+  exhaustiveness pass typed a non-`@property` bound-method *value*
+  (`b.fetch`) as `Unknown`, so the wrapping call's `Result` return type
+  never reached the coverage check. A bound method accessed as a value is
+  now modelled as a `Function` carrying the method's return type, so a
+  call expression (`b.fetch()`) recovers it — bringing method-call match
+  subjects to parity with free-function-call subjects.
+- **`?` after a multi-line call expression failed to parse.** A
+  propagation `?` on the physical line that closes a multi-line call —
+  `let total: int = add(` / `    1, 2` / `)?` — lowered the lone `)?` line
+  to `__typhon_q_0__ = )` and surfaced a spurious `tyc::parse`
+  ("Expected `,`, found name"). The `?` lowering now collapses a statement
+  whose trailing `?` sits on a later physical line than the start of its
+  expression onto one logical line first (joining with single spaces so
+  adjacent tokens never fuse, and blanking the consumed continuation lines
+  to keep line indices stable), so the existing single-line logic handles
+  it. Single-line `?`, plain multi-line calls, and `T?` annotations
+  (including multi-line ones) are untouched.
+- **`gather:` inside a `case` arm emitted `asyncio.TaskGroup()` without
+  injecting `import asyncio`.** The desugar pass that decides whether to
+  inject `import asyncio` walked `if` / `for` / `while` / `with` / `try`
+  bodies but not `match` arms, so a `gather:` nested in a `case` produced a
+  module that `NameError`ed at runtime. The asyncio-usage walker now
+  descends into `match` subjects, guards, and arm bodies (and, while there,
+  into the `except` handlers of a `try`, which it had also skipped).
+  Top-level and `if`-nested `gather:` were already correct, and the
+  de-dupe against an existing `import asyncio` is unchanged (no
+  double-injection).
+- **`tyc fmt` diverged from `tyc check`'s grammar and corrupted multi-line
+  `freeze let`.** Two formatter defects: (1) the validation parse rejected
+  the typed tuple-unpack form `let (a: float, b: float) = pair()` that
+  `tyc check` / `tyc build` accept, because the formatter's validation
+  pipeline omitted `expand_typed_let_unpack`; (2) reformatting a
+  **multi-line** `freeze let X = {` … `}` baked the internal
+  `__typhon_freeze__(` lowering wrapper into the `.ty` source — the
+  single-line restorer couldn't reverse the unclosed opener, and the `)`
+  appended to the closing line was never removed. The validation pipeline
+  now expands typed tuple-unpack, and the keyword-restoration pass reverses
+  the multi-line wrapper (stripping the `__typhon_freeze__(` opener and the
+  matching appended `)`, located by a bracket-depth walk). Single-line
+  `freeze let` round-trips and the build/freeze lowering are unchanged.
+
 ## 0.13.1 — 2026-06-11 — playground stress round (async await-propagation, Task await-unwrap, VM project run, fmt, pub enum)
 
 ### Fixed — playground stress round (async `?`, await-unwrap, VM project run, `fmt`, `pub enum`)

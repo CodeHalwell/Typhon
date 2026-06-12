@@ -120,6 +120,21 @@ constructor (`UserId("seven")`) fires `tyc::newtype_violation`. Use
 `type` instead of `newtype` when you want a transparent,
 bidirectional alias.
 
+## Checked boundary cast (`as!`)
+
+    let data = resp.json() as! dict[str, int]
+    let uid  = row[0] as! int
+
+The one-line, *sound* replacement for the `unsafe:`-block +
+re-assertion dance at an untyped boundary. The checker types the
+expression as the target (so the boundary value — which may be `Any` —
+needs no `unsafe:` block), and at runtime the value's shape is checked
+against the target, raising `TypeError` on a mismatch (recursing
+through `list[…]` / `dict[…]` / `tuple[…]` / unions). Unlike a
+static-only re-assertion or an unchecked `as`, an `as!` can only let
+through values it can't prove wrong. v1: single-line value positions
+(after `=` / `return` / `yield`, or a bare expression).
+
 ## Sealed unions + exhaustive `match`
 
     sealed union Shape:
