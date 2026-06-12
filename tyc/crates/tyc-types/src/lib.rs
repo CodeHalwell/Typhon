@@ -7046,9 +7046,7 @@ fn infer_expr_readonly(c: &Checker, e: &Expr) -> Type {
             // `EXPR as! TYPE`) reads as the target `TYPE` here too, so a
             // `match x as! Shape:` subject or a chained cast resolves.
             if let Expr::Name(n) = call.func.as_ref() {
-                if n.id.as_str() == "__typhon_checked_cast__"
-                    && call.arguments.args.len() == 2
-                {
+                if n.id.as_str() == "__typhon_checked_cast__" && call.arguments.args.len() == 2 {
                     return type_from_annotation(&call.arguments.args[1], &c.classes);
                 }
             }
@@ -11514,9 +11512,7 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
             // verifies the shape and raises on a mismatch, so this is a
             // *checked* cast rather than an unsound escape hatch.
             if let Expr::Name(n) = call.func.as_ref() {
-                if n.id.as_str() == "__typhon_checked_cast__"
-                    && call.arguments.args.len() == 2
-                {
+                if n.id.as_str() == "__typhon_checked_cast__" && call.arguments.args.len() == 2 {
                     // Walk the value argument so its own diagnostics still
                     // surface, then discard its (boundary) type.
                     let _ = infer_expr(c, &call.arguments.args[0]);

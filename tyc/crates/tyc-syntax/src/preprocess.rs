@@ -420,12 +420,26 @@ pub fn preprocess_opts(source: &str, opts: PreprocessOptions) -> PreprocessResul
             // earlier lines we forward the content verbatim.
             if freeze_let_depth > 0 {
                 let line_no_nl = line.trim_end_matches(['\n', '\r']);
+                let pre_string = in_string;
                 let net = bracket_delta_outside_strings(line_no_nl, &mut in_string);
                 freeze_let_depth += net;
                 if freeze_let_depth <= 0 {
                     freeze_let_depth = 0;
                     let trailing = &line[line_no_nl.len()..];
-                    let emitted = format!("{})", line_no_nl);
+                    // Close the `__typhon_freeze__(` call. The `)` must land
+                    // BEFORE any trailing comment, otherwise `#` swallows it
+                    // and the call is left unclosed (a parse error). Find the
+                    // comment boundary with this line's *entry* string-state.
+                    let mut scan_state = pre_string;
+                    let code_end = scan_line_code_end(line_no_nl, &mut scan_state);
+                    let emitted = if code_end < line_no_nl.len() {
+                        let code = line_no_nl[..code_end].trim_end();
+                        let gap = &line_no_nl[code.len()..code_end];
+                        let comment = &line_no_nl[code_end..];
+                        format!("{}){}{}", code, gap, comment)
+                    } else {
+                        format!("{})", line_no_nl)
+                    };
                     python_source.push_str(&emitted);
                     python_source.push_str(trailing);
                 } else {
@@ -1140,6 +1154,7 @@ fn unwrap_freeze_let(content: &str) -> Option<String> {
 /// responsible for the balanced case).
 fn unwrap_freeze_let_open(content: &str) -> Option<(String, i32)> {
     let code = strip_trailing_comment(content);
+    let comment = content[code.len()..].trim();
     let eq = code.find('=')?;
     let lhs = code[..eq].trim_end();
     let rhs = code[eq + 1..].trim();
@@ -1150,7 +1165,14 @@ fn unwrap_freeze_let_open(content: &str) -> Option<(String, i32)> {
     if residual <= 0 {
         return None;
     }
-    Some((format!("{} = {}", lhs, inner), residual))
+    // Preserve a trailing comment on the opener so `tyc fmt` never silently
+    // drops it (mirrors `unwrap_freeze_let`).
+    let suffix = if comment.is_empty() {
+        String::new()
+    } else {
+        format!("  {}", comment)
+    };
+    Some((format!("{} = {}{}", lhs, inner, suffix), residual))
 }
 
 /// Wrap the RHS of a `freeze let` binding in `__typhon_freeze__(...)`.
@@ -2896,8 +2918,13 @@ pub fn postprocess_full(
                         j += 1;
                     }
                     if let Some(j) = close_line {
-                        // The appended `)` is the last `)` on the close line.
-                        if let Some(pos) = lines[j].rfind(')') {
+                        // The appended `)` is the last `)` of the close line's
+                        // *code* portion. Restrict the search to that portion
+                        // so a `)` inside a trailing comment (`}  # see (note)`)
+                        // is never mistaken for it.
+                        let mut state: Option<StringMode> = None;
+                        let code_end = scan_line_code_end(&lines[j], &mut state);
+                        if let Some(pos) = lines[j][..code_end].rfind(')') {
                             lines[j].remove(pos);
                         }
                         lines[line_idx] = format!("{}freeze {}", prefix, open_restored);
@@ -3722,7 +3749,9 @@ pub fn expand_checked_casts(source: &str) -> String {
 /// carries a top-level `as!` cast in a value position. Returns `None` when
 /// there is nothing to rewrite.
 fn rewrite_checked_cast_line(code: &str) -> Option<String> {
-    let indent_len = code.find(|c: char| !c.is_whitespace()).unwrap_or(code.len());
+    let indent_len = code
+        .find(|c: char| !c.is_whitespace())
+        .unwrap_or(code.len());
     let indent = &code[..indent_len];
     let body = &code[indent_len..];
 
@@ -3752,9 +3781,7 @@ fn rewrite_checked_cast_line(code: &str) -> Option<String> {
     if expr.is_empty() || ty.is_empty() {
         return None;
     }
-    Some(format!(
-        "{prefix}__typhon_checked_cast__({expr}, {ty})"
-    ))
+    Some(format!("{prefix}__typhon_checked_cast__({expr}, {ty})"))
 }
 
 /// If `body` is an augmented assignment (`x += …`, `x //= …`, `x @= …`),
@@ -3800,6 +3827,14 @@ fn find_augmented_assign_rhs(body: &str) -> Option<usize> {
                 ) {
                     return Some(i + 1);
                 }
+                // `<<=` / `>>=`: the char before the `<`/`>` is the same shift
+                // char. Distinguishes them from the `<=` / `>=` comparisons,
+                // which `find_assignment_eq` also skips — without this a
+                // `x <<= y as! int` line would fall through to the bare path
+                // and emit `__typhon_checked_cast__(x <<= y, …)` (invalid).
+                if matches!(prev, b'<' | b'>') && i >= 2 && bytes[i - 2] == prev {
+                    return Some(i + 1);
+                }
                 // A plain `=` (handled by `find_assignment_eq`) or a
                 // comparison/walrus tail — not an augmented assignment.
                 return None;
@@ -3814,27 +3849,21 @@ fn find_augmented_assign_rhs(body: &str) -> Option<usize> {
 /// Split a value expression on its top-level `as!` operator, returning
 /// `(expr, type)`. `None` when there is no `as!` at bracket depth 0 outside
 /// strings. The operator token is ` as!` followed by whitespace, so a `!=`
-/// comparison or an identifier ending in `as` never matches.
+/// comparison or an identifier ending in `as` never matches. String regions —
+/// including triple-quoted strings / docstrings — are masked via
+/// [`compute_in_string_mask`], so an `as!` *inside* a string literal is left
+/// alone.
 fn split_top_level_cast(value: &str) -> Option<(&str, &str)> {
     let bytes = value.as_bytes();
+    let mask = compute_in_string_mask(value);
     let mut depth: i32 = 0;
-    let mut in_str: Option<u8> = None;
     let mut i = 0;
     while i < bytes.len() {
-        let b = bytes[i];
-        if let Some(q) = in_str {
-            if b == b'\\' && i + 1 < bytes.len() {
-                i += 2;
-                continue;
-            }
-            if b == q {
-                in_str = None;
-            }
+        if mask[i] {
             i += 1;
             continue;
         }
-        match b {
-            b'\'' | b'"' => in_str = Some(b),
+        match bytes[i] {
             b'(' | b'[' | b'{' => depth += 1,
             b')' | b']' | b'}' => depth -= 1,
             b'a' if depth == 0
@@ -4709,6 +4738,12 @@ fn scan_line_delta_and_code_end(line: &str, in_string: &mut Option<StringMode>) 
                     }
                 }
                 StringMode::TripleSingle | StringMode::TripleDouble => {
+                    // `\` escapes the next char inside a triple-quoted string
+                    // too, so an escaped quote (`\"`) doesn't end the region.
+                    if c == '\\' {
+                        chars.next();
+                        continue;
+                    }
                     let (q, triple) = if matches!(mode, StringMode::TripleSingle) {
                         ('\'', "'''")
                     } else {
@@ -5353,10 +5388,7 @@ fn compute_in_string_mask(s: &str) -> Vec<bool> {
 /// `with`-chain lowerings when they introduced a `__typhon_Err__`
 /// reference. FINDINGS #104.
 fn prepend_typhon_err_alias_import(body: String) -> String {
-    prepend_typhon_runtime_alias_import(
-        body,
-        "from typhon_runtime import Err as __typhon_Err__\n",
-    )
+    prepend_typhon_runtime_alias_import(body, "from typhon_runtime import Err as __typhon_Err__\n")
 }
 
 /// Inject a `from typhon_runtime… import … as __typhon_…__` alias import
@@ -8205,6 +8237,26 @@ mod tests {
     }
 
     #[test]
+    fn freeze_let_multiline_close_line_comment_round_trips() {
+        // PR #190 review (Gemini): a trailing comment on the close line must
+        // not swallow the appended `)`. The forward pass now closes the call
+        // BEFORE the comment, and the reverse drops the `)` from the code
+        // portion only — so the wrapper never leaks and the comment survives.
+        let src = "freeze let CFG: dict[str, float] = {\n    \"a\": 1.0,\n}  # snapshot (daily)\n";
+        let prep = preprocess(src);
+        // Forward must keep the close-paren inside the code, before the `#`.
+        assert!(
+            prep.python_source.contains(")  # snapshot (daily)")
+                || prep.python_source.contains(") # snapshot (daily)"),
+            "the `)` must close the call before the comment:\n{}",
+            prep.python_source
+        );
+        let out = postprocess(&prep.python_source, &prep.stripped, &prep.optionals);
+        assert_eq!(out, src);
+        assert!(!out.contains("__typhon_freeze__"), "wrapper leaked:\n{out}");
+    }
+
+    #[test]
     fn freeze_let_multiline_unannotated_round_trips_via_postprocess() {
         let src = "freeze let TAGS = [\n    \"a\",\n    \"b\",\n]\n";
         let prep = preprocess(src);
@@ -8767,6 +8819,33 @@ mod tests {
             !out.contains("__typhon_checked_cast__"),
             "string content must not trigger a cast:\n{out}"
         );
+    }
+
+    #[test]
+    fn checked_cast_ignored_inside_triple_quoted_string() {
+        // PR #190 review (Copilot): a docstring / triple-quoted string
+        // mentioning `as!` must not be mis-detected as the operator — the
+        // single-line triple `"""…"""` tokenised as three bare quotes used to
+        // leave `as!` looking unquoted.
+        let out = expand_checked_casts("let doc = \"\"\"use x as! int\"\"\"\n");
+        assert!(
+            !out.contains("__typhon_checked_cast__"),
+            "triple-quoted string content must not trigger a cast:\n{out}"
+        );
+    }
+
+    #[test]
+    fn checked_cast_bitshift_augmented_assignment_rhs_only() {
+        // PR #190 review (Codex/Copilot): `<<=` / `>>=` must be recognised as
+        // augmented assignments so only the RHS is cast — otherwise the bare
+        // path emitted `__typhon_checked_cast__(x <<= y, …)` (invalid Python).
+        for op in ["<<=", ">>="] {
+            let out = expand_checked_casts(&format!("acc {op} bits as! int\n"));
+            assert!(
+                out.contains(&format!("acc {op} __typhon_checked_cast__(bits, int)")),
+                "`{op}` must cast only the RHS:\n{out}"
+            );
+        }
     }
 
     #[test]

@@ -84,9 +84,9 @@ pub fn format_source(source: &str, path: &str) -> Result<FormatResult, TycError>
     // output below is still derived from `prep.python_source` so the Typhon
     // sugar is preserved when the file is rewritten.
     let validation_input = expand_question_ops(&expand_inline_question_ops(&expand_pipes(
-        &expand_with_chains(&expand_go_calls(&expand_gather_blocks(&expand_multiline_guards(
-            &expand_typed_let_unpack(&prep.python_source),
-        )))),
+        &expand_with_chains(&expand_go_calls(&expand_gather_blocks(
+            &expand_multiline_guards(&expand_typed_let_unpack(&prep.python_source)),
+        ))),
     )));
     parse_module(&validation_input).map_err(|e| {
         let offset = usize::from(e.location.start());

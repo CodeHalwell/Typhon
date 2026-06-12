@@ -2511,63 +2511,113 @@ _FRAME_RE = re.compile(r'File \"([^\"]+)\", line (\\d+)')
 
 
 def install() -> None:
-    \"\"\"Install a sys.excepthook that maps emitted-.py frames to .ty.\"\"\"
-    maps = _load_maps()
-    if not maps:
+    \"\"\"Install a sys.excepthook that maps emitted-.py frames to .ty source.\"\"\"
+    state = _load_state()
+    if state is None:
         return
     previous = sys.excepthook
 
     def hook(exc_type, exc, tb):
         try:
             text = ''.join(_tb.format_exception(exc_type, exc, tb))
-            sys.stderr.write(_remap(text, maps))
+            sys.stderr.write(_remap(text, state))
         except Exception:  # pragma: no cover - never hide the real error
             previous(exc_type, exc, tb)
 
     sys.excepthook = hook
 
 
-def _sourcemaps_dir():
+def _build_root():
+    # The build output root is the directory containing `.sourcemaps/`.
+    # Walk up from the entry script so `python -m pkg.main` (entry under a
+    # sub-package) still finds it.
     main = sys.modules.get('__main__')
     path = getattr(main, '__file__', None)
     if not path:
         return None
-    candidate = os.path.join(os.path.dirname(os.path.abspath(path)), '.sourcemaps')
-    return candidate if os.path.isdir(candidate) else None
+    cur = os.path.dirname(os.path.abspath(path))
+    for _ in range(64):
+        if os.path.isdir(os.path.join(cur, '.sourcemaps')):
+            return cur
+        parent = os.path.dirname(cur)
+        if parent == cur:
+            break
+        cur = parent
+    return None
 
 
-def _load_maps():
-    directory = _sourcemaps_dir()
-    if not directory:
-        return {}
+def _source_root(build_root):
+    # Resolve the real `.ty` source directory by walking up to a typhon.toml
+    # and reading [project].src (default 'src') — mirrors `tyc trace`. Returns
+    # None for a deployed build with no project file, in which case the bare
+    # src-relative source path is shown instead of a fabricated one.
+    cur = build_root
+    for _ in range(64):
+        toml_path = os.path.join(cur, 'typhon.toml')
+        if os.path.isfile(toml_path):
+            src = 'src'
+            try:
+                import tomllib
+
+                with open(toml_path, 'rb') as handle:
+                    project = tomllib.load(handle).get('project') or {}
+                src = project.get('src', 'src')
+            except Exception:  # pragma: no cover - defensive
+                pass
+            return os.path.join(cur, src)
+        parent = os.path.dirname(cur)
+        if parent == cur:
+            break
+        cur = parent
+    return None
+
+
+def _load_state():
+    build_root = _build_root()
+    if build_root is None:
+        return None
+    sm_dir = os.path.join(build_root, '.sourcemaps')
+    # Recurse so package modules (`.sourcemaps/pkg/mod.py.map`) are found, not
+    # just top-level ones. Key each map by the emitted `.py` path relative to
+    # the build root (e.g. 'pkg/mod.py') so same-named modules don't collide.
     maps = {}
-    for name in os.listdir(directory):
-        if not name.endswith('.py.map'):
-            continue
-        try:
-            with open(os.path.join(directory, name), encoding='utf-8') as handle:
-                data = json.load(handle)
-        except (OSError, ValueError):
-            continue
-        lines = data.get('lines')
-        source = data.get('source')
-        if isinstance(lines, list) and isinstance(source, str):
-            # Key by the emitted basename, e.g. 'main.py' for 'main.py.map'.
-            maps[name[:-4]] = (source, lines)
-    return maps
+    for dirpath, _dirs, files in os.walk(sm_dir):
+        for name in files:
+            if not name.endswith('.py.map'):
+                continue
+            try:
+                with open(os.path.join(dirpath, name), encoding='utf-8') as handle:
+                    data = json.load(handle)
+            except (OSError, ValueError):
+                continue
+            lines = data.get('lines')
+            source = data.get('source')
+            if not (isinstance(lines, list) and isinstance(source, str)):
+                continue
+            rel = os.path.relpath(os.path.join(dirpath, name[:-4]), sm_dir)
+            maps[os.path.normpath(rel)] = (source, lines)
+    if not maps:
+        return None
+    return (build_root, maps, _source_root(build_root))
 
 
-def _remap(text, maps):
+def _remap(text, state):
+    build_root, maps, source_root = state
+
     def repl(match):
         path, lineno = match.group(1), int(match.group(2))
-        entry = maps.get(os.path.basename(path))
+        try:
+            rel = os.path.normpath(os.path.relpath(os.path.abspath(path), build_root))
+        except ValueError:  # pragma: no cover - different drive on Windows
+            return match.group(0)
+        entry = maps.get(rel)
         if not entry:
             return match.group(0)
         source, lines = entry
-        if 1 <= lineno <= len(lines):
-            ty_path = os.path.join(os.path.dirname(path), source)
-            return 'File \"' + ty_path + '\", line ' + str(lines[lineno - 1])
-        return match.group(0)
+        if not (1 <= lineno <= len(lines)):
+            return match.group(0)
+        ty_path = os.path.join(source_root, source) if source_root else source
+        return 'File \"' + ty_path + '\", line ' + str(lines[lineno - 1])
 
     return _FRAME_RE.sub(repl, text)
 ";

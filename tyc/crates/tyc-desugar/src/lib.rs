@@ -4443,7 +4443,9 @@ mod tests {
     #[test]
     fn traceback_remap_injects_install_into_main_guard() {
         let src = "def main() -> None:\n    pass\n\nif __name__ == \"__main__\":\n    main()\n";
-        let module = tyc_syntax::parse_module(src).expect("parse failed").into_syntax();
+        let module = tyc_syntax::parse_module(src)
+            .expect("parse failed")
+            .into_syntax();
         let out = desugar_module_with(
             &module,
             DesugarOptions {
@@ -4453,7 +4455,8 @@ mod tests {
         );
         let emitted = emit(&out.module);
         assert!(
-            emitted.contains("from typhon_runtime.traceback import install as __typhon_install_tb__"),
+            emitted
+                .contains("from typhon_runtime.traceback import install as __typhon_install_tb__"),
             "the installer import must be injected:\n{emitted}"
         );
         assert!(
@@ -4466,13 +4469,18 @@ mod tests {
         let call = emitted
             .find("__typhon_install_tb__()")
             .expect("install call present");
-        assert!(call > guard, "install must be inside the __main__ block:\n{emitted}");
+        assert!(
+            call > guard,
+            "install must be inside the __main__ block:\n{emitted}"
+        );
     }
 
     #[test]
     fn traceback_remap_off_by_default_injects_nothing() {
         let src = "def main() -> None:\n    pass\n\nif __name__ == \"__main__\":\n    main()\n";
-        let module = tyc_syntax::parse_module(src).expect("parse failed").into_syntax();
+        let module = tyc_syntax::parse_module(src)
+            .expect("parse failed")
+            .into_syntax();
         let out = desugar_module_with(&module, DesugarOptions::default());
         let emitted = emit(&out.module);
         assert!(
