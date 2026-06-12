@@ -50,8 +50,9 @@ type ResolvedCache = Arc<Mutex<HashMap<String, (String, Arc<ResolvedModule>)>>>;
 /// `typhon.toml` mtime they were read from (see the field doc on
 /// [`Backend::lint_options_cache`]). Aliased to keep the field type under
 /// clippy's `type_complexity` threshold, matching [`ResolvedCache`].
-type LintOptionsCache =
-    Arc<Mutex<HashMap<std::path::PathBuf, (Option<std::time::SystemTime>, tyc_analyse::LintOptions)>>>;
+type LintOptionsCache = Arc<
+    Mutex<HashMap<std::path::PathBuf, (Option<std::time::SystemTime>, tyc_analyse::LintOptions)>>,
+>;
 
 /// The Typhon LSP backend. Holds a single shared salsa database and the
 /// `Client` handle used to send notifications back to the editor.
