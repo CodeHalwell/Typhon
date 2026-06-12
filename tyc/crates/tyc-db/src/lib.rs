@@ -790,6 +790,15 @@ fn build_external_shapes(
                 })
                 .collect();
             external.sealed_unions.insert(b.name.clone(), mapped);
+        } else if let Some(base) = module_shapes.newtypes.get(member) {
+            // Newtype alias imported by name (`from foo import ProjectTag`).
+            // Re-key its base type under the local import name so the
+            // consumer's asymmetric escape-upward rule (`ProjectTag`
+            // widens into a `str` slot) fires the same way it would for a
+            // locally-declared newtype. The base is published
+            // already-resolved (a primitive in the common case), so no
+            // per-variant re-keying is needed.
+            external.newtypes.insert(b.name.clone(), base.clone());
         }
     }
     // R1-#1 follow-up: variant→union upcasts need the union's variant
@@ -850,6 +859,22 @@ fn build_external_shapes(
                 })
                 .collect();
             external.sealed_unions.insert(union_name.clone(), mapped);
+        }
+        // Same shape of problem for newtypes: an imported class can
+        // expose a field / parameter / return typed as a newtype whose
+        // NAME the consumer never imported (`from models import
+        // AttributedSpend`, where `AttributedSpend.project: ProjectTag`).
+        // The published class shape carries the field type under the
+        // newtype's *source* name, so seed every newtype the touched
+        // module declares under that same source name. Then a
+        // `ProjectTag`-typed field flowing into a `str` slot widens via
+        // the consumer's escape-upward rule. `entry().or_insert` keeps
+        // any alias-keyed entry the per-binding loop already wrote.
+        for (newtype_name, base) in &module_shapes.newtypes {
+            external
+                .newtypes
+                .entry(newtype_name.clone())
+                .or_insert_with(|| base.clone());
         }
     }
     external
@@ -1436,6 +1461,64 @@ let c: ApiClient = ApiClient(api_key=\"k\", base_url=\"u\")
         let mut db = TycDatabase::new();
         let diags = check_file_with_imports(&mut db, "main.ty".into(), main.into(), &registry);
         assert!(!diags.has_errors(), "{:?}", diags.errors());
+    }
+
+    /// The Dead Reckoning dogfooding report: `models` declares
+    /// `newtype ProjectTag = str` and an `AttributedSpend` whose
+    /// `project` field is typed `ProjectTag`. A consumer that imports
+    /// ONLY `AttributedSpend` (never `ProjectTag` by name) must still
+    /// widen `spend.project` into a `str` slot — the newtype is reached
+    /// through the imported class's field type, so the fix has to seed
+    /// it from `by_module` for every touched module, not just when the
+    /// newtype name itself appears in the import list.
+    #[test]
+    fn cross_module_newtype_field_widens_without_importing_newtype() {
+        let models = "\
+newtype ProjectTag = str
+
+class AttributedSpend:
+    project: ProjectTag
+    amount: float
+";
+        let registry = build_registry(&[("models", models)]);
+        let main = "\
+from models import AttributedSpend
+
+def first_key(spend: AttributedSpend) -> str:
+    let key: str = spend.project
+    return key
+";
+        let mut db = TycDatabase::new();
+        let diags = check_file_with_imports(&mut db, "main.ty".into(), main.into(), &registry);
+        assert!(
+            !diags.has_errors(),
+            "imported newtype field must widen to its base type; got: {:?}",
+            diags.errors()
+        );
+    }
+
+    /// Companion to the above: importing the newtype by name (`from
+    /// models import ProjectTag`) and constructing a value with it must
+    /// also widen, exercising the per-binding re-keying branch through
+    /// the real db path.
+    #[test]
+    fn cross_module_imported_newtype_name_widens_to_base() {
+        let models = "pub newtype ProjectTag = str\n";
+        let registry = build_registry(&[("models", models)]);
+        let main = "\
+from models import ProjectTag
+
+def label(t: ProjectTag) -> str:
+    let s: str = t
+    return s
+";
+        let mut db = TycDatabase::new();
+        let diags = check_file_with_imports(&mut db, "main.ty".into(), main.into(), &registry);
+        assert!(
+            !diags.has_errors(),
+            "imported newtype name must widen to its base type; got: {:?}",
+            diags.errors()
+        );
     }
 
     #[test]

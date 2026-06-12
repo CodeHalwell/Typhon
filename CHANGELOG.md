@@ -4,6 +4,49 @@ All notable changes to Typhon are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely; the
 canonical phase-by-phase status lives in `docs/roadmap.md`.
 
+## 0.14.1 — 2026-06-12 — Cross-module newtype widening
+
+A dogfooding round — a self-hosted API budget tracker built end-to-end on
+v0.14.0 — surfaced one compiler defect: a `newtype` declared in one module
+did not widen to its base type when consumed from another module, even
+though the docs promise the asymmetric escape-upward (`Name → Base`) always
+holds. Additive — every previously-accepted program type-checks
+identically, and the full workspace suite plus the 15-app example corpus
+stay green.
+
+### Fixed — newtype escape-upward across module boundaries
+
+- **An imported `newtype` now widens to its base type**, exactly as a
+  locally-declared one does. `newtype ProjectTag = str` in `models.ty` plus
+  a `let key: str = spend.project` (where `spend.project: ProjectTag`) in a
+  consumer module wrongly fired `tyc::type_mismatch` — the consumer's
+  `newtypes` table was only ever populated from its own module body, so the
+  escape-upward rule in `is_assignable` had no base type to unwrap an
+  imported newtype to. The published `ModuleShapes` now carries each
+  module's newtype → base map, and the consumer seeds it both when the
+  newtype name is imported directly (`from models import ProjectTag`,
+  alias-aware) and — the case that actually bit — when the newtype is
+  reached *only* through an imported class's field / parameter / return type
+  (`from models import AttributedSpend`, where `ProjectTag` is never
+  imported by name). The fix threads `newtypes` through the same four-stage
+  cross-module path (`extract_module_shapes` → `ModuleShapes` →
+  `build_external_shapes` → `check_module_with_imports`) that already
+  carries `sealed_unions` and `interfaces`.
+- **The reverse direction stays sound and is now more precise.** A bare
+  base value flowing into an imported-newtype slot (`f("plain")` where
+  `f(t: ProjectTag)`) still errors — and now surfaces the dedicated
+  `tyc::newtype_violation` ("wrap with `ProjectTag(...)`") rather than a
+  generic `tyc::type_mismatch`, matching the in-module diagnostic. A local
+  declaration still wins on a name collision with an imported newtype.
+
+### Tests
+
+- `tyc-types`: `cross_module_newtype_widens_to_base`,
+  `cross_module_bare_base_into_newtype_still_rejected`.
+- `tyc-db`: `cross_module_newtype_field_widens_without_importing_newtype`
+  (the newtype reached only through an imported field) and
+  `cross_module_imported_newtype_name_widens_to_base`.
+
 ## 0.14.0 — 2026-06-12 — `as!` checked boundary cast + auto traceback remap
 
 Two ergonomics features motivated by a playground retrospective: the

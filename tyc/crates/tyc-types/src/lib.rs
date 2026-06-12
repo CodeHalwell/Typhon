@@ -3815,6 +3815,16 @@ pub struct ModuleShapes {
     /// Greeter)` rather than firing `tyc::interface_isinstance` on a
     /// pattern that the source module legitimately authored.
     pub interfaces: HashMap<String, bool>,
+    /// Nominal newtype declarations (`newtype Name = Base`), keyed by
+    /// the newtype name and valued by its (already-resolved) base type.
+    /// Seeded into the consumer's `newtypes` table so the asymmetric
+    /// "escape upward" rule — a `Name` value flows freely into a
+    /// `Base`-typed slot — works across module boundaries exactly as it
+    /// does in-module. Without this, `newtype ProjectTag = str` declared
+    /// in module A and a field typed `ProjectTag` flowing into a `str`
+    /// slot in module B wrongly fired `tyc::type_mismatch`, even though
+    /// the docs promise a newtype always widens to its base.
+    pub newtypes: HashMap<String, Type>,
 }
 
 /// Imports resolved to their source modules' [`ModuleShapes`], keyed
@@ -3855,6 +3865,12 @@ pub struct ExternalShapes {
     /// re-keyed under the local import name so the `isinstance`
     /// check sees the source module's opt-in.
     pub interfaces: HashMap<String, bool>,
+    /// Newtype declarations re-keyed under the local import name of the
+    /// newtype (`from foo import ProjectTag as Tag` → `"Tag" → Str`).
+    /// Seeded into the consumer's `newtypes` table so the asymmetric
+    /// escape-upward rule fires for imported newtypes the same way it
+    /// does for locally-declared ones.
+    pub newtypes: HashMap<String, Type>,
     /// Bare imports that need attribute-access resolution. Keyed by
     /// the *local* binding name; the value is the dotted module path
     /// the import refers to (e.g. `("np", "numpy")` for
@@ -3998,12 +4014,38 @@ pub fn extract_module_shapes(module: &ModModule) -> ModuleShapes {
         }
     }
 
+    // Newtype declarations (`newtype Name = Base`, preprocessed to
+    // `Name = NewType("Name", Base)`). Published so a consumer importing
+    // `Name` can widen a `Name`-typed value into a `Base`-typed slot —
+    // the asymmetric escape-upward rule the in-module checker applies
+    // via its own `newtypes` table. The base is resolved through the
+    // same `type_from_annotation_with_params` path the in-module pass
+    // uses (`classes` doesn't list newtype names, so a primitive base
+    // like `str`/`int` resolves to `Type::Str`/`Type::Int` and any other
+    // identifier degrades to `Type::Class(name)`). Invalid bases
+    // (`newtype X = 42`) are skipped here — the in-module check is the
+    // one place that surfaces `tyc::newtype_invalid_base`; this
+    // surface-extraction pass never emits diagnostics.
+    let mut newtypes: HashMap<String, Type> = HashMap::new();
+    for stmt in &module.body {
+        if let Stmt::Assign(a) = stmt {
+            if let Some((name, base_expr)) = extract_newtype_decl(a) {
+                if non_type_expr_kind(&base_expr).is_some() {
+                    continue;
+                }
+                let base_ty = type_from_annotation_with_params(&base_expr, &classes, &[]);
+                newtypes.insert(name, base_ty);
+            }
+        }
+    }
+
     ModuleShapes {
         class_shapes,
         class_type_params,
         function_arities,
         sealed_unions,
         interfaces,
+        newtypes,
     }
 }
 
@@ -4171,6 +4213,25 @@ pub fn check_module_with_imports(
                 .or_insert_with(|| variants.clone());
             // The classes registry also needs the union name so
             // annotations referring to it resolve to `Type::Class(union)`.
+            if !c.classes.iter().any(|n| n == name) {
+                c.classes.push(name.clone());
+            }
+        }
+        // Cross-module newtypes: an imported `newtype ProjectTag = str`
+        // must allow the asymmetric escape-upward (`ProjectTag` widens
+        // into a `str`-typed slot) at this module's use sites, same as a
+        // locally-declared newtype. Seeding `c.newtypes` also makes the
+        // reverse-direction `tyc::newtype_violation` fire precisely (a
+        // bare base flowing into an imported newtype slot), matching the
+        // in-module diagnostic instead of a generic `type_mismatch`.
+        for (name, base) in &ext.newtypes {
+            c.newtypes
+                .entry(name.clone())
+                .or_insert_with(|| base.clone());
+            // Register the newtype name so annotations referring to it
+            // resolve to `Type::Class(name)`, mirroring the in-module
+            // first pass (which pushes every `newtype` name onto
+            // `c.classes`).
             if !c.classes.iter().any(|n| n == name) {
                 c.classes.push(name.clone());
             }
@@ -21336,6 +21397,153 @@ def label(s: Sub) -> str:
              producer's hierarchy is fully known but `Base` wasn't \
              explicitly imported; got: {:?}",
             d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    /// Cross-module newtype escape-upward. A `newtype ProjectTag = str`
+    /// declared in a producer module must widen into a `str`-typed slot
+    /// in a consumer module exactly as a locally-declared newtype does.
+    /// Before the fix, the consumer's `newtypes` table was only seeded
+    /// from its own body, so an imported newtype field flowing into its
+    /// base type wrongly fired `tyc::type_mismatch` (the Dead Reckoning
+    /// dogfooding report's `let key: str = spend.project`).
+    #[test]
+    fn cross_module_newtype_widens_to_base() {
+        let producer_src = "\
+newtype ProjectTag = str
+
+class AttributedSpend:
+    project: ProjectTag
+    amount: float
+";
+        let producer_prep = preprocess(producer_src);
+        let producer_module = tyc_syntax::parse_module(&producer_prep.python_source)
+            .unwrap()
+            .into_syntax();
+        let producer_shapes = extract_module_shapes(&producer_module);
+
+        // The newtype must be published on the producer's surface, with
+        // its base already resolved to `str`.
+        let tag_base = producer_shapes
+            .newtypes
+            .get("ProjectTag")
+            .expect("ProjectTag must be exported as a newtype")
+            .clone();
+        assert_eq!(
+            tag_base,
+            Type::Str,
+            "newtype base must resolve to the primitive `str`"
+        );
+        let spend_shape = producer_shapes
+            .class_shapes
+            .get("AttributedSpend")
+            .expect("AttributedSpend must be exported")
+            .clone();
+
+        // Consumer imports the class and widens the newtype-typed field
+        // into a `str` binding.
+        let consumer_src = "\
+def first_key(spend: AttributedSpend) -> str:
+    let key: str = spend.project
+    return key
+";
+        let consumer_prep = preprocess(consumer_src);
+        let consumer_module = tyc_syntax::parse_module(&consumer_prep.python_source)
+            .unwrap()
+            .into_syntax();
+        let (resolved, _) = resolve_module(
+            "<consumer>".to_owned(),
+            &consumer_prep.python_source,
+            &consumer_module,
+        );
+
+        // Mirror `tyc-db::build_external_shapes`: the class shape and the
+        // newtype base both land under their local import names.
+        let mut external = ExternalShapes::default();
+        external
+            .class_shapes
+            .insert("AttributedSpend".to_owned(), spend_shape);
+        external.newtypes.insert("ProjectTag".to_owned(), tag_base);
+
+        let d = check_module_with_imports(
+            "<consumer>",
+            &consumer_prep.python_source,
+            &resolved,
+            &consumer_module,
+            &consumer_prep.unsafe_lines,
+            &consumer_prep.frozen_class_lines,
+            Some(&external),
+        );
+        // The widening must produce a completely clean check — no
+        // `type mismatch` (or any other diagnostic) on the consumer.
+        let errors: Vec<String> = d.errors().iter().map(|e| e.to_string()).collect();
+        assert!(
+            errors.is_empty(),
+            "imported newtype must widen to its base type with no errors; got: {errors:?}"
+        );
+    }
+
+    /// The reverse direction stays sound across modules: a bare `str`
+    /// flowing into an imported-newtype-typed slot is still rejected,
+    /// and now with the precise `tyc::newtype_violation` (not a generic
+    /// `type_mismatch`) because the consumer's `newtypes` table knows
+    /// the base. Locks in that seeding the table didn't open a hole.
+    #[test]
+    fn cross_module_bare_base_into_newtype_still_rejected() {
+        let producer_src = "newtype ProjectTag = str\n";
+        let producer_prep = preprocess(producer_src);
+        let producer_module = tyc_syntax::parse_module(&producer_prep.python_source)
+            .unwrap()
+            .into_syntax();
+        let producer_shapes = extract_module_shapes(&producer_module);
+        let tag_base = producer_shapes
+            .newtypes
+            .get("ProjectTag")
+            .expect("ProjectTag must be exported as a newtype")
+            .clone();
+
+        let consumer_src = "\
+def label(t: ProjectTag) -> str:
+    return str(t)
+
+def bad() -> str:
+    return label(\"plain\")
+";
+        let consumer_prep = preprocess(consumer_src);
+        let consumer_module = tyc_syntax::parse_module(&consumer_prep.python_source)
+            .unwrap()
+            .into_syntax();
+        let (resolved, _) = resolve_module(
+            "<consumer>".to_owned(),
+            &consumer_prep.python_source,
+            &consumer_module,
+        );
+
+        let mut external = ExternalShapes::default();
+        external.newtypes.insert("ProjectTag".to_owned(), tag_base);
+        let d = check_module_with_imports(
+            "<consumer>",
+            &consumer_prep.python_source,
+            &resolved,
+            &consumer_module,
+            &consumer_prep.unsafe_lines,
+            &consumer_prep.frozen_class_lines,
+            Some(&external),
+        );
+        let errors: Vec<String> = d.errors().iter().map(|e| e.to_string()).collect();
+        // The precise diagnostic is `newtype_violation`, whose message
+        // reads "expected `ProjectTag`, found bare `str`" — the word
+        // "bare" is what distinguishes it from a generic "type mismatch:
+        // …". Assert the precise one fired and the generic one did not.
+        assert!(
+            errors.iter().any(|s| s.contains("found bare")),
+            "bare `str` into an imported `ProjectTag` slot must fire the \
+             precise newtype_violation; got: {errors:?}"
+        );
+        assert!(
+            !errors.iter().any(|s| s.contains("type mismatch")),
+            "the generic type_mismatch must not fire for an imported \
+             newtype slot; got: {errors:?}"
         );
     }
 

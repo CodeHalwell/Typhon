@@ -517,6 +517,8 @@ fn shapes_from_introspected(intro: &IntrospectedModule) -> ModuleShapes {
         function_arities,
         sealed_unions: HashMap::new(),
         interfaces: HashMap::new(),
+        // Introspected Python modules carry no Typhon newtypes.
+        newtypes: HashMap::new(),
     }
 }
 
