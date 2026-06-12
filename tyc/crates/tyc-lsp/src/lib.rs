@@ -16,13 +16,13 @@ use tower_lsp_server::ls_types::{
     CodeAction, CodeActionKind, CodeActionOrCommand, CodeActionParams,
     CodeActionProviderCapability, CodeActionResponse, CompletionItem, CompletionItemKind,
     CompletionOptions, CompletionParams, CompletionResponse, Diagnostic, DiagnosticSeverity,
-    DidChangeTextDocumentParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
-    Documentation, GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverContents, HoverParams,
-    HoverProviderCapability, InitializeParams, InitializeResult, InitializedParams, Location,
-    MarkupContent, MarkupKind, MessageType, NumberOrString, OneOf, Position, Range,
-    SemanticTokensFullOptions, SemanticTokensOptions, SemanticTokensParams, SemanticTokensResult,
-    SemanticTokensServerCapabilities, ServerCapabilities, TextDocumentSyncCapability,
-    TextDocumentSyncKind, TextEdit, Uri, WorkspaceEdit,
+    DidChangeTextDocumentParams, DidChangeWatchedFilesParams, DidCloseTextDocumentParams,
+    DidOpenTextDocumentParams, Documentation, GotoDefinitionParams, GotoDefinitionResponse, Hover,
+    HoverContents, HoverParams, HoverProviderCapability, InitializeParams, InitializeResult,
+    InitializedParams, Location, MarkupContent, MarkupKind, MessageType, NumberOrString, OneOf,
+    Position, Range, SemanticTokensFullOptions, SemanticTokensOptions, SemanticTokensParams,
+    SemanticTokensResult, SemanticTokensServerCapabilities, ServerCapabilities,
+    TextDocumentSyncCapability, TextDocumentSyncKind, TextEdit, Uri, WorkspaceEdit,
 };
 use tower_lsp_server::{jsonrpc, Client, LanguageServer, LspService, Server};
 use tyc_db::{
@@ -132,6 +132,14 @@ pub struct Backend {
     /// for the synthetic-open form (`source_file_for` injecting an
     /// untracked file).
     prewarmed_versions: Arc<Mutex<HashMap<String, i32>>>,
+    /// Per-project-root cache of the `[strictness]` knobs that gate the
+    /// editor advisory lints (`suggest-gather`, `allow-secret-comptime`).
+    /// Read from `typhon.toml` once per root and reused across keystrokes
+    /// instead of re-parsing the file on every check; invalidated wholesale
+    /// when `did_change_watched_files` reports a `typhon.toml` change, so a
+    /// `[strictness]` edit still takes effect (the file watcher then
+    /// re-checks open documents). Keyed by the project root directory.
+    lint_options_cache: Arc<Mutex<HashMap<std::path::PathBuf, tyc_analyse::LintOptions>>>,
 }
 
 impl std::fmt::Debug for Backend {
@@ -223,6 +231,9 @@ impl Backend {
         // venv) and the Python-shelling enrichment all run inside the blocking
         // closure below, off the async executor.
         let signature_caches_arc = Arc::clone(&self.signature_caches);
+        // Per-root `[strictness]` lint-knob cache, reused across keystrokes;
+        // `did_change_watched_files` clears it when `typhon.toml` changes.
+        let lint_options_cache_arc = Arc::clone(&self.lint_options_cache);
 
         let text_for_check = text.clone();
         let uri_str_for_check = uri_str.clone();
@@ -340,7 +351,15 @@ impl Backend {
             if let Ok(parsed) = tyc_syntax::parse_module(&mapping_source) {
                 let opts = workspace
                     .as_ref()
-                    .map(|(root, _)| read_lint_options(root))
+                    .map(|(root, _)| {
+                        // Cache the parsed knobs per root so we don't re-read
+                        // `typhon.toml` on every keystroke; `LintOptions` is
+                        // `Copy`. The watcher clears this on a config change.
+                        *lint_options_cache_arc
+                            .blocking_lock()
+                            .entry(root.clone())
+                            .or_insert_with(|| read_lint_options(root))
+                    })
                     .unwrap_or_default();
                 diags.extend(tyc_analyse::editor_lint_diagnostics(
                     &parsed.into_syntax(),
@@ -566,6 +585,45 @@ impl LanguageServer for Backend {
             Some(params.text_document.version),
         )
         .await;
+    }
+
+    async fn did_change_watched_files(&self, params: DidChangeWatchedFilesParams) {
+        // The VS Code client watches `**/typhon.toml`, `**/*.ty`, `**/*.dty`
+        // (see `synchronize.fileEvents`). Before this handler existed the
+        // notification was a silent no-op, so a `typhon.toml` edit didn't
+        // take effect until the user re-touched a source file.
+
+        // A `typhon.toml` change invalidates the cached `[strictness]` knobs
+        // so the next check re-reads them.
+        let config_changed = params.changes.iter().any(|change| {
+            std::path::Path::new(change.uri.path().as_str())
+                .file_name()
+                .is_some_and(|n| n == "typhon.toml")
+        });
+        if config_changed {
+            self.lint_options_cache.lock().await.clear();
+        }
+
+        // Re-check every open document so the config change (or a sibling
+        // `.ty` edit the cross-module shape registry now re-reads from disk)
+        // refreshes diagnostics without a keystroke in each open file. The
+        // same-file type-check is Salsa-cached on unchanged text, so this is
+        // cheap for the common single-`typhon.toml`-change case; what
+        // actually re-runs is `editor_lint_diagnostics` (with the freshly
+        // read knobs) and the cross-module shape assembly.
+        let open: Vec<(String, SourceFile)> = {
+            let docs = self.documents.lock().await;
+            docs.iter().map(|(uri, sf)| (uri.clone(), *sf)).collect()
+        };
+        for (uri_str, sf) in open {
+            let text = {
+                let db = self.db.lock().await;
+                sf.text(&*db).clone()
+            };
+            if let Ok(uri) = Uri::from_str(&uri_str) {
+                self.check_and_publish(uri, text, None).await;
+            }
+        }
     }
 
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
@@ -2272,6 +2330,7 @@ pub fn run_stdio(log_level: LogLevel) {
             project_indexes: Arc::new(Mutex::new(HashMap::new())),
             project_files: Arc::new(Mutex::new(HashMap::new())),
             prewarmed_versions: Arc::new(Mutex::new(HashMap::new())),
+            lint_options_cache: Arc::new(Mutex::new(HashMap::new())),
         });
         Server::new(stdin, stdout, socket).serve(service).await;
     });
@@ -3679,6 +3738,221 @@ mod tests {
             opts.allow_secret_comptime,
             "allow-secret-comptime = true must be honoured"
         );
+    }
+
+    // ── End-to-end LSP harness ──────────────────────────────────────────────
+    //
+    // Drives the real `Backend` over an in-memory duplex pair (no sockets, no
+    // subprocess) so the `did_open` → `publishDiagnostics` path — editor
+    // advisory lints and HINT severity mapping included — is covered by a
+    // committed test, not just the unit pieces.
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
+
+    /// Source with two independent awaited calls → one gather opportunity.
+    const GATHER_SRC: &str = "async def load(client, uid):\n    \
+        a = await client.get_user(uid)\n    \
+        b = await client.get_posts(uid)\n    \
+        return (a, b)\n";
+
+    /// Spin up the real server over an in-memory pipe; return the client-side
+    /// (writer, reader) duplex halves.
+    fn spawn_backend() -> (DuplexStream, DuplexStream) {
+        let (service, socket) = LspService::new(|client| Backend {
+            client,
+            db: Arc::new(Mutex::new(TycDatabase::new())),
+            log_level: LogLevel::Error,
+            documents: Arc::new(Mutex::new(HashMap::new())),
+            resolved_cache: Arc::new(Mutex::new(HashMap::new())),
+            introspection: Arc::new(Mutex::new(HashMap::new())),
+            signature_caches: Arc::new(Mutex::new(HashMap::new())),
+            project_indexes: Arc::new(Mutex::new(HashMap::new())),
+            project_files: Arc::new(Mutex::new(HashMap::new())),
+            prewarmed_versions: Arc::new(Mutex::new(HashMap::new())),
+            lint_options_cache: Arc::new(Mutex::new(HashMap::new())),
+        });
+        let (to_server, server_in) = tokio::io::duplex(64 * 1024);
+        let (server_out, from_server) = tokio::io::duplex(64 * 1024);
+        tokio::spawn(async move {
+            Server::new(server_in, server_out, socket)
+                .serve(service)
+                .await
+        });
+        (to_server, from_server)
+    }
+
+    async fn send(w: &mut DuplexStream, v: serde_json::Value) {
+        let body = serde_json::to_vec(&v).unwrap();
+        w.write_all(format!("Content-Length: {}\r\n\r\n", body.len()).as_bytes())
+            .await
+            .unwrap();
+        w.write_all(&body).await.unwrap();
+        w.flush().await.unwrap();
+    }
+
+    /// Read one framed JSON-RPC message.
+    async fn recv(r: &mut DuplexStream) -> serde_json::Value {
+        let mut header = Vec::new();
+        let mut byte = [0u8; 1];
+        while !header.ends_with(b"\r\n\r\n") {
+            r.read_exact(&mut byte).await.unwrap();
+            header.push(byte[0]);
+        }
+        let header = String::from_utf8(header).unwrap();
+        let len: usize = header
+            .lines()
+            .find_map(|l| {
+                l.to_ascii_lowercase()
+                    .strip_prefix("content-length:")
+                    .map(|n| n.trim().to_owned())
+            })
+            .expect("Content-Length header")
+            .parse()
+            .unwrap();
+        let mut body = vec![0u8; len];
+        r.read_exact(&mut body).await.unwrap();
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    /// `initialize` (optionally rooted at `root_uri`) + `initialized`.
+    async fn handshake(to: &mut DuplexStream, from: &mut DuplexStream, root_uri: Option<&str>) {
+        let params = match root_uri {
+            Some(u) => serde_json::json!({ "capabilities": {}, "rootUri": u }),
+            None => serde_json::json!({ "capabilities": {} }),
+        };
+        send(
+            to,
+            serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":params}),
+        )
+        .await;
+        loop {
+            // Drain until the initialize response.
+            if recv(from).await.get("id").and_then(|i| i.as_i64()) == Some(1) {
+                break;
+            }
+        }
+        send(
+            to,
+            serde_json::json!({"jsonrpc":"2.0","method":"initialized","params":{}}),
+        )
+        .await;
+    }
+
+    async fn did_open(to: &mut DuplexStream, uri: &str, text: &str) {
+        send(
+            to,
+            serde_json::json!({"jsonrpc":"2.0","method":"textDocument/didOpen","params":{
+                "textDocument":{"uri":uri,"languageId":"typhon","version":1,"text":text}}}),
+        )
+        .await;
+    }
+
+    /// Read messages until the next `publishDiagnostics` for `uri`; return its
+    /// `diagnostics` array.
+    async fn next_diagnostics(r: &mut DuplexStream, uri: &str) -> Vec<serde_json::Value> {
+        loop {
+            let msg = recv(r).await;
+            if msg.get("method").and_then(|m| m.as_str()) == Some("textDocument/publishDiagnostics")
+                && msg["params"]["uri"].as_str() == Some(uri)
+            {
+                return msg["params"]["diagnostics"]
+                    .as_array()
+                    .cloned()
+                    .unwrap_or_default();
+            }
+        }
+    }
+
+    fn gather_hint(diags: &[serde_json::Value]) -> Option<&serde_json::Value> {
+        diags.iter().find(|d| {
+            d["code"]
+                .as_str()
+                .is_some_and(|c| c.contains("gather_opportunity"))
+        })
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn lsp_publishes_gather_hint_on_did_open() {
+        let (mut to, mut from) = spawn_backend();
+        handshake(&mut to, &mut from, None).await;
+        let uri = "file:///tmp/tyc_lsp_gather_e2e/main.ty";
+        did_open(&mut to, uri, GATHER_SRC).await;
+
+        let diag = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            loop {
+                if let Some(d) = gather_hint(&next_diagnostics(&mut from, uri).await) {
+                    return d.clone();
+                }
+            }
+        })
+        .await
+        .expect("timed out waiting for a gather_opportunity diagnostic");
+
+        assert_eq!(
+            diag["severity"].as_i64(),
+            Some(4),
+            "gather advice must publish as HINT (severity 4); got {diag}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn lsp_watcher_refreshes_after_typhon_toml_change() {
+        // Project with the nudge OFF.
+        let tmp = tempfile::tempdir().unwrap();
+        let src_dir = tmp.path().join("src");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        let toml_path = tmp.path().join("typhon.toml");
+        std::fs::write(
+            &toml_path,
+            "[project]\nname=\"x\"\nsrc=\"src\"\n[strictness]\nsuggest-gather = false\n",
+        )
+        .unwrap();
+        std::fs::write(src_dir.join("main.ty"), GATHER_SRC).unwrap();
+
+        let file_uri = format!("file://{}", src_dir.join("main.ty").display());
+        let toml_uri = format!("file://{}", toml_path.display());
+        let root_uri = format!("file://{}", tmp.path().display());
+
+        let (mut to, mut from) = spawn_backend();
+        handshake(&mut to, &mut from, Some(&root_uri)).await;
+
+        // suggest-gather = false → the open file gets no gather hint.
+        did_open(&mut to, &file_uri, GATHER_SRC).await;
+        let first = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            next_diagnostics(&mut from, &file_uri),
+        )
+        .await
+        .expect("timed out on the initial didOpen diagnostics");
+        assert!(
+            gather_hint(&first).is_none(),
+            "suggest-gather = false must suppress the editor hint; got {first:?}"
+        );
+
+        // Flip the knob on and fire the watched-file notification.
+        std::fs::write(
+            &toml_path,
+            "[project]\nname=\"x\"\nsrc=\"src\"\n[strictness]\nsuggest-gather = true\n",
+        )
+        .unwrap();
+        send(
+            &mut to,
+            serde_json::json!({"jsonrpc":"2.0","method":"workspace/didChangeWatchedFiles","params":{
+                "changes":[{"uri":toml_uri,"type":2}]}}),
+        )
+        .await;
+
+        // The watcher invalidates the cached knobs and re-checks open docs →
+        // the hint now appears without the user touching `main.ty`.
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            loop {
+                if gather_hint(&next_diagnostics(&mut from, &file_uri).await).is_some() {
+                    return;
+                }
+            }
+        })
+        .await
+        .expect("watcher must re-publish the hint after the typhon.toml change");
     }
 
     #[test]
