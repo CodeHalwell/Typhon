@@ -4,6 +4,36 @@ All notable changes to Typhon are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely; the
 canonical phase-by-phase status lives in `docs/roadmap.md`.
 
+## 0.14.3 — 2026-06-12 — LSP: live config refresh + committed end-to-end coverage
+
+Follow-ups to the 0.14.2 editor work, both flagged in the 0.14.2 PR review.
+
+### Changed — `typhon.toml` edits refresh editor diagnostics live
+
+- **The language server now handles `workspace/didChangeWatchedFiles`.** The
+  VS Code client already watches `**/typhon.toml` / `**/*.ty` / `**/*.dty`,
+  but the server ignored the notification — so toggling `[strictness]
+  suggest-gather` (or any knob) didn't take effect until you re-touched a
+  source file. The server now invalidates its config cache on a
+  `typhon.toml` change and re-checks every open document, so the editor
+  reflects the new settings immediately. No VS Code extension change is
+  needed — the existing file watcher already sends the notification.
+- **The `[strictness]` lint knobs are now cached per project root**, keyed by
+  the `typhon.toml` modification time, instead of re-parsed on every
+  keystroke — closing the per-check disk-I/O concern from review. Because the
+  cache is mtime-validated, the knobs stay fresh on an edit even for an editor
+  that never sends `didChangeWatchedFiles`; the watcher just makes the refresh
+  immediate for those that do.
+
+### Added — committed end-to-end LSP tests
+
+- Two `#[tokio::test]`s drive the real server over an in-memory pipe: one
+  asserts `didOpen` of a file with an independent-await run publishes
+  `tyc::gather_opportunity` at LSP severity `Hint`; the other asserts the
+  watcher re-publishes the hint after a `typhon.toml` `suggest-gather`
+  flip. The `didOpen → publishDiagnostics` path was previously only covered
+  by unit tests plus a manual check.
+
 ## 0.14.2 — 2026-06-12 — Async concurrency: `gather_opportunity` advice + cross-module auto-gather
 
 The single biggest "compile to the faster way" lever for async code is
