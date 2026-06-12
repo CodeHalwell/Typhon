@@ -10,11 +10,10 @@ use std::path::PathBuf;
 use clap::Args;
 use miette::{miette, Result};
 use tyc_analyse::{
-    analyse_purity, collect_gatherable_async_fn_names, detect_gather_opportunities,
-    detect_missed_gathers, evaluate_comptime_with_functions, extract_builtin_extensions,
-    load_profile_samples, pgo_memoise_targets, purity_diagnostics, rewrite_auto_gather,
-    rewrite_builtin_extension_calls, rewrite_parallel_comprehensions, substitute_comptime_literals,
-    ProfileSample,
+    analyse_purity, collect_gatherable_async_fn_names, detect_missed_gathers,
+    evaluate_comptime_with_functions, extract_builtin_extensions, load_profile_samples,
+    pgo_memoise_targets, purity_diagnostics, rewrite_auto_gather, rewrite_builtin_extension_calls,
+    rewrite_parallel_comprehensions, substitute_comptime_literals, ProfileSample,
 };
 use tyc_db::{check_file_with_imports, extract_shapes_for_path, TycDatabase};
 use tyc_desugar::{desugar_module_with, DesugarOptions};
@@ -742,22 +741,16 @@ pub fn run(args: BuildArgs) -> Result<()> {
         // miette (like the missed-gather advice above); never blocks a
         // build, and `[strictness] suggest-gather = false` silences it.
         if config.strictness.suggest_gather {
-            for opp in detect_gather_opportunities(&module) {
-                let offset = opp.call_range.start().to_usize();
-                let length = opp
-                    .call_range
-                    .end()
-                    .to_usize()
-                    .saturating_sub(offset)
-                    .max(1);
-                let advice = TycError::gather_opportunity(
-                    opp.count,
-                    path.display().to_string(),
-                    &prep.python_source,
-                    offset,
-                    length,
-                );
-                eprintln!("{:?}", miette::Report::new_boxed(Box::new(advice)));
+            // Same diagnostic construction the `check` command and the LSP
+            // use, so the three surfaces never drift.
+            for advice in tyc_analyse::gather_opportunity_diagnostics(
+                &module,
+                &path.display().to_string(),
+                &prep.python_source,
+            )
+            .warnings()
+            {
+                eprintln!("{:?}", miette::Report::new_boxed(Box::new(advice.clone())));
             }
         }
 

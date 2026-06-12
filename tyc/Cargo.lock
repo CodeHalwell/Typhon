@@ -2028,6 +2028,7 @@ dependencies = [
 name = "tyc-analyse"
 version = "0.14.2"
 dependencies = [
+ "miette",
  "ruff_python_ast",
  "ruff_python_parser",
  "ruff_text_size",
@@ -2104,6 +2105,7 @@ dependencies = [
  "tokio",
  "toml",
  "tower-lsp-server",
+ "tyc-analyse",
  "tyc-db",
  "tyc-diagnostics",
  "tyc-resolve",

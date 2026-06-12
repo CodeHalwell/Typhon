@@ -84,6 +84,25 @@ that call `@gatherable` functions imported from another module.
   module the function lives in. Mis-resolution can only ever *fail* to fold
   (a missed optimisation), never fold something un-attested.
 
+### Added — advisory lints surface live in the editor (LSP)
+
+- **The advisory lints now appear as you type, not just in CI.** The pure-AST
+  advisories — `gather_opportunity`, `mutable_default_param`,
+  `empty_collection_no_annotation`, `typing_alias_in_annotation`,
+  `is`-literal, loop-closure-capture, and the inline secret-literal lint —
+  previously only ran inside the `tyc check` / `tyc build` commands, so they
+  were invisible in the editor. They now flow through the language server too.
+- A single shared `editor_lint_diagnostics` is the source of truth for the
+  advisory set, called by both `tyc check` and the LSP, so the editor and CI
+  can never drift. The LSP reads `[strictness] suggest-gather` /
+  `allow-secret-comptime` from the project's `typhon.toml`, so silencing a
+  lint silences it in the editor as well.
+- Advice-severity diagnostics render as unobtrusive **hints** (the editor's
+  faint underline) rather than warnings, matching the terminal's `☞` badge.
+- No editor-side change is required: the VS Code extension is a thin
+  pass-through language client, so updating the `tyc` binary is enough to
+  light the hints up.
+
 ## 0.14.1 — 2026-06-12 — Cross-module shape propagation completeness
 
 A dogfooding round — a self-hosted API budget tracker built end-to-end on

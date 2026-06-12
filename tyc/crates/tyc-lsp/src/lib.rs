@@ -299,7 +299,7 @@ impl Backend {
                 std::sync::Arc::new(std::collections::HashMap::new())
             };
             #[allow(clippy::explicit_auto_deref)]
-            let diags = if project_shapes.is_empty() {
+            let mut diags = if project_shapes.is_empty() {
                 // No workspace layout discovered — fall back to the
                 // Salsa-cached per-file check so isolated edits keep
                 // the LSP cache warm.
@@ -324,6 +324,31 @@ impl Backend {
             // Salsa `preprocessed_text` query is populated; hover/definition
             // handlers that call it afterward benefit from the cache.
             let mapping_source = preprocessed_text(&*db, source_file);
+
+            // Editor advisory lints — the same pure-AST passes `tyc check`
+            // runs (empty-collection, typing-alias, mutable-default,
+            // `is`-literal, loop-closure, secret-literal, and the
+            // `gather_opportunity` concurrency nudge), surfaced live in the
+            // editor via the shared `editor_lint_diagnostics`. The salsa
+            // type-check above does not run these, so without this the
+            // hints only showed up in CI / `tyc build`. Spans are offsets
+            // into `mapping_source`, the preprocessed text we parse here —
+            // self-consistent with the existing diagnostics, which map
+            // against the same source. The `[strictness]` knobs are read
+            // from the project's `typhon.toml` so a `suggest-gather = false`
+            // silences the editor hint exactly as it does the CLI.
+            if let Ok(parsed) = tyc_syntax::parse_module(&mapping_source) {
+                let opts = workspace
+                    .as_ref()
+                    .map(|(root, _)| read_lint_options(root))
+                    .unwrap_or_default();
+                diags.extend(tyc_analyse::editor_lint_diagnostics(
+                    &parsed.into_syntax(),
+                    &uri_str_for_check,
+                    &mapping_source,
+                    opts,
+                ));
+            }
             (diags, mapping_source)
         })
         .await;
@@ -349,7 +374,11 @@ impl Backend {
         }
         for warn in diags.warnings() {
             let src = diagnostic_source(warn, &text, &mapping_source);
-            if let Some(d) = tyc_error_to_lsp(warn, src, DiagnosticSeverity::WARNING) {
+            // Honour each diagnostic's declared miette severity: advisory
+            // lints (`gather_opportunity`, `mutable_default_param`, …) render
+            // as unobtrusive HINTs rather than yellow WARNINGs, matching how
+            // the terminal renders the `☞` advice badge.
+            if let Some(d) = tyc_error_to_lsp(warn, src, advisory_severity(warn)) {
                 out.push(d);
             }
         }
@@ -1752,6 +1781,36 @@ fn parse_src_dir(toml_path: &std::path::Path) -> Option<String> {
     let project = parsed.get("project")?.as_table()?;
     let src = project.get("src")?.as_str()?;
     Some(src.to_owned())
+}
+
+/// Read the two `[strictness]` knobs that gate the editor advisory lints
+/// (`suggest-gather`, `allow-secret-comptime`) from the project's
+/// `typhon.toml`. Any missing file / key falls back to
+/// [`tyc_analyse::LintOptions::default`], which reproduces the default
+/// `typhon.toml` behaviour (gather on, secret-literal lint on) — so an
+/// editor buffer in a project without an explicit `[strictness]` table
+/// still gets the on-by-default advice, exactly like `tyc check`.
+fn read_lint_options(root: &std::path::Path) -> tyc_analyse::LintOptions {
+    let mut opts = tyc_analyse::LintOptions::default();
+    let Ok(text) = std::fs::read_to_string(root.join("typhon.toml")) else {
+        return opts;
+    };
+    let Ok(parsed) = toml::from_str::<toml::Value>(&text) else {
+        return opts;
+    };
+    let Some(strictness) = parsed.get("strictness").and_then(|s| s.as_table()) else {
+        return opts;
+    };
+    if let Some(b) = strictness.get("suggest-gather").and_then(|v| v.as_bool()) {
+        opts.suggest_gather = b;
+    }
+    if let Some(b) = strictness
+        .get("allow-secret-comptime")
+        .and_then(|v| v.as_bool())
+    {
+        opts.allow_secret_comptime = b;
+    }
+    opts
 }
 
 /// Map a dotted module name to a `.ty` file path under `src_dir`.
@@ -3491,6 +3550,18 @@ fn position_to_byte(source: &str, position: Position) -> usize {
 /// the diagnostic carries no positional label (e.g. an I/O error that is
 /// not anchored to a specific source span — those go through the LSP log
 /// channel instead, handled by the caller).
+/// Map a non-error diagnostic's declared miette severity to the LSP
+/// severity used for its editor squiggle. Advice (the `☞` badge in the
+/// terminal — `gather_opportunity`, `mutable_default_param`, …) becomes a
+/// faint `HINT`; an explicit `Warning` stays a yellow `WARNING`. Errors
+/// never reach here — they're published with `ERROR` severity directly.
+fn advisory_severity(diag: &TycError) -> DiagnosticSeverity {
+    match miette::Diagnostic::severity(diag) {
+        Some(miette::Severity::Advice) => DiagnosticSeverity::HINT,
+        _ => DiagnosticSeverity::WARNING,
+    }
+}
+
 fn tyc_error_to_lsp(
     err: &TycError,
     source: &str,
@@ -3567,6 +3638,48 @@ fn byte_to_position(source: &str, target: usize) -> Position {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn advisory_severity_maps_advice_to_hint() {
+        // `gather_opportunity` is declared `severity(Advice)` → faint HINT.
+        let advice = TycError::gather_opportunity(2, "x.ty", "await a()\nawait b()\n", 0, 7);
+        assert_eq!(advisory_severity(&advice), DiagnosticSeverity::HINT);
+        // A `severity(Warning)` diagnostic stays a yellow WARNING.
+        let warn = TycError::contains_secret_literal("API_KEY", "literal");
+        assert_eq!(advisory_severity(&warn), DiagnosticSeverity::WARNING);
+    }
+
+    #[test]
+    fn read_lint_options_defaults_without_config() {
+        // No `typhon.toml` at the root → on-by-default advice.
+        let tmp = tempfile::tempdir().unwrap();
+        let opts = read_lint_options(tmp.path());
+        assert!(opts.suggest_gather, "gather advice defaults on");
+        assert!(
+            !opts.allow_secret_comptime,
+            "secret-literal lint defaults on"
+        );
+    }
+
+    #[test]
+    fn read_lint_options_parses_strictness_knobs() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("typhon.toml"),
+            "[project]\nname = \"x\"\nsrc = \"src\"\n\
+             [strictness]\nsuggest-gather = false\nallow-secret-comptime = true\n",
+        )
+        .unwrap();
+        let opts = read_lint_options(tmp.path());
+        assert!(
+            !opts.suggest_gather,
+            "suggest-gather = false must be honoured"
+        );
+        assert!(
+            opts.allow_secret_comptime,
+            "allow-secret-comptime = true must be honoured"
+        );
+    }
 
     #[test]
     fn byte_to_position_ascii() {

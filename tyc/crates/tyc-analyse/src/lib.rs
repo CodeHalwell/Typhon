@@ -77,6 +77,88 @@ pub use extend_builtin::{
     ExtensionRegistry,
 };
 
+// ── Shared editor / CLI lint advisories ───────────────────────────────────────
+
+/// Config knobs that gate two of the advisory lints. Mirrors the
+/// matching `[strictness]` keys (`allow-secret-comptime`,
+/// `suggest-gather`); defaults reproduce the default `typhon.toml`
+/// behaviour so callers without a config (a standalone editor buffer)
+/// still get the on-by-default advice.
+#[derive(Debug, Clone, Copy)]
+pub struct LintOptions {
+    /// `[strictness] allow-secret-comptime` — when `true`, suppress the
+    /// hard-coded-credential lint on plain `let` bindings.
+    pub allow_secret_comptime: bool,
+    /// `[strictness] suggest-gather` — when `true` (the default), surface
+    /// `tyc::gather_opportunity` for runs of independent awaits.
+    pub suggest_gather: bool,
+}
+
+impl Default for LintOptions {
+    fn default() -> Self {
+        // `allow-secret-comptime` defaults off (lint on); `suggest-gather`
+        // defaults on — same as `[strictness]`'s own defaults.
+        Self {
+            allow_secret_comptime: false,
+            suggest_gather: true,
+        }
+    }
+}
+
+/// `tyc::gather_opportunity` advice for every run of 2+ adjacent
+/// independent awaited calls in an `async def`. Wraps
+/// [`detect_gather_opportunities`] so the diagnostic construction lives
+/// in exactly one place (the `tyc check` command, the LSP, and the
+/// `tyc build` nudge all route through this).
+pub fn gather_opportunity_diagnostics(module: &ModModule, path: &str, source: &str) -> Diagnostics {
+    let mut diags = Diagnostics::new();
+    for opp in detect_gather_opportunities(module) {
+        let offset = opp.call_range.start().to_usize();
+        let length = opp
+            .call_range
+            .end()
+            .to_usize()
+            .saturating_sub(offset)
+            .max(1);
+        diags.push_warning(TycError::gather_opportunity(
+            opp.count, path, source, offset, length,
+        ));
+    }
+    diags
+}
+
+/// Run the pure-AST advisory lints that should fire identically in
+/// `tyc check` and live in the editor (the LSP). Spans are byte offsets
+/// into `source`, which must be the *preprocessed* Python the `module`
+/// was parsed from. This is the single source of truth for the advisory
+/// set, so a new lint added here lights up both surfaces at once
+/// (purity and the import-vetting / `pub *` checks stay in the `check`
+/// command — they need resolve / comptime context the LSP composes
+/// separately).
+pub fn editor_lint_diagnostics(
+    module: &ModModule,
+    path: &str,
+    source: &str,
+    opts: LintOptions,
+) -> Diagnostics {
+    let mut diags = Diagnostics::new();
+    diags.extend(analyse_empty_collection_bindings(module, path, source));
+    diags.extend(analyse_typing_alias_annotations(module, path, source));
+    diags.extend(analyse_mutable_default_params(module, path, source));
+    diags.extend(analyse_is_literal_comparisons(module, path, source));
+    diags.extend(analyse_loop_closure_captures(module, path, source));
+    diags.extend(analyse_secret_literal_bindings(
+        module,
+        path,
+        source,
+        opts.allow_secret_comptime,
+    ));
+    if opts.suggest_gather {
+        diags.extend(gather_opportunity_diagnostics(module, path, source));
+    }
+    diags
+}
+
 // ── Public types ──────────────────────────────────────────────────────────────
 
 /// A value that was determined at build time by evaluating a `comptime`
@@ -4160,13 +4242,84 @@ fn walk_annotation_expr(expr: &Expr, path: &str, source: &str, diags: &mut Diagn
 #[cfg(test)]
 mod lint_tests {
     use super::*;
+    use miette::Diagnostic as _;
     use tyc_syntax::preprocess::preprocess;
+
+    /// Collect the `tyc::…` codes of a diagnostic set's warnings.
+    fn warning_codes(diags: &Diagnostics) -> Vec<String> {
+        diags
+            .warnings()
+            .iter()
+            .filter_map(|w| w.code().map(|c| c.to_string()))
+            .collect()
+    }
 
     fn parse(src: &str) -> ModModule {
         let prep = preprocess(src);
         tyc_syntax::parse_module(&prep.python_source)
             .expect("parse failed")
             .into_syntax()
+    }
+
+    // ── Shared editor / CLI advisory aggregator ─────────────────────────────
+
+    #[test]
+    fn editor_lint_diagnostics_bundles_gather_and_lints() {
+        // One independent-await run (gather advice) plus a mutable-default
+        // param (lint) — the aggregator should surface both in one pass.
+        let src = "\
+async def fetch_a() -> int:
+    return 1
+async def fetch_b() -> int:
+    return 2
+async def load() -> int:
+    let a = await fetch_a()
+    let b = await fetch_b()
+    return a + b
+def f(xs: list[int] = []) -> int:
+    return len(xs)
+";
+        let prep = preprocess(src);
+        let module = parse(src);
+        let diags =
+            editor_lint_diagnostics(&module, "x.ty", &prep.python_source, LintOptions::default());
+        let codes = warning_codes(&diags);
+        assert!(
+            codes.iter().any(|c| c.contains("gather_opportunity")),
+            "expected gather_opportunity advice; got {codes:?}"
+        );
+        assert!(
+            codes.iter().any(|c| c.contains("mutable_default_param")),
+            "expected mutable_default_param lint; got {codes:?}"
+        );
+    }
+
+    #[test]
+    fn editor_lint_diagnostics_respects_suggest_gather_off() {
+        let src = "\
+async def fetch_a() -> int:
+    return 1
+async def fetch_b() -> int:
+    return 2
+async def load() -> int:
+    let a = await fetch_a()
+    let b = await fetch_b()
+    return a + b
+";
+        let prep = preprocess(src);
+        let module = parse(src);
+        let opts = LintOptions {
+            suggest_gather: false,
+            ..LintOptions::default()
+        };
+        let diags = editor_lint_diagnostics(&module, "x.ty", &prep.python_source, opts);
+        let has_gather = warning_codes(&diags)
+            .iter()
+            .any(|c| c.contains("gather_opportunity"));
+        assert!(
+            !has_gather,
+            "suggest_gather = false must silence the gather nudge"
+        );
     }
 
     // ── Finding #3: empty_collection_no_annotation ──────────────────────────
