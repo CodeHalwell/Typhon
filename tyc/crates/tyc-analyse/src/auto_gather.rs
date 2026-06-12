@@ -829,6 +829,7 @@ fn walk_missed_in_stmt(
             );
         }
         Stmt::For(s) => {
+            // `async for` is `StmtFor { is_async: true }` in ruff — covered.
             walk_missed_in_stmts(&s.body, eligible_if_decorated, decorated, inside_async, out);
             walk_missed_in_stmts(
                 &s.orelse,
@@ -839,6 +840,7 @@ fn walk_missed_in_stmt(
             );
         }
         Stmt::With(s) => {
+            // `async with` is `StmtWith { is_async: true }` in ruff — covered.
             walk_missed_in_stmts(&s.body, eligible_if_decorated, decorated, inside_async, out);
         }
         Stmt::Try(s) => {
@@ -1032,9 +1034,12 @@ fn walk_opportunities_in_stmt(stmt: &Stmt, inside_async: bool, out: &mut Vec<Gat
             walk_opportunities_in_stmts(&s.orelse, inside_async, out);
         }
         Stmt::For(s) => {
+            // ruff models `async for` as `StmtFor { is_async: true }`, so
+            // this arm already covers it (no separate `AsyncFor` variant).
             walk_opportunities_in_stmts(&s.body, inside_async, out);
             walk_opportunities_in_stmts(&s.orelse, inside_async, out);
         }
+        // Likewise `async with` is `StmtWith { is_async: true }` — covered.
         Stmt::With(s) => walk_opportunities_in_stmts(&s.body, inside_async, out),
         Stmt::Try(s) => {
             walk_opportunities_in_stmts(&s.body, inside_async, out);
@@ -1700,6 +1705,29 @@ async def load(client, uid):
         let module = parse_module(src);
         let ops = detect_gather_opportunities(&module);
         assert_eq!(ops.len(), 1, "expected 1 opportunity; got {ops:?}");
+        assert_eq!(ops[0].count, 2);
+    }
+
+    #[test]
+    fn opportunity_flags_independent_awaits_inside_async_with() {
+        // ruff models `async with` as `StmtWith { is_async: true }`, so the
+        // `Stmt::With` traversal arm already descends into it. Guard that:
+        // an independent-await run inside an `async with` block is flagged
+        // exactly like one at the function top level. (PR #191 review.)
+        let src = "\
+async def load(client, uid):
+    async with client.session() as s:
+        a = await s.get_user(uid)
+        b = await s.get_posts(uid)
+        return (a, b)
+";
+        let module = parse_module(src);
+        let ops = detect_gather_opportunities(&module);
+        assert_eq!(
+            ops.len(),
+            1,
+            "independent awaits inside `async with` must be flagged; got {ops:?}"
+        );
         assert_eq!(ops[0].count, 2);
     }
 

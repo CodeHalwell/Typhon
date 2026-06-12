@@ -4132,28 +4132,27 @@ pub fn extract_module_shapes(module: &ModModule) -> ModuleShapes {
         }
     }
 
-    // `@gatherable` async functions (top-level and class methods), so the
-    // `auto-gather` build pass can fold runs that call them across module
-    // boundaries. Mirrors `tyc_analyse::collect_gatherable_async_fn_names`
-    // — kept here as a few lines of AST inspection rather than a
-    // dependency edge from `tyc-types` onto `tyc-analyse`.
+    // `@gatherable` async functions, so the `auto-gather` build pass can
+    // fold runs that call them across module boundaries. Mirrors
+    // `tyc_analyse::collect_gatherable_async_fn_names` — kept here as a few
+    // lines of AST inspection rather than a dependency edge from
+    // `tyc-types` onto `tyc-analyse`.
+    //
+    // ONLY top-level functions are collected, never class methods: this is
+    // a flat name set consumed by the cross-module rewrite, which folds
+    // bare-name calls to *imported* functions (`from m import fetch`). A
+    // class method can't be imported as a bare name, so adding its name
+    // here would be dead weight at best — and unsound at worst, since a
+    // `@gatherable` method `Service.fetch` would make an *undecorated*
+    // top-level `fetch` in the same module look gather-safe to a consumer
+    // importing it. (PR #191 review — gemini-code-assist.)
     let mut gatherable_async_fns: std::collections::HashSet<String> =
         std::collections::HashSet::new();
     for stmt in &module.body {
-        match stmt {
-            Stmt::FunctionDef(f) if f.is_async && has_gatherable_decorator(&f.decorator_list) => {
+        if let Stmt::FunctionDef(f) = stmt {
+            if f.is_async && has_gatherable_decorator(&f.decorator_list) {
                 gatherable_async_fns.insert(f.name.as_str().to_owned());
             }
-            Stmt::ClassDef(c) => {
-                for inner in &c.body {
-                    if let Stmt::FunctionDef(f) = inner {
-                        if f.is_async && has_gatherable_decorator(&f.decorator_list) {
-                            gatherable_async_fns.insert(f.name.as_str().to_owned());
-                        }
-                    }
-                }
-            }
-            _ => {}
         }
     }
 
@@ -4349,7 +4348,7 @@ pub fn check_module_with_imports(
                 .or_insert_with(|| variants.clone());
             // The classes registry also needs the union name so
             // annotations referring to it resolve to `Type::Class(union)`.
-            if !c.classes.iter().any(|n| n == name) {
+            if !c.classes.contains(name) {
                 c.classes.push(name.clone());
             }
         }
@@ -4368,7 +4367,7 @@ pub fn check_module_with_imports(
             // resolve to `Type::Class(name)`, mirroring the in-module
             // first pass (which pushes every `newtype` name onto
             // `c.classes`).
-            if !c.classes.iter().any(|n| n == name) {
+            if !c.classes.contains(name) {
                 c.classes.push(name.clone());
             }
         }
@@ -4380,7 +4379,7 @@ pub fn check_module_with_imports(
             c.type_aliases
                 .entry(name.clone())
                 .or_insert_with(|| alias.clone());
-            if !c.classes.iter().any(|n| n == name) {
+            if !c.classes.contains(name) {
                 c.classes.push(name.clone());
             }
         }
@@ -4391,7 +4390,7 @@ pub fn check_module_with_imports(
             c.enums
                 .entry(name.clone())
                 .or_insert_with(|| members.clone());
-            if !c.classes.iter().any(|n| n == name) {
+            if !c.classes.contains(name) {
                 c.classes.push(name.clone());
             }
         }
@@ -21598,9 +21597,11 @@ def label(s: Sub) -> str:
     }
 
     /// `extract_module_shapes` publishes the names of `@gatherable`
-    /// async functions (top-level and class methods) so the cross-module
-    /// auto-gather build pass can fold runs that call them from another
-    /// module. Undecorated async fns and sync fns are excluded.
+    /// async functions (top-level only) so the cross-module auto-gather
+    /// build pass can fold runs that call them from another module.
+    /// Undecorated async fns, sync fns, and class methods are excluded —
+    /// the last because the set keys bare-name imports, which can never
+    /// resolve to a method (PR #191 review).
     #[test]
     fn extract_publishes_gatherable_async_fns() {
         let src = "\
@@ -21629,8 +21630,10 @@ class Service:
             "decorated top-level async fn must be published"
         );
         assert!(
-            shapes.gatherable_async_fns.contains("fetch_orders"),
-            "decorated async method must be published"
+            !shapes.gatherable_async_fns.contains("fetch_orders"),
+            "a @gatherable class method must NOT be published — it can't be \
+             imported as a bare name, and publishing it could shadow an \
+             undecorated top-level fn of the same name"
         );
         assert!(
             !shapes.gatherable_async_fns.contains("fetch_posts"),

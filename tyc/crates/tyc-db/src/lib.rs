@@ -921,6 +921,47 @@ fn build_external_shapes(
             external.frozen_classes.insert(frozen_name.clone());
         }
     }
+    // Bare module imports (`import models`, then `models.AttributedSpend`)
+    // produce bindings with no `member`, so the per-binding loop above
+    // skips them entirely — yet `models.AttributedSpend.project: ProjectTag`
+    // needs `ProjectTag` in `external.newtypes` to widen into a `str` slot
+    // exactly as the `from models import …` form does. Seed each bare-
+    // imported module's transparent shapes (newtype / alias / enum / frozen)
+    // under their source names. `sealed_unions` stay member-gated — a
+    // variant-to-union upcast isn't reachable without the variant in scope —
+    // and this runs as a separate pass so it can't perturb the
+    // `modules_touched` / variant-remap bookkeeping above. (PR #191 review —
+    // chatgpt-codex-connector.)
+    for b in bindings {
+        let Some(info) = &b.import_info else { continue };
+        if info.member.is_some() {
+            continue;
+        }
+        let Some(module_shapes) = shapes_by_module.get(&info.module) else {
+            continue;
+        };
+        for (newtype_name, base) in &module_shapes.newtypes {
+            external
+                .newtypes
+                .entry(newtype_name.clone())
+                .or_insert_with(|| base.clone());
+        }
+        for (alias_name, alias) in &module_shapes.type_aliases {
+            external
+                .type_aliases
+                .entry(alias_name.clone())
+                .or_insert_with(|| alias.clone());
+        }
+        for (enum_name, members) in &module_shapes.enums {
+            external
+                .enums
+                .entry(enum_name.clone())
+                .or_insert_with(|| members.clone());
+        }
+        for frozen_name in &module_shapes.frozen_classes {
+            external.frozen_classes.insert(frozen_name.clone());
+        }
+    }
     external
 }
 
@@ -1537,6 +1578,36 @@ def first_key(spend: AttributedSpend) -> str:
         assert!(
             !diags.has_errors(),
             "imported newtype field must widen to its base type; got: {:?}",
+            diags.errors()
+        );
+    }
+
+    /// Bare `import models` form of the field-widening case: the binding
+    /// for `models` carries no `member`, so the per-binding seeding loop
+    /// skips it — the dedicated bare-import pass must still seed
+    /// `ProjectTag` so `spend.project` widens. (PR #191 review.)
+    #[test]
+    fn cross_module_newtype_field_widens_via_bare_module_import() {
+        let models = "\
+newtype ProjectTag = str
+
+class AttributedSpend:
+    project: ProjectTag
+    amount: float
+";
+        let registry = build_registry(&[("models", models)]);
+        let main = "\
+import models
+
+def first_key(spend: models.AttributedSpend) -> str:
+    let key: str = spend.project
+    return key
+";
+        let mut db = TycDatabase::new();
+        let diags = check_file_with_imports(&mut db, "main.ty".into(), main.into(), &registry);
+        assert!(
+            !diags.has_errors(),
+            "bare-imported newtype field must widen to its base type; got: {:?}",
             diags.errors()
         );
     }
