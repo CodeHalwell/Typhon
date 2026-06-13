@@ -320,6 +320,45 @@ print("ok")
     }
 
     #[test]
+    fn try_result_bridges_exceptions() {
+        // `try_result(thunk[, on_err])` returns `Ok(thunk())`, or catches a
+        // raised exception and returns `Err(on_err(exc))` / `Err(exc)`. Drives
+        // both the 2-arg (mapped) and 1-arg (raw exception) forms, and the
+        // Ok / Err arms. Wrong results `raise`, surfacing a regression as a
+        // non-zero run.
+        let src = r#"
+def parse(raw: str) -> int:
+    return int(raw)
+
+def safe(raw: str) -> Result[int, str]:
+    return try_result(lambda: parse(raw), lambda e: "bad")
+
+match safe("7"):
+    case Ok(v):
+        if v != 7:
+            raise ValueError("ok value wrong")
+    case Err(e):
+        raise ValueError("expected ok, got err")
+
+match safe("nope"):
+    case Ok(v):
+        raise ValueError("expected err, got ok")
+    case Err(e):
+        if e != "bad":
+            raise ValueError("mapped err wrong")
+
+# 1-arg form: the error is the raw exception object.
+match try_result(lambda: parse("x")):
+    case Ok(v):
+        raise ValueError("expected err from raising thunk")
+    case Err(e):
+        pass
+print("ok")
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    #[test]
     fn type_alias_binds_as_runtime_value() {
         // A `type` alias must bind a runtime name (CPython binds a lazy
         // `TypeAliasType`); previously this was a no-op, so an imported

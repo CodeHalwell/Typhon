@@ -4,6 +4,47 @@ All notable changes to Typhon are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely; the
 canonical phase-by-phase status lives in `docs/roadmap.md`.
 
+## 0.14.6 — 2026-06-13 — `try_result`: exception→Result bridging combinator
+
+Bridging a library boundary into a `Result` meant writing the same shape by
+hand at every call site — `try: ... return Ok(x) except E as e: return
+Err(...)`. A field report flagged this as the one place the otherwise-elegant
+error model leaks Python's exception machinery into user code. This release
+adds the standard combinator.
+
+### Added — `try_result(thunk[, on_err])`
+
+- **`try_result` runs `thunk()` and returns `Ok(result)`; on any exception it
+  returns `Err(on_err(exc))`** — or `Err(exc)` (the raw exception) when no
+  mapper is given. A whole boundary shim collapses to one expression:
+
+  ```ty
+  def load(path: str) -> Result[dict[str, str], str]:
+      return try_result(lambda: read_json(path), lambda e: f"invalid JSON: {e}")
+  ```
+
+- **It is a prelude name** (no import in source, like `Ok`/`Err`/`Result`) and
+  is **typed as `Result[T, E]`** — `T` inferred from the thunk body, `E` from
+  the mapper body (`Exception` when the mapper is omitted, giving
+  `Result[T, Exception]` to `.map_err(...)` later). The checker special-cases
+  it in `infer_expr` (mirroring `as!`/`checked_cast`), so a wrong return
+  annotation still fires `type_mismatch` — it is a real `Result`, not an `Any`
+  escape hatch. Inferring the lambda bodies also surfaces their own
+  diagnostics.
+- **Works under both execution paths.** `tyc build` emits
+  `from typhon_runtime import try_result` (auto-injected by desugar,
+  independently of the `Ok`/`Err`/`Result` family import) backed by a new
+  `typhon_runtime.__init__` helper. `tyc run` (the VM) registers `try_result`
+  as a prelude native that materialises the caught exception exactly as an
+  `except E as e:` handler would, so a mapper like `lambda e: str(e)` works.
+- **Implementation:** the desugar result-name walker was generalised to take
+  the target identifiers (shared by the `Ok`/`Err`/`Result` and `try_result`
+  injectors); resolver prelude, checker prelude + builtin set, and VM root +
+  `typhon_runtime` shim all learn the name. Tests across `tyc-desugar`
+  (independent import injection), `tyc-types` (Result typing + the
+  not-an-`Any` guard), and `tyc-vm` (Ok/Err runtime behaviour, 1- and 2-arg
+  forms) cover it.
+
 ## 0.14.5 — 2026-06-13 — `as!` checked cast composes everywhere (nested + multi-line)
 
 `as!` (v0.14.0) shipped restricted to a single physical line in a value

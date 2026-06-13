@@ -1378,6 +1378,7 @@ fn expr_is_type_shaped(expr: &Expr, classes: &[String], type_params: &[String]) 
         "Result",
         "Ok",
         "Err",
+        "try_result",
         "Counter",
         "OrderedDict",
         "defaultdict",
@@ -5224,6 +5225,16 @@ fn seed_typhon_builtins(c: &mut Checker) {
         span: (0, 0),
         from_unsafe: false,
     });
+    // `try_result` — exception→Result bridging combinator from typhon_runtime.
+    // Calls are special-cased in `infer_expr` to produce `Result[T, E]`; the
+    // binding only needs to make the bare name resolvable.
+    c.env.declare(TypeBinding {
+        name: "try_result".into(),
+        declared: Type::Unknown,
+        narrowed: Type::Unknown,
+        span: (0, 0),
+        from_unsafe: false,
+    });
 }
 
 /// Stdlib calls that block the event loop when invoked from inside an
@@ -7303,6 +7314,33 @@ fn method_arity_info_for_attribute(
 /// without the `Expr::Call` arm, the chained-call receiver would fall
 /// back to `Type::Unknown` and the method arity check would silently
 /// skip. FINDINGS — gemini review of v0.2.0.
+///
+/// Extract the value type a `try_result` argument contributes: the body type
+/// of a `lambda` thunk / error-mapper, or the declared return type of a named
+/// callable. Lambda parameters resolve to `Unknown`, which is fine for the
+/// common mappers (`lambda e: str(e)` → `str`, an f-string → `str`).
+fn try_result_arg_ret_readonly(c: &Checker, arg: &Expr) -> Type {
+    match arg {
+        Expr::Lambda(lam) => infer_expr_readonly(c, &lam.body),
+        other => match infer_expr_readonly(c, other) {
+            Type::Function { ret, .. } => *ret,
+            _ => Type::Unknown,
+        },
+    }
+}
+
+/// Mutable variant of [`try_result_arg_ret_readonly`] — walks the lambda body
+/// with `infer_expr` so the thunk / mapper's own diagnostics surface.
+fn infer_try_result_arg_ret(c: &mut Checker, arg: &Expr) -> Type {
+    match arg {
+        Expr::Lambda(lam) => infer_expr(c, &lam.body),
+        other => match infer_expr(c, other) {
+            Type::Function { ret, .. } => *ret,
+            _ => Type::Unknown,
+        },
+    }
+}
+
 fn infer_expr_readonly(c: &Checker, e: &Expr) -> Type {
     match e {
         Expr::Name(n) => c
@@ -7367,6 +7405,22 @@ fn infer_expr_readonly(c: &Checker, e: &Expr) -> Type {
             if let Expr::Name(n) = call.func.as_ref() {
                 if n.id.as_str() == "__typhon_checked_cast__" && call.arguments.args.len() == 2 {
                     return type_from_annotation(&call.arguments.args[1], &c.classes);
+                }
+            }
+            // `try_result(thunk[, on_err])` reads as `Result[T, E]` here too
+            // (see the `infer_expr` path for the full rationale).
+            if let Expr::Name(n) = call.func.as_ref() {
+                if n.id.as_str() == "try_result"
+                    && (call.arguments.args.len() == 1 || call.arguments.args.len() == 2)
+                    && call.arguments.keywords.is_empty()
+                {
+                    let ok_ty = try_result_arg_ret_readonly(c, &call.arguments.args[0]);
+                    let err_ty = if call.arguments.args.len() == 2 {
+                        try_result_arg_ret_readonly(c, &call.arguments.args[1])
+                    } else {
+                        Type::Class("Exception".into())
+                    };
+                    return Type::Generic("Result".into(), vec![ok_ty, err_ty]);
                 }
             }
             // Resolve the callee's return type so chained call
@@ -11847,6 +11901,28 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
                     return type_from_annotation(&call.arguments.args[1], &c.classes);
                 }
             }
+            // `try_result(thunk)` / `try_result(thunk, on_err)` — the
+            // exception→Result bridging combinator (from typhon_runtime).
+            // It runs `thunk()` and returns `Ok(result)`, or catches an
+            // exception and returns `Err(on_err(exc))` (or `Err(exc)` with no
+            // mapper). The static type is `Result[T, E]` where `T` is the
+            // thunk's result and `E` is the mapper's result (`Exception` with
+            // no mapper). Inferring the lambda bodies also surfaces their own
+            // diagnostics, mirroring the `checked_cast` value-walk above.
+            if let Expr::Name(n) = call.func.as_ref() {
+                if n.id.as_str() == "try_result"
+                    && (call.arguments.args.len() == 1 || call.arguments.args.len() == 2)
+                    && call.arguments.keywords.is_empty()
+                {
+                    let ok_ty = infer_try_result_arg_ret(c, &call.arguments.args[0]);
+                    let err_ty = if call.arguments.args.len() == 2 {
+                        infer_try_result_arg_ret(c, &call.arguments.args[1])
+                    } else {
+                        Type::Class("Exception".into())
+                    };
+                    return Type::Generic("Result".into(), vec![ok_ty, err_ty]);
+                }
+            }
             // B2: a call of shape `first[int]([1, 2, 3])` where `first`
             // is a generic function will type-check (the subscript is
             // assumed to be a type-arg hint) but crash at runtime in
@@ -16242,6 +16318,35 @@ def broken(b: Box) -> int:
                 .iter()
                 .any(|e| matches!(e, TycError::TypeMismatch { .. })),
             "casting to `int` then binding as `str` must mismatch: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn try_result_infers_result_type() {
+        // `try_result(thunk, on_err)` types as `Result[T, E]` — T from the
+        // thunk body, E from the mapper body — so returning it from a matching
+        // `Result[int, str]`-typed function checks cleanly.
+        let src = "def parse(raw: str) -> int:\n    return int(raw)\n\ndef safe(raw: str) -> Result[int, str]:\n    return try_result(lambda: parse(raw), lambda e: str(e))\n";
+        let d = check_full(src);
+        assert!(
+            d.errors().is_empty(),
+            "try_result returning the declared Result type must check cleanly: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn try_result_is_a_result_not_any() {
+        // The combinator returns a `Result`, not a blanket `Any`: binding it to
+        // a non-Result annotation still fires `type_mismatch`.
+        let src = "def f() -> None:\n    let x: int = try_result(lambda: 1, lambda e: \"\")\n";
+        let d = check_full(src);
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::TypeMismatch { .. })),
+            "binding a `Result` to `int` must mismatch: {:?}",
             d.errors()
         );
     }

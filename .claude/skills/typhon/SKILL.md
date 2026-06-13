@@ -141,6 +141,7 @@ The 30-second mental model. Every later section in this skill is detail under on
 | Exhaustive match | `match s: case Circle(r): ...` (no `_` needed) | vanilla Python `match` |
 | Result type | `Result[T, E]`, `Ok(v)`, `Err(e)` | generated `typhon_runtime.Ok/Err` dataclasses |
 | Result combinators (v0.6.0) | `r.map(f) / r.map_err(g) / r.and_then(h) / r.or_else(k)` | method calls on the runtime classes |
+| Exception→Result (v0.14.6) | `try_result(lambda: f(), lambda e: str(e))` | `from typhon_runtime import try_result` + call; types as `Result[T, E]` |
 | Error propagation | `let n: int = f()?` | inline `isinstance(_t, Err): return _t; n = _t.value` |
 | Result chain | `with a = f()?, b = g()?: ...  else err: ...` | sequenced if-isinstance ladder |
 | Generic fn | `def first[T](xs: list[T]) -> T?:` | same (PEP 695) |
@@ -935,6 +936,15 @@ def load(path: str) -> Result[dict[str, str], str]:
 
 After the shim, downstream code uses `?` and `with`-chains without ever writing `try`.
 
+For a **single** boundary call, the `try_result` combinator (v0.14.6) collapses the shim into one expression — a prelude name (no import) typed as `Result[T, E]`:
+
+```python
+def load(path: str) -> Result[dict[str, str], str]:
+    return try_result(lambda: read_json(path), lambda e: f"invalid JSON: {e}")
+```
+
+`try_result(thunk)` runs `thunk()` and returns `Ok(result)`; on any exception it returns `Err(on_err(exc))`, or `Err(exc)` (the raw exception, `Result[T, Exception]`) when the mapper is omitted. `T` is inferred from the thunk body, `E` from the mapper body. It works under `tyc run` (the VM materialises the caught exception just as an `except E as e:` handler would) and the compiled path (`from typhon_runtime import try_result` is auto-injected). Use the explicit multi-`except` `try` shim when you map *distinct* exception types to *distinct* errors; reach for `try_result` for the common single-boundary case.
+
 ---
 
 ## 10. Async and concurrency
@@ -1587,6 +1597,7 @@ When you edit the Rust compiler:
 | Result propagate | `let x: int = parse()?` |
 | Multi-Result chain | `with a = r1?, b = r2?: ... else err: ...` |
 | Result combinators | `r.map(f) / r.map_err(g) / r.and_then(h) / r.or_else(k)` |
+| Exception→Result | `try_result(lambda: f(), lambda e: str(e))` |
 | Guard / early return | `guard u = maybe else: return default` |
 | Pipe | `value \|> f() \|> g()` |
 | Compile-time const | `comptime let PORT: int = int(env("PORT", "8080"))` |

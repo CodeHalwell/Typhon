@@ -3140,6 +3140,8 @@ fn builtin_names() -> std::collections::HashSet<&'static str> {
         "Ok",
         "Err",
         "Result",
+        // Exception→Result bridging combinator (from typhon_runtime).
+        "try_result",
         // `typing.NewType` — referenced by the desugared `newtype` form
         // before the desugar pass injects `from typing import NewType`.
         "NewType",
