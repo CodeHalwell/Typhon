@@ -260,3 +260,29 @@ abbr[title] {
   background-color: color-mix(in srgb, var(--sl-color-accent) 25%, transparent);
   color: inherit;
 }
+
+/* Enhance spatial orientation upon anchor navigation */
+@keyframes highlight-target {
+  0% {
+    background-color: color-mix(in srgb, var(--sl-color-accent) 40%, transparent);
+    box-shadow: 0 0 0 4px color-mix(in srgb, var(--sl-color-accent) 40%, transparent);
+    border-radius: 0.25rem;
+  }
+  100% {
+    background-color: transparent;
+    box-shadow: 0 0 0 4px transparent;
+    border-radius: 0.25rem;
+  }
+}
+
+.sl-markdown-content :target {
+  animation: highlight-target 1.5s ease-out;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .sl-markdown-content :target {
+    animation: none;
+    border-left: 4px solid var(--sl-color-accent);
+    padding-left: 0.5rem;
+  }
+}
