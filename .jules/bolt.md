@@ -6,3 +6,7 @@
 ## 2024-06-12 - Resolve O(N^2) Source Map Generation string traversal bottleneck
 **Learning:** In `build_source_map_v2`, looking up the line number for a source file byte offset using `offset.min(source.len()); source.as_bytes()[..clamped].iter().filter(|&&b| b == b'\n').count()` requires scanning the string from the start every single time. Because this was called in an `O(N)` mapping operation over `line_offsets`, the algorithm degraded into `O(N * L)` complexity, creating severe bottlenecks on larger python source files.
 **Action:** When converting multiple byte offsets to line numbers, precompute an index of newline offsets (which is `O(L)`) and then use binary search via `partition_point` (which is `O(log K)` where `K` is the number of newlines). This reduces the complexity to `O(L + N log K)`.
+
+## 2024-06-05 - Avoid `.to_string()` inside match hot loops
+**Learning:** Checking for string equality against static `.to_string()` allocations (e.g. `["Ok".to_string(), "Err".to_string()]`) inside frequently called functions (like `cases_cover_type`) leads to significant and avoidable heap allocations.
+**Action:** Replace `["Ok".to_string(), "Err".to_string()]` with `["Ok", "Err"]` array of static references (`&'static str`) and dereference in closures properly (e.g. `|&v| covered.contains(v)`).
