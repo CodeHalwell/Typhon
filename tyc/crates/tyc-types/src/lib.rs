@@ -2432,6 +2432,15 @@ pub struct MethodSig {
     /// nullable-into-non-nullable guard misfires on `T?` parameters
     /// (FINDINGS E2 / round 2026-05-20-exploration).
     pub param_types: Vec<Type>,
+    /// `true` when the method is declared `async def`. Recorded so the
+    /// `tyc::async_without_await` carve-out can recognise an awaitless
+    /// `async def` that is async *only* to satisfy an async `interface`
+    /// method (structural conformance) or to override an async
+    /// base-class method. Such a method has no choice but to stay
+    /// `async` — flagging it forces dead `await asyncio.sleep(0)`
+    /// no-ops into the source — so the warning is suppressed in that
+    /// case. FINDINGS — async-impl conformance (Dead Reckoning report).
+    pub is_async: bool,
 }
 
 /// Member shape recorded for an interface or class — methods are recorded as
@@ -3089,6 +3098,58 @@ impl<'a> Checker<'a> {
             }
         }
         true
+    }
+
+    /// Return `true` when an awaitless `async def` method named
+    /// `method_name` on `class_name` is async *only* because an async
+    /// contract requires it to be — either it implements an `interface`
+    /// whose same-named method is `async def` (and the class structurally
+    /// conforms), or it overrides an `async def` method of the same name
+    /// on a base class. In both cases the method cannot drop `async`
+    /// without breaking the contract, so `tyc::async_without_await` is a
+    /// false positive: it would force a dead `await asyncio.sleep(0)`
+    /// no-op into an otherwise-correct trivial implementation (e.g. a
+    /// `ConsoleSink.deliver` that only `print`s, satisfying
+    /// `interface Sink: async def deliver(...)`). Suppress it.
+    /// FINDINGS — async-impl conformance (Dead Reckoning field report).
+    ///
+    /// `class_name` may be the `__typhon_impl_<Real>` pseudo-class the
+    /// preprocessor synthesises for an `impl Real:` block; the prefix is
+    /// stripped so the merged shape of the real class is consulted (its
+    /// `impl`-block methods are folded in by `merge_impl_blocks`).
+    fn method_satisfies_async_contract(&self, class_name: &str, method_name: &str) -> bool {
+        let real = class_name
+            .strip_prefix("__typhon_impl_")
+            .unwrap_or(class_name);
+        // Case A — structural interface conformance: the class fully
+        // conforms to an `interface` whose same-named method is `async`.
+        for (iface_name, iface) in &self.interfaces {
+            if iface
+                .shape
+                .methods
+                .get(method_name)
+                .is_some_and(|sig| sig.is_async)
+                && self.class_conforms_to_interface(real, iface_name)
+            {
+                return true;
+            }
+        }
+        // Case B — override of an `async` base-class method. Walk only
+        // the ancestors (via `class_parents`), never `real` itself, so we
+        // match a method being overridden rather than its own
+        // declaration. `find_method` descends each parent's chain, so a
+        // direct walk of the immediate parents covers transitive bases.
+        if let Some(parents) = self.class_parents.get(real) {
+            for parent in parents {
+                if self
+                    .find_method(parent, method_name)
+                    .is_some_and(|sig| sig.is_async)
+                {
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     /// Return `true` when `child` transitively inherits from `parent` via the
@@ -6617,6 +6678,7 @@ fn collect_class_shape(cd: &ruff_python_ast::StmtClassDef, classes: &[String]) -
                         is_classmethod,
                         arity_info,
                         param_types,
+                        is_async: f.is_async,
                     },
                 );
             }
@@ -8686,13 +8748,22 @@ fn check_function(
     // (prefixed with `__typhon_`). Carve-outs: async-protocol dunders
     // (`__aenter__`/`__aexit__`/`__aiter__`/`__anext__`), declaration-only
     // bodies (`...` / `pass` / docstring) that look like Protocol/interface
-    // signatures, and async generators (bodies that `yield`).
+    // signatures, and async generators (bodies that `yield`). Also exempt:
+    // a method that is async only to honour an async contract it can't opt
+    // out of — implementing an async `interface` method (structural
+    // conformance) or overriding an async base method. Flagging those
+    // forces a dead `await asyncio.sleep(0)` no-op into a correct trivial
+    // impl (FINDINGS — async-impl conformance, Dead Reckoning report).
     if is_async
         && !name.starts_with("__typhon_")
         && !is_async_protocol_dunder(name)
         && !body_has_await(body)
         && !body_is_declaration_only(body)
         && !body_has_yield(body)
+        && !c
+            .current_class
+            .clone()
+            .is_some_and(|cls| c.method_satisfies_async_contract(&cls, name))
     {
         c.diagnostics.push_warning(TycError::async_without_await(
             name,
@@ -20248,6 +20319,118 @@ class Identity frozen:
         assert!(
             !has_async_without_await_warning(&d),
             "async with should suppress async_without_await; got: {:?}",
+            d.warnings()
+                .iter()
+                .map(|w: &TycError| w.to_string())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn async_without_await_suppressed_for_async_interface_impl() {
+        // A trivial impl of an async `interface` method must stay `async`
+        // to structurally conform, even when it awaits nothing — so the
+        // warning is a false positive and is suppressed. The motivating
+        // case from the field report: `ConsoleSink.deliver` only prints.
+        let src = "\
+interface Sink:
+    async def deliver(self, msg: str) -> None
+
+class ConsoleSink:
+    prefix: str
+
+impl ConsoleSink:
+    async def deliver(self, msg: str) -> None:
+        print(self.prefix + msg)
+";
+        let d = check(src);
+        assert!(
+            !has_async_without_await_warning(&d),
+            "async impl of an async interface method should suppress async_without_await; got: {:?}",
+            d.warnings()
+                .iter()
+                .map(|w: &TycError| w.to_string())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn async_without_await_suppressed_for_async_base_override() {
+        // Overriding an async base-class method must stay `async`; a
+        // trivial awaitless override is required, not a mistake. The base
+        // method itself awaits, so only the override exercises the
+        // carve-out.
+        let src = "\
+import asyncio
+
+class Base:
+    pass
+
+impl Base:
+    async def run(self) -> None:
+        await asyncio.sleep(0)
+
+class Worker(Base):
+    pass
+
+impl Worker:
+    async def run(self) -> None:
+        print(\"working\")
+";
+        let d = check(src);
+        assert!(
+            !has_async_without_await_warning(&d),
+            "awaitless override of an async base method should suppress async_without_await; got: {:?}",
+            d.warnings()
+                .iter()
+                .map(|w: &TycError| w.to_string())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn async_without_await_still_warns_for_awaitless_method_without_contract() {
+        // Guard against over-suppression: a method matching no async
+        // interface and overriding no async base method is still flagged.
+        let src = "\
+class Service:
+    name: str
+
+impl Service:
+    async def ping(self) -> None:
+        print(self.name)
+";
+        let d = check(src);
+        assert!(
+            has_async_without_await_warning(&d),
+            "an awaitless async method with no async contract should still warn; got: {:?}",
+            d.warnings()
+                .iter()
+                .map(|w: &TycError| w.to_string())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn async_without_await_warns_when_interface_method_is_sync() {
+        // The carve-out is gated on the *interface* method being async. A
+        // SYNC interface method implemented by an `async` impl is async by
+        // choice, not by contract, so the awaitless warning still applies.
+        let src = "\
+interface Handler:
+    def handle(self, msg: str) -> None
+
+class Logger:
+    pass
+
+impl Logger:
+    async def handle(self, msg: str) -> None:
+        print(msg)
+";
+        let d = check(src);
+        assert!(
+            has_async_without_await_warning(&d),
+            "async impl of a sync interface method should still warn; got: {:?}",
             d.warnings()
                 .iter()
                 .map(|w: &TycError| w.to_string())

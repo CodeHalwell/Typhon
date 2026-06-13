@@ -4,6 +4,41 @@ All notable changes to Typhon are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely; the
 canonical phase-by-phase status lives in `docs/roadmap.md`.
 
+## 0.14.4 — 2026-06-13 — `async_without_await` understands async-interface conformance
+
+A field report from building a real async-end-to-end app flagged
+`tyc::async_without_await` as a false-positive generator at every async
+interface boundary: when you implement an `interface` whose method is
+`async def`, your impl **must** be `async` to conform — even when that
+particular impl awaits nothing. The checker warned on the awaitless impl
+anyway, so the only way to silence it was a dead `await asyncio.sleep(0)`
+no-op in each trivial implementation. False positives that force dead code
+are the corrosive kind; this release removes them.
+
+### Fixed — `async_without_await` no longer fires on contract-required async methods
+
+- **An awaitless `async def` is no longer warned when it is `async` only to
+  honour a contract it can't opt out of** — either it implements an
+  `interface` whose same-named method is `async def` (and the class
+  structurally conforms), or it overrides an `async def` method of the same
+  name on a base class. In both cases dropping `async` would break the
+  contract, so the warning was unactionable. A trivial
+  `impl ConsoleSink: async def deliver(self, msg: str) -> None` that only
+  `print`s — satisfying `interface Sink: async def deliver(...)` — now checks
+  clean, as does an awaitless override of an `async` base method.
+- **The carve-out is precise, not blanket.** It is gated on the *interface*
+  method itself being `async` (an `async` impl of a *sync* interface method is
+  async by choice and still warns) and on genuine structural conformance
+  (`class_conforms_to_interface`), so an awaitless `async def` that satisfies
+  no async contract — the "half-finished refactor / forgot the `await`" case
+  the diagnostic exists for — still warns.
+- Implemented by recording `is_async` on `MethodSig` (so interface and
+  base-class shapes carry it) and consulting it from the `check_function`
+  carve-out via a new `method_satisfies_async_contract` helper, which strips
+  the `__typhon_impl_*` pseudo-class prefix so the merged real-class shape is
+  used. Four new `tyc-types` unit tests cover both suppression paths and both
+  guard rails; the full workspace suite stays green.
+
 ## 0.14.3 — 2026-06-12 — LSP: live config refresh + committed end-to-end coverage
 
 Follow-ups to the 0.14.2 editor work, both flagged in the 0.14.2 PR review.
