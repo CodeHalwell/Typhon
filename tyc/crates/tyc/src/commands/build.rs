@@ -1727,6 +1727,8 @@ fn escape_json_path(s: &str) -> String {
 }
 
 /// Convert a byte `offset` in `source` to a 1-indexed line number.
+#[cfg(test)]
+#[allow(dead_code)]
 fn offset_to_line(source: &str, offset: usize) -> u32 {
     let clamped = offset.min(source.len());
     source.as_bytes()[..clamped]
@@ -1743,10 +1745,23 @@ fn offset_to_line(source: &str, offset: usize) -> u32 {
 /// a 1-indexed line number and the array is serialised inline.  Synthesised
 /// lines (offset 0) correctly land on line 1, matching the identity fallback.
 fn build_source_map_v2(source_rel: &str, preprocessed: &str, line_offsets: &[usize]) -> String {
+    // ⚡ Bolt: Precompute newline offsets and use binary search to resolve lines
+    // to avoid O(N^2) behaviour during source map generation.
+    let newline_offsets: Vec<usize> = preprocessed
+        .as_bytes()
+        .iter()
+        .enumerate()
+        .filter_map(|(i, &b)| if b == b'\n' { Some(i) } else { None })
+        .collect();
+
     let lines: Vec<u32> = line_offsets
         .iter()
-        .map(|&offset| offset_to_line(preprocessed, offset))
+        .map(|&offset| {
+            let clamped = offset.min(preprocessed.len());
+            newline_offsets.partition_point(|&pos| pos < clamped) as u32 + 1
+        })
         .collect();
+
     let mut out = String::with_capacity(64 + lines.len() * 4);
     out.push_str("{\"version\":2,\"source\":\"");
     out.push_str(source_rel);
