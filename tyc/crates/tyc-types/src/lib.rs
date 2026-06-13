@@ -2643,15 +2643,21 @@ impl<'a> Checker<'a> {
         // bare in function / method signatures (`def get(...) -> Response`,
         // `lib.make() -> Foo`), while a use site may reference them qualified
         // (`import httpx; let r: httpx.Response = client.get(...)`,
-        // `let x: lib.Foo = lib.make()`). Treat two class types whose final
-        // `.`-separated segments match as the same identity so the qualified
-        // reference unifies with the bare return type. This only *relaxes*
-        // assignability between two differently-spelled class names — it never
-        // turns a previously-accepted assignment into a mismatch — so it can't
-        // introduce a false positive; it mirrors Typhon's bare-name class
-        // model (a `from M import C` already brings `C` in bare and unifies).
+        // `let x: lib.Foo = lib.make()`). Unify a qualified reference with the
+        // module's bare return type when their final `.`-separated segments
+        // match — but only when at least one side is *bare*. Two distinct
+        // *qualified* names never unify (`a.Response` stays distinct from
+        // `b.Response`), so same-named classes from different modules aren't
+        // accidentally conflated. This only *relaxes* assignability between
+        // two differently-spelled names — it never turns a previously-accepted
+        // assignment into a mismatch, so it can't introduce a false positive —
+        // and mirrors Typhon's bare-name class model (a `from M import C`
+        // already brings `C` in bare and unifies).
         if let (Type::Class(exp_name), Type::Class(act_name)) = (expected, actual) {
-            if exp_name != act_name && class_name_tail(exp_name) == class_name_tail(act_name) {
+            if exp_name != act_name
+                && (!exp_name.contains('.') || !act_name.contains('.'))
+                && class_name_tail(exp_name) == class_name_tail(act_name)
+            {
                 return true;
             }
         }

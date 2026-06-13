@@ -359,6 +359,18 @@ print("ok")
     }
 
     #[test]
+    fn try_result_rejects_wrong_arity() {
+        // Extra positional args aren't silently ignored — `try_result` takes
+        // 1 or 2, matching the runtime `def try_result(thunk, on_err=None)`.
+        let src = "let r = try_result(lambda: 1, lambda e: \"x\", 99)\nprint(r)\n";
+        assert_ne!(
+            run_capturing(src).unwrap_or(1),
+            0,
+            "try_result with 3 args must raise (non-zero exit)"
+        );
+    }
+
+    #[test]
     fn type_alias_binds_as_runtime_value() {
         // A `type` alias must bind a runtime name (CPython binds a lazy
         // `TypeAliasType`); previously this was a no-op, so an imported

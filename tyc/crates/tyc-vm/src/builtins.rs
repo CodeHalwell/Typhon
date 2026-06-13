@@ -1763,6 +1763,15 @@ fn nf(
 /// so a mapper like `lambda e: str(e)` works under `tyc run`.
 fn try_result_native() -> Value {
     nf("try_result", |i, args| {
+        // Enforce arity (1 or 2 positional args) rather than silently ignoring
+        // extras — matches the runtime `def try_result(thunk, on_err=None)`
+        // signature on the compiled path, where Python raises on a 3rd arg.
+        if args.is_empty() || args.len() > 2 {
+            return Err(type_error(format!(
+                "try_result() takes 1 or 2 positional arguments but {} were given",
+                args.len()
+            )));
+        }
         let mut it = args.into_iter();
         let thunk = it.next().unwrap_or(Value::None);
         let on_err = it.next();

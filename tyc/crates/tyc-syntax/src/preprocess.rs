@@ -3877,16 +3877,30 @@ fn eq_is_assignment_boundary(bytes: &[u8], j: usize) -> bool {
     }
 }
 
-/// Strip a leading `return` / `yield` / `yield from` statement keyword (and
+/// Strip a leading statement keyword that introduces a value expression (and
 /// surrounding whitespace) from the `[start, as_pos)` slot so it is not folded
-/// into the guard call. Returns the byte index where the cast expression
-/// proper begins.
+/// into the guard call. Covers `return` / `yield` / `yield from` and the
+/// condition-bearing compound-statement / `assert` / `raise` heads, so a cast
+/// in a condition (`if raw as! bool:`, `while n as! int:`, `assert v as! str`)
+/// lowers to `if __typhon_checked_cast__(raw, bool):` rather than capturing the
+/// keyword. Each keyword carries a trailing space, so an identifier with the
+/// same prefix (`iffy`, `whilst`) is never mis-stripped. Returns the byte index
+/// where the cast expression proper begins.
 fn strip_leading_value_keyword(bytes: &[u8], start: usize, as_pos: usize) -> usize {
     let mut s = start;
     while s < as_pos && matches!(bytes[s], b' ' | b'\t') {
         s += 1;
     }
-    for kw in [b"yield from " as &[u8], b"return ", b"yield "] {
+    for kw in [
+        b"yield from " as &[u8],
+        b"return ",
+        b"yield ",
+        b"if ",
+        b"elif ",
+        b"while ",
+        b"assert ",
+        b"raise ",
+    ] {
         if as_pos - s >= kw.len() && &bytes[s..s + kw.len()] == kw {
             return s + kw.len();
         }
@@ -9060,6 +9074,34 @@ mod tests {
                 crate::parse_module(&lowered).is_ok(),
                 "lowered output must parse:\n{lowered}"
             );
+        }
+    }
+
+    #[test]
+    fn checked_cast_in_statement_conditions() {
+        // A cast in a statement condition keeps the leading keyword outside
+        // the guard call (`if raw as! bool:` → `if __typhon_checked_cast__(raw,
+        // bool):`), rather than folding `if raw` into the cast.
+        for (src, want) in [
+            (
+                "if raw as! bool:\n",
+                "if __typhon_checked_cast__(raw, bool):",
+            ),
+            (
+                "    while n as! int:\n",
+                "    while __typhon_checked_cast__(n, int):",
+            ),
+            (
+                "assert v as! str\n",
+                "assert __typhon_checked_cast__(v, str)",
+            ),
+            (
+                "    elif x as! bool:\n",
+                "    elif __typhon_checked_cast__(x, bool):",
+            ),
+        ] {
+            let out = expand_checked_casts(src);
+            assert!(out.contains(want), "expected `{want}` in:\n{out}");
         }
     }
 

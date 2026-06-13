@@ -41,11 +41,16 @@ distribution. This release adds the mechanism and the first two stubs.
   bare in its signatures, but a use site may reference them qualified; the
   checker treated `httpx.Response` and `Response` as different classes and fired
   a spurious `type_mismatch`. `Checker::is_assignable` now unifies two class
-  types whose final `.`-separated segments match. This only *relaxes*
-  assignability between two differently-spelled class names — it can never turn
-  a previously-accepted assignment into a mismatch — and a genuine mismatch
-  (`Response` vs `int`) is still caught. Without this, bundled stubs would have
-  *regressed* the idiomatic `import httpx` usage they're meant to help.
+  types whose final `.`-separated segments match **when at least one side is
+  bare** — so a qualified reference unifies with the module's bare class, while
+  two *different* qualified classes stay distinct (`httpx.Response` is not
+  assignable to `requests.Response`; the bundled stubs additionally qualify
+  their own return types, e.g. `httpx`'s `get(...) -> httpx.Response`, so a
+  cross-module mix-up is still caught). This only *relaxes* assignability
+  between two differently-spelled names — it can never turn a previously-
+  accepted assignment into a mismatch — and a genuine mismatch (`Response` vs
+  `int`) is still caught. Without this, bundled stubs would have *regressed*
+  the idiomatic `import httpx` usage they're meant to help.
 
 ## 0.14.6 — 2026-06-13 — `try_result`: exception→Result bridging combinator
 

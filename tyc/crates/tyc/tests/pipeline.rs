@@ -1592,3 +1592,39 @@ fn bundled_httpx_stub_catches_bad_constructor_kwarg() {
         "expected an unknown-kwarg diagnostic, got: {combined}"
     );
 }
+
+#[test]
+fn bundled_stubs_keep_cross_module_classes_distinct() {
+    // Both httpx and requests define `Response`. The qualified↔bare
+    // assignability relaxation must NOT conflate them: assigning a
+    // `requests.Response` into an `httpx.Response` slot stays a mismatch.
+    let project = tempfile::tempdir().unwrap();
+    let src = project.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(
+        project.path().join("typhon.toml"),
+        "[project]\nname = \"x\"\nversion = \"0.1.0\"\nsrc = \"src\"\nout = \"build\"\n\
+         [dependencies]\nhttpx = \"*\"\nrequests = \"*\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        src.join("main.ty"),
+        "import httpx\nimport requests\n\ndef f() -> None:\n    \
+             let r: httpx.Response = requests.get(\"https://x\")\n",
+    )
+    .unwrap();
+    let out = tyc().arg("check").arg(project.path()).output().unwrap();
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stderr),
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(
+        !out.status.success(),
+        "requests.Response into httpx.Response must mismatch, got: {combined}"
+    );
+    assert!(
+        combined.contains("type_mismatch"),
+        "expected type_mismatch, got: {combined}"
+    );
+}

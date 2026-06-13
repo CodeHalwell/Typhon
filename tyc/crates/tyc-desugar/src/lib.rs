@@ -554,7 +554,15 @@ fn expr_references_names(expr: &Expr, names: &[&str]) -> bool {
                     .iter()
                     .any(|cc| expr_references_names(cc, names))
         }
-        Expr::Lambda(l) => expr_references_names(&l.body, names),
+        Expr::Lambda(l) => {
+            // Also inspect parameter defaults (`lambda x=Ok(1): x`) — a name
+            // referenced only there must still trigger the runtime-import
+            // injection, or the emitted Python would `NameError` at runtime.
+            l.parameters
+                .as_ref()
+                .is_some_and(|p| parameters_reference_names(p, names))
+                || expr_references_names(&l.body, names)
+        }
         Expr::If(i) => {
             expr_references_names(&i.test, names)
                 || expr_references_names(&i.body, names)
@@ -4521,6 +4529,19 @@ mod tests {
         assert!(
             !out.contains("import Ok, Err, Result"),
             "try_result alone must not inject the Ok/Err/Result family import:\n{out}"
+        );
+    }
+
+    #[test]
+    fn runtime_name_in_lambda_default_injects_import() {
+        // A runtime name referenced ONLY inside a lambda's default-argument
+        // value (`lambda x=Ok(1): x`) must still trigger the import injection —
+        // the walker inspects parameter defaults, not just the lambda body.
+        let src = "def f() -> object:\n    let g = lambda x=Ok(1): x\n    return g\n";
+        let out = parse_and_desugar(src);
+        assert!(
+            out.contains("from typhon_runtime import Ok, Err, Result"),
+            "a result name in a lambda default must inject the runtime import:\n{out}"
         );
     }
 
