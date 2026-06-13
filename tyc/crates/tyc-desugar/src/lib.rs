@@ -25,7 +25,7 @@ use ruff_python_ast::{
     self as ast, Alias, Arguments, AtomicNodeIndex, Decorator, ExceptHandler, Expr, ExprAttribute,
     ExprBooleanLiteral, ExprCall, ExprContext, ExprName, ExprStringLiteral, Identifier, Keyword,
     ModModule, Operator, Parameter, ParameterWithDefault, Parameters, Pattern, Stmt, StmtAssign,
-    StmtImport, StmtImportFrom, StringLiteral, StringLiteralFlags, StringLiteralValue, WithItem,
+    StmtImport, StmtImportFrom, StringLiteral, StringLiteralFlags, StringLiteralValue,
 };
 use ruff_text_size::TextRange;
 
@@ -168,10 +168,15 @@ pub fn desugar_module_with(module: &ModModule, options: DesugarOptions) -> Desug
     // flag here so `tyc build` emits the typhon_runtime/ package even
     // when no other runtime feature is used.
     let needs_freeze_runtime = stmts_use_freeze_call(&desugared_mod.body);
+    // `try_result(...)` is the exception→Result bridging combinator; its use
+    // pulls in `from typhon_runtime import try_result` (and the runtime
+    // package) independently of the `Ok`/`Err`/`Result` family import.
+    let needs_try_result = stmts_use_try_result(&desugared_mod.body);
     let needs_typhon_runtime = has_result_usage
         || has_any_runtime_import
         || has_runtime_qualified
         || needs_freeze_runtime
+        || needs_try_result
         || injected_traceback;
     // Only skip injection when an existing `from typhon_runtime
     // import …` already covers all three names. A partial import
@@ -214,6 +219,10 @@ pub fn desugar_module_with(module: &ModModule, options: DesugarOptions) -> Desug
     // gets emitted alongside the output.
     let needs_freeze = stmts_use_freeze_call(&desugared_mod.body);
     let inject_freeze = needs_freeze && !has_freeze_import(&desugared_mod.body);
+
+    // `from typhon_runtime import try_result` — injected only when the
+    // combinator is used and not already imported.
+    let inject_try_result = needs_try_result && !has_try_result_import(&desugared_mod.body);
 
     // `gather:` lowers to `asyncio.TaskGroup` and best-effort to
     // `asyncio.gather(...)` — ensure `import asyncio` is in scope.
@@ -279,6 +288,9 @@ pub fn desugar_module_with(module: &ModModule, options: DesugarOptions) -> Desug
     if inject_result_import {
         inject(&mut body, make_typhon_runtime_import());
     }
+    if inject_try_result {
+        inject(&mut body, make_try_result_import());
+    }
     // Emit the fewest imports possible: combine into one statement when
     // both are needed, otherwise emit just the missing one.
     if inject_basemodel && inject_config_dict {
@@ -313,129 +325,163 @@ pub fn desugar_module_with(module: &ModModule, options: DesugarOptions) -> Desug
     }
 }
 
-// ── Result detection ─────────────────────────────────────────────────────────
+// ── Runtime-name detection ─────────────────────────────────────────────────────
 
 /// Return `true` if any statement in `stmts` (or its nested bodies) references
-/// the identifiers `Ok`, `Err`, or `Result`.
+/// the identifiers `Ok`, `Err`, or `Result` — gates injection of
+/// `from typhon_runtime import Ok, Err, Result`.
 fn stmts_use_result_names(stmts: &[Stmt]) -> bool {
-    stmts.iter().any(stmt_uses_result_names)
+    stmts_reference_names(stmts, &["Ok", "Err", "Result"])
 }
 
-fn stmt_uses_result_names(stmt: &Stmt) -> bool {
+/// Return `true` if any statement references `try_result`, the exception→
+/// `Result` bridging combinator. Gates an independent
+/// `from typhon_runtime import try_result` injection so a module that only
+/// uses `try_result` (never a bare `Ok`/`Err`) still gets the import.
+fn stmts_use_try_result(stmts: &[Stmt]) -> bool {
+    stmts_reference_names(stmts, &["try_result"])
+}
+
+/// Generic structural walk: `true` when any statement (or a nested body)
+/// references one of the bare identifiers in `names`. Shared by the
+/// `Ok`/`Err`/`Result` and `try_result` runtime-import injectors so both
+/// traverse the full statement/expression grammar identically.
+fn stmts_reference_names(stmts: &[Stmt], names: &[&str]) -> bool {
+    stmts.iter().any(|s| stmt_references_names(s, names))
+}
+
+fn stmt_references_names(stmt: &Stmt, names: &[&str]) -> bool {
     match stmt {
         Stmt::FunctionDef(f) => {
             f.returns
                 .as_ref()
-                .is_some_and(|r| expr_uses_result_names(r))
-                || parameters_use_result_names(&f.parameters)
-                || f.decorator_list.iter().any(decorator_uses_result_names)
-                || stmts_use_result_names(&f.body)
+                .is_some_and(|r| expr_references_names(r, names))
+                || parameters_reference_names(&f.parameters, names)
+                || f.decorator_list
+                    .iter()
+                    .any(|d| expr_references_names(&d.expression, names))
+                || stmts_reference_names(&f.body, names)
         }
         Stmt::ClassDef(c) => {
-            c.decorator_list.iter().any(decorator_uses_result_names)
-                || c.bases().iter().any(expr_uses_result_names)
+            c.decorator_list
+                .iter()
+                .any(|d| expr_references_names(&d.expression, names))
+                || c.bases().iter().any(|b| expr_references_names(b, names))
                 || c.keywords()
                     .iter()
-                    .any(|k| expr_uses_result_names(&k.value))
-                || stmts_use_result_names(&c.body)
+                    .any(|k| expr_references_names(&k.value, names))
+                || stmts_reference_names(&c.body, names)
         }
         Stmt::AnnAssign(a) => {
-            expr_uses_result_names(&a.annotation)
-                || a.value.as_ref().is_some_and(|v| expr_uses_result_names(v))
-                || expr_uses_result_names(&a.target)
+            expr_references_names(&a.annotation, names)
+                || a.value
+                    .as_ref()
+                    .is_some_and(|v| expr_references_names(v, names))
+                || expr_references_names(&a.target, names)
         }
         Stmt::Assign(a) => {
-            expr_uses_result_names(&a.value) || a.targets.iter().any(expr_uses_result_names)
+            expr_references_names(&a.value, names)
+                || a.targets.iter().any(|t| expr_references_names(t, names))
         }
-        Stmt::AugAssign(a) => expr_uses_result_names(&a.target) || expr_uses_result_names(&a.value),
-        Stmt::Return(r) => r.value.as_ref().is_some_and(|v| expr_uses_result_names(v)),
-        Stmt::Expr(e) => expr_uses_result_names(&e.value),
+        Stmt::AugAssign(a) => {
+            expr_references_names(&a.target, names) || expr_references_names(&a.value, names)
+        }
+        Stmt::Return(r) => r
+            .value
+            .as_ref()
+            .is_some_and(|v| expr_references_names(v, names)),
+        Stmt::Expr(e) => expr_references_names(&e.value, names),
         Stmt::If(i) => {
-            expr_uses_result_names(&i.test)
-                || stmts_use_result_names(&i.body)
+            expr_references_names(&i.test, names)
+                || stmts_reference_names(&i.body, names)
                 || i.elif_else_clauses.iter().any(|c| {
-                    c.test.as_ref().is_some_and(expr_uses_result_names)
-                        || stmts_use_result_names(&c.body)
+                    c.test
+                        .as_ref()
+                        .is_some_and(|t| expr_references_names(t, names))
+                        || stmts_reference_names(&c.body, names)
                 })
         }
         Stmt::While(w) => {
-            expr_uses_result_names(&w.test)
-                || stmts_use_result_names(&w.body)
-                || stmts_use_result_names(&w.orelse)
+            expr_references_names(&w.test, names)
+                || stmts_reference_names(&w.body, names)
+                || stmts_reference_names(&w.orelse, names)
         }
         Stmt::For(f) => {
-            expr_uses_result_names(&f.target)
-                || expr_uses_result_names(&f.iter)
-                || stmts_use_result_names(&f.body)
-                || stmts_use_result_names(&f.orelse)
+            expr_references_names(&f.target, names)
+                || expr_references_names(&f.iter, names)
+                || stmts_reference_names(&f.body, names)
+                || stmts_reference_names(&f.orelse, names)
         }
         Stmt::With(w) => {
-            w.items.iter().any(with_item_uses_result_names) || stmts_use_result_names(&w.body)
+            w.items.iter().any(|item| {
+                expr_references_names(&item.context_expr, names)
+                    || item
+                        .optional_vars
+                        .as_ref()
+                        .is_some_and(|v| expr_references_names(v, names))
+            }) || stmts_reference_names(&w.body, names)
         }
         Stmt::Try(t) => {
-            stmts_use_result_names(&t.body)
-                || t.handlers.iter().any(except_handler_uses_result_names)
-                || stmts_use_result_names(&t.orelse)
-                || stmts_use_result_names(&t.finalbody)
+            stmts_reference_names(&t.body, names)
+                || t.handlers.iter().any(|handler| {
+                    let ExceptHandler::ExceptHandler(h) = handler;
+                    h.type_
+                        .as_ref()
+                        .is_some_and(|ty| expr_references_names(ty, names))
+                        || stmts_reference_names(&h.body, names)
+                })
+                || stmts_reference_names(&t.orelse, names)
+                || stmts_reference_names(&t.finalbody, names)
         }
         Stmt::Match(m) => {
-            expr_uses_result_names(&m.subject)
+            expr_references_names(&m.subject, names)
                 || m.cases.iter().any(|case| {
                     case.guard
                         .as_ref()
-                        .is_some_and(|g| expr_uses_result_names(g))
-                        || pattern_uses_result_names(&case.pattern)
-                        || stmts_use_result_names(&case.body)
+                        .is_some_and(|g| expr_references_names(g, names))
+                        || pattern_references_names(&case.pattern, names)
+                        || stmts_reference_names(&case.body, names)
                 })
         }
         Stmt::Raise(r) => {
-            r.exc.as_ref().is_some_and(|e| expr_uses_result_names(e))
-                || r.cause.as_ref().is_some_and(|c| expr_uses_result_names(c))
+            r.exc
+                .as_ref()
+                .is_some_and(|e| expr_references_names(e, names))
+                || r.cause
+                    .as_ref()
+                    .is_some_and(|c| expr_references_names(c, names))
         }
         Stmt::Assert(a) => {
-            expr_uses_result_names(&a.test)
-                || a.msg.as_ref().is_some_and(|m| expr_uses_result_names(m))
+            expr_references_names(&a.test, names)
+                || a.msg
+                    .as_ref()
+                    .is_some_and(|m| expr_references_names(m, names))
         }
-        Stmt::Delete(d) => d.targets.iter().any(expr_uses_result_names),
-        Stmt::TypeAlias(t) => expr_uses_result_names(&t.name) || expr_uses_result_names(&t.value),
+        Stmt::Delete(d) => d.targets.iter().any(|t| expr_references_names(t, names)),
+        Stmt::TypeAlias(t) => {
+            expr_references_names(&t.name, names) || expr_references_names(&t.value, names)
+        }
         _ => false,
     }
 }
 
-fn parameters_use_result_names(params: &Parameters) -> bool {
-    let plain_param_uses = |p: &Parameter| {
+fn parameters_reference_names(params: &Parameters, names: &[&str]) -> bool {
+    let plain_param = |p: &Parameter| {
         p.annotation
             .as_ref()
-            .is_some_and(|a| expr_uses_result_names(a))
+            .is_some_and(|a| expr_references_names(a, names))
     };
-    let with_default_uses = |p: &ParameterWithDefault| {
-        plain_param_uses(&p.parameter)
+    let with_default = |p: &ParameterWithDefault| {
+        plain_param(&p.parameter)
             || p.default
                 .as_ref()
-                .is_some_and(|d| expr_uses_result_names(d))
+                .is_some_and(|d| expr_references_names(d, names))
     };
-    params.posonlyargs.iter().any(with_default_uses)
-        || params.args.iter().any(with_default_uses)
-        || params.kwonlyargs.iter().any(with_default_uses)
-        || params.vararg.as_ref().is_some_and(|a| plain_param_uses(a))
-        || params.kwarg.as_ref().is_some_and(|a| plain_param_uses(a))
-}
-
-fn with_item_uses_result_names(item: &WithItem) -> bool {
-    expr_uses_result_names(&item.context_expr)
-        || item
-            .optional_vars
-            .as_ref()
-            .is_some_and(|v| expr_uses_result_names(v))
-}
-
-fn except_handler_uses_result_names(handler: &ExceptHandler) -> bool {
-    let ExceptHandler::ExceptHandler(h) = handler;
-    h.type_.as_ref().is_some_and(|t| expr_uses_result_names(t)) || stmts_use_result_names(&h.body)
-}
-
-fn decorator_uses_result_names(d: &Decorator) -> bool {
-    expr_uses_result_names(&d.expression)
+    params.posonlyargs.iter().any(with_default)
+        || params.args.iter().any(with_default)
+        || params.kwonlyargs.iter().any(with_default)
+        || params.vararg.as_ref().is_some_and(|a| plain_param(a))
+        || params.kwarg.as_ref().is_some_and(|a| plain_param(a))
 }
 
 /// Walks every sub-pattern in `pattern`, returning `true` when any
@@ -443,109 +489,155 @@ fn decorator_uses_result_names(d: &Decorator) -> bool {
 /// found.  Without this, a file that only ever matches on a `Result`
 /// (never constructs one or returns one) would skip the auto-import
 /// injection and the emitted Python would `NameError` at runtime.
-fn pattern_uses_result_names(pattern: &Pattern) -> bool {
+fn pattern_references_names(pattern: &Pattern, names: &[&str]) -> bool {
     match pattern {
-        Pattern::MatchValue(ast::PatternMatchValue { value, .. }) => expr_uses_result_names(value),
+        Pattern::MatchValue(ast::PatternMatchValue { value, .. }) => {
+            expr_references_names(value, names)
+        }
         Pattern::MatchSingleton(_) => false,
         Pattern::MatchSequence(ast::PatternMatchSequence { patterns, .. }) => {
-            patterns.iter().any(pattern_uses_result_names)
+            patterns.iter().any(|p| pattern_references_names(p, names))
         }
         Pattern::MatchMapping(ast::PatternMatchMapping { keys, patterns, .. }) => {
-            keys.iter().any(expr_uses_result_names)
-                || patterns.iter().any(pattern_uses_result_names)
+            keys.iter().any(|k| expr_references_names(k, names))
+                || patterns.iter().any(|p| pattern_references_names(p, names))
         }
         Pattern::MatchClass(ast::PatternMatchClass { cls, arguments, .. }) => {
-            expr_uses_result_names(cls)
-                || arguments.patterns.iter().any(pattern_uses_result_names)
+            expr_references_names(cls, names)
+                || arguments
+                    .patterns
+                    .iter()
+                    .any(|p| pattern_references_names(p, names))
                 || arguments
                     .keywords
                     .iter()
-                    .any(|kw| pattern_uses_result_names(&kw.pattern))
+                    .any(|kw| pattern_references_names(&kw.pattern, names))
         }
         Pattern::MatchStar(_) => false,
         Pattern::MatchAs(ast::PatternMatchAs { pattern, .. }) => pattern
             .as_ref()
-            .is_some_and(|p| pattern_uses_result_names(p)),
+            .is_some_and(|p| pattern_references_names(p, names)),
         Pattern::MatchOr(ast::PatternMatchOr { patterns, .. }) => {
-            patterns.iter().any(pattern_uses_result_names)
+            patterns.iter().any(|p| pattern_references_names(p, names))
         }
     }
 }
 
-fn expr_uses_result_names(expr: &Expr) -> bool {
+fn expr_references_names(expr: &Expr, names: &[&str]) -> bool {
     match expr {
-        Expr::Name(n) => matches!(n.id.as_str(), "Ok" | "Err" | "Result"),
+        Expr::Name(n) => names.contains(&n.id.as_str()),
         Expr::Call(c) => {
-            expr_uses_result_names(&c.func)
-                || c.arguments.args.iter().any(expr_uses_result_names)
+            expr_references_names(&c.func, names)
+                || c.arguments
+                    .args
+                    .iter()
+                    .any(|a| expr_references_names(a, names))
                 || c.arguments
                     .keywords
                     .iter()
-                    .any(|k| expr_uses_result_names(&k.value))
+                    .any(|k| expr_references_names(&k.value, names))
         }
-        Expr::Subscript(s) => expr_uses_result_names(&s.value) || expr_uses_result_names(&s.slice),
-        Expr::BinOp(b) => expr_uses_result_names(&b.left) || expr_uses_result_names(&b.right),
-        Expr::BoolOp(b) => b.values.iter().any(expr_uses_result_names),
-        Expr::UnaryOp(u) => expr_uses_result_names(&u.operand),
-        Expr::Named(n) => expr_uses_result_names(&n.target) || expr_uses_result_names(&n.value),
+        Expr::Subscript(s) => {
+            expr_references_names(&s.value, names) || expr_references_names(&s.slice, names)
+        }
+        Expr::BinOp(b) => {
+            expr_references_names(&b.left, names) || expr_references_names(&b.right, names)
+        }
+        Expr::BoolOp(b) => b.values.iter().any(|v| expr_references_names(v, names)),
+        Expr::UnaryOp(u) => expr_references_names(&u.operand, names),
+        Expr::Named(n) => {
+            expr_references_names(&n.target, names) || expr_references_names(&n.value, names)
+        }
         Expr::Compare(c) => {
-            expr_uses_result_names(&c.left) || c.comparators.iter().any(expr_uses_result_names)
+            expr_references_names(&c.left, names)
+                || c.comparators
+                    .iter()
+                    .any(|cc| expr_references_names(cc, names))
         }
-        Expr::Lambda(l) => expr_uses_result_names(&l.body),
+        Expr::Lambda(l) => {
+            // Also inspect parameter defaults (`lambda x=Ok(1): x`) — a name
+            // referenced only there must still trigger the runtime-import
+            // injection, or the emitted Python would `NameError` at runtime.
+            l.parameters
+                .as_ref()
+                .is_some_and(|p| parameters_reference_names(p, names))
+                || expr_references_names(&l.body, names)
+        }
         Expr::If(i) => {
-            expr_uses_result_names(&i.test)
-                || expr_uses_result_names(&i.body)
-                || expr_uses_result_names(&i.orelse)
+            expr_references_names(&i.test, names)
+                || expr_references_names(&i.body, names)
+                || expr_references_names(&i.orelse, names)
         }
-        Expr::Tuple(t) => t.elts.iter().any(expr_uses_result_names),
-        Expr::List(l) => l.elts.iter().any(expr_uses_result_names),
-        Expr::Set(s) => s.elts.iter().any(expr_uses_result_names),
+        Expr::Tuple(t) => t.elts.iter().any(|e| expr_references_names(e, names)),
+        Expr::List(l) => l.elts.iter().any(|e| expr_references_names(e, names)),
+        Expr::Set(s) => s.elts.iter().any(|e| expr_references_names(e, names)),
         Expr::Dict(d) => d.items.iter().any(|item| {
-            item.key.as_ref().is_some_and(expr_uses_result_names)
-                || expr_uses_result_names(&item.value)
+            item.key
+                .as_ref()
+                .is_some_and(|k| expr_references_names(k, names))
+                || expr_references_names(&item.value, names)
         }),
         Expr::ListComp(c) => {
-            expr_uses_result_names(&c.elt)
-                || c.generators.iter().any(comprehension_uses_result_names)
+            expr_references_names(&c.elt, names)
+                || c.generators
+                    .iter()
+                    .any(|g| comprehension_references_names(g, names))
         }
         Expr::SetComp(c) => {
-            expr_uses_result_names(&c.elt)
-                || c.generators.iter().any(comprehension_uses_result_names)
+            expr_references_names(&c.elt, names)
+                || c.generators
+                    .iter()
+                    .any(|g| comprehension_references_names(g, names))
         }
         Expr::Generator(g) => {
-            expr_uses_result_names(&g.elt)
-                || g.generators.iter().any(comprehension_uses_result_names)
+            expr_references_names(&g.elt, names)
+                || g.generators
+                    .iter()
+                    .any(|gen| comprehension_references_names(gen, names))
         }
         Expr::DictComp(d) => {
-            d.key.as_ref().is_some_and(|k| expr_uses_result_names(k))
-                || expr_uses_result_names(&d.value)
-                || d.generators.iter().any(comprehension_uses_result_names)
+            d.key
+                .as_ref()
+                .is_some_and(|k| expr_references_names(k, names))
+                || expr_references_names(&d.value, names)
+                || d.generators
+                    .iter()
+                    .any(|g| comprehension_references_names(g, names))
         }
-        Expr::Await(a) => expr_uses_result_names(&a.value),
-        Expr::Yield(y) => y.value.as_ref().is_some_and(|v| expr_uses_result_names(v)),
-        Expr::YieldFrom(y) => expr_uses_result_names(&y.value),
-        Expr::Starred(s) => expr_uses_result_names(&s.value),
+        Expr::Await(a) => expr_references_names(&a.value, names),
+        Expr::Yield(y) => y
+            .value
+            .as_ref()
+            .is_some_and(|v| expr_references_names(v, names)),
+        Expr::YieldFrom(y) => expr_references_names(&y.value, names),
+        Expr::Starred(s) => expr_references_names(&s.value, names),
         Expr::Slice(s) => {
-            s.lower.as_ref().is_some_and(|e| expr_uses_result_names(e))
-                || s.upper.as_ref().is_some_and(|e| expr_uses_result_names(e))
-                || s.step.as_ref().is_some_and(|e| expr_uses_result_names(e))
+            s.lower
+                .as_ref()
+                .is_some_and(|e| expr_references_names(e, names))
+                || s.upper
+                    .as_ref()
+                    .is_some_and(|e| expr_references_names(e, names))
+                || s.step
+                    .as_ref()
+                    .is_some_and(|e| expr_references_names(e, names))
         }
         Expr::FString(f) => f.value.elements().any(|el| match el {
             ruff_python_ast::InterpolatedStringElement::Interpolation(i) => {
-                expr_uses_result_names(&i.expression)
+                expr_references_names(&i.expression, names)
             }
             ruff_python_ast::InterpolatedStringElement::Literal(_) => false,
         }),
-        Expr::Attribute(a) => expr_uses_result_names(&a.value),
-        // Leaf nodes that cannot contain Result names: literals, etc.
+        Expr::Attribute(a) => expr_references_names(&a.value, names),
+        // Leaf nodes that cannot contain the target names: literals, etc.
         _ => false,
     }
 }
 
-fn comprehension_uses_result_names(gen: &ruff_python_ast::Comprehension) -> bool {
-    expr_uses_result_names(&gen.target)
-        || expr_uses_result_names(&gen.iter)
-        || gen.ifs.iter().any(expr_uses_result_names)
+fn comprehension_references_names(gen: &ruff_python_ast::Comprehension, names: &[&str]) -> bool {
+    expr_references_names(&gen.target, names)
+        || expr_references_names(&gen.iter, names)
+        || gen.ifs.iter().any(|i| expr_references_names(i, names))
 }
 
 /// Return `true` if `body` contains any reference to the `typhon_runtime`
@@ -1059,6 +1151,35 @@ fn make_freeze_import() -> Stmt {
         }],
         level: 0,
         is_lazy: false,
+    })
+}
+
+/// Build `from typhon_runtime import try_result`.
+fn make_try_result_import() -> Stmt {
+    Stmt::ImportFrom(StmtImportFrom {
+        range: TextRange::default(),
+        node_index: AtomicNodeIndex::NONE,
+        module: Some(make_identifier("typhon_runtime")),
+        names: vec![ruff_python_ast::Alias {
+            range: TextRange::default(),
+            node_index: AtomicNodeIndex::NONE,
+            name: make_identifier("try_result"),
+            asname: None,
+        }],
+        level: 0,
+        is_lazy: false,
+    })
+}
+
+/// Return `true` if an existing `from typhon_runtime import …` already brings
+/// `try_result` into scope, so the injector doesn't duplicate it.
+fn has_try_result_import(body: &[Stmt]) -> bool {
+    body.iter().any(|stmt| match stmt {
+        Stmt::ImportFrom(i) => {
+            i.module.as_ref().map(|m| m.as_str()) == Some("typhon_runtime")
+                && i.names.iter().any(|a| a.name.as_str() == "try_result")
+        }
+        _ => false,
     })
 }
 
@@ -4391,6 +4512,36 @@ mod tests {
         assert!(
             out.contains("from typhon_runtime import Ok, Err, Result"),
             "match-only Ok/Err reference must inject the runtime import:\n{out}"
+        );
+    }
+
+    #[test]
+    fn try_result_use_injects_its_runtime_import() {
+        // Using `try_result` (with no bare Ok/Err/Result reference) injects
+        // `from typhon_runtime import try_result` independently — and does NOT
+        // pull in the Ok/Err/Result family import when those aren't used.
+        let src = "def f() -> None:\n    try_result(lambda: 1, lambda e: \"x\")\n";
+        let out = parse_and_desugar(src);
+        assert!(
+            out.contains("from typhon_runtime import try_result"),
+            "try_result use must inject its runtime import:\n{out}"
+        );
+        assert!(
+            !out.contains("import Ok, Err, Result"),
+            "try_result alone must not inject the Ok/Err/Result family import:\n{out}"
+        );
+    }
+
+    #[test]
+    fn runtime_name_in_lambda_default_injects_import() {
+        // A runtime name referenced ONLY inside a lambda's default-argument
+        // value (`lambda x=Ok(1): x`) must still trigger the import injection —
+        // the walker inspects parameter defaults, not just the lambda body.
+        let src = "def f() -> object:\n    let g = lambda x=Ok(1): x\n    return g\n";
+        let out = parse_and_desugar(src);
+        assert!(
+            out.contains("from typhon_runtime import Ok, Err, Result"),
+            "a result name in a lambda default must inject the runtime import:\n{out}"
         );
     }
 

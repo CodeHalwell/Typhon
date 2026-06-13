@@ -203,6 +203,15 @@ pub fn is_object_type(ty: &Type) -> bool {
     matches!(ty, Type::Class(name) if name == "object")
 }
 
+/// Final `.`-separated segment of a class name — the bare class identity.
+/// `"httpx.Response"` → `"Response"`, `"Foo"` → `"Foo"`. Used by
+/// [`Checker::is_assignable`] to unify a qualified class reference
+/// (`httpx.Response`) with the module's own bare class name as written in its
+/// signatures (`def get(...) -> Response`).
+fn class_name_tail(name: &str) -> &str {
+    name.rsplit('.').next().unwrap_or(name)
+}
+
 /// Check whether a value of type `actual` is assignable to a target of
 /// type `expected`.
 ///
@@ -1378,6 +1387,7 @@ fn expr_is_type_shaped(expr: &Expr, classes: &[String], type_params: &[String]) 
         "Result",
         "Ok",
         "Err",
+        "try_result",
         "Counter",
         "OrderedDict",
         "defaultdict",
@@ -2432,6 +2442,15 @@ pub struct MethodSig {
     /// nullable-into-non-nullable guard misfires on `T?` parameters
     /// (FINDINGS E2 / round 2026-05-20-exploration).
     pub param_types: Vec<Type>,
+    /// `true` when the method is declared `async def`. Recorded so the
+    /// `tyc::async_without_await` carve-out can recognise an awaitless
+    /// `async def` that is async *only* to satisfy an async `interface`
+    /// method (structural conformance) or to override an async
+    /// base-class method. Such a method has no choice but to stay
+    /// `async` — flagging it forces dead `await asyncio.sleep(0)`
+    /// no-ops into the source — so the warning is suppressed in that
+    /// case. FINDINGS — async-impl conformance (Dead Reckoning report).
+    pub is_async: bool,
 }
 
 /// Member shape recorded for an interface or class — methods are recorded as
@@ -2619,6 +2638,28 @@ impl<'a> Checker<'a> {
     fn is_assignable(&self, expected: &Type, actual: &Type) -> bool {
         if assignable(expected, actual) {
             return true;
+        }
+        // Qualified ↔ bare class identity. A module names its own classes
+        // bare in function / method signatures (`def get(...) -> Response`,
+        // `lib.make() -> Foo`), while a use site may reference them qualified
+        // (`import httpx; let r: httpx.Response = client.get(...)`,
+        // `let x: lib.Foo = lib.make()`). Unify a qualified reference with the
+        // module's bare return type when their final `.`-separated segments
+        // match — but only when at least one side is *bare*. Two distinct
+        // *qualified* names never unify (`a.Response` stays distinct from
+        // `b.Response`), so same-named classes from different modules aren't
+        // accidentally conflated. This only *relaxes* assignability between
+        // two differently-spelled names — it never turns a previously-accepted
+        // assignment into a mismatch, so it can't introduce a false positive —
+        // and mirrors Typhon's bare-name class model (a `from M import C`
+        // already brings `C` in bare and unifies).
+        if let (Type::Class(exp_name), Type::Class(act_name)) = (expected, actual) {
+            if exp_name != act_name
+                && (!exp_name.contains('.') || !act_name.contains('.'))
+                && class_name_tail(exp_name) == class_name_tail(act_name)
+            {
+                return true;
+            }
         }
         // ITEM 2: structural Callable / function assignability with
         // class-aware variance. The standalone `assignable` already
@@ -3089,6 +3130,58 @@ impl<'a> Checker<'a> {
             }
         }
         true
+    }
+
+    /// Return `true` when an awaitless `async def` method named
+    /// `method_name` on `class_name` is async *only* because an async
+    /// contract requires it to be — either it implements an `interface`
+    /// whose same-named method is `async def` (and the class structurally
+    /// conforms), or it overrides an `async def` method of the same name
+    /// on a base class. In both cases the method cannot drop `async`
+    /// without breaking the contract, so `tyc::async_without_await` is a
+    /// false positive: it would force a dead `await asyncio.sleep(0)`
+    /// no-op into an otherwise-correct trivial implementation (e.g. a
+    /// `ConsoleSink.deliver` that only `print`s, satisfying
+    /// `interface Sink: async def deliver(...)`). Suppress it.
+    /// FINDINGS — async-impl conformance (Dead Reckoning field report).
+    ///
+    /// `class_name` may be the `__typhon_impl_<Real>` pseudo-class the
+    /// preprocessor synthesises for an `impl Real:` block; the prefix is
+    /// stripped so the merged shape of the real class is consulted (its
+    /// `impl`-block methods are folded in by `merge_impl_blocks`).
+    fn method_satisfies_async_contract(&self, class_name: &str, method_name: &str) -> bool {
+        let real = class_name
+            .strip_prefix("__typhon_impl_")
+            .unwrap_or(class_name);
+        // Case A — structural interface conformance: the class fully
+        // conforms to an `interface` whose same-named method is `async`.
+        for (iface_name, iface) in &self.interfaces {
+            if iface
+                .shape
+                .methods
+                .get(method_name)
+                .is_some_and(|sig| sig.is_async)
+                && self.class_conforms_to_interface(real, iface_name)
+            {
+                return true;
+            }
+        }
+        // Case B — override of an `async` base-class method. Walk only
+        // the ancestors (via `class_parents`), never `real` itself, so we
+        // match a method being overridden rather than its own
+        // declaration. `find_method` descends each parent's chain, so a
+        // direct walk of the immediate parents covers transitive bases.
+        if let Some(parents) = self.class_parents.get(real) {
+            for parent in parents {
+                if self
+                    .find_method(parent, method_name)
+                    .is_some_and(|sig| sig.is_async)
+                {
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     /// Return `true` when `child` transitively inherits from `parent` via the
@@ -5163,6 +5256,16 @@ fn seed_typhon_builtins(c: &mut Checker) {
         span: (0, 0),
         from_unsafe: false,
     });
+    // `try_result` — exception→Result bridging combinator from typhon_runtime.
+    // Calls are special-cased in `infer_expr` to produce `Result[T, E]`; the
+    // binding only needs to make the bare name resolvable.
+    c.env.declare(TypeBinding {
+        name: "try_result".into(),
+        declared: Type::Unknown,
+        narrowed: Type::Unknown,
+        span: (0, 0),
+        from_unsafe: false,
+    });
 }
 
 /// Stdlib calls that block the event loop when invoked from inside an
@@ -6617,6 +6720,7 @@ fn collect_class_shape(cd: &ruff_python_ast::StmtClassDef, classes: &[String]) -
                         is_classmethod,
                         arity_info,
                         param_types,
+                        is_async: f.is_async,
                     },
                 );
             }
@@ -7241,6 +7345,33 @@ fn method_arity_info_for_attribute(
 /// without the `Expr::Call` arm, the chained-call receiver would fall
 /// back to `Type::Unknown` and the method arity check would silently
 /// skip. FINDINGS — gemini review of v0.2.0.
+///
+/// Extract the value type a `try_result` argument contributes: the body type
+/// of a `lambda` thunk / error-mapper, or the declared return type of a named
+/// callable. Lambda parameters resolve to `Unknown`, which is fine for the
+/// common mappers (`lambda e: str(e)` → `str`, an f-string → `str`).
+fn try_result_arg_ret_readonly(c: &Checker, arg: &Expr) -> Type {
+    match arg {
+        Expr::Lambda(lam) => infer_expr_readonly(c, &lam.body),
+        other => match infer_expr_readonly(c, other) {
+            Type::Function { ret, .. } => *ret,
+            _ => Type::Unknown,
+        },
+    }
+}
+
+/// Mutable variant of [`try_result_arg_ret_readonly`] — walks the lambda body
+/// with `infer_expr` so the thunk / mapper's own diagnostics surface.
+fn infer_try_result_arg_ret(c: &mut Checker, arg: &Expr) -> Type {
+    match arg {
+        Expr::Lambda(lam) => infer_expr(c, &lam.body),
+        other => match infer_expr(c, other) {
+            Type::Function { ret, .. } => *ret,
+            _ => Type::Unknown,
+        },
+    }
+}
+
 fn infer_expr_readonly(c: &Checker, e: &Expr) -> Type {
     match e {
         Expr::Name(n) => c
@@ -7305,6 +7436,22 @@ fn infer_expr_readonly(c: &Checker, e: &Expr) -> Type {
             if let Expr::Name(n) = call.func.as_ref() {
                 if n.id.as_str() == "__typhon_checked_cast__" && call.arguments.args.len() == 2 {
                     return type_from_annotation(&call.arguments.args[1], &c.classes);
+                }
+            }
+            // `try_result(thunk[, on_err])` reads as `Result[T, E]` here too
+            // (see the `infer_expr` path for the full rationale).
+            if let Expr::Name(n) = call.func.as_ref() {
+                if n.id.as_str() == "try_result"
+                    && (call.arguments.args.len() == 1 || call.arguments.args.len() == 2)
+                    && call.arguments.keywords.is_empty()
+                {
+                    let ok_ty = try_result_arg_ret_readonly(c, &call.arguments.args[0]);
+                    let err_ty = if call.arguments.args.len() == 2 {
+                        try_result_arg_ret_readonly(c, &call.arguments.args[1])
+                    } else {
+                        Type::Class("Exception".into())
+                    };
+                    return Type::Generic("Result".into(), vec![ok_ty, err_ty]);
                 }
             }
             // Resolve the callee's return type so chained call
@@ -8686,13 +8833,22 @@ fn check_function(
     // (prefixed with `__typhon_`). Carve-outs: async-protocol dunders
     // (`__aenter__`/`__aexit__`/`__aiter__`/`__anext__`), declaration-only
     // bodies (`...` / `pass` / docstring) that look like Protocol/interface
-    // signatures, and async generators (bodies that `yield`).
+    // signatures, and async generators (bodies that `yield`). Also exempt:
+    // a method that is async only to honour an async contract it can't opt
+    // out of — implementing an async `interface` method (structural
+    // conformance) or overriding an async base method. Flagging those
+    // forces a dead `await asyncio.sleep(0)` no-op into a correct trivial
+    // impl (FINDINGS — async-impl conformance, Dead Reckoning report).
     if is_async
         && !name.starts_with("__typhon_")
         && !is_async_protocol_dunder(name)
         && !body_has_await(body)
         && !body_is_declaration_only(body)
         && !body_has_yield(body)
+        && !c
+            .current_class
+            .clone()
+            .is_some_and(|cls| c.method_satisfies_async_contract(&cls, name))
     {
         c.diagnostics.push_warning(TycError::async_without_await(
             name,
@@ -11774,6 +11930,28 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
                     // surface, then discard its (boundary) type.
                     let _ = infer_expr(c, &call.arguments.args[0]);
                     return type_from_annotation(&call.arguments.args[1], &c.classes);
+                }
+            }
+            // `try_result(thunk)` / `try_result(thunk, on_err)` — the
+            // exception→Result bridging combinator (from typhon_runtime).
+            // It runs `thunk()` and returns `Ok(result)`, or catches an
+            // exception and returns `Err(on_err(exc))` (or `Err(exc)` with no
+            // mapper). The static type is `Result[T, E]` where `T` is the
+            // thunk's result and `E` is the mapper's result (`Exception` with
+            // no mapper). Inferring the lambda bodies also surfaces their own
+            // diagnostics, mirroring the `checked_cast` value-walk above.
+            if let Expr::Name(n) = call.func.as_ref() {
+                if n.id.as_str() == "try_result"
+                    && (call.arguments.args.len() == 1 || call.arguments.args.len() == 2)
+                    && call.arguments.keywords.is_empty()
+                {
+                    let ok_ty = infer_try_result_arg_ret(c, &call.arguments.args[0]);
+                    let err_ty = if call.arguments.args.len() == 2 {
+                        infer_try_result_arg_ret(c, &call.arguments.args[1])
+                    } else {
+                        Type::Class("Exception".into())
+                    };
+                    return Type::Generic("Result".into(), vec![ok_ty, err_ty]);
                 }
             }
             // B2: a call of shape `first[int]([1, 2, 3])` where `first`
@@ -16176,6 +16354,35 @@ def broken(b: Box) -> int:
     }
 
     #[test]
+    fn try_result_infers_result_type() {
+        // `try_result(thunk, on_err)` types as `Result[T, E]` — T from the
+        // thunk body, E from the mapper body — so returning it from a matching
+        // `Result[int, str]`-typed function checks cleanly.
+        let src = "def parse(raw: str) -> int:\n    return int(raw)\n\ndef safe(raw: str) -> Result[int, str]:\n    return try_result(lambda: parse(raw), lambda e: str(e))\n";
+        let d = check_full(src);
+        assert!(
+            d.errors().is_empty(),
+            "try_result returning the declared Result type must check cleanly: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn try_result_is_a_result_not_any() {
+        // The combinator returns a `Result`, not a blanket `Any`: binding it to
+        // a non-Result annotation still fires `type_mismatch`.
+        let src = "def f() -> None:\n    let x: int = try_result(lambda: 1, lambda e: \"\")\n";
+        let d = check_full(src);
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::TypeMismatch { .. })),
+            "binding a `Result` to `int` must mismatch: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
     fn match_on_self_field_non_exhaustive_still_fires() {
         // Sanity check: non-exhaustive `match self.<field>:` must STILL
         // surface the missing_return / non_exhaustive_match diagnostics.
@@ -20248,6 +20455,118 @@ class Identity frozen:
         assert!(
             !has_async_without_await_warning(&d),
             "async with should suppress async_without_await; got: {:?}",
+            d.warnings()
+                .iter()
+                .map(|w: &TycError| w.to_string())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn async_without_await_suppressed_for_async_interface_impl() {
+        // A trivial impl of an async `interface` method must stay `async`
+        // to structurally conform, even when it awaits nothing — so the
+        // warning is a false positive and is suppressed. The motivating
+        // case from the field report: `ConsoleSink.deliver` only prints.
+        let src = "\
+interface Sink:
+    async def deliver(self, msg: str) -> None
+
+class ConsoleSink:
+    prefix: str
+
+impl ConsoleSink:
+    async def deliver(self, msg: str) -> None:
+        print(self.prefix + msg)
+";
+        let d = check(src);
+        assert!(
+            !has_async_without_await_warning(&d),
+            "async impl of an async interface method should suppress async_without_await; got: {:?}",
+            d.warnings()
+                .iter()
+                .map(|w: &TycError| w.to_string())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn async_without_await_suppressed_for_async_base_override() {
+        // Overriding an async base-class method must stay `async`; a
+        // trivial awaitless override is required, not a mistake. The base
+        // method itself awaits, so only the override exercises the
+        // carve-out.
+        let src = "\
+import asyncio
+
+class Base:
+    pass
+
+impl Base:
+    async def run(self) -> None:
+        await asyncio.sleep(0)
+
+class Worker(Base):
+    pass
+
+impl Worker:
+    async def run(self) -> None:
+        print(\"working\")
+";
+        let d = check(src);
+        assert!(
+            !has_async_without_await_warning(&d),
+            "awaitless override of an async base method should suppress async_without_await; got: {:?}",
+            d.warnings()
+                .iter()
+                .map(|w: &TycError| w.to_string())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn async_without_await_still_warns_for_awaitless_method_without_contract() {
+        // Guard against over-suppression: a method matching no async
+        // interface and overriding no async base method is still flagged.
+        let src = "\
+class Service:
+    name: str
+
+impl Service:
+    async def ping(self) -> None:
+        print(self.name)
+";
+        let d = check(src);
+        assert!(
+            has_async_without_await_warning(&d),
+            "an awaitless async method with no async contract should still warn; got: {:?}",
+            d.warnings()
+                .iter()
+                .map(|w: &TycError| w.to_string())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn async_without_await_warns_when_interface_method_is_sync() {
+        // The carve-out is gated on the *interface* method being async. A
+        // SYNC interface method implemented by an `async` impl is async by
+        // choice, not by contract, so the awaitless warning still applies.
+        let src = "\
+interface Handler:
+    def handle(self, msg: str) -> None
+
+class Logger:
+    pass
+
+impl Logger:
+    async def handle(self, msg: str) -> None:
+        print(msg)
+";
+        let d = check(src);
+        assert!(
+            has_async_without_await_warning(&d),
+            "async impl of a sync interface method should still warn; got: {:?}",
             d.warnings()
                 .iter()
                 .map(|w: &TycError| w.to_string())

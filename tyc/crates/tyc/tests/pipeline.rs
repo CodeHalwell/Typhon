@@ -1516,3 +1516,115 @@ fn corpus_examples_all_check_clean() {
         panic!("{msg}");
     }
 }
+
+#[test]
+fn bundled_httpx_stub_checks_without_venv() {
+    // A project that declares (but hasn't installed) httpx still type-checks
+    // against the compiler-bundled stub: construction is validated, the
+    // `httpx.Response` / `httpx.AsyncClient` types resolve, and no
+    // `unintrospectable-dependency` warning fires — with no `.venv` present.
+    let project = tempfile::tempdir().unwrap();
+    let src = project.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(
+        project.path().join("typhon.toml"),
+        "[project]\nname = \"x\"\nversion = \"0.1.0\"\nsrc = \"src\"\nout = \"build\"\n\
+         [python]\ntarget = \"3.13\"\n[dependencies]\nhttpx = \">=0.27\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        src.join("main.ty"),
+        "import httpx\n\n\
+         async def fetch(url: str) -> httpx.Response:\n    \
+             let client: httpx.AsyncClient = httpx.AsyncClient(base_url=\"https://x\", timeout=10)\n    \
+             let resp: httpx.Response = await client.get(url, params={\"q\": \"x\"})\n    \
+             await client.aclose()\n    \
+             return resp\n",
+    )
+    .unwrap();
+    let out = tyc().arg("check").arg(project.path()).output().unwrap();
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stderr),
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(
+        out.status.success(),
+        "bundled httpx stub should let the project check cleanly, got: {combined}"
+    );
+    assert!(
+        !combined.contains("unintrospectable"),
+        "bundled httpx must suppress the unintrospectable-dependency warning, got: {combined}"
+    );
+}
+
+#[test]
+fn bundled_httpx_stub_catches_bad_constructor_kwarg() {
+    // The bundle delivers real checking, not blanket leniency: a wrong
+    // constructor kwarg is still caught.
+    let project = tempfile::tempdir().unwrap();
+    let src = project.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(
+        project.path().join("typhon.toml"),
+        "[project]\nname = \"x\"\nversion = \"0.1.0\"\nsrc = \"src\"\nout = \"build\"\n\
+         [dependencies]\nhttpx = \"*\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        src.join("main.ty"),
+        "import httpx\n\ndef f() -> None:\n    \
+             let c: httpx.AsyncClient = httpx.AsyncClient(no_such_kwarg=1)\n",
+    )
+    .unwrap();
+    let out = tyc().arg("check").arg(project.path()).output().unwrap();
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stderr),
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(
+        !out.status.success(),
+        "a bad httpx constructor kwarg must fail check, got: {combined}"
+    );
+    assert!(
+        combined.contains("unknown_kwarg") || combined.contains("no_such_kwarg"),
+        "expected an unknown-kwarg diagnostic, got: {combined}"
+    );
+}
+
+#[test]
+fn bundled_stubs_keep_cross_module_classes_distinct() {
+    // Both httpx and requests define `Response`. The qualified↔bare
+    // assignability relaxation must NOT conflate them: assigning a
+    // `requests.Response` into an `httpx.Response` slot stays a mismatch.
+    let project = tempfile::tempdir().unwrap();
+    let src = project.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(
+        project.path().join("typhon.toml"),
+        "[project]\nname = \"x\"\nversion = \"0.1.0\"\nsrc = \"src\"\nout = \"build\"\n\
+         [dependencies]\nhttpx = \"*\"\nrequests = \"*\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        src.join("main.ty"),
+        "import httpx\nimport requests\n\ndef f() -> None:\n    \
+             let r: httpx.Response = requests.get(\"https://x\")\n",
+    )
+    .unwrap();
+    let out = tyc().arg("check").arg(project.path()).output().unwrap();
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stderr),
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(
+        !out.status.success(),
+        "requests.Response into httpx.Response must mismatch, got: {combined}"
+    );
+    assert!(
+        combined.contains("type_mismatch"),
+        "expected type_mismatch, got: {combined}"
+    );
+}

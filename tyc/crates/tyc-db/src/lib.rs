@@ -500,6 +500,44 @@ pub fn extract_shapes_for_path(_path: &str, text: &str) -> ModuleShapes {
     shapes
 }
 
+/// Curated, compiler-bundled `.dty` stubs for popular third-party libraries
+/// whose own packaging defeats venv introspection (httpx and friends are the
+/// motivating case — typed, yet `inspect.signature` over the installed
+/// package can't recover a usable shape). Each entry is `(dotted_module,
+/// embedded `.dty` source)`. The "long tail" of dependencies stays best-effort
+/// (venv introspection / `ty` / an authored `.dty`); this is just the head.
+const BUNDLED_STUBS: &[(&str, &str)] = &[
+    ("httpx", include_str!("bundled/httpx.dty")),
+    ("requests", include_str!("bundled/requests.dty")),
+];
+
+/// Seed `shapes` with the bundled stub for any module not already present, so
+/// the most-imported third-party libraries get real compile-time checking out
+/// of the box. Gap-fill only: an authored project `.dty`/`.ty` already in
+/// `shapes` wins. Call this **before** venv enrichment — the venv pass skips
+/// modules already in `shapes`, so a bundled stub both supplies the shape and
+/// suppresses the `unintrospectable-dependency` warning for that module.
+///
+/// Every class shape from a bundled stub is marked `partial`: the stub is
+/// curated but not guaranteed complete, so members it omits stay lenient (no
+/// false `attribute_not_found`), while the members it models still contribute
+/// real types (return types, key fields). Request methods carry
+/// `**kwargs: object` so a call passing httpx's many optional kwargs isn't
+/// rejected, and client constructors enumerate the common kwargs as optional
+/// fields.
+pub fn seed_bundled_stubs(shapes: &mut std::collections::HashMap<String, ModuleShapes>) {
+    for (module, source) in BUNDLED_STUBS {
+        if shapes.contains_key(*module) {
+            continue;
+        }
+        let mut extracted = extract_shapes_for_path(module, source);
+        for shape in extracted.class_shapes.values_mut() {
+            shape.partial = true;
+        }
+        shapes.insert((*module).to_owned(), extracted);
+    }
+}
+
 /// Newtype wrapper around `Arc<ModuleShapes>` so the Salsa-tracked
 /// `module_shapes_query` can satisfy `salsa::Update`. Mirrors
 /// [`ArcResolvedModule`] / [`ArcDiagnostics`] for the same orphan-rule
@@ -1069,6 +1107,47 @@ fn check_impl(path: &str, text: &str) -> Diagnostics {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn seed_bundled_stubs_populates_httpx_and_requests() {
+        let mut shapes: std::collections::HashMap<String, ModuleShapes> =
+            std::collections::HashMap::new();
+        seed_bundled_stubs(&mut shapes);
+        // Both flagship HTTP libraries are seeded with their key classes.
+        let httpx = shapes.get("httpx").expect("httpx stub seeded");
+        assert!(
+            httpx.class_shapes.contains_key("AsyncClient"),
+            "httpx.AsyncClient"
+        );
+        let resp = httpx
+            .class_shapes
+            .get("Response")
+            .expect("httpx.Response shape");
+        // A modeled member is present and the shape is `partial` (so omitted
+        // members stay lenient rather than producing `attribute_not_found`).
+        assert!(resp.methods.contains_key("json"), "Response.json modeled");
+        assert!(resp.partial, "bundled shapes must be marked partial");
+        assert!(shapes.contains_key("requests"), "requests stub seeded");
+    }
+
+    #[test]
+    fn seed_bundled_stubs_gap_fills_only() {
+        // An existing entry (project stub/source) for a bundled module wins.
+        let mut shapes: std::collections::HashMap<String, ModuleShapes> =
+            std::collections::HashMap::new();
+        let sentinel = extract_shapes_for_path("httpx", "class Marker:\n    x: int\n");
+        shapes.insert("httpx".to_owned(), sentinel);
+        seed_bundled_stubs(&mut shapes);
+        let httpx = shapes.get("httpx").expect("httpx present");
+        assert!(
+            httpx.class_shapes.contains_key("Marker"),
+            "project httpx shape must be preserved, not overwritten by the bundle"
+        );
+        assert!(
+            !httpx.class_shapes.contains_key("AsyncClient"),
+            "bundle must not override an existing entry"
+        );
+    }
 
     #[test]
     fn preprocessed_text_query_caches() {

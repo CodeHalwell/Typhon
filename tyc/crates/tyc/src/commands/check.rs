@@ -204,6 +204,11 @@ pub fn run(args: CheckArgs) -> Result<()> {
             &src_root_name,
         );
     }
+    // Seed compiler-bundled stubs for popular third-party libraries (httpx, …)
+    // that venv introspection can't recover. Gap-fill only (project stubs win)
+    // and before venv enrichment, so a bundled module is both shaped and exempt
+    // from the `unintrospectable-dependency` warning.
+    tyc_db::seed_bundled_stubs(&mut shape_map);
 
     // Resolved source directory for the `tyc::stdlib_module_shadow`
     // gating below. We canonicalise once here so the per-file check

@@ -3676,8 +3676,8 @@ pub fn expand_lazy_lets(source: &str) -> String {
 /// Rewrite the checked boundary-cast operator `EXPR as! TYPE` into a call to
 /// the runtime guard `__typhon_checked_cast__(EXPR, TYPE)`.
 ///
-/// `as!` is the sound, one-line replacement for the `unsafe:`-block +
-/// re-assertion dance at an untyped boundary:
+/// `as!` is the sound replacement for the `unsafe:`-block + re-assertion
+/// dance at an untyped boundary:
 ///
 /// ```text
 ///     let data = resp.json() as! dict[str, int]
@@ -3698,184 +3698,274 @@ pub fn expand_lazy_lets(source: &str) -> String {
 /// trusts the boundary blindly. Because Typhon emits runtime code, the cast
 /// is genuinely *checked*, not an unsound `Any`-style escape hatch.
 ///
-/// v1 scope: the operator casts the entire preceding value expression on the
-/// line, with `TYPE` running to the end of the code (a trailing comment is
-/// preserved). It is recognised at the top level of a value position —
-/// after an `=`, after `return` / `yield`, or as a bare expression statement
-/// — on a single physical line. An `as!` nested inside call arguments or a
-/// multi-line value expression is left for the AST-based lowering migration;
-/// until then the stock parser surfaces a clean error.
+/// The rewrite is **structural** rather than line-based: the whole source is
+/// scanned with bracket-, string-, and comment-awareness, so an `as!`
+/// composes wherever an expression can appear — nested inside call arguments
+/// (`foo(row[0] as! int, y)`), inside a comprehension or collection literal
+/// (`[x as! int for x in xs]`), and across a value expression that spans
+/// several physical lines:
+///
+/// ```text
+///     let d = client.request(
+///         method, url,
+///     ) as! dict[str, int]
+/// ```
+///
+/// For each operator, the **left operand** is the whole expression occupying
+/// the current syntactic slot: everything back to the enclosing open bracket,
+/// a top-level `,` / `;` / `:` separator, an assignment / augmented / walrus
+/// `=`, a `return` / `yield` keyword, or the start of the logical line. This
+/// mirrors the precedence of the original single-line form (`a + b as! int`
+/// casts `a + b`). The **right operand** is parsed as a type expression
+/// (dotted name, optional `[...]` subscript, `|`-union chain), so trailing
+/// code after the type (`x as! int + 1`, the `for` of a comprehension) stays
+/// outside the cast. Nested / repeated casts are handled by rewriting the
+/// left-most operator and iterating to a fixpoint. An `as!` whose right side
+/// is not a type expression is left untouched, so the stock parser surfaces a
+/// clean error rather than a mis-lowering.
 pub fn expand_checked_casts(source: &str) -> String {
-    let mut out = String::with_capacity(source.len() + 16);
-    let mut in_string: Option<StringMode> = None;
-    let mut needs_cast_import = false;
-
-    for line in source.split_inclusive('\n') {
-        let raw = line.trim_end_matches(['\n', '\r']);
-        let pre_string = in_string;
-        let code_end = scan_line_code_end(raw, &mut in_string);
-        if pre_string.is_some() {
-            out.push_str(line);
-            continue;
-        }
-        let nl = &line[raw.len()..];
-        match rewrite_checked_cast_line(&raw[..code_end]) {
-            Some(rewritten) => {
-                out.push_str(&rewritten);
-                // Re-attach a trailing comment with the conventional two-space
-                // gap (the original spacing lived in the now-rewritten code).
-                let comment = &raw[code_end..];
-                if !comment.is_empty() {
-                    out.push_str("  ");
-                    out.push_str(comment);
-                }
-                out.push_str(nl);
-                needs_cast_import = true;
-            }
-            None => out.push_str(line),
-        }
+    let mut current = source.to_owned();
+    let mut changed = false;
+    while let Some(next) = rewrite_one_checked_cast(&current) {
+        current = next;
+        changed = true;
     }
-    if needs_cast_import {
+    if changed {
         prepend_typhon_runtime_alias_import(
-            out,
+            current,
             "from typhon_runtime.cast import checked_cast as __typhon_checked_cast__\n",
         )
     } else {
-        out
+        current
     }
 }
 
-/// Rewrite a single line's *code* portion (comment already split off) if it
-/// carries a top-level `as!` cast in a value position. Returns `None` when
-/// there is nothing to rewrite.
-fn rewrite_checked_cast_line(code: &str) -> Option<String> {
-    let indent_len = code
-        .find(|c: char| !c.is_whitespace())
-        .unwrap_or(code.len());
-    let indent = &code[..indent_len];
-    let body = &code[indent_len..];
-
-    // Locate the value region: everything after a `return`/`yield` keyword,
-    // after a top-level plain or augmented `=`, or the whole body for a bare
-    // expression statement.
-    let (prefix, value) = if let Some(rest) = body.strip_prefix("return ") {
-        (format!("{indent}return "), rest)
-    } else if let Some(rest) = body.strip_prefix("yield ") {
-        (format!("{indent}yield "), rest)
-    } else if let Some(eq) = find_assignment_eq(body) {
-        let (lhs, rhs) = body.split_at(eq + 1); // keep the `=`
-        (format!("{indent}{lhs} "), rhs.trim_start())
-    } else if let Some(rhs_start) = find_augmented_assign_rhs(body) {
-        // `x += foo() as! int` — keep the `<lhs> op=` prefix, cast the RHS,
-        // so the bare-expression fallback below doesn't fold the augmented
-        // target into the guard call (which would be invalid Python).
-        let (lhs, rhs) = body.split_at(rhs_start);
-        (format!("{indent}{lhs} "), rhs.trim_start())
-    } else {
-        (indent.to_owned(), body)
-    };
-
-    let (expr, ty) = split_top_level_cast(value)?;
-    let expr = expr.trim();
-    let ty = ty.trim();
-    if expr.is_empty() || ty.is_empty() {
-        return None;
-    }
-    Some(format!("{prefix}__typhon_checked_cast__({expr}, {ty})"))
-}
-
-/// If `body` is an augmented assignment (`x += …`, `x //= …`, `x @= …`),
-/// return the byte index just past its `=` so the caller can treat the rest
-/// as the value region. Depth- and string-aware. Comparisons (`<=`, `>=`,
-/// `==`, `!=`), the walrus `:=`, and the rare bit-shift augmented forms
-/// (`<<=` / `>>=`) are deliberately excluded so they're never mistaken for a
-/// cast-bearing assignment.
-fn find_augmented_assign_rhs(body: &str) -> Option<usize> {
-    let bytes = body.as_bytes();
-    let mut depth: i32 = 0;
-    let mut in_str: Option<u8> = None;
-    let mut i = 0;
-    while i < bytes.len() {
-        let b = bytes[i];
-        if let Some(q) = in_str {
-            if b == b'\\' && i + 1 < bytes.len() {
-                i += 2;
-                continue;
-            }
-            if b == q {
-                in_str = None;
-            }
-            i += 1;
-            continue;
-        }
+/// Per-byte mask marking positions that are *not* structural code — inside a
+/// string literal or a trailing `#` comment. Built on [`compute_in_string_mask`]
+/// (which already handles single-, double-, and triple-quoted strings spanning
+/// lines) with an added single-line comment scan. A real newline is never
+/// masked, so the cast scanner can use it as a logical-line boundary, but the
+/// `#` and the comment text after it are.
+fn compute_code_skip_mask(source: &str) -> Vec<bool> {
+    let bytes = source.as_bytes();
+    let mut skip = compute_in_string_mask(source);
+    let mut in_comment = false;
+    for (i, &b) in bytes.iter().enumerate() {
         match b {
-            b'\'' | b'"' => in_str = Some(b),
-            b'(' | b'[' | b'{' => depth += 1,
-            b')' | b']' | b'}' => depth -= 1,
-            b'=' if depth == 0 => {
-                let prev = if i == 0 { 0 } else { bytes[i - 1] };
-                let next = bytes.get(i + 1).copied().unwrap_or(0);
-                // `==` is a comparison, not an assignment.
-                if next == b'=' {
-                    return None;
-                }
-                // Augmented operators whose last char precedes the `=`
-                // (`+= -= *= /= %= &= |= ^= @=`, and `**= //=` via `*`/`/`).
-                if matches!(
-                    prev,
-                    b'+' | b'-' | b'*' | b'/' | b'%' | b'&' | b'|' | b'^' | b'@'
-                ) {
-                    return Some(i + 1);
-                }
-                // `<<=` / `>>=`: the char before the `<`/`>` is the same shift
-                // char. Distinguishes them from the `<=` / `>=` comparisons,
-                // which `find_assignment_eq` also skips — without this a
-                // `x <<= y as! int` line would fall through to the bare path
-                // and emit `__typhon_checked_cast__(x <<= y, …)` (invalid).
-                if matches!(prev, b'<' | b'>') && i >= 2 && bytes[i - 2] == prev {
-                    return Some(i + 1);
-                }
-                // A plain `=` (handled by `find_assignment_eq`) or a
-                // comparison/walrus tail — not an augmented assignment.
-                return None;
+            b'\n' => in_comment = false,
+            _ if skip[i] => {} // already inside a string literal
+            _ if in_comment => skip[i] = true,
+            b'#' => {
+                in_comment = true;
+                skip[i] = true;
             }
             _ => {}
+        }
+    }
+    skip
+}
+
+/// Find the left-most rewritable `as!` operator in `source` and return the
+/// source with that one cast lowered to `__typhon_checked_cast__(EXPR, TYPE)`,
+/// or `None` when no rewritable `as!` remains. An `as!` whose operands can't
+/// be resolved (e.g. the right side isn't a type expression) is skipped, not
+/// rewritten, so it falls through to the parser as a clean error.
+fn rewrite_one_checked_cast(source: &str) -> Option<String> {
+    let bytes = source.as_bytes();
+    let skip = compute_code_skip_mask(source);
+    let mut i = 0;
+    while i + 3 < bytes.len() {
+        let is_op = !skip[i]
+            && &bytes[i..i + 3] == b"as!"
+            && i > 0
+            && bytes[i - 1].is_ascii_whitespace()
+            && bytes[i + 3].is_ascii_whitespace();
+        if is_op {
+            let expr_start = find_cast_expr_start(bytes, &skip, i);
+            let mut type_start = i + 3;
+            while type_start < bytes.len() && matches!(bytes[type_start], b' ' | b'\t') {
+                type_start += 1;
+            }
+            if let Some(type_end) = find_cast_type_end(bytes, &skip, type_start) {
+                if expr_start < i
+                    && source.is_char_boundary(expr_start)
+                    && source.is_char_boundary(type_end)
+                {
+                    let expr_text = source[expr_start..i].trim();
+                    let type_text = source[type_start..type_end].trim();
+                    if !expr_text.is_empty() && !type_text.is_empty() {
+                        let mut out = String::with_capacity(source.len() + 24);
+                        out.push_str(&source[..expr_start]);
+                        out.push_str("__typhon_checked_cast__(");
+                        out.push_str(expr_text);
+                        out.push_str(", ");
+                        out.push_str(type_text);
+                        out.push(')');
+                        out.push_str(&source[type_end..]);
+                        return Some(out);
+                    }
+                }
+            }
         }
         i += 1;
     }
     None
 }
 
-/// Split a value expression on its top-level `as!` operator, returning
-/// `(expr, type)`. `None` when there is no `as!` at bracket depth 0 outside
-/// strings. The operator token is ` as!` followed by whitespace, so a `!=`
-/// comparison or an identifier ending in `as` never matches. String regions —
-/// including triple-quoted strings / docstrings — are masked via
-/// [`compute_in_string_mask`], so an `as!` *inside* a string literal is left
-/// alone.
-fn split_top_level_cast(value: &str) -> Option<(&str, &str)> {
-    let bytes = value.as_bytes();
-    let mask = compute_in_string_mask(value);
+/// Locate where the left operand of an `as!` at byte `as_pos` begins. Scans
+/// left with bracket-depth tracking (string / comment bytes are skipped via
+/// `skip`), stopping at the enclosing open bracket, a top-level `,` / `;` /
+/// `:` separator, an assignment / augmented / walrus `=`, a real newline at
+/// depth 0, or the start of the buffer. A leading `return` / `yield` /
+/// `yield from` keyword is then stripped so it stays outside the guard call.
+fn find_cast_expr_start(bytes: &[u8], skip: &[bool], as_pos: usize) -> usize {
     let mut depth: i32 = 0;
-    let mut i = 0;
-    while i < bytes.len() {
-        if mask[i] {
-            i += 1;
+    let mut raw_start = 0usize;
+    let mut j = as_pos;
+    while j > 0 {
+        j -= 1;
+        if skip[j] {
             continue;
         }
-        match bytes[i] {
-            b'(' | b'[' | b'{' => depth += 1,
-            b')' | b']' | b'}' => depth -= 1,
-            b'a' if depth == 0
-                && i + 3 < bytes.len()
-                && &bytes[i..i + 3] == b"as!"
-                && i > 0
-                && bytes[i - 1].is_ascii_whitespace()
-                && bytes[i + 3].is_ascii_whitespace() =>
-            {
-                return Some((&value[..i], &value[i + 3..]));
+        let b = bytes[j];
+        if b == b'\n' {
+            if depth <= 0 {
+                raw_start = j + 1;
+                break;
+            }
+            continue;
+        }
+        match b {
+            b')' | b']' | b'}' => depth += 1,
+            b'(' | b'[' | b'{' => {
+                if depth == 0 {
+                    raw_start = j + 1;
+                    break;
+                }
+                depth -= 1;
+            }
+            b',' | b';' | b':' if depth == 0 => {
+                raw_start = j + 1;
+                break;
+            }
+            b'=' if depth == 0 && eq_is_assignment_boundary(bytes, j) => {
+                raw_start = j + 1;
+                break;
             }
             _ => {}
+        }
+    }
+    strip_leading_value_keyword(bytes, raw_start, as_pos)
+}
+
+/// Decide whether the `=` at byte `j` opens a value region — a plain
+/// assignment, an augmented assignment (`+=` … `@=`, `<<=`, `>>=`, `**=`,
+/// `//=`), or the walrus `:=` — as opposed to a comparison (`==`, `!=`, `<=`,
+/// `>=`). Used by the cast scanner to find the left edge of the value.
+fn eq_is_assignment_boundary(bytes: &[u8], j: usize) -> bool {
+    if bytes.get(j + 1).copied() == Some(b'=') {
+        return false; // first `=` of `==`
+    }
+    let prev = if j == 0 { 0 } else { bytes[j - 1] };
+    match prev {
+        b'=' | b'!' => false, // `==` (second half) / `!=`
+        // `<=` / `>=` are comparisons; `<<=` / `>>=` are augmented assignments.
+        b'<' | b'>' => j >= 2 && bytes[j - 2] == prev,
+        // Augmented (`+= -= *= /= %= &= |= ^= @=`, `**=`, `//=`) or walrus `:=`.
+        b'+' | b'-' | b'*' | b'/' | b'%' | b'&' | b'|' | b'^' | b'@' | b':' => true,
+        _ => true, // plain assignment
+    }
+}
+
+/// Strip a leading statement keyword that introduces a value expression (and
+/// surrounding whitespace) from the `[start, as_pos)` slot so it is not folded
+/// into the guard call. Covers `return` / `yield` / `yield from` and the
+/// condition-bearing compound-statement / `assert` / `raise` heads, so a cast
+/// in a condition (`if raw as! bool:`, `while n as! int:`, `assert v as! str`)
+/// lowers to `if __typhon_checked_cast__(raw, bool):` rather than capturing the
+/// keyword. Each keyword carries a trailing space, so an identifier with the
+/// same prefix (`iffy`, `whilst`) is never mis-stripped. Returns the byte index
+/// where the cast expression proper begins.
+fn strip_leading_value_keyword(bytes: &[u8], start: usize, as_pos: usize) -> usize {
+    let mut s = start;
+    while s < as_pos && matches!(bytes[s], b' ' | b'\t') {
+        s += 1;
+    }
+    for kw in [
+        b"yield from " as &[u8],
+        b"return ",
+        b"yield ",
+        b"if ",
+        b"elif ",
+        b"while ",
+        b"assert ",
+        b"raise ",
+    ] {
+        if as_pos - s >= kw.len() && &bytes[s..s + kw.len()] == kw {
+            return s + kw.len();
+        }
+    }
+    s
+}
+
+/// Parse a type expression starting at byte `type_start` and return the byte
+/// index just past it, or `None` when the text is not a type expression
+/// (dotted name, optional `[...]` subscript, `|`-separated union). Keeping the
+/// type grammar tight means trailing code after the type — `x as! int + 1`,
+/// the `for` of `[x as! int for x in xs]` — is left outside the cast.
+fn find_cast_type_end(bytes: &[u8], skip: &[bool], type_start: usize) -> Option<usize> {
+    let len = bytes.len();
+    let mut i = type_start;
+    loop {
+        while i < len && matches!(bytes[i], b' ' | b'\t') {
+            i += 1;
+        }
+        let name_start = i;
+        while i < len
+            && !skip[i]
+            && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_' || bytes[i] == b'.')
+        {
+            i += 1;
+        }
+        if i == name_start {
+            return None; // expected a (dotted) type name
+        }
+        if i < len && !skip[i] && bytes[i] == b'[' {
+            i = match_balanced_bracket(bytes, skip, i)?;
+        }
+        let atom_end = i;
+        let mut k = i;
+        while k < len && matches!(bytes[k], b' ' | b'\t') {
+            k += 1;
+        }
+        // A `|`-union continues the type, but `|=` is an augmented assignment.
+        if k < len && !skip[k] && bytes[k] == b'|' && bytes.get(k + 1).copied() != Some(b'=') {
+            i = k + 1;
+            continue;
+        }
+        return Some(atom_end);
+    }
+}
+
+/// Given `open` pointing at an opening bracket, return the index just past its
+/// matching close, honouring nested brackets and skipping string / comment
+/// bytes. `None` when the brackets are unbalanced.
+fn match_balanced_bracket(bytes: &[u8], skip: &[bool], open: usize) -> Option<usize> {
+    let len = bytes.len();
+    let mut depth: i32 = 0;
+    let mut i = open;
+    while i < len {
+        if !skip[i] {
+            match bytes[i] {
+                b'(' | b'[' | b'{' => depth += 1,
+                b')' | b']' | b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(i + 1);
+                    }
+                }
+                _ => {}
+            }
         }
         i += 1;
     }
@@ -8876,6 +8966,143 @@ mod tests {
             out.contains("__typhon_checked_cast__(a <= b, int)"),
             "comparison must cast the whole value, not split at `<=`:\n{out}"
         );
+    }
+
+    #[test]
+    fn checked_cast_nested_in_call_args() {
+        // The headline new case: an `as!` as a call argument. The cast must
+        // wrap only the argument value, leaving the call and sibling args.
+        let out = expand_checked_casts("save(row[0] as! int, label)\n");
+        assert!(
+            out.contains("save(__typhon_checked_cast__(row[0], int), label)"),
+            "argument-position cast must lower in place:\n{out}"
+        );
+        assert!(
+            out.contains("from typhon_runtime.cast import checked_cast as __typhon_checked_cast__"),
+            "the runtime import must be injected for a nested cast:\n{out}"
+        );
+    }
+
+    #[test]
+    fn checked_cast_inside_comprehension() {
+        // The type grammar stops at the type, so the `for` clause stays out.
+        let out = expand_checked_casts("let xs = [row[0] as! int for row in rows]\n");
+        assert!(
+            out.contains("[__typhon_checked_cast__(row[0], int) for row in rows]"),
+            "comprehension element cast must lower and keep the `for` clause:\n{out}"
+        );
+    }
+
+    #[test]
+    fn checked_cast_dict_value_and_keyword_argument() {
+        // A `:` (dict / slice / lambda) and a kwarg `=` are slot boundaries:
+        // only the value to their right is cast.
+        let dict = expand_checked_casts("let d = {\"k\": v as! int}\n");
+        assert!(
+            dict.contains("{\"k\": __typhon_checked_cast__(v, int)}"),
+            "dict-value cast must keep the key:\n{dict}"
+        );
+        let kw = expand_checked_casts("connect(port=raw as! int)\n");
+        assert!(
+            kw.contains("connect(port=__typhon_checked_cast__(raw, int))"),
+            "keyword-argument cast must keep `port=`:\n{kw}"
+        );
+    }
+
+    #[test]
+    fn checked_cast_union_type_target() {
+        // The right operand parses a `|`-union type, not just a bare name.
+        let out = expand_checked_casts("let v = payload as! int | None\n");
+        assert!(
+            out.contains("__typhon_checked_cast__(payload, int | None)"),
+            "union type target must be captured whole:\n{out}"
+        );
+    }
+
+    #[test]
+    fn checked_cast_type_stops_before_trailing_operator() {
+        // `int` is the type; `+ 1` is ordinary code that stays outside.
+        let out = expand_checked_casts("let n = (x as! int) + 1\n");
+        assert!(
+            out.contains("(__typhon_checked_cast__(x, int)) + 1"),
+            "type must stop at `int`, leaving `+ 1` outside:\n{out}"
+        );
+    }
+
+    #[test]
+    fn checked_cast_nested_casts_iterate_to_fixpoint() {
+        // An outer cast wrapping an inner one: both must lower.
+        let out = expand_checked_casts("let s = wrap(x as! int) as! str\n");
+        assert!(
+            out.contains(
+                "let s = __typhon_checked_cast__(wrap(__typhon_checked_cast__(x, int)), str)"
+            ),
+            "nested casts must both lower:\n{out}"
+        );
+    }
+
+    #[test]
+    fn checked_cast_multiline_value_expression() {
+        // The left operand may span several physical lines (the call's args
+        // are bracketed, so the cast attaches to the whole multi-line call).
+        let src = "let d = client.request(\n    method,\n    url,\n) as! dict[str, int]\n";
+        let out = expand_checked_casts(src);
+        assert!(
+            out.contains("let d = __typhon_checked_cast__(client.request(")
+                && out.contains("), dict[str, int])"),
+            "multi-line value expression must lower across lines:\n{out}"
+        );
+    }
+
+    #[test]
+    fn checked_cast_nested_output_parses() {
+        // The lowered output (nested + multi-line) must be valid Python the
+        // stock parser accepts — the whole point of finishing the migration.
+        // `as!` is lowered by `expand_question_ops` (the outermost value-sugar
+        // pass), which runs after `preprocess`, so mirror that ordering.
+        for src in [
+            "def f() -> None:\n    save(row[0] as! int, label)\n",
+            "def f() -> list[int]:\n    return [r[0] as! int for r in rows]\n",
+            "def f() -> None:\n    let d = client.request(\n        url,\n    ) as! dict[str, int]\n",
+        ] {
+            let lowered = expand_question_ops(&preprocess(src).python_source);
+            assert!(
+                !lowered.contains("as!"),
+                "no `as!` should survive lowering:\n{lowered}"
+            );
+            assert!(
+                crate::parse_module(&lowered).is_ok(),
+                "lowered output must parse:\n{lowered}"
+            );
+        }
+    }
+
+    #[test]
+    fn checked_cast_in_statement_conditions() {
+        // A cast in a statement condition keeps the leading keyword outside
+        // the guard call (`if raw as! bool:` → `if __typhon_checked_cast__(raw,
+        // bool):`), rather than folding `if raw` into the cast.
+        for (src, want) in [
+            (
+                "if raw as! bool:\n",
+                "if __typhon_checked_cast__(raw, bool):",
+            ),
+            (
+                "    while n as! int:\n",
+                "    while __typhon_checked_cast__(n, int):",
+            ),
+            (
+                "assert v as! str\n",
+                "assert __typhon_checked_cast__(v, str)",
+            ),
+            (
+                "    elif x as! bool:\n",
+                "    elif __typhon_checked_cast__(x, bool):",
+            ),
+        ] {
+            let out = expand_checked_casts(src);
+            assert!(out.contains(want), "expected `{want}` in:\n{out}");
+        }
     }
 
     #[test]

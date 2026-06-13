@@ -4,6 +4,108 @@ All notable changes to Typhon are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely; the
 canonical phase-by-phase status lives in `docs/roadmap.md`.
 
+## 0.15.0 — 2026-06-13 — `as!` everywhere, `try_result`, and compiler-bundled library stubs
+
+A feature release sharpening Typhon at the library boundary, driven by a field
+report from building a real async app. Four threads land together: the `as!`
+checked cast now composes in any expression position, a `try_result` combinator
+collapses the exception→`Result` boilerplate, the compiler ships curated `.dty`
+stubs for the most-imported third-party libraries, and `async_without_await`
+stops firing on methods that are async only to honour a contract. A cross-module
+class-identity fix and a round of automated-review hardening round it out.
+
+### Added — `try_result(thunk[, on_err])` exception→Result combinator
+
+- **`try_result` bridges a library boundary into a `Result` in one expression**
+  instead of a hand-written `try: return Ok(x) except E as e: return Err(...)`.
+  It runs `thunk()` and returns `Ok(result)`; on any exception it returns
+  `Err(on_err(exc))`, or `Err(exc)` (the raw exception) when no mapper is given:
+
+  ```ty
+  def load(path: str) -> Result[dict[str, str], str]:
+      return try_result(lambda: read_json(path), lambda e: f"invalid JSON: {e}")
+  ```
+
+- A **prelude name** (no import in source, like `Ok`/`Err`/`Result`), typed as
+  `Result[T, E]` — `T` from the thunk body, `E` from the mapper body
+  (`Exception` when omitted). Special-cased in `infer_expr` like `as!`, so a
+  wrong return annotation still fires `type_mismatch` (it's a real `Result`, not
+  an `Any` escape hatch). `tyc build` auto-injects `from typhon_runtime import
+  try_result`; the VM registers it as a prelude native that materialises the
+  caught exception exactly as an `except E as e:` handler would (so
+  `lambda e: str(e)` works under `tyc run`) and enforces its 1–2-arg arity.
+
+### Added — compiler-bundled `.dty` stubs (httpx, requests)
+
+- **`tyc` ships curated, embedded `.dty` stubs** for popular libraries whose
+  packaging defeats venv introspection (httpx, requests to start), seeded into
+  the project shape map by `tyc check` / `tyc build` / the LSP **before** venv
+  enrichment — so an imported bundled library is shaped out of the box, its
+  construction is type-checked, and its `unintrospectable-dependency` warning is
+  suppressed, with no `.venv` or `tyc sync` required.
+- **Gap-fill, not override**: an authored project `.dty`/`.ty` for the same
+  module wins; the bundle in turn takes precedence over venv introspection.
+  Class shapes are marked `partial` so members the stub omits stay lenient (no
+  false `attribute_not_found`). Request methods take `**kwargs: object` and
+  client constructors enumerate the common kwargs as optional fields. The long
+  tail of dependencies stays best-effort; this is just the head. Lives in
+  `tyc-db::seed_bundled_stubs` with the `.dty` text under `tyc-db/src/bundled/`.
+
+### Changed — `as!` checked cast composes in any expression position
+
+- **`EXPR as! TYPE` now lowers structurally** (a fixpoint rewrite with bracket-,
+  string-, and comment-awareness) instead of line by line, so it composes
+  wherever an expression can appear: nested in call arguments
+  (`save(row[0] as! int, label)`), inside comprehensions / collection literals,
+  across a multi-line value expression, and in statement conditions
+  (`if raw as! bool:`). The left operand is the current syntactic slot (back to
+  an enclosing bracket, a top-level `,`/`;`/`:`, an assignment, a
+  `return`/`yield`/`if`/`while`/`assert` keyword, or the line start); the right
+  operand is parsed as a type expression (dotted name, optional `[...]`
+  subscript, `|`-union), so trailing code after the type stays outside the cast.
+  A non-type right side is left for the parser to reject cleanly.
+- The **VM intercepts `__typhon_checked_cast__` before argument evaluation** and
+  evaluates only the value operand, so a cast to a union / parametric type
+  (`x as! int | None`, `d as! dict[str, int]`) runs under `tyc run`.
+
+### Changed — `async_without_await` understands async contracts
+
+- An awaitless `async def` is **no longer warned when it is async only to honour
+  a contract it can't opt out of** — implementing an async `interface` method
+  (structural conformance) or overriding an async base-class method. A trivial
+  `impl ConsoleSink: async def deliver(...)` satisfying `interface Sink: async
+  def deliver(...)` now checks clean, removing the dead `await asyncio.sleep(0)`
+  no-ops the diagnostic used to force. Gated on the *interface* method being
+  async, so an `async` impl of a *sync* method — or any awaitless `async def`
+  with no contract — still warns. (`MethodSig` gained an `is_async` flag;
+  `method_satisfies_async_contract` does the check.)
+
+### Fixed — qualified cross-module class references unify with their bare form
+
+- **`import httpx; let r: httpx.Response = client.get(...)` no longer
+  mismatches** the method's bare `Response` return (same for any project module:
+  `import lib; let x: lib.Foo = lib.make()`). `Checker::is_assignable` unifies
+  two class types whose final `.`-separated segments match **when at least one
+  side is bare** — so a qualified reference unifies with the module's bare class,
+  while two *different* qualified classes stay distinct (`httpx.Response` is not
+  assignable to `requests.Response`; the bundled stubs additionally qualify
+  their own return types so a cross-module mix-up is still caught). The
+  relaxation only ever *adds* assignability between differently-spelled names —
+  a genuine mismatch (`Response` vs `int`) is still caught.
+
+### Notes
+
+- The in-process VM already runs `async def` / `await` / `gather:` /
+  `asyncio.run` via its cooperative-sequential scheduler (added earlier and
+  documented in `docs/vm.md`); the skill reference's stale "synchronous-only"
+  note was corrected.
+- Hardening from the PR #195 automated review (Gemini / Codex / Copilot):
+  statement-keyword handling for condition `as!` casts, lambda-default
+  reference detection for runtime-import injection, `try_result` arity
+  enforcement, the qualified↔bare bare-side guard, and cross-module stub
+  identity — each with regression tests. Full workspace suite green; rustfmt +
+  clippy clean.
+
 ## 0.14.3 — 2026-06-12 — LSP: live config refresh + committed end-to-end coverage
 
 Follow-ups to the 0.14.2 editor work, both flagged in the 0.14.2 PR review.

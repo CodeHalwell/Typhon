@@ -1197,6 +1197,10 @@ pub fn install(interp: &mut Interpreter) {
     });
     root.set("Ok", Value::Native(Rc::new(ok_ctor)));
     root.set("Err", Value::Native(Rc::new(err_ctor)));
+    // `try_result(thunk[, on_err])` — exception→Result bridging combinator,
+    // available as a prelude name and re-exported from the typhon_runtime
+    // module shim below.
+    root.set("try_result", try_result_native());
     // The `?` operator desugars to `isinstance(_, __typhon_Err__)`, so the
     // preprocessor's import alias must resolve to the VM's `Err` ctor.
     root.set(
@@ -1751,6 +1755,59 @@ fn nf(
     Value::Native(Rc::new(NativeFn::new(name, f)))
 }
 
+/// Native backing for the `try_result(thunk[, on_err])` exception→Result
+/// bridging combinator: run `thunk()`, returning `Ok(result)`; on a raised
+/// exception return `Err(on_err(exc))` (or `Err(exc)` with no mapper).
+/// Mirrors `typhon_runtime.try_result` on the compile path, and materialises
+/// the caught exception as the same value an `except E as e:` handler binds,
+/// so a mapper like `lambda e: str(e)` works under `tyc run`.
+fn try_result_native() -> Value {
+    nf("try_result", |i, args| {
+        // Enforce arity (1 or 2 positional args) rather than silently ignoring
+        // extras — matches the runtime `def try_result(thunk, on_err=None)`
+        // signature on the compiled path, where Python raises on a 3rd arg.
+        if args.is_empty() || args.len() > 2 {
+            return Err(type_error(format!(
+                "try_result() takes 1 or 2 positional arguments but {} were given",
+                args.len()
+            )));
+        }
+        let mut it = args.into_iter();
+        let thunk = it.next().unwrap_or(Value::None);
+        let on_err = it.next();
+        match i.call_value(thunk, vec![], &[]) {
+            Ok(v) => Ok(Value::ResultOk(Box::new(v))),
+            Err(Unwind::Exception(exc)) => {
+                let exc_value = match &exc.value {
+                    Some(v @ (Value::Instance(_) | Value::Exception { .. })) => v.clone(),
+                    _ => {
+                        let exc_args = if exc.message.is_empty() {
+                            Vec::new()
+                        } else {
+                            vec![Value::Str(Rc::new(exc.message.clone()))]
+                        };
+                        Value::Exception {
+                            kind: Rc::new(exc.kind.clone()),
+                            message: Rc::new(exc.message.clone()),
+                            args: Rc::new(exc_args),
+                        }
+                    }
+                };
+                let mapped = match on_err {
+                    Some(f) if !matches!(f, Value::None) => {
+                        i.call_value(f, vec![exc_value], &[])?
+                    }
+                    _ => exc_value,
+                };
+                Ok(Value::ResultErr(Box::new(mapped)))
+            }
+            // `return`/`break`/`continue` can't escape a thunk call here, but
+            // propagate anything non-exception unchanged for completeness.
+            Err(other) => Err(other),
+        }
+    })
+}
+
 fn make_typhon_runtime_module(interp: &Interpreter) -> Value {
     let ok = interp.root.get("Ok").unwrap();
     let err = interp.root.get("Err").unwrap();
@@ -1825,12 +1882,14 @@ fn make_typhon_runtime_module(interp: &Interpreter) -> Value {
     let result_marker = nf("Result", |_i, args| {
         Ok(args.into_iter().next().unwrap_or(Value::None))
     });
+    let try_result = interp.root.get("try_result").unwrap();
     make_module(
         "typhon_runtime",
         vec![
             ("Ok", ok),
             ("Err", err),
             ("Result", result_marker),
+            ("try_result", try_result),
             ("tasks", tasks),
             ("lazy", lazy),
             ("freeze", freeze),

@@ -141,6 +141,7 @@ The 30-second mental model. Every later section in this skill is detail under on
 | Exhaustive match | `match s: case Circle(r): ...` (no `_` needed) | vanilla Python `match` |
 | Result type | `Result[T, E]`, `Ok(v)`, `Err(e)` | generated `typhon_runtime.Ok/Err` dataclasses |
 | Result combinators (v0.6.0) | `r.map(f) / r.map_err(g) / r.and_then(h) / r.or_else(k)` | method calls on the runtime classes |
+| Exception→Result (v0.14.6) | `try_result(lambda: f(), lambda e: str(e))` | `from typhon_runtime import try_result` + call; types as `Result[T, E]` |
 | Error propagation | `let n: int = f()?` | inline `isinstance(_t, Err): return _t; n = _t.value` |
 | Result chain | `with a = f()?, b = g()?: ...  else err: ...` | sequenced if-isinstance ladder |
 | Generic fn | `def first[T](xs: list[T]) -> T?:` | same (PEP 695) |
@@ -513,7 +514,7 @@ let uid  = row[0] as! int
 - `int → float` (and `bool → int`) widening is honoured, so a JSON int cast `as! float` does not spuriously fail.
 - The in-process VM treats `as!` as an identity passthrough (the authoritative structural check runs on the `tyc build && python` path); `tyc fmt` preserves the surface syntax.
 
-**v1 scope:** `as!` casts the entire preceding value expression on a **single physical line**, in a value position — after `=` / augmented `op=` / `return` / `yield`, or as a bare expression. An `as!` nested inside call arguments, or whose value spans multiple lines, is not yet supported (it's slated for the AST-based lowering migration); until then the parser surfaces a clean error rather than miscompiling. Prefer `model X:` for a boundary you validate repeatedly, a `.dty` stub for a long-lived dependency, and `as!` for an ad-hoc one-off shape assertion.
+**Scope (v0.14.5):** the lowering is **structural**, so `as!` composes wherever an expression can appear — value positions (`=` / `op=` / `return` / `yield` / bare expression), **nested inside call arguments** (`foo(row[0] as! int, y)`), inside comprehensions / collection literals (`[x as! int for x in xs]`), and across a **value expression that spans multiple physical lines** (the left operand may run over several lines as long as it stays bracket-balanced). The left operand is the whole current syntactic slot — back to the enclosing bracket, a `,` / `;` / `:` separator, an assignment / augmented / walrus `=`, a `return` / `yield` keyword, or the line start (so `a + b as! int` casts `a + b`); the right operand is parsed as a type expression (dotted name, optional `[...]` subscript, `|`-union), so trailing code after the type (`x as! int + 1`, the `for` of a comprehension) stays outside the cast. An `as!` whose right side isn't a type expression is left for the parser to reject cleanly. (Earlier releases restricted `as!` to a single physical line in value position only.) Prefer `model X:` for a boundary you validate repeatedly, a `.dty` stub for a long-lived dependency, and `as!` for an ad-hoc one-off shape assertion.
 
 ---
 
@@ -935,6 +936,15 @@ def load(path: str) -> Result[dict[str, str], str]:
 
 After the shim, downstream code uses `?` and `with`-chains without ever writing `try`.
 
+For a **single** boundary call, the `try_result` combinator (v0.14.6) collapses the shim into one expression — a prelude name (no import) typed as `Result[T, E]`:
+
+```python
+def load(path: str) -> Result[dict[str, str], str]:
+    return try_result(lambda: read_json(path), lambda e: f"invalid JSON: {e}")
+```
+
+`try_result(thunk)` runs `thunk()` and returns `Ok(result)`; on any exception it returns `Err(on_err(exc))`, or `Err(exc)` (the raw exception, `Result[T, Exception]`) when the mapper is omitted. `T` is inferred from the thunk body, `E` from the mapper body. It works under `tyc run` (the VM materialises the caught exception just as an `except E as e:` handler would) and the compiled path (`from typhon_runtime import try_result` is auto-injected). Use the explicit multi-`except` `try` shim when you map *distinct* exception types to *distinct* errors; reach for `try_result` for the common single-boundary case.
+
 ---
 
 ## 10. Async and concurrency
@@ -1265,15 +1275,18 @@ impl Redis:
 
 **Cross-module shape extraction consumes both `.ty` and `.dty` on equal footing.** When both define the same name, stubs win.
 
-### Three layers of third-party type-checking (v0.12.0)
+### Layers of third-party type-checking (v0.12.0, + bundled stubs v0.14.7)
 
-As of v0.12.0 a third-party call can be type-checked three ways, in increasing coverage:
+A third-party call can be type-checked several ways, in increasing coverage:
 
-1. **Authored `.dty` stub** — full Typhon-dialect types, the strongest and most precise. Write these for long-lived dependencies you call a lot.
+0. **Compiler-bundled `.dty` stubs (v0.14.7)** — `tyc` ships curated, embedded stubs for popular libraries whose packaging defeats venv introspection (`httpx`, `requests` to start). They're seeded into the project shape map by `tyc check` / `tyc build` / the LSP **before** venv introspection, so the library is shaped out of the box and its `unintrospectable-dependency` warning is suppressed — no `.venv` needed. Gap-fill only (an authored project `.dty`/`.ty` wins) and marked `partial` (omitted members stay lenient — no false `attribute_not_found`), so they add real construction checking + resolved client/response types without false positives on the long tail. Lives in `tyc-db::seed_bundled_stubs` with the `.dty` text under `tyc-db/src/bundled/`. The long tail stays best-effort; this is just the head.
+1. **Authored `.dty` stub** — full Typhon-dialect types, the strongest and most precise. Write these for long-lived dependencies you call a lot. Overrides a bundled stub for the same module.
 2. **Venv signature introspection (`tyc-venv`)** — `inspect.signature` over the *installed* package recovers parameter / return *annotations* (scalars, `Optional[X]` / `X | None`, parametric containers, fixed-arity tuples). Catches wrong-*type* and wrong-*arity* arguments to fully-typed pure-Python deps (function **and** constructor) with zero authoring. Degrades to a permissive `Unknown` on anything it can't model, so it only adds true positives. If a declared, imported dependency can't be introspected, `tyc::` surfaces the `unintrospectable-dependency` warning rather than silently skipping the check.
 3. **`ty` typeshed pass (`[checker] external = "ty"` / `--with-ty`)** — the only path that sees **typeshed**, so it covers C-extension and stdlib APIs introspection can't reach (`os.path.join(1, 2)`, numpy/pandas signatures). Runs as a subprocess over the emitted Python, errors re-attributed to `.ty`.
 
-Layer 1 is precise but manual; layer 2 is automatic for installed pure-Python deps; layer 3 is the catch-all for everything typeshed knows. They compose — a `.dty` still wins on a name it defines.
+Layer 0 is automatic for the bundled head; layer 1 is precise but manual; layer 2 is automatic for installed pure-Python deps; layer 3 is the catch-all for everything typeshed knows. They compose — an authored `.dty` wins on a name it defines, then the bundle, then venv, then `ty`.
+
+> **Qualified ↔ bare class identity (v0.14.7):** a module names its own classes bare in signatures (`def get(...) -> Response`), so a qualified use-site reference (`import httpx; let r: httpx.Response = client.get(...)`, or `import lib; let x: lib.Foo = lib.make()`) unifies with the bare return type — `Checker::is_assignable` matches two class types by their final `.`-separated segment. This only relaxes assignability (a real `Response` vs `int` mismatch is still caught).
 
 ---
 
@@ -1587,6 +1600,7 @@ When you edit the Rust compiler:
 | Result propagate | `let x: int = parse()?` |
 | Multi-Result chain | `with a = r1?, b = r2?: ... else err: ...` |
 | Result combinators | `r.map(f) / r.map_err(g) / r.and_then(h) / r.or_else(k)` |
+| Exception→Result | `try_result(lambda: f(), lambda e: str(e))` |
 | Guard / early return | `guard u = maybe else: return default` |
 | Pipe | `value \|> f() \|> g()` |
 | Compile-time const | `comptime let PORT: int = int(env("PORT", "8080"))` |

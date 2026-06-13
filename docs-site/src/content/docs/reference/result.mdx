@@ -137,6 +137,17 @@ def load(path: str) -> Result[dict, str]:
 
 The combination of `open()` write/append/binary modes (v0.9.0), `json.load` / `json.dump` riding on top, and the `with`-block honouring `__enter__` / `__exit__` means the same source runs identically under `tyc run` and the compiled path.
 
+When the boundary is a one-off — a single library call whose exception you want as an `Err` — `try_result` (v0.14.6) collapses the whole `try/except` into one expression. It runs the thunk and returns `Ok(result)`, or catches an exception and returns `Err(on_err(exc))`:
+
+```python
+import json
+
+def load(path: str) -> Result[dict, str]:
+    return try_result(lambda: read_json(path), lambda e: f"invalid JSON: {e}")
+```
+
+`try_result` is a prelude name (no import needed) typed as `Result[T, E]` — `T` is the thunk's result, `E` the mapper's. The mapper is optional: `try_result(lambda: read_json(path))` returns `Result[dict, Exception]`, carrying the raw exception (map it later with `.map_err(...)`). Reach for the explicit `try/except` form when you catch *different* exception types into different errors; reach for `try_result` for the common single-boundary case.
+
 ### Mapping over `Ok`
 
 ```python

@@ -1445,7 +1445,7 @@ let data = raw_data as! dict[str, int]  # then the cast, one line, top-level
 ok = validate(data)
 ```
 
-Supported positions: `let`/`mut` RHS, `x = …`, augmented `x += …`, `return …`, `yield …`, and bare expression statements. (The nested / multi-line forms are slated for the AST-based lowering migration, which lifts the same restriction off multi-line `?`.)
+Supported positions (v0.14.5): any expression position — `let`/`mut` RHS, `x = …`, augmented `x += …`, `return …`, `yield …`, bare expression statements, **nested inside call arguments** (`foo(row[0] as! int, y)`), comprehensions / collection literals, and value expressions that **span multiple physical lines** (the left operand may run over several lines as long as it's bracket-balanced). The right operand parses as a type expression, so trailing code after the type stays outside the cast. (Earlier releases restricted `as!` to a single physical line in value position.)
 
 ## 82. Expecting `as!` to enforce its check under `tyc run` (v0.14.0)
 

@@ -285,6 +285,92 @@ match result:
     }
 
     #[test]
+    fn checked_cast_union_and_parametric_targets_run() {
+        // `EXPR as! int | None` / `EXPR as! dict[str, int]` lower to
+        // `__typhon_checked_cast__(EXPR, <type>)`. The VM must evaluate only
+        // the value operand: evaluating the type descriptor `int | None` as an
+        // ordinary expression used to crash with `unsupported operand type(s)
+        // for |: 'function' and 'NoneType'`. The casts also appear nested in a
+        // call argument and a comprehension to cover the structural lowering.
+        // Wrong results `raise`, so a regression surfaces as a non-zero run.
+        let src = r#"
+def takes_int(n: int) -> int:
+    return n
+
+def widen(x: object) -> int | None:
+    return x as! int | None
+
+def reshape(raw: object) -> dict[str, int]:
+    return raw as! dict[str, int]
+
+let rows: list[object] = [4, 5, 6]
+let doubled = [takes_int(r as! int) * 2 for r in rows]
+if doubled != [8, 10, 12]:
+    raise ValueError("nested / comprehension cast wrong")
+let w = widen(41)
+if w != 41:
+    raise ValueError("union cast wrong")
+let m: object = {"a": 1}
+let d = reshape(m)
+if d["a"] != 1:
+    raise ValueError("parametric cast wrong")
+print("ok")
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    #[test]
+    fn try_result_bridges_exceptions() {
+        // `try_result(thunk[, on_err])` returns `Ok(thunk())`, or catches a
+        // raised exception and returns `Err(on_err(exc))` / `Err(exc)`. Drives
+        // both the 2-arg (mapped) and 1-arg (raw exception) forms, and the
+        // Ok / Err arms. Wrong results `raise`, surfacing a regression as a
+        // non-zero run.
+        let src = r#"
+def parse(raw: str) -> int:
+    return int(raw)
+
+def safe(raw: str) -> Result[int, str]:
+    return try_result(lambda: parse(raw), lambda e: "bad")
+
+match safe("7"):
+    case Ok(v):
+        if v != 7:
+            raise ValueError("ok value wrong")
+    case Err(e):
+        raise ValueError("expected ok, got err")
+
+match safe("nope"):
+    case Ok(v):
+        raise ValueError("expected err, got ok")
+    case Err(e):
+        if e != "bad":
+            raise ValueError("mapped err wrong")
+
+# 1-arg form: the error is the raw exception object.
+match try_result(lambda: parse("x")):
+    case Ok(v):
+        raise ValueError("expected err from raising thunk")
+    case Err(e):
+        pass
+print("ok")
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    #[test]
+    fn try_result_rejects_wrong_arity() {
+        // Extra positional args aren't silently ignored — `try_result` takes
+        // 1 or 2, matching the runtime `def try_result(thunk, on_err=None)`.
+        let src = "let r = try_result(lambda: 1, lambda e: \"x\", 99)\nprint(r)\n";
+        assert_ne!(
+            run_capturing(src).unwrap_or(1),
+            0,
+            "try_result with 3 args must raise (non-zero exit)"
+        );
+    }
+
+    #[test]
     fn type_alias_binds_as_runtime_value() {
         // A `type` alias must bind a runtime name (CPython binds a lazy
         // `TypeAliasType`); previously this was a no-op, so an imported

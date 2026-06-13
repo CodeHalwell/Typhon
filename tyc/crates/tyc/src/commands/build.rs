@@ -252,6 +252,11 @@ pub fn run(args: BuildArgs) -> Result<()> {
         }
         crate::commands::util::aggregate_pub_star_shapes(&mut project_shapes, &all_paths, src_root);
     }
+    // Seed compiler-bundled stubs (httpx, requests, …) for any module not
+    // already shaped by the project — same as `tyc check`. Before venv
+    // enrichment so the venv pass skips them and they're exempt from the
+    // `unintrospectable-dependency` warning.
+    tyc_db::seed_bundled_stubs(&mut project_shapes);
     // Venv-introspection enrichment: shell to the project's Python
     // and recover real signatures for every third-party class /
     // function the project imports. Without this, calls like
@@ -1886,7 +1891,22 @@ class Err(Generic[_E]):
 from typing import TypeAlias, Union
 Result: TypeAlias = Union[Ok, Err]
 
-__all__ = [\"Ok\", \"Err\", \"Result\", \"tasks\", \"lazy\", \"stdlib\", \"result\", \"parallel\"]
+
+def try_result(thunk, on_err=None):
+    \"\"\"Run ``thunk()`` and return ``Ok(result)``; on any exception return
+    ``Err(on_err(exc))`` (or ``Err(exc)`` when no mapper is given).
+
+    Backs Typhon's ``try_result`` exception->Result bridging combinator, so a
+    library boundary reads as ``let r = try_result(lambda: json.load(f), lambda
+    e: str(e))`` instead of a hand-written ``try/except`` that returns
+    ``Ok``/``Err``.\"\"\"
+    try:
+        return Ok(thunk())
+    except Exception as exc:  # noqa: BLE001 - bridging an untyped boundary is intentionally broad
+        return Err(exc if on_err is None else on_err(exc))
+
+
+__all__ = [\"Ok\", \"Err\", \"Result\", \"try_result\", \"tasks\", \"lazy\", \"stdlib\", \"result\", \"parallel\"]
 ";
 
 /// Generated `typhon_runtime/tasks.py` — strong-reference task registry.

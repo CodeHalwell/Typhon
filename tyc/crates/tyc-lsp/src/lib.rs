@@ -275,6 +275,11 @@ impl Backend {
                     &uri_str_for_check,
                     &text_for_check,
                 );
+                // Seed compiler-bundled stubs (httpx, requests, …) so the
+                // editor surfaces their shapes live, matching `tyc check` /
+                // `tyc build`. Before venv enrichment (which skips modules
+                // already in the map).
+                tyc_db::seed_bundled_stubs(&mut shapes);
                 // Fold venv-introspected third-party shapes into the project
                 // map so the cross-module check flags wrong-typed / -arity
                 // calls to installed dependencies live in the editor. All of
