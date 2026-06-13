@@ -28,3 +28,6 @@
 ## 2026-06-06 - [Themed text selection for visual polish]
 **Learning:** Default browser text selection colors (usually stark blue) often clash with custom themes, making the site feel less cohesive.
 **Action:** Implemented `::selection` to match the site's `var(--sl-color-accent)` at 25% opacity, preserving contrast while harmonizing the selection experience with the overall design.
+## 2024-06-13 - [Focus indicators on scrollable code blocks]
+**Learning:** Discovered that scrollable regions in Astro/Starlight documentation, such as code blocks, utilize `tabindex="0"` to allow keyboard users to scroll through the content. However, these elements lacked an explicit focus indicator, making it confusing for keyboard users to know when they had focused on them.
+**Action:** Added `[tabindex="0"]:focus-visible` to the existing focus ring declarations in `docs-site/src/styles/custom.css` to ensure keyboard navigation accessibility for these regions.
