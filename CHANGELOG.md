@@ -4,6 +4,56 @@ All notable changes to Typhon are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely; the
 canonical phase-by-phase status lives in `docs/roadmap.md`.
 
+## 0.14.5 — 2026-06-13 — `as!` checked cast composes everywhere (nested + multi-line)
+
+`as!` (v0.14.0) shipped restricted to a single physical line in a value
+position — after `=` / `op=` / `return` / `yield`, or as a bare expression.
+A field report noted the obvious wall: the moment you reach a more complex
+boundary (a cast as one call argument among several, or a value expression
+that wraps across lines) the operator stopped working and the parser errored.
+This release finishes the lowering so `as!` composes wherever an expression
+can appear.
+
+### Changed — structural `as!` lowering
+
+- **`EXPR as! TYPE` now lowers structurally**, scanning the whole source with
+  bracket-, string-, and comment-awareness instead of line by line. `as!`
+  composes in any expression position:
+  - **nested inside call arguments** — `save(row[0] as! int, label)` →
+    `save(__typhon_checked_cast__(row[0], int), label)`;
+  - inside **comprehensions / collection literals** — `[x as! int for x in xs]`,
+    `{"k": v as! int}` (the `for` clause / dict key stay outside the cast);
+  - across a **multi-line value expression** — a left operand that wraps over
+    several physical lines (bracket-balanced) attaches to the whole call;
+  - **nested / repeated casts** — `wrap(x as! int) as! str` lowers both.
+- The **left operand** is the whole current syntactic slot: back to the
+  enclosing open bracket, a top-level `,` / `;` / `:` separator, an assignment
+  / augmented / walrus `=`, a `return` / `yield` keyword, or the line start.
+  This preserves the original precedence (`a + b as! int` casts `a + b`). The
+  **right operand** is parsed as a type expression (dotted name, optional
+  `[...]` subscript, `|`-union chain), so trailing code after the type
+  (`x as! int + 1`, the `for` of a comprehension) is left outside the cast —
+  fixing a latent issue where the old "type runs to end of line" rule would
+  have swept trailing code into the type argument. An `as!` whose right side
+  isn't a type expression is left untouched, so the parser still surfaces a
+  clean error rather than mis-lowering. Eight new `tyc-syntax` tests cover the
+  new positions plus a parse-validity check on the lowered output; the
+  existing single-line behaviour is unchanged.
+
+### Fixed — VM runs `as!` to a union / parametric type
+
+- **`tyc run` no longer crashes on `EXPR as! int | None` (or `as! dict[str,
+  int]`).** The VM lowering is an identity passthrough, but it evaluated *both*
+  call arguments, so the type descriptor `int | None` was evaluated as an
+  expression and raised `unsupported operand type(s) for |: 'function' and
+  'NoneType'` (the VM's `int` is a builtin function value). The interpreter now
+  intercepts `__typhon_checked_cast__(EXPR, TYPE)` before argument evaluation —
+  mirroring its `super(...)` handling — and evaluates only the value operand,
+  so a cast to a union or parametric type runs in any position. This was
+  pre-existing (a single-line union cast hit the same path); finishing the
+  structural lowering made it reachable far more often. A `tyc-vm` test runs
+  union, parametric, nested, and comprehension casts.
+
 ## 0.14.4 — 2026-06-13 — `async_without_await` understands async-interface conformance
 
 A field report from building a real async-end-to-end app flagged

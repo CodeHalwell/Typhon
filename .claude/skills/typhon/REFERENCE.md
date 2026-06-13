@@ -1252,7 +1252,7 @@ load('{"port": "x"}')    # → TypeError (dict[str, str] ≠ dict[str, int]; ele
 
 Modelled shapes: scalars (`int` / `str` / `bool` / `float` / `bytes` / `None`), `list[X]` / `set[X]` / `frozenset[X]`, `dict[K, V]`, fixed- and variadic-`tuple[...]`, unions / `Optional`. `int → float` and `bool → int` widening is honoured. `Any` / `object` targets and shapes it can't model fall back to acceptance, so `as!` only ever rejects values it can prove wrong. The VM treats it as identity (the build path enforces); `tyc fmt` preserves it.
 
-**v1 scope:** single physical line, value position (after `=` / `op=` / `return` / `yield`, or a bare expression). Nested-in-call-args and multi-line forms error cleanly and await the AST-based lowering migration.
+**Scope (v0.14.5):** structural lowering — composes in any expression position: value positions (`=` / `op=` / `return` / `yield` / bare expression), nested inside call arguments (`foo(row[0] as! int, y)`), comprehensions / collection literals, and value expressions spanning multiple physical lines (left operand bracket-balanced). The right operand parses as a type expression (dotted name + optional `[...]` + `|`-union), so trailing code after the type is left outside the cast. (Earlier releases restricted it to a single physical line in value position.)
 
 ---
 

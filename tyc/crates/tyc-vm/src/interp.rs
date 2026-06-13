@@ -1957,6 +1957,26 @@ impl Interpreter {
                 return self.eval_super_method_call(sup, a.attr.as_str(), c, env);
             }
         }
+        // `EXPR as! TYPE` lowers to `__typhon_checked_cast__(EXPR, TYPE)`. The
+        // VM treats the cast as an identity passthrough (the static type was
+        // pinned by the checker; the recursive structural check runs on the
+        // `tyc build && python` path). Crucially, only the *value* operand is
+        // evaluated — the second argument is a type descriptor (`int | None`,
+        // `dict[str, int]`) for which the VM has no runtime value, so
+        // evaluating it as an ordinary expression would fail (`int | None`
+        // applies `|` to a builtin function). Returning the value directly
+        // keeps `tyc run` working for an `as!` to a union / parametric type, in
+        // any position. Intercepted before argument evaluation, mirroring the
+        // `super(...)` handling above.
+        if let Expr::Name(n) = c.func.as_ref() {
+            if n.id.as_str() == "__typhon_checked_cast__"
+                && c.arguments.args.len() == 2
+                && c.arguments.keywords.is_empty()
+                && !matches!(c.arguments.args[0], Expr::Starred(_))
+            {
+                return self.eval_expr(&c.arguments.args[0], env);
+            }
+        }
         let func = self.eval_expr(&c.func, env)?;
         let mut args = Vec::with_capacity(c.arguments.args.len());
         for arg in c.arguments.args.iter() {

@@ -285,6 +285,41 @@ match result:
     }
 
     #[test]
+    fn checked_cast_union_and_parametric_targets_run() {
+        // `EXPR as! int | None` / `EXPR as! dict[str, int]` lower to
+        // `__typhon_checked_cast__(EXPR, <type>)`. The VM must evaluate only
+        // the value operand: evaluating the type descriptor `int | None` as an
+        // ordinary expression used to crash with `unsupported operand type(s)
+        // for |: 'function' and 'NoneType'`. The casts also appear nested in a
+        // call argument and a comprehension to cover the structural lowering.
+        // Wrong results `raise`, so a regression surfaces as a non-zero run.
+        let src = r#"
+def takes_int(n: int) -> int:
+    return n
+
+def widen(x: object) -> int | None:
+    return x as! int | None
+
+def reshape(raw: object) -> dict[str, int]:
+    return raw as! dict[str, int]
+
+let rows: list[object] = [4, 5, 6]
+let doubled = [takes_int(r as! int) * 2 for r in rows]
+if doubled != [8, 10, 12]:
+    raise ValueError("nested / comprehension cast wrong")
+let w = widen(41)
+if w != 41:
+    raise ValueError("union cast wrong")
+let m: object = {"a": 1}
+let d = reshape(m)
+if d["a"] != 1:
+    raise ValueError("parametric cast wrong")
+print("ok")
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    #[test]
     fn type_alias_binds_as_runtime_value() {
         // A `type` alias must bind a runtime name (CPython binds a lazy
         // `TypeAliasType`); previously this was a no-op, so an imported
