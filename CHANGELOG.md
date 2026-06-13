@@ -4,6 +4,49 @@ All notable changes to Typhon are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely; the
 canonical phase-by-phase status lives in `docs/roadmap.md`.
 
+## 0.14.7 — 2026-06-13 — Bundled `.dty` stubs for popular libraries (httpx, requests)
+
+The three-layer third-party model (authored `.dty` → venv introspection →
+`ty`/typeshed) leaves a gap for libraries whose own packaging defeats
+`inspect.signature` — `httpx` is the motivating case: typed, installed, yet it
+surfaced an `unintrospectable-dependency` warning and left
+`httpx.AsyncClient(...)` / `client.get(...)` effectively unchecked. A field
+report asked for a curated bundled stub set for the head of the import
+distribution. This release adds the mechanism and the first two stubs.
+
+### Added — compiler-bundled stubs
+
+- **`tyc` now ships curated `.dty` stubs for `httpx` and `requests`**, embedded
+  in the binary (`tyc-db`'s `seed_bundled_stubs`). They're seeded into the
+  project shape map by `tyc check`, `tyc build`, and the LSP **before** venv
+  enrichment, so an imported bundled library is shaped out of the box and its
+  `unintrospectable-dependency` warning is suppressed — no `.venv`, no
+  `tyc sync` required.
+- **Gap-fill, not override.** An authored project `.dty`/`.ty` for the same
+  module still wins, and (where it works) live venv introspection isn't
+  displaced for modules the bundle doesn't cover. Each bundled class shape is
+  marked `partial`, so a member the stub omits stays lenient rather than
+  producing a false `attribute_not_found`. The result: real construction
+  checking (a bad `httpx.AsyncClient(no_such_kwarg=…)` is caught, the client /
+  response types resolve) with no false positives on the long tail. Request
+  methods take `**kwargs: object` and client constructors enumerate the common
+  kwargs as optional fields. The long tail of dependencies stays best-effort;
+  this is just the head.
+
+### Fixed — qualified cross-module class references unify with their bare form
+
+- **`import httpx; let r: httpx.Response = client.get(...)` no longer mismatches
+  the method's `Response` return type** (and the same for any project module:
+  `import lib; let x: lib.Foo = lib.make()`). A module names its own classes
+  bare in its signatures, but a use site may reference them qualified; the
+  checker treated `httpx.Response` and `Response` as different classes and fired
+  a spurious `type_mismatch`. `Checker::is_assignable` now unifies two class
+  types whose final `.`-separated segments match. This only *relaxes*
+  assignability between two differently-spelled class names — it can never turn
+  a previously-accepted assignment into a mismatch — and a genuine mismatch
+  (`Response` vs `int`) is still caught. Without this, bundled stubs would have
+  *regressed* the idiomatic `import httpx` usage they're meant to help.
+
 ## 0.14.6 — 2026-06-13 — `try_result`: exception→Result bridging combinator
 
 Bridging a library boundary into a `Result` meant writing the same shape by

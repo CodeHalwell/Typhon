@@ -1,0 +1,102 @@
+# Bundled, curated Typhon stub for `httpx` — best-effort and intentionally
+# partial. Loaded with every class shape marked `partial`, so a member this
+# stub omits stays lenient (no false `attribute_not_found`) while the members
+# it does model contribute real types. Request methods take `**kwargs: object`
+# to accept httpx's many optional request kwargs without arity false positives;
+# the client constructors enumerate the common kwargs as optional fields.
+#
+# An authored project `.dty`/`.ty` for `httpx` — and, where it works, live venv
+# introspection — both take precedence over this bundle.
+
+class Response:
+    status_code: int = 0
+    text: str = ""
+    content: bytes = b""
+    encoding: str? = None
+    url: str = ""
+    reason_phrase: str = ""
+    http_version: str = ""
+    is_success: bool = True
+    is_error: bool = False
+    is_redirect: bool = False
+
+impl Response:
+    def json(self, **kwargs: object) -> object: ...
+    def raise_for_status(self) -> Response: ...
+    def read(self) -> bytes: ...
+    async def aread(self) -> bytes: ...
+
+class AsyncClient:
+    base_url: str = ""
+    timeout: object = None
+    headers: object = None
+    params: object = None
+    cookies: object = None
+    auth: object = None
+    verify: object = None
+    cert: object = None
+    http1: bool = True
+    http2: bool = False
+    proxy: object = None
+    proxies: object = None
+    mounts: object = None
+    follow_redirects: bool = False
+    limits: object = None
+    max_redirects: int = 20
+    event_hooks: object = None
+    transport: object = None
+    app: object = None
+    trust_env: bool = True
+    default_encoding: str = "utf-8"
+
+impl AsyncClient:
+    async def get(self, url: str, **kwargs: object) -> Response: ...
+    async def post(self, url: str, **kwargs: object) -> Response: ...
+    async def put(self, url: str, **kwargs: object) -> Response: ...
+    async def patch(self, url: str, **kwargs: object) -> Response: ...
+    async def delete(self, url: str, **kwargs: object) -> Response: ...
+    async def head(self, url: str, **kwargs: object) -> Response: ...
+    async def options(self, url: str, **kwargs: object) -> Response: ...
+    async def request(self, method: str, url: str, **kwargs: object) -> Response: ...
+    async def aclose(self) -> None: ...
+
+class Client:
+    base_url: str = ""
+    timeout: object = None
+    headers: object = None
+    params: object = None
+    cookies: object = None
+    auth: object = None
+    verify: object = None
+    cert: object = None
+    proxy: object = None
+    proxies: object = None
+    mounts: object = None
+    follow_redirects: bool = False
+    limits: object = None
+    max_redirects: int = 20
+    event_hooks: object = None
+    transport: object = None
+    app: object = None
+    trust_env: bool = True
+    default_encoding: str = "utf-8"
+
+impl Client:
+    def get(self, url: str, **kwargs: object) -> Response: ...
+    def post(self, url: str, **kwargs: object) -> Response: ...
+    def put(self, url: str, **kwargs: object) -> Response: ...
+    def patch(self, url: str, **kwargs: object) -> Response: ...
+    def delete(self, url: str, **kwargs: object) -> Response: ...
+    def head(self, url: str, **kwargs: object) -> Response: ...
+    def options(self, url: str, **kwargs: object) -> Response: ...
+    def request(self, method: str, url: str, **kwargs: object) -> Response: ...
+    def close(self) -> None: ...
+
+def get(url: str, **kwargs: object) -> Response: ...
+def post(url: str, **kwargs: object) -> Response: ...
+def put(url: str, **kwargs: object) -> Response: ...
+def patch(url: str, **kwargs: object) -> Response: ...
+def delete(url: str, **kwargs: object) -> Response: ...
+def head(url: str, **kwargs: object) -> Response: ...
+def options(url: str, **kwargs: object) -> Response: ...
+def request(method: str, url: str, **kwargs: object) -> Response: ...

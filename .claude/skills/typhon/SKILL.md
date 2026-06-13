@@ -1275,15 +1275,18 @@ impl Redis:
 
 **Cross-module shape extraction consumes both `.ty` and `.dty` on equal footing.** When both define the same name, stubs win.
 
-### Three layers of third-party type-checking (v0.12.0)
+### Layers of third-party type-checking (v0.12.0, + bundled stubs v0.14.7)
 
-As of v0.12.0 a third-party call can be type-checked three ways, in increasing coverage:
+A third-party call can be type-checked several ways, in increasing coverage:
 
-1. **Authored `.dty` stub** — full Typhon-dialect types, the strongest and most precise. Write these for long-lived dependencies you call a lot.
+0. **Compiler-bundled `.dty` stubs (v0.14.7)** — `tyc` ships curated, embedded stubs for popular libraries whose packaging defeats venv introspection (`httpx`, `requests` to start). They're seeded into the project shape map by `tyc check` / `tyc build` / the LSP **before** venv introspection, so the library is shaped out of the box and its `unintrospectable-dependency` warning is suppressed — no `.venv` needed. Gap-fill only (an authored project `.dty`/`.ty` wins) and marked `partial` (omitted members stay lenient — no false `attribute_not_found`), so they add real construction checking + resolved client/response types without false positives on the long tail. Lives in `tyc-db::seed_bundled_stubs` with the `.dty` text under `tyc-db/src/bundled/`. The long tail stays best-effort; this is just the head.
+1. **Authored `.dty` stub** — full Typhon-dialect types, the strongest and most precise. Write these for long-lived dependencies you call a lot. Overrides a bundled stub for the same module.
 2. **Venv signature introspection (`tyc-venv`)** — `inspect.signature` over the *installed* package recovers parameter / return *annotations* (scalars, `Optional[X]` / `X | None`, parametric containers, fixed-arity tuples). Catches wrong-*type* and wrong-*arity* arguments to fully-typed pure-Python deps (function **and** constructor) with zero authoring. Degrades to a permissive `Unknown` on anything it can't model, so it only adds true positives. If a declared, imported dependency can't be introspected, `tyc::` surfaces the `unintrospectable-dependency` warning rather than silently skipping the check.
 3. **`ty` typeshed pass (`[checker] external = "ty"` / `--with-ty`)** — the only path that sees **typeshed**, so it covers C-extension and stdlib APIs introspection can't reach (`os.path.join(1, 2)`, numpy/pandas signatures). Runs as a subprocess over the emitted Python, errors re-attributed to `.ty`.
 
-Layer 1 is precise but manual; layer 2 is automatic for installed pure-Python deps; layer 3 is the catch-all for everything typeshed knows. They compose — a `.dty` still wins on a name it defines.
+Layer 0 is automatic for the bundled head; layer 1 is precise but manual; layer 2 is automatic for installed pure-Python deps; layer 3 is the catch-all for everything typeshed knows. They compose — an authored `.dty` wins on a name it defines, then the bundle, then venv, then `ty`.
+
+> **Qualified ↔ bare class identity (v0.14.7):** a module names its own classes bare in signatures (`def get(...) -> Response`), so a qualified use-site reference (`import httpx; let r: httpx.Response = client.get(...)`, or `import lib; let x: lib.Foo = lib.make()`) unifies with the bare return type — `Checker::is_assignable` matches two class types by their final `.`-separated segment. This only relaxes assignability (a real `Response` vs `int` mismatch is still caught).
 
 ---
 

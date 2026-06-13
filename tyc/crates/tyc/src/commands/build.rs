@@ -252,6 +252,11 @@ pub fn run(args: BuildArgs) -> Result<()> {
         }
         crate::commands::util::aggregate_pub_star_shapes(&mut project_shapes, &all_paths, src_root);
     }
+    // Seed compiler-bundled stubs (httpx, requests, …) for any module not
+    // already shaped by the project — same as `tyc check`. Before venv
+    // enrichment so the venv pass skips them and they're exempt from the
+    // `unintrospectable-dependency` warning.
+    tyc_db::seed_bundled_stubs(&mut project_shapes);
     // Venv-introspection enrichment: shell to the project's Python
     // and recover real signatures for every third-party class /
     // function the project imports. Without this, calls like

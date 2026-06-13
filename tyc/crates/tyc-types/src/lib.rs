@@ -203,6 +203,15 @@ pub fn is_object_type(ty: &Type) -> bool {
     matches!(ty, Type::Class(name) if name == "object")
 }
 
+/// Final `.`-separated segment of a class name — the bare class identity.
+/// `"httpx.Response"` → `"Response"`, `"Foo"` → `"Foo"`. Used by
+/// [`Checker::is_assignable`] to unify a qualified class reference
+/// (`httpx.Response`) with the module's own bare class name as written in its
+/// signatures (`def get(...) -> Response`).
+fn class_name_tail(name: &str) -> &str {
+    name.rsplit('.').next().unwrap_or(name)
+}
+
 /// Check whether a value of type `actual` is assignable to a target of
 /// type `expected`.
 ///
@@ -2629,6 +2638,22 @@ impl<'a> Checker<'a> {
     fn is_assignable(&self, expected: &Type, actual: &Type) -> bool {
         if assignable(expected, actual) {
             return true;
+        }
+        // Qualified ↔ bare class identity. A module names its own classes
+        // bare in function / method signatures (`def get(...) -> Response`,
+        // `lib.make() -> Foo`), while a use site may reference them qualified
+        // (`import httpx; let r: httpx.Response = client.get(...)`,
+        // `let x: lib.Foo = lib.make()`). Treat two class types whose final
+        // `.`-separated segments match as the same identity so the qualified
+        // reference unifies with the bare return type. This only *relaxes*
+        // assignability between two differently-spelled class names — it never
+        // turns a previously-accepted assignment into a mismatch — so it can't
+        // introduce a false positive; it mirrors Typhon's bare-name class
+        // model (a `from M import C` already brings `C` in bare and unifies).
+        if let (Type::Class(exp_name), Type::Class(act_name)) = (expected, actual) {
+            if exp_name != act_name && class_name_tail(exp_name) == class_name_tail(act_name) {
+                return true;
+            }
         }
         // ITEM 2: structural Callable / function assignability with
         // class-aware variance. The standalone `assignable` already
