@@ -1731,16 +1731,6 @@ fn escape_json_path(s: &str) -> String {
     out
 }
 
-/// Convert a byte `offset` in `source` to a 1-indexed line number.
-fn offset_to_line(source: &str, offset: usize) -> u32 {
-    let clamped = offset.min(source.len());
-    source.as_bytes()[..clamped]
-        .iter()
-        .filter(|&&b| b == b'\n')
-        .count() as u32
-        + 1
-}
-
 /// Build a v2 `.py.map` JSON body with a full `lines` table.
 ///
 /// `line_offsets[i]` is the byte offset in `preprocessed` that was "active"
@@ -1748,10 +1738,25 @@ fn offset_to_line(source: &str, offset: usize) -> u32 {
 /// a 1-indexed line number and the array is serialised inline.  Synthesised
 /// lines (offset 0) correctly land on line 1, matching the identity fallback.
 fn build_source_map_v2(source_rel: &str, preprocessed: &str, line_offsets: &[usize]) -> String {
+    // ⚡ Bolt optimization: Precompute newline offsets to avoid O(N^2) behavior.
+    // Instead of rescanning the string for every offset, we find all newlines
+    // once O(N) and binary search them for each offset O(log N).
+    let newline_offsets: Vec<usize> = preprocessed
+        .as_bytes()
+        .iter()
+        .enumerate()
+        .filter_map(|(i, &b)| if b == b'\n' { Some(i) } else { None })
+        .collect();
+
     let lines: Vec<u32> = line_offsets
         .iter()
-        .map(|&offset| offset_to_line(preprocessed, offset))
+        .map(|&offset| {
+            let clamped = offset.min(preprocessed.len());
+            let count = newline_offsets.partition_point(|&nl_offset| nl_offset < clamped);
+            count as u32 + 1
+        })
         .collect();
+
     let mut out = String::with_capacity(64 + lines.len() * 4);
     out.push_str("{\"version\":2,\"source\":\"");
     out.push_str(source_rel);
@@ -3676,23 +3681,6 @@ async def load(uid: int) -> int:
     }
 
     // ── Source map v2 helpers ────────────────────────────────────────────────
-
-    #[test]
-    fn offset_to_line_empty_offset_is_line_one() {
-        assert_eq!(offset_to_line("hello\nworld\n", 0), 1);
-    }
-
-    #[test]
-    fn offset_to_line_after_first_newline() {
-        // "hello\n" is 6 bytes; byte 6 is the start of "world"
-        assert_eq!(offset_to_line("hello\nworld\n", 6), 2);
-    }
-
-    #[test]
-    fn offset_to_line_clamps_past_end() {
-        let src = "a\nb\n";
-        assert_eq!(offset_to_line(src, 999), 3);
-    }
 
     #[test]
     fn build_source_map_v2_produces_correct_json() {
