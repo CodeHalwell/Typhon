@@ -40,15 +40,18 @@ impl Client:
 
 
 def parse_response(text: str, expect_id: RequestId) -> Result[Response, JsonRpcError]:
-    try:
-        let raw: dict[str, object] = json.loads(text)
-    except json.JSONDecodeError as e:
-        return Err(JsonRpcError(code=-32700, message=f"parse error: {e}"))
+    # `try_result` collapses the parse boundary into one expression: it runs the
+    # thunk and maps any exception to a typed `Err`, so `?` propagates cleanly.
+    let raw: dict[str, object] = try_result(
+        lambda: json.loads(text),
+        lambda e: JsonRpcError(code=-32700, message=f"parse error: {e}"),
+    )?
     if raw.get("jsonrpc") != "2.0":
         return Err(JsonRpcError(code=-32600, message="not a jsonrpc 2.0 response"))
     if "error" in raw:
-        unsafe:
-            let err_dict: dict[str, object] = raw["error"]
+        # `as!` is the sound, one-line boundary cast: it types the untyped
+        # `raw["error"]` as a dict and runtime-checks the shape (no `unsafe:`).
+        let err_dict: dict[str, object] = raw["error"] as! dict[str, object]
         let err: JsonRpcError = JsonRpcError(
             code=int(err_dict["code"]),
             message=str(err_dict["message"]),
@@ -56,10 +59,9 @@ def parse_response(text: str, expect_id: RequestId) -> Result[Response, JsonRpcE
         return Ok(Failure(id=expect_id, error=err))
     if "result" in raw:
         mut typed_res: dict[str, str] = {}
-        unsafe:
-            let res_raw = raw["result"]
-            for k, v in res_raw.items():
-                typed_res[str(k)] = str(v)
+        let res_raw: dict[str, object] = raw["result"] as! dict[str, object]
+        for k, v in res_raw.items():
+            typed_res[str(k)] = str(v)
         return Ok(Success(id=expect_id, result=typed_res))
     return Err(JsonRpcError(code=-32603, message="missing result and error"))
 

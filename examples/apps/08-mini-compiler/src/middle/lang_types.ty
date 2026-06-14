@@ -22,23 +22,23 @@ pub type Ty = TyInt | TyFloat | TyStr | TyBool | TyUnit | TyFn
 
 
 pub class TyInt frozen:
-    placeholder: int = 0
+    pass
 
 
 pub class TyFloat frozen:
-    placeholder: int = 0
+    pass
 
 
 pub class TyStr frozen:
-    placeholder: int = 0
+    pass
 
 
 pub class TyBool frozen:
-    placeholder: int = 0
+    pass
 
 
 pub class TyUnit frozen:
-    placeholder: int = 0
+    pass
 
 
 pub class TyFn frozen:
@@ -49,11 +49,11 @@ pub class TyFn frozen:
 # Factories — cross-module variant→union upcast.
 pub def ty_label(t: Ty) -> str:
     match t:
-        case TyInt(_):              return "int"
-        case TyFloat(_):            return "float"
-        case TyStr(_):              return "str"
-        case TyBool(_):             return "bool"
-        case TyUnit(_):             return "unit"
+        case TyInt():              return "int"
+        case TyFloat():            return "float"
+        case TyStr():              return "str"
+        case TyBool():             return "bool"
+        case TyUnit():             return "unit"
         case TyFn(params, ret):
             mut parts: list[str] = []
             for p in params:
@@ -64,29 +64,29 @@ pub def ty_label(t: Ty) -> str:
 
 pub def ty_equal(a: Ty, b: Ty) -> bool:
     match a:
-        case TyInt(_):
+        case TyInt():
             match b:
-                case TyInt(_): return True
+                case TyInt(): return True
                 case _:        return False
             raise RuntimeError("unreachable")
-        case TyFloat(_):
+        case TyFloat():
             match b:
-                case TyFloat(_): return True
+                case TyFloat(): return True
                 case _:          return False
             raise RuntimeError("unreachable")
-        case TyStr(_):
+        case TyStr():
             match b:
-                case TyStr(_): return True
+                case TyStr(): return True
                 case _:        return False
             raise RuntimeError("unreachable")
-        case TyBool(_):
+        case TyBool():
             match b:
-                case TyBool(_): return True
+                case TyBool(): return True
                 case _:         return False
             raise RuntimeError("unreachable")
-        case TyUnit(_):
+        case TyUnit():
             match b:
-                case TyUnit(_): return True
+                case TyUnit(): return True
                 case _:         return False
             raise RuntimeError("unreachable")
         case TyFn(ap, ar):
@@ -151,8 +151,8 @@ def _terr(message: str, span: Span) -> TypeError:
 
 def _is_numeric(t: Ty) -> bool:
     match t:
-        case TyInt(_):   return True
-        case TyFloat(_): return True
+        case TyInt():   return True
+        case TyFloat(): return True
         case _:          return False
     raise RuntimeError("unreachable")
 
@@ -160,10 +160,10 @@ def _is_numeric(t: Ty) -> bool:
 def _numeric_join(a: Ty, b: Ty) -> Ty:
     # int + int = int; anything with float = float
     match a:
-        case TyFloat(_): return TyFloat()
+        case TyFloat(): return TyFloat()
         case _:
             match b:
-                case TyFloat(_): return TyFloat()
+                case TyFloat(): return TyFloat()
                 case _:          return TyInt()
             raise RuntimeError("unreachable")
     raise RuntimeError("unreachable")
@@ -171,7 +171,7 @@ def _numeric_join(a: Ty, b: Ty) -> Ty:
 
 def _is_str(t: Ty) -> bool:
     match t:
-        case TyStr(_): return True
+        case TyStr(): return True
         case _:        return False
     raise RuntimeError("unreachable")
 
@@ -259,7 +259,7 @@ pub def check(expr: Expr, env: TypeEnv) -> Result[Ty, TypeError]:
         case ExIf(cond, then_branch, else_branch, sp_if):
             let ct: Ty = check(cond, env)?
             match ct:
-                case TyBool(_):
+                case TyBool():
                     pass
                 case _:
                     return Err(error=_terr(
