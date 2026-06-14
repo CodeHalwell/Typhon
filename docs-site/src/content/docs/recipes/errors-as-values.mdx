@@ -88,6 +88,15 @@ def call_external() -> Result[Response, ExternalFailure]:
 
 Use at the boundary into untyped libraries; convert to a sealed union inside your domain.
 
+When the boundary is a single call and you don't need to distinguish exception types, `try_result` (v0.15.0) collapses that whole `try/except` into one expression. It is a prelude name (no import needed), runs the thunk and returns `Ok(result)`, or returns `Err(on_err(exc))` on any exception:
+
+```python
+def call_external() -> Result[Response, ExternalFailure]:
+    return try_result(lambda: http.get("..."), lambda e: ExternalFailure(cause=e))
+```
+
+Omit the mapper to carry the raw exception as `Result[Response, Exception]`. Reach for the explicit multi-`except` `try` shim when you map **distinct** exception types to **distinct** errors; reach for `try_result` for the common single-boundary case. See [`try_result`](/Typhon/reference/result/#bridging-a-boundary-with-try_result).
+
 ## Layering
 
 A common pattern: each layer defines its own sealed-union error type, and converts at the boundary.
@@ -142,6 +151,20 @@ Pick one — usually `Result`. The `raise` undermines the type signature.
 ### Using `Result[T, str]` for production code
 
 The string-as-error pattern is fine for prototypes; it doesn't scale. Define a proper error type as soon as you have multiple call sites.
+
+## Escaping `Result` deliberately
+
+Most code propagates a `Result` with `?` or `with`-chains. When you genuinely want to *leave* the `Result` world — a default-or-fail at the edge of a program, a script, or a test — the [unwrap/query family](/Typhon/reference/result/#unwrap--query-family) (added v0.13.0) is the intended escape hatch:
+
+```python
+let port: int  = get_port(cfg).unwrap_or(8080)        # default on Err, never raises
+let cfg:  dict = load(path).expect("config is required at startup")   # raise on Err
+let maybe: int? = parse(raw).ok()                     # Result -> T?
+if load(path).is_ok():
+    ...
+```
+
+The eight methods are `.unwrap()`, `.expect(msg)`, `.unwrap_or(d)`, `.unwrap_or_else(f)`, `.ok()`, `.err()`, `.is_ok()`, and `.is_err()`. The `Result` method surface is closed, so a typo'd method name is caught at check time (`tyc::attribute_not_found`) rather than crashing at runtime.
 
 ## Where next
 

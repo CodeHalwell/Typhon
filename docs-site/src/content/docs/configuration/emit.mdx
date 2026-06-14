@@ -5,12 +5,15 @@ sidebar:
   order: 4
 ---
 
+import { Aside } from '@astrojs/starlight/components';
+
 ```toml
 [emit]
 class-default = "dataclass"
 format = true
 skip-decoration-bases = []
 model-extra = "forbid"
+traceback-remap = false
 ```
 
 | Key | Type | Default | Description |
@@ -19,6 +22,7 @@ model-extra = "forbid"
 | `format` | bool | `true` | Post-process emitted `.py` through `ruff format`. |
 | `skip-decoration-bases` | list of strings | `[]` | Extra base-class names that suppress the automatic `@dataclass(slots=True)` decorator. |
 | `model-extra` | `"forbid"` \| `"ignore"` \| `"allow"` | `"forbid"` | Value for `ConfigDict(extra=…)` injected into every `model` class. |
+| `traceback-remap` | bool | `false` | Inject a runtime `sys.excepthook` into the entry module so uncaught-exception tracebacks point at `.ty` source instead of emitted `.py`. |
 
 ## `class-default`
 
@@ -62,6 +66,21 @@ model-extra = "allow"   # trust all incoming JSON
 ```
 
 The value affects every `model` class in the project. To override for a single class, write `model_config = ConfigDict(extra="…")` directly in the class body — the desugarer skips injection when a `model_config` statement is already present.
+
+## `traceback-remap`
+
+**Off by default.** When `true`, the emitter injects `typhon_runtime.traceback.install()` at the top of the entry module's `if __name__ == "__main__":` block. The installed `sys.excepthook` loads the emitted `.py.map` sidecars and rewrites each frame of an uncaught-exception traceback from the emitted `.py` back to the corresponding `.ty` source — the same mapping [`tyc trace`](/Typhon/cli/trace/) applies, but automatically and without a separate command.
+
+```toml
+[emit]
+traceback-remap = true
+```
+
+It only touches the **entry** script — library imports never trip the `__main__` guard, so imported modules are left byte-for-byte unchanged. On any failure (missing sidecar, malformed map) the hook falls back to the previously-installed `sys.excepthook`, so it can only ever improve a traceback, never suppress one.
+
+<Aside type="note">
+  Default-off keeps existing projects and runtime-free entry points byte-for-byte unchanged. A project with no other runtime feature stays free of the generated `typhon_runtime/` package; enabling this knob is what pulls the runtime in for the entry module.
+</Aside>
 
 ## Always-on behaviour
 

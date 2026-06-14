@@ -5,7 +5,7 @@ sidebar:
   order: 3
 ---
 
-import { Tabs, TabItem } from '@astrojs/starlight/components';
+import { Aside, Tabs, TabItem } from '@astrojs/starlight/components';
 
 A `.dty` stub describes a Python module's API in Typhon's strict dialect (`T?`, `Result[T, E]`, sealed unions, interfaces). The compiler:
 
@@ -78,6 +78,26 @@ If you're writing a `.ty` library that Python users will consume via the emitted
 2. You usually don't need a separate `.dty` — the emitted `.py` is typed already.
 
 You'd write a `.dty` only if you want to expose a stricter API surface in Typhon than the implementation reveals (e.g. hiding an internal helper).
+
+## Compiler-bundled stubs (Layer 0)
+
+You don't always have to write the stub yourself. `tyc` ships curated, **embedded** `.dty` stubs for popular libraries whose packaging defeats venv introspection — **`httpx`** and **`requests`** to start. `tyc check`, `tyc build`, and the LSP seed these into the project shape map *before* venv introspection runs, so the library is shaped out of the box:
+
+- Its construction is type-checked.
+- Its `unintrospectable-dependency` warning is suppressed.
+- **No `.venv` and no `tyc sync` are required.**
+
+### Authored stubs win
+
+Bundled stubs are **gap-fill only**. The precedence is: an authored project `.dty`/`.ty` for the same module beats the bundle, and the bundle in turn beats venv introspection. So if you write `src/stubs/httpx.dty`, your stub is the surface the checker uses — the bundle steps aside. Write your own for long-lived dependencies you call a lot and want pinned to a precise, strict surface.
+
+### `partial` leniency
+
+Bundled class shapes are marked `partial`: members the stub omits stay lenient, so a real attribute the curated stub didn't enumerate won't raise a false `attribute_not_found`. Request methods take `**kwargs: object`, and client constructors enumerate the common kwargs as optional fields. The aim is to shape the head of the dependency distribution without becoming a maintenance burden; the long tail stays best-effort.
+
+<Aside type="tip">
+The bundle covers the head — the libraries everyone calls. For everything else, lean on [venv introspection](/Typhon/interop/calling-python/#introspection-checked-imports), an authored `.dty`, or the [`ty` typeshed pass](/Typhon/cli/ty/). See [Layers of third-party type-checking](/Typhon/interop/overview/#layers-of-third-party-type-checking) for how they compose.
+</Aside>
 
 ## Common patterns
 

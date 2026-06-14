@@ -27,6 +27,7 @@ tyc cheatsheet > cheatsheet.txt   # save it locally
 - **Methods in `impl` blocks** — Rule 4.
 - **Sealed unions + exhaustive `match`** — declaration and pattern arms.
 - **`Result[T, E]` + `?`** — Ok/Err, error propagation, with-chains.
+- **Checked boundary cast** — `as!`, e.g. `let d = resp.json() as! dict[str, int]` — sound, runtime-checked one-liner at an untyped boundary.
 - **Concurrency** — `gather:`, `go`, `lazy import`.
 - **Comptime** — `comptime let`, `env()`, build-time evaluation.
 - **CLI** — every common `tyc` subcommand with a one-line purpose.

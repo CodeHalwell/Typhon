@@ -101,6 +101,33 @@ def fetch_user(id: int) -> Result[User, UserError]:
 
 No more `unsafe:`. The dynamism crosses through the stub, not through your code.
 
+## One-expression boundary bridge — `try_result`
+
+When the boundary is a single call whose exception you want as one `Err` — rather than distinct exception types mapped to distinct variants — `try_result` (v0.15.0) collapses the whole `try/except` shim into one expression. It is a prelude name (no import needed in source), and `tyc build` auto-injects `from typhon_runtime import try_result`:
+
+```python
+def fetch_user(id: int) -> Result[User, str]:
+    return try_result(
+        lambda: some_untyped_lib.fetch_user(id),
+        lambda e: f"fetch failed: {e}",
+    )
+```
+
+It runs the thunk and returns `Ok(result)`; on any exception it returns `Err(on_err(exc))`. Omit the mapper to carry the raw exception as `Result[T, Exception]`. The result is a genuine, typed `Result` — `T` inferred from the thunk, `E` from the mapper — so a wrong return annotation still fires `tyc::type_mismatch`.
+
+Keep the explicit multi-`except` shim above when you map **distinct** exception types to **distinct** error variants (`UserNotFoundError` → `NotFound`, `NetworkError` → `NetworkError`); reach for `try_result` for the common single-boundary case. See [`try_result`](/Typhon/reference/result/#bridging-a-boundary-with-try_result) for the full rules.
+
+### Escaping `Result` deliberately
+
+Once the typed adapter hands you a `Result`, most call sites propagate it with `?`. Where you genuinely want to *leave* the `Result` world — a script that should fall back to a default, or a startup path where failure is fatal — the [unwrap/query family](/Typhon/reference/result/#unwrap--query-family) is the escape hatch:
+
+```python
+let user: User = fetch_user(id).unwrap_or(GUEST)     # default on Err, never raises
+let admin: User = fetch_user(0).expect("admin user must exist")   # raise on Err
+if fetch_user(id).is_ok():
+    ...
+```
+
 ## Drift detection
 
 Run `tyc check --stubs` and `tyc stubtest` in CI. When the library upgrades and your stub falls behind, the drift surfaces immediately.

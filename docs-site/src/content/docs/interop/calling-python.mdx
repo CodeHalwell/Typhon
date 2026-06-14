@@ -5,13 +5,17 @@ sidebar:
   order: 2
 ---
 
-import { Tabs, TabItem } from '@astrojs/starlight/components';
+import { Aside, Tabs, TabItem } from '@astrojs/starlight/components';
 
-When you `import` from a plain `.py`, three outcomes are possible:
+When you `import` from a plain `.py`, several outcomes are possible:
 
 1. **The module is typed** (PEP 484 / 526 annotations everywhere). The checker accepts the types and treats the import like a Typhon module.
 2. **An authored `.dty` stub exists** for the module. The stub is the typed surface; the runtime `.py` is the implementation.
-3. **The module is untyped.** Imports return `Any` — values bind silently today, but the type system can't reason about them. Wrap the boundary in `unsafe:` or annotate the call site to keep the rest of the code base honest.
+3. **A compiler-bundled stub exists** for the module (`httpx`, `requests` to start). The library is shaped out of the box — no `.venv` or `tyc sync` needed.
+4. **The package is installed and introspectable.** `tyc` reads its signatures from the venv and type-checks your calls' argument types and arity automatically.
+5. **The module is untyped.** Imports return `Any` — values bind silently today, but the type system can't reason about them. Wrap the boundary in `unsafe:` or annotate the call site to keep the rest of the code base honest.
+
+For the full model — and how these layers compose — see [Layers of third-party type-checking](/Typhon/interop/overview/#layers-of-third-party-type-checking).
 
 ## Typed Python imports
 
@@ -50,6 +54,38 @@ def f() -> str?:
 ```
 
 See [Writing .dty Stubs](/Typhon/interop/dty-stubs/) for the stub format.
+
+## Bundled-stub imports (httpx / requests)
+
+Some libraries are typed via typeshed rather than in their own source, so venv introspection can't recover their signatures. `tyc` ships curated, embedded `.dty` stubs for the most common of these — **`httpx`** and **`requests`** to start — and seeds them before introspection runs:
+
+```python
+import httpx
+
+def fetch() -> httpx.Response:
+    let client = httpx.Client(timeout=10.0)   # ✅ constructor type-checked
+    return client.get("https://example.com")  # ✅ qualified return type
+```
+
+No `.venv` or `tyc sync` is required, and the library's `unintrospectable-dependency` warning is suppressed. The bundled class shapes are `partial`, so members the stub doesn't enumerate stay lenient (no false `attribute_not_found`). An authored `.dty` for the same module always overrides the bundle — write one when you want a stricter surface. See [Compiler-bundled stubs](/Typhon/interop/dty-stubs/#compiler-bundled-stubs-layer-0).
+
+## Introspection-checked imports
+
+When a declared dependency is **installed and introspectable**, `tyc` reads its signatures straight from the venv via `inspect.signature` — recovering parameter and return annotations — and type-checks your calls with no authoring at all:
+
+```python
+import typed_dep
+
+def f() -> None:
+    typed_dep.process("not an int")   # ❌ tyc::type_mismatch (wants int)
+    typed_dep.process(1, 2, 3)        # ❌ wrong arity
+```
+
+This covers both function and constructor calls to fully-typed pure-Python deps, through the same `tyc::type_mismatch` machinery your own code uses. It degrades to a permissive `Unknown` on anything it can't model, so it only ever adds true positives.
+
+<Aside type="note">
+If a declared, imported dependency can't be introspected (stub-only, C-extension, or not installed), `tyc` raises the `unintrospectable-dependency` warning instead of silently skipping the check. A bundled or authored `.dty` — or the [`ty` typeshed pass](/Typhon/cli/ty/) — fills the gap. See [Layers of third-party type-checking](/Typhon/interop/overview/#layers-of-third-party-type-checking).
+</Aside>
 
 ## Untyped Python imports
 

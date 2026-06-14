@@ -98,6 +98,62 @@ match shape:
 
 The diagnostic was documented from v0.3.0 onwards but only got a firing site in v0.8.0. Sibling `case` / `if` / `elif` arms each get fresh-binding behaviour (v0.6.0+), so the diagnostic only fires on genuine shadow situations.
 
+## `tyc::mutable_default_param`
+
+A mutable literal or constructor used as a function **parameter default** is created **once** and shared across every call — the classic Python `def f(x, acc=[])` footgun, where the same list accumulates state between calls:
+
+```python
+def append_id(x: int, acc: list[int] = []) -> list[int]:    # ⚠️ shared default
+    acc.append(x)
+    return acc
+```
+
+Class fields with mutable defaults get the `default_factory` rewrite (see [`tyc::class_attr_shadows_slot`](/Typhon/diagnostics/class-errors/#tycclass_attr_shadows_slot)); parameters can't be rewritten the same way, so they get this warning instead.
+
+**Fix:** default to `None` and build the mutable inside the body:
+
+```python
+def append_id(x: int, acc: list[int] | None = None) -> list[int]:
+    if acc is None:
+        acc = []
+    acc.append(x)
+    return acc
+```
+
+## `tyc::loop_closure_capture`
+
+A closure created inside a loop that references the loop variable observes the loop variable's **final value** at call time, not the value at the iteration where the closure was created (`[lambda: i for i in range(3)]` produces three closures that all return `2`):
+
+```python
+let fns = [lambda: i for i in range(3)]    # ⚠️ each lambda returns 2
+print([f() for f in fns])                  # [2, 2, 2], not [0, 1, 2]
+```
+
+The `lambda i=i:` default-binding idiom and immediately-invoked closures are exempt — those capture the per-iteration value, so they don't fire.
+
+**Fix:** bind the loop variable per-iteration via a default argument, or build the closure in a factory:
+
+```python
+let fns = [lambda i=i: i for i in range(3)]    # ✅ per-iteration binding
+print([f() for f in fns])                      # [0, 1, 2]
+```
+
+## `tyc::is_literal_comparison`
+
+`s is "x"` (or `is 5`, `is (1, 2)`, …) compares **identity** against a literal, not equality. The result depends on CPython's interning of small ints and strings, so it's almost never what's intended — CPython itself raises a `SyntaxWarning` for this form.
+
+```python
+def is_yes(s: str) -> bool:
+    return s is "yes"    # ⚠️ identity comparison against a literal
+```
+
+**Fix:** use `==` for value comparison.
+
+```python
+def is_yes(s: str) -> bool:
+    return s == "yes"
+```
+
 ## `tyc::shadowing_in_same_scope` (reserved)
 
 Future-reserved diagnostic for confusing shadowing patterns. **Not yet emitted by the compiler.** A `let x` followed by another `let x` in the same scope is currently accepted (Typhon treats it as legitimate shadowing). The diagnostic name is reserved so the eventual rule has a stable code from day one.

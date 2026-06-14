@@ -67,6 +67,45 @@ def show(s: str?) -> str:
 
 Before v0.9.0 this match required either a `case _:` fallback or a post-`match` `return`.
 
+### Enum exhaustiveness (v0.13.0)
+
+An enum's member set is a **closed set**, so it participates in exhaustiveness just like a sealed union. Covering every member with `case Enum.MEMBER:` arms (or `|` or-patterns) satisfies the return-path / exhaustiveness analysis:
+
+```python
+from enum import Enum
+
+class Direction(Enum):
+    NORTH = 1
+    SOUTH = 2
+    EAST = 3
+    WEST = 4
+
+def delta(d: Direction) -> tuple[int, int]:
+    match d:
+        case Direction.NORTH: return (0, 1)
+        case Direction.SOUTH: return (0, -1)
+        case Direction.EAST | Direction.WEST: return (0, 0)
+        # ❌ tyc::non_exhaustive_match — but here all members are covered ✅
+```
+
+A **missing** member now fires `tyc::non_exhaustive_match` naming the member that isn't covered. Before v0.13.0 both the sealed-union and enum shapes collapsed into a generic [`tyc::missing_return`](/Typhon/diagnostics/type-errors/) instead of pointing at the specific uncovered member.
+
+**Fix:** add the missing `case Enum.MEMBER:` arm (or fold it into a `|` or-pattern), or use `case _:` for a deliberate catch-all.
+
+### Expression scrutinees and match-arm narrowing (v0.13.0)
+
+Exhaustiveness now works for **expression scrutinees**, not just plain-name subjects — `match items[-1]:` is analysed the same way as `match x:`:
+
+```python
+def last_area(shapes: list[Shape]) -> float:
+    match shapes[-1]:                 # ✅ expression scrutinee, exhaustiveness checked
+        case Circle(r):       return 3.14 * r * r
+        case Rectangle(w, h): return w * h
+        case Triangle(b, h):  return 0.5 * b * h
+```
+
+Match-arm **narrowing** also applies: `case Action(_, _):` narrows the subject to `Action` inside that arm, so member access on the narrowed type type-checks without a separate `isinstance` guard.
+
 ## Adding a variant
 
 The whole point of sealing. Adding `Square` to `Shape`:

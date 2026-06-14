@@ -5,13 +5,17 @@ sidebar:
   order: 12
 ---
 
-import { Tabs, TabItem } from '@astrojs/starlight/components';
+import { Aside, Tabs, TabItem } from '@astrojs/starlight/components';
 
 Typhon's async story is **explicit, not inferred**. A function is async because you said so. The keywords:
 
 - `async def` / `await` — Python's standard coroutine machinery.
 - `gather:` — parallel awaits (lowers to `TaskGroup`).
 - `go` — fire-and-forget spawn (lowers to `typhon_runtime.tasks.spawn`).
+
+<Aside type="note" title="The in-process VM runs async natively (v0.13.0)">
+  `tyc run` executes async code directly — you don't need `tyc build` to try a coroutine. The VM uses a **cooperative-sequential scheduler**: an `async def` call produces a coroutine thunk, and `await` / `asyncio.run` / `gather` (including `return_exceptions=True`) / `TaskGroup.create_task` / `wait_for` / `spawn` (the `go` lowering) force those thunks in program order. `gather:` fan-out, `go ... -> task` + `await task`, `async for` / async comprehensions, `async with`, `asyncio.sleep`, `asyncio.timeout` (wall-clock-checked at scope exit), and `asyncio.Queue` all run, with output identical to CPython — *unless* correctness depends on task **interleaving**, in which case `Queue` operations raise a `RuntimeError` naming `tyc run --compile` rather than deadlocking. Runtime errors under `tyc run` render a CPython-style traceback frame chain pointing at the `.ty` file.
+</Aside>
 
 ## `async def` and `await`
 
@@ -79,7 +83,7 @@ auto-gather = true
 
 When on, the analyser rewrites straight-line runs of independent `name = await callee(...)` statements into a `TaskGroup`, *but only when*:
 
-1. Every callee is a same-module `async def` with the `@gatherable` decorator.
+1. Every callee is an `async def` carrying the `@gatherable` decorator.
 2. LHS bindings don't alias.
 3. The statements are contiguous and independent.
 
@@ -97,6 +101,34 @@ async def load(uid: int) -> tuple[User, list[Post]]:
 ```
 
 Without `@gatherable`, the rewrite doesn't fire. There's no diagnostic when callees are undecorated; you simply get sequential execution.
+
+<Aside type="note" title="Cross-module auto-gather (v0.14.2)">
+  `auto-gather` now extends across module boundaries: a run of independent awaits whose callees are `@gatherable` async functions **imported from another project module** folds into one `asyncio.TaskGroup`, exactly like a same-module run. The `@gatherable` decorator is **still required** on every callee — an imported async callee without it is never folded. Mis-resolution can only ever *fail* to fold (a missed optimisation); it never folds something un-attested.
+</Aside>
+
+### `gather_opportunity` advice (on by default)
+
+Independent of `auto-gather`, `tyc check` and `tyc build` surface a [`tyc::gather_opportunity`](/Typhon/diagnostics/async-errors/) advice (Hint severity, **on by default**) wherever 2+ adjacent independent awaited calls appear inside an `async def`, suggesting you wrap them in an explicit `gather:` block so they run concurrently in an `asyncio.TaskGroup`:
+
+```python
+async def load(client: Client, uid: int) -> tuple[User, list[Post]]:
+    let user  = await client.get_user(uid)     # 💡 these two awaits
+    let posts = await client.get_posts(uid)    #    could run concurrently
+    return (user, posts)
+```
+
+Unlike `auto-gather`, this advice is **callee-agnostic**: it fires for awaited *method* calls on imported clients (`await client.get_user(...)`) — the shape `auto-gather` never touches — because the suggested fix, an explicit `gather:` block, works for any awaitable with no decorator. Independence is decided by static data flow: a run breaks the moment a later await references a name bound earlier (including via the callee's receiver `b = await a.next()`, keyword args, comprehensions, walrus, slices, or f-strings), and a single non-matching statement between two awaits ends the run. It **never rewrites** — concurrency is a behaviour change you opt into — and being advice-level it never blocks a build.
+
+When `auto-gather` is also on, runs it folds into a `TaskGroup` are gone before this pass runs, so they aren't double-reported.
+
+Knob:
+
+```toml
+[strictness]
+suggest-gather = true   # default
+```
+
+`tyc explain gather_opportunity` documents it offline.
 
 ## `go`
 

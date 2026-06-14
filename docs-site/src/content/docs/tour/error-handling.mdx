@@ -158,6 +158,20 @@ The combinators landed in v0.6.0 and have always worked under `tyc build && pyth
 
 The choice between `with`-chain + `?` and method chaining is style. `with`-chains tend to read better when each step uses the previous step's success value by name; combinator chains tend to read better when each step is a function-of-one-argument.
 
+## Escaping `Result` — the unwrap / query family
+
+The combinators above all *stay inside* the `Result` world. When you deliberately want to *leave* it — pull a default out at the edge of a program, fail loudly at startup, or ask a yes/no question — `Ok` / `Err` carry an unwrap/query family too (added v0.13.0):
+
+```python
+let port: int   = get_port(cfg).unwrap_or(8080)        # default on Err, never raises
+let cfg:  dict  = load(path).expect("config is required at startup")   # raise on Err
+let maybe: int? = parse_port(raw).ok()                 # Result -> T?
+if load(path).is_ok():
+    ...
+```
+
+The eight methods are `.unwrap()`, `.expect(msg)`, `.unwrap_or(d)`, `.unwrap_or_else(f)`, `.ok()`, `.err()`, `.is_ok()`, and `.is_err()`. As of v0.13.0 the `Result` method surface is *closed*, so a typo'd method name is caught at check time (`tyc::attribute_not_found`) rather than crashing at runtime. See the [unwrap/query family reference](/Typhon/reference/result/#unwrap--query-family) for the full table.
+
 ## Choosing your error type
 
 `E` in `Result[T, E]` can be anything. Three patterns by complexity:
@@ -216,6 +230,27 @@ def load_config(path: str) -> Result[dict[str, str], str]:
 ```
 
 After this wrapper, downstream code can use `?` and `with`-chains without touching `try`.
+
+When the boundary is a *single* call and you don't need to distinguish exception types, `try_result` (v0.15.0) collapses that whole `try/except` shim into one expression. Like `Ok` / `Err` / `Result`, it is a prelude name (no import needed in source):
+
+<Tabs syncKey="lang">
+  <TabItem label="Typhon">
+    ```python
+    def load_config(path: str) -> Result[dict[str, str], str]:
+        return try_result(lambda: read_json(path), lambda e: f"invalid JSON: {e}")
+    ```
+  </TabItem>
+  <TabItem label="Emitted Python">
+    ```python
+    from typhon_runtime import try_result
+
+    def load_config(path: str) -> Result[dict[str, str], str]:
+        return try_result(lambda: read_json(path), lambda e: f"invalid JSON: {e}")
+    ```
+  </TabItem>
+</Tabs>
+
+It runs the thunk and returns `Ok(result)`; on any exception it returns `Err(on_err(exc))`, or `Err(exc)` — the raw exception, giving `Result[T, Exception]` — when the mapper is omitted. The result is a genuine, typed `Result` (`T` inferred from the thunk, `E` from the mapper), so a wrong return annotation still fires `tyc::type_mismatch`. Reach for the explicit multi-`except` shim when you map distinct exception types to distinct errors; reach for `try_result` for the common single-boundary case. See [`try_result`](/Typhon/reference/result/#bridging-a-boundary-with-try_result).
 
 ## What gets emitted
 
@@ -429,7 +464,8 @@ The checker counts variants and refuses to compile with `tyc::non_exhaustive_mat
 - `?` propagates errors with one character; the checker enforces compatible return types.
 - `with`-chains sequence `Result`-producing calls with a single failure-handling site.
 - Errors emit as small dataclasses in a generated `typhon_runtime.py` — no PyPI runtime.
-- Wrap exception-raising library calls in a `try` shim and lift them into `Result`.
+- Wrap exception-raising library calls in a `try` shim — or `try_result` for a single boundary call — and lift them into `Result`.
+- Leave the `Result` world deliberately with the unwrap/query family (`.unwrap_or`, `.expect`, `.ok`, `.is_ok`, …); the method surface is closed, so typos are caught at check time.
 
 ## Where next
 

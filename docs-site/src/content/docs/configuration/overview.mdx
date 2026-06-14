@@ -5,6 +5,8 @@ sidebar:
   order: 1
 ---
 
+import { Aside } from '@astrojs/starlight/components';
+
 `typhon.toml` lives at the project root and drives every `tyc` subcommand. The default scaffold (`tyc init`) gets you started; this section enumerates every key.
 
 ## The default
@@ -24,18 +26,27 @@ free-threaded = false
 class-default = "dataclass"
 format = true
 skip-decoration-bases = []
+model-extra = "forbid"
+traceback-remap = false
 
 [strictness]
 no-implicit-any = true
 unused-import = "error"
 exhaustive-match = "error"
 methods-in-class-body = "warn"
+unintrospectable-dependency = "warn"
+suggest-gather = true
 auto-memoise = false
 auto-gather = false
 auto-parallel = false
 parallel-min-size = 64
 pgo-memoise = false
 pgo-min-calls = 100
+allow-secret-comptime = false
+
+[checker]
+external = "none"
+external-args = []
 
 [env]
 required = ["DATABASE_URL"]
@@ -55,6 +66,7 @@ pytest = "8.2"
 | `[python]` | Target version, free-threaded mode | [→](/Typhon/configuration/python/) |
 | `[emit]` | Class default, format toggle, framework-base skip list | [→](/Typhon/configuration/emit/) |
 | `[strictness]` | Every strictness knob | [→](/Typhon/configuration/strictness/) |
+| `[checker]` | External type-checker integration | [↓](#checker) |
 | `[env]` | Required build-time env vars | [→](/Typhon/configuration/env/) |
 | `[dependencies]` / `[dev-dependencies]` | Package manifest | [→](/Typhon/configuration/dependencies/) |
 
@@ -67,6 +79,37 @@ One emit policy is no longer configurable and runs unconditionally:
 - **PEP 561 `.pyi` stubs** are emitted for every `.dty` file next to the project, so mypy / pyright / Pyrefly / `ty` can consume Typhon-authored libraries without an interop tax. The previously-documented `[emit] pyi-stubs` toggle has been removed.
 
 **Pydantic `model` classes** now use `[emit] model-extra` (default `"forbid"`) to control the `ConfigDict(extra=…)` value. See the [`[emit]` reference](/Typhon/configuration/emit/) for details.
+
+## `[checker]`
+
+Integrates an **external** type checker that runs over the *emitted* Python after a successful build. This is the only path that type-checks against typeshed, so it covers C-extension and stdlib APIs that runtime-venv introspection can't see.
+
+```toml
+[checker]
+external = "none"
+external-args = []
+```
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `external` | `"none"` \| `"ty"` | `"none"` | Which external checker to run over the emitted `.py`. `"ty"` runs Astral's [`ty`](https://github.com/astral-sh/ty) checker after the build. |
+| `external-args` | list of strings | `[]` | Extra flags forwarded verbatim to the external checker. |
+
+When `external = "ty"`, after a successful build `tyc` runs `ty` over the emitted Python. Because it checks against typeshed, it catches things runtime introspection misses — for example `os.path.join(1, 2)` is flagged. Any `ty` errors **fail the build**, and the diagnostics are re-attributed back to your `.ty` source via the `.py.map` sidecars, so the locations point at the code you wrote.
+
+Requires `ty` on `PATH`:
+
+```sh
+pip install ty        # or: uv tool install ty
+```
+
+<Aside type="tip">
+  You can run the same pass for a single invocation without editing `typhon.toml` by passing `--with-ty` to `tyc build` or `tyc check`. `tyc check --with-ty` builds to a throwaway directory first, then runs `ty` over it.
+</Aside>
+
+<Aside type="note">
+  A Phase 2 embedded (in-process) `ty` checker is prototyped but not shipped — it depends on a git dependency that `cargo deny` disallows. For now, external `ty` is the supported path.
+</Aside>
 
 ## Conventions
 

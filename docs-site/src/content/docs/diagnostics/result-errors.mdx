@@ -77,6 +77,23 @@ def f() -> Result[int, AppError]:
 
 Since v0.8.0 the same check fires inside `with`-chain `?`-bindings — every binding's implicit propagation path is validated against the enclosing function's declared error type. Since v0.9.0 the explicit `else err: return Err(err)` form goes through the same check too; previously the validation was gated on the synthetic `?`-op temp shape, so an `else` block could silently return an `Err` whose payload type didn't match the function's declared return.
 
+## Closed `Result` method surface (v0.13.0)
+
+The `Result` / `Ok` / `Err` method surface is now **closed**. Calling an **unknown** method on a `Result` value — a typo like `.unwarp()` — fires [`tyc::attribute_not_found`](/Typhon/diagnostics/type-errors/#tycattribute_not_found) at **check time**. Before v0.13.0 an unknown method passed the checker and crashed at runtime with `AttributeError`.
+
+```python
+def f() -> Result[int, str]:
+    let r: Result[int, str] = parse_port("8080")
+    return Ok(r.unwarp())    # ❌ tyc::attribute_not_found — typo for `.unwrap`
+```
+
+The known method set is:
+
+- **Combinators:** `.map` / `.map_err` / `.and_then` / `.or_else`.
+- **Unwrap / query family:** `.unwrap()` / `.expect(msg)` / `.unwrap_or(d)` / `.unwrap_or_else(f)` / `.ok()` / `.err()` / `.is_ok()` / `.is_err()`.
+
+**Fix:** correct the method name, or `match` on the `Result` if you need a shape these methods don't cover.
+
 ## `tyc::result_unused` (reserved)
 
 Future-reserved diagnostic for a `Result`-returning call whose value is discarded:

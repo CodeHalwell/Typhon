@@ -21,6 +21,17 @@ Converts typed Python (`.py`) to Typhon (`.ty`) in one pass. Used to bootstrap a
   The reassignment flag is file-wide (a single set, not per-function), so a `total = total + 1` accumulator in one function will also tag a one-shot `total = 0` in an unrelated function as `mut`. That's a deliberate over-approximation — `mut` of an unmutated binding still type-checks, whereas the inverse (`let` on a counter) would not. If the spurious `mut` bothers you, rename the unmutated local.
 - **`from typing import TypeVar` plus `T = TypeVar("T")`** scaffolding is dropped; generic functions become PEP 695 form.
 
+### v0.13.0 enhancements
+
+The migrator now does more of the idiomatic-Typhon rewrite automatically:
+
+- **Class-body methods are relocated into `impl` blocks.** A class with methods is split into the bare field-declaration `class` plus a sibling `impl ClassName:` block holding the methods.
+- **`class X(Enum):` is rewritten to the `enum` keyword.** A plain `Enum` subclass becomes the first-class `enum X:` declaration form.
+- **`field(default_factory=...)` is simplified to bare-literal sugar.** `field(default_factory=list)` / `field(default_factory=dict)` collapse to the `= []` / `= {}` mutable-default form Typhon recognises.
+- **Imports those rewrites orphan are pruned** — e.g. the now-unused `from enum import Enum` or `from dataclasses import field` is dropped.
+
+Together these mean migrated output checks with **zero errors *and* zero warnings**.
+
 Migrated output is intended to pass `tyc check` on first try.
 
 ## Examples

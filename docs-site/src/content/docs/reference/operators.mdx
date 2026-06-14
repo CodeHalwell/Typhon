@@ -5,10 +5,11 @@ sidebar:
   order: 20
 ---
 
-Typhon's operators are Python's, plus two:
+Typhon's operators are Python's, plus three:
 
 - `|>` — pipe, for left-to-right composition.
 - `?` — nullable type suffix, *and* Result-propagation expression suffix (context-dependent).
+- `as!` — the checked boundary cast: `EXPR as! TYPE` (see below).
 
 ## Precedence table
 
@@ -67,6 +68,15 @@ x ^= 0xAA
 ```
 
 All require the target to be `mut`. The checker enforces.
+
+## The `as!` checked cast
+
+`EXPR as! TYPE` is the checked boundary cast. Unlike a normal infix operator it does not slot into the precedence table — it is rewritten structurally rather than parsed by precedence:
+
+- **Left operand** — the whole **current syntactic slot**: everything back to the enclosing bracket, a top-level `,` / `;` / `:` separator, an assignment / augmented / walrus `=`, a `return` / `yield` / `if` / `while` / `assert` keyword, or the line start. So `a + b as! int` casts `a + b`, and `save(row[0] as! int, label)` casts only `row[0]`.
+- **Right operand** — a **type expression**: a dotted name, an optional `[...]` subscript, and `|`-unions. Trailing code after the type stays outside the cast — `x as! int + 1` casts `x` then adds `1`, and the `for` of a comprehension (`[x as! int for x in xs]`) stays outside.
+
+An `as!` whose right side isn't a type expression is left for the parser to reject cleanly. It lowers to `__typhon_checked_cast__(EXPR, TYPE)`, a recursively-checked runtime cast. See [`as!`](/Typhon/reference/unsafe/#as-the-checked-boundary-cast).
 
 ## Type-only operators
 
