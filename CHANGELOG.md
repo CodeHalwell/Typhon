@@ -12,7 +12,7 @@ A performance and polish release with no language or API changes.
 
 - **Source map generation now runs in O(N log N) instead of O(N²).** `build_source_map_v2`
   previously re-scanned the preprocessed source from the start for every token offset it
-  needed to map to a line number. On a 10 000-line file this degraded to ~31 s; after
+  needed to map to a line number. On a 10,000-line file this degraded to ~31 s; after
   precomputing newline positions in a single O(N) pass and resolving each offset with a
   binary search (`partition_point`), the same workload takes ~64 ms. The now-redundant
   `offset_to_line` helper has been removed.
