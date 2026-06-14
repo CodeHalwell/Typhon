@@ -1,0 +1,68 @@
+# Two v0.14/v0.15 features for the untyped-library boundary.
+#
+# try_result(thunk[, on_err]) turns an exception-throwing call into a Result in
+# one expression, with no hand-written try/except shim. The checked cast
+# EXPR as! TYPE types its operand as the target so an untyped boundary value
+# flows in, and ALSO lowers to a runtime structural check, so it can only let
+# through values it cannot prove wrong. Together they replace the old try-shim
+# plus re-assertion dance when reading JSON, a DB row, or any untyped payload.
+#
+# Run this with tyc build then python build/main.py to see the structural check
+# fire: the in-process VM (tyc run) treats the cast as an identity passthrough.
+
+import json
+
+
+# try_result with a mapper: any exception from json.loads becomes a typed Err,
+# so the caller can match on it instead of catching exceptions.
+def parse_json(text: str) -> Result[dict[str, object], str]:
+    return try_result(lambda: json.loads(text), lambda e: f"invalid JSON: {e}")
+
+
+# The dict from json.loads is an untyped boundary. We get it as a typed dict
+# from parse_json, then assert each field shape with a checked cast. Every
+# cast is verified recursively (scalars, list, dict), so a wrong shape raises
+# rather than flowing downstream mislabelled.
+def read_service(text: str) -> Result[str, str]:
+    let raw: dict[str, object] = parse_json(text)?
+    let name: str = raw["name"] as! str
+    let port: int = raw["port"] as! int
+    let hosts: list[str] = raw["hosts"] as! list[str]
+    let limits: dict[str, int] = raw["limits"] as! dict[str, int]
+    return Ok(describe(name, port, hosts, limits["rps"]))
+
+
+def describe(name: str, port: int, hosts: list[str], rps: int) -> str:
+    return f"{name} on :{port} across {hosts} @ {rps} rps"
+
+
+# The soundness payoff: a cast that cannot be proven correct raises at runtime,
+# so wrapping it in try_result surfaces the failure as a clean Err instead of a
+# mis-typed value flowing on.
+def coerce_int(value: object) -> Result[int, str]:
+    return try_result(lambda: value as! int, lambda e: f"not an int: {e}")
+
+
+def main() -> None:
+    let good: str = '{"name": "api", "port": 8080, "hosts": ["a", "b"], "limits": {"rps": 100}}'
+    match read_service(good):
+        case Ok(summary): print(summary)
+        case Err(msg):    print(f"unexpected: {msg}")
+
+    # A malformed payload short-circuits at the try_result boundary.
+    match read_service("not valid json"):
+        case Ok(_):    print("unexpected success")
+        case Err(msg): print(f"rejected: {msg}")
+
+    # A wrong-shaped value is caught by the checked cast, not waved through.
+    match coerce_int(42):
+        case Ok(n):    print(f"coerced int: {n}")
+        case Err(msg): print(f"unexpected: {msg}")
+
+    match coerce_int("oops"):
+        case Ok(n):    print(f"unexpected int: {n}")
+        case Err(msg): print(f"caught bad cast: {msg}")
+
+
+if __name__ == "__main__":
+    main()
