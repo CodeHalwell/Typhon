@@ -5,7 +5,7 @@ This directory holds the design and reference docs for **Typhon**, a statically-
 ## Start here
 
 - **[Long-term plan](long-term-plan.md)** — the harmonised implementation plan. Single canonical source for goals, architecture, language design, roadmap, and risks. Read this first.
-- **[Zero to Hero](zero-to-hero.md)** — the whole language in one sitting, from install to a capstone program. Start here if you want a fast, end-to-end tour before diving into the focused guides.
+- **[Zero to Hero](zero-to-hero/README.md)** — a ten-lesson path from install to a capstone program. Start here if you want a fast, end-to-end tour before diving into the focused guides.
 - **[Programming guides](guides/README.md)** — progressive walk through the language, from hello-world to advanced features. Start here if you want to *write* Typhon code, not just understand its design.
 
 ## Focused references
