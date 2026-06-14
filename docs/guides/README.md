@@ -2,6 +2,8 @@
 
 A progressive walk through the language, from your first `.ty` file to advanced features. Each guide builds on the previous one; skim in order the first time.
 
+> In a hurry? The [Zero to Hero](../zero-to-hero/README.md) lessons condense this whole series into ten short, self-contained lessons ending in a capstone program. Read them for the fast tour, then come back here to go deep on any feature.
+
 > The canonical design doc is [language.md](../language.md). These guides are the *teaching* surface — they show how features feel in practice. Where the two ever drift, the design doc wins.
 
 ## Reading order
