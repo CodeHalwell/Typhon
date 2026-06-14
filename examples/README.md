@@ -99,11 +99,13 @@ build/run steps. The full production-shaped apps live under
 |---|---|---|
 | 47 | Mini app — research assistant | multi-file project: API, DB, LLM, agent |
 
-### Language features (48)
+### Language features (48, 49, 59)
 
 | # | Topic | Highlights |
 |---|---|---|
 | 48 | `newtype` IDs | nominal aliases, `UserId`/`PostId`/`Email`, escape-upward rule, `tyc::newtype_violation` |
+| 49 | Enums | `enum` keyword (v0.11), `enum.auto()` numbering, explicit values + resume, `match` on members, `.name`/`.value` |
+| 59 | Boundary casts | `try_result` (v0.15) exception→`Result`, `as!` (v0.14/v0.15) sound runtime-checked cast at an untyped JSON boundary |
 
 ### High-signal algorithms & patterns (50, 56, 57, 58, 68)
 
@@ -113,7 +115,7 @@ build/run steps. The full production-shaped apps live under
 | 56 | State machine | sealed-union `State`, transition function, exhaustive matching |
 | 57 | Iterators & generators | `yield`, generic `take[T]`, infinite naturals, windowed/chunked |
 | 58 | Context managers | `@contextmanager`, `Iterator[T]`, timing & indentation blocks |
-| 68 | JSON-RPC builder | `newtype RequestId`, `unsafe:` boundary, sealed `Response` union |
+| 68 | JSON-RPC builder | `newtype RequestId`, `try_result` + `as!` boundary parsing, sealed `Response` union |
 
 ### Large multi-file apps
 
