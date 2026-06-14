@@ -1,7 +1,10 @@
 from __future__ import annotations
+from typhon_runtime import try_result
 from typhon_runtime import Ok, Err, Result
 from typing import NewType
 import dataclasses
+from typhon_runtime.cast import checked_cast as __typhon_checked_cast__
+from typhon_runtime import Err as __typhon_Err__
 import json
 
 RequestId = NewType("RequestId", int)
@@ -47,24 +50,30 @@ class Client:
 
 
 def parse_response(text: str, expect_id: RequestId) -> Result[Response, JsonRpcError]:
-    try:
-        raw: dict[str, object] = json.loads(text)
-    except json.JSONDecodeError as e:
-        return Err(JsonRpcError(code=-32700, message=f"parse error: {e}"))
+    __typhon_q_0__ = try_result(
+        lambda: json.loads(text),
+        lambda e: JsonRpcError(code=-32700, message=f"parse error: {e}"),
+    )
+    if isinstance(__typhon_q_0__, __typhon_Err__):
+        return __typhon_q_0__
+    raw: dict[str, object] = __typhon_q_0__.value
     if raw.get("jsonrpc") != "2.0":
         return Err(JsonRpcError(code=-32600, message="not a jsonrpc 2.0 response"))
     if "error" in raw:
-        err_dict: dict[str, object] = raw["error"]
+        err_dict: dict[str, object] = __typhon_checked_cast__(
+            raw["error"], dict[str, object]
+        )
         err: JsonRpcError = JsonRpcError(
             code=int(err_dict["code"]), message=str(err_dict["message"])
         )
         return Ok(Failure(id=expect_id, error=err))
     if "result" in raw:
         typed_res: dict[str, str] = {}
-        if True:
-            res_raw = raw["result"]
-            for k, v in res_raw.items():
-                typed_res[str(k)] = str(v)
+        res_raw: dict[str, object] = __typhon_checked_cast__(
+            raw["result"], dict[str, object]
+        )
+        for k, v in res_raw.items():
+            typed_res[str(k)] = str(v)
         return Ok(Success(id=expect_id, result=typed_res))
     return Err(JsonRpcError(code=-32603, message="missing result and error"))
 
