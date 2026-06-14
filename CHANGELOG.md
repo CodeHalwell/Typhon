@@ -4,6 +4,33 @@ All notable changes to Typhon are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely; the
 canonical phase-by-phase status lives in `docs/roadmap.md`.
 
+## 0.15.1 — 2026-06-14 — Compiler performance and docs-site accessibility
+
+A performance and polish release with no language or API changes.
+
+### Improved — Compiler performance
+
+- **Source map generation now runs in O(N log N) instead of O(N²).** `build_source_map_v2`
+  previously re-scanned the preprocessed source from the start for every token offset it
+  needed to map to a line number. On a 10,000-line file this degraded to ~31 s; after
+  precomputing newline positions in a single O(N) pass and resolving each offset with a
+  binary search (`partition_point`), the same workload takes ~64 ms. The now-redundant
+  `offset_to_line` helper has been removed.
+- **Type-checker `cases_cover_type` no longer allocates on the heap for `Result` variant
+  names.** The `["Ok".to_string(), "Err".to_string()]` array was replaced with `["Ok", "Err"]`
+  (`&'static str`), eliminating two heap allocations per call in the exhaustiveness hot path.
+
+### Improved — Docs-site accessibility
+
+- **Keyboard focus is now visible on scrollable code blocks.** Starlight assigns
+  `tabindex="0"` to horizontally-scrollable `<pre>` elements; those elements now receive the
+  same 2 px accent-coloured focus ring as other interactive elements via
+  `[tabindex="0"]:focus-visible` in `custom.css`.
+- **Anchor-link navigation is now spatially oriented.** Clicking a Table of Contents entry
+  briefly flashes the destination heading with a faded accent-colour halo
+  (`@keyframes highlight-target`, 1.5 s ease-out). A `prefers-reduced-motion` fallback uses a
+  static accent left-border instead of the animation.
+
 ## 0.15.0 — 2026-06-13 — `as!` everywhere, `try_result`, and compiler-bundled library stubs
 
 A feature release sharpening Typhon at the library boundary, driven by a field
