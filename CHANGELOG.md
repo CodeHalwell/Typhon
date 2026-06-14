@@ -4,6 +4,26 @@ All notable changes to Typhon are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely; the
 canonical phase-by-phase status lives in `docs/roadmap.md`.
 
+## 0.15.2 — 2026-06-14 — `as!` comment-awareness fix
+
+A bugfix release with no language or API surface change.
+
+### Fixed — quote in a comment no longer breaks a following `as!` / `?`
+
+- **The `as!` checked-cast preprocessor mis-scanned a quote inside a `#`
+  comment as a string opener.** `compute_code_skip_mask` (which marks the
+  string/comment bytes the cast scanner skips) computed the string mask first —
+  comment-blind — and only layered comment masking on afterwards. An apostrophe
+  in a comment (`# assert each field's shape`) therefore opened a *phantom*
+  string that ran to the next quote, swallowing an `as!` (or `?`) on a following
+  line and surfacing as a spurious `tyc::parse` "Expected a statement" error.
+  Multi-byte characters in such a comment (an em-dash `—`, a bullet `•`) shifted
+  byte offsets the same way. The mask is now built in a **single unified pass**:
+  a `#` outside a string starts a comment that runs to the newline, and quotes
+  inside that comment are inert — so apostrophes, em-dashes, and `#` characters
+  inside string literals all behave correctly. Three regression tests added in
+  `tyc-syntax::preprocess`.
+
 ## 0.15.1 — 2026-06-14 — Compiler performance and docs-site accessibility
 
 A performance and polish release with no language or API changes.

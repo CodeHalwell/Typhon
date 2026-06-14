@@ -3741,26 +3741,79 @@ pub fn expand_checked_casts(source: &str) -> String {
 }
 
 /// Per-byte mask marking positions that are *not* structural code — inside a
-/// string literal or a trailing `#` comment. Built on [`compute_in_string_mask`]
-/// (which already handles single-, double-, and triple-quoted strings spanning
-/// lines) with an added single-line comment scan. A real newline is never
-/// masked, so the cast scanner can use it as a logical-line boundary, but the
-/// `#` and the comment text after it are.
+/// string literal or a trailing `#` comment. Handles single-, double-, and
+/// triple-quoted strings (spanning lines) and single-line `#` comments in one
+/// unified pass. A real newline is never masked, so the cast scanner can use it
+/// as a logical-line boundary, but the `#` and the comment text after it are.
+///
+/// Crucially this is a *single* scan rather than a string-mask followed by a
+/// comment-mask: a quote that lives inside a `#` comment (`# each field's
+/// shape`) must NOT open a phantom string. Computing the string mask first
+/// (comment-blind) would treat that apostrophe as a string opener and mask
+/// everything up to the next quote — swallowing a following `as!` and producing
+/// a spurious parse error.
 fn compute_code_skip_mask(source: &str) -> Vec<bool> {
     let bytes = source.as_bytes();
-    let mut skip = compute_in_string_mask(source);
+    let mut skip = vec![false; bytes.len()];
+    // `None` outside any string/comment; `Some((quote, triple))` inside a
+    // string. Comments are tracked separately because a newline ends a comment
+    // but never a triple-quoted string.
+    let mut in_str: Option<(u8, bool)> = None;
     let mut in_comment = false;
-    for (i, &b) in bytes.iter().enumerate() {
-        match b {
-            b'\n' => in_comment = false,
-            _ if skip[i] => {} // already inside a string literal
-            _ if in_comment => skip[i] = true,
-            b'#' => {
-                in_comment = true;
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if let Some((q, triple)) = in_str {
+            skip[i] = true;
+            if b == b'\\' && i + 1 < bytes.len() {
+                skip[i + 1] = true;
+                i += 2;
+                continue;
+            }
+            if b == q {
+                if triple {
+                    if i + 2 < bytes.len() && bytes[i + 1] == q && bytes[i + 2] == q {
+                        skip[i + 1] = true;
+                        skip[i + 2] = true;
+                        in_str = None;
+                        i += 3;
+                        continue;
+                    }
+                } else {
+                    in_str = None;
+                }
+            }
+            i += 1;
+            continue;
+        }
+        if in_comment {
+            if b == b'\n' {
+                in_comment = false; // newline is structural — leave unmasked
+            } else {
                 skip[i] = true;
             }
-            _ => {}
+            i += 1;
+            continue;
         }
+        if b == b'#' {
+            in_comment = true;
+            skip[i] = true;
+            i += 1;
+            continue;
+        }
+        if b == b'"' || b == b'\'' {
+            if i + 2 < bytes.len() && bytes[i + 1] == b && bytes[i + 2] == b {
+                skip[i] = true;
+                skip[i + 1] = true;
+                skip[i + 2] = true;
+                in_str = Some((b, true));
+                i += 3;
+                continue;
+            }
+            in_str = Some((b, false));
+            skip[i] = true;
+        }
+        i += 1;
     }
     skip
 }
@@ -8921,6 +8974,47 @@ mod tests {
         assert!(
             !out.contains("__typhon_checked_cast__"),
             "triple-quoted string content must not trigger a cast:\n{out}"
+        );
+    }
+
+    #[test]
+    fn checked_cast_apostrophe_in_comment_does_not_swallow_following_cast() {
+        // Regression: a quote inside a `#` comment (an apostrophe like
+        // `field's`) must not open a phantom string that masks the `as!` on a
+        // later line. The comment/string skip-mask is a single pass, so the
+        // comment suppresses the apostrophe's string-opening and the cast on
+        // the next line is still rewritten.
+        let src = "def f(raw: dict[str, object]) -> str:\n    # assert each field's shape\n    let name: str = raw[\"name\"] as! str\n    return name\n";
+        let out = expand_checked_casts(src);
+        assert!(
+            out.contains("__typhon_checked_cast__(raw[\"name\"], str)"),
+            "apostrophe in a comment must not swallow a following cast:\n{out}"
+        );
+    }
+
+    #[test]
+    fn checked_cast_unbalanced_quote_in_comment_is_inert() {
+        // A lone `'` in a comment never toggles string state, so brackets and
+        // the cast operator after it are still seen as code.
+        let src = "# it's fine\nlet n: int = x as! int\n";
+        let out = expand_checked_casts(src);
+        assert!(
+            out.contains("__typhon_checked_cast__(x, int)"),
+            "lone apostrophe in a comment must stay inert:\n{out}"
+        );
+    }
+
+    #[test]
+    fn checked_cast_hash_inside_string_is_not_a_comment() {
+        // The inverse guard: a `#` inside a string literal is content, not a
+        // comment, so a real cast elsewhere on the line/file still rewrites and
+        // the string's contents stay untouched.
+        let src = "let s: str = \"a # not a comment '\"\nlet n: int = x as! int\n";
+        let out = expand_checked_casts(src);
+        assert!(
+            out.contains("__typhon_checked_cast__(x, int)")
+                && out.contains("\"a # not a comment '\""),
+            "a `#` inside a string must not be treated as a comment:\n{out}"
         );
     }
 
