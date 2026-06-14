@@ -5,7 +5,7 @@ sidebar:
   order: 1
 ---
 
-import { Card, CardGrid } from '@astrojs/starlight/components';
+import { Aside, Card, CardGrid } from '@astrojs/starlight/components';
 
 Typhon's whole pitch is "static safety on top of Python's runtime." That means *talking to Python* is a first-class concern, not an edge case. This section maps every way `.ty` and `.py` interact.
 
@@ -34,6 +34,56 @@ Typhon's whole pitch is "static safety on top of Python's runtime." That means *
     `class!` patterns for `torch.nn.Module`, `Enum`, `unittest.TestCase`, Django, SQLAlchemy.
   </Card>
 </CardGrid>
+
+## Layers of third-party type-checking
+
+When your code calls into a third-party Python dependency, Typhon checks that call through a stack of mechanisms, each broader in coverage than the last. They **compose**: for any given name, the most precise source that defines it wins, and the rest fill the gaps. From strongest-and-narrowest to broadest-and-most-permissive:
+
+| Layer | Source | Coverage | Authoring |
+|---|---|---|---|
+| **1** | Authored `.dty` stub | Full Typhon-dialect types — strongest and most precise | You write it |
+| **0** | Compiler-bundled `.dty` stub | Curated, embedded stubs for libraries whose packaging defeats introspection (`httpx`, `requests`) | None — shipped with `tyc` |
+| **2** | Venv signature introspection | Arg **type** and **arity** of fully-typed pure-Python deps | None |
+| **3** | `ty` typeshed pass | C-extension and stdlib APIs introspection can't reach | Opt-in flag |
+
+For one name, an authored `.dty` wins, then the bundle, then venv introspection, then `ty`.
+
+### Layer 1 — Authored `.dty` stub
+
+Full Typhon-dialect types (`T?`, `Result[T, E]`, sealed unions, interfaces) — the strongest and most precise surface. Write these for long-lived dependencies you call a lot. An authored stub **overrides a bundled stub** for the same module. See [Writing .dty Stubs](/Typhon/interop/dty-stubs/).
+
+### Layer 0 — Compiler-bundled `.dty` stubs
+
+`tyc` ships curated, embedded `.dty` stubs for popular libraries whose packaging defeats venv introspection — **`httpx`** and **`requests`** to start. `tyc check`, `tyc build`, and the LSP seed them into the project shape map *before* venv introspection runs, so the library is shaped out of the box: its construction is type-checked and its `unintrospectable-dependency` warning is suppressed — with **no `.venv` and no `tyc sync` required**.
+
+Bundled stubs are **gap-fill only**: an authored project `.dty`/`.ty` for the same module wins over the bundle, and the bundle in turn beats venv introspection. Class shapes are marked `partial`, so members the stub omits stay lenient (no false `attribute_not_found`). Request methods take `**kwargs: object`; client constructors enumerate the common kwargs as optional fields. This covers the head of the dependency distribution; the long tail stays best-effort.
+
+### Layer 2 — Venv signature introspection
+
+`tyc` runs `inspect.signature` over the **installed** package and recovers parameter *and* return annotations — scalars (`int`/`str`/`bool`/`float`/`bytes`/`None`), nullable (`Optional[X]` / `X | None`), parametric containers (`list[X]`/`set[X]`/`frozenset[X]`/`dict[K, V]`), and fixed-arity `tuple[...]`, recursively. This catches wrong-**type** and wrong-**arity** arguments to fully-typed pure-Python deps — both function and constructor calls — through the same `tyc::type_mismatch` machinery your own code uses, with zero authoring.
+
+Introspection degrades to a permissive `Unknown` on anything it can't model, so it only ever *adds* true positives. A stub-only library like `requests` (typed via typeshed's `types-requests`, not in its own source) degrades to `Unknown` here — which is exactly why it now ships as a bundled stub (Layer 0) or is caught by the `ty` pass (Layer 3).
+
+If a declared, imported dependency can't be introspected, `tyc` surfaces the `unintrospectable-dependency` warning rather than silently skipping the check. The introspection also runs live in `tyc lsp` (persistent per-project cache, invalidated when `.venv/pyvenv.cfg` changes).
+
+<Aside type="note" title="When introspection can't see a dependency">
+`[strictness] unintrospectable-dependency` (default `warn`) fires for a declared, imported dependency that can't be introspected — your cue to add a `.dty` stub or install the package. See [Strictness Knobs](/Typhon/configuration/strictness/).
+</Aside>
+
+### Layer 3 — `ty` typeshed pass
+
+Enabled with `[checker] external = "ty"` or `--with-ty`, this is the **only** path that sees typeshed, so it covers C-extension and stdlib APIs that introspection can't reach — `os.path.join(1, 2)`, numpy/pandas signatures, and the like. It runs as a subprocess over the emitted Python, and errors are re-attributed back to the `.ty` source via the `.py.map`. See [`tyc ty`](/Typhon/cli/ty/) and the [`[checker]` configuration](/Typhon/configuration/overview/).
+
+### Qualified ↔ bare class identity
+
+A module names its own classes **bare** in its signatures (`def get(...) -> Response`), but you usually reference them **qualified** at the use site. As of v0.15.0 these unify:
+
+```python
+import httpx
+let r: httpx.Response = client.get("https://example.com")   # ✅ no mismatch
+```
+
+The same holds for any project module — `import lib; let x: lib.Foo = lib.make()` checks cleanly. `Checker::is_assignable` matches two class types by their final `.`-separated segment **when at least one side is bare**. Two *different* qualified classes stay distinct (`httpx.Response` is not assignable to `requests.Response` — the bundled stubs qualify their own return types, so a cross-module mix-up is still caught), and a genuine mismatch (`Response` vs `int`) is still caught. The relaxation only ever *adds* assignability between differently-spelled names.
 
 ## Mixed-language projects
 

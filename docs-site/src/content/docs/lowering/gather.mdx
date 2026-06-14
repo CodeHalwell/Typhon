@@ -115,6 +115,14 @@ When `[strictness] auto-gather = true`, the analyser can rewrite straight-line i
 
 `@gatherable` is the explicit opt-in. Without it, the rewrite skips that callee and the awaits stay sequential (no diagnostic).
 
+### Cross-module folds (v0.14.2)
+
+`auto-gather` now folds runs whose callees are `@gatherable` async functions **imported from another project module**, exactly like a same-module run — the `@gatherable` decorator is still required on every callee. Mis-resolution can only ever *fail* to fold (a missed optimisation), never fold something un-attested.
+
+### Discovering the opportunities
+
+You don't have to hunt for foldable runs by hand. The [`tyc::gather_opportunity`](/Typhon/diagnostics/async-errors/) advice (Hint severity, on by default) flags every run of 2+ adjacent independent awaits inside an `async def` and suggests an explicit `gather:` block. It's **callee-agnostic** — it fires even for awaited method calls on imported clients that `auto-gather` would never touch — and it **never rewrites**, so it complements the auto-gather pass rather than duplicating it. When `auto-gather` is on, runs it already folds are gone before this advice runs, so they aren't double-reported. Toggle with `[strictness] suggest-gather` (default `true`).
+
 ## Where next
 
 - [`async`, `await`, `gather`, `go` reference](/Typhon/reference/async/) — full surface.

@@ -197,6 +197,51 @@ match s:
         return "polygon"     # catches every other variant — no exhaustiveness checking
 ```
 
+## Exhaustiveness on enums (v0.13.0)
+
+An `enum`'s members form a **closed set**, so a `match` covering every member is exhaustive with no wildcard:
+
+```python
+enum Dir: NORTH / SOUTH / EAST / WEST
+
+def delta(d: Dir) -> tuple[int, int]:
+    match d:
+        case Dir.NORTH: return (0, 1)
+        case Dir.SOUTH: return (0, -1)
+        case Dir.EAST:  return (1, 0)
+        case Dir.WEST:  return (-1, 0)     # exhaustive — all four members covered
+```
+
+Drop a member and the `match` fails, naming the one you missed:
+
+```python
+# error[tyc::non_exhaustive_match]: match does not cover member `Dir.WEST`
+```
+
+Since v0.14.1 enum exhaustiveness also carries across module boundaries — an `enum` imported from another module is checked the same way.
+
+## Matching over an expression scrutinee (v0.13.0)
+
+The subject of a `match` doesn't have to be a plain name — exhaustiveness runs the same analysis over any **expression** scrutinee:
+
+```python
+match items[-1]:           # last element of a sealed-union list
+    case Circle(r):       return 3.14 * r * r
+    case Rectangle(w, h): return w * h
+    case Triangle(b, h):  return 0.5 * b * h
+```
+
+## Match-arm scrutinee narrowing (v0.13.0)
+
+A class pattern narrows the **subject variable** to the matched variant inside that arm, so attribute and method access on it type-check against the narrowed shape:
+
+```python
+match action:
+    case Action(_, _):
+        # `action` is narrowed to `Action` here
+        log(action.target)
+```
+
 ## Severity
 
 `[strictness] exhaustive-match` in `typhon.toml`:

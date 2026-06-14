@@ -21,6 +21,18 @@ Where `EXPR` has type `Result[T, E]` for some `T` and `E`. The result of `EXPR?`
 let n: int = parse_port(raw)?
 ```
 
+## Getting a `Result` to `?` in the first place
+
+`?` needs a `Result`-typed expression. When the value you want to propagate comes from a *throwing* boundary call (a library that raises), [`try_result`](/Typhon/reference/result/#bridging-a-boundary-with-try_result) is the idiomatic way to turn that call into a `Result` you can then `?`-propagate, all in one expression:
+
+```python
+def f() -> Result[dict[str, str], str]:
+    let cfg: dict[str, str] = try_result(lambda: read_json(path), lambda e: str(e))?
+    return Ok(cfg)
+```
+
+Going the other way — when you want to deliberately *leave* the `Result` world rather than propagate — the [unwrap/query family](/Typhon/reference/result/#unwrap--query-family) (`.unwrap()`, `.unwrap_or(d)`, `.ok()`, `.is_ok()`, …) is the escape hatch.
+
 ## Where `?` is allowed
 
 `?` is only allowed in two places:

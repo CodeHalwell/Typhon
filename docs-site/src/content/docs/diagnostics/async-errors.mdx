@@ -39,6 +39,33 @@ async def helper() -> int:
 
 The warning already stands down where `async` is genuinely required despite the missing `await`: async-protocol dunders (`__aenter__` / `__aexit__` / `__aiter__` / `__anext__`), declaration-only Protocol/interface bodies, async generators (`yield`), and — the case you'll hit most — a method that is `async` only to satisfy an async contract: it implements an `interface` whose same-named method is `async def` (and the class conforms), or it overrides an `async def` base method. A trivial `impl ConsoleSink: async def deliver(...)` that just `print`s, satisfying `interface Sink: async def deliver(...)`, checks clean without a dead `await asyncio.sleep(0)`. (Gated on the *interface* method being `async` — an `async` impl of a *sync* interface method still warns.)
 
+## `tyc::gather_opportunity` (advice)
+
+Two or more adjacent **independent** awaited calls inside an `async def` could run concurrently. This advice (Hint severity, **on by default**) suggests wrapping them in an explicit `gather:` block, which lowers to an `asyncio.TaskGroup`:
+
+```python
+async def load(client: Client, uid: int) -> tuple[User, list[Post]]:
+    let user  = await client.get_user(uid)     # 💡 tyc::gather_opportunity —
+    let posts = await client.get_posts(uid)    #    these awaits could run concurrently
+    return (user, posts)
+```
+
+Unlike `auto_gather_missed`, this diagnostic is **callee-agnostic**: it fires for awaited *method* calls on imported clients (`await client.get_user(...)`), the shape `auto-gather` never touches, because the suggested fix — an explicit `gather:` block — works for any awaitable, no `@gatherable` decorator needed. Independence is decided by static data flow: a run breaks the moment a later await references a name bound earlier (including via the callee's receiver `b = await a.next()`, keyword args, comprehensions, walrus, slices, or f-strings), and a single non-matching statement between two awaits ends the run.
+
+It **never rewrites** — concurrency is a behaviour change the author opts into — and being advice-level it never blocks a build. When `auto-gather` is also on, runs it folds into a `TaskGroup` are gone before this pass runs, so they aren't double-reported.
+
+**Fix:** wrap the independent awaits in a `gather:` block:
+
+```python
+async def load(client: Client, uid: int) -> tuple[User, list[Post]]:
+    gather:
+        user  = client.get_user(uid)
+        posts = client.get_posts(uid)
+    return (user, posts)
+```
+
+Knob: [`[strictness] suggest-gather`](/Typhon/configuration/strictness/) (default `true`). `tyc explain gather_opportunity` documents it offline.
+
 ## `tyc::auto_gather_missed` (advice)
 
 Two or more adjacent `await CALLEE(...)` statements look independent enough to fold into an `asyncio.TaskGroup` block, but at least one callee is a same-module `async def` that lacks the `@gatherable` decorator. The auto-gather pass only rewrites runs where every callee carries `@gatherable`; without it, the awaits stay sequential silently. This advice-level diagnostic surfaces the missed opportunity so users can decide whether to decorate.

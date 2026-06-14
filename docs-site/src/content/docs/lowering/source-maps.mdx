@@ -47,6 +47,10 @@ The output looks like a normal Python traceback but points at your source.
 
 For cross-file go-to-definition across the `.ty` / `.py` boundary. When you're in a `.ty` file and you go-to-definition on an import from a `.py` (or vice versa), the LSP uses the source maps to land on the right line.
 
+## How `[emit] traceback-remap` uses it
+
+`[emit] traceback-remap = true` (v0.14.0, default off) is the automatic counterpart to the manual `tyc trace`. With the knob on, `tyc build` injects `typhon_runtime.traceback.install()` into the entry module's `__main__` block. That `install()` call sets a `sys.excepthook` that consumes the same `.py.map` sidecars at runtime: when an uncaught exception unwinds, each `File "build/main.py", line N` frame is rewritten in place to `File "src/main.ty", line M` before the traceback is printed — no separate `tyc trace` step. It's the same per-statement `out_line → ty_line` lookup, applied live instead of after the fact.
+
 ## Where the maps live
 
 Alongside the emitted `.py`:

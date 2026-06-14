@@ -168,6 +168,15 @@ callable      ::= "Callable" "[" "[" type ("," type)* "]" "," type "]"
 union         ::= type "|" type
 ```
 
+## Checked cast
+
+```
+checked_cast  ::= EXPR "as!" TYPE
+                  (left = current syntactic slot; right = type expression)
+```
+
+The left operand is the whole current syntactic slot — back to the enclosing bracket, a top-level `,` / `;` / `:` separator, an assignment / augmented / walrus `=`, a `return` / `yield` / `if` / `while` / `assert` keyword, or the line start. The right operand is a type expression (dotted name, optional `[...]` subscript, `|`-union). Lowers to `__typhon_checked_cast__(EXPR, TYPE)`. See [`as!`](/Typhon/reference/unsafe/#as-the-checked-boundary-cast).
+
 ## Operators
 
 See [Operators and Precedence](/Typhon/reference/operators/).

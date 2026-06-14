@@ -5,6 +5,8 @@ sidebar:
   order: 7
 ---
 
+import { Tabs, TabItem, Aside } from '@astrojs/starlight/components';
+
 `Result[T, E]` is a sealed sum with two constructors, `Ok(T)` and `Err(E)`. It is emitted as a tagged dataclass in a generated `typhon_runtime` module — no PyPI dependency.
 
 ## Spelling
@@ -118,6 +120,70 @@ let ty:   TypedAst = check(ast).map_err(_type_to_pipeline)?
 
 The combinators land in v0.6.0 and work under `tyc build && python build/main.py` from that release. Since v0.9.0 they also work under `tyc run` — the VM binds them as native methods via `NativeFn` wrappers that capture the receiver, so a typecheck-clean program no longer crashes with `AttributeError: Ok has no attribute 'and_then'` under `tyc run`.
 
+## Unwrap / query family
+
+The combinators above *stay inside* the `Result` world. The unwrap/query family — added in v0.13.0 — is how you ask a `Result` a yes/no question, pull a default out of it, or deliberately *escape* `Result` back into a plain value (or a `T?`). These eight methods join the combinators on `Ok` / `Err` / `Result`:
+
+| Method | Signature | On `Ok(v)` | On `Err(e)` |
+|---|---|---|---|
+| `.unwrap()` | `() -> T` | `v` | raises |
+| `.expect(msg)` | `(str) -> T` | `v` | raises with `msg` |
+| `.unwrap_or(default)` | `(T) -> T` | `v` | `default` |
+| `.unwrap_or_else(f)` | `((E) -> T) -> T` | `v` | `f(e)` |
+| `.ok()` | `() -> T?` | `v` | `None` |
+| `.err()` | `() -> E?` | `None` | `e` |
+| `.is_ok()` | `() -> bool` | `True` | `False` |
+| `.is_err()` | `() -> bool` | `False` | `True` |
+
+```python
+let port: int  = parse("8080").unwrap_or(80)          # 80 on Err, never raises
+let n:    int  = parse(raw).expect("config must hold a numeric port")
+let maybe: int? = parse(raw).ok()                      # None on Err
+if parse(raw).is_ok():
+    ...
+```
+
+Like the combinators, these are backed by the runtime template in the generated `typhon_runtime/result.py`, by VM natives (so they work identically under `tyc run`), and by receiver-narrowed checker signatures — calling `.ok()` on an expression the checker has narrowed to `Ok[T]` is typed as `T?`, and so on. Added in v0.13.0.
+
+<Aside type="caution" title="The Result method surface is closed">
+As of v0.13.0 the set of methods on a `Result` is *closed*: the four combinators plus the eight methods above. Calling any other name — a typo like `.unwarp()`, or a method that simply doesn't exist — fires `tyc::attribute_not_found` at check time. Before v0.13.0, `.unwrap()` (and every other unknown name) slipped past the checker and crashed at runtime with `AttributeError`.
+</Aside>
+
+## Bridging a boundary with `try_result`
+
+`try_result(thunk[, on_err])` — added in v0.15.0 — turns a *throwing* boundary call into a `Result` in one expression, instead of a hand-written `try: return Ok(x) except E as e: return Err(...)`:
+
+<Tabs syncKey="lang">
+  <TabItem label="Typhon">
+    ```python
+    def load(path: str) -> Result[dict[str, str], str]:
+        return try_result(lambda: read_json(path), lambda e: f"invalid JSON: {e}")
+    ```
+  </TabItem>
+  <TabItem label="Emitted Python">
+    ```python
+    from typhon_runtime import try_result
+
+    def load(path: str) -> Result[dict[str, str], str]:
+        return try_result(lambda: read_json(path), lambda e: f"invalid JSON: {e}")
+    ```
+  </TabItem>
+</Tabs>
+
+It runs `thunk()` and returns `Ok(result)`; on **any** exception it returns `Err(on_err(exc))`. Omit the mapper and it returns `Err(exc)` — the raw exception — giving `Result[T, Exception]`:
+
+```python
+let r: Result[dict, Exception] = try_result(lambda: read_json(path))
+```
+
+- **Prelude name.** No import needed in source — exactly like `Ok` / `Err` / `Result`. `tyc build` auto-injects `from typhon_runtime import try_result` (visible in the Emitted Python tab above), and the VM registers it as a prelude native for `tyc run`.
+- **Typed `Result[T, E]`, not `Any`.** `T` is inferred from the thunk body, `E` from the mapper body (`Exception` when the mapper is omitted). It is special-cased in the checker (like `as!`), so a wrong **return annotation** still fires `tyc::type_mismatch` — `try_result` is a genuine `Result`, never an escape hatch.
+- **Faithful under `tyc run`.** The VM materialises the caught exception exactly as an `except E as e:` handler would, so `lambda e: str(e)` works, and it enforces the 1–2-argument arity.
+
+<Aside type="tip" title="try_result vs. a hand-written try shim">
+Reach for the explicit multi-`except` `try` shim when you map **distinct** exception types to **distinct** errors. Reach for `try_result` for the common single-boundary case. Either way, use `?` and `with`-chains downstream as before.
+</Aside>
+
 ## Common patterns
 
 ### Lifting an exception into `Result`
@@ -137,16 +203,7 @@ def load(path: str) -> Result[dict, str]:
 
 The combination of `open()` write/append/binary modes (v0.9.0), `json.load` / `json.dump` riding on top, and the `with`-block honouring `__enter__` / `__exit__` means the same source runs identically under `tyc run` and the compiled path.
 
-When the boundary is a one-off — a single library call whose exception you want as an `Err` — `try_result` (v0.14.6) collapses the whole `try/except` into one expression. It runs the thunk and returns `Ok(result)`, or catches an exception and returns `Err(on_err(exc))`:
-
-```python
-import json
-
-def load(path: str) -> Result[dict, str]:
-    return try_result(lambda: read_json(path), lambda e: f"invalid JSON: {e}")
-```
-
-`try_result` is a prelude name (no import needed) typed as `Result[T, E]` — `T` is the thunk's result, `E` the mapper's. The mapper is optional: `try_result(lambda: read_json(path))` returns `Result[dict, Exception]`, carrying the raw exception (map it later with `.map_err(...)`). Reach for the explicit `try/except` form when you catch *different* exception types into different errors; reach for `try_result` for the common single-boundary case.
+When the boundary is a one-off — a single library call whose exception you want as an `Err` — `try_result` (v0.15.0) collapses the whole `try/except` into one expression, e.g. `try_result(lambda: read_json(path), lambda e: f"invalid JSON: {e}")`. See [Bridging a boundary with `try_result`](#bridging-a-boundary-with-try_result) above for the full rules.
 
 ### Mapping over `Ok`
 

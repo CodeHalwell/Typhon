@@ -54,6 +54,37 @@ type LoadError = NotFound | Timeout | Backend
 
 The `type` keyword on the left is what makes the union *sealed* for exhaustiveness purposes (see [Sealed Unions](/Typhon/types/sealed-unions/)).
 
+## Recursive aliases (v0.13.0)
+
+A `type` alias may now refer to itself, so self-describing shapes like JSON are expressible directly:
+
+```python
+type Json = None | bool | int | float | str | list[Json] | dict[str, Json]
+```
+
+`tyc::cyclic_type_alias` only fires for a cycle with **no type constructor anywhere** — a cycle with no base case, like `type Loop = Loop` or `type A = B; type B = A`. A cycle that passes through a container or a non-alias leaf (as `Json` does through `list[...]` / `dict[...]` and the scalar members) has a base case and is legal.
+
+Container literals resolve their element expectations *through* aliases and unions, so a nested `Json` literal checks all the way down:
+
+```python
+let doc: Json = {"name": "ada", "tags": ["x", "y"], "meta": {"n": 1}}   # ✅
+```
+
+## Quoted (forward-reference) annotations (v0.13.0)
+
+A string-literal annotation resolves as a **forward reference** to the type it names — useful for self-referential classes and types defined later in the file:
+
+```python
+class Node:
+    value: int
+    next: "Node"
+
+def grow() -> "Tree[T]": ...
+let xs: "list[Node]" = []
+```
+
+This is distinct from the literal-singleton union form (`type Color = "red" | "green"`), which is **unchanged**: there the strings are values in a string-literal union, not forward references to named types.
+
 ## What aliases are not
 
 - **Not new nominal types.** `type UserId = int` does not give you a fresh type — `UserId` is interchangeable with `int`. If you want a distinct wrapper (for accidental-confusion safety), use a small class:

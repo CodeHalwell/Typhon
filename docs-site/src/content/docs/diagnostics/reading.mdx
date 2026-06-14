@@ -52,7 +52,7 @@ Every diagnostic has a `tyc::*` code. The catalog is enumerated across the follo
     [→](/Typhon/diagnostics/type-errors/) — `missing_annotation`, `type_mismatch`, `arg_count`, `not_callable`, `unknown_name`, `attribute_not_found`, `generic`, `typevar_bound`, `generator_return_type`, `cyclic_type_alias`, `comptime`, `operator_type_mismatch`, `tuple_index_out_of_range`, `python_semantic_drift`.
   </Card>
   <Card title="Binding Errors" icon="document">
-    [→](/Typhon/diagnostics/binding-errors/) — `missing_binding_kind`, `immutable_assign`, `unused_import`, `no_block_shadow`, `pattern_shadows_outer`.
+    [→](/Typhon/diagnostics/binding-errors/) — `missing_binding_kind`, `immutable_assign`, `unused_import`, `no_block_shadow`, `pattern_shadows_outer`, `mutable_default_param`, `loop_closure_capture`, `is_literal_comparison`.
   </Card>
   <Card title="Nullability Errors" icon="puzzle">
     [→](/Typhon/diagnostics/nullability/) — `nullable_use`.
@@ -76,7 +76,7 @@ Every diagnostic has a `tyc::*` code. The catalog is enumerated across the follo
     [→](/Typhon/diagnostics/stub-errors/) — `stub_mismatch`.
   </Card>
   <Card title="Compile & Interface Errors" icon="error">
-    [→](/Typhon/diagnostics/compile-errors/) — `io`, `parse`, `interface_not_conforming`, `lazy_usage`, `unknown_module`, `unknown_kwarg`, `typevar_import_rejected`, `typing_alias_deprecated`, `freeze_not_freezable`.
+    [→](/Typhon/diagnostics/compile-errors/) — `io`, `parse`, `interface_not_conforming`, `lazy_usage`, `unknown_module`, `unknown_kwarg`, `typevar_import_rejected`, `typing_alias_deprecated`, `freeze_not_freezable`, `incompatible_override`.
   </Card>
   <Card title="Phase 5 Interop & Lints" icon="information">
     Added in v0.1.6 — `orphan_py_import` (relative `.py` outside `src/`), `contains_secret_literal` (credential-named comptime literal), `invalid_config_value` (unknown `[emit] class-default` / etc.), `main_not_called` (script defines `main()` but never calls it).
@@ -89,6 +89,9 @@ Every diagnostic has a `tyc::*` code. The catalog is enumerated across the follo
   </Card>
   <Card title="v0.9.0 Stress-Test Cleanup" icon="approve-check">
     Added in v0.9.0 — `tyc::freeze_not_freezable` validates `freeze let X = <expr>` RHS at check time (was a runtime `TypeError` before). Polish on existing diagnostics: `interface_not_conforming` arity message reads "got N non-self parameter(s), expected M"; `invalid_question_op` help text covers both the Result-return cause and the comprehension carve-out; sealed-union impl distribution deduplicates by `(code, rendered message)` so a 10-variant union no longer reports 10 identical errors; `class_attr_shadows_slot` no longer false-positives on mutable-literal defaults; `MissingAnnotation` text drops the double-backtick wrapping.
+  </Card>
+  <Card title="v0.13.0 Footguns & Surface Tightening" icon="warning">
+    Added in v0.13.0 — four new warnings: `mutable_default_param` (shared mutable parameter default), `loop_closure_capture` (closure over a loop variable observes its final value), `is_literal_comparison` (`is` against a literal — use `==`), `incompatible_override` (Liskov-violating method override; refined to compare argument *ranges*, so an added optional parameter is not flagged). Checker-surface changes: enum exhaustiveness now fires `non_exhaustive_match` naming the missing member (was a generic `missing_return`), and exhaustiveness now covers expression scrutinees (`match items[-1]:`) plus match-arm narrowing; the `Result` / `Ok` / `Err` method surface is closed, so an unknown method (typo like `.unwarp()`) fires `attribute_not_found` at check time; quoted annotations (`next: "Node"`, `-> "Tree[T]"`) resolve as forward references instead of literal-singleton types (bare quoted scalar builtin names in a union, e.g. `"int" | "str"`, stay literal singletons).
   </Card>
 </CardGrid>
 

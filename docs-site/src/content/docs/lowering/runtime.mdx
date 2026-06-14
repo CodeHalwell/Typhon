@@ -5,7 +5,7 @@ sidebar:
   order: 10
 ---
 
-When you use `Result`, `go`, `lazy import`, or `lazy let`, the compiler generates a small `typhon_runtime/` package alongside your code. This page lists what's in it. The exact source below is what `tyc build` writes verbatim — search for `TYPHON_RUNTIME_*_PY` in `tyc/crates/tyc/src/commands/build.rs` to read the templates.
+The compiler generates a small `typhon_runtime/` package alongside your code whenever the emitted Python references any of its helpers — that is, whenever the program uses `Result` / `Ok` / `Err`, `go` (spawn), `lazy import` / `lazy let`, `map_pure`, `deep_freeze`, `checked_cast` (the `as!` cast, v0.14.0), or `try_result` (v0.15.0). This page lists what's in it. The exact source below is what `tyc build` writes verbatim — search for `TYPHON_RUNTIME_*_PY` in `tyc/crates/tyc/src/commands/build.rs` to read the templates.
 
 ## `typhon_runtime/__init__.py`
 
@@ -160,6 +160,10 @@ Emitted whenever `Result`, `Ok`, or `Err` appears. Holds the combinator surface 
 
 Since v0.9.0 the in-process VM (`tyc run`) also exposes these methods natively — `NativeFn` wrappers capture the receiver and dispatch the right combinator semantics — so `Ok(7).and_then(double)` works under both `tyc run` and `tyc build && python build/main.py`. Before v0.9.0 the methods existed only in the emitted `result.py`, so a typecheck-clean program crashed under `tyc run` with `AttributeError: Ok has no attribute 'and_then'`.
 
+Since v0.13.0 the module also exposes the **unwrap / query family** — `.unwrap()`, `.expect(msg)`, `.unwrap_or(default)`, `.unwrap_or_else(f)`, `.ok()` (→ `T?`), `.err()` (→ `E?`), `.is_ok()`, `.is_err()` — on `Ok` / `Err`. The `Result` method surface is now **closed**: an unknown method fires `tyc::attribute_not_found` at check time instead of crashing at runtime.
+
+Since v0.15.0 the `try_result(thunk[, on_err])` exception→`Result` combinator is also exported from the package root — `from typhon_runtime import try_result`. It runs `thunk()` and returns `Ok(result)`; on any exception it returns `Err(on_err(exc))`, or `Err(exc)` when no mapper is given. In source it is a **prelude name** (no import needed, like `Ok` / `Err` / `Result`); `tyc build` auto-injects the import, and the VM registers it as a prelude native.
+
 ## `typhon_runtime/freeze.py`
 
 Emitted whenever `freeze let` appears (Phase 6, v0.3.0). Recursively converts `list → tuple`, `dict → MappingProxyType`, `set → frozenset`; descends into nested values; raises `TypeError` at startup on anything without a clean immutable equivalent (file handles, sockets, generators, non-frozen dataclasses). Frozen dataclasses pass through unchanged.
@@ -167,6 +171,16 @@ Emitted whenever `freeze let` appears (Phase 6, v0.3.0). Recursively converts `l
 Since v0.9.0 the type checker also pre-validates the `freeze let X = <expr>` RHS at check time via `tyc::freeze_not_freezable`, so non-`frozen` user-class constructors fail at `tyc check` instead of at first import — the deep-freeze raising `TypeError` at runtime is now a backstop for cases the static check can't see through, not the primary error surface. The VM also runs the freeze pass since v0.9.0; before v0.9.0 `tyc run` treated `freeze let` as a regular `let` and mutations through aliased references silently succeeded.
 
 The full implementation lives in `tyc/crates/tyc/src/commands/build.rs` under `TYPHON_RUNTIME_FREEZE_PY`.
+
+## `typhon_runtime/cast.py`
+
+Emitted whenever the `as!` checked boundary cast appears (v0.14.0). Holds `checked_cast(value, tp)`, which backs `EXPR as! TYPE`: it performs a **recursive structural shape check** of `value` against the target type `tp` and returns `value` on success, raising `TypeError` on a mismatch. The check honours `int`→`float` widening (an `int` passes a cast to `float`) and recurses into containers, unions, and parametric types (`x as! int | None`, `d as! dict[str, int]`).
+
+`as!` lowers to a `__typhon_checked_cast__(value, tp)` call routed through this helper on the build path. Under `tyc run` the VM intercepts `__typhon_checked_cast__` before argument evaluation and applies the same structural check natively, so a cast composes in any expression position (v0.15.0) under both runners.
+
+## `typhon_runtime/traceback.py`
+
+Emitted only when `[emit] traceback-remap = true` (v0.14.0, default off). Holds `install()`, which sets a `sys.excepthook` that rewrites the frames of an uncaught exception's traceback from emitted `.py` lines back to `.ty` lines via the `.py.map` sidecars — the automatic counterpart to the manual [`tyc trace`](/Typhon/cli/trace/). When the knob is on, `tyc build` injects a `typhon_runtime.traceback.install()` call into the entry module's `__main__` block so it runs before any user code.
 
 ## `typhon_runtime/parallel.py` and `typhon_runtime/stdlib.py`
 

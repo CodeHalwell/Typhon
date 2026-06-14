@@ -63,10 +63,14 @@ format = true
 no-implicit-any = true
 unused-import = "error"
 exhaustive-match = "error"
+unintrospectable-dependency = "error"   # CI-gate: every dep must be checkable
 auto-memoise = false
 auto-gather = false                 # use explicit `gather:` blocks
 auto-parallel = false
 pgo-memoise = false
+
+[checker]
+external = "ty"                     # type-check emitted Python against typeshed
 
 [env]
 required = ["DATABASE_URL", "API_KEY"]
@@ -141,10 +145,14 @@ format = true
 no-implicit-any = true
 unused-import = "error"
 exhaustive-match = "error"
+unintrospectable-dependency = "error"   # a published lib must check every dep
 auto-memoise = false
 auto-gather = false
 auto-parallel = false
 pgo-memoise = false
+
+[checker]
+external = "ty"                    # catch stdlib / C-extension misuse before release
 
 [dependencies]
 # Keep this minimal — library users inherit your deps.

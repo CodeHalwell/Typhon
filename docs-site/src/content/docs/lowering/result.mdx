@@ -25,19 +25,39 @@ When `Result` is used anywhere in the project, a `typhon_runtime/result.py` (or 
     class Ok(Generic[T]):
         value: T
 
+        # combinators
         def map(self, f): ...           # Ok(f(self.value))
         def map_err(self, g): ...       # self (passthrough)
         def and_then(self, f): ...      # f(self.value)
         def or_else(self, h): ...       # self (passthrough)
+        # unwrap / query family (v0.13.0)
+        def unwrap(self): ...           # self.value
+        def expect(self, msg): ...      # self.value
+        def unwrap_or(self, default): ...      # self.value
+        def unwrap_or_else(self, f): ...       # self.value
+        def ok(self): ...               # self.value
+        def err(self): ...              # None
+        def is_ok(self): ...            # True
+        def is_err(self): ...           # False
 
     @dataclass(slots=True, frozen=True)
     class Err(Generic[E]):
         error: E
 
+        # combinators
         def map(self, f): ...           # self (passthrough)
         def map_err(self, g): ...       # Err(g(self.error))
         def and_then(self, f): ...      # self (passthrough)
         def or_else(self, h): ...       # h(self.error)
+        # unwrap / query family (v0.13.0)
+        def unwrap(self): ...           # raise
+        def expect(self, msg): ...      # raise with msg
+        def unwrap_or(self, default): ...      # default
+        def unwrap_or_else(self, f): ...       # f(self.error)
+        def ok(self): ...               # None
+        def err(self): ...              # self.error
+        def is_ok(self): ...            # False
+        def is_err(self): ...           # True
 
     # Result is a type alias:
     # Result[T, E] = Ok[T] | Err[E]
@@ -51,6 +71,8 @@ When `Result` is used anywhere in the project, a `typhon_runtime/result.py` (or 
 </Tabs>
 
 The four combinator methods (`.map` / `.map_err` / `.and_then` / `.or_else`) ship with the generated `typhon_runtime/result.py` since v0.6.0. Since v0.9.0 the in-process VM (`tyc run`) also binds them as native methods via `NativeFn` wrappers that capture the receiver, so `Ok(7).and_then(double)` works identically under both execution modes.
+
+The eight-method unwrap/query family (`.unwrap` / `.expect` / `.unwrap_or` / `.unwrap_or_else` / `.ok` / `.err` / `.is_ok` / `.is_err`) lowers the same way — added to the runtime template in v0.13.0, bound as VM natives for `tyc run`, and typed by receiver-narrowed checker signatures. There is no special emit shape for them: `r.unwrap_or(80)` is emitted verbatim as a method call resolved against the runtime `Ok` / `Err` class. As of v0.13.0 the method surface is closed, so an unknown method name never reaches emit — it is rejected at check time with `tyc::attribute_not_found`.
 
 User code imports:
 
@@ -132,6 +154,42 @@ Each step's error path runs the same `else err:` block (the unwrapped `error` is
 Without an `else err:`, the lowering omits the block and uses bare `return _tmp_N` short-circuits.
 
 Since v0.8.0 every `?`-binding's implicit error path is type-checked against the enclosing function's declared error type. Since v0.9.0 the explicit `else err: return Err(err)` form goes through the same check — previously the validation was gated on the synthetic `?`-op temp shape, so an `else` block could silently return an `Err` whose payload type didn't match the function's declared return.
+
+## `try_result`
+
+`try_result` (v0.15.0) is a prelude name — like `Ok` / `Err` / `Result`, it needs no import in source. It does **not** desugar into an inline `try`/`except`; it is emitted as a plain call to the runtime helper, and `tyc build` auto-injects the import:
+
+<Tabs>
+  <TabItem label="Typhon">
+    ```python
+    def load(path: str) -> Result[dict[str, str], str]:
+        return try_result(lambda: read_json(path), lambda e: f"invalid JSON: {e}")
+    ```
+  </TabItem>
+  <TabItem label="Emitted">
+    ```python
+    from typhon_runtime import try_result
+
+    def load(path: str) -> Ok[dict[str, str]] | Err[str]:
+        return try_result(lambda: read_json(path), lambda e: f"invalid JSON: {e}")
+    ```
+  </TabItem>
+</Tabs>
+
+The runtime helper does the work:
+
+```python
+# typhon_runtime/result.py (excerpt)
+def try_result(thunk, on_err=None):
+    try:
+        return Ok(thunk())
+    except Exception as exc:
+        return Err(exc if on_err is None else on_err(exc))
+```
+
+- The mapper is optional. Omit it and the raw exception is carried (`Result[T, Exception]`); supply it and the caught exception is mapped (`Result[T, E]`, `E` inferred from the mapper body).
+- The checker special-cases `try_result` (like `as!`): `T` is inferred from the thunk body and `E` from the mapper body, and a wrong **return annotation** still fires `tyc::type_mismatch` — it is a real `Result`, not an `Any` escape hatch.
+- The VM registers `try_result` as a prelude native for `tyc run`, materialising the caught exception exactly as an `except E as e:` handler would (so `lambda e: str(e)` works), and enforcing its 1–2-argument arity.
 
 ## Why a separate runtime module?
 

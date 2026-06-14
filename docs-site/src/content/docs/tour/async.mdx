@@ -133,7 +133,22 @@ This is **opt-in** via project config — it isn't applied silently:
 auto-gather = true
 ```
 
+Auto-gather now reaches **across module boundaries** too: if the callees are `@gatherable` async functions imported from another project module, a run of independent awaits folds into one `TaskGroup` just like a same-module run. (The decorator is still required on every callee.)
+
 Most teams pick explicit `gather:` blocks instead, because they make intent visible in the source.
+
+<Aside type="tip" title="The compiler points out the opportunities">
+  You don't have to spot these by eye. `tyc check` ships a [`tyc::gather_opportunity`](/Typhon/diagnostics/async-errors/) advice (on by default) that flags any run of 2+ adjacent **independent** awaits inside an `async def` and nudges you to wrap them in a `gather:` block:
+
+  ```python
+  async def load(client: Client, uid: int) -> tuple[User, list[Post]]:
+      let user  = await client.get_user(uid)     # 💡 these two awaits
+      let posts = await client.get_posts(uid)    #    could run concurrently
+      return (user, posts)
+  ```
+
+  Unlike `auto-gather`, the advice is **callee-agnostic** — it fires even for awaited method calls on imported clients, because the suggested `gather:` block works for any awaitable with no `@gatherable` needed. It never rewrites your code (concurrency is a behaviour change you opt into) and never blocks a build. Toggle with `[strictness] suggest-gather`.
+</Aside>
 
 ## `go` — fire-and-forget tasks
 

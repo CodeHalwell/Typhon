@@ -13,6 +13,8 @@ no-implicit-any = true
 unused-import = "error"
 exhaustive-match = "error"
 methods-in-class-body = "warn"
+unintrospectable-dependency = "warn"
+suggest-gather = true
 auto-memoise = false
 auto-gather = false
 auto-parallel = false
@@ -28,8 +30,10 @@ allow-secret-comptime = false
 | `unused-import` | `"error"` \| `"warn"` \| `"off"` | `"error"` | Severity for unused imports. The LSP offers a "Remove unused import" quick-fix. |
 | `exhaustive-match` | `"error"` \| `"warn"` \| `"off"` | `"error"` | Severity for non-exhaustive `match` over sealed unions. |
 | `methods-in-class-body` | `"error"` \| `"warn"` \| `"off"` | `"warn"` | Severity for [`tyc::method_in_class_body`](/Typhon/diagnostics/class-errors/) — Rule 4: methods live in `impl Name:`, not the class body. Default `"warn"` matches every other nudge diagnostic; promote to `"error"` once a codebase has finished migrating off in-body methods. `"off"` suppresses it entirely. |
+| `unintrospectable-dependency` | `"warn"` \| `"error"` \| `"off"` | `"warn"` | Severity when a declared dependency is imported but cannot be introspected (no reachable `.venv` / `python3`, not installed, or no introspectable signatures). `"warn"` surfaces it; `"error"` CI-gates; `"off"` restores the old silent skip. |
+| `suggest-gather` | bool | `true` | Emit the advice-level [`tyc::gather_opportunity`](/Typhon/diagnostics/) hint when 2+ adjacent independent awaited calls could be wrapped in a `gather:` block. Never rewrites, never blocks a build. |
 | `auto-memoise` | bool | `false` | Insert `@functools.cache` on every function the analyser infers as pure. **Off by default — caches extend lifetimes invisibly.** |
-| `auto-gather` | bool | `false` | Fold straight-line independent `await` runs into `asyncio.TaskGroup`, but only for `@gatherable`-decorated callees. |
+| `auto-gather` | bool | `false` | Fold straight-line independent `await` runs into `asyncio.TaskGroup`, but only for `@gatherable`-decorated callees (same-module or imported from another project module). |
 | `auto-parallel` | bool | `false` | Rewrite pure list comprehensions over large iterables to a `ThreadPoolExecutor.map` (needs `free-threaded`). |
 | `parallel-min-size` | int | `64` | Minimum iterable size for `auto-parallel` to fire. When the size can't be statically inferred, treated as zero. |
 | `pgo-memoise` | bool | `false` | Promote hot pure functions to `@functools.cache` based on `typhon-profile.json` from a prior `tyc profile` run. |
@@ -83,6 +87,33 @@ Three settings:
 
 The fix is the same regardless of severity: move the `def` into an `impl ClassName:` block at the same scope. Multiple `impl` blocks for one class are merged at desugar time, so the split is cosmetic.
 
+## `unintrospectable-dependency`
+
+A declared dependency that's imported but **can't be introspected** — no reachable `.venv` / `python3`, the package isn't installed, or it exposes no introspectable signatures — now surfaces a diagnostic instead of silently skipping that library's third-party checks.
+
+Three settings:
+
+- `"warn"` (default) — the dependency's signature checks are skipped, but you're told so. This catches the common "checks silently disappeared because the venv was missing" failure mode.
+- `"error"` — CI-gates: an unintrospectable dependency fails the build. Use this when you want a guarantee that every declared dependency was actually checked.
+- `"off"` — restores the old silent behaviour.
+
+Clear the warning by making the dependency introspectable — install it (`uv sync`) or ship a `.dty` stub for it.
+
+<Aside type="note">
+  Compiler-bundled stubs (e.g. `httpx`, `requests`) suppress this warning for those libraries with no `.venv` needed — their signatures ship with the compiler.
+</Aside>
+
+## `suggest-gather`
+
+**On by default.** Controls `tyc::gather_opportunity`, an advice-level (Hint) lint that flags runs of **two-or-more adjacent independent awaited calls** inside an `async def` and suggests wrapping them in an explicit `gather:` block to run them concurrently.
+
+It is purely advisory: it **never rewrites** your code and **never blocks a build** — unlike [`auto-gather`](#auto-gather), which performs the rewrite (and only for `@gatherable` callees). Set `false` to silence the hint project-wide:
+
+```toml
+[strictness]
+suggest-gather = false
+```
+
 ## `auto-memoise`
 
 **Off by default.** When on, every function the analyser infers as pure (all six conditions hold) gets `@functools.cache`. The runtime impact:
@@ -99,9 +130,9 @@ These tradeoffs aren't free. Opt in deliberately, ideally after profiling.
 
 ## `auto-gather`
 
-Folds runs of two-or-more consecutive independent `name = await callee(...)` statements inside an `async def` into an `asyncio.TaskGroup`. **Every callee must be a same-module `async def` carrying an explicit `@gatherable` decorator** — undecorated async functions and externally-imported callees are left alone.
+Folds runs of two-or-more consecutive independent `name = await callee(...)` statements inside an `async def` into an `asyncio.TaskGroup`. **Every callee must carry an explicit `@gatherable` decorator.** As of v0.14.2 the rewrite folds runs whose callees are `@gatherable` async functions imported from **another project module** too, not just same-module callees as before. Undecorated async functions and third-party imported callees are still left alone, and the `@gatherable` decorator remains required on every callee regardless of where it is defined.
 
-There is no diagnostic when a callee lacks `@gatherable` — the awaits just stay sequential. If you forget to decorate, you'll see no parallelism *and* no error. Run `tyc trace` or read the emitted Python to confirm whether a particular run got rewritten.
+There is no diagnostic when a callee lacks `@gatherable` — the awaits just stay sequential. If you forget to decorate, you'll see no parallelism *and* no error. Run `tyc trace` or read the emitted Python to confirm whether a particular run got rewritten. (For a non-rewriting nudge toward `gather:`, see [`suggest-gather`](#suggest-gather).)
 
 Default `false`. Explicit `gather:` blocks are unaffected by this setting.
 
@@ -124,6 +155,17 @@ Missing profile file is not an error — PGO is best-effort.
 That diagnostic flags hardcoded credentials (like `let API_KEY = "test"`) or sensitive environmental variables mapped using `comptime let API_KEY = env("API_KEY")`. While `comptime` substitution is useful, mapping secrets at build time embeds the literal secret directly into the compiled `.py` output, exposing it to anyone who can read the build artifacts.
 
 Setting this to `true` disables the warning, which is useful when the literal is intentionally public or part of a test suite, allowing you to document and silence expected findings.
+
+## Always-on advisory lints
+
+A handful of advisory lints fire at **warn** level without a dedicated `[strictness]` knob — they ride the project's global severity rather than being individually configurable. They're listed here so you know they exist; the full semantics live in the [diagnostics catalog](/Typhon/diagnostics/).
+
+| Lint | Default | Flags |
+|------|---------|-------|
+| `tyc::mutable_default_param` | warn | A mutable default argument value (`def f(x=[])`). |
+| `tyc::is_literal_comparison` | warn | `is` / `is not` against a literal (use `==`). |
+| `tyc::incompatible_override` | warn | A method override whose signature doesn't match the base. |
+| `tyc::loop_closure_capture` | warn | A closure capturing a loop variable by reference. |
 
 ## Where next
 

@@ -63,6 +63,39 @@ The conformance check compares parameter types position-by-position (contravaria
 
 The arity diagnostic message reads "got N non-self parameter(s), expected M" since v0.9.0 instead of the ambiguous "arity N; expected M". The previous wording was easy to misread when the impl matched arity but the parameter type was off, or vice versa — the new wording makes it explicit which axis the diagnostic is reporting on.
 
+## `tyc::incompatible_override`
+
+A subclass method overriding a base method with an incompatible signature — different arity, a **narrower** parameter type, or an **unassignable** return type. This is the Liskov-substitution violation that mypy and pyright flag: a caller holding a base reference must be able to call the override safely.
+
+```python
+class Handler:
+    def handle(self, event: object) -> int: ...
+
+class StrictHandler(Handler):
+    def handle(self, event: str) -> int:    # ⚠️ narrower param: str ⊂ object
+        return len(event)
+```
+
+**Fix:** keep the override signature compatible — accept the same-or-wider parameter types, and return the same-or-narrower type:
+
+```python
+class StrictHandler(Handler):
+    def handle(self, event: object) -> int:    # ✅ same param type
+        return len(str(event))
+```
+
+### v0.13.0 argument-range refinement
+
+The check compares required-vs-accepted argument **ranges** rather than raw parameter counts, so an override that **adds an optional parameter** is no longer flagged — a base reference can still call it with the original argument set:
+
+```python
+class StrictHandler(Handler):
+    def handle(self, event: object, retries: int = 3) -> int:    # ✅ not flagged
+        return len(str(event))
+```
+
+It fires only when the override **requires more arguments** than the base accepts, **accepts fewer** than the base may pass, or **adds a required keyword-only parameter** the base callers never supply.
+
 ## `tyc::lazy_usage`
 
 A `lazy` construct was written in an unsupported form. The message text names the specific problem.
@@ -112,6 +145,27 @@ class Counter frozen:
 
 freeze let CFG = Counter(value=0)    # ✅ check-time validated
 ```
+
+## Quoted annotations as forward references (v0.13.0)
+
+Quoted annotations now resolve as **forward references** — the reflexive Python idiom for naming a type that isn't defined yet — rather than as string-literal singleton types. This covers `next: "Node"`, `-> "Tree[T]"`, and `"list[Node]"`, including a trailing `?` (`"Node"?`).
+
+```python
+class Node:
+    value: int
+    next: "Node"?    # ✅ forward reference — resolves to Node | None
+```
+
+Before v0.13.0 a quoted annotation became a string-literal singleton type, so the example above produced a baffling [`tyc::type_mismatch`](/Typhon/diagnostics/type-errors/#tyctype_mismatch) when a real `Node` was assigned to it.
+
+**Carve-out — bare quoted scalar builtin names stay literal singletons.** A quoted scalar builtin name on its own is still a literal-singleton type, so the literal-union forms are unchanged:
+
+```python
+type Mode = "int" | "str"        # literal-singleton union (NOT a forward ref)
+type Color = "red" | "green"     # literal-singleton union, unchanged
+```
+
+Only annotation positions that name a *type* (a class, an alias, a subscripted generic) resolve as forward references; bare quoted builtin scalar names in a union remain literal singletons.
 
 ## Where next
 

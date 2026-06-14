@@ -9,6 +9,10 @@ import { Aside, TabItem, Tabs } from '@astrojs/starlight/components';
 
 `unsafe:` is Typhon's escape hatch for talking to code the type system can't reason about — typically untyped third-party libraries or genuinely dynamic Python. It is a **lexical region**, not a per-value cast, with a hidden marker that prevents `Any` from leaking into typed code.
 
+<Aside type="tip" title="At a single boundary, reach for `as!`">
+  When the boundary is a *single* untyped value — a JSON payload, a sqlite row, a redis value — the [`as!` checked cast](#as-the-sound-one-line-boundary-cast) replaces the entire `unsafe:` + re-assertion dance with one sound, runtime-checked line. Read on for `unsafe:`, but prefer `as!` for the one-off case.
+</Aside>
+
 ## The shape
 
 <Tabs>
@@ -109,6 +113,79 @@ unsafe:
     let raw = some_lib.fetch()
 let s: str = str(raw)                 # ✅ str() is the cast
 ```
+
+## `as!` — the sound, one-line boundary cast
+
+The re-assertion forms above all share a weakness: an annotation like `let parsed: dict[str, int] = raw` trusts the boundary **blindly**. Nothing checks at runtime that `raw` actually *is* a `dict[str, int]`. `EXPR as! TYPE` is the sound replacement: it collapses the `unsafe:` block and the re-assertion into one line, *and* it verifies the shape at runtime.
+
+<Tabs syncKey="lang">
+  <TabItem label="Typhon">
+    ```python
+    def load(resp: Response) -> dict[str, int]:
+        let data = resp.json() as! dict[str, int]   # was: unsafe: ... then re-assert
+        return data
+
+    def first_id(row: Row) -> int:
+        let uid = row[0] as! int
+        return uid
+    ```
+  </TabItem>
+  <TabItem label="Emitted Python">
+    ```python
+    from typhon_runtime.cast import checked_cast as __typhon_checked_cast__
+
+
+    def load(resp: Response) -> dict[str, int]:
+        data = __typhon_checked_cast__(resp.json(), dict[str, int])
+        return data
+
+
+    def first_id(row: Row) -> int:
+        uid = __typhon_checked_cast__(row[0], int)
+        return uid
+    ```
+  </TabItem>
+</Tabs>
+
+What happens:
+
+1. **The checker types the whole expression as `TYPE`.** The boundary value (which may be `Any`) flows in freely — no `unsafe:` block, no `Unsafe[T]` marker, no `unsafe_value_leak` footgun. `as!` reuses the same machinery as `type[T]` generic inference, not a bespoke special case.
+2. **The lowering** (in `tyc-syntax`) rewrites `EXPR as! TYPE` to `__typhon_checked_cast__(EXPR, TYPE)`, resolved via an injected `from typhon_runtime.cast import checked_cast as __typhon_checked_cast__`.
+3. **At runtime**, `checked_cast` verifies the value's shape against `TYPE` **recursively** — scalars; `list[X]` / `set[X]` / `frozenset[X]`; `dict[K, V]`; fixed- and variadic-`tuple[...]`; unions / `Optional` — and raises `TypeError` on a mismatch.
+
+### Sound, unlike TypeScript's `as`
+
+A static-only re-assertion trusts the boundary blindly; TypeScript's `as` is an *unchecked* compile-time coercion. `as!` is neither — it can only let through values it cannot prove wrong. The structural check is the whole point.
+
+### Fall-back-to-acceptance
+
+`as!` never invents a failure. `Any` / `object` targets, and any shape `checked_cast` can't model, **fall back to acceptance**. And `int → float` (and `bool → int`) widening is honoured, so a JSON int cast `as! float` does not spuriously fail.
+
+### VM behaviour
+
+The in-process VM treats `as!` as an identity passthrough on the value; the authoritative structural check runs on the `tyc build && python` path. The VM intercepts `__typhon_checked_cast__` *before* argument evaluation, so a cast to a union / parametric type still runs under `tyc run`. `tyc fmt` preserves the surface `as!` syntax.
+
+The generated runtime file is `typhon_runtime/cast.py`, exposing `checked_cast(value, tp)`.
+
+### Composition scope
+
+In **v0.14.0**, `as!` was restricted to a single physical line in *value position* only. As of **v0.15.0** the lowering is **structural** — a bracket-, string-, and comment-aware fixpoint rewrite — so `as!` composes wherever an expression can appear:
+
+- value positions (`=` / `op=` / `return` / `yield` / bare expression);
+- nested inside call arguments — `save(row[0] as! int, label)`;
+- inside comprehensions / collection literals — `[x as! int for x in xs]`;
+- in statement conditions — `if raw as! bool:`;
+- across a value expression spanning **multiple physical lines**, as long as the left operand stays bracket-balanced.
+
+The **left** operand is the whole current syntactic slot — back to the enclosing bracket, a top-level `,` / `;` / `:` separator, an assignment / augmented / walrus `=`, a `return` / `yield` / `if` / `while` / `assert` keyword, or the line start (so `a + b as! int` casts `a + b`). The **right** operand is parsed as a type expression (dotted name, optional `[...]` subscript, `|`-union), so trailing code after the type (`x as! int + 1`, the `for` of a comprehension) stays **outside** the cast. An `as!` whose right side isn't a type expression is left for the parser to reject cleanly.
+
+### Which boundary tool to reach for
+
+- **`model X:`** — a boundary you validate repeatedly.
+- **A [`.dty` stub](/Typhon/interop/dty-stubs/)** — a long-lived dependency.
+- **`as!`** — an ad-hoc one-off shape assertion, the sound runtime-checked upgrade over a bare `unsafe:` re-assertion.
+
+See [`unsafe` → `as!`](/Typhon/reference/unsafe/#as-the-checked-boundary-cast) for the reference-page summary.
 
 ## When to use `unsafe:`
 
