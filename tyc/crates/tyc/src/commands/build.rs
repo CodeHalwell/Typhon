@@ -770,23 +770,50 @@ pub fn run(args: BuildArgs) -> Result<()> {
         // from imported modules so `title.slug()` in a consumer resolves
         // when `extend str: def slug(...)` was declared in a dependency.
         let (mut builtin_ext_registry, _ext_stats) = extract_builtin_extensions(&mut module);
-        // Build cross-module extension registry from all project modules.
+        // Build cross-module extension registry scoped to modules that
+        // the current file actually imports. This ensures the build path
+        // agrees with the type-checker's import-based visibility and avoids
+        // non-deterministic provider selection when multiple modules declare
+        // `extend BUILTIN:` for the same type. (#202 review feedback)
         // `fn_name → source_module` reverse map for import injection.
         let mut cross_module_fns: HashMap<String, String> = HashMap::new();
-        for (mod_name, shapes) in project_shapes.as_ref() {
-            let dotted = crate::commands::util::path_to_dotted(path, src_root);
-            if *mod_name == dotted {
-                continue; // skip self
+        {
+            use ruff_python_ast::Stmt;
+            // Collect the set of module names this file imports.
+            let mut imported_modules: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
+            for stmt in &module.body {
+                match stmt {
+                    Stmt::ImportFrom(i) => {
+                        if let Some(m) = &i.module {
+                            imported_modules.insert(m.id.to_string());
+                        }
+                    }
+                    Stmt::Import(i) => {
+                        for alias in &i.names {
+                            imported_modules.insert(alias.name.id.to_string());
+                        }
+                    }
+                    _ => {}
+                }
             }
-            for (cls_name, shape) in &shapes.class_shapes {
-                if let Some(builtin) = cls_name.strip_prefix("__typhon_builtin_ext_") {
-                    let entry = builtin_ext_registry.entry(builtin.to_owned()).or_default();
-                    for method_name in shape.methods.keys() {
-                        let fn_name = format!("__typhon_ext_{builtin}__{method_name}");
-                        entry.entry(method_name.clone()).or_insert_with(|| {
-                            cross_module_fns.insert(fn_name.clone(), mod_name.clone());
-                            fn_name
-                        });
+            for mod_name in &imported_modules {
+                let Some(shapes) = project_shapes.get(mod_name) else {
+                    continue;
+                };
+                for (cls_name, shape) in &shapes.class_shapes {
+                    if let Some(builtin) = cls_name.strip_prefix("__typhon_builtin_ext_") {
+                        let entry =
+                            builtin_ext_registry.entry(builtin.to_owned()).or_default();
+                        for method_name in shape.methods.keys() {
+                            let fn_name =
+                                format!("__typhon_ext_{builtin}__{method_name}");
+                            entry.entry(method_name.clone()).or_insert_with(|| {
+                                cross_module_fns
+                                    .insert(fn_name.clone(), mod_name.clone());
+                                fn_name
+                            });
+                        }
                     }
                 }
             }
@@ -1231,17 +1258,27 @@ fn inject_cross_module_ext_imports(
     }
 
     // Insert after the last existing import at the top of the module,
-    // preserving the module's statement order.
-    let insert_pos = module
-        .body
-        .iter()
-        .position(|s| {
-            !matches!(
-                s,
-                Stmt::Import(_) | Stmt::ImportFrom(_) | Stmt::Expr(_) // docstrings
-            )
-        })
-        .unwrap_or(module.body.len());
+    // preserving the module's statement order. Only skip a leading
+    // string-literal expression (module docstring) — other `Stmt::Expr`
+    // are executable statements that must run after imports.
+    let mut insert_pos = 0;
+    // Skip optional leading docstring (bare string-literal expression).
+    if let Some(Stmt::Expr(e)) = module.body.first() {
+        if matches!(&*e.value, ruff_python_ast::Expr::StringLiteral(_)) {
+            insert_pos = 1;
+        }
+    }
+    // Skip past all contiguous imports.
+    while insert_pos < module.body.len() {
+        if matches!(
+            &module.body[insert_pos],
+            Stmt::Import(_) | Stmt::ImportFrom(_)
+        ) {
+            insert_pos += 1;
+        } else {
+            break;
+        }
+    }
 
     for (i, stmt) in injected.into_iter().enumerate() {
         module.body.insert(insert_pos + i, stmt);

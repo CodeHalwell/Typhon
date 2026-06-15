@@ -964,12 +964,23 @@ fn build_external_shapes(
         // `is_user_builtin_extension`. Without this, `title.slug()` in
         // a consumer that imported a module declaring `extend str: def
         // slug(...)` would fire `tyc::attribute_not_found`. (#202)
+        // When multiple imported modules extend the same built-in, merge
+        // their methods into a single shape rather than keeping only the
+        // first module's sentinel. (#202 review feedback)
         for (cls_name, shape) in &module_shapes.class_shapes {
             if cls_name.starts_with("__typhon_builtin_ext_") {
-                external
+                let entry = external
                     .class_shapes
                     .entry(cls_name.clone())
                     .or_insert_with(|| shape.clone());
+                // If the entry already existed, merge in any new methods
+                // from this module that aren't already present.
+                for (method_name, method_sig) in &shape.methods {
+                    entry
+                        .methods
+                        .entry(method_name.clone())
+                        .or_insert_with(|| method_sig.clone());
+                }
             }
         }
     }

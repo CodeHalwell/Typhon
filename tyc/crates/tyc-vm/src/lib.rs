@@ -264,21 +264,37 @@ fn merge_cross_module_extensions_for_vm(
     // Collect unique module names from import statements.
     let mut seen_modules: std::collections::HashSet<String> = std::collections::HashSet::new();
     for stmt in &module.body {
-        let mod_name = match stmt {
-            Stmt::ImportFrom(i) => i.module.as_ref().map(|m| m.id.to_string()),
-            Stmt::Import(i) => i.names.first().map(|a| a.name.id.to_string()),
-            _ => None,
-        };
-        if let Some(name) = mod_name {
-            // Only consider sibling modules (single segment, no dots).
-            if !name.contains('.') && seen_modules.insert(name.clone()) {
-                let sibling_path = src_root.join(format!("{name}.ty"));
-                if sibling_path.exists() {
-                    if let Ok(text) = std::fs::read_to_string(&sibling_path) {
-                        merge_sibling_extensions(&text, &name, registry, &mut cross_fns);
+        match stmt {
+            Stmt::ImportFrom(i) => {
+                if let Some(m) = &i.module {
+                    let name = m.id.to_string();
+                    if !name.contains('.') && seen_modules.insert(name.clone()) {
+                        let sibling_path = src_root.join(format!("{name}.ty"));
+                        if sibling_path.exists() {
+                            if let Ok(text) = std::fs::read_to_string(&sibling_path) {
+                                merge_sibling_extensions(&text, &name, registry, &mut cross_fns);
+                            }
+                        }
                     }
                 }
             }
+            Stmt::Import(i) => {
+                // Handle all aliases in `import a, b, c` — not just the first.
+                for alias in &i.names {
+                    let name = alias.name.id.to_string();
+                    if !name.contains('.') && seen_modules.insert(name.clone()) {
+                        let sibling_path = src_root.join(format!("{name}.ty"));
+                        if sibling_path.exists() {
+                            if let Ok(text) = std::fs::read_to_string(&sibling_path) {
+                                merge_sibling_extensions(
+                                    &text, &name, registry, &mut cross_fns,
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
         }
     }
     cross_fns
@@ -366,12 +382,25 @@ fn inject_vm_cross_module_ext_imports(
         }));
     }
 
-    // Insert after existing imports.
-    let insert_pos = module
-        .body
-        .iter()
-        .position(|s| !matches!(s, Stmt::Import(_) | Stmt::ImportFrom(_) | Stmt::Expr(_)))
-        .unwrap_or(module.body.len());
+    // Insert after existing imports. Only skip a leading string-literal
+    // expression (module docstring) — other `Stmt::Expr` are executable
+    // statements that must run after imports.
+    let mut insert_pos = 0;
+    if let Some(Stmt::Expr(e)) = module.body.first() {
+        if matches!(&*e.value, ruff_python_ast::Expr::StringLiteral(_)) {
+            insert_pos = 1;
+        }
+    }
+    while insert_pos < module.body.len() {
+        if matches!(
+            &module.body[insert_pos],
+            Stmt::Import(_) | Stmt::ImportFrom(_)
+        ) {
+            insert_pos += 1;
+        } else {
+            break;
+        }
+    }
 
     for (i, stmt) in injected.into_iter().enumerate() {
         module.body.insert(insert_pos + i, stmt);
