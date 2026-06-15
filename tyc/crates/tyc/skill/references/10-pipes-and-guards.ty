@@ -1,0 +1,60 @@
+def clean(raw: str) -> str:
+    return raw |> str.strip() |> str.lower() |> str.replace(",", "")
+
+
+def normalise_username(raw: str?) -> str:
+    guard u = raw else:
+        return "anonymous"
+    let trimmed: str = u.strip()
+    if len(trimmed) == 0:
+        return "anonymous"
+    return trimmed.lower()
+
+
+def total_price(quantity: int?, unit_price: float?) -> float:
+    guard q = quantity else:
+        return 0.0
+    guard p = unit_price else:
+        return 0.0
+    return float(q) * p
+
+
+def fmt_words(words: list[str]) -> str:
+    return (
+        words
+        |> filter_nonempty()
+        |> dedupe()
+        |> sort_alpha()
+        |> ", ".join()
+    )
+
+
+def filter_nonempty(words: list[str]) -> list[str]:
+    return [w for w in words if len(w) > 0]
+
+
+def dedupe(words: list[str]) -> list[str]:
+    let seen: set[str] = set()
+    mut result: list[str] = []
+    for w in words:
+        if w not in seen:
+            seen.add(w)
+            result.append(w)
+    return result
+
+
+def sort_alpha(words: list[str]) -> list[str]:
+    return sorted(words)
+
+
+def main() -> None:
+    print(clean("  Hello, World  "))
+    print(normalise_username(None))
+    print(normalise_username("  AdaLovelace "))
+    print(total_price(3, 4.99))
+    print(total_price(None, 4.99))
+    print(fmt_words(["zebra", "apple", "", "banana", "apple"]))
+
+
+if __name__ == "__main__":
+    main()

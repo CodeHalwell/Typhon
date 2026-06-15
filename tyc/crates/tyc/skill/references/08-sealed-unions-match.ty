@@ -1,0 +1,76 @@
+type Shape = Circle | Rectangle | Triangle
+
+
+class Circle:
+    radius: float
+
+
+class Rectangle:
+    width: float
+    height: float
+
+
+class Triangle:
+    base: float
+    height: float
+
+
+def area(s: Shape) -> float:
+    match s:
+        case Circle(radius):
+            return 3.14159 * radius * radius
+        case Rectangle(width, height):
+            return width * height
+        case Triangle(base, height):
+            return 0.5 * base * height
+
+
+type Event = Login | Logout | Purchase
+
+
+class Login:
+    user_id: int
+    at: str
+
+
+class Logout:
+    user_id: int
+    at: str
+
+
+class Purchase:
+    user_id: int
+    amount: float
+    sku: str
+
+
+def describe(e: Event) -> str:
+    match e:
+        case Login(user_id, at):
+            return f"#{user_id} logged in at {at}"
+        case Logout(user_id, at):
+            return f"#{user_id} logged out at {at}"
+        case Purchase(user_id, amount, sku):
+            return f"#{user_id} bought {sku} for ${amount:.2f}"
+
+
+def main() -> None:
+    let shapes: list[Shape] = [
+        Circle(radius=2.0),
+        Rectangle(width=3.0, height=4.0),
+        Triangle(base=5.0, height=6.0),
+    ]
+    for s in shapes:
+        print(f"area = {area(s):.2f}")
+
+    let events: list[Event] = [
+        Login(user_id=1, at="09:00"),
+        Purchase(user_id=1, amount=29.99, sku="widget"),
+        Logout(user_id=1, at="17:30"),
+    ]
+    for e in events:
+        print(describe(e))
+
+
+if __name__ == "__main__":
+    main()

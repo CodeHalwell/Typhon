@@ -45,16 +45,21 @@ pub struct SkillArgs {
 }
 
 /// The skill, embedded at build time. Each entry is a path relative to the
-/// skill root (`.claude/skills/typhon/`) paired with its file contents.
+/// skill root paired with its file contents.
 ///
-/// Paths are resolved relative to *this source file* by `include_str!`, i.e.
-/// `tyc/crates/tyc/src/commands/install.rs` → repo root is five levels up.
+/// The embedded source of truth is vendored **inside this crate** at
+/// `tyc/crates/tyc/skill/`, so the compiler builds standalone (a packaged
+/// `tyc` crate or a checkout of just `tyc/` has everything it needs — the
+/// `include_str!` paths never climb out of the workspace). The repo's own
+/// `.claude/skills/typhon/` is the *installed* copy of this tree, kept in sync
+/// by running `tyc install skill` at the repo root; `skill/README.md` records
+/// that contract.
+///
+/// Paths resolve relative to *this source file*: `src/commands/` is two levels
+/// below the crate root, so `../../skill/` reaches the vendored tree.
 macro_rules! skill_file {
     ($rel:literal) => {
-        (
-            $rel,
-            include_str!(concat!("../../../../../.claude/skills/typhon/", $rel)),
-        )
+        ($rel, include_str!(concat!("../../skill/", $rel)))
     };
 }
 

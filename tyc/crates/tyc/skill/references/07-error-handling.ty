@@ -1,0 +1,54 @@
+class ParseError:
+    field: str
+    reason: str
+
+
+def parse_port(raw: str) -> Result[int, ParseError]:
+    if not raw.isdigit():
+        return Err(ParseError(field="port", reason=f"not a number: {raw}"))
+    let n: int = int(raw)
+    if n < 1 or n > 65535:
+        return Err(ParseError(field="port", reason=f"out of range: {n}"))
+    return Ok(n)
+
+
+def parse_host(raw: str) -> Result[str, ParseError]:
+    let cleaned: str = raw.strip()
+    if len(cleaned) == 0:
+        return Err(ParseError(field="host", reason="empty"))
+    return Ok(cleaned)
+
+
+def parse_addr(host_raw: str, port_raw: str) -> Result[tuple[str, int], ParseError]:
+    with host = parse_host(host_raw)?,
+         port = parse_port(port_raw)?:
+        return Ok((host, port))
+    else err:
+        print(f"failed parsing {err.field}: {err.reason}")
+        return Err(err)
+
+
+def parse_addr_short(host_raw: str, port_raw: str) -> Result[tuple[str, int], ParseError]:
+    let host: str = parse_host(host_raw)?
+    let port: int = parse_port(port_raw)?
+    return Ok((host, port))
+
+
+def main() -> None:
+    match parse_addr("localhost", "8080"):
+        case Ok((host, port)):
+            print(f"bound to {host}:{port}")
+        case Err(e):
+            print(f"failed: {e.reason}")
+
+    match parse_addr("localhost", "70000"):
+        case Ok(_):
+            print("unexpected success")
+        case Err(e):
+            print(f"rejected: {e.field}={e.reason}")
+
+    print(parse_addr_short(" example.com ", "443"))
+
+
+if __name__ == "__main__":
+    main()
