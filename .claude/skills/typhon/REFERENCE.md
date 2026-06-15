@@ -4,7 +4,7 @@ Every Typhon-specific form, listed side-by-side with the Python it lowers to. Fo
 
 **Convention:** Typhon source on the left or above; emitted Python on the right or below. Where formatting matters, code is shown verbatim from the printer.
 
-**Current release: v0.14.0.** Forms tagged with a version annotation (`(v0.5.0)` etc.) landed in that release; everything else has been in Typhon since v0.1.0 or v0.2.0. The new language *forms* since v0.9.0 are the `enum` keyword (v0.11.0) and the `as!` checked boundary cast (§13.1, v0.14.0); v0.10.0–v0.13.x are otherwise VM-completeness, compile-time-checking, and CPython-parity work (v0.13.1 / v0.13.2 are bug patches), and v0.14.0 also adds the opt-in `[emit] traceback-remap` config — not new syntax.
+**Current release: v0.15.2.** Forms tagged with a version annotation (`(v0.5.0)` etc.) landed in that release; everything else has been in Typhon since v0.1.0 or v0.2.0. The new language *forms* since v0.9.0 are the `enum` keyword (v0.11.0) and the `as!` checked boundary cast (§13.1, v0.14.0); v0.10.0–v0.13.x are otherwise VM-completeness, compile-time-checking, and CPython-parity work (v0.13.1 / v0.13.2 are bug patches), and v0.14.0 also adds the opt-in `[emit] traceback-remap` config — not new syntax. v0.14.1–v0.15.2 are additive too: cross-module shape propagation completeness (v0.14.1), the on-by-default `tyc::gather_opportunity` advice + cross-module `auto-gather` (v0.14.2), live LSP config refresh (v0.14.3), the `as!` cast composing in **any** expression position plus the `try_result(thunk[, on_err])` prelude combinator and compiler-bundled `.dty` stubs (v0.15.0), and perf/bugfix patches (v0.15.1 / v0.15.2).
 
 ---
 
@@ -1252,7 +1252,7 @@ load('{"port": "x"}')    # → TypeError (dict[str, str] ≠ dict[str, int]; ele
 
 Modelled shapes: scalars (`int` / `str` / `bool` / `float` / `bytes` / `None`), `list[X]` / `set[X]` / `frozenset[X]`, `dict[K, V]`, fixed- and variadic-`tuple[...]`, unions / `Optional`. `int → float` and `bool → int` widening is honoured. `Any` / `object` targets and shapes it can't model fall back to acceptance, so `as!` only ever rejects values it can prove wrong. The VM treats it as identity (the build path enforces); `tyc fmt` preserves it.
 
-**Scope (v0.14.5):** structural lowering — composes in any expression position: value positions (`=` / `op=` / `return` / `yield` / bare expression), nested inside call arguments (`foo(row[0] as! int, y)`), comprehensions / collection literals, and value expressions spanning multiple physical lines (left operand bracket-balanced). The right operand parses as a type expression (dotted name + optional `[...]` + `|`-union), so trailing code after the type is left outside the cast. (Earlier releases restricted it to a single physical line in value position.)
+**Scope (v0.15.0):** structural lowering (fixpoint rewrite, bracket-/string-/comment-aware; a quote in a `#` comment no longer derails the scanner, v0.15.2) — composes in any expression position: value positions (`=` / `op=` / `return` / `yield` / bare expression), statement conditions (`if raw as! bool:`), nested inside call arguments (`foo(row[0] as! int, y)`), comprehensions / collection literals, and value expressions spanning multiple physical lines (left operand bracket-balanced). The right operand parses as a type expression (dotted name + optional `[...]` + `|`-union), so trailing code after the type is left outside the cast. (Earlier releases restricted it to a single physical line in value position.)
 
 ---
 

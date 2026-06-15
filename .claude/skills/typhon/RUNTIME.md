@@ -16,6 +16,7 @@ Two things live under "runtime" in Typhon: the **generated `typhon_runtime/` pac
 - `typhon_runtime.freeze.deep_freeze` (from `freeze let`)
 - `typhon_runtime.cast.checked_cast` (from `EXPR as! TYPE`) — v0.14.0
 - `typhon_runtime.traceback.install` (from `[emit] traceback-remap = true`) — v0.14.0
+- `typhon_runtime.try_result` (from a `try_result(...)` call) — v0.15.0
 
 The package source is embedded as `const &str` templates in `tyc/src/commands/build.rs` (`TYPHON_RUNTIME_INIT_PY`, `TASKS_PY`, `LAZY_PY`, `STDLIB_PY`, `RESULT_PY`, `PARALLEL_PY`, `FREEZE_PY`, `CAST_PY`, `TRACEBACK_PY`).
 
@@ -24,7 +25,7 @@ The package source is embedded as `const &str` templates in `tyc/src/commands/bu
 | File | Surface |
 |---|---|
 | `__init__.py` | Re-exports `Ok`, `Err`, `Result` so `from typhon_runtime import Ok, Err, Result` works |
-| `result.py` | `Ok[T]`, `Err[E]`, `Result[T, E]` dataclasses + `.map`/`.map_err`/`.and_then`/`.or_else` methods (v0.6.0). Frozen, slots-based. CPython repr matches the v0.3.0 O24 fix (`Ok(value=20)` / `Err(error='oops')`). |
+| `result.py` | `Ok[T]`, `Err[E]`, `Result[T, E]` dataclasses + `.map`/`.map_err`/`.and_then`/`.or_else` methods (v0.6.0). Frozen, slots-based. CPython repr matches the v0.3.0 O24 fix (`Ok(value=20)` / `Err(error='oops')`). Also exports **`try_result(thunk, on_err=None)`** (v0.15.0): runs `thunk()` → `Ok(result)`; on any exception → `Err(on_err(exc))`, or `Err(exc)` when no mapper is given. `tyc build` auto-injects `from typhon_runtime import try_result`; it's a checker prelude name (typed `Result[T, E]`) and a VM prelude native that materialises the caught exception as an `except E as e:` handler would. |
 | `tasks.py` | `spawn(coro)` — adds the task to a strong-ref `_BACKGROUND` set with a done-callback `discard` to prevent GC mid-flight. Closes the asyncio `create_task` weakref gotcha. |
 | `lazy.py` | `_LazyModule` / `lazy_import(name)` — attribute-proxy with double-checked locking. `_LazyValue` / `lazy_let(factory)` — sentinel-cached single-shot evaluator. |
 | `parallel.py` | `map_pure(fn, iterable)` — `concurrent.futures.ThreadPoolExecutor`-backed parallel map; degrades to sequential on GIL-locked CPython. Used by list/set/dict comprehension rewrites under `auto-parallel`. |

@@ -2,7 +2,7 @@
 
 The full `tyc` surface. For background and design rationale, see `docs/cli.md` and `docs/long-term-plan.md`.
 
-`tyc` is a single Rust binary built from `tyc/Cargo.toml`. Each subcommand reuses the same Salsa-backed pipeline (`tyc-syntax → tyc-resolve → tyc-types → tyc-analyse → tyc-desugar → tyc-emit → tyc-format`); third-party introspection rides on the side crate `tyc-venv`. The current release is **v0.12.0**.
+`tyc` is a single Rust binary built from `tyc/Cargo.toml`. Each subcommand reuses the same Salsa-backed pipeline (`tyc-syntax → tyc-resolve → tyc-types → tyc-analyse → tyc-desugar → tyc-emit → tyc-format`); third-party introspection rides on the side crate `tyc-venv`. The current release is **v0.15.2**.
 
 ```bash
 # One-time: build the compiler
@@ -351,6 +351,31 @@ tyc sync --dry-run                # print the generated pyproject.toml, don't wr
 ```
 
 The generated `pyproject.toml` carries `[project] name/version/requires-python/dependencies` plus `[dependency-groups].dev` when `[dev-dependencies]` is non-empty; user-managed `[tool.*]` tables and other `[project]` keys are preserved byte-for-byte.
+
+---
+
+## Tooling
+
+### `tyc install`
+
+Materialise embedded tooling assets into the current project. The one target today is the `typhon` Claude skill.
+
+```bash
+tyc install skill                 # write .claude/skills/typhon/ into the current project
+tyc install skill --force         # overwrite an existing copy
+tyc install skill --dir ../other  # target a different project root
+tyc install skill --list          # print the files that would be written, write nothing
+```
+
+`tyc install skill` writes the whole skill tree — `SKILL.md`, every sibling reference (`REFERENCE.md`, `CLI.md`, `PITFALLS.md`, `DIAGNOSTICS.md`, `COOKBOOK.md`, `RUNTIME.md`, `PACKAGING.md`), and the `references/` examples folder with its index — into `<dir>/.claude/skills/typhon/`. The skill is **embedded in the `tyc` binary at build time** (`include_str!`), so the command works from any directory with no network access and no dependency on the Typhon source checkout.
+
+| Flag | Effect |
+|---|---|
+| `--force` | Overwrite files that already exist. Without it, `tyc install skill` refuses if `.claude/skills/typhon/SKILL.md` is already present (exit code `1`) so an existing, possibly-customised copy is never clobbered |
+| `--dir PATH` | Install into `PATH/.claude/skills/typhon/` instead of the current directory |
+| `--list` | Dry-run: print every relative path that would be written, then exit `0` without touching disk |
+
+The installed copy is a verbatim snapshot of the skill shipped with the `tyc` you ran, so `tyc --version` tells you which release of the skill you'll get. Re-run with `--force` after upgrading `tyc` to refresh a vendored copy.
 
 ---
 

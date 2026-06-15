@@ -258,6 +258,8 @@ async def fetch_count() -> int:  # warning
 
 **Fix:** Remove `async`, or add the missing `await`.
 
+Contract exemption (v0.15.0): an awaitless `async def` is **not** warned when it is async only to honour a contract it can't opt out of — implementing an async `interface` method (structural conformance) or overriding an async base-class method. So a trivial `impl ConsoleSink: async def deliver(...)` satisfying `interface Sink: async def deliver(...)` checks clean, with no dead `await asyncio.sleep(0)` no-op. An `async` impl of a *sync* method, or any awaitless `async def` with no contract, still warns.
+
 ### `tyc::missing_await` — error
 
 A sync function calls an `async def` without awaiting it. The result is a coroutine, not the declared return value. `loop.run_until_complete(coro())` and `asyncio.run(coro())` are whitelisted (v0.6.0).
@@ -294,6 +296,23 @@ async def fetch_b() -> int: ...
 ```
 
 **Fix:** Add `@gatherable` to every same-module async callee in the run.
+
+Cross-module reach (v0.14.2): the auto-gather pass also folds runs whose callees are `@gatherable` async functions **imported from another project module**, so this advice fires for an imported callee that's missing the decorator too.
+
+### `tyc::gather_opportunity` — advice (controlled by `[strictness] suggest-gather`, default `true`; v0.14.2)
+
+A run of 2+ adjacent **independent** awaited calls inside an `async def` — they could run concurrently in an explicit `gather:` block instead of sequentially. Unlike `auto_gather_missed`, this is **callee-agnostic** and **on by default**: it fires for awaited **method calls on imported clients** (`await client.get_user(...)`), the shape `auto-gather` never touches, because the suggested fix works for any awaitable with no `@gatherable` decorator.
+
+```ty
+async def load(client: Client, uid: int) -> tuple[User, list[Post]]:
+    let user = await client.get_user(uid)     # advice: these 2 awaits …
+    let posts = await client.get_posts(uid)   # … could run concurrently
+    return (user, posts)
+```
+
+Independence is static data flow: a run breaks the moment a later await references a name bound earlier — including through the callee's receiver (`b = await a.next()`), keyword args, comprehensions, walrus, slices, f-strings — and a single non-matching statement between two awaits ends the run. It **never rewrites** (concurrency is a behaviour change the author opts into) and is advice-level (never blocks a build; renders as an editor hint via the LSP). When `auto-gather` is also on, runs it folds are gone before this pass runs, so they aren't double-reported.
+
+**Fix:** Wrap the independent awaits in a `gather:` block, or set `[strictness] suggest-gather = false` to silence the nudge project-wide.
 
 ### `tyc::generator_return_type` — error
 
@@ -887,7 +906,7 @@ Standard values for severity keys are `"off"`, `"warn"`, `"error"`.
 
 **Warnings**: `async_without_await`, `class_attr_shadows_slot`, `blocking_in_async`, `contains_secret_literal`, `orphan_py_import`, `python_semantic_drift`, `resource_not_managed`, `stdlib_module_shadow`.
 
-**Advice**: `auto_gather_missed`, `main_not_called`, `pub_star_outside_init`.
+**Advice**: `auto_gather_missed`, `gather_opportunity`, `main_not_called`, `pub_star_outside_init`.
 
 ---
 

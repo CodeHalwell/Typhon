@@ -8,6 +8,7 @@ pub mod deps;
 pub mod explain;
 pub mod fmt;
 pub mod init;
+pub mod install;
 pub mod lsp;
 pub mod migrate;
 pub mod profile;
