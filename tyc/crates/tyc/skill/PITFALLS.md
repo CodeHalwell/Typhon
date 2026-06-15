@@ -4,7 +4,7 @@ The errors and surprises that bite people who try to write Typhon as if it were 
 
 For each entry: **trigger → diagnostic → fix**.
 
-Current release: **v0.15.4**. Pitfalls tagged with a version annotation landed in that release. Pitfalls 61–75 are the v0.9.0 cleanup additions covering the daily-driver VM, type-checker covariance and narrowing gaps, and multi-file project support; pitfalls 76+ cover the v0.10.0–v0.12.0 VM-completeness, `enum`, and third-party-type-checking surface; pitfalls 81–82 cover the v0.14.0 `as!` checked boundary cast.
+Current release: **v0.15.5**. Pitfalls tagged with a version annotation landed in that release. Pitfalls 61–75 are the v0.9.0 cleanup additions covering the daily-driver VM, type-checker covariance and narrowing gaps, and multi-file project support; pitfalls 76+ cover the v0.10.0–v0.12.0 VM-completeness, `enum`, and third-party-type-checking surface; pitfalls 81–82 cover the v0.14.0 `as!` checked boundary cast.
 
 ---
 
@@ -1457,7 +1457,9 @@ let n = some_value as! int    # tyc run: passes even if some_value is a str
 
 ---
 
-## 83. `extend BUILTIN:` not carrying across an import (module-local)
+## 83. `extend BUILTIN:` not carrying across an import — FIXED in v0.15.5
+
+As of **v0.15.5**, `extend BUILTIN:` now crosses module boundaries. A builtin extension declared in one module is available to any importer:
 
 ```python
 # textutil.ty
@@ -1467,20 +1469,10 @@ extend str:
 
 # main.ty
 from textutil import *
-let s: str = title.slug()       # ❌ tyc::attribute_not_found — `slug` on `str`
+let s: str = title.slug()       # ✅ works as of v0.15.5
 ```
 
-**Trigger:** declaring `extend str:` (or `list`/`dict`/…) in one module and calling the method in another. **Why:** unlike `extend ClassName:` (which merges into a user class and crosses modules), a built-in extension is a purely *static* call-site rewrite (`title.slug()` → `__typhon_ext_str__slug(title)`) keyed off the `extend` block in the **same** module — there is no monkey-patch for an `import` to carry. **Fix:** wrap the behaviour in a plain free function and import *that*:
-
-```python
-# textutil.ty
-pub def to_slug(s: str) -> str:
-    return s.lower().replace(" ", "-")
-
-# main.ty
-from textutil import to_slug
-let s: str = to_slug(title)     # ✅ crosses modules
-```
+**History:** before v0.15.5, `extend BUILTIN:` was module-local and `title.slug()` in a consumer would fire `tyc::attribute_not_found`. The fix propagates extension registries across the type checker (`ExternalShapes`), build/codegen (cross-module registry merge + import injection), and VM runtime (sibling pre-scan). The free-function workaround (`pub def to_slug(s: str) -> str: …`) still works but is no longer necessary.
 
 ---
 

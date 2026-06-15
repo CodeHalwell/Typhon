@@ -2,7 +2,7 @@
 
 The full `tyc` surface. For background and design rationale, see `docs/cli.md` and `docs/long-term-plan.md`.
 
-`tyc` is a single Rust binary built from `tyc/Cargo.toml`. Each subcommand reuses the same Salsa-backed pipeline (`tyc-syntax → tyc-resolve → tyc-types → tyc-analyse → tyc-desugar → tyc-emit → tyc-format`); third-party introspection rides on the side crate `tyc-venv`. The current release is **v0.15.4**.
+`tyc` is a single Rust binary built from `tyc/Cargo.toml`. Each subcommand reuses the same Salsa-backed pipeline (`tyc-syntax → tyc-resolve → tyc-types → tyc-analyse → tyc-desugar → tyc-emit → tyc-format`); third-party introspection rides on the side crate `tyc-venv`. The current release is **v0.15.5**.
 
 ```bash
 # One-time: build the compiler

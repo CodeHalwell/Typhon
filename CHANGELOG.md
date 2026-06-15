@@ -4,6 +4,53 @@ All notable changes to Typhon are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely; the
 canonical phase-by-phase status lives in `docs/roadmap.md`.
 
+## 0.15.5 — 2026-06-15 — cross-module `extend BUILTIN:` propagation
+
+A bugfix release that makes `extend BUILTIN:` work across module boundaries.
+Previously, builtin extension methods (e.g. `extend str: def slug(...)`) only
+rewrote call sites inside the declaring module — importing the module did not
+carry the extension, so `title.slug()` in a consumer would fire
+`tyc::attribute_not_found`. This release fixes the issue end-to-end across the
+type checker, build/codegen, and VM runtime layers.
+
+### Fixed — `extend BUILTIN:` now crosses module boundaries (#202)
+
+- **A builtin extension declared in one module is now available to importers.**
+  Previously `extend str: def slug(self) -> str: ...` in `textutil.ty` only
+  rewrote `x.slug()` call sites *within* `textutil.ty`. Importing `textutil`
+  from another module did nothing — `title.slug()` would fire
+  `tyc::attribute_not_found` on `str`. The fix spans three layers:
+
+  1. **Type checker (`tyc-db`):** `build_external_shapes` now seeds
+     `__typhon_builtin_ext_*` sentinel class shapes from imported modules into
+     the consumer's `ExternalShapes`, so `is_user_builtin_extension` recognises
+     cross-module extension methods and suppresses `attribute_not_found`.
+
+  2. **Build/codegen (`build.rs`):** After extracting local extensions, the
+     build pass merges cross-module extension registries (keyed off
+     `project_shapes`) before rewriting call sites. A new tracking variant
+     (`rewrite_builtin_extension_calls_tracking`) reports which cross-module
+     free functions were actually used, and explicit
+     `from <module> import __typhon_ext_<TYPE>__<METHOD>` statements are
+     injected so the emitted Python resolves at runtime.
+
+  3. **VM runtime (`tyc-vm`):** The entry module is now pre-scanned for imports
+     before builtin-extension rewriting. Sibling `.ty` files are parsed for
+     their extension registries, which are merged into the local registry so
+     `tyc run` rewrites cross-module call sites identically to `tyc build`.
+
+- **New public API:** `rewrite_builtin_extension_calls_tracking` in
+  `tyc-analyse` returns both the rewrite count and a `HashSet<String>` of used
+  free-function names, enabling callers to inject only the required imports.
+
+### Notes
+
+- Full workspace suite green; new integration tests in `build_features`
+  (`build_cross_module_extend_str_rewrites_consumer_call_site` and
+  `check_cross_module_extend_str_no_attribute_not_found`). Clippy clean under
+  `-D warnings`. No previously-accepted program changes behaviour — the fix is
+  purely additive (call sites that previously errored now resolve).
+
 ## 0.15.4 — 2026-06-15 — cross-module interface conformance + `pub comptime let`
 
 A bugfix release driven by a field report from building a layered FastAPI-style

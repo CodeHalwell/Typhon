@@ -21,7 +21,7 @@
 //! attribute accesses on user-defined types that happen to share a
 //! method name with a registered extension.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use ruff_python_ast::{
     name::Name, AtomicNodeIndex, Expr, ExprCall, ExprName, ModModule, Stmt, StmtFunctionDef,
@@ -142,18 +142,36 @@ pub fn rewrite_builtin_extension_calls(
     module: &mut ModModule,
     registry: &ExtensionRegistry,
 ) -> usize {
+    rewrite_builtin_extension_calls_tracking(module, registry).0
+}
+
+/// Like [`rewrite_builtin_extension_calls`] but also returns the set of
+/// free-function names that were actually used in rewrites. The caller can
+/// use this to inject cross-module imports for extension functions defined
+/// in another module. (#202)
+pub fn rewrite_builtin_extension_calls_tracking(
+    module: &mut ModModule,
+    registry: &ExtensionRegistry,
+) -> (usize, HashSet<String>) {
     if registry.is_empty() {
-        return 0;
+        return (0, HashSet::new());
     }
     let mut module_env = collect_module_annotations(module);
     let mut rewrites = 0usize;
+    let mut used_fns: HashSet<String> = HashSet::new();
     let body = std::mem::take(&mut module.body);
     let mut new_body: Vec<Stmt> = Vec::with_capacity(body.len());
     for stmt in body {
-        new_body.push(rewrite_stmt(stmt, registry, &mut module_env, &mut rewrites));
+        new_body.push(rewrite_stmt(
+            stmt,
+            registry,
+            &mut module_env,
+            &mut rewrites,
+            &mut used_fns,
+        ));
     }
     module.body = new_body;
-    rewrites
+    (rewrites, used_fns)
 }
 
 /// Map from variable name to the built-in type it is annotated as.
@@ -206,6 +224,7 @@ fn rewrite_stmt(
     registry: &ExtensionRegistry,
     env: &mut Env,
     rewrites: &mut usize,
+    used_fns: &mut HashSet<String>,
 ) -> Stmt {
     match stmt {
         Stmt::FunctionDef(mut f) => {
@@ -237,18 +256,30 @@ fn rewrite_stmt(
                     }
                 }
             }
-            f.body = walk_body(std::mem::take(&mut f.body), registry, &mut local, rewrites);
+            f.body = walk_body(
+                std::mem::take(&mut f.body),
+                registry,
+                &mut local,
+                rewrites,
+                used_fns,
+            );
             Stmt::FunctionDef(f)
         }
         Stmt::ClassDef(mut c) => {
             // Class bodies also open a fresh scope.
             let mut local = Env::new();
-            c.body = walk_body(std::mem::take(&mut c.body), registry, &mut local, rewrites);
+            c.body = walk_body(
+                std::mem::take(&mut c.body),
+                registry,
+                &mut local,
+                rewrites,
+                used_fns,
+            );
             Stmt::ClassDef(c)
         }
         Stmt::AnnAssign(mut a) => {
             if let Some(v) = a.value.as_mut() {
-                rewrite_expr(v, registry, env, rewrites);
+                rewrite_expr(v, registry, env, rewrites, used_fns);
             }
             // Update the live environment so subsequent statements in
             // this block can rely on the new annotated binding.
@@ -260,7 +291,7 @@ fn rewrite_stmt(
             Stmt::AnnAssign(a)
         }
         Stmt::Assign(mut a) => {
-            rewrite_expr(&mut a.value, registry, env, rewrites);
+            rewrite_expr(&mut a.value, registry, env, rewrites, used_fns);
             // A bare assignment without annotation shadows any prior
             // typed binding for the same name — invalidate it so a
             // later use isn't rewritten against a stale type.
@@ -272,88 +303,160 @@ fn rewrite_stmt(
             Stmt::Assign(a)
         }
         Stmt::AugAssign(mut a) => {
-            rewrite_expr(&mut a.value, registry, env, rewrites);
+            rewrite_expr(&mut a.value, registry, env, rewrites, used_fns);
             Stmt::AugAssign(a)
         }
         Stmt::Expr(mut e) => {
-            rewrite_expr(&mut e.value, registry, env, rewrites);
+            rewrite_expr(&mut e.value, registry, env, rewrites, used_fns);
             Stmt::Expr(e)
         }
         Stmt::Return(mut r) => {
             if let Some(v) = r.value.as_mut() {
-                rewrite_expr(v, registry, env, rewrites);
+                rewrite_expr(v, registry, env, rewrites, used_fns);
             }
             Stmt::Return(r)
         }
         Stmt::Raise(mut r) => {
             if let Some(v) = r.exc.as_mut() {
-                rewrite_expr(v, registry, env, rewrites);
+                rewrite_expr(v, registry, env, rewrites, used_fns);
             }
             if let Some(v) = r.cause.as_mut() {
-                rewrite_expr(v, registry, env, rewrites);
+                rewrite_expr(v, registry, env, rewrites, used_fns);
             }
             Stmt::Raise(r)
         }
         Stmt::Delete(mut d) => {
             for t in &mut d.targets {
-                rewrite_expr(t, registry, env, rewrites);
+                rewrite_expr(t, registry, env, rewrites, used_fns);
             }
             Stmt::Delete(d)
         }
         Stmt::If(mut i) => {
-            rewrite_expr(&mut i.test, registry, env, rewrites);
-            i.body = walk_body(std::mem::take(&mut i.body), registry, env, rewrites);
+            rewrite_expr(&mut i.test, registry, env, rewrites, used_fns);
+            i.body = walk_body(
+                std::mem::take(&mut i.body),
+                registry,
+                env,
+                rewrites,
+                used_fns,
+            );
             for clause in &mut i.elif_else_clauses {
                 if let Some(t) = clause.test.as_mut() {
-                    rewrite_expr(t, registry, env, rewrites);
+                    rewrite_expr(t, registry, env, rewrites, used_fns);
                 }
-                clause.body = walk_body(std::mem::take(&mut clause.body), registry, env, rewrites);
+                clause.body = walk_body(
+                    std::mem::take(&mut clause.body),
+                    registry,
+                    env,
+                    rewrites,
+                    used_fns,
+                );
             }
             Stmt::If(i)
         }
         Stmt::While(mut w) => {
-            rewrite_expr(&mut w.test, registry, env, rewrites);
-            w.body = walk_body(std::mem::take(&mut w.body), registry, env, rewrites);
-            w.orelse = walk_body(std::mem::take(&mut w.orelse), registry, env, rewrites);
+            rewrite_expr(&mut w.test, registry, env, rewrites, used_fns);
+            w.body = walk_body(
+                std::mem::take(&mut w.body),
+                registry,
+                env,
+                rewrites,
+                used_fns,
+            );
+            w.orelse = walk_body(
+                std::mem::take(&mut w.orelse),
+                registry,
+                env,
+                rewrites,
+                used_fns,
+            );
             Stmt::While(w)
         }
         Stmt::For(mut f) => {
-            rewrite_expr(&mut f.target, registry, env, rewrites);
-            rewrite_expr(&mut f.iter, registry, env, rewrites);
-            f.body = walk_body(std::mem::take(&mut f.body), registry, env, rewrites);
-            f.orelse = walk_body(std::mem::take(&mut f.orelse), registry, env, rewrites);
+            rewrite_expr(&mut f.target, registry, env, rewrites, used_fns);
+            rewrite_expr(&mut f.iter, registry, env, rewrites, used_fns);
+            f.body = walk_body(
+                std::mem::take(&mut f.body),
+                registry,
+                env,
+                rewrites,
+                used_fns,
+            );
+            f.orelse = walk_body(
+                std::mem::take(&mut f.orelse),
+                registry,
+                env,
+                rewrites,
+                used_fns,
+            );
             Stmt::For(f)
         }
         Stmt::With(mut w) => {
             for item in &mut w.items {
-                rewrite_expr(&mut item.context_expr, registry, env, rewrites);
+                rewrite_expr(&mut item.context_expr, registry, env, rewrites, used_fns);
                 if let Some(v) = item.optional_vars.as_mut() {
-                    rewrite_expr(v, registry, env, rewrites);
+                    rewrite_expr(v, registry, env, rewrites, used_fns);
                 }
             }
-            w.body = walk_body(std::mem::take(&mut w.body), registry, env, rewrites);
+            w.body = walk_body(
+                std::mem::take(&mut w.body),
+                registry,
+                env,
+                rewrites,
+                used_fns,
+            );
             Stmt::With(w)
         }
         Stmt::Try(mut t) => {
-            t.body = walk_body(std::mem::take(&mut t.body), registry, env, rewrites);
+            t.body = walk_body(
+                std::mem::take(&mut t.body),
+                registry,
+                env,
+                rewrites,
+                used_fns,
+            );
             for handler in &mut t.handlers {
                 let ruff_python_ast::ExceptHandler::ExceptHandler(h) = handler;
                 if let Some(ty) = h.type_.as_mut() {
-                    rewrite_expr(ty, registry, env, rewrites);
+                    rewrite_expr(ty, registry, env, rewrites, used_fns);
                 }
-                h.body = walk_body(std::mem::take(&mut h.body), registry, env, rewrites);
+                h.body = walk_body(
+                    std::mem::take(&mut h.body),
+                    registry,
+                    env,
+                    rewrites,
+                    used_fns,
+                );
             }
-            t.orelse = walk_body(std::mem::take(&mut t.orelse), registry, env, rewrites);
-            t.finalbody = walk_body(std::mem::take(&mut t.finalbody), registry, env, rewrites);
+            t.orelse = walk_body(
+                std::mem::take(&mut t.orelse),
+                registry,
+                env,
+                rewrites,
+                used_fns,
+            );
+            t.finalbody = walk_body(
+                std::mem::take(&mut t.finalbody),
+                registry,
+                env,
+                rewrites,
+                used_fns,
+            );
             Stmt::Try(t)
         }
         Stmt::Match(mut m) => {
-            rewrite_expr(&mut m.subject, registry, env, rewrites);
+            rewrite_expr(&mut m.subject, registry, env, rewrites, used_fns);
             for case in &mut m.cases {
                 if let Some(g) = case.guard.as_mut() {
-                    rewrite_expr(g, registry, env, rewrites);
+                    rewrite_expr(g, registry, env, rewrites, used_fns);
                 }
-                case.body = walk_body(std::mem::take(&mut case.body), registry, env, rewrites);
+                case.body = walk_body(
+                    std::mem::take(&mut case.body),
+                    registry,
+                    env,
+                    rewrites,
+                    used_fns,
+                );
             }
             Stmt::Match(m)
         }
@@ -366,26 +469,33 @@ fn walk_body(
     registry: &ExtensionRegistry,
     env: &mut Env,
     rewrites: &mut usize,
+    used_fns: &mut HashSet<String>,
 ) -> Vec<Stmt> {
     body.into_iter()
-        .map(|s| rewrite_stmt(s, registry, env, rewrites))
+        .map(|s| rewrite_stmt(s, registry, env, rewrites, used_fns))
         .collect()
 }
 
 /// Rewrite eligible attribute calls anywhere inside `expr`.  Descends
 /// through every expression variant so a call buried in `x.shout() + "!"`
 /// or `f(x.shout())` reaches the rewrite logic.
-fn rewrite_expr(expr: &mut Expr, registry: &ExtensionRegistry, env: &Env, rewrites: &mut usize) {
+fn rewrite_expr(
+    expr: &mut Expr,
+    registry: &ExtensionRegistry,
+    env: &Env,
+    rewrites: &mut usize,
+    used_fns: &mut HashSet<String>,
+) {
     // 1. Try the local rewrite first when the head is a callable attribute
     //    on a typed receiver. Other variants fall through to (2) below.
     if let Expr::Call(call) = expr {
         // Recurse into call arguments and (for non-extension calls) the
         // callee expression itself so nested receivers still get fixed.
         for arg in &mut call.arguments.args {
-            rewrite_expr(arg, registry, env, rewrites);
+            rewrite_expr(arg, registry, env, rewrites, used_fns);
         }
         for kw in &mut call.arguments.keywords {
-            rewrite_expr(&mut kw.value, registry, env, rewrites);
+            rewrite_expr(&mut kw.value, registry, env, rewrites, used_fns);
         }
         if let Expr::Attribute(attr) = call.func.as_ref() {
             if let Expr::Name(recv) = attr.value.as_ref() {
@@ -418,6 +528,7 @@ fn rewrite_expr(expr: &mut Expr, registry: &ExtensionRegistry, env: &Env, rewrit
                             };
                             *expr = Expr::Call(new_call);
                             *rewrites += 1;
+                            used_fns.insert(fn_name.clone());
                             return;
                         }
                     }
@@ -427,7 +538,7 @@ fn rewrite_expr(expr: &mut Expr, registry: &ExtensionRegistry, env: &Env, rewrit
         // Not an extension call — still descend into the callee so a
         // receiver buried inside a more complex call expression
         // (lambda, subscript, attribute chain) gets visited.
-        rewrite_expr(&mut call.func, registry, env, rewrites);
+        rewrite_expr(&mut call.func, registry, env, rewrites, used_fns);
         return;
     }
 
@@ -437,18 +548,18 @@ fn rewrite_expr(expr: &mut Expr, registry: &ExtensionRegistry, env: &Env, rewrit
     match expr {
         Expr::BoolOp(b) => {
             for v in &mut b.values {
-                rewrite_expr(v, registry, env, rewrites);
+                rewrite_expr(v, registry, env, rewrites, used_fns);
             }
         }
         Expr::Named(n) => {
-            rewrite_expr(&mut n.target, registry, env, rewrites);
-            rewrite_expr(&mut n.value, registry, env, rewrites);
+            rewrite_expr(&mut n.target, registry, env, rewrites, used_fns);
+            rewrite_expr(&mut n.value, registry, env, rewrites, used_fns);
         }
         Expr::BinOp(b) => {
-            rewrite_expr(&mut b.left, registry, env, rewrites);
-            rewrite_expr(&mut b.right, registry, env, rewrites);
+            rewrite_expr(&mut b.left, registry, env, rewrites, used_fns);
+            rewrite_expr(&mut b.right, registry, env, rewrites, used_fns);
         }
-        Expr::UnaryOp(u) => rewrite_expr(&mut u.operand, registry, env, rewrites),
+        Expr::UnaryOp(u) => rewrite_expr(&mut u.operand, registry, env, rewrites, used_fns),
         Expr::Lambda(l) => {
             // Lambda opens a fresh scope; its parameters can add to a
             // local env. Simpler approach: walk the body with an empty
@@ -469,103 +580,103 @@ fn rewrite_expr(expr: &mut Expr, registry: &ExtensionRegistry, env: &Env, rewrit
                     }
                 }
             }
-            rewrite_expr(&mut l.body, registry, &local, rewrites);
+            rewrite_expr(&mut l.body, registry, &local, rewrites, used_fns);
         }
         Expr::If(i) => {
-            rewrite_expr(&mut i.test, registry, env, rewrites);
-            rewrite_expr(&mut i.body, registry, env, rewrites);
-            rewrite_expr(&mut i.orelse, registry, env, rewrites);
+            rewrite_expr(&mut i.test, registry, env, rewrites, used_fns);
+            rewrite_expr(&mut i.body, registry, env, rewrites, used_fns);
+            rewrite_expr(&mut i.orelse, registry, env, rewrites, used_fns);
         }
         Expr::Dict(d) => {
             for item in &mut d.items {
                 if let Some(k) = item.key.as_mut() {
-                    rewrite_expr(k, registry, env, rewrites);
+                    rewrite_expr(k, registry, env, rewrites, used_fns);
                 }
-                rewrite_expr(&mut item.value, registry, env, rewrites);
+                rewrite_expr(&mut item.value, registry, env, rewrites, used_fns);
             }
         }
         Expr::Set(s) => {
             for e in &mut s.elts {
-                rewrite_expr(e, registry, env, rewrites);
+                rewrite_expr(e, registry, env, rewrites, used_fns);
             }
         }
         Expr::ListComp(lc) => {
-            rewrite_expr(&mut lc.elt, registry, env, rewrites);
+            rewrite_expr(&mut lc.elt, registry, env, rewrites, used_fns);
             for gen in &mut lc.generators {
-                rewrite_expr(&mut gen.iter, registry, env, rewrites);
+                rewrite_expr(&mut gen.iter, registry, env, rewrites, used_fns);
                 for f in &mut gen.ifs {
-                    rewrite_expr(f, registry, env, rewrites);
+                    rewrite_expr(f, registry, env, rewrites, used_fns);
                 }
             }
         }
         Expr::SetComp(c) => {
-            rewrite_expr(&mut c.elt, registry, env, rewrites);
+            rewrite_expr(&mut c.elt, registry, env, rewrites, used_fns);
             for gen in &mut c.generators {
-                rewrite_expr(&mut gen.iter, registry, env, rewrites);
+                rewrite_expr(&mut gen.iter, registry, env, rewrites, used_fns);
                 for f in &mut gen.ifs {
-                    rewrite_expr(f, registry, env, rewrites);
+                    rewrite_expr(f, registry, env, rewrites, used_fns);
                 }
             }
         }
         Expr::DictComp(c) => {
             if let Some(k) = c.key.as_mut() {
-                rewrite_expr(k, registry, env, rewrites);
+                rewrite_expr(k, registry, env, rewrites, used_fns);
             }
-            rewrite_expr(&mut c.value, registry, env, rewrites);
+            rewrite_expr(&mut c.value, registry, env, rewrites, used_fns);
             for gen in &mut c.generators {
-                rewrite_expr(&mut gen.iter, registry, env, rewrites);
+                rewrite_expr(&mut gen.iter, registry, env, rewrites, used_fns);
                 for f in &mut gen.ifs {
-                    rewrite_expr(f, registry, env, rewrites);
+                    rewrite_expr(f, registry, env, rewrites, used_fns);
                 }
             }
         }
         Expr::Generator(g) => {
-            rewrite_expr(&mut g.elt, registry, env, rewrites);
+            rewrite_expr(&mut g.elt, registry, env, rewrites, used_fns);
             for gen in &mut g.generators {
-                rewrite_expr(&mut gen.iter, registry, env, rewrites);
+                rewrite_expr(&mut gen.iter, registry, env, rewrites, used_fns);
                 for f in &mut gen.ifs {
-                    rewrite_expr(f, registry, env, rewrites);
+                    rewrite_expr(f, registry, env, rewrites, used_fns);
                 }
             }
         }
-        Expr::Await(a) => rewrite_expr(&mut a.value, registry, env, rewrites),
+        Expr::Await(a) => rewrite_expr(&mut a.value, registry, env, rewrites, used_fns),
         Expr::Yield(y) => {
             if let Some(v) = y.value.as_mut() {
-                rewrite_expr(v, registry, env, rewrites);
+                rewrite_expr(v, registry, env, rewrites, used_fns);
             }
         }
-        Expr::YieldFrom(y) => rewrite_expr(&mut y.value, registry, env, rewrites),
+        Expr::YieldFrom(y) => rewrite_expr(&mut y.value, registry, env, rewrites, used_fns),
         Expr::Compare(c) => {
-            rewrite_expr(&mut c.left, registry, env, rewrites);
+            rewrite_expr(&mut c.left, registry, env, rewrites, used_fns);
             for cmp in &mut c.comparators {
-                rewrite_expr(cmp, registry, env, rewrites);
+                rewrite_expr(cmp, registry, env, rewrites, used_fns);
             }
         }
-        Expr::Attribute(a) => rewrite_expr(&mut a.value, registry, env, rewrites),
+        Expr::Attribute(a) => rewrite_expr(&mut a.value, registry, env, rewrites, used_fns),
         Expr::Subscript(s) => {
-            rewrite_expr(&mut s.value, registry, env, rewrites);
-            rewrite_expr(&mut s.slice, registry, env, rewrites);
+            rewrite_expr(&mut s.value, registry, env, rewrites, used_fns);
+            rewrite_expr(&mut s.slice, registry, env, rewrites, used_fns);
         }
-        Expr::Starred(s) => rewrite_expr(&mut s.value, registry, env, rewrites),
+        Expr::Starred(s) => rewrite_expr(&mut s.value, registry, env, rewrites, used_fns),
         Expr::List(l) => {
             for e in &mut l.elts {
-                rewrite_expr(e, registry, env, rewrites);
+                rewrite_expr(e, registry, env, rewrites, used_fns);
             }
         }
         Expr::Tuple(t) => {
             for e in &mut t.elts {
-                rewrite_expr(e, registry, env, rewrites);
+                rewrite_expr(e, registry, env, rewrites, used_fns);
             }
         }
         Expr::Slice(s) => {
             if let Some(v) = s.lower.as_mut() {
-                rewrite_expr(v, registry, env, rewrites);
+                rewrite_expr(v, registry, env, rewrites, used_fns);
             }
             if let Some(v) = s.upper.as_mut() {
-                rewrite_expr(v, registry, env, rewrites);
+                rewrite_expr(v, registry, env, rewrites, used_fns);
             }
             if let Some(v) = s.step.as_mut() {
-                rewrite_expr(v, registry, env, rewrites);
+                rewrite_expr(v, registry, env, rewrites, used_fns);
             }
         }
         // Leaves and the previously-handled `Call` are no-ops here.
