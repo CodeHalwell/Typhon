@@ -33,7 +33,9 @@ pub struct SkillArgs {
     #[arg(long, short = 'd', value_name = "DIR", default_value = ".")]
     pub dir: PathBuf,
 
-    /// Overwrite files that already exist.
+    /// Overwrite an existing installed skill. Without it, the command refuses
+    /// when `.claude/skills/typhon/SKILL.md` already exists (so a customised
+    /// copy is never clobbered); with it, the whole tree is rewritten.
     #[arg(long)]
     pub force: bool,
 
@@ -156,4 +158,54 @@ fn run_skill(args: SkillArgs) -> Result<()> {
 
 fn write_file(dest: &Path, contents: &str) -> Result<()> {
     std::fs::write(dest, contents).map_err(|e| miette!("cannot write {}: {}", dest.display(), e))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(dir: &Path, force: bool, list: bool) -> SkillArgs {
+        SkillArgs {
+            dir: dir.to_path_buf(),
+            force,
+            list,
+        }
+    }
+
+    #[test]
+    fn list_does_not_touch_disk() {
+        let tmp = tempfile::tempdir().unwrap();
+        run_skill(args(tmp.path(), false, true)).unwrap();
+        assert!(!tmp.path().join(SKILL_SUBDIR).exists());
+    }
+
+    #[test]
+    fn install_writes_every_manifest_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        run_skill(args(tmp.path(), false, false)).unwrap();
+        let root = tmp.path().join(SKILL_SUBDIR);
+        for (rel, _) in SKILL_FILES {
+            assert!(root.join(rel).is_file(), "missing {rel}");
+        }
+    }
+
+    #[test]
+    fn refuses_to_overwrite_without_force() {
+        let tmp = tempfile::tempdir().unwrap();
+        run_skill(args(tmp.path(), false, false)).unwrap();
+        // A second install without --force must refuse via the sentinel guard.
+        assert!(run_skill(args(tmp.path(), false, false)).is_err());
+    }
+
+    #[test]
+    fn force_overwrites_existing_install() {
+        let tmp = tempfile::tempdir().unwrap();
+        run_skill(args(tmp.path(), false, false)).unwrap();
+        let sentinel = tmp.path().join(SKILL_SUBDIR).join("SKILL.md");
+        std::fs::write(&sentinel, "tampered").unwrap();
+        run_skill(args(tmp.path(), true, false)).unwrap();
+        let restored = std::fs::read_to_string(&sentinel).unwrap();
+        assert_ne!(restored, "tampered");
+        assert!(restored.contains("Typhon"));
+    }
 }

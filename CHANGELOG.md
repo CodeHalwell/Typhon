@@ -21,7 +21,7 @@ with the v0.14.1 → v0.15.2 surface.
   of 20 compile-clean example programs plus an index — into
   `.claude/skills/typhon/` of the current project.
 - **The skill is embedded in the `tyc` binary at build time** via
-  `include_str!` (manifest in `tyc/src/commands/install.rs`), so the command
+  `include_str!` (manifest in `tyc/crates/tyc/src/commands/install.rs`), so the command
   works from any directory with no network access and no dependency on the
   Typhon source checkout. `tyc --version` identifies which snapshot you get.
 - **Flags:** `--force` overwrites an existing copy (without it the command
