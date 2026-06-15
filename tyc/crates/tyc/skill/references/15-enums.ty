@@ -1,0 +1,61 @@
+# The `enum` keyword (v0.11.0) is sugar over `enum.Enum`, the same way
+# `model` is sugar over `pydantic.BaseModel`. Bare members auto-number
+# through `enum.auto()`; an explicit `MEMBER = value` is preserved and a
+# following bare member resumes numbering from the last value.
+
+
+enum Direction:
+    NORTH
+    EAST
+    SOUTH
+    WEST
+
+
+# Explicit values are kept verbatim. The bare `URGENT` after `HIGH = 30`
+# resumes auto-numbering at 31 — standard CPython `enum` semantics.
+enum Priority:
+    LOW = 10
+    MEDIUM = 20
+    HIGH = 30
+    URGENT
+
+
+def turn_right(d: Direction) -> Direction:
+    match d:
+        case Direction.NORTH: return Direction.EAST
+        case Direction.EAST:  return Direction.SOUTH
+        case Direction.SOUTH: return Direction.WEST
+        case Direction.WEST:  return Direction.NORTH
+    raise RuntimeError("unreachable")
+
+
+def sla_minutes(p: Priority) -> int:
+    # Enum members carry their `.value`; here we map priority to a
+    # response budget without re-stating the numbers.
+    match p:
+        case Priority.LOW:    return 24 * 60
+        case Priority.MEDIUM: return 4 * 60
+        case Priority.HIGH:   return 60
+        case Priority.URGENT: return 15
+    raise RuntimeError("unreachable")
+
+
+def main() -> None:
+    # Members repr as `Direction.NORTH` and iterate in declaration order.
+    mut facing: Direction = Direction.NORTH
+    mut steps: list[str] = []
+    for _ in range(4):
+        steps.append(facing.name)
+        facing = turn_right(facing)
+    print("clockwise: " + " -> ".join(steps))
+
+    for p in Priority:
+        print(f"{p.name} (value={p.value}) -> SLA {sla_minutes(p)} min")
+
+    # `.value` round-trips through the constructor: Priority(30) is HIGH.
+    let recovered: Priority = Priority(30)
+    print(f"Priority(30) is {recovered.name}")
+
+
+if __name__ == "__main__":
+    main()

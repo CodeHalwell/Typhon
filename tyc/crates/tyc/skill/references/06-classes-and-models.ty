@@ -1,0 +1,78 @@
+class User:
+    id: int
+    name: str
+    email: str
+
+
+impl User:
+    def display(self) -> str:
+        return f"{self.name} <{self.email}> (#{self.id})"
+
+    def domain(self) -> str:
+        return self.email.split("@")[1]
+
+
+class Point frozen:
+    x: float
+    y: float
+
+
+impl Point:
+    def distance_to(self, other: Point) -> float:
+        let dx: float = self.x - other.x
+        let dy: float = self.y - other.y
+        return (dx * dx + dy * dy) ** 0.5
+
+    def translated(self, dx: float, dy: float) -> Point:
+        return Point(x=self.x + dx, y=self.y + dy)
+
+
+class Cart:
+    items: list[str] = []   # mutable default — lifted to default_factory at desugar
+
+
+impl Cart:
+    @property
+    def size(self) -> int:
+        return len(self.items)
+
+    def add(self, item: str) -> None:
+        self.items.append(item)
+
+
+model ApiUser:
+    id: int
+    name: str
+    email: str
+    age: int? = None
+
+
+extend str:
+    def slug(self) -> str:
+        return self.lower().replace(" ", "-")
+
+
+def main() -> None:
+    let u: User = User(id=1, name="Ada Lovelace", email="ada@example.com")
+    print(u.display())
+    print(u.domain())
+
+    let origin: Point = Point(x=0.0, y=0.0)
+    let p: Point = Point(x=3.0, y=4.0)
+    print(f"distance: {p.distance_to(origin)}")
+    print(p.translated(1.0, 1.0))
+
+    let api: ApiUser = ApiUser(id=2, name="Grace Hopper", email="grace@example.com")
+    print(api)
+
+    let title: str = "The Quick Brown Fox"
+    print(title.slug())
+
+    let cart: Cart = Cart()
+    cart.add("apple")
+    cart.add("pear")
+    print(f"cart size: {cart.size}")    # @property — read like an attribute
+
+
+if __name__ == "__main__":
+    main()

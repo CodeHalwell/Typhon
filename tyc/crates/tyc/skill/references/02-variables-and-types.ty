@@ -1,0 +1,48 @@
+def demo_primitives() -> None:
+    let answer: int = 42
+    let pi: float = 3.14159
+    let greeting: str = "hi"
+    let active: bool = True
+    let nothing: str? = None
+
+    print(answer, pi, greeting, active, nothing)
+
+
+def demo_mutability() -> None:
+    let pi: float = 3.14159
+    mut counter: int = 0
+
+    counter = counter + 1
+    counter = counter * 2
+    print(f"pi={pi} counter={counter}")
+
+
+def demo_nullable() -> None:
+    let maybe_name: str? = lookup_name(1)
+    if maybe_name is None:
+        print("anonymous")
+        return
+    print(f"hi, {maybe_name}")
+
+
+def lookup_name(id: int) -> str?:
+    if id == 1:
+        return "Ada"
+    return None
+
+
+def demo_widening() -> None:
+    let n: int = 3
+    let x: float = n
+    print(f"{n} widened to {x}")
+
+
+def main() -> None:
+    demo_primitives()
+    demo_mutability()
+    demo_nullable()
+    demo_widening()
+
+
+if __name__ == "__main__":
+    main()

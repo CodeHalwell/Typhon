@@ -50,6 +50,9 @@ pub enum Commands {
     /// Scaffold a new Typhon project.
     Init(commands::init::InitArgs),
 
+    /// Install embedded tooling assets (e.g. the `typhon` Claude skill) into a project.
+    Install(commands::install::InstallArgs),
+
     /// Map a Python traceback back to Typhon source via `.py.map` files.
     Trace(commands::trace::TraceArgs),
 
@@ -101,6 +104,7 @@ pub fn run() -> Result<()> {
         Commands::Fmt(args) => commands::fmt::run(args),
         Commands::Lsp(args) => commands::lsp::run(args),
         Commands::Init(args) => commands::init::run(args),
+        Commands::Install(args) => commands::install::run(args),
         Commands::Trace(args) => commands::trace::run(args),
         Commands::Profile(args) => commands::profile::run(args),
         Commands::Migrate(args) => commands::migrate::run(args),

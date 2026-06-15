@@ -4,6 +4,56 @@ All notable changes to Typhon are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely; the
 canonical phase-by-phase status lives in `docs/roadmap.md`.
 
+## 0.15.3 — 2026-06-15 — `tyc install skill` + bundled-skill refresh
+
+A tooling release with no language, type-checker, VM, or emitted-runtime
+change. It ships the `typhon` Claude skill *inside the compiler* and adds a
+command to vendor it into any project, and brings the bundled skill current
+with the v0.14.1 → v0.15.2 surface.
+
+### Added — `tyc install skill`
+
+- **A new `tyc install` subcommand materialises embedded tooling assets into
+  a project; its first target is `skill`.** `tyc install skill` writes the
+  whole `typhon` Claude skill tree — `SKILL.md`, the seven sibling reference
+  docs (`REFERENCE.md`, `CLI.md`, `PITFALLS.md`, `DIAGNOSTICS.md`,
+  `COOKBOOK.md`, `RUNTIME.md`, `PACKAGING.md`), and a new `references/` folder
+  of 20 compile-clean example programs plus an index — into
+  `.claude/skills/typhon/` of the current project.
+- **The skill is embedded in the `tyc` binary at build time** via
+  `include_str!` (manifest in `tyc/crates/tyc/src/commands/install.rs`), so the command
+  works from any directory with no network access and no dependency on the
+  Typhon source checkout. `tyc --version` identifies which snapshot you get.
+- **Flags:** `--force` overwrites an existing copy (without it the command
+  refuses when `.claude/skills/typhon/SKILL.md` already exists, so a
+  customised copy is never clobbered); `--dir PATH` targets another project
+  root; `--list` prints the files that would be written and exits without
+  touching disk. Documented in `docs/cli.md` and the skill's own `CLI.md`.
+
+### Added — `references/` examples in the bundled skill
+
+- **20 curated, compile-clean single-file `.ty` programs** (one feature area
+  each, hello-world through `as!`/`try_result` boundary casts), lifted
+  verbatim from the `examples/` corpus, plus an index `README.md`. Each one
+  type-checks under `tyc check` on this release.
+
+### Changed — bundled skill brought current to v0.15.2
+
+- **The bundled skill was stale at v0.14.0 and mislabelled later features.**
+  The headline and additive-line range are updated to v0.15.2; phantom
+  version tags (`v0.14.5` / `.6` / `.7` — releases that never existed) are
+  corrected to **v0.15.0**, where `as!`-everywhere, `try_result`, and the
+  compiler-bundled `.dty` stubs actually landed. Release-highlights
+  subsections for v0.14.1 → v0.15.2 were added, and `tyc::gather_opportunity`,
+  the `async_without_await` async-contract exemption, and `try_result` are now
+  documented in the diagnostics and runtime references.
+
+### Notes
+
+- Full workspace suite green; `cargo fmt --check` and `cargo clippy` clean.
+  No `.ty` program changes behaviour — `tyc build` / `tyc run` output is
+  byte-for-byte unchanged from v0.15.2.
+
 ## 0.15.2 — 2026-06-14 — `as!` comment-awareness fix
 
 A bugfix release with no language or API surface change.

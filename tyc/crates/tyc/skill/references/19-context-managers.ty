@@ -1,0 +1,50 @@
+import time
+from contextlib import contextmanager
+from typing import Iterator
+
+
+@contextmanager
+def timed(label: str) -> Iterator[None]:
+    let start: float = time.perf_counter()
+    try:
+        yield None
+    finally:
+        let elapsed_ms: float = (time.perf_counter() - start) * 1000.0
+        print(f"[{label}] {elapsed_ms:.2f} ms")
+
+
+@contextmanager
+def indent_block(depth: int) -> Iterator[str]:
+    let prefix: str = "  " * depth
+    print(f"{prefix}<begin depth={depth}>")
+    try:
+        yield prefix
+    finally:
+        print(f"{prefix}<end>")
+
+
+def busy(n: int) -> int:
+    mut total: int = 0
+    for i in range(n):
+        total = total + i * i
+    return total
+
+
+def main() -> None:
+    with timed("small"):
+        let small_sum: int = busy(10_000)
+        print(f"  small_sum = {small_sum}")
+
+    with timed("large"):
+        let large_sum: int = busy(500_000)
+        print(f"  large_sum = {large_sum}")
+
+    with indent_block(0) as p:
+        print(f"{p}line A")
+        with indent_block(1) as p2:
+            print(f"{p2}line B")
+            print(f"{p2}line C")
+
+
+if __name__ == "__main__":
+    main()
