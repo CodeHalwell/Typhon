@@ -286,9 +286,7 @@ fn merge_cross_module_extensions_for_vm(
                         let sibling_path = src_root.join(format!("{name}.ty"));
                         if sibling_path.exists() {
                             if let Ok(text) = std::fs::read_to_string(&sibling_path) {
-                                merge_sibling_extensions(
-                                    &text, &name, registry, &mut cross_fns,
-                                );
+                                merge_sibling_extensions(&text, &name, registry, &mut cross_fns);
                             }
                         }
                     }

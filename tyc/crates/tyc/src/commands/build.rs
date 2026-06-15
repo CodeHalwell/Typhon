@@ -803,14 +803,11 @@ pub fn run(args: BuildArgs) -> Result<()> {
                 };
                 for (cls_name, shape) in &shapes.class_shapes {
                     if let Some(builtin) = cls_name.strip_prefix("__typhon_builtin_ext_") {
-                        let entry =
-                            builtin_ext_registry.entry(builtin.to_owned()).or_default();
+                        let entry = builtin_ext_registry.entry(builtin.to_owned()).or_default();
                         for method_name in shape.methods.keys() {
-                            let fn_name =
-                                format!("__typhon_ext_{builtin}__{method_name}");
+                            let fn_name = format!("__typhon_ext_{builtin}__{method_name}");
                             entry.entry(method_name.clone()).or_insert_with(|| {
-                                cross_module_fns
-                                    .insert(fn_name.clone(), mod_name.clone());
+                                cross_module_fns.insert(fn_name.clone(), mod_name.clone());
                                 fn_name
                             });
                         }
