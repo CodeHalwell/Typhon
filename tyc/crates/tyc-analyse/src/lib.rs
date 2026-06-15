@@ -73,8 +73,8 @@ pub use parallel::{rewrite_parallel_comprehensions, ParallelStats};
 
 pub mod extend_builtin;
 pub use extend_builtin::{
-    extract_builtin_extensions, rewrite_builtin_extension_calls, ExtensionExtractionStats,
-    ExtensionRegistry,
+    extract_builtin_extensions, rewrite_builtin_extension_calls,
+    rewrite_builtin_extension_calls_tracking, ExtensionExtractionStats, ExtensionRegistry,
 };
 
 // ── Shared editor / CLI lint advisories ───────────────────────────────────────

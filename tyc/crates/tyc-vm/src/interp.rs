@@ -80,6 +80,11 @@ pub struct Interpreter {
     /// and forced on demand when used mid-body (`force_alias`), mirroring
     /// the lazy evaluation CPython gives a `TypeAliasType`.
     pub unresolved_aliases: HashMap<String, Expr>,
+    /// Builtin extension registries from loaded sibling modules. Keyed by
+    /// module name, stores the `type → method → free_fn_name` registry so
+    /// that a consumer module can merge imported extensions into its own
+    /// rewrite pass. (#202)
+    pub builtin_ext_registries: HashMap<String, tyc_analyse::ExtensionRegistry>,
 }
 
 /// Upper bound on values an eagerly-evaluated generator may yield before the
@@ -157,6 +162,7 @@ impl Interpreter {
             method_stack: Vec::new(),
             active_exceptions: Vec::new(),
             unresolved_aliases: HashMap::new(),
+            builtin_ext_registries: HashMap::new(),
         };
         crate::builtins::install(&mut interp);
         interp
@@ -1080,6 +1086,10 @@ impl Interpreter {
         module = desugar_out.module;
         let (registry, _stats) = tyc_analyse::extract_builtin_extensions(&mut module);
         let _ = tyc_analyse::rewrite_builtin_extension_calls(&mut module, &registry);
+        // Store the extension registry for cross-module rewrite (#202).
+        if !registry.is_empty() {
+            self.builtin_ext_registries.insert(name.to_owned(), registry);
+        }
 
         // Evaluate the module body in a fresh child scope of root; copy
         // every named binding into a Module namespace so attribute

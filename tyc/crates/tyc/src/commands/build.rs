@@ -12,8 +12,9 @@ use miette::{miette, Result};
 use tyc_analyse::{
     analyse_purity, collect_gatherable_async_fn_names, detect_missed_gathers,
     evaluate_comptime_with_functions, extract_builtin_extensions, load_profile_samples,
-    pgo_memoise_targets, purity_diagnostics, rewrite_auto_gather, rewrite_builtin_extension_calls,
-    rewrite_parallel_comprehensions, substitute_comptime_literals, ProfileSample,
+    pgo_memoise_targets, purity_diagnostics, rewrite_auto_gather,
+    rewrite_builtin_extension_calls_tracking, rewrite_parallel_comprehensions,
+    substitute_comptime_literals, ProfileSample,
 };
 use tyc_db::{check_file_with_imports, extract_shapes_for_path, TycDatabase};
 use tyc_desugar::{desugar_module_with, DesugarOptions};
@@ -764,9 +765,52 @@ pub fn run(args: BuildArgs) -> Result<()> {
         // matching type annotation.  Receivers without a static annotation
         // fall through to native attribute access — matching Python's
         // existing semantics for missing methods.
-        let (builtin_ext_registry, _ext_stats) = extract_builtin_extensions(&mut module);
+        //
+        // Cross-module extensions (#202): also merge extension registries
+        // from imported modules so `title.slug()` in a consumer resolves
+        // when `extend str: def slug(...)` was declared in a dependency.
+        let (mut builtin_ext_registry, _ext_stats) = extract_builtin_extensions(&mut module);
+        // Build cross-module extension registry from all project modules.
+        // `fn_name → source_module` reverse map for import injection.
+        let mut cross_module_fns: HashMap<String, String> = HashMap::new();
+        for (mod_name, shapes) in project_shapes.as_ref() {
+            let dotted = crate::commands::util::path_to_dotted(path, src_root);
+            if *mod_name == dotted {
+                continue; // skip self
+            }
+            for (cls_name, shape) in &shapes.class_shapes {
+                if let Some(builtin) = cls_name.strip_prefix("__typhon_builtin_ext_") {
+                    let entry = builtin_ext_registry
+                        .entry(builtin.to_owned())
+                        .or_default();
+                    for method_name in shape.methods.keys() {
+                        let fn_name = format!("__typhon_ext_{builtin}__{method_name}");
+                        entry.entry(method_name.clone()).or_insert_with(|| {
+                            cross_module_fns.insert(fn_name.clone(), mod_name.clone());
+                            fn_name
+                        });
+                    }
+                }
+            }
+        }
         if !builtin_ext_registry.is_empty() {
-            let _ = rewrite_builtin_extension_calls(&mut module, &builtin_ext_registry);
+            let (_rewrites, used_fns) =
+                rewrite_builtin_extension_calls_tracking(&mut module, &builtin_ext_registry);
+            // Inject `from <module> import <fn_name>` for cross-module
+            // extension functions that were actually used. The injected
+            // import uses the dotted module name; `from X import *` won't
+            // carry `__`-prefixed names, so explicit import is required.
+            let cross_module_used: Vec<(String, String)> = used_fns
+                .iter()
+                .filter_map(|fn_name| {
+                    cross_module_fns
+                        .get(fn_name)
+                        .map(|mod_name| (mod_name.clone(), fn_name.clone()))
+                })
+                .collect();
+            if !cross_module_used.is_empty() {
+                inject_cross_module_ext_imports(&mut module, &cross_module_used);
+            }
         }
 
         // Phase 4 loop parallelisation: rewrite `[f(x) for x in xs]` runs
@@ -1136,6 +1180,78 @@ pub fn run(args: BuildArgs) -> Result<()> {
         )?;
     }
     Ok(())
+}
+
+/// Inject `from <module> import <fn_name>` statements at the top of
+/// `module` for cross-module builtin extension free functions that were
+/// referenced during the rewrite pass. The injected imports are placed
+/// after any existing imports at the top of the module body so they don't
+/// disrupt `__future__` imports or docstrings. (#202)
+fn inject_cross_module_ext_imports(
+    module: &mut ruff_python_ast::ModModule,
+    imports: &[(String, String)],
+) {
+    use ruff_python_ast::{
+        name::Name, AtomicNodeIndex, Identifier, Stmt, StmtImportFrom,
+    };
+    use ruff_text_size::TextRange;
+
+    // Group by module so we emit one `from M import a, b, c` per module.
+    let mut by_module: HashMap<String, Vec<String>> = HashMap::new();
+    for (mod_name, fn_name) in imports {
+        by_module
+            .entry(mod_name.clone())
+            .or_default()
+            .push(fn_name.clone());
+    }
+
+    let mut injected: Vec<Stmt> = Vec::new();
+    for (mod_name, fns) in &by_module {
+        let aliases: Vec<ruff_python_ast::Alias> = fns
+            .iter()
+            .map(|f| ruff_python_ast::Alias {
+                range: TextRange::default(),
+                node_index: AtomicNodeIndex::NONE,
+                name: Identifier {
+                    range: TextRange::default(),
+                    node_index: AtomicNodeIndex::NONE,
+                    id: Name::new(f),
+                },
+                asname: None,
+            })
+            .collect();
+        injected.push(Stmt::ImportFrom(StmtImportFrom {
+            range: TextRange::default(),
+            node_index: AtomicNodeIndex::NONE,
+            module: Some(Identifier {
+                range: TextRange::default(),
+                node_index: AtomicNodeIndex::NONE,
+                id: Name::new(mod_name),
+            }),
+            names: aliases,
+            level: 0,
+            is_lazy: false,
+        }));
+    }
+
+    // Insert after the last existing import at the top of the module,
+    // preserving the module's statement order.
+    let insert_pos = module
+        .body
+        .iter()
+        .position(|s| {
+            !matches!(
+                s,
+                Stmt::Import(_)
+                    | Stmt::ImportFrom(_)
+                    | Stmt::Expr(_) // docstrings
+            )
+        })
+        .unwrap_or(module.body.len());
+
+    for (i, stmt) in injected.into_iter().enumerate() {
+        module.body.insert(insert_pos + i, stmt);
+    }
 }
 
 /// Render `path` as a project-root-relative display string when possible,

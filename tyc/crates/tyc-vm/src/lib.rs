@@ -147,8 +147,29 @@ pub fn run_source(
     // type that the source extended with \`extend BUILTIN:\`. Without this
     // step, calls on extended built-ins fail at runtime with
     // \`AttributeError: 'str' object has no attribute 'slug'\`.
-    let (registry, _stats) = tyc_analyse::extract_builtin_extensions(&mut module);
-    let _ = tyc_analyse::rewrite_builtin_extension_calls(&mut module, &registry);
+    //
+    // Cross-module extensions (#202): pre-scan the entry module's import
+    // statements, peek at sibling `.ty` files to extract their extension
+    // registries, and merge them into the local rewrite pass. The merged
+    // free-fn calls resolve at runtime because the sibling module's
+    // namespace (which contains the lifted `__typhon_ext_*` functions) is
+    // loaded on demand by the VM's import machinery.
+    let (mut registry, _stats) = tyc_analyse::extract_builtin_extensions(&mut module);
+    // Pre-scan sibling modules for cross-module builtin extensions.
+    if let Some(src_root) = origin.and_then(|p| p.parent()) {
+        let cross_module_fns = merge_cross_module_extensions_for_vm(
+            &module, src_root, &mut registry,
+        );
+        let _ = tyc_analyse::rewrite_builtin_extension_calls(&mut module, &registry);
+        // Inject explicit imports for cross-module extension functions
+        // that were used. In the VM, these resolve to the sibling module's
+        // lifted free functions when the module is loaded.
+        if !cross_module_fns.is_empty() {
+            inject_vm_cross_module_ext_imports(&mut module, &cross_module_fns, src_root);
+        }
+    } else {
+        let _ = tyc_analyse::rewrite_builtin_extension_calls(&mut module, &registry);
+    }
 
     let mut interp = Interpreter::new();
     // Source info for traceback frames: file name + line table over the
@@ -225,6 +246,143 @@ pub fn run_source(
         Err(Unwind::Break | Unwind::Continue | Unwind::QuestionMark(_)) => {
             Err(VmError::runtime("unexpected control-flow at module level"))
         }
+    }
+}
+
+/// Pre-scan sibling `.ty` files referenced by the entry module's imports,
+/// extract their builtin extension registries, and merge them into `registry`.
+/// Returns a map of `fn_name → sibling_module_stem` for functions that were
+/// added from cross-module sources, so the caller can inject explicit imports.
+fn merge_cross_module_extensions_for_vm(
+    module: &ruff_python_ast::ModModule,
+    src_root: &Path,
+    registry: &mut tyc_analyse::ExtensionRegistry,
+) -> std::collections::HashMap<String, String> {
+    use ruff_python_ast::Stmt;
+    use std::collections::HashMap;
+
+    let mut cross_fns: HashMap<String, String> = HashMap::new();
+    // Collect unique module names from import statements.
+    let mut seen_modules: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for stmt in &module.body {
+        let mod_name = match stmt {
+            Stmt::ImportFrom(i) => i.module.as_ref().map(|m| m.id.to_string()),
+            Stmt::Import(i) => i.names.first().map(|a| a.name.id.to_string()),
+            _ => None,
+        };
+        if let Some(name) = mod_name {
+            // Only consider sibling modules (single segment, no dots).
+            if !name.contains('.') && seen_modules.insert(name.clone()) {
+                let sibling_path = src_root.join(format!("{name}.ty"));
+                if sibling_path.exists() {
+                    if let Ok(text) = std::fs::read_to_string(&sibling_path) {
+                        merge_sibling_extensions(&text, &name, registry, &mut cross_fns);
+                    }
+                }
+            }
+        }
+    }
+    cross_fns
+}
+
+/// Parse a sibling `.ty` source just enough to extract builtin extension
+/// sentinel classes and merge their methods into `registry`.
+fn merge_sibling_extensions(
+    source: &str,
+    module_name: &str,
+    registry: &mut tyc_analyse::ExtensionRegistry,
+    cross_fns: &mut std::collections::HashMap<String, String>,
+) {
+    let expanded = preprocess::expand_question_ops(&preprocess::expand_pipes(
+        &preprocess::expand_with_chains(&preprocess::expand_go_calls(
+            &preprocess::expand_gather_blocks(&preprocess::expand_multiline_guards(
+                &preprocess::expand_typed_let_unpack(&preprocess::expand_lazy_lets(source)),
+            )),
+        )),
+    ));
+    let prep = preprocess::preprocess(&expanded);
+    let Ok(parsed) = tyc_syntax::parse_module(&prep.python_source) else {
+        return;
+    };
+    let mut sibling_module = parsed.into_syntax();
+    let (sibling_registry, _) = tyc_analyse::extract_builtin_extensions(&mut sibling_module);
+    for (builtin_type, methods) in &sibling_registry {
+        let entry = registry.entry(builtin_type.clone()).or_default();
+        for (method_name, fn_name) in methods {
+            entry.entry(method_name.clone()).or_insert_with(|| {
+                cross_fns.insert(fn_name.clone(), module_name.to_owned());
+                fn_name.clone()
+            });
+        }
+    }
+}
+
+/// Inject `from <module> import <fn_name>` AST nodes into `module` for
+/// cross-module extension functions. This allows the VM to resolve the
+/// lifted free functions during execution.
+fn inject_vm_cross_module_ext_imports(
+    module: &mut ruff_python_ast::ModModule,
+    cross_fns: &std::collections::HashMap<String, String>,
+    _src_root: &Path,
+) {
+    use ruff_python_ast::{
+        name::Name, AtomicNodeIndex, Identifier, Stmt, StmtImportFrom,
+    };
+    use ruff_text_size::TextRange;
+    use std::collections::HashMap;
+
+    // Group by module.
+    let mut by_module: HashMap<String, Vec<String>> = HashMap::new();
+    for (fn_name, mod_name) in cross_fns {
+        by_module
+            .entry(mod_name.clone())
+            .or_default()
+            .push(fn_name.clone());
+    }
+
+    let mut injected: Vec<Stmt> = Vec::new();
+    for (mod_name, fns) in &by_module {
+        let aliases: Vec<ruff_python_ast::Alias> = fns
+            .iter()
+            .map(|f| ruff_python_ast::Alias {
+                range: TextRange::default(),
+                node_index: AtomicNodeIndex::NONE,
+                name: Identifier {
+                    range: TextRange::default(),
+                    node_index: AtomicNodeIndex::NONE,
+                    id: Name::new(f),
+                },
+                asname: None,
+            })
+            .collect();
+        injected.push(Stmt::ImportFrom(StmtImportFrom {
+            range: TextRange::default(),
+            node_index: AtomicNodeIndex::NONE,
+            module: Some(Identifier {
+                range: TextRange::default(),
+                node_index: AtomicNodeIndex::NONE,
+                id: Name::new(mod_name),
+            }),
+            names: aliases,
+            level: 0,
+            is_lazy: false,
+        }));
+    }
+
+    // Insert after existing imports.
+    let insert_pos = module
+        .body
+        .iter()
+        .position(|s| {
+            !matches!(
+                s,
+                Stmt::Import(_) | Stmt::ImportFrom(_) | Stmt::Expr(_)
+            )
+        })
+        .unwrap_or(module.body.len());
+
+    for (i, stmt) in injected.into_iter().enumerate() {
+        module.body.insert(insert_pos + i, stmt);
     }
 }
 

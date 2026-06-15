@@ -662,6 +662,96 @@ fn build_rewrites_str_extension_call_site() {
     }
 }
 
+#[test]
+fn build_cross_module_extend_str_rewrites_consumer_call_site() {
+    // Reproducer for #202: `extend str:` in a dependency module should
+    // be visible to a consumer module's call site.
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(
+        tmp.path().join("typhon.toml"),
+        "[project]\nname=\"ext\"\nversion=\"0.1.0\"\nsrc=\"src\"\nout=\"build\"\n\
+         [python]\ntarget=\"3.13\"\n[emit]\nformat=false\n[strictness]\n[env]\n",
+    )
+    .unwrap();
+    // The provider module declares the extension.
+    std::fs::write(
+        src.join("textutil.ty"),
+        "extend str:\n    def slug(self) -> str:\n        return self.lower().replace(\" \", \"-\")\n",
+    )
+    .unwrap();
+    // The consumer module imports from the provider and uses the method.
+    std::fs::write(
+        src.join("main.ty"),
+        "from textutil import *\n\n\
+         let title: str = \"Hello World\"\n\
+         let s: str = title.slug()\n\
+         print(s)\n",
+    )
+    .unwrap();
+
+    build(tmp.path());
+    let py = std::fs::read_to_string(tmp.path().join("build").join("main.py")).unwrap();
+    // The consumer's call site must be rewritten to the free-function form.
+    assert!(
+        py.contains("__typhon_ext_str__slug(title)"),
+        "cross-module extension call site must be rewritten; got:\n{py}"
+    );
+    // An explicit import for the free function must be injected.
+    assert!(
+        py.contains("from textutil import __typhon_ext_str__slug"),
+        "cross-module extension must inject import; got:\n{py}"
+    );
+    // Runtime: the emitted Python must actually work.
+    if let Some(out) = run_main(tmp.path()) {
+        assert_eq!(out.trim(), "hello-world");
+    }
+}
+
+#[test]
+fn check_cross_module_extend_str_no_attribute_not_found() {
+    // Verify that `tyc check` does NOT fire `attribute_not_found` for a
+    // cross-module builtin extension method.
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(
+        tmp.path().join("typhon.toml"),
+        "[project]\nname=\"ext\"\nversion=\"0.1.0\"\nsrc=\"src\"\nout=\"build\"\n\
+         [python]\ntarget=\"3.13\"\n[emit]\nformat=false\n[strictness]\n[env]\n",
+    )
+    .unwrap();
+    std::fs::write(
+        src.join("textutil.ty"),
+        "extend str:\n    def slug(self) -> str:\n        return self.lower().replace(\" \", \"-\")\n",
+    )
+    .unwrap();
+    std::fs::write(
+        src.join("main.ty"),
+        "from textutil import *\n\n\
+         let title: str = \"Hello World\"\n\
+         let s: str = title.slug()\n\
+         print(s)\n",
+    )
+    .unwrap();
+
+    let out = tyc()
+        .arg("check")
+        .arg(tmp.path().join("src"))
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("attribute_not_found"),
+        "cross-module builtin extension must NOT trigger attribute_not_found; stderr:\n{stderr}"
+    );
+    assert!(
+        out.status.success(),
+        "tyc check should pass for cross-module extension; stderr:\n{stderr}"
+    );
+}
+
 // ── auto-parallel comprehensions ────────────────────────────────────────────
 
 #[test]

@@ -958,6 +958,20 @@ fn build_external_shapes(
         for frozen_name in &module_shapes.frozen_classes {
             external.frozen_classes.insert(frozen_name.clone());
         }
+        // Carry `__typhon_builtin_ext_*` sentinel class shapes from the
+        // imported module so the consumer's type checker recognises
+        // cross-module builtin extension methods via
+        // `is_user_builtin_extension`. Without this, `title.slug()` in
+        // a consumer that imported a module declaring `extend str: def
+        // slug(...)` would fire `tyc::attribute_not_found`. (#202)
+        for (cls_name, shape) in &module_shapes.class_shapes {
+            if cls_name.starts_with("__typhon_builtin_ext_") {
+                external
+                    .class_shapes
+                    .entry(cls_name.clone())
+                    .or_insert_with(|| shape.clone());
+            }
+        }
     }
     // Bare module imports (`import models`, then `models.AttributedSpend`)
     // produce bindings with no `member`, so the per-binding loop above
