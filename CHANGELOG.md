@@ -4,6 +4,66 @@ All notable changes to Typhon are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely; the
 canonical phase-by-phase status lives in `docs/roadmap.md`.
 
+## 0.15.4 — 2026-06-15 — cross-module interface conformance + `pub comptime let`
+
+A bugfix release driven by a field report from building a layered FastAPI-style
+app. It closes the cross-module structural-conformance gap the reviewer called
+"the single biggest gap", fixes a `pub` modifier-stacking parse error, and
+documents the module-local scope of `extend BUILTIN:`. Additive — every
+previously-accepted program still type-checks identically, and `tyc build` /
+`tyc run` output is byte-for-byte unchanged.
+
+### Fixed — cross-module structural interface conformance
+
+- **A concrete class that reaches a consumer module only *indirectly* now
+  satisfies its interface.** When you "depend on abstractions across your
+  package" you import the interface and a provider, never the concrete — so the
+  concrete arrives as an imported provider's return type (`let r: Repo =
+  get_repo()`) or behind a module-qualified annotation (`import m; r:
+  m.Repo`), and was never seeded into the consumer's local `class_shapes`.
+  Structural conformance then saw zero members and wrongly fired
+  `tyc::interface_not_conforming` ("all members missing"), while the qualified
+  form fell through to a nominal `tyc::type_mismatch`. The checker now resolves
+  a class/interface shape through the project-wide module registry
+  (`resolve_class_shape` / `interface_shape_for`) when it isn't locally seeded,
+  so cross-module conformance matches same-module behaviour. Both the bare and
+  the `mod.Iface`-qualified forms are recognised. (`tyc-types`.)
+- **Soundness preserved:** the registry fallback genuinely checks members — a
+  *non*-conforming concrete reached the same way still fires
+  `tyc::interface_not_conforming`. Three regression tests cover the conforming
+  bare path, the qualified path, and the non-conforming guard.
+
+### Fixed — `pub comptime let` / `pub comptime def` parse error
+
+- **`pub` now stacks with `comptime`.** The docs promise `pub` combines with
+  every modifier, but `strip_pub_prefixes` didn't recognise the `comptime`
+  forms, so the leading `pub ` survived, the comptime handler (which matches a
+  line-start `comptime `) never fired, and the Python parser rejected
+  `pub comptime let PORT: int = …`. `pub_decl_name` now recognises
+  `comptime let` / `comptime mut` / `comptime def`, so the public name lands in
+  `__all__` and the binding still inlines to a literal at build time.
+  (`tyc-syntax`.) `pub lazy let` stays a clean parse error for now — its
+  lowering runs in a separate text pass that would silently drop the laziness
+  under a `pub ` prefix, so it is intentionally left unsupported rather than
+  half-working.
+
+### Documented — `extend BUILTIN:` is module-local
+
+- **Clarified that a built-in extension only rewrites call sites inside its
+  declaring module.** Unlike `extend ClassName:` (which merges into a user
+  class and crosses module boundaries), `extend str:` is a purely static
+  call-site rewrite keyed off the local block — importing the module does not
+  carry the extension, so `title.slug()` in a consumer fires
+  `tyc::attribute_not_found` on `str`. The guide, the bundled skill, and this
+  changelog now spell this out and point at the free-function workaround
+  (`pub def to_slug(s: str) -> str: …`, imported by name). No code change.
+
+### Notes
+
+- Full workspace suite green; new regression tests in `tyc-syntax`
+  (`pub comptime let`) and `tyc-types` (cross-module conformance). No `.ty`
+  program changes behaviour.
+
 ## 0.15.3 — 2026-06-15 — `tyc install skill` + bundled-skill refresh
 
 A tooling release with no language, type-checker, VM, or emitted-runtime

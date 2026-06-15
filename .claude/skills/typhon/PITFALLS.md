@@ -4,7 +4,7 @@ The errors and surprises that bite people who try to write Typhon as if it were 
 
 For each entry: **trigger → diagnostic → fix**.
 
-Current release: **v0.15.3**. Pitfalls tagged with a version annotation landed in that release. Pitfalls 61–75 are the v0.9.0 cleanup additions covering the daily-driver VM, type-checker covariance and narrowing gaps, and multi-file project support; pitfalls 76+ cover the v0.10.0–v0.12.0 VM-completeness, `enum`, and third-party-type-checking surface; pitfalls 81–82 cover the v0.14.0 `as!` checked boundary cast.
+Current release: **v0.15.4**. Pitfalls tagged with a version annotation landed in that release. Pitfalls 61–75 are the v0.9.0 cleanup additions covering the daily-driver VM, type-checker covariance and narrowing gaps, and multi-file project support; pitfalls 76+ cover the v0.10.0–v0.12.0 VM-completeness, `enum`, and third-party-type-checking surface; pitfalls 81–82 cover the v0.14.0 `as!` checked boundary cast.
 
 ---
 
