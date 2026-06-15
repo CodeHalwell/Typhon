@@ -2766,8 +2766,12 @@ impl<'a> Checker<'a> {
             if let Some(variants) = self.sealed_unions.get(exp_name.as_str()) {
                 return variants.iter().any(|v| v == act_name);
             }
-            // Structural: actual conforms to expected interface?
-            if self.interfaces.contains_key(exp_name.as_str())
+            // Structural: actual conforms to expected interface? Recognise
+            // the interface locally OR through the project-wide registry
+            // (incl. the module-qualified `repo.Iface` annotation form) so
+            // cross-module conformance doesn't fall through to a nominal
+            // `type_mismatch`.
+            if self.is_interface_name(exp_name.as_str())
                 && self.class_conforms_to_interface(act_name, exp_name)
             {
                 return true;
@@ -2776,7 +2780,7 @@ impl<'a> Checker<'a> {
             // Interfaces are structural-only: a class that merely lists an
             // interface as a base without implementing its members must not
             // satisfy the interface contract.
-            if !self.interfaces.contains_key(exp_name.as_str())
+            if !self.is_interface_name(exp_name.as_str())
                 && self.class_inherits_from(act_name, exp_name)
             {
                 return true;
@@ -2791,7 +2795,7 @@ impl<'a> Checker<'a> {
         // precedent as the parametric sealed-union arm below.
         match (expected, actual) {
             (Type::Generic(exp_name, exp_args), Type::Generic(act_name, act_args)) => {
-                if self.interfaces.contains_key(exp_name.as_str())
+                if self.is_interface_name(exp_name.as_str())
                     && self.class_conforms_to_interface(act_name, exp_name)
                     && exp_args.len() == act_args.len()
                     && exp_args
@@ -2804,7 +2808,7 @@ impl<'a> Checker<'a> {
             }
             (Type::Generic(exp_name, _), Type::Class(act_name))
             | (Type::Class(exp_name), Type::Generic(act_name, _)) => {
-                if self.interfaces.contains_key(exp_name.as_str())
+                if self.is_interface_name(exp_name.as_str())
                     && self.class_conforms_to_interface(act_name, exp_name)
                 {
                     return true;
@@ -2845,8 +2849,8 @@ impl<'a> Checker<'a> {
         // for the builtins (which would conflict with their generic head).
         // O16 / FINDINGS #112.
         if let Type::Class(exp_name) = expected {
-            if let Some(iface) = self.interfaces.get(exp_name.as_str()) {
-                if builtin_satisfies_interface(actual, &iface.shape) {
+            if let Some(iface_shape) = self.interface_shape_for(exp_name.as_str()) {
+                if builtin_satisfies_interface(actual, iface_shape) {
                     return true;
                 }
             }
@@ -3070,16 +3074,36 @@ impl<'a> Checker<'a> {
     /// hierarchy-aware `find_method` / `find_field` lookups so that methods
     /// and fields contributed by a base class count toward conformance.
     fn class_conforms_to_interface(&self, cls_name: &str, iface_name: &str) -> bool {
-        let Some(iface) = self.interfaces.get(iface_name) else {
+        // Resolve the interface shape locally or through the project-wide
+        // registry (handles the module-qualified `repo.TaskRepository`
+        // form, which `self.interfaces` never keys).
+        let Some(iface_shape) = self.interface_shape_for(iface_name) else {
             return false;
         };
-        // Verify the class exists (it may not be in class_shapes if it was
-        // never collected — treat that as non-conforming).
-        if !self.class_shapes.contains_key(cls_name) {
+        // Verify the class exists — locally, or reachable through the
+        // registry (the "depend on abstractions" path, where the concrete
+        // is never imported by name). Absent everywhere → non-conforming.
+        if self.resolve_class_shape(cls_name).is_none() {
             return false;
         }
-        let iface_class_type = Type::Class(iface_name.to_owned());
-        for (m, iface_sig) in &iface.shape.methods {
+        // A self-referential interface method (`def next(self) -> Node`)
+        // must skip the return/param compatibility check to avoid infinite
+        // recursion. The published shape names the interface bare, so match
+        // both the given name and its bare last segment (the qualified form
+        // `repo.Node` and the bare `Node` both denote the same interface).
+        let iface_bare = iface_name.rsplit_once('.').map_or(iface_name, |(_, b)| b);
+        // Match both the plain and the *generic* self-reference (`-> Node`
+        // and `-> Node[T]`) so a generic self-referential interface doesn't
+        // bypass the carve-out and recurse without bound.
+        let is_self_ref = |t: &Type| {
+            let n = match t {
+                Type::Class(name) => name,
+                Type::Generic(name, _) => name,
+                _ => return false,
+            };
+            n == iface_name || n == iface_bare
+        };
+        for (m, iface_sig) in &iface_shape.methods {
             match self.find_method(cls_name, m) {
                 Some(cls_sig) if cls_sig.arity == iface_sig.arity => {
                     // Both return types must be known to enforce compatibility.
@@ -3090,7 +3114,7 @@ impl<'a> Checker<'a> {
                     // self-referential interfaces (e.g. `def next(self) -> Node`).
                     if iface_sig.return_type != Type::Unknown
                         && cls_sig.return_type != Type::Unknown
-                        && iface_sig.return_type != iface_class_type
+                        && !is_self_ref(&iface_sig.return_type)
                         && !self.is_assignable(&iface_sig.return_type, &cls_sig.return_type)
                     {
                         return false;
@@ -3110,7 +3134,7 @@ impl<'a> Checker<'a> {
                         if matches!(ip, Type::Unknown) || matches!(cp, Type::Unknown) {
                             continue;
                         }
-                        if *ip == iface_class_type {
+                        if is_self_ref(ip) {
                             continue;
                         }
                         if !self.is_assignable(cp, ip) {
@@ -3121,7 +3145,7 @@ impl<'a> Checker<'a> {
                 _ => return false,
             }
         }
-        for (f, iface_type) in &iface.shape.fields {
+        for (f, iface_type) in &iface_shape.fields {
             match self.find_field(cls_name, f) {
                 Some(cls_type) if self.is_assignable(iface_type, cls_type) => {}
                 Some(_) => return false, // field present but wrong type
@@ -3204,58 +3228,182 @@ impl<'a> Checker<'a> {
         false
     }
 
+    /// Resolve a class/interface shape by name, falling back to the
+    /// project-wide [`module_registry`] when the name isn't locally seeded.
+    ///
+    /// `self.class_shapes` only holds classes declared in *this* module or
+    /// imported into it *by name*. A class that reaches this module only
+    /// indirectly — e.g. as the return type of an imported provider
+    /// function (`let r: Repo = get_repo()` where `get_repo() ->
+    /// InMemoryRepo` and `InMemoryRepo` is never imported) — is absent from
+    /// `class_shapes` even though its full shape (with merged `impl`-block
+    /// methods) is published in the registry. Without this fallback,
+    /// structural interface conformance against such a class sees zero
+    /// members and wrongly fires `tyc::interface_not_conforming`, breaking
+    /// the "depend on abstractions across your package" pattern (you import
+    /// the interface + provider, never the concrete).
+    ///
+    /// Handles both bare names (`InMemoryRepo`) and the module-qualified
+    /// form (`repo.InMemoryRepo`) produced by `import repo;
+    /// repo.InMemoryRepo` — including an aliased prefix (`import repo as r;
+    /// r.InMemoryRepo`), which is canonicalised through the env's
+    /// `Type::Module` bindings before the registry lookup. Local shapes
+    /// always win; the bare-name registry scan walks the modules in sorted
+    /// key order so resolution is deterministic when two modules happen to
+    /// declare the same class name (a local hit already short-circuited).
+    fn resolve_class_shape(&self, name: &str) -> Option<&InterfaceShape> {
+        if let Some(shape) = self.class_shapes.get(name) {
+            return Some(shape);
+        }
+        if name.contains('.') {
+            // Qualified `mod.Class` (possibly aliased). Canonicalise the
+            // module prefix, then target that module directly. A dotted name
+            // that doesn't resolve to a known module is not a project class.
+            let canonical = self.canonicalize_module_aliases(&Type::Class(name.to_owned()));
+            if let Type::Class(cname) = &canonical {
+                if let Some((module, bare)) = cname.rsplit_once('.') {
+                    if let Some(ms) = self.module_registry.get(module) {
+                        return ms.class_shapes.get(bare);
+                    }
+                }
+            }
+            return None;
+        }
+        // Bare name reachable only via the registry (e.g. an imported
+        // provider's return type whose class wasn't imported by name).
+        // Sort the keys so a same-name collision resolves deterministically
+        // rather than by `HashMap` iteration order.
+        let mut modules: Vec<&String> = self.module_registry.keys().collect();
+        modules.sort_unstable();
+        modules.into_iter().find_map(|m| {
+            self.module_registry
+                .get(m)
+                .and_then(|ms| ms.class_shapes.get(name))
+        })
+    }
+
+    /// Resolve the member shape of an *interface* by name, falling back to
+    /// the project-wide registry. Mirrors [`resolve_class_shape`] but only
+    /// returns a shape when the name is actually Protocol-shaped (an
+    /// `interface`), so a nominal class is never mistaken for one.
+    ///
+    /// Fixes the module-qualified annotation case (`import repo; def
+    /// f(r: repo.TaskRepository)`, and the aliased `import repo as r; r:
+    /// r.TaskRepository`): the annotation types as
+    /// `Type::Class("repo.TaskRepository")`, which `self.interfaces` (keyed
+    /// by bare local import name) never contains — so conformance was never
+    /// attempted and the concrete fell through to a nominal
+    /// `tyc::type_mismatch`. The aliased prefix is canonicalised via the
+    /// env's `Type::Module` bindings, and the bare-name registry scan is
+    /// sorted for deterministic resolution.
+    fn interface_shape_for(&self, name: &str) -> Option<&InterfaceShape> {
+        if let Some(decl) = self.interfaces.get(name) {
+            return Some(&decl.shape);
+        }
+        // A locally-declared class that is NOT registered as an interface
+        // is definitively nominal — don't let a same-named interface in
+        // another module reclassify it as structural.
+        if self.class_shapes.contains_key(name) {
+            return None;
+        }
+        if name.contains('.') {
+            let canonical = self.canonicalize_module_aliases(&Type::Class(name.to_owned()));
+            if let Type::Class(cname) = &canonical {
+                if let Some((module, bare)) = cname.rsplit_once('.') {
+                    if let Some(ms) = self.module_registry.get(module) {
+                        return ms
+                            .interfaces
+                            .contains_key(bare)
+                            .then(|| ms.class_shapes.get(bare))
+                            .flatten();
+                    }
+                }
+            }
+            return None;
+        }
+        let mut modules: Vec<&String> = self.module_registry.keys().collect();
+        modules.sort_unstable();
+        modules.into_iter().find_map(|m| {
+            let ms = self.module_registry.get(m)?;
+            ms.interfaces
+                .contains_key(name)
+                .then(|| ms.class_shapes.get(name))
+                .flatten()
+        })
+    }
+
+    /// `true` when `name` refers to a structural interface, resolvable
+    /// locally or through the registry (including the qualified form). Used
+    /// by [`is_assignable`] to decide whether to attempt structural
+    /// conformance instead of falling back to a nominal comparison.
+    fn is_interface_name(&self, name: &str) -> bool {
+        self.interface_shape_for(name).is_some()
+    }
+
     /// Look up a method by name in `cls_name`'s hierarchy.  Walks `class_parents`
-    /// depth-first so methods inherited from a base class are found even when not
-    /// directly declared on the queried class.  Returns the first matching
-    /// [`MethodSig`] found, or `None` when no class in the hierarchy defines it.
+    /// (and the resolved shape's `bases`) depth-first so methods inherited from a
+    /// base class are found even when not directly declared on the queried class.
+    /// Resolution goes through [`resolve_class_shape`], so a class reachable only
+    /// via the project-wide registry (not imported by name) still surfaces its
+    /// methods.  Returns the first matching [`MethodSig`] found, or `None` when no
+    /// class in the hierarchy defines it.
     fn find_method<'b>(&'b self, cls_name: &str, method_name: &str) -> Option<&'b MethodSig> {
-        let mut stack: Vec<&str> = vec![cls_name];
-        let mut visited: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        let mut stack: Vec<String> = vec![cls_name.to_owned()];
+        let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
         while let Some(name) = stack.pop() {
-            if !visited.insert(name) {
+            if visited.contains(&name) {
                 continue;
             }
-            if let Some(shape) = self.class_shapes.get(name) {
+            if let Some(shape) = self.resolve_class_shape(&name) {
                 if let Some(sig) = shape.methods.get(method_name) {
                     return Some(sig);
                 }
+                stack.extend(shape.bases.iter().cloned());
             }
-            if let Some(parents) = self.class_parents.get(name) {
-                stack.extend(parents.iter().map(String::as_str));
+            if let Some(parents) = self.class_parents.get(&name) {
+                stack.extend(parents.iter().cloned());
             }
+            // Mark visited last so `name` is consumed instead of cloned.
+            visited.insert(name);
         }
         None
     }
 
     /// Look up a field by name in `cls_name`'s hierarchy.  Walks `class_parents`
-    /// depth-first so fields inherited from a base class are found even when not
-    /// directly declared on the queried class.  Returns the first matching
-    /// field type found, or `None` when no class in the hierarchy defines it.
+    /// and the resolved shape's `bases` depth-first so fields inherited from a
+    /// base class are found even when not directly declared on the queried class.
+    /// Resolution goes through [`resolve_class_shape`], so a class reachable only
+    /// via the project-wide registry (not imported by name) still surfaces its
+    /// fields.  Returns the first matching field type found, or `None` when no
+    /// class in the hierarchy defines it.
     fn find_field<'b>(&'b self, cls_name: &str, field_name: &str) -> Option<&'b Type> {
         // Shared `Unknown` so `self`-assigned attributes (which carry no
         // declared type) can be returned by reference.
         static UNKNOWN: Type = Type::Unknown;
-        let mut stack: Vec<&str> = vec![cls_name];
-        let mut visited: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        let mut stack: Vec<String> = vec![cls_name.to_owned()];
+        let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
         while let Some(name) = stack.pop() {
-            if !visited.insert(name) {
+            if visited.contains(&name) {
                 continue;
             }
-            if let Some(shape) = self.class_shapes.get(name) {
+            if let Some(shape) = self.resolve_class_shape(&name) {
                 if let Some(ty) = shape.fields.get(field_name) {
                     return Some(ty);
                 }
+                stack.extend(shape.bases.iter().cloned());
             }
             // Attributes assigned via `self.NAME = ...` in a method body
             // resolve as instance attributes (typed `Unknown`).
-            if let Some(attrs) = self.self_attrs.get(name) {
+            if let Some(attrs) = self.self_attrs.get(&name) {
                 if attrs.contains(field_name) {
                     return Some(&UNKNOWN);
                 }
             }
-            if let Some(parents) = self.class_parents.get(name) {
-                stack.extend(parents.iter().map(String::as_str));
+            if let Some(parents) = self.class_parents.get(&name) {
+                stack.extend(parents.iter().cloned());
             }
+            // Mark visited last so `name` is consumed instead of cloned.
+            visited.insert(name);
         }
         None
     }
@@ -22239,6 +22387,327 @@ def label(p: Point) -> float:
                 .any(|e| e.to_string().contains("totally_bogus_attr")),
             "must still flag bogus attr on a fully-known cross-module class; got: {:?}",
             d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    // ── Cross-module interface conformance (the "depend on abstractions"
+    //    gap) ─────────────────────────────────────────────────────────────────
+    //
+    // A concrete class that reaches the consumer module only *indirectly*
+    // (as an imported provider's return type, or behind a module-qualified
+    // annotation) was never seeded into `external.class_shapes`, so
+    // structural conformance saw zero members and wrongly fired
+    // `tyc::interface_not_conforming` (bare) or `tyc::type_mismatch`
+    // (qualified). The registry-fallback in `resolve_class_shape` /
+    // `interface_shape_for` closes the gap by consulting `by_module`.
+
+    /// Face G: consumer imports the interface + a provider function but
+    /// NEVER the concrete. The concrete's full shape (with merged `impl`
+    /// methods) lives only in `by_module`. Conformance must succeed.
+    #[test]
+    fn cross_module_interface_conformance_concrete_not_imported() {
+        let producer_src = "\
+interface TaskRepository:
+    def get(self, id: int) -> str | None
+
+class InMemoryRepo:
+    data: dict[int, str]
+
+impl InMemoryRepo:
+    def get(self, id: int) -> str | None:
+        return self.data.get(id)
+
+def get_repo() -> InMemoryRepo:
+    return InMemoryRepo(data={})
+";
+        let producer_prep = preprocess(producer_src);
+        let producer_module = tyc_syntax::parse_module(&producer_prep.python_source)
+            .unwrap()
+            .into_syntax();
+        let producer_shapes = extract_module_shapes(&producer_module);
+        let iface_shape = producer_shapes
+            .class_shapes
+            .get("TaskRepository")
+            .expect("interface exported")
+            .clone();
+        let get_repo_arity = producer_shapes
+            .function_arities
+            .get("get_repo")
+            .expect("provider exported")
+            .clone();
+        // The provider's return type must be the concrete class — that's
+        // the only path by which `InMemoryRepo` enters the consumer.
+        assert_eq!(
+            get_repo_arity.return_type,
+            Type::Class("InMemoryRepo".to_owned())
+        );
+
+        let consumer_src = "\
+from producer import TaskRepository, get_repo
+
+def use() -> str | None:
+    let r: TaskRepository = get_repo()
+    return r.get(1)
+";
+        let consumer_prep = preprocess(consumer_src);
+        let consumer_module = tyc_syntax::parse_module(&consumer_prep.python_source)
+            .unwrap()
+            .into_syntax();
+        let (resolved, _) = resolve_module(
+            "<consumer>".to_owned(),
+            &consumer_prep.python_source,
+            &consumer_module,
+        );
+
+        let mut external = ExternalShapes::default();
+        external
+            .interfaces
+            .insert("TaskRepository".to_owned(), false);
+        external
+            .class_shapes
+            .insert("TaskRepository".to_owned(), iface_shape);
+        external
+            .function_arities
+            .insert("get_repo".to_owned(), get_repo_arity);
+        // `InMemoryRepo` is deliberately ABSENT from `external.class_shapes`.
+        let mut by_module: HashMap<String, ModuleShapes> = HashMap::new();
+        by_module.insert("producer".to_owned(), producer_shapes);
+        external.by_module = std::sync::Arc::new(by_module);
+
+        let d = check_module_with_imports(
+            "<consumer>",
+            &consumer_prep.python_source,
+            &resolved,
+            &consumer_module,
+            &consumer_prep.unsafe_lines,
+            &consumer_prep.frozen_class_lines,
+            Some(&external),
+        );
+        let errs: Vec<String> = d.errors().iter().map(|e| e.to_string()).collect();
+        assert!(
+            errs.is_empty(),
+            "a conforming concrete reached via an imported provider's return \
+             type must satisfy the interface even when not imported by name; got: {errs:?}"
+        );
+    }
+
+    /// Soundness guard for the face-G fix: a NON-conforming concrete
+    /// reached the same way must still error. The registry fallback must
+    /// genuinely check members, not blanket-accept.
+    #[test]
+    fn cross_module_interface_conformance_nonconforming_concrete_still_errors() {
+        let producer_src = "\
+interface TaskRepository:
+    def get(self, id: int) -> str | None
+    def all(self) -> list[str]
+
+class InMemoryRepo:
+    data: dict[int, str]
+
+impl InMemoryRepo:
+    def get(self, id: int) -> str | None:
+        return self.data.get(id)
+
+def get_repo() -> InMemoryRepo:
+    return InMemoryRepo(data={})
+";
+        let producer_prep = preprocess(producer_src);
+        let producer_module = tyc_syntax::parse_module(&producer_prep.python_source)
+            .unwrap()
+            .into_syntax();
+        let producer_shapes = extract_module_shapes(&producer_module);
+        let iface_shape = producer_shapes
+            .class_shapes
+            .get("TaskRepository")
+            .expect("interface exported")
+            .clone();
+        let get_repo_arity = producer_shapes
+            .function_arities
+            .get("get_repo")
+            .expect("provider exported")
+            .clone();
+
+        let consumer_src = "\
+from producer import TaskRepository, get_repo
+
+def use() -> str | None:
+    let r: TaskRepository = get_repo()
+    return r.get(1)
+";
+        let consumer_prep = preprocess(consumer_src);
+        let consumer_module = tyc_syntax::parse_module(&consumer_prep.python_source)
+            .unwrap()
+            .into_syntax();
+        let (resolved, _) = resolve_module(
+            "<consumer>".to_owned(),
+            &consumer_prep.python_source,
+            &consumer_module,
+        );
+
+        let mut external = ExternalShapes::default();
+        external
+            .interfaces
+            .insert("TaskRepository".to_owned(), false);
+        external
+            .class_shapes
+            .insert("TaskRepository".to_owned(), iface_shape);
+        external
+            .function_arities
+            .insert("get_repo".to_owned(), get_repo_arity);
+        let mut by_module: HashMap<String, ModuleShapes> = HashMap::new();
+        by_module.insert("producer".to_owned(), producer_shapes);
+        external.by_module = std::sync::Arc::new(by_module);
+
+        let d = check_module_with_imports(
+            "<consumer>",
+            &consumer_prep.python_source,
+            &resolved,
+            &consumer_module,
+            &consumer_prep.unsafe_lines,
+            &consumer_prep.frozen_class_lines,
+            Some(&external),
+        );
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| e.to_string().contains("conform") || e.to_string().contains("all")),
+            "a non-conforming concrete reached via a provider return must still \
+             fire interface_not_conforming; got: {:?}",
+            d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    /// Face B: a module-qualified interface annotation
+    /// (`import producer; r: producer.TaskRepository`) must be recognised as
+    /// an interface via the registry, so a qualified concrete conforms
+    /// instead of falling through to a nominal `tyc::type_mismatch`.
+    #[test]
+    fn cross_module_interface_conformance_qualified_annotation() {
+        let producer_src = "\
+interface TaskRepository:
+    def get(self, id: int) -> str | None
+
+class InMemoryRepo:
+    data: dict[int, str]
+
+impl InMemoryRepo:
+    def get(self, id: int) -> str | None:
+        return self.data.get(id)
+";
+        let producer_prep = preprocess(producer_src);
+        let producer_module = tyc_syntax::parse_module(&producer_prep.python_source)
+            .unwrap()
+            .into_syntax();
+        let producer_shapes = extract_module_shapes(&producer_module);
+
+        let consumer_src = "\
+import producer
+
+def use() -> str | None:
+    let r: producer.TaskRepository = producer.InMemoryRepo(data={})
+    return r.get(1)
+";
+        let consumer_prep = preprocess(consumer_src);
+        let consumer_module = tyc_syntax::parse_module(&consumer_prep.python_source)
+            .unwrap()
+            .into_syntax();
+        let (resolved, _) = resolve_module(
+            "<consumer>".to_owned(),
+            &consumer_prep.python_source,
+            &consumer_module,
+        );
+
+        let mut external = ExternalShapes::default();
+        // Only the bare-import + registry are wired — nothing is keyed under
+        // a bare local name, so recognition must come through `by_module`.
+        external
+            .bare_imports
+            .insert("producer".to_owned(), "producer".to_owned());
+        let mut by_module: HashMap<String, ModuleShapes> = HashMap::new();
+        by_module.insert("producer".to_owned(), producer_shapes);
+        external.by_module = std::sync::Arc::new(by_module);
+
+        let d = check_module_with_imports(
+            "<consumer>",
+            &consumer_prep.python_source,
+            &resolved,
+            &consumer_module,
+            &consumer_prep.unsafe_lines,
+            &consumer_prep.frozen_class_lines,
+            Some(&external),
+        );
+        let errs: Vec<String> = d.errors().iter().map(|e| e.to_string()).collect();
+        assert!(
+            errs.is_empty(),
+            "a qualified `producer.Iface` annotation must be recognised as an \
+             interface so a qualified concrete conforms; got: {errs:?}"
+        );
+    }
+
+    /// PR #201 review (codex P2): the qualified form must also work through
+    /// an import *alias* (`import producer as p; r: p.TaskRepository`). The
+    /// annotation types as `Class("p.TaskRepository")`, so the registry
+    /// lookup must canonicalise the `p` prefix to `producer` via the env's
+    /// `Type::Module` binding before consulting `by_module`.
+    #[test]
+    fn cross_module_interface_conformance_aliased_qualified_annotation() {
+        let producer_src = "\
+interface TaskRepository:
+    def get(self, id: int) -> str | None
+
+class InMemoryRepo:
+    data: dict[int, str]
+
+impl InMemoryRepo:
+    def get(self, id: int) -> str | None:
+        return self.data.get(id)
+";
+        let producer_prep = preprocess(producer_src);
+        let producer_module = tyc_syntax::parse_module(&producer_prep.python_source)
+            .unwrap()
+            .into_syntax();
+        let producer_shapes = extract_module_shapes(&producer_module);
+
+        let consumer_src = "\
+import producer as p
+
+def use() -> str | None:
+    let r: p.TaskRepository = p.InMemoryRepo(data={})
+    return r.get(1)
+";
+        let consumer_prep = preprocess(consumer_src);
+        let consumer_module = tyc_syntax::parse_module(&consumer_prep.python_source)
+            .unwrap()
+            .into_syntax();
+        let (resolved, _) = resolve_module(
+            "<consumer>".to_owned(),
+            &consumer_prep.python_source,
+            &consumer_module,
+        );
+
+        let mut external = ExternalShapes::default();
+        // The local alias `p` maps to the canonical module `producer`.
+        external
+            .bare_imports
+            .insert("p".to_owned(), "producer".to_owned());
+        let mut by_module: HashMap<String, ModuleShapes> = HashMap::new();
+        by_module.insert("producer".to_owned(), producer_shapes);
+        external.by_module = std::sync::Arc::new(by_module);
+
+        let d = check_module_with_imports(
+            "<consumer>",
+            &consumer_prep.python_source,
+            &resolved,
+            &consumer_module,
+            &consumer_prep.unsafe_lines,
+            &consumer_prep.frozen_class_lines,
+            Some(&external),
+        );
+        let errs: Vec<String> = d.errors().iter().map(|e| e.to_string()).collect();
+        assert!(
+            errs.is_empty(),
+            "an aliased qualified `p.Iface` annotation must canonicalise to the \
+             real module and conform; got: {errs:?}"
         );
     }
 

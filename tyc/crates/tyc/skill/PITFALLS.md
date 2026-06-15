@@ -4,7 +4,7 @@ The errors and surprises that bite people who try to write Typhon as if it were 
 
 For each entry: **trigger → diagnostic → fix**.
 
-Current release: **v0.15.3**. Pitfalls tagged with a version annotation landed in that release. Pitfalls 61–75 are the v0.9.0 cleanup additions covering the daily-driver VM, type-checker covariance and narrowing gaps, and multi-file project support; pitfalls 76+ cover the v0.10.0–v0.12.0 VM-completeness, `enum`, and third-party-type-checking surface; pitfalls 81–82 cover the v0.14.0 `as!` checked boundary cast.
+Current release: **v0.15.4**. Pitfalls tagged with a version annotation landed in that release. Pitfalls 61–75 are the v0.9.0 cleanup additions covering the daily-driver VM, type-checker covariance and narrowing gaps, and multi-file project support; pitfalls 76+ cover the v0.10.0–v0.12.0 VM-completeness, `enum`, and third-party-type-checking surface; pitfalls 81–82 cover the v0.14.0 `as!` checked boundary cast.
 
 ---
 
@@ -1454,6 +1454,43 @@ let n = some_value as! int    # tyc run: passes even if some_value is a str
 ```
 
 **Trigger:** relying on the boundary check to fire in the VM. **Why:** the in-process VM treats `as!` as an identity passthrough — the *recursive structural* runtime check lives in `typhon_runtime/cast.py` and runs on the compiled path. **Fix:** the static type is still pinned to the target everywhere; for the *runtime* enforcement, use `tyc build && python build/main.py` (or `tyc run --compile`). `tyc check` already rejects a target that doesn't satisfy the surrounding annotation, so most mistakes are caught before runtime regardless.
+
+---
+
+## 83. `extend BUILTIN:` not carrying across an import (module-local)
+
+```python
+# textutil.ty
+extend str:
+    def slug(self) -> str:
+        return self.lower().replace(" ", "-")
+
+# main.ty
+from textutil import *
+let s: str = title.slug()       # ❌ tyc::attribute_not_found — `slug` on `str`
+```
+
+**Trigger:** declaring `extend str:` (or `list`/`dict`/…) in one module and calling the method in another. **Why:** unlike `extend ClassName:` (which merges into a user class and crosses modules), a built-in extension is a purely *static* call-site rewrite (`title.slug()` → `__typhon_ext_str__slug(title)`) keyed off the `extend` block in the **same** module — there is no monkey-patch for an `import` to carry. **Fix:** wrap the behaviour in a plain free function and import *that*:
+
+```python
+# textutil.ty
+pub def to_slug(s: str) -> str:
+    return s.lower().replace(" ", "-")
+
+# main.ty
+from textutil import to_slug
+let s: str = to_slug(title)     # ✅ crosses modules
+```
+
+---
+
+## 84. `pub lazy let` doesn't parse (v0.15.4)
+
+```python
+pub lazy let CFG: dict[str, int] = load()   # ❌ tyc::parse
+```
+
+**Trigger:** stacking `pub` onto a `lazy let`. **Why:** `pub` stacks with every other modifier — including `comptime` (`pub comptime let` works as of v0.15.4) — but the `lazy let` lowering runs in a separate text pass that would silently drop the laziness under a leading `pub `, so the combination is rejected rather than shipped half-working. **Fix:** drop `pub` — a module-level `lazy let CFG = …` is still importable by name (`from config import CFG`); it just won't appear in a synthesised `__all__`. If a build-time constant fits instead, `pub comptime let` is fully supported.
 
 ---
 

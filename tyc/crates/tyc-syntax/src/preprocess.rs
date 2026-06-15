@@ -1052,6 +1052,31 @@ pub fn pub_decl_name(body: &str) -> Option<String> {
     // Skip a leading `async ` for `pub async def f(...)`.
     let body = body.strip_prefix("async ").unwrap_or(body);
     let body = body.trim_start();
+    // `comptime` stacks in front of a name-declaring binding
+    // (`pub comptime let PORT: int = …`, `pub comptime def feat(...)`).
+    // `pub` is documented as combining with every modifier, so strip the
+    // build-time layer plus its inner binding keyword and read the
+    // declared name from what remains. Without this, the leading `pub `
+    // survives `strip_pub_prefixes` (which only strips when it recognises
+    // a name), so the comptime handler in the main preprocess loop — which
+    // matches a line-start `comptime ` — never fires and the Python parser
+    // chokes on `pub comptime let …`. The comptime substitution that
+    // follows runs over the same (now `pub `-free) source, so the binding
+    // both lands in `__all__` and inlines to a literal.
+    //
+    // `pub lazy let` is intentionally NOT handled here: the `lazy let`
+    // lowering runs in a separate `expand_lazy_lets` text pass *before*
+    // this one and matches a line-start `lazy let`, so accepting it here
+    // would strip `pub ` but leave the laziness silently un-lowered. Until
+    // that pass learns the `pub` prefix, `pub lazy let` stays a clean parse
+    // error rather than a silent semantic drop.
+    if let Some(after) = body.strip_prefix("comptime ") {
+        let inner = after
+            .strip_prefix("let ")
+            .or_else(|| after.strip_prefix("mut "))
+            .or_else(|| after.strip_prefix("def "));
+        return inner.and_then(ident_prefix);
+    }
     // Multi-word keywords first.
     if let Some(rest) = body.strip_prefix("plain class ") {
         return ident_prefix(rest);
@@ -8506,6 +8531,60 @@ mod tests {
         let prep = preprocess(src);
         let out = postprocess(&prep.python_source, &prep.stripped, &prep.optionals);
         assert_eq!(out, src);
+    }
+
+    #[test]
+    fn pub_decl_name_recognises_comptime() {
+        // `pub` must stack with `comptime` (let / mut / def) — the docs
+        // promise `pub` combines with every modifier.
+        assert_eq!(
+            pub_decl_name("comptime let PORT: int = 8080\n").as_deref(),
+            Some("PORT")
+        );
+        assert_eq!(
+            pub_decl_name("comptime mut COUNT: int = 0\n").as_deref(),
+            Some("COUNT")
+        );
+        assert_eq!(
+            pub_decl_name("comptime def feat(name: str) -> bool:\n").as_deref(),
+            Some("feat")
+        );
+    }
+
+    #[test]
+    fn pub_comptime_let_records_name_and_strips_both_modifiers() {
+        // Regression: `pub comptime let` used to be a hard parse error
+        // because `strip_pub_prefixes` didn't recognise the comptime form,
+        // so the leading `pub ` survived and the comptime handler never
+        // fired. Now the `pub ` is stripped (recording the public name) and
+        // the comptime handler records the binding for later inlining.
+        let result = preprocess("pub comptime let PORT: int = 8080\n");
+        assert_eq!(result.pub_names, vec!["PORT".to_owned()]);
+        assert!(
+            result.comptime_bindings.iter().any(|b| b.name == "PORT"),
+            "comptime binding must be recorded; got: {:?}",
+            result.comptime_bindings
+        );
+        assert!(!result.python_source.contains("pub "));
+        assert!(!result.python_source.contains("comptime "));
+    }
+
+    #[test]
+    fn pub_comptime_let_round_trips_via_postprocess() {
+        let src = "pub comptime let PORT: int = 8080\n";
+        let prep = preprocess(src);
+        let out = postprocess(&prep.python_source, &prep.stripped, &prep.optionals);
+        assert_eq!(out, src);
+    }
+
+    #[test]
+    fn pub_decl_name_does_not_claim_lazy() {
+        // `pub lazy let` is intentionally NOT recognised here: the lazy-let
+        // lowering runs in a separate text pass that matches a line-start
+        // `lazy let`, so claiming it would strip `pub ` but silently drop
+        // the laziness. Returning `None` keeps it a clean parse error.
+        assert_eq!(pub_decl_name("lazy let CFG: int = 1\n"), None);
+        assert_eq!(pub_decl_name("lazy import np = numpy\n"), None);
     }
 
     #[test]
