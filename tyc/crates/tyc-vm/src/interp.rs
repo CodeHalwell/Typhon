@@ -1088,7 +1088,8 @@ impl Interpreter {
         let _ = tyc_analyse::rewrite_builtin_extension_calls(&mut module, &registry);
         // Store the extension registry for cross-module rewrite (#202).
         if !registry.is_empty() {
-            self.builtin_ext_registries.insert(name.to_owned(), registry);
+            self.builtin_ext_registries
+                .insert(name.to_owned(), registry);
         }
 
         // Evaluate the module body in a fresh child scope of root; copy

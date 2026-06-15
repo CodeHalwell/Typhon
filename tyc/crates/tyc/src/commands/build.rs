@@ -780,9 +780,7 @@ pub fn run(args: BuildArgs) -> Result<()> {
             }
             for (cls_name, shape) in &shapes.class_shapes {
                 if let Some(builtin) = cls_name.strip_prefix("__typhon_builtin_ext_") {
-                    let entry = builtin_ext_registry
-                        .entry(builtin.to_owned())
-                        .or_default();
+                    let entry = builtin_ext_registry.entry(builtin.to_owned()).or_default();
                     for method_name in shape.methods.keys() {
                         let fn_name = format!("__typhon_ext_{builtin}__{method_name}");
                         entry.entry(method_name.clone()).or_insert_with(|| {
@@ -1191,9 +1189,7 @@ fn inject_cross_module_ext_imports(
     module: &mut ruff_python_ast::ModModule,
     imports: &[(String, String)],
 ) {
-    use ruff_python_ast::{
-        name::Name, AtomicNodeIndex, Identifier, Stmt, StmtImportFrom,
-    };
+    use ruff_python_ast::{name::Name, AtomicNodeIndex, Identifier, Stmt, StmtImportFrom};
     use ruff_text_size::TextRange;
 
     // Group by module so we emit one `from M import a, b, c` per module.
@@ -1242,9 +1238,7 @@ fn inject_cross_module_ext_imports(
         .position(|s| {
             !matches!(
                 s,
-                Stmt::Import(_)
-                    | Stmt::ImportFrom(_)
-                    | Stmt::Expr(_) // docstrings
+                Stmt::Import(_) | Stmt::ImportFrom(_) | Stmt::Expr(_) // docstrings
             )
         })
         .unwrap_or(module.body.len());

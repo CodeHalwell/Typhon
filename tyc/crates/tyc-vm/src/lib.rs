@@ -157,9 +157,8 @@ pub fn run_source(
     let (mut registry, _stats) = tyc_analyse::extract_builtin_extensions(&mut module);
     // Pre-scan sibling modules for cross-module builtin extensions.
     if let Some(src_root) = origin.and_then(|p| p.parent()) {
-        let cross_module_fns = merge_cross_module_extensions_for_vm(
-            &module, src_root, &mut registry,
-        );
+        let cross_module_fns =
+            merge_cross_module_extensions_for_vm(&module, src_root, &mut registry);
         let _ = tyc_analyse::rewrite_builtin_extension_calls(&mut module, &registry);
         // Inject explicit imports for cross-module extension functions
         // that were used. In the VM, these resolve to the sibling module's
@@ -325,9 +324,7 @@ fn inject_vm_cross_module_ext_imports(
     cross_fns: &std::collections::HashMap<String, String>,
     _src_root: &Path,
 ) {
-    use ruff_python_ast::{
-        name::Name, AtomicNodeIndex, Identifier, Stmt, StmtImportFrom,
-    };
+    use ruff_python_ast::{name::Name, AtomicNodeIndex, Identifier, Stmt, StmtImportFrom};
     use ruff_text_size::TextRange;
     use std::collections::HashMap;
 
@@ -373,12 +370,7 @@ fn inject_vm_cross_module_ext_imports(
     let insert_pos = module
         .body
         .iter()
-        .position(|s| {
-            !matches!(
-                s,
-                Stmt::Import(_) | Stmt::ImportFrom(_) | Stmt::Expr(_)
-            )
-        })
+        .position(|s| !matches!(s, Stmt::Import(_) | Stmt::ImportFrom(_) | Stmt::Expr(_)))
         .unwrap_or(module.body.len());
 
     for (i, stmt) in injected.into_iter().enumerate() {
