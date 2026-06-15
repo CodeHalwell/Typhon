@@ -572,7 +572,7 @@ let _internal_default_port: int = 8080   # not exported
 
 When a module declares at least one `pub` name, desugar synthesises a top-of-file `__all__ = [...]` so `from foo import *`, Sphinx autoapi, IDE re-export filters, and the type checker's re-export inference all see the public surface. A hand-written `__all__` wins.
 
-Stacks with every modifier: `pub frozen class`, `pub model`, `pub let`, `pub mut`, `pub freeze let`, `pub newtype`, `pub interface`, `pub type`, `pub def`, `pub async def`.
+Stacks with every modifier: `pub frozen class`, `pub model`, `pub let`, `pub mut`, `pub freeze let`, `pub newtype`, `pub interface`, `pub type`, `pub def`, `pub async def`, and `pub comptime let` / `pub comptime mut` / `pub comptime def` (v0.15.4). The one current exception is **`pub lazy let`, which does NOT parse** — see §7.
 
 ### `pub *` — package-level re-export aggregation (v0.7.0)
 
@@ -836,6 +836,7 @@ The big v0.8.1 → v0.9.0 sweep. Closes 32 of 36 findings from a v0.8.1 stress s
 ### "Designed but NOT yet supported" — avoid these forms
 
 - **`lazy let X: T:` colon-block form** does NOT parse. Use `lazy let X: T = expr`.
+- **`pub lazy let` does NOT parse** (v0.15.4). `pub` stacks with every other modifier — including `comptime` (`pub comptime let` works) — but the `lazy let` lowering runs in a separate text pass that would silently drop the laziness under a leading `pub `, so it is intentionally rejected rather than half-working. Declare a module-level `lazy let` without `pub` (it's importable by name regardless), or use `pub comptime let` when a build-time constant fits.
 - **`lazy[T]` return-type form** is designed but unimplemented.
 - **Multi-line `|>` pipes require wrapping parens.**
 - **`model X frozen:` does NOT parse** — `frozen` is on `class` only.
