@@ -57,7 +57,7 @@ def by_country(people: list[Person]) -> dict[str, list[str]]:
 
 
 def main() -> None:
-    path: Path = Path("/tmp/typhon-people.json")
+    path: Path = Path("typhon-people.json")
     sample: list[dict[str, object]] = [
         {
             "name": "Ada Lovelace",
@@ -76,7 +76,7 @@ def main() -> None:
         {"name": "Kid Genius", "age": 12, "email": "kid@example.com", "address": None},
     ]
     write_json(path, {"people": sample})
-    payload: Path = Path("/tmp/typhon-people-array.json")
+    payload: Path = Path("typhon-people-array.json")
     payload.write_text(json.dumps(sample), encoding="utf-8")
     match load_people(payload):
         case Ok(people):

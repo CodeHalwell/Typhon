@@ -5,6 +5,7 @@
 //! skill` can write the whole `.claude/skills/typhon/` tree into any project
 //! with no network access and no dependency on the Typhon source checkout.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use clap::{Args, Subcommand};
@@ -122,12 +123,19 @@ fn run_skill(args: SkillArgs) -> Result<()> {
         ));
     }
 
+    // Create each unique destination directory once. The manifest shares a
+    // handful of directories (the root and `references/`), so re-running
+    // create_dir_all per file would be redundant I/O; the set keeps it general
+    // for any future nested entry without re-querying directories we've made.
+    let mut created_dirs: HashSet<PathBuf> = HashSet::new();
     let mut written = 0usize;
     for (rel, contents) in SKILL_FILES {
         let dest = skill_root.join(rel);
         if let Some(parent) = dest.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| miette!("cannot create {}: {}", parent.display(), e))?;
+            if created_dirs.insert(parent.to_path_buf()) {
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| miette!("cannot create {}: {}", parent.display(), e))?;
+            }
         }
         write_file(&dest, contents)?;
         written += 1;

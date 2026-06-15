@@ -52,7 +52,7 @@ def by_country(people: list[Person]) -> dict[str, list[str]]:
 
 
 def main() -> None:
-    let path: Path = Path("/tmp/typhon-people.json")
+    let path: Path = Path("typhon-people.json")
 
     let sample: list[dict[str, object]] = [
         {
@@ -74,7 +74,7 @@ def main() -> None:
 
     write_json(path, {"people": sample})
 
-    let payload: Path = Path("/tmp/typhon-people-array.json")
+    let payload: Path = Path("typhon-people-array.json")
     payload.write_text(json.dumps(sample), encoding="utf-8")
 
     match load_people(payload):
