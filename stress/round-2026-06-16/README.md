@@ -84,12 +84,30 @@ The one genuine *test* error found was mine: declaring `let first` then
 rebinding it via `[first, *rest] = ...` correctly trips `immutable_assign` —
 the checker is right.
 
+## Third sweep — batches L–O (~30 more programs)
+
+Custom hashables, fluent interfaces, dict-view set algebra, `match` on tuples
+of unions and on list shapes, OR-patterns, guard cascades, generic memoize,
+and real programs (KV store, matrix multiply, inventory, Caesar cipher, RPN).
+Three more **production-blocking checker false-positives** fixed — all
+`tyc::missing_return` / `operator_type_mismatch` on valid, idiomatic code:
+
+- **`d1.keys() - d2.keys()`** (dict-view set difference) was rejected; the
+  set-difference carve-out only knew `set`/`frozenset`. Extended to the
+  set-like views, and taught the VM to evaluate them.
+- **`match (cmd, count):`** over a `tuple[Union, int]` (state-machine
+  dispatch) had no product-coverage analysis, so an exhaustive match was
+  rejected. Added a sound column-wise `tuple_cases_cover`.
+- **`case [first, *middle, last]:`** — the list-length coverage check only
+  accepted a *tail* star, so an exhaustive list match false-fired. Generalised
+  to a star at any position.
+
 ## Result
 
 The **production path (`tyc build` → CPython 3.13) is correct on the entire
-~85-program corpus.** The frontend held up with zero remaining false
-positives. Remaining divergences are all VM-only with correct compiled output,
-and are documented VM-coverage limitations:
+118-program corpus** (0 build/runtime failures). The frontend held up with
+zero remaining false positives. Remaining divergences are all VM-only with
+correct compiled output, and are documented VM-coverage limitations:
 
 | Repro | VM gap (compiled path correct) |
 |-------|--------------------------------|

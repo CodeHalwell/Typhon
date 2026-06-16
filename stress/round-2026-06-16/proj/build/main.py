@@ -1,23 +1,28 @@
 from __future__ import annotations
 
 
-def analyze(xs: list[int]) -> str:
-    match xs:
-        case []:
-            return "empty"
-        case [x]:
-            return f"single: {x}"
-        case [x, y]:
-            return f"pair: {x},{y}"
-        case [first, *middle, last]:
-            return f"first={first}, last={last}, mid={len(middle)}"
+def is_palindrome(s: str) -> bool:
+    clean: str = "".join([c.lower() for c in s if c.isalnum()])
+    return clean == clean[::-1]
+
+
+def caesar(text: str, shift: int) -> str:
+    result: str = ""
+    for ch in text:
+        if ch.isalpha():
+            base: int = ord("a") if ch.islower() else ord("A")
+            result = result + chr((ord(ch) - base + shift) % 26 + base)
+        else:
+            result = result + ch
+    return result
 
 
 def main() -> None:
-    print(analyze([]))
-    print(analyze([1]))
-    print(analyze([1, 2]))
-    print(analyze([1, 2, 3, 4, 5]))
+    print(is_palindrome("A man a plan a canal Panama"))
+    print(is_palindrome("hello"))
+    enc: str = caesar("Hello, World!", 3)
+    print(enc)
+    print(caesar(enc, 23))
 
 
 if __name__ == "__main__":
