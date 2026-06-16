@@ -1,0 +1,21 @@
+import asyncio
+from typing import AsyncIterator
+
+async def gen(n: int) -> AsyncIterator[int]:
+    mut i: int = 0
+    while i < n:
+        await asyncio.sleep(0)
+        yield i * i
+        i = i + 1
+
+async def collect() -> list[int]:
+    mut out: list[int] = []
+    async for x in gen(5):
+        out.append(x)
+    return out
+
+def main() -> None:
+    print(asyncio.run(collect()))
+
+if __name__ == "__main__":
+    main()

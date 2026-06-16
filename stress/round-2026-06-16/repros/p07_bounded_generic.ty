@@ -1,0 +1,28 @@
+from typing import Callable
+
+def max_by[T](items: list[T], key: Callable[[T], int]) -> T:
+    mut best: T = items[0]
+    mut best_key: int = key(items[0])
+    for item in items[1:]:
+        let k: int = key(item)
+        if k > best_key:
+            best = item
+            best_key = k
+    return best
+
+class Product:
+    name: str
+    price: int
+
+def main() -> None:
+    let products: list[Product] = [
+        Product(name="a", price=30),
+        Product(name="b", price=50),
+        Product(name="c", price=20),
+    ]
+    let priciest: Product = max_by(products, lambda p: p.price)
+    print(priciest.name)
+    print(max_by([3, 7, 1, 9, 2], lambda x: x))
+
+if __name__ == "__main__":
+    main()

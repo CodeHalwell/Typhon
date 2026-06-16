@@ -1,0 +1,16 @@
+def describe(x: int?) -> str:
+    match x:
+        case None:
+            return "nothing"
+        case 0:
+            return "zero"
+        case n:
+            return f"value {n}"
+
+def main() -> None:
+    print(describe(None))
+    print(describe(0))
+    print(describe(42))
+
+if __name__ == "__main__":
+    main()

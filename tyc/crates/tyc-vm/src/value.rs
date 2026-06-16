@@ -1073,6 +1073,10 @@ impl Value {
                     let parts: Vec<String> = args.iter().map(|a| a.py_repr()).collect();
                     format!("({})", parts.join(", "))
                 }
+                // `KeyError` is the one builtin whose `str()` shows the
+                // *repr* of its single argument: `str(KeyError("k"))` is
+                // `"'k'"`, not `"k"` (so a missing key is unambiguous).
+                1 if kind.as_str() == "KeyError" => args[0].py_repr(),
                 1 => args[0].py_str(),
                 _ => {
                     if message.is_empty() {

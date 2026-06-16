@@ -1,0 +1,12 @@
+def process(data: dict[str, int]?, key: str) -> int:
+    assert data is not None
+    let value: int? = data.get(key)
+    assert value is not None
+    return value * 2
+
+def main() -> None:
+    let d: dict[str, int] = {"a": 5}
+    print(process(d, "a"))
+
+if __name__ == "__main__":
+    main()

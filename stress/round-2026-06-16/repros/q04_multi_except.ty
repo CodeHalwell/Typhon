@@ -1,0 +1,25 @@
+def risky(mode: str) -> int:
+    if mode == "value":
+        raise ValueError("bad value")
+    if mode == "key":
+        raise KeyError("bad key")
+    if mode == "type":
+        raise TypeError("bad type")
+    return 42
+
+def handle(mode: str) -> str:
+    try:
+        return f"ok: {risky(mode)}"
+    except (ValueError, KeyError) as e:
+        return f"value/key: {e}"
+    except TypeError as e:
+        return f"type: {e}"
+
+def main() -> None:
+    print(handle("ok"))
+    print(handle("value"))
+    print(handle("key"))
+    print(handle("type"))
+
+if __name__ == "__main__":
+    main()

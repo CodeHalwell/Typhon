@@ -1,0 +1,24 @@
+type Tree[T] = Leaf[T] | Branch[T]
+
+class Leaf[T] frozen:
+    value: T
+class Branch[T] frozen:
+    left: Tree[T]
+    right: Tree[T]
+
+def count_leaves[T](t: Tree[T]) -> int:
+    match t:
+        case Leaf(value=_):
+            return 1
+        case Branch(left=l, right=r):
+            return count_leaves(l) + count_leaves(r)
+
+def main() -> None:
+    let tree: Tree[int] = Branch(
+        left=Branch(left=Leaf(value=1), right=Leaf(value=2)),
+        right=Leaf(value=3),
+    )
+    print(count_leaves(tree))
+
+if __name__ == "__main__":
+    main()

@@ -64,6 +64,16 @@ output (`tyc build` → CPython 3.13) is now correct on the entire corpus.
   these (it previously raised `unsupported operand type(s)`), so `tyc run`
   matches the compiled path. `dict.values()` stays non-set-like, as in CPython.
 
+### Fixed — more VM parity (`tyc-vm`)
+
+- **`del lst[i:j]` / `del lst[::k]`** (slice deletion) now works under
+  `tyc run` instead of raising `slice expression outside subscript`.
+- **User `__format__(self, spec)` is dispatched** by `f"{x:spec}"`,
+  `"{:spec}".format(x)`, and `format(x, spec)` (previously the VM fell back to
+  `__str__` and ignored the spec).
+- **`str(KeyError("k"))` is `"'k'"`** (repr of the key) to match CPython's
+  one builtin whose `str()` quotes its argument.
+
 ### Fixed — `bytes` operators in the VM (`tyc-vm`)
 
 - `b"a" + b"b"` (concatenation) and `b"a" * 3` / `3 * b"a"` (repetition) now

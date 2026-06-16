@@ -363,6 +363,10 @@ pub fn install(interp: &mut Interpreter) {
             .first()
             .ok_or_else(|| type_error("format expected at least 1 argument"))?;
         let spec = args.get(1).map(|s| s.py_str()).unwrap_or_default();
+        // A user `__format__(self, spec)` controls its own formatting.
+        if let Some(formatted) = interp.try_user_format(v, &spec)? {
+            return Ok(Value::Str(Rc::new(formatted)));
+        }
         let base = interp.str_of(v)?;
         Ok(Value::Str(Rc::new(crate::interp::format_with_spec_pub(
             v, &base, &spec,
@@ -6047,14 +6051,20 @@ fn str_format(
                         .ok_or_else(|| key_error(format!("'{}'", field_ref)))?
                 };
 
-                // Apply format spec if present. The default stringification
-                // honours a user `__str__` (via `str_of`), matching `print` /
-                // `str` and CPython's `"{}".format(obj)`.
-                let default = interp.str_of(&value)?;
-                let formatted = if spec.is_empty() {
-                    default
+                // A user `__format__(self, spec)` controls its own
+                // formatting for any spec (including the empty `{}` spec,
+                // which CPython routes through `__format__("")`).
+                let formatted = if let Some(custom) = interp.try_user_format(&value, spec)? {
+                    custom
                 } else {
-                    crate::interp::format_with_spec_pub(&value, &default, spec)?
+                    // The default stringification honours a user `__str__`
+                    // (via `str_of`), matching `print` / `str`.
+                    let default = interp.str_of(&value)?;
+                    if spec.is_empty() {
+                        default
+                    } else {
+                        crate::interp::format_with_spec_pub(&value, &default, spec)?
+                    }
                 };
                 out.push_str(&formatted);
             }

@@ -489,7 +489,9 @@ impl Interpreter {
                         }
                         Expr::Subscript(sub) => {
                             let target = self.eval_expr(&sub.value, env)?;
-                            let key = self.eval_expr(&sub.slice, env)?;
+                            // Slice-aware: `del lst[i:j]` evaluates the slice
+                            // to the `__slice__` marker `del_subscript` handles.
+                            let key = self.eval_subscript_index(&sub.slice, env)?;
                             self.del_subscript(&target, &key)?;
                         }
                         // `del obj.attr` removes an instance attribute.
@@ -1723,10 +1725,17 @@ impl Interpreter {
                                         }
                                     }
                                 };
-                                // Format spec: limited support — width / precision for floats only.
+                                // Format spec. A user instance defining
+                                // `__format__(self, spec)` controls its own
+                                // formatting (`f"{temp:F}"`); otherwise fall
+                                // back to the builtin width/precision engine.
                                 if let Some(spec) = &interp.format_spec {
                                     let spec_str = self.format_spec_text(spec, env)?;
-                                    out.push_str(&format_with_spec(&v, &s, &spec_str)?);
+                                    if let Some(formatted) = self.try_user_format(&v, &spec_str)? {
+                                        out.push_str(&formatted);
+                                    } else {
+                                        out.push_str(&format_with_spec(&v, &s, &spec_str)?);
+                                    }
                                 } else {
                                     out.push_str(&s);
                                 }
@@ -1737,6 +1746,28 @@ impl Interpreter {
             }
         }
         Ok(Value::Str(Rc::new(out)))
+    }
+
+    /// If `v` is a user instance defining `__format__(self, spec)`, call it
+    /// and return the formatted string; otherwise `Ok(None)` so the caller
+    /// falls back to the builtin format engine. Backs `f"{x:spec}"` and
+    /// `"{:spec}".format(x)` / `format(x, spec)` honouring a custom
+    /// `__format__`.
+    pub fn try_user_format(&mut self, v: &Value, spec: &str) -> Result<Option<String>, Unwind> {
+        if let Value::Instance(inst) = v {
+            if let Some(m) = self.find_method(&inst.class, "__format__") {
+                let result = self.call_value(
+                    Value::BoundMethod {
+                        receiver: Box::new(v.clone()),
+                        function: m,
+                    },
+                    vec![Value::Str(Rc::new(spec.to_owned()))],
+                    &[],
+                )?;
+                return Ok(Some(result.py_str()));
+            }
+        }
+        Ok(None)
     }
 
     fn format_spec_text(
@@ -3485,6 +3516,16 @@ impl Interpreter {
     }
 
     fn del_subscript(&mut self, target: &Value, key: &Value) -> Result<(), Unwind> {
+        // Slice deletion: `del lst[i:j]` / `del lst[::2]`.
+        if let Value::Tuple(t) = key {
+            if t.len() == 4 {
+                if let Value::Str(tag) = &t[0] {
+                    if tag.as_str() == "__slice__" {
+                        return self.del_slice(target, &t[1], &t[2], &t[3]);
+                    }
+                }
+            }
+        }
         match target {
             Value::List(l) => {
                 let i = key.to_int()?;
@@ -3522,6 +3563,60 @@ impl Interpreter {
                 )))
             }
             _ => Err(type_error("delete on unsupported target")),
+        }
+    }
+
+    /// `del lst[i:j]` / `del lst[i:j:k]` — removes the selected indices from a
+    /// list (in descending order so earlier removals don't shift later ones).
+    fn del_slice(
+        &mut self,
+        target: &Value,
+        lower: &Value,
+        upper: &Value,
+        step: &Value,
+    ) -> Result<(), Unwind> {
+        match target {
+            Value::List(l) => {
+                let len = l.borrow().len();
+                let step_i = match step {
+                    Value::None => 1,
+                    v => v.to_int()?,
+                };
+                if step_i == 0 {
+                    return Err(value_error("slice step cannot be zero"));
+                }
+                let (start, stop, step_i) = compute_slice(lower, upper, step_i, len)?;
+                let mut indices: Vec<usize> = Vec::new();
+                let mut idx = start;
+                if step_i > 0 {
+                    while idx < stop {
+                        if idx >= 0 {
+                            indices.push(idx as usize);
+                        }
+                        idx += step_i;
+                    }
+                } else {
+                    while idx > stop {
+                        if idx >= 0 {
+                            indices.push(idx as usize);
+                        }
+                        idx += step_i;
+                    }
+                }
+                indices.sort_unstable();
+                indices.dedup();
+                let mut l = l.borrow_mut();
+                for &i in indices.iter().rev() {
+                    if i < l.len() {
+                        l.remove(i);
+                    }
+                }
+                Ok(())
+            }
+            _ => Err(type_error(format!(
+                "'{}' object does not support slice deletion",
+                target.type_name()
+            ))),
         }
     }
 

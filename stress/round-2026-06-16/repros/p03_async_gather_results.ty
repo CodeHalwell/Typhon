@@ -1,0 +1,16 @@
+import asyncio
+
+async def fetch(url: str, delay: int) -> dict[str, int]:
+    await asyncio.sleep(0)
+    return {"url_len": len(url), "delay": delay}
+
+async def fetch_all(urls: list[str]) -> list[dict[str, int]]:
+    return await asyncio.gather(*[fetch(u, i) for i, u in enumerate(urls)])
+
+def main() -> None:
+    let results: list[dict[str, int]] = asyncio.run(fetch_all(["a", "bb", "ccc"]))
+    for r in results:
+        print(r["url_len"], r["delay"])
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,12 @@
+def main() -> None:
+    mut d: dict[str, int] = {"a": 1, "b": 2, "c": 3}
+    del d["b"]
+    print(sorted(d.items()))
+    mut lst: list[int] = [10, 20, 30, 40]
+    del lst[1]
+    print(lst)
+    del lst[1:3]
+    print(lst)
+
+if __name__ == "__main__":
+    main()

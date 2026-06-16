@@ -1,0 +1,14 @@
+def process(value: int | str | list[int]) -> str:
+    if isinstance(value, int):
+        return f"int doubled: {value * 2}"
+    if isinstance(value, str):
+        return f"str upper: {value.upper()}"
+    return f"list sum: {sum(value)}"
+
+def main() -> None:
+    print(process(21))
+    print(process("hello"))
+    print(process([1, 2, 3, 4]))
+
+if __name__ == "__main__":
+    main()

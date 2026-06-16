@@ -541,6 +541,57 @@ print("ok")
     }
 
     #[test]
+    fn user_format_dunder_dispatched() {
+        // `f"{x:spec}"`, `"{:spec}".format(x)`, and `format(x, spec)` all
+        // route through a user `__format__(self, spec)`.
+        let src = r#"
+class T:
+    c: int
+impl T:
+    def __format__(self, spec: str) -> str:
+        return f"<{spec}:{self.c}>"
+
+def main() -> None:
+    let t: T = T(c=7)
+    assert f"{t:F}" == "<F:7>"
+    assert "{:G}".format(t) == "<G:7>"
+    assert format(t, "H") == "<H:7>"
+    print("ok")
+main()
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    #[test]
+    fn del_list_slice() {
+        // `del lst[i:j]` and extended slices remove the selected indices.
+        let src = r#"
+mut a: list[int] = [10, 20, 30, 40, 50]
+del a[1:3]
+assert a == [10, 40, 50]
+mut b: list[int] = [0, 1, 2, 3, 4, 5]
+del b[::2]
+assert b == [1, 3, 5]
+print("ok")
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    #[test]
+    fn key_error_str_shows_repr() {
+        let src = r#"
+def main() -> None:
+    try:
+        raise KeyError("missing")
+    except KeyError as e:
+        assert str(e) == "'missing'"
+        print("ok")
+main()
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    #[test]
     fn dict_view_set_operations() {
         // `dict.keys()` / `dict.items()` are set-like and support `& | - ^`.
         let src = r#"

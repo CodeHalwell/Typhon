@@ -1,0 +1,16 @@
+def main() -> None:
+    let n: int = 5
+    let matrix: list[list[int]] = [[i + j for j in range(n)] for i in range(n)]
+    print(matrix[2])
+    let total: int = sum([sum(row) for row in matrix])
+    print(total)
+    let diag: list[int] = [matrix[i][i] for i in range(n)]
+    print(diag)
+    let flat: list[int] = [x for row in matrix for x in row if x % 2 == 0]
+    print(len(flat))
+    let lookup: dict[int, int] = {i: i ** 2 for i in range(5)}
+    let keys_with_big_vals: list[int] = [k for k, v in lookup.items() if v > 5]
+    print(keys_with_big_vals)
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,28 @@
+type Response = Success | Error
+
+class Success frozen:
+    code: int
+    body: str
+class Error frozen:
+    code: int
+    message: str
+
+def summarize(r: Response) -> str:
+    match r:
+        case Success(code=200, body=b):
+            return f"OK: {b}"
+        case Success(code=c, body=b):
+            return f"success {c}: {b}"
+        case Error(code=404, message=m):
+            return f"not found: {m}"
+        case Error(code=c, message=m):
+            return f"error {c}: {m}"
+
+def main() -> None:
+    print(summarize(Success(code=200, body="data")))
+    print(summarize(Success(code=201, body="created")))
+    print(summarize(Error(code=404, message="missing")))
+    print(summarize(Error(code=500, message="server")))
+
+if __name__ == "__main__":
+    main()

@@ -1,28 +1,22 @@
 from __future__ import annotations
 
 
-def is_palindrome(s: str) -> bool:
-    clean: str = "".join([c.lower() for c in s if c.isalnum()])
-    return clean == clean[::-1]
+def parse_query(query: str) -> dict[str, str]:
+    params: dict[str, str] = {}
+    for pair in query.split("&"):
+        if "=" in pair:
+            parts: list[str] = pair.split("=", 1)
+            params[parts[0]] = parts[1]
+    return params
 
 
-def caesar(text: str, shift: int) -> str:
-    result: str = ""
-    for ch in text:
-        if ch.isalpha():
-            base: int = ord("a") if ch.islower() else ord("A")
-            result = result + chr((ord(ch) - base + shift) % 26 + base)
-        else:
-            result = result + ch
-    return result
+def parse_csv_line(line: str) -> list[str]:
+    return [field.strip() for field in line.split(",")]
 
 
 def main() -> None:
-    print(is_palindrome("A man a plan a canal Panama"))
-    print(is_palindrome("hello"))
-    enc: str = caesar("Hello, World!", 3)
-    print(enc)
-    print(caesar(enc, 23))
+    print(parse_query("name=alice&age=30&city=nyc"))
+    print(parse_csv_line("  a , b ,  c  , d "))
 
 
 if __name__ == "__main__":
