@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # For each .ty: tyc check; VM (tyc run); tyc build + python3.13. Compare VM vs CPython.
-export PATH="/home/user/Typhon/tyc/target/release:$PATH"
-PROJ=/home/user/Typhon/stress/round-2026-06-16/proj
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+export PATH="$REPO_ROOT/tyc/target/release:$PATH"
+PROJ="$SCRIPT_DIR/proj"
 PY=python3.13
 for f in "$@"; do
   name=$(basename "$f" .ty)

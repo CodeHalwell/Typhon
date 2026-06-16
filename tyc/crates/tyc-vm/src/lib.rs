@@ -466,16 +466,22 @@ main()
 
     #[test]
     fn user_exception_caught_via_builtin_base() {
-        // `except KeyError` must catch a user `class MyKeyError(KeyError):`.
+        // `except KeyError` must catch a user `class MyKeyError(KeyError):`,
+        // and the KeyError single-arg `str()` repr-quoting is inherited
+        // (`str(MyKeyError("k")) == "'k'"`).
         let src = r#"
 class MyKeyError(KeyError):
     pass
 
 def main() -> None:
+    mut caught: bool = False
     try:
         raise MyKeyError("missing-key")
     except KeyError as e:
-        print("caught:", str(e))
+        caught = True
+        assert str(e) == "'missing-key'"
+    assert caught
+    print("ok")
 
 main()
 "#;

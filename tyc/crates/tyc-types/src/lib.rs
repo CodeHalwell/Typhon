@@ -2123,14 +2123,13 @@ impl TypeEnv {
     fn attr_narrowed(&self, path: &str) -> Option<&Type> {
         self.attr_narrowings.get(path)
     }
-    /// Drop the narrowing for `path` (e.g. when it's reassigned).
+    /// Drop the narrowing for `path` *and any of its sub-attributes* (e.g.
+    /// when `self.x` is reassigned, any prior narrowing of `self.x.y` is
+    /// stale too because the base object changed).
     fn clear_attr_narrowing(&mut self, path: &str) {
-        self.attr_narrowings.remove(path);
-    }
-    /// Drop every attribute narrowing (e.g. on entering a new function body,
-    /// where a different `self` is in scope).
-    fn clear_all_attr_narrowings(&mut self) {
-        self.attr_narrowings.clear();
+        let sub_prefix = format!("{path}.");
+        self.attr_narrowings
+            .retain(|k, _| k != path && !k.starts_with(&sub_prefix));
     }
 }
 
@@ -2957,11 +2956,9 @@ impl<'a> Checker<'a> {
         // iterator class's `def __iter__(self) -> Iterator[int]: return self`
         // false-fires `type_mismatch` on `return self`.
         if let Type::Generic(exp_head, exp_args) = expected {
+            let exp_name = exp_head.as_str();
             if exp_args.len() == 1
-                && matches!(
-                    exp_head.as_str(),
-                    "Iterator" | "Iterable" | "Collection" | "Reversible"
-                )
+                && matches!(exp_name, "Iterator" | "Iterable" | "Collection" | "Reversible")
             {
                 if let Type::Class(act_name) | Type::Generic(act_name, _) = actual {
                     if let Some(sig) = self.find_method(act_name, "__next__") {
@@ -2969,12 +2966,17 @@ impl<'a> Checker<'a> {
                             return true;
                         }
                     }
-                    if let Some(sig) = self.find_method(act_name, "__iter__") {
-                        if let Type::Generic(_, iter_args) = &sig.return_type {
-                            if iter_args.len() == 1
-                                && self.is_assignable(&exp_args[0], &iter_args[0])
-                            {
-                                return true;
+                    // `__iter__(self) -> Iterator[T]` satisfies the *Iterable*
+                    // family but NOT `Iterator` itself — an `Iterable` without
+                    // `__next__` is not an iterator.
+                    if exp_name != "Iterator" {
+                        if let Some(sig) = self.find_method(act_name, "__iter__") {
+                            if let Type::Generic(_, iter_args) = &sig.return_type {
+                                if iter_args.len() == 1
+                                    && self.is_assignable(&exp_args[0], &iter_args[0])
+                                {
+                                    return true;
+                                }
                             }
                         }
                     }
@@ -8286,10 +8288,12 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                     // provably non-null (so `self.x = v; use(self.x)` sees the
                     // value), otherwise drop the narrowing (revert to declared).
                     if let Some(path) = attr_path_of(target) {
+                        // Invalidate the path and every sub-attribute narrowing
+                        // first (the base object changed), then re-narrow this
+                        // path to the assigned value when it's provably non-null.
+                        c.env.clear_attr_narrowing(&path);
                         if !value_type.is_nullable() && !matches!(value_type, Type::Unknown) {
                             c.env.narrow_attr(path, value_type.clone());
-                        } else {
-                            c.env.clear_attr_narrowing(&path);
                         }
                     }
                 }
@@ -10655,15 +10659,6 @@ fn sequence_cases_cover_all_lengths(cases: &[MatchCase]) -> bool {
     (0..min).all(|n| exact.contains(&n))
 }
 
-/// True if `pattern` (in an unguarded arm) matches every instance of
-/// `class_name`. Recognises:
-/// - `case _:` / `case x:` (always a wildcard for anything).
-/// - `case <wild> as name:` (recurses on the inner pattern).
-/// - `case C():` with no sub-patterns.
-/// - `case C(field=p1, ...):` where every field of `C` is bound and every
-///   sub-pattern `p_i` is itself a wildcard.
-/// - `case [*xs]:` for `class_name == "list"` / `"tuple"`.
-/// - `case <wild1> | <wild2> | ...:` where any branch matches.
 /// Sound cross-arm exhaustiveness for a `match` over a fixed-arity tuple
 /// subject (`tuple[T0, …, Tn-1]`). Recognises the idiomatic state-machine
 /// dispatch `match (state, event):` where each sealed-union variant in one
@@ -10774,6 +10769,15 @@ fn cover_pattern_columns(c: &Checker, rows: &[Vec<&Pattern>], types: &[Type]) ->
     cover_pattern_columns(c, &sub, rest)
 }
 
+/// True if `pattern` (in an unguarded arm) matches every instance of
+/// `class_name`. Recognises:
+/// - `case _:` / `case x:` (always a wildcard for anything).
+/// - `case <wild> as name:` (recurses on the inner pattern).
+/// - `case C():` with no sub-patterns.
+/// - `case C(field=p1, ...):` where every field of `C` is bound and every
+///   sub-pattern `p_i` is itself a wildcard.
+/// - `case [*xs]:` for `class_name == "list"` / `"tuple"`.
+/// - `case <wild1> | <wild2> | ...:` where any branch matches.
 fn pattern_covers_class(c: &Checker, pattern: &Pattern, class_name: &str) -> bool {
     match pattern {
         Pattern::MatchAs(a) => match &a.pattern {
@@ -10932,10 +10936,14 @@ fn subpattern_total_for_field(c: &Checker, pattern: &Pattern, field_ty: Option<&
             .iter()
             .any(|p| subpattern_total_for_field(c, p, Some(field_ty))),
         Pattern::MatchClass(_) => {
-            if let Type::Class(name) = c.unwrap_alias(field_ty) {
-                pattern_covers_class(c, pattern, &name)
-            } else {
-                false
+            // The field's declared type may be a plain class (`Point`) or a
+            // generic class (`Box[int]`); both name a class the nested
+            // pattern can cover.
+            match c.unwrap_alias(field_ty) {
+                Type::Class(name) | Type::Generic(name, _) => {
+                    pattern_covers_class(c, pattern, &name)
+                }
+                _ => false,
             }
         }
         _ => false,
@@ -17000,6 +17008,32 @@ impl CountDown:
         assert!(
             d.errors().is_empty(),
             "an iterator-protocol class must conform to Iterator[int]: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn iterable_only_class_is_not_an_iterator() {
+        // A class with `__iter__` but no `__next__` is an Iterable, not an
+        // Iterator — it must NOT be assignable to `Iterator[int]`.
+        let src = "\
+from typing import Iterator
+class Coll:
+    items: list[int]
+impl Coll:
+    def __iter__(self) -> Iterator[int]:
+        return iter(self.items)
+def wants_iterator(it: Iterator[int]) -> int:
+    return 0
+def bad() -> int:
+    return wants_iterator(Coll(items=[1]))
+";
+        let d = check(src);
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::TypeMismatch { .. })),
+            "an Iterable-only class must not satisfy Iterator[int]: {:?}",
             d.errors()
         );
     }

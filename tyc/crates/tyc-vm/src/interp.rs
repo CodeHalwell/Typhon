@@ -1729,9 +1729,19 @@ impl Interpreter {
                                 // `__format__(self, spec)` controls its own
                                 // formatting (`f"{temp:F}"`); otherwise fall
                                 // back to the builtin width/precision engine.
+                                // An explicit conversion (`!r`/`!s`/`!a`) wins:
+                                // CPython converts to the string `s` first and
+                                // formats *that*, so `__format__` must not run.
+                                let has_conversion =
+                                    !matches!(interp.conversion, ast::ConversionFlag::None);
                                 if let Some(spec) = &interp.format_spec {
                                     let spec_str = self.format_spec_text(spec, env)?;
-                                    if let Some(formatted) = self.try_user_format(&v, &spec_str)? {
+                                    let user_formatted = if has_conversion {
+                                        None
+                                    } else {
+                                        self.try_user_format(&v, &spec_str)?
+                                    };
+                                    if let Some(formatted) = user_formatted {
                                         out.push_str(&formatted);
                                     } else {
                                         out.push_str(&format_with_spec(&v, &s, &spec_str)?);
@@ -6026,8 +6036,13 @@ pub fn builtin_exc_is_a(kind: &str, target: &str) -> bool {
         return true;
     }
     if target == "Exception" {
-        // Everything except the BaseException-only siblings.
-        return !matches!(kind, "KeyboardInterrupt" | "SystemExit" | "GeneratorExit");
+        // Everything except `BaseException` itself and its base-only
+        // siblings — `except Exception` must NOT catch these, matching
+        // CPython (where they derive from BaseException, not Exception).
+        return !matches!(
+            kind,
+            "BaseException" | "KeyboardInterrupt" | "SystemExit" | "GeneratorExit"
+        );
     }
     // Direct parent in the standard hierarchy (subset covering the common
     // intermediate bases programs actually catch).

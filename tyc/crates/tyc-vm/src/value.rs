@@ -1050,7 +1050,7 @@ impl Value {
             // `str(exc)` differs from `repr(exc)` for a field-less exception
             // instance: the message/args, not `ClassName('msg')`.
             Value::Instance(i) => match exception_instance_args(i) {
-                Some(args) => exception_instance_str(&args),
+                Some(args) => exception_instance_str(i, &args),
                 None => instance_repr(i),
             },
             // Match the dataclass-default `repr` shape that
@@ -1112,6 +1112,13 @@ impl Value {
             // `repr(exc)` keeps the `ClassName('msg')` form even though
             // `str(exc)` (py_str) renders just the message.
             Value::Instance(i) => instance_repr(i),
+            // `repr(ValueError("boom"))` is `ValueError('boom')` (and
+            // `KeyError('k')`, `ValueError()` for no args) — the constructor
+            // form, not the `str()` message.
+            Value::Exception { kind, args, .. } => {
+                let parts: Vec<String> = args.iter().map(|a| a.py_repr()).collect();
+                format!("{}({})", kind, parts.join(", "))
+            }
             other => other.py_str(),
         }
     }
@@ -1281,11 +1288,32 @@ fn exception_instance_args(inst: &Instance) -> Option<Rc<Vec<Value>>> {
     }
 }
 
+/// Whether an exception class derives (directly or through its user base
+/// chain) from the builtin `KeyError`. Reads the `__typhon_exc_bases__`
+/// record stamped on each class by the interpreter's `build_class`.
+fn class_derives_from_keyerror(class: &Class) -> bool {
+    if class.name == "KeyError" {
+        return true;
+    }
+    if let Some(Value::Tuple(names)) = class.class_attrs.borrow().get("__typhon_exc_bases__") {
+        if names
+            .iter()
+            .any(|nm| matches!(nm, Value::Str(s) if s.as_str() == "KeyError"))
+        {
+            return true;
+        }
+    }
+    class.bases.iter().any(|b| class_derives_from_keyerror(b))
+}
+
 /// CPython `str(exc)` for a field-less exception instance: `""` for no args,
-/// the single arg for one, the args tuple otherwise.
-fn exception_instance_str(args: &[Value]) -> String {
+/// the single arg for one, the args tuple otherwise. `KeyError` is the one
+/// builtin whose single-arg `str()` shows the *repr* of the key
+/// (`str(KeyError("k")) == "'k'"`), so its subclasses inherit that.
+fn exception_instance_str(inst: &Instance, args: &[Value]) -> String {
     match args.len() {
         0 => String::new(),
+        1 if class_derives_from_keyerror(&inst.class) => args[0].py_repr(),
         1 => args[0].py_str(),
         _ => {
             let parts: Vec<String> = args.iter().map(|a| a.py_repr()).collect();
