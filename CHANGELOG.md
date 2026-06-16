@@ -97,6 +97,13 @@ output (`tyc build` → CPython 3.13) is now correct on the entire corpus.
   these (it previously raised `unsupported operand type(s)`), so `tyc run`
   matches the compiled path. `dict.values()` stays non-set-like, as in CPython.
 
+### Added — VM `abc` module shim (`tyc-vm`)
+
+- **`from abc import ABC, abstractmethod`** now works under `tyc run` (the
+  default VM): `ABC` / `ABCMeta` are no-op bases and the `abstractmethod`
+  family are identity decorators, so `class H(ABC): @abstractmethod def …`
+  plus concrete subclasses run without falling back to `--compile`.
+
 ### Fixed — more VM parity (`tyc-vm`)
 
 - **`del lst[i:j]` / `del lst[::k]`** (slice deletion) now works under

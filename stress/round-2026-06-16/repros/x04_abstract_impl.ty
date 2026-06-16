@@ -1,0 +1,30 @@
+from abc import ABC, abstractmethod
+
+class Handler(ABC):
+    @abstractmethod
+    def handle(self, event: str) -> str:
+        ...
+
+class LogHandler(Handler):
+    prefix: str
+
+impl LogHandler:
+    def handle(self, event: str) -> str:
+        return f"{self.prefix}: {event}"
+
+class EchoHandler(Handler):
+    pass
+
+impl EchoHandler:
+    def handle(self, event: str) -> str:
+        return event
+
+def dispatch(handlers: list[Handler], event: str) -> list[str]:
+    return [h.handle(event) for h in handlers]
+
+def main() -> None:
+    let handlers: list[Handler] = [LogHandler(prefix="LOG"), EchoHandler()]
+    print(dispatch(handlers, "click"))
+
+if __name__ == "__main__":
+    main()

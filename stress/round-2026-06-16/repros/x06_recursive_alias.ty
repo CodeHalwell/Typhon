@@ -1,0 +1,35 @@
+type IntList = Nil | Cons
+
+class Nil frozen:
+    pass
+class Cons frozen:
+    head: int
+    tail: IntList
+
+def length(lst: IntList) -> int:
+    match lst:
+        case Nil():
+            return 0
+        case Cons(head=_, tail=rest):
+            return 1 + length(rest)
+
+def sum_list(lst: IntList) -> int:
+    match lst:
+        case Nil():
+            return 0
+        case Cons(head=h, tail=rest):
+            return h + sum_list(rest)
+
+def from_list(xs: list[int]) -> IntList:
+    mut result: IntList = Nil()
+    for x in reversed(xs):
+        result = Cons(head=x, tail=result)
+    return result
+
+def main() -> None:
+    let lst: IntList = from_list([1, 2, 3, 4, 5])
+    print(length(lst))
+    print(sum_list(lst))
+
+if __name__ == "__main__":
+    main()

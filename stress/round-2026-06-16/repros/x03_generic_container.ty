@@ -1,0 +1,35 @@
+class Queue[T]:
+    items: list[T]
+
+impl[T] Queue[T]:
+    def enqueue(self, x: T) -> None:
+        self.items.append(x)
+    def dequeue(self) -> T?:
+        if len(self.items) == 0:
+            return None
+        return self.items.pop(0)
+    def peek(self) -> T?:
+        if len(self.items) == 0:
+            return None
+        return self.items[0]
+    def is_empty(self) -> bool:
+        return len(self.items) == 0
+
+def drain[T](q: Queue[T]) -> list[T]:
+    mut result: list[T] = []
+    while not q.is_empty():
+        let item: T? = q.dequeue()
+        if item is not None:
+            result.append(item)
+    return result
+
+def main() -> None:
+    mut q: Queue[str] = Queue(items=[])
+    q.enqueue("a")
+    q.enqueue("b")
+    q.enqueue("c")
+    print(q.peek())
+    print(drain(q))
+
+if __name__ == "__main__":
+    main()

@@ -1722,6 +1722,11 @@ pub fn resolve_module(interp: &mut Interpreter, name: &str) -> Result<Value, Unw
         // at runtime, so identity natives (mirroring the `typing` shim)
         // are all the VM needs.
         "collections.abc" => Ok(make_collections_abc_module()),
+        // `abc` — `ABC` / `ABCMeta` are annotation-/base-only at runtime in
+        // the VM (a non-`Value::Class` base is ignored), and the abstract-*
+        // decorators are identity wrappers, so identity natives suffice for
+        // `class H(ABC): @abstractmethod def handle(...): ...`.
+        "abc" => Ok(make_abc_module()),
         // Cooperative (sequential) asyncio: coroutines are thunks forced at
         // await points, tasks complete at creation, and Queue.get on an
         // empty queue fails loudly instead of deadlocking. Programs whose
@@ -4263,6 +4268,22 @@ fn make_collections_abc_module() -> Value {
         entries.push((name, identity_native(name)));
     }
     make_module("collections.abc", entries)
+}
+
+fn make_abc_module() -> Value {
+    let mut entries: Vec<(&str, Value)> = Vec::new();
+    for name in [
+        "ABC",
+        "ABCMeta",
+        "abstractmethod",
+        "abstractproperty",
+        "abstractclassmethod",
+        "abstractstaticmethod",
+        "update_abstractmethods",
+    ] {
+        entries.push((name, identity_native(name)));
+    }
+    make_module("abc", entries)
 }
 
 fn make_collections_module() -> Value {

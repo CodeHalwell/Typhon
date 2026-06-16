@@ -1,0 +1,25 @@
+from functools import reduce
+from typing import Callable
+
+def fold[A, B](xs: list[A], init: B, f: Callable[[B, A], B]) -> B:
+    mut acc: B = init
+    for x in xs:
+        acc = f(acc, x)
+    return acc
+
+def main() -> None:
+    let total: int = fold([1, 2, 3, 4], 0, lambda acc, x: acc + x)
+    print(total)
+    let concat: str = fold(["a", "b", "c"], "", lambda acc, x: acc + x)
+    print(concat)
+    let max_val: int = reduce(lambda a, b: a if a > b else b, [3, 7, 1, 9, 2])
+    print(max_val)
+    let counts: dict[str, int] = fold(
+        ["a", "b", "a", "c", "a"],
+        {},
+        lambda acc, x: {**acc, x: acc.get(x, 0) + 1},
+    )
+    print(sorted(counts.items()))
+
+if __name__ == "__main__":
+    main()

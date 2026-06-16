@@ -1,0 +1,17 @@
+import json
+
+model Config:
+    host: str
+    port: int
+    debug: bool
+
+def load(raw: str) -> Config:
+    return Config.model_validate_json(raw)
+
+def main() -> None:
+    let raw: str = '{"host": "localhost", "port": 8080, "debug": true}'
+    let cfg: Config = load(raw)
+    print(cfg.host, cfg.port, cfg.debug)
+
+if __name__ == "__main__":
+    main()

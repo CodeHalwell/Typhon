@@ -541,6 +541,33 @@ print("ok")
     }
 
     #[test]
+    fn abc_module_shim() {
+        // `from abc import ABC, abstractmethod` + an ABC subclass works in
+        // the VM (ABC base is a no-op, abstractmethod is identity).
+        let src = r#"
+from abc import ABC, abstractmethod
+
+class Handler(ABC):
+    @abstractmethod
+    def handle(self, e: str) -> str:
+        ...
+
+class Echo(Handler):
+    pass
+impl Echo:
+    def handle(self, e: str) -> str:
+        return e
+
+def main() -> None:
+    let h: Handler = Echo()
+    assert h.handle("x") == "x"
+    print("ok")
+main()
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    #[test]
     fn user_format_dunder_dispatched() {
         // `f"{x:spec}"`, `"{:spec}".format(x)`, and `format(x, spec)` all
         // route through a user `__format__(self, spec)`.
