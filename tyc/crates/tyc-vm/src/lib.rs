@@ -547,6 +547,51 @@ print("ok")
     }
 
     #[test]
+    fn non_string_format_raises_typeerror() {
+        // A user `__format__` returning a non-`str` raises `TypeError`
+        // (CPython parity), not a silently-coerced string.
+        let src = r#"
+class T:
+    n: int
+impl T:
+    def __format__(self, spec: str) -> int:
+        return 123
+
+def main() -> None:
+    mut caught: bool = False
+    try:
+        let s: str = f"{T(n=1):x}"
+    except TypeError:
+        caught = True
+    assert caught
+    print("ok")
+
+main()
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    #[test]
+    fn uncaught_exception_message_is_str_form() {
+        // A re-caught exception's `str()` is the message, not the args tuple
+        // — the same form the uncaught traceback uses.
+        let src = r#"
+class AppError(Exception):
+    pass
+
+def main() -> None:
+    try:
+        raise AppError("boom")
+    except AppError as e:
+        assert str(e) == "boom"
+    print("ok")
+
+main()
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    #[test]
     fn abc_module_shim() {
         // `from abc import ABC, abstractmethod` + an ABC subclass works in
         // the VM (ABC base is a no-op, abstractmethod is identity).

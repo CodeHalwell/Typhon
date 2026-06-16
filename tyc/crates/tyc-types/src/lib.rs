@@ -2957,20 +2957,21 @@ impl<'a> Checker<'a> {
             let exp_name = exp_head.as_str();
             if exp_args.len() == 1 && matches!(exp_name, "Iterator" | "Iterable") {
                 if let Type::Class(act_name) | Type::Generic(act_name, _) = actual {
-                    if let Some(sig) = self.find_method(act_name, "__next__") {
-                        if self.is_assignable(&exp_args[0], &sig.return_type) {
-                            return true;
+                    // `Iterator[T]` is satisfied by `__next__(self) -> T`.
+                    if exp_name == "Iterator" {
+                        if let Some(sig) = self.find_method(act_name, "__next__") {
+                            if self.is_assignable(&exp_args[0], &sig.return_type) {
+                                return true;
+                            }
                         }
                     }
-                    // `__iter__(self) -> Iterator[T]` satisfies the *Iterable*
-                    // family but NOT `Iterator` itself — an `Iterable` without
-                    // `__next__` is not an iterator.
-                    if exp_name != "Iterator" {
+                    // `Iterable[T]` requires `__iter__(self) -> Iterator[T]`.
+                    // `__next__` alone does NOT make a class iterable
+                    // (`iter(obj)` / `for x in obj` need `__iter__`), and the
+                    // `__iter__` return must be an `Iterator` (a `list[int]`
+                    // return raises `iter() returned non-iterator` at runtime).
+                    if exp_name == "Iterable" {
                         if let Some(sig) = self.find_method(act_name, "__iter__") {
-                            // `__iter__` must actually return an iterator
-                            // (`Iterator[T]`) — a `list[int]` return does not
-                            // make the class an `Iterable` (CPython raises
-                            // `iter() returned non-iterator` at runtime).
                             if let Type::Generic(ret_head, iter_args) = &sig.return_type {
                                 if ret_head.as_str() == "Iterator"
                                     && iter_args.len() == 1
@@ -17012,6 +17013,32 @@ impl CountDown:
         assert!(
             d.errors().is_empty(),
             "an iterator-protocol class must conform to Iterator[int]: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn next_only_class_is_not_iterable() {
+        // `Iterable[T]` requires `__iter__`; a class with only `__next__`
+        // (no `__iter__`) is not iterable (`iter(obj)` fails at runtime).
+        let src = "\
+from typing import Iterable
+class N:
+    x: int
+impl N:
+    def __next__(self) -> int:
+        return self.x
+def wants(it: Iterable[int]) -> int:
+    return 0
+def bad() -> int:
+    return wants(N(x=1))
+";
+        let d = check(src);
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::TypeMismatch { .. })),
+            "a `__next__`-only class must not satisfy Iterable[int]: {:?}",
             d.errors()
         );
     }

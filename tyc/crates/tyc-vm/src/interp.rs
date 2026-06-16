@@ -1786,7 +1786,9 @@ impl Interpreter {
                     vec![Value::Str(Rc::new(spec.to_owned()))],
                     &[],
                 )?;
-                return Ok(Some(result.py_str()));
+                // CPython raises `TypeError` if `__format__` returns a
+                // non-`str`; don't silently coerce it.
+                return Ok(Some(require_str_return(result, "__format__")?));
             }
         }
         Ok(None)
@@ -4701,10 +4703,16 @@ impl Interpreter {
                 Unwind::Exception(VmException::new(k, m).with_value(v))
             }
             Value::Instance(i) => {
-                // Prefer `args` (Python convention), fall back to `message`,
-                // else stringify nothing. Never panic — this is the error
-                // path we hit during a `raise`.
-                let msg = {
+                let cls_name = i.class.name.clone();
+                // The displayed message follows `str(exc)` (single arg → that
+                // arg, multi → the args tuple, KeyError repr-quoting) so an
+                // uncaught `raise AppError("boom")` shows `AppError: boom`, not
+                // `AppError: ('boom',)`. `py_str` on an exception instance
+                // routes through that logic. Non-exception instances fall back
+                // to the `args` / `message` field convention.
+                let msg = if i.class.is_exception {
+                    Value::Instance(i.clone()).py_str()
+                } else {
                     let fields = i.fields.borrow();
                     fields
                         .get("args")
@@ -4712,9 +4720,7 @@ impl Interpreter {
                         .map(|v| v.py_str())
                         .unwrap_or_default()
                 };
-                Unwind::Exception(
-                    VmException::new(i.class.name.clone(), msg).with_value(Value::Instance(i)),
-                )
+                Unwind::Exception(VmException::new(cls_name, msg).with_value(Value::Instance(i)))
             }
             other => {
                 Unwind::Exception(VmException::new("Exception", other.py_str()).with_value(other))
