@@ -102,10 +102,36 @@ Three more **production-blocking checker false-positives** fixed — all
   accepted a *tail* star, so an exhaustive list match false-fired. Generalised
   to a star at any position.
 
+## Fourth sweep — batches P–U (~48 more programs)
+
+Async iteration / context managers / gather, Literal types, overload-shaped
+`isinstance` chains, bounded generics, stacked decorators, `__call__` /
+`__format__` instances, `del` slices, custom hashables, deep narrowing, and
+real programs (graph BFS, state machines, recursive evaluators, linked-list
+drains). Findings:
+
+**Production-blocking checker false-positives (fixed):**
+- **`match s:` after `if s is None: return`** keyed off the *declared* type
+  (`Shape?`), so it thought `None` was uncovered. Now uses the *narrowed* type.
+- **Optional attribute narrowing** — `if self.value is None: return …` didn't
+  narrow `self.value`, so "check an optional field, then use it" (one of the
+  most common Python patterns) false-fired. Added flow-sensitive narrowing
+  keyed by access path, with assignment-narrowing and full soundness scoping.
+
+**VM-only (compiled already correct, fixed for `tyc run` parity):**
+- `del lst[i:j]` / `del lst[::k]` slice deletion.
+- User `__format__(self, spec)` dispatch from `f"{x:spec}"` / `.format` /
+  `format()`.
+- `str(KeyError("k"))` → `"'k'"`.
+
+A couple of apparent findings were correct behavior (my test errors): a
+`list[dict] → list[object]` assignment is a real invariance violation, and a
+coroutine list annotated `list[object]` likewise.
+
 ## Result
 
 The **production path (`tyc build` → CPython 3.13) is correct on the entire
-118-program corpus** (0 build/runtime failures). The frontend held up with
+166-program corpus** (0 build/runtime failures). The frontend held up with
 zero remaining false positives. Remaining divergences are all VM-only with
 correct compiled output, and are documented VM-coverage limitations:
 
