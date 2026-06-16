@@ -10525,12 +10525,15 @@ fn sequence_cases_cover_all_lengths(cases: &[MatchCase]) -> bool {
         if star_count != 1 {
             continue;
         }
-        if !matches!(seq.patterns.last(), Some(Pattern::MatchStar(_))) {
-            continue;
-        }
-        if !seq.patterns[..seq.patterns.len() - 1]
+        // A single star anywhere — tail (`[a, *rest]`), middle
+        // (`[first, *mid, last]`), or head (`[*init, last]`) — matches every
+        // length ≥ (number of non-star elements), provided every non-star
+        // element is an irrefutable capture / wildcard. (The star binding
+        // itself, `*mid`, is always irrefutable.)
+        if !seq
+            .patterns
             .iter()
-            .all(is_capture_or_underscore)
+            .all(|p| matches!(p, Pattern::MatchStar(_)) || is_capture_or_underscore(p))
         {
             continue;
         }
@@ -16878,6 +16881,54 @@ def f(cmd: Cmd, count: int) -> str:
                 .iter()
                 .any(|e| matches!(e, TycError::MissingReturn { .. })),
             "tuple match that leaves an int column gap must fire missing_return: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn list_match_with_middle_star_is_exhaustive() {
+        // `[]`, `[x]`, `[x, y]`, `[first, *mid, last]` covers lengths
+        // 0, 1, 2, and ≥2 — exhaustive even though the star is mid-pattern.
+        let src = "\
+def f(xs: list[int]) -> str:
+    match xs:
+        case []:
+            return \"e\"
+        case [x]:
+            return \"one\"
+        case [x, y]:
+            return \"two\"
+        case [first, *mid, last]:
+            return \"many\"
+";
+        let d = check(src);
+        assert!(
+            !d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::MissingReturn { .. })),
+            "list match with a middle star must be exhaustive: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn list_match_middle_star_with_gap_fires() {
+        // `[]` + `[first, *mid, last]` (min length 2) leaves length 1
+        // uncovered — missing_return must still fire.
+        let src = "\
+def f(xs: list[int]) -> str:
+    match xs:
+        case []:
+            return \"e\"
+        case [first, *mid, last]:
+            return \"many\"
+";
+        let d = check(src);
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::MissingReturn { .. })),
+            "list match leaving a length gap must fire missing_return: {:?}",
             d.errors()
         );
     }

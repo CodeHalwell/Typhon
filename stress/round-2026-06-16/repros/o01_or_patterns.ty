@@ -1,0 +1,26 @@
+type Token = Keyword | Ident | Number | Symbol
+
+class Keyword frozen:
+    word: str
+class Ident frozen:
+    name: str
+class Number frozen:
+    value: int
+class Symbol frozen:
+    char: str
+
+def is_operand(t: Token) -> bool:
+    match t:
+        case Ident(_) | Number(_):
+            return True
+        case Keyword(_) | Symbol(_):
+            return False
+
+def main() -> None:
+    print(is_operand(Ident(name="x")))
+    print(is_operand(Number(value=5)))
+    print(is_operand(Keyword(word="if")))
+    print(is_operand(Symbol(char="+")))
+
+if __name__ == "__main__":
+    main()

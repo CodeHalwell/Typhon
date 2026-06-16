@@ -1,0 +1,22 @@
+def multiply(a: list[list[float]], b: list[list[float]]) -> list[list[float]]:
+    let n: int = len(a)
+    let m: int = len(b[0])
+    let k: int = len(b)
+    mut result: list[list[float]] = []
+    for i in range(n):
+        mut row: list[float] = []
+        for j in range(m):
+            mut sum: float = 0.0
+            for x in range(k):
+                sum = sum + a[i][x] * b[x][j]
+            row.append(sum)
+        result.append(row)
+    return result
+
+def main() -> None:
+    let a: list[list[float]] = [[1.0, 2.0], [3.0, 4.0]]
+    let b: list[list[float]] = [[5.0, 6.0], [7.0, 8.0]]
+    print(multiply(a, b))
+
+if __name__ == "__main__":
+    main()

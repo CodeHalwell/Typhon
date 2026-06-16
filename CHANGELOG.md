@@ -23,6 +23,17 @@ output (`tyc build` → CPython 3.13) is now correct on the entire corpus.
   nested pattern itself totally covers that class. A nested *value* filter
   (`x=0`) stays correctly refutable, so genuine fall-throughs still fire.
 
+### Fixed — list `match` with a non-tail star is recognised exhaustive
+
+- **`case [first, *middle, last]:` no longer leaves a length-coverage gap.**
+  The list-length exhaustiveness check only accepted a *tail* star
+  (`[a, *rest]`); a star in the middle or head (`[first, *mid, last]`,
+  `[*init, last]`) was ignored, so an otherwise-complete match
+  (`[]` / `[x]` / `[x, y]` / `[first, *mid, last]`) false-fired
+  `tyc::missing_return`. A single star anywhere with capture/wildcard
+  non-star elements now contributes its `≥ len-1` length coverage; a genuine
+  gap (e.g. `[]` + `[a, *m, b]` leaving length 1) still fires.
+
 ### Fixed — exhaustive tuple-of-union `match` no longer blocks the build
 
 - **`match (state, event):` over a `tuple[Union, T]` no longer false-fires

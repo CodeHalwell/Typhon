@@ -1,30 +1,23 @@
 from __future__ import annotations
-from typing import Iterator
 
 
-def chunks[T](items: list[T], size: int) -> Iterator[list[T]]:
-    i: int = 0
-    while i < len(items):
-        yield items[i : i + size]
-        i = i + size
-
-
-def take[T](it: Iterator[T], n: int) -> list[T]:
-    result: list[T] = []
-    count: int = 0
-    for x in it:
-        if count >= n:
-            break
-        result.append(x)
-        count = count + 1
-    return result
+def analyze(xs: list[int]) -> str:
+    match xs:
+        case []:
+            return "empty"
+        case [x]:
+            return f"single: {x}"
+        case [x, y]:
+            return f"pair: {x},{y}"
+        case [first, *middle, last]:
+            return f"first={first}, last={last}, mid={len(middle)}"
 
 
 def main() -> None:
-    data: list[int] = [1, 2, 3, 4, 5, 6, 7]
-    for chunk in chunks(data, 3):
-        print(chunk)
-    print(take(chunks(data, 2), 2))
+    print(analyze([]))
+    print(analyze([1]))
+    print(analyze([1, 2]))
+    print(analyze([1, 2, 3, 4, 5]))
 
 
 if __name__ == "__main__":
