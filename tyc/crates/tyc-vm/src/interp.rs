@@ -3136,17 +3136,23 @@ impl Interpreter {
         }
 
         // Sets.
-        if let (Set(a), op2, Set(b)) = (l, op, r) {
-            let a = a.borrow();
-            let b = b.borrow();
-            let out: std::collections::HashSet<HashKey> = match op2 {
-                BitOr => a.union(&b).cloned().collect(),
-                BitAnd => a.intersection(&b).cloned().collect(),
-                Sub => a.difference(&b).cloned().collect(),
-                BitXor => a.symmetric_difference(&b).cloned().collect(),
-                _ => return Err(type_error("unsupported set operation")),
-            };
-            return Ok(Set(Rc::new(RefCell::new(out))));
+        // Set algebra over `set`s and the set-like dict views
+        // (`dict.keys()` / `dict.items()`). `as_set_operand` returns the
+        // operand's elements as a `HashSet<HashKey>` for any of those, so
+        // `d1.keys() & d2.keys()`, `d.keys() - some_set`, etc. all work —
+        // matching CPython, where keys/items views implement the set
+        // operations (values views do not).
+        if matches!(op, BitOr | BitAnd | Sub | BitXor) {
+            if let (Some(a), Some(b)) = (as_set_operand(l)?, as_set_operand(r)?) {
+                let out: std::collections::HashSet<HashKey> = match op {
+                    BitOr => a.union(&b).cloned().collect(),
+                    BitAnd => a.intersection(&b).cloned().collect(),
+                    Sub => a.difference(&b).cloned().collect(),
+                    BitXor => a.symmetric_difference(&b).cloned().collect(),
+                    _ => unreachable!(),
+                };
+                return Ok(Set(Rc::new(RefCell::new(out))));
+            }
         }
 
         // Operator overloading: dispatch to the left operand's dunder method,
@@ -5883,6 +5889,29 @@ fn class_has_builtin_exc_base(class: &Rc<Class>, target: &str) -> bool {
         .bases
         .iter()
         .any(|b| class_has_builtin_exc_base(b, target))
+}
+
+/// Elements of a set-algebra operand as a `HashSet<HashKey>`, for `set`s and
+/// the set-like dict views (`dict.keys()` / `dict.items()`). Returns
+/// `Ok(None)` for anything that isn't set-like (so the binop falls through to
+/// the normal dunder / mismatch path), and propagates an unwind if a view
+/// element isn't hashable. `dict.values()` is intentionally not set-like.
+fn as_set_operand(v: &Value) -> Result<Option<std::collections::HashSet<HashKey>>, Unwind> {
+    use crate::value::DictViewKind;
+    match v {
+        Value::Set(s) => Ok(Some(s.borrow().iter().cloned().collect())),
+        Value::DictView {
+            kind: DictViewKind::Keys | DictViewKind::Items,
+            items,
+        } => {
+            let mut out = std::collections::HashSet::with_capacity(items.len());
+            for item in items {
+                out.insert(item.to_hash_key()?);
+            }
+            Ok(Some(out))
+        }
+        _ => Ok(None),
+    }
 }
 
 fn exc_fallback_args(message: &str) -> Vec<Value> {

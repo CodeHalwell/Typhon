@@ -1,0 +1,29 @@
+def classify(n: int) -> str:
+    if n < 0:
+        return "negative"
+    elif n == 0:
+        return "zero"
+    else:
+        return "positive"
+
+def first_or_default[T](xs: list[T], default: T) -> T:
+    if len(xs) > 0:
+        return xs[0]
+    return default
+
+def safe_div(a: float, b: float) -> float?:
+    if b == 0.0:
+        return None
+    return a / b
+
+def main() -> None:
+    print(classify(-5), classify(0), classify(5))
+    print(first_or_default([1, 2, 3], 0))
+    print(first_or_default([], 99))
+    let r: float? = safe_div(10.0, 2.0)
+    if r is not None:
+        print(r)
+    print(safe_div(1.0, 0.0))
+
+if __name__ == "__main__":
+    main()

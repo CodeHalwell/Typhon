@@ -14122,6 +14122,10 @@ fn operator_operands_compatible(op: Operator, l: &Type, r: &Type) -> bool {
             }
             // `set - set` and `frozenset - frozenset` are Python set
             // difference (and the symmetric forms across set/frozenset).
+            // `dict.keys()` / `dict.items()` are set-like views that also
+            // support set difference (`d1.keys() - d2.keys()`,
+            // `d.keys() - some_set`), so `KeysView` / `ItemsView` count as
+            // set-like too (`ValuesView` does NOT — values aren't a set).
             // The bitwise ops `&`, `|`, `^` already fall through to the
             // permissive `_ => true` arm; the `-` arm needs an explicit
             // carve-out because it shares this match with the
@@ -14129,7 +14133,8 @@ fn operator_operands_compatible(op: Operator, l: &Type, r: &Type) -> bool {
             if let (Type::Generic(ln, _), Type::Generic(rn, _)) = (l, r) {
                 let ls = ln.as_str();
                 let rs = rn.as_str();
-                let set_like = |n: &str| n == "set" || n == "frozenset";
+                let set_like =
+                    |n: &str| matches!(n, "set" | "frozenset" | "KeysView" | "ItemsView");
                 if matches!(op, Operator::Sub) && set_like(ls) && set_like(rs) {
                     return true;
                 }

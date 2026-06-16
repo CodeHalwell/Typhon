@@ -1,0 +1,23 @@
+import enum
+
+class Direction(enum.Enum):
+    NORTH = 0
+    EAST = 1
+    SOUTH = 2
+    WEST = 3
+
+impl Direction:
+    def opposite(self) -> Direction:
+        return Direction((self.value + 2) % 4)
+    def turn_right(self) -> Direction:
+        return Direction((self.value + 1) % 4)
+
+def main() -> None:
+    let d: Direction = Direction.NORTH
+    print(d.opposite().name)
+    print(d.turn_right().name)
+    for dir in Direction:
+        print(dir.name, dir.value)
+
+if __name__ == "__main__":
+    main()

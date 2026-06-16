@@ -1,0 +1,23 @@
+def main() -> None:
+    mut a: int = 1
+    mut b: int = 2
+    a, b = b, a
+    print(a, b)
+    mut x: int = 0
+    mut y: int = 0
+    mut z: int = 0
+    x, y, z = 10, 20, 30
+    print(x, y, z)
+    mut lst: list[int] = [1, 2, 3]
+    lst[0], lst[2] = lst[2], lst[0]
+    print(lst)
+    mut d: dict[str, int] = {"a": 1, "b": 2}
+    d["a"], d["b"] = d["b"], d["a"]
+    print(d)
+    mut p: int = 0
+    mut q: int = 0
+    p = q = 5
+    print(p, q)
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,29 @@
+class Stats:
+    count: int
+    total: float
+    minimum: float
+    maximum: float
+
+impl Stats:
+    def add(self, value: float) -> None:
+        self.count = self.count + 1
+        self.total = self.total + value
+        if value < self.minimum:
+            self.minimum = value
+        if value > self.maximum:
+            self.maximum = value
+    def mean(self) -> float:
+        if self.count == 0:
+            return 0.0
+        return self.total / float(self.count)
+
+def main() -> None:
+    mut stats: Stats = Stats(count=0, total=0.0, minimum=1e18, maximum=-1e18)
+    for v in [3.0, 1.0, 4.0, 1.0, 5.0, 9.0, 2.0]:
+        stats.add(v)
+    print(stats.count, stats.total)
+    print(stats.minimum, stats.maximum)
+    print(round(stats.mean(), 3))
+
+if __name__ == "__main__":
+    main()

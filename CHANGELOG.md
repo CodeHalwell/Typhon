@@ -30,6 +30,16 @@ output (`tyc build` → CPython 3.13) is now correct on the entire corpus.
   CPython preserves keyword-argument order; the VM now uses an insertion-
   ordered map (`IndexMap` + `shift_remove`) to match.
 
+### Fixed — set operations on `dict` views (`tyc-types` + `tyc-vm`)
+
+- **`d1.keys() - d2.keys()` no longer false-fires `tyc::operator_type_mismatch`
+  (production blocker).** `dict.keys()` / `dict.items()` are set-like views
+  that support `& | - ^`; the checker's set-difference carve-out only allowed
+  `set`/`frozenset`, so `KeysView`/`ItemsView` operands were rejected and the
+  build blocked. (`&`/`|`/`^` already type-checked.) The VM now also evaluates
+  these (it previously raised `unsupported operand type(s)`), so `tyc run`
+  matches the compiled path. `dict.values()` stays non-set-like, as in CPython.
+
 ### Fixed — `bytes` operators in the VM (`tyc-vm`)
 
 - `b"a" + b"b"` (concatenation) and `b"a" * 3` / `3 * b"a"` (repetition) now

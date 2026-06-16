@@ -541,6 +541,20 @@ print("ok")
     }
 
     #[test]
+    fn dict_view_set_operations() {
+        // `dict.keys()` / `dict.items()` are set-like and support `& | - ^`.
+        let src = r#"
+let d1: dict[str, int] = {"a": 1, "b": 2, "c": 3}
+let d2: dict[str, int] = {"b": 2, "c": 4, "d": 5}
+assert sorted(d1.keys() & d2.keys()) == ["b", "c"]
+assert sorted(d1.keys() | d2.keys()) == ["a", "b", "c", "d"]
+assert sorted(d1.keys() - d2.keys()) == ["a"]
+print("ok")
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    #[test]
     fn result_question_mark() {
         let src = r#"
 from typhon_runtime import Ok, Err

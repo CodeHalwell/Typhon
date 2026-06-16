@@ -1,0 +1,14 @@
+def lookup(data: dict[str, dict[str, int]], outer: str, inner: str) -> int?:
+    let inner_dict: dict[str, int]? = data.get(outer)
+    if inner_dict is None:
+        return None
+    return inner_dict.get(inner)
+
+def main() -> None:
+    let data: dict[str, dict[str, int]] = {"a": {"x": 1, "y": 2}, "b": {"z": 3}}
+    print(lookup(data, "a", "x"))
+    print(lookup(data, "a", "missing"))
+    print(lookup(data, "missing", "x"))
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,42 @@
+type JsonValue = JsonNull | JsonBool | JsonNum | JsonStr | JsonArr | JsonObj
+
+class JsonNull frozen:
+    pass
+class JsonBool frozen:
+    value: bool
+class JsonNum frozen:
+    value: float
+class JsonStr frozen:
+    value: str
+class JsonArr frozen:
+    items: list[JsonValue]
+class JsonObj frozen:
+    fields: list[tuple[str, JsonValue]]
+
+def render(v: JsonValue) -> str:
+    match v:
+        case JsonNull():
+            return "null"
+        case JsonBool(value=b):
+            return "true" if b else "false"
+        case JsonNum(value=n):
+            return str(n)
+        case JsonStr(value=s):
+            return f'"{s}"'
+        case JsonArr(items=items):
+            return "[" + ", ".join([render(it) for it in items]) + "]"
+        case JsonObj(fields=fields):
+            let parts: list[str] = [f'"{k}": {render(val)}' for k, val in fields]
+            return "{" + ", ".join(parts) + "}"
+
+def main() -> None:
+    let doc: JsonValue = JsonObj(fields=[
+        ("name", JsonStr(value="Alice")),
+        ("age", JsonNum(value=30.0)),
+        ("active", JsonBool(value=True)),
+        ("tags", JsonArr(items=[JsonStr(value="a"), JsonStr(value="b")])),
+    ])
+    print(render(doc))
+
+if __name__ == "__main__":
+    main()

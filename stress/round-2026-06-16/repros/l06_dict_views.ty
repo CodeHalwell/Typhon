@@ -1,0 +1,15 @@
+def main() -> None:
+    let d1: dict[str, int] = {"a": 1, "b": 2, "c": 3}
+    let d2: dict[str, int] = {"b": 2, "c": 4, "d": 5}
+    let common_keys: set[str] = d1.keys() & d2.keys()
+    print(sorted(common_keys))
+    let all_keys: set[str] = d1.keys() | d2.keys()
+    print(sorted(all_keys))
+    let only_d1: set[str] = d1.keys() - d2.keys()
+    print(sorted(only_d1))
+    print(sorted(d1.items()))
+    print("a" in d1.keys())
+    print(2 in d1.values())
+
+if __name__ == "__main__":
+    main()
