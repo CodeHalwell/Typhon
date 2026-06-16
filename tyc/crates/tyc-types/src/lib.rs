@@ -2958,7 +2958,10 @@ impl<'a> Checker<'a> {
         if let Type::Generic(exp_head, exp_args) = expected {
             let exp_name = exp_head.as_str();
             if exp_args.len() == 1
-                && matches!(exp_name, "Iterator" | "Iterable" | "Collection" | "Reversible")
+                && matches!(
+                    exp_name,
+                    "Iterator" | "Iterable" | "Collection" | "Reversible"
+                )
             {
                 if let Type::Class(act_name) | Type::Generic(act_name, _) = actual {
                     if let Some(sig) = self.find_method(act_name, "__next__") {
