@@ -3374,22 +3374,29 @@ fn is_string_literal(expr: &Expr) -> bool {
 /// names; passing a function or method name through is harmless because
 /// the caller already gated on `Stmt::Assign` / `Stmt::AnnAssign`.
 fn is_secret_name(name: &str) -> bool {
-    // Recognised suffixes. Longest-first matters because of
+    // Recognised secret words. Longest-first matters because of
     // `API_KEY` overlapping `KEY` — both fire, but the help text
     // remains the same so the order is purely defensive.
-    const SUFFIXES: &[&str] = &["API_KEY", "PASSWORD", "TOKEN", "SECRET", "PWD", "KEY"];
+    const WORDS: &[&str] = &["API_KEY", "PASSWORD", "TOKEN", "SECRET", "PWD", "KEY"];
     let upper = name.to_ascii_uppercase();
-    for suffix in SUFFIXES {
-        if upper == *suffix {
-            return true;
-        }
-        if upper.ends_with(suffix) {
-            // Ensure the suffix is preceded by `_` so `MONKEY` doesn't
-            // match `KEY` and `PASSPORT` doesn't match nothing useful.
-            let prefix_len = upper.len() - suffix.len();
-            if upper.as_bytes()[prefix_len - 1] == b'_' {
+    for word in WORDS {
+        let mut start_idx = 0;
+        while let Some(idx) = upper[start_idx..].find(word) {
+            let actual_idx = start_idx + idx;
+            // Ensure the word is bounded by string start/end or underscores,
+            // or preceded/followed by a casing change (for camelCase like `myTokenValue`).
+            // so `MONKEY` doesn't match `KEY` and `PASSPORT` doesn't match `PASS`.
+            let start_ok = actual_idx == 0
+                || upper.as_bytes()[actual_idx - 1] == b'_'
+                || (name.as_bytes()[actual_idx].is_ascii_uppercase() && name.as_bytes()[actual_idx - 1].is_ascii_lowercase());
+            let actual_end = actual_idx + word.len();
+            let end_ok = actual_end == upper.len()
+                || upper.as_bytes()[actual_end] == b'_'
+                || (name.as_bytes()[actual_end].is_ascii_uppercase() && !name.as_bytes()[actual_end - 1].is_ascii_uppercase());
+            if start_ok && end_ok {
                 return true;
             }
+            start_idx = actual_idx + 1;
         }
     }
     false
@@ -4523,6 +4530,21 @@ async def load() -> int:
         let module = parse(src);
         let diags = analyse_secret_literal_bindings(&module, "x.ty", src, false);
         assert_eq!(diags.warnings().len(), 1);
+    }
+
+    #[test]
+    fn secret_literal_fires_on_embedded_words() {
+        let srcs = [
+            "API_KEY_FOO = \"sk-foo\"\n",
+            "FOO_API_KEY_BAR = \"sk-foo\"\n",
+            "KEY_APIKEY = \"sk-foo\"\n",
+            "myTokenValue = \"sk-foo\"\n",
+        ];
+        for src in srcs {
+            let module = parse(src);
+            let diags = analyse_secret_literal_bindings(&module, "x.ty", src, false);
+            assert_eq!(diags.warnings().len(), 1, "Failed to flag {src:?}");
+        }
     }
 
     #[test]
