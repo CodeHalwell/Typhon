@@ -4,12 +4,17 @@ All notable changes to Typhon are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely; the
 canonical phase-by-phase status lives in `docs/roadmap.md`.
 
-## Unreleased — stress-test robustness sweep
+## 0.15.6 — 2026-06-16 — stress-test robustness sweep
 
-An ~85-program adversarial sweep ("if you can write it in Python, you can use
-Typhon") spanning the breadth of what production Python apps do. Two
-production-path bugs and several VM parity gaps were fixed; the compiled
-output (`tyc build` → CPython 3.13) is now correct on the entire corpus.
+An ~198-program adversarial sweep ("if you can write it in Python, you can use
+Typhon") spanning the breadth of what production Python apps do. Several
+type-checker false positives (several of them build-blockers) and a cluster of
+VM parity gaps were fixed; the compiled output (`tyc build` → CPython 3.13) is
+now correct on the entire corpus. The largest cluster was around custom
+exception classes (`class FooError(Exception):` + `raise FooError("msg")`).
+Two small additive features also landed: flow-sensitive attribute narrowing
+(`if self.x is None: return …`) and a VM `abc` module shim. All changes are
+backward-compatible — previously-accepted programs type-check identically.
 
 ### Fixed — nested class patterns no longer block the build
 
