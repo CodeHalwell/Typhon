@@ -1717,6 +1717,7 @@ fn desugar_mod_module_with(m: &ModModule, options: &DesugarOptions) -> ModModule
     // as multi-base parents so the dataclass decorator drops `slots=True`.
     let mut multi_base_parents = multi_base_parents;
     collect_cached_property_targets_into(&m.body, &mut multi_base_parents);
+    let exception_class_names = collect_exception_class_names(&m.body);
     let markers = ClassMarkers {
         raw_starts: &options.raw_class_line_starts,
         frozen_starts: &options.frozen_class_line_starts,
@@ -1724,6 +1725,7 @@ fn desugar_mod_module_with(m: &ModModule, options: &DesugarOptions) -> ModModule
         multi_base_parents: &multi_base_parents,
         skip_decoration_bases: &options.skip_decoration_bases,
         model_extra: &options.model_extra,
+        exception_class_names: &exception_class_names,
     };
     let (new_body, transformed_classes) = desugar_stmts(&m.body, markers);
 
@@ -1981,6 +1983,10 @@ struct ClassMarkers<'a> {
     /// classes. Sourced from `[emit] model-extra` in `typhon.toml` via
     /// [`DesugarOptions::model_extra`].
     model_extra: &'a str,
+    /// Names of every class in the module that is (transitively) an exception
+    /// subclass — so a subclass of a non-suffix-named user exception base
+    /// (`class Timeout(Failure)` where `Failure(Exception)`) is recognised.
+    exception_class_names: &'a std::collections::HashSet<String>,
 }
 
 impl ClassMarkers<'_> {
@@ -2067,8 +2073,10 @@ fn desugar_stmt(stmt: &Stmt, markers: ClassMarkers<'_>) -> (Stmt, bool) {
             // would shadow `BaseException.__init__` and break
             // `raise FooError("msg")`). They lower like `class!`: no
             // decorator, plus a `super().__init__(...)` constructor when the
-            // body has fields.
-            let is_exception_subclass = class_is_exception_subclass(c);
+            // body has fields. The module-level set carries transitive
+            // exception-ness through non-suffix-named user bases.
+            let is_exception_subclass = class_is_exception_subclass(c)
+                || markers.exception_class_names.contains(c.name.as_str());
             // Multi-inheritance with concrete bases conflicts with
             // `slots=True`; emit the decorator without `slots=True` in
             // that case. FINDINGS #102. Also drop `slots=True` for any
@@ -2775,6 +2783,91 @@ fn class_is_exception_subclass(c: &ruff_python_ast::StmtClassDef) -> bool {
             || seg.ends_with("Warning")
             || EXACT_EXCEPTION_BASES.contains(&seg)
     })
+}
+
+/// Whether `name` (a base's trailing segment) marks an exception by the
+/// builtin convention: a `*Error` / `*Exception` / `*Warning` suffix or an
+/// exact non-suffixed builtin (`BaseException`, `KeyboardInterrupt`, …).
+fn name_is_exception_base(name: &str) -> bool {
+    name.ends_with("Error")
+        || name.ends_with("Exception")
+        || name.ends_with("Warning")
+        || EXACT_EXCEPTION_BASES.contains(&name)
+}
+
+/// Names of every class in the module that is (transitively) an exception
+/// subclass. A class qualifies when a base matches the builtin convention
+/// (`name_is_exception_base`) OR names another module class that itself
+/// qualifies. This catches a non-suffix-named user base — e.g.
+/// `class Failure(Exception): pass` then `class Timeout(Failure): pass`,
+/// where `Timeout`'s immediate base (`Failure`) doesn't match the suffix
+/// heuristic but is still an exception.
+fn collect_exception_class_names(body: &[Stmt]) -> std::collections::HashSet<String> {
+    let mut classes: Vec<(String, Vec<String>)> = Vec::new();
+    collect_class_bases_into(body, &mut classes);
+    let mut exc: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for (name, bases) in &classes {
+        if bases.iter().any(|b| name_is_exception_base(b)) {
+            exc.insert(name.clone());
+        }
+    }
+    loop {
+        let mut changed = false;
+        for (name, bases) in &classes {
+            if !exc.contains(name) && bases.iter().any(|b| exc.contains(b)) {
+                exc.insert(name.clone());
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    exc
+}
+
+/// Collect `(class name, base trailing segments)` for every class def in
+/// `body`, recursing into nested scopes, for `collect_exception_class_names`.
+fn collect_class_bases_into(body: &[Stmt], out: &mut Vec<(String, Vec<String>)>) {
+    for stmt in body {
+        match stmt {
+            Stmt::ClassDef(c) => {
+                let bases: Vec<String> = c
+                    .bases()
+                    .iter()
+                    .filter_map(|b| base_last_segment(b).map(|s| s.to_owned()))
+                    .collect();
+                out.push((c.name.as_str().to_owned(), bases));
+                collect_class_bases_into(&c.body, out);
+            }
+            Stmt::FunctionDef(f) => collect_class_bases_into(&f.body, out),
+            Stmt::If(i) => {
+                collect_class_bases_into(&i.body, out);
+                for clause in &i.elif_else_clauses {
+                    collect_class_bases_into(&clause.body, out);
+                }
+            }
+            Stmt::For(f) => {
+                collect_class_bases_into(&f.body, out);
+                collect_class_bases_into(&f.orelse, out);
+            }
+            Stmt::While(w) => {
+                collect_class_bases_into(&w.body, out);
+                collect_class_bases_into(&w.orelse, out);
+            }
+            Stmt::With(w) => collect_class_bases_into(&w.body, out),
+            Stmt::Try(t) => {
+                collect_class_bases_into(&t.body, out);
+                for h in &t.handlers {
+                    let ruff_python_ast::ExceptHandler::ExceptHandler(h) = h;
+                    collect_class_bases_into(&h.body, out);
+                }
+                collect_class_bases_into(&t.orelse, out);
+                collect_class_bases_into(&t.finalbody, out);
+            }
+            _ => {}
+        }
+    }
 }
 
 /// Return `true` if the class body declares at least one top-level annotated
@@ -4563,6 +4656,20 @@ mod tests {
         assert!(
             !out.contains("@dataclasses.dataclass"),
             "exception hierarchy must not get @dataclass:\n{out}"
+        );
+    }
+
+    #[test]
+    fn exception_subclass_via_nonsuffixed_user_base_skips_dataclass() {
+        // `Failure(Exception)` is an exception (base ends in `Exception`),
+        // but `Timeout(Failure)` has a base that does NOT match the suffix
+        // heuristic — the transitive module pass must still recognise it so
+        // `Timeout("msg")` inherits `BaseException.__init__`.
+        let src = "class Failure(Exception):\n    pass\n\nclass Timeout(Failure):\n    pass\n";
+        let out = parse_and_desugar(src);
+        assert!(
+            !out.contains("@dataclasses.dataclass"),
+            "subclass of a non-suffixed exception base must not get @dataclass:\n{out}"
         );
     }
 

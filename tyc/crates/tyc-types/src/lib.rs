@@ -2967,8 +2967,13 @@ impl<'a> Checker<'a> {
                     // `__next__` is not an iterator.
                     if exp_name != "Iterator" {
                         if let Some(sig) = self.find_method(act_name, "__iter__") {
-                            if let Type::Generic(_, iter_args) = &sig.return_type {
-                                if iter_args.len() == 1
+                            // `__iter__` must actually return an iterator
+                            // (`Iterator[T]`) — a `list[int]` return does not
+                            // make the class an `Iterable` (CPython raises
+                            // `iter() returned non-iterator` at runtime).
+                            if let Type::Generic(ret_head, iter_args) = &sig.return_type {
+                                if ret_head.as_str() == "Iterator"
+                                    && iter_args.len() == 1
                                     && self.is_assignable(&exp_args[0], &iter_args[0])
                                 {
                                     return true;
@@ -8243,8 +8248,11 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                                 b.span,
                             );
                         }
-                        // Reset any narrowing on the reassigned name.
+                        // Reset any narrowing on the reassigned name, and
+                        // invalidate every attribute narrowing rooted at it
+                        // (`b = …` makes prior `b.value` narrowings stale).
                         c.env.narrow(n.id.as_str(), b.declared);
+                        c.env.clear_attr_narrowing(n.id.as_str());
                     } else {
                         let from_unsafe = c.unsafe_depth > 0;
                         if from_unsafe {
@@ -17004,6 +17012,59 @@ impl CountDown:
         assert!(
             d.errors().is_empty(),
             "an iterator-protocol class must conform to Iterator[int]: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn iter_returning_non_iterator_is_not_iterable() {
+        // `__iter__` must return an `Iterator[T]`; a `list[int]` return does
+        // not make the class an `Iterable[int]` (CPython would raise
+        // `iter() returned non-iterator`).
+        let src = "\
+from typing import Iterable
+class Bad:
+    xs: list[int]
+impl Bad:
+    def __iter__(self) -> list[int]:
+        return self.xs
+def wants(it: Iterable[int]) -> int:
+    return 0
+def bad() -> int:
+    return wants(Bad(xs=[1]))
+";
+        let d = check(src);
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::TypeMismatch { .. })),
+            "a class whose __iter__ returns a non-Iterator must not be Iterable: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn rebinding_root_name_clears_attribute_narrowing() {
+        // Rebinding the root `b` invalidates a prior `b.value` narrowing —
+        // the new object may restore the nullable field, so the later use
+        // must fire again.
+        let src = "\
+class Box:
+    value: str?
+def f(b: Box) -> int:
+    mut cur: Box = b
+    if cur.value is None:
+        return 0
+    cur = Box(value=None)
+    return len(cur.value)
+";
+        let d = check(src);
+        assert!(
+            d.errors().iter().any(|e| matches!(
+                e,
+                TycError::OperatorTypeMismatch { .. } | TycError::NullableUse { .. }
+            )),
+            "rebinding the narrowed attribute's root must re-expose nullability: {:?}",
             d.errors()
         );
     }
