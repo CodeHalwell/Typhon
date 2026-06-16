@@ -1,0 +1,37 @@
+from functools import reduce
+
+class RunningStats:
+    count: int
+    sum: float
+    sum_sq: float
+
+impl RunningStats:
+    def add(self, x: float) -> RunningStats:
+        return RunningStats(
+            count=self.count + 1,
+            sum=self.sum + x,
+            sum_sq=self.sum_sq + x * x,
+        )
+    def mean(self) -> float:
+        if self.count == 0:
+            return 0.0
+        return self.sum / float(self.count)
+    def variance(self) -> float:
+        if self.count == 0:
+            return 0.0
+        let m: float = self.mean()
+        return self.sum_sq / float(self.count) - m * m
+
+def main() -> None:
+    let data: list[float] = [2.0, 4.0, 4.0, 4.0, 5.0, 5.0, 7.0, 9.0]
+    let stats: RunningStats = reduce(
+        lambda s, x: s.add(x),
+        data,
+        RunningStats(count=0, sum=0.0, sum_sq=0.0),
+    )
+    print(stats.count)
+    print(stats.mean())
+    print(round(stats.variance(), 2))
+
+if __name__ == "__main__":
+    main()

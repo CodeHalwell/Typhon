@@ -1,0 +1,34 @@
+def risky_op(mode: str) -> str:
+    mut log: list[str] = []
+    try:
+        log.append("try")
+        if mode == "raise":
+            raise ValueError("boom")
+        log.append("try-end")
+    except ValueError:
+        log.append("except")
+    else:
+        log.append("else")
+    finally:
+        log.append("finally")
+    return ",".join(log)
+
+def nested_try(x: int) -> str:
+    try:
+        try:
+            if x < 0:
+                raise ValueError("negative")
+            return f"inner-ok-{x}"
+        except ValueError:
+            raise RuntimeError("converted")
+    except RuntimeError as e:
+        return f"outer caught: {e}"
+
+def main() -> None:
+    print(risky_op("ok"))
+    print(risky_op("raise"))
+    print(nested_try(5))
+    print(nested_try(-1))
+
+if __name__ == "__main__":
+    main()

@@ -1,33 +1,24 @@
 from __future__ import annotations
-import dataclasses
-from abc import ABC, abstractmethod
 
 
-class Shape(ABC):
-    @abstractmethod
-    def area(self) -> float: ...
+def build_nested(depth: int) -> dict[str, object]:
+    if depth == 0:
+        return {"leaf": True}
+    return {"level": depth, "child": build_nested(depth - 1)}
 
 
-@dataclasses.dataclass(slots=True)
-class Circle(Shape):
-    radius: float
-
-    def area(self) -> float:
-        return 3.14159 * self.radius * self.radius
-
-
-@dataclasses.dataclass(slots=True)
-class Square(Shape):
-    side: float
-
-    def area(self) -> float:
-        return self.side * self.side
+def count_depth(d: dict[str, object]) -> int:
+    if "leaf" in d:
+        return 0
+    child = d["child"]
+    if isinstance(child, dict):
+        return 1 + count_depth(child)
+    return 0
 
 
 def main() -> None:
-    shapes: list[Shape] = [Circle(radius=2.0), Square(side=3.0)]
-    for s in shapes:
-        print(round(s.area(), 2))
+    nested: dict[str, object] = build_nested(5)
+    print(count_depth(nested))
 
 
 if __name__ == "__main__":

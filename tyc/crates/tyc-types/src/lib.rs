@@ -2928,6 +2928,27 @@ impl<'a> Checker<'a> {
                     && self.is_assignable(&bb[1], &aa[1]);
             }
         }
+        // A bare container type is assignable to its parametric form. This
+        // arises from `isinstance(x, dict)` narrowing — Python's `isinstance`
+        // can't take a parametric type (`isinstance(x, dict[str, int])` is a
+        // TypeError), so a container narrowed this way has unconstrained
+        // (Any) element types, exactly like mypy's `dict[Any, Any]`. Without
+        // this, `if isinstance(x, dict): use_as_dict_str_int(x)` false-fires.
+        if let Type::Generic(exp_head, _) = expected {
+            if matches!(
+                exp_head.as_str(),
+                "list" | "dict" | "set" | "frozenset" | "tuple"
+            ) {
+                let actual_is_bare_same = match actual {
+                    Type::Class(n) => n == exp_head,
+                    Type::Generic(n, args) => n == exp_head && args.is_empty(),
+                    _ => false,
+                };
+                if actual_is_bare_same {
+                    return true;
+                }
+            }
+        }
         // A user class implementing the iterator protocol structurally
         // conforms to `Iterator[T]` / `Iterable[T]` / `Collection[T]` /
         // `Reversible[T]`: `__next__(self) -> T` (the standard
@@ -16913,6 +16934,47 @@ def f(p: tuple[int, int]) -> str:
                 .iter()
                 .any(|e| matches!(e, TycError::MissingReturn { .. })),
             "irrefutable tuple pattern must be exhaustive: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn isinstance_narrowed_container_assignable_to_parametric() {
+        // `isinstance(x, dict)` (Python can't take a parametric type) narrows
+        // to a bare container, which must be usable where `dict[str, object]`
+        // is expected.
+        let src = "\
+def use(d: dict[str, object]) -> int:
+    return len(d)
+def h(x: object) -> int:
+    if isinstance(x, dict):
+        return use(x)
+    return 0
+";
+        let d = check(src);
+        assert!(
+            d.errors().is_empty(),
+            "isinstance-narrowed bare dict should be assignable to dict[str, object]: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn parametric_container_mismatch_still_fires() {
+        // The bare-container relaxation must NOT let `dict[str, int]` flow
+        // into `dict[str, str]`.
+        let src = "\
+def g(d: dict[str, str]) -> int:
+    return len(d)
+def h(d: dict[str, int]) -> int:
+    return g(d)
+";
+        let d = check(src);
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::TypeMismatch { .. })),
+            "a parametric container mismatch must still fire: {:?}",
             d.errors()
         );
     }

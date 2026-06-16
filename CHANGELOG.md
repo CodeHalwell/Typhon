@@ -34,6 +34,16 @@ output (`tyc build` → CPython 3.13) is now correct on the entire corpus.
   non-star elements now contributes its `≥ len-1` length coverage; a genuine
   gap (e.g. `[]` + `[a, *m, b]` leaving length 1) still fires.
 
+### Fixed — `isinstance`-narrowed container is usable parametrically
+
+- **`if isinstance(x, dict): use(x)`** where `use` wants `dict[str, object]`
+  (and the `list` / `set` / `frozenset` / `tuple` analogues) no longer
+  false-fires `tyc::type_mismatch`. Python's `isinstance` can't take a
+  parametric type, so a container narrowed this way has unconstrained element
+  types; a bare container is now assignable to its parametric form (matching
+  mypy's `dict[Any, Any]`). A genuine parametric mismatch
+  (`dict[str, int]` → `dict[str, str]`) still fires.
+
 ### Fixed — iterator-protocol classes conform to `Iterator[T]`
 
 - **`def __iter__(self) -> Iterator[int]: return self`** (the standard
