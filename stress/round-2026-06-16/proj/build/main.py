@@ -1,24 +1,45 @@
 from __future__ import annotations
+import dataclasses
 
 
-def build_nested(depth: int) -> dict[str, object]:
-    if depth == 0:
-        return {"leaf": True}
-    return {"level": depth, "child": build_nested(depth - 1)}
+@dataclasses.dataclass(slots=True)
+class Tree:
+    value: int
+    left: Tree | None
+    right: Tree | None
 
+    def insert(self, v: int) -> Tree:
+        if v < self.value:
+            if self.left is None:
+                return Tree(
+                    value=self.value,
+                    left=Tree(value=v, left=None, right=None),
+                    right=self.right,
+                )
+            return Tree(value=self.value, left=self.left.insert(v), right=self.right)
+        if self.right is None:
+            return Tree(
+                value=self.value,
+                left=self.left,
+                right=Tree(value=v, left=None, right=None),
+            )
+        return Tree(value=self.value, left=self.left, right=self.right.insert(v))
 
-def count_depth(d: dict[str, object]) -> int:
-    if "leaf" in d:
-        return 0
-    child = d["child"]
-    if isinstance(child, dict):
-        return 1 + count_depth(child)
-    return 0
+    def in_order(self) -> list[int]:
+        result: list[int] = []
+        if self.left is not None:
+            result = result + self.left.in_order()
+        result.append(self.value)
+        if self.right is not None:
+            result = result + self.right.in_order()
+        return result
 
 
 def main() -> None:
-    nested: dict[str, object] = build_nested(5)
-    print(count_depth(nested))
+    root: Tree = Tree(value=5, left=None, right=None)
+    for v in [3, 7, 1, 4, 6, 8]:
+        root = root.insert(v)
+    print(root.in_order())
 
 
 if __name__ == "__main__":

@@ -128,10 +128,35 @@ A couple of apparent findings were correct behavior (my test errors): a
 `list[dict] → list[object]` assignment is a real invariance violation, and a
 coroutine list annotated `list[object]` likewise.
 
+## Fifth sweep — batches V–Y + multi-file project (~40 more programs)
+
+Multi-file project (cross-module newtypes / sealed unions / `pub` re-exports),
+`model` (Pydantic) nested models + `model_dump`, structural `Protocol`
+conformance, `super()` in overrides, generic containers, ABC hierarchies,
+recursive ADTs, number theory / big-int, deep `try` nesting, walrus, and
+binary-tree insert with optional children. Findings:
+
+**Production-blocking checker false-positives (fixed):**
+- **Iterator protocol** — `def __iter__(self) -> Iterator[int]: return self`
+  (with `__next__`) false-fired `type_mismatch`; a `__next__`-implementing
+  class now conforms to `Iterator[T]` / `Iterable[T]` / `Collection[T]`.
+- **`isinstance`-narrowed containers** — `if isinstance(x, dict): use(x)` where
+  `use` wants `dict[str, object]` false-fired (Python's `isinstance` can't take
+  a parametric type); a bare container is now assignable to its parametric form.
+
+**VM parity (fixed):** added an `abc` module shim (`ABC` / `abstractmethod`).
+
+**Deliberate design constraint (not a bug):** reassigning a function parameter
+(`def gcd(a, b): … a = …`) fires `immutable_assign` and `mut` params don't
+parse — parameters are immutable; copy to a local `mut`. Pydantic `model`
+classes are fully correct (the build path needs `pydantic` installed; the VM
+ships a shim).
+
 ## Result
 
 The **production path (`tyc build` → CPython 3.13) is correct on the entire
-166-program corpus** (0 build/runtime failures). The frontend held up with
+198-program corpus** (0 build/runtime failures; the lone non-passing case is
+the immutable-parameter design constraint above). The frontend held up with
 zero remaining false positives. Remaining divergences are all VM-only with
 correct compiled output, and are documented VM-coverage limitations:
 
