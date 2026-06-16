@@ -1747,7 +1747,19 @@ impl Interpreter {
                                         out.push_str(&format_with_spec(&v, &s, &spec_str)?);
                                     }
                                 } else {
-                                    out.push_str(&s);
+                                    // No format spec. `f"{obj}"` (no
+                                    // conversion, no debug `=`) calls
+                                    // `obj.__format__("")` in CPython — try
+                                    // that before falling back to `s` (str).
+                                    let user_formatted = if has_conversion || has_debug {
+                                        None
+                                    } else {
+                                        self.try_user_format(&v, "")?
+                                    };
+                                    match user_formatted {
+                                        Some(formatted) => out.push_str(&formatted),
+                                        None => out.push_str(&s),
+                                    }
                                 }
                             }
                         }

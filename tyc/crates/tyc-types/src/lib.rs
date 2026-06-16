@@ -2949,20 +2949,13 @@ impl<'a> Checker<'a> {
             }
         }
         // A user class implementing the iterator protocol structurally
-        // conforms to `Iterator[T]` / `Iterable[T]` / `Collection[T]` /
-        // `Reversible[T]`: `__next__(self) -> T` (the standard
-        // `def __iter__(self): return self` + `__next__` shape), or
-        // `__iter__(self) -> Iterator[T]`. Without this, the canonical
-        // iterator class's `def __iter__(self) -> Iterator[int]: return self`
-        // false-fires `type_mismatch` on `return self`.
+        // conforms to `Iterator[T]` (via `__next__`) or `Iterable[T]` (via
+        // `__iter__ -> Iterator[T]`). Limited to those two — `Collection` /
+        // `Reversible` require more than iteration (`__len__` / `__contains__`
+        // / `__reversed__`), which we don't verify here.
         if let Type::Generic(exp_head, exp_args) = expected {
             let exp_name = exp_head.as_str();
-            if exp_args.len() == 1
-                && matches!(
-                    exp_name,
-                    "Iterator" | "Iterable" | "Collection" | "Reversible"
-                )
-            {
+            if exp_args.len() == 1 && matches!(exp_name, "Iterator" | "Iterable") {
                 if let Type::Class(act_name) | Type::Generic(act_name, _) = actual {
                     if let Some(sig) = self.find_method(act_name, "__next__") {
                         if self.is_assignable(&exp_args[0], &sig.return_type) {
