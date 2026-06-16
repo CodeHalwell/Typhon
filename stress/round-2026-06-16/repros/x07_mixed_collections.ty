@@ -1,0 +1,21 @@
+def analyze(data: dict[str, list[int]]) -> dict[str, float]:
+    mut result: dict[str, float] = {}
+    for key, values in data.items():
+        if len(values) > 0:
+            result[key] = sum(values) / len(values)
+        else:
+            result[key] = 0.0
+    return result
+
+def main() -> None:
+    let data: dict[str, list[int]] = {
+        "a": [1, 2, 3],
+        "b": [10, 20],
+        "c": [],
+    }
+    let averages: dict[str, float] = analyze(data)
+    for key in sorted(averages.keys()):
+        print(f"{key}: {averages[key]}")
+
+if __name__ == "__main__":
+    main()

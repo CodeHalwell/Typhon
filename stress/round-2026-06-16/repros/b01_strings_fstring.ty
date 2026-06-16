@@ -1,0 +1,25 @@
+def main() -> None:
+    let n: int = 42
+    let pi: float = 3.14159
+    print(f"{n:05d}")
+    print(f"{pi:.2f}")
+    print(f"{n:>10}")
+    print(f"{n:#x}")
+    print(f"{pi:e}")
+    print(f"{n:+}")
+    print(f"{1234567:,}")
+    print(f"{0.5:.1%}")
+    let s: str = "Hello, World"
+    print(s.upper(), s.lower())
+    print(s.replace("o", "0"))
+    print(s.split(", "))
+    print(s[::-1])
+    print(s.center(20, "*"))
+    print("  pad  ".strip())
+    print("snake_case".split("_"))
+    print("-".join(["a", "b", "c"]))
+    print(s.startswith("Hello"), s.endswith("World"))
+    print(f"{n=}")
+
+if __name__ == "__main__":
+    main()

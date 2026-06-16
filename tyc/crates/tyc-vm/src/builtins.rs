@@ -362,7 +362,22 @@ pub fn install(interp: &mut Interpreter) {
         let v = args
             .first()
             .ok_or_else(|| type_error("format expected at least 1 argument"))?;
-        let spec = args.get(1).map(|s| s.py_str()).unwrap_or_default();
+        // The format spec must be a `str` — CPython rejects a non-string spec
+        // (`format(obj, 123)`) with `TypeError` before calling `__format__`.
+        let spec = match args.get(1) {
+            None => String::new(),
+            Some(Value::Str(s)) => (**s).clone(),
+            Some(other) => {
+                return Err(type_error(format!(
+                    "format() argument 2 must be str, not {}",
+                    other.type_name()
+                )))
+            }
+        };
+        // A user `__format__(self, spec)` controls its own formatting.
+        if let Some(formatted) = interp.try_user_format(v, &spec)? {
+            return Ok(Value::Str(Rc::new(formatted)));
+        }
         let base = interp.str_of(v)?;
         Ok(Value::Str(Rc::new(crate::interp::format_with_spec_pub(
             v, &base, &spec,
@@ -1168,6 +1183,7 @@ pub fn install(interp: &mut Interpreter) {
             bases: vec![],
             properties: std::cell::RefCell::new(std::collections::HashSet::new()),
             classmethods: std::cell::RefCell::new(std::collections::HashSet::new()),
+            is_exception: false,
         })),
     );
     // Common typing names that show up as zero-effort bases.
@@ -1182,6 +1198,7 @@ pub fn install(interp: &mut Interpreter) {
                 bases: vec![],
                 properties: std::cell::RefCell::new(std::collections::HashSet::new()),
                 classmethods: std::cell::RefCell::new(std::collections::HashSet::new()),
+                is_exception: false,
             })),
         );
     }
@@ -1210,6 +1227,7 @@ pub fn install(interp: &mut Interpreter) {
 
     // A couple of exception types so user `raise ValueError(...)` works.
     for name in [
+        "BaseException",
         "Exception",
         "ValueError",
         "TypeError",
@@ -1220,19 +1238,39 @@ pub fn install(interp: &mut Interpreter) {
         "ZeroDivisionError",
         "AssertionError",
         "StopIteration",
+        "StopAsyncIteration",
         "OSError",
+        "IOError",
         "FileNotFoundError",
         "FileExistsError",
         "PermissionError",
         "IsADirectoryError",
         "NotADirectoryError",
         "TimeoutError",
+        "ConnectionError",
         "EOFError",
         "LookupError",
         "ArithmeticError",
         "OverflowError",
+        "FloatingPointError",
         "RecursionError",
         "NotImplementedError",
+        "NameError",
+        "UnboundLocalError",
+        "ImportError",
+        "ModuleNotFoundError",
+        "UnicodeError",
+        "UnicodeDecodeError",
+        "UnicodeEncodeError",
+        "KeyboardInterrupt",
+        "SystemExit",
+        "GeneratorExit",
+        "Warning",
+        "DeprecationWarning",
+        "UserWarning",
+        "RuntimeWarning",
+        "FutureWarning",
+        "PendingDeprecationWarning",
     ] {
         let n = name.to_owned();
         let ctor = NativeFn::new(Box::leak(n.clone().into_boxed_str()), move |_i, args| {
@@ -1695,6 +1733,11 @@ pub fn resolve_module(interp: &mut Interpreter, name: &str) -> Result<Value, Unw
         // at runtime, so identity natives (mirroring the `typing` shim)
         // are all the VM needs.
         "collections.abc" => Ok(make_collections_abc_module()),
+        // `abc` — `ABC` / `ABCMeta` are annotation-/base-only at runtime in
+        // the VM (a non-`Value::Class` base is ignored), and the abstract-*
+        // decorators are identity wrappers, so identity natives suffice for
+        // `class H(ABC): @abstractmethod def handle(...): ...`.
+        "abc" => Ok(make_abc_module()),
         // Cooperative (sequential) asyncio: coroutines are thunks forced at
         // await points, tasks complete at creation, and Queue.get on an
         // empty queue fails loudly instead of deadlocking. Programs whose
@@ -3618,6 +3661,7 @@ fn make_re_module() -> Value {
             bases: vec![],
             properties: std::cell::RefCell::new(std::collections::HashSet::new()),
             classmethods: std::cell::RefCell::new(std::collections::HashSet::new()),
+            is_exception: false,
         });
         Value::Instance(Rc::new(crate::value::Instance {
             class: cls,
@@ -3741,6 +3785,7 @@ fn make_re_module() -> Value {
             bases: vec![],
             properties: std::cell::RefCell::new(std::collections::HashSet::new()),
             classmethods: std::cell::RefCell::new(std::collections::HashSet::new()),
+            is_exception: false,
         });
         Value::Instance(Rc::new(crate::value::Instance {
             class: cls,
@@ -4236,6 +4281,22 @@ fn make_collections_abc_module() -> Value {
     make_module("collections.abc", entries)
 }
 
+fn make_abc_module() -> Value {
+    let mut entries: Vec<(&str, Value)> = Vec::new();
+    for name in [
+        "ABC",
+        "ABCMeta",
+        "abstractmethod",
+        "abstractproperty",
+        "abstractclassmethod",
+        "abstractstaticmethod",
+        "update_abstractmethods",
+    ] {
+        entries.push((name, identity_native(name)));
+    }
+    make_module("abc", entries)
+}
+
 fn make_collections_module() -> Value {
     let counter = nf("Counter", |i, args| {
         let mut counts: DictMap = IndexMap::new();
@@ -4648,6 +4709,7 @@ fn make_pydantic_module() -> Value {
         bases: vec![],
         properties: std::cell::RefCell::new(std::collections::HashSet::new()),
         classmethods: std::cell::RefCell::new(std::collections::HashSet::new()),
+        is_exception: false,
     }));
     let config_dict = nf("ConfigDict", |_i, _args| {
         // Accept any kwargs and ignore — purely a config-record stub.
@@ -6021,14 +6083,20 @@ fn str_format(
                         .ok_or_else(|| key_error(format!("'{}'", field_ref)))?
                 };
 
-                // Apply format spec if present. The default stringification
-                // honours a user `__str__` (via `str_of`), matching `print` /
-                // `str` and CPython's `"{}".format(obj)`.
-                let default = interp.str_of(&value)?;
-                let formatted = if spec.is_empty() {
-                    default
+                // A user `__format__(self, spec)` controls its own
+                // formatting for any spec (including the empty `{}` spec,
+                // which CPython routes through `__format__("")`).
+                let formatted = if let Some(custom) = interp.try_user_format(&value, spec)? {
+                    custom
                 } else {
-                    crate::interp::format_with_spec_pub(&value, &default, spec)?
+                    // The default stringification honours a user `__str__`
+                    // (via `str_of`), matching `print` / `str`.
+                    let default = interp.str_of(&value)?;
+                    if spec.is_empty() {
+                        default
+                    } else {
+                        crate::interp::format_with_spec_pub(&value, &default, spec)?
+                    }
                 };
                 out.push_str(&formatted);
             }
@@ -7744,6 +7812,7 @@ pub fn make_builtin_type(name: &str) -> Value {
                     bases: vec![],
                     properties: std::cell::RefCell::new(std::collections::HashSet::new()),
                     classmethods: std::cell::RefCell::new(std::collections::HashSet::new()),
+                    is_exception: false,
                 })
             })
             .clone();

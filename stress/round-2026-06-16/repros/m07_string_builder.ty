@@ -1,0 +1,28 @@
+def to_table(rows: list[list[str]]) -> str:
+    if len(rows) == 0:
+        return ""
+    mut widths: list[int] = []
+    for col in range(len(rows[0])):
+        mut w: int = 0
+        for row in rows:
+            if len(row[col]) > w:
+                w = len(row[col])
+        widths.append(w)
+    mut lines: list[str] = []
+    for row in rows:
+        mut cells: list[str] = []
+        for i in range(len(row)):
+            cells.append(row[i].ljust(widths[i]))
+        lines.append(" | ".join(cells))
+    return "\n".join(lines)
+
+def main() -> None:
+    let data: list[list[str]] = [
+        ["Name", "Age", "City"],
+        ["Alice", "30", "NYC"],
+        ["Bob", "5", "LA"],
+    ]
+    print(to_table(data))
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,32 @@
+class KVStore:
+    data: dict[str, str]
+    history: list[tuple[str, str]]
+
+impl KVStore:
+    def set(self, key: str, value: str) -> None:
+        self.history.append((key, value))
+        self.data[key] = value
+    def get(self, key: str) -> str?:
+        return self.data.get(key)
+    def delete(self, key: str) -> bool:
+        if key in self.data:
+            del self.data[key]
+            return True
+        return False
+    def keys(self) -> list[str]:
+        return sorted(self.data.keys())
+
+def main() -> None:
+    mut store: KVStore = KVStore(data={}, history=[])
+    store.set("a", "1")
+    store.set("b", "2")
+    store.set("a", "3")
+    print(store.get("a"))
+    print(store.get("missing"))
+    print(store.keys())
+    print(store.delete("b"))
+    print(store.delete("z"))
+    print(len(store.history))
+
+if __name__ == "__main__":
+    main()

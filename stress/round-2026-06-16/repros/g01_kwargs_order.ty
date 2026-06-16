@@ -1,0 +1,16 @@
+def build(**fields: int) -> dict[str, int]:
+    mut out: dict[str, int] = {}
+    for k in fields:
+        out[k] = fields[k]
+    return out
+
+def passthrough(**kw: str) -> dict[str, str]:
+    return dict(kw)
+
+def main() -> None:
+    print(build(z=1, y=2, x=3, w=4))
+    print(passthrough(first="a", second="b", third="c"))
+    print(list(build(alpha=1, beta=2, gamma=3).keys()))
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,36 @@
+def gcd(a: int, b: int) -> int:
+    while b != 0:
+        let t: int = b
+        b = a % b
+        a = t
+    return a
+
+def mod_pow(base: int, exp: int, mod: int) -> int:
+    mut result: int = 1
+    mut b: int = base % mod
+    mut e: int = exp
+    while e > 0:
+        if e % 2 == 1:
+            result = (result * b) % mod
+        e = e // 2
+        b = (b * b) % mod
+    return result
+
+def is_prime(n: int) -> bool:
+    if n < 2:
+        return False
+    mut i: int = 2
+    while i * i <= n:
+        if n % i == 0:
+            return False
+        i = i + 1
+    return True
+
+def main() -> None:
+    print(gcd(48, 36))
+    print(mod_pow(2, 100, 1000000007))
+    print([n for n in range(2, 30) if is_prime(n)])
+    print(2 ** 200)
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,17 @@
+def main() -> None:
+    let s: str = "café résumé naïve"
+    print(len(s))
+    print(s.upper())
+    print(s.encode("utf-8"))
+    let emoji: str = "hello 世界"
+    print(len(emoji))
+    for ch in "abc":
+        print(ord(ch))
+    print(chr(0x4e16))
+    print("café".encode("utf-8").decode("utf-8"))
+    print("a\tb\nc".split())
+    print(repr("line1\nline2"))
+    print("ÀÉÎ".lower())
+
+if __name__ == "__main__":
+    main()

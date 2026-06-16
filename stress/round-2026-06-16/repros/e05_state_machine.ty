@@ -1,0 +1,30 @@
+type State = Idle | Running | Done
+
+class Idle:
+    pass
+
+class Running:
+    progress: int
+
+class Done frozen:
+    result: str
+
+def step(s: State) -> State:
+    match s:
+        case Idle():
+            return Running(progress=0)
+        case Running(progress=p):
+            if p >= 100:
+                return Done(result="complete")
+            return Running(progress=p + 50)
+        case Done(result=r):
+            return Done(result=r)
+
+def main() -> None:
+    mut s: State = Idle()
+    for _ in range(5):
+        print(type(s).__name__)
+        s = step(s)
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,20 @@
+class Inner:
+    data: str?
+
+class Outer:
+    inner: Inner?
+
+def extract(o: Outer) -> str:
+    if o.inner is None:
+        return "no inner"
+    if o.inner.data is None:
+        return "no data"
+    return o.inner.data
+
+def main() -> None:
+    print(extract(Outer(inner=Inner(data="hello"))))
+    print(extract(Outer(inner=Inner(data=None))))
+    print(extract(Outer(inner=None)))
+
+if __name__ == "__main__":
+    main()

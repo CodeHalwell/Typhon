@@ -1,0 +1,25 @@
+from typing import Callable
+
+class EventEmitter:
+    handlers: dict[str, list[Callable[[int], None]]]
+
+impl EventEmitter:
+    def on(self, event: str, handler: Callable[[int], None]) -> None:
+        if event not in self.handlers:
+            self.handlers[event] = []
+        self.handlers[event].append(handler)
+    def emit(self, event: str, value: int) -> None:
+        for handler in self.handlers.get(event, []):
+            handler(value)
+
+def main() -> None:
+    mut emitter: EventEmitter = EventEmitter(handlers={})
+    mut log: list[int] = []
+    emitter.on("data", lambda v: log.append(v))
+    emitter.on("data", lambda v: log.append(v * 10))
+    emitter.emit("data", 5)
+    emitter.emit("data", 7)
+    print(log)
+
+if __name__ == "__main__":
+    main()

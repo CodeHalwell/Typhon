@@ -1,0 +1,16 @@
+def main() -> None:
+    let name: str = "World"
+    print("Hello, {}!".format(name))
+    print("{0} {1} {0}".format("a", "b"))
+    print("{n:>{w}}".format(n=42, w=8))
+    print("%s is %d" % ("x", 10))
+    print("%.3f" % 3.14159)
+    print("{:,.2f}".format(1234567.891))
+    let pct: float = 0.1234
+    print(f"{pct:.1%}")
+    print(format(255, "08b"))
+    print(format(3.14159, ".2e"))
+    print("{:*^20}".format("center"))
+
+if __name__ == "__main__":
+    main()

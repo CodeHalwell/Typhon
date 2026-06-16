@@ -1,0 +1,23 @@
+from typing import Iterator
+
+class CountDown:
+    start: int
+
+impl CountDown:
+    def __iter__(self) -> Iterator[int]:
+        return self
+    def __next__(self) -> int:
+        if self.start <= 0:
+            raise StopIteration()
+        self.start = self.start - 1
+        return self.start + 1
+
+def main() -> None:
+    let result: list[int] = []
+    mut cd: CountDown = CountDown(start=5)
+    for n in cd:
+        result.append(n)
+    print(result)
+
+if __name__ == "__main__":
+    main()

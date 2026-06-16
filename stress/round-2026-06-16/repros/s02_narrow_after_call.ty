@@ -1,0 +1,30 @@
+def find(items: list[str], target: str) -> int?:
+    for i, item in enumerate(items):
+        if item == target:
+            return i
+    return None
+
+def process(items: list[str], target: str) -> str:
+    let idx: int? = find(items, target)
+    if idx is None:
+        return "not found"
+    return f"found at {idx}"
+
+def get_or_create(cache: dict[str, int], key: str) -> int:
+    let existing: int? = cache.get(key)
+    if existing is not None:
+        return existing
+    let new_val: int = len(cache)
+    cache[key] = new_val
+    return new_val
+
+def main() -> None:
+    print(process(["a", "b", "c"], "b"))
+    print(process(["a", "b"], "z"))
+    mut cache: dict[str, int] = {}
+    print(get_or_create(cache, "x"))
+    print(get_or_create(cache, "x"))
+    print(get_or_create(cache, "y"))
+
+if __name__ == "__main__":
+    main()

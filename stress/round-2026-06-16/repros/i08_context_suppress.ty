@@ -1,0 +1,23 @@
+from contextlib import contextmanager, suppress
+from typing import Iterator
+
+@contextmanager
+def transaction(name: str) -> Iterator[list[str]]:
+    mut log: list[str] = []
+    log.append(f"begin {name}")
+    try:
+        yield log
+        log.append(f"commit {name}")
+    except Exception:
+        log.append(f"rollback {name}")
+    print(log)
+
+def main() -> None:
+    with transaction("t1") as log:
+        log.append("work")
+    with suppress(ValueError):
+        raise ValueError("suppressed")
+    print("after suppress")
+
+if __name__ == "__main__":
+    main()

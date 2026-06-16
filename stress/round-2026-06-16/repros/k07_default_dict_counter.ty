@@ -1,0 +1,19 @@
+from collections import defaultdict, Counter
+
+def main() -> None:
+    let text: str = "the quick brown fox the lazy dog the"
+    let words: list[str] = text.split()
+    mut freq: defaultdict[str, int] = defaultdict(int)
+    for w in words:
+        freq[w] += 1
+    print(dict(sorted(freq.items())))
+    let counter: Counter[str] = Counter(words)
+    print(counter.most_common(2))
+    print(counter["the"])
+    mut groups: defaultdict[int, list[str]] = defaultdict(list)
+    for w in words:
+        groups[len(w)].append(w)
+    print(dict(sorted(groups.items())))
+
+if __name__ == "__main__":
+    main()

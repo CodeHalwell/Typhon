@@ -1,0 +1,25 @@
+from typing import Callable
+
+def zip_with[A, B, C](xs: list[A], ys: list[B], f: Callable[[A, B], C]) -> list[C]:
+    mut result: list[C] = []
+    for i in range(min(len(xs), len(ys))):
+        result.append(f(xs[i], ys[i]))
+    return result
+
+def flat_map[A, B](xs: list[A], f: Callable[[A], list[B]]) -> list[B]:
+    mut result: list[B] = []
+    for x in xs:
+        for y in f(x):
+            result.append(y)
+    return result
+
+def main() -> None:
+    let sums: list[int] = zip_with([1, 2, 3], [10, 20, 30], lambda a, b: a + b)
+    print(sums)
+    let combined: list[str] = zip_with(["a", "b"], [1, 2], lambda s, n: f"{s}{n}")
+    print(combined)
+    let expanded: list[int] = flat_map([1, 2, 3], lambda n: [n, n * 10])
+    print(expanded)
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,20 @@
+from typing import Literal
+
+type Mode = Literal["r", "w", "a"]
+
+def open_file(path: str, mode: Mode) -> str:
+    match mode:
+        case "r":
+            return f"reading {path}"
+        case "w":
+            return f"writing {path}"
+        case "a":
+            return f"appending {path}"
+
+def main() -> None:
+    print(open_file("a.txt", "r"))
+    print(open_file("b.txt", "w"))
+    print(open_file("c.txt", "a"))
+
+if __name__ == "__main__":
+    main()

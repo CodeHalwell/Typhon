@@ -1,0 +1,28 @@
+class ConfigError(Exception):
+    pass
+
+def parse(raw: str) -> int:
+    try:
+        return int(raw)
+    except ValueError:
+        raise ConfigError(f"bad int: {raw}")
+
+def chain_demo() -> None:
+    try:
+        raise ConfigError("outer")
+    except ConfigError as e:
+        raise RuntimeError("wrapped") from e
+
+def main() -> None:
+    print(parse("42"))
+    try:
+        parse("xyz")
+    except ConfigError as e:
+        print("caught:", e)
+    try:
+        chain_demo()
+    except RuntimeError as e:
+        print("runtime:", e, "cause:", e.__cause__)
+
+if __name__ == "__main__":
+    main()

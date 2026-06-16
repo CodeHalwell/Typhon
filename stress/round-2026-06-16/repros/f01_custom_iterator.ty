@@ -1,0 +1,40 @@
+from typing import Iterator
+
+class Fib:
+    limit: int
+
+impl Fib:
+    def __iter__(self) -> Iterator[int]:
+        mut a: int = 0
+        mut b: int = 1
+        mut count: int = 0
+        while count < self.limit:
+            yield a
+            let t: int = a + b
+            a = b
+            b = t
+            count = count + 1
+
+class Range2:
+    start: int
+    stop: int
+
+impl Range2:
+    def __iter__(self) -> Iterator[int]:
+        mut i: int = self.start
+        while i < self.stop:
+            yield i
+            i = i + 1
+    def __len__(self) -> int:
+        return self.stop - self.start
+
+def main() -> None:
+    let f: Fib = Fib(limit=8)
+    print(list(f))
+    let r: Range2 = Range2(start=2, stop=7)
+    print([x for x in r])
+    print(len(r))
+    print(sum(r))
+
+if __name__ == "__main__":
+    main()

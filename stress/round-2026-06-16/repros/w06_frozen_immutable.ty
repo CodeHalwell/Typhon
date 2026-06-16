@@ -1,0 +1,19 @@
+class Point frozen:
+    x: int
+    y: int
+
+impl Point:
+    def translate(self, dx: int, dy: int) -> Point:
+        return Point(x=self.x + dx, y=self.y + dy)
+    def __repr__(self) -> str:
+        return f"({self.x}, {self.y})"
+
+def main() -> None:
+    let p: Point = Point(x=1, y=2)
+    let moved: Point = p.translate(3, 4)
+    print(p)
+    print(moved)
+    print(p == Point(x=1, y=2))
+
+if __name__ == "__main__":
+    main()

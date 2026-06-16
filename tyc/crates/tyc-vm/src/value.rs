@@ -410,6 +410,12 @@ pub struct Class {
     /// Method names decorated with `@classmethod` — the receiver is bound to
     /// the class object (`cls`) rather than the instance.
     pub classmethods: RefCell<std::collections::HashSet<String>>,
+    /// `true` when the class subclasses a builtin or user exception. Such a
+    /// class must behave like `BaseException` on construction — accepting
+    /// positional `args` and rendering them through `str()` — rather than
+    /// getting the dataclass "takes N arguments" treatment, so that the
+    /// ubiquitous `raise FooError("message")` idiom works under the VM.
+    pub is_exception: bool,
 }
 
 #[derive(Clone)]
@@ -1041,7 +1047,12 @@ impl Value {
             Value::Function(func) => format!("<function {}>", func.name),
             Value::BoundMethod { function, .. } => format!("<bound method {}>", function.name),
             Value::Class(c) => format!("<class '{}'>", c.name),
-            Value::Instance(i) => instance_repr(i),
+            // `str(exc)` differs from `repr(exc)` for a field-less exception
+            // instance: the message/args, not `ClassName('msg')`.
+            Value::Instance(i) => match exception_instance_args(i) {
+                Some(args) => exception_instance_str(i, &args),
+                None => instance_repr(i),
+            },
             // Match the dataclass-default `repr` shape that
             // `typhon_runtime`'s `Ok` / `Err` produce under CPython
             // (`Foo(value=42)` / `Foo(error=...)`). The Debug-impl
@@ -1062,6 +1073,10 @@ impl Value {
                     let parts: Vec<String> = args.iter().map(|a| a.py_repr()).collect();
                     format!("({})", parts.join(", "))
                 }
+                // `KeyError` is the one builtin whose `str()` shows the
+                // *repr* of its single argument: `str(KeyError("k"))` is
+                // `"'k'"`, not `"k"` (so a missing key is unambiguous).
+                1 if kind.as_str() == "KeyError" => args[0].py_repr(),
                 1 => args[0].py_str(),
                 _ => {
                     if message.is_empty() {
@@ -1094,6 +1109,16 @@ impl Value {
     pub fn py_repr(&self) -> String {
         match self {
             Value::Str(s) => python_repr_str(s.as_str()),
+            // `repr(exc)` keeps the `ClassName('msg')` form even though
+            // `str(exc)` (py_str) renders just the message.
+            Value::Instance(i) => instance_repr(i),
+            // `repr(ValueError("boom"))` is `ValueError('boom')` (and
+            // `KeyError('k')`, `ValueError()` for no args) — the constructor
+            // form, not the `str()` message.
+            Value::Exception { kind, args, .. } => {
+                let parts: Vec<String> = args.iter().map(|a| a.py_repr()).collect();
+                format!("{}({})", kind, parts.join(", "))
+            }
             other => other.py_str(),
         }
     }
@@ -1248,7 +1273,66 @@ fn class_is_enum(class: &Class) -> bool {
         || class.bases.iter().any(|b| class_is_enum(b))
 }
 
+/// `args` tuple of a field-less exception instance built by the VM's
+/// `BaseException`-style construction path (see `Interpreter::instantiate`).
+/// `Some` only when the instance carries the stashed `args` tuple, so
+/// field-carrying exceptions (which keep dataclass-style rendering) and
+/// ordinary instances are unaffected.
+fn exception_instance_args(inst: &Instance) -> Option<Rc<Vec<Value>>> {
+    if !inst.class.is_exception {
+        return None;
+    }
+    match inst.fields.borrow().get("args") {
+        Some(Value::Tuple(t)) => Some(t.clone()),
+        _ => None,
+    }
+}
+
+/// Whether an exception class derives (directly or through its user base
+/// chain) from the builtin `KeyError`. Reads the `__typhon_exc_bases__`
+/// record stamped on each class by the interpreter's `build_class`.
+fn class_derives_from_keyerror(class: &Class) -> bool {
+    if class.name == "KeyError" {
+        return true;
+    }
+    if let Some(Value::Tuple(names)) = class.class_attrs.borrow().get("__typhon_exc_bases__") {
+        if names
+            .iter()
+            .any(|nm| matches!(nm, Value::Str(s) if s.as_str() == "KeyError"))
+        {
+            return true;
+        }
+    }
+    class.bases.iter().any(|b| class_derives_from_keyerror(b))
+}
+
+/// CPython `str(exc)` for a field-less exception instance: `""` for no args,
+/// the single arg for one, the args tuple otherwise. `KeyError` is the one
+/// builtin whose single-arg `str()` shows the *repr* of the key
+/// (`str(KeyError("k")) == "'k'"`), so its subclasses inherit that.
+fn exception_instance_str(inst: &Instance, args: &[Value]) -> String {
+    match args.len() {
+        0 => String::new(),
+        1 if class_derives_from_keyerror(&inst.class) => args[0].py_repr(),
+        1 => args[0].py_str(),
+        _ => {
+            let parts: Vec<String> = args.iter().map(|a| a.py_repr()).collect();
+            format!("({})", parts.join(", "))
+        }
+    }
+}
+
 fn instance_repr(inst: &Instance) -> String {
+    // Field-less exception instances repr as `ClassName(arg_reprs)` —
+    // CPython's `repr(FooError("x"))` shape — not as dataclass fields.
+    if let Some(args) = exception_instance_args(inst) {
+        let parts: Vec<String> = args.iter().map(|a| a.py_repr()).collect();
+        return format!("{}({})", inst.class.name, parts.join(", "));
+    }
+    instance_repr_inner(inst)
+}
+
+fn instance_repr_inner(inst: &Instance) -> String {
     let fields = inst.fields.borrow();
     // Enum members repr as `<Class.NAME: value>` (CPython default), not as
     // their backing dataclass fields.
@@ -1424,6 +1508,7 @@ mod tests {
             bases: vec![],
             properties: RefCell::new(std::collections::HashSet::new()),
             classmethods: RefCell::new(std::collections::HashSet::new()),
+            is_exception: false,
         })
     }
 

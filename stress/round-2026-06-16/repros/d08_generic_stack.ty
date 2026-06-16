@@ -1,0 +1,25 @@
+class Stack[T]:
+    items: list[T]
+
+impl[T] Stack[T]:
+    def push(self, x: T) -> None:
+        self.items.append(x)
+    def pop(self) -> T?:
+        if len(self.items) == 0:
+            return None
+        return self.items.pop()
+    def size(self) -> int:
+        return len(self.items)
+
+def main() -> None:
+    mut s: Stack[int] = Stack(items=[])
+    s.push(1)
+    s.push(2)
+    s.push(3)
+    print(s.size())
+    print(s.pop())
+    print(s.pop())
+    print(s.size())
+
+if __name__ == "__main__":
+    main()

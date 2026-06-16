@@ -1,0 +1,32 @@
+def validate(name: str, age: int, email: str) -> str:
+    if name == "":
+        return "name required"
+    if age < 0:
+        return "invalid age"
+    if age > 150:
+        return "age too high"
+    if "@" not in email:
+        return "invalid email"
+    return "valid"
+
+def grade(score: int) -> str:
+    if score >= 90:
+        return "A"
+    elif score >= 80:
+        return "B"
+    elif score >= 70:
+        return "C"
+    elif score >= 60:
+        return "D"
+    else:
+        return "F"
+
+def main() -> None:
+    print(validate("", 30, "a@b.com"))
+    print(validate("Alice", 30, "a@b.com"))
+    print(validate("Bob", 200, "a@b.com"))
+    for s in [95, 85, 75, 65, 55]:
+        print(s, grade(s))
+
+if __name__ == "__main__":
+    main()

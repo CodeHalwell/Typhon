@@ -1,0 +1,31 @@
+type Json = JNull | JNum | JList
+class JNull frozen:
+    pass
+class JNum frozen:
+    n: float
+class JList frozen:
+    items: list[Json]
+
+def depth(j: Json) -> int:
+    match j:
+        case JNull():
+            return 0
+        case JNum(n=_):
+            return 0
+        case JList(items=[]) as empty:
+            return 1
+        case JList(items=items):
+            mut m: int = 0
+            for it in items:
+                let d: int = depth(it)
+                if d > m:
+                    m = d
+            return 1 + m
+
+def main() -> None:
+    print(depth(JNull()))
+    print(depth(JList(items=[])))
+    print(depth(JList(items=[JNum(n=1.0), JList(items=[JNum(n=2.0)])])))
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,21 @@
+from typing import Callable
+
+def make_validator(min_len: int) -> Callable[[str], bool]:
+    def validate(s: str) -> bool:
+        return len(s) >= min_len
+    return validate
+
+def apply_validators(value: str, validators: list[Callable[[str], bool]]) -> bool:
+    return all(v(value) for v in validators)
+
+def main() -> None:
+    let validators: list[Callable[[str], bool]] = [
+        make_validator(3),
+        lambda s: s.isalnum(),
+        lambda s: s[0].isupper(),
+    ]
+    print(apply_validators("Hello", validators))
+    print(apply_validators("ab", validators))
+
+if __name__ == "__main__":
+    main()

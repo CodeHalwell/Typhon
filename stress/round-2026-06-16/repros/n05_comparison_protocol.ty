@@ -1,0 +1,27 @@
+class Card frozen:
+    rank: int
+    suit: str
+
+impl Card:
+    def __lt__(self, other: Card) -> bool:
+        return self.rank < other.rank
+    def __le__(self, other: Card) -> bool:
+        return self.rank <= other.rank
+    def __gt__(self, other: Card) -> bool:
+        return self.rank > other.rank
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, Card):
+            return self.rank == other.rank and self.suit == other.suit
+        return False
+    def __repr__(self) -> str:
+        return f"{self.rank}{self.suit}"
+
+def main() -> None:
+    let cards: list[Card] = [Card(rank=5, suit="H"), Card(rank=2, suit="S"), Card(rank=10, suit="D")]
+    print(sorted(cards))
+    print(max(cards))
+    print(Card(rank=5, suit="H") < Card(rank=8, suit="C"))
+    print(Card(rank=5, suit="H") == Card(rank=5, suit="H"))
+
+if __name__ == "__main__":
+    main()

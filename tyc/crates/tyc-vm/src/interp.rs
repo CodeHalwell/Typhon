@@ -489,7 +489,9 @@ impl Interpreter {
                         }
                         Expr::Subscript(sub) => {
                             let target = self.eval_expr(&sub.value, env)?;
-                            let key = self.eval_expr(&sub.slice, env)?;
+                            // Slice-aware: `del lst[i:j]` evaluates the slice
+                            // to the `__slice__` marker `del_subscript` handles.
+                            let key = self.eval_subscript_index(&sub.slice, env)?;
                             self.del_subscript(&target, &key)?;
                         }
                         // `del obj.attr` removes an instance attribute.
@@ -869,6 +871,37 @@ impl Interpreter {
         all_fields.extend(fields);
         let fields = all_fields;
 
+        // An exception subclass either inherits a builtin exception base
+        // (dropped above because the VM models builtin exceptions as native
+        // constructors, not `Value::Class`) or a user class already flagged
+        // as an exception. Detect the builtin case syntactically by the
+        // base's trailing name — the same `*Error`/`*Exception`/`*Warning`
+        // (+ exact builtins) heuristic the desugar pass uses — and the user
+        // case by propagating the flag through `bases`.
+        // Builtin exception base names (`KeyError`, `ValueError`, …) appearing
+        // in this class's base list. They're dropped from `bases` (the VM has
+        // no `Value::Class` for builtin exceptions), so record them here so
+        // `except KeyError` can catch a user `class MyKeyError(KeyError):`.
+        let builtin_exc_bases: Vec<Value> = c
+            .arguments
+            .as_ref()
+            .map(|args| {
+                args.args
+                    .iter()
+                    .filter_map(base_trailing_name)
+                    .filter(|n| name_is_exception_base(n))
+                    .map(|n| Value::Str(Rc::new(n.to_owned())))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let is_exception = bases.iter().any(|b| b.is_exception) || !builtin_exc_bases.is_empty();
+        if !builtin_exc_bases.is_empty() {
+            class_attrs.insert(
+                "__typhon_exc_bases__".to_owned(),
+                Value::Tuple(Rc::new(builtin_exc_bases)),
+            );
+        }
+
         let class = Rc::new(Class {
             name: c.name.as_str().to_owned(),
             methods: RefCell::new(methods),
@@ -877,6 +910,7 @@ impl Interpreter {
             bases,
             properties: RefCell::new(properties),
             classmethods: RefCell::new(classmethods),
+            is_exception,
         });
 
         // Enum subclass: convert simple class-level assignments (`RED = 1`)
@@ -1208,6 +1242,7 @@ impl Interpreter {
                 bases: vec![],
                 properties: RefCell::new(std::collections::HashSet::new()),
                 classmethods: RefCell::new(std::collections::HashSet::new()),
+                is_exception: false,
             });
             members.insert(base_name.to_owned(), Value::Class(cls));
         }
@@ -1690,12 +1725,41 @@ impl Interpreter {
                                         }
                                     }
                                 };
-                                // Format spec: limited support — width / precision for floats only.
+                                // Format spec. A user instance defining
+                                // `__format__(self, spec)` controls its own
+                                // formatting (`f"{temp:F}"`); otherwise fall
+                                // back to the builtin width/precision engine.
+                                // An explicit conversion (`!r`/`!s`/`!a`) wins:
+                                // CPython converts to the string `s` first and
+                                // formats *that*, so `__format__` must not run.
+                                let has_conversion =
+                                    !matches!(interp.conversion, ast::ConversionFlag::None);
                                 if let Some(spec) = &interp.format_spec {
                                     let spec_str = self.format_spec_text(spec, env)?;
-                                    out.push_str(&format_with_spec(&v, &s, &spec_str)?);
+                                    let user_formatted = if has_conversion {
+                                        None
+                                    } else {
+                                        self.try_user_format(&v, &spec_str)?
+                                    };
+                                    if let Some(formatted) = user_formatted {
+                                        out.push_str(&formatted);
+                                    } else {
+                                        out.push_str(&format_with_spec(&v, &s, &spec_str)?);
+                                    }
                                 } else {
-                                    out.push_str(&s);
+                                    // No format spec. `f"{obj}"` (no
+                                    // conversion, no debug `=`) calls
+                                    // `obj.__format__("")` in CPython — try
+                                    // that before falling back to `s` (str).
+                                    let user_formatted = if has_conversion || has_debug {
+                                        None
+                                    } else {
+                                        self.try_user_format(&v, "")?
+                                    };
+                                    match user_formatted {
+                                        Some(formatted) => out.push_str(&formatted),
+                                        None => out.push_str(&s),
+                                    }
                                 }
                             }
                         }
@@ -1704,6 +1768,30 @@ impl Interpreter {
             }
         }
         Ok(Value::Str(Rc::new(out)))
+    }
+
+    /// If `v` is a user instance defining `__format__(self, spec)`, call it
+    /// and return the formatted string; otherwise `Ok(None)` so the caller
+    /// falls back to the builtin format engine. Backs `f"{x:spec}"` and
+    /// `"{:spec}".format(x)` / `format(x, spec)` honouring a custom
+    /// `__format__`.
+    pub fn try_user_format(&mut self, v: &Value, spec: &str) -> Result<Option<String>, Unwind> {
+        if let Value::Instance(inst) = v {
+            if let Some(m) = self.find_method(&inst.class, "__format__") {
+                let result = self.call_value(
+                    Value::BoundMethod {
+                        receiver: Box::new(v.clone()),
+                        function: m,
+                    },
+                    vec![Value::Str(Rc::new(spec.to_owned()))],
+                    &[],
+                )?;
+                // CPython raises `TypeError` if `__format__` returns a
+                // non-`str`; don't silently coerce it.
+                return Ok(Some(require_str_return(result, "__format__")?));
+            }
+        }
+        Ok(None)
     }
 
     fn format_spec_text(
@@ -2082,6 +2170,30 @@ impl Interpreter {
             // the implicit `object`) is a no-op, matching CPython for the
             // synthesised dataclass constructors.
             if attr == "__init__" {
+                // …except on an exception instance: `BaseException.__init__`
+                // stashes its positional args as `.args`, which drives
+                // `str(e)`/`repr(e)`. The builtin base has no `Value::Class`,
+                // so capture the message here so a hand-written
+                // `super().__init__(f"…")` is reflected by `str(e)`.
+                if let Value::Instance(inst) = &self_val {
+                    if inst.class.is_exception {
+                        let mut exc_args = Vec::with_capacity(outer.arguments.args.len());
+                        for arg in outer.arguments.args.iter() {
+                            if let Expr::Starred(s) = arg {
+                                let v = self.eval_expr(&s.value, env)?;
+                                let it = self.make_iter(v)?;
+                                while let Some(x) = self.iter_next(&it)? {
+                                    exc_args.push(x);
+                                }
+                            } else {
+                                exc_args.push(self.eval_expr(arg, env)?);
+                            }
+                        }
+                        inst.fields
+                            .borrow_mut()
+                            .insert("args".to_owned(), Value::Tuple(Rc::new(exc_args)));
+                    }
+                }
                 return Ok(Value::None);
             }
             return Err(attribute_error(format!(
@@ -2379,8 +2491,12 @@ impl Interpreter {
         }
         all_pos.extend(args);
 
-        // Track which kwargs have been consumed.
-        let mut kwargs_left: HashMap<String, Value> =
+        // Track which kwargs have been consumed. An `IndexMap` (not a
+        // `HashMap`) so that the leftover entries bound to a `**kwargs`
+        // parameter keep their call-site order — CPython preserves keyword
+        // argument order, and the resulting dict's order is observable
+        // (iteration, `repr`, serialisation).
+        let mut kwargs_left: IndexMap<String, Value> =
             kwargs.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
 
         // `f.defaults` was evaluated once at def-time and is indexed by
@@ -2396,7 +2512,7 @@ impl Interpreter {
             let default = defaults_iter.next().and_then(|d| d.clone());
             if let Some(v) = pos_iter.next() {
                 env.set(name, v);
-            } else if let Some(v) = kwargs_left.remove(name) {
+            } else if let Some(v) = kwargs_left.shift_remove(name) {
                 env.set(name, v);
             } else if let Some(v) = default {
                 env.set(name, v);
@@ -2426,7 +2542,7 @@ impl Interpreter {
         for p in &params.kwonlyargs {
             let name = p.parameter.name.as_str();
             let default = defaults_iter.next().and_then(|d| d.clone());
-            if let Some(v) = kwargs_left.remove(name) {
+            if let Some(v) = kwargs_left.shift_remove(name) {
                 env.set(name, v);
             } else if let Some(v) = default {
                 env.set(name, v);
@@ -2440,7 +2556,7 @@ impl Interpreter {
 
         if let Some(kw) = &params.kwarg {
             let mut map: DictMap = IndexMap::new();
-            for (k, v) in kwargs_left.drain() {
+            for (k, v) in kwargs_left.drain(..) {
                 map.insert(HashKey::Str(Rc::new(k)), v);
             }
             env.set(kw.name.as_str(), Value::Dict(Rc::new(RefCell::new(map))));
@@ -2466,6 +2582,35 @@ impl Interpreter {
         if Self::is_enum_class(class) {
             return self.enum_lookup_by_value(class, args, kwargs);
         }
+        // Field-less exception subclass with no user/synthesised `__init__`:
+        // behave like `BaseException`. Accept the positional args, stash them
+        // as `.args`, and render via `str()`/`repr()` from those args, so
+        // `raise FooError("message")` and `str(e)` match CPython instead of
+        // dying with "takes 0 arguments". Exception classes that declare
+        // fields get a synthesised field-assigning `__init__` from desugar
+        // and fall through to the custom-`__init__` path below.
+        if class.is_exception
+            && class.fields.is_empty()
+            && self.find_method(class, "__init__").is_none()
+        {
+            // `BaseException.__init__` takes only positional args — CPython
+            // raises `TypeError` for keyword arguments.
+            if !kwargs.is_empty() {
+                return Err(type_error(format!(
+                    "{}() takes no keyword arguments",
+                    class.name
+                )));
+            }
+            let instance = Rc::new(Instance {
+                class: class.clone(),
+                fields: RefCell::new(HashMap::new()),
+            });
+            instance
+                .fields
+                .borrow_mut()
+                .insert("args".to_owned(), Value::Tuple(Rc::new(args)));
+            return Ok(Value::Instance(instance));
+        }
         let instance = Rc::new(Instance {
             class: class.clone(),
             fields: RefCell::new(HashMap::new()),
@@ -2479,6 +2624,7 @@ impl Interpreter {
         for (k, v) in class.class_attrs.borrow().iter() {
             if is_enum_sentinel(k)
                 || k.starts_with("__typhon_setter__")
+                || k == "__typhon_exc_bases__"
                 || matches!(v, Value::Function(_))
             {
                 continue;
@@ -3008,6 +3154,22 @@ impl Interpreter {
             return Ok(Str(Rc::new(a.repeat(n))));
         }
 
+        // Bytes: concatenation (`b"a" + b"b"`) and repetition (`b"a" * 3`).
+        if let (Bytes(a), Add, Bytes(b)) = (l, op, r) {
+            let mut out = Vec::with_capacity(a.len() + b.len());
+            out.extend_from_slice(a);
+            out.extend_from_slice(b);
+            return Ok(Bytes(Rc::new(out)));
+        }
+        if let (Bytes(a), Mult, Int(n)) = (l, op, r) {
+            let n = n.to_usize().unwrap_or(0);
+            return Ok(Bytes(Rc::new(a.repeat(n))));
+        }
+        if let (Int(n), Mult, Bytes(a)) = (l, op, r) {
+            let n = n.to_usize().unwrap_or(0);
+            return Ok(Bytes(Rc::new(a.repeat(n))));
+        }
+
         // Lists / tuples.
         if let (List(a), Add, List(b)) = (l, op, r) {
             let mut out = a.borrow().clone();
@@ -3037,17 +3199,23 @@ impl Interpreter {
         }
 
         // Sets.
-        if let (Set(a), op2, Set(b)) = (l, op, r) {
-            let a = a.borrow();
-            let b = b.borrow();
-            let out: std::collections::HashSet<HashKey> = match op2 {
-                BitOr => a.union(&b).cloned().collect(),
-                BitAnd => a.intersection(&b).cloned().collect(),
-                Sub => a.difference(&b).cloned().collect(),
-                BitXor => a.symmetric_difference(&b).cloned().collect(),
-                _ => return Err(type_error("unsupported set operation")),
-            };
-            return Ok(Set(Rc::new(RefCell::new(out))));
+        // Set algebra over `set`s and the set-like dict views
+        // (`dict.keys()` / `dict.items()`). `as_set_operand` returns the
+        // operand's elements as a `HashSet<HashKey>` for any of those, so
+        // `d1.keys() & d2.keys()`, `d.keys() - some_set`, etc. all work —
+        // matching CPython, where keys/items views implement the set
+        // operations (values views do not).
+        if matches!(op, BitOr | BitAnd | Sub | BitXor) {
+            if let (Some(a), Some(b)) = (as_set_operand(l)?, as_set_operand(r)?) {
+                let out: std::collections::HashSet<HashKey> = match op {
+                    BitOr => a.union(&b).cloned().collect(),
+                    BitAnd => a.intersection(&b).cloned().collect(),
+                    Sub => a.difference(&b).cloned().collect(),
+                    BitXor => a.symmetric_difference(&b).cloned().collect(),
+                    _ => unreachable!(),
+                };
+                return Ok(Set(Rc::new(RefCell::new(out))));
+            }
         }
 
         // Operator overloading: dispatch to the left operand's dunder method,
@@ -3380,6 +3548,16 @@ impl Interpreter {
     }
 
     fn del_subscript(&mut self, target: &Value, key: &Value) -> Result<(), Unwind> {
+        // Slice deletion: `del lst[i:j]` / `del lst[::2]`.
+        if let Value::Tuple(t) = key {
+            if t.len() == 4 {
+                if let Value::Str(tag) = &t[0] {
+                    if tag.as_str() == "__slice__" {
+                        return self.del_slice(target, &t[1], &t[2], &t[3]);
+                    }
+                }
+            }
+        }
         match target {
             Value::List(l) => {
                 let i = key.to_int()?;
@@ -3417,6 +3595,60 @@ impl Interpreter {
                 )))
             }
             _ => Err(type_error("delete on unsupported target")),
+        }
+    }
+
+    /// `del lst[i:j]` / `del lst[i:j:k]` — removes the selected indices from a
+    /// list (in descending order so earlier removals don't shift later ones).
+    fn del_slice(
+        &mut self,
+        target: &Value,
+        lower: &Value,
+        upper: &Value,
+        step: &Value,
+    ) -> Result<(), Unwind> {
+        match target {
+            Value::List(l) => {
+                let len = l.borrow().len();
+                let step_i = match step {
+                    Value::None => 1,
+                    v => v.to_int()?,
+                };
+                if step_i == 0 {
+                    return Err(value_error("slice step cannot be zero"));
+                }
+                let (start, stop, step_i) = compute_slice(lower, upper, step_i, len)?;
+                let mut indices: Vec<usize> = Vec::new();
+                let mut idx = start;
+                if step_i > 0 {
+                    while idx < stop {
+                        if idx >= 0 {
+                            indices.push(idx as usize);
+                        }
+                        idx += step_i;
+                    }
+                } else {
+                    while idx > stop {
+                        if idx >= 0 {
+                            indices.push(idx as usize);
+                        }
+                        idx += step_i;
+                    }
+                }
+                indices.sort_unstable();
+                indices.dedup();
+                let mut l = l.borrow_mut();
+                for &i in indices.iter().rev() {
+                    if i < l.len() {
+                        l.remove(i);
+                    }
+                }
+                Ok(())
+            }
+            _ => Err(type_error(format!(
+                "'{}' object does not support slice deletion",
+                target.type_name()
+            ))),
         }
     }
 
@@ -4452,6 +4684,12 @@ impl Interpreter {
                         return Ok(true);
                     }
                 }
+                // `except KeyError` catching `class MyKeyError(KeyError):` —
+                // the builtin base is recorded on the class (it has no
+                // `Value::Class`), so consult it directly.
+                if class_has_builtin_exc_base(&inst.class, name) {
+                    return Ok(true);
+                }
             }
             return Ok(false);
         }
@@ -4473,10 +4711,16 @@ impl Interpreter {
                 Unwind::Exception(VmException::new(k, m).with_value(v))
             }
             Value::Instance(i) => {
-                // Prefer `args` (Python convention), fall back to `message`,
-                // else stringify nothing. Never panic — this is the error
-                // path we hit during a `raise`.
-                let msg = {
+                let cls_name = i.class.name.clone();
+                // The displayed message follows `str(exc)` (single arg → that
+                // arg, multi → the args tuple, KeyError repr-quoting) so an
+                // uncaught `raise AppError("boom")` shows `AppError: boom`, not
+                // `AppError: ('boom',)`. `py_str` on an exception instance
+                // routes through that logic. Non-exception instances fall back
+                // to the `args` / `message` field convention.
+                let msg = if i.class.is_exception {
+                    Value::Instance(i.clone()).py_str()
+                } else {
                     let fields = i.fields.borrow();
                     fields
                         .get("args")
@@ -4484,9 +4728,7 @@ impl Interpreter {
                         .map(|v| v.py_str())
                         .unwrap_or_default()
                 };
-                Unwind::Exception(
-                    VmException::new(i.class.name.clone(), msg).with_value(Value::Instance(i)),
-                )
+                Unwind::Exception(VmException::new(cls_name, msg).with_value(Value::Instance(i)))
             }
             other => {
                 Unwind::Exception(VmException::new("Exception", other.py_str()).with_value(other))
@@ -5727,6 +5969,82 @@ fn read_pub_names(path: &std::path::Path) -> Vec<String> {
 
 /// The `args` tuple for an exception reconstructed from a `VmException` that
 /// carries only a message string: a 1-tuple of the message, or empty.
+/// Trailing identifier of a class base expression (`Exception` → `Exception`,
+/// `app.errors.AppError` → `AppError`, `MyBase[int]` → `MyBase`). Returns
+/// `None` for forms that can't name a class (calls, etc.).
+fn base_trailing_name(base: &Expr) -> Option<&str> {
+    match base {
+        Expr::Name(n) => Some(n.id.as_str()),
+        Expr::Attribute(a) => Some(a.attr.as_str()),
+        Expr::Subscript(s) => base_trailing_name(&s.value),
+        _ => None,
+    }
+}
+
+/// Whether a base class *name* makes a subclass an exception — the same
+/// name-based heuristic the desugar pass uses (`*Error` / `*Exception` /
+/// `*Warning` suffixes, covering builtins like `ValueError`/`KeyError`/
+/// `Warning` and user hierarchies like `AppError`), plus the handful of
+/// builtin exception bases that don't follow the suffix convention.
+fn name_is_exception_base(name: &str) -> bool {
+    name.ends_with("Error")
+        || name.ends_with("Exception")
+        || name.ends_with("Warning")
+        || matches!(
+            name,
+            "BaseException"
+                | "KeyboardInterrupt"
+                | "SystemExit"
+                | "GeneratorExit"
+                | "StopIteration"
+                | "StopAsyncIteration"
+        )
+}
+
+/// Whether a user exception class derives — directly or through its user
+/// base chain — from a builtin exception named `target` (or a builtin
+/// subclass of it). Reads the `__typhon_exc_bases__` record stamped on each
+/// class by `build_class`, since builtin exception bases have no
+/// `Value::Class` to walk.
+fn class_has_builtin_exc_base(class: &Rc<Class>, target: &str) -> bool {
+    if let Some(Value::Tuple(names)) = class.class_attrs.borrow().get("__typhon_exc_bases__") {
+        for nm in names.iter() {
+            if let Value::Str(s) = nm {
+                if s.as_str() == target || builtin_exc_is_a(s, target) {
+                    return true;
+                }
+            }
+        }
+    }
+    class
+        .bases
+        .iter()
+        .any(|b| class_has_builtin_exc_base(b, target))
+}
+
+/// Elements of a set-algebra operand as a `HashSet<HashKey>`, for `set`s and
+/// the set-like dict views (`dict.keys()` / `dict.items()`). Returns
+/// `Ok(None)` for anything that isn't set-like (so the binop falls through to
+/// the normal dunder / mismatch path), and propagates an unwind if a view
+/// element isn't hashable. `dict.values()` is intentionally not set-like.
+fn as_set_operand(v: &Value) -> Result<Option<std::collections::HashSet<HashKey>>, Unwind> {
+    use crate::value::DictViewKind;
+    match v {
+        Value::Set(s) => Ok(Some(s.borrow().iter().cloned().collect())),
+        Value::DictView {
+            kind: DictViewKind::Keys | DictViewKind::Items,
+            items,
+        } => {
+            let mut out = std::collections::HashSet::with_capacity(items.len());
+            for item in items {
+                out.insert(item.to_hash_key()?);
+            }
+            Ok(Some(out))
+        }
+        _ => Ok(None),
+    }
+}
+
 fn exc_fallback_args(message: &str) -> Vec<Value> {
     if message.is_empty() {
         Vec::new()
@@ -5744,8 +6062,13 @@ pub fn builtin_exc_is_a(kind: &str, target: &str) -> bool {
         return true;
     }
     if target == "Exception" {
-        // Everything except the BaseException-only siblings.
-        return !matches!(kind, "KeyboardInterrupt" | "SystemExit" | "GeneratorExit");
+        // Everything except `BaseException` itself and its base-only
+        // siblings — `except Exception` must NOT catch these, matching
+        // CPython (where they derive from BaseException, not Exception).
+        return !matches!(
+            kind,
+            "BaseException" | "KeyboardInterrupt" | "SystemExit" | "GeneratorExit"
+        );
     }
     // Direct parent in the standard hierarchy (subset covering the common
     // intermediate bases programs actually catch).
@@ -5765,6 +6088,15 @@ pub fn builtin_exc_is_a(kind: &str, target: &str) -> bool {
             | "ConnectionResetError"
             | "ConnectionRefusedError"
             | "ConnectionAbortedError" => "ConnectionError",
+            "DeprecationWarning"
+            | "UserWarning"
+            | "RuntimeWarning"
+            | "FutureWarning"
+            | "PendingDeprecationWarning"
+            | "SyntaxWarning"
+            | "ImportWarning"
+            | "ResourceWarning"
+            | "BytesWarning" => "Warning",
             _ => return None,
         })
     }

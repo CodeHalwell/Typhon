@@ -1,0 +1,22 @@
+from typing import Callable
+
+class Result3[T, E]:
+    ok_value: T?
+    err_value: E?
+
+impl[T, E] Result3[T, E]:
+    def is_ok(self) -> bool:
+        return self.ok_value is not None
+    def map[U](self, f: Callable[[T], U]) -> Result3[U, E]:
+        if self.ok_value is not None:
+            return Result3(ok_value=f(self.ok_value), err_value=None)
+        return Result3(ok_value=None, err_value=self.err_value)
+
+def main() -> None:
+    let r: Result3[int, str] = Result3(ok_value=5, err_value=None)
+    print(r.is_ok())
+    let mapped: Result3[str, str] = r.map(lambda x: f"got {x}")
+    print(mapped.ok_value)
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,17 @@
+import re
+
+def main() -> None:
+    let text: str = "John: 25, Jane: 30, Bob: 45"
+    let pat: str = r"(\w+): (\d+)"
+    for m in re.finditer(pat, text):
+        print(m.group(1), int(m.group(2)))
+    let sub: str = re.sub(r"\d+", "N", text)
+    print(sub)
+    let parts: list[str] = re.split(r",\s*", text)
+    print(parts)
+    let mm = re.match(r"(\d{4})-(\d{2})-(\d{2})", "2026-06-16")
+    if mm is not None:
+        print(mm.groups())
+
+if __name__ == "__main__":
+    main()

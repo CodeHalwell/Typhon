@@ -1,0 +1,29 @@
+class Inventory:
+    items: dict[str, int]
+
+impl Inventory:
+    def add(self, name: str, qty: int) -> None:
+        self.items[name] = self.items.get(name, 0) + qty
+    def remove(self, name: str, qty: int) -> bool:
+        let current: int = self.items.get(name, 0)
+        if current < qty:
+            return False
+        self.items[name] = current - qty
+        if self.items[name] == 0:
+            del self.items[name]
+        return True
+    def total(self) -> int:
+        return sum(self.items.values())
+
+def main() -> None:
+    mut inv: Inventory = Inventory(items={})
+    inv.add("apple", 5)
+    inv.add("banana", 3)
+    inv.add("apple", 2)
+    print(inv.items["apple"])
+    print(inv.remove("banana", 1))
+    print(inv.remove("apple", 10))
+    print(inv.total())
+
+if __name__ == "__main__":
+    main()

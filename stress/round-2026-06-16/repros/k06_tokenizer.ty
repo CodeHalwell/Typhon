@@ -1,0 +1,50 @@
+type Token = Num | Op | Paren
+
+class Num frozen:
+    value: float
+
+class Op frozen:
+    symbol: str
+
+class Paren frozen:
+    is_open: bool
+
+def tokenize(text: str) -> list[Token]:
+    mut tokens: list[Token] = []
+    mut i: int = 0
+    while i < len(text):
+        let ch: str = text[i]
+        if ch == " ":
+            i = i + 1
+        elif ch in "+-*/":
+            tokens.append(Op(symbol=ch))
+            i = i + 1
+        elif ch == "(":
+            tokens.append(Paren(is_open=True))
+            i = i + 1
+        elif ch == ")":
+            tokens.append(Paren(is_open=False))
+            i = i + 1
+        else:
+            mut num: str = ""
+            while i < len(text) and (text[i].isdigit() or text[i] == "."):
+                num = num + text[i]
+                i = i + 1
+            tokens.append(Num(value=float(num)))
+    return tokens
+
+def render(t: Token) -> str:
+    match t:
+        case Num(value=v):
+            return f"N({v})"
+        case Op(symbol=s):
+            return f"O({s})"
+        case Paren(is_open=o):
+            return "(" if o else ")"
+
+def main() -> None:
+    let tokens: list[Token] = tokenize("(3 + 4) * 2")
+    print([render(t) for t in tokens])
+
+if __name__ == "__main__":
+    main()

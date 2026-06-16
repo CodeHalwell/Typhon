@@ -1,0 +1,24 @@
+from typing import Callable
+
+def logged(f: Callable[[int], int]) -> Callable[[int], int]:
+    def wrapper(x: int) -> int:
+        let r: int = f(x)
+        print(f"logged: {x} -> {r}")
+        return r
+    return wrapper
+
+def doubled_result(f: Callable[[int], int]) -> Callable[[int], int]:
+    def wrapper(x: int) -> int:
+        return f(x) * 2
+    return wrapper
+
+@logged
+@doubled_result
+def add_ten(x: int) -> int:
+    return x + 10
+
+def main() -> None:
+    print(add_ten(5))
+
+if __name__ == "__main__":
+    main()

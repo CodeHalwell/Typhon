@@ -1,0 +1,29 @@
+from typing import Callable
+
+def make_counter(start: int) -> Callable[[], int]:
+    mut count: int = start
+    def inc() -> int:
+        nonlocal count
+        count = count + 1
+        return count
+    return inc
+
+def trace(f: Callable[[int], int]) -> Callable[[int], int]:
+    def wrapper(x: int) -> int:
+        let r: int = f(x)
+        print(f"{x} -> {r}")
+        return r
+    return wrapper
+
+def double(x: int) -> int:
+    return x * 2
+
+def main() -> None:
+    let c: Callable[[], int] = make_counter(10)
+    print(c())
+    print(c())
+    let td: Callable[[int], int] = trace(double)
+    print(td(21))
+
+if __name__ == "__main__":
+    main()

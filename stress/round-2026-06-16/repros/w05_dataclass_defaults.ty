@@ -1,0 +1,22 @@
+class Server:
+    host: str
+    port: int = 8080
+    workers: int = 4
+    tags: list[str] = []
+    config: dict[str, str] = {}
+
+impl Server:
+    def url(self) -> str:
+        return f"http://{self.host}:{self.port}"
+
+def main() -> None:
+    let s1: Server = Server(host="localhost")
+    print(s1.url(), s1.workers)
+    s1.tags.append("prod")
+    let s2: Server = Server(host="example.com", port=443)
+    print(s2.tags)
+    s2.config["env"] = "prod"
+    print(s2.config)
+
+if __name__ == "__main__":
+    main()

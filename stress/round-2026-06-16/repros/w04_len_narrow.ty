@@ -1,0 +1,18 @@
+def safe_first(xs: list[int]) -> int:
+    if len(xs) == 0:
+        return -1
+    return xs[0]
+
+def process(data: list[str]) -> str:
+    if len(data) < 2:
+        return "too short"
+    return f"{data[0]} and {data[1]}"
+
+def main() -> None:
+    print(safe_first([5, 10]))
+    print(safe_first([]))
+    print(process(["a", "b", "c"]))
+    print(process(["x"]))
+
+if __name__ == "__main__":
+    main()

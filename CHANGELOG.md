@@ -4,6 +4,177 @@ All notable changes to Typhon are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely; the
 canonical phase-by-phase status lives in `docs/roadmap.md`.
 
+## Unreleased — stress-test robustness sweep
+
+An ~85-program adversarial sweep ("if you can write it in Python, you can use
+Typhon") spanning the breadth of what production Python apps do. Two
+production-path bugs and several VM parity gaps were fixed; the compiled
+output (`tyc build` → CPython 3.13) is now correct on the entire corpus.
+
+### Fixed — nested class patterns no longer block the build
+
+- **An exhaustive `match` with a nested class pattern no longer false-fires
+  `tyc::missing_return` (`tyc-types`).** A case like
+  `case Circle(center=Point(x=cx, y=cy), radius=r):` (where `center: Point`)
+  was treated as refutable because its nested `Point(...)` sub-pattern wasn't
+  a bare capture, so the checker demanded a fall-through arm and **blocked the
+  build** on valid, idiomatic code. A sub-pattern is now recognised as total
+  when it's a nested class pattern against a field of that exact class and the
+  nested pattern itself totally covers that class. A nested *value* filter
+  (`x=0`) stays correctly refutable, so genuine fall-throughs still fire.
+
+### Fixed — list `match` with a non-tail star is recognised exhaustive
+
+- **`case [first, *middle, last]:` no longer leaves a length-coverage gap.**
+  The list-length exhaustiveness check only accepted a *tail* star
+  (`[a, *rest]`); a star in the middle or head (`[first, *mid, last]`,
+  `[*init, last]`) was ignored, so an otherwise-complete match
+  (`[]` / `[x]` / `[x, y]` / `[first, *mid, last]`) false-fired
+  `tyc::missing_return`. A single star anywhere with capture/wildcard
+  non-star elements now contributes its `≥ len-1` length coverage; a genuine
+  gap (e.g. `[]` + `[a, *m, b]` leaving length 1) still fires.
+
+### Fixed — `isinstance`-narrowed container is usable parametrically
+
+- **`if isinstance(x, dict): use(x)`** where `use` wants `dict[str, object]`
+  (and the `list` / `set` / `frozenset` / `tuple` analogues) no longer
+  false-fires `tyc::type_mismatch`. Python's `isinstance` can't take a
+  parametric type, so a container narrowed this way has unconstrained element
+  types; a bare container is now assignable to its parametric form (matching
+  mypy's `dict[Any, Any]`). A genuine parametric mismatch
+  (`dict[str, int]` → `dict[str, str]`) still fires.
+
+### Fixed — iterator-protocol classes conform to `Iterator[T]`
+
+- **`def __iter__(self) -> Iterator[int]: return self`** (the standard
+  custom-iterator shape, with a `__next__(self) -> int`) no longer false-fires
+  `tyc::type_mismatch` on `return self`. `is_assignable` now recognises a class
+  implementing `__next__(self) -> T` (or `__iter__(self) -> Iterator[T]`) as
+  structurally conforming to `Iterator[T]` / `Iterable[T]` / `Collection[T]` /
+  `Reversible[T]`. A class without those methods still fails.
+
+### Added — flow-sensitive attribute narrowing
+
+- **`if self.value is None: return …` now narrows `self.value` to non-`None`
+  for the rest of the block** (and the `is not None` / `if/return` forms),
+  matching how local variables already narrow. Previously every optional
+  *attribute* access stayed `T?`, so the ubiquitous "check an optional field,
+  then use it" pattern false-fired `tyc::nullable_use` /
+  `operator_type_mismatch` / `type_mismatch` and blocked the build — even
+  though both mypy and pyright accept it. Narrowing is keyed by access path
+  (`self.value`, `cfg.db.host`), snapshot/restored around branches (so it
+  never leaks past a non-diverging `if`), invalidated when the path is
+  reassigned, and reset at each function boundary. An un-narrowed nullable
+  attribute still fires.
+
+### Fixed — `match` on a narrowed nullable subject is recognised exhaustive
+
+- **`match s:` after `if s is None: return …` no longer false-fires
+  `tyc::missing_return` (production blocker).** The exhaustiveness pass keyed
+  off the *declared* subject type (`Shape?`), so it thought `None` was an
+  uncovered case even though the earlier guard had narrowed `s` to `Shape`.
+  `match_subject_type` now uses the *narrowed* type (falling back to declared),
+  so flow-sensitive narrowing before the match is respected. An un-narrowed
+  nullable subject still fires (None genuinely uncovered).
+
+### Fixed — exhaustive tuple-of-union `match` no longer blocks the build
+
+- **`match (state, event):` over a `tuple[Union, T]` no longer false-fires
+  `tyc::missing_return` (production blocker).** The idiomatic state-machine
+  dispatch where each sealed-union variant is paired with a capture/wildcard
+  for the other column is exhaustive, but the checker had no product-coverage
+  analysis for tuple subjects, so it demanded a fall-through arm and blocked
+  the build. A sound column-wise coverage check (`tuple_cases_cover`) now
+  proves these exhaustive; it stays conservative (any arm shape it can't model
+  bails to "not covered"), so non-exhaustive tuple matches — a variant left
+  out, or a scalar column with no capture — still fire. `infer_expr_readonly`
+  also learned to type a tuple subject so the exhaustiveness pass can see it.
+
+### Fixed — `**kwargs` preserves call order (`tyc-vm`)
+
+- The VM collected a `**kwargs` parameter into a `HashMap`, so the resulting
+  dict's iteration / `repr` / serialisation order was nondeterministic.
+  CPython preserves keyword-argument order; the VM now uses an insertion-
+  ordered map (`IndexMap` + `shift_remove`) to match.
+
+### Fixed — set operations on `dict` views (`tyc-types` + `tyc-vm`)
+
+- **`d1.keys() - d2.keys()` no longer false-fires `tyc::operator_type_mismatch`
+  (production blocker).** `dict.keys()` / `dict.items()` are set-like views
+  that support `& | - ^`; the checker's set-difference carve-out only allowed
+  `set`/`frozenset`, so `KeysView`/`ItemsView` operands were rejected and the
+  build blocked. (`&`/`|`/`^` already type-checked.) The VM now also evaluates
+  these (it previously raised `unsupported operand type(s)`), so `tyc run`
+  matches the compiled path. `dict.values()` stays non-set-like, as in CPython.
+
+### Added — VM `abc` module shim (`tyc-vm`)
+
+- **`from abc import ABC, abstractmethod`** now works under `tyc run` (the
+  default VM): `ABC` / `ABCMeta` are no-op bases and the `abstractmethod`
+  family are identity decorators, so `class H(ABC): @abstractmethod def …`
+  plus concrete subclasses run without falling back to `--compile`.
+
+### Fixed — more VM parity (`tyc-vm`)
+
+- **`del lst[i:j]` / `del lst[::k]`** (slice deletion) now works under
+  `tyc run` instead of raising `slice expression outside subscript`.
+- **User `__format__(self, spec)` is dispatched** by `f"{x:spec}"`,
+  `"{:spec}".format(x)`, and `format(x, spec)` (previously the VM fell back to
+  `__str__` and ignored the spec).
+- **`str(KeyError("k"))` is `"'k'"`** (repr of the key) to match CPython's
+  one builtin whose `str()` quotes its argument.
+
+### Fixed — `bytes` operators in the VM (`tyc-vm`)
+
+- `b"a" + b"b"` (concatenation) and `b"a" * 3` / `3 * b"a"` (repetition) now
+  work under `tyc run` instead of raising `unsupported operand type(s)`.
+
+The largest cluster was around the most common Python idiom the corpus
+exercised that Typhon got wrong: **custom exception classes**.
+
+### Fixed — `class FooError(Exception):` no longer breaks `raise FooError("msg")`
+
+- **Exception subclasses are no longer auto-decorated with `@dataclass`
+  (`tyc-desugar`).** A `class FooError(Exception): pass` emitted
+  `@dataclasses.dataclass(slots=True)`, whose synthesised no-argument
+  `__init__` shadows `BaseException.__init__`. The ubiquitous
+  `raise FooError("message")` then died at runtime with
+  `TypeError: FooError.__init__() takes 1 positional argument but 2 were
+  given` — on both the compiled output *and* the VM. This affected every
+  exception subclass: builtin bases (`Exception`, `ValueError`, `KeyError`,
+  `Warning`, …) and user hierarchies (`AppError` → `NotFoundError`).
+
+  Exception subclasses are now detected by base name (segment ending in
+  `Error`/`Exception`/`Warning`, or an exact non-suffixed builtin like
+  `BaseException`/`KeyboardInterrupt`) and lowered like `class!`: no
+  `@dataclass`, and a `super().__init__(...)`-calling constructor synthesised
+  **only** when the body declares fields. A field-less exception stays a bare
+  `class FooError(Exception): pass` and inherits `BaseException.__init__`.
+  Error-named classes with **no base** (Result error *variants*) are
+  unaffected and keep their dataclass shape.
+
+- **VM exception parity (`tyc-vm`).** The VM independently mis-modelled
+  exception subclasses; `tyc run` now matches the compiled path:
+  - field-less exception construction accepts positional args
+    (`BaseException`-style, stashed as `.args`) instead of "takes 0 arguments";
+  - `str(e)` / `repr(e)` render from `.args` (`str(FooError("x")) == "x"`,
+    `repr == "FooError('x')"`) rather than the dataclass field form;
+  - `except KeyError` catches a user `class MyKeyError(KeyError):` (builtin
+    exception bases are recorded on the class, since the VM has no
+    `Value::Class` for them);
+  - a hand-written `super().__init__(msg)` in an exception `__init__` is
+    captured so `str(e)` reflects the custom message;
+  - missing builtin exceptions registered: `BaseException`, `Warning`
+    (+ subclasses), `NameError`, `ImportError`, `UnicodeError`,
+    `ConnectionError`, `IOError`, `KeyboardInterrupt`/`SystemExit`/
+    `GeneratorExit`, and more.
+
+  Known remaining VM-only limitations (compiled path is correct): `__cause__`
+  is not tracked for `raise X from Y`, and CPython's `KeyError`-specific
+  repr-quoting in `str()` is not reproduced.
+
+Stress corpus and methodology: `stress/round-2026-06-16/`.
+
 ## 0.15.5 — 2026-06-15 — cross-module `extend BUILTIN:` propagation
 
 A bugfix release that makes `extend BUILTIN:` work across module boundaries.

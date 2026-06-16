@@ -1,0 +1,43 @@
+type LexState = Start | InWord | InNumber
+
+class Start frozen:
+    pass
+class InWord frozen:
+    pass
+class InNumber frozen:
+    pass
+
+def tokenize(text: str) -> list[str]:
+    mut tokens: list[str] = []
+    mut state: LexState = Start()
+    mut current: str = ""
+    for ch in text + " ":
+        match state:
+            case Start():
+                if ch.isalpha():
+                    current = ch
+                    state = InWord()
+                elif ch.isdigit():
+                    current = ch
+                    state = InNumber()
+            case InWord():
+                if ch.isalnum():
+                    current = current + ch
+                else:
+                    tokens.append("W:" + current)
+                    current = ""
+                    state = Start()
+            case InNumber():
+                if ch.isdigit():
+                    current = current + ch
+                else:
+                    tokens.append("N:" + current)
+                    current = ""
+                    state = Start()
+    return tokens
+
+def main() -> None:
+    print(tokenize("abc 123 def456"))
+
+if __name__ == "__main__":
+    main()

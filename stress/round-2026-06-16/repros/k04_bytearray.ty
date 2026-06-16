@@ -1,0 +1,18 @@
+def main() -> None:
+    let b: bytes = b"hello"
+    print(b[0])
+    print(b.hex())
+    print(b.upper())
+    print(len(b))
+    print(b + b" world")
+    print(b"abc" * 2)
+    mut ba: bytearray = bytearray(b"data")
+    ba.append(33)
+    print(bytes(ba))
+    print(list(b"ABC"))
+    print(b"a,b,c".split(b","))
+    print("hello".encode())
+    print(bytes([104, 105]).decode())
+
+if __name__ == "__main__":
+    main()

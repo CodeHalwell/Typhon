@@ -1,0 +1,15 @@
+import itertools
+import functools
+
+def main() -> None:
+    let pairs: list[tuple[int, int]] = list(itertools.combinations([1, 2, 3, 4], 2))
+    print(pairs)
+    let acc: list[int] = list(itertools.accumulate([1, 2, 3, 4]))
+    print(acc)
+    let total: int = functools.reduce(lambda a, b: a + b, [1, 2, 3, 4, 5], 0)
+    print(total)
+    let chained: list[int] = list(itertools.chain([1, 2], [3, 4]))
+    print(chained)
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,24 @@
+def running_max(xs: list[int]) -> list[int]:
+    mut result: list[int] = []
+    mut current_max: int = xs[0]
+    for x in xs:
+        if x > current_max:
+            current_max = x
+        result.append(current_max)
+    return result
+
+def find_index(xs: list[int], target: int) -> int:
+    mut idx: int = -1
+    for i in range(len(xs)):
+        if xs[i] == target:
+            idx = i
+            break
+    return idx
+
+def main() -> None:
+    print(running_max([3, 1, 4, 1, 5, 9, 2, 6]))
+    print(find_index([10, 20, 30, 40], 30))
+    print(find_index([1, 2, 3], 99))
+
+if __name__ == "__main__":
+    main()

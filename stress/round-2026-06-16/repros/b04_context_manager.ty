@@ -1,0 +1,27 @@
+from contextlib import contextmanager
+from typing import Iterator
+
+class Resource:
+    name: str
+
+impl Resource:
+    def __enter__(self) -> Resource:
+        print(f"acquire {self.name}")
+        return self
+    def __exit__(self, *args: object) -> None:
+        print(f"release {self.name}")
+
+@contextmanager
+def timer(label: str) -> Iterator[str]:
+    print(f"start {label}")
+    yield label
+    print(f"end {label}")
+
+def main() -> None:
+    with Resource(name="db") as r:
+        print(f"using {r.name}")
+    with timer("work") as t:
+        print(f"doing {t}")
+
+if __name__ == "__main__":
+    main()

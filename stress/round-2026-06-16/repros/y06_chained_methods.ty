@@ -1,0 +1,14 @@
+def pipeline(text: str) -> str:
+    return text.strip().lower().replace(" ", "_")
+
+def clean_words(text: str) -> list[str]:
+    return [w.strip(".,!?").lower() for w in text.split() if len(w.strip(".,!?")) > 0]
+
+def main() -> None:
+    print(pipeline("  Hello World  "))
+    print(clean_words("The quick, brown fox! jumps."))
+    print("  a-b-c  ".strip().split("-"))
+    print("Hello".upper().lower().title())
+
+if __name__ == "__main__":
+    main()

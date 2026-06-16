@@ -1,0 +1,21 @@
+class User:
+    name: str
+    email: str?
+
+def format_user(u: User) -> str:
+    if u.email is None:
+        return u.name
+    return f"{u.name} <{u.email}>"
+
+def send_to(u: User) -> str:
+    guard email = u.email else: return "skip"
+    return f"sending to {email}"
+
+def main() -> None:
+    print(format_user(User(name="Alice", email="a@b.com")))
+    print(format_user(User(name="Bob", email=None)))
+    print(send_to(User(name="Carol", email="c@d.com")))
+    print(send_to(User(name="Dave", email=None)))
+
+if __name__ == "__main__":
+    main()

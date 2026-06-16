@@ -1,0 +1,29 @@
+type Cmd = Move | Rotate | Stop
+
+class Move frozen:
+    dx: int
+    dy: int
+class Rotate frozen:
+    degrees: int
+class Stop frozen:
+    pass
+
+def process(cmd: Cmd, count: int) -> str:
+    match (cmd, count):
+        case (Move(dx=x, dy=y), 0):
+            return f"first move {x},{y}"
+        case (Move(dx=x, dy=y), n):
+            return f"move {x},{y} (#{n})"
+        case (Rotate(degrees=d), _):
+            return f"rotate {d}"
+        case (Stop(), _):
+            return "stop"
+
+def main() -> None:
+    print(process(Move(dx=1, dy=2), 0))
+    print(process(Move(dx=3, dy=4), 5))
+    print(process(Rotate(degrees=90), 1))
+    print(process(Stop(), 0))
+
+if __name__ == "__main__":
+    main()

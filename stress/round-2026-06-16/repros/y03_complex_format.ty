@@ -1,0 +1,21 @@
+def format_table(data: list[tuple[str, int, float]]) -> str:
+    mut lines: list[str] = []
+    lines.append(f"{'Name':<10}{'Count':>8}{'Avg':>10}")
+    for name, count, avg in data:
+        lines.append(f"{name:<10}{count:>8}{avg:>10.2f}")
+    return "\n".join(lines)
+
+def main() -> None:
+    let data: list[tuple[str, int, float]] = [
+        ("apple", 100, 1.5),
+        ("banana", 50, 0.75),
+        ("cherry", 200, 3.14159),
+    ]
+    print(format_table(data))
+    print(f"{1234567.891:,.2f}")
+    print(f"{255:08b} {255:#x} {255:o}")
+    print(f"{0.000123:.2e}")
+    print(f"{42:+d} {-42:+d}")
+
+if __name__ == "__main__":
+    main()

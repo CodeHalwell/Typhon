@@ -1,0 +1,22 @@
+class Named:
+    name: str
+
+impl Named:
+    def label(self) -> str:
+        return f"name={self.name}"
+
+class Aged:
+    age: int
+
+impl Aged:
+    def info(self) -> str:
+        return f"age={self.age}"
+
+def main() -> None:
+    let n: Named = Named(name="x")
+    print(n.label())
+    let a: Aged = Aged(age=5)
+    print(a.info())
+
+if __name__ == "__main__":
+    main()

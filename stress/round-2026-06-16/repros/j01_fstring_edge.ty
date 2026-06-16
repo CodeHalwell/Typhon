@@ -1,0 +1,29 @@
+class P:
+    x: int
+    y: int
+
+impl P:
+    def __repr__(self) -> str:
+        return f"P({self.x}, {self.y})"
+    def __str__(self) -> str:
+        return f"({self.x},{self.y})"
+
+def main() -> None:
+    let p: P = P(x=1, y=2)
+    print(f"{p}")
+    print(f"{p!r}")
+    print(f"{p!s}")
+    let name: str = "world"
+    print(f"{name!r}")
+    print(f"{'quoted'}")
+    print(f"{ {1, 2, 3} }")
+    print(f"{[i*2 for i in range(3)]}")
+    let d: dict[str, int] = {"a": 1}
+    print(f"{d['a']}")
+    let val: float = 3.14159
+    print(f"{val:.2f} and {val:.0f}")
+    print(f"{1 + 2 = }")
+    print(f"nested {f'inner {name}'}")
+
+if __name__ == "__main__":
+    main()

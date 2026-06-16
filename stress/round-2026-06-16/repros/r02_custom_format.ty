@@ -1,0 +1,19 @@
+class Temperature:
+    celsius: float
+
+impl Temperature:
+    def __format__(self, spec: str) -> str:
+        if spec == "F":
+            return f"{self.celsius * 9 / 5 + 32}°F"
+        return f"{self.celsius}°C"
+    def __str__(self) -> str:
+        return f"{self.celsius}°C"
+
+def main() -> None:
+    let t: Temperature = Temperature(celsius=25.0)
+    print(f"{t}")
+    print(f"{t:F}")
+    print("{}".format(t))
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,22 @@
+type Node = Leaf | Branch
+class Leaf frozen:
+    value: int
+class Branch frozen:
+    children: list[Node]
+
+def process(x: Node | str) -> int:
+    if isinstance(x, str):
+        return len(x)
+    match x:
+        case Leaf(value=v):
+            return v
+        case Branch(children=c):
+            return len(c)
+
+def main() -> None:
+    print(process("hello"))
+    print(process(Leaf(value=42)))
+    print(process(Branch(children=[Leaf(value=1), Leaf(value=2)])))
+
+if __name__ == "__main__":
+    main()

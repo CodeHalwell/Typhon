@@ -1,0 +1,29 @@
+class Animal:
+    name: str
+
+impl Animal:
+    def sound(self) -> str:
+        return "..."
+
+class Dog(Animal):
+    pass
+
+impl Dog:
+    def sound(self) -> str:
+        return "woof"
+
+def describe(a: Animal) -> str:
+    return f"{a.name}: {a.sound()}"
+
+def all_sounds(animals: list[Animal]) -> list[str]:
+    return [a.sound() for a in animals]
+
+def main() -> None:
+    let d: Dog = Dog(name="Rex")
+    print(describe(d))
+    let dogs: list[Dog] = [Dog(name="A"), Dog(name="B")]
+    let animals: list[Animal] = list(dogs)
+    print(all_sounds(animals))
+
+if __name__ == "__main__":
+    main()

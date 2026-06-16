@@ -1,0 +1,33 @@
+type Expr = Lit | Add | Mul | Neg
+
+class Lit frozen:
+    value: int
+class Add frozen:
+    left: Expr
+    right: Expr
+class Mul frozen:
+    left: Expr
+    right: Expr
+class Neg frozen:
+    operand: Expr
+
+def eval_expr(e: Expr) -> int:
+    match e:
+        case Lit(value=v):
+            return v
+        case Add(left=l, right=r):
+            return eval_expr(l) + eval_expr(r)
+        case Mul(left=l, right=r):
+            return eval_expr(l) * eval_expr(r)
+        case Neg(operand=o):
+            return -eval_expr(o)
+
+def main() -> None:
+    let expr: Expr = Add(
+        left=Mul(left=Lit(value=3), right=Lit(value=4)),
+        right=Neg(operand=Lit(value=5)),
+    )
+    print(eval_expr(expr))
+
+if __name__ == "__main__":
+    main()

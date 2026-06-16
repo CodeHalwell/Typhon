@@ -1,0 +1,16 @@
+def main() -> None:
+    let xs: list[int] = [3, 1, 4, 1, 5, 9, 2, 6]
+    print(list(enumerate(["a", "b", "c"])))
+    print(list(zip([1, 2, 3], ["x", "y", "z"])))
+    print(any(x > 8 for x in xs), all(x > 0 for x in xs))
+    print(list(reversed(xs)))
+    print(list(range(0, 20, 5)))
+    let total: int = sum(xs)
+    print(total, total / len(xs))
+    print(sorted(set(xs)))
+    print(list(map(str, xs)))
+    print([x for x in xs if x % 2 == 0])
+    print(next(filter(lambda x: x > 4, xs)))
+
+if __name__ == "__main__":
+    main()

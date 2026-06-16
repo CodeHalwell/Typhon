@@ -1,0 +1,28 @@
+class Multiplier:
+    factor: int
+
+impl Multiplier:
+    def __call__(self, x: int) -> int:
+        return x * self.factor
+
+class Accumulator:
+    total: int
+
+impl Accumulator:
+    def __call__(self, x: int) -> int:
+        self.total = self.total + x
+        return self.total
+
+def main() -> None:
+    let triple: Multiplier = Multiplier(factor=3)
+    print(triple(5))
+    print(triple(10))
+    mut acc: Accumulator = Accumulator(total=0)
+    print(acc(10))
+    print(acc(5))
+    print(acc(3))
+    let nums: list[int] = [1, 2, 3]
+    print([triple(n) for n in nums])
+
+if __name__ == "__main__":
+    main()

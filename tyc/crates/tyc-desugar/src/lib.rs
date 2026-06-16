@@ -1717,6 +1717,15 @@ fn desugar_mod_module_with(m: &ModModule, options: &DesugarOptions) -> ModModule
     // as multi-base parents so the dataclass decorator drops `slots=True`.
     let mut multi_base_parents = multi_base_parents;
     collect_cached_property_targets_into(&m.body, &mut multi_base_parents);
+    // Module-level classes and the transitive exception subset among them.
+    let mut module_level_classes: Vec<(String, Vec<String>)> = Vec::new();
+    collect_class_bases_into(&m.body, &mut module_level_classes);
+    let module_class_names: std::collections::HashSet<String> = module_level_classes
+        .iter()
+        .map(|(n, _)| n.clone())
+        .collect();
+    let exception_class_names =
+        exception_class_names_from(&module_level_classes, &module_class_names);
     let markers = ClassMarkers {
         raw_starts: &options.raw_class_line_starts,
         frozen_starts: &options.frozen_class_line_starts,
@@ -1724,6 +1733,8 @@ fn desugar_mod_module_with(m: &ModModule, options: &DesugarOptions) -> ModModule
         multi_base_parents: &multi_base_parents,
         skip_decoration_bases: &options.skip_decoration_bases,
         model_extra: &options.model_extra,
+        exception_class_names: &exception_class_names,
+        module_class_names: &module_class_names,
     };
     let (new_body, transformed_classes) = desugar_stmts(&m.body, markers);
 
@@ -1981,6 +1992,14 @@ struct ClassMarkers<'a> {
     /// classes. Sourced from `[emit] model-extra` in `typhon.toml` via
     /// [`DesugarOptions::model_extra`].
     model_extra: &'a str,
+    /// Names of every module-level class that is (transitively) an exception
+    /// subclass — so a subclass of a non-suffix-named user exception base
+    /// (`class Timeout(Failure)` where `Failure(Exception)`) is recognised.
+    exception_class_names: &'a std::collections::HashSet<String>,
+    /// Names of every module-level class. Used to tell an *external*
+    /// (builtin/imported) exception base apart from a `*Error`-named module
+    /// dataclass when classifying a class as an exception per-class.
+    module_class_names: &'a std::collections::HashSet<String>,
 }
 
 impl ClassMarkers<'_> {
@@ -2063,6 +2082,22 @@ fn desugar_stmt(stmt: &Stmt, markers: ClassMarkers<'_>) -> (Stmt, bool) {
             // do the right thing without requiring `plain class`/`class!`.
             let is_skip_decoration_subclass =
                 class_inherits_skip_decoration_base(c, markers.skip_decoration_bases);
+            // Exception subclasses must not get a dataclass `__init__` (it
+            // would shadow `BaseException.__init__` and break
+            // `raise FooError("msg")`). They lower like `class!`: no
+            // decorator, plus a `super().__init__(...)` constructor when the
+            // body has fields. A class is an exception when it has an
+            // *external* (builtin/imported) exception base — works in any
+            // scope including nested classes — OR is a module-level class
+            // transitively rooted in one. A `*Error`-named module *dataclass*
+            // base is NOT external, so it doesn't taint its subclasses.
+            let has_external_exception_base = c.bases().iter().any(|b| {
+                base_last_segment(b).is_some_and(|seg| {
+                    !markers.module_class_names.contains(seg) && name_is_exception_base(seg)
+                })
+            });
+            let is_exception_subclass = has_external_exception_base
+                || markers.exception_class_names.contains(c.name.as_str());
             // Multi-inheritance with concrete bases conflicts with
             // `slots=True`; emit the decorator without `slots=True` in
             // that case. FINDINGS #102. Also drop `slots=True` for any
@@ -2084,6 +2119,7 @@ fn desugar_stmt(stmt: &Stmt, markers: ClassMarkers<'_>) -> (Stmt, bool) {
                 && !is_impl_stub
                 && !is_lazy_proxy
                 && !is_skip_decoration_subclass
+                && !is_exception_subclass
                 && !has_dataclass_decorator(&c.decorator_list);
             // Pydantic `model` classes must have `model_config = ConfigDict(extra="forbid")`
             // as their first body statement unless the user already defined it.
@@ -2143,7 +2179,14 @@ fn desugar_stmt(stmt: &Stmt, markers: ClassMarkers<'_>) -> (Stmt, bool) {
             // but allocates real objects for things like `Linear(10, 5)`
             // and confuses libraries that introspect class attributes
             // (e.g. PyTorch parameter registration on subclasses).
-            if is_raw
+            // `class!` always gets a synthesised constructor (the framework
+            // base may need `super().__init__()` called even with no fields).
+            // An auto-detected exception subclass only needs one when it
+            // declares fields — otherwise it stays bare and inherits
+            // `BaseException.__init__`.
+            let wants_raw_init =
+                is_raw || (is_exception_subclass && class_has_annotated_fields(&new_class.body));
+            if wants_raw_init
                 && !is_plain
                 && class_has_any_base(c)
                 && !body_has_init(&new_class.body)
@@ -2717,6 +2760,133 @@ fn class_inherits_typed_dict(c: &ruff_python_ast::StmtClassDef) -> bool {
                 )
         }
         _ => false,
+    })
+}
+
+/// Exact base names — outside the `*Error`/`*Exception`/`*Warning` naming
+/// convention — that nonetheless make a class an exception subclass.
+const EXACT_EXCEPTION_BASES: &[&str] = &[
+    "BaseException",
+    "KeyboardInterrupt",
+    "SystemExit",
+    "GeneratorExit",
+    "StopIteration",
+    "StopAsyncIteration",
+];
+
+/// Whether `name` (a base's trailing segment) marks an exception by the
+/// builtin convention: a `*Error` / `*Exception` / `*Warning` suffix or an
+/// exact non-suffixed builtin (`BaseException`, `KeyboardInterrupt`, …).
+fn name_is_exception_base(name: &str) -> bool {
+    name.ends_with("Error")
+        || name.ends_with("Exception")
+        || name.ends_with("Warning")
+        || EXACT_EXCEPTION_BASES.contains(&name)
+}
+
+/// Names of every class in the module that is (transitively) an exception
+/// subclass. A class qualifies when a base is an *external* (builtin/imported)
+/// name matching the exception convention (`Exception`, `ValueError`, …) OR
+/// names another module class that itself qualifies (transitively). Crucially,
+/// a `*Error`-named base that is itself a *module* class is NOT assumed to be
+/// an exception: `class LexError: line: int` is a Result error-variant
+/// dataclass, so `class Detailed(LexError):` stays a dataclass too. But
+/// `class Failure(Exception): pass` then `class Timeout(Failure): pass` both
+/// qualify, since `Failure` is rooted in the builtin `Exception`.
+fn exception_class_names_from(
+    classes: &[(String, Vec<String>)],
+    module_classes: &std::collections::HashSet<String>,
+) -> std::collections::HashSet<String> {
+    let mut exc: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // Seed only from external exception bases — a `*Error`-named *module*
+    // class is left to the fixpoint (it qualifies only if rooted in a builtin
+    // exception), so a plain `*Error` dataclass base doesn't taint subclasses.
+    for (name, bases) in classes {
+        if bases
+            .iter()
+            .any(|b| !module_classes.contains(b.as_str()) && name_is_exception_base(b))
+        {
+            exc.insert(name.clone());
+        }
+    }
+    loop {
+        let mut changed = false;
+        for (name, bases) in classes {
+            if !exc.contains(name) && bases.iter().any(|b| exc.contains(b)) {
+                exc.insert(name.clone());
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    exc
+}
+
+/// Collect `(class name, base trailing segments)` for every *module-level*
+/// class def in `body` — descending through module-level control flow
+/// (`if`/`try`/`for`/`while`/`with`) but NOT into function or nested-class
+/// bodies. Keeping the set module-scoped avoids a function-local
+/// `class Failure(Exception):` tainting an unrelated top-level
+/// `class Failure:` dataclass of the same name. Nested-scope exception
+/// classes are recognised per-class at decoration time via their *external*
+/// base (see `is_exception_subclass` in `desugar_stmts`).
+fn collect_class_bases_into(body: &[Stmt], out: &mut Vec<(String, Vec<String>)>) {
+    for stmt in body {
+        match stmt {
+            Stmt::ClassDef(c) => {
+                let bases: Vec<String> = c
+                    .bases()
+                    .iter()
+                    .filter_map(|b| base_last_segment(b).map(|s| s.to_owned()))
+                    .collect();
+                out.push((c.name.as_str().to_owned(), bases));
+                // Do NOT descend into the class body — a class nested inside a
+                // class is a different scope.
+            }
+            // Do NOT descend into function bodies (a different scope).
+            Stmt::If(i) => {
+                collect_class_bases_into(&i.body, out);
+                for clause in &i.elif_else_clauses {
+                    collect_class_bases_into(&clause.body, out);
+                }
+            }
+            Stmt::For(f) => {
+                collect_class_bases_into(&f.body, out);
+                collect_class_bases_into(&f.orelse, out);
+            }
+            Stmt::While(w) => {
+                collect_class_bases_into(&w.body, out);
+                collect_class_bases_into(&w.orelse, out);
+            }
+            Stmt::With(w) => collect_class_bases_into(&w.body, out),
+            Stmt::Try(t) => {
+                collect_class_bases_into(&t.body, out);
+                for h in &t.handlers {
+                    let ruff_python_ast::ExceptHandler::ExceptHandler(h) = h;
+                    collect_class_bases_into(&h.body, out);
+                }
+                collect_class_bases_into(&t.orelse, out);
+                collect_class_bases_into(&t.finalbody, out);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Return `true` if the class body declares at least one top-level annotated
+/// field (`name: T` / `name: T = default`). Used to decide whether an
+/// exception subclass needs a synthesised field-assigning `__init__`: a
+/// field-less `class FooError(Exception): pass` should stay bare and inherit
+/// `BaseException.__init__` (so `raise FooError("msg")` just works) rather
+/// than carry a redundant `*args`/`**kwargs` passthrough.
+fn class_has_annotated_fields(body: &[Stmt]) -> bool {
+    body.iter().any(|s| {
+        matches!(
+            s,
+            Stmt::AnnAssign(a) if matches!(a.target.as_ref(), Expr::Name(_))
+        )
     })
 }
 
@@ -4460,6 +4630,124 @@ mod tests {
         assert!(
             out.contains("@dataclasses.dataclass"),
             "unrelated base must still get @dataclass:\n{out}"
+        );
+    }
+
+    #[test]
+    fn exception_subclass_skips_dataclass_decorator() {
+        // `class FooError(Exception): pass` must NOT get `@dataclass` — the
+        // synthesised no-arg `__init__` would shadow `BaseException.__init__`
+        // and break `raise FooError("msg")`.
+        let out = parse_and_desugar("class FooError(Exception):\n    pass\n");
+        assert!(
+            !out.contains("@dataclasses.dataclass"),
+            "exception subclass must not get @dataclass:\n{out}"
+        );
+        // Field-less exception stays bare (inherits BaseException.__init__):
+        // no synthesised `__init__`.
+        assert!(
+            !out.contains("def __init__"),
+            "field-less exception must not synthesise __init__:\n{out}"
+        );
+    }
+
+    #[test]
+    fn exception_subclass_via_user_hierarchy_skips_dataclass() {
+        // `AppError(Exception)` then `NotFoundError(AppError)` — both are
+        // exceptions by the `*Error` naming convention.
+        let src =
+            "class AppError(Exception):\n    pass\n\nclass NotFoundError(AppError):\n    pass\n";
+        let out = parse_and_desugar(src);
+        assert!(
+            !out.contains("@dataclasses.dataclass"),
+            "exception hierarchy must not get @dataclass:\n{out}"
+        );
+    }
+
+    #[test]
+    fn exception_subclass_via_nonsuffixed_user_base_skips_dataclass() {
+        // `Failure(Exception)` is an exception (base ends in `Exception`),
+        // but `Timeout(Failure)` has a base that does NOT match the suffix
+        // heuristic — the transitive module pass must still recognise it so
+        // `Timeout("msg")` inherits `BaseException.__init__`.
+        let src = "class Failure(Exception):\n    pass\n\nclass Timeout(Failure):\n    pass\n";
+        let out = parse_and_desugar(src);
+        assert!(
+            !out.contains("@dataclasses.dataclass"),
+            "subclass of a non-suffixed exception base must not get @dataclass:\n{out}"
+        );
+    }
+
+    #[test]
+    fn exception_subclass_with_fields_synthesises_init() {
+        // An exception that declares fields and no manual __init__ gets a
+        // `class!`-style constructor (super().__init__() + field assigns).
+        let src = "class HttpError(Exception):\n    code: int\n    detail: str\n";
+        let out = parse_and_desugar(src);
+        assert!(
+            !out.contains("@dataclasses.dataclass"),
+            "exception with fields must not get @dataclass:\n{out}"
+        );
+        assert!(
+            out.contains("def __init__(self, code: int, detail: str)"),
+            "exception with fields must synthesise a field-assigning __init__:\n{out}"
+        );
+        assert!(
+            out.contains("self.code = code") && out.contains("self.detail = detail"),
+            "synthesised __init__ must assign fields:\n{out}"
+        );
+    }
+
+    #[test]
+    fn nested_exception_does_not_taint_toplevel_dataclass() {
+        // A function-local `class Failure(Exception):` must NOT mark a
+        // top-level `class Failure:` dataclass as an exception (different
+        // scope). The top-level one keeps `@dataclass`; the nested one is
+        // still detected as an exception via its external base.
+        let src = "\
+class Failure:
+    code: int
+
+def helper() -> None:
+    class Failure(Exception):
+        pass
+";
+        let out = parse_and_desugar(src);
+        // The top-level dataclass `Failure` keeps its decorator; the nested
+        // `Failure(Exception)` does not get one.
+        assert!(
+            out.contains("@dataclasses.dataclass"),
+            "top-level Failure dataclass must keep @dataclass:\n{out}"
+        );
+        assert_eq!(
+            out.matches("@dataclasses.dataclass").count(),
+            1,
+            "only the top-level dataclass should be decorated:\n{out}"
+        );
+    }
+
+    #[test]
+    fn subclass_of_error_named_dataclass_stays_dataclass() {
+        // `LexError` (no base) is a Result error-variant dataclass; a subclass
+        // `Detailed(LexError)` must ALSO stay a dataclass (inherit fields),
+        // not be mistaken for an exception by the `*Error` base name.
+        let src = "class LexError:\n    line: int\n\nclass Detailed(LexError):\n    code: int\n";
+        let out = parse_and_desugar(src);
+        assert_eq!(
+            out.matches("@dataclasses.dataclass").count(),
+            2,
+            "both the error-named dataclass and its subclass must keep @dataclass:\n{out}"
+        );
+    }
+
+    #[test]
+    fn error_named_class_without_base_still_dataclass() {
+        // `class LexError:` with NO base is a Result error *variant*, not an
+        // exception — it must keep its `@dataclass` shape.
+        let out = parse_and_desugar("class LexError:\n    line: int\n    message: str\n");
+        assert!(
+            out.contains("@dataclasses.dataclass"),
+            "error-named class with no base must stay a dataclass:\n{out}"
         );
     }
 

@@ -1,0 +1,24 @@
+from typing import Protocol
+
+class Comparable(Protocol):
+    def value(self) -> int:
+        ...
+
+class Item:
+    n: int
+
+impl Item:
+    def value(self) -> int:
+        return self.n
+
+def total(items: list[Comparable]) -> int:
+    mut s: int = 0
+    for it in items:
+        s = s + it.value()
+    return s
+
+def main() -> None:
+    print(total([Item(n=1), Item(n=2), Item(n=3)]))
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,20 @@
+import json
+
+def main() -> None:
+    let data: dict[str, object] = {
+        "users": [
+            {"id": 1, "name": "Alice", "roles": ["admin", "user"]},
+            {"id": 2, "name": "Bob", "roles": ["user"]},
+        ],
+        "count": 2,
+        "meta": {"version": "1.0", "active": True, "ratio": 0.75},
+    }
+    let s: str = json.dumps(data, sort_keys=True, indent=2)
+    print(s)
+    let parsed = json.loads(s)
+    print(parsed["count"])
+    print(parsed["users"][0]["name"])
+    print(parsed["meta"]["active"])
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,25 @@
+from typing import Iterator
+
+def numbers() -> Iterator[int]:
+    mut i: int = 0
+    while i < 10:
+        yield i
+        i = i + 1
+
+def evens(source: Iterator[int]) -> Iterator[int]:
+    for n in source:
+        if n % 2 == 0:
+            yield n
+
+def squared(source: Iterator[int]) -> Iterator[int]:
+    for n in source:
+        yield n * n
+
+def main() -> None:
+    let result: list[int] = list(squared(evens(numbers())))
+    print(result)
+    let total: int = sum(squared(evens(numbers())))
+    print(total)
+
+if __name__ == "__main__":
+    main()

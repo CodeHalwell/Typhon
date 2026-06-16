@@ -1,0 +1,22 @@
+def append_to(item: int, target: list[int] | None = None) -> list[int]:
+    let result: list[int] = target if target is not None else []
+    result.append(item)
+    return result
+
+def greet(name: str, greeting: str = "Hello") -> str:
+    return f"{greeting}, {name}"
+
+def config(host: str = "localhost", port: int = 8080, debug: bool = False) -> str:
+    return f"{host}:{port} debug={debug}"
+
+def main() -> None:
+    print(append_to(1))
+    print(append_to(2))
+    print(greet("Alice"))
+    print(greet("Bob", "Hi"))
+    print(config())
+    print(config(port=9000))
+    print(config("example.com", debug=True))
+
+if __name__ == "__main__":
+    main()

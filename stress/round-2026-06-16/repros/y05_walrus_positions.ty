@@ -1,0 +1,21 @@
+def process(data: list[str]) -> list[int]:
+    mut result: list[int] = []
+    for line in data:
+        if (n := len(line)) > 3:
+            result.append(n)
+    return result
+
+def find_match(text: str, targets: list[str]) -> str:
+    for target in targets:
+        if (idx := text.find(target)) >= 0:
+            return f"{target} at {idx}"
+    return "none found"
+
+def main() -> None:
+    print(process(["a", "abcd", "xy", "hello"]))
+    print(find_match("hello world", ["xyz", "world", "abc"]))
+    let total: int = sum(y for x in range(5) if (y := x * x) > 2)
+    print(total)
+
+if __name__ == "__main__":
+    main()

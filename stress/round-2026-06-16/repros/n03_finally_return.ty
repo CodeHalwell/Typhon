@@ -1,0 +1,19 @@
+def with_cleanup(fail: bool) -> str:
+    mut state: str = "init"
+    try:
+        if fail:
+            raise ValueError("failed")
+        state = "success"
+        return state
+    except ValueError:
+        state = "caught"
+        return state
+    finally:
+        print(f"cleanup, state was {state}")
+
+def main() -> None:
+    print(with_cleanup(False))
+    print(with_cleanup(True))
+
+if __name__ == "__main__":
+    main()

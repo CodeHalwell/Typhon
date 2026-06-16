@@ -1,0 +1,13 @@
+def divide(a: int, b: int, /) -> float:
+    return a / b
+
+def mixed(a: int, /, b: int, *, c: int) -> int:
+    return a + b + c
+
+def main() -> None:
+    print(divide(10, 3))
+    print(mixed(1, 2, c=3))
+    print(mixed(1, b=2, c=3))
+
+if __name__ == "__main__":
+    main()

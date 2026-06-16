@@ -1,0 +1,27 @@
+class Vector:
+    data: list[float]
+
+impl Vector:
+    def __getitem__(self, idx: int) -> float:
+        return self.data[idx]
+    def __len__(self) -> int:
+        return len(self.data)
+    def __setitem__(self, idx: int, value: float) -> None:
+        self.data[idx] = value
+    def dot(self, other: Vector) -> float:
+        mut total: float = 0.0
+        for i in range(len(self.data)):
+            total = total + self.data[i] * other.data[i]
+        return total
+
+def main() -> None:
+    mut v: Vector = Vector(data=[1.0, 2.0, 3.0])
+    print(v[0], v[2])
+    print(len(v))
+    v[1] = 20.0
+    print(v.data)
+    let w: Vector = Vector(data=[4.0, 5.0, 6.0])
+    print(v.dot(w))
+
+if __name__ == "__main__":
+    main()

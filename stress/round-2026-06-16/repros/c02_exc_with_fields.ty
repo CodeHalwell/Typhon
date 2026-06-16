@@ -1,0 +1,23 @@
+class HttpError(Exception):
+    code: int
+    detail: str
+
+impl HttpError:
+    def __init__(self, code: int, detail: str) -> None:
+        self.code = code
+        self.detail = detail
+        super().__init__(f"HTTP {code}: {detail}")
+
+def fetch(status: int) -> str:
+    if status >= 400:
+        raise HttpError(status, "bad request")
+    return "ok"
+
+def main() -> None:
+    try:
+        fetch(404)
+    except HttpError as e:
+        print(e.code, e.detail, str(e))
+
+if __name__ == "__main__":
+    main()

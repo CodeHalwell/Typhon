@@ -1,0 +1,26 @@
+def fib_gen(n: int) -> list[int]:
+    mut a: int = 0
+    mut b: int = 1
+    mut out: list[int] = []
+    for _ in range(n):
+        out.append(a)
+        let t: int = a + b
+        a = b
+        b = t
+    return out
+
+def quicksort(xs: list[int]) -> list[int]:
+    if len(xs) <= 1:
+        return xs
+    let pivot: int = xs[len(xs) // 2]
+    let less: list[int] = [x for x in xs if x < pivot]
+    let eq: list[int] = [x for x in xs if x == pivot]
+    let more: list[int] = [x for x in xs if x > pivot]
+    return quicksort(less) + eq + quicksort(more)
+
+def main() -> None:
+    print(fib_gen(10))
+    print(quicksort([5, 2, 8, 1, 9, 3, 2]))
+
+if __name__ == "__main__":
+    main()

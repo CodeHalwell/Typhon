@@ -1,0 +1,17 @@
+def lookup(data: dict[str, dict[str, int]], k1: str, k2: str) -> int:
+    let inner: dict[str, int]? = data.get(k1)
+    if inner is None:
+        return -1
+    let val: int? = inner.get(k2)
+    if val is None:
+        return -2
+    return val
+
+def main() -> None:
+    let data: dict[str, dict[str, int]] = {"a": {"x": 1}}
+    print(lookup(data, "a", "x"))
+    print(lookup(data, "a", "y"))
+    print(lookup(data, "z", "x"))
+
+if __name__ == "__main__":
+    main()

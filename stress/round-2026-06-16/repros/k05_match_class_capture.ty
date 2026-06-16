@@ -1,0 +1,23 @@
+class Point:
+    x: int
+    y: int
+
+class Circle:
+    center: Point
+    radius: int
+
+type Shape = Point | Circle
+
+def area(s: Shape) -> str:
+    match s:
+        case Point(x=px, y=py):
+            return f"point at {px},{py}"
+        case Circle(center=Point(x=cx, y=cy), radius=r):
+            return f"circle at {cx},{cy} r={r}"
+
+def main() -> None:
+    print(area(Point(x=1, y=2)))
+    print(area(Circle(center=Point(x=0, y=0), radius=5)))
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,20 @@
+import math
+
+def main() -> None:
+    let inf: float = float("inf")
+    let ninf: float = float("-inf")
+    let nan: float = float("nan")
+    print(inf, ninf)
+    print(math.isinf(inf), math.isnan(nan))
+    print(inf > 1e308)
+    print(nan == nan)
+    print(1.0 / inf)
+    print(math.isfinite(1.0), math.isfinite(inf))
+    print(max(1.0, inf), min(1.0, ninf))
+    print(0.1 + 0.2 == 0.3)
+    print(round(2.675, 2))
+    print(math.floor(3.7), math.ceil(3.2))
+    print(abs(ninf))
+
+if __name__ == "__main__":
+    main()

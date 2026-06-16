@@ -1,0 +1,27 @@
+class Config:
+    host: str?
+    port: int?
+    timeout: float?
+
+impl Config:
+    def describe(self) -> str:
+        if self.host is None:
+            return "no host"
+        if self.port is None:
+            return f"host {self.host}, no port"
+        return f"{self.host}:{self.port}"
+    def total_timeout(self) -> float:
+        if self.timeout is not None:
+            return self.timeout * 2.0
+        return 0.0
+
+def main() -> None:
+    let c1: Config = Config(host="localhost", port=8080, timeout=1.5)
+    print(c1.describe())
+    print(c1.total_timeout())
+    let c2: Config = Config(host=None, port=None, timeout=None)
+    print(c2.describe())
+    print(c2.total_timeout())
+
+if __name__ == "__main__":
+    main()

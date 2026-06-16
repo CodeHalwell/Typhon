@@ -1,0 +1,21 @@
+class Pair[A, B]:
+    first: A
+    second: B
+
+impl[A, B] Pair[A, B]:
+    def swap(self) -> Pair[B, A]:
+        return Pair(first=self.second, second=self.first)
+    def map_first[C](self, f: Callable[[A], C]) -> Pair[C, B]:
+        return Pair(first=f(self.first), second=self.second)
+
+from typing import Callable
+
+def main() -> None:
+    let p: Pair[int, str] = Pair(first=1, second="hello")
+    let swapped: Pair[str, int] = p.swap()
+    print(swapped.first, swapped.second)
+    let mapped: Pair[str, str] = p.map_first(lambda x: f"num{x}")
+    print(mapped.first, mapped.second)
+
+if __name__ == "__main__":
+    main()

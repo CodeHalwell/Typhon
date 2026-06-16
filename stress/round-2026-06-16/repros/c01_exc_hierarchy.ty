@@ -1,0 +1,25 @@
+class AppError(Exception):
+    pass
+
+class NotFoundError(AppError):
+    pass
+
+class ValidationError(AppError):
+    pass
+
+def lookup(key: str) -> str:
+    if key == "":
+        raise ValidationError("empty key")
+    if key == "missing":
+        raise NotFoundError(f"no such key: {key}")
+    return f"value-of-{key}"
+
+def main() -> None:
+    for k in ["ok", "", "missing"]:
+        try:
+            print(lookup(k))
+        except AppError as e:
+            print(f"{type(e).__name__}: {e}")
+
+if __name__ == "__main__":
+    main()

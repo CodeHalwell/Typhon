@@ -1,0 +1,15 @@
+class Logger:
+    prefix: str?
+
+impl Logger:
+    def log(self, msg: str) -> str:
+        if self.prefix is None:
+            return msg
+        return f"[{self.prefix.upper()}] {msg}"
+
+def main() -> None:
+    print(Logger(prefix="info").log("hello"))
+    print(Logger(prefix=None).log("world"))
+
+if __name__ == "__main__":
+    main()

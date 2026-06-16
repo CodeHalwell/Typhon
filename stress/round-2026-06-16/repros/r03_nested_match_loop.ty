@@ -1,0 +1,30 @@
+type Event = Click | Key | Scroll
+
+class Click frozen:
+    x: int
+    y: int
+class Key frozen:
+    code: int
+class Scroll frozen:
+    delta: int
+
+def process_events(events: list[Event]) -> dict[str, int]:
+    mut counts: dict[str, int] = {"click": 0, "key": 0, "scroll": 0}
+    for event in events:
+        match event:
+            case Click(x=_, y=_):
+                counts["click"] += 1
+            case Key(code=_):
+                counts["key"] += 1
+            case Scroll(delta=_):
+                counts["scroll"] += 1
+    return counts
+
+def main() -> None:
+    let events: list[Event] = [
+        Click(x=1, y=2), Key(code=65), Click(x=3, y=4), Scroll(delta=-1), Key(code=66),
+    ]
+    print(process_events(events))
+
+if __name__ == "__main__":
+    main()

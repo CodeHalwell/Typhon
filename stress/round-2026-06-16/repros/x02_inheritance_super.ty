@@ -1,0 +1,21 @@
+class Animal:
+    name: str
+
+impl Animal:
+    def describe(self) -> str:
+        return f"Animal named {self.name}"
+
+class Dog(Animal):
+    breed: str
+
+impl Dog:
+    def describe(self) -> str:
+        let base: str = super().describe()
+        return f"{base}, a {self.breed}"
+
+def main() -> None:
+    let d: Dog = Dog(name="Rex", breed="Lab")
+    print(d.describe())
+
+if __name__ == "__main__":
+    main()

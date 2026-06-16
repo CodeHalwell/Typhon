@@ -1,0 +1,24 @@
+class Optional2[T]:
+    value: T?
+
+impl[T] Optional2[T]:
+    def map[U](self, f: Callable[[T], U]) -> Optional2[U]:
+        if self.value is None:
+            return Optional2(value=None)
+        return Optional2(value=f(self.value))
+    def get_or(self, default: T) -> T:
+        if self.value is None:
+            return default
+        return self.value
+
+from typing import Callable
+
+def main() -> None:
+    let opt: Optional2[int] = Optional2(value=5)
+    let mapped: Optional2[str] = opt.map(lambda x: f"value={x}")
+    print(mapped.get_or("none"))
+    let empty: Optional2[int] = Optional2(value=None)
+    print(empty.map(lambda x: x * 2).get_or(-1))
+
+if __name__ == "__main__":
+    main()

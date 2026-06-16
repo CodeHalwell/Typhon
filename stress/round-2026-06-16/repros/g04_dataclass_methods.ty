@@ -1,0 +1,23 @@
+class Matrix:
+    rows: list[list[float]]
+
+impl Matrix:
+    def transpose(self) -> Matrix:
+        let n: int = len(self.rows)
+        let m: int = len(self.rows[0])
+        mut result: list[list[float]] = []
+        for j in range(m):
+            mut row: list[float] = []
+            for i in range(n):
+                row.append(self.rows[i][j])
+            result.append(row)
+        return Matrix(rows=result)
+    def __repr__(self) -> str:
+        return f"Matrix({self.rows})"
+
+def main() -> None:
+    let m: Matrix = Matrix(rows=[[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])
+    print(m.transpose())
+
+if __name__ == "__main__":
+    main()

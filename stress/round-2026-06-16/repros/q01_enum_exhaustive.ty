@@ -1,0 +1,23 @@
+enum Suit:
+    HEARTS
+    DIAMONDS
+    CLUBS
+    SPADES
+
+def color(s: Suit) -> str:
+    match s:
+        case Suit.HEARTS:
+            return "red"
+        case Suit.DIAMONDS:
+            return "red"
+        case Suit.CLUBS:
+            return "black"
+        case Suit.SPADES:
+            return "black"
+
+def main() -> None:
+    for s in Suit:
+        print(s.name, color(s))
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,27 @@
+enum Op:
+    ADD
+    SUB
+    MUL
+    DIV
+
+def apply(op: Op, a: float, b: float) -> float?:
+    match op:
+        case Op.ADD:
+            return a + b
+        case Op.SUB:
+            return a - b
+        case Op.MUL:
+            return a * b
+        case Op.DIV:
+            if b == 0.0:
+                return None
+            return a / b
+
+def main() -> None:
+    print(apply(Op.ADD, 3.0, 4.0))
+    print(apply(Op.MUL, 5.0, 6.0))
+    print(apply(Op.DIV, 10.0, 2.0))
+    print(apply(Op.DIV, 1.0, 0.0))
+
+if __name__ == "__main__":
+    main()

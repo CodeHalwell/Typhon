@@ -1,0 +1,19 @@
+def main() -> None:
+    let s: str = "a-b-c-d-e"
+    print(s.rsplit("-", 2))
+    print("line1\nline2\nline3".splitlines())
+    print("key=value".partition("="))
+    print("a=b=c".rpartition("="))
+    print("Hello World".title())
+    print("  spaces  ".strip())
+    print("xxYYxx".strip("x"))
+    print("hello".find("l"), "hello".rfind("l"))
+    print("abcabc".replace("bc", "X"))
+    print("Hello".isalpha(), "123".isdigit(), "  ".isspace())
+    print("MixedCase".isupper(), "lower".islower())
+    print("a,b,c".count(","))
+    print("Hello, World".rindex("o"))
+    print("test".ljust(8, "."))
+
+if __name__ == "__main__":
+    main()

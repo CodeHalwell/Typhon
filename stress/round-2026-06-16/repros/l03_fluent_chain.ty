@@ -1,0 +1,16 @@
+class Builder:
+    parts: list[str]
+
+impl Builder:
+    def add(self, s: str) -> Builder:
+        self.parts.append(s)
+        return self
+    def build(self) -> str:
+        return " ".join(self.parts)
+
+def main() -> None:
+    let result: str = Builder(parts=[]).add("hello").add("beautiful").add("world").build()
+    print(result)
+
+if __name__ == "__main__":
+    main()

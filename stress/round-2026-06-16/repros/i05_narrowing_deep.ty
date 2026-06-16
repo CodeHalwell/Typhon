@@ -1,0 +1,23 @@
+def process(x: int | str | None) -> str:
+    if x is None:
+        return "none"
+    if isinstance(x, int):
+        return f"int: {x * 2}"
+    return f"str: {x.upper()}"
+
+def find(d: dict[str, int], key: str) -> str:
+    let v: int? = d.get(key)
+    if v is None:
+        return "missing"
+    return f"found {v}"
+
+def main() -> None:
+    print(process(None))
+    print(process(21))
+    print(process("hi"))
+    let d: dict[str, int] = {"a": 1}
+    print(find(d, "a"))
+    print(find(d, "z"))
+
+if __name__ == "__main__":
+    main()

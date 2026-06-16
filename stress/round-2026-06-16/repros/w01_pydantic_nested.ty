@@ -1,0 +1,26 @@
+model Address:
+    street: str
+    city: str
+    zip_code: str
+
+model Person:
+    name: str
+    age: int
+    address: Address
+    tags: list[str]
+
+def main() -> None:
+    let p: Person = Person(
+        name="Alice",
+        age=30,
+        address=Address(street="1 Main", city="NYC", zip_code="10001"),
+        tags=["admin", "user"],
+    )
+    print(p.name, p.age)
+    print(p.address.city)
+    print(p.tags)
+    let dumped: dict[str, object] = p.model_dump()
+    print(dumped["name"])
+
+if __name__ == "__main__":
+    main()

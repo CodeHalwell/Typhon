@@ -1,0 +1,20 @@
+def divide(pair: tuple[int, int]) -> float:
+    let (a, b) = pair
+    if b == 0:
+        return 0.0
+    return a / b
+
+def swap_if[T](pair: tuple[T, T], cond: bool) -> tuple[T, T]:
+    let (x, y) = pair
+    if cond:
+        return (y, x)
+    return (x, y)
+
+def main() -> None:
+    print(divide((10, 3)))
+    print(divide((5, 0)))
+    print(swap_if((1, 2), True))
+    print(swap_if(("a", "b"), False))
+
+if __name__ == "__main__":
+    main()

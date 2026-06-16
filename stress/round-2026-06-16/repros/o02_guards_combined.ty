@@ -1,0 +1,19 @@
+def categorize(n: int) -> str:
+    match n:
+        case x if x < 0:
+            return "negative"
+        case 0:
+            return "zero"
+        case x if x < 10:
+            return "small"
+        case x if x < 100:
+            return "medium"
+        case _:
+            return "large"
+
+def main() -> None:
+    for n in [-5, 0, 7, 50, 500]:
+        print(n, categorize(n))
+
+if __name__ == "__main__":
+    main()

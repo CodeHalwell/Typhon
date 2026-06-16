@@ -1,0 +1,27 @@
+import enum
+
+class Color(enum.Enum):
+    RED = 1
+    GREEN = 2
+    BLUE = 3
+
+enum Status:
+    ACTIVE
+    INACTIVE
+    PENDING
+
+def main() -> None:
+    print(Color.RED.value, Color.RED.name)
+    for c in Color:
+        print(c)
+    print(Status.ACTIVE)
+    print(Status.PENDING.name)
+    let s: Status = Status.ACTIVE
+    match s:
+        case Status.ACTIVE:
+            print("is active")
+        case _:
+            print("not active")
+
+if __name__ == "__main__":
+    main()

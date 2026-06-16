@@ -1,0 +1,13 @@
+def main() -> None:
+    let words: list[str] = ["banana", "apple", "cherry", "fig"]
+    print(sorted(words, key=lambda w: len(w)))
+    print(sorted(words, reverse=True))
+    let pairs: list[tuple[str, int]] = [("a", 3), ("b", 1), ("c", 2)]
+    print(sorted(pairs, key=lambda p: p[1]))
+    let nums: list[int] = [5, -3, 8, -1, 2]
+    print(sorted(nums, key=abs))
+    print(max(words, key=len))
+    print(min(pairs, key=lambda p: p[1]))
+
+if __name__ == "__main__":
+    main()

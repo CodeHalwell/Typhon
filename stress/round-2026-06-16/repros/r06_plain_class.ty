@@ -1,0 +1,17 @@
+plain class Registry:
+    _instances: dict[str, int] = {}
+
+impl Registry:
+    def register(self, name: str, value: int) -> None:
+        self._instances[name] = value
+    def get(self, name: str) -> int:
+        return self._instances[name]
+
+def main() -> None:
+    mut r: Registry = Registry()
+    r.register("a", 1)
+    r.register("b", 2)
+    print(r.get("a"), r.get("b"))
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,27 @@
+def main() -> None:
+    mut a: int = 0
+    mut b: int = 0
+    a = b = 5
+    print(a, b)
+    let (x, y, z) = (1, 2, 3)
+    print(x, y, z)
+    mut first: int = 0
+    mut rest: list[int] = []
+    [first, *rest] = [10, 20, 30, 40]
+    print(first, rest)
+    mut nums: list[int] = [1, 2, 3]
+    nums += [4, 5]
+    print(nums)
+    mut s: str = "a"
+    s *= 3
+    print(s)
+    mut total: int = 10
+    total -= 3
+    total //= 2
+    total **= 2
+    print(total)
+    let (p, (q, r)) = (1, (2, 3))
+    print(p, q, r)
+
+if __name__ == "__main__":
+    main()

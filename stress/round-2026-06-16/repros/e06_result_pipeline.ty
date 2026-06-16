@@ -1,0 +1,25 @@
+def parse_int(s: str) -> Result[int, str]:
+    if not s.lstrip("-").isdigit():
+        return Err(f"not int: {s}")
+    return Ok(int(s))
+
+def half(n: int) -> Result[int, str]:
+    if n % 2 != 0:
+        return Err(f"odd: {n}")
+    return Ok(n // 2)
+
+def process(s: str) -> Result[int, str]:
+    let n: int = parse_int(s)?
+    let h: int = half(n)?
+    return Ok(h)
+
+def main() -> None:
+    for s in ["10", "7", "abc"]:
+        match process(s):
+            case Ok(v):
+                print(f"{s} -> {v}")
+            case Err(e):
+                print(f"{s} -> error: {e}")
+
+if __name__ == "__main__":
+    main()

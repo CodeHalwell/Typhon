@@ -1,0 +1,17 @@
+class Counter:
+    cached: int?
+
+impl Counter:
+    def compute(self) -> int:
+        if self.cached is not None:
+            return self.cached
+        let result: int = 42
+        self.cached = result
+        return self.cached
+
+def main() -> None:
+    mut c: Counter = Counter(cached=None)
+    print(c.compute())
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,20 @@
+from collections import Counter, defaultdict, deque
+
+def main() -> None:
+    let words: list[str] = ["a", "b", "a", "c", "b", "a"]
+    let counts: Counter[str] = Counter(words)
+    print(counts.most_common(2))
+
+    mut groups: defaultdict[str, list[int]] = defaultdict(list)
+    for i in range(6):
+        groups[str(i % 2)].append(i)
+    print(dict(groups))
+
+    mut dq: deque[int] = deque([1, 2, 3])
+    dq.appendleft(0)
+    dq.append(4)
+    print(list(dq))
+    print(dq.popleft(), dq.pop())
+
+if __name__ == "__main__":
+    main()

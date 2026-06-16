@@ -1,0 +1,19 @@
+def process(x: object) -> int:
+    assert isinstance(x, int)
+    return x * 2
+
+def handle(items: list[object]) -> int:
+    mut total: int = 0
+    for item in items:
+        if isinstance(item, int):
+            total = total + item
+        elif isinstance(item, str):
+            total = total + len(item)
+    return total
+
+def main() -> None:
+    print(process(21))
+    print(handle([1, "abc", 2, "de"]))
+
+if __name__ == "__main__":
+    main()

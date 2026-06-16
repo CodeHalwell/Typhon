@@ -1,0 +1,25 @@
+from typing import Protocol
+
+class Serializer(Protocol):
+    def serialize(self) -> str:
+        ...
+    def size(self) -> int:
+        ...
+
+class JsonDoc:
+    content: str
+
+impl JsonDoc:
+    def serialize(self) -> str:
+        return f"{{{self.content}}}"
+    def size(self) -> int:
+        return len(self.content)
+
+def save(s: Serializer) -> str:
+    return f"[{s.size()}] {s.serialize()}"
+
+def main() -> None:
+    print(save(JsonDoc(content="data")))
+
+if __name__ == "__main__":
+    main()

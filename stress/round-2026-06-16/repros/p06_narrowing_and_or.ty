@@ -1,0 +1,20 @@
+def get_config(env: dict[str, str], key: str, fallback: str?) -> str:
+    let value: str? = env.get(key)
+    if value is not None and len(value) > 0:
+        return value
+    if fallback is not None:
+        return fallback
+    return "default"
+
+def first_truthy(a: str?, b: str?, c: str?) -> str:
+    return a or b or c or "none"
+
+def main() -> None:
+    let env: dict[str, str] = {"HOST": "localhost", "EMPTY": ""}
+    print(get_config(env, "HOST", None))
+    print(get_config(env, "EMPTY", "fb"))
+    print(get_config(env, "MISSING", None))
+    print(first_truthy(None, "", "found"))
+
+if __name__ == "__main__":
+    main()

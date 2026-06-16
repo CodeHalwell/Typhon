@@ -2072,6 +2072,12 @@ struct TypeBinding {
 struct TypeEnv {
     /// `scopes[i].get(name)` → binding.
     scopes: Vec<HashMap<String, TypeBinding>>,
+    /// Flow-sensitive narrowings keyed by attribute access path
+    /// (`"self.value"`, `"b.value"`). Lets `if self.x is None: return …`
+    /// narrow `self.x` to non-`None` for the rest of the block. Cleared
+    /// when the path is reassigned and snapshot/restored around branches
+    /// (it lives in `TypeEnv`, so the whole-env clone covers it).
+    attr_narrowings: HashMap<String, Type>,
 }
 
 impl TypeEnv {
@@ -2103,11 +2109,27 @@ impl TypeEnv {
             }
         }
     }
-    fn snapshot(&self) -> Vec<HashMap<String, TypeBinding>> {
-        self.scopes.clone()
+    fn snapshot(&self) -> TypeEnv {
+        self.clone()
     }
-    fn restore(&mut self, snap: Vec<HashMap<String, TypeBinding>>) {
-        self.scopes = snap;
+    fn restore(&mut self, snap: TypeEnv) {
+        *self = snap;
+    }
+    /// Narrow an attribute access path (`"self.value"`) to `ty`.
+    fn narrow_attr(&mut self, path: String, ty: Type) {
+        self.attr_narrowings.insert(path, ty);
+    }
+    /// The current narrowed type for an attribute path, if any.
+    fn attr_narrowed(&self, path: &str) -> Option<&Type> {
+        self.attr_narrowings.get(path)
+    }
+    /// Drop the narrowing for `path` *and any of its sub-attributes* (e.g.
+    /// when `self.x` is reassigned, any prior narrowing of `self.x.y` is
+    /// stale too because the base object changed).
+    fn clear_attr_narrowing(&mut self, path: &str) {
+        let sub_prefix = format!("{path}.");
+        self.attr_narrowings
+            .retain(|k, _| k != path && !k.starts_with(&sub_prefix));
     }
 }
 
@@ -2903,6 +2925,69 @@ impl<'a> Checker<'a> {
                     && self.is_assignable(&bb[0], &aa[0])
                     && self.is_assignable(&aa[1], &bb[1])
                     && self.is_assignable(&bb[1], &aa[1]);
+            }
+        }
+        // A bare container type is assignable to its parametric form. This
+        // arises from `isinstance(x, dict)` narrowing — Python's `isinstance`
+        // can't take a parametric type (`isinstance(x, dict[str, int])` is a
+        // TypeError), so a container narrowed this way has unconstrained
+        // (Any) element types, exactly like mypy's `dict[Any, Any]`. Without
+        // this, `if isinstance(x, dict): use_as_dict_str_int(x)` false-fires.
+        if let Type::Generic(exp_head, _) = expected {
+            if matches!(
+                exp_head.as_str(),
+                "list" | "dict" | "set" | "frozenset" | "tuple"
+            ) {
+                let actual_is_bare_same = match actual {
+                    Type::Class(n) => n == exp_head,
+                    Type::Generic(n, args) => n == exp_head && args.is_empty(),
+                    _ => false,
+                };
+                if actual_is_bare_same {
+                    return true;
+                }
+            }
+        }
+        // A user class implementing the iterator protocol structurally
+        // conforms to `Iterator[T]` (via `__next__`) or `Iterable[T]` (via
+        // `__iter__ -> Iterator[T]`). Limited to those two — `Collection` /
+        // `Reversible` require more than iteration (`__len__` / `__contains__`
+        // / `__reversed__`), which we don't verify here.
+        if let Type::Generic(exp_head, exp_args) = expected {
+            let exp_name = exp_head.as_str();
+            if exp_args.len() == 1 && matches!(exp_name, "Iterator" | "Iterable") {
+                if let Type::Class(act_name) | Type::Generic(act_name, _) = actual {
+                    // `Iterator[T]` needs `__next__(self) -> T` AND `__iter__`
+                    // — a `__next__`-only class is not iterable (`iter(obj)` /
+                    // `for x in obj` require `__iter__`; the standard iterator
+                    // returns `self` from it).
+                    if exp_name == "Iterator" {
+                        if let Some(sig) = self.find_method(act_name, "__next__") {
+                            if self.find_method(act_name, "__iter__").is_some()
+                                && self.is_assignable(&exp_args[0], &sig.return_type)
+                            {
+                                return true;
+                            }
+                        }
+                    }
+                    // `Iterable[T]` requires `__iter__(self) -> Iterator[T]`.
+                    // `__next__` alone does NOT make a class iterable
+                    // (`iter(obj)` / `for x in obj` need `__iter__`), and the
+                    // `__iter__` return must be an `Iterator` (a `list[int]`
+                    // return raises `iter() returned non-iterator` at runtime).
+                    if exp_name == "Iterable" {
+                        if let Some(sig) = self.find_method(act_name, "__iter__") {
+                            if let Type::Generic(ret_head, iter_args) = &sig.return_type {
+                                if ret_head.as_str() == "Iterator"
+                                    && iter_args.len() == 1
+                                    && self.is_assignable(&exp_args[0], &iter_args[0])
+                                {
+                                    return true;
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
         // Generic / generic (e.g. `Result[T, E] = Ok[V]`, `list[T] = list[V]`):
@@ -7528,6 +7613,11 @@ fn infer_expr_readonly(c: &Checker, e: &Expr) -> Type {
             .map(|b| b.narrowed.clone())
             .unwrap_or(Type::Unknown),
         Expr::Attribute(a) => {
+            if let Some(path) = attr_path_of(e) {
+                if let Some(narrowed) = c.env.attr_narrowed(&path) {
+                    return narrowed.clone();
+                }
+            }
             let recv = infer_expr_readonly(c, &a.value);
             match &recv {
                 Type::Class(class_name) | Type::Generic(class_name, _) => {
@@ -7643,6 +7733,13 @@ fn infer_expr_readonly(c: &Checker, e: &Expr) -> Type {
                 _ => Type::Unknown,
             }
         }
+        // A tuple subject `match (state, event):` infers to
+        // `tuple[T0, T1, …]` from its elements, so the exhaustiveness pass
+        // can reason about product coverage (`tuple_cases_cover`).
+        Expr::Tuple(t) => Type::Generic(
+            "tuple".into(),
+            t.elts.iter().map(|e| infer_expr_readonly(c, e)).collect(),
+        ),
         _ => Type::Unknown,
     }
 }
@@ -8157,8 +8254,11 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                                 b.span,
                             );
                         }
-                        // Reset any narrowing on the reassigned name.
+                        // Reset any narrowing on the reassigned name, and
+                        // invalidate every attribute narrowing rooted at it
+                        // (`b = …` makes prior `b.value` narrowings stale).
                         c.env.narrow(n.id.as_str(), b.declared);
+                        c.env.clear_attr_narrowing(n.id.as_str());
                     } else {
                         let from_unsafe = c.unsafe_depth > 0;
                         if from_unsafe {
@@ -8191,6 +8291,20 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                         }
                     } else {
                         audit_clear_binding(c, n.id.as_str());
+                    }
+                } else if let Expr::Attribute(_) = target {
+                    // Reassigning `self.x = …` updates the flow narrowing on
+                    // that path: narrow to the assigned value's type when it's
+                    // provably non-null (so `self.x = v; use(self.x)` sees the
+                    // value), otherwise drop the narrowing (revert to declared).
+                    if let Some(path) = attr_path_of(target) {
+                        // Invalidate the path and every sub-attribute narrowing
+                        // first (the base object changed), then re-narrow this
+                        // path to the assigned value when it's provably non-null.
+                        c.env.clear_attr_narrowing(&path);
+                        if !value_type.is_nullable() && !matches!(value_type, Type::Unknown) {
+                            c.env.narrow_attr(path, value_type.clone());
+                        }
                     }
                 }
             }
@@ -9040,6 +9154,9 @@ fn check_function(
         .cloned()
         .unwrap_or_default();
     c.env.enter();
+    // Attribute narrowings (`self.x` non-null) belong to the enclosing
+    // function body — a different `self` is in scope here, so start clean.
+    let saved_attr_narrowings = std::mem::take(&mut c.env.attr_narrowings);
 
     // Declare parameters with their annotation types. Type parameters resolve
     // to `Any` until a real inference engine lands. Inside a class body, an
@@ -9163,6 +9280,7 @@ fn check_function(
     }
 
     c.env.leave();
+    c.env.attr_narrowings = saved_attr_narrowings;
     c.current_return = saved_return;
     c.unsafe_origin_bindings = saved_unsafe_origins;
     c.active_typevar_bounds = saved_bounds;
@@ -10277,6 +10395,15 @@ fn match_cases_cover_subject(c: &Checker, m: &ruff_python_ast::StmtMatch) -> boo
 fn match_subject_type(c: &Checker, m: &ruff_python_ast::StmtMatch) -> Option<Type> {
     if let Expr::Name(n) = m.subject.as_ref() {
         if let Some(binding) = c.env.lookup(n.id.as_str()) {
+            // Use the *narrowed* type, not the declared one, so flow-sensitive
+            // narrowing before the match is respected — e.g. after
+            // `if s is None: return …`, a `match s:` over a `Shape?` subject
+            // only needs to cover the sealed-union variants, not `None`
+            // (otherwise an exhaustive match false-fires `missing_return`).
+            // Fall back to the declared type when nothing useful was narrowed.
+            if !matches!(binding.narrowed, Type::Unknown) {
+                return Some(binding.narrowed.clone());
+            }
             return Some(binding.declared.clone());
         }
     }
@@ -10354,6 +10481,14 @@ fn cases_cover_type(c: &Checker, cases: &[MatchCase], ty: &Type) -> bool {
                         return true;
                     }
                 }
+            }
+            // Cross-arm product coverage: `match (cmd, count):` over a
+            // `tuple[Cmd, int]` where each `Cmd` variant is paired with a
+            // capture/wildcard for `count` is exhaustive even though no
+            // single arm is a catch-all. Sound column-wise check (returns
+            // false whenever it can't prove totality).
+            if tuple_cases_cover(c, cases, elems) {
+                return true;
             }
         }
     }
@@ -10510,12 +10645,15 @@ fn sequence_cases_cover_all_lengths(cases: &[MatchCase]) -> bool {
         if star_count != 1 {
             continue;
         }
-        if !matches!(seq.patterns.last(), Some(Pattern::MatchStar(_))) {
-            continue;
-        }
-        if !seq.patterns[..seq.patterns.len() - 1]
+        // A single star anywhere — tail (`[a, *rest]`), middle
+        // (`[first, *mid, last]`), or head (`[*init, last]`) — matches every
+        // length ≥ (number of non-star elements), provided every non-star
+        // element is an irrefutable capture / wildcard. (The star binding
+        // itself, `*mid`, is always irrefutable.)
+        if !seq
+            .patterns
             .iter()
-            .all(is_capture_or_underscore)
+            .all(|p| matches!(p, Pattern::MatchStar(_)) || is_capture_or_underscore(p))
         {
             continue;
         }
@@ -10529,6 +10667,116 @@ fn sequence_cases_cover_all_lengths(cases: &[MatchCase]) -> bool {
         return false;
     };
     (0..min).all(|n| exact.contains(&n))
+}
+
+/// Sound cross-arm exhaustiveness for a `match` over a fixed-arity tuple
+/// subject (`tuple[T0, …, Tn-1]`). Recognises the idiomatic state-machine
+/// dispatch `match (state, event):` where each sealed-union variant in one
+/// column is paired with a capture/wildcard (or full coverage) in the others
+/// — exhaustive even though no single arm is a catch-all.
+///
+/// Conservative: only guardless arms that are bare arity-N tuple patterns
+/// (no `*star`) participate; any other guardless arm shape makes the whole
+/// check bail to `false`, so it can only ever *add* proven coverage.
+fn tuple_cases_cover(c: &Checker, cases: &[MatchCase], elems: &[Type]) -> bool {
+    let arity = elems.len();
+    let mut rows: Vec<Vec<&Pattern>> = Vec::new();
+    for case in cases {
+        if case.guard.is_some() {
+            continue;
+        }
+        // Unwrap a trailing `as` binding: `case (a, b) as whole:`.
+        let mut pat = &case.pattern;
+        while let Pattern::MatchAs(a) = pat {
+            match &a.pattern {
+                Some(inner) => pat = inner,
+                None => return false, // bare capture = wildcard, handled by caller
+            }
+        }
+        let Pattern::MatchSequence(seq) = pat else {
+            return false;
+        };
+        if seq.patterns.len() != arity
+            || seq
+                .patterns
+                .iter()
+                .any(|p| matches!(p, Pattern::MatchStar(_)))
+        {
+            return false;
+        }
+        rows.push(seq.patterns.iter().collect());
+    }
+    !rows.is_empty() && cover_pattern_columns(c, &rows, elems)
+}
+
+/// Recursive column-wise coverage check used by [`tuple_cases_cover`]. Each
+/// row is the list of remaining column sub-patterns; `types` is the matching
+/// list of column types. A column is covered when, for every "head
+/// constructor" the column type can take, the rows that match that head
+/// cover the remaining columns.
+fn cover_pattern_columns(c: &Checker, rows: &[Vec<&Pattern>], types: &[Type]) -> bool {
+    // All columns consumed: this constructor-path is covered iff some arm
+    // reached here (every one of its columns matched the chosen path).
+    if types.is_empty() {
+        return !rows.is_empty();
+    }
+    let col_ty = c.unwrap_alias(&types[0]);
+    let rest = &types[1..];
+    // A row's leading subpattern is irrefutable for this column (covers it
+    // whatever the head): a bare capture / wildcard.
+    let irrefutable = |p: &Pattern| is_capture_or_underscore(p);
+    // Specialise: keep rows whose leading subpattern is irrefutable OR
+    // matches `keep`, dropping the leading column.
+    let specialise = |keep: &dyn Fn(&Pattern) -> bool| -> Vec<Vec<&Pattern>> {
+        rows.iter()
+            .filter(|row| irrefutable(row[0]) || keep(row[0]))
+            .map(|row| row[1..].to_vec())
+            .collect()
+    };
+
+    // Sealed-union column: every variant must be covered.
+    let union_variants: Option<Vec<String>> = match &col_ty {
+        Type::Class(name) => c.sealed_unions.get(name.as_str()).cloned(),
+        Type::Union(vs) => {
+            let names: Vec<String> = vs
+                .iter()
+                .filter_map(|v| match v {
+                    Type::Class(n) => Some(n.clone()),
+                    _ => None,
+                })
+                .collect();
+            if names.len() == vs.len() && !names.is_empty() {
+                Some(names)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    };
+    if let Some(variants) = union_variants {
+        return variants.iter().all(|v| {
+            let sub = specialise(&|p: &Pattern| pattern_covers_class(c, p, v));
+            cover_pattern_columns(c, &sub, rest)
+        });
+    }
+
+    // `bool` column: cover both True and False.
+    if matches!(col_ty, Type::Bool) {
+        return [true, false].iter().all(|&want| {
+            let sub = specialise(&|p: &Pattern| pattern_bool_value(p) == Some(want));
+            cover_pattern_columns(c, &sub, rest)
+        });
+    }
+
+    // Any other column type (int, str, an open class, …) has unbounded /
+    // unmodelled inhabitants: the only way to cover it totally is an
+    // irrefutable leading subpattern. Keep just those rows and recurse.
+    let sub: Vec<Vec<&Pattern>> = rows
+        .iter()
+        .filter(|row| irrefutable(row[0]))
+        .map(|row| row[1..].to_vec())
+        .collect();
+    cover_pattern_columns(c, &sub, rest)
 }
 
 /// True if `pattern` (in an unguarded arm) matches every instance of
@@ -10580,7 +10828,19 @@ fn pattern_covers_class(c: &Checker, pattern: &Pattern, class_name: &str) -> boo
                 if mc.arguments.patterns.len() > shape.field_order.len() {
                     return false;
                 }
-                return mc.arguments.patterns.iter().all(is_capture_or_underscore);
+                // Each positional subpattern is total when it's a bare
+                // capture/wildcard OR a nested pattern that itself totally
+                // covers the corresponding field's declared type (e.g.
+                // `case Node(Leaf(v), r):` where the first field is typed
+                // `Leaf` and `Leaf(v)` is irrefutable). FINDINGS: nested
+                // class patterns spuriously fired `missing_return`.
+                return mc.arguments.patterns.iter().enumerate().all(|(i, p)| {
+                    let field_ty = shape
+                        .field_order
+                        .get(i)
+                        .and_then(|name| shape.fields.get(name));
+                    subpattern_total_for_field(c, p, field_ty)
+                });
             }
             // Keyword-only class pattern — `case TaskStarted(task_id=tid):`.
             // Python's runtime match dispatches on the class first, then
@@ -10600,10 +10860,10 @@ fn pattern_covers_class(c: &Checker, pattern: &Pattern, class_name: &str) -> boo
             // known). The capture-or-wildcard check stays so a
             // `case X(a=Literal[1]):` arm — which adds an inner value
             // filter — does NOT count as total.
-            mc.arguments
-                .keywords
-                .iter()
-                .all(|kw| is_capture_or_underscore(&kw.pattern))
+            mc.arguments.keywords.iter().all(|kw| {
+                let field_ty = shape.fields.get(kw.attr.as_str());
+                subpattern_total_for_field(c, &kw.pattern, field_ty)
+            })
         }
         // `case None:` covers the singleton None type — used by the
         // T? exhaustiveness path (B6). `cases_cover_type` calls in with
@@ -10653,6 +10913,49 @@ fn is_capture_or_underscore(pattern: &Pattern) -> bool {
             None => true,
             Some(inner) => is_capture_or_underscore(inner),
         },
+        _ => false,
+    }
+}
+
+/// Whether a class-pattern subpattern (a positional or keyword sub-pattern)
+/// totally covers its field — i.e. it can never *fail* to match an instance
+/// of the field's type, so it doesn't make the enclosing class pattern
+/// refutable.
+///
+/// A bare capture / wildcard always qualifies. A *nested class pattern*
+/// qualifies when the field's declared type is that exact class (or unwraps
+/// to it) and the nested pattern itself totally covers that class — so
+/// `case Circle(center=Point(x=cx, y=cy), radius=r):`, where `center: Point`,
+/// is recognised as covering `Circle` rather than spuriously demanding a
+/// fall-through arm and firing `tyc::missing_return`. Without a known field
+/// type we stay conservative (only the capture/wildcard case qualifies).
+fn subpattern_total_for_field(c: &Checker, pattern: &Pattern, field_ty: Option<&Type>) -> bool {
+    if is_capture_or_underscore(pattern) {
+        return true;
+    }
+    let Some(field_ty) = field_ty else {
+        return false;
+    };
+    match pattern {
+        Pattern::MatchAs(a) => match &a.pattern {
+            None => true,
+            Some(inner) => subpattern_total_for_field(c, inner, Some(field_ty)),
+        },
+        Pattern::MatchOr(o) => o
+            .patterns
+            .iter()
+            .any(|p| subpattern_total_for_field(c, p, Some(field_ty))),
+        Pattern::MatchClass(_) => {
+            // The field's declared type may be a plain class (`Point`) or a
+            // generic class (`Box[int]`); both name a class the nested
+            // pattern can cover.
+            match c.unwrap_alias(field_ty) {
+                Type::Class(name) | Type::Generic(name, _) => {
+                    pattern_covers_class(c, pattern, &name)
+                }
+                _ => false,
+            }
+        }
         _ => false,
     }
 }
@@ -10734,12 +11037,30 @@ fn check_elif_else_clauses(c: &mut Checker, clauses: &[ruff_python_ast::ElifElse
     }
 }
 
-/// A narrowing instruction: replace the narrowed type of `name` with
+/// A narrowing instruction: replace the narrowed type of a binding with
 /// `replacement` (subject to it being compatible with the declared type).
+/// When `attr_path` is `Some`, the target is an attribute access path
+/// (`"self.value"`) rather than the simple name in `name`.
 #[derive(Debug, Clone)]
 struct Narrowing {
     name: String,
+    attr_path: Option<String>,
     replacement: Type,
+}
+
+/// Canonical dotted path for an attribute-access expression whose base is a
+/// chain of simple names (`self.value` → `"self.value"`,
+/// `cfg.db.host` → `"cfg.db.host"`). Returns `None` for any other shape
+/// (subscripts, calls, …), which are not narrowed.
+fn attr_path_of(e: &Expr) -> Option<String> {
+    match e {
+        Expr::Name(n) => Some(n.id.as_str().to_owned()),
+        Expr::Attribute(a) => {
+            let base = attr_path_of(&a.value)?;
+            Some(format!("{base}.{}", a.attr.as_str()))
+        }
+        _ => None,
+    }
 }
 
 /// Collect narrowings implied by `test`. If `negate` is true, invert the
@@ -10758,18 +11079,20 @@ fn collect_narrowings_inner(c: &Checker, test: &Expr, negate: bool, out: &mut Ve
                 let is_op = matches!(cmp.ops[0], ruff_python_ast::CmpOp::Is);
                 let is_not_op = matches!(cmp.ops[0], ruff_python_ast::CmpOp::IsNot);
                 if is_op || is_not_op {
+                    let want_none = {
+                        let positive_match = is_op; // is None
+                        if negate {
+                            !positive_match
+                        } else {
+                            positive_match
+                        }
+                    };
                     if let (Expr::Name(n), Expr::NoneLiteral(_)) =
                         (cmp.left.as_ref(), &cmp.comparators[0])
                     {
                         if let Some(b) = c.env.lookup(n.id.as_str()) {
                             // x is None  → name becomes None
                             // x is not None → name becomes declared without None
-                            let positive_match = is_op; // is None
-                            let want_none = if negate {
-                                !positive_match
-                            } else {
-                                positive_match
-                            };
                             let replacement = if want_none {
                                 Type::None
                             } else {
@@ -10777,8 +11100,38 @@ fn collect_narrowings_inner(c: &Checker, test: &Expr, negate: bool, out: &mut Ve
                             };
                             out.push(Narrowing {
                                 name: n.id.as_str().to_owned(),
+                                attr_path: None,
                                 replacement,
                             });
+                        }
+                    } else if let (Expr::Attribute(_), Expr::NoneLiteral(_)) =
+                        (cmp.left.as_ref(), &cmp.comparators[0])
+                    {
+                        // `self.value is None` / `b.field is not None` — narrow
+                        // the attribute access path.
+                        if let Some(path) = attr_path_of(cmp.left.as_ref()) {
+                            let current = c
+                                .env
+                                .attr_narrowed(&path)
+                                .cloned()
+                                .unwrap_or_else(|| infer_expr_readonly(c, cmp.left.as_ref()));
+                            // Only narrow when the attribute is actually
+                            // nullable; otherwise leave it alone.
+                            if matches!(&current, Type::Union(_))
+                                || matches!(&current, Type::None)
+                                || current.strip_none() != current
+                            {
+                                let replacement = if want_none {
+                                    Type::None
+                                } else {
+                                    current.strip_none()
+                                };
+                                out.push(Narrowing {
+                                    name: String::new(),
+                                    attr_path: Some(path),
+                                    replacement,
+                                });
+                            }
                         }
                     }
                 }
@@ -10807,6 +11160,7 @@ fn collect_narrowings_inner(c: &Checker, test: &Expr, negate: bool, out: &mut Ve
                             };
                             out.push(Narrowing {
                                 name: target.id.as_str().to_owned(),
+                                attr_path: None,
                                 replacement,
                             });
                         }
@@ -10854,6 +11208,7 @@ fn collect_narrowings_inner(c: &Checker, test: &Expr, negate: bool, out: &mut Ve
                     if b.narrowed.is_nullable() {
                         out.push(Narrowing {
                             name: n.id.as_str().to_owned(),
+                            attr_path: None,
                             replacement: b.narrowed.strip_none(),
                         });
                     }
@@ -11546,7 +11901,10 @@ fn strip_variant(typ: &Type, variant: &Type) -> Type {
 
 fn apply_narrowings(c: &mut Checker, ns: &[Narrowing]) {
     for n in ns {
-        c.env.narrow(&n.name, n.replacement.clone());
+        match &n.attr_path {
+            Some(path) => c.env.narrow_attr(path.clone(), n.replacement.clone()),
+            None => c.env.narrow(&n.name, n.replacement.clone()),
+        }
     }
 }
 
@@ -12955,6 +13313,13 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
             }
         }
         Expr::Attribute(a) => {
+            // Flow-sensitive attribute narrowing: `if self.x is None: return …`
+            // narrows `self.x` to non-`None` for the rest of the block.
+            if let Some(path) = attr_path_of(expr) {
+                if let Some(narrowed) = c.env.attr_narrowed(&path) {
+                    return narrowed.clone();
+                }
+            }
             let recv = infer_expr(c, &a.value);
             if recv.is_nullable() {
                 if let Expr::Name(n) = a.value.as_ref() {
@@ -14071,6 +14436,10 @@ fn operator_operands_compatible(op: Operator, l: &Type, r: &Type) -> bool {
             }
             // `set - set` and `frozenset - frozenset` are Python set
             // difference (and the symmetric forms across set/frozenset).
+            // `dict.keys()` / `dict.items()` are set-like views that also
+            // support set difference (`d1.keys() - d2.keys()`,
+            // `d.keys() - some_set`), so `KeysView` / `ItemsView` count as
+            // set-like too (`ValuesView` does NOT — values aren't a set).
             // The bitwise ops `&`, `|`, `^` already fall through to the
             // permissive `_ => true` arm; the `-` arm needs an explicit
             // carve-out because it shares this match with the
@@ -14078,7 +14447,8 @@ fn operator_operands_compatible(op: Operator, l: &Type, r: &Type) -> bool {
             if let (Type::Generic(ln, _), Type::Generic(rn, _)) = (l, r) {
                 let ls = ln.as_str();
                 let rs = rn.as_str();
-                let set_like = |n: &str| n == "set" || n == "frozenset";
+                let set_like =
+                    |n: &str| matches!(n, "set" | "frozenset" | "KeysView" | "ItemsView");
                 if matches!(op, Operator::Sub) && set_like(ls) && set_like(rs) {
                     return true;
                 }
@@ -16582,6 +16952,496 @@ def f(p: tuple[int, int]) -> str:
                 .iter()
                 .any(|e| matches!(e, TycError::MissingReturn { .. })),
             "irrefutable tuple pattern must be exhaustive: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn isinstance_narrowed_container_assignable_to_parametric() {
+        // `isinstance(x, dict)` (Python can't take a parametric type) narrows
+        // to a bare container, which must be usable where `dict[str, object]`
+        // is expected.
+        let src = "\
+def use(d: dict[str, object]) -> int:
+    return len(d)
+def h(x: object) -> int:
+    if isinstance(x, dict):
+        return use(x)
+    return 0
+";
+        let d = check(src);
+        assert!(
+            d.errors().is_empty(),
+            "isinstance-narrowed bare dict should be assignable to dict[str, object]: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn parametric_container_mismatch_still_fires() {
+        // The bare-container relaxation must NOT let `dict[str, int]` flow
+        // into `dict[str, str]`.
+        let src = "\
+def g(d: dict[str, str]) -> int:
+    return len(d)
+def h(d: dict[str, int]) -> int:
+    return g(d)
+";
+        let d = check(src);
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::TypeMismatch { .. })),
+            "a parametric container mismatch must still fire: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn iterator_protocol_class_conforms() {
+        // `def __iter__(self) -> Iterator[int]: return self` on a class with
+        // `__next__(self) -> int` must type-check (the standard iterator).
+        let src = "\
+from typing import Iterator
+class CountDown:
+    start: int
+impl CountDown:
+    def __iter__(self) -> Iterator[int]:
+        return self
+    def __next__(self) -> int:
+        if self.start <= 0:
+            raise StopIteration()
+        self.start = self.start - 1
+        return self.start + 1
+";
+        let d = check(src);
+        assert!(
+            d.errors().is_empty(),
+            "an iterator-protocol class must conform to Iterator[int]: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn next_only_class_is_not_iterator() {
+        // `Iterator[T]` requires `__iter__` too — a `__next__`-only class is
+        // not a complete iterator (`iter(obj)` / `for` fail at runtime).
+        let src = "\
+from typing import Iterator
+class N:
+    x: int
+impl N:
+    def __next__(self) -> int:
+        return self.x
+def f(it: Iterator[int]) -> int:
+    return 0
+def bad() -> int:
+    return f(N(x=1))
+";
+        let d = check(src);
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::TypeMismatch { .. })),
+            "a `__next__`-only class must not satisfy Iterator[int]: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn next_only_class_is_not_iterable() {
+        // `Iterable[T]` requires `__iter__`; a class with only `__next__`
+        // (no `__iter__`) is not iterable (`iter(obj)` fails at runtime).
+        let src = "\
+from typing import Iterable
+class N:
+    x: int
+impl N:
+    def __next__(self) -> int:
+        return self.x
+def wants(it: Iterable[int]) -> int:
+    return 0
+def bad() -> int:
+    return wants(N(x=1))
+";
+        let d = check(src);
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::TypeMismatch { .. })),
+            "a `__next__`-only class must not satisfy Iterable[int]: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn iter_returning_non_iterator_is_not_iterable() {
+        // `__iter__` must return an `Iterator[T]`; a `list[int]` return does
+        // not make the class an `Iterable[int]` (CPython would raise
+        // `iter() returned non-iterator`).
+        let src = "\
+from typing import Iterable
+class Bad:
+    xs: list[int]
+impl Bad:
+    def __iter__(self) -> list[int]:
+        return self.xs
+def wants(it: Iterable[int]) -> int:
+    return 0
+def bad() -> int:
+    return wants(Bad(xs=[1]))
+";
+        let d = check(src);
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::TypeMismatch { .. })),
+            "a class whose __iter__ returns a non-Iterator must not be Iterable: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn rebinding_root_name_clears_attribute_narrowing() {
+        // Rebinding the root `b` invalidates a prior `b.value` narrowing —
+        // the new object may restore the nullable field, so the later use
+        // must fire again.
+        let src = "\
+class Box:
+    value: str?
+def f(b: Box) -> int:
+    mut cur: Box = b
+    if cur.value is None:
+        return 0
+    cur = Box(value=None)
+    return len(cur.value)
+";
+        let d = check(src);
+        assert!(
+            d.errors().iter().any(|e| matches!(
+                e,
+                TycError::OperatorTypeMismatch { .. } | TycError::NullableUse { .. }
+            )),
+            "rebinding the narrowed attribute's root must re-expose nullability: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn iterable_only_class_is_not_an_iterator() {
+        // A class with `__iter__` but no `__next__` is an Iterable, not an
+        // Iterator — it must NOT be assignable to `Iterator[int]`.
+        let src = "\
+from typing import Iterator
+class Coll:
+    items: list[int]
+impl Coll:
+    def __iter__(self) -> Iterator[int]:
+        return iter(self.items)
+def wants_iterator(it: Iterator[int]) -> int:
+    return 0
+def bad() -> int:
+    return wants_iterator(Coll(items=[1]))
+";
+        let d = check(src);
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::TypeMismatch { .. })),
+            "an Iterable-only class must not satisfy Iterator[int]: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn non_iterator_class_does_not_conform() {
+        // A class without `__next__` is not an Iterator.
+        let src = "\
+from typing import Iterator
+class Plain:
+    x: int
+def make() -> Iterator[int]:
+    return Plain(x=1)
+";
+        let d = check(src);
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::TypeMismatch { .. })),
+            "a class without __next__ must not conform to Iterator: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn attribute_narrowing_after_none_guard() {
+        // `if self.value is None: return …` narrows `self.value` to non-None
+        // for the rest of the method — no operator/nullable diagnostic.
+        let src = "\
+class Box:
+    value: str?
+impl Box:
+    def length(self) -> int:
+        if self.value is None:
+            return 0
+        return len(self.value)
+";
+        let d = check(src);
+        assert!(
+            d.errors().is_empty(),
+            "attribute narrowing after a None guard should clear diagnostics: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn attribute_narrowing_not_leaked_or_unsound() {
+        // Un-narrowed `self.value` (str?) passed to len() must still fire,
+        // and the narrowing must not escape a non-diverging `if`.
+        for src in [
+            "\
+class Box:
+    value: str?
+impl Box:
+    def bad(self) -> int:
+        return len(self.value)
+",
+            "\
+class Box:
+    value: str?
+impl Box:
+    def leak(self) -> int:
+        if self.value is not None:
+            pass
+        return len(self.value)
+",
+        ] {
+            let d = check(src);
+            assert!(
+                d.errors().iter().any(|e| matches!(
+                    e,
+                    TycError::OperatorTypeMismatch { .. } | TycError::NullableUse { .. }
+                )),
+                "un-narrowed / leaked attribute use must fire: {:?}",
+                d.errors()
+            );
+        }
+    }
+
+    #[test]
+    fn match_on_narrowed_nullable_subject_is_exhaustive() {
+        // After `if s is None: return …`, `s: Shape?` is narrowed to `Shape`,
+        // so `match s:` over the two variants is exhaustive — no missing_return.
+        let src = "\
+class Circle:
+    r: float
+class Square:
+    side: float
+type Shape = Circle | Square
+def area(s: Shape?, default: float) -> float:
+    if s is None:
+        return default
+    match s:
+        case Circle(r=r):
+            return r
+        case Square(side=sd):
+            return sd
+";
+        let d = check(src);
+        assert!(
+            !d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::MissingReturn { .. })),
+            "match on a None-narrowed nullable subject must be exhaustive: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn match_on_unnarrowed_nullable_subject_still_fires() {
+        // Without the None check, `None` is an uncovered inhabitant.
+        let src = "\
+class Circle:
+    r: float
+class Square:
+    side: float
+type Shape = Circle | Square
+def area(s: Shape?) -> float:
+    match s:
+        case Circle(r=r):
+            return r
+        case Square(side=sd):
+            return sd
+";
+        let d = check(src);
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::MissingReturn { .. })),
+            "match on an un-narrowed nullable subject must fire missing_return: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn nested_class_pattern_is_exhaustive() {
+        // A nested class subpattern against a field of that exact class is
+        // irrefutable, so `case Circle(center=Point(x=cx, y=cy), radius=r):`
+        // covers `Circle` and must NOT spuriously fire missing_return.
+        let src = "\
+class Point:
+    x: int
+    y: int
+class Circle:
+    center: Point
+    radius: int
+type Shape = Point | Circle
+def area(s: Shape) -> str:
+    match s:
+        case Point(x=px, y=py):
+            return \"point\"
+        case Circle(center=Point(x=cx, y=cy), radius=r):
+            return \"circle\"
+";
+        let d = check(src);
+        assert!(
+            !d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::MissingReturn { .. })),
+            "exhaustive match with a nested class pattern must not fire missing_return: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn refutable_nested_class_pattern_still_fires() {
+        // A nested subpattern carrying a *value* filter (`x=0`) is refutable,
+        // so the arm can fall through — missing_return must still fire.
+        let src = "\
+class Point:
+    x: int
+    y: int
+class Circle:
+    center: Point
+    radius: int
+type Shape = Point | Circle
+def area(s: Shape) -> str:
+    match s:
+        case Point(x=px, y=py):
+            return \"point\"
+        case Circle(center=Point(x=0, y=cy), radius=r):
+            return \"origin circle\"
+";
+        let d = check(src);
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::MissingReturn { .. })),
+            "a refutable nested value pattern must still fire missing_return: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn tuple_of_union_and_capture_is_exhaustive() {
+        // `match (cmd, count):` — each Cmd variant paired with a capture/`_`
+        // for the int column is exhaustive (state-machine dispatch).
+        let src = "\
+class Move:
+    dx: int
+class Stop:
+    pass
+type Cmd = Move | Stop
+def f(cmd: Cmd, count: int) -> str:
+    match (cmd, count):
+        case (Move(dx=x), 0):
+            return \"first\"
+        case (Move(dx=x), n):
+            return \"move\"
+        case (Stop(), _):
+            return \"stop\"
+";
+        let d = check(src);
+        assert!(
+            !d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::MissingReturn { .. })),
+            "exhaustive tuple-of-union match must not fire missing_return: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn tuple_match_missing_count_capture_fires() {
+        // `Move` is only paired with the literal `0` — count != 0 falls
+        // through, so missing_return must still fire.
+        let src = "\
+class Move:
+    dx: int
+class Stop:
+    pass
+type Cmd = Move | Stop
+def f(cmd: Cmd, count: int) -> str:
+    match (cmd, count):
+        case (Move(dx=x), 0):
+            return \"m0\"
+        case (Stop(), _):
+            return \"stop\"
+";
+        let d = check(src);
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::MissingReturn { .. })),
+            "tuple match that leaves an int column gap must fire missing_return: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn list_match_with_middle_star_is_exhaustive() {
+        // `[]`, `[x]`, `[x, y]`, `[first, *mid, last]` covers lengths
+        // 0, 1, 2, and ≥2 — exhaustive even though the star is mid-pattern.
+        let src = "\
+def f(xs: list[int]) -> str:
+    match xs:
+        case []:
+            return \"e\"
+        case [x]:
+            return \"one\"
+        case [x, y]:
+            return \"two\"
+        case [first, *mid, last]:
+            return \"many\"
+";
+        let d = check(src);
+        assert!(
+            !d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::MissingReturn { .. })),
+            "list match with a middle star must be exhaustive: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn list_match_middle_star_with_gap_fires() {
+        // `[]` + `[first, *mid, last]` (min length 2) leaves length 1
+        // uncovered — missing_return must still fire.
+        let src = "\
+def f(xs: list[int]) -> str:
+    match xs:
+        case []:
+            return \"e\"
+        case [first, *mid, last]:
+            return \"many\"
+";
+        let d = check(src);
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::MissingReturn { .. })),
+            "list match leaving a length gap must fire missing_return: {:?}",
             d.errors()
         );
     }
