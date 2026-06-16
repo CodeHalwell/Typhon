@@ -2957,10 +2957,15 @@ impl<'a> Checker<'a> {
             let exp_name = exp_head.as_str();
             if exp_args.len() == 1 && matches!(exp_name, "Iterator" | "Iterable") {
                 if let Type::Class(act_name) | Type::Generic(act_name, _) = actual {
-                    // `Iterator[T]` is satisfied by `__next__(self) -> T`.
+                    // `Iterator[T]` needs `__next__(self) -> T` AND `__iter__`
+                    // — a `__next__`-only class is not iterable (`iter(obj)` /
+                    // `for x in obj` require `__iter__`; the standard iterator
+                    // returns `self` from it).
                     if exp_name == "Iterator" {
                         if let Some(sig) = self.find_method(act_name, "__next__") {
-                            if self.is_assignable(&exp_args[0], &sig.return_type) {
+                            if self.find_method(act_name, "__iter__").is_some()
+                                && self.is_assignable(&exp_args[0], &sig.return_type)
+                            {
                                 return true;
                             }
                         }
@@ -17013,6 +17018,32 @@ impl CountDown:
         assert!(
             d.errors().is_empty(),
             "an iterator-protocol class must conform to Iterator[int]: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn next_only_class_is_not_iterator() {
+        // `Iterator[T]` requires `__iter__` too — a `__next__`-only class is
+        // not a complete iterator (`iter(obj)` / `for` fail at runtime).
+        let src = "\
+from typing import Iterator
+class N:
+    x: int
+impl N:
+    def __next__(self) -> int:
+        return self.x
+def f(it: Iterator[int]) -> int:
+    return 0
+def bad() -> int:
+    return f(N(x=1))
+";
+        let d = check(src);
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::TypeMismatch { .. })),
+            "a `__next__`-only class must not satisfy Iterator[int]: {:?}",
             d.errors()
         );
     }

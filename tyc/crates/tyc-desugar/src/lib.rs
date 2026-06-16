@@ -2073,10 +2073,10 @@ fn desugar_stmt(stmt: &Stmt, markers: ClassMarkers<'_>) -> (Stmt, bool) {
             // would shadow `BaseException.__init__` and break
             // `raise FooError("msg")`). They lower like `class!`: no
             // decorator, plus a `super().__init__(...)` constructor when the
-            // body has fields. The module-level set carries transitive
-            // exception-ness through non-suffix-named user bases.
-            let is_exception_subclass = class_is_exception_subclass(c)
-                || markers.exception_class_names.contains(c.name.as_str());
+            // body has fields. The module-level set is the single source of
+            // truth — it carries transitive exception-ness through user bases
+            // while excluding `*Error`-named *dataclass* bases.
+            let is_exception_subclass = markers.exception_class_names.contains(c.name.as_str());
             // Multi-inheritance with concrete bases conflicts with
             // `slots=True`; emit the decorator without `slots=True` in
             // that case. FINDINGS #102. Also drop `slots=True` for any
@@ -2753,38 +2753,6 @@ const EXACT_EXCEPTION_BASES: &[&str] = &[
     "StopAsyncIteration",
 ];
 
-/// Return `true` if `c` looks like an exception subclass.
-///
-/// A `class FooError(Exception): pass` (or any subclass of a builtin/user
-/// exception) must NOT receive the auto `@dataclasses.dataclass(slots=True)`
-/// decoration: the generated `__init__(self)` takes no positional arguments
-/// and shadows `BaseException.__init__`, so the ubiquitous
-/// `raise FooError("message")` idiom dies with `TypeError: FooError.__init__()
-/// takes 1 positional argument but 2 were given`. Instead, exception
-/// subclasses are routed through the same lowering as `class!` — no dataclass
-/// decorator, and a `super().__init__(...)`-calling constructor synthesised
-/// only when the body declares fields (an empty body inherits
-/// `BaseException.__init__` directly via a `*args`/`**kwargs` passthrough).
-///
-/// Detection is by the immediate base's trailing identifier segment, matching
-/// the existing name-based `skip_decoration_bases` approach: any base whose
-/// segment ends in `Error`/`Exception`/`Warning` (covers `Exception`,
-/// `ValueError`, `KeyError`, `Warning`, and user hierarchies like `AppError`
-/// → `NotFoundError`), or matches an exact non-suffixed builtin exception
-/// (`BaseException`, `KeyboardInterrupt`, `SystemExit`, `GeneratorExit`,
-/// `StopIteration`, `StopAsyncIteration`).
-fn class_is_exception_subclass(c: &ruff_python_ast::StmtClassDef) -> bool {
-    c.bases().iter().any(|base| {
-        let Some(seg) = base_last_segment(base) else {
-            return false;
-        };
-        seg.ends_with("Error")
-            || seg.ends_with("Exception")
-            || seg.ends_with("Warning")
-            || EXACT_EXCEPTION_BASES.contains(&seg)
-    })
-}
-
 /// Whether `name` (a base's trailing segment) marks an exception by the
 /// builtin convention: a `*Error` / `*Exception` / `*Warning` suffix or an
 /// exact non-suffixed builtin (`BaseException`, `KeyboardInterrupt`, …).
@@ -2796,18 +2764,28 @@ fn name_is_exception_base(name: &str) -> bool {
 }
 
 /// Names of every class in the module that is (transitively) an exception
-/// subclass. A class qualifies when a base matches the builtin convention
-/// (`name_is_exception_base`) OR names another module class that itself
-/// qualifies. This catches a non-suffix-named user base — e.g.
-/// `class Failure(Exception): pass` then `class Timeout(Failure): pass`,
-/// where `Timeout`'s immediate base (`Failure`) doesn't match the suffix
-/// heuristic but is still an exception.
+/// subclass. A class qualifies when a base is an *external* (builtin/imported)
+/// name matching the exception convention (`Exception`, `ValueError`, …) OR
+/// names another module class that itself qualifies (transitively). Crucially,
+/// a `*Error`-named base that is itself a *module* class is NOT assumed to be
+/// an exception: `class LexError: line: int` is a Result error-variant
+/// dataclass, so `class Detailed(LexError):` stays a dataclass too. But
+/// `class Failure(Exception): pass` then `class Timeout(Failure): pass` both
+/// qualify, since `Failure` is rooted in the builtin `Exception`.
 fn collect_exception_class_names(body: &[Stmt]) -> std::collections::HashSet<String> {
     let mut classes: Vec<(String, Vec<String>)> = Vec::new();
     collect_class_bases_into(body, &mut classes);
+    let module_classes: std::collections::HashSet<&str> =
+        classes.iter().map(|(n, _)| n.as_str()).collect();
     let mut exc: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // Seed only from external exception bases — a `*Error`-named *module*
+    // class is left to the fixpoint (it qualifies only if rooted in a builtin
+    // exception), so a plain `*Error` dataclass base doesn't taint subclasses.
     for (name, bases) in &classes {
-        if bases.iter().any(|b| name_is_exception_base(b)) {
+        if bases
+            .iter()
+            .any(|b| !module_classes.contains(b.as_str()) && name_is_exception_base(b))
+        {
             exc.insert(name.clone());
         }
     }
@@ -4690,6 +4668,20 @@ mod tests {
         assert!(
             out.contains("self.code = code") && out.contains("self.detail = detail"),
             "synthesised __init__ must assign fields:\n{out}"
+        );
+    }
+
+    #[test]
+    fn subclass_of_error_named_dataclass_stays_dataclass() {
+        // `LexError` (no base) is a Result error-variant dataclass; a subclass
+        // `Detailed(LexError)` must ALSO stay a dataclass (inherit fields),
+        // not be mistaken for an exception by the `*Error` base name.
+        let src = "class LexError:\n    line: int\n\nclass Detailed(LexError):\n    code: int\n";
+        let out = parse_and_desugar(src);
+        assert_eq!(
+            out.matches("@dataclasses.dataclass").count(),
+            2,
+            "both the error-named dataclass and its subclass must keep @dataclass:\n{out}"
         );
     }
 
