@@ -1,23 +1,20 @@
 from __future__ import annotations
+import dataclasses
 
 
-def invert(d: dict[str, int]) -> dict[int, str]:
-    return {v: k for (k, v) in d.items()}
+@dataclasses.dataclass(slots=True)
+class Logger:
+    prefix: str | None
 
-
-def group_lengths(words: list[str]) -> dict[int, list[str]]:
-    groups: dict[int, list[str]] = {}
-    for w in words:
-        n: int = len(w)
-        if n not in groups:
-            groups[n] = []
-        groups[n].append(w)
-    return groups
+    def log(self, msg: str) -> str:
+        if self.prefix is None:
+            return msg
+        return f"[{self.prefix.upper()}] {msg}"
 
 
 def main() -> None:
-    print(invert({"a": 1, "b": 2, "c": 3}))
-    print(group_lengths(["cat", "dog", "fish", "ox", "bird"]))
+    print(Logger(prefix="info").log("hello"))
+    print(Logger(prefix=None).log("world"))
 
 
 if __name__ == "__main__":

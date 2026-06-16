@@ -1,0 +1,16 @@
+class Record:
+    key: str?
+    value: int?
+
+def process(r: Record) -> str:
+    if r.key is not None and r.value is not None:
+        return f"{r.key}={r.value}"
+    return "incomplete"
+
+def main() -> None:
+    print(process(Record(key="x", value=5)))
+    print(process(Record(key="x", value=None)))
+    print(process(Record(key=None, value=5)))
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,23 @@
+class Stack:
+    top: Frame?
+
+class Frame:
+    value: int
+    below: Frame?
+
+def drain(s: Stack) -> list[int]:
+    mut result: list[int] = []
+    mut current: Frame? = s.top
+    while current is not None:
+        result.append(current.value)
+        current = current.below
+    return result
+
+def main() -> None:
+    let f1: Frame = Frame(value=1, below=None)
+    let f2: Frame = Frame(value=2, below=f1)
+    let s: Stack = Stack(top=f2)
+    print(drain(s))
+
+if __name__ == "__main__":
+    main()

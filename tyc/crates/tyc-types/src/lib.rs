@@ -8228,10 +8228,16 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                         audit_clear_binding(c, n.id.as_str());
                     }
                 } else if let Expr::Attribute(_) = target {
-                    // Reassigning `self.x = …` invalidates any flow narrowing
-                    // on that path (it may now hold a different value).
+                    // Reassigning `self.x = …` updates the flow narrowing on
+                    // that path: narrow to the assigned value's type when it's
+                    // provably non-null (so `self.x = v; use(self.x)` sees the
+                    // value), otherwise drop the narrowing (revert to declared).
                     if let Some(path) = attr_path_of(target) {
-                        c.env.clear_attr_narrowing(&path);
+                        if !value_type.is_nullable() && !matches!(value_type, Type::Unknown) {
+                            c.env.narrow_attr(path, value_type.clone());
+                        } else {
+                            c.env.clear_attr_narrowing(&path);
+                        }
                     }
                 }
             }
