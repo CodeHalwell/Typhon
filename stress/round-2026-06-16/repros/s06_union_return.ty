@@ -1,0 +1,24 @@
+def parse_value(s: str) -> int | float | str:
+    if s.lstrip("-").isdigit():
+        return int(s)
+    try:
+        return float(s)
+    except ValueError:
+        return s
+
+def describe(v: int | float | str) -> str:
+    if isinstance(v, bool):
+        return "bool"
+    if isinstance(v, int):
+        return f"int {v}"
+    if isinstance(v, float):
+        return f"float {v}"
+    return f"str {v}"
+
+def main() -> None:
+    for s in ["42", "3.14", "hello"]:
+        let v: int | float | str = parse_value(s)
+        print(describe(v))
+
+if __name__ == "__main__":
+    main()

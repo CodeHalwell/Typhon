@@ -1,0 +1,22 @@
+class Graph:
+    adjacency: dict[int, list[int]]
+
+impl Graph:
+    def add_edge(self, a: int, b: int) -> None:
+        if a not in self.adjacency:
+            self.adjacency[a] = []
+        self.adjacency[a].append(b)
+    def neighbors(self, node: int) -> list[int]:
+        return self.adjacency.get(node, [])
+
+def main() -> None:
+    mut g: Graph = Graph(adjacency={})
+    g.add_edge(1, 2)
+    g.add_edge(1, 3)
+    g.add_edge(2, 3)
+    print(g.neighbors(1))
+    print(g.neighbors(2))
+    print(g.neighbors(99))
+
+if __name__ == "__main__":
+    main()

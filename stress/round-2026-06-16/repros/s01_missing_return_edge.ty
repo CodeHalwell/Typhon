@@ -1,0 +1,42 @@
+def classify(n: int) -> str:
+    if n < 0:
+        return "neg"
+    if n == 0:
+        return "zero"
+    return "pos"
+
+def loop_return(xs: list[int]) -> int:
+    for x in xs:
+        if x > 100:
+            return x
+    return -1
+
+def while_return(n: int) -> int:
+    mut i: int = n
+    while True:
+        if i <= 0:
+            return i
+        i = i - 1
+
+def nested_return(grid: list[list[int]], target: int) -> tuple[int, int]:
+    for i in range(len(grid)):
+        for j in range(len(grid[i])):
+            if grid[i][j] == target:
+                return (i, j)
+    return (-1, -1)
+
+def raise_branch(x: int) -> int:
+    if x < 0:
+        raise ValueError("neg")
+    else:
+        return x * 2
+
+def main() -> None:
+    print(classify(-5), classify(0), classify(5))
+    print(loop_return([1, 2, 200, 3]))
+    print(while_return(3))
+    print(nested_return([[1, 2], [3, 4]], 4))
+    print(raise_branch(5))
+
+if __name__ == "__main__":
+    main()

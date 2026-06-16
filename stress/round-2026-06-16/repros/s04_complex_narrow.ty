@@ -1,0 +1,23 @@
+type Shape = Circle | Square
+
+class Circle frozen:
+    radius: float
+class Square frozen:
+    side: float
+
+def area_or_default(s: Shape?, default: float) -> float:
+    if s is None:
+        return default
+    match s:
+        case Circle(radius=r):
+            return 3.14159 * r * r
+        case Square(side=sd):
+            return sd * sd
+
+def main() -> None:
+    print(area_or_default(Circle(radius=2.0), 0.0))
+    print(area_or_default(Square(side=3.0), 0.0))
+    print(area_or_default(None, -1.0))
+
+if __name__ == "__main__":
+    main()

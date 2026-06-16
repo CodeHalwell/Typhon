@@ -34,6 +34,16 @@ output (`tyc build` → CPython 3.13) is now correct on the entire corpus.
   non-star elements now contributes its `≥ len-1` length coverage; a genuine
   gap (e.g. `[]` + `[a, *m, b]` leaving length 1) still fires.
 
+### Fixed — `match` on a narrowed nullable subject is recognised exhaustive
+
+- **`match s:` after `if s is None: return …` no longer false-fires
+  `tyc::missing_return` (production blocker).** The exhaustiveness pass keyed
+  off the *declared* subject type (`Shape?`), so it thought `None` was an
+  uncovered case even though the earlier guard had narrowed `s` to `Shape`.
+  `match_subject_type` now uses the *narrowed* type (falling back to declared),
+  so flow-sensitive narrowing before the match is respected. An un-narrowed
+  nullable subject still fires (None genuinely uncovered).
+
 ### Fixed — exhaustive tuple-of-union `match` no longer blocks the build
 
 - **`match (state, event):` over a `tuple[Union, T]` no longer false-fires

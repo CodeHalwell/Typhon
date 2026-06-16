@@ -10284,6 +10284,15 @@ fn match_cases_cover_subject(c: &Checker, m: &ruff_python_ast::StmtMatch) -> boo
 fn match_subject_type(c: &Checker, m: &ruff_python_ast::StmtMatch) -> Option<Type> {
     if let Expr::Name(n) = m.subject.as_ref() {
         if let Some(binding) = c.env.lookup(n.id.as_str()) {
+            // Use the *narrowed* type, not the declared one, so flow-sensitive
+            // narrowing before the match is respected — e.g. after
+            // `if s is None: return …`, a `match s:` over a `Shape?` subject
+            // only needs to cover the sealed-union variants, not `None`
+            // (otherwise an exhaustive match false-fires `missing_return`).
+            // Fall back to the declared type when nothing useful was narrowed.
+            if !matches!(binding.narrowed, Type::Unknown) {
+                return Some(binding.narrowed.clone());
+            }
             return Some(binding.declared.clone());
         }
     }
@@ -16766,6 +16775,61 @@ def f(p: tuple[int, int]) -> str:
                 .iter()
                 .any(|e| matches!(e, TycError::MissingReturn { .. })),
             "irrefutable tuple pattern must be exhaustive: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn match_on_narrowed_nullable_subject_is_exhaustive() {
+        // After `if s is None: return …`, `s: Shape?` is narrowed to `Shape`,
+        // so `match s:` over the two variants is exhaustive — no missing_return.
+        let src = "\
+class Circle:
+    r: float
+class Square:
+    side: float
+type Shape = Circle | Square
+def area(s: Shape?, default: float) -> float:
+    if s is None:
+        return default
+    match s:
+        case Circle(r=r):
+            return r
+        case Square(side=sd):
+            return sd
+";
+        let d = check(src);
+        assert!(
+            !d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::MissingReturn { .. })),
+            "match on a None-narrowed nullable subject must be exhaustive: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn match_on_unnarrowed_nullable_subject_still_fires() {
+        // Without the None check, `None` is an uncovered inhabitant.
+        let src = "\
+class Circle:
+    r: float
+class Square:
+    side: float
+type Shape = Circle | Square
+def area(s: Shape?) -> float:
+    match s:
+        case Circle(r=r):
+            return r
+        case Square(side=sd):
+            return sd
+";
+        let d = check(src);
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::MissingReturn { .. })),
+            "match on an un-narrowed nullable subject must fire missing_return: {:?}",
             d.errors()
         );
     }

@@ -1,22 +1,36 @@
 from __future__ import annotations
+import dataclasses
 
 
-def parse_query(query: str) -> dict[str, str]:
-    params: dict[str, str] = {}
-    for pair in query.split("&"):
-        if "=" in pair:
-            parts: list[str] = pair.split("=", 1)
-            params[parts[0]] = parts[1]
-    return params
+@dataclasses.dataclass(slots=True)
+class TreeNode:
+    value: int
+    children: list[TreeNode]
 
+    def total(self) -> int:
+        sum: int = self.value
+        for child in self.children:
+            sum = sum + child.total()
+        return sum
 
-def parse_csv_line(line: str) -> list[str]:
-    return [field.strip() for field in line.split(",")]
+    def depth(self) -> int:
+        if len(self.children) == 0:
+            return 1
+        max_child: int = 0
+        for child in self.children:
+            d: int = child.depth()
+            if d > max_child:
+                max_child = d
+        return 1 + max_child
 
 
 def main() -> None:
-    print(parse_query("name=alice&age=30&city=nyc"))
-    print(parse_csv_line("  a , b ,  c  , d "))
+    leaf1: TreeNode = TreeNode(value=1, children=[])
+    leaf2: TreeNode = TreeNode(value=2, children=[])
+    mid: TreeNode = TreeNode(value=3, children=[leaf1, leaf2])
+    root: TreeNode = TreeNode(value=4, children=[mid])
+    print(root.total())
+    print(root.depth())
 
 
 if __name__ == "__main__":
