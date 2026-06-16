@@ -1,0 +1,24 @@
+import asyncio
+
+async def fetch(n: int) -> int:
+    await asyncio.sleep(0)
+    return n * n
+
+async def process() -> list[int]:
+    gather:
+        a = fetch(2)
+        b = fetch(3)
+        c = fetch(4)
+    return [a, b, c]
+
+async def main_async() -> None:
+    let results: list[int] = await process()
+    print(results)
+    let total: int = sum(results)
+    print(total)
+
+def main() -> None:
+    asyncio.run(main_async())
+
+if __name__ == "__main__":
+    main()

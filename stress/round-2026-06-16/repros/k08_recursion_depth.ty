@@ -1,0 +1,17 @@
+def sum_to(n: int) -> int:
+    if n == 0:
+        return 0
+    return n + sum_to(n - 1)
+
+def deep_list(n: int) -> list[int]:
+    if n == 0:
+        return []
+    return [n] + deep_list(n - 1)
+
+def main() -> None:
+    print(sum_to(500))
+    print(len(deep_list(300)))
+    print(sum(deep_list(100)))
+
+if __name__ == "__main__":
+    main()

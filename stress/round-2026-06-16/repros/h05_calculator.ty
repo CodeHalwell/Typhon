@@ -1,0 +1,25 @@
+def evaluate(tokens: list[str]) -> float:
+    mut stack: list[float] = []
+    for tok in tokens:
+        if tok in {"+", "-", "*", "/"}:
+            let b: float = stack.pop()
+            let a: float = stack.pop()
+            if tok == "+":
+                stack.append(a + b)
+            elif tok == "-":
+                stack.append(a - b)
+            elif tok == "*":
+                stack.append(a * b)
+            else:
+                stack.append(a / b)
+        else:
+            stack.append(float(tok))
+    return stack[0]
+
+def main() -> None:
+    print(evaluate(["3", "4", "+"]))
+    print(evaluate(["5", "1", "2", "+", "4", "*", "+", "3", "-"]))
+    print(evaluate(["10", "2", "/"]))
+
+if __name__ == "__main__":
+    main()

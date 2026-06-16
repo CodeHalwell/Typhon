@@ -1,0 +1,21 @@
+def main() -> None:
+    let a: set[int] = {1, 2, 3, 4, 5}
+    let b: set[int] = {4, 5, 6, 7, 8}
+    print(sorted(a | b))
+    print(sorted(a & b))
+    print(sorted(a - b))
+    print(sorted(a ^ b))
+    print(a.issubset({1, 2, 3, 4, 5, 6}))
+    print(a.issuperset({1, 2}))
+    print({1, 2}.isdisjoint({3, 4}))
+    let fs: frozenset[int] = frozenset([1, 2, 3])
+    print(2 in fs)
+    mut c: set[int] = {1, 2, 3}
+    c.add(4)
+    c.discard(1)
+    print(sorted(c))
+    let comp: set[int] = {x * x for x in range(5)}
+    print(sorted(comp))
+
+if __name__ == "__main__":
+    main()

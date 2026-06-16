@@ -1,0 +1,25 @@
+class Account:
+    _balance: int
+
+impl Account:
+    @property
+    def balance(self) -> int:
+        return self._balance
+    @balance.setter
+    def balance(self, value: int) -> None:
+        if value < 0:
+            raise ValueError("negative balance")
+        self._balance = value
+
+def main() -> None:
+    mut a: Account = Account(_balance=100)
+    print(a.balance)
+    a.balance = 200
+    print(a.balance)
+    try:
+        a.balance = -5
+    except ValueError as e:
+        print("error:", e)
+
+if __name__ == "__main__":
+    main()

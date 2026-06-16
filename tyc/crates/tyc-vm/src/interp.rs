@@ -2436,8 +2436,12 @@ impl Interpreter {
         }
         all_pos.extend(args);
 
-        // Track which kwargs have been consumed.
-        let mut kwargs_left: HashMap<String, Value> =
+        // Track which kwargs have been consumed. An `IndexMap` (not a
+        // `HashMap`) so that the leftover entries bound to a `**kwargs`
+        // parameter keep their call-site order — CPython preserves keyword
+        // argument order, and the resulting dict's order is observable
+        // (iteration, `repr`, serialisation).
+        let mut kwargs_left: IndexMap<String, Value> =
             kwargs.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
 
         // `f.defaults` was evaluated once at def-time and is indexed by
@@ -2453,7 +2457,7 @@ impl Interpreter {
             let default = defaults_iter.next().and_then(|d| d.clone());
             if let Some(v) = pos_iter.next() {
                 env.set(name, v);
-            } else if let Some(v) = kwargs_left.remove(name) {
+            } else if let Some(v) = kwargs_left.shift_remove(name) {
                 env.set(name, v);
             } else if let Some(v) = default {
                 env.set(name, v);
@@ -2483,7 +2487,7 @@ impl Interpreter {
         for p in &params.kwonlyargs {
             let name = p.parameter.name.as_str();
             let default = defaults_iter.next().and_then(|d| d.clone());
-            if let Some(v) = kwargs_left.remove(name) {
+            if let Some(v) = kwargs_left.shift_remove(name) {
                 env.set(name, v);
             } else if let Some(v) = default {
                 env.set(name, v);
@@ -2497,7 +2501,7 @@ impl Interpreter {
 
         if let Some(kw) = &params.kwarg {
             let mut map: DictMap = IndexMap::new();
-            for (k, v) in kwargs_left.drain() {
+            for (k, v) in kwargs_left.drain(..) {
                 map.insert(HashKey::Str(Rc::new(k)), v);
             }
             env.set(kw.name.as_str(), Value::Dict(Rc::new(RefCell::new(map))));
@@ -3085,6 +3089,22 @@ impl Interpreter {
         if let (Int(n), Mult, Str(a)) = (l, op, r) {
             let n = n.to_usize().unwrap_or(0);
             return Ok(Str(Rc::new(a.repeat(n))));
+        }
+
+        // Bytes: concatenation (`b"a" + b"b"`) and repetition (`b"a" * 3`).
+        if let (Bytes(a), Add, Bytes(b)) = (l, op, r) {
+            let mut out = Vec::with_capacity(a.len() + b.len());
+            out.extend_from_slice(a);
+            out.extend_from_slice(b);
+            return Ok(Bytes(Rc::new(out)));
+        }
+        if let (Bytes(a), Mult, Int(n)) = (l, op, r) {
+            let n = n.to_usize().unwrap_or(0);
+            return Ok(Bytes(Rc::new(a.repeat(n))));
+        }
+        if let (Int(n), Mult, Bytes(a)) = (l, op, r) {
+            let n = n.to_usize().unwrap_or(0);
+            return Ok(Bytes(Rc::new(a.repeat(n))));
         }
 
         // Lists / tuples.

@@ -1,0 +1,26 @@
+from typing import Callable
+
+def map_values[K, V, W](d: dict[K, V], f: Callable[[V], W]) -> dict[K, W]:
+    mut result: dict[K, W] = {}
+    for k in d:
+        result[k] = f(d[k])
+    return result
+
+def group_by[T, K](items: list[T], key: Callable[[T], K]) -> dict[K, list[T]]:
+    mut groups: dict[K, list[T]] = {}
+    for item in items:
+        let k: K = key(item)
+        if k not in groups:
+            groups[k] = []
+        groups[k].append(item)
+    return groups
+
+def main() -> None:
+    let d: dict[str, int] = {"a": 1, "b": 2, "c": 3}
+    print(map_values(d, lambda v: v * 10))
+    let nums: list[int] = [1, 2, 3, 4, 5, 6]
+    let grouped: dict[str, list[int]] = group_by(nums, lambda n: "even" if n % 2 == 0 else "odd")
+    print(grouped)
+
+if __name__ == "__main__":
+    main()

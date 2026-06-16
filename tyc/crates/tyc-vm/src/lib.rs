@@ -509,6 +509,38 @@ main()
     }
 
     #[test]
+    fn kwargs_preserve_call_order() {
+        // Regression: `**kwargs` was collected into a HashMap, so the
+        // resulting dict's iteration/repr order was nondeterministic.
+        // CPython preserves keyword-argument order.
+        let src = r#"
+def build(**fields: int) -> dict[str, int]:
+    mut out: dict[str, int] = {}
+    for k in fields:
+        out[k] = fields[k]
+    return out
+
+let d = build(z=1, y=2, x=3, w=4)
+assert list(d.keys()) == ["z", "y", "x", "w"]
+print("ok")
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    #[test]
+    fn bytes_concat_and_repeat() {
+        let src = r#"
+let a: bytes = b"hello"
+let b: bytes = b" world"
+assert a + b == b"hello world"
+assert b"ab" * 3 == b"ababab"
+assert 2 * b"xy" == b"xyxy"
+print("ok")
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    #[test]
     fn result_question_mark() {
         let src = r#"
 from typhon_runtime import Ok, Err

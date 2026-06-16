@@ -1,0 +1,29 @@
+from typing import Callable
+
+def adder(x: int) -> Callable[[int], Callable[[int], int]]:
+    def middle(y: int) -> Callable[[int], int]:
+        def inner(z: int) -> int:
+            return x + y + z
+        return inner
+    return middle
+
+def counter_factory() -> tuple[Callable[[], int], Callable[[], None]]:
+    mut count: int = 0
+    def increment() -> int:
+        nonlocal count
+        count = count + 1
+        return count
+    def reset() -> None:
+        nonlocal count
+        count = 0
+    return (increment, reset)
+
+def main() -> None:
+    print(adder(1)(2)(3))
+    let (inc, reset) = counter_factory()
+    print(inc(), inc(), inc())
+    reset()
+    print(inc())
+
+if __name__ == "__main__":
+    main()

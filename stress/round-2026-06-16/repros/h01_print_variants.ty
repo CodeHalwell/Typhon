@@ -1,0 +1,11 @@
+def main() -> None:
+    print("a", "b", "c", sep=", ")
+    print("no newline", end="")
+    print()
+    print("x", "y", sep="", end="!\n")
+    print(1, 2, 3, sep=" | ")
+    print(*[1, 2, 3])
+    print(*["a", "b"], sep="-")
+
+if __name__ == "__main__":
+    main()

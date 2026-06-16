@@ -1,0 +1,21 @@
+from typing import ClassVar
+
+class Counter:
+    total: ClassVar[int] = 0
+    name: str
+    count: int
+
+impl Counter:
+    def increment(self) -> None:
+        self.count = self.count + 1
+
+def main() -> None:
+    mut c1: Counter = Counter(name="a", count=0)
+    mut c2: Counter = Counter(name="b", count=10)
+    c1.increment()
+    c1.increment()
+    print(c1.count, c2.count)
+    print(Counter.total)
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,22 @@
+mut counter: int = 0
+registry: dict[str, int] = {}
+
+def increment() -> int:
+    global counter
+    counter = counter + 1
+    return counter
+
+def register(name: str, value: int) -> None:
+    registry[name] = value
+
+def main() -> None:
+    print(increment())
+    print(increment())
+    print(increment())
+    register("a", 1)
+    register("b", 2)
+    print(registry)
+    print(counter)
+
+if __name__ == "__main__":
+    main()

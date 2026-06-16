@@ -59,12 +59,37 @@ The VM independently mis-modelled exception subclasses. Fixed in `tyc-vm`:
   `NameError`, `ImportError`, `UnicodeError`, `ConnectionError`, `IOError`,
   `KeyboardInterrupt`/`SystemExit`/`GeneratorExit`, etc.
 
+## Second sweep — batches F–K (~50 more programs)
+
+A deeper round probing advanced OOP (custom `__iter__`/`__len__`/`__getitem__`,
+property setters, MRO), slicing, `*args`/`**kwargs`/keyword-only, `match`
+pattern edge cases, unicode/bytes, decorators-with-args, async `gather:`,
+mutual recursion, deep narrowing, bignum, generics, and real algorithm-shaped
+programs (RPN calculator, tokenizer, LRU cache, BFS, event emitter). Three
+more fixes:
+
+- **`tyc::missing_return` false positive on nested class patterns (production
+  blocker, FIXED).** An exhaustive `match` like
+  `case Circle(center=Point(x=cx, y=cy), radius=r):` (where `center: Point`)
+  was rejected because the nested `Point(...)` sub-pattern wasn't a bare
+  capture — **blocking the build** on valid, idiomatic code. The checker now
+  recognises a nested class sub-pattern as total when it covers the field's
+  exact type; a nested *value* filter (`x=0`) stays refutable.
+- **`**kwargs` call-order (VM, FIXED).** `**kwargs` was collected into a
+  `HashMap`, so the dict's order was nondeterministic; now insertion-ordered.
+- **`bytes` `+` / `*` (VM, FIXED).** `b"a" + b"b"` and `b"a" * 3` now work
+  under `tyc run`.
+
+The one genuine *test* error found was mine: declaring `let first` then
+rebinding it via `[first, *rest] = ...` correctly trips `immutable_assign` —
+the checker is right.
+
 ## Result
 
-The **production path (`tyc build` → CPython 3.13) is correct on all 38
-programs.** The frontend held up with zero false positives. Remaining
-divergences are all VM-only with correct compiled output, and are documented
-VM-coverage limitations:
+The **production path (`tyc build` → CPython 3.13) is correct on the entire
+~85-program corpus.** The frontend held up with zero remaining false
+positives. Remaining divergences are all VM-only with correct compiled output,
+and are documented VM-coverage limitations:
 
 | Repro | VM gap (compiled path correct) |
 |-------|--------------------------------|
@@ -76,7 +101,10 @@ VM-coverage limitations:
 | d05 | VM `date.weekday()` |
 | e01 | VM does not track `__cause__` (`raise X from Y` introspection) |
 | e02 | CPython's `KeyError.__str__` repr-quoting quirk |
+| f08 | VM nested format-spec width (`{n:>{w}}`) |
+| i08 | VM has no `contextlib.suppress` |
+| k04 | VM has no `bytearray` type |
 
-Regression: full `cargo test --workspace` green; zero `tyc check` regressions
-across all `examples/` exercises and `examples/apps/`; representative apps build
-and run under CPython 3.13.
+Regression: full `cargo test --workspace` green (41 suites); zero `tyc check`
+regressions across all `examples/` exercises and `examples/apps/`;
+representative apps build and run under CPython 3.13.

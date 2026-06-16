@@ -1,0 +1,21 @@
+from typing import Callable
+
+def repeat(times: int) -> Callable[[Callable[[], str]], Callable[[], str]]:
+    def decorator(f: Callable[[], str]) -> Callable[[], str]:
+        def wrapper() -> str:
+            mut out: str = ""
+            for _ in range(times):
+                out = out + f()
+            return out
+        return wrapper
+    return decorator
+
+@repeat(3)
+def hello() -> str:
+    return "hi"
+
+def main() -> None:
+    print(hello())
+
+if __name__ == "__main__":
+    main()

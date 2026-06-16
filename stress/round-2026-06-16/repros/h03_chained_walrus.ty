@@ -1,0 +1,16 @@
+def main() -> None:
+    let x: int = 5
+    print(1 < x < 10)
+    print(0 <= x <= 5 <= 10)
+    mut data: list[int] = [1, 2, 3, 4, 5]
+    if (n := len(data)) > 3:
+        print(f"long: {n}")
+    let result: list[int] = [y for x in data if (y := x * 2) > 4]
+    print(result)
+    let total: int = 0
+    mut acc: int = 0
+    while (acc := acc + 1) <= 5:
+        print(acc)
+
+if __name__ == "__main__":
+    main()

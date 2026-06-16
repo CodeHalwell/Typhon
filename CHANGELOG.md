@@ -4,12 +4,39 @@ All notable changes to Typhon are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely; the
 canonical phase-by-phase status lives in `docs/roadmap.md`.
 
-## Unreleased — custom exception robustness
+## Unreleased — stress-test robustness sweep
 
-A stress-test sweep ("if you can write it in Python, you can use Typhon")
-surfaced one production-path correctness bug and a cluster of matching VM
-parity gaps, all around the most common Python idiom the corpus exercised
-that Typhon got wrong: **custom exception classes**.
+An ~85-program adversarial sweep ("if you can write it in Python, you can use
+Typhon") spanning the breadth of what production Python apps do. Two
+production-path bugs and several VM parity gaps were fixed; the compiled
+output (`tyc build` → CPython 3.13) is now correct on the entire corpus.
+
+### Fixed — nested class patterns no longer block the build
+
+- **An exhaustive `match` with a nested class pattern no longer false-fires
+  `tyc::missing_return` (`tyc-types`).** A case like
+  `case Circle(center=Point(x=cx, y=cy), radius=r):` (where `center: Point`)
+  was treated as refutable because its nested `Point(...)` sub-pattern wasn't
+  a bare capture, so the checker demanded a fall-through arm and **blocked the
+  build** on valid, idiomatic code. A sub-pattern is now recognised as total
+  when it's a nested class pattern against a field of that exact class and the
+  nested pattern itself totally covers that class. A nested *value* filter
+  (`x=0`) stays correctly refutable, so genuine fall-throughs still fire.
+
+### Fixed — `**kwargs` preserves call order (`tyc-vm`)
+
+- The VM collected a `**kwargs` parameter into a `HashMap`, so the resulting
+  dict's iteration / `repr` / serialisation order was nondeterministic.
+  CPython preserves keyword-argument order; the VM now uses an insertion-
+  ordered map (`IndexMap` + `shift_remove`) to match.
+
+### Fixed — `bytes` operators in the VM (`tyc-vm`)
+
+- `b"a" + b"b"` (concatenation) and `b"a" * 3` / `3 * b"a"` (repetition) now
+  work under `tyc run` instead of raising `unsupported operand type(s)`.
+
+The largest cluster was around the most common Python idiom the corpus
+exercised that Typhon got wrong: **custom exception classes**.
 
 ### Fixed — `class FooError(Exception):` no longer breaks `raise FooError("msg")`
 

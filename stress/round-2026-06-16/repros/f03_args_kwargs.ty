@@ -1,0 +1,30 @@
+def total(*nums: int) -> int:
+    mut s: int = 0
+    for n in nums:
+        s = s + n
+    return s
+
+def make_dict(**kwargs: int) -> dict[str, int]:
+    mut d: dict[str, int] = {}
+    for k in kwargs:
+        d[k] = kwargs[k]
+    return d
+
+def greet(name: str, *, greeting: str = "Hello", punct: str = "!") -> str:
+    return f"{greeting}, {name}{punct}"
+
+def combine(first: int, *rest: int, sep: str = "-") -> str:
+    let parts: list[str] = [str(first)] + [str(r) for r in rest]
+    return sep.join(parts)
+
+def main() -> None:
+    print(total(1, 2, 3, 4))
+    print(make_dict(a=1, b=2))
+    print(greet("World"))
+    print(greet("Bob", greeting="Hi", punct="."))
+    let nums: list[int] = [1, 2, 3]
+    print(total(*nums))
+    print(combine(1, 2, 3, 4, sep="+"))
+
+if __name__ == "__main__":
+    main()

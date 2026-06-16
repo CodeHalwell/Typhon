@@ -1,0 +1,23 @@
+def side_effect(x: int, log: list[int]) -> bool:
+    log.append(x)
+    return x > 0
+
+def main() -> None:
+    mut log: list[int] = []
+    let r1: bool = side_effect(1, log) or side_effect(2, log)
+    print(r1, log)
+    log.clear()
+    let r2: bool = side_effect(-1, log) and side_effect(2, log)
+    print(r2, log)
+    let x: int? = None
+    let y: int = x or 42
+    print(y)
+    let a: str = "" or "default"
+    print(a)
+    let b: int = 0 or 5 or 10
+    print(b)
+    let c: list[int] = [] or [1, 2]
+    print(c)
+
+if __name__ == "__main__":
+    main()

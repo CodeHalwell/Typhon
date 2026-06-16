@@ -1,0 +1,21 @@
+def parse_config(lines: list[str]) -> dict[str, str]:
+    mut config: dict[str, str] = {}
+    for line in lines:
+        try:
+            let parts: list[str] = line.split("=")
+            if len(parts) != 2:
+                raise ValueError(f"bad line: {line}")
+            config[parts[0].strip()] = parts[1].strip()
+        except ValueError as e:
+            print(f"skipping: {e}")
+        else:
+            print(f"parsed: {line}")
+    return config
+
+def main() -> None:
+    let lines: list[str] = ["a = 1", "invalid", "b = 2"]
+    let cfg: dict[str, str] = parse_config(lines)
+    print(cfg)
+
+if __name__ == "__main__":
+    main()

@@ -10580,7 +10580,19 @@ fn pattern_covers_class(c: &Checker, pattern: &Pattern, class_name: &str) -> boo
                 if mc.arguments.patterns.len() > shape.field_order.len() {
                     return false;
                 }
-                return mc.arguments.patterns.iter().all(is_capture_or_underscore);
+                // Each positional subpattern is total when it's a bare
+                // capture/wildcard OR a nested pattern that itself totally
+                // covers the corresponding field's declared type (e.g.
+                // `case Node(Leaf(v), r):` where the first field is typed
+                // `Leaf` and `Leaf(v)` is irrefutable). FINDINGS: nested
+                // class patterns spuriously fired `missing_return`.
+                return mc.arguments.patterns.iter().enumerate().all(|(i, p)| {
+                    let field_ty = shape
+                        .field_order
+                        .get(i)
+                        .and_then(|name| shape.fields.get(name));
+                    subpattern_total_for_field(c, p, field_ty)
+                });
             }
             // Keyword-only class pattern — `case TaskStarted(task_id=tid):`.
             // Python's runtime match dispatches on the class first, then
@@ -10600,10 +10612,10 @@ fn pattern_covers_class(c: &Checker, pattern: &Pattern, class_name: &str) -> boo
             // known). The capture-or-wildcard check stays so a
             // `case X(a=Literal[1]):` arm — which adds an inner value
             // filter — does NOT count as total.
-            mc.arguments
-                .keywords
-                .iter()
-                .all(|kw| is_capture_or_underscore(&kw.pattern))
+            mc.arguments.keywords.iter().all(|kw| {
+                let field_ty = shape.fields.get(kw.attr.as_str());
+                subpattern_total_for_field(c, &kw.pattern, field_ty)
+            })
         }
         // `case None:` covers the singleton None type — used by the
         // T? exhaustiveness path (B6). `cases_cover_type` calls in with
@@ -10653,6 +10665,45 @@ fn is_capture_or_underscore(pattern: &Pattern) -> bool {
             None => true,
             Some(inner) => is_capture_or_underscore(inner),
         },
+        _ => false,
+    }
+}
+
+/// Whether a class-pattern subpattern (a positional or keyword sub-pattern)
+/// totally covers its field — i.e. it can never *fail* to match an instance
+/// of the field's type, so it doesn't make the enclosing class pattern
+/// refutable.
+///
+/// A bare capture / wildcard always qualifies. A *nested class pattern*
+/// qualifies when the field's declared type is that exact class (or unwraps
+/// to it) and the nested pattern itself totally covers that class — so
+/// `case Circle(center=Point(x=cx, y=cy), radius=r):`, where `center: Point`,
+/// is recognised as covering `Circle` rather than spuriously demanding a
+/// fall-through arm and firing `tyc::missing_return`. Without a known field
+/// type we stay conservative (only the capture/wildcard case qualifies).
+fn subpattern_total_for_field(c: &Checker, pattern: &Pattern, field_ty: Option<&Type>) -> bool {
+    if is_capture_or_underscore(pattern) {
+        return true;
+    }
+    let Some(field_ty) = field_ty else {
+        return false;
+    };
+    match pattern {
+        Pattern::MatchAs(a) => match &a.pattern {
+            None => true,
+            Some(inner) => subpattern_total_for_field(c, inner, Some(field_ty)),
+        },
+        Pattern::MatchOr(o) => o
+            .patterns
+            .iter()
+            .any(|p| subpattern_total_for_field(c, p, Some(field_ty))),
+        Pattern::MatchClass(_) => {
+            if let Type::Class(name) = c.unwrap_alias(field_ty) {
+                pattern_covers_class(c, pattern, &name)
+            } else {
+                false
+            }
+        }
         _ => false,
     }
 }
@@ -16582,6 +16633,65 @@ def f(p: tuple[int, int]) -> str:
                 .iter()
                 .any(|e| matches!(e, TycError::MissingReturn { .. })),
             "irrefutable tuple pattern must be exhaustive: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn nested_class_pattern_is_exhaustive() {
+        // A nested class subpattern against a field of that exact class is
+        // irrefutable, so `case Circle(center=Point(x=cx, y=cy), radius=r):`
+        // covers `Circle` and must NOT spuriously fire missing_return.
+        let src = "\
+class Point:
+    x: int
+    y: int
+class Circle:
+    center: Point
+    radius: int
+type Shape = Point | Circle
+def area(s: Shape) -> str:
+    match s:
+        case Point(x=px, y=py):
+            return \"point\"
+        case Circle(center=Point(x=cx, y=cy), radius=r):
+            return \"circle\"
+";
+        let d = check(src);
+        assert!(
+            !d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::MissingReturn { .. })),
+            "exhaustive match with a nested class pattern must not fire missing_return: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn refutable_nested_class_pattern_still_fires() {
+        // A nested subpattern carrying a *value* filter (`x=0`) is refutable,
+        // so the arm can fall through — missing_return must still fire.
+        let src = "\
+class Point:
+    x: int
+    y: int
+class Circle:
+    center: Point
+    radius: int
+type Shape = Point | Circle
+def area(s: Shape) -> str:
+    match s:
+        case Point(x=px, y=py):
+            return \"point\"
+        case Circle(center=Point(x=0, y=cy), radius=r):
+            return \"origin circle\"
+";
+        let d = check(src);
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::MissingReturn { .. })),
+            "a refutable nested value pattern must still fire missing_return: {:?}",
             d.errors()
         );
     }

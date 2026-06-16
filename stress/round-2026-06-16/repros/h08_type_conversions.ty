@@ -1,0 +1,18 @@
+def main() -> None:
+    print(int("42"), int("ff", 16), int("101", 2))
+    print(float("3.14"), float("1e3"))
+    print(str(42), str(3.14), str(True))
+    print(list("abc"))
+    print(list(range(3)))
+    print(tuple([1, 2, 3]))
+    print(set([1, 1, 2, 2, 3]))
+    print(dict([("a", 1), ("b", 2)]))
+    print(bool(0), bool(1), bool(""), bool("x"), bool([]), bool([1]))
+    print(int(3.9), int(-3.9))
+    print(abs(-5), abs(3.5))
+    print(bytes([72, 105]))
+    print(chr(65), ord("Z"))
+    print(hex(255), oct(64), bin(10))
+
+if __name__ == "__main__":
+    main()

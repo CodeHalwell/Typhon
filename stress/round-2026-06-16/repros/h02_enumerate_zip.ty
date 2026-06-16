@@ -1,0 +1,17 @@
+def main() -> None:
+    let items: list[str] = ["a", "b", "c"]
+    for i, x in enumerate(items):
+        print(i, x)
+    for i, x in enumerate(items, start=1):
+        print(i, x)
+    let names: list[str] = ["Alice", "Bob"]
+    let ages: list[int] = [30, 25]
+    for name, age in zip(names, ages):
+        print(f"{name}: {age}")
+    let pairs: list[tuple[int, str]] = list(zip([1, 2], ["x", "y"]))
+    print(pairs)
+    let d: dict[str, int] = dict(zip(names, ages))
+    print(d)
+
+if __name__ == "__main__":
+    main()

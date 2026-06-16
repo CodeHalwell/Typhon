@@ -1,0 +1,27 @@
+class Employee:
+    name: str
+    dept: str
+    salary: int
+
+impl Employee:
+    def __repr__(self) -> str:
+        return f"{self.name}/{self.dept}/{self.salary}"
+
+def main() -> None:
+    let emps: list[Employee] = [
+        Employee(name="Alice", dept="Eng", salary=100),
+        Employee(name="Bob", dept="Sales", salary=90),
+        Employee(name="Carol", dept="Eng", salary=110),
+        Employee(name="Dave", dept="Sales", salary=95),
+    ]
+    let by_salary: list[Employee] = sorted(emps, key=lambda e: e.salary, reverse=True)
+    print(by_salary)
+    let by_dept_then_name: list[Employee] = sorted(emps, key=lambda e: (e.dept, e.name))
+    print(by_dept_then_name)
+    let total: int = sum(e.salary for e in emps)
+    print(total)
+    let max_emp: Employee = max(emps, key=lambda e: e.salary)
+    print(max_emp.name)
+
+if __name__ == "__main__":
+    main()

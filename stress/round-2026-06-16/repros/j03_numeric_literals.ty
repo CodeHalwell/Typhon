@@ -1,0 +1,14 @@
+def main() -> None:
+    print(1_000_000)
+    print(0xFF, 0o17, 0b1010)
+    print(1.5e3, 2.5e-2)
+    print(1_000.000_1)
+    print(0xDEAD_BEEF)
+    print(100_000 + 1)
+    print(3.14_159)
+    print(1e10)
+    print(.5, 5.)
+    print(1j * 1j)
+
+if __name__ == "__main__":
+    main()

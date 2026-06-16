@@ -1,0 +1,24 @@
+class Version frozen:
+    major: int
+    minor: int
+    patch: int
+
+impl Version:
+    def __lt__(self, other: Version) -> bool:
+        return (self.major, self.minor, self.patch) < (other.major, other.minor, other.patch)
+    def __repr__(self) -> str:
+        return f"{self.major}.{self.minor}.{self.patch}"
+
+def main() -> None:
+    let versions: list[Version] = [
+        Version(major=1, minor=2, patch=0),
+        Version(major=1, minor=0, patch=5),
+        Version(major=2, minor=0, patch=0),
+        Version(major=1, minor=2, patch=1),
+    ]
+    print(sorted(versions))
+    print(max(versions))
+    print(min(versions))
+
+if __name__ == "__main__":
+    main()

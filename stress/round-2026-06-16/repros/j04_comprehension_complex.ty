@@ -1,0 +1,18 @@
+def main() -> None:
+    let pairs: list[tuple[int, int]] = [(i, j) for i in range(3) for j in range(3) if i != j]
+    print(pairs)
+    let nested: list[list[int]] = [[j for j in range(i)] for i in range(4)]
+    print(nested)
+    let cond: list[str] = ["even" if x % 2 == 0 else "odd" for x in range(5)]
+    print(cond)
+    let d: dict[int, list[int]] = {k: [k * i for i in range(3)] for k in range(3)}
+    print(d)
+    let filtered: dict[str, int] = {k: v for k, v in {"a": 1, "b": 2, "c": 3}.items() if v > 1}
+    print(filtered)
+    let s: set[tuple[int, int]] = {(i, i * i) for i in range(4)}
+    print(sorted(s))
+    let gen_sum: int = sum(x * y for x in range(3) for y in range(3))
+    print(gen_sum)
+
+if __name__ == "__main__":
+    main()
