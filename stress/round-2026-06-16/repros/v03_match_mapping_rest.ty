@@ -1,0 +1,19 @@
+def route(request: dict[str, object]) -> str:
+    match request:
+        case {"method": "GET", "path": p}:
+            return f"GET {p}"
+        case {"method": "POST", "path": p, "body": b}:
+            return f"POST {p} with body"
+        case {"method": m}:
+            return f"unknown method {m}"
+        case _:
+            return "malformed"
+
+def main() -> None:
+    print(route({"method": "GET", "path": "/users"}))
+    print(route({"method": "POST", "path": "/users", "body": "data"}))
+    print(route({"method": "DELETE"}))
+    print(route({"foo": "bar"}))
+
+if __name__ == "__main__":
+    main()

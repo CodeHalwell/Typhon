@@ -1,0 +1,16 @@
+pub newtype UserId = int
+
+pub class User:
+    id: UserId
+    name: str
+    email: str?
+
+pub type Event = Created | Updated | Deleted
+
+pub class Created frozen:
+    user: User
+pub class Updated frozen:
+    user: User
+    field: str
+pub class Deleted frozen:
+    user_id: UserId

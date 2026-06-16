@@ -2928,6 +2928,38 @@ impl<'a> Checker<'a> {
                     && self.is_assignable(&bb[1], &aa[1]);
             }
         }
+        // A user class implementing the iterator protocol structurally
+        // conforms to `Iterator[T]` / `Iterable[T]` / `Collection[T]` /
+        // `Reversible[T]`: `__next__(self) -> T` (the standard
+        // `def __iter__(self): return self` + `__next__` shape), or
+        // `__iter__(self) -> Iterator[T]`. Without this, the canonical
+        // iterator class's `def __iter__(self) -> Iterator[int]: return self`
+        // false-fires `type_mismatch` on `return self`.
+        if let Type::Generic(exp_head, exp_args) = expected {
+            if exp_args.len() == 1
+                && matches!(
+                    exp_head.as_str(),
+                    "Iterator" | "Iterable" | "Collection" | "Reversible"
+                )
+            {
+                if let Type::Class(act_name) | Type::Generic(act_name, _) = actual {
+                    if let Some(sig) = self.find_method(act_name, "__next__") {
+                        if self.is_assignable(&exp_args[0], &sig.return_type) {
+                            return true;
+                        }
+                    }
+                    if let Some(sig) = self.find_method(act_name, "__iter__") {
+                        if let Type::Generic(_, iter_args) = &sig.return_type {
+                            if iter_args.len() == 1
+                                && self.is_assignable(&exp_args[0], &iter_args[0])
+                            {
+                                return true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
         // Generic / generic (e.g. `Result[T, E] = Ok[V]`, `list[T] = list[V]`):
         // recurse using `is_assignable` for the inner type pairs so sealed
         // unions and interface conformance work *inside* generic containers.
@@ -16881,6 +16913,51 @@ def f(p: tuple[int, int]) -> str:
                 .iter()
                 .any(|e| matches!(e, TycError::MissingReturn { .. })),
             "irrefutable tuple pattern must be exhaustive: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn iterator_protocol_class_conforms() {
+        // `def __iter__(self) -> Iterator[int]: return self` on a class with
+        // `__next__(self) -> int` must type-check (the standard iterator).
+        let src = "\
+from typing import Iterator
+class CountDown:
+    start: int
+impl CountDown:
+    def __iter__(self) -> Iterator[int]:
+        return self
+    def __next__(self) -> int:
+        if self.start <= 0:
+            raise StopIteration()
+        self.start = self.start - 1
+        return self.start + 1
+";
+        let d = check(src);
+        assert!(
+            d.errors().is_empty(),
+            "an iterator-protocol class must conform to Iterator[int]: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn non_iterator_class_does_not_conform() {
+        // A class without `__next__` is not an Iterator.
+        let src = "\
+from typing import Iterator
+class Plain:
+    x: int
+def make() -> Iterator[int]:
+    return Plain(x=1)
+";
+        let d = check(src);
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::TypeMismatch { .. })),
+            "a class without __next__ must not conform to Iterator: {:?}",
             d.errors()
         );
     }

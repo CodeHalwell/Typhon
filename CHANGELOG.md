@@ -34,6 +34,15 @@ output (`tyc build` → CPython 3.13) is now correct on the entire corpus.
   non-star elements now contributes its `≥ len-1` length coverage; a genuine
   gap (e.g. `[]` + `[a, *m, b]` leaving length 1) still fires.
 
+### Fixed — iterator-protocol classes conform to `Iterator[T]`
+
+- **`def __iter__(self) -> Iterator[int]: return self`** (the standard
+  custom-iterator shape, with a `__next__(self) -> int`) no longer false-fires
+  `tyc::type_mismatch` on `return self`. `is_assignable` now recognises a class
+  implementing `__next__(self) -> T` (or `__iter__(self) -> Iterator[T]`) as
+  structurally conforming to `Iterator[T]` / `Iterable[T]` / `Collection[T]` /
+  `Reversible[T]`. A class without those methods still fails.
+
 ### Added — flow-sensitive attribute narrowing
 
 - **`if self.value is None: return …` now narrows `self.value` to non-`None`

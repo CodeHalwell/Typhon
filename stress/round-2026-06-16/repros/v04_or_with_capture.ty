@@ -1,0 +1,23 @@
+type Shape = Circle | Square | Rectangle
+
+class Circle frozen:
+    radius: float
+class Square frozen:
+    side: float
+class Rectangle frozen:
+    width: float
+    height: float
+
+def perimeter(s: Shape) -> float:
+    match s:
+        case Circle(radius=r):
+            return 2.0 * 3.14159 * r
+        case Square(side=x) | Rectangle(width=x, height=_):
+            return 4.0 * x
+
+def main() -> None:
+    print(round(perimeter(Circle(radius=1.0)), 2))
+    print(perimeter(Square(side=3.0)))
+
+if __name__ == "__main__":
+    main()

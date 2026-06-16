@@ -1,0 +1,21 @@
+model ApiRequest:
+    user_id: int
+    action: str
+    metadata: dict[str, str]
+
+model ApiResponse:
+    status: int
+    message: str
+
+def handle(req: ApiRequest) -> ApiResponse:
+    if req.action == "ping":
+        return ApiResponse(status=200, message="pong")
+    return ApiResponse(status=400, message=f"unknown action: {req.action}")
+
+def main() -> None:
+    let req: ApiRequest = ApiRequest(user_id=1, action="ping", metadata={})
+    let resp: ApiResponse = handle(req)
+    print(resp.status, resp.message)
+
+if __name__ == "__main__":
+    main()

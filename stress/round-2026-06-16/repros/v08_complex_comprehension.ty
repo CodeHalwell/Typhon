@@ -1,0 +1,19 @@
+def primes_up_to(n: int) -> list[int]:
+    return [
+        x for x in range(2, n + 1)
+        if all(x % d != 0 for d in range(2, int(x ** 0.5) + 1))
+    ]
+
+def transpose(matrix: list[list[int]]) -> list[list[int]]:
+    return [[row[i] for row in matrix] for i in range(len(matrix[0]))]
+
+def word_lengths(text: str) -> dict[str, int]:
+    return {word: len(word) for word in text.split() if len(word) > 2}
+
+def main() -> None:
+    print(primes_up_to(30))
+    print(transpose([[1, 2, 3], [4, 5, 6]]))
+    print(word_lengths("the quick brown fox is"))
+
+if __name__ == "__main__":
+    main()
