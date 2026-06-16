@@ -437,6 +437,78 @@ print(fact(6))
     }
 
     #[test]
+    fn user_exception_construct_raise_catch() {
+        // Regression: `raise FooError("msg")` used to die in the VM with
+        // `TypeError: FooError() takes 0 arguments (more given)` because the
+        // field-less exception subclass was treated as a zero-field dataclass.
+        let src = r#"
+class AppError(Exception):
+    pass
+
+class NotFoundError(AppError):
+    pass
+
+def lookup(k: str) -> str:
+    if k == "missing":
+        raise NotFoundError("no such key")
+    return k
+
+def main() -> None:
+    try:
+        print(lookup("missing"))
+    except AppError as e:
+        print(type(e).__name__, str(e))
+
+main()
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    #[test]
+    fn user_exception_caught_via_builtin_base() {
+        // `except KeyError` must catch a user `class MyKeyError(KeyError):`.
+        let src = r#"
+class MyKeyError(KeyError):
+    pass
+
+def main() -> None:
+    try:
+        raise MyKeyError("missing-key")
+    except KeyError as e:
+        print("caught:", str(e))
+
+main()
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    #[test]
+    fn user_exception_with_fields_and_super_init() {
+        // A hand-written __init__ that calls super().__init__(msg) constructs
+        // cleanly and exposes its fields.
+        let src = r#"
+class HttpError(Exception):
+    code: int
+    detail: str
+
+impl HttpError:
+    def __init__(self, code: int, detail: str) -> None:
+        self.code = code
+        self.detail = detail
+        super().__init__(f"HTTP {code}: {detail}")
+
+def main() -> None:
+    try:
+        raise HttpError(404, "missing")
+    except HttpError as e:
+        print(e.code, e.detail, str(e))
+
+main()
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    #[test]
     fn result_question_mark() {
         let src = r#"
 from typhon_runtime import Ok, Err

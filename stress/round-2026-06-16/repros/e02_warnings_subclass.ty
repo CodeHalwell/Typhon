@@ -1,0 +1,16 @@
+class MyWarning(Warning):
+    pass
+
+class MyKeyError(KeyError):
+    pass
+
+def main() -> None:
+    try:
+        raise MyKeyError("missing-key")
+    except KeyError as e:
+        print("key error:", e)
+    let w: MyWarning = MyWarning("deprecated", 42)
+    print(w.args)
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,19 @@
+def main() -> None:
+    let s: str = "The quick brown fox"
+    print(s.title())
+    print(s.count("o"))
+    print(s.find("quick"), s.index("brown"))
+    print("a,b,,c".split(","))
+    print("a b  c".split())
+    print("Hello".ljust(10, "."), "Hello".rjust(10, "."))
+    print("123".zfill(6))
+    print("  x  ".strip(), "xxabcxx".strip("x"))
+    print("ABCabc".swapcase())
+    print("hello world".replace("o", "0", 1))
+    print("café".encode("utf-8"))
+    print(",".join(str(i) for i in range(5)))
+    print("Hello World".casefold())
+    print("test".removeprefix("te"), "test".removesuffix("st"))
+
+if __name__ == "__main__":
+    main()

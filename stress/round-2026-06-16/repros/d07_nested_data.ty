@@ -1,0 +1,30 @@
+class Address:
+    street: str
+    city: str
+
+class Person:
+    name: str
+    age: int
+    address: Address
+
+impl Person:
+    def summary(self) -> str:
+        return f"{self.name} ({self.age}) from {self.address.city}"
+
+def main() -> None:
+    let people: list[Person] = [
+        Person(name="Alice", age=30, address=Address(street="1 Main", city="NYC")),
+        Person(name="Bob", age=25, address=Address(street="2 Elm", city="LA")),
+    ]
+    let by_city: dict[str, list[str]] = {}
+    for p in people:
+        let city: str = p.address.city
+        if city not in by_city:
+            by_city[city] = []
+        by_city[city].append(p.name)
+    print(by_city)
+    for p in sorted(people, key=lambda x: x.age):
+        print(p.summary())
+
+if __name__ == "__main__":
+    main()

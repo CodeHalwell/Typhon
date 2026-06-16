@@ -1,0 +1,9 @@
+[project]
+name = "stress"
+version = "0.1.0"
+src = "src"
+out = "build"
+[python]
+target = "3.13"
+[strictness]
+unintrospectable-dependency = "off"

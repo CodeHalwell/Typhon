@@ -2063,6 +2063,12 @@ fn desugar_stmt(stmt: &Stmt, markers: ClassMarkers<'_>) -> (Stmt, bool) {
             // do the right thing without requiring `plain class`/`class!`.
             let is_skip_decoration_subclass =
                 class_inherits_skip_decoration_base(c, markers.skip_decoration_bases);
+            // Exception subclasses must not get a dataclass `__init__` (it
+            // would shadow `BaseException.__init__` and break
+            // `raise FooError("msg")`). They lower like `class!`: no
+            // decorator, plus a `super().__init__(...)` constructor when the
+            // body has fields.
+            let is_exception_subclass = class_is_exception_subclass(c);
             // Multi-inheritance with concrete bases conflicts with
             // `slots=True`; emit the decorator without `slots=True` in
             // that case. FINDINGS #102. Also drop `slots=True` for any
@@ -2084,6 +2090,7 @@ fn desugar_stmt(stmt: &Stmt, markers: ClassMarkers<'_>) -> (Stmt, bool) {
                 && !is_impl_stub
                 && !is_lazy_proxy
                 && !is_skip_decoration_subclass
+                && !is_exception_subclass
                 && !has_dataclass_decorator(&c.decorator_list);
             // Pydantic `model` classes must have `model_config = ConfigDict(extra="forbid")`
             // as their first body statement unless the user already defined it.
@@ -2143,7 +2150,14 @@ fn desugar_stmt(stmt: &Stmt, markers: ClassMarkers<'_>) -> (Stmt, bool) {
             // but allocates real objects for things like `Linear(10, 5)`
             // and confuses libraries that introspect class attributes
             // (e.g. PyTorch parameter registration on subclasses).
-            if is_raw
+            // `class!` always gets a synthesised constructor (the framework
+            // base may need `super().__init__()` called even with no fields).
+            // An auto-detected exception subclass only needs one when it
+            // declares fields — otherwise it stays bare and inherits
+            // `BaseException.__init__`.
+            let wants_raw_init =
+                is_raw || (is_exception_subclass && class_has_annotated_fields(&new_class.body));
+            if wants_raw_init
                 && !is_plain
                 && class_has_any_base(c)
                 && !body_has_init(&new_class.body)
@@ -2717,6 +2731,64 @@ fn class_inherits_typed_dict(c: &ruff_python_ast::StmtClassDef) -> bool {
                 )
         }
         _ => false,
+    })
+}
+
+/// Exact base names — outside the `*Error`/`*Exception`/`*Warning` naming
+/// convention — that nonetheless make a class an exception subclass.
+const EXACT_EXCEPTION_BASES: &[&str] = &[
+    "BaseException",
+    "KeyboardInterrupt",
+    "SystemExit",
+    "GeneratorExit",
+    "StopIteration",
+    "StopAsyncIteration",
+];
+
+/// Return `true` if `c` looks like an exception subclass.
+///
+/// A `class FooError(Exception): pass` (or any subclass of a builtin/user
+/// exception) must NOT receive the auto `@dataclasses.dataclass(slots=True)`
+/// decoration: the generated `__init__(self)` takes no positional arguments
+/// and shadows `BaseException.__init__`, so the ubiquitous
+/// `raise FooError("message")` idiom dies with `TypeError: FooError.__init__()
+/// takes 1 positional argument but 2 were given`. Instead, exception
+/// subclasses are routed through the same lowering as `class!` — no dataclass
+/// decorator, and a `super().__init__(...)`-calling constructor synthesised
+/// only when the body declares fields (an empty body inherits
+/// `BaseException.__init__` directly via a `*args`/`**kwargs` passthrough).
+///
+/// Detection is by the immediate base's trailing identifier segment, matching
+/// the existing name-based `skip_decoration_bases` approach: any base whose
+/// segment ends in `Error`/`Exception`/`Warning` (covers `Exception`,
+/// `ValueError`, `KeyError`, `Warning`, and user hierarchies like `AppError`
+/// → `NotFoundError`), or matches an exact non-suffixed builtin exception
+/// (`BaseException`, `KeyboardInterrupt`, `SystemExit`, `GeneratorExit`,
+/// `StopIteration`, `StopAsyncIteration`).
+fn class_is_exception_subclass(c: &ruff_python_ast::StmtClassDef) -> bool {
+    c.bases().iter().any(|base| {
+        let Some(seg) = base_last_segment(base) else {
+            return false;
+        };
+        seg.ends_with("Error")
+            || seg.ends_with("Exception")
+            || seg.ends_with("Warning")
+            || EXACT_EXCEPTION_BASES.contains(&seg)
+    })
+}
+
+/// Return `true` if the class body declares at least one top-level annotated
+/// field (`name: T` / `name: T = default`). Used to decide whether an
+/// exception subclass needs a synthesised field-assigning `__init__`: a
+/// field-less `class FooError(Exception): pass` should stay bare and inherit
+/// `BaseException.__init__` (so `raise FooError("msg")` just works) rather
+/// than carry a redundant `*args`/`**kwargs` passthrough.
+fn class_has_annotated_fields(body: &[Stmt]) -> bool {
+    body.iter().any(|s| {
+        matches!(
+            s,
+            Stmt::AnnAssign(a) if matches!(a.target.as_ref(), Expr::Name(_))
+        )
     })
 }
 
@@ -4460,6 +4532,68 @@ mod tests {
         assert!(
             out.contains("@dataclasses.dataclass"),
             "unrelated base must still get @dataclass:\n{out}"
+        );
+    }
+
+    #[test]
+    fn exception_subclass_skips_dataclass_decorator() {
+        // `class FooError(Exception): pass` must NOT get `@dataclass` — the
+        // synthesised no-arg `__init__` would shadow `BaseException.__init__`
+        // and break `raise FooError("msg")`.
+        let out = parse_and_desugar("class FooError(Exception):\n    pass\n");
+        assert!(
+            !out.contains("@dataclasses.dataclass"),
+            "exception subclass must not get @dataclass:\n{out}"
+        );
+        // Field-less exception stays bare (inherits BaseException.__init__):
+        // no synthesised `__init__`.
+        assert!(
+            !out.contains("def __init__"),
+            "field-less exception must not synthesise __init__:\n{out}"
+        );
+    }
+
+    #[test]
+    fn exception_subclass_via_user_hierarchy_skips_dataclass() {
+        // `AppError(Exception)` then `NotFoundError(AppError)` — both are
+        // exceptions by the `*Error` naming convention.
+        let src =
+            "class AppError(Exception):\n    pass\n\nclass NotFoundError(AppError):\n    pass\n";
+        let out = parse_and_desugar(src);
+        assert!(
+            !out.contains("@dataclasses.dataclass"),
+            "exception hierarchy must not get @dataclass:\n{out}"
+        );
+    }
+
+    #[test]
+    fn exception_subclass_with_fields_synthesises_init() {
+        // An exception that declares fields and no manual __init__ gets a
+        // `class!`-style constructor (super().__init__() + field assigns).
+        let src = "class HttpError(Exception):\n    code: int\n    detail: str\n";
+        let out = parse_and_desugar(src);
+        assert!(
+            !out.contains("@dataclasses.dataclass"),
+            "exception with fields must not get @dataclass:\n{out}"
+        );
+        assert!(
+            out.contains("def __init__(self, code: int, detail: str)"),
+            "exception with fields must synthesise a field-assigning __init__:\n{out}"
+        );
+        assert!(
+            out.contains("self.code = code") && out.contains("self.detail = detail"),
+            "synthesised __init__ must assign fields:\n{out}"
+        );
+    }
+
+    #[test]
+    fn error_named_class_without_base_still_dataclass() {
+        // `class LexError:` with NO base is a Result error *variant*, not an
+        // exception — it must keep its `@dataclass` shape.
+        let out = parse_and_desugar("class LexError:\n    line: int\n    message: str\n");
+        assert!(
+            out.contains("@dataclasses.dataclass"),
+            "error-named class with no base must stay a dataclass:\n{out}"
         );
     }
 

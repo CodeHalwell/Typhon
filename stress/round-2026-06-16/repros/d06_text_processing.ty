@@ -1,0 +1,16 @@
+def word_count(text: str) -> dict[str, int]:
+    mut counts: dict[str, int] = {}
+    for word in text.lower().split():
+        let clean: str = word.strip(".,!?;:")
+        if clean != "":
+            counts[clean] = counts.get(clean, 0) + 1
+    return counts
+
+def main() -> None:
+    let text: str = "The cat sat. The cat ran! The dog slept."
+    let wc: dict[str, int] = word_count(text)
+    for word in sorted(wc.keys()):
+        print(f"{word}: {wc[word]}")
+
+if __name__ == "__main__":
+    main()

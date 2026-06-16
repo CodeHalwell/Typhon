@@ -1,0 +1,20 @@
+class Config:
+    host: str
+    port: int = 8080
+    tags: list[str] = []
+    debug: bool = False
+
+impl Config:
+    def url(self) -> str:
+        return f"{self.host}:{self.port}"
+
+def main() -> None:
+    let c1: Config = Config(host="localhost")
+    print(c1.url(), c1.tags, c1.debug)
+    c1.tags.append("a")
+    let c2: Config = Config(host="example.com", port=443)
+    print(c2.tags)
+    print(c1 == Config(host="localhost"))
+
+if __name__ == "__main__":
+    main()

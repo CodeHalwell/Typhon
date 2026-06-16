@@ -1,0 +1,14 @@
+def main() -> None:
+    let matrix: list[list[int]] = [[i * 3 + j for j in range(3)] for i in range(3)]
+    print(matrix)
+    let flat: list[int] = [x for row in matrix for x in row]
+    print(flat)
+    let evens: dict[int, int] = {x: x * x for x in range(6) if x % 2 == 0}
+    print(evens)
+    let uniq: set[int] = {x % 3 for x in range(10)}
+    print(sorted(uniq))
+    let g: int = sum(x for x in range(100) if x % 7 == 0)
+    print(g)
+
+if __name__ == "__main__":
+    main()

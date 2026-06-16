@@ -4,6 +4,56 @@ All notable changes to Typhon are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely; the
 canonical phase-by-phase status lives in `docs/roadmap.md`.
 
+## Unreleased — custom exception robustness
+
+A stress-test sweep ("if you can write it in Python, you can use Typhon")
+surfaced one production-path correctness bug and a cluster of matching VM
+parity gaps, all around the most common Python idiom the corpus exercised
+that Typhon got wrong: **custom exception classes**.
+
+### Fixed — `class FooError(Exception):` no longer breaks `raise FooError("msg")`
+
+- **Exception subclasses are no longer auto-decorated with `@dataclass`
+  (`tyc-desugar`).** A `class FooError(Exception): pass` emitted
+  `@dataclasses.dataclass(slots=True)`, whose synthesised no-argument
+  `__init__` shadows `BaseException.__init__`. The ubiquitous
+  `raise FooError("message")` then died at runtime with
+  `TypeError: FooError.__init__() takes 1 positional argument but 2 were
+  given` — on both the compiled output *and* the VM. This affected every
+  exception subclass: builtin bases (`Exception`, `ValueError`, `KeyError`,
+  `Warning`, …) and user hierarchies (`AppError` → `NotFoundError`).
+
+  Exception subclasses are now detected by base name (segment ending in
+  `Error`/`Exception`/`Warning`, or an exact non-suffixed builtin like
+  `BaseException`/`KeyboardInterrupt`) and lowered like `class!`: no
+  `@dataclass`, and a `super().__init__(...)`-calling constructor synthesised
+  **only** when the body declares fields. A field-less exception stays a bare
+  `class FooError(Exception): pass` and inherits `BaseException.__init__`.
+  Error-named classes with **no base** (Result error *variants*) are
+  unaffected and keep their dataclass shape.
+
+- **VM exception parity (`tyc-vm`).** The VM independently mis-modelled
+  exception subclasses; `tyc run` now matches the compiled path:
+  - field-less exception construction accepts positional args
+    (`BaseException`-style, stashed as `.args`) instead of "takes 0 arguments";
+  - `str(e)` / `repr(e)` render from `.args` (`str(FooError("x")) == "x"`,
+    `repr == "FooError('x')"`) rather than the dataclass field form;
+  - `except KeyError` catches a user `class MyKeyError(KeyError):` (builtin
+    exception bases are recorded on the class, since the VM has no
+    `Value::Class` for them);
+  - a hand-written `super().__init__(msg)` in an exception `__init__` is
+    captured so `str(e)` reflects the custom message;
+  - missing builtin exceptions registered: `BaseException`, `Warning`
+    (+ subclasses), `NameError`, `ImportError`, `UnicodeError`,
+    `ConnectionError`, `IOError`, `KeyboardInterrupt`/`SystemExit`/
+    `GeneratorExit`, and more.
+
+  Known remaining VM-only limitations (compiled path is correct): `__cause__`
+  is not tracked for `raise X from Y`, and CPython's `KeyError`-specific
+  repr-quoting in `str()` is not reproduced.
+
+Stress corpus and methodology: `stress/round-2026-06-16/`.
+
 ## 0.15.5 — 2026-06-15 — cross-module `extend BUILTIN:` propagation
 
 A bugfix release that makes `extend BUILTIN:` work across module boundaries.

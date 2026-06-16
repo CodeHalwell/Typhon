@@ -1,0 +1,18 @@
+def main() -> None:
+    let d: dict[str, int] = {"a": 1, "b": 2, "c": 3}
+    print(list(d.keys()), list(d.values()))
+    print(sorted(d.items()))
+    let merged: dict[str, int] = {**d, "d": 4}
+    print(sorted(merged.items()))
+    print(d.get("z", -1))
+    mut d2: dict[str, int] = dict(d)
+    d2.setdefault("e", 5)
+    d2.update({"a": 10})
+    print(sorted(d2.items()))
+    print("a" in d, "z" in d)
+    let popped: int = d2.pop("a")
+    print(popped)
+    print({k: v * 2 for k, v in d.items()})
+
+if __name__ == "__main__":
+    main()

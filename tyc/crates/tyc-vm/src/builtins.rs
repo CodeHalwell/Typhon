@@ -1168,6 +1168,7 @@ pub fn install(interp: &mut Interpreter) {
             bases: vec![],
             properties: std::cell::RefCell::new(std::collections::HashSet::new()),
             classmethods: std::cell::RefCell::new(std::collections::HashSet::new()),
+            is_exception: false,
         })),
     );
     // Common typing names that show up as zero-effort bases.
@@ -1182,6 +1183,7 @@ pub fn install(interp: &mut Interpreter) {
                 bases: vec![],
                 properties: std::cell::RefCell::new(std::collections::HashSet::new()),
                 classmethods: std::cell::RefCell::new(std::collections::HashSet::new()),
+                is_exception: false,
             })),
         );
     }
@@ -1210,6 +1212,7 @@ pub fn install(interp: &mut Interpreter) {
 
     // A couple of exception types so user `raise ValueError(...)` works.
     for name in [
+        "BaseException",
         "Exception",
         "ValueError",
         "TypeError",
@@ -1220,19 +1223,39 @@ pub fn install(interp: &mut Interpreter) {
         "ZeroDivisionError",
         "AssertionError",
         "StopIteration",
+        "StopAsyncIteration",
         "OSError",
+        "IOError",
         "FileNotFoundError",
         "FileExistsError",
         "PermissionError",
         "IsADirectoryError",
         "NotADirectoryError",
         "TimeoutError",
+        "ConnectionError",
         "EOFError",
         "LookupError",
         "ArithmeticError",
         "OverflowError",
+        "FloatingPointError",
         "RecursionError",
         "NotImplementedError",
+        "NameError",
+        "UnboundLocalError",
+        "ImportError",
+        "ModuleNotFoundError",
+        "UnicodeError",
+        "UnicodeDecodeError",
+        "UnicodeEncodeError",
+        "KeyboardInterrupt",
+        "SystemExit",
+        "GeneratorExit",
+        "Warning",
+        "DeprecationWarning",
+        "UserWarning",
+        "RuntimeWarning",
+        "FutureWarning",
+        "PendingDeprecationWarning",
     ] {
         let n = name.to_owned();
         let ctor = NativeFn::new(Box::leak(n.clone().into_boxed_str()), move |_i, args| {
@@ -3618,6 +3641,7 @@ fn make_re_module() -> Value {
             bases: vec![],
             properties: std::cell::RefCell::new(std::collections::HashSet::new()),
             classmethods: std::cell::RefCell::new(std::collections::HashSet::new()),
+            is_exception: false,
         });
         Value::Instance(Rc::new(crate::value::Instance {
             class: cls,
@@ -3741,6 +3765,7 @@ fn make_re_module() -> Value {
             bases: vec![],
             properties: std::cell::RefCell::new(std::collections::HashSet::new()),
             classmethods: std::cell::RefCell::new(std::collections::HashSet::new()),
+            is_exception: false,
         });
         Value::Instance(Rc::new(crate::value::Instance {
             class: cls,
@@ -4648,6 +4673,7 @@ fn make_pydantic_module() -> Value {
         bases: vec![],
         properties: std::cell::RefCell::new(std::collections::HashSet::new()),
         classmethods: std::cell::RefCell::new(std::collections::HashSet::new()),
+        is_exception: false,
     }));
     let config_dict = nf("ConfigDict", |_i, _args| {
         // Accept any kwargs and ignore — purely a config-record stub.
@@ -7744,6 +7770,7 @@ pub fn make_builtin_type(name: &str) -> Value {
                     bases: vec![],
                     properties: std::cell::RefCell::new(std::collections::HashSet::new()),
                     classmethods: std::cell::RefCell::new(std::collections::HashSet::new()),
+                    is_exception: false,
                 })
             })
             .clone();

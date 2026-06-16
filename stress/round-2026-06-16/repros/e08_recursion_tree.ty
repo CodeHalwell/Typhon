@@ -1,0 +1,30 @@
+type Tree = Leaf | Node
+
+class Leaf frozen:
+    value: int
+
+class Node frozen:
+    left: Tree
+    right: Tree
+
+def tree_sum(t: Tree) -> int:
+    match t:
+        case Leaf(value=v):
+            return v
+        case Node(left=l, right=r):
+            return tree_sum(l) + tree_sum(r)
+
+def depth(t: Tree) -> int:
+    match t:
+        case Leaf(value=_):
+            return 1
+        case Node(left=l, right=r):
+            return 1 + max(depth(l), depth(r))
+
+def main() -> None:
+    let t: Tree = Node(left=Node(left=Leaf(value=1), right=Leaf(value=2)), right=Leaf(value=3))
+    print(tree_sum(t))
+    print(depth(t))
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,23 @@
+from functools import partial, reduce
+from typing import Callable
+
+def apply_all(fns: list[Callable[[int], int]], x: int) -> list[int]:
+    return [f(x) for f in fns]
+
+def add(a: int, b: int) -> int:
+    return a + b
+
+def main() -> None:
+    let add5: Callable[[int], int] = partial(add, 5)
+    print(add5(10))
+    let fns: list[Callable[[int], int]] = [lambda x: x + 1, lambda x: x * 2, lambda x: x - 3]
+    print(apply_all(fns, 10))
+    let product: int = reduce(lambda a, b: a * b, range(1, 6), 1)
+    print(product)
+    let mapped: list[int] = list(map(lambda x: x * x, [1, 2, 3]))
+    print(mapped)
+    let filtered: list[int] = list(filter(lambda x: x > 2, [1, 2, 3, 4]))
+    print(filtered)
+
+if __name__ == "__main__":
+    main()

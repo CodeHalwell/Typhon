@@ -1,0 +1,14 @@
+import os
+import sys
+
+def main() -> None:
+    print(os.path.join("a", "b", "c"))
+    print(os.path.basename("/foo/bar/baz.txt"))
+    print(os.path.splitext("file.tar.gz"))
+    print(sys.platform.startswith("linux") or sys.platform.startswith("darwin") or True)
+    let env: str = os.environ.get("HOME", "unknown")
+    print(len(env) >= 0)
+    print(os.path.dirname("/a/b/c"))
+
+if __name__ == "__main__":
+    main()

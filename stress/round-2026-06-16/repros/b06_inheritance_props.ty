@@ -1,0 +1,30 @@
+class Animal:
+    name: str
+
+impl Animal:
+    def speak(self) -> str:
+        return "..."
+    def describe(self) -> str:
+        return f"{self.name} says {self.speak()}"
+
+class Dog(Animal):
+    breed: str
+
+impl Dog:
+    def speak(self) -> str:
+        return "Woof"
+
+class Cat(Animal):
+    pass
+
+impl Cat:
+    def speak(self) -> str:
+        return "Meow"
+
+def main() -> None:
+    let animals: list[Animal] = [Dog(name="Rex", breed="Lab"), Cat(name="Tom")]
+    for a in animals:
+        print(a.describe())
+
+if __name__ == "__main__":
+    main()

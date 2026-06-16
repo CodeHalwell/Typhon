@@ -1,0 +1,30 @@
+class CustomError(Exception):
+    pass
+
+def risky(x: int) -> int:
+    if x < 0:
+        raise ValueError(f"negative: {x}")
+    if x == 0:
+        raise CustomError("zero not allowed")
+    return 100 // x
+
+def safe(x: int) -> str:
+    try:
+        let r: int = risky(x)
+        return f"ok: {r}"
+    except ValueError as e:
+        return f"value error: {e}"
+    except CustomError as e:
+        return f"custom: {e}"
+    except Exception as e:
+        return f"other: {e}"
+    finally:
+        print(f"handled {x}")
+
+def main() -> None:
+    print(safe(5))
+    print(safe(-1))
+    print(safe(0))
+
+if __name__ == "__main__":
+    main()
