@@ -23,6 +23,19 @@ output (`tyc build` → CPython 3.13) is now correct on the entire corpus.
   nested pattern itself totally covers that class. A nested *value* filter
   (`x=0`) stays correctly refutable, so genuine fall-throughs still fire.
 
+### Fixed — exhaustive tuple-of-union `match` no longer blocks the build
+
+- **`match (state, event):` over a `tuple[Union, T]` no longer false-fires
+  `tyc::missing_return` (production blocker).** The idiomatic state-machine
+  dispatch where each sealed-union variant is paired with a capture/wildcard
+  for the other column is exhaustive, but the checker had no product-coverage
+  analysis for tuple subjects, so it demanded a fall-through arm and blocked
+  the build. A sound column-wise coverage check (`tuple_cases_cover`) now
+  proves these exhaustive; it stays conservative (any arm shape it can't model
+  bails to "not covered"), so non-exhaustive tuple matches — a variant left
+  out, or a scalar column with no capture — still fire. `infer_expr_readonly`
+  also learned to type a tuple subject so the exhaustiveness pass can see it.
+
 ### Fixed — `**kwargs` preserves call order (`tyc-vm`)
 
 - The VM collected a `**kwargs` parameter into a `HashMap`, so the resulting

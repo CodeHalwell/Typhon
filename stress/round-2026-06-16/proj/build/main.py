@@ -1,66 +1,30 @@
 from __future__ import annotations
-import dataclasses
-
-type JsonValue = JsonNull | JsonBool | JsonNum | JsonStr | JsonArr | JsonObj
+from typing import Iterator
 
 
-@dataclasses.dataclass(slots=True, frozen=True)
-class JsonNull:
-    pass
+def chunks[T](items: list[T], size: int) -> Iterator[list[T]]:
+    i: int = 0
+    while i < len(items):
+        yield items[i : i + size]
+        i = i + size
 
 
-@dataclasses.dataclass(slots=True, frozen=True)
-class JsonBool:
-    value: bool
-
-
-@dataclasses.dataclass(slots=True, frozen=True)
-class JsonNum:
-    value: float
-
-
-@dataclasses.dataclass(slots=True, frozen=True)
-class JsonStr:
-    value: str
-
-
-@dataclasses.dataclass(slots=True, frozen=True)
-class JsonArr:
-    items: list[JsonValue]
-
-
-@dataclasses.dataclass(slots=True, frozen=True)
-class JsonObj:
-    fields: list[tuple[str, JsonValue]]
-
-
-def render(v: JsonValue) -> str:
-    match v:
-        case JsonNull():
-            return "null"
-        case JsonBool(value=b):
-            return "true" if b else "false"
-        case JsonNum(value=n):
-            return str(n)
-        case JsonStr(value=s):
-            return f'"{s}"'
-        case JsonArr(items=items):
-            return "[" + ", ".join([render(it) for it in items]) + "]"
-        case JsonObj(fields=fields):
-            parts: list[str] = [f'"{k}": {render(val)}' for (k, val) in fields]
-            return "{" + ", ".join(parts) + "}"
+def take[T](it: Iterator[T], n: int) -> list[T]:
+    result: list[T] = []
+    count: int = 0
+    for x in it:
+        if count >= n:
+            break
+        result.append(x)
+        count = count + 1
+    return result
 
 
 def main() -> None:
-    doc: JsonValue = JsonObj(
-        fields=[
-            ("name", JsonStr(value="Alice")),
-            ("age", JsonNum(value=30.0)),
-            ("active", JsonBool(value=True)),
-            ("tags", JsonArr(items=[JsonStr(value="a"), JsonStr(value="b")])),
-        ]
-    )
-    print(render(doc))
+    data: list[int] = [1, 2, 3, 4, 5, 6, 7]
+    for chunk in chunks(data, 3):
+        print(chunk)
+    print(take(chunks(data, 2), 2))
 
 
 if __name__ == "__main__":

@@ -7643,6 +7643,13 @@ fn infer_expr_readonly(c: &Checker, e: &Expr) -> Type {
                 _ => Type::Unknown,
             }
         }
+        // A tuple subject `match (state, event):` infers to
+        // `tuple[T0, T1, …]` from its elements, so the exhaustiveness pass
+        // can reason about product coverage (`tuple_cases_cover`).
+        Expr::Tuple(t) => Type::Generic(
+            "tuple".into(),
+            t.elts.iter().map(|e| infer_expr_readonly(c, e)).collect(),
+        ),
         _ => Type::Unknown,
     }
 }
@@ -10355,6 +10362,14 @@ fn cases_cover_type(c: &Checker, cases: &[MatchCase], ty: &Type) -> bool {
                     }
                 }
             }
+            // Cross-arm product coverage: `match (cmd, count):` over a
+            // `tuple[Cmd, int]` where each `Cmd` variant is paired with a
+            // capture/wildcard for `count` is exhaustive even though no
+            // single arm is a catch-all. Sound column-wise check (returns
+            // false whenever it can't prove totality).
+            if tuple_cases_cover(c, cases, elems) {
+                return true;
+            }
         }
     }
     // `bool` has exactly two inhabitants: matching both `True` and `False`
@@ -10540,6 +10555,116 @@ fn sequence_cases_cover_all_lengths(cases: &[MatchCase]) -> bool {
 ///   sub-pattern `p_i` is itself a wildcard.
 /// - `case [*xs]:` for `class_name == "list"` / `"tuple"`.
 /// - `case <wild1> | <wild2> | ...:` where any branch matches.
+/// Sound cross-arm exhaustiveness for a `match` over a fixed-arity tuple
+/// subject (`tuple[T0, …, Tn-1]`). Recognises the idiomatic state-machine
+/// dispatch `match (state, event):` where each sealed-union variant in one
+/// column is paired with a capture/wildcard (or full coverage) in the others
+/// — exhaustive even though no single arm is a catch-all.
+///
+/// Conservative: only guardless arms that are bare arity-N tuple patterns
+/// (no `*star`) participate; any other guardless arm shape makes the whole
+/// check bail to `false`, so it can only ever *add* proven coverage.
+fn tuple_cases_cover(c: &Checker, cases: &[MatchCase], elems: &[Type]) -> bool {
+    let arity = elems.len();
+    let mut rows: Vec<Vec<&Pattern>> = Vec::new();
+    for case in cases {
+        if case.guard.is_some() {
+            continue;
+        }
+        // Unwrap a trailing `as` binding: `case (a, b) as whole:`.
+        let mut pat = &case.pattern;
+        while let Pattern::MatchAs(a) = pat {
+            match &a.pattern {
+                Some(inner) => pat = inner,
+                None => return false, // bare capture = wildcard, handled by caller
+            }
+        }
+        let Pattern::MatchSequence(seq) = pat else {
+            return false;
+        };
+        if seq.patterns.len() != arity
+            || seq
+                .patterns
+                .iter()
+                .any(|p| matches!(p, Pattern::MatchStar(_)))
+        {
+            return false;
+        }
+        rows.push(seq.patterns.iter().collect());
+    }
+    !rows.is_empty() && cover_pattern_columns(c, &rows, elems)
+}
+
+/// Recursive column-wise coverage check used by [`tuple_cases_cover`]. Each
+/// row is the list of remaining column sub-patterns; `types` is the matching
+/// list of column types. A column is covered when, for every "head
+/// constructor" the column type can take, the rows that match that head
+/// cover the remaining columns.
+fn cover_pattern_columns(c: &Checker, rows: &[Vec<&Pattern>], types: &[Type]) -> bool {
+    // All columns consumed: this constructor-path is covered iff some arm
+    // reached here (every one of its columns matched the chosen path).
+    if types.is_empty() {
+        return !rows.is_empty();
+    }
+    let col_ty = c.unwrap_alias(&types[0]);
+    let rest = &types[1..];
+    // A row's leading subpattern is irrefutable for this column (covers it
+    // whatever the head): a bare capture / wildcard.
+    let irrefutable = |p: &Pattern| is_capture_or_underscore(p);
+    // Specialise: keep rows whose leading subpattern is irrefutable OR
+    // matches `keep`, dropping the leading column.
+    let specialise = |keep: &dyn Fn(&Pattern) -> bool| -> Vec<Vec<&Pattern>> {
+        rows.iter()
+            .filter(|row| irrefutable(row[0]) || keep(row[0]))
+            .map(|row| row[1..].to_vec())
+            .collect()
+    };
+
+    // Sealed-union column: every variant must be covered.
+    let union_variants: Option<Vec<String>> = match &col_ty {
+        Type::Class(name) => c.sealed_unions.get(name.as_str()).cloned(),
+        Type::Union(vs) => {
+            let names: Vec<String> = vs
+                .iter()
+                .filter_map(|v| match v {
+                    Type::Class(n) => Some(n.clone()),
+                    _ => None,
+                })
+                .collect();
+            if names.len() == vs.len() && !names.is_empty() {
+                Some(names)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    };
+    if let Some(variants) = union_variants {
+        return variants.iter().all(|v| {
+            let sub = specialise(&|p: &Pattern| pattern_covers_class(c, p, v));
+            cover_pattern_columns(c, &sub, rest)
+        });
+    }
+
+    // `bool` column: cover both True and False.
+    if matches!(col_ty, Type::Bool) {
+        return [true, false].iter().all(|&want| {
+            let sub = specialise(&|p: &Pattern| pattern_bool_value(p) == Some(want));
+            cover_pattern_columns(c, &sub, rest)
+        });
+    }
+
+    // Any other column type (int, str, an open class, …) has unbounded /
+    // unmodelled inhabitants: the only way to cover it totally is an
+    // irrefutable leading subpattern. Keep just those rows and recurse.
+    let sub: Vec<Vec<&Pattern>> = rows
+        .iter()
+        .filter(|row| irrefutable(row[0]))
+        .map(|row| row[1..].to_vec())
+        .collect();
+    cover_pattern_columns(c, &sub, rest)
+}
+
 fn pattern_covers_class(c: &Checker, pattern: &Pattern, class_name: &str) -> bool {
     match pattern {
         Pattern::MatchAs(a) => match &a.pattern {
@@ -16697,6 +16822,62 @@ def area(s: Shape) -> str:
                 .iter()
                 .any(|e| matches!(e, TycError::MissingReturn { .. })),
             "a refutable nested value pattern must still fire missing_return: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn tuple_of_union_and_capture_is_exhaustive() {
+        // `match (cmd, count):` — each Cmd variant paired with a capture/`_`
+        // for the int column is exhaustive (state-machine dispatch).
+        let src = "\
+class Move:
+    dx: int
+class Stop:
+    pass
+type Cmd = Move | Stop
+def f(cmd: Cmd, count: int) -> str:
+    match (cmd, count):
+        case (Move(dx=x), 0):
+            return \"first\"
+        case (Move(dx=x), n):
+            return \"move\"
+        case (Stop(), _):
+            return \"stop\"
+";
+        let d = check(src);
+        assert!(
+            !d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::MissingReturn { .. })),
+            "exhaustive tuple-of-union match must not fire missing_return: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn tuple_match_missing_count_capture_fires() {
+        // `Move` is only paired with the literal `0` — count != 0 falls
+        // through, so missing_return must still fire.
+        let src = "\
+class Move:
+    dx: int
+class Stop:
+    pass
+type Cmd = Move | Stop
+def f(cmd: Cmd, count: int) -> str:
+    match (cmd, count):
+        case (Move(dx=x), 0):
+            return \"m0\"
+        case (Stop(), _):
+            return \"stop\"
+";
+        let d = check(src);
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::MissingReturn { .. })),
+            "tuple match that leaves an int column gap must fire missing_return: {:?}",
             d.errors()
         );
     }

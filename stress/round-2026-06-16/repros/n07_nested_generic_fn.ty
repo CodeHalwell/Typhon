@@ -1,0 +1,21 @@
+from typing import Callable
+
+def memoize[K, V](f: Callable[[K], V]) -> Callable[[K], V]:
+    mut cache: dict[K, V] = {}
+    def wrapper(key: K) -> V:
+        if key not in cache:
+            cache[key] = f(key)
+        return cache[key]
+    return wrapper
+
+def slow_square(n: int) -> int:
+    return n * n
+
+def main() -> None:
+    let fast: Callable[[int], int] = memoize(slow_square)
+    print(fast(5))
+    print(fast(5))
+    print(fast(7))
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,22 @@
+class Money frozen:
+    cents: int
+
+impl Money:
+    def __add__(self, other: Money) -> Money:
+        return Money(cents=self.cents + other.cents)
+    def __mul__(self, factor: int) -> Money:
+        return Money(cents=self.cents * factor)
+    def __rmul__(self, factor: int) -> Money:
+        return Money(cents=self.cents * factor)
+    def __repr__(self) -> str:
+        return f"${self.cents / 100}"
+
+def main() -> None:
+    let a: Money = Money(cents=500)
+    let b: Money = Money(cents=250)
+    print(a + b)
+    print(a * 3)
+    print(3 * a)
+
+if __name__ == "__main__":
+    main()

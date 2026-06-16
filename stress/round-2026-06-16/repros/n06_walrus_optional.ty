@@ -1,0 +1,20 @@
+def parse_lines(lines: list[str]) -> list[int]:
+    mut result: list[int] = []
+    for line in lines:
+        let stripped: str = line.strip()
+        if stripped == "":
+            continue
+        if (parsed := try_parse(stripped)) is not None:
+            result.append(parsed)
+    return result
+
+def try_parse(s: str) -> int?:
+    if s.lstrip("-").isdigit():
+        return int(s)
+    return None
+
+def main() -> None:
+    print(parse_lines(["1", "  ", "2", "abc", "-3", ""]))
+
+if __name__ == "__main__":
+    main()
