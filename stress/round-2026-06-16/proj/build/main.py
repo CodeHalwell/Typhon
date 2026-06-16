@@ -1,36 +1,23 @@
 from __future__ import annotations
-import dataclasses
 
 
-@dataclasses.dataclass(slots=True)
-class TreeNode:
-    value: int
-    children: list[TreeNode]
+def invert(d: dict[str, int]) -> dict[int, str]:
+    return {v: k for (k, v) in d.items()}
 
-    def total(self) -> int:
-        sum: int = self.value
-        for child in self.children:
-            sum = sum + child.total()
-        return sum
 
-    def depth(self) -> int:
-        if len(self.children) == 0:
-            return 1
-        max_child: int = 0
-        for child in self.children:
-            d: int = child.depth()
-            if d > max_child:
-                max_child = d
-        return 1 + max_child
+def group_lengths(words: list[str]) -> dict[int, list[str]]:
+    groups: dict[int, list[str]] = {}
+    for w in words:
+        n: int = len(w)
+        if n not in groups:
+            groups[n] = []
+        groups[n].append(w)
+    return groups
 
 
 def main() -> None:
-    leaf1: TreeNode = TreeNode(value=1, children=[])
-    leaf2: TreeNode = TreeNode(value=2, children=[])
-    mid: TreeNode = TreeNode(value=3, children=[leaf1, leaf2])
-    root: TreeNode = TreeNode(value=4, children=[mid])
-    print(root.total())
-    print(root.depth())
+    print(invert({"a": 1, "b": 2, "c": 3}))
+    print(group_lengths(["cat", "dog", "fish", "ox", "bird"]))
 
 
 if __name__ == "__main__":

@@ -1,0 +1,25 @@
+class Matrix2:
+    data: list[list[float]]
+
+impl Matrix2:
+    def __add__(self, other: Matrix2) -> Matrix2:
+        mut result: list[list[float]] = []
+        for i in range(len(self.data)):
+            mut row: list[float] = []
+            for j in range(len(self.data[i])):
+                row.append(self.data[i][j] + other.data[i][j])
+            result.append(row)
+        return Matrix2(data=result)
+    def scale(self, k: float) -> Matrix2:
+        return Matrix2(data=[[x * k for x in row] for row in self.data])
+
+def main() -> None:
+    let a: Matrix2 = Matrix2(data=[[1.0, 2.0], [3.0, 4.0]])
+    let b: Matrix2 = Matrix2(data=[[10.0, 20.0], [30.0, 40.0]])
+    let c: Matrix2 = a + b
+    print(c.data)
+    let scaled: Matrix2 = a.scale(2.0)
+    print(scaled.data)
+
+if __name__ == "__main__":
+    main()

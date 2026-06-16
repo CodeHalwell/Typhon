@@ -1,0 +1,23 @@
+enum State:
+    IDLE
+    RUNNING
+    DONE
+
+def can_start(s: State?) -> bool:
+    if s is None:
+        return False
+    match s:
+        case State.IDLE:
+            return True
+        case State.RUNNING:
+            return False
+        case State.DONE:
+            return False
+
+def main() -> None:
+    print(can_start(State.IDLE))
+    print(can_start(State.RUNNING))
+    print(can_start(None))
+
+if __name__ == "__main__":
+    main()

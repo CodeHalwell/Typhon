@@ -2072,6 +2072,12 @@ struct TypeBinding {
 struct TypeEnv {
     /// `scopes[i].get(name)` → binding.
     scopes: Vec<HashMap<String, TypeBinding>>,
+    /// Flow-sensitive narrowings keyed by attribute access path
+    /// (`"self.value"`, `"b.value"`). Lets `if self.x is None: return …`
+    /// narrow `self.x` to non-`None` for the rest of the block. Cleared
+    /// when the path is reassigned and snapshot/restored around branches
+    /// (it lives in `TypeEnv`, so the whole-env clone covers it).
+    attr_narrowings: HashMap<String, Type>,
 }
 
 impl TypeEnv {
@@ -2103,11 +2109,28 @@ impl TypeEnv {
             }
         }
     }
-    fn snapshot(&self) -> Vec<HashMap<String, TypeBinding>> {
-        self.scopes.clone()
+    fn snapshot(&self) -> TypeEnv {
+        self.clone()
     }
-    fn restore(&mut self, snap: Vec<HashMap<String, TypeBinding>>) {
-        self.scopes = snap;
+    fn restore(&mut self, snap: TypeEnv) {
+        *self = snap;
+    }
+    /// Narrow an attribute access path (`"self.value"`) to `ty`.
+    fn narrow_attr(&mut self, path: String, ty: Type) {
+        self.attr_narrowings.insert(path, ty);
+    }
+    /// The current narrowed type for an attribute path, if any.
+    fn attr_narrowed(&self, path: &str) -> Option<&Type> {
+        self.attr_narrowings.get(path)
+    }
+    /// Drop the narrowing for `path` (e.g. when it's reassigned).
+    fn clear_attr_narrowing(&mut self, path: &str) {
+        self.attr_narrowings.remove(path);
+    }
+    /// Drop every attribute narrowing (e.g. on entering a new function body,
+    /// where a different `self` is in scope).
+    fn clear_all_attr_narrowings(&mut self) {
+        self.attr_narrowings.clear();
     }
 }
 
@@ -7528,6 +7551,11 @@ fn infer_expr_readonly(c: &Checker, e: &Expr) -> Type {
             .map(|b| b.narrowed.clone())
             .unwrap_or(Type::Unknown),
         Expr::Attribute(a) => {
+            if let Some(path) = attr_path_of(e) {
+                if let Some(narrowed) = c.env.attr_narrowed(&path) {
+                    return narrowed.clone();
+                }
+            }
             let recv = infer_expr_readonly(c, &a.value);
             match &recv {
                 Type::Class(class_name) | Type::Generic(class_name, _) => {
@@ -8198,6 +8226,12 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                         }
                     } else {
                         audit_clear_binding(c, n.id.as_str());
+                    }
+                } else if let Expr::Attribute(_) = target {
+                    // Reassigning `self.x = …` invalidates any flow narrowing
+                    // on that path (it may now hold a different value).
+                    if let Some(path) = attr_path_of(target) {
+                        c.env.clear_attr_narrowing(&path);
                     }
                 }
             }
@@ -9047,6 +9081,9 @@ fn check_function(
         .cloned()
         .unwrap_or_default();
     c.env.enter();
+    // Attribute narrowings (`self.x` non-null) belong to the enclosing
+    // function body — a different `self` is in scope here, so start clean.
+    let saved_attr_narrowings = std::mem::take(&mut c.env.attr_narrowings);
 
     // Declare parameters with their annotation types. Type parameters resolve
     // to `Any` until a real inference engine lands. Inside a class body, an
@@ -9170,6 +9207,7 @@ fn check_function(
     }
 
     c.env.leave();
+    c.env.attr_narrowings = saved_attr_narrowings;
     c.current_return = saved_return;
     c.unsafe_origin_bindings = saved_unsafe_origins;
     c.active_typevar_bounds = saved_bounds;
@@ -10922,12 +10960,30 @@ fn check_elif_else_clauses(c: &mut Checker, clauses: &[ruff_python_ast::ElifElse
     }
 }
 
-/// A narrowing instruction: replace the narrowed type of `name` with
+/// A narrowing instruction: replace the narrowed type of a binding with
 /// `replacement` (subject to it being compatible with the declared type).
+/// When `attr_path` is `Some`, the target is an attribute access path
+/// (`"self.value"`) rather than the simple name in `name`.
 #[derive(Debug, Clone)]
 struct Narrowing {
     name: String,
+    attr_path: Option<String>,
     replacement: Type,
+}
+
+/// Canonical dotted path for an attribute-access expression whose base is a
+/// chain of simple names (`self.value` → `"self.value"`,
+/// `cfg.db.host` → `"cfg.db.host"`). Returns `None` for any other shape
+/// (subscripts, calls, …), which are not narrowed.
+fn attr_path_of(e: &Expr) -> Option<String> {
+    match e {
+        Expr::Name(n) => Some(n.id.as_str().to_owned()),
+        Expr::Attribute(a) => {
+            let base = attr_path_of(&a.value)?;
+            Some(format!("{base}.{}", a.attr.as_str()))
+        }
+        _ => None,
+    }
 }
 
 /// Collect narrowings implied by `test`. If `negate` is true, invert the
@@ -10946,18 +11002,20 @@ fn collect_narrowings_inner(c: &Checker, test: &Expr, negate: bool, out: &mut Ve
                 let is_op = matches!(cmp.ops[0], ruff_python_ast::CmpOp::Is);
                 let is_not_op = matches!(cmp.ops[0], ruff_python_ast::CmpOp::IsNot);
                 if is_op || is_not_op {
+                    let want_none = {
+                        let positive_match = is_op; // is None
+                        if negate {
+                            !positive_match
+                        } else {
+                            positive_match
+                        }
+                    };
                     if let (Expr::Name(n), Expr::NoneLiteral(_)) =
                         (cmp.left.as_ref(), &cmp.comparators[0])
                     {
                         if let Some(b) = c.env.lookup(n.id.as_str()) {
                             // x is None  → name becomes None
                             // x is not None → name becomes declared without None
-                            let positive_match = is_op; // is None
-                            let want_none = if negate {
-                                !positive_match
-                            } else {
-                                positive_match
-                            };
                             let replacement = if want_none {
                                 Type::None
                             } else {
@@ -10965,8 +11023,38 @@ fn collect_narrowings_inner(c: &Checker, test: &Expr, negate: bool, out: &mut Ve
                             };
                             out.push(Narrowing {
                                 name: n.id.as_str().to_owned(),
+                                attr_path: None,
                                 replacement,
                             });
+                        }
+                    } else if let (Expr::Attribute(_), Expr::NoneLiteral(_)) =
+                        (cmp.left.as_ref(), &cmp.comparators[0])
+                    {
+                        // `self.value is None` / `b.field is not None` — narrow
+                        // the attribute access path.
+                        if let Some(path) = attr_path_of(cmp.left.as_ref()) {
+                            let current = c
+                                .env
+                                .attr_narrowed(&path)
+                                .cloned()
+                                .unwrap_or_else(|| infer_expr_readonly(c, cmp.left.as_ref()));
+                            // Only narrow when the attribute is actually
+                            // nullable; otherwise leave it alone.
+                            if matches!(&current, Type::Union(_))
+                                || matches!(&current, Type::None)
+                                || current.strip_none() != current
+                            {
+                                let replacement = if want_none {
+                                    Type::None
+                                } else {
+                                    current.strip_none()
+                                };
+                                out.push(Narrowing {
+                                    name: String::new(),
+                                    attr_path: Some(path),
+                                    replacement,
+                                });
+                            }
                         }
                     }
                 }
@@ -10995,6 +11083,7 @@ fn collect_narrowings_inner(c: &Checker, test: &Expr, negate: bool, out: &mut Ve
                             };
                             out.push(Narrowing {
                                 name: target.id.as_str().to_owned(),
+                                attr_path: None,
                                 replacement,
                             });
                         }
@@ -11042,6 +11131,7 @@ fn collect_narrowings_inner(c: &Checker, test: &Expr, negate: bool, out: &mut Ve
                     if b.narrowed.is_nullable() {
                         out.push(Narrowing {
                             name: n.id.as_str().to_owned(),
+                            attr_path: None,
                             replacement: b.narrowed.strip_none(),
                         });
                     }
@@ -11734,7 +11824,10 @@ fn strip_variant(typ: &Type, variant: &Type) -> Type {
 
 fn apply_narrowings(c: &mut Checker, ns: &[Narrowing]) {
     for n in ns {
-        c.env.narrow(&n.name, n.replacement.clone());
+        match &n.attr_path {
+            Some(path) => c.env.narrow_attr(path.clone(), n.replacement.clone()),
+            None => c.env.narrow(&n.name, n.replacement.clone()),
+        }
     }
 }
 
@@ -13143,6 +13236,13 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
             }
         }
         Expr::Attribute(a) => {
+            // Flow-sensitive attribute narrowing: `if self.x is None: return …`
+            // narrows `self.x` to non-`None` for the rest of the block.
+            if let Some(path) = attr_path_of(expr) {
+                if let Some(narrowed) = c.env.attr_narrowed(&path) {
+                    return narrowed.clone();
+                }
+            }
             let recv = infer_expr(c, &a.value);
             if recv.is_nullable() {
                 if let Expr::Name(n) = a.value.as_ref() {
@@ -16777,6 +16877,61 @@ def f(p: tuple[int, int]) -> str:
             "irrefutable tuple pattern must be exhaustive: {:?}",
             d.errors()
         );
+    }
+
+    #[test]
+    fn attribute_narrowing_after_none_guard() {
+        // `if self.value is None: return …` narrows `self.value` to non-None
+        // for the rest of the method — no operator/nullable diagnostic.
+        let src = "\
+class Box:
+    value: str?
+impl Box:
+    def length(self) -> int:
+        if self.value is None:
+            return 0
+        return len(self.value)
+";
+        let d = check(src);
+        assert!(
+            d.errors().is_empty(),
+            "attribute narrowing after a None guard should clear diagnostics: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn attribute_narrowing_not_leaked_or_unsound() {
+        // Un-narrowed `self.value` (str?) passed to len() must still fire,
+        // and the narrowing must not escape a non-diverging `if`.
+        for src in [
+            "\
+class Box:
+    value: str?
+impl Box:
+    def bad(self) -> int:
+        return len(self.value)
+",
+            "\
+class Box:
+    value: str?
+impl Box:
+    def leak(self) -> int:
+        if self.value is not None:
+            pass
+        return len(self.value)
+",
+        ] {
+            let d = check(src);
+            assert!(
+                d.errors().iter().any(|e| matches!(
+                    e,
+                    TycError::OperatorTypeMismatch { .. } | TycError::NullableUse { .. }
+                )),
+                "un-narrowed / leaked attribute use must fire: {:?}",
+                d.errors()
+            );
+        }
     }
 
     #[test]

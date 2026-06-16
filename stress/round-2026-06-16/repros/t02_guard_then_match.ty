@@ -1,0 +1,27 @@
+type Result2 = Pass | Fail
+class Pass frozen:
+    score: int
+class Fail frozen:
+    reason: str
+
+def report(r: Result2?, verbose: bool) -> str:
+    guard res = r else: return "no result"
+    if not verbose:
+        match res:
+            case Pass(score=s):
+                return f"pass {s}"
+            case Fail(reason=_):
+                return "fail"
+    match res:
+        case Pass(score=s):
+            return f"PASSED with {s}"
+        case Fail(reason=r2):
+            return f"FAILED: {r2}"
+
+def main() -> None:
+    print(report(Pass(score=95), False))
+    print(report(Fail(reason="timeout"), True))
+    print(report(None, True))
+
+if __name__ == "__main__":
+    main()

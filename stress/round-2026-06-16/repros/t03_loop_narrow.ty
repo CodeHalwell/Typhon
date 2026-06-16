@@ -1,0 +1,20 @@
+def first_valid(items: list[int?]) -> int:
+    for item in items:
+        if item is not None:
+            return item
+    return -1
+
+def sum_valid(items: list[int?]) -> int:
+    mut total: int = 0
+    for item in items:
+        if item is None:
+            continue
+        total = total + item
+    return total
+
+def main() -> None:
+    print(first_valid([None, None, 5, 3]))
+    print(sum_valid([1, None, 2, None, 3]))
+
+if __name__ == "__main__":
+    main()

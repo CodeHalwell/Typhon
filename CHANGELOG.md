@@ -34,6 +34,20 @@ output (`tyc build` → CPython 3.13) is now correct on the entire corpus.
   non-star elements now contributes its `≥ len-1` length coverage; a genuine
   gap (e.g. `[]` + `[a, *m, b]` leaving length 1) still fires.
 
+### Added — flow-sensitive attribute narrowing
+
+- **`if self.value is None: return …` now narrows `self.value` to non-`None`
+  for the rest of the block** (and the `is not None` / `if/return` forms),
+  matching how local variables already narrow. Previously every optional
+  *attribute* access stayed `T?`, so the ubiquitous "check an optional field,
+  then use it" pattern false-fired `tyc::nullable_use` /
+  `operator_type_mismatch` / `type_mismatch` and blocked the build — even
+  though both mypy and pyright accept it. Narrowing is keyed by access path
+  (`self.value`, `cfg.db.host`), snapshot/restored around branches (so it
+  never leaks past a non-diverging `if`), invalidated when the path is
+  reassigned, and reset at each function boundary. An un-narrowed nullable
+  attribute still fires.
+
 ### Fixed — `match` on a narrowed nullable subject is recognised exhaustive
 
 - **`match s:` after `if s is None: return …` no longer false-fires
