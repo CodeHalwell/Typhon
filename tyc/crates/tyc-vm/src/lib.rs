@@ -592,6 +592,46 @@ main()
     }
 
     #[test]
+    fn fieldless_exception_rejects_kwargs() {
+        // `BaseException` takes no keyword arguments, so a field-less
+        // exception constructed with a keyword raises TypeError.
+        let src = r#"
+class FooError(Exception):
+    pass
+
+def main() -> None:
+    mut caught: bool = False
+    try:
+        raise FooError(message="boom")
+    except TypeError:
+        caught = True
+    assert caught
+    print("ok")
+
+main()
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    #[test]
+    fn format_rejects_non_string_spec() {
+        // `format(obj, 123)` — a non-`str` format spec raises TypeError.
+        let src = r#"
+def main() -> None:
+    mut caught: bool = False
+    try:
+        let s: str = format(42, 8)
+    except TypeError:
+        caught = True
+    assert caught
+    print("ok")
+
+main()
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    #[test]
     fn abc_module_shim() {
         // `from abc import ABC, abstractmethod` + an ABC subclass works in
         // the VM (ABC base is a no-op, abstractmethod is identity).

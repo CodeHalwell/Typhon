@@ -2593,6 +2593,14 @@ impl Interpreter {
             && class.fields.is_empty()
             && self.find_method(class, "__init__").is_none()
         {
+            // `BaseException.__init__` takes only positional args — CPython
+            // raises `TypeError` for keyword arguments.
+            if !kwargs.is_empty() {
+                return Err(type_error(format!(
+                    "{}() takes no keyword arguments",
+                    class.name
+                )));
+            }
             let instance = Rc::new(Instance {
                 class: class.clone(),
                 fields: RefCell::new(HashMap::new()),

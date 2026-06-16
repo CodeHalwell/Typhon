@@ -362,7 +362,18 @@ pub fn install(interp: &mut Interpreter) {
         let v = args
             .first()
             .ok_or_else(|| type_error("format expected at least 1 argument"))?;
-        let spec = args.get(1).map(|s| s.py_str()).unwrap_or_default();
+        // The format spec must be a `str` — CPython rejects a non-string spec
+        // (`format(obj, 123)`) with `TypeError` before calling `__format__`.
+        let spec = match args.get(1) {
+            None => String::new(),
+            Some(Value::Str(s)) => (**s).clone(),
+            Some(other) => {
+                return Err(type_error(format!(
+                    "format() argument 2 must be str, not {}",
+                    other.type_name()
+                )))
+            }
+        };
         // A user `__format__(self, spec)` controls its own formatting.
         if let Some(formatted) = interp.try_user_format(v, &spec)? {
             return Ok(Value::Str(Rc::new(formatted)));

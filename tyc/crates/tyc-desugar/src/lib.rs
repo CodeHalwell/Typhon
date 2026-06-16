@@ -1717,7 +1717,15 @@ fn desugar_mod_module_with(m: &ModModule, options: &DesugarOptions) -> ModModule
     // as multi-base parents so the dataclass decorator drops `slots=True`.
     let mut multi_base_parents = multi_base_parents;
     collect_cached_property_targets_into(&m.body, &mut multi_base_parents);
-    let exception_class_names = collect_exception_class_names(&m.body);
+    // Module-level classes and the transitive exception subset among them.
+    let mut module_level_classes: Vec<(String, Vec<String>)> = Vec::new();
+    collect_class_bases_into(&m.body, &mut module_level_classes);
+    let module_class_names: std::collections::HashSet<String> = module_level_classes
+        .iter()
+        .map(|(n, _)| n.clone())
+        .collect();
+    let exception_class_names =
+        exception_class_names_from(&module_level_classes, &module_class_names);
     let markers = ClassMarkers {
         raw_starts: &options.raw_class_line_starts,
         frozen_starts: &options.frozen_class_line_starts,
@@ -1726,6 +1734,7 @@ fn desugar_mod_module_with(m: &ModModule, options: &DesugarOptions) -> ModModule
         skip_decoration_bases: &options.skip_decoration_bases,
         model_extra: &options.model_extra,
         exception_class_names: &exception_class_names,
+        module_class_names: &module_class_names,
     };
     let (new_body, transformed_classes) = desugar_stmts(&m.body, markers);
 
@@ -1983,10 +1992,14 @@ struct ClassMarkers<'a> {
     /// classes. Sourced from `[emit] model-extra` in `typhon.toml` via
     /// [`DesugarOptions::model_extra`].
     model_extra: &'a str,
-    /// Names of every class in the module that is (transitively) an exception
+    /// Names of every module-level class that is (transitively) an exception
     /// subclass — so a subclass of a non-suffix-named user exception base
     /// (`class Timeout(Failure)` where `Failure(Exception)`) is recognised.
     exception_class_names: &'a std::collections::HashSet<String>,
+    /// Names of every module-level class. Used to tell an *external*
+    /// (builtin/imported) exception base apart from a `*Error`-named module
+    /// dataclass when classifying a class as an exception per-class.
+    module_class_names: &'a std::collections::HashSet<String>,
 }
 
 impl ClassMarkers<'_> {
@@ -2073,10 +2086,18 @@ fn desugar_stmt(stmt: &Stmt, markers: ClassMarkers<'_>) -> (Stmt, bool) {
             // would shadow `BaseException.__init__` and break
             // `raise FooError("msg")`). They lower like `class!`: no
             // decorator, plus a `super().__init__(...)` constructor when the
-            // body has fields. The module-level set is the single source of
-            // truth — it carries transitive exception-ness through user bases
-            // while excluding `*Error`-named *dataclass* bases.
-            let is_exception_subclass = markers.exception_class_names.contains(c.name.as_str());
+            // body has fields. A class is an exception when it has an
+            // *external* (builtin/imported) exception base — works in any
+            // scope including nested classes — OR is a module-level class
+            // transitively rooted in one. A `*Error`-named module *dataclass*
+            // base is NOT external, so it doesn't taint its subclasses.
+            let has_external_exception_base = c.bases().iter().any(|b| {
+                base_last_segment(b).is_some_and(|seg| {
+                    !markers.module_class_names.contains(seg) && name_is_exception_base(seg)
+                })
+            });
+            let is_exception_subclass = has_external_exception_base
+                || markers.exception_class_names.contains(c.name.as_str());
             // Multi-inheritance with concrete bases conflicts with
             // `slots=True`; emit the decorator without `slots=True` in
             // that case. FINDINGS #102. Also drop `slots=True` for any
@@ -2772,16 +2793,15 @@ fn name_is_exception_base(name: &str) -> bool {
 /// dataclass, so `class Detailed(LexError):` stays a dataclass too. But
 /// `class Failure(Exception): pass` then `class Timeout(Failure): pass` both
 /// qualify, since `Failure` is rooted in the builtin `Exception`.
-fn collect_exception_class_names(body: &[Stmt]) -> std::collections::HashSet<String> {
-    let mut classes: Vec<(String, Vec<String>)> = Vec::new();
-    collect_class_bases_into(body, &mut classes);
-    let module_classes: std::collections::HashSet<&str> =
-        classes.iter().map(|(n, _)| n.as_str()).collect();
+fn exception_class_names_from(
+    classes: &[(String, Vec<String>)],
+    module_classes: &std::collections::HashSet<String>,
+) -> std::collections::HashSet<String> {
     let mut exc: std::collections::HashSet<String> = std::collections::HashSet::new();
     // Seed only from external exception bases — a `*Error`-named *module*
     // class is left to the fixpoint (it qualifies only if rooted in a builtin
     // exception), so a plain `*Error` dataclass base doesn't taint subclasses.
-    for (name, bases) in &classes {
+    for (name, bases) in classes {
         if bases
             .iter()
             .any(|b| !module_classes.contains(b.as_str()) && name_is_exception_base(b))
@@ -2791,7 +2811,7 @@ fn collect_exception_class_names(body: &[Stmt]) -> std::collections::HashSet<Str
     }
     loop {
         let mut changed = false;
-        for (name, bases) in &classes {
+        for (name, bases) in classes {
             if !exc.contains(name) && bases.iter().any(|b| exc.contains(b)) {
                 exc.insert(name.clone());
                 changed = true;
@@ -2804,8 +2824,14 @@ fn collect_exception_class_names(body: &[Stmt]) -> std::collections::HashSet<Str
     exc
 }
 
-/// Collect `(class name, base trailing segments)` for every class def in
-/// `body`, recursing into nested scopes, for `collect_exception_class_names`.
+/// Collect `(class name, base trailing segments)` for every *module-level*
+/// class def in `body` — descending through module-level control flow
+/// (`if`/`try`/`for`/`while`/`with`) but NOT into function or nested-class
+/// bodies. Keeping the set module-scoped avoids a function-local
+/// `class Failure(Exception):` tainting an unrelated top-level
+/// `class Failure:` dataclass of the same name. Nested-scope exception
+/// classes are recognised per-class at decoration time via their *external*
+/// base (see `is_exception_subclass` in `desugar_stmts`).
 fn collect_class_bases_into(body: &[Stmt], out: &mut Vec<(String, Vec<String>)>) {
     for stmt in body {
         match stmt {
@@ -2816,9 +2842,10 @@ fn collect_class_bases_into(body: &[Stmt], out: &mut Vec<(String, Vec<String>)>)
                     .filter_map(|b| base_last_segment(b).map(|s| s.to_owned()))
                     .collect();
                 out.push((c.name.as_str().to_owned(), bases));
-                collect_class_bases_into(&c.body, out);
+                // Do NOT descend into the class body — a class nested inside a
+                // class is a different scope.
             }
-            Stmt::FunctionDef(f) => collect_class_bases_into(&f.body, out),
+            // Do NOT descend into function bodies (a different scope).
             Stmt::If(i) => {
                 collect_class_bases_into(&i.body, out);
                 for clause in &i.elif_else_clauses {
@@ -4668,6 +4695,34 @@ mod tests {
         assert!(
             out.contains("self.code = code") && out.contains("self.detail = detail"),
             "synthesised __init__ must assign fields:\n{out}"
+        );
+    }
+
+    #[test]
+    fn nested_exception_does_not_taint_toplevel_dataclass() {
+        // A function-local `class Failure(Exception):` must NOT mark a
+        // top-level `class Failure:` dataclass as an exception (different
+        // scope). The top-level one keeps `@dataclass`; the nested one is
+        // still detected as an exception via its external base.
+        let src = "\
+class Failure:
+    code: int
+
+def helper() -> None:
+    class Failure(Exception):
+        pass
+";
+        let out = parse_and_desugar(src);
+        // The top-level dataclass `Failure` keeps its decorator; the nested
+        // `Failure(Exception)` does not get one.
+        assert!(
+            out.contains("@dataclasses.dataclass"),
+            "top-level Failure dataclass must keep @dataclass:\n{out}"
+        );
+        assert_eq!(
+            out.matches("@dataclasses.dataclass").count(),
+            1,
+            "only the top-level dataclass should be decorated:\n{out}"
         );
     }
 
