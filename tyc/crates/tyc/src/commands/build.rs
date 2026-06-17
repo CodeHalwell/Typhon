@@ -1302,7 +1302,41 @@ fn secret_suffix(name: &str) -> Option<&'static str> {
         "PASSWORD", "SECRET", "TOKEN", "API_KEY", "KEY", "PWD", "PASS",
     ]
     .into_iter()
-    .find(|candidate| upper.ends_with(candidate))
+    .find(|&candidate| {
+        if upper == candidate {
+            return true;
+        }
+        if upper.ends_with(candidate) {
+            let prefix_len = upper.len() - candidate.len();
+            // False positive prevention: prevent innocuous words ending in KEY or PASS
+            // from being flagged (e.g., "MONKEY", "COMPASS").
+
+            // Determine the character immediately preceding the matched suffix.
+            // `to_ascii_uppercase()` preserves byte length, so `prefix_len`
+            // points to the exact same byte boundary in `name`.
+            if prefix_len > 0 {
+                // Determine the corresponding character in the original string.
+                // For ASCII characters, the byte length is identical.
+                let orig_prev_char = name.as_bytes().get(prefix_len - 1).copied().unwrap_or(b'_') as char;
+
+                if orig_prev_char == '_' || orig_prev_char.is_lowercase() || !orig_prev_char.is_alphabetic() {
+                    return true;
+                }
+
+                // If the suffix is short and could be a common word ending (KEY, PASS, PWD),
+                // require an underscore, camelCase boundary, or non-alphabetic char (handled above),
+                // unless it's specifically `APIKEY` or ends with `APIKEY`.
+                if *candidate == *"KEY" || *candidate == *"PASS" || *candidate == *"PWD" {
+                    if upper == "APIKEY" || upper.ends_with("APIKEY") {
+                        return true;
+                    }
+                    return false;
+                }
+                return true;
+            }
+        }
+        false
+    })
 }
 
 /// Scan `source` for `from .NAME import …` lines and return
@@ -4099,6 +4133,8 @@ let pet: Animal = Dog(name=\"Rex\")
         assert_eq!(secret_suffix("DB_PASSWORD"), Some("PASSWORD"));
         assert_eq!(secret_suffix("client_secret"), Some("SECRET"));
         assert_eq!(secret_suffix("PWD"), Some("PWD"));
+        assert_eq!(secret_suffix("APIKEY"), Some("KEY"));
+        assert_eq!(secret_suffix("API1KEY"), Some("KEY"));
     }
 
     #[test]
@@ -4106,6 +4142,8 @@ let pet: Animal = Dog(name=\"Rex\")
         assert_eq!(secret_suffix("PORT"), None);
         assert_eq!(secret_suffix("MAX_RETRIES"), None);
         assert_eq!(secret_suffix("USER"), None);
+        assert_eq!(secret_suffix("MONKEY"), None);
+        assert_eq!(secret_suffix("COMPASS"), None);
     }
 
     #[test]
