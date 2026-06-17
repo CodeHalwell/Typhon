@@ -34,3 +34,6 @@
 ## 2026-06-09 - [Target highlighting for spatial orientation]
 **Learning:** Found that jumping to an anchor link (like clicking a Table of Contents entry) abruptly changes the scroll position without indicating *which* heading was targeted. This loss of spatial orientation makes it harder for users to immediately find where they are supposed to start reading, especially when multiple headings look similar or the target heading is near the bottom of the page.
 **Action:** Added a `:target` CSS animation that briefly flashes the background and outline of the targeted heading using a faded accent color. Also added a `@media (prefers-reduced-motion: reduce)` fallback that uses a static colored left border instead of a fading animation.
+## 2024-06-21 - [Improve blockquote visual hierarchy]
+**Learning:** Standard Markdown blockquotes (`<blockquote>`) in the Starlight documentation site blended too seamlessly with regular text. They lacked sufficient visual cues (like background contrast or structural borders) to differentiate quoted text or callouts from primary paragraphs, reducing reading efficiency.
+**Action:** Applied structural styling to `.sl-markdown-content blockquote` in `custom.css` by adding a soft gray background, an accent-colored left border, and rounded right corners to create a distinct, readable container.

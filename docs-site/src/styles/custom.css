@@ -286,3 +286,12 @@ abbr[title] {
     padding-left: 0.5rem;
   }
 }
+
+/* Blockquote visual polish */
+.sl-markdown-content blockquote {
+  border-left: 4px solid var(--sl-color-accent);
+  background-color: color-mix(in srgb, var(--sl-color-gray-6) 60%, transparent);
+  padding: 0.75rem 1rem;
+  border-radius: 0 0.5rem 0.5rem 0;
+  color: var(--sl-color-gray-2);
+}
