@@ -286,3 +286,18 @@ abbr[title] {
     padding-left: 0.5rem;
   }
 }
+
+/* UX: Add hover feedback and smooth transitions to Starlight tabs */
+starlight-tabs .tab > [role="tab"] {
+  transition: color 150ms ease, border-color 150ms ease;
+}
+
+starlight-tabs .tab > [role="tab"]:not([aria-selected="true"]):hover {
+  color: var(--sl-color-white);
+  border-color: var(--sl-color-gray-4);
+}
+
+/* UX: Highlight table rows when keyboard navigating through links inside them */
+table tbody tr:focus-within {
+  background-color: color-mix(in srgb, var(--sl-color-gray-6) 60%, transparent);
+}
