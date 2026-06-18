@@ -10,3 +10,7 @@
 ## 2024-06-05 - Avoid `.to_string()` inside match hot loops
 **Learning:** Checking for string equality against static `.to_string()` allocations (e.g. `["Ok".to_string(), "Err".to_string()]`) inside frequently called functions (like `cases_cover_type`) leads to significant and avoidable heap allocations.
 **Action:** Replace `["Ok".to_string(), "Err".to_string()]` with `["Ok", "Err"]` array of static references (`&'static str`) and dereference in closures properly (e.g. `|&v| covered.contains(v)`).
+
+## 2025-02-27 - Optimize path display and to_string() overhead
+**Learning:** `std::path::Path::display().to_string()` incurs heavy `std::fmt` allocation overhead. It internally uses `to_string_lossy()` and feeds it through formatting. In the Rust workspace, this is an unnecessary penalty.
+**Action:** Prefer `path.to_string_lossy().into_owned()` or `path.to_string_lossy().as_ref()` where possible to minimize unnecessary string allocations while working with paths. Be careful, as `into_owned()` may cause a clippy warning `unnecessary_to_owned` when string slice operations apply.

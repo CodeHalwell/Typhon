@@ -992,7 +992,7 @@ assert stdlib.split_once('a=b=c', '=') == ('a', 'b=c')
 assert stdlib.group_by(['ant', 'apple', 'bee'], lambda s: s[0]) == {'a': ['ant', 'apple'], 'b': ['bee']}
 print('OK')
 ";
-    let formatted = script.replacen("%r", &format!("{:?}", build_dir.display().to_string()), 1);
+    let formatted = script.replacen("%r", &format!("{:?}", build_dir.to_string_lossy().into_owned()), 1);
     let out = Command::new(py).arg("-c").arg(&formatted).output().unwrap();
     assert!(
         out.status.success(),
@@ -1026,7 +1026,7 @@ assert unwrap(r) == 7
 assert len(called) == 1
 print('OK')
 ",
-        build_dir = build_dir.display().to_string()
+        build_dir = build_dir.to_string_lossy().into_owned()
     );
     let out = Command::new(py).arg("-c").arg(&script).output().unwrap();
     assert!(
@@ -1059,7 +1059,7 @@ assert is_err(r), r
 assert len(called) == 3, called
 print('OK')
 ",
-        build_dir = build_dir.display().to_string()
+        build_dir = build_dir.to_string_lossy().into_owned()
     );
     let out = Command::new(py).arg("-c").arg(&script).output().unwrap();
     assert!(
@@ -1124,7 +1124,7 @@ assert Err('e').or_else(lambda e: Ok(len(e))) == Ok(1), 'Err.or_else recovers'
 assert Ok(7).or_else(lambda e: Err('unused')) == Ok(7), 'Ok.or_else short-circuits'
 print('OK')
 ",
-        build_dir = build_dir.display().to_string()
+        build_dir = build_dir.to_string_lossy().into_owned()
     );
     let out = Command::new(py).arg("-c").arg(&script).output().unwrap();
     assert!(

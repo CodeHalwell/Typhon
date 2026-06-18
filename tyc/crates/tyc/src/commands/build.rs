@@ -228,7 +228,7 @@ pub fn run(args: BuildArgs) -> Result<()> {
             if let Ok(text) = std::fs::read_to_string(&file) {
                 project_shapes
                     .entry(dotted)
-                    .or_insert_with(|| extract_shapes_for_path(&file.display().to_string(), &text));
+                    .or_insert_with(|| extract_shapes_for_path(file.to_string_lossy().as_ref(), &text));
             }
         }
     }
@@ -236,7 +236,7 @@ pub fn run(args: BuildArgs) -> Result<()> {
         let dotted = crate::commands::util::path_to_dotted(path, src_root);
         project_shapes
             .entry(dotted)
-            .or_insert_with(|| extract_shapes_for_path(&path.display().to_string(), source));
+            .or_insert_with(|| extract_shapes_for_path(path.to_string_lossy().as_ref(), source));
     }
     // Aggregate `pub *` package facades into their __init__ shape so a
     // downstream `from <pkg> import X` resolves through the facade.
@@ -305,7 +305,7 @@ pub fn run(args: BuildArgs) -> Result<()> {
     for (path, source) in &sources {
         let file_diags = check_file_with_imports(
             &mut db,
-            path.display().to_string(),
+            path.to_string_lossy().into_owned(),
             source.clone(),
             &project_shapes,
         );
@@ -442,7 +442,7 @@ pub fn run(args: BuildArgs) -> Result<()> {
                 for &line_idx in &prep.pub_star_lines {
                     let offset = line_offset(&expanded, line_idx);
                     let advice = TycError::pub_star_outside_init(
-                        path.display().to_string(),
+                        path.to_string_lossy().into_owned(),
                         expanded.clone(),
                         offset,
                         5,
@@ -514,7 +514,7 @@ pub fn run(args: BuildArgs) -> Result<()> {
                                 name.clone(),
                                 prev.clone(),
                                 sibling.clone(),
-                                path.display().to_string(),
+                                path.to_string_lossy().into_owned(),
                                 expanded.clone(),
                                 marker_offset,
                                 5,
@@ -626,7 +626,7 @@ pub fn run(args: BuildArgs) -> Result<()> {
         // functions to wrap in `@functools.cache`.
         let purity_findings = analyse_purity(&module, config.strictness.auto_memoise);
         let purity_diags =
-            purity_diagnostics(&purity_findings, &path.display().to_string(), source);
+            purity_diagnostics(&purity_findings, path.to_string_lossy().as_ref(), source);
         if purity_diags.has_errors() {
             for err in purity_diags.errors() {
                 eprintln!("{:?}", miette::Report::new_boxed(Box::new(err.clone())));
@@ -698,7 +698,7 @@ pub fn run(args: BuildArgs) -> Result<()> {
                     .max(1);
                 let advice = TycError::auto_gather_missed(
                     missed.missing_callee,
-                    path.display().to_string(),
+                    path.to_string_lossy().into_owned(),
                     &prep.python_source,
                     offset,
                     length,
@@ -717,7 +717,7 @@ pub fn run(args: BuildArgs) -> Result<()> {
             // an `asyncio.TaskGroup` just like a same-module run.
             let mut eligible = collect_gatherable_async_fn_names(&module);
             let (resolved, _) = tyc_resolve::resolve_module(
-                path.display().to_string(),
+                path.to_string_lossy().into_owned(),
                 &prep.python_source,
                 &module,
             );
@@ -751,7 +751,7 @@ pub fn run(args: BuildArgs) -> Result<()> {
             // use, so the three surfaces never drift.
             for advice in tyc_analyse::gather_opportunity_diagnostics(
                 &module,
-                &path.display().to_string(),
+                path.to_string_lossy().as_ref(),
                 &prep.python_source,
             )
             .warnings()
@@ -903,7 +903,7 @@ pub fn run(args: BuildArgs) -> Result<()> {
         // trailing whitespace, final newline).  Full ruff-style reformatting
         // will replace this when the ruff vendor fork lands in Phase 3.
         if do_format {
-            let path_str = path.display().to_string();
+            let path_str = path.to_string_lossy().into_owned();
             if let Ok(result) = format_source(&python_src, &path_str) {
                 python_src = result.output;
             }
@@ -1050,7 +1050,7 @@ pub fn run(args: BuildArgs) -> Result<()> {
             if found_orphan_parent {
                 let warn = TycError::orphan_py_import(
                     snippet,
-                    path.display().to_string(),
+                    path.to_string_lossy().into_owned(),
                     source.clone(),
                     offset,
                     length,
@@ -1287,8 +1287,8 @@ fn inject_cross_module_ext_imports(
 /// to keep `would write …` lines readable.
 fn display_relative(path: &std::path::Path, project_root: &std::path::Path) -> String {
     path.strip_prefix(project_root)
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|_| path.display().to_string())
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| path.to_string_lossy().into_owned())
 }
 
 /// Return `Some(suffix)` if `name` looks like a credential identifier.
@@ -1579,7 +1579,7 @@ pub(crate) fn detect_pub_star_diagnostics(
             for &line_idx in &prep.pub_star_lines {
                 let offset = line_offset(&expanded, line_idx);
                 advice.push(tyc_diagnostics::TycError::pub_star_outside_init(
-                    path.display().to_string(),
+                    path.to_string_lossy().into_owned(),
                     expanded.clone(),
                     offset,
                     5,
@@ -1656,7 +1656,7 @@ pub(crate) fn detect_pub_star_diagnostics(
                         name.clone(),
                         prev,
                         sibling.clone(),
-                        path.display().to_string(),
+                        path.to_string_lossy().into_owned(),
                         expanded.clone(),
                         marker_offset,
                         5,
