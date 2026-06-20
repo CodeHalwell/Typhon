@@ -10,3 +10,6 @@
 ## 2024-06-05 - Avoid `.to_string()` inside match hot loops
 **Learning:** Checking for string equality against static `.to_string()` allocations (e.g. `["Ok".to_string(), "Err".to_string()]`) inside frequently called functions (like `cases_cover_type`) leads to significant and avoidable heap allocations.
 **Action:** Replace `["Ok".to_string(), "Err".to_string()]` with `["Ok", "Err"]` array of static references (`&'static str`) and dereference in closures properly (e.g. `|&v| covered.contains(v)`).
+## 2024-06-20 - Path Display Allocation in Hot Paths
+**Learning:** In the Typhon compiler, using `path.display().to_string()` incurs significant overhead from heap allocation and `std::fmt` formatting machinery. This is especially problematic in hot loops handling module resolution (`extract_shapes_for_path`). Replacing this with `path.to_string_lossy()` leverages `std::borrow::Cow`, avoiding allocations entirely when passing references (`as_ref()`) to functions requiring borrowed strings, while securely allowing owned strings when needed (`into_owned()`).
+**Action:** Always prefer `path.to_string_lossy()` over `path.display().to_string()` for path-to-string conversions, ensuring allocations are minimized.

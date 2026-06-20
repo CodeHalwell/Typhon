@@ -176,13 +176,13 @@ pub fn run_source(
     // frame numbers match the user's .ty lines).
     interp.current_source = Some(std::rc::Rc::new(interp::SourceInfo::new(
         origin
-            .map(|p| p.display().to_string())
+            .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_else(|| "<source>".to_string()),
         &prep.python_source,
     )));
     // Seed sys.argv before any user code (or import sys) can observe it.
     let argv0 = origin
-        .map(|p| p.display().to_string())
+        .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|| "-".to_string());
     interp.script_argv = std::iter::once(argv0)
         .chain(script_args.iter().cloned())
@@ -203,7 +203,7 @@ pub fn run_source(
     if let Some(p) = origin {
         interp.root.set(
             "__file__",
-            Value::Str(std::rc::Rc::new(p.display().to_string())),
+            Value::Str(std::rc::Rc::new(p.to_string_lossy().into_owned())),
         );
     }
 
