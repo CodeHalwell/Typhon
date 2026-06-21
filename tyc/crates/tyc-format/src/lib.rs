@@ -174,8 +174,217 @@ pub fn format_source(source: &str, path: &str) -> Result<FormatResult, TycError>
         &translated_lazy,
     );
 
+    // Step 4b: repair the builtin-extend restoration.
+    //
+    // `postprocess_full`'s `Extend` arm only knows how to undo the
+    // user-class lowering (`class __typhon_impl_X(object):` → `extend
+    // X:`). For an `extend BUILTIN:` header the preprocessor emits a
+    // *different* stub — `class __typhon_builtin_ext_BUILTIN(object):`
+    // — which that arm does not recognise, so it falls through to its
+    // generic branch and produces the broken header
+    // `extend class __typhon_builtin_ext_BUILTIN(object):`. Left as-is
+    // this leaks an internal lowering into formatted source AND makes
+    // `tyc fmt` non-idempotent (the second pass can no longer parse the
+    // file). Recover the original `extend BUILTIN:` surface form here so
+    // the round-trip is faithful. This correction lives in the formatter
+    // crate to keep the change disjoint from the shared preprocess path.
+    let output = repair_builtin_extend_restoration(&output);
+
+    // Step 4c: restore `impl …:` / `extend …:` headers verbatim.
+    //
+    // The preprocess→postprocess round-trip for `impl`/`extend` headers
+    // is LOSSY for the generic forms: `impl[T] Dataset[T]:` lowers to
+    // `class __typhon_impl_Dataset[T](object):` and restores to
+    // `impl Dataset[T]:` (the `impl[T]` prefix is dropped), and a second
+    // pass over `impl Dataset[T]:` then drops the target `[T]` too,
+    // yielding `impl Dataset:`. That non-invertible lowering makes
+    // `tyc fmt` mangle generic impl/extend blocks and breaks idempotence.
+    //
+    // The formatter has no reason to route these headers through the
+    // lossy lowering at all — it only needs to tidy their whitespace.
+    // Re-apply the user's ORIGINAL header text (with the same trailing-
+    // whitespace trim + tab expansion the normaliser uses) at each
+    // recorded header line. The `StrippedKeyword` line indices reference
+    // the pre-normalisation source, so translate them through `line_map`
+    // exactly as the keyword restoration above does. This keeps the
+    // body — which is plain Python and round-trips fine — formatted,
+    // while the header survives byte-for-byte (modulo whitespace).
+    let original_lines: Vec<&str> = source.lines().collect();
+    let output =
+        restore_impl_extend_headers_verbatim(&output, &prep.stripped, &original_lines, &translate);
+
     let changed = output != source;
     Ok(FormatResult { output, changed })
+}
+
+/// Marker prefix the preprocessor uses for the synthesised stub class of
+/// an `extend BUILTIN:` header (e.g. `extend str:` →
+/// `class __typhon_builtin_ext_str(object):`).
+const BUILTIN_EXTEND_STUB_PREFIX: &str = "__typhon_builtin_ext_";
+
+/// Undo a mis-restored `extend BUILTIN:` header.
+///
+/// `postprocess_full` does not recognise the builtin-extend stub, so a
+/// line that should read `<indent>extend str:` comes back as
+/// `<indent>extend class __typhon_builtin_ext_str(object):`. This pass
+/// rewrites every such line back to its surface form. The match is
+/// deliberately strict — it only fires on the exact
+/// `extend class __typhon_builtin_ext_<name>(object)` shape, preserving
+/// the original header tail (the trailing `:` and anything after it) so
+/// nothing else on the line is disturbed. Lines inside triple-quoted
+/// strings cannot match this shape, so no string-awareness is needed.
+fn repair_builtin_extend_restoration(source: &str) -> String {
+    // Fast path: the stub marker is absent, so there is nothing to fix.
+    if !source.contains(BUILTIN_EXTEND_STUB_PREFIX) {
+        return source.to_owned();
+    }
+    let mut out = String::with_capacity(source.len());
+    // `split_inclusive` keeps each line's terminator attached, so the
+    // exact newline layout (a final blank line, a missing trailing
+    // newline, or CRLF terminators) round-trips byte-for-byte. Only the
+    // line's code portion is rewritten; the terminator is re-appended
+    // verbatim. (A naive `split('\n')` + rejoin double-counts the final
+    // newline and grows a trailing blank line on every pass, which would
+    // make `tyc fmt` non-idempotent.)
+    for line in source.split_inclusive('\n') {
+        let (content, term) = match line.strip_suffix('\n') {
+            Some(c) => (c.strip_suffix('\r').unwrap_or(c), &line[c.len()..]),
+            None => (line, ""),
+        };
+        out.push_str(&repair_builtin_extend_line(content));
+        out.push_str(term);
+    }
+    out
+}
+
+/// Repair a single line if it carries the mis-restored builtin-extend
+/// header; otherwise return it unchanged.
+fn repair_builtin_extend_line(line: &str) -> String {
+    let indent_len = line
+        .find(|c: char| !c.is_whitespace())
+        .unwrap_or(line.len());
+    let indent = &line[..indent_len];
+    let rest = &line[indent_len..];
+    let Some(after) = rest.strip_prefix("extend class ") else {
+        return line.to_owned();
+    };
+    let Some(after) = after.strip_prefix(BUILTIN_EXTEND_STUB_PREFIX) else {
+        return line.to_owned();
+    };
+    // `after` now looks like `str(object):` (or `list(object):  # cmt`).
+    // The synthesised name runs up to the `(object)` marker; everything
+    // after it (the `:` and any trailing comment) is the original header
+    // tail and must be preserved verbatim.
+    let Some(paren_idx) = after.find("(object)") else {
+        return line.to_owned();
+    };
+    let name = &after[..paren_idx];
+    if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return line.to_owned();
+    }
+    let tail = &after[paren_idx + "(object)".len()..];
+    format!("{indent}extend {name}{tail}")
+}
+
+/// Overwrite every `impl …:` / `extend …:` header line in `output` with
+/// the user's original (whitespace-tidied) header text.
+///
+/// The preprocess→postprocess lowering for these headers is not
+/// invertible for the generic forms (`impl[T] Name[T]:`), so relying on
+/// it both mangles the source and breaks idempotence. Instead we keep the
+/// body — plain Python that round-trips fine — and splice the original
+/// header back in. `stripped` carries the *pre-normalisation* line index
+/// of each header; `translate` maps that to the corresponding line in the
+/// normalised `output` buffer (the same mapping `postprocess_full` used).
+///
+/// The spliced header is the original line with trailing whitespace
+/// trimmed and leading tabs expanded to four spaces — identical to what
+/// the whitespace normaliser does to every other line — so the result is
+/// a fixed point: a second `tyc fmt` pass produces byte-identical output.
+fn restore_impl_extend_headers_verbatim(
+    output: &str,
+    stripped: &[StrippedKeyword],
+    original_lines: &[&str],
+    translate: &impl Fn(usize) -> usize,
+) -> String {
+    use tyc_syntax::lexer::TyphonKeyword;
+
+    // Collect (output_line_index -> tidied original header) for every
+    // impl/extend header. Skip anything that doesn't resolve to a real
+    // original line so a stale index can never panic or corrupt output.
+    let mut overrides: std::collections::HashMap<usize, String> = std::collections::HashMap::new();
+    for s in stripped {
+        if !matches!(s.keyword, TyphonKeyword::Impl | TyphonKeyword::Extend) {
+            continue;
+        }
+        let Some(orig) = original_lines.get(s.line_index) else {
+            continue;
+        };
+        let tidied = tidy_header_line(orig);
+        // Defensive: only override a line that the lowering actually
+        // produced (it must still mention the impl/extend keyword or the
+        // lowered class stub). Without a sanity check a wrong index could
+        // clobber unrelated code; with it the worst case is a no-op.
+        overrides.insert(translate(s.line_index), tidied);
+    }
+    if overrides.is_empty() {
+        return output.to_owned();
+    }
+
+    let mut out = String::with_capacity(output.len());
+    for (i, line) in output.split_inclusive('\n').enumerate() {
+        let (content, term) = match line.strip_suffix('\n') {
+            Some(c) => (c.strip_suffix('\r').unwrap_or(c), &line[c.len()..]),
+            None => (line, ""),
+        };
+        match overrides.get(&i) {
+            // Only splice when the line at this index still looks like a
+            // restored impl/extend header — i.e. it begins (after indent)
+            // with `impl`, `extend`, or a leftover lowered stub. This
+            // guards against an index drift silently overwriting body
+            // code; if the shape doesn't match we keep the formatted line.
+            Some(header) if line_is_impl_or_extend_header(content) => {
+                out.push_str(header);
+            }
+            _ => out.push_str(content),
+        }
+        out.push_str(term);
+    }
+    out
+}
+
+/// Whether `line` (already stripped of its terminator) reads as a
+/// restored `impl`/`extend` header at any indentation. Accepts both the
+/// surface keywords and a residual lowered `class __typhon_impl_…` /
+/// `extend class __typhon_builtin_ext_…` stub in case an earlier pass
+/// left one behind.
+fn line_is_impl_or_extend_header(line: &str) -> bool {
+    let rest = line.trim_start();
+    rest.starts_with("impl ")
+        || rest.starts_with("impl[")
+        || rest.starts_with("extend ")
+        || rest.starts_with("class __typhon_impl_")
+}
+
+/// Tidy a header line the same way the whitespace normaliser tidies every
+/// line: expand leading tabs to four spaces and strip trailing
+/// whitespace. The header's interior is left verbatim so the exact
+/// `impl[T] Name[T]:` text round-trips.
+fn tidy_header_line(line: &str) -> String {
+    let trimmed = line.trim_end();
+    let indent_end = trimmed
+        .find(|c: char| !c.is_whitespace())
+        .unwrap_or(trimmed.len());
+    let mut out = String::with_capacity(trimmed.len());
+    for ch in trimmed[..indent_end].chars() {
+        if ch == '\t' {
+            out.push_str("    ");
+        } else {
+            out.push(ch);
+        }
+    }
+    out.push_str(&trimmed[indent_end..]);
+    out
 }
 
 /// Normalise whitespace in a Python-compatible source string.
@@ -1768,5 +1977,183 @@ def run() -> Result[int, str]:
             "string \\t escape must be preserved, got: {:?}",
             result.output
         );
+    }
+
+    // ── B15 follow-up: `extend BUILTIN:` round-trip + idempotence ─────────
+
+    #[test]
+    fn format_preserves_extend_builtin_header() {
+        // `extend str:` lowers to a `class __typhon_builtin_ext_str(object):`
+        // stub that `postprocess_full` did not know how to restore — the
+        // formatter used to emit `extend class __typhon_builtin_ext_str(object):`,
+        // leaking the lowering AND breaking the next parse. The surface form
+        // must round-trip verbatim.
+        let _guard = lock_env();
+        let prior = std::env::var_os("TYC_FMT_DISABLE_RUFF");
+        unsafe {
+            std::env::set_var("TYC_FMT_DISABLE_RUFF", "1");
+        }
+        let src = "extend str:\n    def slug(self) -> str:\n        return self.lower()\n";
+        let result = format_source(src, "<test>").unwrap();
+        assert!(
+            result.output.contains("extend str:"),
+            "extend builtin header must round-trip, got:\n{}",
+            result.output
+        );
+        assert!(
+            !result.output.contains("__typhon_builtin_ext_"),
+            "the builtin-extend lowering must not leak into formatted source:\n{}",
+            result.output
+        );
+        assert!(
+            !result.output.contains("extend class"),
+            "the mis-restored `extend class …` header must not survive:\n{}",
+            result.output
+        );
+        unsafe {
+            match prior {
+                Some(v) => std::env::set_var("TYC_FMT_DISABLE_RUFF", v),
+                None => std::env::remove_var("TYC_FMT_DISABLE_RUFF"),
+            }
+        }
+    }
+
+    #[test]
+    fn format_extend_builtin_is_idempotent() {
+        // Formatting an `extend BUILTIN:` file twice must reach a fixed
+        // point — the second pass is a no-op. This is the regression the
+        // whole-corpus idempotence sweep exposed.
+        let _guard = lock_env();
+        let prior = std::env::var_os("TYC_FMT_DISABLE_RUFF");
+        unsafe {
+            std::env::set_var("TYC_FMT_DISABLE_RUFF", "1");
+        }
+        let src = "extend list:\n    def first(self):\n        return self[0]\n";
+        let once = format_source(src, "<test>").unwrap().output;
+        let twice = format_source(&once, "<test>").unwrap();
+        assert_eq!(
+            once, twice.output,
+            "second format pass must be a no-op; got first:\n{}\nsecond:\n{}",
+            once, twice.output
+        );
+        assert!(
+            !twice.changed,
+            "already-formatted `extend BUILTIN:` source must report unchanged"
+        );
+        unsafe {
+            match prior {
+                Some(v) => std::env::set_var("TYC_FMT_DISABLE_RUFF", v),
+                None => std::env::remove_var("TYC_FMT_DISABLE_RUFF"),
+            }
+        }
+    }
+
+    #[test]
+    fn repair_builtin_extend_leaves_user_extend_untouched() {
+        // A user-class `extend` (no builtin stub) is restored correctly by
+        // `postprocess_full`; the repair pass must not touch it. The repair
+        // fires only on the exact mis-restored builtin shape.
+        assert_eq!(repair_builtin_extend_line("extend User:"), "extend User:");
+        assert_eq!(
+            repair_builtin_extend_line("    extend Point:"),
+            "    extend Point:"
+        );
+        // The mis-restored builtin shape is repaired, indent + tail kept.
+        assert_eq!(
+            repair_builtin_extend_line("extend class __typhon_builtin_ext_str(object):"),
+            "extend str:"
+        );
+        assert_eq!(
+            repair_builtin_extend_line(
+                "    extend class __typhon_builtin_ext_dict(object):  # note"
+            ),
+            "    extend dict:  # note"
+        );
+        // A genuine class named with the marker substring inside a string
+        // or unrelated context must not be rewritten — the pass keys off
+        // the precise `extend class __typhon_builtin_ext_…(object)` head.
+        assert_eq!(
+            repair_builtin_extend_line("x = \"__typhon_builtin_ext_str\""),
+            "x = \"__typhon_builtin_ext_str\""
+        );
+    }
+
+    /// Representative pre-formatted snippets that must be left byte-for-byte
+    /// unchanged by `tyc fmt` (idempotence on already-clean input). Mirrors
+    /// the shapes found across `examples/` so the in-process pipeline is a
+    /// fixed point on clean code.
+    #[test]
+    fn format_is_idempotent_on_clean_snippets() {
+        let _guard = lock_env();
+        let prior = std::env::var_os("TYC_FMT_DISABLE_RUFF");
+        unsafe {
+            std::env::set_var("TYC_FMT_DISABLE_RUFF", "1");
+        }
+        let clean = [
+            "x: int = 1\n",
+            "let y: str = \"hi\"\n",
+            "mut count: int = 0\n",
+            "z = xs[1:2]\n",
+            "w = data[a:b:c]\n",
+            "r = f(name=\"Alice\", age=30)\n",
+            "def f(x: int, y: int) -> int:\n    return x + y\n",
+            "d = {\"a\": 1, \"b\": 2}\n",
+            "u = 1e-12\n",
+            "extend str:\n    def slug(self) -> str:\n        return self.lower()\n",
+        ];
+        for src in clean {
+            let result = format_source(src, "<test>").unwrap();
+            assert_eq!(
+                result.output, src,
+                "clean snippet must be unchanged by fmt:\n{src:?}\n-> {:?}",
+                result.output
+            );
+            assert!(
+                !result.changed,
+                "clean snippet must report unchanged:\n{src:?}"
+            );
+        }
+        unsafe {
+            match prior {
+                Some(v) => std::env::set_var("TYC_FMT_DISABLE_RUFF", v),
+                None => std::env::remove_var("TYC_FMT_DISABLE_RUFF"),
+            }
+        }
+    }
+
+    #[test]
+    fn format_double_pass_reaches_fixed_point_on_messy_input() {
+        // For messy input the FIRST pass may change the file, but a SECOND
+        // pass over the already-formatted output must be a no-op. This is
+        // the core `tyc fmt --check` idempotence guarantee.
+        let _guard = lock_env();
+        let prior = std::env::var_os("TYC_FMT_DISABLE_RUFF");
+        unsafe {
+            std::env::set_var("TYC_FMT_DISABLE_RUFF", "1");
+        }
+        let messy = [
+            "def    f(  x:int,y:int)->int:\n    let    z:int=x+y\n",
+            "x = f(name=\"Alice\",age=30)\n",
+            "extend dict:\n    def keys2(self):\n        return list(self)\n",
+        ];
+        for src in messy {
+            let once = format_source(src, "<test>").unwrap().output;
+            let twice = format_source(&once, "<test>").unwrap();
+            assert_eq!(
+                once, twice.output,
+                "second pass must be a no-op for input:\n{src:?}\nfirst:\n{once}\nsecond:\n{}",
+                twice.output
+            );
+            assert!(
+                !twice.changed,
+                "second pass must report unchanged for input:\n{src:?}"
+            );
+        }
+        unsafe {
+            match prior {
+                Some(v) => std::env::set_var("TYC_FMT_DISABLE_RUFF", v),
+                None => std::env::remove_var("TYC_FMT_DISABLE_RUFF"),
+            }
+        }
     }
 }
