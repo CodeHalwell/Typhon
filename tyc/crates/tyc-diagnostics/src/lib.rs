@@ -3636,8 +3636,14 @@ impl BlockRemap {
             let first = blocks[g];
             let first_body = body_text(&first);
             let mut k = g + 1;
-            while k < blocks.len() && body_text(&blocks[k]) == first_body {
-                k += 1;
+            // Only group blocks with a non-empty body. Genuinely empty (or
+            // whitespace/comment-only) `impl` blocks all share the empty body
+            // string and would otherwise be mis-grouped as a synthetic
+            // distribution and remapped to a wrong location.
+            if !first_body.trim().is_empty() {
+                while k < blocks.len() && body_text(&blocks[k]) == first_body {
+                    k += 1;
+                }
             }
             // blocks[g..k] form a distributed group of size (k - g).
             if k - g >= 2 {

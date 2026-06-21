@@ -103,10 +103,13 @@ done
 # --- Timed runs -----------------------------------------------------------
 samples=()
 for ((i = 0; i < PERF_RUNS; i++)); do
-  start=$(date +%s%N)
-  "$TYC_BIN" "${BUILD_FLAGS[@]}" >/dev/null 2>&1
-  end=$(date +%s%N)
-  ms=$(((end - start) / 1000000))
+  # Time the run in Python (already a required dependency): `date +%s%N` is a
+  # GNU extension and emits a literal `%N` on macOS/BSD `date`, breaking the
+  # arithmetic. `time.perf_counter()` is portable and monotonic.
+  ms=$(python3 -c 'import time, subprocess, sys
+t0 = time.perf_counter()
+subprocess.run([sys.argv[1], *sys.argv[2:]], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+print(int((time.perf_counter() - t0) * 1000))' "$TYC_BIN" "${BUILD_FLAGS[@]}")
   samples+=("$ms")
 done
 

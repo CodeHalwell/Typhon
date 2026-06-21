@@ -5632,9 +5632,7 @@ fn resolve_partial_summary(
         // Cycle / recursion: conservatively not-partial.
         return None;
     }
-    let Some(body) = fn_bodies.get(name).copied() else {
-        return None;
-    };
+    let body = fn_bodies.get(name).copied()?;
     in_progress.insert(name.to_owned());
     let summary = summarise_partial_return(c, body, fn_bodies, in_progress);
     in_progress.remove(name);
@@ -5727,9 +5725,7 @@ fn summarise_partial_return(
             }
             Stmt::Return(ret) => {
                 // First reachable return decides the summary.
-                let Some(value) = ret.value.as_deref() else {
-                    return None;
-                };
+                let value = ret.value.as_deref()?;
                 // Direct `return X.__new__(X)`.
                 if let Some(class_name) = detect_new_bypass(value) {
                     return uninit_instance_for(c, &class_name);
