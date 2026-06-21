@@ -4166,10 +4166,11 @@ fn try_rewrite_rescue_at(
         err_start += 1;
     }
 
-    let err_end = find_rescue_err_end(bytes, skip, err_start);
+    let err_end = find_rescue_err_end(bytes, err_start);
     // Statement-tail only: the error expression must reach the logical-line
-    // end (newline) or EOF — not a depth-0 separator or enclosing bracket.
-    if err_end < bytes.len() && bytes[err_end] != b'\n' {
+    // end — a newline, a trailing comment (`#`), or EOF — not a depth-0
+    // separator or enclosing bracket (those mark an inline position).
+    if err_end < bytes.len() && bytes[err_end] != b'\n' && bytes[err_end] != b'#' {
         return None;
     }
     if !source.is_char_boundary(err_start) || !source.is_char_boundary(err_end) {
@@ -4196,18 +4197,57 @@ fn try_rewrite_rescue_at(
 
 /// Locate where the error expression of a postfix `rescue` ends: the right
 /// edge of the current syntactic slot. Scans right from `start` tracking
-/// bracket depth (string / comment bytes skipped via `skip`), stopping at a
-/// depth-0 `,` / `;`, the enclosing close bracket, a depth-0 newline, or EOF.
-fn find_rescue_err_end(bytes: &[u8], skip: &[bool], start: usize) -> usize {
+/// bracket depth and string state inline, stopping at a depth-0 `,` / `;`, the
+/// enclosing close bracket, a depth-0 comment (`#`), a depth-0 newline, or EOF.
+///
+/// Stopping at a depth-0 `#` is what keeps a *trailing comment* from being
+/// folded into the error expression — without it `int(s) rescue e: E()  # note`
+/// would scan past the comment to the newline and emit `…E()  # note)?`, where
+/// the appended `)?` lands inside the comment and is lost (a syntax error). A
+/// `#` *inside* brackets (depth > 0) is a comment on its own physical line of a
+/// bracketed expression, so it is skipped to end-of-line and the scan continues.
+fn find_rescue_err_end(bytes: &[u8], start: usize) -> usize {
     let mut depth: i32 = 0;
+    let mut in_str: Option<(u8, bool)> = None; // (quote, triple)
     let mut j = start;
     while j < bytes.len() {
-        if skip[j] {
+        let b = bytes[j];
+        if let Some((q, triple)) = in_str {
+            if b == b'\\' && !triple && j + 1 < bytes.len() {
+                j += 2;
+                continue;
+            }
+            if b == q {
+                if triple {
+                    if j + 2 < bytes.len() && bytes[j + 1] == q && bytes[j + 2] == q {
+                        in_str = None;
+                        j += 3;
+                        continue;
+                    }
+                } else {
+                    in_str = None;
+                }
+            }
             j += 1;
             continue;
         }
-        match bytes[j] {
+        match b {
+            b'#' if depth <= 0 => return j,
+            b'#' => {
+                while j < bytes.len() && bytes[j] != b'\n' {
+                    j += 1;
+                }
+                continue;
+            }
             b'\n' if depth <= 0 => return j,
+            b'"' | b'\'' => {
+                if j + 2 < bytes.len() && bytes[j + 1] == b && bytes[j + 2] == b {
+                    in_str = Some((b, true));
+                    j += 3;
+                    continue;
+                }
+                in_str = Some((b, false));
+            }
             b'(' | b'[' | b'{' => depth += 1,
             b')' | b']' | b'}' => {
                 if depth == 0 {
@@ -4280,7 +4320,9 @@ fn expand_rescue_blocks_once(source: &str) -> String {
         }
 
         let code = &raw[..code_end];
-        let indent_len = code.find(|c: char| !c.is_whitespace()).unwrap_or(code.len());
+        let indent_len = code
+            .find(|c: char| !c.is_whitespace())
+            .unwrap_or(code.len());
         let header_indent = &code[..indent_len];
         let body = code[indent_len..].trim_end();
 
@@ -9370,13 +9412,19 @@ mod tests {
     #[test]
     fn rescue_return_position() {
         let out = expand_rescue("    return parse(s) rescue e: str(e)\n");
-        assert_eq!(out, "    return try_result(lambda: parse(s), lambda e: str(e))?\n");
+        assert_eq!(
+            out,
+            "    return try_result(lambda: parse(s), lambda e: str(e))?\n"
+        );
     }
 
     #[test]
     fn rescue_with_string_error_expr() {
         let out = expand_rescue("let x = f() rescue e: f\"bad: {e}\"\n");
-        assert_eq!(out, "let x = try_result(lambda: f(), lambda e: f\"bad: {e}\")?\n");
+        assert_eq!(
+            out,
+            "let x = try_result(lambda: f(), lambda e: f\"bad: {e}\")?\n"
+        );
     }
 
     #[test]
@@ -9384,9 +9432,18 @@ mod tests {
         // End-to-end through expand_question_ops: rescue → try_result(...)? →
         // the temp + isinstance(Err) propagation the `?` pass emits.
         let out = expand_question_ops("    let n: int = int(raw) rescue e: str(e)\n");
-        assert!(out.contains("try_result(lambda: int(raw), lambda e: str(e))"), "{out}");
-        assert!(out.contains("__typhon_Err__") || out.contains("Err"), "must lower the `?`:\n{out}");
-        assert!(!out.contains("rescue"), "no `rescue` keyword should survive:\n{out}");
+        assert!(
+            out.contains("try_result(lambda: int(raw), lambda e: str(e))"),
+            "{out}"
+        );
+        assert!(
+            out.contains("__typhon_Err__") || out.contains("Err"),
+            "must lower the `?`:\n{out}"
+        );
+        assert!(
+            !out.contains("rescue"),
+            "no `rescue` keyword should survive:\n{out}"
+        );
     }
 
     #[test]
@@ -9417,10 +9474,39 @@ mod tests {
         assert_eq!(expand_rescue(src), src);
     }
 
+    #[test]
+    fn rescue_trailing_comment_does_not_swallow_close_paren() {
+        // A trailing comment must end the error expression so the generated
+        // `)?` lands before the comment, not inside it.
+        let out = expand_rescue("let n = int(s) rescue e: oops(e)  # note\n");
+        assert!(
+            out.contains("try_result(lambda: int(s), lambda e: oops(e))?"),
+            "the `)?` must precede the comment:\n{out}"
+        );
+        // And it still lowers cleanly end-to-end (the `?` is recognised).
+        let lowered = expand_question_ops("    let n: int = int(s) rescue e: str(e)  # note\n");
+        assert!(!lowered.contains("rescue"), "{lowered}");
+        assert!(
+            lowered.contains("__typhon_q_"),
+            "the `?` must lower:\n{lowered}"
+        );
+    }
+
+    #[test]
+    fn rescue_hash_inside_string_is_not_a_comment() {
+        // A `#` inside the error expression's string is not a comment boundary.
+        let out = expand_rescue("let n = f() rescue e: tag(\"a#b\")\n");
+        assert_eq!(
+            out,
+            "let n = try_result(lambda: f(), lambda e: tag(\"a#b\"))?\n"
+        );
+    }
+
     // ── block `rescue` form ───────────────────────────────────────────────
     #[test]
     fn rescue_block_lowers_to_try_except() {
-        let src = "    rescue e: f\"bad: {e}\":\n        let x: int = risky()\n        return Ok(x)\n";
+        let src =
+            "    rescue e: f\"bad: {e}\":\n        let x: int = risky()\n        return Ok(x)\n";
         let out = expand_rescue_blocks(src);
         assert_eq!(
             out,
@@ -9432,8 +9518,16 @@ mod tests {
     fn rescue_block_stops_at_dedent() {
         let src = "    rescue e: g(e):\n        step()\n    after()\n";
         let out = expand_rescue_blocks(src);
-        assert!(out.contains("    try:\n        step()\n    except Exception as e:\n        return Err(g(e))\n"), "{out}");
-        assert!(out.trim_end().ends_with("    after()"), "code after the block must survive:\n{out}");
+        assert!(
+            out.contains(
+                "    try:\n        step()\n    except Exception as e:\n        return Err(g(e))\n"
+            ),
+            "{out}"
+        );
+        assert!(
+            out.trim_end().ends_with("    after()"),
+            "code after the block must survive:\n{out}"
+        );
     }
 
     #[test]
@@ -9450,7 +9544,10 @@ mod tests {
         let src = "rescue a: x:\n    rescue b: y:\n        inner()\n";
         let out = expand_rescue_blocks(src);
         assert_eq!(out.matches("try:").count(), 2, "both blocks expand:\n{out}");
-        assert!(out.contains("except Exception as a:") && out.contains("except Exception as b:"), "{out}");
+        assert!(
+            out.contains("except Exception as a:") && out.contains("except Exception as b:"),
+            "{out}"
+        );
     }
 
     #[test]

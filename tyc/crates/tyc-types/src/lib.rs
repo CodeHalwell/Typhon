@@ -12212,6 +12212,18 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
                     for el in &f.elements {
                         if let ruff_python_ast::InterpolatedStringElement::Interpolation(e) = el {
                             let _ = infer_expr(c, &e.expression);
+                            // A format spec can itself carry nested interpolations
+                            // (`f"{v:.{prec}f}"`); walk those too.
+                            if let Some(spec) = &e.format_spec {
+                                for spec_el in spec.elements.iter() {
+                                    if let ruff_python_ast::InterpolatedStringElement::Interpolation(
+                                        se,
+                                    ) = spec_el
+                                    {
+                                        let _ = infer_expr(c, &se.expression);
+                                    }
+                                }
+                            }
                         }
                     }
                 }
