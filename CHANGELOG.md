@@ -6,6 +6,36 @@ canonical phase-by-phase status lives in `docs/roadmap.md`.
 
 ## Unreleased
 
+### Added — third-party **method** calls are now arity-checked (missing required arguments caught)
+
+- **`tyc-venv` now introspects the public methods of every third-party class,
+  not just its constructor**, so a missing required argument to a *method* call
+  is caught at `tyc check` / `tyc build` time — the same way constructor and
+  free-function calls already were. The motivating case: a typed ML pipeline
+  where `PCA(n_components=2).fit()` (sklearn `fit(self, X, y=None)`) silently
+  compiled despite the missing `X`. It now fails with
+  `tyc::missing_argument: supply ``X`` when calling ``fit```, and likewise for
+  `scaler.transform()` (→ `X`), `df.merge()` (→ `right`), etc.
+  - The introspection script (`inspect.getattr_static` + `inspect.signature`)
+    captures instance methods, `@classmethod`s, and `@staticmethod`s, stripping
+    the implicit `self` / `cls` only when it is a genuine leading positional
+    (a decorator-wrapped `(*args, **kwargs)` method, common in scikit-learn, is
+    left fully permissive rather than having its `*args` mis-stripped).
+  - Each captured method becomes a `MethodSig` on the class's `InterfaceShape`,
+    so the existing `method_arity_info_for_attribute` path arity-checks the
+    call. Methods whose signature can't be recovered (C-extension slots, e.g.
+    most `numpy.ndarray` methods) are simply absent and stay lenient — the
+    shape remains `partial`, so no false `attribute_not_found` / arity errors.
+  - **Conservative by design / verified false-positive-free:** a realistic
+    numpy + pandas + scikit-learn pipeline (PCA, StandardScaler, KMeans,
+    LogisticRegression, RandomForestClassifier, `train_test_split`,
+    `accuracy_score`, DataFrame `groupby`/`merge`/`sort_values`, ndarray
+    `reshape`/`sum`/`astype`, …) type-checks clean and the emitted Python runs
+    against the real libraries; the missing-argument cases above all fail with
+    a named parameter. Requires the dependency installed in the project `.venv`
+    (the dist→import-name resolution — `scikit-learn` → `sklearn` — already
+    works via `.dist-info` metadata).
+
 ### Fixed — `Counter + Counter` / `Counter - Counter` no longer false-fire `tyc::operator_type_mismatch`
 
 - **`collections.Counter` multiset addition (`+`) and subtraction (`-`) were

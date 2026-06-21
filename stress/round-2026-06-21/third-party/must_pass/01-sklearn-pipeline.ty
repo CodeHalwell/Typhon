@@ -1,0 +1,26 @@
+import numpy as np
+from sklearn.decomposition import PCA
+from sklearn.preprocessing import StandardScaler
+from sklearn.cluster import KMeans
+from sklearn.linear_model import LogisticRegression
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score
+
+def main() -> None:
+    let x = np.random.rand(50, 4)
+    let y = np.random.randint(0, 2, 50)
+    let parts = train_test_split(x, y, test_size=0.25, random_state=0)
+    let sc = StandardScaler()
+    let xs = sc.fit_transform(x)
+    let pca = PCA(n_components=2)
+    pca.fit(xs)
+    let reduced = pca.transform(xs)
+    let km = KMeans(n_clusters=3, n_init=10)
+    km.fit(reduced)
+    let clf = LogisticRegression(max_iter=200)
+    clf.fit(xs, y)
+    let preds = clf.predict(xs)
+    print(accuracy_score(y, preds))
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,8 @@
+import numpy as np
+
+def main() -> None:
+    let a = np.zeros()              # function missing required shape
+    print(a)
+
+if __name__ == "__main__":
+    main()

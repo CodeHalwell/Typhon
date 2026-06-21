@@ -1,0 +1,9 @@
+import pandas as pd
+
+def main() -> None:
+    let df = pd.DataFrame({"a": [1, 2, 3]})
+    df.merge()                      # method missing required right
+    print(df)
+
+if __name__ == "__main__":
+    main()

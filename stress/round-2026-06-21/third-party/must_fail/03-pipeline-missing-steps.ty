@@ -1,0 +1,8 @@
+from sklearn.pipeline import Pipeline
+
+def main() -> None:
+    let p = Pipeline()              # constructor missing required steps
+    print(p)
+
+if __name__ == "__main__":
+    main()
