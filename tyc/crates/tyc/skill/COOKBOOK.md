@@ -201,6 +201,26 @@ let ast:  Ast      = parse(toks).map_err(_parse_to_pipeline)?
 let ty:   TypedAst = check(ast).map_err(_type_to_pipeline)?
 ```
 
+### Exception boundary: `rescue` (`examples/60-rescue-boundaries/`)
+
+Lift a throwing boundary into a `Result` with no lambdas and no `try`/`except`. Postfix maps one expression's exception and propagates it; the block form maps any exception across a suite.
+
+```python
+# postfix — catch + map + propagate (like `?`)
+def parse_port(raw: str) -> Result[int, ConfigError]:
+    let n: int = int(raw) rescue e: BadField(field="port", reason=str(e))
+    return Ok(n)
+
+# block — one catch-all mapping over a suite (replaces a try/except shim)
+def load_config(text: str) -> Result[Config, ConfigError]:
+    rescue e: BadJson(reason=str(e)):
+        let data: dict[str, str] = json.loads(text) as! dict[str, str]
+        let port: int = parse_port(data["port"])?
+        return Ok(Config(host=data["host"], port=port))
+```
+
+Postfix lowers to `try_result(lambda: EXPR, lambda e: ERR)?`, the block to `try`/`except Exception as e: return Err(ERR)`. The mapped error type is checked against the function's declared error type. Use the explicit multi-`except` `try` shim only when mapping *distinct* exception types to *distinct* errors.
+
 ---
 
 ## 8. Sealed union + exhaustive match (`examples/08-sealed-unions-match/`)

@@ -726,6 +726,39 @@ let ty:   TypedAst = check(ast).map_err(_type_to_pipeline)?
 
 `Ok` and `Err` carry `.map`, `.map_err`, `.and_then`, `.or_else` methods on the runtime classes. Semantics: `Ok.map(f)` transforms value; `Ok.map_err(g)` identity; `and_then` chains a `Result`-returning op on `Ok`; `or_else` recovers from `Err`. Since v0.9.0 these combinators also work under `tyc run` — the VM binds them as native methods via `NativeFn` wrappers that capture the receiver.
 
+### 5.4 `try_result` and `rescue` — exception boundaries
+
+`try_result(thunk[, on_err])` (v0.15.0) turns a throwing call into a `Result` in one expression. `rescue` (Unreleased) is the no-lambda, no-`try`/`except` surface for the same bridge, in two forms:
+
+```python
+# Typhon — postfix rescue
+let n: int = int(raw) rescue e: BadField(field="port", reason=str(e))
+
+# Typhon — block rescue
+def load_config(text: str) -> Result[Config, ConfigError]:
+    rescue e: BadJson(reason=str(e)):
+        let data: dict[str, str] = json.loads(text) as! dict[str, str]
+        return Ok(Config(host=data["host"], port=int(data["port"])))
+```
+
+```python
+# Emitted Python — postfix lowers to try_result + the `?` ladder
+__typhon_q_0__ = try_result(lambda: int(raw), lambda e: BadField(field="port", reason=str(e)))
+if isinstance(__typhon_q_0__, __typhon_Err__):
+    return __typhon_q_0__
+n: int = __typhon_q_0__.value
+
+# Emitted Python — block lowers to try/except returning Err
+def load_config(text: str) -> Result[Config, ConfigError]:
+    try:
+        data: dict[str, str] = __typhon_checked_cast__(json.loads(text), dict[str, str])
+        return Ok(Config(host=data["host"], port=int(data["port"])))
+    except Exception as e:
+        return Err(BadJson(reason=str(e)))
+```
+
+Postfix `EXPR rescue NAME: ERR` → `try_result(lambda: EXPR, lambda NAME: ERR)?`; lowered in **statement-tail** position, composes with `as!`, works after `return`/`if`/`while`/`assert`. Block `rescue NAME: ERR:` → `try`/`except Exception as NAME: return Err(ERR)` (fixpoint, so nested blocks expand). The block emits a real `Err(...)`, so its error type is checked against the function's declared error type; the postfix form is checked through `?` (`tyc::result_error_mismatch`). Both run under `tyc check` / `tyc run` / `tyc build`; `tyc fmt` round-trips. Worked example: `examples/60-rescue-boundaries/`.
+
 ---
 
 ## 6. Async and concurrency

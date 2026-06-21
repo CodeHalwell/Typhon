@@ -1,0 +1,77 @@
+# rescue — lambda-free, try/except-free exception boundaries.
+#
+# Typhon's internal error model is Result[T, E] plus the `?` operator. The one
+# place exceptions still enter is the untyped Python boundary. `rescue` bridges
+# that boundary into a Result with no lambdas and no try/except in source:
+#
+#   postfix   EXPR rescue NAME: ERR    catch EXPR, map the exception, propagate
+#   block     rescue NAME: ERR:        map any exception raised across a suite
+#
+# Both lower to machinery that already ships — try_result + `?` for the postfix
+# form, try/except returning Err for the block form — so they run identically
+# under `tyc run` and `tyc build` + python, and compose with `?` and `as!`.
+
+import json
+
+
+# One shared error type for the module: a sealed union, matched exhaustively.
+type ConfigError = NotFound | BadJson | BadField
+
+class NotFound:
+    path: str
+
+class BadJson:
+    reason: str
+
+class BadField:
+    field: str
+    reason: str
+
+impl ConfigError:
+    def display(self) -> str:
+        match self:
+            case NotFound(path):          return f"not found: {path}"
+            case BadJson(reason):         return f"invalid JSON: {reason}"
+            case BadField(field, reason): return f"bad {field}: {reason}"
+
+
+class Config:
+    host: str
+    port: int
+
+
+# Postfix `rescue`: one fallible step, mapped to one error. `int(raw)` throws
+# ValueError on bad input; rescue catches it, builds a BadField, and propagates
+# the Err to the caller exactly like `?`.
+def parse_port(raw: str) -> Result[int, ConfigError]:
+    let n: int = int(raw) rescue e: BadField(field="port", reason=str(e))
+    return Ok(n)
+
+
+# Block `rescue`: one catch-all mapping over a whole suite — the lambda-free
+# replacement for a try/except shim. Any exception raised in the body (bad JSON,
+# a missing key) becomes a BadJson Err. The `?` propagates parse_port's own
+# error straight out, bypassing the block's except (it returns, never raises).
+def load_config(text: str) -> Result[Config, ConfigError]:
+    rescue e: BadJson(reason=str(e)):
+        let data: dict[str, str] = json.loads(text) as! dict[str, str]
+        let port: int = parse_port(data["port"])?
+        return Ok(Config(host=data["host"], port=port))
+
+
+def main() -> None:
+    match load_config('{"host": "localhost", "port": "8080"}'):
+        case Ok(cfg):  print(f"ok {cfg.host}:{cfg.port}")
+        case Err(err): print(f"error: {err.display()}")
+
+    match load_config("not json"):
+        case Ok(cfg):  print(f"ok {cfg.host}:{cfg.port}")
+        case Err(err): print(f"error: {err.display()}")
+
+    match load_config('{"host": "localhost", "port": "x"}'):
+        case Ok(cfg):  print(f"ok {cfg.host}:{cfg.port}")
+        case Err(err): print(f"error: {err.display()}")
+
+
+if __name__ == "__main__":
+    main()
