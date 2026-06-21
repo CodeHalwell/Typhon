@@ -5565,6 +5565,28 @@ fn expand_question_ops_inner(source: &str) -> String {
             }
         }
 
+        // A value-keyword prefix on a no-LHS RHS (`return f()?` / `yield f()?`)
+        // is a statement form where the keyword must apply to the *Ok value*,
+        // not the temp assignment. Strip it here and re-apply it below.
+        // This is most often produced by a postfix `rescue` in return position
+        // (`return EXPR rescue e: ERR` lowers to `return try_result(...)?`),
+        // which reaches this pass after the inline-`?` pass has already run.
+        // It also makes `return f()?` work under the VM pipeline, which does
+        // not run the inline-`?` pass.
+        let (value_keyword, rhs): (Option<&str>, String) = if lhs.is_none() {
+            if let Some(rest) = rhs.strip_prefix("return ") {
+                (Some("return"), rest.trim_start().to_owned())
+            } else if let Some(rest) = rhs.strip_prefix("yield from ") {
+                (Some("yield from"), rest.trim_start().to_owned())
+            } else if let Some(rest) = rhs.strip_prefix("yield ") {
+                (Some("yield"), rest.trim_start().to_owned())
+            } else {
+                (None, rhs)
+            }
+        } else {
+            (None, rhs)
+        };
+
         // Generate a unique temporary variable name.
         let tmp = format!("__typhon_q_{counter}__");
         counter += 1;
@@ -5592,11 +5614,19 @@ fn expand_question_ops_inner(source: &str) -> String {
         result.push_str(&tmp);
         result.push('\n');
 
-        // 3. Bind the Ok value if there is an assignment target.
+        // 3. Bind / return the Ok value.
         if let Some(l) = lhs {
             result.push_str(indent);
             result.push_str(&l);
             result.push_str(" = ");
+            result.push_str(&tmp);
+            result.push_str(".value");
+            result.push_str(nl);
+        } else if let Some(kw) = value_keyword {
+            // `return`/`yield` the unwrapped Ok value.
+            result.push_str(indent);
+            result.push_str(kw);
+            result.push(' ');
             result.push_str(&tmp);
             result.push_str(".value");
             result.push_str(nl);
@@ -9415,6 +9445,27 @@ mod tests {
         assert_eq!(
             out,
             "    return try_result(lambda: parse(s), lambda e: str(e))?\n"
+        );
+    }
+
+    #[test]
+    fn rescue_return_position_full_pipeline() {
+        // Regression (PR #219, codex P1): the generated `return try_result(...)?`
+        // reaches the end-of-line `?` pass after the inline pass has run, so it
+        // must lower the `return`-led form rather than emitting the invalid
+        // `__typhon_q_0__ = return try_result(...)`.
+        let out = expand_question_ops("    return parse(s) rescue e: str(e)\n");
+        assert!(
+            !out.contains("= return"),
+            "must not assign a `return` statement to the temp:\n{out}"
+        );
+        assert!(
+            out.contains("__typhon_q_0__ = try_result(lambda: parse(s), lambda e: str(e))"),
+            "the temp must hold the bare expression:\n{out}"
+        );
+        assert!(
+            out.contains("return __typhon_q_0__.value"),
+            "the Ok value must be returned:\n{out}"
         );
     }
 
