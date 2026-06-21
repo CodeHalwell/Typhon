@@ -1,0 +1,35 @@
+from typing import Callable
+import functools
+
+def trace(fn: Callable[[int], int]) -> Callable[[int], int]:
+    @functools.wraps(fn)
+    def wrapper(x: int) -> int:
+        print(f"-> {fn.__name__}({x})")
+        let r: int = fn(x)
+        print(f"<- {r}")
+        return r
+    return wrapper
+
+def repeat(times: int) -> Callable[[Callable[[], None]], Callable[[], None]]:
+    def deco(fn: Callable[[], None]) -> Callable[[], None]:
+        def wrapper() -> None:
+            for _ in range(times):
+                fn()
+        return wrapper
+    return deco
+
+@trace
+def cube(x: int) -> int:
+    return x ** 3
+
+@repeat(3)
+def greet() -> None:
+    print("hello")
+
+def main() -> None:
+    print(cube(3))
+    print(cube.__name__)
+    greet()
+
+if __name__ == "__main__":
+    main()

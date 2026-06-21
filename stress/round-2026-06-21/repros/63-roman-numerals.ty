@@ -1,0 +1,36 @@
+let VALUES: list[tuple[int, str]] = [
+    (1000, "M"), (900, "CM"), (500, "D"), (400, "CD"),
+    (100, "C"), (90, "XC"), (50, "L"), (40, "XL"),
+    (10, "X"), (9, "IX"), (5, "V"), (4, "IV"), (1, "I"),
+]
+
+def to_roman(n: int) -> str:
+    mut remaining: int = n
+    mut parts: list[str] = []
+    for value, symbol in VALUES:
+        while remaining >= value:
+            parts.append(symbol)
+            remaining = remaining - value
+    return "".join(parts)
+
+def from_roman(s: str) -> int:
+    let symbols: dict[str, int] = {"I": 1, "V": 5, "X": 10, "L": 50, "C": 100, "D": 500, "M": 1000}
+    mut total: int = 0
+    mut i: int = 0
+    while i < len(s):
+        let cur: int = symbols[s[i]]
+        if i + 1 < len(s) and symbols[s[i + 1]] > cur:
+            total = total + symbols[s[i + 1]] - cur
+            i = i + 2
+        else:
+            total = total + cur
+            i = i + 1
+    return total
+
+def main() -> None:
+    for n in [4, 9, 14, 40, 90, 400, 1994, 2024]:
+        let r: str = to_roman(n)
+        print(f"{n} = {r} = {from_roman(r)}")
+
+if __name__ == "__main__":
+    main()

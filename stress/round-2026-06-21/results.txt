@@ -232,6 +232,190 @@ True False
 ===== 46-mutual-recursion (check=0 vm=0 comp=0) [PASS] =====
 ===== 47-global-counter (check=0 vm=0 comp=0) [PASS] =====
 ===== 48-as-checked-cast (check=0 vm=0 comp=0) [PASS] =====
+===== 49-iterator-protocol (check=0 vm=0 comp=0) [PASS] =====
+===== 50-container-protocol (check=0 vm=0 comp=0) [PASS] =====
+===== 51-property-setter (check=0 vm=0 comp=0) [PASS] =====
+===== 52-user-decorators (check=0 vm=0 comp=0) [PASS] {VM-DIVERGE} =====
+--- VM ---
+-> cube(3)
+<- 27
+27
+wrapper
+hello
+hello
+hello
+--- BUILD+PY ---
+-> cube(3)
+<- 27
+27
+cube
+hello
+hello
+hello
+===== 53-chained-comparisons (check=0 vm=0 comp=0) [PASS] =====
+===== 54-slicing (check=0 vm=0 comp=0) [PASS] =====
+===== 55-super-inheritance (check=0 vm=0 comp=0) [PASS] =====
+===== 56-custom-hash-key (check=0 vm=0 comp=0) [PASS] =====
+===== 57-nested-match (check=0 vm=0 comp=0) [PASS] =====
+===== 58-augmented-assign (check=0 vm=0 comp=0) [PASS] =====
+===== 59-graph-traversal (check=0 vm=0 comp=0) [PASS] =====
+===== 60-dijkstra-heapq (check=0 vm=0 comp=0) [PASS] =====
+===== 61-calculator-parser (check=0 vm=0 comp=0) [PASS] =====
+===== 62-run-length-encoding (check=0 vm=0 comp=0) [PASS] =====
+===== 63-roman-numerals (check=0 vm=0 comp=0) [PASS] =====
+===== 64-lru-cache (check=0 vm=0 comp=0) [PASS] =====
+===== 65-observer-pattern (check=0 vm=0 comp=0) [PASS] =====
+===== 66-visitor-sealed (check=0 vm=0 comp=0) [PASS] =====
+===== 67-matrix-ops (check=0 vm=0 comp=0) [PASS] =====
+===== 68-result-with-chain (check=0 vm=0 comp=0) [PASS] =====
+===== 69-param-kinds (check=0 vm=0 comp=0) [PASS] =====
+===== 70-namedtuple (check=0 vm=1 comp=0) [PASS] {VM-DIVERGE} =====
+--- VM ---
+3 4
+Point(x=3, y=4)
+7
+Traceback (most recent call last):
+  File "repros/70-namedtuple.ty", line 35, in <module>
+    main()
+  File "repros/70-namedtuple.ty", line 24, in main
+    let a: int = p[0]
+TypeError: 'instance' object is not subscriptable
+--- BUILD+PY ---
+3 4
+Point(x=3, y=4)
+7
+3 4
+3 4
+255 128 0
+True
+===== 71-generator-pipelines (check=0 vm=1 comp=0) [PASS] {VM-DIVERGE} =====
+--- VM ---
+Traceback (most recent call last):
+  File "repros/71-generator-pipelines.ty", line 37, in <module>
+    main()
+  File "repros/71-generator-pipelines.ty", line 28, in main
+    print(take(naturals(), 5))
+  File "repros/71-generator-pipelines.ty", line 7, in naturals
+    yield n
+RuntimeError: generator exceeded the VM's eager-evaluation limit (1000000 values); the tree-walking VM materialises generators eagerly — run unbounded or lazily-consumed generators with `tyc build` then `python`
+--- BUILD+PY ---
+[1, 2, 3, 4, 5]
+[1, 4, 9, 16, 25]
+[3, 6, 9, 12, 15]
+[4, 16, 36, 64]
+[1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+55
+===== 72-complex-numbers (check=0 vm=0 comp=0) [PASS] =====
+===== 73-string-methods (check=0 vm=0 comp=0) [PASS] =====
+===== 74-string-literals (check=0 vm=0 comp=0) [PASS] =====
+===== 75-enum-methods (check=0 vm=1 comp=0) [PASS] {VM-DIVERGE} =====
+--- VM ---
+#1: MERCURY True
+#2: VENUS True
+#3: EARTH False
+#4: MARS False
+True
+6
+Traceback (most recent call last):
+  File "repros/75-enum-methods.ty", line 37, in <module>
+    main()
+  File "repros/75-enum-methods.ty", line 30, in main
+    print(int(Priority.HIGH))
+TypeError: int() argument must be a string or a number, not 'instance'
+--- BUILD+PY ---
+#1: MERCURY True
+#2: VENUS True
+#3: EARTH False
+#4: MARS False
+True
+6
+10
+hearts
+True
+spades
+===== 76-assertions (check=0 vm=0 comp=0) [PASS] =====
+===== 77-zip-enumerate (check=0 vm=0 comp=0) [PASS] =====
+===== 78-deep-recursion-bignum (check=0 vm=1 comp=0) [PASS] {VM-DIVERGE} =====
+--- VM ---
+Traceback (most recent call last):
+  File "repros/78-deep-recursion-bignum.ty", line 36, in <module>
+    main()
+  File "repros/78-deep-recursion-bignum.ty", line 14, in main
+    sys.setrecursionlimit(5000)
+AttributeError: module 'sys' has no attribute 'setrecursionlimit'
+--- BUILD+PY ---
+500500
+65536
+30414093201713378043612608166064768844377641568960512000000000000
+65
+280571172992510140037611932413038677189525
+115792089237316195423570985008687907853269984665640564039457584007913129639936
+===== 79-format-builtin (check=0 vm=0 comp=0) [PASS] =====
+===== 80-typing-constructs (check=0 vm=0 comp=0) [PASS] =====
+===== 81-dataclass-internals (check=0 vm=0 comp=0) [PASS] =====
+===== 82-custom-exceptions (check=0 vm=0 comp=0) [PASS] =====
+===== 83-cm-exception-handling (check=0 vm=1 comp=0) [PASS] {VM-DIVERGE} =====
+--- VM ---
+[block1] enter
+[block1] exit
+Traceback (most recent call last):
+  File "repros/83-cm-exception-handling.ty", line 36, in <module>
+    main()
+  File "repros/83-cm-exception-handling.ty", line 22, in main
+    with suppress_errors("block1"):
+NotImplementedError: `@contextmanager` generators as context managers (the VM evaluates generators eagerly); run with `tyc build` then `python` is not yet supported in the tree-walking VM; use `tyc build` then `python build/main.py` to run this program
+--- BUILD+PY ---
+[block1] enter
+doing work
+[block1] suppressed: oops
+[block1] exit
+[block2] enter
+clean work
+[block2] exit
+start compute
+end compute: collected [0, 1, 4]
+after blocks
+===== 84-datetime (check=0 vm=1 comp=0) [PASS] {VM-DIVERGE} =====
+--- VM ---
+2026 6 21
+Traceback (most recent call last):
+  File "repros/84-datetime.ty", line 26, in <module>
+    main()
+  File "repros/84-datetime.ty", line 6, in main
+    print(d.weekday())
+AttributeError: 'date' object has no attribute 'weekday'
+--- BUILD+PY ---
+2026 6 21
+6
+2026-06-21
+12 30
+2026-01-01T12:30:00
+2026-01-11T18:30:00
+364
+1 3600
+===== 85-match-positional (check=0 vm=0 comp=0) [PASS] =====
+===== 86-map-filter-reduce (check=0 vm=0 comp=0) [PASS] =====
+===== 87-bit-manipulation (check=0 vm=0 comp=0) [PASS] =====
+===== 88-data-pipeline (check=0 vm=0 comp=0) [PASS] =====
+===== 89-frozen-replace (check=0 vm=1 comp=0) [PASS] {VM-DIVERGE} =====
+--- VM ---
+localhost:8080
+Traceback (most recent call last):
+  File "repros/89-frozen-replace.ty", line 34, in <module>
+    main()
+  File "repros/89-frozen-replace.ty", line 17, in main
+    let prod: Config = base.with_port(443)
+  File "repros/89-frozen-replace.ty", line 10, in with_port
+    return dataclasses.replace(self, port=port)
+AttributeError: module 'dataclasses' has no attribute 'replace'
+--- BUILD+PY ---
+localhost:8080
+localhost:443
+localhost:8080
+True
+True
+frozen blocked mutation: True
+===== 90-aggregate-builtins (check=0 vm=0 comp=0) [PASS] =====
 
 ######## SUMMARY ########
-total=48 pass=48 buildfail=0 runfail=0 checkfail=0 vm_diverge=10
+total=90 pass=90 buildfail=0 runfail=0 checkfail=0 vm_diverge=18

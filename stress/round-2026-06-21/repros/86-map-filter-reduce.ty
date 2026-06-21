@@ -1,0 +1,32 @@
+from functools import reduce
+
+def main() -> None:
+    let nums: list[int] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+
+    let doubled: list[int] = list(map(lambda x: x * 2, nums))
+    print(doubled)
+
+    let evens: list[int] = list(filter(lambda x: x % 2 == 0, nums))
+    print(evens)
+
+    let total: int = reduce(lambda a, b: a + b, nums)
+    print(total)
+
+    let product: int = reduce(lambda a, b: a * b, nums, 1)
+    print(product)
+
+    let chained: list[int] = list(map(lambda x: x + 1, filter(lambda x: x > 5, nums)))
+    print(chained)
+
+    let words: list[str] = ["hello", "world", "foo"]
+    let lengths: list[int] = list(map(len, words))
+    print(lengths)
+
+    let combined: list[int] = list(map(lambda p: p[0] + p[1], zip(nums, doubled)))
+    print(combined)
+
+    let max_via_reduce: int = reduce(lambda a, b: a if a > b else b, nums)
+    print(max_via_reduce)
+
+if __name__ == "__main__":
+    main()

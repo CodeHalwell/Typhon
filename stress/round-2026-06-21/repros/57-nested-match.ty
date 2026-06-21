@@ -1,0 +1,48 @@
+class Point:
+    x: int
+    y: int
+class Line:
+    start: Point
+    end: Point
+
+def classify_line(l: Line) -> str:
+    match l:
+        case Line(start=Point(x=0, y=0), end=e):
+            return f"from origin to ({e.x},{e.y})"
+        case Line(start=Point(x=x1), end=Point(x=x2)) if x1 == x2:
+            return "vertical"
+        case Line(start=Point(y=y1), end=Point(y=y2)) if y1 == y2:
+            return "horizontal"
+        case _:
+            return "general"
+
+def describe(v: object) -> str:
+    match v:
+        case (0, 0):
+            return "origin"
+        case (x, 0) | (0, x):
+            return f"on axis at {x}"
+        case {"name": n, **rest}:
+            return f"named {n}, {len(rest)} extra fields"
+        case [1, 2, *tail]:
+            return f"prefix 1,2 rest={tail}"
+        case [a, b, c]:
+            return f"triple {a},{b},{c}"
+        case _:
+            return "other"
+
+def main() -> None:
+    print(classify_line(Line(start=Point(x=0, y=0), end=Point(x=3, y=4))))
+    print(classify_line(Line(start=Point(x=2, y=1), end=Point(x=2, y=9))))
+    print(classify_line(Line(start=Point(x=1, y=5), end=Point(x=8, y=5))))
+    print(classify_line(Line(start=Point(x=1, y=2), end=Point(x=3, y=9))))
+    print(describe((0, 0)))
+    print(describe((7, 0)))
+    print(describe((0, 9)))
+    print(describe({"name": "x", "a": 1, "b": 2}))
+    print(describe([1, 2, 3, 4]))
+    print(describe([5, 6, 7]))
+    print(describe(3.14))
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,50 @@
+def main() -> None:
+    mut n: int = 10
+    n += 5
+    n -= 2
+    n *= 3
+    n //= 2
+    n %= 7
+    n **= 2
+    print(n)
+
+    mut f: float = 100.0
+    f /= 4.0
+    print(f)
+
+    mut xs: list[int] = [1, 2]
+    xs += [3, 4]
+    xs *= 2
+    print(xs)
+
+    mut s: str = "a"
+    s += "b"
+    s *= 3
+    print(s)
+
+    mut d: dict[str, int] = {"a": 1, "b": 2}
+    d["a"] += 10
+    d["b"] *= 5
+    print(d)
+
+    mut bits: int = 0b1010
+    bits |= 0b0101
+    bits &= 0b1110
+    bits ^= 0b0010
+    bits <<= 2
+    bits >>= 1
+    print(bits)
+
+    mut st: set[int] = {1, 2, 3}
+    st |= {4, 5}
+    st &= {2, 3, 4}
+    st -= {3}
+    print(sorted(st))
+
+    mut grid: list[list[int]] = [[0, 0], [0, 0]]
+    grid[0][1] += 5
+    grid[1][0] += 3
+    print(grid)
+
+if __name__ == "__main__":
+    main()

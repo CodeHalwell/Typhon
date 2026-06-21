@@ -1,0 +1,36 @@
+import sys
+
+def sum_to(n: int) -> int:
+    if n == 0:
+        return 0
+    return n + sum_to(n - 1)
+
+def power_tower(base: int, height: int) -> int:
+    if height == 0:
+        return 1
+    return base ** power_tower(base, height - 1)
+
+def main() -> None:
+    sys.setrecursionlimit(5000)
+    print(sum_to(1000))
+    print(power_tower(2, 4))
+
+    # big factorial
+    mut fact: int = 1
+    for i in range(1, 51):
+        fact = fact * i
+    print(fact)
+    print(len(str(fact)))
+
+    # large fibonacci, iterative
+    mut a: int = 0
+    mut b: int = 1
+    for _ in range(200):
+        let nxt: int = a + b
+        a = b
+        b = nxt
+    print(a)
+    print(2 ** 256)
+
+if __name__ == "__main__":
+    main()

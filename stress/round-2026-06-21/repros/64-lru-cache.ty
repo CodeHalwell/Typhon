@@ -1,0 +1,34 @@
+from collections import OrderedDict
+
+class LRUCache:
+    capacity: int
+    store: OrderedDict[str, int]
+
+impl LRUCache:
+    def get(self, key: str) -> int?:
+        if key not in self.store:
+            return None
+        let value: int = self.store.pop(key)
+        self.store[key] = value
+        return value
+
+    def put(self, key: str, value: int) -> None:
+        if key in self.store:
+            let _: int = self.store.pop(key)
+        elif len(self.store) >= self.capacity:
+            let evicted: tuple[str, int] = self.store.popitem(last=False)
+            print(f"evict {evicted[0]}")
+        self.store[key] = value
+
+def main() -> None:
+    mut cache: LRUCache = LRUCache(capacity=2, store=OrderedDict())
+    cache.put("a", 1)
+    cache.put("b", 2)
+    print(cache.get("a"))
+    cache.put("c", 3)
+    print(cache.get("b"))
+    print(cache.get("a"))
+    print(cache.get("c"))
+
+if __name__ == "__main__":
+    main()

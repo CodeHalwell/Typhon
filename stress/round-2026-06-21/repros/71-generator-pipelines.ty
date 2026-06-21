@@ -1,0 +1,37 @@
+from typing import Iterator
+import itertools
+
+def naturals() -> Iterator[int]:
+    mut n: int = 1
+    while True:
+        yield n
+        n = n + 1
+
+def take[T](it: Iterator[T], k: int) -> list[T]:
+    mut out: list[T] = []
+    for x in it:
+        if len(out) >= k:
+            break
+        out.append(x)
+    return out
+
+def squares_of(it: Iterator[int]) -> Iterator[int]:
+    for x in it:
+        yield x * x
+
+def filtered(it: Iterator[int], pred_mod: int) -> Iterator[int]:
+    for x in it:
+        if x % pred_mod == 0:
+            yield x
+
+def main() -> None:
+    print(take(naturals(), 5))
+    print(take(squares_of(naturals()), 5))
+    print(take(filtered(naturals(), 3), 5))
+    print(take(squares_of(filtered(naturals(), 2)), 4))
+    let first_ten: list[int] = list(itertools.islice(naturals(), 10))
+    print(first_ten)
+    print(sum(itertools.islice(squares_of(naturals()), 5)))
+
+if __name__ == "__main__":
+    main()

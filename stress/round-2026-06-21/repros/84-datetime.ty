@@ -1,0 +1,26 @@
+from datetime import datetime, date, timedelta
+
+def main() -> None:
+    let d: date = date(2026, 6, 21)
+    print(d.year, d.month, d.day)
+    print(d.weekday())
+    print(d.isoformat())
+
+    let dt: datetime = datetime(2026, 1, 1, 12, 30, 0)
+    print(dt.hour, dt.minute)
+    print(dt.isoformat())
+
+    let delta: timedelta = timedelta(days=10, hours=6)
+    let later: datetime = dt + delta
+    print(later.isoformat())
+
+    let d1: date = date(2026, 12, 31)
+    let d2: date = date(2026, 1, 1)
+    let diff: timedelta = d1 - d2
+    print(diff.days)
+
+    let dur: timedelta = timedelta(hours=25)
+    print(dur.days, dur.seconds)
+
+if __name__ == "__main__":
+    main()

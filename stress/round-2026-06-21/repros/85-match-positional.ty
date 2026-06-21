@@ -1,0 +1,43 @@
+class Vector3:
+    x: float
+    y: float
+    z: float
+
+class Command:
+    name: str
+    args: list[str]
+
+def classify_vec(v: Vector3) -> str:
+    match v:
+        case Vector3(0.0, 0.0, 0.0):
+            return "zero"
+        case Vector3(x, 0.0, 0.0):
+            return f"x-axis at {x}"
+        case Vector3(x, y, 0.0):
+            return f"xy-plane ({x},{y})"
+        case Vector3(x, y, z):
+            return f"general ({x},{y},{z})"
+
+def run(cmd: Command) -> str:
+    match cmd:
+        case Command("quit", []):
+            return "quitting"
+        case Command("echo", [msg]):
+            return f"echo: {msg}"
+        case Command("add", [a, b]):
+            return f"sum: {int(a) + int(b)}"
+        case Command(name, args):
+            return f"unknown {name} with {len(args)} args"
+
+def main() -> None:
+    print(classify_vec(Vector3(x=0.0, y=0.0, z=0.0)))
+    print(classify_vec(Vector3(x=5.0, y=0.0, z=0.0)))
+    print(classify_vec(Vector3(x=1.0, y=2.0, z=0.0)))
+    print(classify_vec(Vector3(x=1.0, y=2.0, z=3.0)))
+    print(run(Command(name="quit", args=[])))
+    print(run(Command(name="echo", args=["hello"])))
+    print(run(Command(name="add", args=["3", "4"])))
+    print(run(Command(name="foo", args=["a", "b", "c"])))
+
+if __name__ == "__main__":
+    main()

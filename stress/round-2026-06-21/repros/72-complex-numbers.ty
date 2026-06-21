@@ -1,0 +1,25 @@
+def mandelbrot_escapes(cr: float, ci: float, max_iter: int) -> int:
+    mut z: complex = complex(0.0, 0.0)
+    let c: complex = complex(cr, ci)
+    mut i: int = 0
+    while i < max_iter:
+        z = z * z + c
+        if abs(z) > 2.0:
+            return i
+        i = i + 1
+    return max_iter
+
+def main() -> None:
+    let a: complex = complex(3.0, 4.0)
+    print(abs(a))
+    print(a.real, a.imag)
+    print(a.conjugate())
+    let b: complex = 1 + 2j
+    print(a + b)
+    print(a * b)
+    print((1 + 1j) ** 2)
+    print(mandelbrot_escapes(0.0, 0.0, 50))
+    print(mandelbrot_escapes(2.0, 2.0, 50))
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,26 @@
+def main() -> None:
+    let xs: list[int] = list(range(10))
+    print(xs[2:5], xs[:3], xs[7:], xs[-3:])
+    print(xs[::2], xs[1::2], xs[::-1], xs[::-2])
+    print(xs[2:8:3])
+
+    mut ys: list[int] = list(range(10))
+    ys[2:5] = [20, 30]
+    print(ys)
+    ys[0:0] = [-1, -2]
+    print(ys)
+    del ys[0]
+    print(ys)
+    del ys[0:2]
+    print(ys)
+    ys[::2] = [0, 0, 0, 0]
+    print(ys)
+
+    let s: str = "abcdefghij"
+    print(s[1:6:2], s[::-1], s[-3:])
+
+    let t: tuple[int, ...] = (1, 2, 3, 4, 5)
+    print(t[1:4], t[::-1])
+
+if __name__ == "__main__":
+    main()

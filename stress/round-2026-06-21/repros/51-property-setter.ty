@@ -1,0 +1,36 @@
+class Temperature:
+    _celsius: float
+
+impl Temperature:
+    @property
+    def celsius(self) -> float:
+        return self._celsius
+
+    @celsius.setter
+    def celsius(self, value: float) -> None:
+        if value < -273.15:
+            raise ValueError("below absolute zero")
+        self._celsius = value
+
+    @property
+    def fahrenheit(self) -> float:
+        return self._celsius * 9.0 / 5.0 + 32.0
+
+    @fahrenheit.setter
+    def fahrenheit(self, value: float) -> None:
+        self._celsius = (value - 32.0) * 5.0 / 9.0
+
+def main() -> None:
+    mut t: Temperature = Temperature(_celsius=0.0)
+    print(t.celsius, t.fahrenheit)
+    t.celsius = 100.0
+    print(t.celsius, t.fahrenheit)
+    t.fahrenheit = 32.0
+    print(t.celsius, t.fahrenheit)
+    try:
+        t.celsius = -300.0
+    except ValueError as e:
+        print(f"rejected: {e}")
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,28 @@
+def main() -> None:
+    print(format(255, "x"))
+    print(format(255, "08b"))
+    print(format(3.14159, ".2f"))
+    print(format(1234567, ","))
+    print(format(0.875, ".1%"))
+    print(format(42, ">10"))
+    print(format("hi", "^8"))
+    print(format(-5, "+"))
+
+    print(repr("hello"))
+    print(repr([1, 2, 3]))
+    print(str(3.14), str([1, 2]), str({"a": 1}))
+    print(ascii("café"))
+
+    let values: list[float] = [1.5, 22.25, 333.125]
+    for v in values:
+        print(f"{v:>10.3f}")
+
+    print(f"{255:{'08b'}}")
+    let spec: str = ".4f"
+    print(f"{3.14159:{spec}}")
+
+    print(bin(10), oct(64), hex(255))
+    print(int("1010", 2), int("777", 8), int("ff", 16))
+
+if __name__ == "__main__":
+    main()
