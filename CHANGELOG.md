@@ -4,6 +4,49 @@ All notable changes to Typhon are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely; the
 canonical phase-by-phase status lives in `docs/roadmap.md`.
 
+## Unreleased
+
+### Added — postfix `rescue`: lambda-free, `try`/`except`-free exception boundaries
+
+A new postfix operator, **`EXPR rescue NAME: ERR_EXPR`**, lifts a single fallible
+boundary call into a `Result` and propagates the error to the enclosing
+`Result`-returning function — with no lambdas, no `try`, and no `except` in
+source:
+
+```python
+def load_port(raw: str) -> Result[int, str]:
+    let n: int = int(raw) rescue e: f"bad port: {e}"
+    return Ok(n)
+```
+
+`rescue` is pure surface sugar over machinery that already ships: it lowers (in
+`tyc-syntax`'s `expand_rescue`, folded into `expand_question_ops` so it reaches
+every pipeline including the VM) to
+`try_result(lambda: EXPR, lambda NAME: ERR_EXPR)?`. The desugar pass's existing
+`try_result` import injection and the `?` propagation operator (with its
+enclosing-`Result` placement rule) carry the rest, so the feature works
+identically under `tyc check`, `tyc run` (VM), and `tyc build` + CPython, and
+composes with `as!` (`json.loads(t) as! dict[str, str] rescue e: …`). The left
+operand is found with the same bracket-/string-/comment-aware scan the `as!`
+cast uses, so `rescue` works in value positions and after a leading
+`return`/`if`/`while`/`assert`. `tyc fmt` round-trips it unchanged.
+
+This replaces the hand-written `try: return Ok(…) except E as e: return Err(…)`
+shim and the lambda-heavy `try_result(lambda: …, lambda e: …)` call for the
+common single-boundary case. See `docs/design/error-boundary-sugar.md` for the
+design and `docs/guides/06-error-handling.md` for usage.
+
+**Scope (v1):** only the **statement-tail** form (`LHS = EXPR rescue e: ERR`
+ending the logical line) is lowered — the `…)?` shape every pipeline's
+end-of-line `?` pass handles. A `rescue` in inline/mid-expression position, or
+whose right side isn't `NAME: EXPR`, is left for the parser. The **block form**
+(`rescue e: ERR:` wrapping a suite) from the design note is not yet implemented.
+**Known limitation:** the mapped error type is not statically checked against the
+function's declared error type — `rescue` inherits this from `try_result`, whose
+inferred error type already flows through `?` unchecked (a plain `?` on a
+`Result`-returning call still fires `tyc::result_error_mismatch` as before; only
+the `try_result`/`rescue` boundary is loose). Runtime propagation is unaffected.
+
 ## 0.15.7 — 2026-06-21 — third-party introspection depth + stress-round robustness
 
 A robustness release that deepens compile-time checking of third-party code and

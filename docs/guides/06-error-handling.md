@@ -226,6 +226,36 @@ def load_config(path: str) -> Result[dict[str, str], str]:
 
 After this wrapper, downstream code can use `?` and `with`-chains without touching `try`.
 
+### `try_result` and postfix `rescue` — bridge without writing `try`
+
+When you map *distinct* exception types to *distinct* errors, the explicit `try/except` shim above is the clearest form. But for the common single-boundary case — "run this; if it throws, turn the exception into my error" — you don't need `try`/`except` at all.
+
+The `try_result(thunk[, on_err])` combinator runs `thunk()` and returns `Ok(result)`, or `Err(on_err(exc))` on any exception (or `Err(exc)` when no mapper is given):
+
+```python
+def load_config(path: str) -> Result[dict[str, str], str]:
+    return try_result(lambda: json.load(open(path)), lambda e: f"bad config: {e}")
+```
+
+The lambdas are the ugly part. The postfix **`rescue`** operator says the same thing with none:
+
+```python
+def load_port(raw: str) -> Result[int, str]:
+    let n: int = int(raw) rescue e: f"bad port: {e}"     # catch + map + propagate
+    return Ok(n)
+```
+
+`EXPR rescue NAME: ERR_EXPR` runs `EXPR`; on any exception it binds the exception to `NAME`, evaluates `ERR_EXPR`, and propagates `Err(ERR_EXPR)` to the enclosing function — exactly like `?`, so the function must return a compatible `Result`. It's surface sugar for `try_result(lambda: EXPR, lambda NAME: ERR_EXPR)?` and lowers to the same emitted code. One fallible step per line, mapped to one error, reads straight down:
+
+```python
+def load_config(text: str) -> Result[Config, str]:
+    let data: dict[str, str] = json.loads(text) as! dict[str, str] rescue e: f"bad json: {e}"
+    let port: int           = int(data["port"])                    rescue e: f"bad port: {e}"
+    return Ok(Config(host=data["host"], port=port))
+```
+
+`rescue` works in value positions and after a leading `return` / `if` / `while` / `assert`, and composes with `as!` as shown. The error expression runs to the end of the line. Today the statement-tail form (the last thing on the line, as above) is what's lowered; reach for the explicit multi-`except` `try` shim when you need to map several exception *types* to different errors.
+
 ## What gets emitted
 
 `Result`, `Ok`, and `Err` are emitted as tagged dataclasses in a generated `typhon_runtime.py` module that sits in your output tree:

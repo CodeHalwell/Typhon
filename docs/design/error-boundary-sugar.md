@@ -1,6 +1,29 @@
 # Design note: lambda-free exception boundaries (`rescue`)
 
-**Status:** proposal · **Branch:** `claude/typhon-error-handling-x8oau5` · **Date:** 2026-06-21
+**Status:** postfix `rescue` **implemented** (statement-tail form); block form + error-type check are follow-ups · **Branch:** `claude/typhon-error-handling-x8oau5` · **Date:** 2026-06-21
+
+## Implementation status
+
+- **Postfix `rescue` (statement-tail) — shipped.** `EXPR rescue NAME: ERR` lowers
+  in `tyc-syntax::preprocess::expand_rescue` (folded into `expand_question_ops`,
+  so it reaches `check`, `run`/VM, `build`, `fmt`, and the LSP) to
+  `try_result(lambda: EXPR, lambda NAME: ERR)?`. Verified end-to-end: `tyc check`
+  passes, the VM and the compiled CPython path produce identical output, it
+  composes with `as!`, `tyc fmt` round-trips it, and `rescue` in a non-`Result`
+  function is rejected. Unit tests live beside the `as!` tests in `preprocess.rs`.
+- **Not yet implemented:** the block form (§"Block `rescue`"), the non-propagating
+  `catch` sibling, type filters, and multi-arm blocks.
+- **Known limitation:** the mapped error type is not statically checked against
+  the enclosing function's declared error type. This is **inherited from
+  `try_result`** — a hand-written `try_result(...)?` with a mismatched error type
+  already slips past the checker today, while a plain `?` on a `Result`-returning
+  call still fires `tyc::result_error_mismatch`. Closing it means teaching the
+  checker to infer `try_result`'s `E` from the mapper body and feed it the `?`
+  error-type check; tracked as a separate follow-up since it also tightens
+  existing `try_result` users. Runtime propagation is correct regardless.
+
+---
+
 
 ## Summary
 
