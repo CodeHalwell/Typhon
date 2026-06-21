@@ -4,7 +4,28 @@ All notable changes to Typhon are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely; the
 canonical phase-by-phase status lives in `docs/roadmap.md`.
 
-## Unreleased
+## 0.15.7 — 2026-06-21 — third-party introspection depth + stress-round robustness
+
+A robustness release that deepens compile-time checking of third-party code and
+clears a fresh batch of type-checker false positives surfaced by the 2026-06-21
+stress round (~130-program breadth sweep) and a wide third-party introspection
+audit (43 libraries). The headline is that **third-party *method* calls are now
+arity-checked** — a missing required argument to `PCA(...).fit()` or
+`df.merge()` is caught at `tyc check` / `tyc build` time, the same way
+constructor and free-function calls already were. Three introspection-robustness
+fixes (a proxy member that raises from `inspect.signature` no longer silently
+disables a whole module's checks; the implicit-Optional `x: T = None` idiom no
+longer false-positives; `pkg.sub.Thing()` multi-segment attribute calls are now
+checked like the `from`-import form) plus three pure type-checker false-positive
+fixes (`Counter +/- Counter`, a `plain class` / `class!` with a hand-written
+`__init__`, and a `__call__`-bearing instance passed where a `Callable` is
+expected) remove build-blockers on valid, idiomatic code. A VM correctness fix
+(`str.isupper()` / `str.islower()` on uncased strings) closes a silent-wrong-output
+gap under `tyc run`. Rounding out the release: three compiler-perf passes (fewer
+heap allocations in type narrowing, VM `repr`, source-map generation, and Path
+handling), a hardened hardcoded-secret lint (now catches embedded secret terms),
+and a docs-site styling refresh. All changes are backward-compatible —
+previously-accepted programs type-check identically.
 
 ### Added — third-party **method** calls are now arity-checked (missing required arguments caught)
 
@@ -161,6 +182,38 @@ canonical phase-by-phase status lives in `docs/roadmap.md`.
   always correct. Both predicates now require a cased character of the matching
   case and none of the opposite case. Found by the 2026-06-21 stress round
   (`stress/round-2026-06-21/`, repro `29`).
+
+### Changed — compiler performance: fewer heap allocations on hot paths
+
+- **`tyc-types` exhaustiveness / narrowing** (`cases_cover_type`): now compares
+  type names by `&str` reference instead of allocating an owned `String` per
+  type-check match, removing a dynamic `.to_string()` per case in match
+  exhaustiveness and `isinstance` narrowing (#210).
+- **`tyc-vm` Python `repr`** (`python_repr_str` / `python_repr_bytes`): replaces
+  `write!` / `format!` (`std::fmt`) with direct string/byte assembly in these
+  tight loops; **source-map generation** (`build_source_map_v2`) stringifies
+  line/column integers through an `itoa` buffer instead of `format!` (#213).
+- **Path handling across the compiler** (`tyc`, `tyc-vm`, `tyc-lsp`,
+  `tyc-format`): `display().to_string()` is replaced with
+  `to_string_lossy().into_owned()` for `std::path::Path`, dropping the
+  `std::fmt` formatting machinery on a frequently-hit path (#215).
+- All three are internal refactors with no behavioural change.
+
+### Changed — the hardcoded-secret lint catches *embedded* secret terms
+
+- **`tyc-analyse` / `tyc build`** secret-literal detection (`is_secret_name` /
+  `secret_suffix`) now searches for secret terms *anywhere* within an
+  identifier rather than only as a suffix, with word-boundary checks so it
+  flags `API_KEY_FOO` and `myTokenValue` while still ignoring false positives
+  like `MONKEY` and `PASSPORT`. New unit tests cover the camelCase and embedded
+  cases (#205).
+
+### Changed — docs-site styling refresh
+
+- The Starlight docs theme gains elevated markdown blockquotes (subtle
+  background, thicker accent border, rounded corners) and adds tab-hover and
+  table focus-within styling for clearer visual hierarchy and keyboard
+  navigation (#204, #212). Docs-site only — no compiler or language change.
 
 ## 0.15.6 — 2026-06-16 — stress-test robustness sweep
 
