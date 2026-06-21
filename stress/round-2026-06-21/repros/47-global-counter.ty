@@ -1,0 +1,23 @@
+mut CALL_COUNT: int = 0
+let REGISTRY: dict[str, int] = {}
+
+def tick() -> int:
+    global CALL_COUNT
+    CALL_COUNT = CALL_COUNT + 1
+    return CALL_COUNT
+
+def register(name: str, value: int) -> None:
+    REGISTRY[name] = value
+
+def main() -> None:
+    print(tick())
+    print(tick())
+    print(tick())
+    print(f"total calls: {CALL_COUNT}")
+
+    register("alpha", 1)
+    register("beta", 2)
+    print(dict(sorted(REGISTRY.items())))
+
+if __name__ == "__main__":
+    main()

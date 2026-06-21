@@ -1,0 +1,9 @@
+from sklearn.preprocessing import StandardScaler
+
+def main() -> None:
+    let sc = StandardScaler()
+    sc.transform()                  # missing required X
+    print(sc)
+
+if __name__ == "__main__":
+    main()

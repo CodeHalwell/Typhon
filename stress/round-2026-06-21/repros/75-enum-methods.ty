@@ -1,0 +1,37 @@
+from enum import IntEnum, StrEnum
+
+enum Planet:
+    MERCURY = 1
+    VENUS = 2
+    EARTH = 3
+    MARS = 4
+
+impl Planet:
+    def is_inner(self) -> bool:
+        return self.value <= 2
+    def order(self) -> str:
+        return f"#{self.value}: {self.name}"
+
+class Priority(IntEnum):
+    LOW = 1
+    MEDIUM = 5
+    HIGH = 10
+
+class Suit(StrEnum):
+    HEARTS = "hearts"
+    SPADES = "spades"
+
+def main() -> None:
+    for p in Planet:
+        print(p.order(), p.is_inner())
+
+    print(Priority.HIGH > Priority.LOW)
+    print(Priority.MEDIUM + 1)
+    print(int(Priority.HIGH))
+
+    print(Suit.HEARTS)
+    print(Suit.HEARTS == "hearts")
+    print(Suit.SPADES.value)
+
+if __name__ == "__main__":
+    main()

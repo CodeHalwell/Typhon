@@ -1,0 +1,43 @@
+def is_prime(n: int) -> bool:
+    if n < 2:
+        return False
+    mut i: int = 2
+    while i * i <= n:
+        if n % i == 0:
+            return False
+        i = i + 1
+    return True
+
+def find_divisor(n: int) -> int?:
+    for d in range(2, n):
+        if n % d == 0:
+            return d
+    else:
+        return None
+
+def search(haystack: list[int], needle: int) -> str:
+    for i, x in enumerate(haystack):
+        if x == needle:
+            break
+    else:
+        return "not found"
+    return f"found at {i}"
+
+def main() -> None:
+    print([n for n in range(20) if is_prime(n)])
+    print(find_divisor(15))
+    print(find_divisor(13))
+    print(search([10, 20, 30], 20))
+    print(search([10, 20, 30], 99))
+
+    mut total: int = 0
+    for i in range(10):
+        if i == 5:
+            continue
+        if i == 8:
+            break
+        total = total + i
+    print(total)
+
+if __name__ == "__main__":
+    main()

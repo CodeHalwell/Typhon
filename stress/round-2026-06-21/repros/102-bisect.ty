@@ -1,0 +1,24 @@
+import bisect
+
+def grade(score: int) -> str:
+    let breakpoints: list[int] = [60, 70, 80, 90]
+    let grades: list[str] = ["F", "D", "C", "B", "A"]
+    let i: int = bisect.bisect(breakpoints, score)
+    return grades[i]
+
+def main() -> None:
+    mut xs: list[int] = [1, 3, 5, 7, 9]
+    print(bisect.bisect_left(xs, 5))
+    print(bisect.bisect_right(xs, 5))
+    print(bisect.bisect(xs, 6))
+
+    bisect.insort(xs, 4)
+    print(xs)
+    bisect.insort(xs, 10)
+    print(xs)
+
+    for score in [55, 65, 75, 85, 95, 100]:
+        print(f"{score}: {grade(score)}")
+
+if __name__ == "__main__":
+    main()

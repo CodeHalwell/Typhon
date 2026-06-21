@@ -1,0 +1,23 @@
+def parse_int(s: str) -> Result[int, str]:
+    return try_result(lambda: int(s), lambda e: f"bad int: {s}")
+
+def safe_index(xs: list[int], i: int) -> Result[int, str]:
+    return try_result(lambda: xs[i], lambda e: f"index {i} out of range")
+
+def sum_parsed(strs: list[str]) -> Result[int, str]:
+    mut total: int = 0
+    for s in strs:
+        let n: int = parse_int(s)?
+        total = total + n
+    return Ok(total)
+
+def main() -> None:
+    print(parse_int("42"))
+    print(parse_int("nope"))
+    print(safe_index([1, 2, 3], 1))
+    print(safe_index([1, 2, 3], 10))
+    print(sum_parsed(["1", "2", "3"]))
+    print(sum_parsed(["1", "x", "3"]))
+
+if __name__ == "__main__":
+    main()

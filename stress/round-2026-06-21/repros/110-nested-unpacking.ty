@@ -1,0 +1,32 @@
+def stats(xs: list[int]) -> tuple[int, int, int]:
+    return (min(xs), sum(xs) // len(xs), max(xs))
+
+def make_url(host: str, port: int, secure: bool) -> str:
+    let scheme: str = "https" if secure else "http"
+    return f"{scheme}://{host}:{port}"
+
+def main() -> None:
+    for name, (x, y) in [("a", (1, 2)), ("b", (3, 4))]:
+        print(name, x, y)
+
+    for first, *rest in [[1, 2, 3], [4, 5, 6, 7]]:
+        print(first, rest)
+
+    for *init, last in [[1, 2, 3], [4, 5]]:
+        print(init, last)
+
+    let (lo: int, mid: int, hi: int) = stats([5, 1, 9, 3])
+    print(lo, mid, hi)
+
+    let args: list[object] = ["localhost", 8080, True]
+    let kwargs: dict[str, object] = {"host": "example.com", "port": 443, "secure": False}
+    print(make_url("h", 80, secure=False))
+    print(make_url(**kwargs))
+
+    let nested: list[tuple[int, list[int]]] = [(1, [2, 3]), (4, [5, 6])]
+    for key, vals in nested:
+        let total: int = key + sum(vals)
+        print(total)
+
+if __name__ == "__main__":
+    main()

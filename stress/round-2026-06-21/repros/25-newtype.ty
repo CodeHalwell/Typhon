@@ -1,0 +1,32 @@
+newtype UserId = int
+newtype OrderId = int
+newtype Cents = int
+
+class User:
+    id: UserId
+    name: str
+
+def total_cents(prices: list[Cents]) -> Cents:
+    mut total: Cents = Cents(0)
+    for p in prices:
+        total = total + p
+    return total
+
+def format_money(c: Cents) -> str:
+    let dollars: int = c // 100
+    let rem: int = c % 100
+    return f"${dollars}.{rem:02d}"
+
+def main() -> None:
+    let uid: UserId = UserId(42)
+    let u: User = User(id=uid, name="Alice")
+    print(u.id, u.name)
+    let raw: int = u.id
+    print(raw + 1)
+
+    let prices: list[Cents] = [Cents(1999), Cents(500), Cents(250)]
+    let total: Cents = total_cents(prices)
+    print(format_money(total))
+
+if __name__ == "__main__":
+    main()

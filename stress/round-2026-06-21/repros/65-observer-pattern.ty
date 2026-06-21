@@ -1,0 +1,32 @@
+from typing import Callable
+
+class EventBus:
+    handlers: dict[str, list[Callable[[str], None]]]
+
+impl EventBus:
+    def subscribe(self, event: str, handler: Callable[[str], None]) -> None:
+        if event not in self.handlers:
+            self.handlers[event] = []
+        self.handlers[event].append(handler)
+
+    def emit(self, event: str, payload: str) -> None:
+        for handler in self.handlers.get(event, []):
+            handler(payload)
+
+def main() -> None:
+    mut log: list[str] = []
+    mut bus: EventBus = EventBus(handlers={})
+
+    bus.subscribe("login", lambda p: log.append(f"audit: {p} logged in"))
+    bus.subscribe("login", lambda p: log.append(f"welcome {p}"))
+    bus.subscribe("logout", lambda p: log.append(f"bye {p}"))
+
+    bus.emit("login", "alice")
+    bus.emit("logout", "alice")
+    bus.emit("unknown", "noop")
+
+    for line in log:
+        print(line)
+
+if __name__ == "__main__":
+    main()

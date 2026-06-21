@@ -1,0 +1,31 @@
+import operator
+from operator import itemgetter, attrgetter
+from functools import reduce
+
+class Person:
+    name: str
+    age: int
+
+def main() -> None:
+    print(operator.add(3, 4), operator.mul(3, 4), operator.sub(10, 3))
+    print(operator.lt(1, 2), operator.eq(5, 5), operator.ge(3, 7))
+
+    let data: list[tuple[int, str]] = [(3, "c"), (1, "a"), (2, "b")]
+    print(sorted(data, key=itemgetter(0)))
+    print(sorted(data, key=itemgetter(1)))
+    print(itemgetter(1, 0)((10, 20)))
+
+    let people: list[Person] = [
+        Person(name="Bob", age=30),
+        Person(name="Al", age=25),
+        Person(name="Cy", age=28),
+    ]
+    let by_age: list[Person] = sorted(people, key=attrgetter("age"))
+    print([p.name for p in by_age])
+
+    print(list(map(operator.neg, [1, -2, 3])))
+    print(reduce(operator.mul, [1, 2, 3, 4], 1))
+    print(operator.concat([1, 2], [3, 4]))
+
+if __name__ == "__main__":
+    main()

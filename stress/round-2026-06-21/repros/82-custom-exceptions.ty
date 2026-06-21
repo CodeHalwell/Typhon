@@ -1,0 +1,47 @@
+class ParseError(Exception):
+    pass
+
+class HttpError(Exception):
+    code: int
+    detail: str
+
+impl HttpError:
+    def __str__(self) -> str:
+        return f"HTTP {self.code}: {self.detail}"
+
+def parse(s: str) -> int:
+    if not s.isdigit():
+        raise ParseError(f"not a number: {s}")
+    return int(s)
+
+def fetch(status: int) -> str:
+    if status >= 400:
+        raise HttpError(code=status, detail="request failed")
+    return "ok"
+
+def main() -> None:
+    try:
+        print(parse("123"))
+        print(parse("abc"))
+    except ParseError as e:
+        print(f"parse error: {e}")
+
+    try:
+        print(fetch(200))
+        print(fetch(404))
+    except HttpError as e:
+        print(f"caught: {e}")
+        print(f"code = {e.code}, detail = {e.detail}")
+
+    # exception chaining + else
+    try:
+        let n: int = parse("42")
+    except ParseError:
+        print("failed")
+    else:
+        print(f"parsed cleanly: {n}")
+    finally:
+        print("done")
+
+if __name__ == "__main__":
+    main()

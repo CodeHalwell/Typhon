@@ -1,0 +1,38 @@
+class User:
+    id: int
+    name: str
+
+class Account:
+    user_id: int
+    balance: int
+
+def find_user(uid: int) -> Result[User, str]:
+    if uid == 1:
+        return Ok(User(id=1, name="Alice"))
+    return Err(f"no user {uid}")
+
+def find_account(user: User) -> Result[Account, str]:
+    if user.id == 1:
+        return Ok(Account(user_id=1, balance=500))
+    return Err(f"no account for {user.name}")
+
+def withdraw(account: Account, amount: int) -> Result[int, str]:
+    if amount > account.balance:
+        return Err("insufficient funds")
+    return Ok(account.balance - amount)
+
+def process(uid: int, amount: int) -> Result[int, str]:
+    with user = find_user(uid)?,
+         account = find_account(user)?,
+         remaining = withdraw(account, amount)?:
+        return Ok(remaining)
+    else err:
+        return Err(f"transaction failed: {err}")
+
+def main() -> None:
+    print(process(1, 200))
+    print(process(1, 1000))
+    print(process(2, 100))
+
+if __name__ == "__main__":
+    main()

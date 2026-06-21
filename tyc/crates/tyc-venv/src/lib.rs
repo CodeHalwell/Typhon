@@ -50,7 +50,7 @@ use std::time::Duration;
 
 use serde::Deserialize;
 
-use tyc_types::{ArityInfo, InterfaceShape, ModuleShapes, Type};
+use tyc_types::{ArityInfo, InterfaceShape, MethodSig, ModuleShapes, Type};
 
 /// One parameter recovered from `inspect.signature`.
 #[derive(Debug, Clone, Deserialize)]
@@ -84,6 +84,28 @@ struct IntrospectedMember {
     params: Option<Vec<IntrospectedParam>>,
     /// The return annotation rendered to a string, or `None` when the
     /// function has none. Only meaningful for `"function"` members.
+    #[serde(default)]
+    returns: Option<String>,
+    /// Public methods of a `"class"` member, each with its own
+    /// (receiver-stripped) signature. `None`/empty for non-class members
+    /// or classes whose methods couldn't be introspected. Lets the checker
+    /// arity-check `obj.method(...)` calls against a foreign class — the
+    /// constructor (`params`) only covers `Cls(...)`.
+    #[serde(default)]
+    methods: Option<Vec<IntrospectedMethod>>,
+}
+
+/// One public method recovered from an introspected class. The `params`
+/// list already has the implicit receiver (`self` / `cls`) stripped on the
+/// Python side, so it maps straight onto an [`ArityInfo`] via
+/// [`arity_info_from_params`].
+#[derive(Debug, Clone, Deserialize)]
+struct IntrospectedMethod {
+    name: String,
+    /// `"method"` (instance), `"classmethod"`, or `"staticmethod"`.
+    #[serde(default)]
+    kind: String,
+    params: Vec<IntrospectedParam>,
     #[serde(default)]
     returns: Option<String>,
 }
@@ -366,6 +388,50 @@ def returns_of(obj):
         return None
     return ann_to_str(sig.return_annotation)
 
+def methods_of(cls):
+    # Public methods of `cls`, each with its receiver-stripped signature.
+    # Only plain Python functions / classmethods / staticmethods are
+    # captured — C-extension slots and descriptors raise from
+    # `inspect.signature` (or aren't functions) and are skipped, so a
+    # numpy ndarray's C methods stay unchecked (lenient) rather than
+    # false-positive. Properties carry no call arity and are skipped.
+    out = []
+    try:
+        names = dir(cls)
+    except BaseException:
+        return out
+    for mname in names:
+        if mname.startswith("_"):
+            continue
+        try:
+            raw = inspect.getattr_static(cls, mname)
+        except BaseException:
+            continue
+        if isinstance(raw, staticmethod):
+            mkind, strip = "staticmethod", False
+            target = raw.__func__
+        elif isinstance(raw, classmethod):
+            mkind, strip = "classmethod", True
+            target = raw.__func__
+        elif inspect.isfunction(raw):
+            mkind, strip = "method", True
+            target = raw
+        else:
+            # property, slot wrapper, C method_descriptor, plain attribute…
+            continue
+        p = params_of(target)
+        if p is None:
+            continue
+        # Drop the leading receiver (self / cls) ONLY when it's a genuine
+        # leading positional. A decorator-wrapped method whose signature is
+        # `(*args, **kwargs)` (common in sklearn via functools.wraps) has no
+        # real receiver slot — stripping its `*args` would wrongly cap the
+        # method's positional arity and false-positive every valid call.
+        if strip and p and p[0]["kind"] in ("positional_only", "positional_or_keyword"):
+            p = p[1:]
+        out.append({"name": mname, "kind": mkind, "params": p, "returns": returns_of(target)})
+    return out
+
 def introspect_one(mod_name):
     try:
         m = importlib.import_module(mod_name)
@@ -385,6 +451,7 @@ def introspect_one(mod_name):
             "kind": kind,
             "params": params_of(obj) if kind in ("class", "function") else None,
             "returns": returns_of(obj) if kind == "function" else None,
+            "methods": methods_of(obj) if kind == "class" else None,
         })
     return {"members": members}
 
@@ -499,7 +566,19 @@ fn shapes_from_introspected(intro: &IntrospectedModule) -> ModuleShapes {
         };
         match member.kind.as_str() {
             "class" => {
-                if let Some(shape) = class_shape_from_params(params) {
+                if let Some(mut shape) = class_shape_from_params(params) {
+                    // Attach introspected method signatures so `obj.method(...)`
+                    // calls are arity-checked (the constructor `params` only
+                    // cover `Cls(...)`). Methods we couldn't introspect simply
+                    // aren't present, and the shape stays `partial`, so missing
+                    // ones remain lenient — no false `attribute_not_found`.
+                    if let Some(methods) = &member.methods {
+                        for m in methods {
+                            if let Some(sig) = method_sig_from_introspected(m) {
+                                shape.methods.insert(m.name.clone(), sig);
+                            }
+                        }
+                    }
                     class_shapes.insert(member.name.clone(), shape);
                 }
             }
@@ -766,6 +845,29 @@ fn split_top_level_union(s: &str) -> Option<(&str, &str)> {
 
 /// Build an [`ArityInfo`] for an introspected free function. `returns` is
 /// the function's return annotation (or `None`).
+/// Build a [`MethodSig`] for an introspected class method. The `params`
+/// already have the receiver stripped (Python side), so they map straight
+/// onto an [`ArityInfo`]. Returns `None` only when the signature couldn't be
+/// turned into arity info. A `**kwargs` / `*args` method still yields a usable
+/// (permissive-max) shape via `arity_info_from_params`, so the *minimum*
+/// required positional count is still enforced — `model.fit()` with `fit(self,
+/// X, y=None, **kw)` still flags the missing `X`.
+fn method_sig_from_introspected(m: &IntrospectedMethod) -> Option<MethodSig> {
+    let info = arity_info_from_params(&m.params, m.returns.as_deref())?;
+    let param_types = info.param_types.clone();
+    let return_type = info.return_type.clone();
+    Some(MethodSig {
+        arity: info.param_names.len(),
+        return_type,
+        is_property: false,
+        is_static: m.kind == "staticmethod",
+        is_classmethod: m.kind == "classmethod",
+        arity_info: info,
+        param_types,
+        is_async: false,
+    })
+}
+
 fn arity_info_from_params(
     params: &[IntrospectedParam],
     returns: Option<&str>,
@@ -1413,18 +1515,62 @@ mod tests {
                     kind: "value".into(),
                     params: None,
                     returns: None,
+                    methods: None,
                 },
                 IntrospectedMember {
                     name: "Agent".into(),
                     kind: "class".into(),
                     params: Some(vec![p("name", "keyword_only", false)]),
                     returns: None,
+                    methods: None,
                 },
             ],
         };
         let shapes = shapes_from_introspected(&intro);
         assert!(shapes.class_shapes.contains_key("Agent"));
         assert!(!shapes.class_shapes.contains_key("VERSION"));
+    }
+
+    #[test]
+    fn introspected_methods_populate_class_shape() {
+        // A class member's methods become arity-checkable MethodSigs on the
+        // InterfaceShape, so `obj.fit(...)` (not just `Cls(...)`) is covered.
+        let intro = IntrospectedModule {
+            members: vec![IntrospectedMember {
+                name: "PCA".into(),
+                kind: "class".into(),
+                params: Some(vec![p("n_components", "positional_or_keyword", true)]),
+                returns: None,
+                methods: Some(vec![
+                    IntrospectedMethod {
+                        name: "fit".into(),
+                        kind: "method".into(),
+                        // receiver already stripped on the Python side
+                        params: vec![
+                            p("X", "positional_or_keyword", false),
+                            p("y", "positional_or_keyword", true),
+                        ],
+                        returns: None,
+                    },
+                    IntrospectedMethod {
+                        name: "set_params".into(),
+                        kind: "method".into(),
+                        params: vec![p("params", "var_keyword", false)],
+                        returns: None,
+                    },
+                ]),
+            }],
+        };
+        let shapes = shapes_from_introspected(&intro);
+        let pca = shapes.class_shapes.get("PCA").expect("PCA shape");
+        let fit = pca.methods.get("fit").expect("fit method captured");
+        assert_eq!(fit.arity_info.min_positional, 1, "X required, y optional");
+        assert_eq!(fit.arity_info.max_positional, Some(2));
+        assert!(!fit.is_static && !fit.is_classmethod);
+        // `set_params(**params)` stays permissive (no required positionals).
+        let sp = pca.methods.get("set_params").expect("set_params captured");
+        assert_eq!(sp.arity_info.min_positional, 0);
+        assert!(sp.arity_info.has_kwarg);
     }
 
     #[test]
@@ -1760,6 +1906,7 @@ lazy import np = numpy
                 kind: "class".into(),
                 params: None,
                 returns: None,
+                methods: None,
             }],
         };
         let shapes = shapes_from_introspected(&intro);

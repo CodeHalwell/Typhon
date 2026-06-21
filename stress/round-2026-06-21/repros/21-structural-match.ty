@@ -1,0 +1,34 @@
+def describe(value: object) -> str:
+    match value:
+        case 0:
+            return "zero"
+        case int() as n if n < 0:
+            return f"negative {n}"
+        case int() as n:
+            return f"positive {n}"
+        case str() as s:
+            return f"string of len {len(s)}"
+        case [x]:
+            return f"singleton {x}"
+        case [x, y]:
+            return f"pair {x},{y}"
+        case [first, *rest]:
+            return f"list head {first} tail {rest}"
+        case {"type": t, "val": v}:
+            return f"record {t}={v}"
+        case _:
+            return "unknown"
+
+def main() -> None:
+    print(describe(0))
+    print(describe(-7))
+    print(describe(42))
+    print(describe("hello"))
+    print(describe([99]))
+    print(describe([1, 2]))
+    print(describe([1, 2, 3, 4]))
+    print(describe({"type": "x", "val": 5}))
+    print(describe(3.14))
+
+if __name__ == "__main__":
+    main()

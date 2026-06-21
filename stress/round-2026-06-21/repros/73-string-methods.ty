@@ -1,0 +1,25 @@
+def main() -> None:
+    let s: str = "  Hello, World, Foo  "
+    print(s.partition(","))
+    print(s.rpartition(","))
+    print("a\nb\nc".splitlines())
+    print("HELLO".casefold())
+    print("hello world".title())
+    print("hello".ljust(10, "."), "hi".rjust(5, "0"))
+    print("xxhelloxx".removeprefix("xx").removesuffix("xx"))
+    print("a,b,,c".split(","))
+    print("a b  c   d".split())
+    print("one two three".rsplit(" ", 1))
+    print("HeLLo".lower(), "HeLLo".upper())
+    print("café".encode("utf-8").decode("utf-8"))
+    let table: dict[int, int] = str.maketrans("abc", "xyz")
+    print("aabbcc".translate(table))
+    print("Hello".isalpha(), "Hello123".isalnum(), "12345".isdigit())
+    print("  spaces  ".lstrip(), "  spaces  ".rstrip())
+    print("repeat".count("e"), "repeat".index("p"))
+    print("Mississippi".replace("ss", "SS", 1))
+    print("template {x}".format(x=42))
+    print("|".join(str(n) for n in range(5)))
+
+if __name__ == "__main__":
+    main()

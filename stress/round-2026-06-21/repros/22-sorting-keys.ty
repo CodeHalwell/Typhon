@@ -1,0 +1,33 @@
+class Person:
+    name: str
+    age: int
+
+impl Person:
+    def __repr__(self) -> str:
+        return f"{self.name}({self.age})"
+
+def main() -> None:
+    let nums: list[int] = [5, 2, 8, 1, 9, 3]
+    print(sorted(nums))
+    print(sorted(nums, reverse=True))
+
+    let words: list[str] = ["banana", "apple", "cherry", "date"]
+    print(sorted(words, key=len))
+    print(sorted(words, key=lambda w: w[-1]))
+
+    let people: list[Person] = [
+        Person(name="Alice", age=30),
+        Person(name="Bob", age=25),
+        Person(name="Carol", age=30),
+    ]
+    let by_age: list[Person] = sorted(people, key=lambda p: (p.age, p.name))
+    print(by_age)
+    print(max(people, key=lambda p: p.age))
+    print(min(people, key=lambda p: p.age))
+
+    let pairs: list[tuple[int, str]] = [(3, "c"), (1, "a"), (2, "b")]
+    print(sorted(pairs))
+    print(sorted(pairs, key=lambda p: p[1], reverse=True))
+
+if __name__ == "__main__":
+    main()

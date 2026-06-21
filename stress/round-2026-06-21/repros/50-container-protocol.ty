@@ -1,0 +1,42 @@
+class SparseVec:
+    data: dict[int, float]
+    size: int
+
+impl SparseVec:
+    def __getitem__(self, i: int) -> float:
+        return self.data.get(i, 0.0)
+    def __setitem__(self, i: int, v: float) -> None:
+        self.data[i] = v
+    def __delitem__(self, i: int) -> None:
+        if i in self.data:
+            del self.data[i]
+    def __len__(self) -> int:
+        return self.size
+    def __contains__(self, i: int) -> bool:
+        return i in self.data
+    def dot(self, other: SparseVec) -> float:
+        mut total: float = 0.0
+        for k, v in self.data.items():
+            total = total + v * other[k]
+        return total
+
+def main() -> None:
+    mut sv: SparseVec = SparseVec(data={}, size=10)
+    sv[3] = 1.5
+    sv[7] = 2.0
+    print(sv[3], sv[0])
+    print(len(sv))
+    print(3 in sv, 0 in sv)
+    del sv[3]
+    print(3 in sv)
+
+    mut a: SparseVec = SparseVec(data={}, size=5)
+    a[1] = 2.0
+    a[2] = 3.0
+    mut b: SparseVec = SparseVec(data={}, size=5)
+    b[1] = 4.0
+    b[2] = 5.0
+    print(a.dot(b))
+
+if __name__ == "__main__":
+    main()

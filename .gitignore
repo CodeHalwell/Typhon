@@ -15,3 +15,7 @@ examples/apps/*/.venv/
 
 # stress/ build artefacts (created by stress harnesses, regenerated on demand)
 stress/round-*/build/
+
+# Generated stress-test project dirs (contain a heavy .venv)
+stress/**/third-party/proj/
+stress/round-2026-06-21/proj/

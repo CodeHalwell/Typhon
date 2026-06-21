@@ -1,0 +1,28 @@
+class Point frozen:
+    x: int
+    y: int
+
+class Edge frozen:
+    a: Point
+    b: Point
+
+def main() -> None:
+    mut locations: dict[Point, str] = {}
+    locations[Point(x=0, y=0)] = "origin"
+    locations[Point(x=1, y=1)] = "diagonal"
+    print(locations[Point(x=0, y=0)])
+    print(Point(x=1, y=1) in locations)
+    print(Point(x=9, y=9) in locations)
+
+    let pts: set[Point] = {Point(x=0, y=0), Point(x=0, y=0), Point(x=1, y=0)}
+    print(len(pts))
+
+    let e1: Edge = Edge(a=Point(x=0, y=0), b=Point(x=1, y=1))
+    let e2: Edge = Edge(a=Point(x=0, y=0), b=Point(x=1, y=1))
+    print(e1 == e2, hash(e1) == hash(e2))
+
+    let visited: set[Edge] = {e1, e2}
+    print(len(visited))
+
+if __name__ == "__main__":
+    main()

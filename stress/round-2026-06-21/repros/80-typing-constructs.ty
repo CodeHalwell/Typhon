@@ -1,0 +1,37 @@
+from typing import Literal, Optional, Union
+
+type Mode = Literal["r", "w", "a"]
+type Number = Union[int, float]
+type StrOrInt = str | int
+
+def open_mode(mode: Mode) -> str:
+    match mode:
+        case "r": return "reading"
+        case "w": return "writing"
+        case "a": return "appending"
+
+def stringify(x: StrOrInt) -> str:
+    match x:
+        case str() as s: return f"str:{s}"
+        case int() as n: return f"int:{n}"
+
+def maybe_double(x: Optional[int]) -> int:
+    if x is None:
+        return 0
+    return x * 2
+
+def add(a: Number, b: Number) -> Number:
+    return a + b
+
+def main() -> None:
+    print(open_mode("r"))
+    print(open_mode("w"))
+    print(stringify("hello"))
+    print(stringify(42))
+    print(maybe_double(None))
+    print(maybe_double(21))
+    print(add(1, 2))
+    print(add(1.5, 2.5))
+
+if __name__ == "__main__":
+    main()

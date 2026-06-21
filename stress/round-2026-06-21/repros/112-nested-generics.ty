@@ -1,0 +1,39 @@
+from typing import Callable
+
+class Box[T]:
+    value: T
+
+impl[T] Box[T]:
+    def get(self) -> T:
+        return self.value
+    def map[U](self, f: Callable[[T], U]) -> Box[U]:
+        return Box(value=f(self.value))
+
+def main() -> None:
+    let nested: Box[Box[int]] = Box(value=Box(value=42))
+    print(nested.get().get())
+
+    let deep: list[dict[str, list[int]]] = [
+        {"a": [1, 2], "b": [3]},
+        {"c": [4, 5, 6]},
+    ]
+    mut total: int = 0
+    for d in deep:
+        for k, vals in d.items():
+            total = total + sum(vals)
+    print(total)
+
+    let matrix: dict[tuple[int, int], str] = {(0, 0): "origin", (1, 1): "diag"}
+    print(matrix[(0, 0)], matrix[(1, 1)])
+
+    let wrapped: Box[list[int]] = Box(value=[1, 2, 3])
+    let lengths: Box[int] = wrapped.map(lambda xs: len(xs))
+    print(lengths.get())
+
+    let nested_opt: dict[str, int?] = {"a": 1, "b": None}
+    for key in sorted(nested_opt.keys()):
+        let v: int? = nested_opt[key]
+        print(key, v if v is not None else -1)
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,21 @@
+def main() -> None:
+    print("tab\there")
+    print("newline\nhere")
+    print("quote: \" and backslash: \\")
+    print(r"raw \n not a newline")
+    print("unicode: é ❤ \N{BULLET}")
+    print("hex: \x41\x42")
+    let multi: str = """line one
+line two
+line three"""
+    print(multi)
+    print(len(multi.splitlines()))
+    let concat: str = "auto" "matic" "concat"
+    print(concat)
+    let emoji: str = "café \U0001F600"
+    print(emoji, len(emoji))
+    print("\N{GREEK SMALL LETTER ALPHA}")
+    print(f"braces: {{literal}} and {1 + 1}")
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,31 @@
+import io
+import hashlib
+import base64
+
+def main() -> None:
+    mut buf: io.StringIO = io.StringIO()
+    buf.write("hello ")
+    buf.write("world")
+    print(buf.getvalue())
+
+    mut lines: io.StringIO = io.StringIO()
+    for i in range(3):
+        let _: int = lines.write(f"line {i}\n")
+    print(lines.getvalue().splitlines())
+
+    let sha: str = hashlib.sha256(b"typhon").hexdigest()
+    print(sha)
+    print(len(sha))
+    let md5: str = hashlib.md5(b"data").hexdigest()
+    print(md5)
+
+    let encoded: bytes = base64.b64encode(b"hello world")
+    print(encoded.decode())
+    let decoded: bytes = base64.b64decode(encoded)
+    print(decoded.decode())
+
+    let hex_enc: str = base64.b16encode(b"AB").decode()
+    print(hex_enc)
+
+if __name__ == "__main__":
+    main()

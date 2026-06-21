@@ -1,0 +1,12 @@
+lazy import jsonlib = json
+
+def serialize(data: dict[str, int]) -> str:
+    return jsonlib.dumps(data, sort_keys=True)
+
+def main() -> None:
+    let d: dict[str, int] = {"b": 2, "a": 1, "c": 3}
+    print(serialize(d))
+    print(jsonlib.dumps([1, 2, 3]))
+
+if __name__ == "__main__":
+    main()

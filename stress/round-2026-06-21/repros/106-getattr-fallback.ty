@@ -1,0 +1,29 @@
+plain class DynamicRecord:
+    _data: dict[str, int]
+
+impl DynamicRecord:
+    def __init__(self, data: dict[str, int]) -> None:
+        self._data = data
+    def __getattr__(self, name: str) -> int:
+        if name in self._data:
+            return self._data[name]
+        raise AttributeError(f"no field: {name}")
+    def __setattr__(self, name: str, value: object) -> None:
+        if name == "_data":
+            object.__setattr__(self, name, value)
+        else:
+            self._data[name] = value
+
+def main() -> None:
+    mut rec: DynamicRecord = DynamicRecord(data={"x": 1, "y": 2})
+    print(rec.x)
+    print(rec.y)
+    rec.z = 99
+    print(rec.z)
+    try:
+        let _: int = rec.missing
+    except AttributeError as e:
+        print(f"caught: {e}")
+
+if __name__ == "__main__":
+    main()

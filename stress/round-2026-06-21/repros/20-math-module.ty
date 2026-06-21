@@ -1,0 +1,19 @@
+import math
+
+def main() -> None:
+    print(math.pi, math.e)
+    print(math.sqrt(144.0), math.isqrt(145))
+    print(math.floor(3.7), math.ceil(3.2), math.trunc(-3.7))
+    print(math.gcd(48, 36), math.lcm(4, 6))
+    print(math.factorial(6))
+    print(math.comb(5, 2), math.perm(5, 2))
+    print(f"{math.sin(math.pi / 2):.4f}", f"{math.cos(0.0):.4f}")
+    print(f"{math.log(math.e):.4f}", f"{math.log2(8.0):.4f}", f"{math.log10(1000.0):.4f}")
+    print(f"{math.exp(1.0):.4f}")
+    print(math.isnan(float("nan")), math.isinf(float("inf")), math.isfinite(1.0))
+    print(f"{math.hypot(3.0, 4.0):.1f}")
+    print(math.copysign(3.0, -1.0))
+    print(f"{math.degrees(math.pi):.1f}", f"{math.radians(180.0):.4f}")
+
+if __name__ == "__main__":
+    main()

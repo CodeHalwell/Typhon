@@ -1,0 +1,29 @@
+def in_range(x: int, lo: int, hi: int) -> bool:
+    return lo <= x <= hi
+
+def main() -> None:
+    let x: int = 5
+    print(1 < x < 10)
+    print(10 < x < 20)
+    print(0 <= x <= 10 and x != 7)
+    let a: int = 1
+    let b: int = 2
+    let c: int = 3
+    print(a < b < c)
+    print(a < b > c)
+    print(a <= a <= a)
+    print(in_range(5, 1, 10), in_range(15, 1, 10))
+
+    # short-circuit returning operands
+    let y: int = 0
+    print(y or 42)
+    print(y and 42)
+    print(x or 99)
+    let name: str = ""
+    print(name or "default")
+    let chain: int = 0 or 0 or 7 or 9
+    print(chain)
+    print(1 < 2 == 2 < 3)
+
+if __name__ == "__main__":
+    main()

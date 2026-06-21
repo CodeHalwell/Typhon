@@ -1,0 +1,8 @@
+from sklearn.metrics import accuracy_score
+
+def main() -> None:
+    let s = accuracy_score([1, 0, 1])   # function missing required y_pred
+    print(s)
+
+if __name__ == "__main__":
+    main()

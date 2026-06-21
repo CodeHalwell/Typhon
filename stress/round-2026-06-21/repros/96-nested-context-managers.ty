@@ -1,0 +1,29 @@
+from typing import Iterator
+from contextlib import contextmanager, suppress, ExitStack
+
+@contextmanager
+def scope(name: str) -> Iterator[str]:
+    print(f"enter {name}")
+    yield name
+    print(f"exit {name}")
+
+def main() -> None:
+    with scope("outer") as o, scope("inner") as i:
+        print(f"in {o}/{i}")
+
+    with scope("a") as a:
+        with scope("b") as b:
+            print(f"nested {a}/{b}")
+
+    with suppress(ValueError, KeyError):
+        let d: dict[str, int] = {"x": 1}
+        let _: int = d["missing"]
+    print("suppressed KeyError")
+
+    with ExitStack() as stack:
+        let names: list[str] = [stack.enter_context(scope(f"ctx{n}")) for n in range(3)]
+        print(f"managing {names}")
+    print("all closed")
+
+if __name__ == "__main__":
+    main()

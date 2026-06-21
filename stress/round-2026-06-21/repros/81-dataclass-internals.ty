@@ -1,0 +1,37 @@
+class Inventory:
+    name: str
+    items: list[str] = []
+    counts: dict[str, int] = {}
+
+impl Inventory:
+    def __post_init__(self) -> None:
+        print(f"created inventory '{self.name}'")
+
+    def add(self, item: str, qty: int) -> None:
+        self.items.append(item)
+        self.counts[item] = self.counts.get(item, 0) + qty
+
+class Versioned:
+    major: int
+    minor: int = 0
+    patch: int = 0
+
+impl Versioned:
+    def __repr__(self) -> str:
+        return f"v{self.major}.{self.minor}.{self.patch}"
+
+def main() -> None:
+    let inv1: Inventory = Inventory(name="warehouse")
+    let inv2: Inventory = Inventory(name="store")
+    inv1.add("widget", 5)
+    inv1.add("widget", 3)
+    inv2.add("gadget", 1)
+    print(inv1.items, inv1.counts)
+    print(inv2.items, inv2.counts)
+
+    print(Versioned(major=1))
+    print(Versioned(major=2, minor=3))
+    print(Versioned(major=4, minor=5, patch=6))
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,21 @@
+import json
+
+def extract_ids(blob: str) -> list[int]:
+    let parsed: dict[str, object] = json.loads(blob) as! dict[str, object]
+    let ids: list[int] = parsed["ids"] as! list[int]
+    return ids
+
+def main() -> None:
+    let blob: str = "{\"ids\": [1, 2, 3], \"name\": \"batch\"}"
+    print(extract_ids(blob))
+
+    let raw: object = json.loads("42")
+    let n: int = raw as! int
+    print(n + 8)
+
+    let mixed: object = json.loads("[true, false, true]")
+    let flags: list[bool] = mixed as! list[bool]
+    print(flags, sum([1 for f in flags if f]))
+
+if __name__ == "__main__":
+    main()

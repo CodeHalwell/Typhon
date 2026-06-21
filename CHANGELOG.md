@@ -4,6 +4,96 @@ All notable changes to Typhon are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely; the
 canonical phase-by-phase status lives in `docs/roadmap.md`.
 
+## Unreleased
+
+### Added — third-party **method** calls are now arity-checked (missing required arguments caught)
+
+- **`tyc-venv` now introspects the public methods of every third-party class,
+  not just its constructor**, so a missing required argument to a *method* call
+  is caught at `tyc check` / `tyc build` time — the same way constructor and
+  free-function calls already were. The motivating case: a typed ML pipeline
+  where `PCA(n_components=2).fit()` (sklearn `fit(self, X, y=None)`) silently
+  compiled despite the missing `X`. It now fails with
+  `tyc::missing_argument: supply ``X`` when calling ``fit```, and likewise for
+  `scaler.transform()` (→ `X`), `df.merge()` (→ `right`), etc.
+  - The introspection script (`inspect.getattr_static` + `inspect.signature`)
+    captures instance methods, `@classmethod`s, and `@staticmethod`s, stripping
+    the implicit `self` / `cls` only when it is a genuine leading positional
+    (a decorator-wrapped `(*args, **kwargs)` method, common in scikit-learn, is
+    left fully permissive rather than having its `*args` mis-stripped).
+  - Each captured method becomes a `MethodSig` on the class's `InterfaceShape`,
+    so the existing `method_arity_info_for_attribute` path arity-checks the
+    call. Methods whose signature can't be recovered (C-extension slots, e.g.
+    most `numpy.ndarray` methods) are simply absent and stay lenient — the
+    shape remains `partial`, so no false `attribute_not_found` / arity errors.
+  - **Conservative by design / verified false-positive-free:** a realistic
+    numpy + pandas + scikit-learn pipeline (PCA, StandardScaler, KMeans,
+    LogisticRegression, RandomForestClassifier, `train_test_split`,
+    `accuracy_score`, DataFrame `groupby`/`merge`/`sort_values`, ndarray
+    `reshape`/`sum`/`astype`, …) type-checks clean and the emitted Python runs
+    against the real libraries; the missing-argument cases above all fail with
+    a named parameter. Requires the dependency installed in the project `.venv`
+    (the dist→import-name resolution — `scikit-learn` → `sklearn` — already
+    works via `.dist-info` metadata).
+
+### Fixed — `Counter + Counter` / `Counter - Counter` no longer false-fire `tyc::operator_type_mismatch`
+
+- **`collections.Counter` multiset addition (`+`) and subtraction (`-`) were
+  rejected** (`tyc-types`, `tyc::operator_type_mismatch`: "unsupported operand
+  types for `+`: `Counter[str]` and `Counter[str]`"), **blocking the build**,
+  even though `Counter` overloads both (and the set-style `&` / `|` already
+  passed via the permissive bitwise arm). `operator_operands_compatible` now
+  accepts `Counter + Counter` (alongside `list`/`tuple`) and `Counter - Counter`
+  (alongside the set-difference carve-out). `Counter + int` (and other
+  cross-type mixes) still correctly errors. Found by the 2026-06-21 stress round
+  (`stress/round-2026-06-21/`, repro `117`).
+
+### Fixed — `plain class` / `class!` with a hand-written `__init__` no longer false-fires `tyc::unknown_kwarg`
+
+- **A `plain class` (or `class!`) carrying a hand-written `__init__` whose
+  parameter names differ from the declared fields was rejected at the
+  constructor call site** (`tyc-types`, `tyc::unknown_kwarg`). e.g.
+  `plain class Box: _data: dict[...]` with `def __init__(self, data): self._data = data`
+  constructed as `Box(data={...})` reported "unknown keyword argument 'data'
+  (did you mean `_data`?)" and **blocked the build**, even though the custom
+  constructor accepts `data`. The constructor **arity** check already exempted
+  `plain class` / `class!` (they may carry an `__init__` not reflected in the
+  fields), but the adjacent **unknown-kwarg** loop did not. It now applies the
+  same exemption. A normal `class` / `model` / `frozen` (whose constructor is
+  auto-generated from its fields) still reports a misspelled kwarg. Found by the
+  2026-06-21 stress round (`stress/round-2026-06-21/`, repro `106`).
+
+### Fixed — a `__call__`-bearing instance now satisfies a `Callable` parameter
+
+- **An instance of a class defining `__call__` was rejected where a
+  `Callable[...]` was expected** (`tyc-types`, `tyc::type_mismatch`). Passing a
+  callable instance — `apply(fn=my_multiplier, x=5)` where
+  `my_multiplier.__call__(self, x: int) -> int` — is a standard Python pattern
+  (typeshed treats such an instance as structurally callable), but the nominal
+  assignability check reported `expected (int) -> int, found Multiplier` and
+  **blocked the build** on code that runs correctly. `Checker::is_assignable`
+  now, when the expected type is a function type and the actual is a class,
+  looks up `__call__` in the class hierarchy, rebuilds its signature as a
+  function type (its stored `param_types` / `return_type` already exclude
+  `self`), and re-runs the contravariant-param / covariant-return function
+  check. A class *without* `__call__` is still correctly rejected, so the
+  change only relaxes assignability and cannot introduce a false positive.
+  Found by the 2026-06-21 stress round (`stress/round-2026-06-21/`, repro `95`).
+
+### Fixed — VM `str.isupper()` / `str.islower()` on uncased strings
+
+- **The tree-walking VM (`tyc run`) returned `True` from `str.isupper()` /
+  `str.islower()` for strings with no cased characters** (`tyc-vm`). The
+  predicates were computed as "non-empty and no lowercase/uppercase char", so
+  `",".isupper()`, `" ".isupper()`, `"5".isupper()`, and `",".islower()` all
+  returned `True` where CPython returns `False` (the predicate requires *at
+  least one cased character*). This produced silently wrong output under
+  `tyc run` — e.g. a Caesar cipher that branches on `c.isupper()` / `c.islower()`
+  mangled punctuation and spaces. The compiled path (`tyc build` → CPython) was
+  always correct. Both predicates now require a cased character of the matching
+  case and none of the opposite case. Found by the 2026-06-21 stress round
+  (`stress/round-2026-06-21/`, repro `29`).
+
 ## 0.15.6 — 2026-06-16 — stress-test robustness sweep
 
 An ~198-program adversarial sweep ("if you can write it in Python, you can use

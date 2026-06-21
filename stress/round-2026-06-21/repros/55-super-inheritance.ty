@@ -1,0 +1,39 @@
+class Shape:
+    name: str
+
+impl Shape:
+    def area(self) -> float:
+        return 0.0
+    def describe(self) -> str:
+        return f"{self.name}: area={self.area():.2f}"
+
+class Circle(Shape):
+    radius: float
+
+impl Circle:
+    def area(self) -> float:
+        return 3.14159 * self.radius ** 2
+    def describe(self) -> str:
+        return "[Circle] " + super().describe()
+
+class Cylinder(Circle):
+    height: float
+
+impl Cylinder:
+    def area(self) -> float:
+        let base: float = super().area()
+        return 2.0 * base + 2.0 * 3.14159 * self.radius * self.height
+
+def main() -> None:
+    let shapes: list[Shape] = [
+        Shape(name="nothing"),
+        Circle(name="circle", radius=2.0),
+        Cylinder(name="cylinder", radius=2.0, height=5.0),
+    ]
+    for s in shapes:
+        print(s.describe())
+    let cyl: Cylinder = Cylinder(name="can", radius=1.0, height=10.0)
+    print(f"{cyl.area():.2f}")
+
+if __name__ == "__main__":
+    main()

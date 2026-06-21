@@ -1,0 +1,31 @@
+class Config:
+    host: str
+    port: int
+    debug: bool
+
+def main() -> None:
+    let cfg: Config = Config(host="localhost", port=8080, debug=True)
+
+    print(getattr(cfg, "host"))
+    print(getattr(cfg, "missing", "default"))
+    print(hasattr(cfg, "port"), hasattr(cfg, "nope"))
+
+    setattr(cfg, "port", 9090)
+    print(cfg.port)
+
+    let fields: list[str] = ["host", "port", "debug"]
+    for f in fields:
+        print(f"{f} = {getattr(cfg, f)}")
+
+    let d: dict[str, object] = {f: getattr(cfg, f) for f in fields}
+    print(d)
+
+    from typing import Callable
+    let names: list[str] = ["upper", "lower", "title"]
+    let s: str = "Hello"
+    for method_name in names:
+        let method: Callable[[], str] = getattr(s, method_name)
+        print(method())
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,27 @@
+def main() -> None:
+    let names: list[str] = ["alice", "bob", "carol"]
+    let scores: list[int] = [90, 85, 95]
+    let ages: list[int] = [30, 25, 35]
+
+    for i, name in enumerate(names, start=1):
+        print(f"{i}. {name}")
+
+    for name, score in zip(names, scores):
+        print(f"{name}: {score}")
+
+    for name, score, age in zip(names, scores, ages):
+        print(f"{name} ({age}): {score}")
+
+    let combined: dict[str, int] = dict(zip(names, scores))
+    print(combined)
+
+    let ranked: list[tuple[int, str]] = sorted(zip(scores, names), reverse=True)
+    for rank, (score, name) in enumerate(ranked, start=1):
+        print(f"#{rank}: {name} with {score}")
+
+    let pairs: list[tuple[str, int]] = list(zip(names, scores))
+    let unzipped_names: tuple[str, ...] = tuple(p[0] for p in pairs)
+    print(unzipped_names)
+
+if __name__ == "__main__":
+    main()

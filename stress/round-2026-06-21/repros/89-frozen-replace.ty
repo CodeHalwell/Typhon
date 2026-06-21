@@ -1,0 +1,34 @@
+import dataclasses
+
+class Config frozen:
+    host: str
+    port: int
+    debug: bool
+
+impl Config:
+    def with_port(self, port: int) -> Config:
+        return dataclasses.replace(self, port=port)
+    def url(self) -> str:
+        return f"{self.host}:{self.port}"
+
+def main() -> None:
+    let base: Config = Config(host="localhost", port=8080, debug=False)
+    print(base.url())
+    let prod: Config = base.with_port(443)
+    print(prod.url())
+    print(base.url())
+    print(base == Config(host="localhost", port=8080, debug=False))
+    print(base != prod)
+
+    # A field write on a frozen class (`base.port = 9999`) is rejected at
+    # COMPILE time by tyc::frozen_assign — stronger than CPython's runtime
+    # FrozenInstanceError. Demonstrate the runtime guard reflectively instead.
+    mut blocked: bool = False
+    try:
+        setattr(base, "port", 9999)
+    except dataclasses.FrozenInstanceError:
+        blocked = True
+    print(f"frozen blocked mutation: {blocked}")
+
+if __name__ == "__main__":
+    main()

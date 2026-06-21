@@ -1,0 +1,39 @@
+import heapq
+
+def dijkstra(graph: dict[str, list[tuple[str, int]]], start: str) -> dict[str, int]:
+    mut dist: dict[str, int] = {start: 0}
+    mut heap: list[tuple[int, str]] = [(0, start)]
+    while len(heap) > 0:
+        let popped: tuple[int, str] = heapq.heappop(heap)
+        let d: int = popped[0]
+        let node: str = popped[1]
+        if d > dist.get(node, 1000000):
+            continue
+        for edge in graph.get(node, []):
+            let neighbor: str = edge[0]
+            let weight: int = edge[1]
+            let nd: int = d + weight
+            if nd < dist.get(neighbor, 1000000):
+                dist[neighbor] = nd
+                heapq.heappush(heap, (nd, neighbor))
+    return dist
+
+def main() -> None:
+    let graph: dict[str, list[tuple[str, int]]] = {
+        "A": [("B", 1), ("C", 4)],
+        "B": [("C", 2), ("D", 5)],
+        "C": [("D", 1)],
+        "D": [],
+    }
+    let dist: dict[str, int] = dijkstra(graph, "A")
+    for node in sorted(dist.keys()):
+        print(f"{node}: {dist[node]}")
+
+    mut h: list[int] = [5, 3, 8, 1, 9, 2]
+    heapq.heapify(h)
+    let smallest3: list[int] = heapq.nsmallest(3, h)
+    print(smallest3)
+    print(heapq.heappop(h))
+
+if __name__ == "__main__":
+    main()

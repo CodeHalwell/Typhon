@@ -1,0 +1,27 @@
+def main() -> None:
+    let squares: list[int] = [x * x for x in range(10)]
+    print(squares)
+    let evens: list[int] = [x for x in range(20) if x % 2 == 0]
+    print(evens)
+    let grid: list[list[int]] = [[r * 3 + c for c in range(3)] for r in range(3)]
+    print(grid)
+    let flat: list[int] = [v for row in grid for v in row]
+    print(flat)
+    let squared_map: dict[int, int] = {x: x * x for x in range(5)}
+    print(squared_map)
+    let unique: set[int] = {x % 5 for x in range(20)}
+    print(sorted(unique))
+    let words: list[str] = ["apple", "banana", "cherry"]
+    let lengths: dict[str, int] = {w: len(w) for w in words}
+    print(lengths)
+    let pairs: list[tuple[int, str]] = list(enumerate(words))
+    print(pairs)
+    let zipped: list[tuple[str, int]] = list(zip(words, [1, 2, 3]))
+    print(zipped)
+    print(sum(squares), max(squares), min(squares))
+    print(any(x > 50 for x in squares), all(x >= 0 for x in squares))
+    let nested: dict[str, list[int]] = {"a": [1, 2], "b": [3, 4]}
+    print({k: sum(v) for k, v in nested.items()})
+
+if __name__ == "__main__":
+    main()

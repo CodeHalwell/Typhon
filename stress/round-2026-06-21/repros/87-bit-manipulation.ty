@@ -1,0 +1,32 @@
+def count_bits(n: int) -> int:
+    mut count: int = 0
+    mut v: int = n
+    while v > 0:
+        count = count + (v & 1)
+        v = v >> 1
+    return count
+
+def is_power_of_two(n: int) -> bool:
+    return n > 0 and (n & (n - 1)) == 0
+
+def reverse_bits(n: int, width: int) -> int:
+    mut result: int = 0
+    mut v: int = n
+    for _ in range(width):
+        result = (result << 1) | (v & 1)
+        v = v >> 1
+    return result
+
+def main() -> None:
+    print(count_bits(255), count_bits(7), count_bits(0))
+    print(bin(255).count("1"))
+    for n in [1, 2, 3, 4, 16, 17, 64]:
+        print(f"{n}: power_of_two={is_power_of_two(n)}")
+    print(reverse_bits(0b1101, 4))
+    print(0xFF & 0x0F, 0xF0 | 0x0F, 0xFF ^ 0x0F)
+    print(~0, ~5)
+    print(1 << 10, 1024 >> 5)
+    print(0b1010 & 0b0110, 0b1010 | 0b0110)
+
+if __name__ == "__main__":
+    main()

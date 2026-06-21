@@ -1,0 +1,37 @@
+interface Container[T]:
+    def get(self, i: int) -> T
+    def size(self) -> int
+
+class IntList:
+    items: list[int]
+class StrList:
+    items: list[str]
+
+impl IntList:
+    def get(self, i: int) -> int:
+        return self.items[i]
+    def size(self) -> int:
+        return len(self.items)
+
+impl StrList:
+    def get(self, i: int) -> str:
+        return self.items[i]
+    def size(self) -> int:
+        return len(self.items)
+
+def first_of[T](c: Container[T]) -> T:
+    return c.get(0)
+
+def describe[T](c: Container[T]) -> str:
+    return f"container of size {c.size()}"
+
+def main() -> None:
+    let il: IntList = IntList(items=[10, 20, 30])
+    let sl: StrList = StrList(items=["a", "b"])
+    print(first_of(il))
+    print(first_of(sl))
+    print(describe(il))
+    print(describe(sl))
+
+if __name__ == "__main__":
+    main()

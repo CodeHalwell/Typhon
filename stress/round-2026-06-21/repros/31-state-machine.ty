@@ -1,0 +1,44 @@
+type State = Idle | Running | Paused | Stopped
+
+class Idle:
+    pass
+class Running:
+    progress: int
+class Paused:
+    progress: int
+class Stopped:
+    reason: str
+
+impl State:
+    def label(self) -> str:
+        match self:
+            case Idle():        return "idle"
+            case Running(p):    return f"running {p}%"
+            case Paused(p):     return f"paused at {p}%"
+            case Stopped(r):    return f"stopped: {r}"
+
+def transition(s: State, event: str) -> State:
+    match s:
+        case Idle() if event == "start":
+            return Running(progress=0)
+        case Running(p) if event == "pause":
+            return Paused(progress=p)
+        case Running(p) if event == "tick":
+            return Running(progress=p + 25)
+        case Paused(p) if event == "resume":
+            return Running(progress=p)
+        case _ if event == "stop":
+            return Stopped(reason="user")
+        case _:
+            return s
+
+def main() -> None:
+    mut state: State = Idle()
+    let events: list[str] = ["start", "tick", "tick", "pause", "resume", "tick", "stop"]
+    print(state.label())
+    for ev in events:
+        state = transition(state, ev)
+        print(f"{ev} -> {state.label()}")
+
+if __name__ == "__main__":
+    main()

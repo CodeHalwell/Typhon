@@ -1,0 +1,22 @@
+def divide(a: int, b: int, /, *, rounding: str = "floor") -> int:
+    if rounding == "ceil":
+        return -((-a) // b)
+    return a // b
+
+def make_url(host: str, port: int = 80, *, secure: bool = False, path: str = "/") -> str:
+    let scheme: str = "https" if secure else "http"
+    return f"{scheme}://{host}:{port}{path}"
+
+def positional_only(x: int, y: int, /) -> int:
+    return x - y
+
+def main() -> None:
+    print(divide(17, 5))
+    print(divide(17, 5, rounding="ceil"))
+    print(make_url("example.com"))
+    print(make_url("example.com", 8080, secure=True, path="/api"))
+    print(make_url("localhost", secure=True))
+    print(positional_only(10, 3))
+
+if __name__ == "__main__":
+    main()

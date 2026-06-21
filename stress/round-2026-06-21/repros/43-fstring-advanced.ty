@@ -1,0 +1,37 @@
+def main() -> None:
+    let name: str = "world"
+    let n: int = 42
+    let pi: float = 3.14159265
+
+    # nested f-strings
+    let width: int = 10
+    print(f"{name:>{width}}")
+    print(f"{pi:.{3}f}")
+
+    # debug = specifier
+    print(f"{n=}")
+    print(f"{n + 1=}")
+
+    # conversions
+    print(f"{name!r}")
+    print(f"{'quote'!r}")
+
+    # expressions inside
+    let items: list[int] = [1, 2, 3]
+    print(f"sum is {sum(items)} of {len(items)} items")
+    print(f"{'yes' if n > 0 else 'no'}")
+
+    # format specs
+    print(f"{255:08b}")
+    print(f"{255:#06x}")
+    print(f"{-42:+}")
+    print(f"{1234567.891:,.2f}")
+    print(f"{0.4567:.1%}")
+    print(f"{42:*^10}")
+
+    # multiline / dict access
+    let d: dict[str, int] = {"key": 99}
+    print(f"value={d['key']}")
+
+if __name__ == "__main__":
+    main()

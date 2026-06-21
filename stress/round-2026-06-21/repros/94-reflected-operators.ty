@@ -1,0 +1,36 @@
+class Money:
+    cents: int
+
+impl Money:
+    def __add__(self, other: Money) -> Money:
+        return Money(cents=self.cents + other.cents)
+    def __mul__(self, factor: int) -> Money:
+        return Money(cents=self.cents * factor)
+    def __rmul__(self, factor: int) -> Money:
+        return Money(cents=self.cents * factor)
+    def __lt__(self, other: Money) -> bool:
+        return self.cents < other.cents
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, Money):
+            return False
+        return self.cents == other.cents
+    def __le__(self, other: Money) -> bool:
+        return self.cents <= other.cents
+    def __repr__(self) -> str:
+        return f"${self.cents / 100:.2f}"
+
+def main() -> None:
+    let a: Money = Money(cents=500)
+    let b: Money = Money(cents=250)
+    print(a + b)
+    print(a * 3)
+    print(3 * a)
+    print(a < b, b < a)
+    print(a <= a)
+    print(a == Money(cents=500))
+    let prices: list[Money] = [Money(cents=300), Money(cents=100), Money(cents=200)]
+    print(sorted(prices))
+    print(max(prices), min(prices))
+
+if __name__ == "__main__":
+    main()

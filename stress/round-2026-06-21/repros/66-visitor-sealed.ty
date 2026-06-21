@@ -1,0 +1,54 @@
+type Json = JNull | JBool | JNum | JStr | JArr | JObj
+
+class JNull:
+    pass
+class JBool:
+    value: bool
+class JNum:
+    value: float
+class JStr:
+    value: str
+class JArr:
+    items: list[Json]
+class JObj:
+    fields: list[tuple[str, Json]]
+
+impl Json:
+    def render(self) -> str:
+        match self:
+            case JNull():
+                return "null"
+            case JBool(v):
+                return "true" if v else "false"
+            case JNum(v):
+                return str(v)
+            case JStr(v):
+                return f"\"{v}\""
+            case JArr(items):
+                return "[" + ", ".join([it.render() for it in items]) + "]"
+            case JObj(fields):
+                let parts: list[str] = [f"\"{k}\": {val.render()}" for k, val in fields]
+                return "{" + ", ".join(parts) + "}"
+
+    def count_nodes(self) -> int:
+        match self:
+            case JArr(items):
+                return 1 + sum([it.count_nodes() for it in items])
+            case JObj(fields):
+                return 1 + sum([val.count_nodes() for k, val in fields])
+            case _:
+                return 1
+
+def main() -> None:
+    let doc: Json = JObj(fields=[
+        ("name", JStr(value="typhon")),
+        ("version", JNum(value=15.0)),
+        ("active", JBool(value=True)),
+        ("tags", JArr(items=[JStr(value="fast"), JStr(value="typed")])),
+        ("meta", JNull()),
+    ])
+    print(doc.render())
+    print(f"nodes: {doc.count_nodes()}")
+
+if __name__ == "__main__":
+    main()

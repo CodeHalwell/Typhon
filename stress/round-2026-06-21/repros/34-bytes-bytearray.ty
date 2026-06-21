@@ -1,0 +1,25 @@
+def main() -> None:
+    let data: bytes = b"Hello, Typhon"
+    print(len(data))
+    print(data[0], data[7])
+    print(data[:5])
+    print(data.upper())
+    print(data.hex())
+    print(data.decode("utf-8"))
+
+    let encoded: bytes = "héllo".encode("utf-8")
+    print(len(encoded))
+    print(encoded.decode("utf-8"))
+
+    mut ba: bytearray = bytearray(b"abc")
+    ba.append(100)
+    ba[0] = 65
+    print(bytes(ba))
+
+    let joined: bytes = b"-".join([b"a", b"b", b"c"])
+    print(joined)
+    print(b"x" * 5)
+    print(bytes([72, 105]))
+
+if __name__ == "__main__":
+    main()

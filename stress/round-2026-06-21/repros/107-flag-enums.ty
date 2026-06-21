@@ -1,0 +1,32 @@
+from enum import Flag, IntFlag, auto
+
+class Permission(IntFlag):
+    READ = 1
+    WRITE = 2
+    EXECUTE = 4
+
+class Style(Flag):
+    BOLD = auto()
+    ITALIC = auto()
+    UNDERLINE = auto()
+
+def main() -> None:
+    let rw: Permission = Permission.READ | Permission.WRITE
+    print(int(rw))
+    print(Permission.READ in rw)
+    print(Permission.EXECUTE in rw)
+    print(bool(rw & Permission.WRITE))
+
+    let full: Permission = Permission.READ | Permission.WRITE | Permission.EXECUTE
+    print(int(full))
+
+    let style: Style = Style.BOLD | Style.UNDERLINE
+    print(Style.BOLD in style)
+    print(Style.ITALIC in style)
+
+    mut perms: Permission = Permission.READ
+    perms = perms | Permission.EXECUTE
+    print(int(perms))
+
+if __name__ == "__main__":
+    main()

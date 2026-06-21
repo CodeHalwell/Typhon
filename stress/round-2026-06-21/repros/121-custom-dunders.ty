@@ -1,0 +1,36 @@
+class Percentage:
+    fraction: float
+
+impl Percentage:
+    def __format__(self, spec: str) -> str:
+        if spec == "bar":
+            let filled: int = int(self.fraction * 10)
+            return "#" * filled + "-" * (10 - filled)
+        return f"{self.fraction * 100:.1f}%"
+    def __bool__(self) -> bool:
+        return self.fraction > 0.0
+    def __index__(self) -> int:
+        return int(self.fraction * 100)
+    def __hash__(self) -> int:
+        return hash(self.fraction)
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, Percentage):
+            return False
+        return self.fraction == other.fraction
+
+def main() -> None:
+    let p: Percentage = Percentage(fraction=0.75)
+    print(f"{p}")
+    print(f"{p:bar}")
+    print(bool(p), bool(Percentage(fraction=0.0)))
+    print(format(p))
+
+    # __index__ returns int(0.75 * 100) == 75, used as a real list index.
+    let xs: list[int] = list(range(100))
+    print(xs[p])
+
+    let seen: set[Percentage] = {Percentage(fraction=0.5), Percentage(fraction=0.5)}
+    print(len(seen))
+
+if __name__ == "__main__":
+    main()

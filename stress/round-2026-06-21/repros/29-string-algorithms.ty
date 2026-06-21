@@ -1,0 +1,37 @@
+def word_count(text: str) -> dict[str, int]:
+    mut counts: dict[str, int] = {}
+    for word in text.lower().split():
+        let cleaned: str = word.strip(".,!?;:")
+        if len(cleaned) > 0:
+            counts[cleaned] = counts.get(cleaned, 0) + 1
+    return counts
+
+def is_palindrome(s: str) -> bool:
+    let cleaned: str = "".join([c for c in s.lower() if c.isalnum()])
+    return cleaned == cleaned[::-1]
+
+def caesar(text: str, shift: int) -> str:
+    mut result: list[str] = []
+    for c in text:
+        if c.isupper():
+            result.append(chr((ord(c) - 65 + shift) % 26 + 65))
+        elif c.islower():
+            result.append(chr((ord(c) - 97 + shift) % 26 + 97))
+        else:
+            result.append(c)
+    return "".join(result)
+
+def main() -> None:
+    let counts: dict[str, int] = word_count("The cat sat. The cat ran! The dog slept.")
+    for word in sorted(counts.keys()):
+        print(f"{word}: {counts[word]}")
+
+    print(is_palindrome("A man, a plan, a canal: Panama"))
+    print(is_palindrome("hello"))
+
+    let enc: str = caesar("Hello, World!", 3)
+    print(enc)
+    print(caesar(enc, -3))
+
+if __name__ == "__main__":
+    main()

@@ -2724,6 +2724,27 @@ impl<'a> Checker<'a> {
             let params_ok = ep.iter().zip(ap).all(|(e, a)| self.is_assignable(a, e));
             return params_ok && self.is_assignable(er, ar);
         }
+        // A class instance that defines `__call__` is structurally a
+        // `Callable[...]` — `apply(fn=instance)` where `instance.__call__`
+        // matches the expected signature. Python (and typeshed) treat such an
+        // instance as assignable to a function type, but the nominal
+        // `assignable` check rejects `Class("Doubler")` against `(int) -> int`.
+        // Look up `__call__` in the class hierarchy, rebuild its signature as a
+        // function type (its `param_types` / `return_type` already exclude the
+        // implicit `self`), and re-run the function-to-function check above.
+        // Only *relaxes* assignability, so it can't introduce a false positive.
+        if let (Type::Function { .. }, Type::Class(cls_name)) = (expected, actual) {
+            if let Some(sig) = self.find_method(cls_name, "__call__") {
+                let call_ty = Type::Function {
+                    params: sig.param_types.clone(),
+                    ret: Box::new(sig.return_type.clone()),
+                    variadic: false,
+                };
+                if self.is_assignable(expected, &call_ty) {
+                    return true;
+                }
+            }
+        }
         // Canonicalize module aliases on both sides and retry. An
         // annotation `let c: f.Cls` (where `import foo as f`) produces
         // `Class("f.Cls")`, but the call site `f.Cls(...)` resolves
@@ -13125,8 +13146,20 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
                         return Type::Unknown;
                     }
                     if let Some(shape) = effective_class_shape(&name, &c.class_shapes) {
+                        // `plain class` / `class!` may carry a hand-written
+                        // `__init__` whose parameter names need not match the
+                        // declared fields (e.g. `def __init__(self, data: ...)`
+                        // assigning to a `_data` field, or `__getattr__`-backed
+                        // dynamic records). The auto-generated constructor only
+                        // exists for plain `class` / `model` / `frozen`, so the
+                        // kwarg-vs-fields check (and the arity check below, via
+                        // `shape_is_authoritative`) is only sound for those.
+                        let has_custom_init = c.is_plain_class(&name) || c.is_raw_class(&name);
                         let candidates: Vec<String> = shape.fields.keys().cloned().collect();
                         for kw in kw_args {
+                            if has_custom_init {
+                                break;
+                            }
                             let Some(ident) = &kw.arg else { continue };
                             let kw_name = ident.as_str();
                             if !shape.fields.contains_key(kw_name) {
@@ -14424,7 +14457,9 @@ fn operator_operands_compatible(op: Operator, l: &Type, r: &Type) -> bool {
                 return true;
             }
             if let (Type::Generic(ln, _), Type::Generic(rn, _)) = (l, r) {
-                if ln == rn && (ln == "list" || ln == "tuple") {
+                // `list + list`, `tuple + tuple`, and `Counter + Counter`
+                // (multiset addition — `collections.Counter` overloads `+`).
+                if ln == rn && (ln == "list" || ln == "tuple" || ln == "Counter") {
                     return true;
                 }
             }
@@ -14450,6 +14485,11 @@ fn operator_operands_compatible(op: Operator, l: &Type, r: &Type) -> bool {
                 let set_like =
                     |n: &str| matches!(n, "set" | "frozenset" | "KeysView" | "ItemsView");
                 if matches!(op, Operator::Sub) && set_like(ls) && set_like(rs) {
+                    return true;
+                }
+                // `Counter - Counter` is multiset subtraction (keeps only
+                // positive counts) — `collections.Counter` overloads `-`.
+                if matches!(op, Operator::Sub) && ls == "Counter" && rs == "Counter" {
                     return true;
                 }
             }
@@ -16029,6 +16069,114 @@ let g: str = u.greet(\"hi \")
 ";
         let d = check(src);
         assert!(!d.has_errors(), "{:?}", d.errors());
+    }
+
+    #[test]
+    fn callable_instance_conforms_to_callable_param() {
+        // An instance of a class with `__call__` is structurally a Callable
+        // and must be accepted where `Callable[[int], int]` is expected.
+        let src = "\
+from typing import Callable
+
+class Doubler:
+    factor: int
+
+impl Doubler:
+    def __call__(self, x: int) -> int:
+        return x * self.factor
+
+def apply(fn: Callable[[int], int], x: int) -> int:
+    return fn(x)
+
+let d: Doubler = Doubler(factor=2)
+let r: int = apply(d, 5)
+";
+        let diags = check(src);
+        assert!(!diags.has_errors(), "{:?}", diags.errors());
+    }
+
+    #[test]
+    fn non_callable_instance_rejected_as_callable_param() {
+        // A class WITHOUT `__call__` must still be rejected — the relaxation
+        // is structural, not a blanket class→function acceptance.
+        let src = "\
+from typing import Callable
+
+class Plain:
+    factor: int
+
+def apply(fn: Callable[[int], int], x: int) -> int:
+    return fn(x)
+
+let p: Plain = Plain(factor=2)
+let r: int = apply(p, 5)
+";
+        let diags = check(src);
+        assert!(
+            diags.has_errors(),
+            "instance without __call__ must not satisfy a Callable param"
+        );
+    }
+
+    // NOTE: the companion case — a `plain class` with a hand-written `__init__`
+    // whose params differ from the declared fields must NOT trip
+    // `tyc::unknown_kwarg` — is gated on `is_plain_class`, which reads
+    // `resolved.plain_classes`. The in-crate `check()` harness doesn't scrape
+    // those the way the CLI does (see the NOTE above `newtype_self_cycle_…`),
+    // so it's verified end-to-end against the real binary instead
+    // (stress/round-2026-06-21 repro 106).
+
+    #[test]
+    fn counter_add_and_sub_accepted() {
+        // collections.Counter overloads `+` (multiset add) and `-` (multiset
+        // subtract); both must type-check, like the already-accepted `&`/`|`.
+        let src = "\
+from collections import Counter
+
+let c1: Counter[str] = Counter()
+let c2: Counter[str] = Counter()
+let added: Counter[str] = c1 + c2
+let subbed: Counter[str] = c1 - c2
+let anded: Counter[str] = c1 & c2
+let ored: Counter[str] = c1 | c2
+";
+        let diags = check(src);
+        assert!(!diags.has_errors(), "{:?}", diags.errors());
+    }
+
+    #[test]
+    fn counter_plus_int_still_rejected() {
+        // The relaxation is Counter-vs-Counter only — adding a Counter and an
+        // int is still an operator mismatch.
+        let src = "\
+from collections import Counter
+
+let c: Counter[str] = Counter()
+let bad: Counter[str] = c + 5
+";
+        let diags = check(src);
+        assert!(
+            diags.has_errors(),
+            "Counter + int must still be an operator mismatch"
+        );
+    }
+
+    #[test]
+    fn normal_class_unknown_kwarg_still_rejected() {
+        // The exemption is scoped to plain/raw classes — a normal `class` with
+        // a misspelled kwarg must still error.
+        let src = "\
+class User:
+    name: str
+    age: int
+
+let u: User = User(name=\"x\", agee=5)
+";
+        let diags = check(src);
+        assert!(
+            diags.has_errors(),
+            "misspelled kwarg on a normal class must still error"
+        );
     }
 
     #[test]

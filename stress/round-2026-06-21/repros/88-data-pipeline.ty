@@ -1,0 +1,44 @@
+class Record:
+    name: str
+    dept: str
+    salary: int
+
+impl Record:
+    def __repr__(self) -> str:
+        return f"{self.name}/{self.dept}/{self.salary}"
+
+def main() -> None:
+    let records: list[Record] = [
+        Record(name="Alice", dept="eng", salary=100),
+        Record(name="Bob", dept="eng", salary=90),
+        Record(name="Carol", dept="sales", salary=80),
+        Record(name="Dave", dept="sales", salary=85),
+        Record(name="Eve", dept="eng", salary=120),
+    ]
+
+    # group by dept
+    mut by_dept: dict[str, list[Record]] = {}
+    for r in records:
+        if r.dept not in by_dept:
+            by_dept[r.dept] = []
+        by_dept[r.dept].append(r)
+
+    # average salary per dept
+    for dept in sorted(by_dept.keys()):
+        let group: list[Record] = by_dept[dept]
+        let avg: float = sum([r.salary for r in group]) / len(group)
+        let top: Record = max(group, key=lambda r: r.salary)
+        print(f"{dept}: count={len(group)} avg={avg:.1f} top={top.name}")
+
+    # filter + sort + project
+    let high_earners: list[str] = [
+        r.name for r in sorted(records, key=lambda r: -r.salary)
+        if r.salary >= 90
+    ]
+    print(high_earners)
+
+    let total_payroll: int = sum(r.salary for r in records)
+    print(f"total: {total_payroll}")
+
+if __name__ == "__main__":
+    main()

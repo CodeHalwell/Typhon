@@ -1,0 +1,24 @@
+import struct
+
+def main() -> None:
+    let packed: bytes = struct.pack(">iif", 1, 2, 3.5)
+    print(len(packed))
+    print(packed.hex())
+
+    let unpacked: tuple[int, int, float] = struct.unpack(">iif", packed)
+    print(unpacked)
+
+    let p2: bytes = struct.pack("<H", 256)
+    print(list(p2))
+
+    print(struct.calcsize(">iif"))
+
+    let coords: bytes = struct.pack(">3f", 1.0, 2.0, 3.0)
+    let back: tuple[float, ...] = struct.unpack(">3f", coords)
+    print(back)
+
+    let n: bytes = struct.pack(">Q", 18446744073709551615)
+    print(struct.unpack(">Q", n)[0])
+
+if __name__ == "__main__":
+    main()

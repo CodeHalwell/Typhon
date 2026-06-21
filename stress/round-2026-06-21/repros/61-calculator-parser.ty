@@ -1,0 +1,78 @@
+class Parser:
+    tokens: list[str]
+    pos: int
+
+impl Parser:
+    def peek(self) -> str?:
+        if self.pos < len(self.tokens):
+            return self.tokens[self.pos]
+        return None
+
+    def advance(self) -> str:
+        let tok: str = self.tokens[self.pos]
+        self.pos = self.pos + 1
+        return tok
+
+    def parse_expr(self) -> float:
+        mut value: float = self.parse_term()
+        while True:
+            let op: str? = self.peek()
+            if op == "+":
+                let _: str = self.advance()
+                value = value + self.parse_term()
+            elif op == "-":
+                let _: str = self.advance()
+                value = value - self.parse_term()
+            else:
+                return value
+
+    def parse_term(self) -> float:
+        mut value: float = self.parse_factor()
+        while True:
+            let op: str? = self.peek()
+            if op == "*":
+                let _: str = self.advance()
+                value = value * self.parse_factor()
+            elif op == "/":
+                let _: str = self.advance()
+                value = value / self.parse_factor()
+            else:
+                return value
+
+    def parse_factor(self) -> float:
+        let tok: str = self.advance()
+        if tok == "(":
+            let value: float = self.parse_expr()
+            let _: str = self.advance()
+            return value
+        return float(tok)
+
+def tokenize(src: str) -> list[str]:
+    mut tokens: list[str] = []
+    mut num: str = ""
+    for ch in src:
+        if ch.isdigit() or ch == ".":
+            num = num + ch
+        else:
+            if len(num) > 0:
+                tokens.append(num)
+                num = ""
+            if ch != " ":
+                tokens.append(ch)
+    if len(num) > 0:
+        tokens.append(num)
+    return tokens
+
+def evaluate(src: str) -> float:
+    let p: Parser = Parser(tokens=tokenize(src), pos=0)
+    return p.parse_expr()
+
+def main() -> None:
+    print(evaluate("2 + 3 * 4"))
+    print(evaluate("(2 + 3) * 4"))
+    print(evaluate("10 / 2 - 3"))
+    print(evaluate("2 * (3 + 4) * (5 - 1)"))
+    print(evaluate("100"))
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,35 @@
+class Matrix:
+    rows: int
+    cols: int
+    data: list[float]
+
+impl Matrix:
+    def __getitem__(self, pos: tuple[int, int]) -> float:
+        let r: int = pos[0]
+        let c: int = pos[1]
+        return self.data[r * self.cols + c]
+    def __setitem__(self, pos: tuple[int, int], value: float) -> None:
+        let r: int = pos[0]
+        let c: int = pos[1]
+        self.data[r * self.cols + c] = value
+    def __len__(self) -> int:
+        return self.rows * self.cols
+    def transpose(self) -> Matrix:
+        mut result: Matrix = Matrix(rows=self.cols, cols=self.rows, data=[0.0] * (self.rows * self.cols))
+        for r in range(self.rows):
+            for c in range(self.cols):
+                result[(c, r)] = self[(r, c)]
+        return result
+
+def main() -> None:
+    mut m: Matrix = Matrix(rows=2, cols=3, data=[1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+    print(m[(0, 0)], m[(1, 2)])
+    m[(0, 1)] = 99.0
+    print(m[(0, 1)])
+    print(len(m))
+    let t: Matrix = m.transpose()
+    print(t.rows, t.cols)
+    print(t[(2, 1)])
+
+if __name__ == "__main__":
+    main()

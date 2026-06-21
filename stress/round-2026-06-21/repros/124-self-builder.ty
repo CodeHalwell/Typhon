@@ -1,0 +1,37 @@
+from typing import Self
+
+class QueryBuilder:
+    table: str
+    conditions: list[str]
+    limit_val: int
+
+impl QueryBuilder:
+    def where(self, cond: str) -> Self:
+        self.conditions.append(cond)
+        return self
+    def limit(self, n: int) -> Self:
+        self.limit_val = n
+        return self
+    def build(self) -> str:
+        mut sql: str = f"SELECT * FROM {self.table}"
+        if len(self.conditions) > 0:
+            sql = sql + " WHERE " + " AND ".join(self.conditions)
+        if self.limit_val > 0:
+            sql = sql + f" LIMIT {self.limit_val}"
+        return sql
+
+def main() -> None:
+    let query: str = (
+        QueryBuilder(table="users", conditions=[], limit_val=0)
+        .where("age > 18")
+        .where("active = true")
+        .limit(10)
+        .build()
+    )
+    print(query)
+
+    let simple: str = QueryBuilder(table="logs", conditions=[], limit_val=0).build()
+    print(simple)
+
+if __name__ == "__main__":
+    main()

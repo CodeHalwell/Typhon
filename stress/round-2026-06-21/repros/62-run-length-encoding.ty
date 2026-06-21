@@ -1,0 +1,35 @@
+def encode(s: str) -> list[tuple[str, int]]:
+    mut result: list[tuple[str, int]] = []
+    if len(s) == 0:
+        return result
+    mut prev: str = s[0]
+    mut count: int = 1
+    for ch in s[1:]:
+        if ch == prev:
+            count = count + 1
+        else:
+            result.append((prev, count))
+            prev = ch
+            count = 1
+    result.append((prev, count))
+    return result
+
+def decode(pairs: list[tuple[str, int]]) -> str:
+    mut parts: list[str] = []
+    for ch, count in pairs:
+        parts.append(ch * count)
+    return "".join(parts)
+
+def main() -> None:
+    let s: str = "aaabbbcccd"
+    let encoded: list[tuple[str, int]] = encode(s)
+    print(encoded)
+    let decoded: str = decode(encoded)
+    print(decoded)
+    print(decoded == s)
+    print(encode(""))
+    print(encode("xyz"))
+    print(decode([("a", 5), ("b", 2)]))
+
+if __name__ == "__main__":
+    main()

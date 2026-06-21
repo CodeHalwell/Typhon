@@ -1,0 +1,37 @@
+def find_first_long(words: list[str], min_len: int) -> str?:
+    for w in words:
+        if (n := len(w)) >= min_len:
+            return f"{w} ({n})"
+    return None
+
+def classify(x: int?) -> str:
+    if x is None:
+        return "none"
+    if x < 0:
+        return "negative"
+    return f"positive {x}"
+
+def parse_config(d: dict[str, int]) -> int:
+    mut total: int = 0
+    if (port := d.get("port")) is not None:
+        total = total + port
+    if (timeout := d.get("timeout")) is not None:
+        total = total + timeout
+    return total
+
+def main() -> None:
+    print(find_first_long(["a", "bb", "ccccc", "dd"], 3))
+    print(find_first_long(["a", "bb"], 5))
+    print(classify(None))
+    print(classify(-3))
+    print(classify(7))
+    print(parse_config({"port": 8080, "timeout": 30}))
+    print(parse_config({"port": 80}))
+
+    let data: list[int] = [1, 2, 3, 4, 5]
+    while (count := len(data)) > 0:
+        data.pop()
+    print(f"emptied, last count was {count}")
+
+if __name__ == "__main__":
+    main()

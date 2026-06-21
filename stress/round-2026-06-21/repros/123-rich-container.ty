@@ -1,0 +1,32 @@
+from typing import Iterator
+
+class Ring:
+    items: list[int]
+
+impl Ring:
+    def __len__(self) -> int:
+        return len(self.items)
+    def __contains__(self, x: int) -> bool:
+        return x in self.items
+    def __iter__(self) -> Iterator[int]:
+        for x in self.items:
+            yield x
+    def __reversed__(self) -> Iterator[int]:
+        for x in reversed(self.items):
+            yield x
+    def __getitem__(self, i: int) -> int:
+        return self.items[i % len(self.items)]
+
+def main() -> None:
+    let r: Ring = Ring(items=[10, 20, 30])
+    print(len(r))
+    print(20 in r, 99 in r)
+    print(list(r))
+    print(list(reversed(r)))
+    print(r[0], r[3], r[5], r[-1])
+    print([x * 2 for x in r])
+    print(sum(r))
+    print(max(r), min(r))
+
+if __name__ == "__main__":
+    main()

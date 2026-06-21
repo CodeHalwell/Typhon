@@ -5828,8 +5828,15 @@ fn str_method(
         "isalpha" => Value::Bool(!s.is_empty() && s.chars().all(|c| c.is_alphabetic())),
         "isalnum" => Value::Bool(!s.is_empty() && s.chars().all(|c| c.is_alphanumeric())),
         "isspace" => Value::Bool(!s.is_empty() && s.chars().all(|c| c.is_whitespace())),
-        "isupper" => Value::Bool(!s.is_empty() && s.chars().all(|c| !c.is_lowercase())),
-        "islower" => Value::Bool(!s.is_empty() && s.chars().all(|c| !c.is_uppercase())),
+        // CPython: true iff there is at least one cased character and no
+        // character of the opposite case (uncased chars like ',', ' ', digits
+        // do not satisfy the predicate on their own).
+        "isupper" => {
+            Value::Bool(s.chars().any(|c| c.is_uppercase()) && !s.chars().any(|c| c.is_lowercase()))
+        }
+        "islower" => {
+            Value::Bool(s.chars().any(|c| c.is_lowercase()) && !s.chars().any(|c| c.is_uppercase()))
+        }
         "title" => Value::Str(Rc::new(title_case(s))),
         "capitalize" => Value::Str(Rc::new(capitalize(s))),
         "swapcase" => Value::Str(Rc::new(

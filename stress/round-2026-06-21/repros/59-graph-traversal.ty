@@ -1,0 +1,44 @@
+from collections import deque
+
+def bfs(graph: dict[int, list[int]], start: int) -> list[int]:
+    mut visited: list[int] = []
+    mut seen: set[int] = {start}
+    let queue: deque[int] = deque([start])
+    while len(queue) > 0:
+        let node: int = queue.popleft()
+        visited.append(node)
+        for neighbor in graph.get(node, []):
+            if neighbor not in seen:
+                seen.add(neighbor)
+                queue.append(neighbor)
+    return visited
+
+def dfs(graph: dict[int, list[int]], start: int) -> list[int]:
+    mut visited: list[int] = []
+    mut seen: set[int] = set()
+    mut stack: list[int] = [start]
+    while len(stack) > 0:
+        let node: int = stack.pop()
+        if node in seen:
+            continue
+        seen.add(node)
+        visited.append(node)
+        for neighbor in reversed(graph.get(node, [])):
+            if neighbor not in seen:
+                stack.append(neighbor)
+    return visited
+
+def main() -> None:
+    let graph: dict[int, list[int]] = {
+        1: [2, 3],
+        2: [4, 5],
+        3: [6],
+        4: [],
+        5: [6],
+        6: [],
+    }
+    print(bfs(graph, 1))
+    print(dfs(graph, 1))
+
+if __name__ == "__main__":
+    main()

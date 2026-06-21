@@ -1,0 +1,35 @@
+class Point:
+    x: int
+    y: int
+
+def analyze(data: object) -> str:
+    match data:
+        case [Point(x=0, y=0), *rest]:
+            return f"starts at origin, {len(rest)} more"
+        case [Point() as p, *_]:
+            return f"starts at ({p.x},{p.y})"
+        case {"points": [first, *_], "name": n}:
+            return f"{n} first={first}"
+        case (a, b, c) if a + b + c == 0:
+            return "triple sums to zero"
+        case [x, y] if x == y:
+            return "equal pair"
+        case str() | bytes():
+            return "text-like"
+        case int() | float() as num:
+            return f"number {num}"
+        case _:
+            return "other"
+
+def main() -> None:
+    print(analyze([Point(x=0, y=0), Point(x=1, y=1)]))
+    print(analyze([Point(x=5, y=7)]))
+    print(analyze({"points": [10, 20], "name": "path"}))
+    print(analyze((1, 2, -3)))
+    print(analyze([4, 4]))
+    print(analyze("hello"))
+    print(analyze(3.14))
+    print(analyze({"unknown": 1}))
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,49 @@
+class AppError(Exception):
+    pass
+
+class NotFoundError(AppError):
+    pass
+
+class ValidationError(AppError):
+    pass
+
+def lookup(db: dict[str, int], key: str) -> int:
+    if key not in db:
+        raise NotFoundError(f"missing key: {key}")
+    return db[key]
+
+def validate(n: int) -> int:
+    if n < 0:
+        raise ValidationError("must be non-negative")
+    return n
+
+def main() -> None:
+    let db: dict[str, int] = {"a": 1, "b": 2}
+    try:
+        print(lookup(db, "a"))
+        print(lookup(db, "z"))
+    except NotFoundError as e:
+        print(f"not found: {e}")
+    except AppError as e:
+        print(f"app error: {e}")
+    finally:
+        print("cleanup done")
+
+    try:
+        validate(-5)
+    except ValidationError as e:
+        print(f"validation: {e}")
+
+    let zero: int = len([])
+    try:
+        let x: int = 10 // zero
+    except ZeroDivisionError:
+        print("caught div by zero")
+
+    try:
+        raise ValueError("wrapped") from KeyError("inner")
+    except ValueError as e:
+        print(f"value error: {e}")
+
+if __name__ == "__main__":
+    main()

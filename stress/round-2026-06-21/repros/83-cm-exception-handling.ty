@@ -1,0 +1,36 @@
+from typing import Iterator
+from contextlib import contextmanager
+
+@contextmanager
+def suppress_errors(label: str) -> Iterator[None]:
+    print(f"[{label}] enter")
+    try:
+        yield None
+    except ValueError as e:
+        print(f"[{label}] suppressed: {e}")
+    finally:
+        print(f"[{label}] exit")
+
+@contextmanager
+def timer(name: str) -> Iterator[list[int]]:
+    let collected: list[int] = []
+    print(f"start {name}")
+    yield collected
+    print(f"end {name}: collected {collected}")
+
+def main() -> None:
+    with suppress_errors("block1"):
+        print("doing work")
+        raise ValueError("oops")
+
+    with suppress_errors("block2"):
+        print("clean work")
+
+    with timer("compute") as results:
+        for i in range(3):
+            results.append(i * i)
+
+    print("after blocks")
+
+if __name__ == "__main__":
+    main()

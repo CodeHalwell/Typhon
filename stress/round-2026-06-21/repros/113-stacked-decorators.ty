@@ -1,0 +1,29 @@
+from typing import Callable
+
+def bold(fn: Callable[[str], str]) -> Callable[[str], str]:
+    def wrapper(s: str) -> str:
+        return f"<b>{fn(s)}</b>"
+    return wrapper
+
+def italic(fn: Callable[[str], str]) -> Callable[[str], str]:
+    def wrapper(s: str) -> str:
+        return f"<i>{fn(s)}</i>"
+    return wrapper
+
+def exclaim(fn: Callable[[str], str]) -> Callable[[str], str]:
+    def wrapper(s: str) -> str:
+        return fn(s) + "!"
+    return wrapper
+
+@bold
+@italic
+@exclaim
+def render(s: str) -> str:
+    return s
+
+def main() -> None:
+    print(render("hello"))
+    print(render("world"))
+
+if __name__ == "__main__":
+    main()

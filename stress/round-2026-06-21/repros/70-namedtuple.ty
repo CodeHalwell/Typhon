@@ -1,0 +1,35 @@
+from typing import NamedTuple
+
+class Point(NamedTuple):
+    x: int
+    y: int
+
+class Color(NamedTuple):
+    r: int
+    g: int
+    b: int
+
+impl Point:
+    def manhattan(self, other: Point) -> int:
+        return abs(self.x - other.x) + abs(self.y - other.y)
+
+def main() -> None:
+    let p: Point = Point(3, 4)
+    print(p.x, p.y)
+    print(p)
+    let q: Point = Point(x=0, y=0)
+    print(p.manhattan(q))
+
+    # tuple behaviour
+    let a: int = p[0]
+    let b: int = p[1]
+    print(a, b)
+    let (px, py) = p
+    print(px, py)
+
+    let c: Color = Color(255, 128, 0)
+    print(c.r, c.g, c.b)
+    print(c == Color(255, 128, 0))
+
+if __name__ == "__main__":
+    main()

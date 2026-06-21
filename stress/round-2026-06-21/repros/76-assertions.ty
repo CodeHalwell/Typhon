@@ -1,0 +1,33 @@
+def safe_sqrt(x: float) -> float:
+    assert x >= 0.0, f"cannot sqrt negative: {x}"
+    return x ** 0.5
+
+def binary_rep(n: int) -> str:
+    assert n >= 0
+    if n == 0:
+        return "0"
+    mut bits: list[str] = []
+    mut v: int = n
+    while v > 0:
+        bits.append(str(v % 2))
+        v = v // 2
+    return "".join(reversed(bits))
+
+def main() -> None:
+    print(safe_sqrt(16.0))
+    print(binary_rep(13))
+    print(binary_rep(0))
+
+    try:
+        let _: float = safe_sqrt(-4.0)
+    except AssertionError as e:
+        print(f"assertion failed: {e}")
+
+    mut total: int = 0
+    for i in range(1, 11):
+        total = total + i
+    assert total == 55
+    print(f"sum verified: {total}")
+
+if __name__ == "__main__":
+    main()

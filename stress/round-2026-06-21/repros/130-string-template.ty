@@ -1,0 +1,23 @@
+from string import Template
+import textwrap
+
+def main() -> None:
+    let t: Template = Template("$greeting, $name!")
+    print(t.substitute(greeting="Hello", name="World"))
+    print(t.safe_substitute(greeting="Hi"))
+
+    let data: dict[str, int] = {"x": 1, "y": 2}
+    print("{x} and {y}".format_map(data))
+
+    let long: str = "the quick brown fox jumps over the lazy dog repeatedly"
+    print(textwrap.fill(long, width=20))
+    print("---")
+    print(textwrap.indent("line1\nline2", "> "))
+    print(textwrap.shorten(long, width=20))
+    print(textwrap.dedent("    a\n    b\n    c"))
+
+    let words: list[str] = textwrap.wrap(long, width=25)
+    print(len(words))
+
+if __name__ == "__main__":
+    main()

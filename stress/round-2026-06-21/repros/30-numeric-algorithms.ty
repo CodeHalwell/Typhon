@@ -1,0 +1,38 @@
+def sieve(n: int) -> list[int]:
+    mut is_prime: list[bool] = [True] * (n + 1)
+    is_prime[0] = False
+    if n >= 1:
+        is_prime[1] = False
+    mut i: int = 2
+    while i * i <= n:
+        if is_prime[i]:
+            mut j: int = i * i
+            while j <= n:
+                is_prime[j] = False
+                j = j + i
+        i = i + 1
+    return [k for k in range(n + 1) if is_prime[k]]
+
+def matmul(a: list[list[int]], b: list[list[int]]) -> list[list[int]]:
+    let n: int = len(a)
+    let m: int = len(b[0])
+    let p: int = len(b)
+    mut result: list[list[int]] = [[0 for _ in range(m)] for _ in range(n)]
+    for i in range(n):
+        for j in range(m):
+            mut acc: int = 0
+            for k in range(p):
+                acc = acc + a[i][k] * b[k][j]
+            result[i][j] = acc
+    return result
+
+def main() -> None:
+    print(sieve(30))
+    let a: list[list[int]] = [[1, 2], [3, 4]]
+    let b: list[list[int]] = [[5, 6], [7, 8]]
+    print(matmul(a, b))
+    let identity: list[list[int]] = [[1, 0], [0, 1]]
+    print(matmul(a, identity))
+
+if __name__ == "__main__":
+    main()
