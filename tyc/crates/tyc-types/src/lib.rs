@@ -10572,8 +10572,8 @@ fn cases_cover_type(c: &Checker, cases: &[MatchCase], ty: &Type) -> bool {
         }
         return false;
     }
-    let class_name = match ty {
-        Type::Class(n) => n.clone(),
+    let class_name: &str = match ty {
+        Type::Class(n) => n.as_str(),
         Type::Generic(head, _) => {
             if head == "Result" {
                 let variants = ["Ok", "Err"];
@@ -10586,23 +10586,23 @@ fn cases_cover_type(c: &Checker, cases: &[MatchCase], ty: &Type) -> bool {
                 }
                 return variants.iter().all(|&v| covered.contains(v));
             }
-            head.clone()
+            head.as_str()
         }
-        Type::Int => "int".to_string(),
-        Type::Str => "str".to_string(),
-        Type::Bool => "bool".to_string(),
-        Type::Float => "float".to_string(),
-        Type::Bytes => "bytes".to_string(),
-        Type::None => "NoneType".to_string(),
+        Type::Int => "int",
+        Type::Str => "str",
+        Type::Bool => "bool",
+        Type::Float => "float",
+        Type::Bytes => "bytes",
+        Type::None => "NoneType",
         _ => return false,
     };
-    if let Some(variants) = c.sealed_unions.get(class_name.as_str()).cloned() {
+    if let Some(variants) = c.sealed_unions.get(class_name).cloned() {
         let mut covered: HashSet<String> = HashSet::new();
         let mut covered_with_guards: HashSet<String> = HashSet::new();
         let mut has_guarded_wildcard = false;
         for case in cases {
             if case.guard.is_none() {
-                if pattern_covers_class(c, &case.pattern, &class_name) {
+                if pattern_covers_class(c, &case.pattern, class_name) {
                     return true;
                 }
                 collect_matched_class_names(&case.pattern, &mut covered);
@@ -10644,7 +10644,7 @@ fn cases_cover_type(c: &Checker, cases: &[MatchCase], ty: &Type) -> bool {
     }
     if cases
         .iter()
-        .any(|case| case.guard.is_none() && pattern_covers_class(c, &case.pattern, &class_name))
+        .any(|case| case.guard.is_none() && pattern_covers_class(c, &case.pattern, class_name))
     {
         return true;
     }
