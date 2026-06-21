@@ -1,0 +1,28 @@
+from typing import cast, Callable
+from functools import partial
+
+def greet(greeting: str, name: str, punct: str) -> str:
+    return f"{greeting}, {name}{punct}"
+
+def power(base: int, exp: int) -> int:
+    return base ** exp
+
+def main() -> None:
+    let x: object = 42
+    let n: int = cast(int, x)
+    print(n + 1)
+
+    let hello: Callable[..., str] = partial(greet, "Hello", punct="!")
+    print(hello(name="World"))
+
+    let square: Callable[[int], int] = partial(power, exp=2)
+    print(square(5))
+
+    let cube: Callable[..., int] = partial(power, exp=3)
+    print(cube(3))
+
+    let halves: list[float] = [cast(float, x) / 2 for x in [10, 20, 30]]
+    print(halves)
+
+if __name__ == "__main__":
+    main()

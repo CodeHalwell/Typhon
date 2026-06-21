@@ -6,6 +6,18 @@ canonical phase-by-phase status lives in `docs/roadmap.md`.
 
 ## Unreleased
 
+### Fixed — `Counter + Counter` / `Counter - Counter` no longer false-fire `tyc::operator_type_mismatch`
+
+- **`collections.Counter` multiset addition (`+`) and subtraction (`-`) were
+  rejected** (`tyc-types`, `tyc::operator_type_mismatch`: "unsupported operand
+  types for `+`: `Counter[str]` and `Counter[str]`"), **blocking the build**,
+  even though `Counter` overloads both (and the set-style `&` / `|` already
+  passed via the permissive bitwise arm). `operator_operands_compatible` now
+  accepts `Counter + Counter` (alongside `list`/`tuple`) and `Counter - Counter`
+  (alongside the set-difference carve-out). `Counter + int` (and other
+  cross-type mixes) still correctly errors. Found by the 2026-06-21 stress round
+  (`stress/round-2026-06-21/`, repro `117`).
+
 ### Fixed — `plain class` / `class!` with a hand-written `__init__` no longer false-fires `tyc::unknown_kwarg`
 
 - **A `plain class` (or `class!`) carrying a hand-written `__init__` whose

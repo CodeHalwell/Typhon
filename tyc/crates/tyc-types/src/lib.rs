@@ -14457,7 +14457,9 @@ fn operator_operands_compatible(op: Operator, l: &Type, r: &Type) -> bool {
                 return true;
             }
             if let (Type::Generic(ln, _), Type::Generic(rn, _)) = (l, r) {
-                if ln == rn && (ln == "list" || ln == "tuple") {
+                // `list + list`, `tuple + tuple`, and `Counter + Counter`
+                // (multiset addition — `collections.Counter` overloads `+`).
+                if ln == rn && (ln == "list" || ln == "tuple" || ln == "Counter") {
                     return true;
                 }
             }
@@ -14483,6 +14485,11 @@ fn operator_operands_compatible(op: Operator, l: &Type, r: &Type) -> bool {
                 let set_like =
                     |n: &str| matches!(n, "set" | "frozenset" | "KeysView" | "ItemsView");
                 if matches!(op, Operator::Sub) && set_like(ls) && set_like(rs) {
+                    return true;
+                }
+                // `Counter - Counter` is multiset subtraction (keeps only
+                // positive counts) — `collections.Counter` overloads `-`.
+                if matches!(op, Operator::Sub) && ls == "Counter" && rs == "Counter" {
                     return true;
                 }
             }
@@ -16118,6 +16125,41 @@ let r: int = apply(p, 5)
     // those the way the CLI does (see the NOTE above `newtype_self_cycle_…`),
     // so it's verified end-to-end against the real binary instead
     // (stress/round-2026-06-21 repro 106).
+
+    #[test]
+    fn counter_add_and_sub_accepted() {
+        // collections.Counter overloads `+` (multiset add) and `-` (multiset
+        // subtract); both must type-check, like the already-accepted `&`/`|`.
+        let src = "\
+from collections import Counter
+
+let c1: Counter[str] = Counter()
+let c2: Counter[str] = Counter()
+let added: Counter[str] = c1 + c2
+let subbed: Counter[str] = c1 - c2
+let anded: Counter[str] = c1 & c2
+let ored: Counter[str] = c1 | c2
+";
+        let diags = check(src);
+        assert!(!diags.has_errors(), "{:?}", diags.errors());
+    }
+
+    #[test]
+    fn counter_plus_int_still_rejected() {
+        // The relaxation is Counter-vs-Counter only — adding a Counter and an
+        // int is still an operator mismatch.
+        let src = "\
+from collections import Counter
+
+let c: Counter[str] = Counter()
+let bad: Counter[str] = c + 5
+";
+        let diags = check(src);
+        assert!(
+            diags.has_errors(),
+            "Counter + int must still be an operator mismatch"
+        );
+    }
 
     #[test]
     fn normal_class_unknown_kwarg_still_rejected() {

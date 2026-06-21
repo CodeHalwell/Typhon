@@ -204,7 +204,76 @@ computing mean...
 25.0
 ===== 11-operator-dunders (check=0 vm=0 comp=0) [PASS] =====
 ===== 110-nested-unpacking (check=0 vm=0 comp=0) [PASS] =====
+===== 111-generic-interface (check=0 vm=0 comp=0) [PASS] =====
+===== 112-nested-generics (check=0 vm=0 comp=0) [PASS] =====
+===== 113-stacked-decorators (check=0 vm=0 comp=0) [PASS] =====
+===== 114-classmethod-constructors (check=0 vm=0 comp=0) [PASS] =====
+===== 115-dataclass-reflection (check=0 vm=1 comp=0) [PASS] {VM-DIVERGE} =====
+--- VM ---
+{'age': 30, 'name': 'Alice', 'address': Address(street='1 Main', city='Springfield')}
+Traceback (most recent call last):
+  File "repros/115-dataclass-reflection.ty", line 35, in <module>
+    main()
+  File "repros/115-dataclass-reflection.ty", line 22, in main
+    let t: tuple[object, ...] = dataclasses.astuple(p)
+AttributeError: module 'dataclasses' has no attribute 'astuple'
+--- BUILD+PY ---
+{'name': 'Alice', 'age': 30, 'address': {'street': '1 Main', 'city': 'Springfield'}}
+('Alice', 30, ('1 Main', 'Springfield'))
+['name', 'age', 'address']
+['str', 'str']
+True
+False
+===== 116-itertools-advanced (check=0 vm=1 comp=0) [PASS] {VM-DIVERGE} =====
+--- VM ---
+Traceback (most recent call last):
+  File "repros/116-itertools-advanced.ty", line 27, in <module>
+    main()
+  File "repros/116-itertools-advanced.ty", line 5, in main
+    print(list(itertools.chain.from_iterable(nested)))
+AttributeError: 'function' object has no attribute 'from_iterable'
+--- BUILD+PY ---
+[1, 2, 3, 4, 5]
+[(1, 'x'), (2, 'y'), (3, '?')]
+[(1, 2), (2, 3), (3, 4)]
+[10, 20, 30] [10, 20, 30]
+['a', 'c']
+[1, 3, 5, 7, 9]
+[100, 105, 110, 115]
+[(0, 1, 2), (3, 4, 5), (6,)]
+===== 117-chainmap-counter (check=0 vm=1 comp=0) [PASS] {VM-DIVERGE} =====
+--- VM ---
+Traceback (most recent call last):
+  File "repros/117-chainmap-counter.ty", line 1, in <module>
+    from collections import ChainMap, Counter
+AttributeError: module 'collections' has no attribute 'ChainMap'
+--- BUILD+PY ---
+1 20 3 40
+['a', 'b', 'c', 'd']
+{'a': 1, 'b': 20, 'c': 3, 'd': 40}
+{'a': 3, 'b': 3, 'c': 3}
+{'a': 1, 'b': 1}
+{'a': 1, 'b': 1, 'c': 1}
+{'a': 2, 'b': 2, 'c': 2}
+5
+===== 118-cast-partial (check=0 vm=1 comp=0) [PASS] {VM-DIVERGE} =====
+--- VM ---
+43
+Traceback (most recent call last):
+  File "repros/118-cast-partial.ty", line 28, in <module>
+    main()
+  File "repros/118-cast-partial.ty", line 15, in main
+    let hello: Callable[..., str] = partial(greet, "Hello", punct="!")
+TypeError: partial() does not accept keyword arguments
+--- BUILD+PY ---
+43
+Hello, World!
+25
+27
+[5.0, 10.0, 15.0]
+===== 119-complex-match (check=0 vm=0 comp=0) [PASS] =====
 ===== 12-enum (check=0 vm=0 comp=0) [PASS] =====
+===== 120-generic-tree-fold (check=0 vm=0 comp=0) [PASS] =====
 ===== 13-sealed-union-eval (check=0 vm=0 comp=0) [PASS] =====
 ===== 14-result-error-handling (check=0 vm=0 comp=0) [PASS] =====
 ===== 15-generics (check=0 vm=0 comp=0) [PASS] =====
@@ -625,4 +694,4 @@ list with 3 items
 object: 3.14
 
 ######## SUMMARY ########
-total=110 pass=110 buildfail=0 runfail=0 checkfail=0 vm_diverge=29
+total=120 pass=120 buildfail=0 runfail=0 checkfail=0 vm_diverge=33

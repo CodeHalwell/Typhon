@@ -1,0 +1,20 @@
+from collections import ChainMap, Counter
+
+def main() -> None:
+    let defaults: dict[str, int] = {"a": 1, "b": 2, "c": 3}
+    let overrides: dict[str, int] = {"b": 20, "d": 40}
+    let cm: ChainMap[str, int] = ChainMap(overrides, defaults)
+    print(cm["a"], cm["b"], cm["c"], cm["d"])
+    print(sorted(cm.keys()))
+    print(dict(sorted(cm.items())))
+
+    let c1: Counter[str] = Counter("aabbc")
+    let c2: Counter[str] = Counter("abcc")
+    print(dict(sorted((c1 + c2).items())))
+    print(dict(sorted((c1 - c2).items())))
+    print(dict(sorted((c1 & c2).items())))
+    print(dict(sorted((c1 | c2).items())))
+    print(c1.total())
+
+if __name__ == "__main__":
+    main()

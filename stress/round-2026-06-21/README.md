@@ -7,7 +7,7 @@ language surfaces and lowering paths rather than going deep on one.
 
 ## Methodology
 
-Each of the **110** `.ty` programs in `repros/` is run through three paths by
+Each of the **120** `.ty` programs in `repros/` is run through three paths by
 `harness.sh` and compared:
 
 1. **`tyc check`** — frontend (parser + resolver + type checker).
@@ -28,19 +28,19 @@ bash harness.sh repros/*.ty        # TYC=… PYTHON=… overridable
 Requires `pydantic` installed for the `model` repro (`36`); everything else is
 stdlib-only.
 
-## Result — 110 / 110 compile to valid, runnable Python
+## Result — 120 / 120 compile to valid, runnable Python
 
 ```
-total=110 pass=110 buildfail=0 runfail=0 checkfail=0 vm_diverge=29
+total=120 pass=120 buildfail=0 runfail=0 checkfail=0 vm_diverge=33
 ```
 
 Every program type-checks, builds, and runs correctly on the compiled
 (`tyc build` → CPython 3.13) path. **Zero codegen defects** were found across
-the whole 110-program corpus.
+the whole 120-program corpus.
 
-### Two real type-checker build-blockers found and fixed
+### Three real type-checker build-blockers found and fixed
 
-Both were **false positives** that blocked the build on code that runs
+All three were **false positives** that blocked the build on code that runs
 correctly under CPython — exactly what this round exists to surface.
 
 - **`__call__` → `Callable` (repro `95`).** An instance of a class with a
@@ -57,12 +57,18 @@ correctly under CPython — exactly what this round exists to surface.
   `_data`?"). The constructor *arity* check already exempted `plain class` /
   `class!`; the adjacent *unknown-kwarg* loop now does too. A normal `class`
   still reports a misspelled kwarg.
+- **`Counter + Counter` / `Counter - Counter` (repro `117`).** Multiset
+  add/subtract on `collections.Counter` was rejected with
+  `tyc::operator_type_mismatch`, even though Counter overloads both (and the
+  set-style `&`/`|` already passed). `operator_operands_compatible` now accepts
+  Counter on the `+` and `-` arms. `Counter + int` still errors.
 
 Regression tests added in `tyc-types` (`callable_instance_conforms_to_callable_param`,
 `non_callable_instance_rejected_as_callable_param`,
-`normal_class_unknown_kwarg_still_rejected`; the plain-class half is verified
-end-to-end against the binary, since the unit harness doesn't populate
-`plain_classes`). Full workspace test suite green.
+`normal_class_unknown_kwarg_still_rejected`, `counter_add_and_sub_accepted`,
+`counter_plus_int_still_rejected`; the plain-class half is verified end-to-end
+against the binary, since the unit harness doesn't populate `plain_classes`).
+Full workspace test suite green.
 
 ### The type checker caught two deliberately-buggy probes at compile time
 
@@ -142,9 +148,17 @@ runtime behaviour they were probing:
 | 104 | printf-style `%` formatting (tuple + dict) | 109 | `functools.cached_property` |
 | 105 | dynamic `getattr`/`setattr`/`hasattr` | 110 | nested / starred unpacking + `**`-call |
 
+| # | Area | # | Area |
+|---|---|---|---|
+| 111 | generic `interface[T]` (Protocol) | 116 | itertools advanced (`chain.from_iterable`/`tee`/`pairwise`/`batched`) |
+| 112 | nested generics (`Box[Box[int]]`, `dict[str, list[int]]`) | 117 | `ChainMap` + `Counter` arithmetic |
+| 113 | stacked decorators | 118 | `typing.cast` + `functools.partial` (kwargs) |
+| 114 | `@classmethod` alternative constructors | 119 | complex match (`as`/`\|`/nested/guards) |
+| 115 | `dataclasses.asdict`/`astuple`/`fields` | 120 | generic recursive tree `fold` |
+
 ## VM-divergence findings (secondary — production path is correct in all cases)
 
-The 29 `{VM-DIVERGE}` programs are **VM-only** (`tyc run`) gaps; the shipped
+The 33 `{VM-DIVERGE}` programs are **VM-only** (`tyc run`) gaps; the shipped
 Python is correct for every one. Categorised:
 
 ### Fixed this round
@@ -191,6 +205,10 @@ Python is correct for every one. Categorised:
 - `107` — `Flag`/`IntFlag` membership (`x in flag`) treats the flag as a bare int.
 - `108` — a `TypedDict`-typed value is not subscriptable in the VM (`m["k"]`).
 - `109` — `functools.cached_property` re-computes (no per-instance cache) in the VM.
+- `115` — `dataclasses.astuple` not implemented in the VM (`asdict` is).
+- `116` — `itertools.chain.from_iterable` not exposed in the VM.
+- `117` — `collections.ChainMap` not implemented in the VM.
+- `118` — `functools.partial` rejects keyword arguments in the VM.
 
 ### Cosmetic (different repr, same value)
 
@@ -200,6 +218,6 @@ Python is correct for every one. Categorised:
 
 ## Files
 
-- `repros/*.ty` — the 110-program corpus.
+- `repros/*.ty` — the 120-program corpus.
 - `harness.sh` — three-path runner + comparator.
 - `results.txt` — captured full-sweep output (post-fix).

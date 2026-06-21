@@ -1,0 +1,35 @@
+import dataclasses
+
+class Address:
+    street: str
+    city: str
+
+class Person:
+    name: str
+    age: int
+    address: Address
+
+def main() -> None:
+    let p: Person = Person(
+        name="Alice",
+        age=30,
+        address=Address(street="1 Main", city="Springfield"),
+    )
+
+    let d: dict[str, object] = dataclasses.asdict(p)
+    print(d)
+
+    let t: tuple[object, ...] = dataclasses.astuple(p)
+    print(t)
+
+    let field_names: list[str] = [f.name for f in dataclasses.fields(p)]
+    print(field_names)
+
+    let field_types: list[str] = [str(f.type) for f in dataclasses.fields(Address)]
+    print(field_types)
+
+    print(dataclasses.is_dataclass(p))
+    print(dataclasses.is_dataclass(42))
+
+if __name__ == "__main__":
+    main()

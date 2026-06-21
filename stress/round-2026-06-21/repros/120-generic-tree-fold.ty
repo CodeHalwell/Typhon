@@ -1,0 +1,34 @@
+from typing import Callable
+
+type Tree[T] = Leaf[T] | Node[T]
+
+class Leaf[T]:
+    value: T
+class Node[T]:
+    left: Tree[T]
+    right: Tree[T]
+
+impl[T] Tree[T]:
+    def fold[U](self, on_leaf: Callable[[T], U], on_node: Callable[[U, U], U]) -> U:
+        match self:
+            case Leaf(v):
+                return on_leaf(v)
+            case Node(l, r):
+                return on_node(l.fold(on_leaf, on_node), r.fold(on_leaf, on_node))
+
+def main() -> None:
+    let tree: Tree[int] = Node(
+        left=Node(left=Leaf(value=1), right=Leaf(value=2)),
+        right=Leaf(value=3),
+    )
+    let total: int = tree.fold(lambda v: v, lambda a, b: a + b)
+    print(total)
+    let count: int = tree.fold(lambda v: 1, lambda a, b: a + b)
+    print(count)
+    let depth: int = tree.fold(lambda v: 1, lambda a, b: 1 + max(a, b))
+    print(depth)
+    let as_str: str = tree.fold(lambda v: str(v), lambda a, b: f"({a}+{b})")
+    print(as_str)
+
+if __name__ == "__main__":
+    main()

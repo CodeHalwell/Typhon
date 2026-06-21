@@ -1,0 +1,27 @@
+import itertools
+
+def main() -> None:
+    let nested: list[list[int]] = [[1, 2], [3, 4], [5]]
+    print(list(itertools.chain.from_iterable(nested)))
+
+    let a: list[int] = [1, 2, 3]
+    let b: list[str] = ["x", "y"]
+    print(list(itertools.zip_longest(a, b, fillvalue="?")))
+
+    print(list(itertools.pairwise([1, 2, 3, 4])))
+
+    let it1, it2 = itertools.tee([10, 20, 30], 2)
+    print(list(it1), list(it2))
+
+    print(list(itertools.compress(["a", "b", "c", "d"], [1, 0, 1, 0])))
+
+    print(list(itertools.filterfalse(lambda x: x % 2 == 0, range(10))))
+
+    let counter = itertools.count(100, 5)
+    print([next(counter) for _ in range(4)])
+
+    let batched: list[tuple[int, ...]] = list(itertools.batched(range(7), 3))
+    print(batched)
+
+if __name__ == "__main__":
+    main()
