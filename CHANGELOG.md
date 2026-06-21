@@ -87,6 +87,19 @@ First batch toward the feature-complete `v1.0.0-alpha`. See
   `Union[str, os.PathLike]` (Flask) now reject an `int` argument while per-member
   numeric widening (`int → float`, `bool → int`) is preserved. 3+ member unions
   are deferred. Zero corpus false positives.
+- **Added — inter-procedural field-init audit (C3).** The `tyc::missing_field_init`
+  audit (which catches `X.__new__(X)` partial instances escaping with required
+  fields unassigned) now tracks partial instances across helper chains via a
+  sound, dependency-ordered, cycle-safe per-function summary, replacing the two
+  trivial-factory special cases. A `let c = make()` whose callee returns a
+  partially-initialised instance fires at the caller's escape, across silent
+  passthrough (`return X.__new__(X)`) and multi-hop chains (`make2 → make1`).
+  Every uncertainty drops to not-partial and never invents a missing field:
+  `setattr`, `obj.method(...)`, passing the instance into any call, any compound
+  control-flow, rebinds to unknown values, and arg-bearing call shapes; the
+  `unsafe:` posture is unchanged. Cross-module helper chains, branch-merge/SSA
+  unification, and parameter-based partial tracking remain deferred (sound).
+  Zero corpus false positives.
 
 - **Added — performance regression CI gate (F2).** `scripts/perf-gate.sh` times
   the full build pipeline over a real multi-module example, takes the median of

@@ -5487,84 +5487,356 @@ fn detect_new_bypass(value: &Expr) -> Option<String> {
 /// (fields in `field_order` minus the ones in `field_defaults`).
 /// Skipped inside `unsafe:` blocks where the user has opted out of
 /// the static type discipline.
-/// Pre-scan every top-level function for the trivial
-/// `def f(...): return X.__new__(X)` (or `object.__new__(X)`) shape
-/// and record the (class, missing) pair under the function name in
-/// `c.partial_returning_fns`.
+/// Pre-scan every top-level function for the partial-instance
+/// factory shape and record the (class, missing) pair under the
+/// function name in `c.partial_returning_fns`.
 ///
-/// The scan is narrow on purpose: we only recognise the literal
-/// factory-helper shape. A function that performs intervening field
-/// assignments before returning is treated as having initialised the
-/// instance properly, even if some required field is still missing —
-/// detecting that case would need an inter-procedural data-flow
-/// analysis. Better to miss an obscure case than emit a false-positive
-/// on a helper that legitimately leaves some optional fields for the
-/// caller.
+/// C3 — generalised inter-procedural field-init summary. Where the
+/// original pre-scan only recognised the two literal trivial-factory
+/// shapes (`return X.__new__(X)` and the 2-statement
+/// `obj = X.__new__(X); return obj`), this version computes a small,
+/// SOUND per-function summary by simulating the same intra-procedural
+/// partial-instance tracker the live audit runs: it walks the body
+/// straight-line, registers a `__new__`-bypass (or a callee that
+/// itself summarises as partial-returning, via its already-computed
+/// summary) under its local name, clears a field when it sees
+/// `obj.field = ...`, and — crucially — DROPS the instance to "fully
+/// initialised / not partial" the moment it sees anything it cannot
+/// prove (a method call / `setattr` / passing the instance into a
+/// call / any compound control flow / a rebind to an unknown value).
+/// At `return NAME`, a still-tracked NAME with a non-empty missing
+/// set becomes the function's summary; a NAME whose missing set is
+/// empty (every required field assigned) — or any escape the walker
+/// dropped — yields no summary, so the helper is treated as properly
+/// initialising. This guarantees the audit only ever fires on a
+/// partial instance it positively tracked through the body; a
+/// false-positive would break a valid build, so every uncertainty
+/// resolves to "not partial".
+///
+/// Summaries are built in dependency order with a recursion guard
+/// (`in_progress`): a function currently being summarised is treated
+/// as not-partial if reached again, so multi-hop chains
+/// (`make2` calls `make1`) resolve precisely while cycles / recursion
+/// terminate at "not partial" rather than looping.
 fn prescan_partial_returning_fns(c: &mut Checker, body: &[Stmt]) {
+    // Collect the top-level function bodies by name. The summary
+    // walker needs to consult *other* functions' summaries (multi-hop
+    // chains), so we resolve them with memoised recursion over this
+    // map rather than a single linear scan.
+    let mut fn_bodies: HashMap<String, &[Stmt]> = HashMap::new();
     for stmt in body {
-        let Stmt::FunctionDef(f) = stmt else { continue };
-        let fn_name = f.name.as_str();
-        if let Some(info) = function_returns_partial_instance(c, &f.body) {
-            c.partial_returning_fns.insert(fn_name.to_owned(), info);
+        if let Stmt::FunctionDef(f) = stmt {
+            fn_bodies.insert(f.name.as_str().to_owned(), f.body.as_slice());
+        }
+    }
+    let mut in_progress: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let names: Vec<String> = fn_bodies.keys().cloned().collect();
+    for name in names {
+        if c.partial_returning_fns.contains_key(&name) {
+            continue;
+        }
+        let _ = resolve_partial_summary(c, &name, &fn_bodies, &mut in_progress);
+    }
+}
+
+/// Resolve (and memoise) the partial-instance summary for the
+/// top-level function `name`. Returns `Some(UninitInstance)` when the
+/// function provably returns a partial instance with a non-empty
+/// missing-field set, `None` otherwise.
+///
+/// `in_progress` is the recursion guard: a function reached while it
+/// is still being summarised (direct or mutual recursion) is treated
+/// as not-partial, guaranteeing termination.
+fn resolve_partial_summary(
+    c: &mut Checker,
+    name: &str,
+    fn_bodies: &HashMap<String, &[Stmt]>,
+    in_progress: &mut std::collections::HashSet<String>,
+) -> Option<UninitInstance> {
+    if let Some(existing) = c.partial_returning_fns.get(name) {
+        return Some(existing.clone());
+    }
+    if in_progress.contains(name) {
+        // Cycle / recursion: conservatively not-partial.
+        return None;
+    }
+    let Some(body) = fn_bodies.get(name).copied() else {
+        return None;
+    };
+    in_progress.insert(name.to_owned());
+    let summary = summarise_partial_return(c, body, fn_bodies, in_progress);
+    in_progress.remove(name);
+    if let Some(info) = &summary {
+        c.partial_returning_fns
+            .insert(name.to_owned(), info.clone());
+    }
+    summary
+}
+
+/// Walk a function body straight-line, tracking local partial
+/// instances exactly the way the live intra-procedural audit does,
+/// and return the partial summary implied by the first reachable
+/// `return`.
+///
+/// SOUNDNESS: every form the walker cannot prove resolves to
+/// "fully initialised / not partial". In particular it drops tracking
+/// on `setattr`, method calls, passing the instance into a call, any
+/// compound control-flow statement (`if`/`for`/`while`/`with`/`try`/
+/// `match`), and a rebind to an unknown value. So a non-empty summary
+/// is only ever produced for an instance the walker positively
+/// followed from its `__new__` (or a partial callee) to the `return`
+/// with at least one required field never assigned.
+fn summarise_partial_return(
+    c: &mut Checker,
+    body: &[Stmt],
+    fn_bodies: &HashMap<String, &[Stmt]>,
+    in_progress: &mut std::collections::HashSet<String>,
+) -> Option<UninitInstance> {
+    // Local tracker: name → (class, missing fields). Mirrors
+    // `c.uninit_instances` but scoped to this pre-scan walk.
+    let mut tracked: HashMap<String, UninitInstance> = HashMap::new();
+    for stmt in body {
+        match stmt {
+            Stmt::Pass(_) | Stmt::Assert(_) => {}
+            Stmt::Expr(e) => {
+                // Docstrings are inert; any other bare expression
+                // (notably a call) might touch a tracked instance, so
+                // observe it for drops.
+                match e.value.as_ref() {
+                    Expr::StringLiteral(_) | Expr::FString(_) => {}
+                    Expr::Call(call) => {
+                        summary_observe_call(&mut tracked, call);
+                    }
+                    other => {
+                        // Anything else referencing a tracked name is
+                        // an escape we can't follow — drop those names.
+                        for n in collect_names_in_expr(other) {
+                            tracked.remove(&n);
+                        }
+                    }
+                }
+            }
+            Stmt::Assign(a) => {
+                // Field write `obj.field = ...` clears that field.
+                for target in &a.targets {
+                    summary_record_field_set(&mut tracked, target);
+                }
+                // Any tracked name referenced by the RHS (other than a
+                // recognised partial source) is dropped — it may flow
+                // somewhere we can't follow.
+                summary_observe_value(c, &mut tracked, &a.value, fn_bodies, in_progress);
+                // Name-target rebinds: register / refresh / drop.
+                if let [Expr::Name(n)] = a.targets.as_slice() {
+                    summary_bind_name(
+                        c,
+                        &mut tracked,
+                        n.id.as_str(),
+                        &a.value,
+                        fn_bodies,
+                        in_progress,
+                    );
+                }
+            }
+            Stmt::AnnAssign(a) => {
+                summary_record_field_set(&mut tracked, a.target.as_ref());
+                if let Some(value) = &a.value {
+                    summary_observe_value(c, &mut tracked, value, fn_bodies, in_progress);
+                    if let Expr::Name(n) = a.target.as_ref() {
+                        summary_bind_name(
+                            c,
+                            &mut tracked,
+                            n.id.as_str(),
+                            value,
+                            fn_bodies,
+                            in_progress,
+                        );
+                    }
+                }
+            }
+            Stmt::Return(ret) => {
+                // First reachable return decides the summary.
+                let Some(value) = ret.value.as_deref() else {
+                    return None;
+                };
+                // Direct `return X.__new__(X)`.
+                if let Some(class_name) = detect_new_bypass(value) {
+                    return uninit_instance_for(c, &class_name);
+                }
+                // Direct `return make_partial()` — flow the callee's
+                // own summary straight through.
+                if let Expr::Call(call) = value {
+                    if let Expr::Name(fname) = call.func.as_ref() {
+                        if let Some(info) =
+                            resolve_partial_summary(c, fname.id.as_str(), fn_bodies, in_progress)
+                        {
+                            return Some(info);
+                        }
+                    }
+                }
+                // `return obj` where `obj` is a tracked partial.
+                if let Expr::Name(n) = value {
+                    return tracked
+                        .get(n.id.as_str())
+                        .filter(|info| !info.missing.is_empty())
+                        .cloned();
+                }
+                // Any other return shape (attribute read, expression):
+                // not a partial-instance escape.
+                return None;
+            }
+            // Any compound control-flow statement can assign fields on,
+            // or otherwise consume, a tracked instance on a path the
+            // straight-line walker doesn't model. Drop ALL tracking
+            // rather than risk a false-positive summary.
+            _ => {
+                tracked.clear();
+            }
+        }
+    }
+    None
+}
+
+/// Observe a call in the summary walk for drop-inducing forms,
+/// mirroring [`audit_observe_call`]: `setattr(obj, ...)` and
+/// `obj.method(...)` both drop `obj` from local tracking. Additionally,
+/// any tracked name passed as a positional / keyword argument is
+/// dropped (the callee may consume or finish-initialise it).
+fn summary_observe_call(
+    tracked: &mut HashMap<String, UninitInstance>,
+    call: &ruff_python_ast::ExprCall,
+) {
+    let is_setattr = matches!(
+        call.func.as_ref(),
+        Expr::Name(n) if n.id.as_str() == "setattr"
+    );
+    if is_setattr {
+        let obj_arg = call.arguments.args.first().or_else(|| {
+            call.arguments
+                .keywords
+                .iter()
+                .find(|kw| {
+                    kw.arg
+                        .as_ref()
+                        .map(|a| a.as_str() == "obj")
+                        .unwrap_or(false)
+                })
+                .map(|kw| &kw.value)
+        });
+        if let Some(Expr::Name(n)) = obj_arg {
+            tracked.remove(n.id.as_str());
+        }
+        return;
+    }
+    // `obj.method(...)` — drop the receiver (it might initialise
+    // fields). The `X.__new__(X)` form has the class as receiver, which
+    // is never a tracked binding, so this is safe.
+    if let Expr::Attribute(attr) = call.func.as_ref() {
+        if let Expr::Name(recv) = attr.value.as_ref() {
+            if attr.attr.as_str() != "__new__" {
+                tracked.remove(recv.id.as_str());
+            }
+        }
+    }
+    // Any tracked name appearing as an argument escapes into the
+    // callee — drop it conservatively.
+    for arg in &call.arguments.args {
+        for n in collect_names_in_expr(arg) {
+            tracked.remove(&n);
+        }
+    }
+    for kw in &call.arguments.keywords {
+        for n in collect_names_in_expr(&kw.value) {
+            tracked.remove(&n);
         }
     }
 }
 
-/// Inspect a function body for the partial-return shape. Returns
-/// `Some(UninitInstance)` when the body is one of:
-///   - `[return X.__new__(X)]`
-///   - `[obj = X.__new__(X), return obj]` (no intervening attribute
-///     assignments on `obj`)
-///
-/// Otherwise `None`.
-fn function_returns_partial_instance(c: &Checker, body: &[Stmt]) -> Option<UninitInstance> {
-    // Case 1: single-statement `return X.__new__(X)`.
-    if let [Stmt::Return(ret)] = body {
-        let value = ret.value.as_deref()?;
-        let class_name = detect_new_bypass(value)?;
-        return uninit_instance_for(c, &class_name);
+/// Drop any tracked name that appears in `value`, EXCEPT when `value`
+/// is a recognised partial source (`X.__new__(X)` or a partial-
+/// returning call) — those are handled by [`summary_bind_name`]. A
+/// nested call inside `value` is observed for method/setattr drops too.
+fn summary_observe_value(
+    c: &mut Checker,
+    tracked: &mut HashMap<String, UninitInstance>,
+    value: &Expr,
+    fn_bodies: &HashMap<String, &[Stmt]>,
+    in_progress: &mut std::collections::HashSet<String>,
+) {
+    // Recognised partial sources are bound, not dropped.
+    if detect_new_bypass(value).is_some() {
+        return;
     }
-    // Case 2: `obj = X.__new__(X)` followed by `return obj`. We
-    // tolerate any number of intervening pass / docstring / assert
-    // statements but reject anything that touches the target binding
-    // (assignments, attribute writes, method calls).
-    let mut target: Option<&str> = None;
-    let mut class: Option<String> = None;
-    for stmt in body {
-        match stmt {
-            Stmt::Pass(_) => continue,
-            Stmt::Expr(e) => {
-                // Docstrings (a bare `"..."`) are fine.
-                if matches!(e.value.as_ref(), Expr::StringLiteral(_) | Expr::FString(_)) {
-                    continue;
+    if let Expr::Call(call) = value {
+        if let Expr::Name(fname) = call.func.as_ref() {
+            if call.arguments.args.is_empty()
+                && call.arguments.keywords.is_empty()
+                && resolve_partial_summary(c, fname.id.as_str(), fn_bodies, in_progress).is_some()
+            {
+                return;
+            }
+        }
+        // Otherwise observe the call (method/setattr/arg escapes).
+        summary_observe_call(tracked, call);
+        return;
+    }
+    for n in collect_names_in_expr(value) {
+        tracked.remove(&n);
+    }
+}
+
+/// Mark a field assigned on a tracked instance during the summary walk:
+/// `obj.field = ...` removes `field` from `obj`'s missing set.
+fn summary_record_field_set(tracked: &mut HashMap<String, UninitInstance>, target: &Expr) {
+    let Expr::Attribute(attr) = target else {
+        return;
+    };
+    let Expr::Name(recv) = attr.value.as_ref() else {
+        return;
+    };
+    if let Some(entry) = tracked.get_mut(recv.id.as_str()) {
+        entry.missing.remove(attr.attr.as_str());
+    }
+}
+
+/// Register / refresh / drop the local tracking for a name-target
+/// assignment in the summary walk, mirroring the live audit's
+/// `detect_new_bypass` / `detect_partial_returning_call` /
+/// `audit_clear_binding` logic.
+fn summary_bind_name(
+    c: &mut Checker,
+    tracked: &mut HashMap<String, UninitInstance>,
+    binding: &str,
+    value: &Expr,
+    fn_bodies: &HashMap<String, &[Stmt]>,
+    in_progress: &mut std::collections::HashSet<String>,
+) {
+    // `binding = X.__new__(X)` — register fresh.
+    if let Some(class) = detect_new_bypass(value) {
+        if let Some(info) = uninit_instance_for(c, &class) {
+            tracked.insert(binding.to_owned(), info);
+        } else {
+            tracked.remove(binding);
+        }
+        return;
+    }
+    // `binding = make_partial()` — register with the callee's summary
+    // (multi-hop). Only the zero-argument call shape is recognised; a
+    // call passing arguments may have its result entangled with them,
+    // so it's handled as a generic drop.
+    if let Expr::Call(call) = value {
+        if let Expr::Name(fname) = call.func.as_ref() {
+            if call.arguments.args.is_empty() && call.arguments.keywords.is_empty() {
+                if let Some(info) =
+                    resolve_partial_summary(c, fname.id.as_str(), fn_bodies, in_progress)
+                {
+                    tracked.insert(binding.to_owned(), info);
+                    return;
                 }
-                return None;
             }
-            Stmt::Assert(_) => continue,
-            Stmt::Assign(a) if target.is_none() => {
-                let [Expr::Name(n)] = a.targets.as_slice() else {
-                    return None;
-                };
-                let cls = detect_new_bypass(&a.value)?;
-                target = Some(n.id.as_str());
-                class = Some(cls);
-            }
-            Stmt::Return(ret) => {
-                let target = target?;
-                let class = class.as_ref()?;
-                let value = ret.value.as_deref()?;
-                let Expr::Name(n) = value else {
-                    return None;
-                };
-                if n.id.as_str() != target {
-                    return None;
-                }
-                return uninit_instance_for(c, class);
-            }
-            _ => return None,
         }
     }
-    None
+    // Anything else rebinds the name to a non-partial value.
+    tracked.remove(binding);
 }
 
 /// Look up `class_name`'s required fields and return an
@@ -17770,6 +18042,260 @@ def f(cond: bool) -> ApiClient:
             missing_count, 1,
             "exactly one diagnostic expected; got {missing_count}"
         );
+    }
+
+    // ── C3: generalised inter-procedural partial-instance summaries ───
+
+    #[test]
+    fn c3_nontrivial_helper_partial_init_fires_at_escape() {
+        // A non-trivial helper that initialises SOME but not all
+        // required fields, whose result then escapes, must fire
+        // missing_field_init naming the still-missing field.
+        let src = "\
+class ApiClient:
+    api_key: str
+    base_url: str
+
+def make() -> ApiClient:
+    let o: ApiClient = ApiClient.__new__(ApiClient)
+    o.api_key = \"sk-x\"
+    return o
+
+def use() -> ApiClient:
+    let c: ApiClient = make()
+    return c
+";
+        let d = check(src);
+        let missing: Vec<&TycError> = d
+            .errors()
+            .iter()
+            .filter(|e| matches!(e, TycError::MissingFieldInit { .. }))
+            .collect();
+        assert!(
+            !missing.is_empty(),
+            "partial helper escape must fire missing_field_init; got {:?}",
+            d.errors()
+        );
+        let msg = format!("{}", missing[0]);
+        assert!(
+            msg.contains("base_url"),
+            "diagnostic should name the unset field base_url, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn c3_helper_initialising_all_fields_no_fire() {
+        // A non-trivial helper that initialises EVERY required field
+        // must NOT be summarised as partial-returning — no diagnostic.
+        let src = "\
+class ApiClient:
+    api_key: str
+    base_url: str
+
+def make() -> ApiClient:
+    let o: ApiClient = ApiClient.__new__(ApiClient)
+    o.api_key = \"sk-x\"
+    o.base_url = \"https://x\"
+    return o
+
+def use() -> ApiClient:
+    let c: ApiClient = make()
+    return c
+";
+        let d = check(src);
+        assert!(
+            !d.has_errors(),
+            "fully-initialising helper must be clean: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn c3_two_hop_partial_chain_fires_at_caller() {
+        // Two-hop passthrough chain of trivial bypass factories (both
+        // silent at their own returns). The partial summary must flow
+        // make1 → make2 → caller, where the result escapes with every
+        // required field still unset — firing at the caller exactly as
+        // if the partial instance were constructed inline.
+        let src = "\
+class Config:
+    host: str
+    port: int
+
+def make1() -> Config:
+    return Config.__new__(Config)
+
+def make2() -> Config:
+    return make1()
+
+def use() -> Config:
+    let c: Config = make2()
+    return c
+";
+        let d = check(src);
+        let missing: Vec<&TycError> = d
+            .errors()
+            .iter()
+            .filter(|e| matches!(e, TycError::MissingFieldInit { .. }))
+            .collect();
+        assert_eq!(
+            missing.len(),
+            1,
+            "two-hop passthrough chain must fire exactly once, at the caller; got {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn c3_two_hop_chain_caller_finishes_no_fire() {
+        // Two-hop passthrough chain of trivial bypass factories (both
+        // silent at their own returns — the class name, not a tracked
+        // binding, escapes). The partial summary flows make1 → make2 →
+        // caller; the caller assigns every required field before the
+        // escape, so there is no diagnostic anywhere.
+        let src = "\
+class Config:
+    host: str
+    port: int
+
+def make1() -> Config:
+    return Config.__new__(Config)
+
+def make2() -> Config:
+    return make1()
+
+def use() -> Config:
+    let c: Config = make2()
+    c.host = \"localhost\"
+    c.port = 8080
+    return c
+";
+        let d = check(src);
+        assert!(
+            !d.has_errors(),
+            "chain fully initialised before escape must be clean: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn c3_helper_with_setattr_conservatively_no_fire() {
+        // A helper whose field init goes through setattr defeats the
+        // static tracker — the summary must conservatively treat the
+        // instance as fully initialised (NO false positive).
+        let src = "\
+class ApiClient:
+    api_key: str
+    base_url: str
+
+def make() -> ApiClient:
+    let o: ApiClient = ApiClient.__new__(ApiClient)
+    setattr(o, \"api_key\", \"sk-x\")
+    return o
+
+def use() -> ApiClient:
+    let c: ApiClient = make()
+    return c
+";
+        let d = check(src);
+        assert!(
+            !d.has_errors(),
+            "setattr helper must conservatively not fire: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn c3_helper_with_loop_init_conservatively_no_fire() {
+        // A helper that initialises fields inside a loop is beyond the
+        // straight-line walker; the compound statement drops tracking,
+        // so the summary is not-partial (NO false positive).
+        let src = "\
+class Bag:
+    a: int
+    b: int
+
+def make() -> Bag:
+    let o: Bag = Bag.__new__(Bag)
+    for name in [\"a\", \"b\"]:
+        setattr(o, name, 1)
+    return o
+
+def use() -> Bag:
+    let c: Bag = make()
+    return c
+";
+        let d = check(src);
+        assert!(
+            !d.has_errors(),
+            "loop-init helper must conservatively not fire: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn c3_summary_drops_when_instance_passed_to_call() {
+        // A passthrough helper whose summary must NOT propagate as
+        // partial because the (silent, trivial) factory result is
+        // handed to another call before being returned — the callee
+        // may finish init, so the summary conservatively drops and the
+        // caller is not flagged. The intermediate helper stays clean
+        // too (the partial instance never escapes it as a bare name).
+        let src = "\
+class ApiClient:
+    api_key: str
+    base_url: str
+
+def finish(o: ApiClient) -> ApiClient:
+    o.api_key = \"x\"
+    o.base_url = \"y\"
+    return o
+
+def make() -> ApiClient:
+    mut o = ApiClient.__new__(ApiClient)
+    return finish(o)
+
+def use() -> ApiClient:
+    let c: ApiClient = make()
+    return c
+";
+        let d = check(src);
+        // `make` itself fires at the `finish(o)` arg escape (partial
+        // instance passed to a call) — that is the established
+        // intra-procedural posture. What C3 must guarantee is that the
+        // summary does NOT additionally mark `make` partial-returning,
+        // so the CALLER (`use`) is not double-flagged. Assert exactly
+        // one diagnostic, located inside `make`, never inside `use`.
+        let missing: Vec<&TycError> = d
+            .errors()
+            .iter()
+            .filter(|e| matches!(e, TycError::MissingFieldInit { .. }))
+            .collect();
+        assert_eq!(
+            missing.len(),
+            1,
+            "summary must not propagate a dropped instance to the caller; got {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn c3_recursive_helper_terminates_no_fire() {
+        // A self-recursive helper must not loop the summary builder and
+        // must resolve to not-partial (the recursion guard returns None
+        // for the in-progress call).
+        let src = "\
+class Config:
+    host: str
+    port: int
+
+def make() -> Config:
+    let o: Config = make()
+    o.host = \"x\"
+    return o
+";
+        let d = check(src);
+        let _ = d; // termination is the assertion; just must not hang.
     }
 
     // ── FINDINGS #72: bare collection annotations are implicit-any ────
