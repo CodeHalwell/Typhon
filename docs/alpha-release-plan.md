@@ -47,6 +47,31 @@ The alpha is releasable when **all** of the following hold:
 
 ---
 
+## Progress log (live)
+
+**Completed and pushed** (branch `claude/typhon-full-review-pp7ty9`):
+- **M1:** A1 (`Annotated[T,…]` checked), B1 (`migrate` `mut else:` fix), B3
+  (`stdlib_module_shadow` on build), E1 (cross-file go-to-def), F1/F3 (CI audit +
+  doc refresh).
+- **M2 (type-system frontier — COMPLETE):** C1 (HKT unification), C2 (user-generic
+  variance inference), C4 (sound variance through generic interface bounds — closed
+  a soundness hole), C3 (inter-procedural field-init audit), A2 (small non-nullable
+  union modelling).
+- **M3 (early):** E2 (formatter idempotence + two source-corrupting bug fixes),
+  F2 (perf regression CI gate).
+
+Each landed with tests, full `cargo test --workspace` green, and both corpus gates
+(`corpus_examples_all_check_clean`, `third_party_corpus_round_trips_cleanly`) passing.
+
+**Remaining tail (blocked-here or owner-decision):**
+- **A3** (typeshed for pure-extension libs) — large; pairs with D2; needs typeshed corpus.
+- **B2** (migrate-harden on real PyPI packages) — needs reliable `pip`; suited to the
+  nightly `pypi-sweep` harness, not a sandbox task.
+- **D1/D2** (embedded `ty`) — needs vendoring Astral's `ty` (git source) + `cargo deny`
+  carve-out; perf-only (subprocess Phase 1 ships).
+- **E3** (ergonomics: newtype arithmetic, `impl` on sealed-union aliases) — local but
+  changes language semantics; needs a design decision per item.
+
 ## 2. Workstreams
 
 Six workstreams. Each item carries: **scope**, **primary crate(s)/files**,
