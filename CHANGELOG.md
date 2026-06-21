@@ -119,6 +119,20 @@ First batch toward the feature-complete `v1.0.0-alpha`. See
   `perf-baseline.json` by >20%. Methodology and re-baselining are documented in
   `docs/performance-baseline.md`. Designed to be non-flaky (median, warmup,
   generous threshold) and dependency-light (bash + python3 + jq, no network).
+- **Fixed — `impl Alias:`-over-sealed-union diagnostics point at real source
+  (B15).** Distributing one `impl Alias:` block into one block per variant
+  byte-duplicates the method body, appending later blocks past EOF of the real
+  file, so a diagnostic inside a duplicated body rendered a line number beyond
+  the file's length (the length-preserving `sanitize_synthetic_source` restored
+  the header text but kept the duplicated lines — its `TODO(#32)`). A new
+  `BlockRemap` at the existing diagnostic-sanitisation chokepoint detects the
+  signature (a run of 2+ same-indent `impl <Name>:` blocks with byte-identical
+  bodies) and remaps each label's span per-line back onto the first
+  real-source-aligned block (per-line deltas keep columns correct across uneven
+  variant-name lengths). Body diagnostics now resolve to the exact authored
+  member line; no diagnostic can exceed the real line count. Files without a
+  distributed impl group are untouched. Closes the long-standing B15 limitation
+  with no invasive source-map plumbing.
 
 - **Fixed — `tyc fmt` is now idempotent and semantics-preserving (E2).** Two
   source-corrupting bugs are fixed: `extend BUILTIN:` (e.g. `extend str:`) was

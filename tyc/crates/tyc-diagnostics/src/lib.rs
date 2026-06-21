@@ -3465,6 +3465,14 @@ fn source_line<'a>(source: &'a str, starts: &[usize], line_idx: usize) -> Option
 pub struct SanitisedDiagnostic {
     inner: TycError,
     sanitised: Option<NamedSource<String>>,
+    /// B15 remap table for `impl Alias:`-over-sealed-union distribution.
+    /// `preprocess` duplicates the impl body once per union variant, so
+    /// the 2nd…Nth synthesised blocks occupy line numbers *past the end
+    /// of the user's real source*. A label landing in one of those
+    /// duplicated blocks is redirected back to the byte-equivalent
+    /// position in the first (real-source-aligned) block, so the
+    /// rendered line number never exceeds the file's real line count.
+    block_remap: Option<BlockRemap>,
 }
 
 impl SanitisedDiagnostic {
@@ -3477,7 +3485,14 @@ impl SanitisedDiagnostic {
             let cleaned = sanitize_synthetic_source(src.inner());
             NamedSource::new(src.name(), cleaned)
         });
-        Self { inner, sanitised }
+        let block_remap = sanitised
+            .as_ref()
+            .and_then(|s| BlockRemap::from_sanitised(&named_source_text(s)));
+        Self {
+            inner,
+            sanitised,
+            block_remap,
+        }
     }
 
     /// Build a wrapper that reuses a pre-sanitised `NamedSource`. Callers
@@ -3485,10 +3500,197 @@ impl SanitisedDiagnostic {
     /// and pass the result here to avoid the O(n_diags × file_size)
     /// rework that [`wrap`](Self::wrap) does on a hot loop.
     pub fn wrap_with_source(inner: TycError, sanitised: NamedSource<String>) -> Self {
+        let block_remap = BlockRemap::from_sanitised(&named_source_text(&sanitised));
         Self {
             inner,
             sanitised: Some(sanitised),
+            block_remap,
         }
+    }
+}
+
+/// Read the full text out of a `NamedSource<String>`. miette doesn't
+/// expose the inner string directly, so we round-trip through the
+/// `SourceCode` interface (a 1-byte span at offset 0 with an unbounded
+/// trailing-context request returns the whole document — see
+/// [`TycError::embedded_source`] for the same trick).
+fn named_source_text(src: &NamedSource<String>) -> String {
+    use miette::SourceCode;
+    let span = miette::SourceSpan::new(miette::SourceOffset::from(0), 1);
+    match src.read_span(&span, 0, usize::MAX) {
+        Ok(contents) => std::str::from_utf8(contents.data())
+            .map(|s| s.to_owned())
+            .unwrap_or_default(),
+        Err(_) => String::new(),
+    }
+}
+
+/// B15 byte-offset remap for `impl Alias:`-over-sealed-union distribution.
+///
+/// The preprocessor expands one `impl Alias:` block (where `Alias` is a
+/// sealed union `A | B | …`) into one `impl A:` / `impl B:` / … block
+/// per variant, byte-duplicating the user's method bodies. The first
+/// block keeps the original source's line numbers; every later block is
+/// *synthetic*, sitting past the end of the real `.ty` file. A
+/// diagnostic that fires inside a later block therefore reports a line
+/// number greater than the file's real line count (B15).
+///
+/// This table records, for each synthetic (2nd…Nth) block, the byte
+/// range it occupies in the rendered source and the offset `delta` that
+/// maps a position inside it back to the byte-equivalent position in the
+/// first block (which is real-source-aligned). Because the blocks are
+/// byte-for-byte duplicates of one another, subtracting `delta` lands on
+/// the matching column of the matching real line — the diagnostic points
+/// at honest source, never past EOF.
+#[derive(Clone, Debug)]
+struct BlockRemap {
+    /// `(start, end, delta)` — a label offset in `start..end` is remapped
+    /// to `offset - delta`. Sorted by `start`, non-overlapping.
+    ranges: Vec<(usize, usize, usize)>,
+}
+
+impl BlockRemap {
+    /// Build a remap table from the *sanitised* source text (the form
+    /// `sanitize_synthetic_source` produces, where each distributed
+    /// `class __typhon_impl_<Variant>(object):` header has already been
+    /// restored to `impl <Variant>:`). Returns `None` when the source
+    /// contains no distributed impl group (the overwhelmingly common
+    /// case), so normal diagnostics pay only a cheap scan.
+    ///
+    /// Detection: a *group* is a maximal run of two or more `impl <Name>:`
+    /// header lines at the same indent whose bodies (every more-indented
+    /// line up to the next dedent) are byte-for-byte identical. Only the
+    /// distribution pass produces such duplicate-bodied consecutive impl
+    /// blocks, so the signature is specific to B15.
+    fn from_sanitised(source: &str) -> Option<Self> {
+        // Cheap reject: the restoration step only emits `impl ` headers
+        // for files that carried an `impl`/`extend` block. Bail early
+        // when there isn't one.
+        if !source.contains("impl ") {
+            return None;
+        }
+        let lines: Vec<&str> = source.split_inclusive('\n').collect();
+        // Byte offset at the start of each line.
+        let mut starts = Vec::with_capacity(lines.len() + 1);
+        let mut acc = 0usize;
+        for l in &lines {
+            starts.push(acc);
+            acc += l.len();
+        }
+        starts.push(acc);
+
+        let impl_header_indent = |raw: &str| -> Option<usize> {
+            let indent = raw.len() - raw.trim_start().len();
+            let trimmed = raw.trim_start();
+            let after = trimmed.strip_prefix("impl ")?;
+            // Must look like `impl <Name…>:` — a header, not a method
+            // body line that merely starts with the word.
+            if after.trim_end().ends_with(':') {
+                Some(indent)
+            } else {
+                None
+            }
+        };
+
+        // The (header_line, body_start_line, body_end_line) of each impl
+        // block, in source order. `body_end_line` is exclusive.
+        let mut blocks: Vec<(usize, usize, usize)> = Vec::new();
+        let mut i = 0;
+        while i < lines.len() {
+            let raw = lines[i].trim_end_matches(['\r', '\n']);
+            if let Some(indent) = impl_header_indent(raw) {
+                let header = i;
+                let mut j = i + 1;
+                let mut last_body = header;
+                while j < lines.len() {
+                    let cand = lines[j].trim_end_matches(['\r', '\n']);
+                    if cand.trim().is_empty() {
+                        j += 1;
+                        continue;
+                    }
+                    let cand_indent = cand.len() - cand.trim_start().len();
+                    if cand_indent <= indent {
+                        break;
+                    }
+                    last_body = j;
+                    j += 1;
+                }
+                blocks.push((header, header + 1, last_body + 1));
+                i = last_body + 1;
+            } else {
+                i += 1;
+            }
+        }
+
+        if blocks.len() < 2 {
+            return None;
+        }
+
+        // Concatenated body text of a block, for the duplicate check.
+        let body_text = |b: &(usize, usize, usize)| -> String { lines[b.1..b.2].concat() };
+
+        let mut ranges: Vec<(usize, usize, usize)> = Vec::new();
+        // Walk consecutive blocks; group runs with identical bodies.
+        let mut g = 0;
+        while g < blocks.len() {
+            let first = blocks[g];
+            let first_body = body_text(&first);
+            let mut k = g + 1;
+            while k < blocks.len() && body_text(&blocks[k]) == first_body {
+                k += 1;
+            }
+            // blocks[g..k] form a distributed group of size (k - g).
+            if k - g >= 2 {
+                for dup in &blocks[g + 1..k] {
+                    // Map the duplicate block back onto the first block
+                    // *per line*, not per block: the synthesised headers
+                    // differ in length (`impl Circle:` vs `impl Triangle:`),
+                    // so a single block-level byte delta would skew the
+                    // column on body lines. Each body line is byte-identical
+                    // to the first block's matching body line, so we emit
+                    // one range per line with its own delta — preserving
+                    // the exact column.
+                    //
+                    // The header line itself is redirected to the first
+                    // block's header (the real `impl Alias:` source line);
+                    // a span there can't preserve a meaningful column
+                    // across differing variant names, so it clamps to the
+                    // header line start. Body lines keep their column.
+                    let header_delta = starts[dup.0] - starts[first.0];
+                    ranges.push((starts[dup.0], starts[dup.1], header_delta));
+                    // Body lines: dup body line i ↔ first body line i.
+                    let dup_body_lines = dup.2 - dup.1;
+                    for off in 0..dup_body_lines {
+                        let dup_line = dup.1 + off;
+                        let first_line = first.1 + off;
+                        let dline_start = starts[dup_line];
+                        let dline_end = starts[dup_line + 1];
+                        let fline_start = starts[first_line];
+                        ranges.push((dline_start, dline_end, dline_start - fline_start));
+                    }
+                }
+            }
+            g = k;
+        }
+        ranges.sort_by_key(|r| r.0);
+
+        if ranges.is_empty() {
+            None
+        } else {
+            Some(Self { ranges })
+        }
+    }
+
+    /// Remap a single byte offset out of a synthetic duplicate block back
+    /// onto the first (real-source-aligned) block. Offsets outside every
+    /// synthetic range are returned unchanged.
+    fn remap_offset(&self, offset: usize) -> usize {
+        for &(start, end, delta) in &self.ranges {
+            if offset >= start && offset < end {
+                return offset - delta;
+            }
+        }
+        offset
     }
 }
 
@@ -3534,7 +3736,24 @@ impl miette::Diagnostic for SanitisedDiagnostic {
         self.inner.url()
     }
     fn labels(&self) -> Option<Box<dyn Iterator<Item = miette::LabeledSpan> + '_>> {
-        self.inner.labels()
+        let labels = self.inner.labels()?;
+        // B15: redirect any label that landed in a synthetic duplicated
+        // `impl Variant:` block (past the real source's EOF) back onto the
+        // first, real-source-aligned block. No-op when the file carries
+        // no distributed impl group.
+        let Some(remap) = self.block_remap.clone() else {
+            return Some(labels);
+        };
+        let remapped = labels.map(move |label| {
+            let span = label.inner();
+            let new_offset = remap.remap_offset(span.offset());
+            if new_offset == span.offset() {
+                return label;
+            }
+            let new_span = miette::SourceSpan::new(new_offset.into(), span.len());
+            miette::LabeledSpan::new_with_span(label.label().map(|s| s.to_owned()), new_span)
+        });
+        Some(Box::new(remapped))
     }
     fn related<'b>(&'b self) -> Option<Box<dyn Iterator<Item = &'b dyn miette::Diagnostic> + 'b>> {
         self.inner.related()
@@ -3762,6 +3981,76 @@ mod tests {
         assert!(
             !out.contains("__typhon_impl_"),
             "synthetic wrapper must be hidden, got: {out}"
+        );
+    }
+
+    #[test]
+    fn block_remap_redirects_duplicate_impl_blocks() {
+        // B15: the sanitised buffer for an `impl Alias:` distributed over
+        // a two-variant union has two consecutive `impl <Variant>:` blocks
+        // with byte-identical bodies. A label offset inside the *second*
+        // (synthetic, past-EOF) block must remap onto the byte-equivalent
+        // position in the first (real-source-aligned) block.
+        let sanitised = "impl Leaf:\n\
+                         \x20\x20\x20\x20def total(self) -> int:\n\
+                         \x20\x20\x20\x20\x20\x20\x20\x20return self.x\n\
+                         \n\
+                         impl Node:\n\
+                         \x20\x20\x20\x20def total(self) -> int:\n\
+                         \x20\x20\x20\x20\x20\x20\x20\x20return self.x\n";
+        let remap = BlockRemap::from_sanitised(sanitised)
+            .expect("two duplicate impl blocks should produce a remap");
+
+        // Offset of `self.x` inside the SECOND block.
+        let second_block = sanitised.find("impl Node:").unwrap();
+        let dup_self = second_block + sanitised[second_block..].find("self.x").unwrap();
+        // Offset of `self.x` inside the FIRST block.
+        let first_self = sanitised.find("self.x").unwrap();
+
+        assert_eq!(
+            remap.remap_offset(dup_self),
+            first_self,
+            "a label in the duplicated block must redirect onto the first block"
+        );
+        // An offset in the first block is left untouched.
+        assert_eq!(remap.remap_offset(first_self), first_self);
+    }
+
+    #[test]
+    fn block_remap_ignores_single_impl_block() {
+        // A lone `impl Foo:` (no union distribution) must NOT be remapped —
+        // its line numbers are already real, so the table is `None`.
+        let sanitised = "impl Foo:\n\
+                         \x20\x20\x20\x20def m(self) -> int:\n\
+                         \x20\x20\x20\x20\x20\x20\x20\x20return self.x\n";
+        assert!(
+            BlockRemap::from_sanitised(sanitised).is_none(),
+            "a single impl block has no synthetic duplicates to remap"
+        );
+    }
+
+    #[test]
+    fn block_remap_preserves_columns_across_uneven_variant_names() {
+        // Variant headers differ in length (`impl Circle:` vs
+        // `impl Triangle:`), so the per-line delta — not a single
+        // block-level delta — is what preserves the body column. A label
+        // in the longer-named block's body must map to the SAME column in
+        // the first block's body.
+        let sanitised = "impl Circle:\n\
+                         \x20\x20\x20\x20def area(self) -> int:\n\
+                         \x20\x20\x20\x20\x20\x20\x20\x20return self.q\n\
+                         \n\
+                         impl Triangle:\n\
+                         \x20\x20\x20\x20def area(self) -> int:\n\
+                         \x20\x20\x20\x20\x20\x20\x20\x20return self.q\n";
+        let remap = BlockRemap::from_sanitised(sanitised).unwrap();
+        let first_q = sanitised.find("self.q").unwrap();
+        let tri = sanitised.find("impl Triangle:").unwrap();
+        let dup_q = tri + sanitised[tri..].find("self.q").unwrap();
+        assert_eq!(
+            remap.remap_offset(dup_q),
+            first_q,
+            "uneven variant-name lengths must not skew the remapped column"
         );
     }
 

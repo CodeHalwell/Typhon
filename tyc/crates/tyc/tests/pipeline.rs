@@ -240,6 +240,86 @@ fn impl_unknown_class_emits_diagnostic() {
 }
 
 #[test]
+fn impl_alias_sealed_union_diagnostics_point_at_real_source() {
+    // B15: distributing `impl Alias:` over a sealed union (`type X = A | B`)
+    // byte-duplicates the impl body once per variant in the preprocessed
+    // buffer, pushing the 2nd…Nth blocks *past the real source's EOF*.
+    // Before the fix, the diagnostic for the second variant rendered at a
+    // synthetic line number greater than the file's real line count.
+    //
+    // This asserts (a) every rendered `[file:line:col]` location lands on a
+    // line that actually exists in the source, and (b) the per-variant
+    // diagnostics resolve to the single, real `return` member line the
+    // user wrote — never a line past EOF.
+    let tmp = tempfile::tempdir().unwrap();
+    let src = "type TreeAlias = Leaf | Node\n\
+               \n\
+               class Leaf:\n\
+               \x20\x20\x20\x20value: int\n\
+               \n\
+               class Node:\n\
+               \x20\x20\x20\x20left: int\n\
+               \x20\x20\x20\x20right: int\n\
+               \n\
+               impl TreeAlias:\n\
+               \x20\x20\x20\x20def total(self) -> int:\n\
+               \x20\x20\x20\x20\x20\x20\x20\x20return self.nonexistent_field + 1\n";
+    let real_line_count = src.lines().count();
+    // The user-written impl body member (`return …`) is the 12th line.
+    let body_line = 12usize;
+    let path = tmp.path().join("tree.ty");
+    std::fs::write(&path, src).unwrap();
+
+    let out = tyc().arg("check").arg(&path).output().unwrap();
+    assert!(
+        !out.status.success(),
+        "expected the bogus-attribute check to fail"
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stderr),
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(
+        combined.contains("tyc::attribute_not_found"),
+        "expected attribute_not_found, got:\n{combined}"
+    );
+    // Both variants must be reported (one diagnostic each for Leaf/Node).
+    assert!(
+        combined.contains("on `Leaf`") && combined.contains("on `Node`"),
+        "expected a diagnostic for each union variant, got:\n{combined}"
+    );
+
+    // Parse every `tree.ty:<line>:<col>` location from the rendered output
+    // and assert none exceeds the real source's line count.
+    let mut saw_location = false;
+    for cap in combined.split("tree.ty:").skip(1) {
+        let digits: String = cap.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if digits.is_empty() {
+            continue;
+        }
+        saw_location = true;
+        let line: usize = digits.parse().unwrap();
+        assert!(
+            line <= real_line_count,
+            "B15: diagnostic reported line {line}, past the source's real \
+             {real_line_count} lines:\n{combined}"
+        );
+        // The distributed impl body collapses to the single real member
+        // line the user authored.
+        assert_eq!(
+            line, body_line,
+            "B15: per-variant diagnostic should resolve to the real impl \
+             member line {body_line}, got {line}:\n{combined}"
+        );
+    }
+    assert!(
+        saw_location,
+        "expected at least one `tree.ty:<line>:<col>` location, got:\n{combined}"
+    );
+}
+
+#[test]
 fn cyclic_type_alias_emits_diagnostic() {
     // FINDINGS #81: `type A = B; type B = A` forms a cycle. No concrete
     // type can ever satisfy it; reject at check time instead of letting
