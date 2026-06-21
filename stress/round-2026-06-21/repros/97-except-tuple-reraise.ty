@@ -1,0 +1,36 @@
+def risky(mode: str) -> int:
+    if mode == "value":
+        raise ValueError("bad value")
+    if mode == "key":
+        raise KeyError("bad key")
+    if mode == "type":
+        raise TypeError("bad type")
+    return 0
+
+def handle(mode: str) -> str:
+    try:
+        return f"ok: {risky(mode)}"
+    except (ValueError, KeyError) as e:
+        return f"value-or-key: {type(e).__name__}: {e}"
+    except Exception as e:
+        return f"other: {type(e).__name__}"
+
+def wrap_and_reraise(mode: str) -> str:
+    try:
+        let _: int = risky(mode)
+        return "no error"
+    except ValueError:
+        try:
+            raise RuntimeError("wrapped")
+        except RuntimeError as re:
+            return f"reraised as {type(re).__name__}: {re}"
+
+def main() -> None:
+    print(handle("value"))
+    print(handle("key"))
+    print(handle("type"))
+    print(handle("none"))
+    print(wrap_and_reraise("value"))
+
+if __name__ == "__main__":
+    main()

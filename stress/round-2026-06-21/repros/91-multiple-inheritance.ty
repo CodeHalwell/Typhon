@@ -1,0 +1,29 @@
+plain class Serializable:
+    def serialize(self) -> str:
+        return "<serializable>"
+
+plain class Comparable:
+    def rank(self) -> int:
+        return 0
+
+plain class Widget(Serializable, Comparable):
+    label: str
+
+impl Widget:
+    def __init__(self, label: str) -> None:
+        self.label = label
+    def serialize(self) -> str:
+        return f"Widget({self.label})"
+    def rank(self) -> int:
+        return len(self.label)
+
+def main() -> None:
+    let w: Widget = Widget("button")
+    print(w.serialize())
+    print(w.rank())
+    print(isinstance(w, Serializable))
+    print(isinstance(w, Comparable))
+    print(Widget.__mro__[0].__name__)
+
+if __name__ == "__main__":
+    main()

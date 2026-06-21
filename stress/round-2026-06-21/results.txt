@@ -69,6 +69,21 @@ AttributeError: module 'functools' has no attribute 'cmp_to_key'
 ===== 08-closures-decorators (check=0 vm=0 comp=0) [PASS] =====
 ===== 09-dataclasses-frozen (check=0 vm=0 comp=0) [PASS] =====
 ===== 10-inheritance-properties (check=0 vm=0 comp=0) [PASS] =====
+===== 100-io-hashlib-base64 (check=0 vm=1 comp=0) [PASS] {VM-DIVERGE} =====
+--- VM ---
+Traceback (most recent call last):
+  File "repros/100-io-hashlib-base64.ty", line 1, in <module>
+    import io
+ImportError: tyc-vm cannot import 'io': only a small native stdlib is available. Run with `tyc run --compile` to use the full Python interpreter.
+--- BUILD+PY ---
+hello world
+['line 0', 'line 1', 'line 2']
+b1fc1c68a28135561cdb827e85081055da92f15662d9c33466d153b4e8e9a7b4
+64
+8d777f385d3dfec8815d20f7496026dc
+aGVsbG8gd29ybGQ=
+hello world
+4142
 ===== 11-operator-dunders (check=0 vm=0 comp=0) [PASS] =====
 ===== 12-enum (check=0 vm=0 comp=0) [PASS] =====
 ===== 13-sealed-union-eval (check=0 vm=0 comp=0) [PASS] =====
@@ -416,6 +431,79 @@ True
 True
 frozen blocked mutation: True
 ===== 90-aggregate-builtins (check=0 vm=0 comp=0) [PASS] =====
+===== 91-multiple-inheritance (check=0 vm=1 comp=0) [PASS] {VM-DIVERGE} =====
+--- VM ---
+Widget(button)
+6
+True
+True
+Traceback (most recent call last):
+  File "repros/91-multiple-inheritance.ty", line 29, in <module>
+    main()
+  File "repros/91-multiple-inheritance.ty", line 26, in main
+    print(Widget.__mro__[0].__name__)
+AttributeError: type object 'Widget' has no attribute '__mro__'
+--- BUILD+PY ---
+Widget(button)
+6
+True
+True
+Widget
+===== 92-abc (check=0 vm=0 comp=0) [PASS] =====
+===== 93-classvar (check=0 vm=0 comp=0) [PASS] =====
+===== 94-reflected-operators (check=0 vm=0 comp=0) [PASS] =====
+===== 95-callable-objects (check=0 vm=0 comp=0) [PASS] =====
+===== 96-nested-context-managers (check=0 vm=1 comp=0) [PASS] {VM-DIVERGE} =====
+--- VM ---
+Traceback (most recent call last):
+  File "repros/96-nested-context-managers.ty", line 2, in <module>
+    from contextlib import contextmanager, suppress, ExitStack
+AttributeError: module 'contextlib' has no attribute 'suppress'
+--- BUILD+PY ---
+enter outer
+enter inner
+in outer/inner
+exit inner
+exit outer
+enter a
+enter b
+nested a/b
+exit b
+exit a
+suppressed KeyError
+enter ctx0
+===== 97-except-tuple-reraise (check=0 vm=0 comp=0) [PASS] =====
+===== 98-async-generators (check=0 vm=1 comp=0) [PASS] {VM-DIVERGE} =====
+--- VM ---
+total = 10
+[0, 1, 2, 3]
+acquire db
+release db
+Traceback (most recent call last):
+  File "repros/98-async-generators.ty", line 34, in <module>
+    main()
+  File "repros/98-async-generators.ty", line 31, in main
+    asyncio.run(run())
+  File "repros/98-async-generators.ty", line 27, in run
+    async with aresource("db") as r:
+NotImplementedError: `@contextmanager` generators as context managers (the VM evaluates generators eagerly); run with `tyc build` then `python` is not yet supported in the tree-walking VM; use `tyc build` then `python build/main.py` to run this program
+--- BUILD+PY ---
+total = 10
+[0, 1, 2, 3]
+acquire db
+using db
+release db
+===== 99-singledispatch (check=0 vm=1 comp=0) [PASS] {VM-DIVERGE} =====
+--- VM ---
+Traceback (most recent call last):
+  File "repros/99-singledispatch.ty", line 1, in <module>
+    from functools import singledispatch
+AttributeError: module 'functools' has no attribute 'singledispatch'
+--- BUILD+PY ---
+int: 42 (squared 1764)
+str of length 5
+list with 3 items
+object: 3.14
 
 ######## SUMMARY ########
-total=90 pass=90 buildfail=0 runfail=0 checkfail=0 vm_diverge=18
+total=100 pass=100 buildfail=0 runfail=0 checkfail=0 vm_diverge=23

@@ -1,0 +1,34 @@
+import asyncio
+from typing import AsyncIterator
+from contextlib import asynccontextmanager
+
+async def arange(n: int) -> AsyncIterator[int]:
+    mut i: int = 0
+    while i < n:
+        await asyncio.sleep(0)
+        yield i
+        i = i + 1
+
+@asynccontextmanager
+async def aresource(name: str) -> AsyncIterator[str]:
+    print(f"acquire {name}")
+    yield name
+    print(f"release {name}")
+
+async def run() -> None:
+    mut total: int = 0
+    async for x in arange(5):
+        total = total + x
+    print(f"total = {total}")
+
+    let collected: list[int] = [x async for x in arange(4)]
+    print(collected)
+
+    async with aresource("db") as r:
+        print(f"using {r}")
+
+def main() -> None:
+    asyncio.run(run())
+
+if __name__ == "__main__":
+    main()

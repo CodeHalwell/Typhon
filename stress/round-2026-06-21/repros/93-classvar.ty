@@ -1,0 +1,30 @@
+from typing import ClassVar
+
+class Counter:
+    total_created: ClassVar[int] = 0
+    instance_id: int
+
+impl Counter:
+    def __post_init__(self) -> None:
+        Counter.total_created = Counter.total_created + 1
+
+class Circle:
+    PI: ClassVar[float] = 3.14159
+    radius: float
+
+impl Circle:
+    def area(self) -> float:
+        return Circle.PI * self.radius * self.radius
+
+def main() -> None:
+    let a: Counter = Counter(instance_id=1)
+    let b: Counter = Counter(instance_id=2)
+    let c: Counter = Counter(instance_id=3)
+    print(Counter.total_created)
+    print(a.instance_id, b.instance_id, c.instance_id)
+
+    print(Circle.PI)
+    print(f"{Circle(radius=2.0).area():.4f}")
+
+if __name__ == "__main__":
+    main()

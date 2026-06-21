@@ -7,7 +7,7 @@ language surfaces and lowering paths rather than going deep on one.
 
 ## Methodology
 
-Each of the **90** `.ty` programs in `repros/` is run through three paths by
+Each of the **100** `.ty` programs in `repros/` is run through three paths by
 `harness.sh` and compared:
 
 1. **`tyc check`** — frontend (parser + resolver + type checker).
@@ -28,15 +28,29 @@ bash harness.sh repros/*.ty        # TYC=… PYTHON=… overridable
 Requires `pydantic` installed for the `model` repro (`36`); everything else is
 stdlib-only.
 
-## Result — 90 / 90 compile to valid, runnable Python
+## Result — 100 / 100 compile to valid, runnable Python
 
 ```
-total=90 pass=90 buildfail=0 runfail=0 checkfail=0 vm_diverge=18
+total=100 pass=100 buildfail=0 runfail=0 checkfail=0 vm_diverge=23
 ```
 
 Every program type-checks, builds, and runs correctly on the compiled
 (`tyc build` → CPython 3.13) path. **Zero codegen defects** were found across
-the whole 90-program corpus.
+the whole 100-program corpus.
+
+### One real type-checker build-blocker found and fixed (`__call__` → `Callable`)
+
+Repro `95` exposed a genuine **false positive**: an instance of a class with a
+`__call__` method (a "functor" / callable object) was rejected where a
+`Callable[[int], int]` parameter was expected — `tyc::type_mismatch`
+(`expected (int) -> int, found Multiplier`) **blocked the build** on code that
+runs correctly under CPython. **Fixed** in `tyc-types`: `is_assignable` now
+recognises a `__call__`-bearing class as structurally conforming to a function
+type (looking up `__call__`, rebuilding its signature, and re-running the
+function-to-function variance check). A class *without* `__call__` is still
+rejected, so the change can only relax assignability. Two regression tests
+added (`callable_instance_conforms_to_callable_param`,
+`non_callable_instance_rejected_as_callable_param`).
 
 ### The type checker caught two deliberately-buggy probes at compile time
 
@@ -100,9 +114,17 @@ runtime behaviour they were probing:
 | 44 | `extend str:` / `extend list:` | 89 | `frozen` + `dataclasses.replace` |
 | 45 | `lazy import` | 90 | nested-aggregate builtins (`sum`/`max`/`all`/`any`) |
 
+| # | Area | # | Area |
+|---|---|---|---|
+| 91 | multiple inheritance / mixins (`plain class`) | 96 | nested/`with a, b:` CMs + `ExitStack` + `suppress` |
+| 92 | `abc.ABC` + `@abstractmethod` | 97 | `except (A, B)` tuple + nested re-raise |
+| 93 | `ClassVar` class-level state | 98 | async generators / `async for` / `async with` |
+| 94 | reflected operators (`__rmul__`, `__lt__`…) | 99 | `functools.singledispatch` |
+| 95 | callable objects (`__call__`) as `Callable` | 100 | `io.StringIO` / `hashlib` / `base64` |
+
 ## VM-divergence findings (secondary — production path is correct in all cases)
 
-The 18 `{VM-DIVERGE}` programs are **VM-only** (`tyc run`) gaps; the shipped
+The 23 `{VM-DIVERGE}` programs are **VM-only** (`tyc run`) gaps; the shipped
 Python is correct for every one. Categorised:
 
 ### Fixed this round
@@ -117,9 +139,11 @@ Python is correct for every one. Categorised:
 
 ### Documented VM limitations (run these with `tyc build` / `tyc run --compile`)
 
-- `18`, `83` — `@contextmanager` generators as context managers (the VM
-  evaluates generators eagerly — the explicit error the VM raises).
-- `33` — `decimal` / `fractions` not in the VM's native stdlib subset.
+- `18`, `83`, `98` — `@contextmanager` / `@asynccontextmanager` generators as
+  context managers (the VM evaluates generators eagerly — the explicit error
+  the VM raises).
+- `33`, `100` — `decimal` / `fractions` / `io` not in the VM's native stdlib
+  subset (the explicit "run with `tyc run --compile`" error).
 - `71` — unbounded generators (`while True: yield`) exceed the VM's
   1M-value eager-materialisation cap.
 - `78` — `sys.setrecursionlimit` not modelled by the VM.
@@ -139,6 +163,9 @@ Python is correct for every one. Categorised:
 - `75` — `int(IntEnum.MEMBER)` raises in the VM (IntEnum member not coerced).
 - `84` — `date.weekday()` and several `date` ops missing from the VM shim.
 - `89` — `dataclasses.replace` not implemented in the VM.
+- `91` — `type.__mro__` not exposed by the VM.
+- `96` — `contextlib.suppress` not implemented in the VM.
+- `99` — `functools.singledispatch` not implemented in the VM.
 
 ### Cosmetic (different repr, same value)
 
@@ -148,6 +175,6 @@ Python is correct for every one. Categorised:
 
 ## Files
 
-- `repros/*.ty` — the 90-program corpus.
+- `repros/*.ty` — the 100-program corpus.
 - `harness.sh` — three-path runner + comparator.
 - `results.txt` — captured full-sweep output (post-fix).

@@ -1,0 +1,26 @@
+from functools import singledispatch
+
+@singledispatch
+def describe(x: object) -> str:
+    return f"object: {x}"
+
+@describe.register(int)
+def describe_int(x: int) -> str:
+    return f"int: {x} (squared {x * x})"
+
+@describe.register(str)
+def describe_str(x: str) -> str:
+    return f"str of length {len(x)}"
+
+@describe.register(list)
+def describe_list(x: list[object]) -> str:
+    return f"list with {len(x)} items"
+
+def main() -> None:
+    print(describe(42))
+    print(describe("hello"))
+    print(describe([1, 2, 3]))
+    print(describe(3.14))
+
+if __name__ == "__main__":
+    main()

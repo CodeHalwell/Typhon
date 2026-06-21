@@ -2724,6 +2724,27 @@ impl<'a> Checker<'a> {
             let params_ok = ep.iter().zip(ap).all(|(e, a)| self.is_assignable(a, e));
             return params_ok && self.is_assignable(er, ar);
         }
+        // A class instance that defines `__call__` is structurally a
+        // `Callable[...]` — `apply(fn=instance)` where `instance.__call__`
+        // matches the expected signature. Python (and typeshed) treat such an
+        // instance as assignable to a function type, but the nominal
+        // `assignable` check rejects `Class("Doubler")` against `(int) -> int`.
+        // Look up `__call__` in the class hierarchy, rebuild its signature as a
+        // function type (its `param_types` / `return_type` already exclude the
+        // implicit `self`), and re-run the function-to-function check above.
+        // Only *relaxes* assignability, so it can't introduce a false positive.
+        if let (Type::Function { .. }, Type::Class(cls_name)) = (expected, actual) {
+            if let Some(sig) = self.find_method(cls_name, "__call__") {
+                let call_ty = Type::Function {
+                    params: sig.param_types.clone(),
+                    ret: Box::new(sig.return_type.clone()),
+                    variadic: false,
+                };
+                if self.is_assignable(expected, &call_ty) {
+                    return true;
+                }
+            }
+        }
         // Canonicalize module aliases on both sides and retry. An
         // annotation `let c: f.Cls` (where `import foo as f`) produces
         // `Class("f.Cls")`, but the call site `f.Cls(...)` resolves
@@ -16029,6 +16050,53 @@ let g: str = u.greet(\"hi \")
 ";
         let d = check(src);
         assert!(!d.has_errors(), "{:?}", d.errors());
+    }
+
+    #[test]
+    fn callable_instance_conforms_to_callable_param() {
+        // An instance of a class with `__call__` is structurally a Callable
+        // and must be accepted where `Callable[[int], int]` is expected.
+        let src = "\
+from typing import Callable
+
+class Doubler:
+    factor: int
+
+impl Doubler:
+    def __call__(self, x: int) -> int:
+        return x * self.factor
+
+def apply(fn: Callable[[int], int], x: int) -> int:
+    return fn(x)
+
+let d: Doubler = Doubler(factor=2)
+let r: int = apply(d, 5)
+";
+        let diags = check(src);
+        assert!(!diags.has_errors(), "{:?}", diags.errors());
+    }
+
+    #[test]
+    fn non_callable_instance_rejected_as_callable_param() {
+        // A class WITHOUT `__call__` must still be rejected — the relaxation
+        // is structural, not a blanket class→function acceptance.
+        let src = "\
+from typing import Callable
+
+class Plain:
+    factor: int
+
+def apply(fn: Callable[[int], int], x: int) -> int:
+    return fn(x)
+
+let p: Plain = Plain(factor=2)
+let r: int = apply(p, 5)
+";
+        let diags = check(src);
+        assert!(
+            diags.has_errors(),
+            "instance without __call__ must not satisfy a Callable param"
+        );
     }
 
     #[test]

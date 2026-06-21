@@ -1,0 +1,36 @@
+from abc import ABC, abstractmethod
+
+class Repository(ABC):
+    @abstractmethod
+    def get(self, key: str) -> int?:
+        ...
+    @abstractmethod
+    def put(self, key: str, value: int) -> None:
+        ...
+    def get_or_default(self, key: str, default: int) -> int:
+        let v: int? = self.get(key)
+        if v is None:
+            return default
+        return v
+
+class MemoryRepo(Repository):
+    store: dict[str, int]
+
+impl MemoryRepo:
+    def get(self, key: str) -> int?:
+        return self.store.get(key)
+    def put(self, key: str, value: int) -> None:
+        self.store[key] = value
+
+def main() -> None:
+    let repo: MemoryRepo = MemoryRepo(store={})
+    repo.put("a", 1)
+    repo.put("b", 2)
+    print(repo.get("a"))
+    print(repo.get("z"))
+    print(repo.get_or_default("a", 99))
+    print(repo.get_or_default("z", 99))
+    print(isinstance(repo, Repository))
+
+if __name__ == "__main__":
+    main()

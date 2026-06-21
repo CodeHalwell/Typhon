@@ -6,6 +6,23 @@ canonical phase-by-phase status lives in `docs/roadmap.md`.
 
 ## Unreleased
 
+### Fixed — a `__call__`-bearing instance now satisfies a `Callable` parameter
+
+- **An instance of a class defining `__call__` was rejected where a
+  `Callable[...]` was expected** (`tyc-types`, `tyc::type_mismatch`). Passing a
+  callable instance — `apply(fn=my_multiplier, x=5)` where
+  `my_multiplier.__call__(self, x: int) -> int` — is a standard Python pattern
+  (typeshed treats such an instance as structurally callable), but the nominal
+  assignability check reported `expected (int) -> int, found Multiplier` and
+  **blocked the build** on code that runs correctly. `Checker::is_assignable`
+  now, when the expected type is a function type and the actual is a class,
+  looks up `__call__` in the class hierarchy, rebuilds its signature as a
+  function type (its stored `param_types` / `return_type` already exclude
+  `self`), and re-runs the contravariant-param / covariant-return function
+  check. A class *without* `__call__` is still correctly rejected, so the
+  change only relaxes assignability and cannot introduce a false positive.
+  Found by the 2026-06-21 stress round (`stress/round-2026-06-21/`, repro `95`).
+
 ### Fixed — VM `str.isupper()` / `str.islower()` on uncased strings
 
 - **The tree-walking VM (`tyc run`) returned `True` from `str.isupper()` /
