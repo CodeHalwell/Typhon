@@ -60,6 +60,27 @@ canonical phase-by-phase status lives in `docs/roadmap.md`.
     change can only *add* true positives. Regression test
     `introspection_survives_a_member_that_raises_on_signature`.
 
+### Fixed — the implicit-Optional idiom (`x: T = None`) no longer false-positives a third-party argument
+
+- **A third-party parameter annotated as a bare scalar but defaulted to
+  `None` — the ubiquitous "implicit Optional" idiom `def f(x: int = None)` /
+  `Cls(x: str = None)` — was type-checked against the *non-nullable* scalar,
+  so passing `None` (or any nullable value) failed with
+  `tyc::type_mismatch: expected ``str``, found ``None```.** This is a real
+  false positive (a build-blocker on valid code), observed on real installed
+  libraries: `redis.exceptions.AskError` / `MovedError` / `ClusterDownError`
+  / `MasterDownError` (`status_code: str = None`) and `pydantic.v1.confloat`
+  / `conlist` / `parse_file_as` / `parse_raw_as`.
+  - **`tyc-venv`**: `INTROSPECT_SCRIPT` now captures `default_is_none` per
+    parameter, and the new `param_type_from` helper widens a None-default
+    param's concrete type to nullable (`str → str | None`). Only concrete,
+    non-nullable types are widened — an already-`Optional[X]` annotation,
+    `Unknown`, or `None` is left untouched. The widening only ever *adds*
+    accepted values, so it can only remove false positives, never introduce
+    one; a genuinely wrong-typed argument (`status_code=123`) still fails
+    against `str | None`. Regression test
+    `implicit_optional_default_none_widens_param_to_nullable`.
+
 ### Fixed — multi-segment attribute calls (`pkg.sub.Thing()`) now arity/type-checked like the `from`-import form
 
 - **A nested-module attribute call — `sklearn.pipeline.Pipeline()`,
@@ -77,9 +98,11 @@ canonical phase-by-phase status lives in `docs/roadmap.md`.
     attribute to `Type::Module("pkg.sub")` instead of returning `Unknown`.
     Regression test `nested_submodule_attribute_constructor_arity_checks`.
 - Found by the 2026-06-21 wide third-party audit
-  (`stress/round-2026-06-21/third-party-wide/`, 43 libraries): the corpus missed
-  7/15 must_fail cases pre-fix and catches 15/15 post-fix, with **0 false
-  positives across 43 idiomatic must_pass programs** both before and after.
+  (`stress/round-2026-06-21/third-party-wide/`, 43 libraries): pre-fix the
+  corpus missed 7/16 must_fail cases **and false-positive-rejected a valid
+  must_pass** (`redis.exceptions.AskError(status_code=None)`); post-fix it
+  catches 16/16 and is clean across **44 idiomatic must_pass programs (0 false
+  positives)**.
 
 ### Fixed — `Counter + Counter` / `Counter - Counter` no longer false-fire `tyc::operator_type_mismatch`
 

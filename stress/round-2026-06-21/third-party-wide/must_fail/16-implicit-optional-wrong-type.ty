@@ -1,0 +1,6 @@
+# redis AskError(status_code: str = None) — passing int must still fail against
+# the widened `str | None`. expect tyc::type_mismatch (str | None vs int)
+from redis.exceptions import AskError
+def main() -> None:
+    let e: AskError = AskError("resp", status_code=123)
+    print(e)

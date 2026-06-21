@@ -8,30 +8,44 @@ installed into a real project `.venv` (versions in `requirements.txt`).
 
 ## Executive summary
 
-- **False-positive rate: 0/43 must_pass (0.0%).** Every idiomatic,
+- **False-positive rate: 0/44 must_pass (0.0%).** Every idiomatic,
   correct program — constructors, free functions, fluent method chains,
-  keyword args, decorators, nested-module access — type-checks clean. The
-  conservative "degrade to `Unknown`" design holds across pure-Python,
-  C-extension, stub-only and `**kwargs`/`Annotated` APIs.
-- **Coverage by call kind (must_fail, post-fix): 15/15 caught** —
+  keyword args, decorators, nested-module access, the implicit-Optional
+  idiom — type-checks clean. The conservative "degrade to `Unknown`" design
+  holds across pure-Python, C-extension, stub-only and `**kwargs`/`Annotated`
+  APIs.
+- **Coverage by call kind (must_fail, post-fix): 16/16 caught** —
   constructors (`Flask`, `Pipeline`, `uvicorn.Config`, `django.conf.Settings`),
   free functions (`create_engine`, `dateutil.parser.parse`), and **methods**
   (`scaler.transform`, `pca.fit`, `schema.load`, `redis.set`), across
   `missing_argument`, `type_mismatch` and `unknown_kwarg`.
-- **Two real bugs found and fixed**, both surfaced only by going wide:
+- **Three real bugs found and fixed**, all surfaced only by going wide:
   1. **Introspection of an entire module silently crashed** when any
      member raised a non-`(TypeError|ValueError)` from `inspect.signature`
      (or `callable()`) — the canonical trigger is a re-exported proxy
      object (Flask's `current_app`/`g`/`request`/`session`; Django's
-     `settings`). All of Flask's third-party checks were silently disabled.
+     `settings`). All of Flask's third-party checks were silently disabled
+     (a false negative), and the crash is pervasive — it affects **12 flask
+     submodules**, since the proxies leak into nearly every one via
+     `from .globals import …`.
   2. **Multi-segment attribute calls** (`pkg.sub.Thing()`) skipped the
      check that the `from`-import form (`from pkg.sub import Thing; Thing()`)
      already got — a pure false negative on `sklearn.pipeline.*`,
      `django.conf.*`, `dateutil.parser.*`, `rich.console.*`, `starlette.applications.*`.
+  3. **The implicit-Optional idiom (`x: int = None`) produced a real
+     `type_mismatch` FALSE POSITIVE** — the critical class. A param whose
+     annotation is a bare scalar but whose default is `None` "lies": `None`
+     (and any nullable value) is valid, but the checker rejected it. Observed
+     on real libraries — `redis.exceptions.AskError`/`MovedError`/
+     `ClusterDownError`/`MasterDownError` (`status_code: str = None`) and
+     `pydantic.v1.confloat`/`conlist`/`parse_file_as`/`parse_raw_as`. Fixed
+     by widening a None-default param's type to nullable.
 - **Baseline vs. fixed:** the same corpus on the pre-fix `tyc 0.15.6`
-  binary missed **7/15** must_fail cases (still 0 false positives). The
-  fixes recover all 7 with **no new false positives** and the full
-  workspace suite + the 130/130 repros corpus stay green.
+  binary missed **7/16** must_fail cases **and false-positive-rejected the
+  implicit-Optional must_pass** (`AskError("resp", status_code=None)` →
+  `expected str, found None`). The fixes recover all 7 missed checks and the
+  false positive, introduce **no new false positives**, and keep the full
+  workspace suite + the 130/130 repros corpus green.
 - **Top 3 to improve next:** (1) unwrap `typing.Annotated[T, …]` to `T`
   so FastAPI/Typer/Pydantic kw-only param *types* become checkable;
   (2) model the common 2-member `Union[str, bytes]`/`Union[str, PathLike]`
@@ -75,7 +89,7 @@ functions; **method** = instance methods; **kw**/`**kwargs` = keyword/var-kw;
 | 24 | msgspec | 0.21.1 | C-ext | no (lenient) | 1 | – | 0 | – |
 | 25 | orjson | 3.11.9 | C-ext | no (lenient) | 1 | – | 0 | – |
 | 26 | sqlalchemy | 2.0.51 | fn+ctor | **yes** | 1 | 1 | 0 | 0 |
-| 27 | redis | 8.0.0 | ctor+method | **yes** | 1 | 1 | 0 | 0 |
+| 27 | redis | 8.0.0 | ctor+method | **yes** ⚠fixed | 2 | 2 | 0 | 0 |
 | 28 | pymongo | 4.17.0 | `**kwargs` ctor | partial (lenient) | 1 | – | 0 | – |
 | 29 | psycopg2-binary→psycopg2 | 2.9.12 | C-ext | no (lenient) | 1 | – | 0 | – |
 | 30 | anyio | 4.14.0 | fn | yes | 1 | – | 0 | – |
@@ -93,9 +107,10 @@ functions; **method** = instance methods; **kw**/`**kwargs` = keyword/var-kw;
 | 42 | boto3 | 1.43.34 | dynamic factory | lenient | 1 | – | 0 | – |
 | 43 | google-cloud-storage→google | 3.12.0 | namespace pkg | lenient | 1 | – | 0 | – |
 
-`⚠fixed` = a library whose checks were previously broken (false negative)
-and are restored by the fixes below. Totals: **43 must_pass / 15 must_fail
-/ 0 false positives / 0 missed (post-fix)**.
+`⚠fixed` = a library whose checks were previously broken — a false negative
+(flask/django/dateutil/rich/starlette) or a false positive (redis) — and are
+corrected by the fixes below. Totals: **44 must_pass / 16 must_fail / 0 false
+positives / 0 missed (post-fix)**.
 
 The import-name≠dist-name resolution was exercised and works for every
 case: `scikit-learn→sklearn`, `pillow→PIL`, `beautifulsoup4→bs4`,
@@ -180,7 +195,47 @@ gaps. All three now recognise a parent-of-a-registered-key as a module and
 chain nested submodule access. Regression test
 `nested_submodule_attribute_constructor_arity_checks`.
 
-### #3 — by-design leniency (documented, not bugs)
+### #3 — CRITICAL (false positive): the implicit-Optional idiom (`x: T = None`) wrongly rejected — *FIXED*
+
+**Severity:** high — this is the worst class (a false positive is a
+build-blocker on valid library code). A parameter annotated with a bare
+scalar but defaulted to `None` ("implicit Optional", pervasive in Python)
+was type-checked against the non-nullable scalar, so passing `None` — or any
+nullable value — was rejected.
+
+**Minimal repro** (`must_pass/44-redis-implicit-optional.ty`, a *valid*
+program the pre-fix compiler rejected):
+
+```python
+from redis.exceptions import AskError    # AskError(resp, status_code: str = None)
+def main() -> None:
+    let e: AskError = AskError("MOVED 1 127.0.0.1:7001", status_code=None)
+    print(e)
+```
+
+Pre-fix: `tyc::type_mismatch: expected ``str``, found ``None```. Observed on
+real installed libraries: `redis.exceptions` (`AskError`, `MovedError`,
+`ClusterDownError`, `MasterDownError` — `status_code: str = None`) and
+`pydantic.v1` (`confloat`, `conlist`, `parse_file_as`, `parse_raw_as`). (The
+base `redis.RedisError` escapes only because it also declares `*args`, which
+makes `class_shape_from_params` skip the whole class.)
+
+**Root cause** (`tyc-venv/src/lib.rs`): introspection captured the
+annotation faithfully (`str`) but discarded the fact that the default is
+`None`, so `annotation_to_type("str") = Str` and the checker rejected
+`None`.
+
+**Fix:** capture `default_is_none` per parameter in `INTROSPECT_SCRIPT`, and
+in the new `param_type_from` helper widen a None-default param's concrete
+type to nullable (`str → str | None`). Only concrete, non-nullable types are
+widened — an already-`Optional[X]` annotation, `Unknown`, or `None` is left
+untouched. The widening only ever *adds* accepted values, so it can only
+remove false positives, never introduce one; a genuinely wrong-typed
+argument (`status_code=123`) still fails against `str | None`
+(`must_fail/16-implicit-optional-wrong-type.ty`). Regression test
+`implicit_optional_default_none_widens_param_to_nullable`.
+
+### #4 — by-design leniency (documented, not bugs)
 
 These are correct conservative behaviour — recorded so they aren't
 mistaken for gaps:
@@ -232,11 +287,11 @@ cd stress/round-2026-06-21/third-party-wide
 python3.13 -m venv proj/.venv
 proj/.venv/bin/pip install -r requirements.txt
 bash harness.sh        # TYC=/path/to/tyc overridable
-# Expect: must_pass ok=43 false_positive=0 | must_fail caught=15 missed=0
+# Expect: must_pass ok=44 false_positive=0 | must_fail caught=16 missed=0
 ```
 
 `proj/` (venv + generated build output) is gitignored and must not be
 committed. The in-crate `tyc-venv` unit harness does not populate venv
 data, so the venv-dependent behaviour above is verified end-to-end against
-the built binary; the two landed fixes additionally carry crate-level
+the built binary; the three landed fixes additionally carry crate-level
 regression tests (`tyc-venv` and `tyc-types`).

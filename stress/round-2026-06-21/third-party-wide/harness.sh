@@ -27,6 +27,17 @@ if [ ! -x "$PROJ/.venv/bin/python" ]; then
 fi
 mkdir -p "$PROJ/src"
 
+# Generate proj/typhon.toml from requirements.txt so the corpus is
+# self-contained (proj/ itself is gitignored). Each requirement's PyPI name
+# becomes a `[dependencies]` key — that drives the introspection allow-list
+# and the dist->import name resolution.
+{
+  printf '[project]\nname = "tpwide"\nversion = "0.1.0"\nsrc = "src"\nout = "build"\n'
+  printf '[python]\ntarget = "3.13"\n[dependencies]\n'
+  sed 's/[=<>!~].*//' "$SCRIPT_DIR/requirements.txt" | sed '/^[[:space:]]*$/d' \
+    | while read -r dep; do printf '%s = "*"\n' "$dep"; done
+} > "$PROJ/typhon.toml"
+
 run_check() { cp "$1" "$PROJ/src/main.ty"; (cd "$PROJ" && "$TYC" check src/main.ty 2>&1); }
 has_error() { echo "$1" | grep -qE "[1-9][0-9]* error\(s\)"; }
 
