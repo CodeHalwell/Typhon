@@ -482,12 +482,16 @@ def introspect_one(mod_name):
                 "returns": returns_of(obj) if kind == "function" else None,
                 "methods": methods_of(obj) if kind == "class" else None,
             })
-        except BaseException:
+        except Exception:
             # Defense in depth: never let one pathological member crash the
             # whole module's introspection. `kind_of`'s `callable(obj)` can
             # raise on an exotic descriptor, and `methods_of` walks `dir(cls)`
             # on a class whose metaclass misbehaves. A single bad member must
             # only lose itself, not every other class/function in the module.
+            # `Exception` (not `BaseException`) so a genuine `KeyboardInterrupt`
+            # / `SystemExit` still terminates the subprocess — every realistic
+            # crash-causer here (the werkzeug `LocalProxy` `RuntimeError`, a
+            # Django `ImproperlyConfigured`) is an `Exception` subclass.
             continue
     return {"members": members}
 
