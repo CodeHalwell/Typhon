@@ -40,6 +40,21 @@ First batch toward the feature-complete `v1.0.0-alpha`. See
   confirmed `fmt` / `clippy -D warnings` / `test --workspace` / corpus
   round-trip are all already enforced.
 
+### Alpha prep — milestone M3 (landing early): formatter robustness
+
+- **Fixed — `tyc fmt` is now idempotent and semantics-preserving (E2).** Two
+  source-corrupting bugs are fixed: `extend BUILTIN:` (e.g. `extend str:`) was
+  rewritten to the internal lowering `extend class
+  __typhon_builtin_ext_str(object):`, and generic `impl[T] Name[T]:` / generic
+  `extend` headers were mangled to `impl Name:` across two passes. Both headers
+  are now restored verbatim (line-map-aware) while their bodies are still
+  formatted, so `tyc fmt --check` is a clean no-op across the whole corpus and
+  formatting never changes program meaning. Bracket-depth-aware `:` / `->` / `=`
+  spacing confirmed (annotation/dict spaced, slice colons tight, kwarg/default
+  `=` tight, statement `=` spaced). The B15 synthetic-line-number leakage is
+  deferred — a correct fix needs a source-span remap threaded through
+  `tyc-syntax` / `tyc-resolve` / `tyc-types`, outside the formatter's scope.
+
 ### Added — `rescue`: lambda-free, `try`/`except`-free exception boundaries
 
 Two new forms — a postfix operator and a block prefix — lift a throwing boundary
