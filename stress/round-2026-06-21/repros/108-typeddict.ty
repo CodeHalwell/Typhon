@@ -1,0 +1,31 @@
+from typing import TypedDict
+
+class Movie(TypedDict):
+    title: str
+    year: int
+    rating: float
+
+class Config(TypedDict):
+    host: str
+    port: int
+
+def format_movie(m: Movie) -> str:
+    return f"{m['title']} ({m['year']}) - {m['rating']}"
+
+def main() -> None:
+    let m: Movie = {"title": "Inception", "year": 2010, "rating": 8.8}
+    print(format_movie(m))
+    print(m["title"], m["year"])
+
+    let movies: list[Movie] = [
+        {"title": "A", "year": 2000, "rating": 7.0},
+        {"title": "B", "year": 2010, "rating": 9.0},
+    ]
+    let best: Movie = max(movies, key=lambda x: x["rating"])
+    print(best["title"])
+
+    let cfg: Config = {"host": "localhost", "port": 8080}
+    print(f"{cfg['host']}:{cfg['port']}")
+
+if __name__ == "__main__":
+    main()

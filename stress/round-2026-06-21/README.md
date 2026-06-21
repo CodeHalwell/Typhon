@@ -7,7 +7,7 @@ language surfaces and lowering paths rather than going deep on one.
 
 ## Methodology
 
-Each of the **100** `.ty` programs in `repros/` is run through three paths by
+Each of the **110** `.ty` programs in `repros/` is run through three paths by
 `harness.sh` and compared:
 
 1. **`tyc check`** — frontend (parser + resolver + type checker).
@@ -28,29 +28,41 @@ bash harness.sh repros/*.ty        # TYC=… PYTHON=… overridable
 Requires `pydantic` installed for the `model` repro (`36`); everything else is
 stdlib-only.
 
-## Result — 100 / 100 compile to valid, runnable Python
+## Result — 110 / 110 compile to valid, runnable Python
 
 ```
-total=100 pass=100 buildfail=0 runfail=0 checkfail=0 vm_diverge=23
+total=110 pass=110 buildfail=0 runfail=0 checkfail=0 vm_diverge=29
 ```
 
 Every program type-checks, builds, and runs correctly on the compiled
 (`tyc build` → CPython 3.13) path. **Zero codegen defects** were found across
-the whole 100-program corpus.
+the whole 110-program corpus.
 
-### One real type-checker build-blocker found and fixed (`__call__` → `Callable`)
+### Two real type-checker build-blockers found and fixed
 
-Repro `95` exposed a genuine **false positive**: an instance of a class with a
-`__call__` method (a "functor" / callable object) was rejected where a
-`Callable[[int], int]` parameter was expected — `tyc::type_mismatch`
-(`expected (int) -> int, found Multiplier`) **blocked the build** on code that
-runs correctly under CPython. **Fixed** in `tyc-types`: `is_assignable` now
-recognises a `__call__`-bearing class as structurally conforming to a function
-type (looking up `__call__`, rebuilding its signature, and re-running the
-function-to-function variance check). A class *without* `__call__` is still
-rejected, so the change can only relax assignability. Two regression tests
-added (`callable_instance_conforms_to_callable_param`,
-`non_callable_instance_rejected_as_callable_param`).
+Both were **false positives** that blocked the build on code that runs
+correctly under CPython — exactly what this round exists to surface.
+
+- **`__call__` → `Callable` (repro `95`).** An instance of a class with a
+  `__call__` method (a "functor" / callable object) was rejected where a
+  `Callable[[int], int]` parameter was expected — `tyc::type_mismatch`
+  (`expected (int) -> int, found Multiplier`). **Fixed** in `tyc-types`:
+  `is_assignable` now recognises a `__call__`-bearing class as structurally
+  conforming to a function type (look up `__call__`, rebuild its signature,
+  re-run the function-to-function variance check). A class *without* `__call__`
+  is still rejected, so the change can only relax assignability.
+- **`plain class` custom `__init__` (repro `106`).** A `plain class` with a
+  hand-written `__init__(self, data: ...)` assigning to a `_data` field, built
+  as `DynamicRecord(data=...)`, false-fired `tyc::unknown_kwarg` ("did you mean
+  `_data`?"). The constructor *arity* check already exempted `plain class` /
+  `class!`; the adjacent *unknown-kwarg* loop now does too. A normal `class`
+  still reports a misspelled kwarg.
+
+Regression tests added in `tyc-types` (`callable_instance_conforms_to_callable_param`,
+`non_callable_instance_rejected_as_callable_param`,
+`normal_class_unknown_kwarg_still_rejected`; the plain-class half is verified
+end-to-end against the binary, since the unit harness doesn't populate
+`plain_classes`). Full workspace test suite green.
 
 ### The type checker caught two deliberately-buggy probes at compile time
 
@@ -122,9 +134,17 @@ runtime behaviour they were probing:
 | 94 | reflected operators (`__rmul__`, `__lt__`…) | 99 | `functools.singledispatch` |
 | 95 | callable objects (`__call__`) as `Callable` | 100 | `io.StringIO` / `hashlib` / `base64` |
 
+| # | Area | # | Area |
+|---|---|---|---|
+| 101 | `operator` module (`itemgetter`/`attrgetter`/…) | 106 | `__getattr__` / `__setattr__` dynamic record |
+| 102 | `bisect` | 107 | `Flag` / `IntFlag` enums |
+| 103 | `for`/`while`-`else` + `break`/`continue` | 108 | `TypedDict` |
+| 104 | printf-style `%` formatting (tuple + dict) | 109 | `functools.cached_property` |
+| 105 | dynamic `getattr`/`setattr`/`hasattr` | 110 | nested / starred unpacking + `**`-call |
+
 ## VM-divergence findings (secondary — production path is correct in all cases)
 
-The 23 `{VM-DIVERGE}` programs are **VM-only** (`tyc run`) gaps; the shipped
+The 29 `{VM-DIVERGE}` programs are **VM-only** (`tyc run`) gaps; the shipped
 Python is correct for every one. Categorised:
 
 ### Fixed this round
@@ -142,8 +162,9 @@ Python is correct for every one. Categorised:
 - `18`, `83`, `98` — `@contextmanager` / `@asynccontextmanager` generators as
   context managers (the VM evaluates generators eagerly — the explicit error
   the VM raises).
-- `33`, `100` — `decimal` / `fractions` / `io` not in the VM's native stdlib
-  subset (the explicit "run with `tyc run --compile`" error).
+- `33`, `100`, `101`, `102` — `decimal` / `fractions` / `io` / `operator` /
+  `bisect` not in the VM's native stdlib subset (the explicit "run with
+  `tyc run --compile`" error).
 - `71` — unbounded generators (`while True: yield`) exceed the VM's
   1M-value eager-materialisation cap.
 - `78` — `sys.setrecursionlimit` not modelled by the VM.
@@ -166,6 +187,10 @@ Python is correct for every one. Categorised:
 - `91` — `type.__mro__` not exposed by the VM.
 - `96` — `contextlib.suppress` not implemented in the VM.
 - `99` — `functools.singledispatch` not implemented in the VM.
+- `104` — printf-style `%` with a **mapping** (`"%(name)s" % {...}`) unsupported.
+- `107` — `Flag`/`IntFlag` membership (`x in flag`) treats the flag as a bare int.
+- `108` — a `TypedDict`-typed value is not subscriptable in the VM (`m["k"]`).
+- `109` — `functools.cached_property` re-computes (no per-instance cache) in the VM.
 
 ### Cosmetic (different repr, same value)
 
@@ -175,6 +200,6 @@ Python is correct for every one. Categorised:
 
 ## Files
 
-- `repros/*.ty` — the 100-program corpus.
+- `repros/*.ty` — the 110-program corpus.
 - `harness.sh` — three-path runner + comparator.
 - `results.txt` — captured full-sweep output (post-fix).

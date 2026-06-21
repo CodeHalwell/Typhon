@@ -13146,8 +13146,20 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
                         return Type::Unknown;
                     }
                     if let Some(shape) = effective_class_shape(&name, &c.class_shapes) {
+                        // `plain class` / `class!` may carry a hand-written
+                        // `__init__` whose parameter names need not match the
+                        // declared fields (e.g. `def __init__(self, data: ...)`
+                        // assigning to a `_data` field, or `__getattr__`-backed
+                        // dynamic records). The auto-generated constructor only
+                        // exists for plain `class` / `model` / `frozen`, so the
+                        // kwarg-vs-fields check (and the arity check below, via
+                        // `shape_is_authoritative`) is only sound for those.
+                        let has_custom_init = c.is_plain_class(&name) || c.is_raw_class(&name);
                         let candidates: Vec<String> = shape.fields.keys().cloned().collect();
                         for kw in kw_args {
+                            if has_custom_init {
+                                break;
+                            }
                             let Some(ident) = &kw.arg else { continue };
                             let kw_name = ident.as_str();
                             if !shape.fields.contains_key(kw_name) {
@@ -16096,6 +16108,32 @@ let r: int = apply(p, 5)
         assert!(
             diags.has_errors(),
             "instance without __call__ must not satisfy a Callable param"
+        );
+    }
+
+    // NOTE: the companion case — a `plain class` with a hand-written `__init__`
+    // whose params differ from the declared fields must NOT trip
+    // `tyc::unknown_kwarg` — is gated on `is_plain_class`, which reads
+    // `resolved.plain_classes`. The in-crate `check()` harness doesn't scrape
+    // those the way the CLI does (see the NOTE above `newtype_self_cycle_…`),
+    // so it's verified end-to-end against the real binary instead
+    // (stress/round-2026-06-21 repro 106).
+
+    #[test]
+    fn normal_class_unknown_kwarg_still_rejected() {
+        // The exemption is scoped to plain/raw classes — a normal `class` with
+        // a misspelled kwarg must still error.
+        let src = "\
+class User:
+    name: str
+    age: int
+
+let u: User = User(name=\"x\", agee=5)
+";
+        let diags = check(src);
+        assert!(
+            diags.has_errors(),
+            "misspelled kwarg on a normal class must still error"
         );
     }
 

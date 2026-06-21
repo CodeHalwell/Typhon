@@ -6,6 +6,21 @@ canonical phase-by-phase status lives in `docs/roadmap.md`.
 
 ## Unreleased
 
+### Fixed — `plain class` / `class!` with a hand-written `__init__` no longer false-fires `tyc::unknown_kwarg`
+
+- **A `plain class` (or `class!`) carrying a hand-written `__init__` whose
+  parameter names differ from the declared fields was rejected at the
+  constructor call site** (`tyc-types`, `tyc::unknown_kwarg`). e.g.
+  `plain class Box: _data: dict[...]` with `def __init__(self, data): self._data = data`
+  constructed as `Box(data={...})` reported "unknown keyword argument 'data'
+  (did you mean `_data`?)" and **blocked the build**, even though the custom
+  constructor accepts `data`. The constructor **arity** check already exempted
+  `plain class` / `class!` (they may carry an `__init__` not reflected in the
+  fields), but the adjacent **unknown-kwarg** loop did not. It now applies the
+  same exemption. A normal `class` / `model` / `frozen` (whose constructor is
+  auto-generated from its fields) still reports a misspelled kwarg. Found by the
+  2026-06-21 stress round (`stress/round-2026-06-21/`, repro `106`).
+
 ### Fixed — a `__call__`-bearing instance now satisfies a `Callable` parameter
 
 - **An instance of a class defining `__call__` was rejected where a

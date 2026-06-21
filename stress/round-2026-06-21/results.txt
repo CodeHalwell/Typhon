@@ -84,7 +84,126 @@ b1fc1c68a28135561cdb827e85081055da92f15662d9c33466d153b4e8e9a7b4
 aGVsbG8gd29ybGQ=
 hello world
 4142
+===== 101-operator-module (check=0 vm=1 comp=0) [PASS] {VM-DIVERGE} =====
+--- VM ---
+Traceback (most recent call last):
+  File "repros/101-operator-module.ty", line 1, in <module>
+    import operator
+ImportError: tyc-vm cannot import 'operator': only a small native stdlib is available. Run with `tyc run --compile` to use the full Python interpreter.
+--- BUILD+PY ---
+7 12 7
+True True False
+[(1, 'a'), (2, 'b'), (3, 'c')]
+[(1, 'a'), (2, 'b'), (3, 'c')]
+(20, 10)
+['Al', 'Cy', 'Bob']
+[-1, 2, -3]
+24
+[1, 2, 3, 4]
+===== 102-bisect (check=0 vm=1 comp=0) [PASS] {VM-DIVERGE} =====
+--- VM ---
+Traceback (most recent call last):
+  File "repros/102-bisect.ty", line 1, in <module>
+    import bisect
+ImportError: tyc-vm cannot import 'bisect': only a small native stdlib is available. Run with `tyc run --compile` to use the full Python interpreter.
+--- BUILD+PY ---
+2
+3
+3
+[1, 3, 4, 5, 7, 9]
+[1, 3, 4, 5, 7, 9, 10]
+55: F
+65: D
+75: C
+85: B
+95: A
+100: A
+===== 103-loop-else (check=0 vm=0 comp=0) [PASS] =====
+===== 104-printf-formatting (check=0 vm=1 comp=0) [PASS] {VM-DIVERGE} =====
+--- VM ---
+2 + 3 = 5
+Alice is 30 years old
+3.14
+   42|42   |
+ff 100
+Hi!
+Traceback (most recent call last):
+  File "repros/104-printf-formatting.ty", line 19, in <module>
+    main()
+  File "repros/104-printf-formatting.ty", line 8, in main
+    print("%(name)s scored %(score)d" % {"name": "Bob", "score": 95})
+ValueError: unsupported format character '('
+--- BUILD+PY ---
+2 + 3 = 5
+Alice is 30 years old
+3.14
+   42|42   |
+ff 100
+Hi!
+Bob scored 95
++5 -5
+0003.142
+1.234568e+05
+0.0001234
+'quoted'
+===== 105-dynamic-attrs (check=0 vm=0 comp=0) [PASS] =====
+===== 106-getattr-fallback (check=0 vm=0 comp=0) [PASS] =====
+===== 107-flag-enums (check=0 vm=1 comp=0) [PASS] {VM-DIVERGE} =====
+--- VM ---
+3
+Traceback (most recent call last):
+  File "repros/107-flag-enums.ty", line 32, in <module>
+    main()
+  File "repros/107-flag-enums.ty", line 16, in main
+    print(Permission.READ in rw)
+TypeError: argument of type 'int' is not iterable
+--- BUILD+PY ---
+3
+True
+False
+True
+7
+True
+False
+5
+===== 108-typeddict (check=0 vm=1 comp=0) [PASS] {VM-DIVERGE} =====
+--- VM ---
+Traceback (most recent call last):
+  File "repros/108-typeddict.ty", line 31, in <module>
+    main()
+  File "repros/108-typeddict.ty", line 17, in main
+    print(format_movie(m))
+  File "repros/108-typeddict.ty", line 13, in format_movie
+    return f"{m['title']} ({m['year']}) - {m['rating']}"
+TypeError: 'instance' object is not subscriptable
+--- BUILD+PY ---
+Inception (2010) - 8.8
+Inception 2010
+B
+localhost:8080
+===== 109-cached-property (check=0 vm=0 comp=0) [PASS] {VM-DIVERGE} =====
+--- VM ---
+4
+computing total...
+100
+computing total...
+100
+computing mean...
+computing total...
+25.0
+computing mean...
+computing total...
+25.0
+--- BUILD+PY ---
+4
+computing total...
+100
+100
+computing mean...
+25.0
+25.0
 ===== 11-operator-dunders (check=0 vm=0 comp=0) [PASS] =====
+===== 110-nested-unpacking (check=0 vm=0 comp=0) [PASS] =====
 ===== 12-enum (check=0 vm=0 comp=0) [PASS] =====
 ===== 13-sealed-union-eval (check=0 vm=0 comp=0) [PASS] =====
 ===== 14-result-error-handling (check=0 vm=0 comp=0) [PASS] =====
@@ -506,4 +625,4 @@ list with 3 items
 object: 3.14
 
 ######## SUMMARY ########
-total=100 pass=100 buildfail=0 runfail=0 checkfail=0 vm_diverge=23
+total=110 pass=110 buildfail=0 runfail=0 checkfail=0 vm_diverge=29

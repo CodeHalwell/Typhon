@@ -1,0 +1,30 @@
+from functools import cached_property
+
+class Dataset:
+    values: list[int]
+
+impl Dataset:
+    @cached_property
+    def total(self) -> int:
+        print("computing total...")
+        return sum(self.values)
+
+    @cached_property
+    def mean(self) -> float:
+        print("computing mean...")
+        return self.total / len(self.values)
+
+    @property
+    def count(self) -> int:
+        return len(self.values)
+
+def main() -> None:
+    let ds: Dataset = Dataset(values=[10, 20, 30, 40])
+    print(ds.count)
+    print(ds.total)
+    print(ds.total)
+    print(ds.mean)
+    print(ds.mean)
+
+if __name__ == "__main__":
+    main()
