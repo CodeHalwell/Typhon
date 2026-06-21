@@ -2538,6 +2538,16 @@ struct Checker<'a> {
     /// (e.g. `c.configure(...)` which might assign fields). Skipped
     /// entirely inside `unsafe:` regions.
     uninit_instances: HashMap<String, UninitInstance>,
+    /// Names locally reassigned (rebound) within the current function
+    /// body. A module-level function name that is rebound by a `let` /
+    /// assignment inside a function (`let make_partial = make_complete`)
+    /// no longer resolves to the pre-scanned module-level `def` at call
+    /// sites below the rebind. The cross-function field-init audit
+    /// (`detect_partial_returning_call`) consults this set so a shadowed
+    /// call target is NOT treated as the original partial-returning
+    /// factory — conservatively dropping to not-partial rather than
+    /// inventing a missing field. Reset at each `check_function` entry.
+    reassigned_names: std::collections::HashSet<String>,
     /// Cross-function field-init audit: functions whose body is the
     /// literal pattern `return X.__new__(X)` / `return object.__new__(X)`
     /// (with no intervening field assignment) are recorded here. When
@@ -2822,6 +2832,7 @@ impl<'a> Checker<'a> {
             current_return: None,
             current_class: None,
             uninit_instances: HashMap::new(),
+            reassigned_names: std::collections::HashSet::new(),
             partial_returning_fns: HashMap::new(),
             module_registry: std::sync::Arc::new(HashMap::new()),
             contextmanager_yields: HashMap::new(),
@@ -5665,6 +5676,11 @@ fn summarise_partial_return(
     // Local tracker: name → (class, missing fields). Mirrors
     // `c.uninit_instances` but scoped to this pre-scan walk.
     let mut tracked: HashMap<String, UninitInstance> = HashMap::new();
+    // Names locally rebound within this body. A `let f = g` shadows the
+    // module-level `def f`, so a later `f()` must NOT be resolved against
+    // the global partial summary for `f` — mirrors the live audit's
+    // `detect_partial_returning_call` shadow guard.
+    let mut shadowed: std::collections::HashSet<String> = std::collections::HashSet::new();
     for stmt in body {
         match stmt {
             Stmt::Pass(_) | Stmt::Assert(_) => {}
@@ -5694,32 +5710,45 @@ fn summarise_partial_return(
                 // Any tracked name referenced by the RHS (other than a
                 // recognised partial source) is dropped — it may flow
                 // somewhere we can't follow.
-                summary_observe_value(c, &mut tracked, &a.value, fn_bodies, in_progress);
+                summary_observe_value(c, &mut tracked, &shadowed, &a.value, fn_bodies, in_progress);
                 // Name-target rebinds: register / refresh / drop.
                 if let [Expr::Name(n)] = a.targets.as_slice() {
                     summary_bind_name(
                         c,
                         &mut tracked,
+                        &shadowed,
                         n.id.as_str(),
                         &a.value,
                         fn_bodies,
                         in_progress,
                     );
+                    // The name is now rebound locally: any later `n()`
+                    // resolves to this value, not the module-level `def`.
+                    shadowed.insert(n.id.as_str().to_owned());
                 }
             }
             Stmt::AnnAssign(a) => {
                 summary_record_field_set(&mut tracked, a.target.as_ref());
                 if let Some(value) = &a.value {
-                    summary_observe_value(c, &mut tracked, value, fn_bodies, in_progress);
+                    summary_observe_value(
+                        c,
+                        &mut tracked,
+                        &shadowed,
+                        value,
+                        fn_bodies,
+                        in_progress,
+                    );
                     if let Expr::Name(n) = a.target.as_ref() {
                         summary_bind_name(
                             c,
                             &mut tracked,
+                            &shadowed,
                             n.id.as_str(),
                             value,
                             fn_bodies,
                             in_progress,
                         );
+                        shadowed.insert(n.id.as_str().to_owned());
                     }
                 }
             }
@@ -5731,13 +5760,20 @@ fn summarise_partial_return(
                     return uninit_instance_for(c, &class_name);
                 }
                 // Direct `return make_partial()` — flow the callee's
-                // own summary straight through.
+                // own summary straight through, UNLESS the target name was
+                // locally rebound (then it no longer names the module-level
+                // factory; conservatively treat as not-partial).
                 if let Expr::Call(call) = value {
                     if let Expr::Name(fname) = call.func.as_ref() {
-                        if let Some(info) =
-                            resolve_partial_summary(c, fname.id.as_str(), fn_bodies, in_progress)
-                        {
-                            return Some(info);
+                        if !shadowed.contains(fname.id.as_str()) {
+                            if let Some(info) = resolve_partial_summary(
+                                c,
+                                fname.id.as_str(),
+                                fn_bodies,
+                                in_progress,
+                            ) {
+                                return Some(info);
+                            }
                         }
                     }
                 }
@@ -5826,6 +5862,7 @@ fn summary_observe_call(
 fn summary_observe_value(
     c: &mut Checker,
     tracked: &mut HashMap<String, UninitInstance>,
+    shadowed: &std::collections::HashSet<String>,
     value: &Expr,
     fn_bodies: &HashMap<String, &[Stmt]>,
     in_progress: &mut std::collections::HashSet<String>,
@@ -5838,6 +5875,7 @@ fn summary_observe_value(
         if let Expr::Name(fname) = call.func.as_ref() {
             if call.arguments.args.is_empty()
                 && call.arguments.keywords.is_empty()
+                && !shadowed.contains(fname.id.as_str())
                 && resolve_partial_summary(c, fname.id.as_str(), fn_bodies, in_progress).is_some()
             {
                 return;
@@ -5873,6 +5911,7 @@ fn summary_record_field_set(tracked: &mut HashMap<String, UninitInstance>, targe
 fn summary_bind_name(
     c: &mut Checker,
     tracked: &mut HashMap<String, UninitInstance>,
+    shadowed: &std::collections::HashSet<String>,
     binding: &str,
     value: &Expr,
     fn_bodies: &HashMap<String, &[Stmt]>,
@@ -5890,10 +5929,15 @@ fn summary_bind_name(
     // `binding = make_partial()` — register with the callee's summary
     // (multi-hop). Only the zero-argument call shape is recognised; a
     // call passing arguments may have its result entangled with them,
-    // so it's handled as a generic drop.
+    // so it's handled as a generic drop. A locally-rebound target name
+    // no longer names the module-level factory, so skip the global
+    // summary for it (mirrors the live `detect_partial_returning_call`).
     if let Expr::Call(call) = value {
         if let Expr::Name(fname) = call.func.as_ref() {
-            if call.arguments.args.is_empty() && call.arguments.keywords.is_empty() {
+            if call.arguments.args.is_empty()
+                && call.arguments.keywords.is_empty()
+                && !shadowed.contains(fname.id.as_str())
+            {
                 if let Some(info) =
                     resolve_partial_summary(c, fname.id.as_str(), fn_bodies, in_progress)
                 {
@@ -5948,6 +5992,16 @@ fn detect_partial_returning_call(c: &Checker, value: &Expr) -> Option<UninitInst
     };
     let name = fn_name.id.as_str();
     let info = c.partial_returning_fns.get(name).cloned()?;
+    // A name rebound earlier in this function body no longer resolves to
+    // the pre-scanned module-level `def` (`let make_partial =
+    // make_complete; make_partial()` runs `make_complete`). The env
+    // `declared` type can collide when two `def`s share a signature, so
+    // the type-equality check below is insufficient on its own; an
+    // explicit local-rebind record is authoritative. Conservatively drop
+    // to not-partial rather than follow the stale global summary.
+    if c.reassigned_names.contains(name) {
+        return None;
+    }
     // Verify the name still resolves to the same module-level
     // function we pre-scanned. `function_signatures` is populated
     // from the module body, so it's our ground truth for the
@@ -9443,6 +9497,13 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                     // Copilot review on PR #96.
                     c.unsafe_origin_bindings.remove(n.id.as_str());
                 }
+                // An annotated rebind of a name that already resolved to
+                // a module-level function (`let make_partial: object =
+                // make_complete`) shadows that `def` for the rest of the
+                // body; record it for the cross-function field-init audit.
+                if c.env.lookup(n.id.as_str()).is_some() {
+                    c.reassigned_names.insert(n.id.as_str().to_owned());
+                }
                 c.env.declare(TypeBinding {
                     name: n.id.as_str().to_owned(),
                     declared: ann_type.clone(),
@@ -9488,6 +9549,12 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                     );
                     let existing = c.env.lookup(n.id.as_str()).cloned();
                     if let Some(b) = existing {
+                        // A name rebound inside this function no longer
+                        // resolves to the pre-scanned module-level `def`
+                        // at call sites below. Record it so the
+                        // cross-function field-init audit skips the
+                        // global partial-summary lookup for this target.
+                        c.reassigned_names.insert(n.id.as_str().to_owned());
                         // Reassignment: the static type stays as declared;
                         // check the new value fits. When it doesn't, emit
                         // the dedicated reassignment-mismatch diagnostic
@@ -10411,6 +10478,10 @@ fn check_function(
     // Attribute narrowings (`self.x` non-null) belong to the enclosing
     // function body — a different `self` is in scope here, so start clean.
     let saved_attr_narrowings = std::mem::take(&mut c.env.attr_narrowings);
+    // Local rebinds tracked for the cross-function field-init audit are
+    // scoped to this function body (a nested function starts clean and
+    // the enclosing set is restored on exit).
+    let saved_reassigned_names = std::mem::take(&mut c.reassigned_names);
 
     // Declare parameters with their annotation types. Type parameters resolve
     // to `Any` until a real inference engine lands. Inside a class body, an
@@ -10535,6 +10606,7 @@ fn check_function(
 
     c.env.leave();
     c.env.attr_narrowings = saved_attr_narrowings;
+    c.reassigned_names = saved_reassigned_names;
     c.current_return = saved_return;
     c.unsafe_origin_bindings = saved_unsafe_origins;
     c.active_typevar_bounds = saved_bounds;
@@ -14743,6 +14815,21 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
                             let tps = tps.clone();
                             c.class_type_params.entry(qualified.clone()).or_insert(tps);
                         }
+                        // C2 cross-module: a qualified generic access
+                        // (`import producer; producer.Producer[Dog]`)
+                        // instantiates as `Type::Generic("producer.Producer",
+                        // …)`, so `user_generic_param_variance` looks the
+                        // per-parameter variance up under the QUALIFIED head.
+                        // Seed it here (mirroring `class_type_params`)
+                        // otherwise it falls back to invariant and a sound
+                        // covariant upcast is wrongly rejected. A pure
+                        // relaxation — absence keeps the invariant default.
+                        if let Some(variances) = shapes.class_param_variance.get(attr_name) {
+                            let variances = variances.clone();
+                            c.class_param_variance
+                                .entry(qualified.clone())
+                                .or_insert(variances);
+                        }
                         return Type::Class(qualified);
                     }
                     if let Some(info) = shapes.function_arities.get(attr_name) {
@@ -17794,6 +17881,153 @@ def use(make: object) -> ApiClient:
             partial_init_errs.is_empty(),
             "shadowed `make` must not trigger partial-init tracking; got: {:?}",
             partial_init_errs
+        );
+    }
+
+    #[test]
+    fn audit_partial_factory_skipped_when_name_locally_rebound() {
+        // C3 false positive: the module-level partial factory
+        // `make_partial` is locally rebound to `make_complete` (a fully
+        // initialising factory) before the call. The runtime call invokes
+        // `make_complete`, which returns a complete instance — so the
+        // partial-init audit must NOT fire. Mirrors the live shadow guard
+        // in `detect_partial_returning_call`.
+        let src = "\
+class Config:
+    host: str
+    port: int
+
+def make_complete() -> Config:
+    let c: Config = Config.__new__(Config)
+    c.host = \"localhost\"
+    c.port = 8080
+    return c
+
+def make_partial() -> Config:
+    return Config.__new__(Config)
+
+def passthrough() -> Config:
+    let make_partial = make_complete
+    let c: Config = make_partial()
+    return c
+";
+        let d = check(src);
+        let partial_init_errs: Vec<&TycError> = d
+            .errors()
+            .iter()
+            .filter(|e| matches!(e, TycError::MissingFieldInit { .. }))
+            .collect();
+        assert!(
+            partial_init_errs.is_empty(),
+            "locally-rebound `make_partial` (now `make_complete`) must not \
+             trigger partial-init tracking; got: {:?}",
+            partial_init_errs
+        );
+    }
+
+    #[test]
+    fn audit_unshadowed_partial_factory_still_fires() {
+        // SOUNDNESS FLOOR for the rebind guard: an un-shadowed
+        // `return make_partial()` whose result escapes uninitialised must
+        // STILL fire `missing_field_init` (the guard must not over-suppress).
+        let src = "\
+class Config:
+    host: str
+    port: int
+
+def make_partial() -> Config:
+    return Config.__new__(Config)
+
+def passthrough() -> Config:
+    let c: Config = make_partial()
+    return c
+";
+        let d = check(src);
+        let partial_init_errs: Vec<&TycError> = d
+            .errors()
+            .iter()
+            .filter(|e| matches!(e, TycError::MissingFieldInit { .. }))
+            .collect();
+        assert_eq!(
+            partial_init_errs.len(),
+            1,
+            "un-shadowed escaping partial must still fire exactly once; got {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn c3_summary_skips_locally_rebound_factory_in_callee() {
+        // The summary walk computes `make2`'s partial-return summary. Inside
+        // `make2`, `make1` is locally rebound to a complete factory, so the
+        // `return make1()` runs the complete factory — `make2`'s summary
+        // must be not-partial, and the caller must stay clean.
+        let src = "\
+class Config:
+    host: str
+    port: int
+
+def make_complete() -> Config:
+    let c: Config = Config.__new__(Config)
+    c.host = \"localhost\"
+    c.port = 8080
+    return c
+
+def make1() -> Config:
+    return Config.__new__(Config)
+
+def make2() -> Config:
+    let make1 = make_complete
+    return make1()
+
+def use() -> Config:
+    let c: Config = make2()
+    return c
+";
+        let d = check(src);
+        let partial_init_errs: Vec<&TycError> = d
+            .errors()
+            .iter()
+            .filter(|e| matches!(e, TycError::MissingFieldInit { .. }))
+            .collect();
+        assert!(
+            partial_init_errs.is_empty(),
+            "summary walk must skip the locally-rebound factory `make1`; got: {:?}",
+            partial_init_errs
+        );
+    }
+
+    #[test]
+    fn c3_summary_unshadowed_chain_still_fires() {
+        // SOUNDNESS FLOOR for the summary-walk shadow guard: an un-shadowed
+        // two-hop passthrough chain must still flow the partial summary
+        // through and fire at the caller.
+        let src = "\
+class Config:
+    host: str
+    port: int
+
+def make1() -> Config:
+    return Config.__new__(Config)
+
+def make2() -> Config:
+    return make1()
+
+def use() -> Config:
+    let c: Config = make2()
+    return c
+";
+        let d = check(src);
+        let partial_init_errs: Vec<&TycError> = d
+            .errors()
+            .iter()
+            .filter(|e| matches!(e, TycError::MissingFieldInit { .. }))
+            .collect();
+        assert_eq!(
+            partial_init_errs.len(),
+            1,
+            "un-shadowed two-hop chain must still fire exactly once at the caller; got {:?}",
+            d.errors()
         );
     }
 
@@ -24659,6 +24893,138 @@ def lift(fx: Functor[list]) -> None:
                 .iter()
                 .any(|e| matches!(e, TycError::TypeMismatch { .. })),
             "imported HKT Functor must not false-positive; got {:?}",
+            d.errors()
+        );
+    }
+
+    /// Helper mirroring `tyc-db::build_external_shapes` for the BARE
+    /// `import producer` (qualified-access) form: stash the producer
+    /// module's shapes in the `by_module` registry, register the bare
+    /// import so `producer` resolves to `Type::Module`, and seed
+    /// `class_param_variance` under each source class's BARE name — the
+    /// key a qualified annotation `producer.Producer[Dog]` resolves its
+    /// `Type::Generic("Producer", …)` head to.
+    fn cross_module_qualified_external(producer_src: &str) -> ExternalShapes {
+        let producer_prep = preprocess(producer_src);
+        let producer_module = tyc_syntax::parse_module(&producer_prep.python_source)
+            .unwrap()
+            .into_syntax();
+        let producer_shapes = extract_module_shapes(&producer_module);
+
+        let mut external = ExternalShapes::default();
+        external
+            .bare_imports
+            .insert("producer".to_owned(), "producer".to_owned());
+        // Mirror build_external_shapes' bare-import variance seeding:
+        // key under the BARE source class name.
+        for (cls_name, variances) in &producer_shapes.class_param_variance {
+            external
+                .class_param_variance
+                .insert(cls_name.clone(), variances.clone());
+        }
+        for h in &producer_shapes.hkt_param_names {
+            external.hkt_param_names.insert(h.clone());
+        }
+        let mut by_module: HashMap<String, ModuleShapes> = HashMap::new();
+        by_module.insert("producer".to_owned(), producer_shapes);
+        external.by_module = std::sync::Arc::new(by_module);
+        external
+    }
+
+    #[test]
+    fn cross_module_qualified_covariant_generic_accepts_upcast() {
+        // C2 FALSE POSITIVE CLOSED: a covariant generic imported via a
+        // bare `import producer` and used qualified
+        // (`producer.Producer[Dog] -> producer.Producer[Animal]`) must
+        // widen exactly as the `from producer import Producer` form does.
+        let external = cross_module_qualified_external(
+            "\
+class Producer[T]:
+    def get(self) -> T:
+        ...
+",
+        );
+        let consumer_src = "\
+import producer
+class Animal:
+    name: str
+class Dog(Animal):
+    name: str
+def use_animals(p: producer.Producer[Animal]) -> None:
+    ...
+def main(dogs: producer.Producer[Dog]) -> None:
+    use_animals(dogs)
+";
+        let d = check_consumer(consumer_src, &external);
+        assert!(
+            !d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::TypeMismatch { .. })),
+            "qualified covariant producer.Producer[Dog] -> [Animal] must be accepted; got {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn cross_module_qualified_invariant_generic_rejects_upcast() {
+        // SOUNDNESS FLOOR: a qualified-imported INVARIANT generic must
+        // still reject the upcast.
+        let external = cross_module_qualified_external(
+            "\
+class Box[T]:
+    value: T
+",
+        );
+        let consumer_src = "\
+import producer
+class Animal:
+    name: str
+class Dog(Animal):
+    name: str
+def use_box(b: producer.Box[Animal]) -> None:
+    ...
+def main(dog_box: producer.Box[Dog]) -> None:
+    use_box(dog_box)
+";
+        let d = check_consumer(consumer_src, &external);
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::TypeMismatch { .. })),
+            "qualified invariant producer.Box[Dog] -> [Animal] must still be rejected; got {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn cross_module_qualified_covariant_generic_still_rejects_downcast() {
+        // The qualified-import relaxation must not flip into unsoundness:
+        // a covariant `producer.Producer[Animal]` must NOT flow into a
+        // `producer.Producer[Dog]` slot (wrong direction).
+        let external = cross_module_qualified_external(
+            "\
+class Producer[T]:
+    def get(self) -> T:
+        ...
+",
+        );
+        let consumer_src = "\
+import producer
+class Animal:
+    name: str
+class Dog(Animal):
+    name: str
+def needs_dog_producer(p: producer.Producer[Dog]) -> None:
+    ...
+def main(animals: producer.Producer[Animal]) -> None:
+    needs_dog_producer(animals)
+";
+        let d = check_consumer(consumer_src, &external);
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::TypeMismatch { .. })),
+            "qualified covariant producer.Producer[Animal] -> [Dog] must still be rejected; got {:?}",
             d.errors()
         );
     }

@@ -1062,6 +1062,24 @@ fn build_external_shapes(
         for hkt_name in &module_shapes.hkt_param_names {
             external.hkt_param_names.insert(hkt_name.clone());
         }
+        // C2 cross-module: a bare `import producer` plus a qualified
+        // annotation `producer.Producer[Dog]` resolves to
+        // `Type::Generic("Producer", …)` — the annotation path drops the
+        // module qualifier, so the generic head is the BARE source class
+        // name. The consumer's `user_generic_param_variance` looks the
+        // per-parameter variance up under that bare head, so seed it here
+        // under the source class name (mirroring the member-gated
+        // touched-module pass above). Without this the covariant upcast
+        // `Producer[Dog] -> Producer[Animal]` falls back to invariant and
+        // is wrongly rejected as `tyc::type_mismatch`. A pure relaxation —
+        // absence keeps the invariant default, so an actually-invariant
+        // imported generic still rejects.
+        for (cls_name, variances) in &module_shapes.class_param_variance {
+            external
+                .class_param_variance
+                .entry(cls_name.clone())
+                .or_insert_with(|| variances.clone());
+        }
     }
     external
 }
