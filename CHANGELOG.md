@@ -6,6 +6,40 @@ canonical phase-by-phase status lives in `docs/roadmap.md`.
 
 ## Unreleased
 
+### Alpha prep — milestone M1 ("Tidy & deepen") of the [alpha release plan](docs/alpha-release-plan.md)
+
+First batch toward the feature-complete `v1.0.0-alpha`. See
+`docs/alpha-release-plan.md` for the full plan, milestones, and release gates.
+
+- **Added — `Annotated[T, …]` is type-checked through third-party introspection
+  (A1).** `tyc-venv`'s annotation mapper had no `Annotated` arm, so dependencies
+  typed as `Annotated[str, FieldInfo(...)]` (FastAPI / Typer / Pydantic) degraded
+  to `Unknown` and wrong-typed kwargs slipped past the checker. The mapper now
+  strips the optional `typing` / `typing_extensions` qualifier and resolves the
+  first type argument (metadata `repr`s with commas handled), degrading to
+  `Unknown` only when the inner type is unresolvable. Relaxing/strengthening
+  only — no new false positives on the corpus.
+- **Added — `tyc::stdlib_module_shadow` now fires on `tyc build` (B3).** The
+  diagnostic existed but was `tyc check`-only; a top-level `types.ty` / `ast.ty`
+  / `parser.ty` that silently shadows a stdlib module is now warned about when
+  building too (non-fatal). `parser` and `this` added to the curated stdlib list.
+- **Added — cross-file go-to-definition for import aliases and `.py` siblings
+  (E1).** `tyc lsp` go-to-definition now resolves `import foo as f` then `f.Bar`
+  to `Bar`'s definition in `foo`, splices dotted receivers (`pkg.sub.Thing`),
+  and resolves `.py` / `__init__.py` siblings (with `.ty` winning). A missing
+  named member now falls back to the local declaration site instead of jumping
+  to the wrong file top.
+- **Fixed — `tyc migrate` no longer emits invalid `mut else:` / `let else:`
+  (B1).** Keyword-led compound headers (`else:`, `try:`, `finally:`, …) were
+  misclassified as annotated-assignment targets and prefixed with a binding
+  marker. The migrate pass now skips Python reserved words, so only genuine
+  (re)assignments get `let` / `mut`.
+- **Docs — `roadmap.md` refreshed to v0.15.7** (per-release summaries through the
+  0.14.x / 0.15.x line); `examples/apps/TYPHON_FEEDBACK.md` banner-stamped as
+  historical (captured at v0.5.2 — most findings since resolved). CI gate audit
+  confirmed `fmt` / `clippy -D warnings` / `test --workspace` / corpus
+  round-trip are all already enforced.
+
 ### Added — `rescue`: lambda-free, `try`/`except`-free exception boundaries
 
 Two new forms — a postfix operator and a block prefix — lift a throwing boundary
