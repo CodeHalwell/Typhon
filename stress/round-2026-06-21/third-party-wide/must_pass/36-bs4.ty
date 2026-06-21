@@ -1,0 +1,6 @@
+# beautifulsoup4 4.15.0 — dist 'beautifulsoup4' -> import 'bs4'; **kwargs ctor, lenient.
+import bs4
+def main() -> None:
+    let soup: bs4.BeautifulSoup = bs4.BeautifulSoup("<a href='x'>t</a>", "html.parser")
+    let links = soup.find_all("a")
+    print(links)

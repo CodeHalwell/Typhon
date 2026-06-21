@@ -1,0 +1,5 @@
+# seaborn 0.13.2 — pure-Python; set_theme introspectable.
+import seaborn
+def main() -> None:
+    seaborn.set_theme()
+    print("ok")

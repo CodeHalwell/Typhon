@@ -1,0 +1,5 @@
+# pyarrow 24.0.0 — C++ extension; lenient.
+import pyarrow
+def main() -> None:
+    let arr = pyarrow.array([1, 2, 3])
+    print(arr)

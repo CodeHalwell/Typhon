@@ -1,0 +1,5 @@
+# python-dotenv 1.2.2 — dist 'python-dotenv' -> import 'dotenv'.
+import dotenv
+def main() -> None:
+    let ok: bool = dotenv.load_dotenv()
+    print(ok)

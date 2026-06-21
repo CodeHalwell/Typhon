@@ -1,0 +1,5 @@
+# polars 1.41.2 — Rust extension; lenient.
+import polars
+def main() -> None:
+    let df = polars.DataFrame({"a": [1, 2]})
+    print(df)

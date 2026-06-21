@@ -1,0 +1,5 @@
+# typer 0.26.7 — Annotated kw-only params; lenient.
+import typer
+def main() -> None:
+    let app: typer.Typer = typer.Typer()
+    print(app)

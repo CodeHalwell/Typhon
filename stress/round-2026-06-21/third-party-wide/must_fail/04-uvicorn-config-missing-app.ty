@@ -1,0 +1,5 @@
+# uvicorn.Config(app) omitted. expect tyc::missing_argument (app)
+import uvicorn
+def main() -> None:
+    let c: uvicorn.Config = uvicorn.Config()
+    print(c)

@@ -1,0 +1,7 @@
+# sqlalchemy 2.0.51 — pure-Python core; create_engine(url) introspectable.
+import sqlalchemy
+def main() -> None:
+    let e: sqlalchemy.Engine = sqlalchemy.create_engine("sqlite://", echo=True)
+    let md: sqlalchemy.MetaData = sqlalchemy.MetaData()
+    print(e)
+    print(md)

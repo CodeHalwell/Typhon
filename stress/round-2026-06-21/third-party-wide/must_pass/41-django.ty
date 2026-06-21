@@ -1,0 +1,4 @@
+# django 6.0.6 — pure-Python; introspectable (conf.Settings(settings_module) required).
+import django
+def main() -> None:
+    print(django.get_version())

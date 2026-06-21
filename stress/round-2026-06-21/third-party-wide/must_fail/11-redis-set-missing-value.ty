@@ -1,0 +1,6 @@
+# Redis().set(name, value) — value omitted (method). expect tyc::missing_argument (value)
+import redis
+def main() -> None:
+    let r: redis.Redis = redis.Redis()
+    r.set("k")
+    print(r)

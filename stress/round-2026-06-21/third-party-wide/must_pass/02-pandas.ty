@@ -1,0 +1,6 @@
+# pandas 3.0.3 — C-extension/Cython; lenient.
+import pandas
+def main() -> None:
+    let df = pandas.DataFrame({"a": [1, 2], "b": [3, 4]})
+    let g = df.groupby("a")
+    print(g)

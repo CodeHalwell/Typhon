@@ -1,0 +1,6 @@
+# httpx 0.28.1 — bundled .dty stub + introspectable.
+import httpx
+def main() -> None:
+    let c: httpx.Client = httpx.Client()
+    let r: httpx.Response = c.get("https://example.com")
+    print(r.status_code)

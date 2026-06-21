@@ -1,0 +1,5 @@
+# pymongo 4.17.0 — MongoClient uses **kwargs; lenient.
+import pymongo
+def main() -> None:
+    let c: pymongo.MongoClient = pymongo.MongoClient("mongodb://localhost:27017")
+    print(c)

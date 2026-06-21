@@ -1,0 +1,5 @@
+# rich 15.0.0 — pure-Python; Console introspectable.
+import rich.console
+def main() -> None:
+    let c: rich.console.Console = rich.console.Console(width=80)
+    c.print("hello")

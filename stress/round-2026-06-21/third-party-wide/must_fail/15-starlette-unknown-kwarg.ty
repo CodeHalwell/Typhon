@@ -1,0 +1,5 @@
+# starlette Starlette(bogus=1) — unknown kwarg (nested-attr ctor). expect tyc::unknown_kwarg
+import starlette.applications
+def main() -> None:
+    let app: starlette.applications.Starlette = starlette.applications.Starlette(bogus_kw=1)
+    print(app)

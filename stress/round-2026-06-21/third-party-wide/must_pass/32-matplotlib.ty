@@ -1,0 +1,5 @@
+# matplotlib 3.11.0 — pyplot funcs largely *args/**kwargs; lenient.
+import matplotlib.pyplot
+def main() -> None:
+    matplotlib.pyplot.plot([1, 2, 3])
+    matplotlib.pyplot.savefig("out.png")

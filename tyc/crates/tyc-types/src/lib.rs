@@ -7677,10 +7677,19 @@ fn infer_expr_readonly(c: &Checker, e: &Expr) -> Type {
                     // then resolve `url` on it.
                     if let Some(shapes) = c.module_registry.get(mod_name) {
                         if shapes.class_shapes.contains_key(a.attr.as_str()) {
-                            Type::Class(format!("{}.{}", mod_name, a.attr.as_str()))
-                        } else {
-                            Type::Unknown
+                            return Type::Class(format!("{}.{}", mod_name, a.attr.as_str()));
                         }
+                    }
+                    // Nested submodule access (`import dateutil.parser` →
+                    // `dateutil.parser.parse(...)`). Mirror `infer_attribute`'s
+                    // main path so the call-site `fn_name` qualification
+                    // resolves to `dateutil.parser.parse` and the function's
+                    // arity entry is found — otherwise a nested free-function
+                    // call silently skips the arity/type check that the
+                    // `from`-import form already gets.
+                    let nested = format!("{}.{}", mod_name, a.attr.as_str());
+                    if c.module_registry.contains_key(nested.as_str()) {
+                        Type::Module(nested)
                     } else {
                         Type::Unknown
                     }
@@ -8094,7 +8103,19 @@ fn seed_env_from_scope(c: &mut Checker, scope: ScopeId) {
                         variadic: info.max_positional.is_none(),
                     }
                 } else if let Some(info) = &b.import_info {
-                    if info.member.is_none() && c.module_registry.contains_key(&info.module) {
+                    // `import pkg.sub` binds the TOP name `pkg` (Python
+                    // semantics), so `info.module` is `pkg` even though only
+                    // the introspected leaf `pkg.sub` is a registry key. Treat
+                    // `pkg` as a module whenever it's a registry key OR the
+                    // parent of one, so `pkg.sub.Class()` chains through the
+                    // nested-module resolution in `infer_attribute` and gets
+                    // the same constructor/arity check `from pkg.sub import
+                    // Class` already does.
+                    let prefix = format!("{}.", info.module);
+                    let is_module = info.member.is_none()
+                        && (c.module_registry.contains_key(&info.module)
+                            || c.module_registry.keys().any(|k| k.starts_with(&prefix)));
+                    if is_module {
                         Type::Module(info.module.clone())
                     } else {
                         Type::Unknown
@@ -13486,6 +13507,21 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
                             variadic,
                         };
                     }
+                }
+                // Nested submodule access: `import sklearn.pipeline` lowers a
+                // use of `sklearn.pipeline.Pipeline()` to the attribute chain
+                // `((sklearn).pipeline).Pipeline()`. The inner `sklearn.pipeline`
+                // must resolve to a *module* (not `Unknown`) so the outer
+                // `.Pipeline()` access keeps flowing through the
+                // class-constructor / function-arity check. Without this, a
+                // multi-segment attribute call silently skips the checks that
+                // both `from sklearn.pipeline import Pipeline; Pipeline()` and a
+                // single-segment `jinja2.Template()` already get. Gate on the
+                // dotted path being a module we actually have shapes for so we
+                // never invent a module type for an unknown attribute.
+                let nested = format!("{mod_name}.{attr_name}");
+                if registry.contains_key(nested.as_str()) {
+                    return Type::Module(nested);
                 }
                 // Attribute not found in the registry — degrade to
                 // `Unknown` rather than emitting a diagnostic. The
@@ -23716,6 +23752,68 @@ def use() -> str | None:
             errs.is_empty(),
             "an aliased qualified `p.Iface` annotation must canonicalise to the \
              real module and conform; got: {errs:?}"
+        );
+    }
+
+    /// Regression: `import pkg.sub; pkg.sub.Thing()` (a multi-segment
+    /// attribute call) must flow through the constructor arity check exactly
+    /// like `from pkg.sub import Thing; Thing()` already does. Before the fix,
+    /// the bare top name `pkg` (which `import pkg.sub` binds) never resolved to
+    /// a `Type::Module` because only the leaf `pkg.sub` is a registry key, so
+    /// `pkg.sub.Thing()` degraded to `Unknown` and silently skipped the check
+    /// — a real third-party false negative (`sklearn.pipeline.Pipeline()`,
+    /// `django.conf.Settings()`, `dateutil.parser.parse()`).
+    #[test]
+    fn nested_submodule_attribute_constructor_arity_checks() {
+        let producer_src = "\
+class Thing:
+    required: int
+";
+        let producer_prep = preprocess(producer_src);
+        let producer_module = tyc_syntax::parse_module(&producer_prep.python_source)
+            .unwrap()
+            .into_syntax();
+        let producer_shapes = extract_module_shapes(&producer_module);
+
+        let consumer_src = "\
+import producer.sub
+
+def use() -> None:
+    producer.sub.Thing()
+";
+        let consumer_prep = preprocess(consumer_src);
+        let consumer_module = tyc_syntax::parse_module(&consumer_prep.python_source)
+            .unwrap()
+            .into_syntax();
+        let (resolved, _) = resolve_module(
+            "<consumer>".to_owned(),
+            &consumer_prep.python_source,
+            &consumer_module,
+        );
+
+        let mut external = ExternalShapes::default();
+        // Only the leaf `producer.sub` is registered (mirrors venv enrichment,
+        // which introspects exactly the imported dotted module). The bare top
+        // `producer` must still resolve as a module via the parent-of-a-key
+        // rule.
+        let mut by_module: HashMap<String, ModuleShapes> = HashMap::new();
+        by_module.insert("producer.sub".to_owned(), producer_shapes);
+        external.by_module = std::sync::Arc::new(by_module);
+
+        let d = check_module_with_imports(
+            "<consumer>",
+            &consumer_prep.python_source,
+            &resolved,
+            &consumer_module,
+            &consumer_prep.unsafe_lines,
+            &consumer_prep.frozen_class_lines,
+            Some(&external),
+        );
+        let errs: Vec<String> = d.errors().iter().map(|e| e.to_string()).collect();
+        assert!(
+            errs.iter().any(|e| e.contains("required")),
+            "nested `producer.sub.Thing()` must fire missing_argument for \
+             `required`; got: {errs:?}"
         );
     }
 

@@ -1,0 +1,9 @@
+# scikit-learn 1.9.0 — dist 'scikit-learn' -> import 'sklearn'. Pure-Python, introspectable.
+from sklearn.preprocessing import StandardScaler
+from sklearn.decomposition import PCA
+from sklearn.pipeline import Pipeline
+def main() -> None:
+    let sc: StandardScaler = StandardScaler()
+    let pca: PCA = PCA(n_components=2)
+    let p: Pipeline = Pipeline(steps=[("scale", sc), ("pca", pca)])
+    print(p)

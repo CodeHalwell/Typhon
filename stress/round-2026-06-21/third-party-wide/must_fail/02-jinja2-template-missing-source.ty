@@ -1,0 +1,5 @@
+# jinja2.Template(source) omitted. expect tyc::missing_argument (source)
+import jinja2
+def main() -> None:
+    let t: jinja2.Template = jinja2.Template()
+    print(t)

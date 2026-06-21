@@ -1,0 +1,8 @@
+# click 8.4.1 — decorator-driven; decorators stay permissive.
+import click
+@click.command()
+@click.option("--count", default=1)
+def hello(count: int) -> None:
+    print(count)
+def main() -> None:
+    print("ok")

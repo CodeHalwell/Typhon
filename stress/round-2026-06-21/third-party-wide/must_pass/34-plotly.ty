@@ -1,0 +1,5 @@
+# plotly 6.8.0 — pure-Python; Figure introspectable (lenient defaults).
+import plotly.graph_objects
+def main() -> None:
+    let fig = plotly.graph_objects.Figure()
+    print(fig)

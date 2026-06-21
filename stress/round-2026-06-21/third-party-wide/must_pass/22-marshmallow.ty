@@ -1,0 +1,6 @@
+# marshmallow 4.3.0 — pure-Python; introspectable.
+import marshmallow
+def main() -> None:
+    let s: marshmallow.Schema = marshmallow.Schema()
+    let r = s.load({"a": 1})
+    print(r)

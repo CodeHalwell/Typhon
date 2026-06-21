@@ -369,7 +369,18 @@ def ann_to_str(ann):
 def params_of(obj):
     try:
         sig = inspect.signature(obj)
-    except (TypeError, ValueError):
+    except Exception:
+        # `inspect.signature` is documented to raise TypeError / ValueError
+        # when an object has no recoverable signature, but third-party
+        # objects raise plenty else. A werkzeug `LocalProxy` re-exported at
+        # module scope (`flask.current_app` / `g` / `request` / `session`)
+        # is `callable()`, so `kind_of` labels it a "function" and we probe
+        # its signature — which raises `RuntimeError: Working outside of
+        # application context`. Catching only (TypeError, ValueError) let
+        # that propagate and crash the *entire* module's introspection,
+        # silently disabling every third-party check for the library (Flask
+        # constructors/functions all went unchecked). Treat ANY failure as
+        # "no signature recoverable" → the member is skipped (stays lenient).
         return None
     out = []
     for p in sig.parameters.values():
@@ -384,7 +395,9 @@ def params_of(obj):
 def returns_of(obj):
     try:
         sig = inspect.signature(obj)
-    except (TypeError, ValueError):
+    except Exception:
+        # See `params_of` — any signature failure means "no return type
+        # recoverable", never a crash that takes the whole module down.
         return None
     return ann_to_str(sig.return_annotation)
 
@@ -445,14 +458,22 @@ def introspect_one(mod_name):
             obj = getattr(m, name)
         except BaseException:
             continue
-        kind = kind_of(obj)
-        members.append({
-            "name": name,
-            "kind": kind,
-            "params": params_of(obj) if kind in ("class", "function") else None,
-            "returns": returns_of(obj) if kind == "function" else None,
-            "methods": methods_of(obj) if kind == "class" else None,
-        })
+        try:
+            kind = kind_of(obj)
+            members.append({
+                "name": name,
+                "kind": kind,
+                "params": params_of(obj) if kind in ("class", "function") else None,
+                "returns": returns_of(obj) if kind == "function" else None,
+                "methods": methods_of(obj) if kind == "class" else None,
+            })
+        except BaseException:
+            # Defense in depth: never let one pathological member crash the
+            # whole module's introspection. `kind_of`'s `callable(obj)` can
+            # raise on an exotic descriptor, and `methods_of` walks `dir(cls)`
+            # on a class whose metaclass misbehaves. A single bad member must
+            # only lose itself, not every other class/function in the module.
+            continue
     return {"members": members}
 
 def main():
@@ -1893,6 +1914,73 @@ lazy import np = numpy
             invocations, 4,
             "expected 1 batched + 3 per-module fallback spawns; got {invocations} (log: {log:?})"
         );
+    }
+
+    #[test]
+    fn introspection_survives_a_member_that_raises_on_signature() {
+        // Regression: a module member that raises a NON-(TypeError|ValueError)
+        // from `inspect.signature` (the canonical case is a werkzeug
+        // `LocalProxy` re-exported at module scope — `flask.current_app` / `g`
+        // / `request` / `session`) used to crash the *entire* module's
+        // introspection, so Flask's constructors/functions all went unchecked.
+        // The embedded script must now skip the bad member and still recover
+        // the module's real classes/functions. Driven end-to-end against a
+        // real Python because the in-crate harness doesn't spawn the venv
+        // introspection itself.
+        let Some(python) = which_python3() else {
+            return; // no Python on PATH — nothing to verify here.
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        // A callable module-level value whose `__signature__` raises
+        // RuntimeError on access — exactly how a werkzeug LocalProxy behaves
+        // outside an application context — plus a genuine class we must still
+        // recover.
+        std::fs::write(
+            tmp.path().join("flaskish.py"),
+            "\
+class _Proxy:
+    def __call__(self):
+        return None
+    @property
+    def __signature__(self):
+        raise RuntimeError('Working outside of application context.')
+
+current_app = _Proxy()
+
+class App:
+    def __init__(self, import_name):
+        self.import_name = import_name
+",
+        )
+        .unwrap();
+        let result = introspect_batch_via_python(
+            &python,
+            tmp.path(),
+            std::slice::from_ref(&"flaskish".to_owned()),
+        )
+        .expect("introspection batch should succeed despite the raising member");
+        let module = result.get("flaskish").expect("flaskish module present");
+        // The proxy member must not have crashed the run: the real class is
+        // recovered with its required constructor parameter.
+        let app = module
+            .members
+            .iter()
+            .find(|m| m.name == "App")
+            .expect("App class recovered despite the raising proxy member");
+        assert_eq!(app.kind, "class");
+        let params = app.params.as_ref().expect("App __init__ params captured");
+        assert!(
+            params.iter().any(|p| p.name == "import_name"),
+            "App's required `import_name` param must be captured: {params:?}"
+        );
+        // And the shape conversion yields a checkable constructor.
+        let shapes = shapes_from_introspected(module);
+        let shape = shapes
+            .class_shapes
+            .get("App")
+            .expect("App shape built from introspection");
+        assert!(shape.field_order.contains(&"import_name".to_owned()));
+        assert!(!shape.field_defaults.contains("import_name"));
     }
 
     #[test]

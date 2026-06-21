@@ -1,0 +1,5 @@
+# scipy 1.18.0 — C/Fortran extension; lenient.
+import scipy.stats
+def main() -> None:
+    let d = scipy.stats.norm()
+    print(d)

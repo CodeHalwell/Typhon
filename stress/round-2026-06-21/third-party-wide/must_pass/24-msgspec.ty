@@ -1,0 +1,5 @@
+# msgspec 0.21.1 — C-extension; lenient.
+import msgspec
+def main() -> None:
+    let b: bytes = msgspec.json.encode({"a": 1})
+    print(b)

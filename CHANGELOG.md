@@ -36,6 +36,51 @@ canonical phase-by-phase status lives in `docs/roadmap.md`.
     (the dist→import-name resolution — `scikit-learn` → `sklearn` — already
     works via `.dist-info` metadata).
 
+### Fixed — third-party introspection no longer silently disabled by a proxy member that raises from `inspect.signature`
+
+- **A single module-level object that raised a non-`(TypeError|ValueError)`
+  exception from `inspect.signature` (or `callable()`) crashed the introspection
+  of the *entire* module**, silently skipping every third-party check for that
+  library — the worst failure mode for this feature, since a skipped check looks
+  identical to a clean pass. The canonical trigger is a re-exported proxy: Flask
+  exposes werkzeug `LocalProxy` objects (`current_app`, `g`, `request`,
+  `session`) at module scope; `callable(proxy)` is `True`, so the script probed
+  them as functions and `inspect.signature` raised
+  `RuntimeError: Working outside of application context`. Django's
+  `django.conf.settings` (`LazySettings`) trips the same path via `callable()`.
+  As a result `flask.Flask()` (missing the required `import_name`), a wrong-typed
+  arg, and unknown kwargs all compiled clean.
+  - **`tyc-venv`** (`INTROSPECT_SCRIPT`): `params_of` / `returns_of` now catch any
+    `Exception` from `inspect.signature` (treated as "no signature recoverable" →
+    the member is skipped, stays lenient), and `introspect_one` wraps each
+    member's shape computation in `try/except BaseException` so one pathological
+    member can only lose itself, never the whole module. Strictly widens
+    robustness — recovered shapes are the same `inspect`-derived,
+    conservatively-modelled ones already trusted for jinja2/sklearn, so the
+    change can only *add* true positives. Regression test
+    `introspection_survives_a_member_that_raises_on_signature`.
+
+### Fixed — multi-segment attribute calls (`pkg.sub.Thing()`) now arity/type-checked like the `from`-import form
+
+- **A nested-module attribute call — `sklearn.pipeline.Pipeline()`,
+  `django.conf.Settings()`, `dateutil.parser.parse()`, `rich.console.Console(...)`,
+  `starlette.applications.Starlette(...)` — silently skipped the
+  arity/type/unknown-kwarg check** that `from pkg.sub import Thing; Thing()` and a
+  single-segment `jinja2.Template()` already got. `import pkg.sub` binds the
+  *top* name `pkg` (Python semantics), but venv enrichment only registers the
+  introspected *leaf* `pkg.sub`, so `pkg` never became a `Type::Module` and the
+  whole chain degraded to `Unknown`.
+  - **`tyc-types`**: the `BindingKind::Import` arm now treats `pkg` as a module
+    when it is a registry key *or the parent of one*; the `Type::Module` arm of
+    both `infer_attribute` and the side-effect-free `infer_expr_readonly` (used
+    to compute the call-site function name) now chain a nested submodule
+    attribute to `Type::Module("pkg.sub")` instead of returning `Unknown`.
+    Regression test `nested_submodule_attribute_constructor_arity_checks`.
+- Found by the 2026-06-21 wide third-party audit
+  (`stress/round-2026-06-21/third-party-wide/`, 43 libraries): the corpus missed
+  7/15 must_fail cases pre-fix and catches 15/15 post-fix, with **0 false
+  positives across 43 idiomatic must_pass programs** both before and after.
+
 ### Fixed — `Counter + Counter` / `Counter - Counter` no longer false-fire `tyc::operator_type_mismatch`
 
 - **`collections.Counter` multiset addition (`+`) and subtraction (`-`) were

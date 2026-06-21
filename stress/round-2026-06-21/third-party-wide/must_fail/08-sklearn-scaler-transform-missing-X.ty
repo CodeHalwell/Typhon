@@ -1,0 +1,6 @@
+# StandardScaler().transform(X) omitted (method). expect tyc::missing_argument (X)
+from sklearn.preprocessing import StandardScaler
+def main() -> None:
+    let sc: StandardScaler = StandardScaler()
+    let r = sc.transform()
+    print(r)
