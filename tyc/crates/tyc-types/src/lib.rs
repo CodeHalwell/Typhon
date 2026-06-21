@@ -15843,6 +15843,77 @@ def main() -> None:
     }
 
     #[test]
+    fn annotation_unwraps_annotated_to_first_type_arg() {
+        // A1: `Annotated[T, meta…]` resolves to `T`, discarding the metadata
+        // args. Covers the bare, `typing.`-qualified, and nested-`Optional`
+        // forms, plus the wrong-type-degrades-gracefully guarantee.
+        fn ty_of(src: &str) -> Type {
+            let parsed = tyc_syntax::parse_module(src).expect("parse");
+            let module = parsed.syntax();
+            let func = match &module.body[0] {
+                ruff_python_ast::Stmt::FunctionDef(f) => f,
+                other => panic!("expected FunctionDef, got {:?}", other),
+            };
+            let ann = func.parameters.args[0]
+                .parameter
+                .annotation
+                .as_deref()
+                .expect("annotation present");
+            type_from_annotation(ann, &[])
+        }
+        // `Annotated[int, "meta"]` resolves to `int`.
+        assert_eq!(
+            ty_of("def f(x: Annotated[int, \"meta\"]) -> None: pass\n"),
+            Type::Int
+        );
+        // `typing.Annotated[str, FieldInfo(...)]` — the FastAPI / Pydantic
+        // param form — resolves to `str`.
+        assert_eq!(
+            ty_of("def f(x: typing.Annotated[str, \"meta\"]) -> None: pass\n"),
+            Type::Str
+        );
+        // Nested `Annotated[Optional[int], …]` resolves through to `int | None`.
+        assert_eq!(
+            ty_of("def f(x: Annotated[Optional[int], \"meta\"]) -> None: pass\n"),
+            Type::optional(Type::Int)
+        );
+    }
+
+    #[test]
+    fn annotated_param_rejects_wrong_typed_arg() {
+        // A1: a value of the wrong type against an `Annotated[str, …]`
+        // parameter is now caught — the whole point of the unwrap.
+        let src = "\
+def f(x: Annotated[str, \"meta\"]) -> None: pass
+def main() -> None:
+    f(42)
+";
+        let d = check(src);
+        assert!(
+            d.has_errors(),
+            "wrong-typed arg against Annotated[str, …] must be rejected; got {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn annotated_param_accepts_correct_typed_arg() {
+        // A1: the relaxation must not introduce false positives — a correctly
+        // typed argument against an `Annotated[str, …]` parameter is clean.
+        let src = "\
+def f(x: Annotated[str, \"meta\"]) -> None: pass
+def main() -> None:
+    f(\"hello\")
+";
+        let d = check(src);
+        assert!(
+            !d.has_errors(),
+            "correctly-typed arg against Annotated[str, …] must be accepted; got {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
     fn annotation_module_alias_canonicalised_via_is_assignable() {
         // Gemini #1 (PR #103): `import foo as f; let c: f.Cls = …`
         // — the annotation lands as `Class("f.Cls")` but the call

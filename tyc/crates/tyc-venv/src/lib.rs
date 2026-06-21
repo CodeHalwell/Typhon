@@ -727,6 +727,32 @@ fn annotation_to_type(ann: &str) -> Type {
     }
     s = s.trim();
 
+    // `Annotated[T, meta…]` (optionally `typing.` / `typing_extensions.`
+    // -qualified) → resolve to the FIRST type argument `T`, discarding the
+    // metadata. This is the form FastAPI / Typer / Pydantic stamp onto their
+    // parameters (`Annotated[str, FieldInfo(...)]`); without this the whole
+    // annotation degraded to `Unknown` and wrong-typed kwargs went uncaught.
+    // The metadata args are arbitrary `repr()` text (commas / brackets /
+    // parens), so we take only the first top-level comma-separated segment;
+    // if `T` itself doesn't resolve we degrade to `Unknown` exactly as before
+    // (never stricter than today). A1.
+    {
+        let head_stripped = s
+            .strip_prefix("typing.")
+            .or_else(|| s.strip_prefix("typing_extensions."))
+            .unwrap_or(s);
+        if let Some(inner) = head_stripped
+            .strip_prefix("Annotated[")
+            .and_then(|r| r.strip_suffix(']'))
+        {
+            let parts = split_top_level_commas(inner);
+            if let Some(first) = parts.first() {
+                return annotation_to_type(first.trim());
+            }
+            return Type::Unknown;
+        }
+    }
+
     // `Optional[X]` (optionally `typing.`-qualified) → `X | None`.
     let unqualified = s.strip_prefix("typing.").unwrap_or(s);
     if let Some(inner) = unqualified
@@ -1718,6 +1744,50 @@ mod tests {
         assert_eq!(annotation_to_type("int | str | None"), Type::Unknown);
         assert_eq!(annotation_to_type("int | str"), Type::Unknown);
         assert_eq!(annotation_to_type("requests.Session"), Type::Unknown);
+    }
+
+    #[test]
+    fn annotation_unwraps_annotated_to_first_type_arg() {
+        // `Annotated[T, meta…]` resolves to `T`, discarding metadata — this is
+        // the FastAPI / Typer / Pydantic param form. A1.
+        assert_eq!(annotation_to_type("Annotated[int, \"meta\"]"), Type::Int);
+        assert_eq!(
+            annotation_to_type("typing.Annotated[str, 'meta']"),
+            Type::Str
+        );
+        assert_eq!(
+            annotation_to_type("typing_extensions.Annotated[bool, 'x']"),
+            Type::Bool
+        );
+        // Metadata carrying its own commas / brackets / parens (the typical
+        // `repr()` of a Pydantic / FastAPI marker) must not derail the split:
+        // only the first top-level segment is the type.
+        assert_eq!(
+            annotation_to_type(
+                "typing.Annotated[str, FieldInfo(default=PydanticUndefined, extra={})]"
+            ),
+            Type::Str
+        );
+        assert_eq!(
+            annotation_to_type("Annotated[int, Gt(0), Lt(10)]"),
+            Type::Int
+        );
+        // Nested `Annotated[Optional[int], …]` resolves through to the inner
+        // nullable type.
+        assert_eq!(
+            annotation_to_type("Annotated[Optional[int], 'meta']"),
+            Type::Union(vec![Type::Int, Type::None])
+        );
+        assert_eq!(
+            annotation_to_type("Annotated[list[int], 'meta']"),
+            Type::Generic("list".into(), vec![Type::Int])
+        );
+        // If the wrapped type doesn't resolve we degrade to Unknown exactly as
+        // before — never stricter than today.
+        assert_eq!(
+            annotation_to_type("Annotated[requests.Session, 'meta']"),
+            Type::Unknown
+        );
     }
 
     #[test]
