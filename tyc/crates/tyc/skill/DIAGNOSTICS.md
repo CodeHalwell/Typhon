@@ -811,6 +811,25 @@ min(1, 2)             # error: `int` does not satisfy `Comparable`
 
 **Fix:** Pass values whose type satisfies the bound, or drop the bound if unused.
 
+### `tyc::kind_mismatch` — error
+
+A higher-kinded type-constructor variable (the `F` in `class Functor[F[_]]:`) is
+applied with the wrong arity, or bound to two different constructors in one call.
+Landed post-v0.15.7 (unreleased) with HKT unification.
+
+```ty
+interface Functor[F[_]]:
+    def map[A, B](self, fa: F[A], f: Callable[[A], B]) -> F[B]: ...
+
+# error: `F` expects 1 type argument, applied with 2
+# error: `F` bound to both `list` and `set` in one call
+```
+
+**Fix:** Apply the constructor variable with the arity its kind declares
+(`F[_]` takes exactly one argument), and keep a single call's `F` bound to one
+concrete constructor. Function-level HKT params (`def f[F[_]]`) are not yet
+supported — see `TYPE_SYSTEM_FRONTIER.md`.
+
 ---
 
 ## 13. Parse / I/O
