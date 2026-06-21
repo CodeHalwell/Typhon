@@ -1,0 +1,38 @@
+from enum import Enum
+
+enum Weekday:
+    MONDAY = 1
+    TUESDAY = 2
+    WEDNESDAY = 3
+    THURSDAY = 4
+    FRIDAY = 5
+    SATURDAY = 6
+    SUNDAY = 7
+
+impl Weekday:
+    def is_weekend(self) -> bool:
+        return self.value >= 6
+    def short(self) -> str:
+        return self.name[:3].title()
+
+def schedule(day: Weekday) -> str:
+    match day:
+        case Weekday.SATURDAY | Weekday.SUNDAY:
+            return "rest"
+        case Weekday.FRIDAY:
+            return "wrap up"
+        case _:
+            return "work"
+
+def main() -> None:
+    for day in Weekday:
+        print(f"{day.short()}: weekend={day.is_weekend()} -> {schedule(day)}")
+
+    print(Weekday.MONDAY.value < Weekday.FRIDAY.value)
+    let days: list[Weekday] = [Weekday.FRIDAY, Weekday.MONDAY, Weekday.WEDNESDAY]
+    let sorted_days: list[Weekday] = sorted(days, key=lambda d: d.value)
+    print([d.short() for d in sorted_days])
+    print(Weekday(3))
+
+if __name__ == "__main__":
+    main()

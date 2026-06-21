@@ -1,0 +1,42 @@
+from typing import Callable
+
+type Either[L, R] = Left[L] | Right[R]
+
+class Left[L]:
+    error: L
+class Right[R]:
+    value: R
+
+impl[L, R] Either[L, R]:
+    def map[U](self, f: Callable[[R], U]) -> Either[L, U]:
+        match self:
+            case Left(e):  return Left(error=e)
+            case Right(v): return Right(value=f(v))
+    def is_right(self) -> bool:
+        match self:
+            case Left(_):  return False
+            case Right(_): return True
+    def get_or[U](self, default: R) -> R:
+        match self:
+            case Left(_):  return default
+            case Right(v): return v
+
+def divide(a: int, b: int) -> Either[str, float]:
+    if b == 0:
+        return Left(error="division by zero")
+    return Right(value=a / b)
+
+def main() -> None:
+    let r1: Either[str, float] = divide(10, 2)
+    print(r1.is_right())
+    print(r1.get_or(0.0))
+    let mapped: Either[str, float] = r1.map(lambda x: x * 10)
+    print(mapped.get_or(-1.0))
+
+    let r2: Either[str, float] = divide(5, 0)
+    print(r2.is_right())
+    print(r2.get_or(-1.0))
+    print(r2.map(lambda x: x + 1).get_or(-99.0))
+
+if __name__ == "__main__":
+    main()

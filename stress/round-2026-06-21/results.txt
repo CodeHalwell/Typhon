@@ -210,7 +210,7 @@ computing mean...
 ===== 114-classmethod-constructors (check=0 vm=0 comp=0) [PASS] =====
 ===== 115-dataclass-reflection (check=0 vm=1 comp=0) [PASS] {VM-DIVERGE} =====
 --- VM ---
-{'age': 30, 'name': 'Alice', 'address': Address(street='1 Main', city='Springfield')}
+{'name': 'Alice', 'age': 30, 'address': Address(street='1 Main', city='Springfield')}
 Traceback (most recent call last):
   File "repros/115-dataclass-reflection.ty", line 35, in <module>
     main()
@@ -274,7 +274,75 @@ Hello, World!
 ===== 119-complex-match (check=0 vm=0 comp=0) [PASS] =====
 ===== 12-enum (check=0 vm=0 comp=0) [PASS] =====
 ===== 120-generic-tree-fold (check=0 vm=0 comp=0) [PASS] =====
+===== 121-custom-dunders (check=0 vm=0 comp=0) [PASS] =====
+===== 122-getitem-matrix (check=0 vm=0 comp=0) [PASS] =====
+===== 123-rich-container (check=0 vm=0 comp=0) [PASS] =====
+===== 124-self-builder (check=0 vm=0 comp=0) [PASS] =====
+===== 125-generic-either (check=0 vm=0 comp=0) [PASS] =====
+===== 126-enum-rich (check=0 vm=0 comp=0) [PASS] =====
+===== 127-asyncio-queue (check=0 vm=1 comp=0) [PASS] {VM-DIVERGE} =====
+--- VM ---
+consumed total: 10
+Traceback (most recent call last):
+  File "repros/127-asyncio-queue.ty", line 38, in <module>
+    main()
+  File "repros/127-asyncio-queue.ty", line 35, in main
+    asyncio.run(run())
+  File "repros/127-asyncio-queue.ty", line 26, in run
+    let lock: asyncio.Lock = asyncio.Lock()
+AttributeError: module 'asyncio' has no attribute 'Lock'
+--- BUILD+PY ---
+consumed total: 10
+counter: 3
+===== 128-decimal-context (check=0 vm=1 comp=0) [PASS] {VM-DIVERGE} =====
+--- VM ---
+Traceback (most recent call last):
+  File "repros/128-decimal-context.ty", line 1, in <module>
+    from decimal import Decimal, ROUND_HALF_UP, ROUND_DOWN, getcontext
+ImportError: tyc-vm cannot import 'decimal': only a small native stdlib is available. Run with `tyc run --compile` to use the full Python interpreter.
+--- BUILD+PY ---
+21.639175
+21.64
+21.63
+0.142857
+3
+3.16228
+100.56
+True
+===== 129-struct (check=0 vm=1 comp=0) [PASS] {VM-DIVERGE} =====
+--- VM ---
+Traceback (most recent call last):
+  File "repros/129-struct.ty", line 1, in <module>
+    import struct
+ImportError: tyc-vm cannot import 'struct': only a small native stdlib is available. Run with `tyc run --compile` to use the full Python interpreter.
+--- BUILD+PY ---
+12
+000000010000000240600000
+(1, 2, 3.5)
+[0, 1]
+12
+(1.0, 2.0, 3.0)
+18446744073709551615
 ===== 13-sealed-union-eval (check=0 vm=0 comp=0) [PASS] =====
+===== 130-string-template (check=0 vm=1 comp=0) [PASS] {VM-DIVERGE} =====
+--- VM ---
+Traceback (most recent call last):
+  File "repros/130-string-template.ty", line 1, in <module>
+    from string import Template
+ImportError: tyc-vm cannot import 'string': only a small native stdlib is available. Run with `tyc run --compile` to use the full Python interpreter.
+--- BUILD+PY ---
+Hello, World!
+Hi, $name!
+1 and 2
+the quick brown fox
+jumps over the lazy
+dog repeatedly
+---
+> line1
+> line2
+the quick [...]
+a
+b
 ===== 14-result-error-handling (check=0 vm=0 comp=0) [PASS] =====
 ===== 15-generics (check=0 vm=0 comp=0) [PASS] =====
 ===== 16-interfaces (check=0 vm=0 comp=0) [PASS] =====
@@ -694,4 +762,4 @@ list with 3 items
 object: 3.14
 
 ######## SUMMARY ########
-total=120 pass=120 buildfail=0 runfail=0 checkfail=0 vm_diverge=33
+total=130 pass=130 buildfail=0 runfail=0 checkfail=0 vm_diverge=37

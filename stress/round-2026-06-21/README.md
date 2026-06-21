@@ -7,7 +7,7 @@ language surfaces and lowering paths rather than going deep on one.
 
 ## Methodology
 
-Each of the **120** `.ty` programs in `repros/` is run through three paths by
+Each of the **130** `.ty` programs in `repros/` is run through three paths by
 `harness.sh` and compared:
 
 1. **`tyc check`** — frontend (parser + resolver + type checker).
@@ -28,15 +28,15 @@ bash harness.sh repros/*.ty        # TYC=… PYTHON=… overridable
 Requires `pydantic` installed for the `model` repro (`36`); everything else is
 stdlib-only.
 
-## Result — 120 / 120 compile to valid, runnable Python
+## Result — 130 / 130 compile to valid, runnable Python
 
 ```
-total=120 pass=120 buildfail=0 runfail=0 checkfail=0 vm_diverge=33
+total=130 pass=130 buildfail=0 runfail=0 checkfail=0 vm_diverge=37
 ```
 
 Every program type-checks, builds, and runs correctly on the compiled
 (`tyc build` → CPython 3.13) path. **Zero codegen defects** were found across
-the whole 120-program corpus.
+the whole 130-program corpus.
 
 ### Three real type-checker build-blockers found and fixed
 
@@ -156,9 +156,17 @@ runtime behaviour they were probing:
 | 114 | `@classmethod` alternative constructors | 119 | complex match (`as`/`\|`/nested/guards) |
 | 115 | `dataclasses.asdict`/`astuple`/`fields` | 120 | generic recursive tree `fold` |
 
+| # | Area | # | Area |
+|---|---|---|---|
+| 121 | custom `__format__`/`__bool__`/`__index__`/`__hash__` | 126 | `enum` + methods + `match` + `Weekday(n)` lookup |
+| 122 | `__getitem__`/`__setitem__` with tuple keys (Matrix) | 127 | `asyncio.Queue` + `Lock` + `gather:` |
+| 123 | rich container (`__iter__`/`__reversed__`/`__contains__`) | 128 | `Decimal` context / `quantize` / rounding |
+| 124 | `typing.Self` fluent builder | 129 | `struct` pack / unpack |
+| 125 | generic `Either[L,R]` with `map` | 130 | `string.Template` / `format_map` / `textwrap` |
+
 ## VM-divergence findings (secondary — production path is correct in all cases)
 
-The 33 `{VM-DIVERGE}` programs are **VM-only** (`tyc run`) gaps; the shipped
+The 37 `{VM-DIVERGE}` programs are **VM-only** (`tyc run`) gaps; the shipped
 Python is correct for every one. Categorised:
 
 ### Fixed this round
@@ -176,9 +184,9 @@ Python is correct for every one. Categorised:
 - `18`, `83`, `98` — `@contextmanager` / `@asynccontextmanager` generators as
   context managers (the VM evaluates generators eagerly — the explicit error
   the VM raises).
-- `33`, `100`, `101`, `102` — `decimal` / `fractions` / `io` / `operator` /
-  `bisect` not in the VM's native stdlib subset (the explicit "run with
-  `tyc run --compile`" error).
+- `33`, `100`, `101`, `102`, `128`, `129`, `130` — `decimal` / `fractions` /
+  `io` / `operator` / `bisect` / `struct` / `string` not in the VM's native
+  stdlib subset (the explicit "run with `tyc run --compile`" error).
 - `71` — unbounded generators (`while True: yield`) exceed the VM's
   1M-value eager-materialisation cap.
 - `78` — `sys.setrecursionlimit` not modelled by the VM.
@@ -209,6 +217,7 @@ Python is correct for every one. Categorised:
 - `116` — `itertools.chain.from_iterable` not exposed in the VM.
 - `117` — `collections.ChainMap` not implemented in the VM.
 - `118` — `functools.partial` rejects keyword arguments in the VM.
+- `127` — `asyncio.Lock` not implemented in the VM.
 
 ### Cosmetic (different repr, same value)
 
@@ -218,6 +227,6 @@ Python is correct for every one. Categorised:
 
 ## Files
 
-- `repros/*.ty` — the 120-program corpus.
+- `repros/*.ty` — the 130-program corpus.
 - `harness.sh` — three-path runner + comparator.
 - `results.txt` — captured full-sweep output (post-fix).

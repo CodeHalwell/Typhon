@@ -1,0 +1,21 @@
+from decimal import Decimal, ROUND_HALF_UP, ROUND_DOWN, getcontext
+
+def main() -> None:
+    let price: Decimal = Decimal("19.99")
+    let tax_rate: Decimal = Decimal("0.0825")
+    let total: Decimal = price * (Decimal("1") + tax_rate)
+    print(total)
+    print(total.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+    print(total.quantize(Decimal("0.01"), rounding=ROUND_DOWN))
+
+    getcontext().prec = 6
+    print(Decimal("1") / Decimal("7"))
+    print(Decimal("2.5").quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+    print(Decimal("10").sqrt())
+
+    let cents: Decimal = Decimal("100.555")
+    print(cents.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+    print(Decimal("0.1") + Decimal("0.2") == Decimal("0.3"))
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,36 @@
+import asyncio
+
+async def producer(queue: asyncio.Queue[int], count: int) -> None:
+    for i in range(count):
+        await queue.put(i)
+    await queue.put(-1)
+
+async def consumer(queue: asyncio.Queue[int]) -> int:
+    mut total: int = 0
+    while True:
+        let item: int = await queue.get()
+        if item == -1:
+            break
+        total = total + item
+    return total
+
+async def run() -> None:
+    let queue: asyncio.Queue[int] = asyncio.Queue()
+    gather:
+        _prod = producer(queue, 5)
+        total = consumer(queue)
+    print(f"consumed total: {total}")
+
+    let lock: asyncio.Lock = asyncio.Lock()
+    mut counter: list[int] = [0]
+    async def increment() -> None:
+        async with lock:
+            counter[0] = counter[0] + 1
+    await asyncio.gather(increment(), increment(), increment())
+    print(f"counter: {counter[0]}")
+
+def main() -> None:
+    asyncio.run(run())
+
+if __name__ == "__main__":
+    main()
