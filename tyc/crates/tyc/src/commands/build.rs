@@ -1292,17 +1292,48 @@ fn display_relative(path: &std::path::Path, project_root: &std::path::Path) -> S
 }
 
 /// Return `Some(suffix)` if `name` looks like a credential identifier.
-/// The match is case-insensitive on the trailing token and is suffix-only.
+/// The match is case-insensitive and ensures the token is bounded by the
+/// start/end of the string or underscores.
 /// Used by the secret-comptime lint.
 fn secret_suffix(name: &str) -> Option<&'static str> {
     let upper = name.to_ascii_uppercase();
     // Order matters: check the longest/most specific suffixes first so
     // `MY_PASSWORD` reports `PASSWORD` rather than the shorter `PASS`.
-    [
+    let words = [
         "PASSWORD", "SECRET", "TOKEN", "API_KEY", "KEY", "PWD", "PASS",
-    ]
-    .into_iter()
-    .find(|candidate| upper.ends_with(candidate))
+    ];
+    for candidate in words {
+        // We match if the substring is bounded by:
+        // - start/end of string
+        // - underscore (`_`)
+        // - or if it's preceded/followed by a casing change (for camelCase)
+        // e.g. "myTokenValue" -> "my" + "Token" + "Value" -> preceded by 'y' (lowercase),
+        // followed by 'V' (uppercase).
+        // Ensure "PASSPORT" does not match "PASS" by checking that the matched prefix/suffix
+        // boundaries are actually word boundaries (i.e. we don't have uppercase letters directly next to uppercase letters in original, etc).
+        // The simplest check for camelCase/PascalCase is:
+        // start_ok: actual_idx == 0 OR previous char is `_` OR (previous char is lowercase AND current char is uppercase).
+        // end_ok: actual_end == len OR next char is `_` OR (next char is uppercase AND last char of match was NOT uppercase).
+        let mut start_idx = 0;
+        while let Some(idx) = upper[start_idx..].find(candidate) {
+            let actual_idx = start_idx + idx;
+
+            let start_ok = actual_idx == 0
+                || upper.as_bytes()[actual_idx - 1] == b'_'
+                || (name.as_bytes()[actual_idx].is_ascii_uppercase() && name.as_bytes()[actual_idx - 1].is_ascii_lowercase());
+
+            let actual_end = actual_idx + candidate.len();
+            let end_ok = actual_end == upper.len()
+                || upper.as_bytes()[actual_end] == b'_'
+                || (name.as_bytes()[actual_end].is_ascii_uppercase() && !name.as_bytes()[actual_end - 1].is_ascii_uppercase());
+
+            if start_ok && end_ok {
+                return Some(candidate);
+            }
+            start_idx = actual_idx + 1;
+        }
+    }
+    None
 }
 
 /// Scan `source` for `from .NAME import …` lines and return
@@ -4096,9 +4127,13 @@ let pet: Animal = Dog(name=\"Rex\")
     fn secret_suffix_matches_credential_names() {
         assert_eq!(secret_suffix("API_KEY"), Some("API_KEY"));
         assert_eq!(secret_suffix("MyToken"), Some("TOKEN"));
+        assert_eq!(secret_suffix("myTokenValue"), Some("TOKEN"));
         assert_eq!(secret_suffix("DB_PASSWORD"), Some("PASSWORD"));
         assert_eq!(secret_suffix("client_secret"), Some("SECRET"));
         assert_eq!(secret_suffix("PWD"), Some("PWD"));
+        assert_eq!(secret_suffix("API_KEY_FOO"), Some("API_KEY"));
+        assert_eq!(secret_suffix("FOO_API_KEY_BAR"), Some("API_KEY"));
+        assert_eq!(secret_suffix("KEY_APIKEY"), Some("KEY"));
     }
 
     #[test]
@@ -4106,6 +4141,9 @@ let pet: Animal = Dog(name=\"Rex\")
         assert_eq!(secret_suffix("PORT"), None);
         assert_eq!(secret_suffix("MAX_RETRIES"), None);
         assert_eq!(secret_suffix("USER"), None);
+        assert_eq!(secret_suffix("MONKEY"), None);
+        assert_eq!(secret_suffix("PASSPORT"), None);
+        assert_eq!(secret_suffix("APIKEY"), None);
     }
 
     #[test]
