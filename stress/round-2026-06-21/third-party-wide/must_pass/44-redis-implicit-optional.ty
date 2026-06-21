@@ -1,0 +1,7 @@
+# redis 8.0.0 — implicit-Optional idiom: AskError(resp, status_code: str = None).
+# Passing None to the "lying" bare-scalar param must NOT false-positive
+# (param type is widened to `str | None` because the default is None).
+from redis.exceptions import AskError
+def main() -> None:
+    let e: AskError = AskError("MOVED 1 127.0.0.1:7001", status_code=None)
+    print(e)

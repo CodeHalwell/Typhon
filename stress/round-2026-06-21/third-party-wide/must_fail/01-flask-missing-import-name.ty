@@ -1,0 +1,5 @@
+# flask.Flask(import_name) — required positional omitted. expect tyc::missing_argument (import_name)
+import flask
+def main() -> None:
+    let app: flask.Flask = flask.Flask()
+    print(app)

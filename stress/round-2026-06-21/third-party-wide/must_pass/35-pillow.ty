@@ -1,0 +1,5 @@
+# pillow 12.2.0 — dist 'pillow' -> import 'PIL'; C-extension; lenient.
+import PIL.Image
+def main() -> None:
+    let im = PIL.Image.new("RGB", (10, 10))
+    print(im)

@@ -1,0 +1,4 @@
+# psycopg2-binary 2.9.12 — dist 'psycopg2-binary' -> import 'psycopg2'; C-extension; lenient.
+import psycopg2
+def main() -> None:
+    print(psycopg2.__libpq_version__)

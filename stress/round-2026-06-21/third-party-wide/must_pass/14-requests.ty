@@ -1,0 +1,5 @@
+# requests 2.x — stub-only (typeshed); compiler ships a bundled .dty stub.
+import requests
+def main() -> None:
+    let r = requests.get("https://example.com")
+    print(r)

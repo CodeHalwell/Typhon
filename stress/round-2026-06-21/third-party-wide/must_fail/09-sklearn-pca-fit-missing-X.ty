@@ -1,0 +1,6 @@
+# PCA(n_components=2).fit(X) omitted (method). expect tyc::missing_argument (X)
+from sklearn.decomposition import PCA
+def main() -> None:
+    let p: PCA = PCA(n_components=2)
+    p.fit()
+    print(p)

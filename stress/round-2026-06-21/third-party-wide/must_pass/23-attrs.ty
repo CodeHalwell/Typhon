@@ -1,0 +1,8 @@
+# attrs 26.1.0 — dist 'attrs' -> import 'attr'; decorator-driven.
+import attr
+@attr.s
+class Point:
+    x: int = attr.ib()
+    y: int = attr.ib()
+def main() -> None:
+    print("ok")

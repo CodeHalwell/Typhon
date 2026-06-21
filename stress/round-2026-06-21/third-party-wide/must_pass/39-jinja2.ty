@@ -1,0 +1,6 @@
+# jinja2 3.1.6 — pure-Python; Environment / Template introspectable.
+import jinja2
+def main() -> None:
+    let env: jinja2.Environment = jinja2.Environment(autoescape=True)
+    let t: jinja2.Template = env.from_string("{{ x }}")
+    print(t.render(x=1))

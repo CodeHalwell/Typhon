@@ -1,0 +1,7 @@
+# pydantic 2.13.4 — use the `model` form (emits class X(BaseModel)).
+model User:
+    id: int
+    name: str
+def main() -> None:
+    let u: User = User(id=1, name="alice")
+    print(u.model_dump())

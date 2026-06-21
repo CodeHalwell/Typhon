@@ -1,0 +1,5 @@
+# lightgbm 4.6.0 — mixed; lenient.
+import lightgbm
+def main() -> None:
+    let m = lightgbm.LGBMClassifier(n_estimators=10)
+    print(m)

@@ -1,0 +1,4 @@
+# google-cloud-storage 3.12.0 — dist -> import root 'google' (namespace pkg).
+import google.cloud.storage
+def main() -> None:
+    print("ok")

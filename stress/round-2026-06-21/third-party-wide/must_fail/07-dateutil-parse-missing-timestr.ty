@@ -1,0 +1,5 @@
+# dateutil.parser.parse(timestr) omitted, nested-attr free-fn. expect tyc::missing_argument
+import dateutil.parser
+def main() -> None:
+    let dt = dateutil.parser.parse()
+    print(dt)

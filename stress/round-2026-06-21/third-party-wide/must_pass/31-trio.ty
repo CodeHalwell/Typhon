@@ -1,0 +1,6 @@
+# trio 0.33.0 — pure-Python; trio.run introspectable.
+import trio
+async def work() -> None:
+    await trio.sleep(0)
+def main() -> None:
+    trio.run(work)

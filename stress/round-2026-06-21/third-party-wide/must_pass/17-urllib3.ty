@@ -1,0 +1,5 @@
+# urllib3 2.7.0 — pure-Python; PoolManager has defaults.
+import urllib3
+def main() -> None:
+    let pm: urllib3.PoolManager = urllib3.PoolManager()
+    print(pm)

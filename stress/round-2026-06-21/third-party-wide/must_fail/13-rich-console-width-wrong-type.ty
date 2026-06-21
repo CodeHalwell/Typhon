@@ -1,0 +1,5 @@
+# rich Console(width: int) given str. expect tyc::type_mismatch
+import rich.console
+def main() -> None:
+    let c: rich.console.Console = rich.console.Console(width="wide")
+    print(c)

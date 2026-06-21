@@ -1,0 +1,5 @@
+# sklearn Pipeline(steps) omitted. expect tyc::missing_argument (steps)
+from sklearn.pipeline import Pipeline
+def main() -> None:
+    let p: Pipeline = Pipeline()
+    print(p)

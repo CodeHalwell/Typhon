@@ -1,0 +1,6 @@
+# Schema().load(data) omitted (method). expect tyc::missing_argument (data)
+import marshmallow
+def main() -> None:
+    let s: marshmallow.Schema = marshmallow.Schema()
+    let r = s.load()
+    print(r)

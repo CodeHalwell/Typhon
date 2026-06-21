@@ -1,0 +1,5 @@
+# pyyaml 6.0.3 — dist 'pyyaml' -> import 'yaml'; introspectable funcs.
+import yaml
+def main() -> None:
+    let s: str = yaml.dump({"a": 1})
+    print(s)

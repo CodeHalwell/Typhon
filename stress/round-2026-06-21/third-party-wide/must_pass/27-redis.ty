@@ -1,0 +1,7 @@
+# redis 8.0.0 — pure-Python; Redis(host=...) introspectable.
+import redis
+def main() -> None:
+    let r: redis.Redis = redis.Redis(host="localhost", port=6379, db=0)
+    r.set("k", "v")
+    let v = r.get("k")
+    print(v)

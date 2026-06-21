@@ -1,0 +1,5 @@
+# boto3 1.43.34 — dynamic client factory; client() arity lenient.
+import boto3
+def main() -> None:
+    let s3 = boto3.client("s3")
+    print(s3)

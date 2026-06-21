@@ -1,0 +1,5 @@
+# fastapi 0.138.0 — keyword-only Annotated params with defaults; lenient on extras.
+import fastapi
+def main() -> None:
+    let app: fastapi.FastAPI = fastapi.FastAPI(title="demo")
+    print(app)

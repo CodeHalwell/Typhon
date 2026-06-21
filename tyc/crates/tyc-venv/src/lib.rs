@@ -61,6 +61,16 @@ struct IntrospectedParam {
     /// `"var_keyword"` (i.e. `**kwargs`).
     kind: String,
     has_default: bool,
+    /// `true` when the parameter's default value is literally `None`. This is
+    /// the ubiquitous "implicit Optional" idiom — `def f(x: int = None)` /
+    /// `Cls(x: str = None)` — where the annotation is a bare scalar but `None`
+    /// is in fact a valid argument. Without it the annotation "lies" and a
+    /// call passing `None` (or relying on the sentinel) would false-positive
+    /// with `tyc::type_mismatch`. When set, [`annotation_to_type`]'s result is
+    /// widened to nullable so the check stays sound. Defaults to `false` for
+    /// older cached payloads that predate the field.
+    #[serde(default)]
+    default_is_none: bool,
     /// The parameter's annotation rendered to a string (`"int"`, `"str"`,
     /// `"Optional[int]"`, `"<class 'requests.Session'>"`, …) or `None` when
     /// unannotated. Mapped to a Typhon [`Type`] by [`annotation_to_type`];
@@ -369,7 +379,18 @@ def ann_to_str(ann):
 def params_of(obj):
     try:
         sig = inspect.signature(obj)
-    except (TypeError, ValueError):
+    except Exception:
+        # `inspect.signature` is documented to raise TypeError / ValueError
+        # when an object has no recoverable signature, but third-party
+        # objects raise plenty else. A werkzeug `LocalProxy` re-exported at
+        # module scope (`flask.current_app` / `g` / `request` / `session`)
+        # is `callable()`, so `kind_of` labels it a "function" and we probe
+        # its signature — which raises `RuntimeError: Working outside of
+        # application context`. Catching only (TypeError, ValueError) let
+        # that propagate and crash the *entire* module's introspection,
+        # silently disabling every third-party check for the library (Flask
+        # constructors/functions all went unchecked). Treat ANY failure as
+        # "no signature recoverable" → the member is skipped (stays lenient).
         return None
     out = []
     for p in sig.parameters.values():
@@ -377,6 +398,11 @@ def params_of(obj):
             "name": p.name,
             "kind": PARAM_KIND_MAP.get(p.kind, "positional_or_keyword"),
             "has_default": p.default is not inspect.Parameter.empty,
+            # The "implicit Optional" idiom (`x: int = None`): the annotation
+            # is a bare scalar but None is a valid argument. The Rust side
+            # widens the param type to nullable so a `None` argument doesn't
+            # false-positive.
+            "default_is_none": p.default is None,
             "annotation": ann_to_str(p.annotation),
         })
     return out
@@ -384,7 +410,9 @@ def params_of(obj):
 def returns_of(obj):
     try:
         sig = inspect.signature(obj)
-    except (TypeError, ValueError):
+    except Exception:
+        # See `params_of` — any signature failure means "no return type
+        # recoverable", never a crash that takes the whole module down.
         return None
     return ann_to_str(sig.return_annotation)
 
@@ -445,14 +473,26 @@ def introspect_one(mod_name):
             obj = getattr(m, name)
         except BaseException:
             continue
-        kind = kind_of(obj)
-        members.append({
-            "name": name,
-            "kind": kind,
-            "params": params_of(obj) if kind in ("class", "function") else None,
-            "returns": returns_of(obj) if kind == "function" else None,
-            "methods": methods_of(obj) if kind == "class" else None,
-        })
+        try:
+            kind = kind_of(obj)
+            members.append({
+                "name": name,
+                "kind": kind,
+                "params": params_of(obj) if kind in ("class", "function") else None,
+                "returns": returns_of(obj) if kind == "function" else None,
+                "methods": methods_of(obj) if kind == "class" else None,
+            })
+        except Exception:
+            # Defense in depth: never let one pathological member crash the
+            # whole module's introspection. `kind_of`'s `callable(obj)` can
+            # raise on an exotic descriptor, and `methods_of` walks `dir(cls)`
+            # on a class whose metaclass misbehaves. A single bad member must
+            # only lose itself, not every other class/function in the module.
+            # `Exception` (not `BaseException`) so a genuine `KeyboardInterrupt`
+            # / `SystemExit` still terminates the subprocess — every realistic
+            # crash-causer here (the werkzeug `LocalProxy` `RuntimeError`, a
+            # Django `ImproperlyConfigured`) is an `Exception` subclass.
+            continue
     return {"members": members}
 
 def main():
@@ -632,13 +672,7 @@ fn class_shape_from_params(params: &[IntrospectedParam]) -> Option<InterfaceShap
             field_defaults.insert(p.name.clone());
         }
         field_order.push(p.name.clone());
-        fields.insert(
-            p.name.clone(),
-            p.annotation
-                .as_deref()
-                .map(annotation_to_type)
-                .unwrap_or(Type::Unknown),
-        );
+        fields.insert(p.name.clone(), param_type_from(p));
     }
     if field_order.is_empty() {
         // A zero-arg constructor still benefits from being modelled —
@@ -816,6 +850,34 @@ fn split_top_level_commas(s: &str) -> Vec<&str> {
     parts
 }
 
+/// Map an introspected parameter to its Typhon [`Type`], applying the
+/// "implicit Optional" widening: a param whose default is literally `None`
+/// (`def f(x: int = None)`) accepts `None`, so its bare-scalar / container
+/// annotation is widened to nullable. Without this, a call passing `None`
+/// (or any value the checker infers as nullable) would false-positive with
+/// `tyc::type_mismatch` against a third-party annotation that "lies".
+///
+/// Only concrete, non-nullable types are widened — an already-`Optional[X]`
+/// annotation (`Type::Union`), `Unknown`, or `None` is left untouched (the
+/// author already expressed the optionality, or there's nothing to widen).
+/// The widening only ever *adds* accepted values, so it can only remove
+/// false positives, never introduce one; a genuinely wrong-typed argument
+/// (`x="str"` for `x: int = None`) still fails against `int | None`.
+fn param_type_from(param: &IntrospectedParam) -> Type {
+    let ty = param
+        .annotation
+        .as_deref()
+        .map(annotation_to_type)
+        .unwrap_or(Type::Unknown);
+    if !param.default_is_none {
+        return ty;
+    }
+    match ty {
+        Type::Unknown | Type::Any | Type::None | Type::Union(_) => ty,
+        other => nullable_of(other),
+    }
+}
+
 /// Wrap `inner` as nullable (`inner | None`). A non-mappable inner collapses
 /// to `Unknown` (a nullable-`Unknown` is just `Unknown` — still permissive).
 fn nullable_of(inner: Type) -> Type {
@@ -881,11 +943,7 @@ fn arity_info_from_params(
     let mut has_kwarg = false;
     let mut has_vararg = false;
     for p in params {
-        let ty = p
-            .annotation
-            .as_deref()
-            .map(annotation_to_type)
-            .unwrap_or(Type::Unknown);
+        let ty = param_type_from(p);
         match p.kind.as_str() {
             "var_positional" => has_vararg = true,
             "var_keyword" => has_kwarg = true,
@@ -1417,6 +1475,7 @@ mod tests {
             name: name.into(),
             kind: kind.into(),
             has_default,
+            default_is_none: false,
             annotation: None,
         }
     }
@@ -1428,6 +1487,19 @@ mod tests {
             name: name.into(),
             kind: kind.into(),
             has_default,
+            default_is_none: false,
+            annotation: Some(annotation.into()),
+        }
+    }
+
+    /// Like [`p_ann`] but marks the parameter's default as literally `None`
+    /// (the implicit-Optional idiom `x: int = None`).
+    fn p_ann_none(name: &str, kind: &str, annotation: &str) -> IntrospectedParam {
+        IntrospectedParam {
+            name: name.into(),
+            kind: kind.into(),
+            has_default: true,
+            default_is_none: true,
             annotation: Some(annotation.into()),
         }
     }
@@ -1662,6 +1734,45 @@ mod tests {
     }
 
     #[test]
+    fn implicit_optional_default_none_widens_param_to_nullable() {
+        // `def f(x: int = None, y: str = None)` — the bare-scalar annotations
+        // "lie" (None is valid). Both must widen to `T | None` so a `None`
+        // argument doesn't false-positive, while a genuinely wrong-typed arg
+        // still fails against the nullable form.
+        let params = vec![
+            p_ann_none("x", "positional_or_keyword", "int"),
+            p_ann_none("y", "keyword_only", "str"),
+        ];
+        let info = arity_info_from_params(&params, None).unwrap();
+        assert_eq!(
+            info.param_types,
+            vec![Type::Union(vec![Type::Int, Type::None])]
+        );
+        assert_eq!(
+            info.kwonly_types,
+            vec![Type::Union(vec![Type::Str, Type::None])]
+        );
+        // The same widening flows into a constructor field type.
+        let shape = class_shape_from_params(&params).unwrap();
+        assert_eq!(
+            shape.fields.get("x"),
+            Some(&Type::Union(vec![Type::Int, Type::None]))
+        );
+        // An already-Optional annotation with a None default isn't double-wrapped.
+        let opt = vec![p_ann_none("z", "positional_or_keyword", "Optional[int]")];
+        let info2 = arity_info_from_params(&opt, None).unwrap();
+        assert_eq!(
+            info2.param_types,
+            vec![Type::Union(vec![Type::Int, Type::None])]
+        );
+        // A param with a non-None default keeps its bare type (the widening is
+        // keyed on the default being literally `None`, not on having a default).
+        let non_none = vec![p_ann("w", "positional_or_keyword", true, "int")];
+        let info3 = arity_info_from_params(&non_none, None).unwrap();
+        assert_eq!(info3.param_types, vec![Type::Int]);
+    }
+
+    #[test]
     fn annotation_capture_populates_constructor_field_types() {
         // `class C: __init__(self, host: str, port: int)`
         let params = vec![
@@ -1893,6 +2004,73 @@ lazy import np = numpy
             invocations, 4,
             "expected 1 batched + 3 per-module fallback spawns; got {invocations} (log: {log:?})"
         );
+    }
+
+    #[test]
+    fn introspection_survives_a_member_that_raises_on_signature() {
+        // Regression: a module member that raises a NON-(TypeError|ValueError)
+        // from `inspect.signature` (the canonical case is a werkzeug
+        // `LocalProxy` re-exported at module scope — `flask.current_app` / `g`
+        // / `request` / `session`) used to crash the *entire* module's
+        // introspection, so Flask's constructors/functions all went unchecked.
+        // The embedded script must now skip the bad member and still recover
+        // the module's real classes/functions. Driven end-to-end against a
+        // real Python because the in-crate harness doesn't spawn the venv
+        // introspection itself.
+        let Some(python) = which_python3() else {
+            return; // no Python on PATH — nothing to verify here.
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        // A callable module-level value whose `__signature__` raises
+        // RuntimeError on access — exactly how a werkzeug LocalProxy behaves
+        // outside an application context — plus a genuine class we must still
+        // recover.
+        std::fs::write(
+            tmp.path().join("flaskish.py"),
+            "\
+class _Proxy:
+    def __call__(self):
+        return None
+    @property
+    def __signature__(self):
+        raise RuntimeError('Working outside of application context.')
+
+current_app = _Proxy()
+
+class App:
+    def __init__(self, import_name):
+        self.import_name = import_name
+",
+        )
+        .unwrap();
+        let result = introspect_batch_via_python(
+            &python,
+            tmp.path(),
+            std::slice::from_ref(&"flaskish".to_owned()),
+        )
+        .expect("introspection batch should succeed despite the raising member");
+        let module = result.get("flaskish").expect("flaskish module present");
+        // The proxy member must not have crashed the run: the real class is
+        // recovered with its required constructor parameter.
+        let app = module
+            .members
+            .iter()
+            .find(|m| m.name == "App")
+            .expect("App class recovered despite the raising proxy member");
+        assert_eq!(app.kind, "class");
+        let params = app.params.as_ref().expect("App __init__ params captured");
+        assert!(
+            params.iter().any(|p| p.name == "import_name"),
+            "App's required `import_name` param must be captured: {params:?}"
+        );
+        // And the shape conversion yields a checkable constructor.
+        let shapes = shapes_from_introspected(module);
+        let shape = shapes
+            .class_shapes
+            .get("App")
+            .expect("App shape built from introspection");
+        assert!(shape.field_order.contains(&"import_name".to_owned()));
+        assert!(!shape.field_defaults.contains("import_name"));
     }
 
     #[test]

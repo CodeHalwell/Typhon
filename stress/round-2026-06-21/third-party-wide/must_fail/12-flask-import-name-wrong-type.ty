@@ -1,0 +1,5 @@
+# flask.Flask(import_name: str) given int. expect tyc::type_mismatch (str vs int)
+import flask
+def main() -> None:
+    let app: flask.Flask = flask.Flask(12345)
+    print(app)

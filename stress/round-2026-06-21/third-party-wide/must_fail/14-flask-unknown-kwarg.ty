@@ -1,0 +1,5 @@
+# flask.Flask(nonexistent=1) — unknown kwarg. expect tyc::unknown_kwarg
+import flask
+def main() -> None:
+    let app: flask.Flask = flask.Flask("app", nonexistent_param=1)
+    print(app)

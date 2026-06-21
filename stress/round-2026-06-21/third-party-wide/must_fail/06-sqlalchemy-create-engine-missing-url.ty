@@ -1,0 +1,5 @@
+# sqlalchemy.create_engine(url) omitted. expect tyc::missing_argument (url)
+import sqlalchemy
+def main() -> None:
+    let e: sqlalchemy.Engine = sqlalchemy.create_engine()
+    print(e)

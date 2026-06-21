@@ -1,0 +1,5 @@
+# lxml 6.1.1 — dist 'lxml' -> import 'lxml'; C-extension; lenient.
+import lxml.etree
+def main() -> None:
+    let root = lxml.etree.Element("root")
+    print(root)

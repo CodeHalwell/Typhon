@@ -1,0 +1,5 @@
+# django.conf.Settings(settings_module) omitted, nested-attr form. expect tyc::missing_argument
+import django.conf
+def main() -> None:
+    let s: django.conf.Settings = django.conf.Settings()
+    print(s)

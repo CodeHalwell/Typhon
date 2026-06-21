@@ -1,0 +1,7 @@
+# anyio 4.14.0 — pure-Python; anyio.run introspectable.
+import anyio
+async def work() -> int:
+    return 1
+def main() -> None:
+    let r: int = anyio.run(work)
+    print(r)

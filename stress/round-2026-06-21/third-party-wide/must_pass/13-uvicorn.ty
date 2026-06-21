@@ -1,0 +1,6 @@
+# uvicorn 0.49.0 — pure-Python; Config(app) required.
+import uvicorn
+def main() -> None:
+    let cfg: uvicorn.Config = uvicorn.Config("main:app", port=8000)
+    let srv: uvicorn.Server = uvicorn.Server(cfg)
+    print(srv)
