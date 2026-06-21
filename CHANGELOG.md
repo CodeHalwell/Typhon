@@ -54,8 +54,17 @@ First batch toward the feature-complete `v1.0.0-alpha`. See
   (`def f[F[_]]`), non-class constructor application, constructor composition,
   and cross-module HKT arity propagation are deferred and degrade to prior
   behavior (no new false positives).
-
-### Alpha prep — milestone M3 (landing early): formatter robustness + perf gate
+- **Added — variance inference for user-declared generics (C2).** Each user
+  generic class's type parameters are now classified by usage: appearing only
+  in output positions (method return types, read-only `@property`) infers
+  covariant; only in input positions (method params, settable fields) infers
+  contravariant; appearing in both, behind a mutable container/field, or in any
+  unprovable position stays `Invariant` (the safe default). A covariant
+  `Producer[Dog]` now flows into a `Producer[Animal]` slot while an invariant
+  `Box[Dog]` still does not; the builtin variance table is unchanged. A bare
+  `@covariant` / `@contravariant` class decorator overrides inference.
+  Cross-module variance (carrying inferred variance through `ModuleShapes`) is
+  deferred and stays at the invariant default — sound, never unsound widening.
 
 - **Added — performance regression CI gate (F2).** `scripts/perf-gate.sh` times
   the full build pipeline over a real multi-module example, takes the median of

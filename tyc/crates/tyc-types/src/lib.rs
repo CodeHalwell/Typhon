@@ -2469,6 +2469,23 @@ struct Checker<'a> {
     /// and the HKT assignability relaxation, so the relaxation never leaks
     /// onto ordinary generics or abstract collection heads.
     hkt_param_names: std::collections::HashSet<String>,
+    /// Inferred variance of each user-declared generic class's type
+    /// parameters (C2). Positionally aligned with `class_type_params`:
+    /// `class_param_variance["Producer"][0]` is the variance of the first
+    /// type parameter of `class Producer[T]`. Populated by
+    /// [`infer_class_param_variance`] from how each parameter is used in
+    /// the class body — covariant when it only appears in OUTPUT positions
+    /// (method return types, read-only `@property` field types),
+    /// contravariant when it only appears in INPUT positions (method
+    /// parameter types, settable fields), and the safe `Invariant` default
+    /// when it appears in both, behind a mutable container/field, or in any
+    /// position whose own variance we can't prove. Consulted by
+    /// [`Checker::user_generic_param_variance`] from the generic-arm of
+    /// `is_assignable`, so a covariant `Producer[Dog]` flows into a
+    /// `Producer[Animal]` slot while an invariant `Box[Dog]` still does
+    /// not. Explicit `@covariant` / `@contravariant` class decorators, when
+    /// present, override the inferred result.
+    class_param_variance: HashMap<String, Vec<Variance>>,
     /// Classes declared with the `frozen` modifier (`class Foo frozen:`).
     /// Used to reject attribute writes to instances of these classes at
     /// check time — matches the runtime behaviour of the emitted
@@ -2789,6 +2806,7 @@ impl<'a> Checker<'a> {
             class_shapes: HashMap::new(),
             class_type_params: HashMap::new(),
             hkt_param_names: std::collections::HashSet::new(),
+            class_param_variance: HashMap::new(),
             frozen_classes: std::collections::HashSet::new(),
             class_parents: HashMap::new(),
             self_attrs: HashMap::new(),
@@ -3287,19 +3305,40 @@ impl<'a> Checker<'a> {
                     .iter()
                     .zip(bb)
                     .enumerate()
-                    .all(
-                        |(idx, (formal, actual_arg))| match generic_param_variance(an, idx) {
+                    .all(|(idx, (formal, actual_arg))| {
+                        match self.user_generic_param_variance(an, idx) {
                             Variance::Covariant => self.is_assignable(formal, actual_arg),
                             Variance::Contravariant => self.is_assignable(actual_arg, formal),
                             Variance::Invariant => {
                                 self.is_assignable(formal, actual_arg)
                                     && self.is_assignable(actual_arg, formal)
                             }
-                        },
-                    );
+                        }
+                    });
             }
         }
         false
+    }
+
+    /// Variance of the `idx`-th type parameter of the generic head `head`,
+    /// consulting the per-class inference (C2) for user-declared generics
+    /// before falling back to the built-in [`generic_param_variance`]
+    /// table.
+    ///
+    /// User generics take priority: `class Producer[T]` whose `T` only
+    /// flows out infers `Covariant` and stored in `class_param_variance`,
+    /// so `Producer[Dog]` flows into a `Producer[Animal]` slot. A built-in
+    /// head (`list`, `Sequence`, `Callable`, …) is never present in
+    /// `class_param_variance`, so its hand-written variance is unchanged.
+    /// Any head with no inference entry and no built-in rule stays
+    /// `Invariant` — the sound default.
+    fn user_generic_param_variance(&self, head: &str, idx: usize) -> Variance {
+        if let Some(vs) = self.class_param_variance.get(head) {
+            if let Some(v) = vs.get(idx) {
+                return *v;
+            }
+        }
+        generic_param_variance(head, idx)
     }
 
     /// If `ty` (or its head, for a generic application) names a transparent
@@ -6591,6 +6630,12 @@ fn collect_classes_and_functions(c: &mut Checker, body: &[Stmt]) {
                 // parameter is never applied like that.
                 let hkt = hkt_params_used_as_head(cd, &tps, &c.classes);
                 c.hkt_param_names.extend(hkt);
+                // C2: infer the variance of each type parameter from how it
+                // is used in the class body, then store it positionally so
+                // `is_assignable` can widen covariant / contravariant user
+                // generics while keeping the invariant default elsewhere.
+                let variances = infer_class_param_variance(cd, &tps, &classes);
+                c.class_param_variance.insert(name.clone(), variances);
                 c.class_type_params.insert(name, tps);
             }
         }
@@ -7342,6 +7387,261 @@ fn has_contextmanager_decorator(decorators: &[ruff_python_ast::Decorator]) -> bo
         };
         matches!(name, Some("contextmanager") | Some("asynccontextmanager"))
     })
+}
+
+/// Compose an outer position's variance with an inner type-parameter's
+/// declared variance — the standard variance algebra used to track sign
+/// through nested generic applications.
+///
+/// `outer` is the polarity of the position we are currently in
+/// (`Covariant` = output / positive, `Contravariant` = input / negative,
+/// `Invariant` = already forced invariant). `inner` is the variance of the
+/// argument slot we are about to descend into (`list[_]` is invariant,
+/// `Sequence[_]` covariant, `Callable[arg]` contravariant). The result is
+/// the effective polarity of a type parameter that appears inside that
+/// slot:
+///
+/// - through a covariant slot the sign is preserved,
+/// - through a contravariant slot the sign flips,
+/// - through an invariant slot (or once invariance is reached) the sign is
+///   pinned to `Invariant` — the parameter is then forced invariant no
+///   matter where else it appears.
+fn compose_variance(outer: Variance, inner: Variance) -> Variance {
+    match (outer, inner) {
+        (Variance::Invariant, _) | (_, Variance::Invariant) => Variance::Invariant,
+        (Variance::Covariant, v) => v,
+        (Variance::Contravariant, Variance::Covariant) => Variance::Contravariant,
+        (Variance::Contravariant, Variance::Contravariant) => Variance::Covariant,
+    }
+}
+
+/// Join two variance observations for the *same* type parameter seen at
+/// two different use sites. A parameter used only in output positions is
+/// covariant, only in input positions is contravariant, and in both (or in
+/// any invariant position) collapses to the sound `Invariant` default.
+fn join_variance(a: Variance, b: Variance) -> Variance {
+    if a == b {
+        a
+    } else {
+        Variance::Invariant
+    }
+}
+
+/// Record the variance contribution of every class type parameter that
+/// appears inside `ty`, given that `ty` itself sits at polarity `sign`
+/// (`Covariant` for an output position such as a return type, `Contravariant`
+/// for an input position such as a parameter type). Results are joined into
+/// `out`, keyed by type-parameter name.
+///
+/// The walk pushes `sign` through the structure using [`compose_variance`]:
+/// a `TypeVar(P)` leaf contributes `sign`; a generic argument contributes
+/// `compose(sign, variance_of_that_slot)`; function parameters flip to
+/// contravariant and the return stays covariant; union members stay at the
+/// current sign. Built-in slot variances come from [`generic_param_variance`],
+/// so an element behind a mutable `list[P]` / `dict[_, P]` is correctly
+/// forced invariant.
+fn collect_param_variance(
+    ty: &Type,
+    candidates: &std::collections::HashSet<&str>,
+    sign: Variance,
+    out: &mut HashMap<String, Variance>,
+) {
+    match ty {
+        Type::TypeVar(name) if candidates.contains(name.as_str()) => {
+            out.entry(name.clone())
+                .and_modify(|v| *v = join_variance(*v, sign))
+                .or_insert(sign);
+        }
+        Type::Generic(head, args) => {
+            for (idx, arg) in args.iter().enumerate() {
+                let slot = generic_param_variance(head, idx);
+                collect_param_variance(arg, candidates, compose_variance(sign, slot), out);
+            }
+        }
+        Type::Union(xs) => {
+            // Union membership is covariant — a `T | None` output flows out
+            // covariantly, an input flows in contravariantly — so the sign
+            // is preserved (compose with Covariant).
+            for x in xs {
+                collect_param_variance(x, candidates, sign, out);
+            }
+        }
+        Type::Function { params, ret, .. } => {
+            // Function params are contravariant, the return covariant.
+            for p in params {
+                collect_param_variance(
+                    p,
+                    candidates,
+                    compose_variance(sign, Variance::Contravariant),
+                    out,
+                );
+            }
+            collect_param_variance(ret, candidates, sign, out);
+        }
+        _ => {}
+    }
+}
+
+/// `true` when `f` carries a `@<name>.setter` decorator (the property-setter
+/// half of a getter/setter pair). Such a method takes the new value as its
+/// single non-receiver parameter, so the property's type appears in an
+/// INPUT position there.
+fn is_property_setter(f: &ruff_python_ast::StmtFunctionDef) -> bool {
+    f.decorator_list
+        .iter()
+        .any(|d| matches!(&d.expression, Expr::Attribute(a) if a.attr.as_str() == "setter"))
+}
+
+/// `true` when `f` is a read-only `@property` getter (`@property`,
+/// `@cached_property`, …). Its return type sits in an OUTPUT position; with
+/// no matching `@x.setter` the underlying field is read-only and may flow
+/// covariantly.
+fn is_property_getter(f: &ruff_python_ast::StmtFunctionDef) -> bool {
+    f.decorator_list.iter().any(|d| match &d.expression {
+        Expr::Name(n) => matches!(
+            n.id.as_str(),
+            "property" | "cached_property" | "_typhon_cached_property"
+        ),
+        Expr::Attribute(a) => matches!(a.attr.as_str(), "property" | "cached_property"),
+        _ => false,
+    })
+}
+
+/// Infer the variance of each PEP 695 type parameter of a generic class
+/// (C2). Returns a `Vec<Variance>` positionally aligned with `class_tps`.
+///
+/// Classification rules (conservative — `Invariant` wins ties):
+///
+/// - **Method return types** are OUTPUT positions → covariant contribution.
+/// - **Method parameter types** (excluding the receiver) are INPUT
+///   positions → contravariant contribution. Property *setters*
+///   (`@x.setter`) count their value parameter as input.
+/// - **`@property` getter** return types are OUTPUT positions (read-only
+///   field view) → covariant.
+/// - **Plain annotated fields** (`value: T`) are settable (the emitted
+///   dataclass exposes a mutable attribute), so they are treated as BOTH
+///   readable and writable → invariant. This is what keeps `class Box[T]:
+///   value: T` invariant.
+/// - A parameter reached **behind an invariant built-in slot** (a `list[T]`
+///   element, a `dict[T, _]` key, …) is forced invariant by the variance
+///   algebra in [`collect_param_variance`].
+/// - A parameter that appears in BOTH an output and an input position
+///   collapses to invariant via [`join_variance`].
+/// - A parameter that never appears in any classified position stays
+///   invariant — the safe default for phantom / unconstrained parameters.
+///
+/// An explicit `@covariant` / `@contravariant` class decorator (if the
+/// parser already tolerates it as a bare name decorator) overrides the
+/// inferred result for *every* parameter of the class — a cheap escape
+/// hatch that needs no new syntax.
+fn infer_class_param_variance(
+    cd: &ruff_python_ast::StmtClassDef,
+    class_tps: &[String],
+    classes: &[String],
+) -> Vec<Variance> {
+    let candidates: std::collections::HashSet<&str> =
+        class_tps.iter().map(|s| s.as_str()).collect();
+    let mut observed: HashMap<String, Variance> = HashMap::new();
+
+    for item in &cd.body {
+        match item {
+            Stmt::FunctionDef(f) => {
+                // Scope = class type params + this method's own type params
+                // so `def map[U](self, f: Callable[[T], U])` resolves `T`.
+                let mut scope = class_tps.to_vec();
+                scope.extend(type_param_names_from(f.type_params.as_deref()));
+
+                let is_static = f.decorator_list.iter().any(
+                    |d| matches!(&d.expression, Expr::Name(n) if n.id.as_str() == "staticmethod"),
+                );
+                let getter = is_property_getter(f);
+                let setter = is_property_setter(f);
+
+                // Parameters (inputs, contravariant). Skip the implicit
+                // receiver for non-static methods.
+                let mut params = f
+                    .parameters
+                    .posonlyargs
+                    .iter()
+                    .chain(f.parameters.args.iter())
+                    .chain(f.parameters.kwonlyargs.iter());
+                if !is_static {
+                    params.next();
+                }
+                for pwd in params {
+                    if let Some(ann) = &pwd.parameter.annotation {
+                        let t = type_from_annotation_with_params(ann, classes, &scope);
+                        collect_param_variance(
+                            &t,
+                            &candidates,
+                            Variance::Contravariant,
+                            &mut observed,
+                        );
+                    }
+                }
+                // Return type (output, covariant). A property getter's
+                // return is the read-only field view; a normal method's
+                // return is likewise an output. Either way: covariant.
+                let _ = (getter, setter);
+                if let Some(r) = f.returns.as_deref() {
+                    let t = type_from_annotation_with_params(r, classes, &scope);
+                    collect_param_variance(&t, &candidates, Variance::Covariant, &mut observed);
+                }
+            }
+            Stmt::AnnAssign(ann) => {
+                // A plain annotated field is settable on the emitted
+                // dataclass, so the parameter is both read and written →
+                // invariant. Feed it through at `Invariant` so any mention
+                // pins the parameter.
+                let t = type_from_annotation_with_params(&ann.annotation, classes, class_tps);
+                collect_param_variance(&t, &candidates, Variance::Invariant, &mut observed);
+            }
+            _ => {}
+        }
+    }
+
+    // Optional explicit override via a bare `@covariant` / `@contravariant`
+    // class decorator. Honoured only if the parser already produced it as a
+    // decorator — no new syntax is introduced. Applies to every parameter.
+    let forced = explicit_variance_override(&cd.decorator_list);
+
+    class_tps
+        .iter()
+        .map(|tp| {
+            if let Some(v) = forced {
+                v
+            } else {
+                // Unobserved parameters default to the sound `Invariant`.
+                observed.get(tp).copied().unwrap_or(Variance::Invariant)
+            }
+        })
+        .collect()
+}
+
+/// Recognise an explicit, whole-class variance override expressed as a bare
+/// `@covariant` / `@contravariant` decorator. Returns `None` when neither is
+/// present (the common case — inference then decides). This is the cheap
+/// escape hatch: it reuses the existing decorator syntax the parser already
+/// accepts, so it needs no grammar change. A class carrying both is treated
+/// as `Invariant` (contradictory request → safe default).
+fn explicit_variance_override(decorators: &[ruff_python_ast::Decorator]) -> Option<Variance> {
+    let mut co = false;
+    let mut contra = false;
+    for d in decorators {
+        if let Expr::Name(n) = &d.expression {
+            match n.id.as_str() {
+                "covariant" => co = true,
+                "contravariant" => contra = true,
+                _ => {}
+            }
+        }
+    }
+    match (co, contra) {
+        (true, false) => Some(Variance::Covariant),
+        (false, true) => Some(Variance::Contravariant),
+        (true, true) => Some(Variance::Invariant),
+        (false, false) => None,
+    }
 }
 
 /// Walk a class body and record its methods and annotated fields into an
@@ -22851,6 +23151,321 @@ def main() -> None:
                 .iter()
                 .any(|e| matches!(e, TycError::TypeMismatch { .. })),
             "covariant Callable param must be rejected; got {:?}",
+            d.errors()
+        );
+    }
+
+    // ── C2: user-generic variance inference tests ────────────────────────
+
+    /// Parse `src`, take its first `class` declaration, and run the C2
+    /// inference pass over it. Returns the per-type-parameter variance
+    /// vector positionally aligned with the class's declared parameters.
+    fn infer_variance_of_first_class(src: &str) -> Vec<Variance> {
+        let prep = preprocess(src);
+        let module = tyc_syntax::parse_module(&prep.python_source)
+            .unwrap()
+            .into_syntax();
+        let classes: Vec<String> = module
+            .body
+            .iter()
+            .filter_map(|s| match s {
+                Stmt::ClassDef(cd) => Some(cd.name.as_str().to_owned()),
+                _ => None,
+            })
+            .collect();
+        let cd = module
+            .body
+            .iter()
+            .find_map(|s| match s {
+                Stmt::ClassDef(cd) => Some(cd),
+                _ => None,
+            })
+            .expect("a class declaration");
+        let tps = type_param_names_from(cd.type_params.as_deref());
+        infer_class_param_variance(cd, &tps, &classes)
+    }
+
+    #[test]
+    fn variance_algebra_compose_and_join() {
+        // Composition: contravariant ∘ contravariant flips back to
+        // covariant; anything through an invariant slot is invariant.
+        assert_eq!(
+            compose_variance(Variance::Covariant, Variance::Covariant),
+            Variance::Covariant
+        );
+        assert_eq!(
+            compose_variance(Variance::Contravariant, Variance::Contravariant),
+            Variance::Covariant
+        );
+        assert_eq!(
+            compose_variance(Variance::Contravariant, Variance::Covariant),
+            Variance::Contravariant
+        );
+        assert_eq!(
+            compose_variance(Variance::Covariant, Variance::Invariant),
+            Variance::Invariant
+        );
+        // Join: same direction sticks, opposite directions collapse to
+        // invariant.
+        assert_eq!(
+            join_variance(Variance::Covariant, Variance::Covariant),
+            Variance::Covariant
+        );
+        assert_eq!(
+            join_variance(Variance::Covariant, Variance::Contravariant),
+            Variance::Invariant
+        );
+    }
+
+    #[test]
+    fn infers_covariant_for_output_only_param() {
+        // `T` only ever flows OUT (a method return) → covariant.
+        let v = infer_variance_of_first_class(
+            "\
+class Producer[T]:
+    def get(self) -> T:
+        ...
+",
+        );
+        assert_eq!(v, vec![Variance::Covariant]);
+    }
+
+    #[test]
+    fn infers_contravariant_for_input_only_param() {
+        // `T` only ever flows IN (a method parameter) → contravariant.
+        let v = infer_variance_of_first_class(
+            "\
+class Consumer[T]:
+    def accept(self, item: T) -> None:
+        ...
+",
+        );
+        assert_eq!(v, vec![Variance::Contravariant]);
+    }
+
+    #[test]
+    fn infers_invariant_for_param_used_in_both_positions() {
+        // `T` flows both in (parameter) and out (return) → invariant.
+        let v = infer_variance_of_first_class(
+            "\
+class Channel[T]:
+    def put(self, item: T) -> None:
+        ...
+    def take(self) -> T:
+        ...
+",
+        );
+        assert_eq!(v, vec![Variance::Invariant]);
+    }
+
+    #[test]
+    fn infers_invariant_for_settable_field() {
+        // A plain annotated field is settable on the emitted dataclass →
+        // invariant. This is exactly why `Box[T]` must stay invariant.
+        let v = infer_variance_of_first_class(
+            "\
+class Box[T]:
+    value: T
+",
+        );
+        assert_eq!(v, vec![Variance::Invariant]);
+    }
+
+    #[test]
+    fn infers_invariant_behind_mutable_list_field() {
+        // `T` appears only in a method return, but BEHIND a mutable
+        // `list[T]` — the list element slot is invariant, so the whole
+        // parameter is forced invariant even though the position is output.
+        let v = infer_variance_of_first_class(
+            "\
+class Bag[T]:
+    def items(self) -> list[T]:
+        ...
+",
+        );
+        assert_eq!(v, vec![Variance::Invariant]);
+    }
+
+    #[test]
+    fn infers_covariant_behind_sequence_return() {
+        // A read-only `Sequence[T]` element slot is covariant, so an
+        // output-position `Sequence[T]` keeps `T` covariant.
+        let v = infer_variance_of_first_class(
+            "\
+class Source[T]:
+    def items(self) -> Sequence[T]:
+        ...
+",
+        );
+        assert_eq!(v, vec![Variance::Covariant]);
+    }
+
+    #[test]
+    fn unused_param_defaults_to_invariant() {
+        // A phantom parameter that never appears in a classified position
+        // stays invariant — the sound default.
+        let v = infer_variance_of_first_class(
+            "\
+class Phantom[T]:
+    def noop(self) -> None:
+        ...
+",
+        );
+        assert_eq!(v, vec![Variance::Invariant]);
+    }
+
+    #[test]
+    fn explicit_covariant_decorator_overrides_inference() {
+        // `@covariant` forces covariance even though `T` is used as an
+        // input (which would otherwise infer contravariant).
+        let v = infer_variance_of_first_class(
+            "\
+@covariant
+class Forced[T]:
+    def accept(self, item: T) -> None:
+        ...
+",
+        );
+        assert_eq!(v, vec![Variance::Covariant]);
+    }
+
+    #[test]
+    fn covariant_user_generic_accepts_upcast() {
+        // End-to-end: a covariant `Producer[Dog]` flows into a
+        // `Producer[Animal]` slot.
+        let src = "\
+class Animal:
+    name: str
+class Dog(Animal):
+    name: str
+class Producer[T]:
+    def get(self) -> T:
+        ...
+def use_animals(p: Producer[Animal]) -> None:
+    ...
+def main(dogs: Producer[Dog]) -> None:
+    use_animals(dogs)
+";
+        let d = check(src);
+        assert!(
+            !d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::TypeMismatch { .. })),
+            "covariant Producer[Dog] -> Producer[Animal] must be accepted; got {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn contravariant_user_generic_accepts_reversed_assignment() {
+        // A contravariant `Consumer[Animal]` flows into a `Consumer[Dog]`
+        // slot — the reversed (sound) direction.
+        let src = "\
+class Animal:
+    name: str
+class Dog(Animal):
+    name: str
+class Consumer[T]:
+    def accept(self, item: T) -> None:
+        ...
+def needs_dog_consumer(c: Consumer[Dog]) -> None:
+    ...
+def main(any_consumer: Consumer[Animal]) -> None:
+    needs_dog_consumer(any_consumer)
+";
+        let d = check(src);
+        assert!(
+            !d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::TypeMismatch { .. })),
+            "contravariant Consumer[Animal] -> Consumer[Dog] must be accepted; got {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn invariant_user_generic_rejects_upcast() {
+        // `Box[T]` has a settable field `value: T`, so it is invariant: a
+        // `Box[Dog]` must NOT flow into a `Box[Animal]` slot.
+        let src = "\
+class Animal:
+    name: str
+class Dog(Animal):
+    name: str
+class Box[T]:
+    value: T
+def use_animal_box(b: Box[Animal]) -> None:
+    ...
+def main(dog_box: Box[Dog]) -> None:
+    use_animal_box(dog_box)
+";
+        let d = check(src);
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::TypeMismatch { .. })),
+            "invariant Box[Dog] -> Box[Animal] must be rejected; got {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn covariant_user_generic_still_rejects_downcast() {
+        // Soundness floor: even a covariant `Producer` must reject the
+        // WRONG direction — `Producer[Animal]` does not flow into a
+        // `Producer[Dog]` slot.
+        let src = "\
+class Animal:
+    name: str
+class Dog(Animal):
+    name: str
+class Producer[T]:
+    def get(self) -> T:
+        ...
+def needs_dog_producer(p: Producer[Dog]) -> None:
+    ...
+def main(animals: Producer[Animal]) -> None:
+    needs_dog_producer(animals)
+";
+        let d = check(src);
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::TypeMismatch { .. })),
+            "covariant Producer[Animal] -> Producer[Dog] must still be rejected; got {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn builtin_container_variance_unchanged_by_user_inference() {
+        // The C2 inference must not perturb built-in heads: mutable `list`
+        // stays invariant, read-only `Sequence` stays covariant, and the
+        // user-aware lookup falls back to the built-in table for them.
+        assert_eq!(generic_param_variance("list", 0), Variance::Invariant);
+        assert_eq!(generic_param_variance("Sequence", 0), Variance::Covariant);
+        assert_eq!(
+            generic_param_variance("Callable", 0),
+            Variance::Contravariant
+        );
+        assert_eq!(generic_param_variance("Callable", 1), Variance::Covariant);
+        // A mutable `list[Dog]` must still NOT flow into `list[Animal]`.
+        let src = "\
+class Animal:
+    name: str
+class Dog(Animal):
+    name: str
+def use_animals(xs: list[Animal]) -> None:
+    ...
+def main(dogs: list[Dog]) -> None:
+    use_animals(dogs)
+";
+        let d = check(src);
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::TypeMismatch { .. })),
+            "list invariance must be preserved (list[Dog] -/-> list[Animal]); got {:?}",
             d.errors()
         );
     }
