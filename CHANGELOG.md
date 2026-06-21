@@ -55,7 +55,14 @@ First batch toward the feature-complete `v1.0.0-alpha`. See
   and cross-module HKT arity propagation are deferred and degrade to prior
   behavior (no new false positives).
 
-### Alpha prep — milestone M3 (landing early): formatter robustness
+### Alpha prep — milestone M3 (landing early): formatter robustness + perf gate
+
+- **Added — performance regression CI gate (F2).** `scripts/perf-gate.sh` times
+  the full build pipeline over a real multi-module example, takes the median of
+  9 runs (after 2 warmups), and fails CI when it exceeds the committed
+  `perf-baseline.json` by >20%. Methodology and re-baselining are documented in
+  `docs/performance-baseline.md`. Designed to be non-flaky (median, warmup,
+  generous threshold) and dependency-light (bash + python3 + jq, no network).
 
 - **Fixed — `tyc fmt` is now idempotent and semantics-preserving (E2).** Two
   source-corrupting bugs are fixed: `extend BUILTIN:` (e.g. `extend str:`) was

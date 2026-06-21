@@ -90,3 +90,86 @@ Once resolve and type-check are migrated to Salsa tracked queries, the
    `chore: update performance baseline (YYYY-MM-DD)`.
 5. Do not baseline on a machine under unusually high load; Criterion
    measures wall time and background processes inflate results.
+
+---
+
+## CI-enforced build-pipeline regression gate (alpha-plan F2)
+
+The Criterion suites above measure individual passes in microseconds and serve
+as a *review aid*. Separately, CI runs an automated gate over the **whole
+`tyc build` pipeline** — preprocess → parse → check → comptime → desugar →
+emit → format — and **fails the build** when it regresses beyond a threshold.
+
+### What it measures
+
+`scripts/perf-gate.sh` times the release binary running:
+
+```bash
+tyc build examples/47-mini-app --no-sync --check
+```
+
+- **Fixed corpus:** `examples/47-mini-app` — a real, self-contained ~356-line
+  Typhon project (multiple modules, classes, async/gather, `Result`, nullable
+  signatures) that exercises every pipeline stage.
+- **Network-free & non-destructive:** `--no-sync` skips `uv sync` (no network);
+  `--check` runs the full pipeline as a dry run without writing output.
+- **Median of N runs** (default 9, after 2 untimed warmup runs) to absorb
+  runner noise. The median ignores the occasional slow outlier that a mean
+  would let through.
+
+The script depends only on `bash`, `python3`, and `jq` (all present on
+`ubuntu-latest`) and adds **no Rust build targets or crate dependencies**, so it
+stays disjoint from compiler work.
+
+### Pass / fail decision
+
+The committed baseline lives in `perf-baseline.json` at the repo root:
+
+```json
+{ "median_ms": 89, "corpus": "examples/47-mini-app", "threshold": 0.20, ... }
+```
+
+The gate computes `limit = median_ms * (1 + threshold)` and **fails (exit 1)**
+when the measured median exceeds that limit. With the default 20 % threshold and
+an 89 ms baseline, builds slower than ~107 ms fail. Anything at or under the
+limit passes.
+
+### Threshold rationale and false-failure tradeoff
+
+CI runners are noisy, so a tight gate would flake. The design minimises false
+failures three ways: (1) take a **median**, not a single sample or a mean;
+(2) use a **generous 20 % threshold** — small, legitimate drifts pass; (3) run
+**warmup iterations** first so cold caches don't count. In practice the local
+median spread is ~1–3 ms (88–90 ms) and even a noisy run staying under +20 %
+passes, so the gate only trips on a **large, sustained regression** — which is
+exactly what F2 asks for. The cost of this choice is that a *small* genuine
+regression (say +10 %) slips through; that is an intentional trade for a
+trustworthy, non-flaky hard gate.
+
+### Running it locally
+
+```bash
+# build the release binary first
+(cd tyc && cargo build --release --bin tyc)
+
+# gate against the committed baseline (exit 1 on regression)
+scripts/perf-gate.sh
+
+# refresh the baseline after an intentional, justified change
+scripts/perf-gate.sh --update     # measures, then rewrites perf-baseline.json
+```
+
+Useful env overrides: `PERF_RUNS`, `PERF_WARMUP`, `PERF_THRESHOLD` (fraction,
+e.g. `0.20`), `PERF_BASELINE` (path), `TYC_BIN` (binary path).
+
+### Refreshing the baseline
+
+Only refresh for an **intentional** change that legitimately moves the number
+(a new pass, a larger corpus, a deliberate trade-off). On a quiet machine:
+
+1. `(cd tyc && cargo build --release --bin tyc)`
+2. `scripts/perf-gate.sh --update`
+3. Commit `perf-baseline.json` with a message noting *why* the baseline moved.
+
+The CI runner is slower than a typical laptop, so the committed number is a
+conservative upper bound; expect local runs to be faster.
