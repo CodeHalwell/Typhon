@@ -350,8 +350,8 @@ fn write_typhon_pdb_wrapper(
     breakpoint_cmds: &[String],
 ) -> std::io::Result<tempfile::NamedTempFile> {
     use std::io::Write;
-    let entry_str = entry.display().to_string();
-    let map_dir = out_dir.display().to_string();
+    let entry_str = entry.to_string_lossy().into_owned();
+    let map_dir = out_dir.to_string_lossy().into_owned();
     // Quoting strategy: emit each path as a Python double-quoted
     // string literal via Rust's `{:?}` formatter. Rust's debug
     // format escapes `\` and `"` per the Rust string spec, which
