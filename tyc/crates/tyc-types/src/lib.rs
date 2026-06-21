@@ -1800,6 +1800,100 @@ fn bind_typevars(
     actual: &Type,
     bindings: &mut std::collections::HashMap<String, Type>,
 ) {
+    bind_typevars_with_ctors(formal, actual, bindings, &std::collections::HashSet::new());
+}
+
+/// Outcome of an ill-kinded higher-kinded application discovered while
+/// binding a type-constructor variable (e.g. `F` in `F[A]`) against a
+/// concrete constructor application (e.g. `list[int]`). Surfaced so the
+/// call-site checker can emit a `tyc::kind_mismatch` diagnostic instead of
+/// silently degrading to `Unknown`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KindError {
+    /// A constructor variable was applied to a different number of
+    /// arguments than the matching actual constructor supplies.
+    /// `F[A, B]` against `list[int]` →
+    /// `Arity { ctor: "F", expected: 2, actual: 1 }`.
+    Arity {
+        ctor: String,
+        expected: usize,
+        actual: usize,
+    },
+    /// A constructor variable was bound to two different concrete
+    /// constructors within the same call. `F` bound to both `list` and
+    /// `set` → `Conflict { ctor: "F", first: "list", second: "set" }`.
+    Conflict {
+        ctor: String,
+        first: String,
+        second: String,
+    },
+}
+
+/// Like [`bind_typevars`], but `ctor_vars` names the set of higher-kinded
+/// type-constructor variables in scope (e.g. `{"F"}` for a signature
+/// declared under `class Functor[F[_]]`). When a formal `Generic(F, [..])`
+/// whose head is in `ctor_vars` is matched against a concrete
+/// `Generic(list, [..])`, the head `F` is bound to `Class(list)` and the
+/// arguments are unified positionally — this is what makes `fmap` over a
+/// `list[int]` infer `F → list` and `A → int`.
+fn bind_typevars_with_ctors(
+    formal: &Type,
+    actual: &Type,
+    bindings: &mut std::collections::HashMap<String, Type>,
+    ctor_vars: &std::collections::HashSet<String>,
+) {
+    let _ = bind_typevars_checked(formal, actual, bindings, ctor_vars);
+}
+
+/// Core binding walk. Returns `Err(KindError)` on the first ill-kinded
+/// higher-kinded application encountered so callers that care (the
+/// call-site checker) can diagnose it; callers that don't simply discard
+/// the result and get today's permissive behaviour.
+fn bind_typevars_checked(
+    formal: &Type,
+    actual: &Type,
+    bindings: &mut std::collections::HashMap<String, Type>,
+    ctor_vars: &std::collections::HashSet<String>,
+) -> Result<(), KindError> {
+    // Higher-kinded application: formal `F[A...]` (a `Generic` whose head
+    // is a constructor variable) against a concrete `head[...]`. Bind
+    // `F → Class(head)` and unify the arguments pairwise. Handled before
+    // the generic-equal-head arm below so a constructor variable never
+    // collides with a real same-named class — the caller that builds
+    // `ctor_vars` keeps those names disjoint from known classes.
+    if let (Type::Generic(fh, fa), Type::Generic(ah, aa)) = (formal, actual) {
+        if ctor_vars.contains(fh) && fh != ah {
+            // Kind (arity) check: the constructor variable is applied to
+            // `fa.len()` arguments here; the concrete actual supplies
+            // `aa.len()`. A mismatch is an ill-kinded application.
+            if fa.len() != aa.len() {
+                return Err(KindError::Arity {
+                    ctor: fh.clone(),
+                    expected: fa.len(),
+                    actual: aa.len(),
+                });
+            }
+            // Bind (or check) the constructor head. Binding `F` to two
+            // different concrete constructors in one call is a conflict.
+            match bindings.get(fh) {
+                Some(Type::Class(prev)) if prev != ah => {
+                    return Err(KindError::Conflict {
+                        ctor: fh.clone(),
+                        first: prev.clone(),
+                        second: ah.clone(),
+                    });
+                }
+                Some(_) => {}
+                None => {
+                    bindings.insert(fh.clone(), Type::Class(ah.clone()));
+                }
+            }
+            for (f, a) in fa.iter().zip(aa) {
+                bind_typevars_checked(f, a, bindings, ctor_vars)?;
+            }
+            return Ok(());
+        }
+    }
     match (formal, actual) {
         (Type::TypeVar(name), other) => {
             // Suppress self-bindings (`T → T`): they're uninformative and,
@@ -1811,7 +1905,7 @@ fn bind_typevars(
             // forward pass would otherwise insert `T → T`).
             if let Type::TypeVar(other_name) = other {
                 if other_name == name {
-                    return;
+                    return Ok(());
                 }
             }
             if let Some(existing) = bindings.get(name).cloned() {
@@ -1824,16 +1918,35 @@ fn bind_typevars(
         }
         (Type::Generic(fh, fa), Type::Generic(ah, aa)) if fh == ah && fa.len() == aa.len() => {
             for (f, a) in fa.iter().zip(aa) {
-                bind_typevars(f, a, bindings);
+                bind_typevars_checked(f, a, bindings, ctor_vars)?;
             }
         }
-        // Higher-kinded type constructor binding: treat `F[_]` as a type variable
-        // that should unify with the actual type constructor head.
-        // E.g. `F[_]` against `list[int]` could bind `F → list`.
-        (Type::TypeConstructor(name, _arity), Type::Generic(head, _args)) => {
-            // For now, we bind the constructor name to the generic head.
-            // A complete implementation would validate arity matches.
-            bindings.insert(name.clone(), Type::Class(head.clone()));
+        // Higher-kinded type constructor binding: treat a bare `F[_]`
+        // (parsed as `Type::TypeConstructor`) as a type variable that
+        // should unify with the actual type constructor head.
+        // E.g. `F[_]` against `list[int]` binds `F → list`. Arity is
+        // validated so applying a 2-ary constructor to a 1-ary actual
+        // (or vice versa) is reported rather than silently accepted.
+        (Type::TypeConstructor(name, arity), Type::Generic(head, args)) => {
+            if *arity != args.len() {
+                return Err(KindError::Arity {
+                    ctor: name.clone(),
+                    expected: *arity,
+                    actual: args.len(),
+                });
+            }
+            match bindings.get(name) {
+                Some(Type::Class(prev)) if prev != head => {
+                    return Err(KindError::Conflict {
+                        ctor: name.clone(),
+                        first: prev.clone(),
+                        second: head.clone(),
+                    });
+                }
+                _ => {
+                    bindings.insert(name.clone(), Type::Class(head.clone()));
+                }
+            }
         }
         (
             Type::Function {
@@ -1848,9 +1961,9 @@ fn bind_typevars(
             },
         ) if fp.len() == ap.len() => {
             for (f, a) in fp.iter().zip(ap) {
-                bind_typevars(f, a, bindings);
+                bind_typevars_checked(f, a, bindings, ctor_vars)?;
             }
-            bind_typevars(fr, ar, bindings);
+            bind_typevars_checked(fr, ar, bindings, ctor_vars)?;
         }
         // `Optional[T]` (formal `T | None`) against a concrete actual:
         // narrow each formal variant against the non-None portion of
@@ -1861,7 +1974,7 @@ fn bind_typevars(
                 if matches!(variant, Type::None) {
                     continue;
                 }
-                bind_typevars(variant, &actual_stripped, bindings);
+                bind_typevars_checked(variant, &actual_stripped, bindings, ctor_vars)?;
             }
         }
         // Formal contains a TypeVar but actual is a Union — bind each
@@ -1869,11 +1982,12 @@ fn bind_typevars(
         // full set (e.g. `list[T]` against `list[int] | list[str]`).
         (f, Type::Union(av)) if !collect_typevar_positions(f).is_empty() => {
             for variant in av {
-                bind_typevars(f, variant, bindings);
+                bind_typevars_checked(f, variant, bindings, ctor_vars)?;
             }
         }
         _ => {}
     }
+    Ok(())
 }
 
 /// Substitute every `TypeVar` in `ty` whose name appears in `bindings`
@@ -2024,6 +2138,101 @@ pub fn compute_bidirectional_bindings(
         }
     }
     bindings
+}
+
+/// Higher-kinded variant of [`bind_typevars_and_substitute_bidirectional`].
+/// `ctor_vars` names the type-constructor variables in scope for this
+/// signature (e.g. `{"F"}` under `class Functor[F[_]]`). When non-empty,
+/// formals shaped `F[A]` unify against concrete `list[int]` applications,
+/// binding `F → list` and `A → int` and substituting both through the
+/// return type so `-> F[B]` yields `list[B]`. Any ill-kinded application
+/// (wrong arity, or `F` bound to two different constructors) is returned in
+/// the `Vec<KindError>` so the caller can diagnose it; the substitution is
+/// still produced on a best-effort basis.
+pub fn bind_typevars_and_substitute_hkt(
+    formal_params: &[Type],
+    actual_args: &[Type],
+    return_type: &Type,
+    expected_return: Option<&Type>,
+    ctor_vars: &std::collections::HashSet<String>,
+) -> (Type, Vec<KindError>) {
+    let (bindings, errors) = compute_bidirectional_bindings_hkt(
+        formal_params,
+        actual_args,
+        return_type,
+        expected_return,
+        ctor_vars,
+    );
+    (substitute_typevars(return_type, &bindings), errors)
+}
+
+/// Higher-kinded variant of [`compute_bidirectional_bindings`]. Identical
+/// behaviour when `ctor_vars` is empty (the common, non-HKT case); when
+/// non-empty it additionally binds type-constructor variables and collects
+/// any [`KindError`] encountered during the forward pass.
+pub fn compute_bidirectional_bindings_hkt(
+    formal_params: &[Type],
+    actual_args: &[Type],
+    return_type: &Type,
+    expected_return: Option<&Type>,
+    ctor_vars: &std::collections::HashSet<String>,
+) -> (std::collections::HashMap<String, Type>, Vec<KindError>) {
+    let mut bindings: std::collections::HashMap<String, Type> = std::collections::HashMap::new();
+    let mut errors: Vec<KindError> = Vec::new();
+    // Skip work when no formal mentions a TypeVar or constructor variable.
+    let has_typevar = formal_params
+        .iter()
+        .chain(std::iter::once(return_type))
+        .any(|t| {
+            let mut tmp = Vec::new();
+            walk_typevars(t, &mut tmp);
+            !tmp.is_empty()
+        });
+    let mentions_ctor = !ctor_vars.is_empty()
+        && formal_params
+            .iter()
+            .chain(std::iter::once(return_type))
+            .any(|t| type_mentions_ctor_head(t, ctor_vars));
+    if !has_typevar && !mentions_ctor {
+        return (bindings, errors);
+    }
+    for (formal, actual) in formal_params.iter().zip(actual_args.iter()) {
+        if let Err(e) = bind_typevars_checked(formal, actual, &mut bindings, ctor_vars) {
+            errors.push(e);
+        }
+    }
+    if let Some(expected) = expected_return {
+        let mut return_tvs = Vec::new();
+        walk_typevars(return_type, &mut return_tvs);
+        let any_unbound = return_tvs.iter().any(|n| !bindings.contains_key(n));
+        if any_unbound {
+            let mut backward: std::collections::HashMap<String, Type> =
+                std::collections::HashMap::new();
+            bind_typevars_with_ctors(return_type, expected, &mut backward, ctor_vars);
+            for (name, ty) in backward {
+                bindings.entry(name).or_insert(ty);
+            }
+        }
+    }
+    (bindings, errors)
+}
+
+/// `true` if `ty` mentions any name in `ctor_vars` as a `Generic` head
+/// (an applied constructor variable such as `F` in `F[A]`) or as a bare
+/// `TypeConstructor`. Used to decide whether HKT binding work is needed.
+fn type_mentions_ctor_head(ty: &Type, ctor_vars: &std::collections::HashSet<String>) -> bool {
+    match ty {
+        Type::Generic(head, args) => {
+            ctor_vars.contains(head) || args.iter().any(|a| type_mentions_ctor_head(a, ctor_vars))
+        }
+        Type::TypeConstructor(name, _) => ctor_vars.contains(name),
+        Type::Union(xs) => xs.iter().any(|x| type_mentions_ctor_head(x, ctor_vars)),
+        Type::Function { params, ret, .. } => {
+            params.iter().any(|p| type_mentions_ctor_head(p, ctor_vars))
+                || type_mentions_ctor_head(ret, ctor_vars)
+        }
+        _ => false,
+    }
 }
 
 /// Used by tests in lower layers (resolver, db) that want to enumerate
@@ -2250,6 +2459,16 @@ struct Checker<'a> {
     /// `Type::Generic("Box", [Int])` rather than `Type::Class("Box")`
     /// (FINDINGS #46).
     class_type_params: HashMap<String, Vec<String>>,
+    /// Higher-kinded type-constructor *variable* names — PEP-695 type
+    /// parameters declared with the `F[_]` kind marker (e.g. `F` in
+    /// `class Functor[F[_]]`). The marker is stripped by preprocess before
+    /// the checker runs, so these are recovered structurally: a class type
+    /// parameter that is used as a `Generic` head (`fa: F[A]`) in any of its
+    /// method/field signatures is a constructor variable. Consulted by
+    /// `is_ctor_var_name` to gate HKT unification (`bind_typevars_*_hkt`)
+    /// and the HKT assignability relaxation, so the relaxation never leaks
+    /// onto ordinary generics or abstract collection heads.
+    hkt_param_names: std::collections::HashSet<String>,
     /// Classes declared with the `frozen` modifier (`class Foo frozen:`).
     /// Used to reject attribute writes to instances of these classes at
     /// check time — matches the runtime behaviour of the emitted
@@ -2569,6 +2788,7 @@ impl<'a> Checker<'a> {
             interfaces: HashMap::new(),
             class_shapes: HashMap::new(),
             class_type_params: HashMap::new(),
+            hkt_param_names: std::collections::HashSet::new(),
             frozen_classes: std::collections::HashSet::new(),
             class_parents: HashMap::new(),
             self_attrs: HashMap::new(),
@@ -2660,6 +2880,31 @@ impl<'a> Checker<'a> {
     fn is_assignable(&self, expected: &Type, actual: &Type) -> bool {
         if assignable(expected, actual) {
             return true;
+        }
+        // Higher-kinded positions are unbound until call-site inference
+        // binds them. A formal `F[A]` (a `Generic` whose head is a
+        // constructor variable) or a bare `F[_]` (`Type::TypeConstructor`)
+        // behaves like a `TypeVar` here: permissive in both directions, so
+        // passing a concrete `list[int]` to an `F[A]` parameter is accepted
+        // and the real well-kindedness check happens in the unifier
+        // (`bind_typevars_and_substitute_hkt`), which emits
+        // `tyc::kind_mismatch` on a genuine arity/conflict error. This only
+        // *relaxes* assignability for names that aren't concrete types, so
+        // it can't turn previously-accepted code into a mismatch.
+        if matches!(expected, Type::TypeConstructor(..))
+            || matches!(actual, Type::TypeConstructor(..))
+        {
+            return true;
+        }
+        if let Type::Generic(head, _) = expected {
+            if self.is_ctor_var_name(head) {
+                return true;
+            }
+        }
+        if let Type::Generic(head, _) = actual {
+            if self.is_ctor_var_name(head) {
+                return true;
+            }
         }
         // Qualified ↔ bare class identity. A module names its own classes
         // bare in function / method signatures (`def get(...) -> Response`,
@@ -4112,6 +4357,124 @@ impl<'a> Checker<'a> {
                     );
                 }
             }
+        }
+    }
+
+    /// Collect the set of higher-kinded type-constructor *variable* names
+    /// referenced by a callee signature. A name `N` is a constructor
+    /// variable iff it is used as a `Generic(N, [..])` head (an applied
+    /// constructor, e.g. `F` in `F[A]`) or as a bare `Type::TypeConstructor`
+    /// **and** it is not a concrete type the checker already knows about
+    /// (a builtin generic head like `list`, or a declared / imported
+    /// class). This keeps the HKT binding path strictly additive: real
+    /// generic classes (`Box[T]`) and builtins (`list[int]`) are never
+    /// treated as constructor variables, so the unifier's behaviour for
+    /// existing code is unchanged.
+    fn collect_ctor_vars(
+        &self,
+        formal_params: &[Type],
+        return_type: &Type,
+    ) -> std::collections::HashSet<String> {
+        let mut out = std::collections::HashSet::new();
+        for t in formal_params.iter().chain(std::iter::once(return_type)) {
+            self.collect_ctor_vars_in(t, &mut out);
+        }
+        out
+    }
+
+    fn collect_ctor_vars_in(&self, ty: &Type, out: &mut std::collections::HashSet<String>) {
+        match ty {
+            Type::Generic(head, args) => {
+                if self.is_ctor_var_name(head) {
+                    out.insert(head.clone());
+                }
+                for a in args {
+                    self.collect_ctor_vars_in(a, out);
+                }
+            }
+            Type::TypeConstructor(name, _) => {
+                if self.is_ctor_var_name(name) {
+                    out.insert(name.clone());
+                }
+            }
+            Type::Union(xs) => {
+                for x in xs {
+                    self.collect_ctor_vars_in(x, out);
+                }
+            }
+            Type::Function { params, ret, .. } => {
+                for p in params {
+                    self.collect_ctor_vars_in(p, out);
+                }
+                self.collect_ctor_vars_in(ret, out);
+            }
+            _ => {}
+        }
+    }
+
+    /// `true` when `name` is a higher-kinded type-constructor *variable* —
+    /// a PEP-695 type parameter declared with the `F[_]` kind marker (e.g.
+    /// `F` in `class Functor[F[_]]`). These names are collected up front
+    /// into `self.hkt_param_names`; everything else (builtin generics,
+    /// declared classes, abstract collection heads like `Iterator`, etc.)
+    /// is a concrete type head and keeps its normal nominal behaviour. Using
+    /// an explicit allowlist — rather than an "unknown head" heuristic —
+    /// keeps the HKT relaxation from leaking into ordinary generics.
+    fn is_ctor_var_name(&self, name: &str) -> bool {
+        if is_builtin_generic_head(name) || name == "tuple_variadic" {
+            return false;
+        }
+        if self.classes.iter().any(|c| c == name) {
+            return false;
+        }
+        if self.class_shapes.contains_key(name) {
+            return false;
+        }
+        self.hkt_param_names.contains(name)
+    }
+
+    /// Emit a `tyc::kind_mismatch` diagnostic for each ill-kinded
+    /// higher-kinded application discovered at a call site.
+    fn report_kind_errors(&mut self, errors: &[KindError], span: (usize, usize)) {
+        if self.unsafe_depth > 0 {
+            return;
+        }
+        let length = span.1.saturating_sub(span.0).max(1);
+        for err in errors {
+            let (message, help) = match err {
+                KindError::Arity {
+                    ctor,
+                    expected,
+                    actual,
+                } => (
+                    format!(
+                        "type constructor `{ctor}` applied to {actual} argument(s) \
+                         but expects {expected}"
+                    ),
+                    format!("apply `{ctor}` to exactly {expected} type argument(s)"),
+                ),
+                KindError::Conflict {
+                    ctor,
+                    first,
+                    second,
+                } => (
+                    format!(
+                        "type constructor `{ctor}` is bound to both `{first}` and \
+                         `{second}` in the same call"
+                    ),
+                    format!(
+                        "pass arguments whose constructors agree so `{ctor}` resolves to one type"
+                    ),
+                ),
+            };
+            self.diagnostics.push_error(TycError::kind_mismatch(
+                message,
+                help,
+                &self.path,
+                self.source,
+                span.0,
+                length,
+            ));
         }
     }
 }
@@ -6220,6 +6583,14 @@ fn collect_classes_and_functions(c: &mut Checker, body: &[Stmt]) {
             // generic classes (FINDINGS #46).
             let tps = type_param_names_from(cd.type_params.as_deref());
             if !tps.is_empty() {
+                // Recover higher-kinded constructor parameters. The `F[_]`
+                // kind marker is stripped by preprocess, so a class type
+                // parameter is identified as a constructor variable when it
+                // is used as a `Generic` head (`fa: F[A]`, `-> F[B]`) in any
+                // of the class's method/field signatures — a non-HKT type
+                // parameter is never applied like that.
+                let hkt = hkt_params_used_as_head(cd, &tps, &c.classes);
+                c.hkt_param_names.extend(hkt);
                 c.class_type_params.insert(name, tps);
             }
         }
@@ -6735,6 +7106,104 @@ fn type_param_names_from(type_params: Option<&ruff_python_ast::TypeParams>) -> V
     match type_params {
         Some(tps) => collect_type_param_names(&tps.type_params),
         None => Vec::new(),
+    }
+}
+
+/// Identify which of a generic class's `class_tps` are higher-kinded
+/// type-constructor parameters. The `F[_]` kind marker is removed by the
+/// preprocess pass, so we recover the kind structurally: a class type
+/// parameter is a constructor variable when it is used as a `Generic` head
+/// — `fa: F[A]`, `-> F[B]`, or a field typed `F[...]` — in any of the
+/// class's method/field signatures. A plain (kind-`*`) type parameter such
+/// as `T` is only ever used as a leaf, never applied, so it is never
+/// misclassified.
+///
+/// Method type parameters (declared on the `def`, e.g. `A`/`B` in
+/// `def fmap[A, B](...)`) are added to the scope used to parse each
+/// signature so `F[A]` resolves to `Generic("F", [TypeVar("A")])` rather
+/// than treating `A` as an unknown class.
+fn hkt_params_used_as_head(
+    cd: &ruff_python_ast::StmtClassDef,
+    class_tps: &[String],
+    classes: &[String],
+) -> std::collections::HashSet<String> {
+    let mut found = std::collections::HashSet::new();
+    let candidates: std::collections::HashSet<&str> =
+        class_tps.iter().map(|s| s.as_str()).collect();
+    if candidates.is_empty() {
+        return found;
+    }
+    let consider = |ty: &Type, found: &mut std::collections::HashSet<String>| {
+        collect_generic_heads_matching(ty, &candidates, found);
+    };
+    for item in &cd.body {
+        match item {
+            Stmt::FunctionDef(f) => {
+                // Scope = class type params + this method's own type params.
+                let mut scope = class_tps.to_vec();
+                scope.extend(type_param_names_from(f.type_params.as_deref()));
+                let all = f
+                    .parameters
+                    .posonlyargs
+                    .iter()
+                    .chain(f.parameters.args.iter())
+                    .chain(f.parameters.kwonlyargs.iter());
+                for pwd in all {
+                    if let Some(ann) = &pwd.parameter.annotation {
+                        let t = type_from_annotation_with_params(ann, classes, &scope);
+                        consider(&t, &mut found);
+                    }
+                }
+                if let Some(r) = f.returns.as_deref() {
+                    let t = type_from_annotation_with_params(r, classes, &scope);
+                    consider(&t, &mut found);
+                }
+            }
+            // Field annotations (`payload: F[int]`).
+            Stmt::AnnAssign(ann) => {
+                let t = type_from_annotation_with_params(&ann.annotation, classes, class_tps);
+                consider(&t, &mut found);
+            }
+            _ => {}
+        }
+    }
+    found
+}
+
+/// Walk `ty` collecting every `Generic` head (or bare `TypeConstructor`
+/// name) that appears in `candidates`. These are the applied — hence
+/// higher-kinded — uses of a type parameter.
+fn collect_generic_heads_matching(
+    ty: &Type,
+    candidates: &std::collections::HashSet<&str>,
+    out: &mut std::collections::HashSet<String>,
+) {
+    match ty {
+        Type::Generic(head, args) => {
+            if candidates.contains(head.as_str()) {
+                out.insert(head.clone());
+            }
+            for a in args {
+                collect_generic_heads_matching(a, candidates, out);
+            }
+        }
+        Type::TypeConstructor(name, _) => {
+            if candidates.contains(name.as_str()) {
+                out.insert(name.clone());
+            }
+        }
+        Type::Union(xs) => {
+            for x in xs {
+                collect_generic_heads_matching(x, candidates, out);
+            }
+        }
+        Type::Function { params, ret, .. } => {
+            for p in params {
+                collect_generic_heads_matching(p, candidates, out);
+            }
+            collect_generic_heads_matching(ret, candidates, out);
+        }
+        _ => {}
     }
 }
 
@@ -13125,9 +13594,26 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
                     // unbound after the forward arg pass, use the call's
                     // expected return type (from the enclosing annotation
                     // or `return` statement) to pin it.
-                    let result = bind_typevars_and_substitute_bidirectional(
-                        &params, &actuals, &ret, expected,
-                    );
+                    //
+                    // Higher-kinded inference: when the signature mentions a
+                    // type-constructor variable (e.g. `F` in `fa: F[A] -> F[B]`
+                    // under `class Functor[F[_]]`), unify it against the
+                    // actual constructor application so `F → list` / `A → int`
+                    // flow into the substituted return type. The constructor
+                    // set is empty for ordinary signatures, in which case this
+                    // is exactly `bind_typevars_and_substitute_bidirectional`.
+                    let ctor_vars = c.collect_ctor_vars(&params, &ret);
+                    let result = if ctor_vars.is_empty() {
+                        bind_typevars_and_substitute_bidirectional(
+                            &params, &actuals, &ret, expected,
+                        )
+                    } else {
+                        let (substituted, kind_errors) = bind_typevars_and_substitute_hkt(
+                            &params, &actuals, &ret, expected, &ctor_vars,
+                        );
+                        c.report_kind_errors(&kind_errors, call_span);
+                        substituted
+                    };
                     // FINDINGS #71: narrow `<dict[K, V]>.get(k, default)` to
                     // `V | type(default)`, which collapses to `V` when default
                     // is V-compatible. Without this, the one-arg signature
@@ -22567,6 +23053,262 @@ def main() -> None:
             result,
             Type::Generic("T".to_string(), vec![Type::Str]),
             "non-Class binding must not replace Generic head; got {result:?}"
+        );
+    }
+
+    // ── HKT application: F[A] formal unifying against a concrete ctor ─────
+    //
+    // These exercise the new `bind_typevars_and_substitute_hkt` path, where
+    // the formal is `Generic("F", [TypeVar("A")])` (how `fa: F[A]` actually
+    // parses) — distinct from the older bare-`TypeConstructor("F", 1)` form.
+
+    #[test]
+    fn hkt_applied_ctor_var_binds_head_and_arg() {
+        // Formal `F[A]` against actual `list[int]` with F a constructor var:
+        // binds F → list and A → int, and the return `F[B]` (with B bound to
+        // str elsewhere) substitutes to `list[str]`.
+        use crate::{bind_typevars_and_substitute_hkt, Type};
+        use std::collections::HashSet;
+
+        let ctor_vars: HashSet<String> = ["F".to_string()].into_iter().collect();
+        // def fmap[A, B](fa: F[A], b: B) -> F[B]
+        let formal_params = vec![
+            Type::Generic("F".to_string(), vec![Type::TypeVar("A".to_string())]),
+            Type::TypeVar("B".to_string()),
+        ];
+        let actual_args = vec![
+            Type::Generic("list".to_string(), vec![Type::Int]),
+            Type::Str,
+        ];
+        let return_type = Type::Generic("F".to_string(), vec![Type::TypeVar("B".to_string())]);
+
+        let (result, errors) = bind_typevars_and_substitute_hkt(
+            &formal_params,
+            &actual_args,
+            &return_type,
+            None,
+            &ctor_vars,
+        );
+        assert!(errors.is_empty(), "no kind errors expected; got {errors:?}");
+        assert_eq!(
+            result,
+            Type::Generic("list".to_string(), vec![Type::Str]),
+            "F[B] must resolve to list[str] when F→list and B→str; got {result:?}"
+        );
+    }
+
+    #[test]
+    fn hkt_applied_ctor_var_arity_mismatch_is_reported() {
+        // Formal `F[A, B]` (a 2-ary application) against `list[int]` (1-ary)
+        // is ill-kinded.
+        use crate::{bind_typevars_and_substitute_hkt, KindError, Type};
+        use std::collections::HashSet;
+
+        let ctor_vars: HashSet<String> = ["F".to_string()].into_iter().collect();
+        let formal_params = vec![Type::Generic(
+            "F".to_string(),
+            vec![
+                Type::TypeVar("A".to_string()),
+                Type::TypeVar("B".to_string()),
+            ],
+        )];
+        let actual_args = vec![Type::Generic("list".to_string(), vec![Type::Int])];
+        let return_type = Type::None;
+
+        let (_result, errors) = bind_typevars_and_substitute_hkt(
+            &formal_params,
+            &actual_args,
+            &return_type,
+            None,
+            &ctor_vars,
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|e| matches!(e, KindError::Arity { ctor, expected, actual }
+                    if ctor == "F" && *expected == 2 && *actual == 1)),
+            "expected an Arity kind error for F; got {errors:?}"
+        );
+    }
+
+    #[test]
+    fn hkt_applied_ctor_var_conflicting_constructors_is_reported() {
+        // `F[A]` matched against `list[int]` then `F[A]` against `set[int]`
+        // binds F to two different constructors — a conflict.
+        use crate::{bind_typevars_and_substitute_hkt, KindError, Type};
+        use std::collections::HashSet;
+
+        let ctor_vars: HashSet<String> = ["F".to_string()].into_iter().collect();
+        let formal_params = vec![
+            Type::Generic("F".to_string(), vec![Type::TypeVar("A".to_string())]),
+            Type::Generic("F".to_string(), vec![Type::TypeVar("A".to_string())]),
+        ];
+        let actual_args = vec![
+            Type::Generic("list".to_string(), vec![Type::Int]),
+            Type::Generic("set".to_string(), vec![Type::Int]),
+        ];
+        let return_type = Type::None;
+
+        let (_result, errors) = bind_typevars_and_substitute_hkt(
+            &formal_params,
+            &actual_args,
+            &return_type,
+            None,
+            &ctor_vars,
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|e| matches!(e, KindError::Conflict { ctor, .. } if ctor == "F")),
+            "expected a Conflict kind error for F; got {errors:?}"
+        );
+    }
+
+    #[test]
+    fn hkt_empty_ctor_vars_matches_legacy_behaviour() {
+        // With an empty constructor set, the HKT entry point must produce
+        // exactly the same result as the legacy bidirectional substitution —
+        // so a `Generic("F", ...)` mismatch binds nothing and the return
+        // type is unchanged (today's conservative behaviour).
+        use crate::{bind_typevars_and_substitute_hkt, Type};
+        use std::collections::HashSet;
+
+        let ctor_vars: HashSet<String> = HashSet::new();
+        let formal_params = vec![Type::Generic(
+            "F".to_string(),
+            vec![Type::TypeVar("A".to_string())],
+        )];
+        let actual_args = vec![Type::Generic("list".to_string(), vec![Type::Int])];
+        let return_type = Type::Generic("F".to_string(), vec![Type::TypeVar("A".to_string())]);
+
+        let (result, errors) = bind_typevars_and_substitute_hkt(
+            &formal_params,
+            &actual_args,
+            &return_type,
+            None,
+            &ctor_vars,
+        );
+        assert!(errors.is_empty());
+        assert_eq!(
+            result,
+            Type::Generic("F".to_string(), vec![Type::TypeVar("A".to_string())]),
+            "empty ctor set must leave F[A] unbound; got {result:?}"
+        );
+    }
+
+    // ── HKT end-to-end: Functor-style map over concrete constructors ─────
+
+    #[test]
+    fn hkt_functor_map_over_list_typechecks() {
+        // The canonical scaffold: `class Functor[F[_]]` with a `map` method
+        // shaped `F[A] -> F[B]`. Calling it with a `list[int]` argument must
+        // type-check clean (F binds to list, the call is well-kinded).
+        let src = "\
+class Functor[F[_]]:
+    def fmap[A, B](self, fa: F[A], f: B) -> F[B]:
+        return fa
+
+def main() -> None:
+    let xs: list[int] = [1, 2, 3]
+    let _ys = Functor().fmap(xs, \"tag\")
+";
+        let d = check(src);
+        assert!(
+            d.errors().is_empty(),
+            "Functor.fmap over list[int] must check clean; got {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn hkt_functor_map_over_user_box_typechecks() {
+        // A second, user-declared 1-ary constructor `Box[T]` also unifies.
+        let src = "\
+class Box[T]:
+    value: T
+
+class Functor[F[_]]:
+    def fmap[A, B](self, fa: F[A], f: B) -> F[B]:
+        return fa
+
+def main() -> None:
+    let b: Box[int] = Box(value=1)
+    let _r = Functor().fmap(b, \"tag\")
+";
+        let d = check(src);
+        assert!(
+            d.errors().is_empty(),
+            "Functor.fmap over Box[int] must check clean; got {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn hkt_functor_map_arity_mismatch_errors() {
+        // A 2-ary constructor application `F[A, B]` in the parameter, applied
+        // to a 1-ary `list[int]` actual, is ill-kinded and must be flagged
+        // with `tyc::kind_mismatch`.
+        let src = "\
+class Functor[F[_]]:
+    def bad[A, B, C](self, fa: F[A, B], f: C) -> C:
+        return f
+
+def main() -> None:
+    let xs: list[int] = [1, 2, 3]
+    let _r = Functor().bad(xs, 0)
+";
+        let d = check(src);
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::KindMismatch { .. })),
+            "F[A, B] applied to list[int] must raise kind_mismatch; got {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn hkt_functor_map_conflicting_constructors_errors() {
+        // Binding F to two different constructors in one call (list and set)
+        // must raise `tyc::kind_mismatch`.
+        let src = "\
+class Functor[F[_]]:
+    def both[A](self, x: F[A], y: F[A]) -> None:
+        return None
+
+def main() -> None:
+    let xs: list[int] = [1, 2, 3]
+    let ss: set[int] = {1, 2, 3}
+    Functor().both(xs, ss)
+";
+        let d = check(src);
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::KindMismatch { .. })),
+            "F bound to both list and set must raise kind_mismatch; got {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn hkt_real_generic_class_call_unaffected() {
+        // Regression guard: a normal generic class method call (no HKT) must
+        // keep working — `Box` is a real class, never a constructor var, so
+        // the unifier path is unchanged.
+        let src = "\
+class Box[T]:
+    value: T
+
+def main() -> None:
+    let b: Box[int] = Box(value=1)
+    let _v: int = b.value
+";
+        let d = check(src);
+        assert!(
+            d.errors().is_empty(),
+            "ordinary generic class usage must stay clean; got {:?}",
+            d.errors()
         );
     }
 

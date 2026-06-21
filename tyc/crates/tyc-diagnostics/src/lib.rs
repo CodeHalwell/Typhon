@@ -832,6 +832,28 @@ pub enum TycError {
         span: SourceSpan,
     },
 
+    /// A higher-kinded type constructor was applied ill-kindedly at a call
+    /// site — either to the wrong number of type arguments, or bound to two
+    /// different concrete constructors within the same call. The human-
+    /// readable `message` and `help` are composed by the type checker
+    /// (which knows the constructor name and arities); this variant just
+    /// carries them through with a stable diagnostic code so the unifier
+    /// reports the kind error instead of silently producing `Unknown`.
+    #[error("{message}")]
+    #[diagnostic(
+        code(tyc::kind_mismatch),
+        url("https://typhon.dev/lang/diagnostics/kind_mismatch"),
+        help("{help}")
+    )]
+    KindMismatch {
+        message: String,
+        help: String,
+        #[source_code]
+        src: NamedSource<String>,
+        #[label("ill-kinded type-constructor application")]
+        span: SourceSpan,
+    },
+
     /// An attribute is accessed on a value whose type doesn't expose it.
     #[error("attribute `{attr}` is not defined on `{recv_type}`")]
     #[diagnostic(
@@ -2255,6 +2277,25 @@ impl TycError {
             typevar: typevar.into(),
             actual: actual.into(),
             bound: bound.into(),
+            src: NamedSource::new(path.into(), source.into()),
+            span: SourceSpan::new(SourceOffset::from(offset), length.max(1)),
+        }
+    }
+
+    /// Construct a [`TycError::KindMismatch`] diagnostic. `message` and
+    /// `help` are fully composed by the caller (the type checker), which
+    /// has the constructor name and arities in hand.
+    pub fn kind_mismatch(
+        message: impl Into<String>,
+        help: impl Into<String>,
+        path: impl Into<String>,
+        source: impl Into<String>,
+        offset: usize,
+        length: usize,
+    ) -> Self {
+        Self::KindMismatch {
+            message: message.into(),
+            help: help.into(),
             src: NamedSource::new(path.into(), source.into()),
             span: SourceSpan::new(SourceOffset::from(offset), length.max(1)),
         }
