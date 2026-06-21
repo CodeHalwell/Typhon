@@ -1,0 +1,33 @@
+import collections
+from collections import deque, Counter, defaultdict, OrderedDict
+
+def main() -> None:
+    let dq: deque[int] = deque([1, 2, 3])
+    dq.appendleft(0)
+    dq.append(4)
+    print(list(dq))
+    dq.rotate(1)
+    print(list(dq))
+
+    let c: Counter[str] = Counter("mississippi")
+    print(c.most_common(2))
+    print(c["s"], c["z"])
+
+    let dd: defaultdict[str, list[int]] = defaultdict(list)
+    dd["a"].append(1)
+    dd["a"].append(2)
+    dd["b"].append(3)
+    print(dict(dd))
+
+    let od: OrderedDict[str, int] = OrderedDict()
+    od["x"] = 1
+    od["y"] = 2
+    print(list(od.items()))
+
+    let counts: defaultdict[int, int] = defaultdict(int)
+    for ch in [1, 1, 2, 3, 3, 3]:
+        counts[ch] = counts[ch] + 1
+    print(dict(counts))
+
+if __name__ == "__main__":
+    main()

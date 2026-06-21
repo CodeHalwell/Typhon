@@ -1,0 +1,33 @@
+def parse_port(raw: str) -> Result[int, str]:
+    if not raw.isdigit():
+        return Err(f"not a number: {raw}")
+    let n: int = int(raw)
+    if n < 1 or n > 65535:
+        return Err(f"out of range: {n}")
+    return Ok(n)
+
+def parse_addr(host: str, raw: str) -> Result[tuple[str, int], str]:
+    let port: int = parse_port(raw)?
+    return Ok((host, port))
+
+def safe_div(a: int, b: int) -> Result[int, str]:
+    if b == 0:
+        return Err("division by zero")
+    return Ok(a // b)
+
+def main() -> None:
+    match parse_port("8080"):
+        case Ok(n):  print(f"ok port {n}")
+        case Err(e): print(f"err {e}")
+    match parse_port("99999"):
+        case Ok(n):  print(f"ok port {n}")
+        case Err(e): print(f"err {e}")
+    print(parse_addr("localhost", "443"))
+    print(parse_addr("localhost", "abc"))
+
+    let chained: Result[int, str] = safe_div(100, 5).map(lambda x: x + 1).and_then(lambda x: safe_div(x, 3))
+    print(chained)
+    print(safe_div(1, 0).or_else(lambda e: Ok(-1)))
+
+if __name__ == "__main__":
+    main()

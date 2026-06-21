@@ -1,0 +1,25 @@
+import json
+
+def main() -> None:
+    let data: dict[str, object] = {
+        "name": "typhon",
+        "version": 15,
+        "tags": ["fast", "typed"],
+        "nested": {"a": 1, "b": [2, 3]},
+        "active": True,
+        "ratio": 0.5,
+    }
+    let encoded: str = json.dumps(data, sort_keys=True)
+    print(encoded)
+    let pretty: str = json.dumps({"x": 1, "y": 2}, indent=2, sort_keys=True)
+    print(pretty)
+
+    let raw: str = "{\"id\": 42, \"items\": [1, 2, 3], \"ok\": false}"
+    let parsed: dict[str, object] = json.loads(raw) as! dict[str, object]
+    print(parsed["id"], parsed["items"], parsed["ok"])
+
+    let roundtrip: str = json.dumps(json.loads(raw), sort_keys=True)
+    print(roundtrip)
+
+if __name__ == "__main__":
+    main()

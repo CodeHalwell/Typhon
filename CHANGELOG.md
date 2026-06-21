@@ -4,6 +4,22 @@ All notable changes to Typhon are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely; the
 canonical phase-by-phase status lives in `docs/roadmap.md`.
 
+## Unreleased
+
+### Fixed — VM `str.isupper()` / `str.islower()` on uncased strings
+
+- **The tree-walking VM (`tyc run`) returned `True` from `str.isupper()` /
+  `str.islower()` for strings with no cased characters** (`tyc-vm`). The
+  predicates were computed as "non-empty and no lowercase/uppercase char", so
+  `",".isupper()`, `" ".isupper()`, `"5".isupper()`, and `",".islower()` all
+  returned `True` where CPython returns `False` (the predicate requires *at
+  least one cased character*). This produced silently wrong output under
+  `tyc run` — e.g. a Caesar cipher that branches on `c.isupper()` / `c.islower()`
+  mangled punctuation and spaces. The compiled path (`tyc build` → CPython) was
+  always correct. Both predicates now require a cased character of the matching
+  case and none of the opposite case. Found by the 2026-06-21 stress round
+  (`stress/round-2026-06-21/`, repro `29`).
+
 ## 0.15.6 — 2026-06-16 — stress-test robustness sweep
 
 An ~198-program adversarial sweep ("if you can write it in Python, you can use

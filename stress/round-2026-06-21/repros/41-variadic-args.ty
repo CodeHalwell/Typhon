@@ -1,0 +1,28 @@
+def total(*nums: int) -> int:
+    mut acc: int = 0
+    for n in nums:
+        acc = acc + n
+    return acc
+
+def greet(greeting: str, *names: str, punct: str = "!") -> str:
+    return f"{greeting} {', '.join(names)}{punct}"
+
+def describe(**attrs: object) -> str:
+    let parts: list[str] = [f"{k}={v}" for k, v in attrs.items()]
+    return ", ".join(sorted(parts))
+
+def forward(*args: int, **kwargs: int) -> int:
+    return total(*args) + sum(kwargs.values())
+
+def main() -> None:
+    print(total(1, 2, 3, 4, 5))
+    print(total())
+    let xs: list[int] = [10, 20, 30]
+    print(total(*xs))
+    print(greet("Hello", "Alice", "Bob"))
+    print(greet("Hi", "Carol", punct="."))
+    print(describe(name="x", count=3, active=True))
+    print(forward(1, 2, a=10, b=20))
+
+if __name__ == "__main__":
+    main()

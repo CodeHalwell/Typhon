@@ -1,0 +1,50 @@
+from typing import Callable
+
+class Box[T]:
+    value: T
+
+impl[T] Box[T]:
+    def get(self) -> T:
+        return self.value
+    def map[U](self, f: Callable[[T], U]) -> Box[U]:
+        return Box(value=f(self.value))
+
+class Stack[T]:
+    items: list[T]
+
+impl[T] Stack[T]:
+    def push(self, item: T) -> None:
+        self.items.append(item)
+    def pop(self) -> T?:
+        if len(self.items) == 0:
+            return None
+        return self.items.pop()
+    def size(self) -> int:
+        return len(self.items)
+
+def first[T](xs: list[T]) -> T?:
+    if len(xs) == 0:
+        return None
+    return xs[0]
+
+def pair[A, B](a: A, b: B) -> tuple[A, B]:
+    return (a, b)
+
+def main() -> None:
+    let b: Box[int] = Box(value=21)
+    print(b.map(lambda x: x * 2).get())
+
+    let s: Stack[str] = Stack(items=[])
+    s.push("a")
+    s.push("b")
+    print(s.size())
+    print(s.pop())
+    print(s.pop())
+    print(s.pop())
+
+    print(first([10, 20, 30]))
+    print(first([]))
+    print(pair("x", 99))
+
+if __name__ == "__main__":
+    main()

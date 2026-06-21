@@ -1,0 +1,24 @@
+def main() -> None:
+    let s: str = "Hello, Typhon World"
+    print(s.upper())
+    print(s.lower())
+    print(s.replace("o", "0"))
+    print(s.split(", "))
+    print(s[7:13], s[::-1], s[::2])
+    print(len(s), s.count("o"), s.find("Typhon"))
+    print("  trim  ".strip(), "xxabcxx".strip("x"))
+    print("-".join(["a", "b", "c"]))
+    print(s.startswith("Hello"), s.endswith("World"))
+    let n: int = 42
+    let pi: float = 3.14159
+    print(f"{n:05d} {n:>8} {n:#x} {n:b}")
+    print(f"{pi:.2f} {pi:10.3f} {pi:+.1f}")
+    print(f"{'mid':^11}|")
+    print(f"{1234567:,} {0.875:.1%}")
+    print("{} and {name}".format("pos", name="kw"))
+    print("abc".center(9, "*"), "5".zfill(4))
+    print("CamelCase".swapcase())
+    print(ord("A"), chr(97), "ABC".encode("utf-8"))
+
+if __name__ == "__main__":
+    main()

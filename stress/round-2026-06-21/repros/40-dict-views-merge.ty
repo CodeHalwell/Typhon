@@ -1,0 +1,36 @@
+def main() -> None:
+    let d1: dict[str, int] = {"a": 1, "b": 2}
+    let d2: dict[str, int] = {"b": 20, "c": 30}
+
+    let merged: dict[str, int] = d1 | d2
+    print(merged)
+
+    mut acc: dict[str, int] = {}
+    acc.update(d1)
+    acc.update(d2)
+    print(acc)
+
+    print(sorted(d1.keys()))
+    print(sorted(d1.values()))
+    print(sorted(d1.items()))
+
+    let common: set[str] = d1.keys() & d2.keys()
+    print(sorted(common))
+
+    print(d1.get("a", 0), d1.get("z", -1))
+    print("a" in d1, "z" in d1)
+
+    let inverted: dict[int, str] = {v: k for k, v in d1.items()}
+    print(inverted)
+
+    mut counts: dict[str, int] = {}
+    for c in "banana":
+        counts[c] = counts.get(c, 0) + 1
+    print(dict(sorted(counts.items())))
+
+    let popped: int = acc.pop("a")
+    print(popped, "a" in acc)
+    print(acc.setdefault("z", 99), acc["z"])
+
+if __name__ == "__main__":
+    main()

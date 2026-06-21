@@ -1,0 +1,34 @@
+from typing import Callable
+
+def make_counter() -> Callable[[], int]:
+    mut count: int = 0
+    def increment() -> int:
+        nonlocal count
+        count = count + 1
+        return count
+    return increment
+
+def make_adder(n: int) -> Callable[[int], int]:
+    def add(x: int) -> int:
+        return x + n
+    return add
+
+def logged(fn: Callable[[int], int]) -> Callable[[int], int]:
+    def wrapper(x: int) -> int:
+        let result: int = fn(x)
+        print(f"called with {x} -> {result}")
+        return result
+    return wrapper
+
+def main() -> None:
+    let counter: Callable[[], int] = make_counter()
+    print(counter(), counter(), counter())
+    let add10: Callable[[int], int] = make_adder(10)
+    print(add10(5))
+    let traced: Callable[[int], int] = logged(add10)
+    print(traced(7))
+    let composed: list[Callable[[int], int]] = [make_adder(i) for i in range(3)]
+    print([f(100) for f in composed])
+
+if __name__ == "__main__":
+    main()

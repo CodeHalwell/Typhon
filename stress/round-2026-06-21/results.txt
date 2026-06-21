@@ -1,0 +1,237 @@
+===== 01-arithmetic-bigint (check=0 vm=0 comp=0) [PASS] =====
+===== 02-strings-formatting (check=0 vm=0 comp=0) [PASS] =====
+===== 03-collections-comprehensions (check=0 vm=0 comp=0) [PASS] =====
+===== 04-collections-module (check=0 vm=1 comp=0) [PASS] {VM-DIVERGE} =====
+--- VM ---
+[0, 1, 2, 3, 4]
+[4, 0, 1, 2, 3]
+[('i', 4), ('s', 4)]
+Traceback (most recent call last):
+  File "repros/04-collections-module.ty", line 33, in <module>
+    main()
+  File "repros/04-collections-module.ty", line 14, in main
+    print(c["s"], c["z"])
+KeyError: 'z'
+--- BUILD+PY ---
+[0, 1, 2, 3, 4]
+[4, 0, 1, 2, 3]
+[('i', 4), ('s', 4)]
+4 0
+{'a': [1, 2], 'b': [3]}
+[('x', 1), ('y', 2)]
+{1: 2, 2: 1, 3: 3}
+===== 05-itertools (check=0 vm=1 comp=0) [PASS] {VM-DIVERGE} =====
+--- VM ---
+[1, 2, 3, 4, 5]
+[10, 11, 12, 13, 14]
+[0, 1, 2, 3, 4]
+[5, 6, 7, 8, 9]
+[1, 3, 6, 10]
+[(1, 2), (1, 3), (2, 3)]
+[(1, 2), (1, 3), (2, 1), (2, 3), (3, 1), (3, 2)]
+Traceback (most recent call last):
+  File "repros/05-itertools.ty", line 21, in <module>
+    main()
+  File "repros/05-itertools.ty", line 11, in main
+    print(list(itertools.product([0, 1], repeat=2)))
+--- BUILD+PY ---
+[1, 2, 3, 4, 5]
+[10, 11, 12, 13, 14]
+[0, 1, 2, 3, 4]
+[5, 6, 7, 8, 9]
+[1, 3, 6, 10]
+[(1, 2), (1, 3), (2, 3)]
+[(1, 2), (1, 3), (2, 1), (2, 3), (3, 1), (3, 2)]
+[(0, 0), (0, 1), (1, 0), (1, 1)]
+[1, 2, 1, 2, 1]
+a [1, 2]
+b [3]
+['z', 'z', 'z']
+===== 06-functools (check=0 vm=1 comp=0) [PASS] {VM-DIVERGE} =====
+--- VM ---
+[0, 1, 1, 2, 3, 5, 8, 13, 21, 34, 55, 89, 144, 233, 377]
+15
+120
+15
+Traceback (most recent call last):
+  File "repros/06-functools.ty", line 20, in <module>
+    main()
+  File "repros/06-functools.ty", line 16, in main
+    let by_parity: list[int] = sorted(nums, key=functools.cmp_to_key(lambda a, b: (a % 2) - (b % 2)))
+AttributeError: module 'functools' has no attribute 'cmp_to_key'
+--- BUILD+PY ---
+[0, 1, 1, 2, 3, 5, 8, 13, 21, 34, 55, 89, 144, 233, 377]
+15
+120
+15
+[4, 2, 6, 3, 1, 1, 5, 9]
+===== 07-generators-yield (check=0 vm=0 comp=0) [PASS] =====
+===== 08-closures-decorators (check=0 vm=0 comp=0) [PASS] =====
+===== 09-dataclasses-frozen (check=0 vm=0 comp=0) [PASS] =====
+===== 10-inheritance-properties (check=0 vm=0 comp=0) [PASS] =====
+===== 11-operator-dunders (check=0 vm=0 comp=0) [PASS] =====
+===== 12-enum (check=0 vm=0 comp=0) [PASS] =====
+===== 13-sealed-union-eval (check=0 vm=0 comp=0) [PASS] =====
+===== 14-result-error-handling (check=0 vm=0 comp=0) [PASS] =====
+===== 15-generics (check=0 vm=0 comp=0) [PASS] =====
+===== 16-interfaces (check=0 vm=0 comp=0) [PASS] =====
+===== 17-exceptions-hierarchy (check=0 vm=0 comp=0) [PASS] =====
+===== 18-context-managers (check=0 vm=1 comp=0) [PASS] {VM-DIVERGE} =====
+--- VM ---
+<div>
+</div>
+Traceback (most recent call last):
+  File "repros/18-context-managers.ty", line 32, in <module>
+    main()
+  File "repros/18-context-managers.ty", line 24, in main
+    with tag("div") as t:
+NotImplementedError: `@contextmanager` generators as context managers (the VM evaluates generators eagerly); run with `tyc build` then `python` is not yet supported in the tree-walking VM; use `tyc build` then `python build/main.py` to run this program
+--- BUILD+PY ---
+<div>
+  inside div
+</div>
+open db
+  using db
+close db
+closed = True
+===== 19-json (check=0 vm=0 comp=0) [PASS] =====
+===== 20-math-module (check=0 vm=0 comp=0) [PASS] =====
+===== 21-structural-match (check=0 vm=0 comp=0) [PASS] =====
+===== 22-sorting-keys (check=0 vm=0 comp=0) [PASS] =====
+===== 23-recursion-algorithms (check=0 vm=0 comp=0) [PASS] =====
+===== 24-pipes-guards (check=0 vm=0 comp=0) [PASS] =====
+===== 25-newtype (check=0 vm=0 comp=0) [PASS] =====
+===== 26-freeze-let (check=0 vm=0 comp=0) [PASS] {VM-DIVERGE} =====
+--- VM ---
+8080
+('a', 'b', 'c')
+mappingproxy({'max': 100})
+5 Mon Fri
+frozen dict rejected mutation: True
+--- BUILD+PY ---
+8080
+('a', 'b', 'c')
+{'max': 100}
+5 Mon Fri
+frozen dict rejected mutation: True
+===== 27-comptime (check=0 vm=0 comp=0) [PASS] =====
+===== 28-regex (check=0 vm=0 comp=0) [PASS] =====
+===== 29-string-algorithms (check=0 vm=0 comp=0) [PASS] =====
+===== 30-numeric-algorithms (check=0 vm=0 comp=0) [PASS] =====
+===== 31-state-machine (check=0 vm=0 comp=0) [PASS] =====
+===== 32-linked-list-generic (check=0 vm=0 comp=0) [PASS] =====
+===== 33-decimal-fraction (check=0 vm=1 comp=0) [PASS] {VM-DIVERGE} =====
+--- VM ---
+Traceback (most recent call last):
+  File "repros/33-decimal-fraction.ty", line 1, in <module>
+    from decimal import Decimal
+ImportError: tyc-vm cannot import 'decimal': only a small native stdlib is available. Run with `tyc run --compile` to use the full Python interpreter.
+--- BUILD+PY ---
+0.3
+0.3333333333333333333333333333
+0.3
+1/2
+1/18
+1/2
+1/4
+0.25
+===== 34-bytes-bytearray (check=0 vm=1 comp=0) [PASS] {VM-DIVERGE} =====
+--- VM ---
+13
+72 84
+b'Hello'
+b'HELLO, TYPHON'
+48656c6c6f2c20547970686f6e
+Hello, Typhon
+6
+héllo
+Traceback (most recent call last):
+  File "repros/34-bytes-bytearray.ty", line 25, in <module>
+    main()
+  File "repros/34-bytes-bytearray.ty", line 14, in main
+--- BUILD+PY ---
+13
+72 84
+b'Hello'
+b'HELLO, TYPHON'
+48656c6c6f2c20547970686f6e
+Hello, Typhon
+6
+héllo
+b'Abcd'
+b'a-b-c'
+b'xxxxx'
+b'Hi'
+===== 35-set-algebra (check=0 vm=1 comp=0) [PASS] {VM-DIVERGE} =====
+--- VM ---
+[1, 2, 3, 4, 5, 6, 7, 8]
+[4, 5]
+[1, 2, 3]
+[1, 2, 3, 6, 7, 8]
+Traceback (most recent call last):
+  File "repros/35-set-algebra.ty", line 29, in <module>
+    main()
+  File "repros/35-set-algebra.ty", line 8, in main
+    print(a <= {1, 2, 3, 4, 5, 6})
+TypeError: comparison not supported
+--- BUILD+PY ---
+[1, 2, 3, 4, 5, 6, 7, 8]
+[4, 5]
+[1, 2, 3]
+[1, 2, 3, 6, 7, 8]
+True
+True
+True
+['x', 'y'] 2
+['y']
+True False
+2
+['a', 'b', 'c']
+===== 36-model-validation (check=0 vm=0 comp=0) [PASS] {VM-DIVERGE} =====
+--- VM ---
+Springfield
+Alice True
+{'id': 1, 'name': 'Alice', 'email': 'a@b.com', 'age': 30}
+Bob False
+{"id": 2, "name": "Bob", "email": "b@c.com", "age": 15}
+--- BUILD+PY ---
+Springfield
+Alice True
+{'id': 1, 'name': 'Alice', 'email': 'a@b.com', 'age': 30}
+Bob False
+{"id":2,"name":"Bob","email":"b@c.com","age":15}
+===== 37-walrus-narrowing (check=0 vm=0 comp=0) [PASS] =====
+===== 38-async-gather (check=0 vm=0 comp=0) [PASS] =====
+===== 39-try-result (check=0 vm=0 comp=0) [PASS] =====
+===== 40-dict-views-merge (check=0 vm=1 comp=0) [PASS] {VM-DIVERGE} =====
+--- VM ---
+Traceback (most recent call last):
+  File "repros/40-dict-views-merge.ty", line 36, in <module>
+    main()
+  File "repros/40-dict-views-merge.ty", line 5, in main
+    let merged: dict[str, int] = d1 | d2
+TypeError: unsupported operand type(s) for |: 'dict' and 'dict'
+--- BUILD+PY ---
+{'a': 1, 'b': 20, 'c': 30}
+{'a': 1, 'b': 20, 'c': 30}
+['a', 'b']
+[1, 2]
+[('a', 1), ('b', 2)]
+['b']
+1 -1
+True False
+{1: 'a', 2: 'b'}
+{'a': 3, 'b': 1, 'n': 2}
+1 False
+99 99
+===== 41-variadic-args (check=0 vm=0 comp=0) [PASS] =====
+===== 42-unpacking (check=0 vm=0 comp=0) [PASS] =====
+===== 43-fstring-advanced (check=0 vm=0 comp=0) [PASS] =====
+===== 44-extend-builtin (check=0 vm=0 comp=0) [PASS] =====
+===== 45-lazy-import (check=0 vm=0 comp=0) [PASS] =====
+===== 46-mutual-recursion (check=0 vm=0 comp=0) [PASS] =====
+===== 47-global-counter (check=0 vm=0 comp=0) [PASS] =====
+===== 48-as-checked-cast (check=0 vm=0 comp=0) [PASS] =====
+
+######## SUMMARY ########
+total=48 pass=48 buildfail=0 runfail=0 checkfail=0 vm_diverge=10

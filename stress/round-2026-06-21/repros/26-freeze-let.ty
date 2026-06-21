@@ -1,0 +1,18 @@
+freeze let CONFIG = {"port": 8080, "hosts": ["a", "b", "c"], "limits": {"max": 100}}
+freeze let WEEKDAYS = ["Mon", "Tue", "Wed", "Thu", "Fri"]
+
+def main() -> None:
+    print(CONFIG["port"])
+    print(CONFIG["hosts"])
+    print(CONFIG["limits"])
+    print(len(WEEKDAYS), WEEKDAYS[0], WEEKDAYS[-1])
+
+    mut found: bool = False
+    try:
+        CONFIG["port"] = 9000
+    except TypeError:
+        found = True
+    print(f"frozen dict rejected mutation: {found}")
+
+if __name__ == "__main__":
+    main()

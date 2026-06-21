@@ -1,0 +1,31 @@
+from typing import Iterator
+
+def countdown(n: int) -> Iterator[int]:
+    mut i: int = n
+    while i > 0:
+        yield i
+        i = i - 1
+
+def flatten(nested: list[list[int]]) -> Iterator[int]:
+    for row in nested:
+        yield from row
+
+def fib_gen(limit: int) -> Iterator[int]:
+    mut a: int = 0
+    mut b: int = 1
+    while a < limit:
+        yield a
+        let nxt: int = a + b
+        a = b
+        b = nxt
+
+def main() -> None:
+    print(list(countdown(5)))
+    print(list(flatten([[1, 2], [3], [4, 5, 6]])))
+    print(list(fib_gen(50)))
+    let gen_exp: list[int] = list(x * 2 for x in range(5))
+    print(gen_exp)
+    print(sum(x for x in range(100) if x % 3 == 0))
+
+if __name__ == "__main__":
+    main()

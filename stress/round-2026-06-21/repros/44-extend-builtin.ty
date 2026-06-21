@@ -1,0 +1,24 @@
+extend str:
+    def shout(self) -> str:
+        return self.upper() + "!"
+    def slug(self) -> str:
+        return "-".join(self.lower().split())
+
+extend list:
+    def second(self) -> int?:
+        if len(self) < 2:
+            return None
+        return self[1]
+
+def main() -> None:
+    let title: str = "Hello World"
+    print(title.shout())
+    print(title.slug())
+
+    let xs: list[int] = [10, 20, 30]
+    print(xs.second())
+    let empty: list[int] = []
+    print(empty.second())
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,34 @@
+def minmax(xs: list[int]) -> tuple[int, int]:
+    return (min(xs), max(xs))
+
+def main() -> None:
+    let (lo: int, hi: int) = minmax([3, 1, 4, 1, 5, 9, 2])
+    print(lo, hi)
+
+    mut a: int = 1
+    mut b: int = 2
+    a, b = b, a
+    print(a, b)
+
+    let nums: list[int] = [1, 2, 3, 4, 5]
+    let first: int = nums[0]
+    let rest: list[int] = nums[1:]
+    print(first, rest)
+
+    let point: tuple[int, int, int] = (10, 20, 30)
+    let (x: int, y: int, z: int) = point
+    print(x, y, z)
+
+    let combined: list[int] = [*[1, 2], *[3, 4], 5]
+    print(combined)
+
+    let d1: dict[str, int] = {"a": 1}
+    let d2: dict[str, int] = {"b": 2}
+    let merged: dict[str, int] = {**d1, **d2, "c": 3}
+    print(merged)
+
+    for i, (name, score) in enumerate([("a", 90), ("b", 85)]):
+        print(i, name, score)
+
+if __name__ == "__main__":
+    main()

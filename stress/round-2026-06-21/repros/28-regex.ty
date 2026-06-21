@@ -1,0 +1,27 @@
+import re
+
+def main() -> None:
+    let text: str = "Contact: alice@example.com and bob@test.org"
+    let emails: list[str] = re.findall(r"[\w.]+@[\w.]+", text)
+    print(emails)
+
+    let m: re.Match[str]? = re.search(r"(\w+)@(\w+)", text)
+    if m is not None:
+        print(m.group(0), m.group(1), m.group(2))
+
+    let replaced: str = re.sub(r"\d+", "#", "order 123 has 45 items")
+    print(replaced)
+
+    let parts: list[str] = re.split(r"[,;]\s*", "a, b; c,d")
+    print(parts)
+
+    let phone: str = "555-123-4567"
+    let pm: re.Match[str]? = re.match(r"(\d{3})-(\d{3})-(\d{4})", phone)
+    if pm is not None:
+        print(pm.groups())
+
+    print(bool(re.fullmatch(r"\d+", "12345")))
+    print(bool(re.fullmatch(r"\d+", "12a45")))
+
+if __name__ == "__main__":
+    main()

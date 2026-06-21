@@ -1,0 +1,32 @@
+from typing import Iterator
+from contextlib import contextmanager
+
+@contextmanager
+def tag(name: str) -> Iterator[str]:
+    print(f"<{name}>")
+    yield name
+    print(f"</{name}>")
+
+class Resource:
+    label: str
+    closed: bool
+
+impl Resource:
+    def __enter__(self) -> Resource:
+        print(f"open {self.label}")
+        return self
+    def __exit__(self, exc_type: object, exc: object, tb: object) -> bool:
+        print(f"close {self.label}")
+        self.closed = True
+        return False
+
+def main() -> None:
+    with tag("div") as t:
+        print(f"  inside {t}")
+
+    with Resource(label="db", closed=False) as r:
+        print(f"  using {r.label}")
+    print(f"closed = {r.closed}")
+
+if __name__ == "__main__":
+    main()

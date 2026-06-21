@@ -1,0 +1,44 @@
+def gcd(a: int, b: int) -> int:
+    if b == 0:
+        return a
+    return gcd(b, a % b)
+
+def ackermann(m: int, n: int) -> int:
+    if m == 0:
+        return n + 1
+    if n == 0:
+        return ackermann(m - 1, 1)
+    return ackermann(m - 1, ackermann(m, n - 1))
+
+def quicksort(xs: list[int]) -> list[int]:
+    if len(xs) <= 1:
+        return xs
+    let pivot: int = xs[0]
+    let rest: list[int] = xs[1:]
+    let less: list[int] = [x for x in rest if x < pivot]
+    let more: list[int] = [x for x in rest if x >= pivot]
+    return quicksort(less) + [pivot] + quicksort(more)
+
+def binary_search(xs: list[int], target: int) -> int:
+    mut lo: int = 0
+    mut hi: int = len(xs) - 1
+    while lo <= hi:
+        let mid: int = (lo + hi) // 2
+        if xs[mid] == target:
+            return mid
+        if xs[mid] < target:
+            lo = mid + 1
+        else:
+            hi = mid - 1
+    return -1
+
+def main() -> None:
+    print(gcd(48, 36))
+    print(ackermann(2, 3))
+    print(quicksort([3, 6, 1, 8, 2, 9, 4]))
+    let sorted_xs: list[int] = quicksort([10, 20, 30, 40, 50])
+    print(binary_search(sorted_xs, 30))
+    print(binary_search(sorted_xs, 35))
+
+if __name__ == "__main__":
+    main()

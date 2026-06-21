@@ -1,0 +1,47 @@
+type LinkedList[T] = Cons[T] | Nil
+
+class Cons[T]:
+    head: T
+    tail: LinkedList[T]
+class Nil:
+    pass
+
+impl[T] LinkedList[T]:
+    def length(self) -> int:
+        mut count: int = 0
+        mut cur: LinkedList[T] = self
+        while True:
+            match cur:
+                case Nil():
+                    return count
+                case Cons(_, tail):
+                    count = count + 1
+                    cur = tail
+
+    def to_list(self) -> list[T]:
+        mut out: list[T] = []
+        mut cur: LinkedList[T] = self
+        while True:
+            match cur:
+                case Nil():
+                    return out
+                case Cons(head, tail):
+                    out.append(head)
+                    cur = tail
+
+def from_list[T](xs: list[T]) -> LinkedList[T]:
+    mut acc: LinkedList[T] = Nil()
+    for x in reversed(xs):
+        acc = Cons(head=x, tail=acc)
+    return acc
+
+def main() -> None:
+    let ll: LinkedList[int] = from_list([1, 2, 3, 4, 5])
+    print(ll.length())
+    print(ll.to_list())
+    let empty: LinkedList[str] = Nil()
+    print(empty.length())
+    print(empty.to_list())
+
+if __name__ == "__main__":
+    main()

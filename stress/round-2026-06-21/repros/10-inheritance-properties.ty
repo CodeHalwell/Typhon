@@ -1,0 +1,48 @@
+class Animal:
+    name: str
+    legs: int
+
+class Dog(Animal):
+    breed: str
+
+impl Animal:
+    def describe(self) -> str:
+        return f"{self.name} has {self.legs} legs"
+
+impl Dog:
+    def bark(self) -> str:
+        return f"{self.name} ({self.breed}) says woof"
+
+class Circle:
+    radius: float
+
+impl Circle:
+    @property
+    def area(self) -> float:
+        return 3.141592653589793 * self.radius * self.radius
+
+    @property
+    def circumference(self) -> float:
+        return 2.0 * 3.141592653589793 * self.radius
+
+    @classmethod
+    def unit(cls) -> Circle:
+        return Circle(radius=1.0)
+
+    @staticmethod
+    def pi() -> float:
+        return 3.141592653589793
+
+def main() -> None:
+    let d: Dog = Dog(name="Rex", legs=4, breed="Husky")
+    print(d.describe())
+    print(d.bark())
+
+    let c: Circle = Circle(radius=2.0)
+    print(f"{c.area:.4f}")
+    print(f"{c.circumference:.4f}")
+    print(f"{Circle.unit().area:.4f}")
+    print(Circle.pi())
+
+if __name__ == "__main__":
+    main()

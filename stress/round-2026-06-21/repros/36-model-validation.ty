@@ -1,0 +1,30 @@
+model Address:
+    street: str
+    city: str
+    zip: str
+
+model User:
+    id: int
+    name: str
+    email: str
+    age: int
+
+impl User:
+    def is_adult(self) -> bool:
+        return self.age >= 18
+
+def main() -> None:
+    let addr: Address = Address(street="1 Main St", city="Springfield", zip="00000")
+    print(addr.city)
+
+    let u: User = User(id=1, name="Alice", email="a@b.com", age=30)
+    print(u.name, u.is_adult())
+    print(u.model_dump())
+
+    let raw: dict[str, object] = {"id": 2, "name": "Bob", "email": "b@c.com", "age": 15}
+    let parsed: User = User.model_validate(raw)
+    print(parsed.name, parsed.is_adult())
+    print(parsed.model_dump_json())
+
+if __name__ == "__main__":
+    main()

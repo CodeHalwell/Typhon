@@ -1,0 +1,42 @@
+class Point:
+    x: float
+    y: float
+
+class Rgb frozen:
+    r: int
+    g: int
+    b: int
+
+class Config:
+    name: str
+    tags: list[str] = []
+    retries: int = 3
+
+impl Point:
+    def dist_sq(self, other: Point) -> float:
+        let dx: float = self.x - other.x
+        let dy: float = self.y - other.y
+        return dx * dx + dy * dy
+
+impl Rgb:
+    def hex(self) -> str:
+        return f"#{self.r:02x}{self.g:02x}{self.b:02x}"
+
+def main() -> None:
+    let p1: Point = Point(x=0.0, y=0.0)
+    let p2: Point = Point(x=3.0, y=4.0)
+    print(p1.dist_sq(p2))
+    print(p1, p2)
+    print(p1 == Point(x=0.0, y=0.0))
+
+    let red: Rgb = Rgb(r=255, g=0, b=0)
+    print(red.hex())
+    print(red == Rgb(r=255, g=0, b=0))
+
+    let c1: Config = Config(name="a")
+    let c2: Config = Config(name="b")
+    c1.tags.append("x")
+    print(c1.tags, c2.tags, c1.retries)
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,21 @@
+import itertools
+
+def main() -> None:
+    print(list(itertools.chain([1, 2], [3, 4], [5])))
+    print(list(itertools.islice(itertools.count(10), 5)))
+    print(list(itertools.takewhile(lambda x: x < 5, range(10))))
+    print(list(itertools.dropwhile(lambda x: x < 5, range(10))))
+    print(list(itertools.accumulate([1, 2, 3, 4])))
+    print(list(itertools.combinations([1, 2, 3], 2)))
+    print(list(itertools.permutations([1, 2, 3], 2)))
+    print(list(itertools.product([0, 1], repeat=2)))
+    let cyc: list[int] = list(itertools.islice(itertools.cycle([1, 2]), 5))
+    print(cyc)
+    let data: list[tuple[str, int]] = [("a", 1), ("a", 2), ("b", 3)]
+    for key, grp in itertools.groupby(data, key=lambda p: p[0]):
+        print(key, [p[1] for p in grp])
+    print(list(itertools.repeat("z", 3)))
+    print(list(itertools.starmap(lambda a, b: a + b, [(1, 2), (3, 4)])))
+
+if __name__ == "__main__":
+    main()

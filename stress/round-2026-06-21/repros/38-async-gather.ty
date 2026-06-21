@@ -1,0 +1,37 @@
+import asyncio
+
+async def fetch_value(key: str, delay: float) -> int:
+    await asyncio.sleep(delay)
+    return len(key) * 10
+
+async def fetch_user(uid: int) -> str:
+    await asyncio.sleep(0.01)
+    return f"user{uid}"
+
+async def fetch_posts(uid: int) -> list[int]:
+    await asyncio.sleep(0.01)
+    return [uid, uid + 1, uid + 2]
+
+async def load_dashboard(uid: int) -> tuple[str, list[int]]:
+    gather:
+        user = fetch_user(uid)
+        posts = fetch_posts(uid)
+    return (user, posts)
+
+async def run() -> None:
+    let v: int = await fetch_value("hello", 0.01)
+    print(v)
+    let result: tuple[str, list[int]] = await load_dashboard(7)
+    print(result)
+    let all_vals: list[int] = await asyncio.gather(
+        fetch_value("a", 0.01),
+        fetch_value("bb", 0.01),
+        fetch_value("ccc", 0.01),
+    )
+    print(all_vals)
+
+def main() -> None:
+    asyncio.run(run())
+
+if __name__ == "__main__":
+    main()

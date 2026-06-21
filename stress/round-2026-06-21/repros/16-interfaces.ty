@@ -1,0 +1,39 @@
+interface Shape:
+    def area(self) -> float
+    def name(self) -> str
+
+class Square:
+    side: float
+class Rect:
+    w: float
+    h: float
+
+impl Square:
+    def area(self) -> float:
+        return self.side * self.side
+    def name(self) -> str:
+        return "square"
+
+impl Rect:
+    def area(self) -> float:
+        return self.w * self.h
+    def name(self) -> str:
+        return "rect"
+
+def total_area(shapes: list[Shape]) -> float:
+    mut total: float = 0.0
+    for s in shapes:
+        total = total + s.area()
+    return total
+
+def describe(s: Shape) -> str:
+    return f"{s.name()}: {s.area()}"
+
+def main() -> None:
+    let shapes: list[Shape] = [Square(side=2.0), Rect(w=3.0, h=4.0)]
+    print(total_area(shapes))
+    for s in shapes:
+        print(describe(s))
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,30 @@
+enum Direction:
+    NORTH
+    EAST
+    SOUTH
+    WEST
+
+enum Permission:
+    READ = 1
+    WRITE = 2
+    EXECUTE = 4
+
+def opposite(d: Direction) -> Direction:
+    match d:
+        case Direction.NORTH: return Direction.SOUTH
+        case Direction.SOUTH: return Direction.NORTH
+        case Direction.EAST:  return Direction.WEST
+        case Direction.WEST:  return Direction.EAST
+
+def main() -> None:
+    print(Direction.NORTH)
+    print(Direction.NORTH.name, Direction.NORTH.value)
+    print(opposite(Direction.EAST))
+    for d in Direction:
+        print(d.name, d.value)
+    print(Permission.READ.value + Permission.WRITE.value)
+    let mask: int = Permission.READ.value | Permission.EXECUTE.value
+    print(mask)
+
+if __name__ == "__main__":
+    main()

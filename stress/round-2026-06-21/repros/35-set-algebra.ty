@@ -1,0 +1,29 @@
+def main() -> None:
+    let a: set[int] = {1, 2, 3, 4, 5}
+    let b: set[int] = {4, 5, 6, 7, 8}
+    print(sorted(a | b))
+    print(sorted(a & b))
+    print(sorted(a - b))
+    print(sorted(a ^ b))
+    print(a <= {1, 2, 3, 4, 5, 6})
+    print({1, 2} < a)
+    print(a.isdisjoint({9, 10}))
+
+    mut s: set[str] = set()
+    s.add("x")
+    s.add("y")
+    s.add("x")
+    print(sorted(s), len(s))
+    s.discard("x")
+    print(sorted(s))
+
+    let fs: frozenset[int] = frozenset([1, 2, 3])
+    print(2 in fs, 9 in fs)
+    let nested: set[frozenset[int]] = {frozenset([1, 2]), frozenset([3, 4])}
+    print(len(nested))
+
+    let words: list[str] = ["a", "b", "a", "c", "b", "a"]
+    print(sorted(set(words)))
+
+if __name__ == "__main__":
+    main()

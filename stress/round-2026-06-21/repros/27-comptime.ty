@@ -1,0 +1,19 @@
+comptime let MAX_RETRIES: int = 3 + 2
+comptime let GREETING: str = "hello".upper()
+comptime let ENABLED: bool = MAX_RETRIES > 4
+
+comptime def square(n: int) -> int:
+    return n * n
+
+comptime let AREA: int = square(8)
+
+def main() -> None:
+    print(MAX_RETRIES)
+    print(GREETING)
+    print(ENABLED)
+    print(AREA)
+    for i in range(MAX_RETRIES):
+        print(f"attempt {i}")
+
+if __name__ == "__main__":
+    main()

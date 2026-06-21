@@ -1,0 +1,37 @@
+type Expr = Num | Add | Sub | Mul | Neg
+
+class Num:
+    value: float
+class Add:
+    left: Expr
+    right: Expr
+class Sub:
+    left: Expr
+    right: Expr
+class Mul:
+    left: Expr
+    right: Expr
+class Neg:
+    operand: Expr
+
+impl Expr:
+    def eval(self) -> float:
+        match self:
+            case Num(v):       return v
+            case Add(l, r):    return l.eval() + r.eval()
+            case Sub(l, r):    return l.eval() - r.eval()
+            case Mul(l, r):    return l.eval() * r.eval()
+            case Neg(e):       return -e.eval()
+
+def main() -> None:
+    # (2 + 3) * -(4 - 1) = 5 * -3 = -15
+    let expr: Expr = Mul(
+        left=Add(left=Num(value=2.0), right=Num(value=3.0)),
+        right=Neg(operand=Sub(left=Num(value=4.0), right=Num(value=1.0))),
+    )
+    print(expr.eval())
+    let simple: Expr = Add(left=Num(value=10.0), right=Num(value=32.0))
+    print(simple.eval())
+
+if __name__ == "__main__":
+    main()
