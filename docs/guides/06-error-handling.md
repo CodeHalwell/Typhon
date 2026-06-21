@@ -254,7 +254,18 @@ def load_config(text: str) -> Result[Config, str]:
     return Ok(Config(host=data["host"], port=port))
 ```
 
-`rescue` works in value positions and after a leading `return` / `if` / `while` / `assert`, and composes with `as!` as shown. The error expression runs to the end of the line. Today the statement-tail form (the last thing on the line, as above) is what's lowered; reach for the explicit multi-`except` `try` shim when you need to map several exception *types* to different errors.
+`rescue` works in value positions and after a leading `return` / `if` / `while` / `assert`, and composes with `as!` as shown.
+
+When several statements share one catch-all mapping, the **block form** avoids repeating `rescue e: …` on every line:
+
+```python
+def load_config(text: str) -> Result[Config, str]:
+    rescue e: f"bad config: {e}":
+        let data: dict[str, str] = json.loads(text) as! dict[str, str]
+        return Ok(Config(host=data["host"], port=int(data["port"])))
+```
+
+Any exception raised in the suite is mapped through the error expression and returned as `Err(...)` — the lambda-free replacement for a `try/except` shim. The mapped error type is checked against the function's declared error type in both forms. Reach for the explicit multi-`except` `try` shim only when you need to map several exception *types* to different errors.
 
 ## What gets emitted
 

@@ -387,7 +387,16 @@ def load_port(raw: str) -> Result[int, str]:
 let data: dict[str, str] = json.loads(text) as! dict[str, str] rescue e: f"bad json: {e}"
 ```
 
-The error expression runs to the end of the logical line. `rescue` works in value positions and after a leading `return` / `if` / `while` / `assert`. **Scope (v1):** the statement-tail form above is lowered; an inline/mid-expression `rescue`, or one whose right side isn't `NAME: EXPR`, is left for the parser. The mapped error type is not yet statically checked against the function's declared error type (inherited from `try_result`); runtime propagation is unaffected.
+A **block form** maps any exception raised across a whole suite — the lambda-free replacement for a `try/except` shim:
+
+```python
+def load_config(text: str) -> Result[Config, str]:
+    rescue e: f"bad config: {e}":
+        let data: dict[str, str] = json.loads(text) as! dict[str, str]
+        return Ok(Config(host=data["host"], port=int(data["port"])))
+```
+
+The block form lowers to `try` / `except Exception as e: return Err(...)`. The mapped error type is checked against the function's declared error type in both forms (`tyc::result_error_mismatch`). `rescue` works in value positions and after a leading `return` / `if` / `while` / `assert`. **Scope (v1):** postfix `rescue` is lowered in statement-tail position (the last thing on the line); an inline/mid-expression postfix `rescue`, or one whose right side isn't `NAME: EXPR`, is left for the parser.
 
 ## Async and concurrency
 

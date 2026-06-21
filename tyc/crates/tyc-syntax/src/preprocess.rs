@@ -4223,6 +4223,155 @@ fn find_rescue_err_end(bytes: &[u8], skip: &[bool], start: usize) -> usize {
     bytes.len()
 }
 
+/// Lower the **block** form of `rescue` — a one-line error-mapping prefix over a
+/// suite — into a `try` / `except` that returns `Err`:
+///
+/// ```text
+///     rescue e: f"bad config: {e}":
+///         let data = json.loads(open(path).read()) as! dict[str, str]
+///         return Ok(Config(host=data["host"], port=int(data["port"])))
+/// ```
+///
+/// becomes
+///
+/// ```text
+///     try:
+///         let data = json.loads(open(path).read()) as! dict[str, str]
+///         return Ok(Config(host=data["host"], port=int(data["port"])))
+///     except Exception as e:
+///         return Err(f"bad config: {e}")
+/// ```
+///
+/// Any exception raised in the suite is bound to `NAME`, mapped through
+/// `ERR_EXPR`, and returned as `Err(ERR_EXPR)`. Emitting a real `Err(...)`
+/// constructor (rather than an internal alias) means the checker's
+/// `return Err(...)` error-type check validates `ERR_EXPR` against the enclosing
+/// function's declared error type, exactly like a hand-written `else err:`
+/// branch. Runs to a fixpoint so nested `rescue` blocks expand. Like the
+/// `with`-chain and `gather:` expanders, this is a line-based transform that
+/// adds lines.
+pub fn expand_rescue_blocks(source: &str) -> String {
+    let mut current = source.to_owned();
+    loop {
+        let next = expand_rescue_blocks_once(&current);
+        if next == current {
+            return current;
+        }
+        current = next;
+    }
+}
+
+fn expand_rescue_blocks_once(source: &str) -> String {
+    let mut out = String::with_capacity(source.len() + 64);
+    let mut in_string: Option<StringMode> = None;
+    let lines: Vec<&str> = source.split_inclusive('\n').collect();
+    let mut i = 0;
+    while i < lines.len() {
+        let line = lines[i];
+        let pre_string = in_string;
+        let raw = line.trim_end_matches(['\n', '\r']);
+        let code_end = scan_line_code_end(raw, &mut in_string);
+
+        // A line that begins inside a triple-quoted string is pure content.
+        if pre_string.is_some() {
+            out.push_str(line);
+            i += 1;
+            continue;
+        }
+
+        let code = &raw[..code_end];
+        let indent_len = code.find(|c: char| !c.is_whitespace()).unwrap_or(code.len());
+        let header_indent = &code[..indent_len];
+        let body = code[indent_len..].trim_end();
+
+        if let Some((name, err_expr)) = parse_rescue_block_header(body) {
+            // Collect the suite: subsequent blank lines and lines indented
+            // strictly deeper than the header (and any line that continues a
+            // triple-quoted string opened within the suite).
+            let mut suite_state = in_string;
+            let mut j = i + 1;
+            let mut suite_end = i + 1;
+            while j < lines.len() {
+                let lr = lines[j].trim_end_matches(['\n', '\r']);
+                let in_str_before = suite_state.is_some();
+                let _ = scan_line_code_end(lr, &mut suite_state);
+                let is_blank = lr.trim().is_empty();
+                let l_indent = lr.find(|c: char| !c.is_whitespace()).unwrap_or(lr.len());
+                if !in_str_before && !is_blank && l_indent <= indent_len {
+                    break; // dedented to/below the header — the suite has ended
+                }
+                j += 1;
+                if !is_blank {
+                    suite_end = j;
+                }
+            }
+
+            if suite_end > i + 1 {
+                out.push_str(header_indent);
+                out.push_str("try:\n");
+                for s in &lines[i + 1..suite_end] {
+                    out.push_str(s);
+                }
+                out.push_str(header_indent);
+                out.push_str("except Exception as ");
+                out.push_str(&name);
+                out.push_str(":\n");
+                out.push_str(header_indent);
+                out.push_str("    return Err(");
+                out.push_str(&err_expr);
+                out.push_str(")\n");
+                // Re-emit any trailing blank lines that were scanned past the
+                // last suite statement so spacing is preserved.
+                for s in &lines[suite_end..j] {
+                    out.push_str(s);
+                }
+                // Recompute carried string state up to where we resume.
+                in_string = None;
+                for s in &lines[i..j] {
+                    let sr = s.trim_end_matches(['\n', '\r']);
+                    let _ = scan_line_code_end(sr, &mut in_string);
+                }
+                i = j;
+                continue;
+            }
+        }
+
+        out.push_str(line);
+        i += 1;
+    }
+    out
+}
+
+/// Parse a `rescue NAME: ERR_EXPR:` block header from the comment-stripped,
+/// trailing-trimmed code portion of a line. Returns `(NAME, ERR_EXPR)` or
+/// `None` when the line isn't a well-formed block header (so the postfix pass /
+/// parser handles it). The trailing `:` is the block opener; a `:` inside the
+/// error expression's strings or brackets is preserved.
+fn parse_rescue_block_header(body: &str) -> Option<(String, String)> {
+    let rest = body.strip_prefix("rescue")?;
+    if !rest.starts_with([' ', '\t']) {
+        return None; // `rescue_x`, not the keyword
+    }
+    let rest = rest.trim_start();
+    let bytes = rest.as_bytes();
+    if bytes.is_empty() || !(bytes[0].is_ascii_alphabetic() || bytes[0] == b'_') {
+        return None;
+    }
+    let mut k = 1;
+    while k < bytes.len() && (bytes[k].is_ascii_alphanumeric() || bytes[k] == b'_') {
+        k += 1;
+    }
+    let name = &rest[..k];
+    let after = rest[k..].trim_start();
+    let after = after.strip_prefix(':')?; // binder colon
+    let code = after.trim_end();
+    let err_expr = code.strip_suffix(':')?.trim(); // block-opener colon
+    if err_expr.is_empty() {
+        return None;
+    }
+    Some((name.to_owned(), err_expr.to_owned()))
+}
+
 /// Rewrite typed tuple-unpacking `let` declarations into a temp +
 /// per-element sequence. N4 (2026-05-22).
 ///
@@ -5257,10 +5406,15 @@ pub fn expand_question_ops(source: &str) -> String {
     // call site) — after the inline-`?` lift that the pipelines run just
     // before this function (so `f()? as! T` already has its `?` hoisted),
     // and before the multi-line-`?` join and the end-of-line `?` expansion.
-    // Lower the postfix `rescue` boundary operator first: it rewrites to
-    // `try_result(lambda: EXPR, lambda e: ERR)?`, so its generated `?` must be
-    // in place before the cast lift and the end-of-line `?` expansion below.
-    let rescued = expand_rescue(source);
+    // Lower the `rescue` boundary forms first. The block form
+    // (`rescue e: ERR:` over a suite) lowers to `try`/`except` returning `Err`;
+    // the postfix form (`EXPR rescue e: ERR`) lowers to
+    // `try_result(lambda: EXPR, lambda e: ERR)?`. Blocks run first (their
+    // header has no left operand, so the postfix scanner skips it anyway), then
+    // the postfix pass, so any generated `?` is in place before the cast lift
+    // and the end-of-line `?` expansion below.
+    let deblocked = expand_rescue_blocks(source);
+    let rescued = expand_rescue(&deblocked);
     let casted = expand_checked_casts(&rescued);
     let joined = join_multiline_question_statements(&casted);
     expand_question_ops_inner(&joined)
@@ -9261,6 +9415,48 @@ mod tests {
         // `rescue` not followed by `NAME:` is left alone.
         let src = "let x = f() rescue boom\n";
         assert_eq!(expand_rescue(src), src);
+    }
+
+    // ── block `rescue` form ───────────────────────────────────────────────
+    #[test]
+    fn rescue_block_lowers_to_try_except() {
+        let src = "    rescue e: f\"bad: {e}\":\n        let x: int = risky()\n        return Ok(x)\n";
+        let out = expand_rescue_blocks(src);
+        assert_eq!(
+            out,
+            "    try:\n        let x: int = risky()\n        return Ok(x)\n    except Exception as e:\n        return Err(f\"bad: {e}\")\n",
+        );
+    }
+
+    #[test]
+    fn rescue_block_stops_at_dedent() {
+        let src = "    rescue e: g(e):\n        step()\n    after()\n";
+        let out = expand_rescue_blocks(src);
+        assert!(out.contains("    try:\n        step()\n    except Exception as e:\n        return Err(g(e))\n"), "{out}");
+        assert!(out.trim_end().ends_with("    after()"), "code after the block must survive:\n{out}");
+    }
+
+    #[test]
+    fn rescue_block_preserves_colon_in_error_expr() {
+        // The block-opener `:` is the last structural colon; a `:` inside the
+        // error expression's string must be preserved.
+        let src = "rescue e: f\"a:b {e}\":\n    work()\n";
+        let out = expand_rescue_blocks(src);
+        assert!(out.contains("return Err(f\"a:b {e}\")"), "{out}");
+    }
+
+    #[test]
+    fn rescue_block_nested_expands_both() {
+        let src = "rescue a: x:\n    rescue b: y:\n        inner()\n";
+        let out = expand_rescue_blocks(src);
+        assert_eq!(out.matches("try:").count(), 2, "both blocks expand:\n{out}");
+        assert!(out.contains("except Exception as a:") && out.contains("except Exception as b:"), "{out}");
+    }
+
+    #[test]
+    fn rescue_block_header_without_suite_is_left_alone() {
+        let src = "rescue e: oops:\nnext_stmt()\n";
+        assert_eq!(expand_rescue_blocks(src), src);
     }
 
     #[test]
