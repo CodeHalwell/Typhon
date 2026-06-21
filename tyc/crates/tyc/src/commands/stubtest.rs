@@ -201,7 +201,7 @@ fn run_stubtest_for_module(
     // change above doesn't affect resolution.
     let existing = std::env::var("PYTHONPATH").unwrap_or_default();
     let joined = if existing.is_empty() {
-        out_dir.display().to_string()
+        out_dir.to_string_lossy().into_owned()
     } else {
         format!("{}{}{}", out_dir.display(), path_separator(), existing)
     };

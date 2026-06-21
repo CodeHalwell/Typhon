@@ -1134,7 +1134,7 @@ impl Interpreter {
         let module_env = Env::new_child(&self.root);
         let saved_source = self.current_source.clone();
         self.current_source = Some(Rc::new(SourceInfo::new(
-            path.display().to_string(),
+            path.to_string_lossy().into_owned(),
             &prep.python_source,
         )));
         let body_result = self.exec_block(&module.body, &module_env);

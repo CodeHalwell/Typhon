@@ -305,13 +305,13 @@ impl TyphonConfig {
             if candidate.exists() {
                 let text = std::fs::read_to_string(&candidate).map_err(|e| {
                     crate::config::ConfigError::Io {
-                        path: candidate.display().to_string(),
+                        path: candidate.to_string_lossy().into_owned(),
                         cause: e.to_string(),
                     }
                 })?;
                 let config: Self =
                     toml::from_str(&text).map_err(|e| crate::config::ConfigError::Parse {
-                        path: candidate.display().to_string(),
+                        path: candidate.to_string_lossy().into_owned(),
                         cause: e.to_string(),
                     })?;
                 config.validate(&candidate)?;
@@ -350,13 +350,13 @@ impl TyphonConfig {
         let raw = self.python.target.trim();
         let (major, minor) =
             parse_python_target(raw).ok_or_else(|| ConfigError::UnsupportedPythonTarget {
-                path: source_path.display().to_string(),
+                path: source_path.to_string_lossy().into_owned(),
                 target: raw.to_owned(),
                 reason: "expected a `MAJOR.MINOR` string such as `3.13` or `3.14t`".to_owned(),
             })?;
         if (major, minor) < (3, 13) {
             return Err(ConfigError::UnsupportedPythonTarget {
-                path: source_path.display().to_string(),
+                path: source_path.to_string_lossy().into_owned(),
                 target: raw.to_owned(),
                 reason: format!(
                     "Typhon requires CPython 3.13+ (got {major}.{minor}); update `[python] target` to `\"3.13\"` or newer",
@@ -370,7 +370,7 @@ impl TyphonConfig {
         let cd = self.emit.class_default.trim();
         if !ALLOWED_CLASS_DEFAULTS.contains(&cd) {
             return Err(ConfigError::InvalidClassDefault {
-                path: source_path.display().to_string(),
+                path: source_path.to_string_lossy().into_owned(),
                 value: self.emit.class_default.clone(),
                 allowed: ALLOWED_CLASS_DEFAULTS.join(", "),
             });
@@ -379,7 +379,7 @@ impl TyphonConfig {
         let me = self.emit.model_extra.trim();
         if !ALLOWED_MODEL_EXTRAS.contains(&me) {
             return Err(ConfigError::InvalidModelExtra {
-                path: source_path.display().to_string(),
+                path: source_path.to_string_lossy().into_owned(),
                 value: self.emit.model_extra.clone(),
                 allowed: ALLOWED_MODEL_EXTRAS.join(", "),
             });

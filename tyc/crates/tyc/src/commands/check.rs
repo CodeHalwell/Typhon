@@ -322,14 +322,14 @@ pub fn run(args: CheckArgs) -> Result<()> {
                     let err = io_errors
                         .get(&path)
                         .expect("source absent from cache must have an io_errors entry");
-                    diags.push_error(TycError::io(path.display().to_string(), err));
+                    diags.push_error(TycError::io(path.to_string_lossy().into_owned(), err));
                     continue;
                 }
             };
 
             let file_diags = check_file_with_imports(
                 &mut db,
-                path.display().to_string(),
+                path.to_string_lossy().into_owned(),
                 source.clone(),
                 &project_shapes,
             );
@@ -356,7 +356,7 @@ pub fn run(args: CheckArgs) -> Result<()> {
             // it adds up — each preprocess walks the full source and
             // each `parse_module` call rebuilds the ruff AST.
             let analysis_diags = run_secondary_passes(
-                &path.display().to_string(),
+                &path.to_string_lossy(),
                 &source,
                 has_project_config.then_some(&vetting_ctx),
                 config.strictness.allow_secret_comptime,
@@ -375,13 +375,13 @@ pub fn run(args: CheckArgs) -> Result<()> {
                 let source = match std::fs::read_to_string(&path) {
                     Ok(s) => s,
                     Err(e) => {
-                        diags.push_error(TycError::io(path.display().to_string(), &e));
+                        diags.push_error(TycError::io(path.to_string_lossy().into_owned(), &e));
                         continue;
                     }
                 };
                 let file_diags = check_file_with_imports(
                     &mut db,
-                    path.display().to_string(),
+                    path.to_string_lossy().into_owned(),
                     source.clone(),
                     &project_shapes,
                 );
@@ -422,7 +422,7 @@ pub fn run(args: CheckArgs) -> Result<()> {
                 let impl_source = match std::fs::read_to_string(&impl_path) {
                     Ok(s) => s,
                     Err(e) => {
-                        diags.push_error(TycError::io(impl_path.display().to_string(), &e));
+                        diags.push_error(TycError::io(impl_path.to_string_lossy().into_owned(), &e));
                         continue;
                     }
                 };
@@ -441,7 +441,7 @@ pub fn run(args: CheckArgs) -> Result<()> {
                             // (`"warn"`), or drop it (`"off"`).
                             diags.push_warning(TycError::stub_mismatch(
                                 format!("{label}: {}", finding.message),
-                                path.display().to_string(),
+                                path.to_string_lossy().into_owned(),
                                 source.clone(),
                                 0,
                                 1,
@@ -451,7 +451,7 @@ pub fn run(args: CheckArgs) -> Result<()> {
                     Err(e) => {
                         diags.push_warning(TycError::stub_mismatch(
                             format!("could not diff stub against implementation: {e}"),
-                            path.display().to_string(),
+                            path.to_string_lossy().into_owned(),
                             source.clone(),
                             0,
                             1,
@@ -533,7 +533,7 @@ pub fn run(args: CheckArgs) -> Result<()> {
             // path), so the user sees that a directory of `.dty` files
             // without any `.ty` siblings isn't picked up by default.
             let display_paths: Vec<String> =
-                args.paths.iter().map(|p| p.display().to_string()).collect();
+                args.paths.iter().map(|p| p.to_string_lossy().into_owned()).collect();
             let joined = if display_paths.is_empty() {
                 ".".to_owned()
             } else {
@@ -975,7 +975,7 @@ fn check_stdlib_module_shadow(
     }
     Some(TycError::stdlib_module_shadow(
         stem.to_owned(),
-        path.display().to_string(),
+        path.to_string_lossy().into_owned(),
         source.to_owned(),
         0,
         0,
@@ -1117,7 +1117,7 @@ fn collect_project_shapes(
                 let dotted = ty_path_to_dotted(&file, src_root);
                 if let Ok(text) = std::fs::read_to_string(&file) {
                     shapes.entry(dotted).or_insert_with(|| {
-                        extract_shapes_for_path(&file.display().to_string(), &text)
+                        extract_shapes_for_path(&file.to_string_lossy(), &text)
                     });
                 }
             }
@@ -1131,7 +1131,7 @@ fn collect_project_shapes(
                 if let Ok(text) = std::fs::read_to_string(&file) {
                     shapes.insert(
                         dotted,
-                        extract_shapes_for_path(&file.display().to_string(), &text),
+                        extract_shapes_for_path(&file.to_string_lossy(), &text),
                     );
                 }
             }

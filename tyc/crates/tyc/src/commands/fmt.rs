@@ -36,11 +36,11 @@ pub fn run(args: FmtArgs) -> Result<()> {
             if args.check {
                 let source = std::fs::read_to_string(&path).map_err(|e| {
                     Report::new(tyc_diagnostics::TycError::io(
-                        path.display().to_string(),
+                        path.to_string_lossy().into_owned(),
                         &e,
                     ))
                 })?;
-                let result = tyc_format::format_source(&source, &path.display().to_string())
+                let result = tyc_format::format_source(&source, &path.to_string_lossy())
                     .map_err(Report::new)?;
                 if result.changed {
                     changed += 1;

@@ -998,14 +998,14 @@ fn run_ruff_format(source: &str, path: &str) -> Result<String, String> {
 #[allow(clippy::result_large_err)]
 pub fn format_file(path: &Path) -> Result<bool, TycError> {
     let source =
-        std::fs::read_to_string(path).map_err(|e| TycError::io(path.display().to_string(), &e))?;
+        std::fs::read_to_string(path).map_err(|e| TycError::io(path.to_string_lossy().into_owned(), &e))?;
 
-    let path_str = path.display().to_string();
+    let path_str = path.to_string_lossy().into_owned();
     let result = format_source(&source, &path_str)?;
 
     if result.changed {
         std::fs::write(path, result.output.as_bytes())
-            .map_err(|e| TycError::io(path.display().to_string(), &e))?;
+            .map_err(|e| TycError::io(path.to_string_lossy().into_owned(), &e))?;
     }
 
     Ok(result.changed)

@@ -1757,7 +1757,7 @@ fn upsert_source_file(
         sf.set_text(db).to(text);
         sf
     } else {
-        let sf = SourceFile::new(db, path.display().to_string(), text);
+        let sf = SourceFile::new(db, path.to_string_lossy().into_owned(), text);
         entries.insert(dotted.to_owned(), sf);
         sf
     }
