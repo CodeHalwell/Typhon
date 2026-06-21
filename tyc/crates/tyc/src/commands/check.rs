@@ -422,7 +422,8 @@ pub fn run(args: CheckArgs) -> Result<()> {
                 let impl_source = match std::fs::read_to_string(&impl_path) {
                     Ok(s) => s,
                     Err(e) => {
-                        diags.push_error(TycError::io(impl_path.to_string_lossy().into_owned(), &e));
+                        diags
+                            .push_error(TycError::io(impl_path.to_string_lossy().into_owned(), &e));
                         continue;
                     }
                 };
@@ -532,8 +533,11 @@ pub fn run(args: CheckArgs) -> Result<()> {
             // and at the `--stubs` flag (the recursive stub-discovery
             // path), so the user sees that a directory of `.dty` files
             // without any `.ty` siblings isn't picked up by default.
-            let display_paths: Vec<String> =
-                args.paths.iter().map(|p| p.to_string_lossy().into_owned()).collect();
+            let display_paths: Vec<String> = args
+                .paths
+                .iter()
+                .map(|p| p.to_string_lossy().into_owned())
+                .collect();
             let joined = if display_paths.is_empty() {
                 ".".to_owned()
             } else {
@@ -1116,9 +1120,9 @@ fn collect_project_shapes(
             for file in files {
                 let dotted = ty_path_to_dotted(&file, src_root);
                 if let Ok(text) = std::fs::read_to_string(&file) {
-                    shapes.entry(dotted).or_insert_with(|| {
-                        extract_shapes_for_path(&file.to_string_lossy(), &text)
-                    });
+                    shapes
+                        .entry(dotted)
+                        .or_insert_with(|| extract_shapes_for_path(&file.to_string_lossy(), &text));
                 }
             }
         }

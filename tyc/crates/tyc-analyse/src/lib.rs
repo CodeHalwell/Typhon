@@ -3388,11 +3388,13 @@ fn is_secret_name(name: &str) -> bool {
             // so `MONKEY` doesn't match `KEY` and `PASSPORT` doesn't match `PASS`.
             let start_ok = actual_idx == 0
                 || upper.as_bytes()[actual_idx - 1] == b'_'
-                || (name.as_bytes()[actual_idx].is_ascii_uppercase() && name.as_bytes()[actual_idx - 1].is_ascii_lowercase());
+                || (name.as_bytes()[actual_idx].is_ascii_uppercase()
+                    && name.as_bytes()[actual_idx - 1].is_ascii_lowercase());
             let actual_end = actual_idx + word.len();
             let end_ok = actual_end == upper.len()
                 || upper.as_bytes()[actual_end] == b'_'
-                || (name.as_bytes()[actual_end].is_ascii_uppercase() && !name.as_bytes()[actual_end - 1].is_ascii_uppercase());
+                || (name.as_bytes()[actual_end].is_ascii_uppercase()
+                    && !name.as_bytes()[actual_end - 1].is_ascii_uppercase());
             if start_ok && end_ok {
                 return true;
             }

@@ -997,8 +997,8 @@ fn run_ruff_format(source: &str, path: &str) -> Result<String, String> {
 /// Returns `true` if the file was changed.
 #[allow(clippy::result_large_err)]
 pub fn format_file(path: &Path) -> Result<bool, TycError> {
-    let source =
-        std::fs::read_to_string(path).map_err(|e| TycError::io(path.to_string_lossy().into_owned(), &e))?;
+    let source = std::fs::read_to_string(path)
+        .map_err(|e| TycError::io(path.to_string_lossy().into_owned(), &e))?;
 
     let path_str = path.to_string_lossy().into_owned();
     let result = format_source(&source, &path_str)?;
