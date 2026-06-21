@@ -1037,6 +1037,45 @@ impl LanguageServer for Backend {
             (preprocessed_text(&*db, sf), resolved_module_arc(&*db, sf))
         };
         let offset = position_to_byte(&preprocessed, position);
+
+        // Member-access cross-file jump: clicking on `Bar` in `f.Bar`
+        // (after `import foo as f` / `import pkg.sub`) has no resolver
+        // reference to follow — the resolver records the receiver `f` but
+        // not the attribute name `Bar`.  Recover the `(alias, member)` pair
+        // textually; if `alias` is a bare-import binding, build an
+        // `ImportInfo` for `member` and resolve it in the alias's module.
+        if let Some((receiver, member)) = extract_member_access_at_offset(&preprocessed, offset) {
+            // Only the left-most segment of a dotted receiver names a
+            // binding in scope (`pkg` in `pkg.sub.Thing`); the alias lookup
+            // uses that root.
+            let alias_root = receiver.split('.').next().unwrap_or(&receiver);
+            if let Some(import) = resolved
+                .scopes
+                .first()
+                .and_then(|s| s.bindings.iter().find(|b| b.name == alias_root))
+                .filter(|b| b.kind == BindingKind::Import)
+                .and_then(|b| b.import_info.as_ref())
+                .filter(|info| info.member.is_none())
+            {
+                // For `import pkg.sub` the bound name is `pkg`, but a
+                // `pkg.sub.Thing` access targets the `pkg.sub` module. Splice
+                // any extra receiver segments onto the import's module path.
+                let extra = receiver.split('.').skip(1).collect::<Vec<_>>().join(".");
+                let module = if extra.is_empty() {
+                    import.module.clone()
+                } else {
+                    format!("{}.{extra}", import.module)
+                };
+                let target = ImportInfo {
+                    module,
+                    member: Some(member.clone()),
+                };
+                if let Some(loc) = self.resolve_cross_file_import(&uri, &target).await {
+                    return Ok(Some(GotoDefinitionResponse::Scalar(loc)));
+                }
+            }
+        }
+
         let Some(symbol) = resolved.symbol_at_offset(offset) else {
             return Ok(None);
         };
@@ -1495,22 +1534,25 @@ impl Backend {
             None => return None,
         };
 
-        let target_name = info.member.clone();
         let module_scope = 0;
-        let target_binding = match target_name {
-            Some(name) => resolved
-                .scopes
-                .get(module_scope)?
-                .bindings
-                .iter()
-                .find(|b| b.name == name),
-            None => None,
-        };
-
-        let (start_prep, end_prep) = if let Some(b) = target_binding {
-            (b.span.0, b.span.1)
-        } else {
-            (0, 0)
+        let (start_prep, end_prep) = match &info.member {
+            // `from foo import Bar` / `f.Bar`: jump to `Bar`'s declaration.
+            // If the member isn't a top-level binding in the target module
+            // (re-export, typo, dynamic attr) we return `None` rather than
+            // silently landing at the top of the file — the caller then
+            // falls back to the local declaration site, never a wrong jump.
+            Some(name) => {
+                let b = resolved
+                    .scopes
+                    .get(module_scope)?
+                    .bindings
+                    .iter()
+                    .find(|b| &b.name == name)?;
+                (b.span.0, b.span.1)
+            }
+            // Bare `import foo` / `import pkg.sub`: the binding *is* the
+            // module, so jump to the top of its source file.
+            None => (0, 0),
         };
         // Map preprocessed-source offsets back to original-source offsets
         // by adding back the bytes preprocess stripped from earlier lines
@@ -1905,10 +1947,13 @@ fn read_lint_options(root: &std::path::Path) -> tyc_analyse::LintOptions {
     opts
 }
 
-/// Map a dotted module name to a `.ty` file path under `src_dir`.
+/// Map a dotted module name to a source file path under `src_dir`.
 ///
 /// `pkg.util` → `src_dir/pkg/util.ty`, falling back to
 /// `src_dir/pkg/util/__init__.ty` when the leaf is itself a package.
+/// A `.ty` source is preferred; when none exists the same candidates are
+/// retried with a `.py` extension so go-to-definition can also land in a
+/// hand-written `.py` sibling that lives alongside the Typhon sources.
 /// Returns `None` when neither candidate exists on disk.
 fn resolve_module_to_file(src_dir: &std::path::Path, module: &str) -> Option<std::path::PathBuf> {
     let parts: Vec<&str> = module.split('.').collect();
@@ -1918,13 +1963,17 @@ fn resolve_module_to_file(src_dir: &std::path::Path, module: &str) -> Option<std
     let mut leaf = src_dir.to_path_buf();
     for (i, segment) in parts.iter().enumerate() {
         if i + 1 == parts.len() {
-            let direct = leaf.join(format!("{segment}.ty"));
-            if direct.exists() {
-                return Some(direct);
-            }
-            let pkg_init = leaf.join(segment).join("__init__.ty");
-            if pkg_init.exists() {
-                return Some(pkg_init);
+            // `.ty` wins over `.py` at every step so a Typhon source masks
+            // a stale generated `.py` of the same name.
+            for ext in ["ty", "py"] {
+                let direct = leaf.join(format!("{segment}.{ext}"));
+                if direct.exists() {
+                    return Some(direct);
+                }
+                let pkg_init = leaf.join(segment).join(format!("__init__.{ext}"));
+                if pkg_init.exists() {
+                    return Some(pkg_init);
+                }
             }
             return None;
         } else {
@@ -2642,6 +2691,48 @@ pub fn extract_member_access_receiver(text: &str, offset: usize) -> Option<Strin
         return None;
     }
     Some(receiver.to_owned())
+}
+
+/// When the cursor sits on the *member* identifier of a `receiver.member`
+/// attribute access (`f.Bar`, `pkg.util.Thing`), return
+/// `(receiver, member)` where `receiver` is the dotted text left of the
+/// final `.` and `member` is the identifier under the cursor.
+///
+/// Drives cross-file go-to-definition for bare-import aliases: clicking on
+/// `Bar` in `f.Bar` (after `import foo as f`) has no resolver reference to
+/// follow — the resolver doesn't record attribute names — so we recover the
+/// `(alias, member)` pair textually and resolve the member in the alias's
+/// module instead.  Returns `None` when the cursor isn't on the member of a
+/// `receiver.member` form.
+pub fn extract_member_access_at_offset(text: &str, offset: usize) -> Option<(String, String)> {
+    let bytes = text.as_bytes();
+    if offset > bytes.len() {
+        return None;
+    }
+    // Expand left and right over identifier characters to cover the full
+    // member name regardless of where in it the cursor sits.
+    let is_ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
+    let mut member_start = offset;
+    while member_start > 0 && is_ident(bytes[member_start - 1]) {
+        member_start -= 1;
+    }
+    let mut member_end = offset;
+    while member_end < bytes.len() && is_ident(bytes[member_end]) {
+        member_end += 1;
+    }
+    if member_start == member_end {
+        return None;
+    }
+    // The member must be immediately preceded by a `.`.
+    if member_start == 0 || bytes[member_start - 1] != b'.' {
+        return None;
+    }
+    let receiver = extract_member_access_receiver(text, member_start)?;
+    let member = text[member_start..member_end].to_owned();
+    // A leading identifier char would make this an in-progress chain rather
+    // than a settled `receiver.member`; the receiver extractor already
+    // rejects those, so reaching here means we have a clean pair.
+    Some((receiver, member))
 }
 
 /// Detect that the cursor sits inside the import list of a
@@ -4655,6 +4746,242 @@ mod tests {
         let toml = tmp.path().join("typhon.toml");
         std::fs::write(&toml, "[project]\nsrc = \"src\"\n").unwrap();
         assert_eq!(parse_src_dir(&toml).as_deref(), Some("src"));
+    }
+
+    #[test]
+    fn resolve_module_to_file_falls_back_to_py_sibling() {
+        // No `.ty` source — a hand-written `.py` of the same name should
+        // still resolve so go-to-definition can land in it.
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        std::fs::create_dir_all(src.join("pkg")).unwrap();
+        std::fs::write(src.join("legacy.py"), "def f():\n    pass\n").unwrap();
+        std::fs::write(src.join("pkg").join("__init__.py"), "y = 2\n").unwrap();
+
+        let direct = resolve_module_to_file(&src, "legacy").expect("legacy.py must resolve");
+        assert_eq!(direct.file_name().unwrap(), "legacy.py");
+
+        let pkg = resolve_module_to_file(&src, "pkg").expect("pkg/__init__.py must resolve");
+        assert_eq!(pkg.file_name().unwrap(), "__init__.py");
+    }
+
+    #[test]
+    fn resolve_module_to_file_prefers_ty_over_py() {
+        // When both extensions exist, `.ty` wins so a stale generated `.py`
+        // never masks the Typhon source.
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("util.ty"), "let x: int = 1\n").unwrap();
+        std::fs::write(src.join("util.py"), "x = 1\n").unwrap();
+
+        let resolved = resolve_module_to_file(&src, "util").expect("util must resolve");
+        assert_eq!(resolved.file_name().unwrap(), "util.ty");
+    }
+
+    #[test]
+    fn extract_member_access_at_offset_finds_alias_member() {
+        // Cursor inside `Bar` of `f.Bar(...)` yields ("f", "Bar").
+        let text = "import foo as f\nlet x = f.Bar()\n";
+        let bar = text.find("Bar").unwrap() + 1;
+        let (recv, member) = extract_member_access_at_offset(text, bar).unwrap();
+        assert_eq!(recv, "f");
+        assert_eq!(member, "Bar");
+    }
+
+    #[test]
+    fn extract_member_access_at_offset_handles_dotted_receiver() {
+        // `pkg.sub.Thing` → receiver "pkg.sub", member "Thing".
+        let text = "x = pkg.sub.Thing\n";
+        let off = text.find("Thing").unwrap() + 2;
+        let (recv, member) = extract_member_access_at_offset(text, off).unwrap();
+        assert_eq!(recv, "pkg.sub");
+        assert_eq!(member, "Thing");
+    }
+
+    #[test]
+    fn extract_member_access_at_offset_none_on_plain_name() {
+        // A bare identifier (not an attribute access) yields None.
+        let text = "let value = plain\n";
+        let off = text.find("plain").unwrap() + 1;
+        assert!(extract_member_access_at_offset(text, off).is_none());
+    }
+
+    #[test]
+    fn extract_member_access_at_offset_none_on_receiver() {
+        // Cursor on the receiver `f` (not the member) yields None — that
+        // path is handled by the resolver's reference for `f` instead.
+        let text = "x = f.Bar\n";
+        let off = text.find("f.Bar").unwrap();
+        assert!(extract_member_access_at_offset(text, off).is_none());
+    }
+
+    /// Send a `textDocument/definition` request and return the parsed
+    /// response `result` (the `Location` JSON, or `null`).
+    async fn goto_definition_request(
+        to: &mut DuplexStream,
+        from: &mut DuplexStream,
+        id: i64,
+        uri: &str,
+        line: u32,
+        character: u32,
+    ) -> serde_json::Value {
+        send(
+            to,
+            serde_json::json!({"jsonrpc":"2.0","id":id,"method":"textDocument/definition","params":{
+                "textDocument":{"uri":uri},
+                "position":{"line":line,"character":character}}}),
+        )
+        .await;
+        loop {
+            let msg = recv(from).await;
+            if msg.get("id").and_then(|i| i.as_i64()) == Some(id) {
+                return msg
+                    .get("result")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn goto_definition_jumps_across_files_for_from_import() {
+        // `from utils import Helper` in main.ty → click `Helper` lands on
+        // its `class Helper:` declaration in utils.ty.
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(
+            tmp.path().join("typhon.toml"),
+            "[project]\nname=\"x\"\nsrc=\"src\"\n",
+        )
+        .unwrap();
+        let utils_src = "class Helper:\n    pass\n";
+        std::fs::write(src.join("utils.ty"), utils_src).unwrap();
+        let main_src = "from utils import Helper\n\nlet h = Helper()\n";
+        std::fs::write(src.join("main.ty"), main_src).unwrap();
+
+        let main_uri = format!("file://{}", src.join("main.ty").display());
+        let utils_uri = format!("file://{}", src.join("utils.ty").display());
+        let root_uri = format!("file://{}", tmp.path().display());
+
+        let (mut to, mut from) = spawn_backend();
+        handshake(&mut to, &mut from, Some(&root_uri)).await;
+        did_open(&mut to, &main_uri, main_src).await;
+
+        // `Helper` on the `let h = Helper()` line (line 2). Column of the H.
+        let col = main_src.lines().nth(2).unwrap().find("Helper").unwrap() as u32;
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            goto_definition_request(&mut to, &mut from, 100, &main_uri, 2, col + 1),
+        )
+        .await
+        .expect("goto_definition timed out");
+
+        assert_eq!(
+            result["uri"].as_str(),
+            Some(utils_uri.as_str()),
+            "definition should land in utils.ty, got {result}"
+        );
+        // `class Helper:` is on line 0; the binding span starts at the `H`.
+        assert_eq!(result["range"]["start"]["line"].as_u64(), Some(0));
+        let start_char = result["range"]["start"]["character"].as_u64().unwrap() as usize;
+        assert!(
+            utils_src[start_char..].starts_with("Helper"),
+            "range start should sit on `Helper`, got char {start_char}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn goto_definition_jumps_across_files_for_alias_member() {
+        // `import utils as u` then `u.Helper()` → click `Helper` lands on
+        // its declaration in utils.ty (the attribute-access path).
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(
+            tmp.path().join("typhon.toml"),
+            "[project]\nname=\"x\"\nsrc=\"src\"\n",
+        )
+        .unwrap();
+        let utils_src = "def helper() -> None:\n    pass\n";
+        std::fs::write(src.join("utils.ty"), utils_src).unwrap();
+        let main_src = "import utils as u\n\nlet _ = u.helper()\n";
+        std::fs::write(src.join("main.ty"), main_src).unwrap();
+
+        let main_uri = format!("file://{}", src.join("main.ty").display());
+        let utils_uri = format!("file://{}", src.join("utils.ty").display());
+        let root_uri = format!("file://{}", tmp.path().display());
+
+        let (mut to, mut from) = spawn_backend();
+        handshake(&mut to, &mut from, Some(&root_uri)).await;
+        did_open(&mut to, &main_uri, main_src).await;
+
+        // `helper` within `u.helper()` on line 2.
+        let col = main_src.lines().nth(2).unwrap().find("helper").unwrap() as u32;
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            goto_definition_request(&mut to, &mut from, 101, &main_uri, 2, col + 1),
+        )
+        .await
+        .expect("goto_definition timed out");
+
+        assert_eq!(
+            result["uri"].as_str(),
+            Some(utils_uri.as_str()),
+            "alias-member definition should land in utils.ty, got {result}"
+        );
+        assert_eq!(result["range"]["start"]["line"].as_u64(), Some(0));
+        let start_char = result["range"]["start"]["character"].as_u64().unwrap() as usize;
+        assert!(
+            utils_src[start_char..].starts_with("helper"),
+            "range start should sit on `helper`, got char {start_char}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn goto_definition_falls_back_when_member_missing() {
+        // `from utils import Missing` where `Missing` isn't a top-level
+        // binding in utils.ty → must NOT jump to the top of utils.ty;
+        // instead fall back to the local import declaration in main.ty.
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(
+            tmp.path().join("typhon.toml"),
+            "[project]\nname=\"x\"\nsrc=\"src\"\n",
+        )
+        .unwrap();
+        std::fs::write(src.join("utils.ty"), "class Helper:\n    pass\n").unwrap();
+        let main_src = "from utils import Missing\n\nlet x = Missing\n";
+        std::fs::write(src.join("main.ty"), main_src).unwrap();
+
+        let main_uri = format!("file://{}", src.join("main.ty").display());
+        let root_uri = format!("file://{}", tmp.path().display());
+
+        let (mut to, mut from) = spawn_backend();
+        handshake(&mut to, &mut from, Some(&root_uri)).await;
+        did_open(&mut to, &main_uri, main_src).await;
+
+        let col = main_src.lines().nth(2).unwrap().find("Missing").unwrap() as u32;
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            goto_definition_request(&mut to, &mut from, 102, &main_uri, 2, col + 1),
+        )
+        .await
+        .expect("goto_definition timed out");
+
+        // Falls back to the local declaration site in main.ty (the import).
+        assert_eq!(
+            result["uri"].as_str(),
+            Some(main_uri.as_str()),
+            "missing member must fall back to the local file, got {result}"
+        );
+        assert_eq!(
+            result["range"]["start"]["line"].as_u64(),
+            Some(0),
+            "fallback should land on the `from utils import Missing` line"
+        );
     }
 
     #[test]
