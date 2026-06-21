@@ -145,6 +145,7 @@ The 30-second mental model. Every later section in this skill is detail under on
 | Result type | `Result[T, E]`, `Ok(v)`, `Err(e)` | generated `typhon_runtime.Ok/Err` dataclasses |
 | Result combinators (v0.6.0) | `r.map(f) / r.map_err(g) / r.and_then(h) / r.or_else(k)` | method calls on the runtime classes |
 | Exception→Result (v0.15.0) | `try_result(lambda: f(), lambda e: str(e))` | `from typhon_runtime import try_result` + call; types as `Result[T, E]` |
+| Boundary `rescue` (Unreleased) | `let n = int(s) rescue e: f"bad: {e}"` / `rescue e: ERR:`-block | postfix → `try_result(lambda: …, lambda e: …)?`; block → `try`/`except … return Err(…)` |
 | Error propagation | `let n: int = f()?` | inline `isinstance(_t, Err): return _t; n = _t.value` |
 | Result chain | `with a = f()?, b = g()?: ...  else err: ...` | sequenced if-isinstance ladder |
 | Generic fn | `def first[T](xs: list[T]) -> T?:` | same (PEP 695) |
@@ -981,6 +982,29 @@ def load(path: str) -> Result[dict[str, str], str]:
 
 `try_result(thunk)` runs `thunk()` and returns `Ok(result)`; on any exception it returns `Err(on_err(exc))`, or `Err(exc)` (the raw exception, `Result[T, Exception]`) when the mapper is omitted. `T` is inferred from the thunk body, `E` from the mapper body. It works under `tyc run` (the VM materialises the caught exception just as an `except E as e:` handler would) and the compiled path (`from typhon_runtime import try_result` is auto-injected). Use the explicit multi-`except` `try` shim when you map *distinct* exception types to *distinct* errors; reach for `try_result` for the common single-boundary case.
 
+### `rescue` — lambda-free exception boundaries (Unreleased)
+
+`rescue` is the no-lambda, no-`try`/`except` surface for the same bridge. Two forms:
+
+```python
+# postfix — catch EXPR, map the exception, propagate the Err like `?`
+def parse_port(raw: str) -> Result[int, ConfigError]:
+    let n: int = int(raw) rescue e: BadField(field="port", reason=str(e))
+    return Ok(n)
+
+# block — map any exception raised across a whole suite (replaces a try/except shim)
+def load_config(text: str) -> Result[Config, ConfigError]:
+    rescue e: BadJson(reason=str(e)):
+        let data: dict[str, str] = json.loads(text) as! dict[str, str]
+        let port: int = parse_port(data["port"])?
+        return Ok(Config(host=data["host"], port=port))
+```
+
+- **Postfix `EXPR rescue NAME: ERR`** lowers (in `tyc-syntax`'s `expand_rescue`, folded into `expand_question_ops`) to `try_result(lambda: EXPR, lambda NAME: ERR)?`. The left operand is found with the same bracket-/string-/comment-aware scan `as!` uses, so it works in value positions and after a leading `return`/`if`/`while`/`assert`, and composes with `as!` (`json.loads(t) as! dict[str, str] rescue e: …`). **Scope:** lowered in **statement-tail** position (the last thing on the logical line — the `…)?` shape every pipeline's end-of-line `?` pass handles); an inline/mid-expression postfix `rescue`, or one whose right side isn't `NAME: EXPR`, is left for the parser.
+- **Block `rescue NAME: ERR:`** over a suite lowers (in `expand_rescue_blocks`, run ahead of the postfix pass, to a fixpoint so nested blocks expand) to `try: <suite> except Exception as NAME: return Err(ERR)`. It emits a real `Err(...)`, so the checker's `return Err(...)` error-type check validates `ERR` against the function's declared error type.
+- The mapped error type **is** checked against the enclosing function's error type in both forms (`tyc::result_error_mismatch`) — the Unreleased work also fixed f-strings inferring as `Unknown` (they now infer as `str`), which had let an f-string mapper slip a `Result[T, Unknown]` past `?`.
+- Both forms run identically under `tyc check`, `tyc run` (VM), and `tyc build` + CPython; `tyc fmt` round-trips them. Worked example: `examples/60-rescue-boundaries/`.
+
 ---
 
 ## 10. Async and concurrency
@@ -1544,6 +1568,8 @@ See [COOKBOOK.md](COOKBOOK.md) for canonical patterns extracted from the 68 exam
 | PEP 695 generics / `Callable` / closures | `examples/05-functions-and-generics/` |
 | `class` / `class frozen` / `model` / `impl` / `extend` | `examples/06-classes-and-models/` |
 | `Result` / `?` / `with`-chain | `examples/07-error-handling/` |
+| `try_result` / `as!` at the untyped boundary | `examples/59-boundary-casts/` |
+| `rescue` postfix + block exception boundaries | `examples/60-rescue-boundaries/` |
 | Sealed unions + exhaustive match | `examples/08-sealed-unions-match/` |
 | Structural interfaces | `examples/09-interfaces/` |
 | Pipes + guards | `examples/10-pipes-and-guards/` |
@@ -1653,6 +1679,8 @@ When you edit the Rust compiler:
 | Multi-Result chain | `with a = r1?, b = r2?: ... else err: ...` |
 | Result combinators | `r.map(f) / r.map_err(g) / r.and_then(h) / r.or_else(k)` |
 | Exception→Result | `try_result(lambda: f(), lambda e: str(e))` |
+| Boundary rescue (postfix) | `let n: int = int(s) rescue e: f"bad: {e}"` |
+| Boundary rescue (block) | `rescue e: ERR:` then an indented suite |
 | Guard / early return | `guard u = maybe else: return default` |
 | Pipe | `value \|> f() \|> g()` |
 | Compile-time const | `comptime let PORT: int = int(env("PORT", "8080"))` |

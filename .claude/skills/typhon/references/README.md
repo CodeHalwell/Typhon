@@ -31,6 +31,7 @@ authoritative prose for a feature, follow the cross-reference back into the skil
 | `18-iterators-generators.ty` | `yield` / `yield from`, `Iterator[T]` | SKILL §11, RUNTIME |
 | `19-context-managers.ty` | `@contextmanager`, `with … as` typing | SKILL §10, §5 |
 | `20-boundary-casts.ty` | `as!` checked cast + `try_result` (v0.14–v0.15) | SKILL §5.10, §9 |
+| `21-rescue-boundaries.ty` | `rescue` postfix + block exception boundaries (Unreleased) | SKILL §9 |
 
 ## Running an example
 

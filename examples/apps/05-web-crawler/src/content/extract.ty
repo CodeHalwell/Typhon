@@ -18,10 +18,9 @@ pub class Document:
 
 
 pub def extract(html: str, base_url: Url) -> Result[Document, ExtractError]:
-    try:
-        let soup: BeautifulSoup = BeautifulSoup(html, "html.parser")
-    except Exception as e:
-        return Err(ExtractError(reason=f"parse_error: {e}"))
+    # The parser is an untyped boundary that can throw on malformed input;
+    # `rescue` lifts that into the function's ExtractError and propagates it.
+    let soup: BeautifulSoup = BeautifulSoup(html, "html.parser") rescue e: ExtractError(reason=f"parse_error: {e}")
 
     let title_node = soup.find("title")
     let title: str = title_node.get_text(strip=True) if title_node is not None else ""

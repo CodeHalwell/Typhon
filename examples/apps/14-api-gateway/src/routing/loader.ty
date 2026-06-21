@@ -51,14 +51,15 @@ def _upstreams_for(specs: list[UpstreamSpec]) -> list[Upstream]:
 
 
 pub def parse_routes_text(raw_path: str, raw_text: str) -> Result[RoutesFile, LoadError]:
+    # Keep the explicit `try/except` where we map a *specific* exception type
+    # (a JSON decode error) to its own message...
     try:
         let parsed: object = json.loads(raw_text)
     except json.JSONDecodeError as e:
         return Err(err_load(raw_path, f"invalid JSON: {e}"))
-    try:
-        let model: RoutesFile = RoutesFile.model_validate(parsed)
-    except Exception as e2:
-        return Err(err_load(raw_path, f"schema mismatch: {e2}"))
+    # ...and use postfix `rescue` for the broad validation boundary, where any
+    # failure is one "schema mismatch" error.
+    let model: RoutesFile = RoutesFile.model_validate(parsed) rescue e2: err_load(raw_path, f"schema mismatch: {e2}")
     return Ok(model)
 
 

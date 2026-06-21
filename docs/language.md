@@ -369,6 +369,35 @@ else err:
 
 Since v0.8.0 the implicit propagation path on every `?`-binding is type-checked against the enclosing function's declared error type — a chain that routes a mismatching error class no longer slips through. Since v0.9.0 the same check covers the explicit `else err: return Err(err)` form too — previously the check was gated on the synthetic `?`-op temp shape, so an `else` block could silently return an `Err` whose payload type didn't match the function's declared return.
 
+### Bridging exceptions: `try_result` and postfix `rescue`
+
+Third-party Python raises exceptions. Rather than a `try/except` shim, lift the boundary into a `Result` and use `?` / `match` downstream. The `try_result(thunk[, on_err])` combinator runs `thunk()`, returning `Ok(result)` or, on any exception, `Err(on_err(exc))` (or `Err(exc)` when no mapper is given).
+
+For the common single-boundary case, the **postfix `rescue` operator** says the same thing with no lambdas, no `try`, and no `except`:
+
+```python
+def load_port(raw: str) -> Result[int, str]:
+    let n: int = int(raw) rescue e: f"bad port: {e}"     # ✅ lambda-free boundary
+    return Ok(n)
+```
+
+`EXPR rescue NAME: ERR_EXPR` runs `EXPR`; on any exception it binds the exception to `NAME`, evaluates `ERR_EXPR`, and propagates `Err(ERR_EXPR)` to the enclosing function exactly like `?` (so the enclosing function must return a compatible `Result`). It is surface sugar for `try_result(lambda: EXPR, lambda NAME: ERR_EXPR)?`, and composes with `as!`:
+
+```python
+let data: dict[str, str] = json.loads(text) as! dict[str, str] rescue e: f"bad json: {e}"
+```
+
+A **block form** maps any exception raised across a whole suite — the lambda-free replacement for a `try/except` shim:
+
+```python
+def load_config(text: str) -> Result[Config, str]:
+    rescue e: f"bad config: {e}":
+        let data: dict[str, str] = json.loads(text) as! dict[str, str]
+        return Ok(Config(host=data["host"], port=int(data["port"])))
+```
+
+The block form lowers to `try` / `except Exception as e: return Err(...)`. The mapped error type is checked against the function's declared error type in both forms (`tyc::result_error_mismatch`). `rescue` works in value positions and after a leading `return` / `if` / `while` / `assert`. **Scope (v1):** postfix `rescue` is lowered in statement-tail position (the last thing on the line); an inline/mid-expression postfix `rescue`, or one whose right side isn't `NAME: EXPR`, is left for the parser.
+
 ## Async and concurrency
 
 ### Explicit `async`, not inferred

@@ -4,6 +4,67 @@ All notable changes to Typhon are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely; the
 canonical phase-by-phase status lives in `docs/roadmap.md`.
 
+## Unreleased
+
+### Added — `rescue`: lambda-free, `try`/`except`-free exception boundaries
+
+Two new forms — a postfix operator and a block prefix — lift a throwing boundary
+into a `Result` with no lambdas, no `try`, and no `except` in source.
+
+**Postfix** (`EXPR rescue NAME: ERR_EXPR`) catches an exception from a single
+expression, maps it, and propagates the `Err` to the enclosing `Result`-returning
+function like `?`:
+
+```python
+def load_port(raw: str) -> Result[int, str]:
+    let n: int = int(raw) rescue e: f"bad port: {e}"
+    return Ok(n)
+```
+
+**Block** (`rescue NAME: ERR_EXPR:` over a suite) maps any exception raised
+anywhere in the suite — the apples-to-apples replacement for a `try/except` shim:
+
+```python
+def load_config(text: str) -> Result[Config, str]:
+    rescue e: f"bad config: {e}":
+        let data: dict[str, str] = json.loads(text) as! dict[str, str]
+        return Ok(Config(host=data["host"], port=int(data["port"])))
+```
+
+Both are pure surface sugar (in `tyc-syntax`, folded into `expand_question_ops`
+so they reach every pipeline including the VM): the postfix form lowers to
+`try_result(lambda: EXPR, lambda NAME: ERR_EXPR)?`; the block form lowers to a
+`try` / `except Exception as NAME: return Err(ERR_EXPR)`. They work identically
+under `tyc check`, `tyc run` (VM), and `tyc build` + CPython, compose with `as!`,
+and `tyc fmt` round-trips them. The block form runs to a fixpoint, so nested
+`rescue` blocks expand.
+
+This replaces the hand-written `try: return Ok(…) except E as e: return Err(…)`
+shim and the lambda-heavy `try_result(lambda: …, lambda e: …)` call. See
+`docs/design/error-boundary-sugar.md` and `docs/guides/06-error-handling.md`.
+
+The mapped error type **is** checked against the enclosing function's declared
+error type: a postfix `rescue`/`try_result` whose mapper type doesn't match fires
+`tyc::result_error_mismatch` (see the f-string fix below, which closed the last
+hole here), and a block `rescue` emits a real `Err(...)` so the existing
+`return Err(...)` error-type check covers it.
+
+**Scope (v1):** postfix `rescue` lowers in **statement-tail** position (the last
+thing on the logical line — the `…)?` shape every pipeline's end-of-line `?` pass
+handles); an inline/mid-expression postfix `rescue`, or one whose right side
+isn't `NAME: EXPR`, is left for the parser.
+
+### Fixed — f-strings now infer as `str` (closing a type-checking hole)
+
+`infer_expr_ctx` had no `Expr::FString` arm, so every f-string fell through to
+`Unknown`, silently disabling type-checking of f-string values: `let x: int =
+f"{n}"` was accepted, and a `try_result`/`rescue` error mapper written as
+`lambda e: f"bad: {e}"` inferred `Result[T, Unknown]`, so a mismatched error type
+slipped past the `?` propagation check. F-strings now infer as `str` (and their
+interpolated expressions are walked so their own diagnostics surface), so those
+cases are caught. Verified against the full `examples/` + `examples/apps/` corpus
+with zero regressions.
+
 ## 0.15.7 — 2026-06-21 — third-party introspection depth + stress-round robustness
 
 A robustness release that deepens compile-time checking of third-party code and

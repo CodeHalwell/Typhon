@@ -153,14 +153,15 @@ Missing variants without a wildcard arm: `tyc::non_exhaustive_match`.
 ## Result + `?`
 
     def parse_count(s: str) -> Result[int, str]:
-        try:
-            return Ok(int(s))
-        except ValueError:
-            return Err(f"not an int: {s}")
+        let n: int = int(s) rescue e: f"not an int: {s}"  # catch + map + forward
+        return Ok(n)
 
     def doubled(s: str) -> Result[int, str]:
         let n: int = parse_count(s)?   # forwards Err to caller
         return Ok(n * 2)
+
+`EXPR rescue NAME: ERR` lifts a throwing boundary call into a `Result` (sugar for
+`try_result(lambda: EXPR, lambda NAME: ERR)?`) — no `try`/`except`, no lambdas.
 
 ## Concurrency
 

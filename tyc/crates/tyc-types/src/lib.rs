@@ -12197,6 +12197,39 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
         }
         Expr::BytesLiteral(_) => Type::Bytes,
         Expr::NoneLiteral(_) => Type::None,
+        // An f-string always evaluates to `str`. Walk the interpolated
+        // expressions first so their own diagnostics still surface, then
+        // return `str`. Previously there was no `FString` arm, so f-strings
+        // fell through to the default `Unknown` — which silently disabled
+        // assignment / argument type-checking of any f-string value. Most
+        // visibly that defeated the `?` error-type check on a `try_result`
+        // mapper written as `lambda e: f"bad: {e}"` (the inferred error type
+        // became `Unknown`, so `Result[T, Unknown]` flowed through `?`
+        // unchecked), and let `let x: int = f"{n}"` slip past.
+        Expr::FString(fs) => {
+            for part in &fs.value {
+                if let ruff_python_ast::FStringPart::FString(f) = part {
+                    for el in &f.elements {
+                        if let ruff_python_ast::InterpolatedStringElement::Interpolation(e) = el {
+                            let _ = infer_expr(c, &e.expression);
+                            // A format spec can itself carry nested interpolations
+                            // (`f"{v:.{prec}f}"`); walk those too.
+                            if let Some(spec) = &e.format_spec {
+                                for spec_el in spec.elements.iter() {
+                                    if let ruff_python_ast::InterpolatedStringElement::Interpolation(
+                                        se,
+                                    ) = spec_el
+                                    {
+                                        let _ = infer_expr(c, &se.expression);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Type::Str
+        }
         // Lambdas carry their *arity* into the type so a call site
         // expecting `Callable[[int, int], int]` rejects `lambda x: x`
         // at check time instead of TypeError-ing at runtime. Parameter
@@ -17080,6 +17113,39 @@ def broken(b: Box) -> int:
                 .iter()
                 .any(|e| matches!(e, TycError::TypeMismatch { .. })),
             "binding a `Result` to `int` must mismatch: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn fstring_is_str_not_unknown() {
+        // An f-string evaluates to `str`, so binding one to `int` mismatches.
+        // Regression: f-strings used to fall through to `Unknown`, silently
+        // disabling type-checking of every f-string value.
+        let src = "def f(n: int) -> None:\n    let x: int = f\"value {n}\"\n";
+        let d = check_full(src);
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::TypeMismatch { .. })),
+            "an f-string bound to `int` must mismatch: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn try_result_fstring_mapper_error_type_is_checked() {
+        // The mapper's f-string error type (`str`) must flow through `?` and
+        // fire `result_error_mismatch` against a function declaring a class
+        // error type. Regression: the f-string mapper used to infer `Unknown`,
+        // so `Result[T, Unknown]` slipped past the `?` error-type check.
+        let src = "class AppErr:\n    msg: str\n\ndef f(raw: str) -> Result[int, AppErr]:\n    let n: int = try_result(lambda: int(raw), lambda e: f\"bad: {e}\")?\n    return Ok(n)\n";
+        let d = check_full(src);
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::ResultErrorMismatch { .. })),
+            "f-string error mapper mismatching the declared error type must fire: {:?}",
             d.errors()
         );
     }
