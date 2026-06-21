@@ -803,6 +803,17 @@ fn build_external_shapes(
                     .class_type_params
                     .insert(b.name.clone(), tps.clone());
             }
+            // C2 cross-module: re-key the imported generic's inferred
+            // per-parameter variance under the local import name so the
+            // consumer's `user_generic_param_variance` widens a covariant /
+            // contravariant imported generic the same way it does an
+            // in-module one. A pure relaxation — absence keeps the
+            // invariant default.
+            if let Some(variances) = module_shapes.class_param_variance.get(member) {
+                external
+                    .class_param_variance
+                    .insert(b.name.clone(), variances.clone());
+            }
             // If the foreign module declared `Foo` as an interface
             // (Protocol-shaped), record that fact — together with
             // the source's `@runtime_checkable` opt-in — under the
@@ -958,6 +969,28 @@ fn build_external_shapes(
         for frozen_name in &module_shapes.frozen_classes {
             external.frozen_classes.insert(frozen_name.clone());
         }
+        // C1 cross-module: an imported class's higher-kinded constructor
+        // variables (`F` in `class Functor[F[_]]`) are bare
+        // type-parameter identifiers consulted by name when the consumer
+        // resolves the imported class's signatures. They carry no class
+        // re-keying — they're identity tokens — so seed the touched
+        // module's full HKT set. Absence degrades to today's permissive
+        // (pre-HKT) handling, so this can only restore a sound check, never
+        // introduce a false positive.
+        for hkt_name in &module_shapes.hkt_param_names {
+            external.hkt_param_names.insert(hkt_name.clone());
+        }
+        // Variance of a generic reached only through an imported signature
+        // (a function returning `Producer[Dog]` where `Producer` itself was
+        // not imported by name) — seed under the source name so the
+        // consumer can widen it. `entry().or_insert` preserves any
+        // alias-keyed entry the per-binding loop already wrote.
+        for (cls_name, variances) in &module_shapes.class_param_variance {
+            external
+                .class_param_variance
+                .entry(cls_name.clone())
+                .or_insert_with(|| variances.clone());
+        }
         // Carry `__typhon_builtin_ext_*` sentinel class shapes from the
         // imported module so the consumer's type checker recognises
         // cross-module builtin extension methods via
@@ -1023,6 +1056,11 @@ fn build_external_shapes(
         }
         for frozen_name in &module_shapes.frozen_classes {
             external.frozen_classes.insert(frozen_name.clone());
+        }
+        // Bare-imported module's HKT constructor variables (see the
+        // member-import pass above for rationale).
+        for hkt_name in &module_shapes.hkt_param_names {
+            external.hkt_param_names.insert(hkt_name.clone());
         }
     }
     external

@@ -4708,6 +4708,26 @@ pub struct ModuleShapes {
     /// `from services import fetch_user` where `fetch_user` is
     /// `@gatherable` in `services`.
     pub gatherable_async_fns: std::collections::HashSet<String>,
+    /// Per-class inferred type-parameter variance (C2), positionally
+    /// aligned with `class_type_params`. Published so a covariant /
+    /// contravariant generic declared in module A widens correctly at a
+    /// use site in module B — without this, an *imported* generic always
+    /// degraded to the invariant default, rejecting a sound `Producer[Dog]
+    /// -> Producer[Animal]` upcast that an in-module `Producer` accepts.
+    /// Cross-module variance is a pure RELAXATION: seeding it can only
+    /// newly-accept widening that was previously (soundly) rejected, never
+    /// introduce a false positive. A class absent here keeps the invariant
+    /// default in the consumer.
+    pub class_param_variance: HashMap<String, Vec<Variance>>,
+    /// Higher-kinded constructor-variable type parameters (C1): the subset
+    /// of a class's type parameters that are applied as a `Generic` head
+    /// (`fa: F[A]`) somewhere in its body, hence kind `* -> *`. Published
+    /// so a `class Functor[F[_]]` imported across modules keeps its HKT
+    /// identity instead of degrading to the pre-HKT (permissive) behaviour.
+    /// Names are the bare type-parameter identifiers as they appear in the
+    /// source module. Absence simply means the consumer degrades to today's
+    /// permissive handling for that imported class — never a false positive.
+    pub hkt_param_names: std::collections::HashSet<String>,
 }
 
 /// Imports resolved to their source modules' [`ModuleShapes`], keyed
@@ -4782,6 +4802,18 @@ pub struct ExternalShapes {
     /// without paying an O(modules) clone per file. FINDINGS —
     /// copilot review of v0.2.0.
     pub by_module: std::sync::Arc<HashMap<String, ModuleShapes>>,
+    /// Per-class inferred type-parameter variance re-keyed under the local
+    /// import name (`from m import Producer` → `"Producer" → [Covariant]`).
+    /// Seeded into the consumer's `class_param_variance` table so
+    /// `user_generic_param_variance` consults it for an imported generic
+    /// exactly as for a locally-declared one. A pure relaxation (see
+    /// `ModuleShapes::class_param_variance`).
+    pub class_param_variance: HashMap<String, Vec<Variance>>,
+    /// HKT constructor-variable type parameters re-keyed under the local
+    /// import name, seeded into the consumer's `hkt_param_names` set so an
+    /// imported `Functor`-shape class keeps its higher-kinded identity
+    /// across the module boundary. Degrades to permissive when absent.
+    pub hkt_param_names: std::collections::HashSet<String>,
 }
 
 /// Light-weight first-pass extractor that walks a parsed module and
@@ -4811,6 +4843,12 @@ pub fn extract_module_shapes(module: &ModModule) -> ModuleShapes {
 
     let mut class_shapes: HashMap<String, InterfaceShape> = HashMap::new();
     let mut class_type_params: HashMap<String, Vec<String>> = HashMap::new();
+    // C2 / C1 cross-module: published alongside `class_type_params` so an
+    // imported generic keeps its inferred variance and higher-kinded
+    // identity in the consumer (mirrors the in-module computation in
+    // `collect_classes_and_functions`).
+    let mut class_param_variance: HashMap<String, Vec<Variance>> = HashMap::new();
+    let mut hkt_param_names: std::collections::HashSet<String> = std::collections::HashSet::new();
     // First sweep: every declared class gets its own shape, including
     // the synthetic `__typhon_impl_NAME` pseudo-classes the
     // preprocessor introduces for `impl Name:` / `extend Name:`.
@@ -4821,6 +4859,14 @@ pub fn extract_module_shapes(module: &ModModule) -> ModuleShapes {
             class_shapes.insert(name.clone(), shape);
             let tps = type_param_names_from(cd.type_params.as_deref());
             if !tps.is_empty() {
+                // C1: recover higher-kinded constructor variables — type
+                // parameters applied as a `Generic` head in the class body.
+                hkt_param_names.extend(hkt_params_used_as_head(cd, &tps, &classes));
+                // C2: infer each parameter's variance positionally, so the
+                // consumer can widen covariant / contravariant imported
+                // generics instead of forcing the invariant default.
+                let variances = infer_class_param_variance(cd, &tps, &classes);
+                class_param_variance.insert(name.clone(), variances);
                 class_type_params.insert(name, tps);
             }
         }
@@ -5023,6 +5069,8 @@ pub fn extract_module_shapes(module: &ModModule) -> ModuleShapes {
         // fill this in via `frozen_class_names`.
         frozen_classes: std::collections::HashSet::new(),
         gatherable_async_fns,
+        class_param_variance,
+        hkt_param_names,
     }
 }
 
@@ -5185,6 +5233,30 @@ pub fn check_module_with_imports(
             c.class_type_params
                 .entry(name.clone())
                 .or_insert_with(|| tps.clone());
+        }
+        // Cross-module variance (C2 deferred half): an imported generic's
+        // inferred per-parameter variance must reach
+        // `user_generic_param_variance` so a covariant `Producer[Dog]`
+        // widens into a `Producer[Animal]`-typed slot at this module's use
+        // sites, exactly as an in-module `Producer` does. Local
+        // declarations win on collision (`or_insert`), mirroring the
+        // `class_type_params` seed above. SOUNDNESS: this only relaxes — a
+        // missing entry leaves the invariant default untouched, so it can
+        // never introduce a false positive.
+        for (name, variances) in &ext.class_param_variance {
+            c.class_param_variance
+                .entry(name.clone())
+                .or_insert_with(|| variances.clone());
+        }
+        // Cross-module HKT (C1 deferred half): an imported class's
+        // higher-kinded constructor variables must be recognised so a
+        // `class Functor[F[_]]` imported here keeps its HKT identity rather
+        // than degrading to the pre-HKT behaviour. The set is keyed by the
+        // bare type-parameter identifier (`F`), matching how the in-module
+        // pass populates `hkt_param_names`. Absence simply degrades to
+        // today's permissive handling — never a false positive.
+        for name in &ext.hkt_param_names {
+            c.hkt_param_names.insert(name.clone());
         }
         for (name, info) in &ext.function_arities {
             c.function_arity_info
@@ -24355,6 +24427,242 @@ def main(dogs: list[Dog]) -> None:
                 .iter()
                 .any(|e| matches!(e, TycError::TypeMismatch { .. })),
             "list invariance must be preserved (list[Dog] -/-> list[Animal]); got {:?}",
+            d.errors()
+        );
+    }
+
+    // ── Cross-module variance / HKT (deferred C1 / C2 halves) ────────────
+
+    /// Helper mirroring `tyc-db::build_external_shapes` for the common
+    /// `from producer import <names>` form: extract the producer module's
+    /// shapes, re-key class shapes / type-params / variance / HKT under the
+    /// (here identical) local import names, and stash the full `by_module`
+    /// registry. Returns the parsed+resolved consumer plus its
+    /// `ExternalShapes`.
+    fn cross_module_external(
+        producer_src: &str,
+        imported: &[&str],
+    ) -> (ModuleShapes, ExternalShapes) {
+        let producer_prep = preprocess(producer_src);
+        let producer_module = tyc_syntax::parse_module(&producer_prep.python_source)
+            .unwrap()
+            .into_syntax();
+        let producer_shapes = extract_module_shapes(&producer_module);
+
+        let mut external = ExternalShapes::default();
+        for name in imported {
+            if let Some(shape) = producer_shapes.class_shapes.get(*name) {
+                external
+                    .class_shapes
+                    .insert((*name).to_owned(), shape.clone());
+            }
+            if let Some(tps) = producer_shapes.class_type_params.get(*name) {
+                external
+                    .class_type_params
+                    .insert((*name).to_owned(), tps.clone());
+            }
+            if let Some(v) = producer_shapes.class_param_variance.get(*name) {
+                external
+                    .class_param_variance
+                    .insert((*name).to_owned(), v.clone());
+            }
+        }
+        // HKT names are identity tokens, not re-keyed per class — seed the
+        // producer's full set, exactly as `build_external_shapes` does.
+        for h in &producer_shapes.hkt_param_names {
+            external.hkt_param_names.insert(h.clone());
+        }
+        let mut by_module: HashMap<String, ModuleShapes> = HashMap::new();
+        by_module.insert("producer".to_owned(), producer_shapes.clone());
+        external.by_module = std::sync::Arc::new(by_module);
+        (producer_shapes, external)
+    }
+
+    fn check_consumer(consumer_src: &str, external: &ExternalShapes) -> Diagnostics {
+        let consumer_prep = preprocess(consumer_src);
+        let consumer_module = tyc_syntax::parse_module(&consumer_prep.python_source)
+            .unwrap()
+            .into_syntax();
+        let (resolved, _) = resolve_module(
+            "<consumer>".to_owned(),
+            &consumer_prep.python_source,
+            &consumer_module,
+        );
+        check_module_with_imports(
+            "<consumer>",
+            &consumer_prep.python_source,
+            &resolved,
+            &consumer_module,
+            &consumer_prep.unsafe_lines,
+            &consumer_prep.frozen_class_lines,
+            Some(external),
+        )
+    }
+
+    #[test]
+    fn extract_module_shapes_publishes_variance_and_hkt() {
+        // The surface-extraction pass must now carry inferred variance
+        // (C2) and the HKT constructor-variable set (C1) so the consumer
+        // can consult them for imported generics.
+        let shapes = extract_module_shapes(
+            &tyc_syntax::parse_module(
+                &preprocess(
+                    "\
+class Producer[T]:
+    def get(self) -> T:
+        ...
+class Functor[F]:
+    def fmap(self, fa: F[int]) -> F[str]:
+        ...
+",
+                )
+                .python_source,
+            )
+            .unwrap()
+            .into_syntax(),
+        );
+        assert_eq!(
+            shapes.class_param_variance.get("Producer"),
+            Some(&vec![Variance::Covariant]),
+            "Producer[T] (output-only) must publish covariant variance"
+        );
+        assert!(
+            shapes.hkt_param_names.contains("F"),
+            "Functor[F[_]]'s constructor variable F must be published as HKT; got {:?}",
+            shapes.hkt_param_names
+        );
+    }
+
+    #[test]
+    fn cross_module_covariant_generic_accepts_upcast() {
+        // THE C2 GAP CLOSED: a covariant `Producer` imported from another
+        // module must widen `Producer[Dog] -> Producer[Animal]` exactly as
+        // an in-module `Producer` does.
+        let (_p, external) = cross_module_external(
+            "\
+class Producer[T]:
+    def get(self) -> T:
+        ...
+",
+            &["Producer"],
+        );
+        let consumer_src = "\
+class Animal:
+    name: str
+class Dog(Animal):
+    name: str
+def use_animals(p: Producer[Animal]) -> None:
+    ...
+def main(dogs: Producer[Dog]) -> None:
+    use_animals(dogs)
+";
+        let d = check_consumer(consumer_src, &external);
+        assert!(
+            !d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::TypeMismatch { .. })),
+            "imported covariant Producer[Dog] -> Producer[Animal] must be accepted; got {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn cross_module_invariant_generic_rejects_upcast() {
+        // SOUNDNESS FLOOR: an imported INVARIANT generic (`Box[T]` with a
+        // settable field) must still reject the upcast — variance flows,
+        // but it carries the *invariant* verdict too.
+        let (_p, external) = cross_module_external(
+            "\
+class Box[T]:
+    value: T
+",
+            &["Box"],
+        );
+        let consumer_src = "\
+class Animal:
+    name: str
+class Dog(Animal):
+    name: str
+def use_animal_box(b: Box[Animal]) -> None:
+    ...
+def main(dog_box: Box[Dog]) -> None:
+    use_animal_box(dog_box)
+";
+        let d = check_consumer(consumer_src, &external);
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::TypeMismatch { .. })),
+            "imported invariant Box[Dog] -> Box[Animal] must still be rejected; got {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn cross_module_covariant_generic_still_rejects_downcast() {
+        // The relaxation must not flip into unsoundness: an imported
+        // covariant `Producer[Animal]` must NOT flow into a `Producer[Dog]`
+        // slot (wrong direction).
+        let (_p, external) = cross_module_external(
+            "\
+class Producer[T]:
+    def get(self) -> T:
+        ...
+",
+            &["Producer"],
+        );
+        let consumer_src = "\
+class Animal:
+    name: str
+class Dog(Animal):
+    name: str
+def needs_dog_producer(p: Producer[Dog]) -> None:
+    ...
+def main(animals: Producer[Animal]) -> None:
+    needs_dog_producer(animals)
+";
+        let d = check_consumer(consumer_src, &external);
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::TypeMismatch { .. })),
+            "imported covariant Producer[Animal] -> Producer[Dog] must still be rejected; got {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn cross_module_hkt_constructor_var_binds_across_boundary() {
+        // THE C1 GAP CLOSED: an imported `Functor[F[_]]`'s constructor
+        // variable `F` must be recognised as higher-kinded in the consumer,
+        // so `is_constructor_variable` returns true after seeding. Without
+        // the cross-module propagation it would degrade to pre-HKT
+        // (`F` unknown), so we assert the seed lands in the checker's set.
+        let (_p, external) = cross_module_external(
+            "\
+class Functor[F]:
+    def fmap(self, fa: F[int]) -> F[str]:
+        ...
+",
+            &["Functor"],
+        );
+        assert!(
+            external.hkt_param_names.contains("F"),
+            "F must propagate into ExternalShapes.hkt_param_names; got {:?}",
+            external.hkt_param_names
+        );
+        // And the consumer-side seed must populate the checker so a use of
+        // the imported Functor doesn't regress to a false positive.
+        let consumer_src = "\
+def lift(fx: Functor[list]) -> None:
+    ...
+";
+        let d = check_consumer(consumer_src, &external);
+        assert!(
+            !d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::TypeMismatch { .. })),
+            "imported HKT Functor must not false-positive; got {:?}",
             d.errors()
         );
     }

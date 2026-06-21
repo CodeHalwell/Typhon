@@ -100,6 +100,18 @@ First batch toward the feature-complete `v1.0.0-alpha`. See
   `unsafe:` posture is unchanged. Cross-module helper chains, branch-merge/SSA
   unification, and parameter-based partial tracking remain deferred (sound).
   Zero corpus false positives.
+- **Added — cross-module variance + HKT propagation (C1/C2 cross-module).** The
+  deferred cross-module halves of HKT and variance inference now flow through the
+  existing `ModuleShapes` / `ExternalShapes` mechanism: a generic class imported
+  from a sibling module carries its inferred type-parameter variance and its HKT
+  constructor-variable identity, so `user_generic_param_variance` and the HKT arm
+  consult imported generics exactly as local ones. An imported covariant
+  `Producer[Dog]` now widens into a `Producer[Animal]` slot (previously stuck at
+  the invariant default across module boundaries), invariant imports still
+  reject, and `Functor[F[_]]`-shape HKT binds across the boundary. Variance is a
+  pure relaxation (missing entry → invariant default, never a false positive);
+  HKT degrades to pre-HKT permissive when an imported class's identity is
+  unavailable.
 
 - **Added — performance regression CI gate (F2).** `scripts/perf-gate.sh` times
   the full build pipeline over a real multi-module example, takes the median of

@@ -643,6 +643,10 @@ fn shapes_from_introspected(intro: &IntrospectedModule) -> ModuleShapes {
         enums: HashMap::new(),
         frozen_classes: std::collections::HashSet::new(),
         gatherable_async_fns: std::collections::HashSet::new(),
+        // Introspected Python modules carry no inferred-variance or
+        // higher-kinded metadata — those are Typhon-source concepts.
+        class_param_variance: HashMap::new(),
+        hkt_param_names: std::collections::HashSet::new(),
     }
 }
 
