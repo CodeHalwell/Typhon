@@ -625,8 +625,7 @@ pub fn run(args: BuildArgs) -> Result<()> {
         // against the six-condition rule, and the desugarer is told which
         // functions to wrap in `@functools.cache`.
         let purity_findings = analyse_purity(&module, config.strictness.auto_memoise);
-        let purity_diags =
-            purity_diagnostics(&purity_findings, &path.to_string_lossy(), source);
+        let purity_diags = purity_diagnostics(&purity_findings, &path.to_string_lossy(), source);
         if purity_diags.has_errors() {
             for err in purity_diags.errors() {
                 eprintln!("{:?}", miette::Report::new_boxed(Box::new(err.clone())));
@@ -1320,12 +1319,14 @@ fn secret_suffix(name: &str) -> Option<&'static str> {
 
             let start_ok = actual_idx == 0
                 || upper.as_bytes()[actual_idx - 1] == b'_'
-                || (name.as_bytes()[actual_idx].is_ascii_uppercase() && name.as_bytes()[actual_idx - 1].is_ascii_lowercase());
+                || (name.as_bytes()[actual_idx].is_ascii_uppercase()
+                    && name.as_bytes()[actual_idx - 1].is_ascii_lowercase());
 
             let actual_end = actual_idx + candidate.len();
             let end_ok = actual_end == upper.len()
                 || upper.as_bytes()[actual_end] == b'_'
-                || (name.as_bytes()[actual_end].is_ascii_uppercase() && !name.as_bytes()[actual_end - 1].is_ascii_uppercase());
+                || (name.as_bytes()[actual_end].is_ascii_uppercase()
+                    && !name.as_bytes()[actual_end - 1].is_ascii_uppercase());
 
             if start_ok && end_ok {
                 return Some(candidate);

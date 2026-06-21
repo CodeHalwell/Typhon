@@ -992,7 +992,11 @@ assert stdlib.split_once('a=b=c', '=') == ('a', 'b=c')
 assert stdlib.group_by(['ant', 'apple', 'bee'], lambda s: s[0]) == {'a': ['ant', 'apple'], 'b': ['bee']}
 print('OK')
 ";
-    let formatted = script.replacen("%r", &format!("{:?}", build_dir.to_string_lossy().into_owned()), 1);
+    let formatted = script.replacen(
+        "%r",
+        &format!("{:?}", build_dir.to_string_lossy().into_owned()),
+        1,
+    );
     let out = Command::new(py).arg("-c").arg(&formatted).output().unwrap();
     assert!(
         out.status.success(),
