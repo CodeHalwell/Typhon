@@ -75,6 +75,18 @@ First batch toward the feature-complete `v1.0.0-alpha`. See
   flow covariantly and parameters contravariantly. Non-generic interface bounds
   were already correct; un-introspected third-party generic interfaces degrade
   to the prior permissive check — no false positives. A sound tightening.
+- **Added — small non-nullable unions are type-checked through introspection
+  (A2).** The tyc-types AST path and `is_assignable` already handled N-ary
+  `Type::Union`; the leak was the `tyc-venv` string parser, which degraded any
+  non-`None` pipe union to `Unknown`. It now emits a real 2-member union
+  (`split_top_level_pipes` for true arity, plus a `Union[A, B, …]` branch) with
+  soundness guards: `X | None` reduces to the nullable form, a redundant member
+  collapses, exactly two distinct concrete members become a real union, and any
+  `Unknown`/`Any` member — or 3+ members, or `X | Y | None` — degrades the whole
+  union back to `Unknown`. So `Union[str, bytes]` (jinja2) and
+  `Union[str, os.PathLike]` (Flask) now reject an `int` argument while per-member
+  numeric widening (`int → float`, `bool → int`) is preserved. 3+ member unions
+  are deferred. Zero corpus false positives.
 
 - **Added — performance regression CI gate (F2).** `scripts/perf-gate.sh` times
   the full build pipeline over a real multi-module example, takes the median of

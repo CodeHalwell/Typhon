@@ -16420,6 +16420,44 @@ mod tests {
         assert!(!d.has_errors(), "{:?}", d.errors());
     }
 
+    // --- A2: small non-nullable unions ---------------------------------
+
+    #[test]
+    fn non_nullable_union_accepts_either_member() {
+        // `Union[str, bytes]` (the jinja2 `Template(source)` shape) must accept
+        // a value of either member.
+        let d = check("def f(x: str | bytes) -> None:\n    pass\nf(\"hi\")\nf(b\"hi\")\n");
+        assert!(!d.has_errors(), "{:?}", d.errors());
+    }
+
+    #[test]
+    fn non_nullable_union_rejects_non_member() {
+        // The whole point of A2: an `int` argument to a `str | bytes` param is
+        // now rejected instead of silently accepted via `Unknown`.
+        let d = check("def f(x: str | bytes) -> None:\n    pass\nf(1)\n");
+        assert!(
+            d.has_errors(),
+            "expected int -> (str | bytes) to be rejected"
+        );
+    }
+
+    #[test]
+    fn union_accepts_int_member() {
+        let d = check("def f(x: int | str) -> None:\n    pass\nf(1)\nf(\"s\")\n");
+        assert!(!d.has_errors(), "{:?}", d.errors());
+    }
+
+    #[test]
+    fn union_member_preserves_numeric_widening() {
+        // SOUNDNESS: numeric widening must hold per-member — an `int` is
+        // assignable to a `float | str` union because `int` widens to `float`.
+        let d = check("def f(x: float | str) -> None:\n    pass\nf(1)\n");
+        assert!(!d.has_errors(), "{:?}", d.errors());
+        // `bool` widens to `int` likewise.
+        let d = check("def g(x: int | bytes) -> None:\n    pass\ng(True)\n");
+        assert!(!d.has_errors(), "{:?}", d.errors());
+    }
+
     #[test]
     fn narrowing_is_not_none() {
         let src = "\
