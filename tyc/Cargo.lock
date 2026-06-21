@@ -1999,6 +1999,7 @@ name = "tyc"
 version = "0.15.6"
 dependencies = [
  "clap",
+ "itoa",
  "miette",
  "notify",
  "ruff_python_ast",

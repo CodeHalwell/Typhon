@@ -1906,12 +1906,12 @@ fn build_source_map_v2(source_rel: &str, preprocessed: &str, line_offsets: &[usi
     out.push_str(source_rel);
     out.push_str("\",\"line_strategy\":\"table\",\"lines\":[");
 
-    use std::fmt::Write;
+    let mut buf = itoa::Buffer::new();
     for (i, &n) in lines.iter().enumerate() {
         if i > 0 {
             out.push(',');
         }
-        let _ = write!(&mut out, "{}", n);
+        out.push_str(buf.format(n));
     }
 
     out.push_str("]}\n");

@@ -1150,8 +1150,10 @@ fn python_repr_bytes(b: &[u8]) -> String {
             }
             c if (0x20..0x7f).contains(&c) => out.push(c as char),
             c => {
-                use std::fmt::Write;
-                let _ = write!(out, "\\x{:02x}", c);
+                out.push_str("\\x");
+                let hex = b"0123456789abcdef";
+                out.push(hex[(c as usize >> 4) & 0xf] as char);
+                out.push(hex[c as usize & 0xf] as char);
             }
         }
     }
@@ -1181,7 +1183,10 @@ fn python_repr_str(s: &str) -> String {
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
             c if (c as u32) < 0x20 || c as u32 == 0x7f => {
-                out.push_str(&format!("\\x{:02x}", c as u32));
+                out.push_str("\\x");
+                let hex = b"0123456789abcdef";
+                out.push(hex[(c as u32 as usize >> 4) & 0xf] as char);
+                out.push(hex[c as u32 as usize & 0xf] as char);
             }
             c => out.push(c),
         }
