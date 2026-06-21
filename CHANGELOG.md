@@ -65,6 +65,16 @@ First batch toward the feature-complete `v1.0.0-alpha`. See
   `@covariant` / `@contravariant` class decorator overrides inference.
   Cross-module variance (carrying inferred variance through `ModuleShapes`) is
   deferred and stays at the invariant default — sound, never unsound widening.
+- **Fixed — sound variance through generic interface bounds (C4).** A generic
+  interface bound (`def f[X: Producer[Animal]]`) checked the implementer with
+  the interface's type parameter left unbound (treated as `Any`), so the type
+  argument was discarded and every class spuriously conformed — a soundness
+  hole that accepted covariant-return and contravariant-parameter violations.
+  Conformance now substitutes the interface's type arguments into each member's
+  return / parameter / field types before the assignability check, so returns
+  flow covariantly and parameters contravariantly. Non-generic interface bounds
+  were already correct; un-introspected third-party generic interfaces degrade
+  to the prior permissive check — no false positives. A sound tightening.
 
 - **Added — performance regression CI gate (F2).** `scripts/perf-gate.sh` times
   the full build pipeline over a real multi-module example, takes the median of

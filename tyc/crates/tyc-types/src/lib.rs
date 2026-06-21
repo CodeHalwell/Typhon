@@ -3101,8 +3101,15 @@ impl<'a> Checker<'a> {
         // precedent as the parametric sealed-union arm below.
         match (expected, actual) {
             (Type::Generic(exp_name, exp_args), Type::Generic(act_name, act_args)) => {
+                // C4: when the actual is itself a parameterised generic of the
+                // *same* head as the interface, the same-head variance arm
+                // below already compares the type arguments slot-by-slot. Here
+                // the actual is a (possibly differently-named) class that
+                // structurally conforms to the generic interface — bind the
+                // interface's type parameters to `exp_args` and check the
+                // members under that substitution so variance flows correctly.
                 if self.is_interface_name(exp_name.as_str())
-                    && self.class_conforms_to_interface(act_name, exp_name)
+                    && self.class_conforms_to_generic_interface(act_name, exp_name, exp_args)
                     && exp_args.len() == act_args.len()
                     && exp_args
                         .iter()
@@ -3112,8 +3119,22 @@ impl<'a> Checker<'a> {
                     return true;
                 }
             }
-            (Type::Generic(exp_name, _), Type::Class(act_name))
-            | (Type::Class(exp_name), Type::Generic(act_name, _)) => {
+            // A bare class conforming to a generic interface bound
+            // (`PlantProducer` into `Producer[Animal]`). Substituting the
+            // interface's type params with the bound's `exp_args` is what
+            // makes covariant return / contravariant param flow sound: with
+            // the raw `T` left in place every class spuriously conformed.
+            (Type::Generic(exp_name, exp_args), Type::Class(act_name)) => {
+                if self.is_interface_name(exp_name.as_str())
+                    && self.class_conforms_to_generic_interface(act_name, exp_name, exp_args)
+                {
+                    return true;
+                }
+            }
+            // The mirror direction (generic class value into a bare interface
+            // expectation) carries no interface type arguments to bind, so the
+            // bare structural check is the correct (and unchanged) behaviour.
+            (Type::Class(exp_name), Type::Generic(act_name, _)) => {
                 if self.is_interface_name(exp_name.as_str())
                     && self.class_conforms_to_interface(act_name, exp_name)
                 {
@@ -3464,6 +3485,73 @@ impl<'a> Checker<'a> {
     /// hierarchy-aware `find_method` / `find_field` lookups so that methods
     /// and fields contributed by a base class count toward conformance.
     fn class_conforms_to_interface(&self, cls_name: &str, iface_name: &str) -> bool {
+        self.class_conforms_to_interface_subst(cls_name, iface_name, &HashMap::new())
+    }
+
+    /// C4: conformance of `cls_name` against a **generic** interface bound
+    /// `iface_name[iface_args...]`. The interface's PEP 695 type parameters
+    /// are bound to `iface_args` and that substitution is applied to each
+    /// interface member's declared return / parameter types *before* the
+    /// usual assignability check. This is what makes variance flow correctly
+    /// through an interface bound:
+    ///
+    /// - Return positions are covariant: a class whose `get(self) -> Dog`
+    ///   conforms to `Producer[Animal]` only when `Dog <: Animal` (the
+    ///   interface return becomes `Animal`, then
+    ///   `is_assignable(Animal, Dog)` must hold).
+    /// - Parameter positions are contravariant: a class whose
+    ///   `consume(self, x: Animal)` conforms to `Consumer[Dog]` only when the
+    ///   class accepts at least `Dog` (the interface param becomes `Dog`,
+    ///   then `is_assignable(class_param=Animal, iface_param=Dog)` must hold).
+    ///
+    /// Without the substitution the interface members still mention the raw
+    /// type variable `T`, which `is_assignable` treats as `Any` (the
+    /// unbound-PEP-695 arm), so *every* class spuriously conformed — a
+    /// soundness gap. When the type-parameter names are unknown (e.g. the
+    /// interface arrived via venv introspection with no recorded params) the
+    /// substitution is empty and behaviour is identical to the bare
+    /// `class_conforms_to_interface`.
+    fn class_conforms_to_generic_interface(
+        &self,
+        cls_name: &str,
+        iface_name: &str,
+        iface_args: &[Type],
+    ) -> bool {
+        let subst = self.interface_typevar_bindings(iface_name, iface_args);
+        self.class_conforms_to_interface_subst(cls_name, iface_name, &subst)
+    }
+
+    /// Build the `{param_name -> actual}` substitution for a generic
+    /// interface application. The interface's type-parameter names are
+    /// recorded in `class_type_params` (interfaces are classes for the
+    /// purposes of that table). Returns an empty map — i.e. no
+    /// substitution — when the param names are unavailable or the arities
+    /// disagree, so the caller degrades to the permissive bare check rather
+    /// than mis-binding.
+    fn interface_typevar_bindings(
+        &self,
+        iface_name: &str,
+        iface_args: &[Type],
+    ) -> HashMap<String, Type> {
+        let bare = iface_name.rsplit_once('.').map_or(iface_name, |(_, b)| b);
+        let params = self
+            .class_type_params
+            .get(iface_name)
+            .or_else(|| self.class_type_params.get(bare));
+        match params {
+            Some(ps) if ps.len() == iface_args.len() => {
+                ps.iter().cloned().zip(iface_args.iter().cloned()).collect()
+            }
+            _ => HashMap::new(),
+        }
+    }
+
+    fn class_conforms_to_interface_subst(
+        &self,
+        cls_name: &str,
+        iface_name: &str,
+        iface_subst: &HashMap<String, Type>,
+    ) -> bool {
         // Resolve the interface shape locally or through the project-wide
         // registry (handles the module-qualified `repo.TaskRepository`
         // form, which `self.interfaces` never keys).
@@ -3502,10 +3590,15 @@ impl<'a> Checker<'a> {
                     // Skip the check when the interface method returns the same
                     // interface type to avoid infinite recursion for
                     // self-referential interfaces (e.g. `def next(self) -> Node`).
-                    if iface_sig.return_type != Type::Unknown
+                    let iface_ret = if iface_subst.is_empty() {
+                        iface_sig.return_type.clone()
+                    } else {
+                        substitute_typevars(&iface_sig.return_type, iface_subst)
+                    };
+                    if iface_ret != Type::Unknown
                         && cls_sig.return_type != Type::Unknown
-                        && !is_self_ref(&iface_sig.return_type)
-                        && !self.is_assignable(&iface_sig.return_type, &cls_sig.return_type)
+                        && !is_self_ref(&iface_ret)
+                        && !self.is_assignable(&iface_ret, &cls_sig.return_type)
                     {
                         return false;
                     }
@@ -3519,15 +3612,20 @@ impl<'a> Checker<'a> {
                     // return-type carve-out.
                     let cmp_len = iface_sig.param_types.len().min(cls_sig.param_types.len());
                     for i in 0..cmp_len {
-                        let ip = &iface_sig.param_types[i];
+                        let ip_raw = &iface_sig.param_types[i];
                         let cp = &cls_sig.param_types[i];
-                        if matches!(ip, Type::Unknown) || matches!(cp, Type::Unknown) {
+                        if matches!(ip_raw, Type::Unknown) || matches!(cp, Type::Unknown) {
                             continue;
                         }
-                        if is_self_ref(ip) {
+                        if is_self_ref(ip_raw) {
                             continue;
                         }
-                        if !self.is_assignable(cp, ip) {
+                        let ip = if iface_subst.is_empty() {
+                            ip_raw.clone()
+                        } else {
+                            substitute_typevars(ip_raw, iface_subst)
+                        };
+                        if !self.is_assignable(cp, &ip) {
                             return false;
                         }
                     }
@@ -3535,9 +3633,14 @@ impl<'a> Checker<'a> {
                 _ => return false,
             }
         }
-        for (f, iface_type) in &iface_shape.fields {
+        for (f, iface_type_raw) in &iface_shape.fields {
+            let iface_type = if iface_subst.is_empty() {
+                iface_type_raw.clone()
+            } else {
+                substitute_typevars(iface_type_raw, iface_subst)
+            };
             match self.find_field(cls_name, f) {
-                Some(cls_type) if self.is_assignable(iface_type, cls_type) => {}
+                Some(cls_type) if self.is_assignable(&iface_type, cls_type) => {}
                 Some(_) => return false, // field present but wrong type
                 None if self.find_method(cls_name, f).is_some_and(|s| s.arity == 0) => {} // property-like method satisfies field
                 None => return false,
@@ -21806,6 +21909,228 @@ let r: Dog = f(d)
         d.errors()
             .iter()
             .any(|e| e.to_string().contains("does not satisfy bound"))
+    }
+
+    // ---- C4: variance flow through a *generic* interface bound -----------
+    //
+    // A generic interface `Producer[T]` / `Consumer[T]` is a type-parameter
+    // bound (`def f[X: Producer[Animal]](...)`). Conformance must bind the
+    // interface's `T` to the bound's argument and then honour position
+    // variance: return types covariantly, parameter types contravariantly.
+
+    #[test]
+    fn typevar_generic_iface_bound_covariant_exact_match_accepted() {
+        // `AnimalProducer.get -> Animal` against `Producer[Animal]`: exact.
+        let src = "\
+class Animal:
+    pass
+
+interface Producer[T]:
+    def get(self) -> T: ...
+
+class AnimalProducer:
+    def get(self) -> Animal:
+        return Animal()
+
+def use_ap[X: Producer[Animal]](p: X) -> Animal:
+    return p.get()
+
+let ap: AnimalProducer = AnimalProducer()
+let a: Animal = use_ap(ap)
+";
+        let d = check(src);
+        assert!(
+            !has_typevar_bound_error(&d),
+            "exact-match producer should satisfy Producer[Animal]; errors: {:?}",
+            d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn typevar_generic_iface_bound_covariant_subtype_accepted() {
+        // `DogProducer.get -> Dog` against `Producer[Animal]` with
+        // `Dog <: Animal`: covariant return, sound, accepted.
+        let src = "\
+class Animal:
+    pass
+
+class Dog(Animal):
+    pass
+
+interface Producer[T]:
+    def get(self) -> T: ...
+
+class DogProducer:
+    def get(self) -> Dog:
+        return Dog()
+
+def use_ap[X: Producer[Animal]](p: X) -> Animal:
+    return p.get()
+
+let dp: DogProducer = DogProducer()
+let a: Animal = use_ap(dp)
+";
+        let d = check(src);
+        assert!(
+            !has_typevar_bound_error(&d),
+            "Dog<:Animal so DogProducer should satisfy Producer[Animal] covariantly; errors: {:?}",
+            d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn typevar_generic_iface_bound_covariant_unrelated_return_rejected() {
+        // `PlantProducer.get -> Plant` against `Producer[Animal]`: `Plant`
+        // is not a subtype of `Animal`, so the covariant return position
+        // is violated and the bound must be reported. Before C4 the
+        // interface's `T` was left unbound (treated as `Any`) and this
+        // spuriously conformed.
+        let src = "\
+class Animal:
+    pass
+
+class Plant:
+    pass
+
+interface Producer[T]:
+    def get(self) -> T: ...
+
+class PlantProducer:
+    def get(self) -> Plant:
+        return Plant()
+
+def use_ap[X: Producer[Animal]](p: X) -> Animal:
+    return p.get()
+
+let pp: PlantProducer = PlantProducer()
+let a: Animal = use_ap(pp)
+";
+        let d = check(src);
+        assert!(
+            has_typevar_bound_error(&d),
+            "Plant is not Animal so PlantProducer must NOT satisfy Producer[Animal]; errors: {:?}",
+            d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn typevar_generic_iface_bound_contravariant_supertype_accepted() {
+        // `AnimalConsumer.consume(item: Animal)` against `Consumer[Dog]`:
+        // a consumer of the wider `Animal` can stand in where a
+        // `Consumer[Dog]` is required (contravariant parameter). Accepted.
+        let src = "\
+class Animal:
+    pass
+
+class Dog(Animal):
+    pass
+
+interface Consumer[T]:
+    def consume(self, item: T) -> None: ...
+
+class AnimalConsumer:
+    def consume(self, item: Animal) -> None:
+        pass
+
+def use_dc[X: Consumer[Dog]](c: X) -> None:
+    pass
+
+let ac: AnimalConsumer = AnimalConsumer()
+use_dc(ac)
+";
+        let d = check(src);
+        assert!(
+            !has_typevar_bound_error(&d),
+            "Animal consumer should satisfy Consumer[Dog] contravariantly; errors: {:?}",
+            d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn typevar_generic_iface_bound_contravariant_subtype_param_rejected() {
+        // `DogConsumer.consume(item: Dog)` against `Consumer[Animal]`: a
+        // consumer that only handles `Dog` cannot stand in where any
+        // `Animal` may be passed (contravariant parameter violated).
+        // Before C4 this spuriously conformed.
+        let src = "\
+class Animal:
+    pass
+
+class Dog(Animal):
+    pass
+
+interface Consumer[T]:
+    def consume(self, item: T) -> None: ...
+
+class DogConsumer:
+    def consume(self, item: Dog) -> None:
+        pass
+
+def use_ac[X: Consumer[Animal]](c: X) -> None:
+    pass
+
+let dc: DogConsumer = DogConsumer()
+use_ac(dc)
+";
+        let d = check(src);
+        assert!(
+            has_typevar_bound_error(&d),
+            "Dog-only consumer must NOT satisfy Consumer[Animal] (contravariance); errors: {:?}",
+            d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn typevar_generic_iface_bound_field_type_substituted() {
+        // Field-shaped interface member: `value: T` against
+        // `Holder[int]`. A class whose `value` is `str` must be rejected;
+        // an `int`-valued one accepted. Exercises the field substitution
+        // path of the conformance check.
+        let ok = "\
+interface Holder[T]:
+    value: T
+
+class IntHolder:
+    value: int
+
+    def __init__(self) -> None:
+        self.value = 0
+
+def use_holder[X: Holder[int]](h: X) -> None:
+    pass
+
+let ih: IntHolder = IntHolder()
+use_holder(ih)
+";
+        let d = check(ok);
+        assert!(
+            !has_typevar_bound_error(&d),
+            "int field should satisfy Holder[int]; errors: {:?}",
+            d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+
+        let bad = "\
+interface Holder[T]:
+    value: T
+
+class StrHolder:
+    value: str
+
+    def __init__(self) -> None:
+        self.value = \"x\"
+
+def use_holder[X: Holder[int]](h: X) -> None:
+    pass
+
+let sh: StrHolder = StrHolder()
+use_holder(sh)
+";
+        let d = check(bad);
+        assert!(
+            has_typevar_bound_error(&d),
+            "str field must NOT satisfy Holder[int]; errors: {:?}",
+            d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
     }
 
     #[test]
