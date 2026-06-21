@@ -818,6 +818,10 @@ const STDLIB_TOP_LEVEL: &[&str] = &[
     "operator",
     "optparse",
     "os",
+    // `parser` was removed in Python 3.10 but is still a name users
+    // reach for (and historically a stdlib module), so we keep warning
+    // on it — `parser.py` on `sys.path` is confusing regardless. B3.
+    "parser",
     "pathlib",
     "pdb",
     "pickle",
@@ -876,6 +880,7 @@ const STDLIB_TOP_LEVEL: &[&str] = &[
     "termios",
     "test",
     "textwrap",
+    "this",
     "threading",
     "time",
     "timeit",
@@ -947,7 +952,7 @@ fn pub_star_line_offset(source: &str, line_idx: usize) -> usize {
     offset
 }
 
-fn check_stdlib_module_shadow(
+pub(crate) fn check_stdlib_module_shadow(
     path: &std::path::Path,
     source: &str,
     src_dir: &std::path::Path,
@@ -1231,6 +1236,10 @@ mod tests {
         assert!(stdlib_top_level_contains("io"));
         assert!(stdlib_top_level_contains("json"));
         assert!(stdlib_top_level_contains("dataclasses"));
+        // B3: `parser` (removed in 3.10 but still a confusing name) and
+        // `this` (the Zen easter-egg module) are in the curated set.
+        assert!(stdlib_top_level_contains("parser"));
+        assert!(stdlib_top_level_contains("this"));
     }
 
     #[test]
