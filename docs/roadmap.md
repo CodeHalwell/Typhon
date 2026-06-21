@@ -1,10 +1,112 @@
 # Roadmap
 
 > Excerpted from the [long-term plan](long-term-plan.md). The plan is the source of truth.
+>
+> The active, sequenced path to the first tagged alpha is the
+> [Full Alpha (v1.0-alpha) Release Plan](alpha-release-plan.md) — when it and
+> the long-term plan disagree about *sequencing*, the alpha plan wins.
 
 Realistic milestones for one person plus AI assistance. The headline target is a useful subset shippable in twelve months.
 
 ## Current release
+
+**[v0.15.7](https://github.com/CodeHalwell/Typhon/releases/tag/v0.15.7) — 2026-06-21.**
+A robustness release deepening compile-time checking of third-party code and
+clearing a batch of type-checker false positives surfaced by the 2026-06-21
+stress round (~130-program sweep) and a 43-library introspection audit. The
+headline: **third-party *method* calls are now arity-checked** — a missing
+required argument to `PCA(...).fit()` or `df.merge()` is caught at `tyc check` /
+`tyc build` time, the same way constructor and free-function calls already were.
+Three introspection-robustness fixes (a proxy member that raises from
+`inspect.signature` no longer disables a whole module's checks; the
+implicit-Optional `x: T = None` idiom no longer false-positives; `pkg.sub.Thing()`
+multi-segment attribute calls are checked like the `from`-import form) plus three
+pure type-checker false-positive fixes (`Counter +/- Counter`, a `plain class` /
+`class!` with a hand-written `__init__`, and others). Additive on the accepted
+surface. (The `rescue` exception-boundary sugar — postfix + block forms — is
+landed on the Unreleased line; see [the design note](design/error-boundary-sugar.md)
+and the language reference.)
+
+**[v0.15.6](https://github.com/CodeHalwell/Typhon/releases/tag/v0.15.6) — 2026-06-16.**
+An ~198-program adversarial sweep ("if you can write it in Python, you can use
+Typhon"). Several type-checker false positives (several build-blockers) and a
+cluster of VM parity gaps were fixed; compiled output (`tyc build` → CPython
+3.13) is now correct on the entire corpus. The largest cluster was custom
+exception classes (`class FooError(Exception):` + `raise FooError("msg")`). Two
+additive features also landed: flow-sensitive attribute narrowing
+(`if self.x is None: return …`) and a VM `abc` module shim. Backward-compatible.
+
+**[v0.15.5](https://github.com/CodeHalwell/Typhon/releases/tag/v0.15.5) — 2026-06-15.**
+A bugfix release making `extend BUILTIN:` work across module boundaries.
+Previously builtin extension methods (`extend str: def slug(...)`) only rewrote
+call sites inside the declaring module; importing the module dropped the
+extension, firing `tyc::attribute_not_found` on `title.slug()` in a consumer.
+Fixed end-to-end across the type checker, build/codegen, and VM.
+
+**[v0.15.4](https://github.com/CodeHalwell/Typhon/releases/tag/v0.15.4) — 2026-06-15.**
+A bugfix release from a layered FastAPI-style app field report. Closes the
+cross-module structural-conformance gap the reviewer called "the single biggest
+gap", fixes a `pub` modifier-stacking parse error (`pub comptime let`), and
+documents the module-local scope of `extend BUILTIN:`. Additive — output is
+byte-for-byte unchanged.
+
+**[v0.15.3](https://github.com/CodeHalwell/Typhon/releases/tag/v0.15.3) — 2026-06-15.**
+A tooling release with no language, type-checker, VM, or runtime change. Ships
+the `typhon` Claude skill *inside the compiler* and adds `tyc install skill` to
+vendor it into any project, bringing the bundled skill current with the
+v0.14.1 → v0.15.2 surface.
+
+**[v0.15.2](https://github.com/CodeHalwell/Typhon/releases/tag/v0.15.2) — 2026-06-14.**
+A bugfix release with no surface change: a quote inside a comment no longer
+breaks a following `as!` / `?` (the preprocess left-operand scan is now
+comment-aware).
+
+**[v0.15.1](https://github.com/CodeHalwell/Typhon/releases/tag/v0.15.1) — 2026-06-14.**
+A performance and polish release with no language or API change. Source-map
+generation now runs in O(N log N) instead of O(N²) (`build_source_map_v2` no
+longer re-scans from the start for every token offset — a 10k-line file dropped
+from ~31 s), plus docs-site accessibility fixes.
+
+**[v0.15.0](https://github.com/CodeHalwell/Typhon/releases/tag/v0.15.0) — 2026-06-13.**
+A feature release sharpening Typhon at the library boundary, driven by an async-app
+field report. Four threads land together: the `as!` checked cast now composes in
+any expression position; a `try_result(thunk[, on_err])` combinator collapses the
+exception→`Result` boilerplate; the compiler ships curated `.dty` stubs for the
+most-imported third-party libraries; and `async_without_await` stops firing on
+methods that are async only to honour a contract. A cross-module class-identity
+fix and a round of review hardening round it out.
+
+**[v0.14.3](https://github.com/CodeHalwell/Typhon/releases/tag/v0.14.3) — 2026-06-12.**
+LSP follow-ups to the 0.14.2 editor work: `typhon.toml` edits now refresh editor
+diagnostics live, plus committed end-to-end LSP coverage.
+
+**[v0.14.2](https://github.com/CodeHalwell/Typhon/releases/tag/v0.14.2) — 2026-06-12.**
+Async concurrency. `auto-gather` was opt-in, required a `@gatherable` decorator
+on every callee, and only considered same-module `async def`s — so the most
+common missed-concurrency shape (two awaited method calls on an imported client)
+was never surfaced. This release closes both gaps: a default-on
+`tyc::gather_opportunity` advice points out independent sequential `await` runs
+for *any* awaited callee, and the `auto-gather` rewrite now folds in callees
+imported from other project modules.
+
+**[v0.14.1](https://github.com/CodeHalwell/Typhon/releases/tag/v0.14.1) — 2026-06-12.**
+Cross-module shape-propagation completeness. A self-hosted API budget tracker
+built on v0.14.0 surfaced that four per-module checker tables — `newtypes`,
+transparent `type_aliases`, `enums`, and `frozen_classes` — were never threaded
+through the cross-module shape registry, so that type information silently went
+missing once a declaration was consumed from another module. All four are now
+carried across the boundary.
+
+**[v0.14.0](https://github.com/CodeHalwell/Typhon/releases/tag/v0.14.0) — 2026-06-12.**
+Two ergonomics features from a playground retrospective: the **`as!` checked
+boundary cast** (`EXPR as! TYPE`) is the one-line, *sound* replacement for the
+`unsafe:`-block-plus-re-assertion dance at every untyped boundary, and runtime
+tracebacks now auto-remap to `.ty` source rather than the emitted `.py`. Both
+additive — every previously-accepted program type-checks identically.
+
+**[v0.13.2](https://github.com/CodeHalwell/Typhon/releases/tag/v0.13.2) — 2026-06-12.**
+A playground stress round: method-call `match`, multi-line `?`, the `gather:`-in-`match`
+import, and `tyc fmt` round-trips. Additive on the accepted surface.
 
 **[v0.13.1](https://github.com/CodeHalwell/Typhon/releases/tag/v0.13.1) — 2026-06-11.**
 A six-fix patch on v0.13.0 from a round of app-building (plus two

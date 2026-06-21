@@ -1,3 +1,16 @@
+> ## ⚠️ HISTORICAL DOCUMENT — captured against tyc 0.5.2
+>
+> **This is not a current bug list. Do not triage from it.** These findings were
+> captured against **tyc 0.5.2**; the current version is **v0.15.7**. **Most of
+> the friction documented below has since been resolved** — for example
+> cross-module variant → union flow, `await` on an `Awaitable` (R3-1),
+> multi-line `go` (R3-2), and the exhaustive-match `missing_return` gap are all
+> fixed (see `CHANGELOG.md` for the v0.6.x–v0.15.x line). It is retained
+> verbatim as a historical record of the dogfooding round that drove much of
+> that work, **not** as a description of the language as it stands today. Before
+> acting on any item here, confirm it against the current `CHANGELOG.md`,
+> `docs/language.md`, and a fresh `tyc check`.
+
 # Typhon — feedback from building the five `examples/apps/`
 
 Notes captured while writing five multi-file production-shaped apps under
