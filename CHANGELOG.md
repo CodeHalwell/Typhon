@@ -40,6 +40,21 @@ First batch toward the feature-complete `v1.0.0-alpha`. See
   confirmed `fmt` / `clippy -D warnings` / `test --workspace` / corpus
   round-trip are all already enforced.
 
+### Alpha prep — milestone M2 ("Type-system frontier")
+
+- **Added — higher-kinded type unification (C1).** `Type::TypeConstructor` is now
+  wired through the unifier. A class type parameter used as a generic head
+  (`fa: F[A]`, `-> F[B]`) is recognised as a constructor variable; binding a
+  formal `F[A]` against a concrete `list[int]` binds `F → list, A → int` and
+  substitutes consistently in the return type, so `class Functor[F[_]]` /
+  `map` type-checks over builtins (`list`) and user generics (`Box[T]`). Wrong
+  arity (`F[A, B]` vs `list[int]`) and conflicting constructor binding (`F` to
+  both `list` and `set` in one call) now emit the new `tyc::kind_mismatch`
+  diagnostic instead of silently producing `Unknown`. Function-level HKT params
+  (`def f[F[_]]`), non-class constructor application, constructor composition,
+  and cross-module HKT arity propagation are deferred and degrade to prior
+  behavior (no new false positives).
+
 ### Alpha prep — milestone M3 (landing early): formatter robustness
 
 - **Fixed — `tyc fmt` is now idempotent and semantics-preserving (E2).** Two
