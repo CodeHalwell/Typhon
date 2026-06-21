@@ -286,3 +286,17 @@ abbr[title] {
     padding-left: 0.5rem;
   }
 }
+
+/* Enhance blockquote visibility and visual hierarchy */
+.sl-markdown-content blockquote:not(:where(.not-content *)) {
+  background-color: color-mix(in srgb, var(--sl-color-accent) 8%, transparent);
+  border-left: 4px solid var(--sl-color-accent);
+  border-radius: 0 0.5rem 0.5rem 0;
+  padding: 1rem 1.25rem;
+  margin: 1.5rem 0;
+  color: var(--sl-color-gray-2);
+}
+
+.sl-markdown-content blockquote:not(:where(.not-content *)) p {
+  color: inherit;
+}
