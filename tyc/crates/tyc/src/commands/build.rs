@@ -185,6 +185,28 @@ pub fn run(args: BuildArgs) -> Result<()> {
             .insert("pydantic".to_string(), "*".to_string());
     }
 
+    // B3 stdlib-shadow warning: a top-level module named after a Python
+    // stdlib module (`types.ty`, `ast.ty`, …) emits `<out>/types.py`,
+    // which lands on `sys.path` ahead of the stdlib and shadows it —
+    // producing baffling circular-import failures pointing at stdlib
+    // internals rather than the user's file (R2-4). Non-fatal: the build
+    // still succeeds; we only surface an actionable rename suggestion.
+    //
+    // Reuses the exact `tyc::stdlib_module_shadow` detection that
+    // `tyc check` runs (top-level-only gating, `lang_<name>` rename
+    // hint), so the two surfaces never drift. `tyc build` previously
+    // never emitted this warning — only `tyc check` did.
+    {
+        let src_dir_canon = src_dir.canonicalize().unwrap_or_else(|_| src_dir.clone());
+        for (path, source) in &sources {
+            if let Some(warn) =
+                crate::commands::check::check_stdlib_module_shadow(path, source, &src_dir_canon)
+            {
+                eprintln!("{:?}", miette::Report::new_boxed(Box::new(warn)));
+            }
+        }
+    }
+
     // Bootstrap the Python environment before codegen: merge our owned
     // keys into pyproject.toml (preserving user-managed tables) and run
     // `uv sync` so `.venv` is ready when the user runs the emitted
@@ -2996,6 +3018,62 @@ mod tests {
         .unwrap();
         std::fs::write(src_dir.join("main.ty"), src_content).unwrap();
         (src_dir, out_dir)
+    }
+
+    #[test]
+    fn build_emits_stdlib_shadow_warning_for_types_module() {
+        // The B3 wiring: `tyc build` reuses the same detection as
+        // `tyc check`, so a top-level `types.ty` is flagged while a
+        // normally-named `main.ty` is not. We assert against the shared
+        // helper directly (the build path prints it to stderr).
+        let tmp = tempfile::tempdir().unwrap();
+        let src_dir = tmp.path().join("src");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        std::fs::write(src_dir.join("types.ty"), "let kind: str = \"x\"\n").unwrap();
+        std::fs::write(src_dir.join("main.ty"), "let x: int = 1\n").unwrap();
+        let src_canon = src_dir.canonicalize().unwrap();
+
+        let types_diag = crate::commands::check::check_stdlib_module_shadow(
+            &src_dir.join("types.ty"),
+            "let kind: str = \"x\"\n",
+            &src_canon,
+        );
+        assert!(
+            types_diag.is_some(),
+            "a top-level `types.ty` module must produce a stdlib-shadow warning"
+        );
+
+        let main_diag = crate::commands::check::check_stdlib_module_shadow(
+            &src_dir.join("main.ty"),
+            "let x: int = 1\n",
+            &src_canon,
+        );
+        assert!(
+            main_diag.is_none(),
+            "a normally-named `main.ty` module must NOT warn"
+        );
+    }
+
+    #[test]
+    fn build_with_stdlib_shadow_module_still_succeeds() {
+        // The warning is non-fatal: a project containing a top-level
+        // `types.ty` must still build and emit `types.py`.
+        let tmp = tempfile::tempdir().unwrap();
+        let (src_dir, out_dir) = scaffold(tmp.path(), "let x: int = 1\n");
+        std::fs::write(src_dir.join("types.ty"), "let kind: str = \"thing\"\n").unwrap();
+        run(BuildArgs {
+            path: tmp.path().to_path_buf(),
+            out: None,
+            no_format: true,
+            check: false,
+            no_sync: false,
+            with_ty: false,
+        })
+        .expect("build must succeed despite the stdlib-shadow warning");
+        assert!(
+            out_dir.join("types.py").exists(),
+            "types.py should still be emitted (warning is non-fatal)"
+        );
     }
 
     #[test]

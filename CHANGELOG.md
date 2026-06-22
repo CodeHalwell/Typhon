@@ -6,6 +6,147 @@ canonical phase-by-phase status lives in `docs/roadmap.md`.
 
 ## Unreleased
 
+### Alpha prep — milestone M1 ("Tidy & deepen") of the [alpha release plan](docs/alpha-release-plan.md)
+
+First batch toward the feature-complete `v1.0.0-alpha`. See
+`docs/alpha-release-plan.md` for the full plan, milestones, and release gates.
+
+- **Added — `Annotated[T, …]` is type-checked through third-party introspection
+  (A1).** `tyc-venv`'s annotation mapper had no `Annotated` arm, so dependencies
+  typed as `Annotated[str, FieldInfo(...)]` (FastAPI / Typer / Pydantic) degraded
+  to `Unknown` and wrong-typed kwargs slipped past the checker. The mapper now
+  strips the optional `typing` / `typing_extensions` qualifier and resolves the
+  first type argument (metadata `repr`s with commas handled), degrading to
+  `Unknown` only when the inner type is unresolvable. Relaxing/strengthening
+  only — no new false positives on the corpus.
+- **Added — `tyc::stdlib_module_shadow` now fires on `tyc build` (B3).** The
+  diagnostic existed but was `tyc check`-only; a top-level `types.ty` / `ast.ty`
+  / `parser.ty` that silently shadows a stdlib module is now warned about when
+  building too (non-fatal). `parser` and `this` added to the curated stdlib list.
+- **Added — cross-file go-to-definition for import aliases and `.py` siblings
+  (E1).** `tyc lsp` go-to-definition now resolves `import foo as f` then `f.Bar`
+  to `Bar`'s definition in `foo`, splices dotted receivers (`pkg.sub.Thing`),
+  and resolves `.py` / `__init__.py` siblings (with `.ty` winning). A missing
+  named member now falls back to the local declaration site instead of jumping
+  to the wrong file top.
+- **Fixed — `tyc migrate` no longer emits invalid `mut else:` / `let else:`
+  (B1).** Keyword-led compound headers (`else:`, `try:`, `finally:`, …) were
+  misclassified as annotated-assignment targets and prefixed with a binding
+  marker. The migrate pass now skips Python reserved words, so only genuine
+  (re)assignments get `let` / `mut`.
+- **Docs — `roadmap.md` refreshed to v0.15.7** (per-release summaries through the
+  0.14.x / 0.15.x line); `examples/apps/TYPHON_FEEDBACK.md` banner-stamped as
+  historical (captured at v0.5.2 — most findings since resolved). CI gate audit
+  confirmed `fmt` / `clippy -D warnings` / `test --workspace` / corpus
+  round-trip are all already enforced.
+
+### Alpha prep — milestone M2 ("Type-system frontier")
+
+- **Added — higher-kinded type unification (C1).** `Type::TypeConstructor` is now
+  wired through the unifier. A class type parameter used as a generic head
+  (`fa: F[A]`, `-> F[B]`) is recognised as a constructor variable; binding a
+  formal `F[A]` against a concrete `list[int]` binds `F → list, A → int` and
+  substitutes consistently in the return type, so `class Functor[F[_]]` /
+  `map` type-checks over builtins (`list`) and user generics (`Box[T]`). Wrong
+  arity (`F[A, B]` vs `list[int]`) and conflicting constructor binding (`F` to
+  both `list` and `set` in one call) now emit the new `tyc::kind_mismatch`
+  diagnostic instead of silently producing `Unknown`. Function-level HKT params
+  (`def f[F[_]]`), non-class constructor application, constructor composition,
+  and cross-module HKT arity propagation are deferred and degrade to prior
+  behavior (no new false positives).
+- **Added — variance inference for user-declared generics (C2).** Each user
+  generic class's type parameters are now classified by usage: appearing only
+  in output positions (method return types, read-only `@property`) infers
+  covariant; only in input positions (method params, settable fields) infers
+  contravariant; appearing in both, behind a mutable container/field, or in any
+  unprovable position stays `Invariant` (the safe default). A covariant
+  `Producer[Dog]` now flows into a `Producer[Animal]` slot while an invariant
+  `Box[Dog]` still does not; the builtin variance table is unchanged. A bare
+  `@covariant` / `@contravariant` class decorator overrides inference.
+  Cross-module variance (carrying inferred variance through `ModuleShapes`) is
+  deferred and stays at the invariant default — sound, never unsound widening.
+- **Fixed — sound variance through generic interface bounds (C4).** A generic
+  interface bound (`def f[X: Producer[Animal]]`) checked the implementer with
+  the interface's type parameter left unbound (treated as `Any`), so the type
+  argument was discarded and every class spuriously conformed — a soundness
+  hole that accepted covariant-return and contravariant-parameter violations.
+  Conformance now substitutes the interface's type arguments into each member's
+  return / parameter / field types before the assignability check, so returns
+  flow covariantly and parameters contravariantly. Non-generic interface bounds
+  were already correct; un-introspected third-party generic interfaces degrade
+  to the prior permissive check — no false positives. A sound tightening.
+- **Added — small non-nullable unions are type-checked through introspection
+  (A2).** The tyc-types AST path and `is_assignable` already handled N-ary
+  `Type::Union`; the leak was the `tyc-venv` string parser, which degraded any
+  non-`None` pipe union to `Unknown`. It now emits a real 2-member union
+  (`split_top_level_pipes` for true arity, plus a `Union[A, B, …]` branch) with
+  soundness guards: `X | None` reduces to the nullable form, a redundant member
+  collapses, exactly two distinct concrete members become a real union, and any
+  `Unknown`/`Any` member — or 3+ members, or `X | Y | None` — degrades the whole
+  union back to `Unknown`. So `Union[str, bytes]` (jinja2) and
+  `Union[str, os.PathLike]` (Flask) now reject an `int` argument while per-member
+  numeric widening (`int → float`, `bool → int`) is preserved. 3+ member unions
+  are deferred. Zero corpus false positives.
+- **Added — inter-procedural field-init audit (C3).** The `tyc::missing_field_init`
+  audit (which catches `X.__new__(X)` partial instances escaping with required
+  fields unassigned) now tracks partial instances across helper chains via a
+  sound, dependency-ordered, cycle-safe per-function summary, replacing the two
+  trivial-factory special cases. A `let c = make()` whose callee returns a
+  partially-initialised instance fires at the caller's escape, across silent
+  passthrough (`return X.__new__(X)`) and multi-hop chains (`make2 → make1`).
+  Every uncertainty drops to not-partial and never invents a missing field:
+  `setattr`, `obj.method(...)`, passing the instance into any call, any compound
+  control-flow, rebinds to unknown values, and arg-bearing call shapes; the
+  `unsafe:` posture is unchanged. Cross-module helper chains, branch-merge/SSA
+  unification, and parameter-based partial tracking remain deferred (sound).
+  Zero corpus false positives.
+- **Added — cross-module variance + HKT propagation (C1/C2 cross-module).** The
+  deferred cross-module halves of HKT and variance inference now flow through the
+  existing `ModuleShapes` / `ExternalShapes` mechanism: a generic class imported
+  from a sibling module carries its inferred type-parameter variance and its HKT
+  constructor-variable identity, so `user_generic_param_variance` and the HKT arm
+  consult imported generics exactly as local ones. An imported covariant
+  `Producer[Dog]` now widens into a `Producer[Animal]` slot (previously stuck at
+  the invariant default across module boundaries), invariant imports still
+  reject, and `Functor[F[_]]`-shape HKT binds across the boundary. Variance is a
+  pure relaxation (missing entry → invariant default, never a false positive);
+  HKT degrades to pre-HKT permissive when an imported class's identity is
+  unavailable.
+
+- **Added — performance regression CI gate (F2).** `scripts/perf-gate.sh` times
+  the full build pipeline over a real multi-module example, takes the median of
+  9 runs (after 2 warmups), and fails CI when it exceeds the committed
+  `perf-baseline.json` by >20%. Methodology and re-baselining are documented in
+  `docs/performance-baseline.md`. Designed to be non-flaky (median, warmup,
+  generous threshold) and dependency-light (bash + python3 + jq, no network).
+- **Fixed — `impl Alias:`-over-sealed-union diagnostics point at real source
+  (B15).** Distributing one `impl Alias:` block into one block per variant
+  byte-duplicates the method body, appending later blocks past EOF of the real
+  file, so a diagnostic inside a duplicated body rendered a line number beyond
+  the file's length (the length-preserving `sanitize_synthetic_source` restored
+  the header text but kept the duplicated lines — its `TODO(#32)`). A new
+  `BlockRemap` at the existing diagnostic-sanitisation chokepoint detects the
+  signature (a run of 2+ same-indent `impl <Name>:` blocks with byte-identical
+  bodies) and remaps each label's span per-line back onto the first
+  real-source-aligned block (per-line deltas keep columns correct across uneven
+  variant-name lengths). Body diagnostics now resolve to the exact authored
+  member line; no diagnostic can exceed the real line count. Files without a
+  distributed impl group are untouched. Closes the long-standing B15 limitation
+  with no invasive source-map plumbing.
+
+- **Fixed — `tyc fmt` is now idempotent and semantics-preserving (E2).** Two
+  source-corrupting bugs are fixed: `extend BUILTIN:` (e.g. `extend str:`) was
+  rewritten to the internal lowering `extend class
+  __typhon_builtin_ext_str(object):`, and generic `impl[T] Name[T]:` / generic
+  `extend` headers were mangled to `impl Name:` across two passes. Both headers
+  are now restored verbatim (line-map-aware) while their bodies are still
+  formatted, so `tyc fmt --check` is a clean no-op across the whole corpus and
+  formatting never changes program meaning. Bracket-depth-aware `:` / `->` / `=`
+  spacing confirmed (annotation/dict spaced, slice colons tight, kwarg/default
+  `=` tight, statement `=` spaced). The B15 synthetic-line-number leakage is
+  deferred — a correct fix needs a source-span remap threaded through
+  `tyc-syntax` / `tyc-resolve` / `tyc-types`, outside the formatter's scope.
+
 ### Added — `rescue`: lambda-free, `try`/`except`-free exception boundaries
 
 Two new forms — a postfix operator and a block prefix — lift a throwing boundary

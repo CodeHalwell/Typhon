@@ -57,3 +57,38 @@ jobs:
         uses: EmbarkStudios/cargo-deny-action@v2
         with:
           manifest-path: tyc/Cargo.toml
+
+  perf-gate:
+    name: Performance regression gate (F2)
+    runs-on: ubuntu-latest
+    # Times the full `tyc build` pipeline over a fixed, network-free corpus and
+    # fails if the median regresses >20% past the committed perf-baseline.json.
+    # Methodology + how to refresh the baseline: docs/performance-baseline.md.
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.94"
+
+      - name: Cache cargo registry and build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            tyc/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('tyc/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: Build release tyc binary
+        working-directory: tyc
+        run: cargo build --release --bin tyc
+
+      - name: Run build-pipeline perf gate
+        # Median of several runs vs. committed baseline; >20% slower fails.
+        # The gate is network-free (`--no-sync --check`) and uses only
+        # bash + python3 + jq, all present on ubuntu-latest runners.
+        run: scripts/perf-gate.sh

@@ -50,6 +50,7 @@
         { "include": "#numbers" },
         { "include": "#lambda" },
         { "include": "#typhon-keywords" },
+        { "include": "#checked-cast" },
         { "include": "#python-keywords" },
         { "include": "#control-keywords" },
         { "include": "#operator-keywords" },
@@ -473,7 +474,7 @@
         },
         {
           "name": "keyword.control.typhon.typhon",
-          "match": "\\b(impl|interface|model|enum|extend|gather|go|guard|with)\\b"
+          "match": "\\b(impl|interface|model|enum|extend|gather|go|guard|with|rescue)\\b"
         }
       ]
     },
@@ -572,6 +573,12 @@
     "pipe-operator": {
       "name": "keyword.operator.pipe.typhon",
       "match": "\\|>"
+    },
+
+    "checked-cast": {
+      "comment": "`EXPR as! TYPE` — the checked boundary cast (v0.14.0). Matched before the bare `as` context keyword so the whole `as!` reads as one operator.",
+      "name": "keyword.operator.checked-cast.typhon",
+      "match": "\\bas!"
     },
 
     "operators": {

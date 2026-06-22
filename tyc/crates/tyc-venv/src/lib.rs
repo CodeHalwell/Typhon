@@ -643,6 +643,10 @@ fn shapes_from_introspected(intro: &IntrospectedModule) -> ModuleShapes {
         enums: HashMap::new(),
         frozen_classes: std::collections::HashSet::new(),
         gatherable_async_fns: std::collections::HashSet::new(),
+        // Introspected Python modules carry no inferred-variance or
+        // higher-kinded metadata — those are Typhon-source concepts.
+        class_param_variance: HashMap::new(),
+        hkt_param_names: std::collections::HashSet::new(),
     }
 }
 
@@ -706,12 +710,16 @@ fn class_shape_from_params(params: &[IntrospectedParam]) -> Option<InterfaceShap
 /// recognised:
 /// - scalar built-ins (`int` / `str` / `bool` / `float` / `bytes` / `None`);
 /// - the nullable forms `Optional[X]` and the 2-member `X | None`;
+/// - small non-nullable unions: the 2-member `X | Y` / `Union[X, Y]` forms
+///   become a real `Type::Union`, but ONLY when both members resolve to a
+///   concrete type (any unresolvable member degrades the whole union to
+///   `Unknown`). A2.
 /// - fully-concrete parametric containers `list[X]` / `set[X]` /
 ///   `frozenset[X]` / `dict[K, V]` and fixed-arity `tuple[T1, …]`
 ///   (recursively — a container whose element doesn't resolve degrades the
 ///   whole thing).
 ///
-/// Everything else — multi-member unions, `tuple[T, ...]`, `Callable`,
+/// Everything else — 3+-member unions, `tuple[T, ...]`, `Callable`,
 /// foreign classes, unknown typing constructs — degrades to
 /// [`Type::Unknown`] (which accepts anything). So annotation capture can
 /// only ever *add* true positives; it never rejects valid code on a shape
@@ -727,6 +735,32 @@ fn annotation_to_type(ann: &str) -> Type {
     }
     s = s.trim();
 
+    // `Annotated[T, meta…]` (optionally `typing.` / `typing_extensions.`
+    // -qualified) → resolve to the FIRST type argument `T`, discarding the
+    // metadata. This is the form FastAPI / Typer / Pydantic stamp onto their
+    // parameters (`Annotated[str, FieldInfo(...)]`); without this the whole
+    // annotation degraded to `Unknown` and wrong-typed kwargs went uncaught.
+    // The metadata args are arbitrary `repr()` text (commas / brackets /
+    // parens), so we take only the first top-level comma-separated segment;
+    // if `T` itself doesn't resolve we degrade to `Unknown` exactly as before
+    // (never stricter than today). A1.
+    {
+        let head_stripped = s
+            .strip_prefix("typing.")
+            .or_else(|| s.strip_prefix("typing_extensions."))
+            .unwrap_or(s);
+        if let Some(inner) = head_stripped
+            .strip_prefix("Annotated[")
+            .and_then(|r| r.strip_suffix(']'))
+        {
+            let parts = split_top_level_commas(inner);
+            if let Some(first) = parts.first() {
+                return annotation_to_type(first.trim());
+            }
+            return Type::Unknown;
+        }
+    }
+
     // `Optional[X]` (optionally `typing.`-qualified) → `X | None`.
     let unqualified = s.strip_prefix("typing.").unwrap_or(s);
     if let Some(inner) = unqualified
@@ -736,17 +770,29 @@ fn annotation_to_type(ann: &str) -> Type {
         return nullable_of(annotation_to_type(inner));
     }
 
-    // `X | None` / `None | X` (PEP 604) — the 2-member nullable form. Richer
-    // unions stay permissive (`Unknown`) so we never false-positive.
-    if let Some((a, b)) = split_top_level_union(s) {
-        let (a, b) = (a.trim(), b.trim());
-        if b == "None" || b == "NoneType" {
-            return nullable_of(annotation_to_type(a));
+    // `Union[A, B, …]` (optionally `typing.`-qualified) — the bracketed PEP 484
+    // form. Mapped through the same small-union machinery as the `|` form
+    // (A2): a 2-member non-nullable union becomes a real `Type::Union`; the
+    // nullable 2-member form (`Union[X, None]`) becomes `X | None`; everything
+    // wider or with an unresolvable member degrades to `Unknown`.
+    if let Some(inner) = unqualified
+        .strip_prefix("Union[")
+        .and_then(|r| r.strip_suffix(']'))
+    {
+        let members = split_top_level_commas(inner);
+        return union_from_members(&members);
+    }
+
+    // `X | Y` / `X | None` (PEP 604). Splits on EVERY top-level pipe so we know
+    // the true arity (`split_top_level_union` only finds the first pipe, which
+    // would mis-read `int | str | None` as a 2-member union). `union_from_members`
+    // applies the soundness guard: a 2-member union (nullable or not) is modelled
+    // precisely; 3+ members or an unresolvable member degrade to `Unknown`. A2.
+    if s.contains('|') {
+        let members = split_top_level_pipes(s);
+        if members.len() >= 2 {
+            return union_from_members(&members);
         }
-        if a == "None" || a == "NoneType" {
-            return nullable_of(annotation_to_type(b));
-        }
-        return Type::Unknown;
     }
 
     // Parametric containers: `list[X]` / `set[X]` / `frozenset[X]` /
@@ -888,21 +934,96 @@ fn nullable_of(inner: Type) -> Type {
     }
 }
 
-/// Split `s` on a single top-level `|` (ignoring pipes nested inside
-/// `[...]` / `(...)`), returning the two halves. Used to recognise the
-/// `X | None` nullable form. `None` when there is no top-level pipe.
-fn split_top_level_union(s: &str) -> Option<(&str, &str)> {
-    let bytes = s.as_bytes();
+/// Split `s` on every top-level `|` (ignoring pipes nested inside
+/// `[...]` / `(...)`), returning all members. Used to recognise PEP 604
+/// unions (`X | None`, `X | Y`) with their true arity, so a 3+-member union
+/// isn't mistaken for a 2-member one. A single member (no top-level pipe)
+/// yields a one-element vec.
+fn split_top_level_pipes(s: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
     let mut depth = 0i32;
-    for (i, &b) in bytes.iter().enumerate() {
+    let mut start = 0;
+    for (i, &b) in s.as_bytes().iter().enumerate() {
         match b {
             b'[' | b'(' => depth += 1,
             b']' | b')' => depth -= 1,
-            b'|' if depth == 0 => return Some((&s[..i], &s[i + 1..])),
+            b'|' if depth == 0 => {
+                parts.push(&s[start..i]);
+                start = i + 1;
+            }
             _ => {}
         }
     }
-    None
+    parts.push(&s[start..]);
+    parts
+}
+
+/// Map the (already-split) members of a `Union[...]` / `X | Y` annotation to a
+/// Typhon [`Type`], applying the A2 soundness guard for small non-nullable
+/// unions:
+///
+/// - The 2-member nullable forms (`X | None`, `Union[X, None]`) collapse to
+///   `X | None` via [`nullable_of`] — exactly as before A2.
+/// - A 2-member NON-nullable union (`str | bytes`, `Union[int, str]`) becomes a
+///   real `Type::Union([A, B])` — *only* when BOTH members resolve to a
+///   concrete (non-`Unknown`/`Any`) type. If either member is unresolvable the
+///   whole union degrades to `Unknown` (permissive), so we never reject a value
+///   on a union we can't fully represent.
+/// - 3+-member unions (after deduping) stay `Unknown` for now — modelling them
+///   precisely is deferred; degrading is always sound.
+///
+/// Because `Type::union_of` flattens/dedups, a redundant `int | int` collapses
+/// to `Int` and a `X | None | None` to `X | None` — these reduce to the
+/// 1-/2-member cases naturally.
+fn union_from_members(members: &[&str]) -> Type {
+    let mapped: Vec<Type> = members
+        .iter()
+        .map(|m| annotation_to_type(m.trim()))
+        .collect();
+
+    // Partition into the None members and the rest. The nullable forms reuse
+    // the existing `nullable_of` machinery; a single non-None concrete member
+    // alongside `None` is exactly `X | None`.
+    let mut non_none: Vec<Type> = Vec::new();
+    let mut has_none = false;
+    for t in &mapped {
+        match t {
+            Type::None => has_none = true,
+            other => non_none.push(other.clone()),
+        }
+    }
+
+    // Dedup the non-None members so `int | int` and `Union[str, str]` reduce.
+    let mut unique: Vec<Type> = Vec::new();
+    for t in non_none {
+        if !unique.contains(&t) {
+            unique.push(t);
+        }
+    }
+
+    match (has_none, unique.len()) {
+        // Pure nullable (`None | None`) or nothing concrete — permissive.
+        (true, 0) => Type::None,
+        // 2-member nullable form `X | None` — model precisely if `X` resolves.
+        (true, 1) => nullable_of(unique.into_iter().next().unwrap()),
+        // A single distinct non-None member (e.g. a redundant `int | int`)
+        // collapses to that member.
+        (false, 1) => unique.into_iter().next().unwrap(),
+        // 2-member non-nullable union — model precisely, but ONLY when both
+        // members are concrete; any unresolvable member ⇒ degrade to Unknown.
+        (false, 2) => {
+            if unique
+                .iter()
+                .any(|t| matches!(t, Type::Unknown | Type::Any))
+            {
+                return Type::Unknown;
+            }
+            Type::union_of(unique)
+        }
+        // 3+ distinct members (deferred), or a `X | Y | None` shape — stay
+        // permissive rather than guess.
+        _ => Type::Unknown,
+    }
 }
 
 /// Build an [`ArityInfo`] for an introspected free function. `returns` is
@@ -1714,10 +1835,122 @@ mod tests {
         );
         assert_eq!(annotation_to_type("tuple[int, ...]"), Type::Unknown);
         assert_eq!(annotation_to_type("Callable[[int], str]"), Type::Unknown);
-        // Anything else we don't confidently model degrades to Unknown.
+        // 3+-member unions stay permissive (deferred); foreign names too.
         assert_eq!(annotation_to_type("int | str | None"), Type::Unknown);
-        assert_eq!(annotation_to_type("int | str"), Type::Unknown);
+        assert_eq!(annotation_to_type("int | str | bytes"), Type::Unknown);
         assert_eq!(annotation_to_type("requests.Session"), Type::Unknown);
+    }
+
+    #[test]
+    fn small_non_nullable_unions_map_to_real_union() {
+        // A2: a 2-member non-nullable union becomes a real `Type::Union`, in
+        // both the `X | Y` (PEP 604) and `Union[X, Y]` (PEP 484) spellings.
+        // These are the jinja2 `Union[str, bytes]` / Flask `Union[str,
+        // PathLike]`-shaped params that previously degraded to `Unknown`.
+        assert_eq!(
+            annotation_to_type("str | bytes"),
+            Type::Union(vec![Type::Str, Type::Bytes])
+        );
+        assert_eq!(
+            annotation_to_type("Union[str, bytes]"),
+            Type::Union(vec![Type::Str, Type::Bytes])
+        );
+        assert_eq!(
+            annotation_to_type("typing.Union[int, str]"),
+            Type::Union(vec![Type::Int, Type::Str])
+        );
+        // Member order is preserved.
+        assert_eq!(
+            annotation_to_type("int | str"),
+            Type::Union(vec![Type::Int, Type::Str])
+        );
+        // Concrete container members are fine.
+        assert_eq!(
+            annotation_to_type("str | list[int]"),
+            Type::Union(vec![
+                Type::Str,
+                Type::Generic("list".into(), vec![Type::Int])
+            ])
+        );
+    }
+
+    #[test]
+    fn small_union_with_unresolvable_member_degrades() {
+        // SOUNDNESS: if ANY member is unresolvable the whole union degrades to
+        // `Unknown` (permissive) — never reject a value on a union we can't
+        // fully model. This is the hard guard against false positives.
+        assert_eq!(annotation_to_type("str | requests.Session"), Type::Unknown);
+        assert_eq!(annotation_to_type("Union[int, Session]"), Type::Unknown);
+        assert_eq!(
+            annotation_to_type("Foo | Bar"),
+            Type::Unknown,
+            "two foreign members ⇒ Unknown"
+        );
+        // A container with an unresolvable element is itself Unknown, so the
+        // union degrades too.
+        assert_eq!(annotation_to_type("str | list[Session]"), Type::Unknown);
+    }
+
+    #[test]
+    fn union_nullable_and_redundant_forms_reduce() {
+        // `Union[X, None]` is just the nullable form `X | None`.
+        assert_eq!(
+            annotation_to_type("Union[str, None]"),
+            Type::Union(vec![Type::Str, Type::None])
+        );
+        // Redundant members dedup down to the simpler shape.
+        assert_eq!(annotation_to_type("int | int"), Type::Int);
+        assert_eq!(
+            annotation_to_type("Union[str, str, bytes]"),
+            Type::Union(vec![Type::Str, Type::Bytes])
+        );
+        // A non-nullable member alongside None with another member is the
+        // deferred `X | Y | None` shape — permissive.
+        assert_eq!(annotation_to_type("int | str | None"), Type::Unknown);
+    }
+
+    #[test]
+    fn annotation_unwraps_annotated_to_first_type_arg() {
+        // `Annotated[T, meta…]` resolves to `T`, discarding metadata — this is
+        // the FastAPI / Typer / Pydantic param form. A1.
+        assert_eq!(annotation_to_type("Annotated[int, \"meta\"]"), Type::Int);
+        assert_eq!(
+            annotation_to_type("typing.Annotated[str, 'meta']"),
+            Type::Str
+        );
+        assert_eq!(
+            annotation_to_type("typing_extensions.Annotated[bool, 'x']"),
+            Type::Bool
+        );
+        // Metadata carrying its own commas / brackets / parens (the typical
+        // `repr()` of a Pydantic / FastAPI marker) must not derail the split:
+        // only the first top-level segment is the type.
+        assert_eq!(
+            annotation_to_type(
+                "typing.Annotated[str, FieldInfo(default=PydanticUndefined, extra={})]"
+            ),
+            Type::Str
+        );
+        assert_eq!(
+            annotation_to_type("Annotated[int, Gt(0), Lt(10)]"),
+            Type::Int
+        );
+        // Nested `Annotated[Optional[int], …]` resolves through to the inner
+        // nullable type.
+        assert_eq!(
+            annotation_to_type("Annotated[Optional[int], 'meta']"),
+            Type::Union(vec![Type::Int, Type::None])
+        );
+        assert_eq!(
+            annotation_to_type("Annotated[list[int], 'meta']"),
+            Type::Generic("list".into(), vec![Type::Int])
+        );
+        // If the wrapped type doesn't resolve we degrade to Unknown exactly as
+        // before — never stricter than today.
+        assert_eq!(
+            annotation_to_type("Annotated[requests.Session, 'meta']"),
+            Type::Unknown
+        );
     }
 
     #[test]

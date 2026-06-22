@@ -1,0 +1,13 @@
+{
+  "_comment": "Performance regression gate baseline (alpha-plan item F2). The CI 'perf-gate' job runs scripts/perf-gate.sh, which times `tyc build <corpus> --no-sync --check` (the full preprocess->parse->check->comptime->desugar->emit->format pipeline) over N runs and FAILS if the median exceeds median_ms by more than `threshold`. See docs/performance-baseline.md for full methodology.",
+  "metric": "tyc build pipeline wall-clock, median of runs, milliseconds",
+  "command": "tyc build examples/47-mini-app --no-sync --check",
+  "corpus": "examples/47-mini-app",
+  "median_ms": 89,
+  "runs": 9,
+  "warmup": 2,
+  "threshold": 0.20,
+  "threshold_meaning": "fail when measured median > median_ms * (1 + threshold)",
+  "recorded_utc": "2026-06-21T21:49:17Z",
+  "refresh": "Run 'scripts/perf-gate.sh --update' on a quiet machine and commit this file. Do this only for an intentional, justified change (new pass, larger corpus). The CI runner is noisier than a laptop, so this number is a conservative upper bound; expect local runs to be faster."
+}

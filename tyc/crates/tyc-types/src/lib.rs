@@ -1800,6 +1800,100 @@ fn bind_typevars(
     actual: &Type,
     bindings: &mut std::collections::HashMap<String, Type>,
 ) {
+    bind_typevars_with_ctors(formal, actual, bindings, &std::collections::HashSet::new());
+}
+
+/// Outcome of an ill-kinded higher-kinded application discovered while
+/// binding a type-constructor variable (e.g. `F` in `F[A]`) against a
+/// concrete constructor application (e.g. `list[int]`). Surfaced so the
+/// call-site checker can emit a `tyc::kind_mismatch` diagnostic instead of
+/// silently degrading to `Unknown`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KindError {
+    /// A constructor variable was applied to a different number of
+    /// arguments than the matching actual constructor supplies.
+    /// `F[A, B]` against `list[int]` →
+    /// `Arity { ctor: "F", expected: 2, actual: 1 }`.
+    Arity {
+        ctor: String,
+        expected: usize,
+        actual: usize,
+    },
+    /// A constructor variable was bound to two different concrete
+    /// constructors within the same call. `F` bound to both `list` and
+    /// `set` → `Conflict { ctor: "F", first: "list", second: "set" }`.
+    Conflict {
+        ctor: String,
+        first: String,
+        second: String,
+    },
+}
+
+/// Like [`bind_typevars`], but `ctor_vars` names the set of higher-kinded
+/// type-constructor variables in scope (e.g. `{"F"}` for a signature
+/// declared under `class Functor[F[_]]`). When a formal `Generic(F, [..])`
+/// whose head is in `ctor_vars` is matched against a concrete
+/// `Generic(list, [..])`, the head `F` is bound to `Class(list)` and the
+/// arguments are unified positionally — this is what makes `fmap` over a
+/// `list[int]` infer `F → list` and `A → int`.
+fn bind_typevars_with_ctors(
+    formal: &Type,
+    actual: &Type,
+    bindings: &mut std::collections::HashMap<String, Type>,
+    ctor_vars: &std::collections::HashSet<String>,
+) {
+    let _ = bind_typevars_checked(formal, actual, bindings, ctor_vars);
+}
+
+/// Core binding walk. Returns `Err(KindError)` on the first ill-kinded
+/// higher-kinded application encountered so callers that care (the
+/// call-site checker) can diagnose it; callers that don't simply discard
+/// the result and get today's permissive behaviour.
+fn bind_typevars_checked(
+    formal: &Type,
+    actual: &Type,
+    bindings: &mut std::collections::HashMap<String, Type>,
+    ctor_vars: &std::collections::HashSet<String>,
+) -> Result<(), KindError> {
+    // Higher-kinded application: formal `F[A...]` (a `Generic` whose head
+    // is a constructor variable) against a concrete `head[...]`. Bind
+    // `F → Class(head)` and unify the arguments pairwise. Handled before
+    // the generic-equal-head arm below so a constructor variable never
+    // collides with a real same-named class — the caller that builds
+    // `ctor_vars` keeps those names disjoint from known classes.
+    if let (Type::Generic(fh, fa), Type::Generic(ah, aa)) = (formal, actual) {
+        if ctor_vars.contains(fh) && fh != ah {
+            // Kind (arity) check: the constructor variable is applied to
+            // `fa.len()` arguments here; the concrete actual supplies
+            // `aa.len()`. A mismatch is an ill-kinded application.
+            if fa.len() != aa.len() {
+                return Err(KindError::Arity {
+                    ctor: fh.clone(),
+                    expected: fa.len(),
+                    actual: aa.len(),
+                });
+            }
+            // Bind (or check) the constructor head. Binding `F` to two
+            // different concrete constructors in one call is a conflict.
+            match bindings.get(fh) {
+                Some(Type::Class(prev)) if prev != ah => {
+                    return Err(KindError::Conflict {
+                        ctor: fh.clone(),
+                        first: prev.clone(),
+                        second: ah.clone(),
+                    });
+                }
+                Some(_) => {}
+                None => {
+                    bindings.insert(fh.clone(), Type::Class(ah.clone()));
+                }
+            }
+            for (f, a) in fa.iter().zip(aa) {
+                bind_typevars_checked(f, a, bindings, ctor_vars)?;
+            }
+            return Ok(());
+        }
+    }
     match (formal, actual) {
         (Type::TypeVar(name), other) => {
             // Suppress self-bindings (`T → T`): they're uninformative and,
@@ -1811,7 +1905,7 @@ fn bind_typevars(
             // forward pass would otherwise insert `T → T`).
             if let Type::TypeVar(other_name) = other {
                 if other_name == name {
-                    return;
+                    return Ok(());
                 }
             }
             if let Some(existing) = bindings.get(name).cloned() {
@@ -1824,16 +1918,35 @@ fn bind_typevars(
         }
         (Type::Generic(fh, fa), Type::Generic(ah, aa)) if fh == ah && fa.len() == aa.len() => {
             for (f, a) in fa.iter().zip(aa) {
-                bind_typevars(f, a, bindings);
+                bind_typevars_checked(f, a, bindings, ctor_vars)?;
             }
         }
-        // Higher-kinded type constructor binding: treat `F[_]` as a type variable
-        // that should unify with the actual type constructor head.
-        // E.g. `F[_]` against `list[int]` could bind `F → list`.
-        (Type::TypeConstructor(name, _arity), Type::Generic(head, _args)) => {
-            // For now, we bind the constructor name to the generic head.
-            // A complete implementation would validate arity matches.
-            bindings.insert(name.clone(), Type::Class(head.clone()));
+        // Higher-kinded type constructor binding: treat a bare `F[_]`
+        // (parsed as `Type::TypeConstructor`) as a type variable that
+        // should unify with the actual type constructor head.
+        // E.g. `F[_]` against `list[int]` binds `F → list`. Arity is
+        // validated so applying a 2-ary constructor to a 1-ary actual
+        // (or vice versa) is reported rather than silently accepted.
+        (Type::TypeConstructor(name, arity), Type::Generic(head, args)) => {
+            if *arity != args.len() {
+                return Err(KindError::Arity {
+                    ctor: name.clone(),
+                    expected: *arity,
+                    actual: args.len(),
+                });
+            }
+            match bindings.get(name) {
+                Some(Type::Class(prev)) if prev != head => {
+                    return Err(KindError::Conflict {
+                        ctor: name.clone(),
+                        first: prev.clone(),
+                        second: head.clone(),
+                    });
+                }
+                _ => {
+                    bindings.insert(name.clone(), Type::Class(head.clone()));
+                }
+            }
         }
         (
             Type::Function {
@@ -1848,9 +1961,9 @@ fn bind_typevars(
             },
         ) if fp.len() == ap.len() => {
             for (f, a) in fp.iter().zip(ap) {
-                bind_typevars(f, a, bindings);
+                bind_typevars_checked(f, a, bindings, ctor_vars)?;
             }
-            bind_typevars(fr, ar, bindings);
+            bind_typevars_checked(fr, ar, bindings, ctor_vars)?;
         }
         // `Optional[T]` (formal `T | None`) against a concrete actual:
         // narrow each formal variant against the non-None portion of
@@ -1861,7 +1974,7 @@ fn bind_typevars(
                 if matches!(variant, Type::None) {
                     continue;
                 }
-                bind_typevars(variant, &actual_stripped, bindings);
+                bind_typevars_checked(variant, &actual_stripped, bindings, ctor_vars)?;
             }
         }
         // Formal contains a TypeVar but actual is a Union — bind each
@@ -1869,11 +1982,12 @@ fn bind_typevars(
         // full set (e.g. `list[T]` against `list[int] | list[str]`).
         (f, Type::Union(av)) if !collect_typevar_positions(f).is_empty() => {
             for variant in av {
-                bind_typevars(f, variant, bindings);
+                bind_typevars_checked(f, variant, bindings, ctor_vars)?;
             }
         }
         _ => {}
     }
+    Ok(())
 }
 
 /// Substitute every `TypeVar` in `ty` whose name appears in `bindings`
@@ -2024,6 +2138,113 @@ pub fn compute_bidirectional_bindings(
         }
     }
     bindings
+}
+
+/// Higher-kinded variant of [`bind_typevars_and_substitute_bidirectional`].
+/// `ctor_vars` names the type-constructor variables in scope for this
+/// signature (e.g. `{"F"}` under `class Functor[F[_]]`). When non-empty,
+/// formals shaped `F[A]` unify against concrete `list[int]` applications,
+/// binding `F → list` and `A → int` and substituting both through the
+/// return type so `-> F[B]` yields `list[B]`. Any ill-kinded application
+/// (wrong arity, or `F` bound to two different constructors) is returned in
+/// the `Vec<KindError>` so the caller can diagnose it; the substitution is
+/// still produced on a best-effort basis.
+pub fn bind_typevars_and_substitute_hkt(
+    formal_params: &[Type],
+    actual_args: &[Type],
+    return_type: &Type,
+    expected_return: Option<&Type>,
+    ctor_vars: &std::collections::HashSet<String>,
+) -> (Type, Vec<KindError>) {
+    let (bindings, errors) = compute_bidirectional_bindings_hkt(
+        formal_params,
+        actual_args,
+        return_type,
+        expected_return,
+        ctor_vars,
+    );
+    (substitute_typevars(return_type, &bindings), errors)
+}
+
+/// Higher-kinded variant of [`compute_bidirectional_bindings`]. Identical
+/// behaviour when `ctor_vars` is empty (the common, non-HKT case); when
+/// non-empty it additionally binds type-constructor variables and collects
+/// any [`KindError`] encountered during the forward pass.
+pub fn compute_bidirectional_bindings_hkt(
+    formal_params: &[Type],
+    actual_args: &[Type],
+    return_type: &Type,
+    expected_return: Option<&Type>,
+    ctor_vars: &std::collections::HashSet<String>,
+) -> (std::collections::HashMap<String, Type>, Vec<KindError>) {
+    let mut bindings: std::collections::HashMap<String, Type> = std::collections::HashMap::new();
+    let mut errors: Vec<KindError> = Vec::new();
+    // Skip work when no formal mentions a TypeVar or constructor variable.
+    let has_typevar = formal_params
+        .iter()
+        .chain(std::iter::once(return_type))
+        .any(|t| {
+            let mut tmp = Vec::new();
+            walk_typevars(t, &mut tmp);
+            !tmp.is_empty()
+        });
+    let mentions_ctor = !ctor_vars.is_empty()
+        && formal_params
+            .iter()
+            .chain(std::iter::once(return_type))
+            .any(|t| type_mentions_ctor_head(t, ctor_vars));
+    if !has_typevar && !mentions_ctor {
+        return (bindings, errors);
+    }
+    for (formal, actual) in formal_params.iter().zip(actual_args.iter()) {
+        if let Err(e) = bind_typevars_checked(formal, actual, &mut bindings, ctor_vars) {
+            errors.push(e);
+        }
+    }
+    if let Some(expected) = expected_return {
+        let mut return_tvs = Vec::new();
+        walk_typevars(return_type, &mut return_tvs);
+        let any_unbound = return_tvs.iter().any(|n| !bindings.contains_key(n));
+        if any_unbound {
+            let mut backward: std::collections::HashMap<String, Type> =
+                std::collections::HashMap::new();
+            // Use the *checked* binding walk so an ill-kinded application
+            // discovered during return-type-driven inference (e.g. a method
+            // returning `F[A]` used where `dict[str, int]` is expected — an
+            // arity mismatch, `F` applied to ONE argument vs `dict`'s TWO)
+            // surfaces as a `KindError` on the SAME reporting path the
+            // forward argument-binding pass uses, instead of being silently
+            // dropped and accepted by the later HKT assignability shortcut.
+            // A legitimate backward HKT binding (returning `F[A]` where
+            // `list[int]` is expected → `F=list, A=int`) produces no error
+            // and still succeeds silently.
+            if let Err(e) = bind_typevars_checked(return_type, expected, &mut backward, ctor_vars) {
+                errors.push(e);
+            }
+            for (name, ty) in backward {
+                bindings.entry(name).or_insert(ty);
+            }
+        }
+    }
+    (bindings, errors)
+}
+
+/// `true` if `ty` mentions any name in `ctor_vars` as a `Generic` head
+/// (an applied constructor variable such as `F` in `F[A]`) or as a bare
+/// `TypeConstructor`. Used to decide whether HKT binding work is needed.
+fn type_mentions_ctor_head(ty: &Type, ctor_vars: &std::collections::HashSet<String>) -> bool {
+    match ty {
+        Type::Generic(head, args) => {
+            ctor_vars.contains(head) || args.iter().any(|a| type_mentions_ctor_head(a, ctor_vars))
+        }
+        Type::TypeConstructor(name, _) => ctor_vars.contains(name),
+        Type::Union(xs) => xs.iter().any(|x| type_mentions_ctor_head(x, ctor_vars)),
+        Type::Function { params, ret, .. } => {
+            params.iter().any(|p| type_mentions_ctor_head(p, ctor_vars))
+                || type_mentions_ctor_head(ret, ctor_vars)
+        }
+        _ => false,
+    }
 }
 
 /// Used by tests in lower layers (resolver, db) that want to enumerate
@@ -2250,6 +2471,33 @@ struct Checker<'a> {
     /// `Type::Generic("Box", [Int])` rather than `Type::Class("Box")`
     /// (FINDINGS #46).
     class_type_params: HashMap<String, Vec<String>>,
+    /// Higher-kinded type-constructor *variable* names — PEP-695 type
+    /// parameters declared with the `F[_]` kind marker (e.g. `F` in
+    /// `class Functor[F[_]]`). The marker is stripped by preprocess before
+    /// the checker runs, so these are recovered structurally: a class type
+    /// parameter that is used as a `Generic` head (`fa: F[A]`) in any of its
+    /// method/field signatures is a constructor variable. Consulted by
+    /// `is_ctor_var_name` to gate HKT unification (`bind_typevars_*_hkt`)
+    /// and the HKT assignability relaxation, so the relaxation never leaks
+    /// onto ordinary generics or abstract collection heads.
+    hkt_param_names: std::collections::HashSet<String>,
+    /// Inferred variance of each user-declared generic class's type
+    /// parameters (C2). Positionally aligned with `class_type_params`:
+    /// `class_param_variance["Producer"][0]` is the variance of the first
+    /// type parameter of `class Producer[T]`. Populated by
+    /// [`infer_class_param_variance`] from how each parameter is used in
+    /// the class body — covariant when it only appears in OUTPUT positions
+    /// (method return types, read-only `@property` field types),
+    /// contravariant when it only appears in INPUT positions (method
+    /// parameter types, settable fields), and the safe `Invariant` default
+    /// when it appears in both, behind a mutable container/field, or in any
+    /// position whose own variance we can't prove. Consulted by
+    /// [`Checker::user_generic_param_variance`] from the generic-arm of
+    /// `is_assignable`, so a covariant `Producer[Dog]` flows into a
+    /// `Producer[Animal]` slot while an invariant `Box[Dog]` still does
+    /// not. Explicit `@covariant` / `@contravariant` class decorators, when
+    /// present, override the inferred result.
+    class_param_variance: HashMap<String, Vec<Variance>>,
     /// Classes declared with the `frozen` modifier (`class Foo frozen:`).
     /// Used to reject attribute writes to instances of these classes at
     /// check time — matches the runtime behaviour of the emitted
@@ -2302,6 +2550,16 @@ struct Checker<'a> {
     /// (e.g. `c.configure(...)` which might assign fields). Skipped
     /// entirely inside `unsafe:` regions.
     uninit_instances: HashMap<String, UninitInstance>,
+    /// Names locally reassigned (rebound) within the current function
+    /// body. A module-level function name that is rebound by a `let` /
+    /// assignment inside a function (`let make_partial = make_complete`)
+    /// no longer resolves to the pre-scanned module-level `def` at call
+    /// sites below the rebind. The cross-function field-init audit
+    /// (`detect_partial_returning_call`) consults this set so a shadowed
+    /// call target is NOT treated as the original partial-returning
+    /// factory — conservatively dropping to not-partial rather than
+    /// inventing a missing field. Reset at each `check_function` entry.
+    reassigned_names: std::collections::HashSet<String>,
     /// Cross-function field-init audit: functions whose body is the
     /// literal pattern `return X.__new__(X)` / `return object.__new__(X)`
     /// (with no intervening field assignment) are recorded here. When
@@ -2569,6 +2827,8 @@ impl<'a> Checker<'a> {
             interfaces: HashMap::new(),
             class_shapes: HashMap::new(),
             class_type_params: HashMap::new(),
+            hkt_param_names: std::collections::HashSet::new(),
+            class_param_variance: HashMap::new(),
             frozen_classes: std::collections::HashSet::new(),
             class_parents: HashMap::new(),
             self_attrs: HashMap::new(),
@@ -2584,6 +2844,7 @@ impl<'a> Checker<'a> {
             current_return: None,
             current_class: None,
             uninit_instances: HashMap::new(),
+            reassigned_names: std::collections::HashSet::new(),
             partial_returning_fns: HashMap::new(),
             module_registry: std::sync::Arc::new(HashMap::new()),
             contextmanager_yields: HashMap::new(),
@@ -2660,6 +2921,31 @@ impl<'a> Checker<'a> {
     fn is_assignable(&self, expected: &Type, actual: &Type) -> bool {
         if assignable(expected, actual) {
             return true;
+        }
+        // Higher-kinded positions are unbound until call-site inference
+        // binds them. A formal `F[A]` (a `Generic` whose head is a
+        // constructor variable) or a bare `F[_]` (`Type::TypeConstructor`)
+        // behaves like a `TypeVar` here: permissive in both directions, so
+        // passing a concrete `list[int]` to an `F[A]` parameter is accepted
+        // and the real well-kindedness check happens in the unifier
+        // (`bind_typevars_and_substitute_hkt`), which emits
+        // `tyc::kind_mismatch` on a genuine arity/conflict error. This only
+        // *relaxes* assignability for names that aren't concrete types, so
+        // it can't turn previously-accepted code into a mismatch.
+        if matches!(expected, Type::TypeConstructor(..))
+            || matches!(actual, Type::TypeConstructor(..))
+        {
+            return true;
+        }
+        if let Type::Generic(head, _) = expected {
+            if self.is_ctor_var_name(head) {
+                return true;
+            }
+        }
+        if let Type::Generic(head, _) = actual {
+            if self.is_ctor_var_name(head) {
+                return true;
+            }
         }
         // Qualified ↔ bare class identity. A module names its own classes
         // bare in function / method signatures (`def get(...) -> Response`,
@@ -2838,8 +3124,15 @@ impl<'a> Checker<'a> {
         // precedent as the parametric sealed-union arm below.
         match (expected, actual) {
             (Type::Generic(exp_name, exp_args), Type::Generic(act_name, act_args)) => {
+                // C4: when the actual is itself a parameterised generic of the
+                // *same* head as the interface, the same-head variance arm
+                // below already compares the type arguments slot-by-slot. Here
+                // the actual is a (possibly differently-named) class that
+                // structurally conforms to the generic interface — bind the
+                // interface's type parameters to `exp_args` and check the
+                // members under that substitution so variance flows correctly.
                 if self.is_interface_name(exp_name.as_str())
-                    && self.class_conforms_to_interface(act_name, exp_name)
+                    && self.class_conforms_to_generic_interface(act_name, exp_name, exp_args)
                     && exp_args.len() == act_args.len()
                     && exp_args
                         .iter()
@@ -2849,8 +3142,22 @@ impl<'a> Checker<'a> {
                     return true;
                 }
             }
-            (Type::Generic(exp_name, _), Type::Class(act_name))
-            | (Type::Class(exp_name), Type::Generic(act_name, _)) => {
+            // A bare class conforming to a generic interface bound
+            // (`PlantProducer` into `Producer[Animal]`). Substituting the
+            // interface's type params with the bound's `exp_args` is what
+            // makes covariant return / contravariant param flow sound: with
+            // the raw `T` left in place every class spuriously conformed.
+            (Type::Generic(exp_name, exp_args), Type::Class(act_name)) => {
+                if self.is_interface_name(exp_name.as_str())
+                    && self.class_conforms_to_generic_interface(act_name, exp_name, exp_args)
+                {
+                    return true;
+                }
+            }
+            // The mirror direction (generic class value into a bare interface
+            // expectation) carries no interface type arguments to bind, so the
+            // bare structural check is the correct (and unchanged) behaviour.
+            (Type::Class(exp_name), Type::Generic(act_name, _)) => {
                 if self.is_interface_name(exp_name.as_str())
                     && self.class_conforms_to_interface(act_name, exp_name)
                 {
@@ -3042,19 +3349,40 @@ impl<'a> Checker<'a> {
                     .iter()
                     .zip(bb)
                     .enumerate()
-                    .all(
-                        |(idx, (formal, actual_arg))| match generic_param_variance(an, idx) {
+                    .all(|(idx, (formal, actual_arg))| {
+                        match self.user_generic_param_variance(an, idx) {
                             Variance::Covariant => self.is_assignable(formal, actual_arg),
                             Variance::Contravariant => self.is_assignable(actual_arg, formal),
                             Variance::Invariant => {
                                 self.is_assignable(formal, actual_arg)
                                     && self.is_assignable(actual_arg, formal)
                             }
-                        },
-                    );
+                        }
+                    });
             }
         }
         false
+    }
+
+    /// Variance of the `idx`-th type parameter of the generic head `head`,
+    /// consulting the per-class inference (C2) for user-declared generics
+    /// before falling back to the built-in [`generic_param_variance`]
+    /// table.
+    ///
+    /// User generics take priority: `class Producer[T]` whose `T` only
+    /// flows out infers `Covariant` and stored in `class_param_variance`,
+    /// so `Producer[Dog]` flows into a `Producer[Animal]` slot. A built-in
+    /// head (`list`, `Sequence`, `Callable`, …) is never present in
+    /// `class_param_variance`, so its hand-written variance is unchanged.
+    /// Any head with no inference entry and no built-in rule stays
+    /// `Invariant` — the sound default.
+    fn user_generic_param_variance(&self, head: &str, idx: usize) -> Variance {
+        if let Some(vs) = self.class_param_variance.get(head) {
+            if let Some(v) = vs.get(idx) {
+                return *v;
+            }
+        }
+        generic_param_variance(head, idx)
     }
 
     /// If `ty` (or its head, for a generic application) names a transparent
@@ -3180,6 +3508,73 @@ impl<'a> Checker<'a> {
     /// hierarchy-aware `find_method` / `find_field` lookups so that methods
     /// and fields contributed by a base class count toward conformance.
     fn class_conforms_to_interface(&self, cls_name: &str, iface_name: &str) -> bool {
+        self.class_conforms_to_interface_subst(cls_name, iface_name, &HashMap::new())
+    }
+
+    /// C4: conformance of `cls_name` against a **generic** interface bound
+    /// `iface_name[iface_args...]`. The interface's PEP 695 type parameters
+    /// are bound to `iface_args` and that substitution is applied to each
+    /// interface member's declared return / parameter types *before* the
+    /// usual assignability check. This is what makes variance flow correctly
+    /// through an interface bound:
+    ///
+    /// - Return positions are covariant: a class whose `get(self) -> Dog`
+    ///   conforms to `Producer[Animal]` only when `Dog <: Animal` (the
+    ///   interface return becomes `Animal`, then
+    ///   `is_assignable(Animal, Dog)` must hold).
+    /// - Parameter positions are contravariant: a class whose
+    ///   `consume(self, x: Animal)` conforms to `Consumer[Dog]` only when the
+    ///   class accepts at least `Dog` (the interface param becomes `Dog`,
+    ///   then `is_assignable(class_param=Animal, iface_param=Dog)` must hold).
+    ///
+    /// Without the substitution the interface members still mention the raw
+    /// type variable `T`, which `is_assignable` treats as `Any` (the
+    /// unbound-PEP-695 arm), so *every* class spuriously conformed — a
+    /// soundness gap. When the type-parameter names are unknown (e.g. the
+    /// interface arrived via venv introspection with no recorded params) the
+    /// substitution is empty and behaviour is identical to the bare
+    /// `class_conforms_to_interface`.
+    fn class_conforms_to_generic_interface(
+        &self,
+        cls_name: &str,
+        iface_name: &str,
+        iface_args: &[Type],
+    ) -> bool {
+        let subst = self.interface_typevar_bindings(iface_name, iface_args);
+        self.class_conforms_to_interface_subst(cls_name, iface_name, &subst)
+    }
+
+    /// Build the `{param_name -> actual}` substitution for a generic
+    /// interface application. The interface's type-parameter names are
+    /// recorded in `class_type_params` (interfaces are classes for the
+    /// purposes of that table). Returns an empty map — i.e. no
+    /// substitution — when the param names are unavailable or the arities
+    /// disagree, so the caller degrades to the permissive bare check rather
+    /// than mis-binding.
+    fn interface_typevar_bindings(
+        &self,
+        iface_name: &str,
+        iface_args: &[Type],
+    ) -> HashMap<String, Type> {
+        let bare = iface_name.rsplit_once('.').map_or(iface_name, |(_, b)| b);
+        let params = self
+            .class_type_params
+            .get(iface_name)
+            .or_else(|| self.class_type_params.get(bare));
+        match params {
+            Some(ps) if ps.len() == iface_args.len() => {
+                ps.iter().cloned().zip(iface_args.iter().cloned()).collect()
+            }
+            _ => HashMap::new(),
+        }
+    }
+
+    fn class_conforms_to_interface_subst(
+        &self,
+        cls_name: &str,
+        iface_name: &str,
+        iface_subst: &HashMap<String, Type>,
+    ) -> bool {
         // Resolve the interface shape locally or through the project-wide
         // registry (handles the module-qualified `repo.TaskRepository`
         // form, which `self.interfaces` never keys).
@@ -3218,10 +3613,15 @@ impl<'a> Checker<'a> {
                     // Skip the check when the interface method returns the same
                     // interface type to avoid infinite recursion for
                     // self-referential interfaces (e.g. `def next(self) -> Node`).
-                    if iface_sig.return_type != Type::Unknown
+                    let iface_ret = if iface_subst.is_empty() {
+                        iface_sig.return_type.clone()
+                    } else {
+                        substitute_typevars(&iface_sig.return_type, iface_subst)
+                    };
+                    if iface_ret != Type::Unknown
                         && cls_sig.return_type != Type::Unknown
-                        && !is_self_ref(&iface_sig.return_type)
-                        && !self.is_assignable(&iface_sig.return_type, &cls_sig.return_type)
+                        && !is_self_ref(&iface_ret)
+                        && !self.is_assignable(&iface_ret, &cls_sig.return_type)
                     {
                         return false;
                     }
@@ -3235,15 +3635,20 @@ impl<'a> Checker<'a> {
                     // return-type carve-out.
                     let cmp_len = iface_sig.param_types.len().min(cls_sig.param_types.len());
                     for i in 0..cmp_len {
-                        let ip = &iface_sig.param_types[i];
+                        let ip_raw = &iface_sig.param_types[i];
                         let cp = &cls_sig.param_types[i];
-                        if matches!(ip, Type::Unknown) || matches!(cp, Type::Unknown) {
+                        if matches!(ip_raw, Type::Unknown) || matches!(cp, Type::Unknown) {
                             continue;
                         }
-                        if is_self_ref(ip) {
+                        if is_self_ref(ip_raw) {
                             continue;
                         }
-                        if !self.is_assignable(cp, ip) {
+                        let ip = if iface_subst.is_empty() {
+                            ip_raw.clone()
+                        } else {
+                            substitute_typevars(ip_raw, iface_subst)
+                        };
+                        if !self.is_assignable(cp, &ip) {
                             return false;
                         }
                     }
@@ -3251,9 +3656,14 @@ impl<'a> Checker<'a> {
                 _ => return false,
             }
         }
-        for (f, iface_type) in &iface_shape.fields {
+        for (f, iface_type_raw) in &iface_shape.fields {
+            let iface_type = if iface_subst.is_empty() {
+                iface_type_raw.clone()
+            } else {
+                substitute_typevars(iface_type_raw, iface_subst)
+            };
             match self.find_field(cls_name, f) {
-                Some(cls_type) if self.is_assignable(iface_type, cls_type) => {}
+                Some(cls_type) if self.is_assignable(&iface_type, cls_type) => {}
                 Some(_) => return false, // field present but wrong type
                 None if self.find_method(cls_name, f).is_some_and(|s| s.arity == 0) => {} // property-like method satisfies field
                 None => return false,
@@ -4114,6 +4524,140 @@ impl<'a> Checker<'a> {
             }
         }
     }
+
+    /// Collect the set of higher-kinded type-constructor *variable* names
+    /// referenced by a callee signature. A name `N` is a constructor
+    /// variable iff it is used as a `Generic(N, [..])` head (an applied
+    /// constructor, e.g. `F` in `F[A]`) or as a bare `Type::TypeConstructor`
+    /// **and** it is not a concrete type the checker already knows about
+    /// (a builtin generic head like `list`, or a declared / imported
+    /// class). This keeps the HKT binding path strictly additive: real
+    /// generic classes (`Box[T]`) and builtins (`list[int]`) are never
+    /// treated as constructor variables, so the unifier's behaviour for
+    /// existing code is unchanged.
+    fn collect_ctor_vars(
+        &self,
+        formal_params: &[Type],
+        return_type: &Type,
+    ) -> std::collections::HashSet<String> {
+        let mut out = std::collections::HashSet::new();
+        for t in formal_params.iter().chain(std::iter::once(return_type)) {
+            self.collect_ctor_vars_in(t, &mut out);
+        }
+        out
+    }
+
+    fn collect_ctor_vars_in(&self, ty: &Type, out: &mut std::collections::HashSet<String>) {
+        match ty {
+            Type::Generic(head, args) => {
+                if self.is_ctor_var_name(head) {
+                    out.insert(head.clone());
+                }
+                for a in args {
+                    self.collect_ctor_vars_in(a, out);
+                }
+            }
+            Type::TypeConstructor(name, _) => {
+                if self.is_ctor_var_name(name) {
+                    out.insert(name.clone());
+                }
+            }
+            Type::Union(xs) => {
+                for x in xs {
+                    self.collect_ctor_vars_in(x, out);
+                }
+            }
+            Type::Function { params, ret, .. } => {
+                for p in params {
+                    self.collect_ctor_vars_in(p, out);
+                }
+                self.collect_ctor_vars_in(ret, out);
+            }
+            _ => {}
+        }
+    }
+
+    /// `true` when `name` is a higher-kinded type-constructor *variable* —
+    /// a PEP-695 type parameter declared with the `F[_]` kind marker (e.g.
+    /// `F` in `class Functor[F[_]]`). These names are collected up front
+    /// into `self.hkt_param_names`; everything else (builtin generics,
+    /// declared classes, abstract collection heads like `Iterator`, etc.)
+    /// is a concrete type head and keeps its normal nominal behaviour. Using
+    /// an explicit allowlist — rather than an "unknown head" heuristic —
+    /// keeps the HKT relaxation from leaking into ordinary generics.
+    fn is_ctor_var_name(&self, name: &str) -> bool {
+        if is_builtin_generic_head(name) || name == "tuple_variadic" {
+            return false;
+        }
+        if self.classes.iter().any(|c| c == name) {
+            return false;
+        }
+        if self.class_shapes.contains_key(name) {
+            return false;
+        }
+        // SOUNDNESS (Finding 2): a name that also resolves to a concrete type
+        // alias or a sealed-union alias in scope is NOT a higher-kinded
+        // constructor *variable* — it is a real, structurally-meaningful head.
+        // If a module declares both an HKT param `F` and a concrete alias
+        // `type F[T] = list[T]`, treating `F[..]` as a constructor variable
+        // would let the HKT shortcut in `is_assignable` bind `F` and skip
+        // comparing the alias arguments, wrongly accepting `F[str]` where
+        // `F[int]` is required. Excluding concrete alias / union heads forces
+        // those `F[..]` applications down the alias-unwrap path
+        // (`list[str]` vs `list[int]` → reject) instead.
+        if self.type_aliases.contains_key(name) {
+            return false;
+        }
+        if self.sealed_unions.contains_key(name) {
+            return false;
+        }
+        self.hkt_param_names.contains(name)
+    }
+
+    /// Emit a `tyc::kind_mismatch` diagnostic for each ill-kinded
+    /// higher-kinded application discovered at a call site.
+    fn report_kind_errors(&mut self, errors: &[KindError], span: (usize, usize)) {
+        if self.unsafe_depth > 0 {
+            return;
+        }
+        let length = span.1.saturating_sub(span.0).max(1);
+        for err in errors {
+            let (message, help) = match err {
+                KindError::Arity {
+                    ctor,
+                    expected,
+                    actual,
+                } => (
+                    format!(
+                        "type constructor `{ctor}` applied to {actual} argument(s) \
+                         but expects {expected}"
+                    ),
+                    format!("apply `{ctor}` to exactly {expected} type argument(s)"),
+                ),
+                KindError::Conflict {
+                    ctor,
+                    first,
+                    second,
+                } => (
+                    format!(
+                        "type constructor `{ctor}` is bound to both `{first}` and \
+                         `{second}` in the same call"
+                    ),
+                    format!(
+                        "pass arguments whose constructors agree so `{ctor}` resolves to one type"
+                    ),
+                ),
+            };
+            self.diagnostics.push_error(TycError::kind_mismatch(
+                message,
+                help,
+                &self.path,
+                self.source,
+                span.0,
+                length,
+            ));
+        }
+    }
 }
 
 /// Run the type checker on `module` and return diagnostics.
@@ -4203,6 +4747,26 @@ pub struct ModuleShapes {
     /// `from services import fetch_user` where `fetch_user` is
     /// `@gatherable` in `services`.
     pub gatherable_async_fns: std::collections::HashSet<String>,
+    /// Per-class inferred type-parameter variance (C2), positionally
+    /// aligned with `class_type_params`. Published so a covariant /
+    /// contravariant generic declared in module A widens correctly at a
+    /// use site in module B — without this, an *imported* generic always
+    /// degraded to the invariant default, rejecting a sound `Producer[Dog]
+    /// -> Producer[Animal]` upcast that an in-module `Producer` accepts.
+    /// Cross-module variance is a pure RELAXATION: seeding it can only
+    /// newly-accept widening that was previously (soundly) rejected, never
+    /// introduce a false positive. A class absent here keeps the invariant
+    /// default in the consumer.
+    pub class_param_variance: HashMap<String, Vec<Variance>>,
+    /// Higher-kinded constructor-variable type parameters (C1): the subset
+    /// of a class's type parameters that are applied as a `Generic` head
+    /// (`fa: F[A]`) somewhere in its body, hence kind `* -> *`. Published
+    /// so a `class Functor[F[_]]` imported across modules keeps its HKT
+    /// identity instead of degrading to the pre-HKT (permissive) behaviour.
+    /// Names are the bare type-parameter identifiers as they appear in the
+    /// source module. Absence simply means the consumer degrades to today's
+    /// permissive handling for that imported class — never a false positive.
+    pub hkt_param_names: std::collections::HashSet<String>,
 }
 
 /// Imports resolved to their source modules' [`ModuleShapes`], keyed
@@ -4277,6 +4841,18 @@ pub struct ExternalShapes {
     /// without paying an O(modules) clone per file. FINDINGS —
     /// copilot review of v0.2.0.
     pub by_module: std::sync::Arc<HashMap<String, ModuleShapes>>,
+    /// Per-class inferred type-parameter variance re-keyed under the local
+    /// import name (`from m import Producer` → `"Producer" → [Covariant]`).
+    /// Seeded into the consumer's `class_param_variance` table so
+    /// `user_generic_param_variance` consults it for an imported generic
+    /// exactly as for a locally-declared one. A pure relaxation (see
+    /// `ModuleShapes::class_param_variance`).
+    pub class_param_variance: HashMap<String, Vec<Variance>>,
+    /// HKT constructor-variable type parameters re-keyed under the local
+    /// import name, seeded into the consumer's `hkt_param_names` set so an
+    /// imported `Functor`-shape class keeps its higher-kinded identity
+    /// across the module boundary. Degrades to permissive when absent.
+    pub hkt_param_names: std::collections::HashSet<String>,
 }
 
 /// Light-weight first-pass extractor that walks a parsed module and
@@ -4306,6 +4882,12 @@ pub fn extract_module_shapes(module: &ModModule) -> ModuleShapes {
 
     let mut class_shapes: HashMap<String, InterfaceShape> = HashMap::new();
     let mut class_type_params: HashMap<String, Vec<String>> = HashMap::new();
+    // C2 / C1 cross-module: published alongside `class_type_params` so an
+    // imported generic keeps its inferred variance and higher-kinded
+    // identity in the consumer (mirrors the in-module computation in
+    // `collect_classes_and_functions`).
+    let mut class_param_variance: HashMap<String, Vec<Variance>> = HashMap::new();
+    let mut hkt_param_names: std::collections::HashSet<String> = std::collections::HashSet::new();
     // First sweep: every declared class gets its own shape, including
     // the synthetic `__typhon_impl_NAME` pseudo-classes the
     // preprocessor introduces for `impl Name:` / `extend Name:`.
@@ -4316,6 +4898,14 @@ pub fn extract_module_shapes(module: &ModModule) -> ModuleShapes {
             class_shapes.insert(name.clone(), shape);
             let tps = type_param_names_from(cd.type_params.as_deref());
             if !tps.is_empty() {
+                // C1: recover higher-kinded constructor variables — type
+                // parameters applied as a `Generic` head in the class body.
+                hkt_param_names.extend(hkt_params_used_as_head(cd, &tps, &classes));
+                // C2: infer each parameter's variance positionally, so the
+                // consumer can widen covariant / contravariant imported
+                // generics instead of forcing the invariant default.
+                let variances = infer_class_param_variance(cd, &tps, &classes);
+                class_param_variance.insert(name.clone(), variances);
                 class_type_params.insert(name, tps);
             }
         }
@@ -4518,6 +5108,8 @@ pub fn extract_module_shapes(module: &ModModule) -> ModuleShapes {
         // fill this in via `frozen_class_names`.
         frozen_classes: std::collections::HashSet::new(),
         gatherable_async_fns,
+        class_param_variance,
+        hkt_param_names,
     }
 }
 
@@ -4680,6 +5272,30 @@ pub fn check_module_with_imports(
             c.class_type_params
                 .entry(name.clone())
                 .or_insert_with(|| tps.clone());
+        }
+        // Cross-module variance (C2 deferred half): an imported generic's
+        // inferred per-parameter variance must reach
+        // `user_generic_param_variance` so a covariant `Producer[Dog]`
+        // widens into a `Producer[Animal]`-typed slot at this module's use
+        // sites, exactly as an in-module `Producer` does. Local
+        // declarations win on collision (`or_insert`), mirroring the
+        // `class_type_params` seed above. SOUNDNESS: this only relaxes — a
+        // missing entry leaves the invariant default untouched, so it can
+        // never introduce a false positive.
+        for (name, variances) in &ext.class_param_variance {
+            c.class_param_variance
+                .entry(name.clone())
+                .or_insert_with(|| variances.clone());
+        }
+        // Cross-module HKT (C1 deferred half): an imported class's
+        // higher-kinded constructor variables must be recognised so a
+        // `class Functor[F[_]]` imported here keeps its HKT identity rather
+        // than degrading to the pre-HKT behaviour. The set is keyed by the
+        // bare type-parameter identifier (`F`), matching how the in-module
+        // pass populates `hkt_param_names`. Absence simply degrades to
+        // today's permissive handling — never a false positive.
+        for name in &ext.hkt_param_names {
+            c.hkt_param_names.insert(name.clone());
         }
         for (name, info) in &ext.function_arities {
             c.function_arity_info
@@ -4982,84 +5598,385 @@ fn detect_new_bypass(value: &Expr) -> Option<String> {
 /// (fields in `field_order` minus the ones in `field_defaults`).
 /// Skipped inside `unsafe:` blocks where the user has opted out of
 /// the static type discipline.
-/// Pre-scan every top-level function for the trivial
-/// `def f(...): return X.__new__(X)` (or `object.__new__(X)`) shape
-/// and record the (class, missing) pair under the function name in
-/// `c.partial_returning_fns`.
+/// Pre-scan every top-level function for the partial-instance
+/// factory shape and record the (class, missing) pair under the
+/// function name in `c.partial_returning_fns`.
 ///
-/// The scan is narrow on purpose: we only recognise the literal
-/// factory-helper shape. A function that performs intervening field
-/// assignments before returning is treated as having initialised the
-/// instance properly, even if some required field is still missing —
-/// detecting that case would need an inter-procedural data-flow
-/// analysis. Better to miss an obscure case than emit a false-positive
-/// on a helper that legitimately leaves some optional fields for the
-/// caller.
+/// C3 — generalised inter-procedural field-init summary. Where the
+/// original pre-scan only recognised the two literal trivial-factory
+/// shapes (`return X.__new__(X)` and the 2-statement
+/// `obj = X.__new__(X); return obj`), this version computes a small,
+/// SOUND per-function summary by simulating the same intra-procedural
+/// partial-instance tracker the live audit runs: it walks the body
+/// straight-line, registers a `__new__`-bypass (or a callee that
+/// itself summarises as partial-returning, via its already-computed
+/// summary) under its local name, clears a field when it sees
+/// `obj.field = ...`, and — crucially — DROPS the instance to "fully
+/// initialised / not partial" the moment it sees anything it cannot
+/// prove (a method call / `setattr` / passing the instance into a
+/// call / any compound control flow / a rebind to an unknown value).
+/// At `return NAME`, a still-tracked NAME with a non-empty missing
+/// set becomes the function's summary; a NAME whose missing set is
+/// empty (every required field assigned) — or any escape the walker
+/// dropped — yields no summary, so the helper is treated as properly
+/// initialising. This guarantees the audit only ever fires on a
+/// partial instance it positively tracked through the body; a
+/// false-positive would break a valid build, so every uncertainty
+/// resolves to "not partial".
+///
+/// Summaries are built in dependency order with a recursion guard
+/// (`in_progress`): a function currently being summarised is treated
+/// as not-partial if reached again, so multi-hop chains
+/// (`make2` calls `make1`) resolve precisely while cycles / recursion
+/// terminate at "not partial" rather than looping.
 fn prescan_partial_returning_fns(c: &mut Checker, body: &[Stmt]) {
+    // Collect the top-level function bodies by name. The summary
+    // walker needs to consult *other* functions' summaries (multi-hop
+    // chains), so we resolve them with memoised recursion over this
+    // map rather than a single linear scan.
+    let mut fn_bodies: HashMap<String, &[Stmt]> = HashMap::new();
     for stmt in body {
-        let Stmt::FunctionDef(f) = stmt else { continue };
-        let fn_name = f.name.as_str();
-        if let Some(info) = function_returns_partial_instance(c, &f.body) {
-            c.partial_returning_fns.insert(fn_name.to_owned(), info);
+        if let Stmt::FunctionDef(f) = stmt {
+            fn_bodies.insert(f.name.as_str().to_owned(), f.body.as_slice());
+        }
+    }
+    let mut in_progress: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let names: Vec<String> = fn_bodies.keys().cloned().collect();
+    for name in names {
+        if c.partial_returning_fns.contains_key(&name) {
+            continue;
+        }
+        let _ = resolve_partial_summary(c, &name, &fn_bodies, &mut in_progress);
+    }
+}
+
+/// Resolve (and memoise) the partial-instance summary for the
+/// top-level function `name`. Returns `Some(UninitInstance)` when the
+/// function provably returns a partial instance with a non-empty
+/// missing-field set, `None` otherwise.
+///
+/// `in_progress` is the recursion guard: a function reached while it
+/// is still being summarised (direct or mutual recursion) is treated
+/// as not-partial, guaranteeing termination.
+fn resolve_partial_summary(
+    c: &mut Checker,
+    name: &str,
+    fn_bodies: &HashMap<String, &[Stmt]>,
+    in_progress: &mut std::collections::HashSet<String>,
+) -> Option<UninitInstance> {
+    if let Some(existing) = c.partial_returning_fns.get(name) {
+        return Some(existing.clone());
+    }
+    if in_progress.contains(name) {
+        // Cycle / recursion: conservatively not-partial.
+        return None;
+    }
+    let body = fn_bodies.get(name).copied()?;
+    in_progress.insert(name.to_owned());
+    let summary = summarise_partial_return(c, body, fn_bodies, in_progress);
+    in_progress.remove(name);
+    if let Some(info) = &summary {
+        c.partial_returning_fns
+            .insert(name.to_owned(), info.clone());
+    }
+    summary
+}
+
+/// Walk a function body straight-line, tracking local partial
+/// instances exactly the way the live intra-procedural audit does,
+/// and return the partial summary implied by the first reachable
+/// `return`.
+///
+/// SOUNDNESS: every form the walker cannot prove resolves to
+/// "fully initialised / not partial". In particular it drops tracking
+/// on `setattr`, method calls, passing the instance into a call, any
+/// compound control-flow statement (`if`/`for`/`while`/`with`/`try`/
+/// `match`), and a rebind to an unknown value. So a non-empty summary
+/// is only ever produced for an instance the walker positively
+/// followed from its `__new__` (or a partial callee) to the `return`
+/// with at least one required field never assigned.
+fn summarise_partial_return(
+    c: &mut Checker,
+    body: &[Stmt],
+    fn_bodies: &HashMap<String, &[Stmt]>,
+    in_progress: &mut std::collections::HashSet<String>,
+) -> Option<UninitInstance> {
+    // Local tracker: name → (class, missing fields). Mirrors
+    // `c.uninit_instances` but scoped to this pre-scan walk.
+    let mut tracked: HashMap<String, UninitInstance> = HashMap::new();
+    // Names locally rebound within this body. A `let f = g` shadows the
+    // module-level `def f`, so a later `f()` must NOT be resolved against
+    // the global partial summary for `f` — mirrors the live audit's
+    // `detect_partial_returning_call` shadow guard.
+    let mut shadowed: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for stmt in body {
+        match stmt {
+            Stmt::Pass(_) | Stmt::Assert(_) => {}
+            Stmt::Expr(e) => {
+                // Docstrings are inert; any other bare expression
+                // (notably a call) might touch a tracked instance, so
+                // observe it for drops.
+                match e.value.as_ref() {
+                    Expr::StringLiteral(_) | Expr::FString(_) => {}
+                    Expr::Call(call) => {
+                        summary_observe_call(&mut tracked, call);
+                    }
+                    other => {
+                        // Anything else referencing a tracked name is
+                        // an escape we can't follow — drop those names.
+                        for n in collect_names_in_expr(other) {
+                            tracked.remove(&n);
+                        }
+                    }
+                }
+            }
+            Stmt::Assign(a) => {
+                // Field write `obj.field = ...` clears that field.
+                for target in &a.targets {
+                    summary_record_field_set(&mut tracked, target);
+                }
+                // Any tracked name referenced by the RHS (other than a
+                // recognised partial source) is dropped — it may flow
+                // somewhere we can't follow.
+                summary_observe_value(c, &mut tracked, &shadowed, &a.value, fn_bodies, in_progress);
+                // Name-target rebinds: register / refresh / drop.
+                if let [Expr::Name(n)] = a.targets.as_slice() {
+                    summary_bind_name(
+                        c,
+                        &mut tracked,
+                        &shadowed,
+                        n.id.as_str(),
+                        &a.value,
+                        fn_bodies,
+                        in_progress,
+                    );
+                    // The name is now rebound locally: any later `n()`
+                    // resolves to this value, not the module-level `def`.
+                    shadowed.insert(n.id.as_str().to_owned());
+                }
+            }
+            Stmt::AnnAssign(a) => {
+                summary_record_field_set(&mut tracked, a.target.as_ref());
+                if let Some(value) = &a.value {
+                    summary_observe_value(
+                        c,
+                        &mut tracked,
+                        &shadowed,
+                        value,
+                        fn_bodies,
+                        in_progress,
+                    );
+                    if let Expr::Name(n) = a.target.as_ref() {
+                        summary_bind_name(
+                            c,
+                            &mut tracked,
+                            &shadowed,
+                            n.id.as_str(),
+                            value,
+                            fn_bodies,
+                            in_progress,
+                        );
+                        shadowed.insert(n.id.as_str().to_owned());
+                    }
+                }
+            }
+            Stmt::Return(ret) => {
+                // First reachable return decides the summary.
+                let value = ret.value.as_deref()?;
+                // Direct `return X.__new__(X)`.
+                if let Some(class_name) = detect_new_bypass(value) {
+                    return uninit_instance_for(c, &class_name);
+                }
+                // Direct `return make_partial()` — flow the callee's
+                // own summary straight through, UNLESS the target name was
+                // locally rebound (then it no longer names the module-level
+                // factory; conservatively treat as not-partial).
+                if let Expr::Call(call) = value {
+                    if let Expr::Name(fname) = call.func.as_ref() {
+                        if !shadowed.contains(fname.id.as_str()) {
+                            if let Some(info) = resolve_partial_summary(
+                                c,
+                                fname.id.as_str(),
+                                fn_bodies,
+                                in_progress,
+                            ) {
+                                return Some(info);
+                            }
+                        }
+                    }
+                }
+                // `return obj` where `obj` is a tracked partial.
+                if let Expr::Name(n) = value {
+                    return tracked
+                        .get(n.id.as_str())
+                        .filter(|info| !info.missing.is_empty())
+                        .cloned();
+                }
+                // Any other return shape (attribute read, expression):
+                // not a partial-instance escape.
+                return None;
+            }
+            // Any compound control-flow statement can assign fields on,
+            // or otherwise consume, a tracked instance on a path the
+            // straight-line walker doesn't model. Drop ALL tracking
+            // rather than risk a false-positive summary.
+            _ => {
+                tracked.clear();
+            }
+        }
+    }
+    None
+}
+
+/// Observe a call in the summary walk for drop-inducing forms,
+/// mirroring [`audit_observe_call`]: `setattr(obj, ...)` and
+/// `obj.method(...)` both drop `obj` from local tracking. Additionally,
+/// any tracked name passed as a positional / keyword argument is
+/// dropped (the callee may consume or finish-initialise it).
+fn summary_observe_call(
+    tracked: &mut HashMap<String, UninitInstance>,
+    call: &ruff_python_ast::ExprCall,
+) {
+    let is_setattr = matches!(
+        call.func.as_ref(),
+        Expr::Name(n) if n.id.as_str() == "setattr"
+    );
+    if is_setattr {
+        let obj_arg = call.arguments.args.first().or_else(|| {
+            call.arguments
+                .keywords
+                .iter()
+                .find(|kw| {
+                    kw.arg
+                        .as_ref()
+                        .map(|a| a.as_str() == "obj")
+                        .unwrap_or(false)
+                })
+                .map(|kw| &kw.value)
+        });
+        if let Some(Expr::Name(n)) = obj_arg {
+            tracked.remove(n.id.as_str());
+        }
+        return;
+    }
+    // `obj.method(...)` — drop the receiver (it might initialise
+    // fields). The `X.__new__(X)` form has the class as receiver, which
+    // is never a tracked binding, so this is safe.
+    if let Expr::Attribute(attr) = call.func.as_ref() {
+        if let Expr::Name(recv) = attr.value.as_ref() {
+            if attr.attr.as_str() != "__new__" {
+                tracked.remove(recv.id.as_str());
+            }
+        }
+    }
+    // Any tracked name appearing as an argument escapes into the
+    // callee — drop it conservatively.
+    for arg in &call.arguments.args {
+        for n in collect_names_in_expr(arg) {
+            tracked.remove(&n);
+        }
+    }
+    for kw in &call.arguments.keywords {
+        for n in collect_names_in_expr(&kw.value) {
+            tracked.remove(&n);
         }
     }
 }
 
-/// Inspect a function body for the partial-return shape. Returns
-/// `Some(UninitInstance)` when the body is one of:
-///   - `[return X.__new__(X)]`
-///   - `[obj = X.__new__(X), return obj]` (no intervening attribute
-///     assignments on `obj`)
-///
-/// Otherwise `None`.
-fn function_returns_partial_instance(c: &Checker, body: &[Stmt]) -> Option<UninitInstance> {
-    // Case 1: single-statement `return X.__new__(X)`.
-    if let [Stmt::Return(ret)] = body {
-        let value = ret.value.as_deref()?;
-        let class_name = detect_new_bypass(value)?;
-        return uninit_instance_for(c, &class_name);
+/// Drop any tracked name that appears in `value`, EXCEPT when `value`
+/// is a recognised partial source (`X.__new__(X)` or a partial-
+/// returning call) — those are handled by [`summary_bind_name`]. A
+/// nested call inside `value` is observed for method/setattr drops too.
+fn summary_observe_value(
+    c: &mut Checker,
+    tracked: &mut HashMap<String, UninitInstance>,
+    shadowed: &std::collections::HashSet<String>,
+    value: &Expr,
+    fn_bodies: &HashMap<String, &[Stmt]>,
+    in_progress: &mut std::collections::HashSet<String>,
+) {
+    // Recognised partial sources are bound, not dropped.
+    if detect_new_bypass(value).is_some() {
+        return;
     }
-    // Case 2: `obj = X.__new__(X)` followed by `return obj`. We
-    // tolerate any number of intervening pass / docstring / assert
-    // statements but reject anything that touches the target binding
-    // (assignments, attribute writes, method calls).
-    let mut target: Option<&str> = None;
-    let mut class: Option<String> = None;
-    for stmt in body {
-        match stmt {
-            Stmt::Pass(_) => continue,
-            Stmt::Expr(e) => {
-                // Docstrings (a bare `"..."`) are fine.
-                if matches!(e.value.as_ref(), Expr::StringLiteral(_) | Expr::FString(_)) {
-                    continue;
+    if let Expr::Call(call) = value {
+        if let Expr::Name(fname) = call.func.as_ref() {
+            if call.arguments.args.is_empty()
+                && call.arguments.keywords.is_empty()
+                && !shadowed.contains(fname.id.as_str())
+                && resolve_partial_summary(c, fname.id.as_str(), fn_bodies, in_progress).is_some()
+            {
+                return;
+            }
+        }
+        // Otherwise observe the call (method/setattr/arg escapes).
+        summary_observe_call(tracked, call);
+        return;
+    }
+    for n in collect_names_in_expr(value) {
+        tracked.remove(&n);
+    }
+}
+
+/// Mark a field assigned on a tracked instance during the summary walk:
+/// `obj.field = ...` removes `field` from `obj`'s missing set.
+fn summary_record_field_set(tracked: &mut HashMap<String, UninitInstance>, target: &Expr) {
+    let Expr::Attribute(attr) = target else {
+        return;
+    };
+    let Expr::Name(recv) = attr.value.as_ref() else {
+        return;
+    };
+    if let Some(entry) = tracked.get_mut(recv.id.as_str()) {
+        entry.missing.remove(attr.attr.as_str());
+    }
+}
+
+/// Register / refresh / drop the local tracking for a name-target
+/// assignment in the summary walk, mirroring the live audit's
+/// `detect_new_bypass` / `detect_partial_returning_call` /
+/// `audit_clear_binding` logic.
+fn summary_bind_name(
+    c: &mut Checker,
+    tracked: &mut HashMap<String, UninitInstance>,
+    shadowed: &std::collections::HashSet<String>,
+    binding: &str,
+    value: &Expr,
+    fn_bodies: &HashMap<String, &[Stmt]>,
+    in_progress: &mut std::collections::HashSet<String>,
+) {
+    // `binding = X.__new__(X)` — register fresh.
+    if let Some(class) = detect_new_bypass(value) {
+        if let Some(info) = uninit_instance_for(c, &class) {
+            tracked.insert(binding.to_owned(), info);
+        } else {
+            tracked.remove(binding);
+        }
+        return;
+    }
+    // `binding = make_partial()` — register with the callee's summary
+    // (multi-hop). Only the zero-argument call shape is recognised; a
+    // call passing arguments may have its result entangled with them,
+    // so it's handled as a generic drop. A locally-rebound target name
+    // no longer names the module-level factory, so skip the global
+    // summary for it (mirrors the live `detect_partial_returning_call`).
+    if let Expr::Call(call) = value {
+        if let Expr::Name(fname) = call.func.as_ref() {
+            if call.arguments.args.is_empty()
+                && call.arguments.keywords.is_empty()
+                && !shadowed.contains(fname.id.as_str())
+            {
+                if let Some(info) =
+                    resolve_partial_summary(c, fname.id.as_str(), fn_bodies, in_progress)
+                {
+                    tracked.insert(binding.to_owned(), info);
+                    return;
                 }
-                return None;
             }
-            Stmt::Assert(_) => continue,
-            Stmt::Assign(a) if target.is_none() => {
-                let [Expr::Name(n)] = a.targets.as_slice() else {
-                    return None;
-                };
-                let cls = detect_new_bypass(&a.value)?;
-                target = Some(n.id.as_str());
-                class = Some(cls);
-            }
-            Stmt::Return(ret) => {
-                let target = target?;
-                let class = class.as_ref()?;
-                let value = ret.value.as_deref()?;
-                let Expr::Name(n) = value else {
-                    return None;
-                };
-                if n.id.as_str() != target {
-                    return None;
-                }
-                return uninit_instance_for(c, class);
-            }
-            _ => return None,
         }
     }
-    None
+    // Anything else rebinds the name to a non-partial value.
+    tracked.remove(binding);
 }
 
 /// Look up `class_name`'s required fields and return an
@@ -5103,6 +6020,16 @@ fn detect_partial_returning_call(c: &Checker, value: &Expr) -> Option<UninitInst
     };
     let name = fn_name.id.as_str();
     let info = c.partial_returning_fns.get(name).cloned()?;
+    // A name rebound earlier in this function body no longer resolves to
+    // the pre-scanned module-level `def` (`let make_partial =
+    // make_complete; make_partial()` runs `make_complete`). The env
+    // `declared` type can collide when two `def`s share a signature, so
+    // the type-equality check below is insufficient on its own; an
+    // explicit local-rebind record is authoritative. Conservatively drop
+    // to not-partial rather than follow the stale global summary.
+    if c.reassigned_names.contains(name) {
+        return None;
+    }
     // Verify the name still resolves to the same module-level
     // function we pre-scanned. `function_signatures` is populated
     // from the module body, so it's our ground truth for the
@@ -6220,6 +7147,20 @@ fn collect_classes_and_functions(c: &mut Checker, body: &[Stmt]) {
             // generic classes (FINDINGS #46).
             let tps = type_param_names_from(cd.type_params.as_deref());
             if !tps.is_empty() {
+                // Recover higher-kinded constructor parameters. The `F[_]`
+                // kind marker is stripped by preprocess, so a class type
+                // parameter is identified as a constructor variable when it
+                // is used as a `Generic` head (`fa: F[A]`, `-> F[B]`) in any
+                // of the class's method/field signatures — a non-HKT type
+                // parameter is never applied like that.
+                let hkt = hkt_params_used_as_head(cd, &tps, &c.classes);
+                c.hkt_param_names.extend(hkt);
+                // C2: infer the variance of each type parameter from how it
+                // is used in the class body, then store it positionally so
+                // `is_assignable` can widen covariant / contravariant user
+                // generics while keeping the invariant default elsewhere.
+                let variances = infer_class_param_variance(cd, &tps, &classes);
+                c.class_param_variance.insert(name.clone(), variances);
                 c.class_type_params.insert(name, tps);
             }
         }
@@ -6738,6 +7679,104 @@ fn type_param_names_from(type_params: Option<&ruff_python_ast::TypeParams>) -> V
     }
 }
 
+/// Identify which of a generic class's `class_tps` are higher-kinded
+/// type-constructor parameters. The `F[_]` kind marker is removed by the
+/// preprocess pass, so we recover the kind structurally: a class type
+/// parameter is a constructor variable when it is used as a `Generic` head
+/// — `fa: F[A]`, `-> F[B]`, or a field typed `F[...]` — in any of the
+/// class's method/field signatures. A plain (kind-`*`) type parameter such
+/// as `T` is only ever used as a leaf, never applied, so it is never
+/// misclassified.
+///
+/// Method type parameters (declared on the `def`, e.g. `A`/`B` in
+/// `def fmap[A, B](...)`) are added to the scope used to parse each
+/// signature so `F[A]` resolves to `Generic("F", [TypeVar("A")])` rather
+/// than treating `A` as an unknown class.
+fn hkt_params_used_as_head(
+    cd: &ruff_python_ast::StmtClassDef,
+    class_tps: &[String],
+    classes: &[String],
+) -> std::collections::HashSet<String> {
+    let mut found = std::collections::HashSet::new();
+    let candidates: std::collections::HashSet<&str> =
+        class_tps.iter().map(|s| s.as_str()).collect();
+    if candidates.is_empty() {
+        return found;
+    }
+    let consider = |ty: &Type, found: &mut std::collections::HashSet<String>| {
+        collect_generic_heads_matching(ty, &candidates, found);
+    };
+    for item in &cd.body {
+        match item {
+            Stmt::FunctionDef(f) => {
+                // Scope = class type params + this method's own type params.
+                let mut scope = class_tps.to_vec();
+                scope.extend(type_param_names_from(f.type_params.as_deref()));
+                let all = f
+                    .parameters
+                    .posonlyargs
+                    .iter()
+                    .chain(f.parameters.args.iter())
+                    .chain(f.parameters.kwonlyargs.iter());
+                for pwd in all {
+                    if let Some(ann) = &pwd.parameter.annotation {
+                        let t = type_from_annotation_with_params(ann, classes, &scope);
+                        consider(&t, &mut found);
+                    }
+                }
+                if let Some(r) = f.returns.as_deref() {
+                    let t = type_from_annotation_with_params(r, classes, &scope);
+                    consider(&t, &mut found);
+                }
+            }
+            // Field annotations (`payload: F[int]`).
+            Stmt::AnnAssign(ann) => {
+                let t = type_from_annotation_with_params(&ann.annotation, classes, class_tps);
+                consider(&t, &mut found);
+            }
+            _ => {}
+        }
+    }
+    found
+}
+
+/// Walk `ty` collecting every `Generic` head (or bare `TypeConstructor`
+/// name) that appears in `candidates`. These are the applied — hence
+/// higher-kinded — uses of a type parameter.
+fn collect_generic_heads_matching(
+    ty: &Type,
+    candidates: &std::collections::HashSet<&str>,
+    out: &mut std::collections::HashSet<String>,
+) {
+    match ty {
+        Type::Generic(head, args) => {
+            if candidates.contains(head.as_str()) {
+                out.insert(head.clone());
+            }
+            for a in args {
+                collect_generic_heads_matching(a, candidates, out);
+            }
+        }
+        Type::TypeConstructor(name, _) => {
+            if candidates.contains(name.as_str()) {
+                out.insert(name.clone());
+            }
+        }
+        Type::Union(xs) => {
+            for x in xs {
+                collect_generic_heads_matching(x, candidates, out);
+            }
+        }
+        Type::Function { params, ret, .. } => {
+            for p in params {
+                collect_generic_heads_matching(p, candidates, out);
+            }
+            collect_generic_heads_matching(ret, candidates, out);
+        }
+        _ => {}
+    }
+}
+
 /// Extract declared bounds for PEP 695 `TypeVar` parameters.
 ///
 /// Returns a map from typevar name to the resolved bound `Type`.  Only
@@ -6873,6 +7912,261 @@ fn has_contextmanager_decorator(decorators: &[ruff_python_ast::Decorator]) -> bo
         };
         matches!(name, Some("contextmanager") | Some("asynccontextmanager"))
     })
+}
+
+/// Compose an outer position's variance with an inner type-parameter's
+/// declared variance — the standard variance algebra used to track sign
+/// through nested generic applications.
+///
+/// `outer` is the polarity of the position we are currently in
+/// (`Covariant` = output / positive, `Contravariant` = input / negative,
+/// `Invariant` = already forced invariant). `inner` is the variance of the
+/// argument slot we are about to descend into (`list[_]` is invariant,
+/// `Sequence[_]` covariant, `Callable[arg]` contravariant). The result is
+/// the effective polarity of a type parameter that appears inside that
+/// slot:
+///
+/// - through a covariant slot the sign is preserved,
+/// - through a contravariant slot the sign flips,
+/// - through an invariant slot (or once invariance is reached) the sign is
+///   pinned to `Invariant` — the parameter is then forced invariant no
+///   matter where else it appears.
+fn compose_variance(outer: Variance, inner: Variance) -> Variance {
+    match (outer, inner) {
+        (Variance::Invariant, _) | (_, Variance::Invariant) => Variance::Invariant,
+        (Variance::Covariant, v) => v,
+        (Variance::Contravariant, Variance::Covariant) => Variance::Contravariant,
+        (Variance::Contravariant, Variance::Contravariant) => Variance::Covariant,
+    }
+}
+
+/// Join two variance observations for the *same* type parameter seen at
+/// two different use sites. A parameter used only in output positions is
+/// covariant, only in input positions is contravariant, and in both (or in
+/// any invariant position) collapses to the sound `Invariant` default.
+fn join_variance(a: Variance, b: Variance) -> Variance {
+    if a == b {
+        a
+    } else {
+        Variance::Invariant
+    }
+}
+
+/// Record the variance contribution of every class type parameter that
+/// appears inside `ty`, given that `ty` itself sits at polarity `sign`
+/// (`Covariant` for an output position such as a return type, `Contravariant`
+/// for an input position such as a parameter type). Results are joined into
+/// `out`, keyed by type-parameter name.
+///
+/// The walk pushes `sign` through the structure using [`compose_variance`]:
+/// a `TypeVar(P)` leaf contributes `sign`; a generic argument contributes
+/// `compose(sign, variance_of_that_slot)`; function parameters flip to
+/// contravariant and the return stays covariant; union members stay at the
+/// current sign. Built-in slot variances come from [`generic_param_variance`],
+/// so an element behind a mutable `list[P]` / `dict[_, P]` is correctly
+/// forced invariant.
+fn collect_param_variance(
+    ty: &Type,
+    candidates: &std::collections::HashSet<&str>,
+    sign: Variance,
+    out: &mut HashMap<String, Variance>,
+) {
+    match ty {
+        Type::TypeVar(name) if candidates.contains(name.as_str()) => {
+            out.entry(name.clone())
+                .and_modify(|v| *v = join_variance(*v, sign))
+                .or_insert(sign);
+        }
+        Type::Generic(head, args) => {
+            for (idx, arg) in args.iter().enumerate() {
+                let slot = generic_param_variance(head, idx);
+                collect_param_variance(arg, candidates, compose_variance(sign, slot), out);
+            }
+        }
+        Type::Union(xs) => {
+            // Union membership is covariant — a `T | None` output flows out
+            // covariantly, an input flows in contravariantly — so the sign
+            // is preserved (compose with Covariant).
+            for x in xs {
+                collect_param_variance(x, candidates, sign, out);
+            }
+        }
+        Type::Function { params, ret, .. } => {
+            // Function params are contravariant, the return covariant.
+            for p in params {
+                collect_param_variance(
+                    p,
+                    candidates,
+                    compose_variance(sign, Variance::Contravariant),
+                    out,
+                );
+            }
+            collect_param_variance(ret, candidates, sign, out);
+        }
+        _ => {}
+    }
+}
+
+/// `true` when `f` carries a `@<name>.setter` decorator (the property-setter
+/// half of a getter/setter pair). Such a method takes the new value as its
+/// single non-receiver parameter, so the property's type appears in an
+/// INPUT position there.
+fn is_property_setter(f: &ruff_python_ast::StmtFunctionDef) -> bool {
+    f.decorator_list
+        .iter()
+        .any(|d| matches!(&d.expression, Expr::Attribute(a) if a.attr.as_str() == "setter"))
+}
+
+/// `true` when `f` is a read-only `@property` getter (`@property`,
+/// `@cached_property`, …). Its return type sits in an OUTPUT position; with
+/// no matching `@x.setter` the underlying field is read-only and may flow
+/// covariantly.
+fn is_property_getter(f: &ruff_python_ast::StmtFunctionDef) -> bool {
+    f.decorator_list.iter().any(|d| match &d.expression {
+        Expr::Name(n) => matches!(
+            n.id.as_str(),
+            "property" | "cached_property" | "_typhon_cached_property"
+        ),
+        Expr::Attribute(a) => matches!(a.attr.as_str(), "property" | "cached_property"),
+        _ => false,
+    })
+}
+
+/// Infer the variance of each PEP 695 type parameter of a generic class
+/// (C2). Returns a `Vec<Variance>` positionally aligned with `class_tps`.
+///
+/// Classification rules (conservative — `Invariant` wins ties):
+///
+/// - **Method return types** are OUTPUT positions → covariant contribution.
+/// - **Method parameter types** (excluding the receiver) are INPUT
+///   positions → contravariant contribution. Property *setters*
+///   (`@x.setter`) count their value parameter as input.
+/// - **`@property` getter** return types are OUTPUT positions (read-only
+///   field view) → covariant.
+/// - **Plain annotated fields** (`value: T`) are settable (the emitted
+///   dataclass exposes a mutable attribute), so they are treated as BOTH
+///   readable and writable → invariant. This is what keeps `class Box[T]:
+///   value: T` invariant.
+/// - A parameter reached **behind an invariant built-in slot** (a `list[T]`
+///   element, a `dict[T, _]` key, …) is forced invariant by the variance
+///   algebra in [`collect_param_variance`].
+/// - A parameter that appears in BOTH an output and an input position
+///   collapses to invariant via [`join_variance`].
+/// - A parameter that never appears in any classified position stays
+///   invariant — the safe default for phantom / unconstrained parameters.
+///
+/// An explicit `@covariant` / `@contravariant` class decorator (if the
+/// parser already tolerates it as a bare name decorator) overrides the
+/// inferred result for *every* parameter of the class — a cheap escape
+/// hatch that needs no new syntax.
+fn infer_class_param_variance(
+    cd: &ruff_python_ast::StmtClassDef,
+    class_tps: &[String],
+    classes: &[String],
+) -> Vec<Variance> {
+    let candidates: std::collections::HashSet<&str> =
+        class_tps.iter().map(|s| s.as_str()).collect();
+    let mut observed: HashMap<String, Variance> = HashMap::new();
+
+    for item in &cd.body {
+        match item {
+            Stmt::FunctionDef(f) => {
+                // Scope = class type params + this method's own type params
+                // so `def map[U](self, f: Callable[[T], U])` resolves `T`.
+                let mut scope = class_tps.to_vec();
+                scope.extend(type_param_names_from(f.type_params.as_deref()));
+
+                let is_static = f.decorator_list.iter().any(
+                    |d| matches!(&d.expression, Expr::Name(n) if n.id.as_str() == "staticmethod"),
+                );
+                let getter = is_property_getter(f);
+                let setter = is_property_setter(f);
+
+                // Parameters (inputs, contravariant). Skip the implicit
+                // receiver for non-static methods.
+                let mut params = f
+                    .parameters
+                    .posonlyargs
+                    .iter()
+                    .chain(f.parameters.args.iter())
+                    .chain(f.parameters.kwonlyargs.iter());
+                if !is_static {
+                    params.next();
+                }
+                for pwd in params {
+                    if let Some(ann) = &pwd.parameter.annotation {
+                        let t = type_from_annotation_with_params(ann, classes, &scope);
+                        collect_param_variance(
+                            &t,
+                            &candidates,
+                            Variance::Contravariant,
+                            &mut observed,
+                        );
+                    }
+                }
+                // Return type (output, covariant). A property getter's
+                // return is the read-only field view; a normal method's
+                // return is likewise an output. Either way: covariant.
+                let _ = (getter, setter);
+                if let Some(r) = f.returns.as_deref() {
+                    let t = type_from_annotation_with_params(r, classes, &scope);
+                    collect_param_variance(&t, &candidates, Variance::Covariant, &mut observed);
+                }
+            }
+            Stmt::AnnAssign(ann) => {
+                // A plain annotated field is settable on the emitted
+                // dataclass, so the parameter is both read and written →
+                // invariant. Feed it through at `Invariant` so any mention
+                // pins the parameter.
+                let t = type_from_annotation_with_params(&ann.annotation, classes, class_tps);
+                collect_param_variance(&t, &candidates, Variance::Invariant, &mut observed);
+            }
+            _ => {}
+        }
+    }
+
+    // Optional explicit override via a bare `@covariant` / `@contravariant`
+    // class decorator. Honoured only if the parser already produced it as a
+    // decorator — no new syntax is introduced. Applies to every parameter.
+    let forced = explicit_variance_override(&cd.decorator_list);
+
+    class_tps
+        .iter()
+        .map(|tp| {
+            if let Some(v) = forced {
+                v
+            } else {
+                // Unobserved parameters default to the sound `Invariant`.
+                observed.get(tp).copied().unwrap_or(Variance::Invariant)
+            }
+        })
+        .collect()
+}
+
+/// Recognise an explicit, whole-class variance override expressed as a bare
+/// `@covariant` / `@contravariant` decorator. Returns `None` when neither is
+/// present (the common case — inference then decides). This is the cheap
+/// escape hatch: it reuses the existing decorator syntax the parser already
+/// accepts, so it needs no grammar change. A class carrying both is treated
+/// as `Invariant` (contradictory request → safe default).
+fn explicit_variance_override(decorators: &[ruff_python_ast::Decorator]) -> Option<Variance> {
+    let mut co = false;
+    let mut contra = false;
+    for d in decorators {
+        if let Expr::Name(n) = &d.expression {
+            match n.id.as_str() {
+                "covariant" => co = true,
+                "contravariant" => contra = true,
+                _ => {}
+            }
+        }
+    }
+    match (co, contra) {
+        (true, false) => Some(Variance::Covariant),
+        (false, true) => Some(Variance::Contravariant),
+        (true, true) => Some(Variance::Invariant),
+        (false, false) => None,
+    }
 }
 
 /// Walk a class body and record its methods and annotated fields into an
@@ -8231,6 +9525,13 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                     // Copilot review on PR #96.
                     c.unsafe_origin_bindings.remove(n.id.as_str());
                 }
+                // An annotated rebind of a name that already resolved to
+                // a module-level function (`let make_partial: object =
+                // make_complete`) shadows that `def` for the rest of the
+                // body; record it for the cross-function field-init audit.
+                if c.env.lookup(n.id.as_str()).is_some() {
+                    c.reassigned_names.insert(n.id.as_str().to_owned());
+                }
                 c.env.declare(TypeBinding {
                     name: n.id.as_str().to_owned(),
                     declared: ann_type.clone(),
@@ -8276,6 +9577,12 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                     );
                     let existing = c.env.lookup(n.id.as_str()).cloned();
                     if let Some(b) = existing {
+                        // A name rebound inside this function no longer
+                        // resolves to the pre-scanned module-level `def`
+                        // at call sites below. Record it so the
+                        // cross-function field-init audit skips the
+                        // global partial-summary lookup for this target.
+                        c.reassigned_names.insert(n.id.as_str().to_owned());
                         // Reassignment: the static type stays as declared;
                         // check the new value fits. When it doesn't, emit
                         // the dedicated reassignment-mismatch diagnostic
@@ -9199,6 +10506,10 @@ fn check_function(
     // Attribute narrowings (`self.x` non-null) belong to the enclosing
     // function body — a different `self` is in scope here, so start clean.
     let saved_attr_narrowings = std::mem::take(&mut c.env.attr_narrowings);
+    // Local rebinds tracked for the cross-function field-init audit are
+    // scoped to this function body (a nested function starts clean and
+    // the enclosing set is restored on exit).
+    let saved_reassigned_names = std::mem::take(&mut c.reassigned_names);
 
     // Declare parameters with their annotation types. Type parameters resolve
     // to `Any` until a real inference engine lands. Inside a class body, an
@@ -9323,6 +10634,7 @@ fn check_function(
 
     c.env.leave();
     c.env.attr_narrowings = saved_attr_narrowings;
+    c.reassigned_names = saved_reassigned_names;
     c.current_return = saved_return;
     c.unsafe_origin_bindings = saved_unsafe_origins;
     c.active_typevar_bounds = saved_bounds;
@@ -13125,9 +14437,26 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
                     // unbound after the forward arg pass, use the call's
                     // expected return type (from the enclosing annotation
                     // or `return` statement) to pin it.
-                    let result = bind_typevars_and_substitute_bidirectional(
-                        &params, &actuals, &ret, expected,
-                    );
+                    //
+                    // Higher-kinded inference: when the signature mentions a
+                    // type-constructor variable (e.g. `F` in `fa: F[A] -> F[B]`
+                    // under `class Functor[F[_]]`), unify it against the
+                    // actual constructor application so `F → list` / `A → int`
+                    // flow into the substituted return type. The constructor
+                    // set is empty for ordinary signatures, in which case this
+                    // is exactly `bind_typevars_and_substitute_bidirectional`.
+                    let ctor_vars = c.collect_ctor_vars(&params, &ret);
+                    let result = if ctor_vars.is_empty() {
+                        bind_typevars_and_substitute_bidirectional(
+                            &params, &actuals, &ret, expected,
+                        )
+                    } else {
+                        let (substituted, kind_errors) = bind_typevars_and_substitute_hkt(
+                            &params, &actuals, &ret, expected, &ctor_vars,
+                        );
+                        c.report_kind_errors(&kind_errors, call_span);
+                        substituted
+                    };
                     // FINDINGS #71: narrow `<dict[K, V]>.get(k, default)` to
                     // `V | type(default)`, which collapses to `V` when default
                     // is V-compatible. Without this, the one-arg signature
@@ -13513,6 +14842,21 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
                         if let Some(tps) = shapes.class_type_params.get(attr_name) {
                             let tps = tps.clone();
                             c.class_type_params.entry(qualified.clone()).or_insert(tps);
+                        }
+                        // C2 cross-module: a qualified generic access
+                        // (`import producer; producer.Producer[Dog]`)
+                        // instantiates as `Type::Generic("producer.Producer",
+                        // …)`, so `user_generic_param_variance` looks the
+                        // per-parameter variance up under the QUALIFIED head.
+                        // Seed it here (mirroring `class_type_params`)
+                        // otherwise it falls back to invariant and a sound
+                        // covariant upcast is wrongly rejected. A pure
+                        // relaxation — absence keeps the invariant default.
+                        if let Some(variances) = shapes.class_param_variance.get(attr_name) {
+                            let variances = variances.clone();
+                            c.class_param_variance
+                                .entry(qualified.clone())
+                                .or_insert(variances);
                         }
                         return Type::Class(qualified);
                     }
@@ -15531,6 +16875,44 @@ mod tests {
         assert!(!d.has_errors(), "{:?}", d.errors());
     }
 
+    // --- A2: small non-nullable unions ---------------------------------
+
+    #[test]
+    fn non_nullable_union_accepts_either_member() {
+        // `Union[str, bytes]` (the jinja2 `Template(source)` shape) must accept
+        // a value of either member.
+        let d = check("def f(x: str | bytes) -> None:\n    pass\nf(\"hi\")\nf(b\"hi\")\n");
+        assert!(!d.has_errors(), "{:?}", d.errors());
+    }
+
+    #[test]
+    fn non_nullable_union_rejects_non_member() {
+        // The whole point of A2: an `int` argument to a `str | bytes` param is
+        // now rejected instead of silently accepted via `Unknown`.
+        let d = check("def f(x: str | bytes) -> None:\n    pass\nf(1)\n");
+        assert!(
+            d.has_errors(),
+            "expected int -> (str | bytes) to be rejected"
+        );
+    }
+
+    #[test]
+    fn union_accepts_int_member() {
+        let d = check("def f(x: int | str) -> None:\n    pass\nf(1)\nf(\"s\")\n");
+        assert!(!d.has_errors(), "{:?}", d.errors());
+    }
+
+    #[test]
+    fn union_member_preserves_numeric_widening() {
+        // SOUNDNESS: numeric widening must hold per-member — an `int` is
+        // assignable to a `float | str` union because `int` widens to `float`.
+        let d = check("def f(x: float | str) -> None:\n    pass\nf(1)\n");
+        assert!(!d.has_errors(), "{:?}", d.errors());
+        // `bool` widens to `int` likewise.
+        let d = check("def g(x: int | bytes) -> None:\n    pass\ng(True)\n");
+        assert!(!d.has_errors(), "{:?}", d.errors());
+    }
+
     #[test]
     fn narrowing_is_not_none() {
         let src = "\
@@ -15838,6 +17220,77 @@ def main() -> None:
         assert!(
             !d.has_errors(),
             "`typing.Any` must be permissive; got {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn annotation_unwraps_annotated_to_first_type_arg() {
+        // A1: `Annotated[T, meta…]` resolves to `T`, discarding the metadata
+        // args. Covers the bare, `typing.`-qualified, and nested-`Optional`
+        // forms, plus the wrong-type-degrades-gracefully guarantee.
+        fn ty_of(src: &str) -> Type {
+            let parsed = tyc_syntax::parse_module(src).expect("parse");
+            let module = parsed.syntax();
+            let func = match &module.body[0] {
+                ruff_python_ast::Stmt::FunctionDef(f) => f,
+                other => panic!("expected FunctionDef, got {:?}", other),
+            };
+            let ann = func.parameters.args[0]
+                .parameter
+                .annotation
+                .as_deref()
+                .expect("annotation present");
+            type_from_annotation(ann, &[])
+        }
+        // `Annotated[int, "meta"]` resolves to `int`.
+        assert_eq!(
+            ty_of("def f(x: Annotated[int, \"meta\"]) -> None: pass\n"),
+            Type::Int
+        );
+        // `typing.Annotated[str, FieldInfo(...)]` — the FastAPI / Pydantic
+        // param form — resolves to `str`.
+        assert_eq!(
+            ty_of("def f(x: typing.Annotated[str, \"meta\"]) -> None: pass\n"),
+            Type::Str
+        );
+        // Nested `Annotated[Optional[int], …]` resolves through to `int | None`.
+        assert_eq!(
+            ty_of("def f(x: Annotated[Optional[int], \"meta\"]) -> None: pass\n"),
+            Type::optional(Type::Int)
+        );
+    }
+
+    #[test]
+    fn annotated_param_rejects_wrong_typed_arg() {
+        // A1: a value of the wrong type against an `Annotated[str, …]`
+        // parameter is now caught — the whole point of the unwrap.
+        let src = "\
+def f(x: Annotated[str, \"meta\"]) -> None: pass
+def main() -> None:
+    f(42)
+";
+        let d = check(src);
+        assert!(
+            d.has_errors(),
+            "wrong-typed arg against Annotated[str, …] must be rejected; got {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn annotated_param_accepts_correct_typed_arg() {
+        // A1: the relaxation must not introduce false positives — a correctly
+        // typed argument against an `Annotated[str, …]` parameter is clean.
+        let src = "\
+def f(x: Annotated[str, \"meta\"]) -> None: pass
+def main() -> None:
+    f(\"hello\")
+";
+        let d = check(src);
+        assert!(
+            !d.has_errors(),
+            "correctly-typed arg against Annotated[str, …] must be accepted; got {:?}",
             d.errors()
         );
     }
@@ -16460,6 +17913,153 @@ def use(make: object) -> ApiClient:
     }
 
     #[test]
+    fn audit_partial_factory_skipped_when_name_locally_rebound() {
+        // C3 false positive: the module-level partial factory
+        // `make_partial` is locally rebound to `make_complete` (a fully
+        // initialising factory) before the call. The runtime call invokes
+        // `make_complete`, which returns a complete instance — so the
+        // partial-init audit must NOT fire. Mirrors the live shadow guard
+        // in `detect_partial_returning_call`.
+        let src = "\
+class Config:
+    host: str
+    port: int
+
+def make_complete() -> Config:
+    let c: Config = Config.__new__(Config)
+    c.host = \"localhost\"
+    c.port = 8080
+    return c
+
+def make_partial() -> Config:
+    return Config.__new__(Config)
+
+def passthrough() -> Config:
+    let make_partial = make_complete
+    let c: Config = make_partial()
+    return c
+";
+        let d = check(src);
+        let partial_init_errs: Vec<&TycError> = d
+            .errors()
+            .iter()
+            .filter(|e| matches!(e, TycError::MissingFieldInit { .. }))
+            .collect();
+        assert!(
+            partial_init_errs.is_empty(),
+            "locally-rebound `make_partial` (now `make_complete`) must not \
+             trigger partial-init tracking; got: {:?}",
+            partial_init_errs
+        );
+    }
+
+    #[test]
+    fn audit_unshadowed_partial_factory_still_fires() {
+        // SOUNDNESS FLOOR for the rebind guard: an un-shadowed
+        // `return make_partial()` whose result escapes uninitialised must
+        // STILL fire `missing_field_init` (the guard must not over-suppress).
+        let src = "\
+class Config:
+    host: str
+    port: int
+
+def make_partial() -> Config:
+    return Config.__new__(Config)
+
+def passthrough() -> Config:
+    let c: Config = make_partial()
+    return c
+";
+        let d = check(src);
+        let partial_init_errs: Vec<&TycError> = d
+            .errors()
+            .iter()
+            .filter(|e| matches!(e, TycError::MissingFieldInit { .. }))
+            .collect();
+        assert_eq!(
+            partial_init_errs.len(),
+            1,
+            "un-shadowed escaping partial must still fire exactly once; got {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn c3_summary_skips_locally_rebound_factory_in_callee() {
+        // The summary walk computes `make2`'s partial-return summary. Inside
+        // `make2`, `make1` is locally rebound to a complete factory, so the
+        // `return make1()` runs the complete factory — `make2`'s summary
+        // must be not-partial, and the caller must stay clean.
+        let src = "\
+class Config:
+    host: str
+    port: int
+
+def make_complete() -> Config:
+    let c: Config = Config.__new__(Config)
+    c.host = \"localhost\"
+    c.port = 8080
+    return c
+
+def make1() -> Config:
+    return Config.__new__(Config)
+
+def make2() -> Config:
+    let make1 = make_complete
+    return make1()
+
+def use() -> Config:
+    let c: Config = make2()
+    return c
+";
+        let d = check(src);
+        let partial_init_errs: Vec<&TycError> = d
+            .errors()
+            .iter()
+            .filter(|e| matches!(e, TycError::MissingFieldInit { .. }))
+            .collect();
+        assert!(
+            partial_init_errs.is_empty(),
+            "summary walk must skip the locally-rebound factory `make1`; got: {:?}",
+            partial_init_errs
+        );
+    }
+
+    #[test]
+    fn c3_summary_unshadowed_chain_still_fires() {
+        // SOUNDNESS FLOOR for the summary-walk shadow guard: an un-shadowed
+        // two-hop passthrough chain must still flow the partial summary
+        // through and fire at the caller.
+        let src = "\
+class Config:
+    host: str
+    port: int
+
+def make1() -> Config:
+    return Config.__new__(Config)
+
+def make2() -> Config:
+    return make1()
+
+def use() -> Config:
+    let c: Config = make2()
+    return c
+";
+        let d = check(src);
+        let partial_init_errs: Vec<&TycError> = d
+            .errors()
+            .iter()
+            .filter(|e| matches!(e, TycError::MissingFieldInit { .. }))
+            .collect();
+        assert_eq!(
+            partial_init_errs.len(),
+            1,
+            "un-shadowed two-hop chain must still fire exactly once at the caller; got {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
     fn audit_proper_initialising_factory_not_tracked() {
         // Helpers that actually initialise the instance must NOT be
         // recorded as partial-returning. The pre-scan rejects any
@@ -16772,6 +18372,260 @@ def f(cond: bool) -> ApiClient:
             missing_count, 1,
             "exactly one diagnostic expected; got {missing_count}"
         );
+    }
+
+    // ── C3: generalised inter-procedural partial-instance summaries ───
+
+    #[test]
+    fn c3_nontrivial_helper_partial_init_fires_at_escape() {
+        // A non-trivial helper that initialises SOME but not all
+        // required fields, whose result then escapes, must fire
+        // missing_field_init naming the still-missing field.
+        let src = "\
+class ApiClient:
+    api_key: str
+    base_url: str
+
+def make() -> ApiClient:
+    let o: ApiClient = ApiClient.__new__(ApiClient)
+    o.api_key = \"sk-x\"
+    return o
+
+def use() -> ApiClient:
+    let c: ApiClient = make()
+    return c
+";
+        let d = check(src);
+        let missing: Vec<&TycError> = d
+            .errors()
+            .iter()
+            .filter(|e| matches!(e, TycError::MissingFieldInit { .. }))
+            .collect();
+        assert!(
+            !missing.is_empty(),
+            "partial helper escape must fire missing_field_init; got {:?}",
+            d.errors()
+        );
+        let msg = format!("{}", missing[0]);
+        assert!(
+            msg.contains("base_url"),
+            "diagnostic should name the unset field base_url, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn c3_helper_initialising_all_fields_no_fire() {
+        // A non-trivial helper that initialises EVERY required field
+        // must NOT be summarised as partial-returning — no diagnostic.
+        let src = "\
+class ApiClient:
+    api_key: str
+    base_url: str
+
+def make() -> ApiClient:
+    let o: ApiClient = ApiClient.__new__(ApiClient)
+    o.api_key = \"sk-x\"
+    o.base_url = \"https://x\"
+    return o
+
+def use() -> ApiClient:
+    let c: ApiClient = make()
+    return c
+";
+        let d = check(src);
+        assert!(
+            !d.has_errors(),
+            "fully-initialising helper must be clean: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn c3_two_hop_partial_chain_fires_at_caller() {
+        // Two-hop passthrough chain of trivial bypass factories (both
+        // silent at their own returns). The partial summary must flow
+        // make1 → make2 → caller, where the result escapes with every
+        // required field still unset — firing at the caller exactly as
+        // if the partial instance were constructed inline.
+        let src = "\
+class Config:
+    host: str
+    port: int
+
+def make1() -> Config:
+    return Config.__new__(Config)
+
+def make2() -> Config:
+    return make1()
+
+def use() -> Config:
+    let c: Config = make2()
+    return c
+";
+        let d = check(src);
+        let missing: Vec<&TycError> = d
+            .errors()
+            .iter()
+            .filter(|e| matches!(e, TycError::MissingFieldInit { .. }))
+            .collect();
+        assert_eq!(
+            missing.len(),
+            1,
+            "two-hop passthrough chain must fire exactly once, at the caller; got {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn c3_two_hop_chain_caller_finishes_no_fire() {
+        // Two-hop passthrough chain of trivial bypass factories (both
+        // silent at their own returns — the class name, not a tracked
+        // binding, escapes). The partial summary flows make1 → make2 →
+        // caller; the caller assigns every required field before the
+        // escape, so there is no diagnostic anywhere.
+        let src = "\
+class Config:
+    host: str
+    port: int
+
+def make1() -> Config:
+    return Config.__new__(Config)
+
+def make2() -> Config:
+    return make1()
+
+def use() -> Config:
+    let c: Config = make2()
+    c.host = \"localhost\"
+    c.port = 8080
+    return c
+";
+        let d = check(src);
+        assert!(
+            !d.has_errors(),
+            "chain fully initialised before escape must be clean: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn c3_helper_with_setattr_conservatively_no_fire() {
+        // A helper whose field init goes through setattr defeats the
+        // static tracker — the summary must conservatively treat the
+        // instance as fully initialised (NO false positive).
+        let src = "\
+class ApiClient:
+    api_key: str
+    base_url: str
+
+def make() -> ApiClient:
+    let o: ApiClient = ApiClient.__new__(ApiClient)
+    setattr(o, \"api_key\", \"sk-x\")
+    return o
+
+def use() -> ApiClient:
+    let c: ApiClient = make()
+    return c
+";
+        let d = check(src);
+        assert!(
+            !d.has_errors(),
+            "setattr helper must conservatively not fire: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn c3_helper_with_loop_init_conservatively_no_fire() {
+        // A helper that initialises fields inside a loop is beyond the
+        // straight-line walker; the compound statement drops tracking,
+        // so the summary is not-partial (NO false positive).
+        let src = "\
+class Bag:
+    a: int
+    b: int
+
+def make() -> Bag:
+    let o: Bag = Bag.__new__(Bag)
+    for name in [\"a\", \"b\"]:
+        setattr(o, name, 1)
+    return o
+
+def use() -> Bag:
+    let c: Bag = make()
+    return c
+";
+        let d = check(src);
+        assert!(
+            !d.has_errors(),
+            "loop-init helper must conservatively not fire: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn c3_summary_drops_when_instance_passed_to_call() {
+        // A passthrough helper whose summary must NOT propagate as
+        // partial because the (silent, trivial) factory result is
+        // handed to another call before being returned — the callee
+        // may finish init, so the summary conservatively drops and the
+        // caller is not flagged. The intermediate helper stays clean
+        // too (the partial instance never escapes it as a bare name).
+        let src = "\
+class ApiClient:
+    api_key: str
+    base_url: str
+
+def finish(o: ApiClient) -> ApiClient:
+    o.api_key = \"x\"
+    o.base_url = \"y\"
+    return o
+
+def make() -> ApiClient:
+    mut o = ApiClient.__new__(ApiClient)
+    return finish(o)
+
+def use() -> ApiClient:
+    let c: ApiClient = make()
+    return c
+";
+        let d = check(src);
+        // `make` itself fires at the `finish(o)` arg escape (partial
+        // instance passed to a call) — that is the established
+        // intra-procedural posture. What C3 must guarantee is that the
+        // summary does NOT additionally mark `make` partial-returning,
+        // so the CALLER (`use`) is not double-flagged. Assert exactly
+        // one diagnostic, located inside `make`, never inside `use`.
+        let missing: Vec<&TycError> = d
+            .errors()
+            .iter()
+            .filter(|e| matches!(e, TycError::MissingFieldInit { .. }))
+            .collect();
+        assert_eq!(
+            missing.len(),
+            1,
+            "summary must not propagate a dropped instance to the caller; got {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn c3_recursive_helper_terminates_no_fire() {
+        // A self-recursive helper must not loop the summary builder and
+        // must resolve to not-partial (the recursion guard returns None
+        // for the in-progress call).
+        let src = "\
+class Config:
+    host: str
+    port: int
+
+def make() -> Config:
+    let o: Config = make()
+    o.host = \"x\"
+    return o
+";
+        let d = check(src);
+        let _ = d; // termination is the assertion; just must not hang.
     }
 
     // ── FINDINGS #72: bare collection annotations are implicit-any ────
@@ -20951,6 +22805,228 @@ let r: Dog = f(d)
             .any(|e| e.to_string().contains("does not satisfy bound"))
     }
 
+    // ---- C4: variance flow through a *generic* interface bound -----------
+    //
+    // A generic interface `Producer[T]` / `Consumer[T]` is a type-parameter
+    // bound (`def f[X: Producer[Animal]](...)`). Conformance must bind the
+    // interface's `T` to the bound's argument and then honour position
+    // variance: return types covariantly, parameter types contravariantly.
+
+    #[test]
+    fn typevar_generic_iface_bound_covariant_exact_match_accepted() {
+        // `AnimalProducer.get -> Animal` against `Producer[Animal]`: exact.
+        let src = "\
+class Animal:
+    pass
+
+interface Producer[T]:
+    def get(self) -> T: ...
+
+class AnimalProducer:
+    def get(self) -> Animal:
+        return Animal()
+
+def use_ap[X: Producer[Animal]](p: X) -> Animal:
+    return p.get()
+
+let ap: AnimalProducer = AnimalProducer()
+let a: Animal = use_ap(ap)
+";
+        let d = check(src);
+        assert!(
+            !has_typevar_bound_error(&d),
+            "exact-match producer should satisfy Producer[Animal]; errors: {:?}",
+            d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn typevar_generic_iface_bound_covariant_subtype_accepted() {
+        // `DogProducer.get -> Dog` against `Producer[Animal]` with
+        // `Dog <: Animal`: covariant return, sound, accepted.
+        let src = "\
+class Animal:
+    pass
+
+class Dog(Animal):
+    pass
+
+interface Producer[T]:
+    def get(self) -> T: ...
+
+class DogProducer:
+    def get(self) -> Dog:
+        return Dog()
+
+def use_ap[X: Producer[Animal]](p: X) -> Animal:
+    return p.get()
+
+let dp: DogProducer = DogProducer()
+let a: Animal = use_ap(dp)
+";
+        let d = check(src);
+        assert!(
+            !has_typevar_bound_error(&d),
+            "Dog<:Animal so DogProducer should satisfy Producer[Animal] covariantly; errors: {:?}",
+            d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn typevar_generic_iface_bound_covariant_unrelated_return_rejected() {
+        // `PlantProducer.get -> Plant` against `Producer[Animal]`: `Plant`
+        // is not a subtype of `Animal`, so the covariant return position
+        // is violated and the bound must be reported. Before C4 the
+        // interface's `T` was left unbound (treated as `Any`) and this
+        // spuriously conformed.
+        let src = "\
+class Animal:
+    pass
+
+class Plant:
+    pass
+
+interface Producer[T]:
+    def get(self) -> T: ...
+
+class PlantProducer:
+    def get(self) -> Plant:
+        return Plant()
+
+def use_ap[X: Producer[Animal]](p: X) -> Animal:
+    return p.get()
+
+let pp: PlantProducer = PlantProducer()
+let a: Animal = use_ap(pp)
+";
+        let d = check(src);
+        assert!(
+            has_typevar_bound_error(&d),
+            "Plant is not Animal so PlantProducer must NOT satisfy Producer[Animal]; errors: {:?}",
+            d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn typevar_generic_iface_bound_contravariant_supertype_accepted() {
+        // `AnimalConsumer.consume(item: Animal)` against `Consumer[Dog]`:
+        // a consumer of the wider `Animal` can stand in where a
+        // `Consumer[Dog]` is required (contravariant parameter). Accepted.
+        let src = "\
+class Animal:
+    pass
+
+class Dog(Animal):
+    pass
+
+interface Consumer[T]:
+    def consume(self, item: T) -> None: ...
+
+class AnimalConsumer:
+    def consume(self, item: Animal) -> None:
+        pass
+
+def use_dc[X: Consumer[Dog]](c: X) -> None:
+    pass
+
+let ac: AnimalConsumer = AnimalConsumer()
+use_dc(ac)
+";
+        let d = check(src);
+        assert!(
+            !has_typevar_bound_error(&d),
+            "Animal consumer should satisfy Consumer[Dog] contravariantly; errors: {:?}",
+            d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn typevar_generic_iface_bound_contravariant_subtype_param_rejected() {
+        // `DogConsumer.consume(item: Dog)` against `Consumer[Animal]`: a
+        // consumer that only handles `Dog` cannot stand in where any
+        // `Animal` may be passed (contravariant parameter violated).
+        // Before C4 this spuriously conformed.
+        let src = "\
+class Animal:
+    pass
+
+class Dog(Animal):
+    pass
+
+interface Consumer[T]:
+    def consume(self, item: T) -> None: ...
+
+class DogConsumer:
+    def consume(self, item: Dog) -> None:
+        pass
+
+def use_ac[X: Consumer[Animal]](c: X) -> None:
+    pass
+
+let dc: DogConsumer = DogConsumer()
+use_ac(dc)
+";
+        let d = check(src);
+        assert!(
+            has_typevar_bound_error(&d),
+            "Dog-only consumer must NOT satisfy Consumer[Animal] (contravariance); errors: {:?}",
+            d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn typevar_generic_iface_bound_field_type_substituted() {
+        // Field-shaped interface member: `value: T` against
+        // `Holder[int]`. A class whose `value` is `str` must be rejected;
+        // an `int`-valued one accepted. Exercises the field substitution
+        // path of the conformance check.
+        let ok = "\
+interface Holder[T]:
+    value: T
+
+class IntHolder:
+    value: int
+
+    def __init__(self) -> None:
+        self.value = 0
+
+def use_holder[X: Holder[int]](h: X) -> None:
+    pass
+
+let ih: IntHolder = IntHolder()
+use_holder(ih)
+";
+        let d = check(ok);
+        assert!(
+            !has_typevar_bound_error(&d),
+            "int field should satisfy Holder[int]; errors: {:?}",
+            d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+
+        let bad = "\
+interface Holder[T]:
+    value: T
+
+class StrHolder:
+    value: str
+
+    def __init__(self) -> None:
+        self.value = \"x\"
+
+def use_holder[X: Holder[int]](h: X) -> None:
+    pass
+
+let sh: StrHolder = StrHolder()
+use_holder(sh)
+";
+        let d = check(bad);
+        assert!(
+            has_typevar_bound_error(&d),
+            "str field must NOT satisfy Holder[int]; errors: {:?}",
+            d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
     #[test]
     fn typevar_bound_violated_emits_diagnostic() {
         // `def f[T: int](x: T) -> T` called with a `str` argument.
@@ -22298,6 +24374,689 @@ def main() -> None:
         );
     }
 
+    // ── C2: user-generic variance inference tests ────────────────────────
+
+    /// Parse `src`, take its first `class` declaration, and run the C2
+    /// inference pass over it. Returns the per-type-parameter variance
+    /// vector positionally aligned with the class's declared parameters.
+    fn infer_variance_of_first_class(src: &str) -> Vec<Variance> {
+        let prep = preprocess(src);
+        let module = tyc_syntax::parse_module(&prep.python_source)
+            .unwrap()
+            .into_syntax();
+        let classes: Vec<String> = module
+            .body
+            .iter()
+            .filter_map(|s| match s {
+                Stmt::ClassDef(cd) => Some(cd.name.as_str().to_owned()),
+                _ => None,
+            })
+            .collect();
+        let cd = module
+            .body
+            .iter()
+            .find_map(|s| match s {
+                Stmt::ClassDef(cd) => Some(cd),
+                _ => None,
+            })
+            .expect("a class declaration");
+        let tps = type_param_names_from(cd.type_params.as_deref());
+        infer_class_param_variance(cd, &tps, &classes)
+    }
+
+    #[test]
+    fn variance_algebra_compose_and_join() {
+        // Composition: contravariant ∘ contravariant flips back to
+        // covariant; anything through an invariant slot is invariant.
+        assert_eq!(
+            compose_variance(Variance::Covariant, Variance::Covariant),
+            Variance::Covariant
+        );
+        assert_eq!(
+            compose_variance(Variance::Contravariant, Variance::Contravariant),
+            Variance::Covariant
+        );
+        assert_eq!(
+            compose_variance(Variance::Contravariant, Variance::Covariant),
+            Variance::Contravariant
+        );
+        assert_eq!(
+            compose_variance(Variance::Covariant, Variance::Invariant),
+            Variance::Invariant
+        );
+        // Join: same direction sticks, opposite directions collapse to
+        // invariant.
+        assert_eq!(
+            join_variance(Variance::Covariant, Variance::Covariant),
+            Variance::Covariant
+        );
+        assert_eq!(
+            join_variance(Variance::Covariant, Variance::Contravariant),
+            Variance::Invariant
+        );
+    }
+
+    #[test]
+    fn infers_covariant_for_output_only_param() {
+        // `T` only ever flows OUT (a method return) → covariant.
+        let v = infer_variance_of_first_class(
+            "\
+class Producer[T]:
+    def get(self) -> T:
+        ...
+",
+        );
+        assert_eq!(v, vec![Variance::Covariant]);
+    }
+
+    #[test]
+    fn infers_contravariant_for_input_only_param() {
+        // `T` only ever flows IN (a method parameter) → contravariant.
+        let v = infer_variance_of_first_class(
+            "\
+class Consumer[T]:
+    def accept(self, item: T) -> None:
+        ...
+",
+        );
+        assert_eq!(v, vec![Variance::Contravariant]);
+    }
+
+    #[test]
+    fn infers_invariant_for_param_used_in_both_positions() {
+        // `T` flows both in (parameter) and out (return) → invariant.
+        let v = infer_variance_of_first_class(
+            "\
+class Channel[T]:
+    def put(self, item: T) -> None:
+        ...
+    def take(self) -> T:
+        ...
+",
+        );
+        assert_eq!(v, vec![Variance::Invariant]);
+    }
+
+    #[test]
+    fn infers_invariant_for_settable_field() {
+        // A plain annotated field is settable on the emitted dataclass →
+        // invariant. This is exactly why `Box[T]` must stay invariant.
+        let v = infer_variance_of_first_class(
+            "\
+class Box[T]:
+    value: T
+",
+        );
+        assert_eq!(v, vec![Variance::Invariant]);
+    }
+
+    #[test]
+    fn infers_invariant_behind_mutable_list_field() {
+        // `T` appears only in a method return, but BEHIND a mutable
+        // `list[T]` — the list element slot is invariant, so the whole
+        // parameter is forced invariant even though the position is output.
+        let v = infer_variance_of_first_class(
+            "\
+class Bag[T]:
+    def items(self) -> list[T]:
+        ...
+",
+        );
+        assert_eq!(v, vec![Variance::Invariant]);
+    }
+
+    #[test]
+    fn infers_covariant_behind_sequence_return() {
+        // A read-only `Sequence[T]` element slot is covariant, so an
+        // output-position `Sequence[T]` keeps `T` covariant.
+        let v = infer_variance_of_first_class(
+            "\
+class Source[T]:
+    def items(self) -> Sequence[T]:
+        ...
+",
+        );
+        assert_eq!(v, vec![Variance::Covariant]);
+    }
+
+    #[test]
+    fn unused_param_defaults_to_invariant() {
+        // A phantom parameter that never appears in a classified position
+        // stays invariant — the sound default.
+        let v = infer_variance_of_first_class(
+            "\
+class Phantom[T]:
+    def noop(self) -> None:
+        ...
+",
+        );
+        assert_eq!(v, vec![Variance::Invariant]);
+    }
+
+    #[test]
+    fn explicit_covariant_decorator_overrides_inference() {
+        // `@covariant` forces covariance even though `T` is used as an
+        // input (which would otherwise infer contravariant).
+        let v = infer_variance_of_first_class(
+            "\
+@covariant
+class Forced[T]:
+    def accept(self, item: T) -> None:
+        ...
+",
+        );
+        assert_eq!(v, vec![Variance::Covariant]);
+    }
+
+    #[test]
+    fn covariant_user_generic_accepts_upcast() {
+        // End-to-end: a covariant `Producer[Dog]` flows into a
+        // `Producer[Animal]` slot.
+        let src = "\
+class Animal:
+    name: str
+class Dog(Animal):
+    name: str
+class Producer[T]:
+    def get(self) -> T:
+        ...
+def use_animals(p: Producer[Animal]) -> None:
+    ...
+def main(dogs: Producer[Dog]) -> None:
+    use_animals(dogs)
+";
+        let d = check(src);
+        assert!(
+            !d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::TypeMismatch { .. })),
+            "covariant Producer[Dog] -> Producer[Animal] must be accepted; got {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn contravariant_user_generic_accepts_reversed_assignment() {
+        // A contravariant `Consumer[Animal]` flows into a `Consumer[Dog]`
+        // slot — the reversed (sound) direction.
+        let src = "\
+class Animal:
+    name: str
+class Dog(Animal):
+    name: str
+class Consumer[T]:
+    def accept(self, item: T) -> None:
+        ...
+def needs_dog_consumer(c: Consumer[Dog]) -> None:
+    ...
+def main(any_consumer: Consumer[Animal]) -> None:
+    needs_dog_consumer(any_consumer)
+";
+        let d = check(src);
+        assert!(
+            !d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::TypeMismatch { .. })),
+            "contravariant Consumer[Animal] -> Consumer[Dog] must be accepted; got {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn invariant_user_generic_rejects_upcast() {
+        // `Box[T]` has a settable field `value: T`, so it is invariant: a
+        // `Box[Dog]` must NOT flow into a `Box[Animal]` slot.
+        let src = "\
+class Animal:
+    name: str
+class Dog(Animal):
+    name: str
+class Box[T]:
+    value: T
+def use_animal_box(b: Box[Animal]) -> None:
+    ...
+def main(dog_box: Box[Dog]) -> None:
+    use_animal_box(dog_box)
+";
+        let d = check(src);
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::TypeMismatch { .. })),
+            "invariant Box[Dog] -> Box[Animal] must be rejected; got {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn covariant_user_generic_still_rejects_downcast() {
+        // Soundness floor: even a covariant `Producer` must reject the
+        // WRONG direction — `Producer[Animal]` does not flow into a
+        // `Producer[Dog]` slot.
+        let src = "\
+class Animal:
+    name: str
+class Dog(Animal):
+    name: str
+class Producer[T]:
+    def get(self) -> T:
+        ...
+def needs_dog_producer(p: Producer[Dog]) -> None:
+    ...
+def main(animals: Producer[Animal]) -> None:
+    needs_dog_producer(animals)
+";
+        let d = check(src);
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::TypeMismatch { .. })),
+            "covariant Producer[Animal] -> Producer[Dog] must still be rejected; got {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn builtin_container_variance_unchanged_by_user_inference() {
+        // The C2 inference must not perturb built-in heads: mutable `list`
+        // stays invariant, read-only `Sequence` stays covariant, and the
+        // user-aware lookup falls back to the built-in table for them.
+        assert_eq!(generic_param_variance("list", 0), Variance::Invariant);
+        assert_eq!(generic_param_variance("Sequence", 0), Variance::Covariant);
+        assert_eq!(
+            generic_param_variance("Callable", 0),
+            Variance::Contravariant
+        );
+        assert_eq!(generic_param_variance("Callable", 1), Variance::Covariant);
+        // A mutable `list[Dog]` must still NOT flow into `list[Animal]`.
+        let src = "\
+class Animal:
+    name: str
+class Dog(Animal):
+    name: str
+def use_animals(xs: list[Animal]) -> None:
+    ...
+def main(dogs: list[Dog]) -> None:
+    use_animals(dogs)
+";
+        let d = check(src);
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::TypeMismatch { .. })),
+            "list invariance must be preserved (list[Dog] -/-> list[Animal]); got {:?}",
+            d.errors()
+        );
+    }
+
+    // ── Cross-module variance / HKT (deferred C1 / C2 halves) ────────────
+
+    /// Helper mirroring `tyc-db::build_external_shapes` for the common
+    /// `from producer import <names>` form: extract the producer module's
+    /// shapes, re-key class shapes / type-params / variance / HKT under the
+    /// (here identical) local import names, and stash the full `by_module`
+    /// registry. Returns the parsed+resolved consumer plus its
+    /// `ExternalShapes`.
+    fn cross_module_external(
+        producer_src: &str,
+        imported: &[&str],
+    ) -> (ModuleShapes, ExternalShapes) {
+        let producer_prep = preprocess(producer_src);
+        let producer_module = tyc_syntax::parse_module(&producer_prep.python_source)
+            .unwrap()
+            .into_syntax();
+        let producer_shapes = extract_module_shapes(&producer_module);
+
+        let mut external = ExternalShapes::default();
+        for name in imported {
+            if let Some(shape) = producer_shapes.class_shapes.get(*name) {
+                external
+                    .class_shapes
+                    .insert((*name).to_owned(), shape.clone());
+            }
+            if let Some(tps) = producer_shapes.class_type_params.get(*name) {
+                external
+                    .class_type_params
+                    .insert((*name).to_owned(), tps.clone());
+            }
+            if let Some(v) = producer_shapes.class_param_variance.get(*name) {
+                external
+                    .class_param_variance
+                    .insert((*name).to_owned(), v.clone());
+            }
+        }
+        // HKT names are identity tokens, not re-keyed per class — seed the
+        // producer's full set, exactly as `build_external_shapes` does.
+        for h in &producer_shapes.hkt_param_names {
+            external.hkt_param_names.insert(h.clone());
+        }
+        let mut by_module: HashMap<String, ModuleShapes> = HashMap::new();
+        by_module.insert("producer".to_owned(), producer_shapes.clone());
+        external.by_module = std::sync::Arc::new(by_module);
+        (producer_shapes, external)
+    }
+
+    fn check_consumer(consumer_src: &str, external: &ExternalShapes) -> Diagnostics {
+        let consumer_prep = preprocess(consumer_src);
+        let consumer_module = tyc_syntax::parse_module(&consumer_prep.python_source)
+            .unwrap()
+            .into_syntax();
+        let (resolved, _) = resolve_module(
+            "<consumer>".to_owned(),
+            &consumer_prep.python_source,
+            &consumer_module,
+        );
+        check_module_with_imports(
+            "<consumer>",
+            &consumer_prep.python_source,
+            &resolved,
+            &consumer_module,
+            &consumer_prep.unsafe_lines,
+            &consumer_prep.frozen_class_lines,
+            Some(external),
+        )
+    }
+
+    #[test]
+    fn extract_module_shapes_publishes_variance_and_hkt() {
+        // The surface-extraction pass must now carry inferred variance
+        // (C2) and the HKT constructor-variable set (C1) so the consumer
+        // can consult them for imported generics.
+        let shapes = extract_module_shapes(
+            &tyc_syntax::parse_module(
+                &preprocess(
+                    "\
+class Producer[T]:
+    def get(self) -> T:
+        ...
+class Functor[F]:
+    def fmap(self, fa: F[int]) -> F[str]:
+        ...
+",
+                )
+                .python_source,
+            )
+            .unwrap()
+            .into_syntax(),
+        );
+        assert_eq!(
+            shapes.class_param_variance.get("Producer"),
+            Some(&vec![Variance::Covariant]),
+            "Producer[T] (output-only) must publish covariant variance"
+        );
+        assert!(
+            shapes.hkt_param_names.contains("F"),
+            "Functor[F[_]]'s constructor variable F must be published as HKT; got {:?}",
+            shapes.hkt_param_names
+        );
+    }
+
+    #[test]
+    fn cross_module_covariant_generic_accepts_upcast() {
+        // THE C2 GAP CLOSED: a covariant `Producer` imported from another
+        // module must widen `Producer[Dog] -> Producer[Animal]` exactly as
+        // an in-module `Producer` does.
+        let (_p, external) = cross_module_external(
+            "\
+class Producer[T]:
+    def get(self) -> T:
+        ...
+",
+            &["Producer"],
+        );
+        let consumer_src = "\
+class Animal:
+    name: str
+class Dog(Animal):
+    name: str
+def use_animals(p: Producer[Animal]) -> None:
+    ...
+def main(dogs: Producer[Dog]) -> None:
+    use_animals(dogs)
+";
+        let d = check_consumer(consumer_src, &external);
+        assert!(
+            !d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::TypeMismatch { .. })),
+            "imported covariant Producer[Dog] -> Producer[Animal] must be accepted; got {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn cross_module_invariant_generic_rejects_upcast() {
+        // SOUNDNESS FLOOR: an imported INVARIANT generic (`Box[T]` with a
+        // settable field) must still reject the upcast — variance flows,
+        // but it carries the *invariant* verdict too.
+        let (_p, external) = cross_module_external(
+            "\
+class Box[T]:
+    value: T
+",
+            &["Box"],
+        );
+        let consumer_src = "\
+class Animal:
+    name: str
+class Dog(Animal):
+    name: str
+def use_animal_box(b: Box[Animal]) -> None:
+    ...
+def main(dog_box: Box[Dog]) -> None:
+    use_animal_box(dog_box)
+";
+        let d = check_consumer(consumer_src, &external);
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::TypeMismatch { .. })),
+            "imported invariant Box[Dog] -> Box[Animal] must still be rejected; got {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn cross_module_covariant_generic_still_rejects_downcast() {
+        // The relaxation must not flip into unsoundness: an imported
+        // covariant `Producer[Animal]` must NOT flow into a `Producer[Dog]`
+        // slot (wrong direction).
+        let (_p, external) = cross_module_external(
+            "\
+class Producer[T]:
+    def get(self) -> T:
+        ...
+",
+            &["Producer"],
+        );
+        let consumer_src = "\
+class Animal:
+    name: str
+class Dog(Animal):
+    name: str
+def needs_dog_producer(p: Producer[Dog]) -> None:
+    ...
+def main(animals: Producer[Animal]) -> None:
+    needs_dog_producer(animals)
+";
+        let d = check_consumer(consumer_src, &external);
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::TypeMismatch { .. })),
+            "imported covariant Producer[Animal] -> Producer[Dog] must still be rejected; got {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn cross_module_hkt_constructor_var_binds_across_boundary() {
+        // THE C1 GAP CLOSED: an imported `Functor[F[_]]`'s constructor
+        // variable `F` must be recognised as higher-kinded in the consumer,
+        // so `is_constructor_variable` returns true after seeding. Without
+        // the cross-module propagation it would degrade to pre-HKT
+        // (`F` unknown), so we assert the seed lands in the checker's set.
+        let (_p, external) = cross_module_external(
+            "\
+class Functor[F]:
+    def fmap(self, fa: F[int]) -> F[str]:
+        ...
+",
+            &["Functor"],
+        );
+        assert!(
+            external.hkt_param_names.contains("F"),
+            "F must propagate into ExternalShapes.hkt_param_names; got {:?}",
+            external.hkt_param_names
+        );
+        // And the consumer-side seed must populate the checker so a use of
+        // the imported Functor doesn't regress to a false positive.
+        let consumer_src = "\
+def lift(fx: Functor[list]) -> None:
+    ...
+";
+        let d = check_consumer(consumer_src, &external);
+        assert!(
+            !d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::TypeMismatch { .. })),
+            "imported HKT Functor must not false-positive; got {:?}",
+            d.errors()
+        );
+    }
+
+    /// Helper mirroring `tyc-db::build_external_shapes` for the BARE
+    /// `import producer` (qualified-access) form: stash the producer
+    /// module's shapes in the `by_module` registry, register the bare
+    /// import so `producer` resolves to `Type::Module`, and seed
+    /// `class_param_variance` under each source class's BARE name — the
+    /// key a qualified annotation `producer.Producer[Dog]` resolves its
+    /// `Type::Generic("Producer", …)` head to.
+    fn cross_module_qualified_external(producer_src: &str) -> ExternalShapes {
+        let producer_prep = preprocess(producer_src);
+        let producer_module = tyc_syntax::parse_module(&producer_prep.python_source)
+            .unwrap()
+            .into_syntax();
+        let producer_shapes = extract_module_shapes(&producer_module);
+
+        let mut external = ExternalShapes::default();
+        external
+            .bare_imports
+            .insert("producer".to_owned(), "producer".to_owned());
+        // Mirror build_external_shapes' bare-import variance seeding:
+        // key under the BARE source class name.
+        for (cls_name, variances) in &producer_shapes.class_param_variance {
+            external
+                .class_param_variance
+                .insert(cls_name.clone(), variances.clone());
+        }
+        for h in &producer_shapes.hkt_param_names {
+            external.hkt_param_names.insert(h.clone());
+        }
+        let mut by_module: HashMap<String, ModuleShapes> = HashMap::new();
+        by_module.insert("producer".to_owned(), producer_shapes);
+        external.by_module = std::sync::Arc::new(by_module);
+        external
+    }
+
+    #[test]
+    fn cross_module_qualified_covariant_generic_accepts_upcast() {
+        // C2 FALSE POSITIVE CLOSED: a covariant generic imported via a
+        // bare `import producer` and used qualified
+        // (`producer.Producer[Dog] -> producer.Producer[Animal]`) must
+        // widen exactly as the `from producer import Producer` form does.
+        let external = cross_module_qualified_external(
+            "\
+class Producer[T]:
+    def get(self) -> T:
+        ...
+",
+        );
+        let consumer_src = "\
+import producer
+class Animal:
+    name: str
+class Dog(Animal):
+    name: str
+def use_animals(p: producer.Producer[Animal]) -> None:
+    ...
+def main(dogs: producer.Producer[Dog]) -> None:
+    use_animals(dogs)
+";
+        let d = check_consumer(consumer_src, &external);
+        assert!(
+            !d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::TypeMismatch { .. })),
+            "qualified covariant producer.Producer[Dog] -> [Animal] must be accepted; got {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn cross_module_qualified_invariant_generic_rejects_upcast() {
+        // SOUNDNESS FLOOR: a qualified-imported INVARIANT generic must
+        // still reject the upcast.
+        let external = cross_module_qualified_external(
+            "\
+class Box[T]:
+    value: T
+",
+        );
+        let consumer_src = "\
+import producer
+class Animal:
+    name: str
+class Dog(Animal):
+    name: str
+def use_box(b: producer.Box[Animal]) -> None:
+    ...
+def main(dog_box: producer.Box[Dog]) -> None:
+    use_box(dog_box)
+";
+        let d = check_consumer(consumer_src, &external);
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::TypeMismatch { .. })),
+            "qualified invariant producer.Box[Dog] -> [Animal] must still be rejected; got {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn cross_module_qualified_covariant_generic_still_rejects_downcast() {
+        // The qualified-import relaxation must not flip into unsoundness:
+        // a covariant `producer.Producer[Animal]` must NOT flow into a
+        // `producer.Producer[Dog]` slot (wrong direction).
+        let external = cross_module_qualified_external(
+            "\
+class Producer[T]:
+    def get(self) -> T:
+        ...
+",
+        );
+        let consumer_src = "\
+import producer
+class Animal:
+    name: str
+class Dog(Animal):
+    name: str
+def needs_dog_producer(p: producer.Producer[Dog]) -> None:
+    ...
+def main(animals: producer.Producer[Animal]) -> None:
+    needs_dog_producer(animals)
+";
+        let d = check_consumer(consumer_src, &external);
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::TypeMismatch { .. })),
+            "qualified covariant producer.Producer[Animal] -> [Dog] must still be rejected; got {:?}",
+            d.errors()
+        );
+    }
+
     // ── Higher-Kinded Types (HKT) tests ──────────────────────────────────
 
     #[test]
@@ -22496,6 +25255,407 @@ def main() -> None:
             result,
             Type::Generic("T".to_string(), vec![Type::Str]),
             "non-Class binding must not replace Generic head; got {result:?}"
+        );
+    }
+
+    // ── HKT application: F[A] formal unifying against a concrete ctor ─────
+    //
+    // These exercise the new `bind_typevars_and_substitute_hkt` path, where
+    // the formal is `Generic("F", [TypeVar("A")])` (how `fa: F[A]` actually
+    // parses) — distinct from the older bare-`TypeConstructor("F", 1)` form.
+
+    #[test]
+    fn hkt_applied_ctor_var_binds_head_and_arg() {
+        // Formal `F[A]` against actual `list[int]` with F a constructor var:
+        // binds F → list and A → int, and the return `F[B]` (with B bound to
+        // str elsewhere) substitutes to `list[str]`.
+        use crate::{bind_typevars_and_substitute_hkt, Type};
+        use std::collections::HashSet;
+
+        let ctor_vars: HashSet<String> = ["F".to_string()].into_iter().collect();
+        // def fmap[A, B](fa: F[A], b: B) -> F[B]
+        let formal_params = vec![
+            Type::Generic("F".to_string(), vec![Type::TypeVar("A".to_string())]),
+            Type::TypeVar("B".to_string()),
+        ];
+        let actual_args = vec![
+            Type::Generic("list".to_string(), vec![Type::Int]),
+            Type::Str,
+        ];
+        let return_type = Type::Generic("F".to_string(), vec![Type::TypeVar("B".to_string())]);
+
+        let (result, errors) = bind_typevars_and_substitute_hkt(
+            &formal_params,
+            &actual_args,
+            &return_type,
+            None,
+            &ctor_vars,
+        );
+        assert!(errors.is_empty(), "no kind errors expected; got {errors:?}");
+        assert_eq!(
+            result,
+            Type::Generic("list".to_string(), vec![Type::Str]),
+            "F[B] must resolve to list[str] when F→list and B→str; got {result:?}"
+        );
+    }
+
+    #[test]
+    fn hkt_applied_ctor_var_arity_mismatch_is_reported() {
+        // Formal `F[A, B]` (a 2-ary application) against `list[int]` (1-ary)
+        // is ill-kinded.
+        use crate::{bind_typevars_and_substitute_hkt, KindError, Type};
+        use std::collections::HashSet;
+
+        let ctor_vars: HashSet<String> = ["F".to_string()].into_iter().collect();
+        let formal_params = vec![Type::Generic(
+            "F".to_string(),
+            vec![
+                Type::TypeVar("A".to_string()),
+                Type::TypeVar("B".to_string()),
+            ],
+        )];
+        let actual_args = vec![Type::Generic("list".to_string(), vec![Type::Int])];
+        let return_type = Type::None;
+
+        let (_result, errors) = bind_typevars_and_substitute_hkt(
+            &formal_params,
+            &actual_args,
+            &return_type,
+            None,
+            &ctor_vars,
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|e| matches!(e, KindError::Arity { ctor, expected, actual }
+                    if ctor == "F" && *expected == 2 && *actual == 1)),
+            "expected an Arity kind error for F; got {errors:?}"
+        );
+    }
+
+    #[test]
+    fn hkt_applied_ctor_var_conflicting_constructors_is_reported() {
+        // `F[A]` matched against `list[int]` then `F[A]` against `set[int]`
+        // binds F to two different constructors — a conflict.
+        use crate::{bind_typevars_and_substitute_hkt, KindError, Type};
+        use std::collections::HashSet;
+
+        let ctor_vars: HashSet<String> = ["F".to_string()].into_iter().collect();
+        let formal_params = vec![
+            Type::Generic("F".to_string(), vec![Type::TypeVar("A".to_string())]),
+            Type::Generic("F".to_string(), vec![Type::TypeVar("A".to_string())]),
+        ];
+        let actual_args = vec![
+            Type::Generic("list".to_string(), vec![Type::Int]),
+            Type::Generic("set".to_string(), vec![Type::Int]),
+        ];
+        let return_type = Type::None;
+
+        let (_result, errors) = bind_typevars_and_substitute_hkt(
+            &formal_params,
+            &actual_args,
+            &return_type,
+            None,
+            &ctor_vars,
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|e| matches!(e, KindError::Conflict { ctor, .. } if ctor == "F")),
+            "expected a Conflict kind error for F; got {errors:?}"
+        );
+    }
+
+    #[test]
+    fn hkt_empty_ctor_vars_matches_legacy_behaviour() {
+        // With an empty constructor set, the HKT entry point must produce
+        // exactly the same result as the legacy bidirectional substitution —
+        // so a `Generic("F", ...)` mismatch binds nothing and the return
+        // type is unchanged (today's conservative behaviour).
+        use crate::{bind_typevars_and_substitute_hkt, Type};
+        use std::collections::HashSet;
+
+        let ctor_vars: HashSet<String> = HashSet::new();
+        let formal_params = vec![Type::Generic(
+            "F".to_string(),
+            vec![Type::TypeVar("A".to_string())],
+        )];
+        let actual_args = vec![Type::Generic("list".to_string(), vec![Type::Int])];
+        let return_type = Type::Generic("F".to_string(), vec![Type::TypeVar("A".to_string())]);
+
+        let (result, errors) = bind_typevars_and_substitute_hkt(
+            &formal_params,
+            &actual_args,
+            &return_type,
+            None,
+            &ctor_vars,
+        );
+        assert!(errors.is_empty());
+        assert_eq!(
+            result,
+            Type::Generic("F".to_string(), vec![Type::TypeVar("A".to_string())]),
+            "empty ctor set must leave F[A] unbound; got {result:?}"
+        );
+    }
+
+    #[test]
+    fn hkt_backward_ctor_var_arity_mismatch_is_reported() {
+        // Backward (return-type-driven) inference: a no-arg signature whose
+        // return is `F[A]` (a genuine constructor var) used where the
+        // EXPECTED type is `dict[str, int]`. Binding `F[A]` (1 arg) against
+        // `dict[str, int]` (2 args) is an arity mismatch. The forward pass
+        // binds nothing (no actual args mention F), so the error can only be
+        // discovered backward — and must surface, not be silently dropped.
+        use crate::{bind_typevars_and_substitute_hkt, KindError, Type};
+        use std::collections::HashSet;
+
+        let ctor_vars: HashSet<String> = ["F".to_string()].into_iter().collect();
+        let formal_params: Vec<Type> = vec![];
+        let actual_args: Vec<Type> = vec![];
+        let return_type = Type::Generic("F".to_string(), vec![Type::TypeVar("A".to_string())]);
+        let expected = Type::Generic("dict".to_string(), vec![Type::Str, Type::Int]);
+
+        let (_result, errors) = bind_typevars_and_substitute_hkt(
+            &formal_params,
+            &actual_args,
+            &return_type,
+            Some(&expected),
+            &ctor_vars,
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|e| matches!(e, KindError::Arity { ctor, expected, actual }
+                    if ctor == "F" && *expected == 1 && *actual == 2)),
+            "backward F[A] vs dict[str, int] must report an Arity kind error; got {errors:?}"
+        );
+    }
+
+    #[test]
+    fn hkt_backward_ctor_var_matching_arity_binds_clean() {
+        // The legitimate backward case: return `F[A]` used where `list[int]`
+        // is expected → `F=list, A=int`, no error, return resolves to
+        // `list[int]`. This must keep succeeding silently after the fix.
+        use crate::{bind_typevars_and_substitute_hkt, Type};
+        use std::collections::HashSet;
+
+        let ctor_vars: HashSet<String> = ["F".to_string()].into_iter().collect();
+        let formal_params: Vec<Type> = vec![];
+        let actual_args: Vec<Type> = vec![];
+        let return_type = Type::Generic("F".to_string(), vec![Type::TypeVar("A".to_string())]);
+        let expected = Type::Generic("list".to_string(), vec![Type::Int]);
+
+        let (result, errors) = bind_typevars_and_substitute_hkt(
+            &formal_params,
+            &actual_args,
+            &return_type,
+            Some(&expected),
+            &ctor_vars,
+        );
+        assert!(
+            errors.is_empty(),
+            "matching-arity backward HKT binding must not error; got {errors:?}"
+        );
+        assert_eq!(
+            result,
+            Type::Generic("list".to_string(), vec![Type::Int]),
+            "F[A] vs list[int] must resolve F→list, A→int; got {result:?}"
+        );
+    }
+
+    // ── HKT end-to-end: Functor-style map over concrete constructors ─────
+
+    #[test]
+    fn hkt_functor_map_over_list_typechecks() {
+        // The canonical scaffold: `class Functor[F[_]]` with a `map` method
+        // shaped `F[A] -> F[B]`. Calling it with a `list[int]` argument must
+        // type-check clean (F binds to list, the call is well-kinded).
+        let src = "\
+class Functor[F[_]]:
+    def fmap[A, B](self, fa: F[A], f: B) -> F[B]:
+        return fa
+
+def main() -> None:
+    let xs: list[int] = [1, 2, 3]
+    let _ys = Functor().fmap(xs, \"tag\")
+";
+        let d = check(src);
+        assert!(
+            d.errors().is_empty(),
+            "Functor.fmap over list[int] must check clean; got {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn hkt_functor_map_over_user_box_typechecks() {
+        // A second, user-declared 1-ary constructor `Box[T]` also unifies.
+        let src = "\
+class Box[T]:
+    value: T
+
+class Functor[F[_]]:
+    def fmap[A, B](self, fa: F[A], f: B) -> F[B]:
+        return fa
+
+def main() -> None:
+    let b: Box[int] = Box(value=1)
+    let _r = Functor().fmap(b, \"tag\")
+";
+        let d = check(src);
+        assert!(
+            d.errors().is_empty(),
+            "Functor.fmap over Box[int] must check clean; got {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn hkt_functor_map_arity_mismatch_errors() {
+        // A 2-ary constructor application `F[A, B]` in the parameter, applied
+        // to a 1-ary `list[int]` actual, is ill-kinded and must be flagged
+        // with `tyc::kind_mismatch`.
+        let src = "\
+class Functor[F[_]]:
+    def bad[A, B, C](self, fa: F[A, B], f: C) -> C:
+        return f
+
+def main() -> None:
+    let xs: list[int] = [1, 2, 3]
+    let _r = Functor().bad(xs, 0)
+";
+        let d = check(src);
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::KindMismatch { .. })),
+            "F[A, B] applied to list[int] must raise kind_mismatch; got {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn hkt_functor_map_conflicting_constructors_errors() {
+        // Binding F to two different constructors in one call (list and set)
+        // must raise `tyc::kind_mismatch`.
+        let src = "\
+class Functor[F[_]]:
+    def both[A](self, x: F[A], y: F[A]) -> None:
+        return None
+
+def main() -> None:
+    let xs: list[int] = [1, 2, 3]
+    let ss: set[int] = {1, 2, 3}
+    Functor().both(xs, ss)
+";
+        let d = check(src);
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::KindMismatch { .. })),
+            "F bound to both list and set must raise kind_mismatch; got {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn hkt_real_generic_class_call_unaffected() {
+        // Regression guard: a normal generic class method call (no HKT) must
+        // keep working — `Box` is a real class, never a constructor var, so
+        // the unifier path is unchanged.
+        let src = "\
+class Box[T]:
+    value: T
+
+def main() -> None:
+    let b: Box[int] = Box(value=1)
+    let _v: int = b.value
+";
+        let d = check(src);
+        assert!(
+            d.errors().is_empty(),
+            "ordinary generic class usage must stay clean; got {:?}",
+            d.errors()
+        );
+    }
+
+    // ── Finding 2 (SOUNDNESS): an HKT-param name that is ALSO a concrete
+    //    type alias / union in scope must NOT be treated as a higher-kinded
+    //    constructor variable by `is_assignable`. Otherwise the HKT shortcut
+    //    binds the head and skips comparing the alias arguments, wrongly
+    //    accepting `F[str]` where `F[int]` is required. ──────────────────────
+
+    #[test]
+    fn hkt_alias_head_is_not_a_ctor_var() {
+        use tyc_resolve::resolve_module;
+        use tyc_syntax::preprocess::preprocess;
+
+        // Trivial source just to construct a resolved module / Checker.
+        let prep = preprocess("x = 1\n");
+        let module = tyc_syntax::parse_module(&prep.python_source)
+            .unwrap()
+            .into_syntax();
+        let (resolved, _) = resolve_module("<test>".to_owned(), &prep.python_source, &module);
+
+        let mut c = Checker::new("<test>".to_owned(), &prep.python_source, &resolved);
+        // `class Functor[F[_]]` would put `F` in `hkt_param_names`...
+        c.hkt_param_names.insert("F".to_owned());
+        // ...but the module ALSO declares `type F[T] = list[T]`, a concrete
+        // alias — so `F[..]` heads must compare structurally, not bind.
+        c.type_aliases.insert(
+            "F".to_owned(),
+            (
+                vec!["T".to_owned()],
+                Type::Generic("list".to_owned(), vec![Type::TypeVar("T".to_owned())]),
+            ),
+        );
+
+        let f_int = Type::Generic("F".to_owned(), vec![Type::Int]);
+        let f_str = Type::Generic("F".to_owned(), vec![Type::Str]);
+
+        assert!(
+            !c.is_ctor_var_name("F"),
+            "a name that is also a concrete alias must not be a ctor var"
+        );
+        assert!(
+            !c.is_assignable(&f_int, &f_str),
+            "F[str] must NOT be assignable to F[int] when F is a concrete \
+             alias `type F[T] = list[T]` (compares list[str] vs list[int])"
+        );
+        assert!(
+            c.is_assignable(&f_int, &f_int),
+            "F[int] into F[int] (same alias args) must still be accepted"
+        );
+    }
+
+    #[test]
+    fn hkt_genuine_ctor_var_without_shadowing_alias_still_binds() {
+        use tyc_resolve::resolve_module;
+        use tyc_syntax::preprocess::preprocess;
+
+        let prep = preprocess("x = 1\n");
+        let module = tyc_syntax::parse_module(&prep.python_source)
+            .unwrap()
+            .into_syntax();
+        let (resolved, _) = resolve_module("<test>".to_owned(), &prep.python_source, &module);
+
+        let mut c = Checker::new("<test>".to_owned(), &prep.python_source, &resolved);
+        // A genuine `class Functor[F[_]]` with NO shadowing concrete alias:
+        // `F` is a real constructor variable, so the HKT shortcut still treats
+        // `F[..]` permissively (the real well-kindedness check runs in the
+        // unifier). C1 must not regress.
+        c.hkt_param_names.insert("F".to_owned());
+
+        let f_int = Type::Generic("F".to_owned(), vec![Type::Int]);
+        let f_str = Type::Generic("F".to_owned(), vec![Type::Str]);
+
+        assert!(
+            c.is_ctor_var_name("F"),
+            "a real HKT param with no shadowing concrete alias is a ctor var"
+        );
+        assert!(
+            c.is_assignable(&f_int, &f_str),
+            "genuine HKT ctor-var heads stay permissive in is_assignable (C1)"
         );
     }
 

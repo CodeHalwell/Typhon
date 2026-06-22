@@ -2138,7 +2138,63 @@ fn leading_ann_assign_name(line: &str) -> Option<String> {
     if !after_trim.starts_with(':') {
         return None;
     }
+    // Reject Python keywords that are syntactically followed by `:` — most
+    // importantly the compound-statement headers (`else:`, `try:`,
+    // `finally:`, …). Without this guard the name extractor treats the
+    // keyword as the LHS of an annotated assignment and the caller
+    // prepends `let`/`mut`, producing invalid Typhon like `mut else:`.
+    if is_python_keyword(name) {
+        return None;
+    }
     Some(name.to_owned())
+}
+
+/// `true` when `s` is a Python soft/hard keyword that the migrator must
+/// never mistake for an assignment target. Conservatively includes the
+/// compound-statement headers that can legitimately be followed by `:`
+/// (`else`, `try`, `finally`, …) plus the rest of the reserved words so
+/// no keyword is ever prefixed with a `let`/`mut` binding marker.
+fn is_python_keyword(s: &str) -> bool {
+    matches!(
+        s,
+        "False"
+            | "None"
+            | "True"
+            | "and"
+            | "as"
+            | "assert"
+            | "async"
+            | "await"
+            | "break"
+            | "class"
+            | "continue"
+            | "def"
+            | "del"
+            | "elif"
+            | "else"
+            | "except"
+            | "finally"
+            | "for"
+            | "from"
+            | "global"
+            | "if"
+            | "import"
+            | "in"
+            | "is"
+            | "lambda"
+            | "nonlocal"
+            | "not"
+            | "or"
+            | "pass"
+            | "raise"
+            | "return"
+            | "try"
+            | "while"
+            | "with"
+            | "yield"
+            | "match"
+            | "case"
+    )
 }
 
 /// Walk every line and record names that appear on the LHS of a plain
@@ -2302,6 +2358,32 @@ fn walk(dir: &std::path::Path, out: &mut Vec<PathBuf>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn never_prefixes_else_with_binding_keyword() {
+        // Regression (B1): the migrator used to treat an `else:` header as
+        // an annotated assignment (`else` followed by `:`) and prepend the
+        // `let`/`mut` binding marker, emitting invalid Typhon `mut else:` /
+        // `let else:`. The `else:` keyword must stay bare while genuine
+        // reassignments in the branches still get their `mut`/`let`.
+        let src = "\
+def f(x: int) -> int:
+    if x > 0:
+        y: int = 1
+    else:
+        y = 2
+    return y
+";
+        let out = migrate_source(src);
+        assert!(
+            !out.contains("mut else") && !out.contains("let else"),
+            "an `else:` must never be prefixed with a binding marker; got:\n{out}",
+        );
+        assert!(
+            out.lines().any(|l| l.trim() == "else:"),
+            "the bare `else:` header must be preserved; got:\n{out}",
+        );
+    }
 
     #[test]
     fn rewrites_optional_to_question_mark() {
