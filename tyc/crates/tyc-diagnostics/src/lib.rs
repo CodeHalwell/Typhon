@@ -3611,11 +3611,14 @@ impl BlockRemap {
     /// When `distributed_lines` is empty the function returns `None`
     /// (no remap) — safer than wrongly collapsing a real block.
     fn from_sanitised(source: &str, distributed_lines: &[usize]) -> Option<Self> {
-        // Cheap reject: the restoration step only emits `impl ` headers
-        // for files that carried an `impl`/`extend` block. Bail early
-        // when there isn't one — or when nothing was distributed, in
-        // which case there is nothing to remap.
-        if distributed_lines.is_empty() || !source.contains("impl ") {
+        // Cheap reject: the restoration step only emits `impl ` / `impl[…] `
+        // headers for files that carried an `impl`/`extend` block. Bail
+        // early when there isn't one — or when nothing was distributed, in
+        // which case there is nothing to remap. The scan recognises BOTH
+        // the non-generic `impl <Name>:` form and the generic
+        // `impl[T,…] <Name>[…]:` form (mirroring `expand_impl_sealed_unions`
+        // in tyc-syntax) so an all-generic distributed buffer isn't dropped.
+        if distributed_lines.is_empty() || !source_has_impl_header(source) {
             return None;
         }
         let is_distributed = |line: usize| distributed_lines.contains(&line);
@@ -3631,15 +3634,13 @@ impl BlockRemap {
 
         let impl_header_indent = |raw: &str| -> Option<usize> {
             let indent = raw.len() - raw.trim_start().len();
-            let trimmed = raw.trim_start();
-            let after = trimmed.strip_prefix("impl ")?;
-            // Must look like `impl <Name…>:` — a header, not a method
-            // body line that merely starts with the word.
-            if after.trim_end().ends_with(':') {
-                Some(indent)
-            } else {
-                None
-            }
+            // Recognise both the non-generic `impl <Name…>:` form and the
+            // generic `impl[T,…] <Name…>:` form (matching
+            // `expand_impl_sealed_unions` in tyc-syntax). `impl_header_name`
+            // strips any `impl[…]` type-param prefix and the trailing `:`,
+            // so a successful parse means this *is* an impl header line, not
+            // a method body line that merely starts with the word.
+            impl_header_name(raw).map(|_| indent)
         };
 
         // The (header_line, body_start_line, body_end_line) of each impl
@@ -3785,7 +3786,7 @@ impl BlockRemap {
 /// the recovered set equals the recorded `impl_distributed_lines` for any
 /// buffer the preprocessor produced.
 fn distributed_impl_lines(source: &str) -> Vec<usize> {
-    if !source.contains("impl ") {
+    if !source_has_impl_header(source) {
         return Vec::new();
     }
     let aliases = sealed_union_aliases(source);
@@ -3879,6 +3880,21 @@ fn distributed_impl_lines(source: &str) -> Vec<usize> {
     }
     out.sort_unstable();
     out
+}
+
+/// Cheap reject for buffers that carry no `impl` header at all. Returns
+/// `true` if any line, once leading whitespace is stripped, begins an impl
+/// header in either the non-generic `impl <Name…>:` form or the generic
+/// `impl[T,…] <Name…>:` form. Mirrors `expand_impl_sealed_unions` in
+/// tyc-syntax, which accepts both `impl ` and `impl[`. A bare
+/// `source.contains("impl ")` would wrongly drop a buffer whose impl
+/// headers are *all* generic (`impl[T] ` has no `impl ` with a trailing
+/// space), so the B15 remap must scan for the prefix structurally.
+fn source_has_impl_header(source: &str) -> bool {
+    source.lines().any(|line| {
+        let trimmed = line.trim_start();
+        trimmed.starts_with("impl ") || trimmed.starts_with("impl[")
+    })
 }
 
 /// Extract the bare class/alias name from an `impl <Name…>:` header line
@@ -4360,6 +4376,33 @@ mod tests {
             "a label in the duplicated block must redirect onto the first block"
         );
         // An offset in the first block is left untouched.
+        assert_eq!(remap.remap_offset(first_self), first_self);
+    }
+
+    #[test]
+    fn block_remap_redirects_generic_distributed_impl_blocks() {
+        // B15 generic case: an `impl[T] Tree[T]:` over `type Tree[T] =
+        // Leaf[T] | Branch[T]` distributes into two blocks whose SANITISED
+        // headers carry the `[T]` arg on the name (`impl Leaf[T]:` /
+        // `impl Branch[T]:`). The remap must still group and redirect them
+        // exactly as for the non-generic `impl Leaf:` / `impl Branch:` form.
+        let sanitised = "impl Leaf[T]:\n\
+                         \x20\x20\x20\x20def total(self) -> int:\n\
+                         \x20\x20\x20\x20\x20\x20\x20\x20return self.x\n\
+                         \n\
+                         impl Branch[T]:\n\
+                         \x20\x20\x20\x20def total(self) -> int:\n\
+                         \x20\x20\x20\x20\x20\x20\x20\x20return self.x\n";
+        let remap = BlockRemap::from_sanitised(sanitised, &[0, 4])
+            .expect("two generic distributed impl blocks should produce a remap");
+        let second_block = sanitised.find("impl Branch[T]:").unwrap();
+        let dup_self = second_block + sanitised[second_block..].find("self.x").unwrap();
+        let first_self = sanitised.find("self.x").unwrap();
+        assert_eq!(
+            remap.remap_offset(dup_self),
+            first_self,
+            "a label in the generic duplicated block must redirect onto the first block"
+        );
         assert_eq!(remap.remap_offset(first_self), first_self);
     }
 

@@ -320,6 +320,80 @@ fn impl_alias_sealed_union_diagnostics_point_at_real_source() {
 }
 
 #[test]
+fn impl_generic_alias_sealed_union_diagnostics_point_at_real_source() {
+    // B15 generic case: distributing a GENERIC `impl[T] Tree[T]:` over a
+    // sealed union (`type Tree[T] = Leaf[T] | Branch[T]`) byte-duplicates
+    // the impl body once per variant. The sanitised headers carry the
+    // `[T]` arg on the name (`impl Leaf[T]:` / `impl Branch[T]:`), so the
+    // `impl `/`impl[` recognition in both the check-driver gating and the
+    // B15 remap must accept the generic form. Before the fix, the second
+    // variant's diagnostic rendered at a synthetic line past the file's
+    // real EOF; after, it resolves to the single real impl member line.
+    let tmp = tempfile::tempdir().unwrap();
+    let src = "class Leaf[T]:\n\
+               \x20\x20\x20\x20value: int\n\
+               \n\
+               class Branch[T]:\n\
+               \x20\x20\x20\x20left: int\n\
+               \x20\x20\x20\x20right: int\n\
+               \n\
+               type Tree[T] = Leaf[T] | Branch[T]\n\
+               \n\
+               impl[T] Tree[T]:\n\
+               \x20\x20\x20\x20def total(self) -> int:\n\
+               \x20\x20\x20\x20\x20\x20\x20\x20return self.nonexistent_field + 1\n";
+    let real_line_count = src.lines().count();
+    // The user-written impl body member (`return …`) is the 12th line.
+    let body_line = 12usize;
+    let path = tmp.path().join("tree.ty");
+    std::fs::write(&path, src).unwrap();
+
+    let out = tyc().arg("check").arg(&path).output().unwrap();
+    assert!(
+        !out.status.success(),
+        "expected the bogus-attribute check to fail"
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stderr),
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(
+        combined.contains("tyc::attribute_not_found"),
+        "expected attribute_not_found, got:\n{combined}"
+    );
+    // Both variants must be reported (one diagnostic each for Leaf/Branch).
+    assert!(
+        combined.contains("on `Leaf`") && combined.contains("on `Branch`"),
+        "expected a diagnostic for each union variant, got:\n{combined}"
+    );
+
+    let mut saw_location = false;
+    for cap in combined.split("tree.ty:").skip(1) {
+        let digits: String = cap.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if digits.is_empty() {
+            continue;
+        }
+        saw_location = true;
+        let line: usize = digits.parse().unwrap();
+        assert!(
+            line <= real_line_count,
+            "B15 (generic): diagnostic reported line {line}, past the source's \
+             real {real_line_count} lines:\n{combined}"
+        );
+        assert_eq!(
+            line, body_line,
+            "B15 (generic): per-variant diagnostic should resolve to the real \
+             impl member line {body_line}, got {line}:\n{combined}"
+        );
+    }
+    assert!(
+        saw_location,
+        "expected at least one `tree.ty:<line>:<col>` location, got:\n{combined}"
+    );
+}
+
+#[test]
 fn real_adjacent_duplicate_impls_report_their_own_lines() {
     // B15 robustness: two GENUINELY-REAL, adjacent `impl A:` / `impl B:`
     // blocks with byte-identical bodies are indistinguishable from a

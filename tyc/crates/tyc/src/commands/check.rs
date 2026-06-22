@@ -580,7 +580,19 @@ fn record_distributed_lines(
     path_key: &str,
     source: &str,
 ) {
-    let lines = if source.contains("impl ") || source.contains("extend ") {
+    // Recognise both the non-generic `impl ` / `extend ` headers and the
+    // generic `impl[T,…] ` / `extend[T,…] ` forms (mirroring
+    // `expand_impl_sealed_unions` in tyc-syntax). A bare `contains("impl ")`
+    // would miss a buffer whose impl headers are ALL generic (`impl[T] Tree[T]:`
+    // has no `impl ` with a trailing space), skipping the preprocess and
+    // recording an empty distributed set — which then disables the B15 remap
+    // for generic distributions (their 2nd+ variant diagnostics would render
+    // past EOF).
+    let carries_impl_or_extend = source.contains("impl ")
+        || source.contains("extend ")
+        || source.contains("impl[")
+        || source.contains("extend[");
+    let lines = if carries_impl_or_extend {
         preprocess(source).impl_distributed_lines
     } else {
         Vec::new()

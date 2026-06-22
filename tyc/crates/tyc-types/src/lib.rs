@@ -2208,7 +2208,19 @@ pub fn compute_bidirectional_bindings_hkt(
         if any_unbound {
             let mut backward: std::collections::HashMap<String, Type> =
                 std::collections::HashMap::new();
-            bind_typevars_with_ctors(return_type, expected, &mut backward, ctor_vars);
+            // Use the *checked* binding walk so an ill-kinded application
+            // discovered during return-type-driven inference (e.g. a method
+            // returning `F[A]` used where `dict[str, int]` is expected — an
+            // arity mismatch, `F` applied to ONE argument vs `dict`'s TWO)
+            // surfaces as a `KindError` on the SAME reporting path the
+            // forward argument-binding pass uses, instead of being silently
+            // dropped and accepted by the later HKT assignability shortcut.
+            // A legitimate backward HKT binding (returning `F[A]` where
+            // `list[int]` is expected → `F=list, A=int`) produces no error
+            // and still succeeds silently.
+            if let Err(e) = bind_typevars_checked(return_type, expected, &mut backward, ctor_vars) {
+                errors.push(e);
+            }
             for (name, ty) in backward {
                 bindings.entry(name).or_insert(ty);
             }
@@ -25383,6 +25395,71 @@ def main(animals: producer.Producer[Animal]) -> None:
             result,
             Type::Generic("F".to_string(), vec![Type::TypeVar("A".to_string())]),
             "empty ctor set must leave F[A] unbound; got {result:?}"
+        );
+    }
+
+    #[test]
+    fn hkt_backward_ctor_var_arity_mismatch_is_reported() {
+        // Backward (return-type-driven) inference: a no-arg signature whose
+        // return is `F[A]` (a genuine constructor var) used where the
+        // EXPECTED type is `dict[str, int]`. Binding `F[A]` (1 arg) against
+        // `dict[str, int]` (2 args) is an arity mismatch. The forward pass
+        // binds nothing (no actual args mention F), so the error can only be
+        // discovered backward — and must surface, not be silently dropped.
+        use crate::{bind_typevars_and_substitute_hkt, KindError, Type};
+        use std::collections::HashSet;
+
+        let ctor_vars: HashSet<String> = ["F".to_string()].into_iter().collect();
+        let formal_params: Vec<Type> = vec![];
+        let actual_args: Vec<Type> = vec![];
+        let return_type = Type::Generic("F".to_string(), vec![Type::TypeVar("A".to_string())]);
+        let expected = Type::Generic("dict".to_string(), vec![Type::Str, Type::Int]);
+
+        let (_result, errors) = bind_typevars_and_substitute_hkt(
+            &formal_params,
+            &actual_args,
+            &return_type,
+            Some(&expected),
+            &ctor_vars,
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|e| matches!(e, KindError::Arity { ctor, expected, actual }
+                    if ctor == "F" && *expected == 1 && *actual == 2)),
+            "backward F[A] vs dict[str, int] must report an Arity kind error; got {errors:?}"
+        );
+    }
+
+    #[test]
+    fn hkt_backward_ctor_var_matching_arity_binds_clean() {
+        // The legitimate backward case: return `F[A]` used where `list[int]`
+        // is expected → `F=list, A=int`, no error, return resolves to
+        // `list[int]`. This must keep succeeding silently after the fix.
+        use crate::{bind_typevars_and_substitute_hkt, Type};
+        use std::collections::HashSet;
+
+        let ctor_vars: HashSet<String> = ["F".to_string()].into_iter().collect();
+        let formal_params: Vec<Type> = vec![];
+        let actual_args: Vec<Type> = vec![];
+        let return_type = Type::Generic("F".to_string(), vec![Type::TypeVar("A".to_string())]);
+        let expected = Type::Generic("list".to_string(), vec![Type::Int]);
+
+        let (result, errors) = bind_typevars_and_substitute_hkt(
+            &formal_params,
+            &actual_args,
+            &return_type,
+            Some(&expected),
+            &ctor_vars,
+        );
+        assert!(
+            errors.is_empty(),
+            "matching-arity backward HKT binding must not error; got {errors:?}"
+        );
+        assert_eq!(
+            result,
+            Type::Generic("list".to_string(), vec![Type::Int]),
+            "F[A] vs list[int] must resolve F→list, A→int; got {result:?}"
         );
     }
 
