@@ -395,6 +395,81 @@ fn real_adjacent_duplicate_impls_report_their_own_lines() {
 }
 
 #[test]
+fn alias_present_but_real_adjacent_impls_report_their_own_lines() {
+    // Finding 1 (B15 edge): the source declares BOTH a sealed-union alias
+    // `type Event = A | B` AND manually-written, adjacent `impl A:` /
+    // `impl B:` blocks (NOT `impl Event:`) whose bodies are byte-identical
+    // and whose names match the alias's variant list in order. The
+    // preprocessor did NOT distribute anything here (the user wrote the
+    // per-variant impls themselves), so its recorded
+    // `impl_distributed_lines` is empty. The OLD diagnostic remap
+    // re-derived the distributed set from the text and — unable to tell
+    // this apart from a real distribution — wrongly collapsed the `impl B:`
+    // diagnostic onto `impl A:`. Threading the recorded metadata closes the
+    // edge: the `impl B:` diagnostic must report B's OWN real line.
+    let tmp = tempfile::tempdir().unwrap();
+    let src = "type Event = A | B\n\
+               \n\
+               class A:\n\
+               \x20\x20\x20\x20a_field: int\n\
+               \n\
+               class B:\n\
+               \x20\x20\x20\x20b_field: int\n\
+               \n\
+               impl A:\n\
+               \x20\x20\x20\x20def total(self) -> int:\n\
+               \x20\x20\x20\x20\x20\x20\x20\x20return self.missing\n\
+               \n\
+               impl B:\n\
+               \x20\x20\x20\x20def total(self) -> int:\n\
+               \x20\x20\x20\x20\x20\x20\x20\x20return self.missing\n";
+    // `return self.missing` inside `impl A:` is line 11, inside `impl B:`
+    // line 15 (1-based).
+    let first_block_line = 11usize;
+    let second_block_line = 15usize;
+    let path = tmp.path().join("edge.ty");
+    std::fs::write(&path, src).unwrap();
+
+    let out = tyc().arg("check").arg(&path).output().unwrap();
+    assert!(
+        !out.status.success(),
+        "expected the bogus-attribute check to fail"
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stderr),
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(
+        combined.contains("tyc::attribute_not_found"),
+        "expected attribute_not_found, got:\n{combined}"
+    );
+    let mut lines: Vec<usize> = Vec::new();
+    for cap in combined.split("edge.ty:").skip(1) {
+        let digits: String = cap.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if let Ok(n) = digits.parse::<usize>() {
+            lines.push(n);
+        }
+    }
+    assert!(
+        !lines.is_empty(),
+        "expected at least one `edge.ty:<line>:<col>` location, got:\n{combined}"
+    );
+    // The `impl B:` diagnostic must land on B's own real line, NOT be
+    // collapsed onto the first block by the text re-derivation.
+    assert!(
+        lines.contains(&second_block_line),
+        "Finding 1: the `impl B:` diagnostic must report its real line \
+         {second_block_line}, got {lines:?}:\n{combined}"
+    );
+    assert!(
+        lines.contains(&first_block_line),
+        "expected the `impl A:` diagnostic at line {first_block_line}, \
+         got {lines:?}:\n{combined}"
+    );
+}
+
+#[test]
 fn cyclic_type_alias_emits_diagnostic() {
     // FINDINGS #81: `type A = B; type B = A` forms a cycle. No concrete
     // type can ever satisfy it; reject at check time instead of letting

@@ -103,6 +103,16 @@ pub fn run(args: CheckArgs) -> Result<()> {
     let mut diags = Diagnostics::new();
     let mut file_count = 0usize;
     let mut db = TycDatabase::new();
+    // B15 (Finding 1): the diagnostic line-remap for `impl Alias:`-over-
+    // sealed-union distributions needs the *recorded* set of synthesised
+    // header lines to tell a real, user-authored adjacent `impl A:` /
+    // `impl B:` pair apart from a synthetic distribution. The renderer only
+    // holds each diagnostic's embedded source, so we capture the
+    // preprocessor's `impl_distributed_lines` here — keyed by the same path
+    // string the diagnostics carry — and hand the map to the render loop,
+    // which prefers it over the (sound but less precise) text re-derivation.
+    let mut distributed_by_path: std::collections::HashMap<String, Vec<usize>> =
+        std::collections::HashMap::new();
 
     // FINDINGS #79: build the set of dotted module names contained in the
     // project so the per-file unknown-module check can resolve sibling
@@ -327,12 +337,10 @@ pub fn run(args: CheckArgs) -> Result<()> {
                 }
             };
 
-            let file_diags = check_file_with_imports(
-                &mut db,
-                path.to_string_lossy().into_owned(),
-                source.clone(),
-                &project_shapes,
-            );
+            let path_key = path.to_string_lossy().into_owned();
+            record_distributed_lines(&mut distributed_by_path, &path_key, &source);
+            let file_diags =
+                check_file_with_imports(&mut db, path_key, source.clone(), &project_shapes);
             diags.extend(file_diags);
 
             // R2-4: warn if the module name collides with a Python
@@ -379,12 +387,10 @@ pub fn run(args: CheckArgs) -> Result<()> {
                         continue;
                     }
                 };
-                let file_diags = check_file_with_imports(
-                    &mut db,
-                    path.to_string_lossy().into_owned(),
-                    source.clone(),
-                    &project_shapes,
-                );
+                let path_key = path.to_string_lossy().into_owned();
+                record_distributed_lines(&mut distributed_by_path, &path_key, &source);
+                let file_diags =
+                    check_file_with_imports(&mut db, path_key, source.clone(), &project_shapes);
                 diags.extend(file_diags);
 
                 // R2-4: same stdlib-name shadow check for `.dty` stubs
@@ -469,7 +475,7 @@ pub fn run(args: CheckArgs) -> Result<()> {
     // an error root (e.g. a repeated definition across passes).
     diags.dedup();
 
-    render_diagnostics(&diags);
+    render_diagnostics(&diags, &distributed_by_path);
 
     if diags.has_errors() {
         return Err(miette!(
@@ -561,12 +567,36 @@ pub fn run(args: CheckArgs) -> Result<()> {
     Ok(())
 }
 
+/// Capture the preprocessor's recorded `impl_distributed_lines` for
+/// `source` under `path_key`, for the B15 diagnostic line-remap (Finding
+/// 1). Only files that actually carry an `impl`/`extend` block can have a
+/// non-empty distributed set, so the (otherwise wasted) extra preprocess
+/// is skipped for the overwhelmingly common case. An empty entry is still
+/// recorded so the renderer can distinguish "checked, nothing distributed"
+/// (use recorded → no remap) from "no metadata" (fall back to
+/// re-derivation).
+fn record_distributed_lines(
+    map: &mut std::collections::HashMap<String, Vec<usize>>,
+    path_key: &str,
+    source: &str,
+) {
+    let lines = if source.contains("impl ") || source.contains("extend ") {
+        preprocess(source).impl_distributed_lines
+    } else {
+        Vec::new()
+    };
+    map.insert(path_key.to_owned(), lines);
+}
+
 /// Render every diagnostic in `diags`, grouping by source file (so CI
 /// logs cluster related errors instead of interleaving by phase) and
 /// printing a per-code tally + `tyc explain` hint at the end. The
 /// previous renderer fired errors in the order they were collected,
 /// which scattered findings across files on multi-file projects.
-fn render_diagnostics(diags: &Diagnostics) {
+fn render_diagnostics(
+    diags: &Diagnostics,
+    distributed_by_path: &std::collections::HashMap<String, Vec<usize>>,
+) {
     use miette::Diagnostic;
 
     // Group by `(severity, file)` so a warning in foo.ty doesn't get
@@ -592,10 +622,24 @@ fn render_diagnostics(diags: &Diagnostics) {
         for (file, items) in groups {
             eprintln!("── {} in {} ──", label, file);
             let cached = items.first().and_then(|d| sanitised_named_source_for(d));
+            // Prefer the preprocessor's RECORDED distributed-impl lines for
+            // this file (B15 / Finding 1). When the map has no entry — e.g.
+            // the diagnostic's path string didn't match any checked file —
+            // fall back to `wrap_with_source`, whose text re-derivation is a
+            // sound (if marginally less precise) signal, never leaving a
+            // render path with no distributed-line data.
+            let recorded = distributed_by_path.get(file);
             for d in items {
-                let wrapped = match cached.clone() {
-                    Some(src) => SanitisedDiagnostic::wrap_with_source((*d).clone(), src),
-                    None => SanitisedDiagnostic::wrap((*d).clone()),
+                let wrapped = match (cached.clone(), recorded) {
+                    (Some(src), Some(lines)) => {
+                        SanitisedDiagnostic::wrap_with_source_and_distributed(
+                            (*d).clone(),
+                            src,
+                            lines,
+                        )
+                    }
+                    (Some(src), None) => SanitisedDiagnostic::wrap_with_source((*d).clone(), src),
+                    (None, _) => SanitisedDiagnostic::wrap((*d).clone()),
                 };
                 eprintln!("{:?}", miette::Report::new_boxed(Box::new(wrapped)));
             }

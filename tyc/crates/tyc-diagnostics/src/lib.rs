@@ -3511,6 +3511,40 @@ impl SanitisedDiagnostic {
             block_remap,
         }
     }
+
+    /// Like [`wrap_with_source`](Self::wrap_with_source) but uses the
+    /// `impl_distributed_lines` the preprocessor *recorded* at expansion
+    /// time, instead of re-deriving the distributed set from the source
+    /// text.
+    ///
+    /// Re-derivation (`distributed_impl_lines`) reconstructs the set by
+    /// matching `impl` runs against the source's own `type X = A | B`
+    /// aliases. That is sound for buffers the preprocessor produced, but
+    /// it cannot tell a synthetic distribution apart from a genuinely
+    /// user-authored pair of adjacent `impl A:` / `impl B:` blocks that
+    /// happen to share an identical body *and* whose names match such an
+    /// alias's variants in order — it would wrongly remap a diagnostic in
+    /// the user's `impl B` onto `impl A`. The recorded indices carry the
+    /// real/synthetic distinction directly, closing that edge.
+    ///
+    /// Callers that hold the originating [`tyc_syntax::PreprocessResult`]
+    /// (the primary `tyc check` render path) should prefer this
+    /// constructor; paths without the metadata keep using
+    /// [`wrap_with_source`](Self::wrap_with_source), whose re-derivation
+    /// remains a sound fallback.
+    pub fn wrap_with_source_and_distributed(
+        inner: TycError,
+        sanitised: NamedSource<String>,
+        distributed_lines: &[usize],
+    ) -> Self {
+        let text = named_source_text(&sanitised);
+        let block_remap = BlockRemap::from_sanitised(&text, distributed_lines);
+        Self {
+            inner,
+            sanitised: Some(sanitised),
+            block_remap,
+        }
+    }
 }
 
 /// Read the full text out of a `NamedSource<String>`. miette doesn't

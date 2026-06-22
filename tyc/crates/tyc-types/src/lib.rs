@@ -4583,6 +4583,22 @@ impl<'a> Checker<'a> {
         if self.class_shapes.contains_key(name) {
             return false;
         }
+        // SOUNDNESS (Finding 2): a name that also resolves to a concrete type
+        // alias or a sealed-union alias in scope is NOT a higher-kinded
+        // constructor *variable* — it is a real, structurally-meaningful head.
+        // If a module declares both an HKT param `F` and a concrete alias
+        // `type F[T] = list[T]`, treating `F[..]` as a constructor variable
+        // would let the HKT shortcut in `is_assignable` bind `F` and skip
+        // comparing the alias arguments, wrongly accepting `F[str]` where
+        // `F[int]` is required. Excluding concrete alias / union heads forces
+        // those `F[..]` applications down the alias-unwrap path
+        // (`list[str]` vs `list[int]` → reject) instead.
+        if self.type_aliases.contains_key(name) {
+            return false;
+        }
+        if self.sealed_unions.contains_key(name) {
+            return false;
+        }
         self.hkt_param_names.contains(name)
     }
 
@@ -25483,6 +25499,86 @@ def main() -> None:
             d.errors().is_empty(),
             "ordinary generic class usage must stay clean; got {:?}",
             d.errors()
+        );
+    }
+
+    // ── Finding 2 (SOUNDNESS): an HKT-param name that is ALSO a concrete
+    //    type alias / union in scope must NOT be treated as a higher-kinded
+    //    constructor variable by `is_assignable`. Otherwise the HKT shortcut
+    //    binds the head and skips comparing the alias arguments, wrongly
+    //    accepting `F[str]` where `F[int]` is required. ──────────────────────
+
+    #[test]
+    fn hkt_alias_head_is_not_a_ctor_var() {
+        use tyc_resolve::resolve_module;
+        use tyc_syntax::preprocess::preprocess;
+
+        // Trivial source just to construct a resolved module / Checker.
+        let prep = preprocess("x = 1\n");
+        let module = tyc_syntax::parse_module(&prep.python_source)
+            .unwrap()
+            .into_syntax();
+        let (resolved, _) = resolve_module("<test>".to_owned(), &prep.python_source, &module);
+
+        let mut c = Checker::new("<test>".to_owned(), &prep.python_source, &resolved);
+        // `class Functor[F[_]]` would put `F` in `hkt_param_names`...
+        c.hkt_param_names.insert("F".to_owned());
+        // ...but the module ALSO declares `type F[T] = list[T]`, a concrete
+        // alias — so `F[..]` heads must compare structurally, not bind.
+        c.type_aliases.insert(
+            "F".to_owned(),
+            (
+                vec!["T".to_owned()],
+                Type::Generic("list".to_owned(), vec![Type::TypeVar("T".to_owned())]),
+            ),
+        );
+
+        let f_int = Type::Generic("F".to_owned(), vec![Type::Int]);
+        let f_str = Type::Generic("F".to_owned(), vec![Type::Str]);
+
+        assert!(
+            !c.is_ctor_var_name("F"),
+            "a name that is also a concrete alias must not be a ctor var"
+        );
+        assert!(
+            !c.is_assignable(&f_int, &f_str),
+            "F[str] must NOT be assignable to F[int] when F is a concrete \
+             alias `type F[T] = list[T]` (compares list[str] vs list[int])"
+        );
+        assert!(
+            c.is_assignable(&f_int, &f_int),
+            "F[int] into F[int] (same alias args) must still be accepted"
+        );
+    }
+
+    #[test]
+    fn hkt_genuine_ctor_var_without_shadowing_alias_still_binds() {
+        use tyc_resolve::resolve_module;
+        use tyc_syntax::preprocess::preprocess;
+
+        let prep = preprocess("x = 1\n");
+        let module = tyc_syntax::parse_module(&prep.python_source)
+            .unwrap()
+            .into_syntax();
+        let (resolved, _) = resolve_module("<test>".to_owned(), &prep.python_source, &module);
+
+        let mut c = Checker::new("<test>".to_owned(), &prep.python_source, &resolved);
+        // A genuine `class Functor[F[_]]` with NO shadowing concrete alias:
+        // `F` is a real constructor variable, so the HKT shortcut still treats
+        // `F[..]` permissively (the real well-kindedness check runs in the
+        // unifier). C1 must not regress.
+        c.hkt_param_names.insert("F".to_owned());
+
+        let f_int = Type::Generic("F".to_owned(), vec![Type::Int]);
+        let f_str = Type::Generic("F".to_owned(), vec![Type::Str]);
+
+        assert!(
+            c.is_ctor_var_name("F"),
+            "a real HKT param with no shadowing concrete alias is a ctor var"
+        );
+        assert!(
+            c.is_assignable(&f_int, &f_str),
+            "genuine HKT ctor-var heads stay permissive in is_assignable (C1)"
         );
     }
 
