@@ -34,8 +34,8 @@ v0.5.0) is now backed by real unification.
 (`def f[F[_]](...)`), constructor application on non-class heads, and
 constructor composition.
 
-Code: `tyc-types/src/lib.rs` (`Type::TypeConstructor`, `bind_typevars_and_substitute`),
-`tyc-diagnostics/src/lib.rs` (`kind_mismatch`).
+Code: `tyc/crates/tyc-types/src/lib.rs` (`Type::TypeConstructor`, `bind_typevars_and_substitute`),
+`tyc/crates/tyc-diagnostics/src/lib.rs` (`kind_mismatch`).
 
 ### 2. User-generic variance inference ✅
 
@@ -59,7 +59,7 @@ Built-in variance (mutable containers invariant; read-only views, `tuple`,
 `Mapping` values, `Callable` return covariant; `Callable` args contravariant;
 `Result` covariant in both) was already in place and is unchanged.
 
-Code: `tyc-types/src/lib.rs` (`Variance`, `generic_param_variance`,
+Code: `tyc/crates/tyc-types/src/lib.rs` (`Variance`, `generic_param_variance`,
 `user_generic_param_variance`, `infer_class_param_variance`).
 
 ### 3. General inter-procedural field-init audit ✅
@@ -69,7 +69,7 @@ that tracks partial-instance escapes across call chains, so a partially
 initialised instance escaping through a non-trivial helper chain fires
 `tyc::missing_field_init` (no false positives on the corpus).
 
-Code: `tyc-types` / `tyc-analyse` (per-function init summary).
+Code: `tyc/crates/tyc-types` / `tyc/crates/tyc-analyse` (per-function init summary).
 
 ### 4. Comptime types-as-values ✅ (since v0.5.0)
 
@@ -78,7 +78,7 @@ Code: `tyc-types` / `tyc-analyse` (per-function init summary).
 type expressions and are usable in annotation positions. `Any` is excluded (not
 a runtime builtin). Unchanged from the original implementation.
 
-Code: `tyc-analyse/src/lib.rs` (`ComptimeValue::Type`).
+Code: `tyc/crates/tyc-analyse/src/lib.rs` (`ComptimeValue::Type`).
 
 ---
 
