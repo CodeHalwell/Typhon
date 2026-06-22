@@ -1,151 +1,111 @@
-# Type System Frontier - Implementation Summary
+# Type System Frontier — Status
 
-This document summarizes the implementation of three independent type system enhancements
-from [Epic: type-system frontier — HKT, full variance inference, comptime types-as-values](https://github.com/CodeHalwell/Typhon/pull/113).
+This document tracks the type-system frontier work: what has **landed** in the
+development line, and what remains **open**. It supersedes the original
+"foundation" summary from
+[Epic: type-system frontier — HKT, full variance inference, comptime types-as-values](https://github.com/CodeHalwell/Typhon/pull/113);
+the unification and variance-inference work that epic scoped as future has since
+shipped (post-v0.15.7, on the line converging toward `v1.0.0-alpha`).
 
-## 1. Higher-Kinded Types (HKT) - Foundation ✅
+---
 
-### What was implemented
+## Landed (post-v0.15.7, development line)
 
-- **New `Type::TypeConstructor` variant**: Represents type constructors with unbound parameters
-- **`F[_]` syntax recognition**: Parser recognizes higher-kinded type parameters (only when F is a declared type parameter)
-- **HKT binding support**: TypeConstructor unification in `bind_typevars` for proper HKT inference
-- **Display support**: `Functor[_]`, `Bifunctor[_, _]` display correctly
+### 1. Higher-Kinded Types (HKT) — unification ✅
 
-### Code locations
+The HKT scaffold (the `Type::TypeConstructor` variant and `F[_]` parser support,
+v0.5.0) is now backed by real unification.
 
-- Type enum: `tyc/crates/tyc-types/src/lib.rs:87`
-- Parser support: `tyc/crates/tyc-types/src/lib.rs:1090-1111` (restricted to type parameters)
-- HKT binding: `tyc/crates/tyc-types/src/lib.rs:1241-1248`
-- Display: `tyc/crates/tyc-types/src/lib.rs:181-184`
+- **Constructor-variable binding**: `bind_typevars_and_substitute` binds a
+  constructor variable against a concrete head — `F[A]` against `list[int]`
+  binds `F = list, A = int` — and substitutes `F`/`A` in the return type, so a
+  `class Functor[F[_]]:` / `interface Functor[F[_]]:` with a `map` over `list`
+  (and other single-arg constructors) type-checks.
+- **Kind checking**: applying a constructor variable with the wrong arity
+  (`F[A, B]` against `list[int]`), or binding one `F` to two different
+  constructors within a single call, emits the new **`tyc::kind_mismatch`**
+  diagnostic. Backward kind-error propagation and generic-impl-header remapping
+  are wired through `tyc-diagnostics`.
+- **Cross-module**: constructor identity propagates across module boundaries
+  alongside variance (a `Functor[F[_]]` declared in one module unifies in a
+  consumer).
 
-### Example usage
+**Still deferred** (see *Open* below): function-level HKT params
+(`def f[F[_]](...)`), constructor application on non-class heads, and
+constructor composition.
 
-```python
-# Not yet fully functional - this is the foundation
-# Future work: Update bind_typevars_and_substitute for HKT unification
-class Functor[F[_]]:
-    def map[A, B](self, fa: F[A], f: A -> B) -> F[B]: ...
-```
+Code: `tyc/crates/tyc-types/src/lib.rs` (`Type::TypeConstructor`, `bind_typevars_and_substitute`),
+`tyc/crates/tyc-diagnostics/src/lib.rs` (`kind_mismatch`).
 
-### Tests
+### 2. User-generic variance inference ✅
 
-Four comprehensive tests added:
-- `hkt_type_constructor_single_underscore`
-- `hkt_type_constructor_multiple_underscores`
-- `hkt_type_constructor_display`
-- `hkt_type_constructor_is_assignable`
+User-declared generics are no longer invariant-by-default. A pass classifies
+each class type-parameter's usage and stores per-class variance, consulted in
+`is_assignable`.
 
-## 2. Comptime Types-as-Values ✅
+- **Inference from usage**: a param used only in output position infers
+  **covariant**, only in input position **contravariant**, in both **invariant**
+  (`infer_class_param_variance` / `collect_param_variance`, composed via
+  `compose_variance` / `join_variance`). So a `class Producer[T]` with `T` only
+  in returns accepts `Producer[Dog]` where `Producer[Animal]` is expected.
+- **Explicit override**: a bare `@covariant` / `@contravariant` class decorator
+  forces the variance regardless of inferred usage (`explicit_variance_override`).
+- **Through interface bounds (C4)**: variance flows soundly through
+  bounded type-params (`T: SomeInterface`) — this closed a soundness hole, not
+  just a relaxation.
+- **Cross-module**: inferred variance propagates across module boundaries.
 
-### What was implemented
+Built-in variance (mutable containers invariant; read-only views, `tuple`,
+`Mapping` values, `Callable` return covariant; `Callable` args contravariant;
+`Result` covariant in both) was already in place and is unchanged.
 
-- **New `ComptimeValue::Type` variant**: Types can now be comptime values
-- **Type name recognition**: Runtime-resolvable built-in types only: `int`, `str`, `bool`, `float`, `bytes`, `None`, `type`, `object`
-- **`Any` excluded**: Not a runtime builtin; would cause NameError without importing from `typing`
-- **Emission strategy**: Type values emit as type expressions, not string literals
-- **Full integration**: Works with all existing comptime operations
+Code: `tyc/crates/tyc-types/src/lib.rs` (`Variance`, `generic_param_variance`,
+`user_generic_param_variance`, `infer_class_param_variance`).
 
-### Code locations
+### 3. General inter-procedural field-init audit ✅
 
-- ComptimeValue enum: `tyc/crates/tyc-analyse/src/lib.rs:104`
-- Type recognition: `tyc/crates/tyc-analyse/src/lib.rs:381-395`
-- Display: `tyc/crates/tyc-analyse/src/lib.rs:162-166`
-- Tests: `tyc/crates/tyc/tests/build_features.rs:1542-1621`
+The trivial factory-helper special case is replaced by a per-function summary
+that tracks partial-instance escapes across call chains, so a partially
+initialised instance escaping through a non-trivial helper chain fires
+`tyc::missing_field_init` (no false positives on the corpus).
 
-### Example usage
+Code: `tyc/crates/tyc-types` / `tyc/crates/tyc-analyse` (per-function init summary).
 
-```python
-# Define a type at compile time
-comptime let T: type = int
+### 4. Comptime types-as-values ✅ (since v0.5.0)
 
-# Use it in annotations
-let x: T = 42  # Equivalent to: let x: int = 42
+`comptime let T: type = int` and the runtime-resolvable builtin type set
+(`int`, `str`, `bool`, `float`, `bytes`, `None`, `type`, `object`) emit as bare
+type expressions and are usable in annotation positions. `Any` is excluded (not
+a runtime builtin). Unchanged from the original implementation.
 
-# Type names are first-class comptime values
-comptime let types = [int, str, bool]
-comptime let name = str(int)  # "int"
-```
+Code: `tyc/crates/tyc-analyse/src/lib.rs` (`ComptimeValue::Type`).
 
-### Design notes
+---
 
-- Type values emit as bare type names, not string literals
-- `comptime let T: type = int` emits `int` not `"int"`
-- This allows types to be used in annotation positions
-- The `type` annotation is recognized at comptime only
+## Open (remaining frontier)
 
-## 3. Full Variance Inference - Infrastructure Complete ✅
+These are the items the language reference and skill point here for:
 
-### What was implemented
+- **Embedded `ty` (Phase 2)** — run Astral's `ty` in-process sharing the Salsa
+  DB, eliminating the subprocess parse/re-elaborate round-trip
+  (`docs/ty-integration.md` Phase 2). Blocked on vendoring `ty` (a git source)
+  past the `cargo deny` supply-chain policy, then sharing the DB. The Phase 1
+  subprocess path (`[checker] external = "ty"` / `--with-ty`) ships and remains
+  the fallback; Phase 2 is **perf-only**, no new capability.
+- **Typeshed-backed checking for pure-extension libraries** — arg-type checking
+  for `.pyi`-only / C-extension packages (numpy/pandas public API) whose
+  signatures venv introspection can't recover. Shares typeshed handling with the
+  embedded-`ty` work.
+- **Accumulator-loop parallelisation** — comprehension parallelisation already
+  ships (`auto-parallel`); generalising it to accumulator loops is a non-goal
+  for the alpha.
+- **Function-level HKT params, non-class constructor application, constructor
+  composition** — the deferred remainder of the HKT work above.
 
-The variance infrastructure is fully in place and covers all Python built-ins:
-
-- **Mutable containers** (invariant): `list[0]`, `dict[0]`, `dict[1]`, `set[0]`
-- **Read-only views** (covariant): `Sequence[0]`, `Iterable[0]`, `Iterator[0]`, `tuple[*]`
-- **Mapping types**: `Mapping[0]` invariant (keys), `Mapping[1]` covariant (values)
-- **Callable**: `Callable[0]` contravariant (args), `Callable[1]` covariant (return)
-- **Result**: Both `Result[0]` and `Result[1]` are covariant
-
-### Code locations
-
-- Variance enum: `tyc/crates/tyc-types/src/lib.rs:747-757`
-- Built-in mapping: `tyc/crates/tyc-types/src/lib.rs:768-862`
-- Used in assignability: `tyc/crates/tyc-types/src/lib.rs:294-316`
-
-### What's deferred
-
-User-declared generics (`class Box[T]: ...`) currently default to invariant.
-Full variance inference would require:
-
-1. Walking the class body to classify each type parameter's usage
-2. Storing per-class variance in `class_type_params`
-3. Consulting the inferred variance in `is_assignable`
-
-This is a well-scoped future enhancement, as described in the roadmap.
-
-## Test Results
-
-All tests pass:
-- **tyc-types**: 242 tests (including 4 new HKT tests)
-- **tyc-analyse**: 138 tests (ComptimeValue::Type integrated)
-- **Total workspace**: 1477 tests across all packages
-
-## Next Steps
-
-### For HKT (medium effort)
-
-The foundation is complete. The remaining work is in `bind_typevars_and_substitute`:
-
-1. Extend type variable binding to handle type constructors
-2. Support unification of `F[_]` with concrete types like `list`
-3. Allow higher-kinded type parameters in function signatures
-
-See `docs/roadmap.md` Concrete next step #2.
-
-### For Variance Inference (medium effort)
-
-The classification rules are well-defined:
-
-1. Create a pass that walks `ClassDef.body`
-2. Track whether each type parameter appears in covariant, contravariant, or invariant positions
-3. Store the inferred variance alongside the type parameter names
-4. Use it in the `is_assignable` Generic arm
-
-See `docs/roadmap.md` Concrete next step #2.
-
-### For Comptime Types (design decision)
-
-The implementation is complete for the basic case. The open question is:
-
-**What is `type` at the type level?**
-- Is `type` a comptime-only marker?
-- Should it surface to the type checker as a first-class type?
-- Should `comptime let T: type = int` allow `T` to be used at runtime?
-
-See `docs/roadmap.md` Phase 4+ "Richer comptime".
+---
 
 ## References
 
-- Epic PR: [type-system frontier — HKT, full variance inference, comptime types-as-values](https://github.com/CodeHalwell/Typhon/pull/113)
-- Roadmap: `docs/roadmap.md` Concrete next step #2 and Phase 4+
-- Implementation PR: [#113](https://github.com/CodeHalwell/Typhon/pull/113)
+- Alpha plan: [`docs/alpha-release-plan.md`](docs/alpha-release-plan.md) (WS-C, WS-D, WS-A/A3).
+- `ty` integration: [`docs/ty-integration.md`](docs/ty-integration.md).
+- Epic PR (original scope): [#113](https://github.com/CodeHalwell/Typhon/pull/113).

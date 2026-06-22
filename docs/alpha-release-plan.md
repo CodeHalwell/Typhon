@@ -63,10 +63,22 @@ The alpha is releasable when **all** of the following hold:
 Each landed with tests, full `cargo test --workspace` green, and both corpus gates
 (`corpus_examples_all_check_clean`, `third_party_corpus_round_trips_cleanly`) passing.
 
-**Remaining tail (blocked-here or owner-decision):**
+**Alpha cut — PREPARED (2026-06-22).** F4 is staged on the release branch:
+workspace version bumped to `1.0.0-alpha` (`tyc/Cargo.toml`), the
+`1.0.0-alpha` CHANGELOG section written with a compat/stability statement and a
+known-limitations list, and the README / roadmap "current release" pointers
+updated. The tag + GitHub release are produced automatically by `auto-tag.yml`
+→ `release.yml` on merge to `main` (the workflow reads the version from
+`tyc/Cargo.toml` → tag `v1.0.0-alpha`). Owner decision: **cut now, defer the M3
+tail to beta** (the alpha can ship after M2 per the risk register). All release
+gates re-verified at the cut: `cargo fmt --check`, `cargo clippy --workspace
+-D warnings`, `cargo test --workspace` green; examples 48/48 and
+`stress/round-2026-06-21/` 130/130 check clean.
+
+**Deferred to beta (owner decision 2026-06-22 — documented known-limitations):**
 - **A3** (typeshed for pure-extension libs) — large; pairs with D2; needs typeshed corpus.
 - **B2** (migrate-harden on real PyPI packages) — needs reliable `pip`; suited to the
-  nightly `pypi-sweep` harness, not a sandbox task.
+  nightly `pypi-sweep` harness, not a sandbox task. (B1 `mut else:` fix shipped.)
 - **D1/D2** (embedded `ty`) — needs vendoring Astral's `ty` (git source) + `cargo deny`
   carve-out; perf-only (subprocess Phase 1 ships).
 - **E3** (ergonomics: newtype arithmetic, `impl` on sealed-union aliases) — local but

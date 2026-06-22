@@ -10,6 +10,22 @@ Realistic milestones for one person plus AI assistance. The headline target is a
 
 ## Current release
 
+**[v1.0.0-alpha](https://github.com/CodeHalwell/Typhon/releases/tag/v1.0.0-alpha) — 2026-06-22.**
+Typhon's first tagged alpha and first *feature-complete* milestone — the proven
+production surface plus the previously-deferred type-system frontier. Rolls up
+M1 + M2 of the [alpha release plan](alpha-release-plan.md), the early M3 polish
+(formatter idempotence, perf-regression CI gate), and the `rescue` boundary
+sugar. Frontier work lands: HKT unification (`tyc::kind_mismatch` on bad arity /
+conflicting binding), user-generic variance inference (covariant / contravariant
+from usage, cross-module, with `@covariant` / `@contravariant` overrides),
+variance through generic interface bounds, the inter-procedural field-init
+audit, and 2-member non-nullable union modelling. The production path
+(`tyc build` → CPython 3.13+) is stable; the full corpus builds to runnable
+Python and checks clean. Alpha caveat: surface syntax is not yet frozen and may
+change before `1.0.0` with a migration note. Deferred to beta: embedded `ty`
+Phase 2 (subprocess Phase 1 ships), typeshed pure-extension checking, and the
+function-level HKT tail. Additive on the accepted surface.
+
 **[v0.15.7](https://github.com/CodeHalwell/Typhon/releases/tag/v0.15.7) — 2026-06-21.**
 A robustness release deepening compile-time checking of third-party code and
 clearing a batch of type-checker false positives surfaced by the 2026-06-21

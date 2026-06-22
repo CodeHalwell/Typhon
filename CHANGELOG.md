@@ -6,6 +6,43 @@ canonical phase-by-phase status lives in `docs/roadmap.md`.
 
 ## Unreleased
 
+_Nothing yet._
+
+## 1.0.0-alpha — 2026-06-22 — first feature-complete alpha
+
+**Typhon's first tagged alpha.** This release rolls up milestones **M1**
+("Tidy & deepen") and **M2** ("Type-system frontier") of the
+[alpha release plan](docs/alpha-release-plan.md), plus the early M3 items
+(formatter idempotence, the performance-regression CI gate) and the `rescue`
+exception-boundary sugar. It is **additive on the accepted surface** since
+v0.15.7 — every previously-accepted program type-checks identically.
+
+**Compatibility & stability statement.** The production path
+(`tyc build` → CPython 3.13+) is stable: emitted Python is valid, idiomatic,
+and carries **no runtime dependency** on the Typhon toolchain (only a small
+generated `typhon_runtime/` package when you use `Result` / `go` / `freeze let`
+/ `lazy let` / auto-parallel / `as!`). The full `examples/` + `examples/apps/`
++ `stress/round-2026-06-21/` corpus builds to runnable Python and checks clean.
+As an **alpha**, the *surface syntax is not yet frozen* — it may still change
+before `1.0.0` with a documented migration note (per the plan's explicit
+non-goals). There is no semver stability guarantee on the language surface yet.
+
+**Known limitations deferred to beta** (tracked in
+[`TYPE_SYSTEM_FRONTIER.md`](TYPE_SYSTEM_FRONTIER.md) and the alpha plan's M3 tail):
+
+- **Embedded `ty` (Phase 2)** is not shipped — the Phase 1 subprocess path
+  (`[checker] external = "ty"` / `--with-ty`) ships and is the supported way to
+  get typeshed-backed checking. Phase 2 is perf-only (blocked on vendoring a git
+  source past `cargo deny`).
+- **Typeshed-backed checking for pure-extension libraries** (numpy/pandas
+  `.pyi`-only public APIs) is not yet automatic; use an authored `.dty` stub or
+  the `ty` subprocess pass.
+- **`tyc migrate` hardening** on the full curated PyPI set (B2) is ongoing; the
+  `mut else:` defect (B1) is fixed.
+- **Function-level HKT params** (`def f[F[_]]`), non-class constructor
+  application, and constructor composition remain deferred (class-level HKT
+  unification ships).
+
 ### Alpha prep — milestone M1 ("Tidy & deepen") of the [alpha release plan](docs/alpha-release-plan.md)
 
 First batch toward the feature-complete `v1.0.0-alpha`. See
