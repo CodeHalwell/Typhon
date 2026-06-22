@@ -1996,7 +1996,7 @@ dependencies = [
 
 [[package]]
 name = "tyc"
-version = "0.15.7"
+version = "1.0.0-alpha"
 dependencies = [
  "clap",
  "itoa",
@@ -2027,7 +2027,7 @@ dependencies = [
 
 [[package]]
 name = "tyc-analyse"
-version = "0.15.7"
+version = "1.0.0-alpha"
 dependencies = [
  "miette",
  "ruff_python_ast",
@@ -2041,7 +2041,7 @@ dependencies = [
 
 [[package]]
 name = "tyc-db"
-version = "0.15.7"
+version = "1.0.0-alpha"
 dependencies = [
  "criterion",
  "salsa",
@@ -2054,7 +2054,7 @@ dependencies = [
 
 [[package]]
 name = "tyc-desugar"
-version = "0.15.7"
+version = "1.0.0-alpha"
 dependencies = [
  "ruff_python_ast",
  "ruff_text_size",
@@ -2064,7 +2064,7 @@ dependencies = [
 
 [[package]]
 name = "tyc-diagnostics"
-version = "0.15.7"
+version = "1.0.0-alpha"
 dependencies = [
  "miette",
  "thiserror",
@@ -2072,7 +2072,7 @@ dependencies = [
 
 [[package]]
 name = "tyc-emit"
-version = "0.15.7"
+version = "1.0.0-alpha"
 dependencies = [
  "itoa",
  "ruff_python_ast",
@@ -2084,7 +2084,7 @@ dependencies = [
 
 [[package]]
 name = "tyc-format"
-version = "0.15.7"
+version = "1.0.0-alpha"
 dependencies = [
  "thiserror",
  "tyc-diagnostics",
@@ -2093,7 +2093,7 @@ dependencies = [
 
 [[package]]
 name = "tyc-lsp"
-version = "0.15.7"
+version = "1.0.0-alpha"
 dependencies = [
  "miette",
  "ruff_python_ast",
@@ -2116,7 +2116,7 @@ dependencies = [
 
 [[package]]
 name = "tyc-resolve"
-version = "0.15.7"
+version = "1.0.0-alpha"
 dependencies = [
  "ruff_python_ast",
  "ruff_text_size",
@@ -2126,7 +2126,7 @@ dependencies = [
 
 [[package]]
 name = "tyc-syntax"
-version = "0.15.7"
+version = "1.0.0-alpha"
 dependencies = [
  "criterion",
  "ruff_python_ast",
@@ -2136,7 +2136,7 @@ dependencies = [
 
 [[package]]
 name = "tyc-types"
-version = "0.15.7"
+version = "1.0.0-alpha"
 dependencies = [
  "ruff_python_ast",
  "ruff_text_size",
@@ -2147,7 +2147,7 @@ dependencies = [
 
 [[package]]
 name = "tyc-venv"
-version = "0.15.7"
+version = "1.0.0-alpha"
 dependencies = [
  "serde",
  "serde_json",
@@ -2158,7 +2158,7 @@ dependencies = [
 
 [[package]]
 name = "tyc-vm"
-version = "0.15.7"
+version = "1.0.0-alpha"
 dependencies = [
  "indexmap",
  "num-bigint",
