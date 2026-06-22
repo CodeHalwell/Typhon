@@ -1032,11 +1032,30 @@ impl LanguageServer for Backend {
         let Some(sf) = self.source_file_for(&uri).await else {
             return Ok(None);
         };
-        let (preprocessed, resolved) = {
+        let (preprocessed, prep_full, resolved) = {
             let db = self.db.lock().await;
-            (preprocessed_text(&*db, sf), resolved_module_arc(&*db, sf))
+            (
+                preprocessed_text(&*db, sf),
+                preprocessed_full(&*db, sf),
+                resolved_module_arc(&*db, sf),
+            )
         };
-        let offset = position_to_byte(&preprocessed, position);
+        // The editor's `position` is in *original* (pre-preprocess) text
+        // coordinates, but `preprocessed` is what the resolver bindings,
+        // `symbol_at_offset`, `scope_at_offset`, and the member fast path all
+        // index. Preprocessing strips leading modifier keywords (`comptime `,
+        // `freeze `, `lazy `, `newtype `, `pub `) from a line, which shifts
+        // every column on that line left by the keyword width. Mapping the
+        // position through the same per-line shift table the hover /
+        // semantic-tokens paths use (`line_col_shifts`) keeps the offset in
+        // the preprocessed buffer's coordinate space — without it a short
+        // member name like `f` in `comptime let x = u.f()` lands past the
+        // token and the cross-file jump silently fails (E1).
+        let offset = map_original_position_to_preprocessed_offset(
+            &preprocessed,
+            &prep_full.0.line_col_shifts(),
+            position,
+        );
 
         // Member-access cross-file jump: clicking on `Bar` in `f.Bar`
         // (after `import foo as f` / `import pkg.sub`) has no resolver
@@ -1579,6 +1598,38 @@ impl Backend {
             },
         })
     }
+}
+
+/// Map an LSP [`Position`] expressed in *original* (pre-preprocess) text
+/// coordinates to a byte offset in the `preprocessed` buffer.
+///
+/// Preprocessing strips leading modifier keywords (`comptime `, `freeze `,
+/// `lazy `, `newtype `, `pub `) from a line, shifting every column on that
+/// line left by the keyword width; it never adds or removes lines.
+/// `line_shifts` is the per-line stripped-prefix byte count from
+/// [`tyc_syntax::preprocess::PreprocessResult::line_col_shifts`] — the same
+/// table the hover / semantic-tokens paths use to reconcile original ↔
+/// preprocessed columns. Subtracting the line's shift from the editor column
+/// puts the offset back into the preprocessed buffer's coordinate space.
+///
+/// The stripped keywords are pure ASCII, so a column's byte width and its
+/// UTF-16 width coincide for the shifted prefix; subtracting the byte shift
+/// from the UTF-16 character index is therefore exact. For lines with no
+/// stripped prefix (shift 0) this is identical to `position_to_byte`.
+fn map_original_position_to_preprocessed_offset(
+    preprocessed: &str,
+    line_shifts: &[usize],
+    position: Position,
+) -> usize {
+    let shift = line_shifts
+        .get(position.line as usize)
+        .copied()
+        .unwrap_or(0);
+    let adjusted = Position {
+        line: position.line,
+        character: position.character.saturating_sub(shift as u32),
+    };
+    position_to_byte(preprocessed, adjusted)
 }
 
 /// Map a byte offset in `preprocessed` text back to a byte offset in
@@ -5084,6 +5135,192 @@ mod tests {
             result["range"]["start"]["line"].as_u64(),
             Some(0),
             "fallback should land on the `from utils import Missing` line"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn goto_definition_jumps_for_short_alias_member_after_let() {
+        // Regression (E1 P2): `let x = u.f()` where `u` is `import utils as u`.
+        // Preprocessing strips the leading `let ` (4 cols) from the line, so
+        // the editor column of `f` lands 4 bytes past `f` in the preprocessed
+        // buffer. A short member name (`f`) means the shifted offset misses
+        // the token entirely, so the cross-file jump silently failed. With the
+        // position mapped into preprocessed coordinates the jump must land in
+        // utils.ty.
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(
+            tmp.path().join("typhon.toml"),
+            "[project]\nname=\"x\"\nsrc=\"src\"\n",
+        )
+        .unwrap();
+        let utils_src = "def f() -> None:\n    pass\n";
+        std::fs::write(src.join("utils.ty"), utils_src).unwrap();
+        let main_src = "import utils as u\n\nlet x = u.f()\n";
+        std::fs::write(src.join("main.ty"), main_src).unwrap();
+
+        let main_uri = format!("file://{}", src.join("main.ty").display());
+        let utils_uri = format!("file://{}", src.join("utils.ty").display());
+        let root_uri = format!("file://{}", tmp.path().display());
+
+        let (mut to, mut from) = spawn_backend();
+        handshake(&mut to, &mut from, Some(&root_uri)).await;
+        did_open(&mut to, &main_uri, main_src).await;
+
+        // Column of `f` within `let x = u.f()` on line 2 (original coords).
+        let col = main_src.lines().nth(2).unwrap().find("u.f").unwrap() as u32 + 2;
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            goto_definition_request(&mut to, &mut from, 110, &main_uri, 2, col),
+        )
+        .await
+        .expect("goto_definition timed out");
+
+        assert_eq!(
+            result["uri"].as_str(),
+            Some(utils_uri.as_str()),
+            "short alias member after `let` must jump to utils.ty, got {result}"
+        );
+        assert_eq!(result["range"]["start"]["line"].as_u64(), Some(0));
+        let start_char = result["range"]["start"]["character"].as_u64().unwrap() as usize;
+        assert!(
+            utils_src[start_char..].starts_with('f'),
+            "range start should sit on `f`, got char {start_char}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn goto_definition_jumps_for_short_alias_member_after_mut() {
+        // `mut`-stripped variant of the regression above.
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(
+            tmp.path().join("typhon.toml"),
+            "[project]\nname=\"x\"\nsrc=\"src\"\n",
+        )
+        .unwrap();
+        let utils_src = "def f() -> None:\n    pass\n";
+        std::fs::write(src.join("utils.ty"), utils_src).unwrap();
+        let main_src = "import utils as u\n\nmut x = u.f()\n";
+        std::fs::write(src.join("main.ty"), main_src).unwrap();
+
+        let main_uri = format!("file://{}", src.join("main.ty").display());
+        let utils_uri = format!("file://{}", src.join("utils.ty").display());
+        let root_uri = format!("file://{}", tmp.path().display());
+
+        let (mut to, mut from) = spawn_backend();
+        handshake(&mut to, &mut from, Some(&root_uri)).await;
+        did_open(&mut to, &main_uri, main_src).await;
+
+        let col = main_src.lines().nth(2).unwrap().find("u.f").unwrap() as u32 + 2;
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            goto_definition_request(&mut to, &mut from, 111, &main_uri, 2, col),
+        )
+        .await
+        .expect("goto_definition timed out");
+
+        assert_eq!(
+            result["uri"].as_str(),
+            Some(utils_uri.as_str()),
+            "short alias member after `mut` must jump to utils.ty, got {result}"
+        );
+        assert_eq!(result["range"]["start"]["line"].as_u64(), Some(0));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn goto_definition_jumps_for_short_alias_member_no_let() {
+        // Control: same short member but on a non-stripped line (`x = u.f()`,
+        // no `let`). This always worked and must keep working.
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(
+            tmp.path().join("typhon.toml"),
+            "[project]\nname=\"x\"\nsrc=\"src\"\n",
+        )
+        .unwrap();
+        let utils_src = "def f() -> None:\n    pass\n";
+        std::fs::write(src.join("utils.ty"), utils_src).unwrap();
+        let main_src = "import utils as u\n\nx = u.f()\n";
+        std::fs::write(src.join("main.ty"), main_src).unwrap();
+
+        let main_uri = format!("file://{}", src.join("main.ty").display());
+        let utils_uri = format!("file://{}", src.join("utils.ty").display());
+        let root_uri = format!("file://{}", tmp.path().display());
+
+        let (mut to, mut from) = spawn_backend();
+        handshake(&mut to, &mut from, Some(&root_uri)).await;
+        did_open(&mut to, &main_uri, main_src).await;
+
+        let col = main_src.lines().nth(2).unwrap().find("u.f").unwrap() as u32 + 2;
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            goto_definition_request(&mut to, &mut from, 112, &main_uri, 2, col),
+        )
+        .await
+        .expect("goto_definition timed out");
+
+        assert_eq!(
+            result["uri"].as_str(),
+            Some(utils_uri.as_str()),
+            "short alias member without `let` must jump to utils.ty, got {result}"
+        );
+        assert_eq!(result["range"]["start"]["line"].as_u64(), Some(0));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn goto_definition_jumps_for_short_alias_member_after_comptime_let() {
+        // The literal `let`/`mut` keywords are no longer stripped by the
+        // preprocessor (Ruff parses them as soft keywords), but a leading
+        // `comptime ` modifier IS stripped — 9 columns. So clicking `f` in
+        // `comptime let x = u.f()` lands 9 bytes past `f` in the preprocessed
+        // buffer and the member fast path misses the short token, silently
+        // dropping the cross-file jump. This is the live instance of the E1
+        // position/offset-mapping bug; with the position mapped through the
+        // preprocessor's leading-strip shifts it must jump into utils.ty.
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(
+            tmp.path().join("typhon.toml"),
+            "[project]\nname=\"x\"\nsrc=\"src\"\n",
+        )
+        .unwrap();
+        let utils_src = "def f() -> int:\n    return 1\n";
+        std::fs::write(src.join("utils.ty"), utils_src).unwrap();
+        let main_src = "import utils as u\n\ncomptime let x = u.f()\n";
+        std::fs::write(src.join("main.ty"), main_src).unwrap();
+
+        let main_uri = format!("file://{}", src.join("main.ty").display());
+        let utils_uri = format!("file://{}", src.join("utils.ty").display());
+        let root_uri = format!("file://{}", tmp.path().display());
+
+        let (mut to, mut from) = spawn_backend();
+        handshake(&mut to, &mut from, Some(&root_uri)).await;
+        did_open(&mut to, &main_uri, main_src).await;
+
+        // Column of `f` within `comptime let x = u.f()` (original coords).
+        let col = main_src.lines().nth(2).unwrap().find("u.f").unwrap() as u32 + 2;
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            goto_definition_request(&mut to, &mut from, 113, &main_uri, 2, col),
+        )
+        .await
+        .expect("goto_definition timed out");
+
+        assert_eq!(
+            result["uri"].as_str(),
+            Some(utils_uri.as_str()),
+            "short alias member after `comptime let` must jump to utils.ty, got {result}"
+        );
+        assert_eq!(result["range"]["start"]["line"].as_u64(), Some(0));
+        let start_char = result["range"]["start"]["character"].as_u64().unwrap() as usize;
+        assert!(
+            utils_src[start_char..].starts_with('f'),
+            "range start should sit on `f`, got char {start_char}"
         );
     }
 
