@@ -143,6 +143,30 @@ pub struct PreprocessResult {
     /// `tyc::pub_star_outside_init` diagnostic. (Carries line indices
     /// rather than a bool so the diagnostic spans the exact marker.)
     pub pub_star_lines: Vec<usize>,
+    /// 0-based line indices, in the *preprocessed* buffer, of every
+    /// `impl <Variant>:` header line that the sealed-union distribution
+    /// pre-pass ([`expand_impl_sealed_unions`]) synthesised. One
+    /// `impl Alias:` block over a sealed union `A | B | …` is expanded
+    /// into one byte-duplicated `impl A:` / `impl B:` / … block per
+    /// variant; this records the header line of each generated block
+    /// (ALL members of every distribution group, including the first).
+    ///
+    /// B15: real and distributed `impl` blocks are byte-identical in the
+    /// preprocessed buffer (`make_impl_class_line` rewrites every header
+    /// the same way), so this list is the ONLY signal that distinguishes
+    /// a genuine, user-authored `impl A:` / `impl B:` pair from a
+    /// synthetic distribution. The diagnostic line-remap consults it so
+    /// it only collapses synthetic duplicates onto the first block and
+    /// never mis-remaps two genuinely-real adjacent blocks that happen to
+    /// share an identical body.
+    ///
+    /// Indices are assigned at distribution time but address the same
+    /// lines downstream: the later in-place, line-preserving
+    /// `make_impl_class_line` header rewrite and the tyc-diagnostics
+    /// header restoration are both length- and line-preserving, so the
+    /// recorded indices still point at the same headers in the sanitised
+    /// buffer the remap operates on.
+    pub impl_distributed_lines: Vec<usize>,
 }
 
 impl PreprocessResult {
@@ -278,10 +302,10 @@ pub fn preprocess_opts(source: &str, opts: PreprocessOptions) -> PreprocessResul
     // missing case and emits one real `impl Variant:` block per
     // variant so the user's method bodies wire up at every call site.
     // Finding #7.
-    let source_owned = if opts.expand_impl_sealed_unions {
+    let (source_owned, impl_distributed_lines) = if opts.expand_impl_sealed_unions {
         expand_impl_sealed_unions(&source_owned)
     } else {
-        source_owned
+        (source_owned, Vec::new())
     };
     let source = source_owned.as_str();
 
@@ -942,6 +966,7 @@ pub fn preprocess_opts(source: &str, opts: PreprocessOptions) -> PreprocessResul
         plain_class_lines,
         pub_names,
         pub_star_lines,
+        impl_distributed_lines,
     }
 }
 
@@ -1773,13 +1798,27 @@ fn append_ellipsis_to_bodiless_def(line: &str) -> Option<String> {
 /// is duplicated. Downstream callers that need byte-accurate spans for
 /// the *body* of these blocks should consume the desugared AST rather
 /// than rely on raw line indices.
-fn expand_impl_sealed_unions(source: &str) -> String {
+///
+/// Returns the rewritten source alongside the 0-based line indices (in
+/// the *output* buffer) of every synthesised `impl <Variant>:` header
+/// line. B15: these indices are the only signal that distinguishes a
+/// synthetic distribution from a genuine, byte-identical, user-authored
+/// `impl A:` / `impl B:` pair, so the diagnostic line-remap consults
+/// them to avoid mis-remapping real blocks. ALL members of each
+/// distribution group are recorded (including the first) so a consumer
+/// can gate purely on membership.
+fn expand_impl_sealed_unions(source: &str) -> (String, Vec<usize>) {
     let aliases = collect_sealed_union_aliases_from_text(source);
     if aliases.is_empty() {
-        return source.to_owned();
+        return (source.to_owned(), Vec::new());
     }
     let lines: Vec<&str> = source.split_inclusive('\n').collect();
     let mut out = String::with_capacity(source.len());
+    let mut distributed_lines: Vec<usize> = Vec::new();
+    // Track the 0-based line index at the *start* of `out` so we can
+    // record the absolute output line of each synthesised header. Every
+    // `\n` already pushed to `out` advances this counter.
+    let mut out_line: usize = 0;
     let mut idx = 0;
     let mut in_string: Option<StringMode> = None;
     while idx < lines.len() {
@@ -1789,6 +1828,7 @@ fn expand_impl_sealed_unions(source: &str) -> String {
         let _code_end = scan_line_code_end(raw, &mut in_string);
         if pre_string.is_some() {
             out.push_str(line);
+            out_line += line.matches('\n').count();
             idx += 1;
             continue;
         }
@@ -1846,8 +1886,13 @@ fn expand_impl_sealed_unions(source: &str) -> String {
                     args = info.target_args.as_deref().unwrap_or(""),
                     term = term,
                 );
+                // `out_line` is the index of the line currently at the end
+                // of `out`; the header we're about to push lands there.
+                distributed_lines.push(out_line);
                 out.push_str(&header);
+                out_line += header.matches('\n').count();
                 out.push_str(&body_slice);
+                out_line += body_slice.matches('\n').count();
                 // Separate consecutive duplicated blocks by a blank line.
                 // `body_slice` from `split_inclusive('\n')` always ends in
                 // a newline when non-empty, so we need an *extra* newline
@@ -1856,8 +1901,10 @@ fn expand_impl_sealed_unions(source: &str) -> String {
                 if i + 1 < variants.len() {
                     if !body_slice.ends_with('\n') {
                         out.push_str(block_sep);
+                        out_line += block_sep.matches('\n').count();
                     }
                     out.push_str(block_sep);
+                    out_line += block_sep.matches('\n').count();
                 }
             }
             // Resume after the last body line (or just after the header
@@ -1867,9 +1914,10 @@ fn expand_impl_sealed_unions(source: &str) -> String {
             continue;
         }
         out.push_str(line);
+        out_line += line.matches('\n').count();
         idx += 1;
     }
-    out
+    (out, distributed_lines)
 }
 
 /// Collect sealed-union type aliases from a Typhon source string by
@@ -11770,7 +11818,7 @@ impl Tree:
     def depth(self) -> int:
         return 0
 ";
-        let out = expand_impl_sealed_unions(src);
+        let (out, distributed) = expand_impl_sealed_unions(src);
         assert!(
             out.contains("impl Leaf:"),
             "expected `impl Leaf:` block; got:\n{out}"
@@ -11788,6 +11836,18 @@ impl Tree:
             2,
             "depth body must be replicated once per variant; got:\n{out}"
         );
+        // Both synthesised headers must be recorded as distributed, and
+        // each recorded index must address an `impl <Variant>:` header.
+        assert_eq!(distributed.len(), 2, "two variants → two recorded headers");
+        let out_lines: Vec<&str> = out.lines().collect();
+        for &li in &distributed {
+            let header = out_lines[li].trim_start();
+            assert!(
+                header.starts_with("impl ") && header.trim_end().ends_with(':'),
+                "recorded distributed line {li} must be an impl header; got: {:?}",
+                out_lines[li]
+            );
+        }
     }
 
     #[test]
@@ -11806,7 +11866,7 @@ impl[T] Tree[T]:
     def depth(self) -> int:
         return 0
 ";
-        let out = expand_impl_sealed_unions(src);
+        let (out, _distributed) = expand_impl_sealed_unions(src);
         assert!(
             out.contains("impl[T] Leaf[T]:"),
             "expected `impl[T] Leaf[T]:`; got:\n{out}"
@@ -11838,8 +11898,12 @@ impl Foo:
     def bar(self) -> int:
         return 0
 ";
-        let out = expand_impl_sealed_unions(src);
+        let (out, distributed) = expand_impl_sealed_unions(src);
         assert_eq!(out, src, "non-alias impl must round-trip unchanged");
+        assert!(
+            distributed.is_empty(),
+            "a non-alias impl distributes nothing; got: {distributed:?}"
+        );
     }
 
     #[test]
@@ -11877,6 +11941,68 @@ impl[T] Tree[T]:
             !result.python_source.contains("__typhon_impl_Tree"),
             "the `Tree` synthetic name must not leak into preprocessed output; got:\n{}",
             result.python_source
+        );
+    }
+
+    #[test]
+    fn impl_distributed_lines_address_synthetic_headers() {
+        // B15: `impl Tree:` over `type Tree = Leaf | Branch` distributes
+        // into two byte-duplicated `class __typhon_impl_<Variant>(object):`
+        // blocks. `impl_distributed_lines` must record the header line of
+        // each synthesised block (in the preprocessed buffer's numbering).
+        let src = "\
+class Leaf:
+    pass
+class Branch:
+    pass
+type Tree = Leaf | Branch
+impl Tree:
+    def depth(self) -> int:
+        return 0
+";
+        let result = preprocess(src);
+        assert_eq!(
+            result.impl_distributed_lines.len(),
+            2,
+            "two variants → two distributed headers; got: {:?}",
+            result.impl_distributed_lines
+        );
+        let lines: Vec<&str> = result.python_source.lines().collect();
+        for &li in &result.impl_distributed_lines {
+            let header = lines[li].trim_start();
+            assert!(
+                header.starts_with("class __typhon_impl_") && header.trim_end().ends_with(':'),
+                "distributed line {li} must point at a lowered impl header; got: {:?}",
+                lines[li]
+            );
+        }
+    }
+
+    #[test]
+    fn impl_distributed_lines_empty_for_real_adjacent_impls() {
+        // Two genuinely-real, adjacent `impl A:` / `impl B:` blocks with
+        // byte-identical bodies — and NO sealed-union alias declaring
+        // `A | B` — must record NOTHING. This is the B15 false-positive
+        // the distribution metadata exists to prevent: these blocks are
+        // byte-identical to a distribution in the preprocessed buffer,
+        // so only the (empty) distributed-line set keeps them apart.
+        let src = "\
+class A:
+    missing: int
+class B:
+    missing: int
+impl A:
+    def total(self) -> int:
+        return self.missing
+impl B:
+    def total(self) -> int:
+        return self.missing
+";
+        let result = preprocess(src);
+        assert!(
+            result.impl_distributed_lines.is_empty(),
+            "real adjacent impls distribute nothing; got: {:?}",
+            result.impl_distributed_lines
         );
     }
 }

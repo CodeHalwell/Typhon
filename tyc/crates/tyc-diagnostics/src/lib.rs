@@ -3485,9 +3485,11 @@ impl SanitisedDiagnostic {
             let cleaned = sanitize_synthetic_source(src.inner());
             NamedSource::new(src.name(), cleaned)
         });
-        let block_remap = sanitised
-            .as_ref()
-            .and_then(|s| BlockRemap::from_sanitised(&named_source_text(s)));
+        let block_remap = sanitised.as_ref().and_then(|s| {
+            let text = named_source_text(s);
+            let distributed = distributed_impl_lines(&text);
+            BlockRemap::from_sanitised(&text, &distributed)
+        });
         Self {
             inner,
             sanitised,
@@ -3500,7 +3502,9 @@ impl SanitisedDiagnostic {
     /// and pass the result here to avoid the O(n_diags × file_size)
     /// rework that [`wrap`](Self::wrap) does on a hot loop.
     pub fn wrap_with_source(inner: TycError, sanitised: NamedSource<String>) -> Self {
-        let block_remap = BlockRemap::from_sanitised(&named_source_text(&sanitised));
+        let text = named_source_text(&sanitised);
+        let distributed = distributed_impl_lines(&text);
+        let block_remap = BlockRemap::from_sanitised(&text, &distributed);
         Self {
             inner,
             sanitised: Some(sanitised),
@@ -3559,16 +3563,28 @@ impl BlockRemap {
     ///
     /// Detection: a *group* is a maximal run of two or more `impl <Name>:`
     /// header lines at the same indent whose bodies (every more-indented
-    /// line up to the next dedent) are byte-for-byte identical. Only the
-    /// distribution pass produces such duplicate-bodied consecutive impl
-    /// blocks, so the signature is specific to B15.
-    fn from_sanitised(source: &str) -> Option<Self> {
+    /// line up to the next dedent) are byte-for-byte identical AND whose
+    /// header lines are all in `distributed_lines` — the 0-based line
+    /// indices the preprocessor recorded for blocks it synthesised by
+    /// distributing one `impl Alias:` over a sealed union.
+    ///
+    /// B15 robustness: a byte-identical body is NOT sufficient to treat a
+    /// run as synthetic — two genuinely-real, adjacent `impl A:` /
+    /// `impl B:` blocks the user authored can share an identical body and
+    /// are indistinguishable from a distribution by text alone. Gating on
+    /// `distributed_lines` (the only place the real/synthetic distinction
+    /// is recorded) ensures a real block is never grouped or remapped.
+    /// When `distributed_lines` is empty the function returns `None`
+    /// (no remap) — safer than wrongly collapsing a real block.
+    fn from_sanitised(source: &str, distributed_lines: &[usize]) -> Option<Self> {
         // Cheap reject: the restoration step only emits `impl ` headers
         // for files that carried an `impl`/`extend` block. Bail early
-        // when there isn't one.
-        if !source.contains("impl ") {
+        // when there isn't one — or when nothing was distributed, in
+        // which case there is nothing to remap.
+        if distributed_lines.is_empty() || !source.contains("impl ") {
             return None;
         }
+        let is_distributed = |line: usize| distributed_lines.contains(&line);
         let lines: Vec<&str> = source.split_inclusive('\n').collect();
         // Byte offset at the start of each line.
         let mut starts = Vec::with_capacity(lines.len() + 1);
@@ -3630,18 +3646,30 @@ impl BlockRemap {
         let body_text = |b: &(usize, usize, usize)| -> String { lines[b.1..b.2].concat() };
 
         let mut ranges: Vec<(usize, usize, usize)> = Vec::new();
-        // Walk consecutive blocks; group runs with identical bodies.
+        // Walk consecutive blocks; group runs with identical bodies whose
+        // header lines are all flagged as distributed.
         let mut g = 0;
         while g < blocks.len() {
             let first = blocks[g];
+            // A real (non-distributed) block anchors no group: skip it so
+            // a genuine `impl A:` immediately before a distribution can't
+            // absorb the synthetic blocks that follow.
+            if !is_distributed(first.0) {
+                g += 1;
+                continue;
+            }
             let first_body = body_text(&first);
             let mut k = g + 1;
-            // Only group blocks with a non-empty body. Genuinely empty (or
-            // whitespace/comment-only) `impl` blocks all share the empty body
-            // string and would otherwise be mis-grouped as a synthetic
+            // Only group blocks with a non-empty body, a byte-identical
+            // body, AND a distributed header. Genuinely empty (or
+            // whitespace/comment-only) `impl` blocks all share the empty
+            // body string and would otherwise be mis-grouped as a synthetic
             // distribution and remapped to a wrong location.
             if !first_body.trim().is_empty() {
-                while k < blocks.len() && body_text(&blocks[k]) == first_body {
+                while k < blocks.len()
+                    && is_distributed(blocks[k].0)
+                    && body_text(&blocks[k]) == first_body
+                {
                     k += 1;
                 }
             }
@@ -3698,6 +3726,283 @@ impl BlockRemap {
         }
         offset
     }
+}
+
+/// Recover the set of distributed `impl <Variant>:` header line indices
+/// (0-based) from a *sanitised* source buffer.
+///
+/// The driver that renders a diagnostic only holds the diagnostic's
+/// embedded source — not the [`tyc_syntax::PreprocessResult`] that
+/// recorded `impl_distributed_lines` at preprocess time. Re-deriving the
+/// set here, from structure that survives into the sanitised buffer,
+/// keeps the B15 remap correct without threading the metadata through
+/// every analysis crate.
+///
+/// The signal is real, not a textual-prefix heuristic: the preprocessor
+/// only distributes an `impl Alias:` block when `Alias` is a sealed-union
+/// `type Alias = V1 | V2 | …` declared in the same module. So a run of
+/// consecutive `impl <Name>:` blocks is synthetic iff the run's header
+/// names equal, *in order*, the full variant list of such an alias and
+/// the bodies are byte-identical. Two genuinely-real adjacent
+/// `impl A:` / `impl B:` blocks with no matching alias never match and
+/// are therefore never flagged — exactly the case B15 must protect.
+///
+/// This mirrors the `expand_impl_sealed_unions` rule in `tyc-syntax`, so
+/// the recovered set equals the recorded `impl_distributed_lines` for any
+/// buffer the preprocessor produced.
+fn distributed_impl_lines(source: &str) -> Vec<usize> {
+    if !source.contains("impl ") {
+        return Vec::new();
+    }
+    let aliases = sealed_union_aliases(source);
+    if aliases.is_empty() {
+        return Vec::new();
+    }
+    let lines: Vec<&str> = source.split_inclusive('\n').collect();
+
+    // Header line + name + (body_start, body_end exclusive) for each
+    // `impl <Name>:` block, in source order.
+    struct ImplBlock {
+        header: usize,
+        name: String,
+        body_start: usize,
+        body_end: usize,
+    }
+    let mut blocks: Vec<ImplBlock> = Vec::new();
+    let mut i = 0;
+    while i < lines.len() {
+        let raw = lines[i].trim_end_matches(['\r', '\n']);
+        if let Some(name) = impl_header_name(raw) {
+            let indent = raw.len() - raw.trim_start().len();
+            let header = i;
+            let mut j = i + 1;
+            let mut last_body = header;
+            while j < lines.len() {
+                let cand = lines[j].trim_end_matches(['\r', '\n']);
+                if cand.trim().is_empty() {
+                    j += 1;
+                    continue;
+                }
+                let cand_indent = cand.len() - cand.trim_start().len();
+                if cand_indent <= indent {
+                    break;
+                }
+                last_body = j;
+                j += 1;
+            }
+            blocks.push(ImplBlock {
+                header,
+                name,
+                body_start: header + 1,
+                body_end: last_body + 1,
+            });
+            i = last_body + 1;
+        } else {
+            i += 1;
+        }
+    }
+
+    let body_text = |b: &ImplBlock| -> String { lines[b.body_start..b.body_end].concat() };
+
+    let mut out: Vec<usize> = Vec::new();
+    let mut g = 0;
+    while g < blocks.len() {
+        // A distribution group is `run` consecutive blocks whose names
+        // equal some alias's variant list in order, with identical
+        // non-empty bodies. Match greedily against each alias.
+        let first_body = body_text(&blocks[g]);
+        let mut matched = false;
+        if !first_body.trim().is_empty() {
+            for variants in aliases.values() {
+                let run = variants.len();
+                if run < 2 || g + run > blocks.len() {
+                    continue;
+                }
+                let names_match = blocks[g..g + run]
+                    .iter()
+                    .zip(variants.iter())
+                    .all(|(b, v)| &b.name == v);
+                if !names_match {
+                    continue;
+                }
+                let bodies_match = blocks[g + 1..g + run]
+                    .iter()
+                    .all(|b| body_text(b) == first_body);
+                if !bodies_match {
+                    continue;
+                }
+                for b in &blocks[g..g + run] {
+                    out.push(b.header);
+                }
+                g += run;
+                matched = true;
+                break;
+            }
+        }
+        if !matched {
+            g += 1;
+        }
+    }
+    out.sort_unstable();
+    out
+}
+
+/// Extract the bare class/alias name from an `impl <Name…>:` header line
+/// in a sanitised buffer. Returns `None` when the line isn't an impl
+/// header. Strips any `impl[T,…]` type-param prefix and any `[args]` /
+/// `(bases)` suffix on the name so generic and based forms collapse to
+/// their head name — matching `tyc-syntax`'s distribution rule.
+fn impl_header_name(raw: &str) -> Option<String> {
+    let trimmed = raw.trim_start();
+    let after = if let Some(s) = trimmed.strip_prefix("impl ") {
+        s
+    } else if let Some(s) = trimmed.strip_prefix("impl[") {
+        // Skip the `[T, …]` impl type-param list.
+        let mut depth = 1i32;
+        let mut end = None;
+        for (i, c) in s.char_indices() {
+            match c {
+                '[' => depth += 1,
+                ']' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = Some(i + 1);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        s[end?..].trim_start()
+    } else {
+        return None;
+    };
+    let header = after.trim_end();
+    let body = header.strip_suffix(':')?;
+    let head_end = body
+        .find(|c: char| !(c.is_alphanumeric() || c == '_'))
+        .unwrap_or(body.len());
+    let name = &body[..head_end];
+    if name.is_empty() {
+        None
+    } else {
+        Some(name.to_owned())
+    }
+}
+
+/// Collect sealed-union aliases (`type NAME[…]? = V1 | V2 | …`, two or
+/// more variants) from a source buffer at indent zero, mapping each alias
+/// name to its ordered list of variant head-names. Mirrors
+/// `tyc_syntax::preprocess::collect_sealed_union_aliases_from_text`,
+/// reimplemented here so `tyc-diagnostics` needn't depend on the
+/// preprocessor internals.
+fn sealed_union_aliases(source: &str) -> std::collections::HashMap<String, Vec<String>> {
+    let mut out = std::collections::HashMap::new();
+    for line in source.lines() {
+        // Indent zero only — nested `type` aliases aren't legal targets.
+        if line.starts_with(char::is_whitespace) {
+            continue;
+        }
+        let after = match line.trim_end().strip_prefix("type ") {
+            Some(s) => s,
+            None => continue,
+        };
+        let name_end = after
+            .find(|c: char| !(c.is_alphanumeric() || c == '_'))
+            .unwrap_or(after.len());
+        if name_end == 0 {
+            continue;
+        }
+        let name = &after[..name_end];
+        let rest = &after[name_end..];
+        // Skip an optional `[T, …]` type-param list on the alias name.
+        let after_tps = if rest.starts_with('[') {
+            let mut depth = 0i32;
+            let mut close = None;
+            for (i, c) in rest.char_indices() {
+                match c {
+                    '[' => depth += 1,
+                    ']' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            close = Some(i + 1);
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            match close {
+                Some(p) => &rest[p..],
+                None => continue,
+            }
+        } else {
+            rest
+        };
+        let rhs = match after_tps.trim_start().strip_prefix('=') {
+            Some(s) => s.trim(),
+            None => continue,
+        };
+        // Strip a trailing `# comment`.
+        let rhs = rhs.split('#').next().unwrap_or(rhs).trim();
+        if rhs.is_empty() {
+            continue;
+        }
+        let variants: Vec<String> = split_top_level_pipes(rhs)
+            .into_iter()
+            .map(|p| {
+                let p = p.trim();
+                let head_end = p
+                    .find(|c: char| !(c.is_alphanumeric() || c == '_'))
+                    .unwrap_or(p.len());
+                p[..head_end].to_owned()
+            })
+            .filter(|p| !p.is_empty())
+            .collect();
+        if variants.len() >= 2 {
+            out.insert(name.to_owned(), variants);
+        }
+    }
+    out
+}
+
+/// Split `s` on top-level `|` characters, respecting `[]` / `()` / `{}`
+/// nesting and `'`/`"` string literals. Operands are returned in source
+/// order (untrimmed; callers trim).
+fn split_top_level_pipes(s: &str) -> Vec<&str> {
+    let bytes = s.as_bytes();
+    let mut out = Vec::new();
+    let mut depth: i32 = 0;
+    let mut start = 0usize;
+    let mut in_str: Option<u8> = None;
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if let Some(q) = in_str {
+            if b == b'\\' && i + 1 < bytes.len() {
+                i += 2;
+                continue;
+            }
+            if b == q {
+                in_str = None;
+            }
+            i += 1;
+            continue;
+        }
+        match b {
+            b'\'' | b'"' => in_str = Some(b),
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => depth -= 1,
+            b'|' if depth == 0 => {
+                out.push(&s[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    out.push(&s[start..]);
+    out
 }
 
 /// Compute the sanitised `NamedSource` for a single diagnostic. Returns
@@ -4004,7 +4309,9 @@ mod tests {
                          impl Node:\n\
                          \x20\x20\x20\x20def total(self) -> int:\n\
                          \x20\x20\x20\x20\x20\x20\x20\x20return self.x\n";
-        let remap = BlockRemap::from_sanitised(sanitised)
+        // Headers `impl Leaf:` (line 0) and `impl Node:` (line 4) are the
+        // synthetic distribution; both are flagged as distributed.
+        let remap = BlockRemap::from_sanitised(sanitised, &[0, 4])
             .expect("two duplicate impl blocks should produce a remap");
 
         // Offset of `self.x` inside the SECOND block.
@@ -4030,7 +4337,7 @@ mod tests {
                          \x20\x20\x20\x20def m(self) -> int:\n\
                          \x20\x20\x20\x20\x20\x20\x20\x20return self.x\n";
         assert!(
-            BlockRemap::from_sanitised(sanitised).is_none(),
+            BlockRemap::from_sanitised(sanitised, &[0]).is_none(),
             "a single impl block has no synthetic duplicates to remap"
         );
     }
@@ -4049,7 +4356,9 @@ mod tests {
                          impl Triangle:\n\
                          \x20\x20\x20\x20def area(self) -> int:\n\
                          \x20\x20\x20\x20\x20\x20\x20\x20return self.q\n";
-        let remap = BlockRemap::from_sanitised(sanitised).unwrap();
+        // `impl Circle:` (line 0) and `impl Triangle:` (line 4) are the
+        // synthetic distribution.
+        let remap = BlockRemap::from_sanitised(sanitised, &[0, 4]).unwrap();
         let first_q = sanitised.find("self.q").unwrap();
         let tri = sanitised.find("impl Triangle:").unwrap();
         let dup_q = tri + sanitised[tri..].find("self.q").unwrap();
@@ -4057,6 +4366,62 @@ mod tests {
             remap.remap_offset(dup_q),
             first_q,
             "uneven variant-name lengths must not skew the remapped column"
+        );
+    }
+
+    #[test]
+    fn block_remap_skips_real_adjacent_duplicate_impls() {
+        // B15 fix: two genuinely-real, adjacent `impl A:` / `impl B:`
+        // blocks with byte-identical bodies must NOT be remapped when no
+        // block is flagged as distributed — a label in the SECOND block
+        // stays put instead of collapsing onto the first.
+        let sanitised = "impl A:\n\
+                         \x20\x20\x20\x20def total(self) -> int:\n\
+                         \x20\x20\x20\x20\x20\x20\x20\x20return self.missing\n\
+                         \n\
+                         impl B:\n\
+                         \x20\x20\x20\x20def total(self) -> int:\n\
+                         \x20\x20\x20\x20\x20\x20\x20\x20return self.missing\n";
+        // Empty distributed set → no remap at all.
+        assert!(
+            BlockRemap::from_sanitised(sanitised, &[]).is_none(),
+            "real adjacent impls with no distributed flag must not remap"
+        );
+    }
+
+    #[test]
+    fn distributed_impl_lines_flags_only_alias_distributions() {
+        // The render-time recovery must flag the synthetic
+        // `impl Leaf:` / `impl Node:` run produced from a sealed-union
+        // alias, but leave a real, non-alias `impl Other:` block alone.
+        let sanitised = "type Tree = Leaf | Node\n\
+                         impl Leaf:\n\
+                         \x20\x20\x20\x20def total(self) -> int:\n\
+                         \x20\x20\x20\x20\x20\x20\x20\x20return self.x\n\
+                         impl Node:\n\
+                         \x20\x20\x20\x20def total(self) -> int:\n\
+                         \x20\x20\x20\x20\x20\x20\x20\x20return self.x\n\
+                         impl Other:\n\
+                         \x20\x20\x20\x20def total(self) -> int:\n\
+                         \x20\x20\x20\x20\x20\x20\x20\x20return self.x\n";
+        let flagged = distributed_impl_lines(sanitised);
+        // `impl Leaf:` is line 1, `impl Node:` is line 4.
+        assert_eq!(flagged, vec![1, 4], "only the Leaf/Node distribution");
+    }
+
+    #[test]
+    fn distributed_impl_lines_empty_for_real_adjacent_impls() {
+        // No `type _ = A | B` alias declared → no distribution → nothing
+        // flagged, even though the two blocks are byte-identical.
+        let sanitised = "impl A:\n\
+                         \x20\x20\x20\x20def total(self) -> int:\n\
+                         \x20\x20\x20\x20\x20\x20\x20\x20return self.missing\n\
+                         impl B:\n\
+                         \x20\x20\x20\x20def total(self) -> int:\n\
+                         \x20\x20\x20\x20\x20\x20\x20\x20return self.missing\n";
+        assert!(
+            distributed_impl_lines(sanitised).is_empty(),
+            "no alias → no synthetic distribution flagged"
         );
     }
 
