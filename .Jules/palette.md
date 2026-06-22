@@ -40,3 +40,6 @@
 ## 2026-06-18 - [Add hover state to unselected tabs and focus-within to tables]
 **Learning:** Discovered that unselected Starlight tabs (`starlight-tabs`) lacked any hover feedback, leaving users without visual confirmation that the tabs are interactive before clicking. Additionally, data tables containing links did not highlight the entire row when the links were focused via keyboard, breaking the visual connection for keyboard users that mouse users get from `:hover`.
 **Action:** Added a `transition: color 150ms ease, border-color 150ms ease;` and a `:hover` state modifying the text and border colors for unselected tabs (`[role="tab"]:not([aria-selected="true"])`) in `custom.css`. Also added a `:focus-within` selector mirroring the `:hover` style for `table tbody tr` to improve keyboard navigation inside tables.
+## 2026-06-22 - [Add focus outline for expressive-code blocks]
+**Learning:** Discovered that expressive-code blocks natively lacked explicit focus rings upon keyboard navigation. Starlight's global custom focus-visible CSS did not automatically map to syntax highlighting libraries injected by default integrations.
+**Action:** Targeted `.expressive-code pre:focus-visible` to append it to the site's default `[tabindex="0"]` explicit focus-visible styles.
