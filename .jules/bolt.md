@@ -13,3 +13,7 @@
 ## 2024-08-01 - Avoid display().to_string() for Paths
 **Learning:** Converting `std::path::Path` objects to strings using `path.display().to_string()` incurs heavy `std::fmt` allocation overhead.
 **Action:** Prefer `path.to_string_lossy().into_owned()` when an owned `String` is strictly required to reduce formatting overhead.
+
+## 2024-06-06 - Avoid .to_owned() allocations in match variant coverage
+**Learning:** Checking enum variant coverage via `collect_matched_class_names` in `tyc-types` previously inserted `String` values (`n.id.as_str().to_owned()`) into a `HashSet<String>`. In cases like `Result` match exhaustiveness checks, this involves unnecessary string allocation since we only need to compare against static slice references (e.g. `["Ok", "Err"]`).
+**Action:** Replace `HashSet<String>` with `HashSet<&str>` and remove the `.to_owned()` allocation when traversing match patterns (`PatternMatchClass` wrappers like `MatchAs`/`MatchOr`).

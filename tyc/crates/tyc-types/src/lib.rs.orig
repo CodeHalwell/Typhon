@@ -10577,12 +10577,12 @@ fn cases_cover_type(c: &Checker, cases: &[MatchCase], ty: &Type) -> bool {
         Type::Generic(head, _) => {
             if head == "Result" {
                 let variants = ["Ok", "Err"];
-                let mut covered: HashSet<&str> = HashSet::new();
+                let mut covered: HashSet<String> = HashSet::new();
                 for case in cases {
                     if case.guard.is_some() {
                         continue;
                     }
-                    collect_matched_class_names_ref(&case.pattern, &mut covered);
+                    collect_matched_class_names(&case.pattern, &mut covered);
                 }
                 return variants.iter().all(|&v| covered.contains(v));
             }
@@ -10597,19 +10597,19 @@ fn cases_cover_type(c: &Checker, cases: &[MatchCase], ty: &Type) -> bool {
         _ => return false,
     };
     if let Some(variants) = c.sealed_unions.get(class_name).cloned() {
-        let mut covered: HashSet<&str> = HashSet::new();
-        let mut covered_with_guards: HashSet<&str> = HashSet::new();
+        let mut covered: HashSet<String> = HashSet::new();
+        let mut covered_with_guards: HashSet<String> = HashSet::new();
         let mut has_guarded_wildcard = false;
         for case in cases {
             if case.guard.is_none() {
                 if pattern_covers_class(c, &case.pattern, class_name) {
                     return true;
                 }
-                collect_matched_class_names_ref(&case.pattern, &mut covered);
+                collect_matched_class_names(&case.pattern, &mut covered);
             }
             // Also collect guarded coverage for the pragmatic
             // exhaustive-with-guards relaxation below. FINDINGS v0.7.1 #15.
-            collect_matched_class_names_ref(&case.pattern, &mut covered_with_guards);
+            collect_matched_class_names(&case.pattern, &mut covered_with_guards);
             // A guarded `case _:` / capture also signals intent to handle
             // every leftover variant (e.g. `case other if cond: ...`).
             if case.guard.is_some()
@@ -10621,7 +10621,7 @@ fn cases_cover_type(c: &Checker, cases: &[MatchCase], ty: &Type) -> bool {
                 has_guarded_wildcard = true;
             }
         }
-        if variants.iter().all(|v| covered.contains(v.as_str())) {
+        if variants.iter().all(|v| covered.contains(v)) {
             return true;
         }
         // FINDINGS v0.7.1 #15: when every sealed-union variant has at least
@@ -10633,10 +10633,10 @@ fn cases_cover_type(c: &Checker, cases: &[MatchCase], ty: &Type) -> bool {
         // gap (e.g. `case IntTok(0) if False: …`) will no longer surface
         // `missing_return`. We accept that cost to eliminate the much
         // louder false-positive on every guard-driven sealed-union match.
-        if (has_guarded_wildcard || variants.iter().all(|v| covered_with_guards.contains(v.as_str())))
+        if (has_guarded_wildcard || variants.iter().all(|v| covered_with_guards.contains(v)))
             && variants
                 .iter()
-                .any(|v| covered_with_guards.contains(v.as_str()) && !covered.contains(v.as_str()))
+                .any(|v| covered_with_guards.contains(v) && !covered.contains(v))
         {
             return true;
         }
@@ -11255,31 +11255,6 @@ fn collect_narrowings_inner(c: &Checker, test: &Expr, negate: bool, out: &mut Ve
                         });
                     }
                 }
-            }
-        }
-        _ => {}
-    }
-}
-
-/// Collect the class names matched by `PatternMatchClass` nodes in a pattern,
-/// recursing through wrapper forms (`MatchAs`, `MatchOr`). This avoids allocating
-/// Strings for each matched variant name when we only need to check membership
-/// against static arrays.
-fn collect_matched_class_names_ref<'a>(pattern: &'a Pattern, covered: &mut HashSet<&'a str>) {
-    match pattern {
-        Pattern::MatchClass(mc) => {
-            if let Expr::Name(n) = mc.cls.as_ref() {
-                covered.insert(n.id.as_str());
-            }
-        }
-        Pattern::MatchAs(a) => {
-            if let Some(inner) = &a.pattern {
-                collect_matched_class_names_ref(inner, covered);
-            }
-        }
-        Pattern::MatchOr(o) => {
-            for p in &o.patterns {
-                collect_matched_class_names_ref(p, covered);
             }
         }
         _ => {}
