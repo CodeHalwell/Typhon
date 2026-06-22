@@ -98,4 +98,4 @@ Key architectural facts that aren't obvious from any single file:
 
 ## Git workflow for this environment
 
-Develop on the branch `claude/claude-md-docs-gdihog`; create it locally if missing. Commit with clear messages and push with `git push -u origin <branch>`. Do **not** open a pull request unless explicitly asked. CI runs on `main`, `dev/**`, and `claude/**` pushes.
+Develop on a task-specific branch (e.g., claude/feature-name); create it locally if missing. Commit with clear messages and push with git push -u origin <branch>. Do not open a pull request unless explicitly asked. CI runs on main, dev/**, and claude/** pushes.
