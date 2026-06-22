@@ -1049,10 +1049,20 @@ impl LanguageServer for Backend {
             // binding in scope (`pkg` in `pkg.sub.Thing`); the alias lookup
             // uses that root.
             let alias_root = receiver.split('.').next().unwrap_or(&receiver);
+            // Resolve `alias_root` as it's actually bound *at the cursor*,
+            // walking the scope chain from the innermost enclosing scope.
+            // A module-level `import utils as u` is only the right target
+            // when nothing nearer shadows it — e.g. `def f(u): u.helper()`
+            // binds `u` as a parameter, so the member jump must NOT leap
+            // into `utils`. Taking the binding the resolver sees at this
+            // offset (rather than always the module-scope import) makes
+            // the fast path respect lexical shadowing; when a non-import
+            // binding wins, `b.kind == Import` is false and we fall through
+            // to the normal single-file symbol lookup below.
+            let cursor_scope = resolved.scope_at_offset(offset);
             if let Some(import) = resolved
-                .scopes
-                .first()
-                .and_then(|s| s.bindings.iter().find(|b| b.name == alias_root))
+                .lookup(cursor_scope, alias_root)
+                .map(|(b, _)| b)
                 .filter(|b| b.kind == BindingKind::Import)
                 .and_then(|b| b.import_info.as_ref())
                 .filter(|info| info.member.is_none())
@@ -4937,6 +4947,99 @@ mod tests {
             utils_src[start_char..].starts_with("helper"),
             "range start should sit on `helper`, got char {start_char}"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn goto_definition_alias_member_not_jumped_when_shadowed_by_param() {
+        // `import utils as u` at module scope, then `def f(u): u.helper()`
+        // where `u` is the *parameter*, not the module import. Clicking
+        // `helper` must NOT jump cross-file into utils.ty — the receiver
+        // `u` is the local parameter. The import fast path must respect
+        // the shadowing and fall through to the (single-file) symbol
+        // lookup, which has no cross-file target for the parameter's
+        // attribute, so the response is the local declaration or null —
+        // never `utils.ty`.
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(
+            tmp.path().join("typhon.toml"),
+            "[project]\nname=\"x\"\nsrc=\"src\"\n",
+        )
+        .unwrap();
+        let utils_src = "def helper() -> None:\n    pass\n";
+        std::fs::write(src.join("utils.ty"), utils_src).unwrap();
+        // `u` is a parameter of `f`, shadowing the module-level import.
+        let main_src = "import utils as u\n\ndef f(u: int) -> None:\n    let _ = u.helper()\n";
+        std::fs::write(src.join("main.ty"), main_src).unwrap();
+
+        let main_uri = format!("file://{}", src.join("main.ty").display());
+        let utils_uri = format!("file://{}", src.join("utils.ty").display());
+        let root_uri = format!("file://{}", tmp.path().display());
+
+        let (mut to, mut from) = spawn_backend();
+        handshake(&mut to, &mut from, Some(&root_uri)).await;
+        did_open(&mut to, &main_uri, main_src).await;
+
+        // `helper` within `u.helper()` on line 3.
+        let col = main_src.lines().nth(3).unwrap().find("helper").unwrap() as u32;
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            goto_definition_request(&mut to, &mut from, 103, &main_uri, 3, col + 1),
+        )
+        .await
+        .expect("goto_definition timed out");
+
+        // The crux: must NOT have leapt into utils.ty.
+        assert_ne!(
+            result["uri"].as_str(),
+            Some(utils_uri.as_str()),
+            "a parameter `u` shadowing the import must not jump into utils.ty, got {result}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn goto_definition_alias_member_still_jumps_at_module_scope() {
+        // Control for the shadowing test: with no local `u` binding, the
+        // module-level `import utils as u` + `u.helper()` must still jump
+        // cross-file (the existing fast path, unchanged).
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(
+            tmp.path().join("typhon.toml"),
+            "[project]\nname=\"x\"\nsrc=\"src\"\n",
+        )
+        .unwrap();
+        let utils_src = "def helper() -> None:\n    pass\n";
+        std::fs::write(src.join("utils.ty"), utils_src).unwrap();
+        // `f` takes an unrelated param; `u` inside still resolves to the
+        // module import (not shadowed in this scope).
+        let main_src = "import utils as u\n\ndef f(n: int) -> None:\n    let _ = u.helper()\n";
+        std::fs::write(src.join("main.ty"), main_src).unwrap();
+
+        let main_uri = format!("file://{}", src.join("main.ty").display());
+        let utils_uri = format!("file://{}", src.join("utils.ty").display());
+        let root_uri = format!("file://{}", tmp.path().display());
+
+        let (mut to, mut from) = spawn_backend();
+        handshake(&mut to, &mut from, Some(&root_uri)).await;
+        did_open(&mut to, &main_uri, main_src).await;
+
+        let col = main_src.lines().nth(3).unwrap().find("helper").unwrap() as u32;
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            goto_definition_request(&mut to, &mut from, 104, &main_uri, 3, col + 1),
+        )
+        .await
+        .expect("goto_definition timed out");
+
+        assert_eq!(
+            result["uri"].as_str(),
+            Some(utils_uri.as_str()),
+            "unshadowed `u.helper()` inside a function must still jump to utils.ty, got {result}"
+        );
+        assert_eq!(result["range"]["start"]["line"].as_u64(), Some(0));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
