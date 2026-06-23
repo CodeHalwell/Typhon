@@ -13,3 +13,7 @@
 ## 2024-08-01 - Avoid display().to_string() for Paths
 **Learning:** Converting `std::path::Path` objects to strings using `path.display().to_string()` incurs heavy `std::fmt` allocation overhead.
 **Action:** Prefer `path.to_string_lossy().into_owned()` when an owned `String` is strictly required to reduce formatting overhead.
+
+## 2024-08-10 - Avoid HashSet<String> for AST Identifiers
+**Learning:** Checking for subset matching or exhaustiveness against multiple AST node identifiers utilizing `HashSet<String>` creates constant temporary heap allocations within hot match evaluation logic.
+**Action:** Always borrow AST node string slices into `HashSet<&str>` directly where practical (e.g. for short-lived tracking sets during type-checking pattern loops) to mitigate massive redundant allocations across deep compilation traces.
