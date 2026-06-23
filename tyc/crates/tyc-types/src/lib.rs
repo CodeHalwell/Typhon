@@ -11189,7 +11189,7 @@ fn match_is_exhaustive_for_da(c: &Checker, subject: &Expr, cases: &[MatchCase]) 
     // means no implicit fall-through — the member set is closed.
     if let Type::Class(name) = &subject_ty {
         if let Some(members) = c.enums.get(name.as_str()) {
-            let mut covered: HashSet<String> = HashSet::new();
+            let mut covered: HashSet<&str> = HashSet::new();
             let mut all_classified = true;
             for case in cases {
                 if case.guard.is_some() {
@@ -11200,7 +11200,7 @@ fn match_is_exhaustive_for_da(c: &Checker, subject: &Expr, cases: &[MatchCase]) 
                     break;
                 }
             }
-            if all_classified && members.iter().all(|m| covered.contains(m)) {
+            if all_classified && members.iter().all(|m| covered.contains(m.as_str())) {
                 return true;
             }
         }
@@ -11242,19 +11242,19 @@ fn match_is_exhaustive_for_da(c: &Checker, subject: &Expr, cases: &[MatchCase]) 
         _ => Vec::new(),
     };
     if !union_variants.is_empty() {
-        let mut covered: HashSet<String> = HashSet::new();
+        let mut covered: HashSet<&str> = HashSet::new();
         for case in cases {
             if case.guard.is_some() {
                 continue;
             }
             for variant in &union_variants {
                 if pattern_covers_class(c, &case.pattern, variant) {
-                    covered.insert(variant.clone());
+                    covered.insert(variant.as_str());
                 }
             }
             collect_matched_class_names(&case.pattern, &mut covered);
         }
-        if union_variants.iter().all(|v| covered.contains(v)) {
+        if union_variants.iter().all(|v| covered.contains(v.as_str())) {
             return true;
         }
     }
@@ -11263,7 +11263,7 @@ fn match_is_exhaustive_for_da(c: &Checker, subject: &Expr, cases: &[MatchCase]) 
     // hard-coded Ok/Err pair for Result), trust the user. Lets the DA
     // pass succeed for cross-module Result idioms where the call's
     // return type didn't carry through.
-    let mut pattern_classes: HashSet<String> = HashSet::new();
+    let mut pattern_classes: HashSet<&str> = HashSet::new();
     for case in cases {
         if case.guard.is_some() {
             continue;
@@ -11277,7 +11277,7 @@ fn match_is_exhaustive_for_da(c: &Checker, subject: &Expr, cases: &[MatchCase]) 
         return true;
     }
     for variants in c.sealed_unions.values() {
-        if !variants.is_empty() && variants.iter().all(|v| pattern_classes.contains(v)) {
+        if !variants.is_empty() && variants.iter().all(|v| pattern_classes.contains(v.as_str())) {
             return true;
         }
     }
@@ -11790,7 +11790,7 @@ fn cases_cover_type(c: &Checker, cases: &[MatchCase], ty: &Type) -> bool {
     // `case Enum.MEMBER:` arms covering every member are exhaustive.
     if let Type::Class(name) = ty {
         if let Some(members) = c.enums.get(name.as_str()) {
-            let mut covered: HashSet<String> = HashSet::new();
+            let mut covered: HashSet<&str> = HashSet::new();
             for case in cases {
                 if case.guard.is_some() {
                     continue;
@@ -11802,7 +11802,7 @@ fn cases_cover_type(c: &Checker, cases: &[MatchCase], ty: &Type) -> bool {
                 // only add coverage we can't prove, never remove it).
                 let _ = enum_pattern_covered_members(&case.pattern, name, &mut covered);
             }
-            if members.iter().all(|m| covered.contains(m)) {
+            if members.iter().all(|m| covered.contains(m.as_str())) {
                 return true;
             }
         }
@@ -11889,7 +11889,7 @@ fn cases_cover_type(c: &Checker, cases: &[MatchCase], ty: &Type) -> bool {
         Type::Generic(head, _) => {
             if head == "Result" {
                 let variants = ["Ok", "Err"];
-                let mut covered: HashSet<String> = HashSet::new();
+                let mut covered: HashSet<&str> = HashSet::new();
                 for case in cases {
                     if case.guard.is_some() {
                         continue;
@@ -11909,8 +11909,8 @@ fn cases_cover_type(c: &Checker, cases: &[MatchCase], ty: &Type) -> bool {
         _ => return false,
     };
     if let Some(variants) = c.sealed_unions.get(class_name).cloned() {
-        let mut covered: HashSet<String> = HashSet::new();
-        let mut covered_with_guards: HashSet<String> = HashSet::new();
+        let mut covered: HashSet<&str> = HashSet::new();
+        let mut covered_with_guards: HashSet<&str> = HashSet::new();
         let mut has_guarded_wildcard = false;
         for case in cases {
             if case.guard.is_none() {
@@ -11933,7 +11933,7 @@ fn cases_cover_type(c: &Checker, cases: &[MatchCase], ty: &Type) -> bool {
                 has_guarded_wildcard = true;
             }
         }
-        if variants.iter().all(|v| covered.contains(v)) {
+        if variants.iter().all(|v| covered.contains(v.as_str())) {
             return true;
         }
         // FINDINGS v0.7.1 #15: when every sealed-union variant has at least
@@ -11945,10 +11945,10 @@ fn cases_cover_type(c: &Checker, cases: &[MatchCase], ty: &Type) -> bool {
         // gap (e.g. `case IntTok(0) if False: …`) will no longer surface
         // `missing_return`. We accept that cost to eliminate the much
         // louder false-positive on every guard-driven sealed-union match.
-        if (has_guarded_wildcard || variants.iter().all(|v| covered_with_guards.contains(v)))
+        if (has_guarded_wildcard || variants.iter().all(|v| covered_with_guards.contains(v.as_str())))
             && variants
                 .iter()
-                .any(|v| covered_with_guards.contains(v) && !covered.contains(v))
+                .any(|v| covered_with_guards.contains(v.as_str()) && !covered.contains(v.as_str()))
         {
             return true;
         }
@@ -16062,7 +16062,7 @@ fn check_match_exhaustiveness(
     variants: &[String],
     subject_span: (usize, usize),
 ) {
-    let mut covered: HashSet<String> = HashSet::new();
+    let mut covered: HashSet<&str> = HashSet::new();
     let mut has_wildcard = false;
 
     for case in cases {
@@ -16078,7 +16078,7 @@ fn check_match_exhaustiveness(
         }
         for variant in variants {
             if pattern_covers_class(c, &case.pattern, variant) {
-                covered.insert(variant.clone());
+                covered.insert(variant.as_str());
             }
         }
         collect_matched_class_names(&case.pattern, &mut covered);
@@ -16360,17 +16360,17 @@ fn class_has_enum_family_base(cd: &ruff_python_ast::StmtClassDef) -> bool {
 /// shape we can't classify (a literal, a different class, a capture with a
 /// sub-pattern, …) — the caller then skips enforcement entirely rather
 /// than risking a false positive.
-fn enum_pattern_covered_members(
-    pattern: &Pattern,
+fn enum_pattern_covered_members<'a>(
+    pattern: &'a Pattern,
     enum_name: &str,
-    covered: &mut HashSet<String>,
+    covered: &mut HashSet<&'a str>,
 ) -> bool {
     match pattern {
         Pattern::MatchValue(v) => {
             if let Expr::Attribute(a) = v.value.as_ref() {
                 if let Expr::Name(n) = a.value.as_ref() {
                     if n.id.as_str() == enum_name {
-                        covered.insert(a.attr.as_str().to_owned());
+                        covered.insert(a.attr.as_str());
                         return true;
                     }
                 }
@@ -16396,7 +16396,7 @@ fn check_enum_match_exhaustiveness(
     members: &[String],
     subject_span: (usize, usize),
 ) {
-    let mut covered: HashSet<String> = HashSet::new();
+    let mut covered: HashSet<&str> = HashSet::new();
     for case in cases {
         if case.guard.is_some() {
             continue;
@@ -16440,11 +16440,11 @@ fn is_wildcard_pattern(pattern: &Pattern) -> bool {
 /// Collect the class names matched by `PatternMatchClass` nodes in a pattern,
 /// recursing through wrapper forms (`MatchAs`, `MatchOr`) so that patterns
 /// like `case Circle() as c:` count as covering the `Circle` variant.
-fn collect_matched_class_names(pattern: &Pattern, covered: &mut HashSet<String>) {
+fn collect_matched_class_names<'a>(pattern: &'a Pattern, covered: &mut HashSet<&'a str>) {
     match pattern {
         Pattern::MatchClass(mc) => {
             if let Expr::Name(n) = mc.cls.as_ref() {
-                covered.insert(n.id.as_str().to_owned());
+                covered.insert(n.id.as_str());
             }
         }
         // `case Circle() as c:` — unwrap the alias and count the inner class.
