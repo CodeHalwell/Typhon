@@ -11277,7 +11277,11 @@ fn match_is_exhaustive_for_da(c: &Checker, subject: &Expr, cases: &[MatchCase]) 
         return true;
     }
     for variants in c.sealed_unions.values() {
-        if !variants.is_empty() && variants.iter().all(|v| pattern_classes.contains(v.as_str())) {
+        if !variants.is_empty()
+            && variants
+                .iter()
+                .all(|v| pattern_classes.contains(v.as_str()))
+        {
             return true;
         }
     }
@@ -11945,7 +11949,10 @@ fn cases_cover_type(c: &Checker, cases: &[MatchCase], ty: &Type) -> bool {
         // gap (e.g. `case IntTok(0) if False: …`) will no longer surface
         // `missing_return`. We accept that cost to eliminate the much
         // louder false-positive on every guard-driven sealed-union match.
-        if (has_guarded_wildcard || variants.iter().all(|v| covered_with_guards.contains(v.as_str())))
+        if (has_guarded_wildcard
+            || variants
+                .iter()
+                .all(|v| covered_with_guards.contains(v.as_str())))
             && variants
                 .iter()
                 .any(|v| covered_with_guards.contains(v.as_str()) && !covered.contains(v.as_str()))
