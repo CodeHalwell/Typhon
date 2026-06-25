@@ -2881,20 +2881,20 @@ impl<'a> Checker<'a> {
     /// at runtime, so `tyc::attribute_not_found` must be suppressed for
     /// attribute access on its instances.
     fn class_defines_getattr(&self, name: &str) -> bool {
-        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-        let mut stack: Vec<String> = vec![name.to_owned()];
+        let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        let mut stack: Vec<&str> = vec![name];
         while let Some(cur) = stack.pop() {
-            if !seen.insert(cur.clone()) {
+            if !seen.insert(cur) {
                 continue;
             }
-            if let Some(shape) = self.class_shapes.get(&cur) {
+            if let Some(shape) = self.class_shapes.get(cur) {
                 if shape.methods.contains_key("__getattr__") {
                     return true;
                 }
             }
-            if let Some(parents) = self.class_parents.get(&cur) {
+            if let Some(parents) = self.class_parents.get(cur) {
                 for p in parents {
-                    stack.push(p.clone());
+                    stack.push(p.as_str());
                 }
             }
         }
@@ -3864,20 +3864,20 @@ impl<'a> Checker<'a> {
     /// methods.  Returns the first matching [`MethodSig`] found, or `None` when no
     /// class in the hierarchy defines it.
     fn find_method<'b>(&'b self, cls_name: &str, method_name: &str) -> Option<&'b MethodSig> {
-        let mut stack: Vec<String> = vec![cls_name.to_owned()];
-        let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut stack: Vec<&str> = vec![cls_name];
+        let mut visited: std::collections::HashSet<&str> = std::collections::HashSet::new();
         while let Some(name) = stack.pop() {
-            if visited.contains(&name) {
+            if visited.contains(name) {
                 continue;
             }
-            if let Some(shape) = self.resolve_class_shape(&name) {
+            if let Some(shape) = self.resolve_class_shape(name) {
                 if let Some(sig) = shape.methods.get(method_name) {
                     return Some(sig);
                 }
-                stack.extend(shape.bases.iter().cloned());
+                stack.extend(shape.bases.iter().map(String::as_str));
             }
-            if let Some(parents) = self.class_parents.get(&name) {
-                stack.extend(parents.iter().cloned());
+            if let Some(parents) = self.class_parents.get(name) {
+                stack.extend(parents.iter().map(String::as_str));
             }
             // Mark visited last so `name` is consumed instead of cloned.
             visited.insert(name);
@@ -3896,27 +3896,27 @@ impl<'a> Checker<'a> {
         // Shared `Unknown` so `self`-assigned attributes (which carry no
         // declared type) can be returned by reference.
         static UNKNOWN: Type = Type::Unknown;
-        let mut stack: Vec<String> = vec![cls_name.to_owned()];
-        let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut stack: Vec<&str> = vec![cls_name];
+        let mut visited: std::collections::HashSet<&str> = std::collections::HashSet::new();
         while let Some(name) = stack.pop() {
-            if visited.contains(&name) {
+            if visited.contains(name) {
                 continue;
             }
-            if let Some(shape) = self.resolve_class_shape(&name) {
+            if let Some(shape) = self.resolve_class_shape(name) {
                 if let Some(ty) = shape.fields.get(field_name) {
                     return Some(ty);
                 }
-                stack.extend(shape.bases.iter().cloned());
+                stack.extend(shape.bases.iter().map(String::as_str));
             }
             // Attributes assigned via `self.NAME = ...` in a method body
             // resolve as instance attributes (typed `Unknown`).
-            if let Some(attrs) = self.self_attrs.get(&name) {
+            if let Some(attrs) = self.self_attrs.get(name) {
                 if attrs.contains(field_name) {
                     return Some(&UNKNOWN);
                 }
             }
-            if let Some(parents) = self.class_parents.get(&name) {
-                stack.extend(parents.iter().cloned());
+            if let Some(parents) = self.class_parents.get(name) {
+                stack.extend(parents.iter().map(String::as_str));
             }
             // Mark visited last so `name` is consumed instead of cloned.
             visited.insert(name);
@@ -5195,7 +5195,7 @@ fn seed_external_class_with_bases(
             }
             for module_shapes in by_module.values() {
                 if let Some(base_shape) = module_shapes.class_shapes.get(base) {
-                    stack.push((base.clone(), base_shape.clone()));
+                    stack.push((base.to_string(), base_shape.clone()));
                     break;
                 }
             }
@@ -6946,14 +6946,14 @@ fn collect_classes_and_functions(c: &mut Checker, body: &[Stmt]) {
     // synthesised pseudo-classes (`__typhon_impl_*`, `__TyphonLazy_*`) are
     // exempt: multiple `impl Foo:` blocks legitimately produce multiple
     // pseudo-classes, and the merge pass handles deduplication.
-    let mut seen_class_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut seen_class_names: std::collections::HashSet<&str> = std::collections::HashSet::new();
     for stmt in body {
         match stmt {
             Stmt::ClassDef(cd) => {
-                let name = cd.name.as_str().to_owned();
+                let name = cd.name.as_str();
                 if !name.starts_with("__typhon_impl_")
                     && !name.starts_with("__TyphonLazy_")
-                    && !seen_class_names.insert(name.clone())
+                    && !seen_class_names.insert(name)
                 {
                     let span_start = cd.name.range.start().to_usize();
                     let span_len = cd
@@ -6964,14 +6964,10 @@ fn collect_classes_and_functions(c: &mut Checker, body: &[Stmt]) {
                         .saturating_sub(span_start)
                         .max(1);
                     c.diagnostics.push_error(TycError::duplicate_class(
-                        name.as_str(),
-                        &c.path,
-                        c.source,
-                        span_start,
-                        span_len,
+                        name, &c.path, c.source, span_start, span_len,
                     ));
                 }
-                c.classes.push(name.clone());
+                c.classes.push(name.to_owned());
                 // Collect direct base class names for inheritance tracking.
                 // Handle both plain `Name` bases and `Subscript` bases like
                 // `list[int]` — in the latter case the base name is the subscript
@@ -7000,7 +6996,7 @@ fn collect_classes_and_functions(c: &mut Checker, body: &[Stmt]) {
                     })
                     .collect();
                 if !parents.is_empty() {
-                    c.class_parents.insert(name, parents);
+                    c.class_parents.insert(name.to_owned(), parents);
                 } else {
                     // Locally-declared `class Foo:` with no explicit
                     // bases must overwrite any imported parent chain
@@ -7009,7 +7005,7 @@ fn collect_classes_and_functions(c: &mut Checker, body: &[Stmt]) {
                     // `check_module_with_imports`) leaves a stale
                     // entry that the four hierarchy walks would still
                     // walk through. PR #150 review (copilot).
-                    c.class_parents.remove(&name);
+                    c.class_parents.remove(name);
                 }
             }
             Stmt::TypeAlias(ta) => {
@@ -7171,9 +7167,9 @@ fn collect_classes_and_functions(c: &mut Checker, body: &[Stmt]) {
     // not fire `impl_unknown_class` just because `Foo` isn't declared in
     // this file. (The project-wide check path also merges the method into
     // the imported shape, so call sites still type-check.)
-    let imported_names: HashSet<String> = body
+    let imported_names: HashSet<&str> = body
         .iter()
-        .flat_map(|stmt| -> Vec<String> {
+        .flat_map(|stmt| -> Vec<&str> {
             match stmt {
                 Stmt::ImportFrom(i) => i
                     .names
@@ -7181,21 +7177,18 @@ fn collect_classes_and_functions(c: &mut Checker, body: &[Stmt]) {
                     .map(|a| {
                         a.asname
                             .as_ref()
-                            .map(|n| n.as_str().to_owned())
-                            .unwrap_or_else(|| a.name.as_str().to_owned())
+                            .map(|n| n.as_str())
+                            .unwrap_or_else(|| a.name.as_str())
                     })
                     .collect(),
                 Stmt::Import(i) => i
                     .names
                     .iter()
                     .map(|a| {
-                        a.asname
-                            .as_ref()
-                            .map(|n| n.as_str().to_owned())
-                            .unwrap_or_else(|| {
-                                // `import a.b.c` binds the first segment.
-                                a.name.as_str().split('.').next().unwrap_or("").to_owned()
-                            })
+                        a.asname.as_ref().map(|n| n.as_str()).unwrap_or_else(|| {
+                            // `import a.b.c` binds the first segment.
+                            a.name.as_str().split('.').next().unwrap_or("")
+                        })
                     })
                     .collect(),
                 _ => Vec::new(),
@@ -10950,7 +10943,7 @@ fn da_walk_stmt(
                 let bound = alias
                     .asname
                     .as_ref()
-                    .map(|n| n.as_str().to_owned())
+                    .map(|n| n.as_str())
                     .unwrap_or_else(|| {
                         alias
                             .name
@@ -10958,9 +10951,8 @@ fn da_walk_stmt(
                             .split('.')
                             .next()
                             .unwrap_or(alias.name.as_str())
-                            .to_owned()
                     });
-                state.assign(&bound);
+                state.assign(bound);
             }
         }
         Stmt::ImportFrom(i) => {
@@ -10968,9 +10960,9 @@ fn da_walk_stmt(
                 let bound = alias
                     .asname
                     .as_ref()
-                    .map(|n| n.as_str().to_owned())
-                    .unwrap_or_else(|| alias.name.as_str().to_owned());
-                state.assign(&bound);
+                    .map(|n| n.as_str())
+                    .unwrap_or_else(|| alias.name.as_str());
+                state.assign(bound);
             }
         }
         Stmt::Global(g) => {
@@ -11277,7 +11269,11 @@ fn match_is_exhaustive_for_da(c: &Checker, subject: &Expr, cases: &[MatchCase]) 
         return true;
     }
     for variants in c.sealed_unions.values() {
-        if !variants.is_empty() && variants.iter().all(|v| pattern_classes.contains(v.as_str())) {
+        if !variants.is_empty()
+            && variants
+                .iter()
+                .all(|v| pattern_classes.contains(v.as_str()))
+        {
             return true;
         }
     }
@@ -11945,7 +11941,10 @@ fn cases_cover_type(c: &Checker, cases: &[MatchCase], ty: &Type) -> bool {
         // gap (e.g. `case IntTok(0) if False: …`) will no longer surface
         // `missing_return`. We accept that cost to eliminate the much
         // louder false-positive on every guard-driven sealed-union match.
-        if (has_guarded_wildcard || variants.iter().all(|v| covered_with_guards.contains(v.as_str())))
+        if (has_guarded_wildcard
+            || variants
+                .iter()
+                .all(|v| covered_with_guards.contains(v.as_str())))
             && variants
                 .iter()
                 .any(|v| covered_with_guards.contains(v.as_str()) && !covered.contains(v.as_str()))
@@ -16199,20 +16198,23 @@ fn check_override_compatibility(c: &mut Checker, body: &[Stmt]) {
             continue;
         };
         // Walk the full ancestor chain.
-        let mut chain: Vec<String> = Vec::new();
-        let mut frontier: Vec<String> = parents_map.get(sub).cloned().unwrap_or_default();
-        let mut seen: HashSet<String> = HashSet::new();
+        let mut chain: Vec<&str> = Vec::new();
+        let mut frontier: Vec<&str> = parents_map
+            .get(sub)
+            .map(|v| v.iter().map(String::as_str).collect())
+            .unwrap_or_default();
+        let mut seen: HashSet<&str> = HashSet::new();
         while let Some(p) = frontier.pop() {
-            if !seen.insert(p.clone()) {
+            if !seen.insert(p) {
                 continue;
             }
-            if let Some(more) = parents_map.get(&p) {
-                frontier.extend(more.iter().cloned());
+            if let Some(more) = parents_map.get(p) {
+                frontier.extend(more.iter().map(String::as_str));
             }
             chain.push(p);
         }
         for base in &chain {
-            let Some(base_shape) = c.class_shapes.get(base.as_str()) else {
+            let Some(base_shape) = c.class_shapes.get(*base) else {
                 continue;
             };
             for (name, base_sig) in &base_shape.methods {
@@ -16272,7 +16274,7 @@ fn check_override_compatibility(c: &mut Checker, body: &[Stmt]) {
                             "accepts at most {sub_max} parameter(s); the base accepts {base_max}"
                         )
                     };
-                    findings.push((sub.clone(), name.clone(), base.clone(), reason));
+                    findings.push((sub.clone(), name.clone(), base.to_string(), reason));
                     continue;
                 }
                 let mut flagged = false;
@@ -16293,7 +16295,7 @@ fn check_override_compatibility(c: &mut Checker, body: &[Stmt]) {
                         findings.push((
                             sub.clone(),
                             name.clone(),
-                            base.clone(),
+                            base.to_string(),
                             format!(
                                 "parameter {} narrows the base's `{}` to `{}`",
                                 i + 1,
@@ -16316,7 +16318,7 @@ fn check_override_compatibility(c: &mut Checker, body: &[Stmt]) {
                     findings.push((
                         sub.clone(),
                         name.clone(),
-                        base.clone(),
+                        base.to_string(),
                         format!(
                             "returns `{}`, not assignable to the base's `{}`",
                             sub_ret.display(),
