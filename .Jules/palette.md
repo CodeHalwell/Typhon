@@ -46,3 +46,6 @@
 ## 2026-06-23 - [Focus indicators on expressive code blocks]
 **Learning:** Found that Starlight 'Expressive Code' blocks specifically use the \`.expressive-code pre\` selector for the scrollable container. While \`[tabindex="0"]\` focus styling covered some generic scrollable elements, the expressive code blocks specifically required \`.expressive-code pre:focus-visible\` to ensure a visible focus outline when navigating via keyboard, confirming that custom components sometimes bypass generic accessibility selectors.
 **Action:** Appended \`.expressive-code pre:focus-visible\` to the global focus ring CSS rules in \`custom.css\`.
+## 2024-06-26 - Markdown Abbreviations and Code Blocks
+**Learning:** When using `<abbr>` tags for accessibility tooltips in `.mdx` content files, standard regex replacements will erroneously apply the HTML tags inside code blocks (```). Markdown engines render HTML in code blocks literally, breaking the presentation (e.g., ASCII art).
+**Action:** When applying string or regex replacements in Markdown files to add HTML semantics, use a parsing script or stateful replacement to explicitly skip lines inside code blocks.
