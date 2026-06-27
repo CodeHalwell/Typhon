@@ -46,6 +46,9 @@
 ## 2026-06-23 - [Focus indicators on expressive code blocks]
 **Learning:** Found that Starlight 'Expressive Code' blocks specifically use the \`.expressive-code pre\` selector for the scrollable container. While \`[tabindex="0"]\` focus styling covered some generic scrollable elements, the expressive code blocks specifically required \`.expressive-code pre:focus-visible\` to ensure a visible focus outline when navigating via keyboard, confirming that custom components sometimes bypass generic accessibility selectors.
 **Action:** Appended \`.expressive-code pre:focus-visible\` to the global focus ring CSS rules in \`custom.css\`.
+## 2024-06-26 - Markdown Abbreviations and Code Blocks
+**Learning:** When using `<abbr>` tags for accessibility tooltips in `.mdx` content files, standard regex replacements will erroneously apply the HTML tags inside code blocks (```). Markdown engines render HTML in code blocks literally, breaking the presentation (e.g., ASCII art).
+**Action:** When applying string or regex replacements in Markdown files to add HTML semantics, use a parsing script or stateful replacement to explicitly skip lines inside code blocks.
 ## 2026-06-25 - [Modern thin scrollbars for technical documentation]
 **Learning:** Default OS scrollbars (especially on Windows/Linux) are bulky and visually clash with custom, modern documentation themes. They are particularly detrimental when dealing with horizontally scrollable technical content, like `.expressive-code pre` blocks, as thick default scrollbars can overlap or reduce the visibility of code content.
 **Action:** Added global `scrollbar-width: thin` and `::-webkit-scrollbar` styling in `custom.css` with a matching theme color. Included a specific fix for `.expressive-code pre::-webkit-scrollbar-corner` to prevent unsightly corner boxes on code blocks with both horizontal and vertical overflow.
