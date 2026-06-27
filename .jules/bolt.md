@@ -17,3 +17,6 @@
 ## 2024-08-10 - Avoid HashSet<String> for AST Identifiers
 **Learning:** Checking for subset matching or exhaustiveness against multiple AST node identifiers utilizing `HashSet<String>` creates constant temporary heap allocations within hot match evaluation logic.
 **Action:** Always borrow AST node string slices into `HashSet<&str>` directly where practical (e.g. for short-lived tracking sets during type-checking pattern loops) to mitigate massive redundant allocations across deep compilation traces.
+## 2024-05-19 - Use `&str` instead of `String` for HashSet duplicate tracking
+**Learning:** Using `HashSet<String>` combined with `.to_owned()` during hot loops (like scanning class definitions in an AST) introduces unnecessary heap allocations that can be avoided by borrowing slices `HashSet<&str>` directly from the nodes.
+**Action:** When tracking unique occurrences of names in AST nodes or strings in short-lived localized scopes, use `HashSet<&str>` to borrow without allocating, converting to owned strings only when they must be passed to long-lived containers.
