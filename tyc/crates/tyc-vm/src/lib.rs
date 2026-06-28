@@ -837,6 +837,41 @@ print("ok")
     }
 
     #[test]
+    fn numeric_keys_collapse_like_cpython() {
+        // CPython treats numerically-equal bool/int/float as one mapping/set
+        // key: `1 == 1.0 == True`, all hash-equal. The VM used to keep them
+        // distinct (silent data divergence). Regressions `raise` → non-zero run.
+        let src = r#"
+mut d: dict[object, str] = {}
+d[1] = "a"
+d[1.0] = "b"
+d[True] = "c"
+if len(d) != 1:
+    raise ValueError("int/float/bool keys should collapse to one")
+# first-inserted key identity is kept, value updated to last write
+if str(d) != "{1: 'c'}":
+    raise ValueError("expected {1: 'c'}, got " + str(d))
+
+if len({1, 1.0, True, 2}) != 2:
+    raise ValueError("set should collapse numeric duplicates")
+if 1 not in {1.0}:
+    raise ValueError("1 should be in {1.0}")
+if hash(1) != hash(1.0):
+    raise ValueError("hash(1) should equal hash(1.0)")
+# the cross-type frozenset case that the canonical ordering must handle
+if frozenset({1, 2.0}) != frozenset({1.0, 2}):
+    raise ValueError("mixed-type frozensets should compare equal")
+# non-integral floats stay distinct
+if len({1.5, 2.5, 1.5}) != 2:
+    raise ValueError("non-integral floats should not collapse")
+if 1.5 in {1}:
+    raise ValueError("1.5 should not be in {1}")
+print("ok")
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    #[test]
     fn try_result_bridges_exceptions() {
         // `try_result(thunk[, on_err])` returns `Ok(thunk())`, or catches a
         // raised exception and returns `Err(on_err(exc))` / `Err(exc)`. Drives

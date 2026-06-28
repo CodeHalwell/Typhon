@@ -20,6 +20,12 @@ canonical phase-by-phase status lives in `docs/roadmap.md`.
   with a new doc page) were emitted by the compiler and documented but returned
   "unknown diagnostic code"; they're now registered in the catalog and
   `tyc explain --list`.
+- **VM dict/set keys collapse numerically-equal `int` / `float` / `bool`**, matching
+  CPython (`{1: a, 1.0: b, True: c}` is one entry; `1 in {1.0}`; `hash(1) ==
+  hash(1.0)`; `frozenset({1, 2.0}) == frozenset({1.0, 2})`). The `HashKey`
+  equality, hashing, and canonical ordering now treat an integral float like the
+  equal int; non-integral floats keep their own identity. Closes a silent VM/
+  CPython data divergence.
 - **VM now enforces the `as!` checked cast** (was an identity passthrough). The
   in-process VM interprets the `as!` type descriptor and runs the same recursive
   structural check as the compiled path's `typhon_runtime/cast.py`, so a
