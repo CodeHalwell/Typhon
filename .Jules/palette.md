@@ -52,3 +52,7 @@
 ## 2026-06-25 - [Modern thin scrollbars for technical documentation]
 **Learning:** Default OS scrollbars (especially on Windows/Linux) are bulky and visually clash with custom, modern documentation themes. They are particularly detrimental when dealing with horizontally scrollable technical content, like `.expressive-code pre` blocks, as thick default scrollbars can overlap or reduce the visibility of code content.
 **Action:** Added global `scrollbar-width: thin` and `::-webkit-scrollbar` styling in `custom.css` with a matching theme color. Included a specific fix for `.expressive-code pre::-webkit-scrollbar-corner` to prevent unsightly corner boxes on code blocks with both horizontal and vertical overflow.
+
+## 2026-06-28 - Card Focus-Within Parity
+**Learning:** Container elements like `<Card>` or `<LinkCard>` often have prominent `:hover` effects (like border color changes and box-shadow elevations). However, these containers can lack equivalent visual feedback for keyboard users tabbing through internal links. If tabbing into a link only highlights the link but the container remains static, it breaks the spatial and visual hierarchy for keyboard navigation compared to pointer devices.
+**Action:** Always add `:focus-within` to container components alongside `:hover` states to ensure parity between mouse and keyboard interaction feedback. Ensure any container animations (like `box-shadow`) are included in the `transition` property for smooth execution on both states. Also ensure `:focus-within` respects `prefers-reduced-motion` media queries.

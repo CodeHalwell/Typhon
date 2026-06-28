@@ -80,10 +80,12 @@
   border: 1px solid var(--sl-color-gray-5);
   border-radius: 0.75rem;
   padding: 1rem 1.1rem;
-  transition: border-color 120ms ease, transform 120ms ease;
+  transition: border-color 120ms ease, transform 120ms ease, box-shadow 120ms ease;
 }
 
-.card:hover {
+/* UX: Elevate card on focus-within to provide keyboard navigators the same visual feedback as mouse hover */
+.card:hover,
+.card:focus-within {
   border-color: var(--sl-color-accent);
   transform: translateY(-2px);
   box-shadow: 0 4px 12px color-mix(in srgb, var(--sl-color-accent) 20%, transparent);
@@ -220,11 +222,13 @@ textarea:focus-visible,
 }
 
 /* Starlight specific focus fixes */
+.sl-link-card:hover,
 .sl-link-card:focus-within {
   background: var(--sl-color-gray-7, var(--sl-color-gray-6));
   border-color: var(--sl-color-gray-2);
 }
 
+.sl-link-card:hover .icon,
 .sl-link-card:focus-within .icon {
   color: var(--sl-color-white);
 }
@@ -232,7 +236,9 @@ textarea:focus-visible,
 /* Respect user's motion preferences */
 @media (prefers-reduced-motion: reduce) {
   .card:hover,
-  .sl-link-card:hover {
+  .card:focus-within,
+  .sl-link-card:hover,
+  .sl-link-card:focus-within {
     transform: none;
   }
 }
