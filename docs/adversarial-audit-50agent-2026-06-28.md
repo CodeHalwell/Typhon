@@ -101,7 +101,7 @@ Status legend: ✅ fixed · ⏳ pending · 🔁 dup of an already-fixed item.
 - **Status:** ⏳ pending
 - **Root cause:** The binary-operator type rule in tyc-types models `int ** int -> int` unconditionally. Python's `int.__pow__` returns `float` when the exponent is negative (e.g. `2 ** -1 == 0.5`). The checker has no special case for a statically-known negative literal exponent (where pyright/mypy DO narrow the result to `float`), nor does it widen `int ** int` to `int | float` for an unknown-sign exponent. So a f
 
-### [20] (soundness / e_question) Inline `?` is hoisted out of conditionally-evaluated positions (ternary branch, `and`/`or` RHS), breaking short-circuit evaluation — runs the fallible call unconditionally and returns a spurious `Err` (VM crashes)
+### [20] ✅ (soundness / e_question) Inline `?` is hoisted out of conditionally-evaluated positions (ternary branch, `and`/`or` RHS), breaking short-circuit evaluation — runs the fallible call unconditionally and returns a spurious `Err` (VM crashes)
 - **Status:** ⏳ pending
 - **Root cause:** The inline-`?` desugaring pass (tyc-desugar, the `?`-hoisting/statement-tail lowering that produces `__typhon_qi_N__` temporaries) lifts the fallible operand to the nearest enclosing statement unconditionally. It does not account for operands that sit in conditionally-evaluated sub-expressions (ternary `then`/`else` arms, RHS of `and`/`or`). Postfix `?` must be evaluated only on the control-flow p
 

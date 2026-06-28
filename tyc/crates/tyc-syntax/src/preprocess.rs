@@ -3385,6 +3385,18 @@ pub fn validate_question_ops(source: &str) -> Vec<QuestionOpError> {
                 });
                 continue;
             }
+            if let Some(ctx) = questionmark_in_unhoistable_position(code, offset) {
+                errors.push(QuestionOpError {
+                    line_index,
+                    offset: q_offset,
+                    message: format!(
+                        "`?` operator cannot appear inside {ctx}; it is lifted to a \
+                         statement-level temp that always runs, which would change evaluation \
+                         order — bind the `Result` with `?` on its own line first, then use it"
+                    ),
+                });
+                continue;
+            }
             match fn_stack.last() {
                 None => {
                     errors.push(QuestionOpError {
@@ -3416,6 +3428,23 @@ pub fn validate_question_ops(source: &str) -> Vec<QuestionOpError> {
             if before_q.ends_with(')') {
                 // Byte offset of the `?` in the original source.
                 let q_offset = byte_offset + code.len() - 1;
+                // A trailing `)?` inside a lambda body / ternary arm / and-or
+                // operand (`lambda: f()?`, `0 if c else f()?`, `a and f()?`)
+                // can't be hoisted without changing evaluation.
+                if let Some(ctx) = questionmark_in_unhoistable_position(code, code.len() - 1) {
+                    errors.push(QuestionOpError {
+                        line_index,
+                        offset: q_offset,
+                        message: format!(
+                            "`?` operator cannot appear inside {ctx}; it is lifted to a \
+                             statement-level temp that always runs, which would change \
+                             evaluation order — bind the `Result` with `?` on its own line \
+                             first, then use it"
+                        ),
+                    });
+                    byte_offset += line.len();
+                    continue;
+                }
                 match fn_stack.last() {
                     None => {
                         errors.push(QuestionOpError {
@@ -3537,6 +3566,159 @@ fn find_mid_expression_questionmarks(code: &str) -> Vec<usize> {
 /// the resulting code lays out very differently from what the user
 /// wrote, so rejecting up-front with a clear message is the cleaner
 /// behaviour.
+/// Detect a `?` that sits in a position the hoisting lowering cannot move it
+/// out of without changing evaluation: a `lambda` body (the operand runs later,
+/// not in the enclosing function), or a conditionally-evaluated slot — a
+/// ternary arm (`x if c else y`) or an `and`/`or` operand (short-circuit). The
+/// hoister lifts the `?` operand to an unconditional statement-level temp, so
+/// in these positions it would run code that should be deferred/skipped
+/// (crash or silently-wrong result). Returns the context name for the message.
+/// Scans the code before `?` with string- and bracket-awareness; analysis is
+/// per (innermost) bracket group, covering the common single-line forms.
+fn questionmark_in_unhoistable_position(code: &str, q_idx: usize) -> Option<&'static str> {
+    let bytes = code.as_bytes();
+    if q_idx > bytes.len() {
+        return None;
+    }
+    let kw_at = |idx: usize, kw: &str| -> bool {
+        let prev_ok = idx == 0 || !(bytes[idx - 1].is_ascii_alphanumeric() || bytes[idx - 1] == b'_');
+        prev_ok
+            && code[idx..].starts_with(kw)
+            && code[idx + kw.len()..]
+                .chars()
+                .next()
+                .map(|ch| !(ch.is_alphanumeric() || ch == '_'))
+                .unwrap_or(true)
+    };
+    // Per-depth flags, snapshotted on a stack across bracket groups. A token
+    // only counts if it sits at the `?`'s own (innermost) bracket level — and a
+    // top-level `,` resets the flags because it separates sibling expressions.
+    #[derive(Clone, Copy, Default)]
+    struct Flags {
+        pending_lambda: bool,
+        lambda_body: bool,
+        ternary: bool,
+        boolop: bool,
+    }
+    let mut f = Flags::default();
+    let mut stack: Vec<Flags> = Vec::new();
+    let mut in_str: Option<u8> = None;
+    let mut i = 0;
+    while i < q_idx {
+        let b = bytes[i];
+        if let Some(q) = in_str {
+            if b == b'\\' && i + 1 < bytes.len() {
+                i += 2;
+                continue;
+            }
+            if b == q {
+                in_str = None;
+            }
+            i += 1;
+            continue;
+        }
+        match b {
+            b'#' => break,
+            b'\'' | b'"' => in_str = Some(b),
+            b'(' | b'[' | b'{' => {
+                stack.push(f);
+                f = Flags::default();
+            }
+            b')' | b']' | b'}' => {
+                f = stack.pop().unwrap_or_default();
+            }
+            b',' => f = Flags { lambda_body: f.lambda_body, ..Flags::default() },
+            b':' if f.pending_lambda => {
+                f.pending_lambda = false;
+                f.lambda_body = true;
+            }
+            _ => {
+                if kw_at(i, "lambda") {
+                    f.pending_lambda = true;
+                } else if kw_at(i, "else") {
+                    // `… if … else <here>` — the false-arm is conditionally
+                    // evaluated. (The true-arm, before `if`, is caught by the
+                    // end-of-line path scanning the whole line.)
+                    f.ternary = true;
+                } else if kw_at(i, "and") || kw_at(i, "or") {
+                    f.boolop = true;
+                }
+            }
+        }
+        i += 1;
+    }
+    if f.lambda_body {
+        return Some("a `lambda` body");
+    }
+    if f.boolop {
+        return Some("an `and` / `or` operand (short-circuit evaluation)");
+    }
+    if f.ternary {
+        return Some("a conditional-expression (`… if … else …`) branch");
+    }
+    // A `?` BEFORE a top-level ternary `if … else` (the true-arm) — scan the
+    // rest of the line at the `?`'s depth for ` if … else `.
+    if questionmark_precedes_ternary(code, q_idx) {
+        return Some("a conditional-expression (`… if … else …`) branch");
+    }
+    None
+}
+
+/// True when, at the `?`'s bracket depth, a ternary `if … else` follows the
+/// `?` on the line — i.e. the `?` is in the true-arm of `X? if C else Y`.
+fn questionmark_precedes_ternary(code: &str, q_idx: usize) -> bool {
+    let bytes = code.as_bytes();
+    let mut depth: i32 = 0;
+    let mut in_str: Option<u8> = None;
+    let mut saw_if = false;
+    let mut j = q_idx + 1;
+    while j < bytes.len() {
+        let b = bytes[j];
+        if let Some(q) = in_str {
+            if b == b'\\' && j + 1 < bytes.len() {
+                j += 2;
+                continue;
+            }
+            if b == q {
+                in_str = None;
+            }
+            j += 1;
+            continue;
+        }
+        let kw = |idx: usize, kw: &str| -> bool {
+            let prev = bytes[idx - 1];
+            !(prev.is_ascii_alphanumeric() || prev == b'_')
+                && code[idx..].starts_with(kw)
+                && code[idx + kw.len()..]
+                    .chars()
+                    .next()
+                    .map(|c| !(c.is_alphanumeric() || c == '_'))
+                    .unwrap_or(true)
+        };
+        match b {
+            b'#' => break,
+            b'\'' | b'"' => in_str = Some(b),
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => {
+                if depth == 0 {
+                    break;
+                }
+                depth -= 1;
+            }
+            _ if depth == 0 && j > 0 => {
+                if kw(j, "if") {
+                    saw_if = true;
+                } else if saw_if && kw(j, "else") {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+        j += 1;
+    }
+    false
+}
+
 fn questionmark_is_in_comprehension(code: &str, q_idx: usize) -> bool {
     let bytes = code.as_bytes();
     if q_idx >= bytes.len() {
@@ -10623,6 +10805,32 @@ mod tests {
             "got: {}",
             errs[0].message
         );
+    }
+
+    #[test]
+    fn question_op_rejected_in_unhoistable_positions() {
+        // `?` is lifted to an unconditional statement-level temp, so it cannot
+        // sit in a lambda body or a conditionally-evaluated slot (ternary arm /
+        // and-or operand) — doing so would crash (lambda) or run a branch that
+        // should be skipped (silently wrong result).
+        let cases = [
+            ("def f() -> Result[int, str]:\n    let g = (lambda: parse(a)?)\n", "lambda"),
+            ("def f() -> Result[int, str]:\n    let v: int = parse(a)? if c else parse(b)?\n", "conditional"),
+            ("def f() -> Result[int, str]:\n    let v: int = 0 if c else parse(b)?\n", "conditional"),
+            ("def f() -> Result[bool, str]:\n    let v: bool = chk(a)? and chk(b)?\n", "and"),
+            ("def f() -> Result[bool, str]:\n    let v: bool = chk(a)? or chk(b)?\n", "and"),
+        ];
+        for (src, needle) in cases {
+            let errs = validate_question_ops(src);
+            assert!(!errs.is_empty(), "must reject `?` here: {src}");
+            assert!(
+                errs.iter().any(|e| e.message.contains(needle)),
+                "expected a {needle} message for `{src}`, got {:?}",
+                errs.iter().map(|e| &e.message).collect::<Vec<_>>()
+            );
+        }
+        // A plain single `?` and a `?` in the ternary TEST stay valid.
+        assert!(validate_question_ops("def f() -> Result[int, str]:\n    let g: int = parse(a)?\n    return Ok(g)\n").is_empty());
     }
 
     #[test]
