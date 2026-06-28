@@ -115,7 +115,10 @@ impl Default for EmitConfig {
 /// [`TyphonConfig::validate`] — including the empty string and historical
 /// aliases like `"struct"` / `"regular"` / `"none"` which were never wired
 /// through the emitter.
-pub const ALLOWED_CLASS_DEFAULTS: &[&str] = &["dataclass", "pydantic"];
+// `"pydantic"` is intentionally NOT here: a project-wide pydantic default is
+// not wired into the emitter, so it is rejected with a dedicated message in
+// [`TyphonConfig::validate`] pointing at the per-class `model` keyword.
+pub const ALLOWED_CLASS_DEFAULTS: &[&str] = &["dataclass"];
 
 /// Accepted values for `[emit] model-extra`. Anything else is rejected by
 /// [`TyphonConfig::validate`].
@@ -368,6 +371,21 @@ impl TyphonConfig {
         // `"regular"`, `"none"`) all surface here rather than silently
         // falling back to dataclass at emit time.
         let cd = self.emit.class_default.trim();
+        if cd == "pydantic" {
+            // Project-wide pydantic default is not wired into the emitter
+            // (it was silently a no-op — every `class` still emitted a
+            // dataclass). Reject it explicitly and point at the per-class
+            // `model` keyword, which IS implemented, rather than letting the
+            // user believe the knob took effect.
+            return Err(ConfigError::InvalidClassDefault {
+                path: source_path.to_string_lossy().into_owned(),
+                value: self.emit.class_default.clone(),
+                allowed:
+                    "dataclass (a project-wide pydantic default is not yet implemented — declare \
+                     a boundary type with the `model` keyword per class instead)"
+                        .to_owned(),
+            });
+        }
         if !ALLOWED_CLASS_DEFAULTS.contains(&cd) {
             return Err(ConfigError::InvalidClassDefault {
                 path: source_path.to_string_lossy().into_owned(),
@@ -608,13 +626,30 @@ mod tests {
     }
 
     #[test]
-    fn validate_accepts_dataclass_and_pydantic() {
+    fn validate_accepts_dataclass() {
         let path = Path::new("typhon.toml");
-        for v in &["dataclass", "pydantic"] {
-            let mut cfg = cfg_with_target("3.13");
-            cfg.emit.class_default = (*v).into();
-            cfg.validate(path)
-                .unwrap_or_else(|e| panic!("class-default {v} should be accepted, got {e}"));
+        let mut cfg = cfg_with_target("3.13");
+        cfg.emit.class_default = "dataclass".into();
+        cfg.validate(path)
+            .unwrap_or_else(|e| panic!("class-default dataclass should be accepted, got {e}"));
+    }
+
+    #[test]
+    fn validate_rejects_pydantic_class_default_with_model_hint() {
+        // A project-wide pydantic default is not wired; it must be rejected
+        // (not a silent no-op) with a pointer to the per-class `model` keyword.
+        let path = Path::new("typhon.toml");
+        let mut cfg = cfg_with_target("3.13");
+        cfg.emit.class_default = "pydantic".into();
+        let err = cfg
+            .validate(path)
+            .expect_err("class-default pydantic should be rejected");
+        match err {
+            ConfigError::InvalidClassDefault { value, allowed, .. } => {
+                assert_eq!(value, "pydantic");
+                assert!(allowed.contains("model"), "message should mention `model`, got {allowed}");
+            }
+            other => panic!("expected InvalidClassDefault, got {other:?}"),
         }
     }
 
@@ -631,8 +666,8 @@ mod tests {
                 ConfigError::InvalidClassDefault { value, allowed, .. } => {
                     assert_eq!(value, *v);
                     assert!(
-                        allowed.contains("dataclass") && allowed.contains("pydantic"),
-                        "expected allowed list to mention dataclass+pydantic, got {allowed}"
+                        allowed.contains("dataclass"),
+                        "expected allowed list to mention dataclass, got {allowed}"
                     );
                 }
                 other => panic!("expected InvalidClassDefault for {v:?}, got {other:?}"),
@@ -651,7 +686,6 @@ mod tests {
         let msg = format!("{err}");
         assert!(msg.contains("msgspec"), "got {msg}");
         assert!(msg.contains("dataclass"), "got {msg}");
-        assert!(msg.contains("pydantic"), "got {msg}");
     }
 
     #[test]

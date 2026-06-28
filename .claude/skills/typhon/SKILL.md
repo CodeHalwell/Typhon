@@ -1223,7 +1223,7 @@ target = "3.13"                  # **required: 3.13+ only**. Valid: "3.13" / "3.
 free-threaded = false            # requires 3.13t/3.14t; off by default
 
 [emit]
-class-default = "dataclass"      # or "pydantic". Unknown values → tyc::invalid_config_value
+class-default = "dataclass"      # only "dataclass" today; project-wide "pydantic" is rejected (use `model` per class). Unknown values → tyc::invalid_config_value
 format = true                    # post-process through ruff format
 model-extra = "forbid"           # "forbid" | "allow" | "ignore"
 skip-decoration-bases = []       # extra base-class names suppressing the auto @dataclass decoration. Matched by last segment.
