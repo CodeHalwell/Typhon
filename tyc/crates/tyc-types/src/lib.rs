@@ -2352,6 +2352,24 @@ impl TypeEnv {
         self.attr_narrowings
             .retain(|k, _| k != path && !k.starts_with(&sub_prefix));
     }
+    /// Reset flow-narrowing on module-global bindings (the outermost scope)
+    /// back to their declared type. A call may reassign a module global via a
+    /// `global NAME` in the callee, so any narrowing the caller established on
+    /// that global (`if g is not None:` / a `match g:` arm) is stale once an
+    /// intervening call runs. Local bindings (inner scopes) are untouched —
+    /// Python has no by-reference rebinding of a caller's local, so a call
+    /// cannot invalidate their narrowing. This closes the *global* slice of the
+    /// narrowing-across-call soundness gap (the `match`-over-a-global case in
+    /// particular silently broke the sealed-union exhaustiveness guarantee).
+    fn reset_global_narrowings(&mut self) {
+        if let Some(globals) = self.scopes.first_mut() {
+            for b in globals.values_mut() {
+                if b.narrowed != b.declared {
+                    b.narrowed = b.declared.clone();
+                }
+            }
+        }
+    }
 }
 
 /// Per-module check state.
@@ -9423,6 +9441,35 @@ fn seed_env_from_scope(c: &mut Checker, scope: ScopeId) {
     }
 }
 
+/// Whether an expression contains a call anywhere in evaluation position —
+/// used to decide if a bare expression statement could have side-effected a
+/// module global (and thus invalidate global narrowing). Conservative: any
+/// `Call`/`Await` node counts.
+fn expr_contains_call(e: &Expr) -> bool {
+    use ruff_python_ast::Expr as E;
+    match e {
+        E::Call(_) | E::Await(_) => true,
+        E::Attribute(a) => expr_contains_call(&a.value),
+        E::Subscript(s) => expr_contains_call(&s.value) || expr_contains_call(&s.slice),
+        E::BoolOp(b) => b.values.iter().any(expr_contains_call),
+        E::BinOp(b) => expr_contains_call(&b.left) || expr_contains_call(&b.right),
+        E::UnaryOp(u) => expr_contains_call(&u.operand),
+        E::Compare(cmp) => {
+            expr_contains_call(&cmp.left) || cmp.comparators.iter().any(expr_contains_call)
+        }
+        E::If(i) => {
+            expr_contains_call(&i.test)
+                || expr_contains_call(&i.body)
+                || expr_contains_call(&i.orelse)
+        }
+        E::Named(n) => expr_contains_call(&n.value),
+        E::Starred(s) => expr_contains_call(&s.value),
+        E::Tuple(t) => t.elts.iter().any(expr_contains_call),
+        E::List(l) => l.elts.iter().any(expr_contains_call),
+        _ => false,
+    }
+}
+
 fn check_stmt(c: &mut Checker, stmt: &Stmt) {
     match stmt {
         Stmt::AnnAssign(a) => {
@@ -10116,6 +10163,14 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
         }
         Stmt::Expr(e) => {
             let _ = infer_expr(c, &e.value);
+            // A bare-call statement (`self.clear()`, `flip()`, `await f()`)
+            // may reassign a module global via a `global NAME` in the callee,
+            // so any narrowing the caller established on a global is now stale.
+            // Reset it. (Locals are immune — a call can't rebind a caller's
+            // local.) See `reset_global_narrowings`.
+            if expr_contains_call(&e.value) {
+                c.env.reset_global_narrowings();
+            }
         }
         Stmt::AugAssign(a) => {
             let l = infer_expr(c, &a.target);
@@ -16711,6 +16766,39 @@ mod tests {
         assert!(d.has_errors());
         let msg = format!("{}", d.errors()[0]);
         assert!(msg.contains("expected `int`"), "got {}", msg);
+    }
+
+    // ── Narrowing invalidation across calls ──────────────────────────────
+
+    #[test]
+    fn global_narrowing_invalidated_by_intervening_call() {
+        // `clear()` reassigns the global via `global g; g = None`, so the
+        // `g is not None` narrowing is stale at `len(g)`. Must be rejected
+        // (was a silent soundness hole — clean check, `TypeError` at runtime).
+        let src = "mut g: str? = \"hi\"\n\
+                   def clear() -> None:\n    global g\n    g = None\n\
+                   def f() -> int:\n    if g is not None:\n        clear()\n        return len(g)\n    return 0\n";
+        let d = check(src);
+        assert!(d.has_errors(), "expected narrowing to be invalidated: {:?}", d.errors());
+    }
+
+    #[test]
+    fn global_narrowing_survives_without_intervening_call() {
+        // No call between the narrow and the use — narrowing must hold.
+        let src = "mut g: str? = \"hi\"\n\
+                   def f() -> int:\n    if g is not None:\n        return len(g)\n    return 0\n";
+        let d = check(src);
+        assert!(!d.has_errors(), "narrowing should hold with no call: {:?}", d.errors());
+    }
+
+    #[test]
+    fn local_narrowing_survives_intervening_call() {
+        // A call cannot rebind a caller's local, so local narrowing must
+        // survive an intervening call (guards against an over-broad fix).
+        let src = "def helper() -> None:\n    print(\"noop\")\n\
+                   def f(x: str?) -> int:\n    if x is not None:\n        helper()\n        return len(x)\n    return 0\n";
+        let d = check(src);
+        assert!(!d.has_errors(), "local narrowing should survive a call: {:?}", d.errors());
     }
 
     // ── Variance ─────────────────────────────────────────────────────────
