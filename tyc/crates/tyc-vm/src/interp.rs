@@ -6206,7 +6206,11 @@ fn format_cast_type(tp: &Expr) -> String {
         Expr::Attribute(a) => format!("{}.{}", format_cast_type(&a.value), a.attr.as_str()),
         Expr::EllipsisLiteral(_) => "...".to_owned(),
         Expr::BinOp(b) if matches!(b.op, Operator::BitOr) => {
-            format!("{} | {}", format_cast_type(&b.left), format_cast_type(&b.right))
+            format!(
+                "{} | {}",
+                format_cast_type(&b.left),
+                format_cast_type(&b.right)
+            )
         }
         Expr::Subscript(s) => {
             let inner = match s.slice.as_ref() {

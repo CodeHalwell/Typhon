@@ -8953,12 +8953,23 @@ mod tests {
             let prep = preprocess(src);
             // Forward pass must produce a balanced wrapper call.
             let opens = prep.python_source.matches("__typhon_freeze__(").count();
-            assert_eq!(opens, 1, "expected one freeze wrapper:\n{}", prep.python_source);
+            assert_eq!(
+                opens, 1,
+                "expected one freeze wrapper:\n{}",
+                prep.python_source
+            );
             let parsed = crate::parse_module(&prep.python_source);
-            assert!(parsed.is_ok(), "preprocessed freeze let must parse:\n{}", prep.python_source);
+            assert!(
+                parsed.is_ok(),
+                "preprocessed freeze let must parse:\n{}",
+                prep.python_source
+            );
             // And it must round-trip back to the original surface.
             let out = postprocess(&prep.python_source, &prep.stripped, &prep.optionals);
-            assert_eq!(out, src, "multi-line freeze let with in-string `#` must round-trip");
+            assert_eq!(
+                out, src,
+                "multi-line freeze let with in-string `#` must round-trip"
+            );
         }
     }
 

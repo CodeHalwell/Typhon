@@ -16813,7 +16813,11 @@ mod tests {
                    def clear() -> None:\n    global g\n    g = None\n\
                    def f() -> int:\n    if g is not None:\n        clear()\n        return len(g)\n    return 0\n";
         let d = check(src);
-        assert!(d.has_errors(), "expected narrowing to be invalidated: {:?}", d.errors());
+        assert!(
+            d.has_errors(),
+            "expected narrowing to be invalidated: {:?}",
+            d.errors()
+        );
     }
 
     #[test]
@@ -16822,7 +16826,11 @@ mod tests {
         let src = "mut g: str? = \"hi\"\n\
                    def f() -> int:\n    if g is not None:\n        return len(g)\n    return 0\n";
         let d = check(src);
-        assert!(!d.has_errors(), "narrowing should hold with no call: {:?}", d.errors());
+        assert!(
+            !d.has_errors(),
+            "narrowing should hold with no call: {:?}",
+            d.errors()
+        );
     }
 
     #[test]
@@ -16832,22 +16840,35 @@ mod tests {
         let src = "def helper() -> None:\n    print(\"noop\")\n\
                    def f(x: str?) -> int:\n    if x is not None:\n        helper()\n        return len(x)\n    return 0\n";
         let d = check(src);
-        assert!(!d.has_errors(), "local narrowing should survive a call: {:?}", d.errors());
+        assert!(
+            !d.has_errors(),
+            "local narrowing should survive a call: {:?}",
+            d.errors()
+        );
     }
 
     #[test]
     fn and_narrows_receiver_of_method_call() {
         // `x is not None and x.method()` — the canonical null-check idiom.
         // The second operand's receiver must see `x` narrowed to non-None.
-        let d = check("def a(x: str?) -> bool:\n    return x is not None and x.startswith(\"a\")\n");
-        assert!(!d.has_errors(), "and-narrowing should reach receiver: {:?}", d.errors());
+        let d =
+            check("def a(x: str?) -> bool:\n    return x is not None and x.startswith(\"a\")\n");
+        assert!(
+            !d.has_errors(),
+            "and-narrowing should reach receiver: {:?}",
+            d.errors()
+        );
     }
 
     #[test]
     fn or_de_morgan_narrows_receiver() {
         // `x is None or x.method()` — reaching the 2nd operand means x is set.
         let d = check("def a(s: str?) -> bool:\n    return s is None or s.startswith(\"#\")\n");
-        assert!(!d.has_errors(), "or-narrowing should reach receiver: {:?}", d.errors());
+        assert!(
+            !d.has_errors(),
+            "or-narrowing should reach receiver: {:?}",
+            d.errors()
+        );
     }
 
     #[test]
@@ -16857,7 +16878,11 @@ mod tests {
         let d = check(
             "def f(x: str?) -> int:\n    let ok: bool = x is not None and x.startswith(\"a\")\n    return len(x)\n",
         );
-        assert!(d.has_errors(), "narrowing must not leak past the bool-op: {:?}", d.errors());
+        assert!(
+            d.has_errors(),
+            "narrowing must not leak past the bool-op: {:?}",
+            d.errors()
+        );
     }
 
     // ── Variance ─────────────────────────────────────────────────────────

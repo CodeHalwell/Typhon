@@ -3397,7 +3397,9 @@ fn is_secret_name(name: &str) -> bool {
     // Recognised secret words. Longest-first matters because of
     // `API_KEY` overlapping `KEY` — both fire, but the help text
     // remains the same so the order is purely defensive.
-    const WORDS: &[&str] = &["API_KEY", "PASSWORD", "TOKEN", "SECRET", "PWD", "KEY", "APIKEY"];
+    const WORDS: &[&str] = &[
+        "API_KEY", "PASSWORD", "TOKEN", "SECRET", "PWD", "KEY", "APIKEY",
+    ];
     let upper = name.to_ascii_uppercase();
     for word in WORDS {
         let mut start_idx = 0;
