@@ -832,14 +832,6 @@ fn eval_cmpop(
     rhs: &ComptimeValue,
 ) -> Result<bool, String> {
     use ruff_python_ast::CmpOp::*;
-    // Promote int/float to a common float for ordering when types mix.
-    fn as_f64(v: &ComptimeValue) -> Option<f64> {
-        match v {
-            ComptimeValue::Int(n) => Some(*n as f64),
-            ComptimeValue::Float(f) => Some(*f),
-            _ => None,
-        }
-    }
     match (op, lhs, rhs) {
         (Eq, a, b) => Ok(values_equal(a, b)),
         (NotEq, a, b) => Ok(!values_equal(a, b)),
@@ -850,7 +842,20 @@ fn eval_cmpop(
             GtE => a >= b,
             _ => unreachable!(),
         }),
-        (Lt | LtE | Gt | GtE, a, b) => match (as_f64(a), as_f64(b)) {
+        // Two integers (incl. bool) compare exactly as i64 — no lossy f64
+        // round-trip (`9007199254740993 > 9007199254740992` is True, but
+        // both round to the same f64). Mixed int/float fall back to f64.
+        (Lt | LtE | Gt | GtE, a, b) if cmp_num_int(a).is_some() && cmp_num_int(b).is_some() => {
+            let (x, y) = (cmp_num_int(a).unwrap(), cmp_num_int(b).unwrap());
+            Ok(match op {
+                Lt => x < y,
+                LtE => x <= y,
+                Gt => x > y,
+                GtE => x >= y,
+                _ => unreachable!(),
+            })
+        }
+        (Lt | LtE | Gt | GtE, a, b) => match (cmp_num_f64(a), cmp_num_f64(b)) {
             (Some(x), Some(y)) => Ok(match op {
                 Lt => x < y,
                 LtE => x <= y,
@@ -929,16 +934,37 @@ fn comptime_value_kind(v: &ComptimeValue) -> &'static str {
     }
 }
 
+/// Numeric view of a value treating `bool` as `0`/`1` — Python's `bool` is a
+/// subclass of `int`, so `True == 1` / `True < 2` must hold at comptime.
+fn cmp_num_int(v: &ComptimeValue) -> Option<i64> {
+    match v {
+        ComptimeValue::Int(n) => Some(*n),
+        ComptimeValue::Bool(b) => Some(*b as i64),
+        _ => None,
+    }
+}
+fn cmp_num_f64(v: &ComptimeValue) -> Option<f64> {
+    match v {
+        ComptimeValue::Int(n) => Some(*n as f64),
+        ComptimeValue::Float(f) => Some(*f),
+        ComptimeValue::Bool(b) => Some(*b as i64 as f64),
+        _ => None,
+    }
+}
+
 fn values_equal(a: &ComptimeValue, b: &ComptimeValue) -> bool {
     match (a, b) {
-        (ComptimeValue::Int(x), ComptimeValue::Int(y)) => x == y,
-        (ComptimeValue::Float(x), ComptimeValue::Float(y)) => x == y,
-        (ComptimeValue::Int(x), ComptimeValue::Float(y)) => (*x as f64) == *y,
-        (ComptimeValue::Float(x), ComptimeValue::Int(y)) => *x == (*y as f64),
         (ComptimeValue::Str(x), ComptimeValue::Str(y)) => x == y,
-        (ComptimeValue::Bool(x), ComptimeValue::Bool(y)) => x == y,
         (ComptimeValue::Type(x), ComptimeValue::Type(y)) => x == y,
-        _ => false,
+        // Numeric (int/float/bool) equality. `bool` folds into `int`
+        // (`True == 1`); two integers compare exactly (no lossy f64 round-trip).
+        _ => match (cmp_num_int(a), cmp_num_int(b)) {
+            (Some(x), Some(y)) => x == y,
+            _ => match (cmp_num_f64(a), cmp_num_f64(b)) {
+                (Some(x), Some(y)) => x == y,
+                _ => false,
+            },
+        },
     }
 }
 
@@ -1044,18 +1070,24 @@ fn eval_call(call: &ExprCall, ctx: &mut EvalContext<'_>) -> Result<ComptimeValue
             Ok(ComptimeValue::Str(match v {
                 ComptimeValue::Str(s) => s,
                 ComptimeValue::Int(n) => n.to_string(),
-                ComptimeValue::Float(f) => f.to_string(),
+                // Python-faithful float string: `str(2.0)` → `"2.0"` (the bare
+                // `f.to_string()` dropped the trailing `.0`, inlining a wrong
+                // constant). An integer-valued float gets `.0`; everything else
+                // its shortest round-trip form.
+                ComptimeValue::Float(f) => {
+                    if f.is_finite() && f.fract() == 0.0 {
+                        format!("{f:.1}")
+                    } else {
+                        format!("{f}")
+                    }
+                }
                 ComptimeValue::Bool(b) => if b { "True" } else { "False" }.into(),
                 ComptimeValue::Type(t) => t,
                 // Reject `str(container)` at comptime: matching Python's
-                // `str(["a"])` -> `"['a']"` (single-quoted nested
-                // strings) would require a separate Python-flavoured
-                // repr serialiser. `to_python_literal` always emits
-                // double-quoted strings, which is valid Python source
-                // but differs from Python's runtime `str()` output by
-                // one character per nested string. Better to reject
-                // than silently produce a value that contradicts what
-                // the same expression would compute at runtime.
+                // `str(["a"])` -> `"['a']"` (single-quoted nested strings) would
+                // require a separate Python-flavoured repr serialiser, and the
+                // double-quoted literal form would differ from the runtime
+                // result by one character per nested string.
                 ComptimeValue::List(_)
                 | ComptimeValue::Tuple(_)
                 | ComptimeValue::Dict(_) => {
@@ -2595,6 +2627,25 @@ comptime let P: tuple[int, int] = pair(1, 2)
         assert!(!diags.has_errors(), "{:?}", diags.errors());
         let v = values.get("M").expect("M must evaluate");
         assert!(matches!(v, ComptimeValue::Dict(items) if items.len() == 1));
+    }
+
+    #[test]
+    fn comptime_numeric_constants_match_cpython() {
+        // str(float) keeps the `.0`; bool folds into int for == and ordering;
+        // two large ints compare exactly (no lossy f64 round-trip).
+        let cases = [
+            ("comptime let X: str = str(2.0)\n", "X", "\"2.0\""),
+            ("comptime let X: str = str(2.5)\n", "X", "\"2.5\""),
+            ("comptime let X: bool = True == 1\n", "X", "True"),
+            ("comptime let X: bool = True < 2\n", "X", "True"),
+            ("comptime let X: bool = 0 == False\n", "X", "True"),
+        ];
+        for (src, name, expected) in cases {
+            let (vals, diags) = eval(src);
+            assert!(!diags.has_errors(), "{src} should fold cleanly: {:?}", diags.errors());
+            let got = vals.get(name).expect("binding folded").to_python_literal();
+            assert_eq!(got, expected, "for `{src}`");
+        }
     }
 
     #[test]
