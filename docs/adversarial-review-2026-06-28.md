@@ -192,6 +192,57 @@ is left unterminated. Same bug *class* as the v0.13.1 `#`-string fix, but in the
 nested-bracket continuation path. Fails loudly and leaves the file intact (not silent
 corruption), hence HIGH not CRITICAL. Reproducers: `scratch_probe_fmt/REPRO_freeze_*.ty`.
 
+## Round 2 — deeper sweep of `tyc check` / `tyc build` (non-VM priority)
+
+A second adversarial round focused on the type checker and build pipeline.
+All fixes below are committed on this branch (tests + clippy + fmt + 47-project
+corpus green).
+
+**Soundness holes (CRITICAL) — all fixed:**
+- ✅ **`match` capture variables were typed `Any`.** `case Ok(v): v.upper()`
+  (where `v: int`) checked clean then `AttributeError`d at runtime — defeating
+  the flagship sealed-union/`Result` safety. Captures now take the variant's
+  field types.
+- ✅ **Walrus narrowing leak.** `if (v := f()) is not None:` left `v` as a
+  permissive `Unknown` everywhere — not narrowed in the body, and a post-block
+  read of the `None` that ended the loop checked clean then crashed. Walrus
+  targets are now typed and narrowed.
+
+**`tyc build` emit bug (CRITICAL) — fixed:**
+- ✅ **Two `?` in an unparenthesized binary RHS.** `let v = parse(a)? + parse(b)?`
+  emitted `int + Result` → runtime `TypeError`, while `tyc check` passed. Both
+  operands are now lifted (postfix `?` binds tighter than `+`).
+
+**False positive (HIGH) — fixed (one variant deferred):**
+- ✅ **`mut` assignment narrowing.** `mut x: int? = None; x = 5; x + 1` no longer
+  false-reports `nullable_use` (straight-line + union reassignment). The
+  default-fill-across-an-`if` variant (`if x is None: x = d`) needs branch-join
+  and is still open.
+
+**Build/tooling — fixed:**
+- ✅ **Non-deterministic `pub *` `__all__` ordering** (HashSet iteration → sorted).
+- ✅ **`class Sub(Base)` inherited default-field ordering** now caught at `tyc
+  check` (was a `TypeError` at import; the check only saw the subclass body).
+- ✅ **Unknown `[strictness]` severity strings rejected** (a typo like `"eror"`
+  silently disabled a CI gate the user thought they'd enabled).
+
+**Round-2 items still open** (tracked for follow-up):
+- ⏸️ Default-fill `mut` narrowing across an `if` (branch-join dataflow).
+- ⏸️ `tyc migrate` drops the type-param list on `impl` of a generic class
+  (`impl Stack:` should be `impl[T] Stack[T]:`) — migrated code fails `tyc check`.
+- ⏸️ Orphan relative import escaping `src/` (`from ..outside import x`) is
+  accepted and emits crashing Python — should diagnose.
+- ⏸️ `[emit] class-default = "pydantic"` is a dead no-op (never read by emit).
+- ⏸️ `comptime` integer arithmetic is i64-capped (rejects valid bignum
+  constants) — contradicts the bignum promise, but rejects cleanly (no silent
+  wrong value).
+
+Verified-clean in round 2 (no issue): `?`/`with`-chain/`rescue`/`try_result`
+lowering, newtype arithmetic, `freeze`/`comptime`/pipe/`guard` emit, `gather:`/
+`go`, every emitted `.py` is valid Python, build idempotence, `.dty` stub
+checking, the comptime sandbox (no escapes, correct constants in i64 range),
+`pub *` packaging runtime, and `tyc fmt`→check/build interactions.
+
 ## Remediation status (this branch)
 
 Fixed, tested, and committed on `claude/typhon-adversarial-review-31ep54`
