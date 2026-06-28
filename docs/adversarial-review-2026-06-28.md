@@ -192,6 +192,49 @@ is left unterminated. Same bug *class* as the v0.13.1 `#`-string fix, but in the
 nested-bracket continuation path. Fails loudly and leaves the file intact (not silent
 corruption), hence HIGH not CRITICAL. Reproducers: `scratch_probe_fmt/REPRO_freeze_*.ty`.
 
+## Remediation status (this branch)
+
+Fixed, tested, and committed on `claude/typhon-adversarial-review-31ep54`
+(full workspace tests, `clippy -D warnings`, `fmt --check`, and the 47-project
+corpus all stay green):
+
+- ✅ **Global narrowing invalidated across calls** (§1, the global slice — p13).
+  A module-global's narrowing is reset after any intervening call. Locals are
+  untouched (sound; no new false positives).
+- ✅ **`x is not None and x.method()` false positive** (§2). Short-circuit
+  narrowing now reaches later bool-op operands, contained to the expression.
+- ✅ **`as!` enforced in the VM** (§3). The VM runs the same structural check as
+  the compiled path and raises `TypeError` on a wrong shape; contradictory docs
+  reconciled.
+- ✅ **Numeric dict/set key collapsing** (§3, C1). `1`/`1.0`/`True` share a key,
+  matching CPython, including the cross-type frozenset case.
+- ✅ **Stack-overflow aborts** (§4). The CLI runs on a 256 MiB worker stack;
+  long `+` chains and deep nesting no longer SIGABRT.
+- ✅ **`freeze let` `#`-in-string parse bug** (§6).
+- ✅ **`tyc explain` registration + cheatsheet `sealed union`/`comptime let`**
+  (§5), plus a clearer comptime-annotation message and a new `kind_mismatch`
+  doc page.
+
+Deferred (with rationale — recommended as careful follow-ups, not rushed
+pre-handoff changes):
+
+- ⏸️ **Field-narrowing & match-over-global across calls** (§1, p15/p16/p34/p37).
+  This is the *same* deliberate unsoundness mypy and pyright both ship
+  (narrowing of a member/subject isn't invalidated by an intervening call).
+  Tightening it would reject idiomatic code those checkers accept
+  (`if self.conn is not None: self.log(); self.conn.send()`), a net negative for
+  a Python-familiarity launch. Keep as a documented known limitation.
+- ⏸️ **Non-frozen dataclass hashable in the VM** (§3, C5). Correct fix needs the
+  VM to distinguish dataclass / `plain class` / `model` / exception class-kinds
+  (each hashes differently in CPython) and is a *tightening* with regression
+  risk; it's also a documented tradeoff. Worth doing with soak testing.
+- ⏸️ **VM stdlib gaps** (§3, MEDIUM): `bin/hex/oct` of negatives, `Counter`
+  arithmetic/repr, `dict | dict`, `%`-mapping format, `datetime.strftime`,
+  `date.weekday`, `math.isclose`, `Path.parts`, exception message text. Each is
+  a small, low-risk additive fix; batch them in a follow-up VM-parity pass.
+- ⏸️ **Generator eagerness** (§3): already a documented VM limitation; keep it
+  loud in the release notes.
+
 ## Recommended pre-launch priority
 
 1. **Narrowing invalidation for non-local places** (§1) — soundness, idiomatic.
