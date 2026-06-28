@@ -8,6 +8,18 @@ canonical phase-by-phase status lives in `docs/roadmap.md`.
 
 ### Fixed
 
+- **Multi-line `freeze let` with a `#` inside a string no longer fails to
+  parse.** A continuation line like `"list": ["a#b"],` made the bracket-depth
+  scanner treat the in-string `#` as a comment and miss the following `]`, so
+  the synthesised `__typhon_freeze__(` was left unterminated and `tyc check` /
+  `run` / `fmt` all rejected a valid program. The scanner now tracks single-
+  and triple-quoted string state.
+- **`tyc explain` now resolves every shipped diagnostic.**
+  `field_default_ordering`, `use_of_uninitialised`, `pub_name_collision`,
+  `missing_field_init`, `pub_star_outside_init`, and `kind_mismatch` (the last
+  with a new doc page) were emitted by the compiler and documented but returned
+  "unknown diagnostic code"; they're now registered in the catalog and
+  `tyc explain --list`.
 - **VM now enforces the `as!` checked cast** (was an identity passthrough). The
   in-process VM interprets the `as!` type descriptor and runs the same recursive
   structural check as the compiled path's `typhon_runtime/cast.py`, so a

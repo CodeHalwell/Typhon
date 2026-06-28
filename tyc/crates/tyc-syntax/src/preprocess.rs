@@ -1422,21 +1422,64 @@ fn bracket_delta_simple(s: &str) -> i32 {
 /// to the wider preprocess loop's string tracker so brackets inside an
 /// active triple-quoted string don't count.
 fn bracket_delta_outside_strings(line: &str, in_string: &mut Option<StringMode>) -> i32 {
+    fn mode_parts(mode: StringMode) -> (u8, bool) {
+        match mode {
+            StringMode::Single => (b'\'', false),
+            StringMode::Double => (b'"', false),
+            StringMode::TripleSingle => (b'\'', true),
+            StringMode::TripleDouble => (b'"', true),
+        }
+    }
+    fn open_mode(quote: u8, triple: bool) -> StringMode {
+        match (triple, quote == b'\'') {
+            (false, true) => StringMode::Single,
+            (false, false) => StringMode::Double,
+            (true, true) => StringMode::TripleSingle,
+            (true, false) => StringMode::TripleDouble,
+        }
+    }
+
     let bytes = line.as_bytes();
     let mut depth: i32 = 0;
     let mut i = 0;
     while i < bytes.len() {
-        if in_string.is_some() {
-            // Conservatively skip — we don't try to count brackets inside
-            // a triple-quoted string. The wider loop handles entering /
-            // leaving these strings via the existing `update_string_state`
-            // path; here we just don't disturb depth counts.
+        // Inside a string (single-line, or a triple-quoted one carried over
+        // from a previous line via `in_string`) — skip its contents so a `#`
+        // or a bracket inside a string never affects the comment/depth scan.
+        // This is what makes `freeze let X = {"list": ["a#b"], ...}` over
+        // several lines balance correctly: the `#` is part of a string, not a
+        // comment, so the `]` after it is still counted.
+        if let Some(mode) = *in_string {
+            let (q, triple) = mode_parts(mode);
+            let b = bytes[i];
+            if b == b'\\' && i + 1 < bytes.len() {
+                i += 2;
+                continue;
+            }
+            if b == q {
+                if triple {
+                    if i + 2 < bytes.len() && bytes[i + 1] == q && bytes[i + 2] == q {
+                        *in_string = None;
+                        i += 3;
+                        continue;
+                    }
+                } else {
+                    *in_string = None;
+                }
+            }
             i += 1;
             continue;
         }
         let b = bytes[i];
         match b {
+            // A `#` outside any string starts a comment to end-of-line.
             b'#' => break,
+            b'"' | b'\'' => {
+                let triple = i + 2 < bytes.len() && bytes[i + 1] == b && bytes[i + 2] == b;
+                *in_string = Some(open_mode(b, triple));
+                i += if triple { 3 } else { 1 };
+                continue;
+            }
             b'(' | b'[' | b'{' => depth += 1,
             b')' | b']' | b'}' => depth -= 1,
             _ => {}
@@ -8893,6 +8936,30 @@ mod tests {
         let out = postprocess(&prep.python_source, &prep.stripped, &prep.optionals);
         assert_eq!(out, src);
         assert!(!out.contains("__typhon_freeze__"), "wrapper leaked:\n{out}");
+    }
+
+    #[test]
+    fn freeze_let_multiline_hash_in_string_before_bracket_parses() {
+        // Regression: in a *multi-line* `freeze let`, a `#` inside a string on
+        // a continuation line that also has a closing bracket after it
+        // (`"list": ["a#b"],`) made the bracket-depth walk treat the `#` as a
+        // comment and miss the `]`, so the synthesised `__typhon_freeze__(`
+        // was left unterminated → `tyc::parse` (whole toolchain rejected a
+        // valid program). The depth scanner now tracks string state.
+        for src in [
+            "freeze let X = {\n    \"list\": [\"a#b\"],\n    \"after\": 1,\n}\n",
+            "freeze let Y = {\n    \"a\": {\"k\": \"v#w\"},\n    \"b\": (\"x#y\", \"z\"),\n}\n",
+        ] {
+            let prep = preprocess(src);
+            // Forward pass must produce a balanced wrapper call.
+            let opens = prep.python_source.matches("__typhon_freeze__(").count();
+            assert_eq!(opens, 1, "expected one freeze wrapper:\n{}", prep.python_source);
+            let parsed = crate::parse_module(&prep.python_source);
+            assert!(parsed.is_ok(), "preprocessed freeze let must parse:\n{}", prep.python_source);
+            // And it must round-trip back to the original surface.
+            let out = postprocess(&prep.python_source, &prep.stripped, &prep.optionals);
+            assert_eq!(out, src, "multi-line freeze let with in-string `#` must round-trip");
+        }
     }
 
     #[test]
