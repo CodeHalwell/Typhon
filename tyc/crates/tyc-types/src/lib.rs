@@ -10088,6 +10088,7 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
         Stmt::If(i) => check_if(c, i),
         Stmt::While(w) => {
             let _ = infer_expr(c, &w.test);
+            declare_walrus_targets(c, &w.test);
             // Flow narrowing inside the loop body: the test is known to
             // hold on every iteration that *enters* the body, so the
             // narrowing it implies is sound at the top of each pass
@@ -11417,6 +11418,7 @@ fn check_if(c: &mut Checker, i: &ruff_python_ast::StmtIf) {
     let is_unsafe = c.is_unsafe_marker(i.range);
 
     let _ = infer_expr(c, &i.test);
+    declare_walrus_targets(c, &i.test);
 
     // Apply narrowing for the true branch.
     let narrowings = collect_narrowings(c, &i.test, /*negate=*/ false);
@@ -12487,6 +12489,42 @@ fn attr_path_of(e: &Expr) -> Option<String> {
 
 /// Collect narrowings implied by `test`. If `negate` is true, invert the
 /// sense (used for the `else` branch).
+/// Declare every walrus (`target := value`) binding in a condition expression
+/// into the current type env before narrowing is collected. The top-level
+/// `Expr::Compare`/`BoolOp` inference arms short-circuit to `Bool` without
+/// walking their operands, so a walrus nested in a test (`if (v := f()) is not
+/// None:`) would otherwise never reach the `Expr::Named` arm in `infer_expr`,
+/// leaving `v` undeclared (a permissive `Unknown`) — which let a nullable
+/// walrus value escape its own `is not None` check. Walking the boolean/compare
+/// structure and inferring each `Named` node registers the binding with its
+/// declared type so narrowing (and the post-block declared type) are correct.
+fn declare_walrus_targets(c: &mut Checker, e: &Expr) {
+    match e {
+        Expr::Named(_) => {
+            // Hits the `Expr::Named` arm in `infer_expr_ctx`, which declares
+            // the target with the value's type (and recurses into the value).
+            let _ = infer_expr(c, e);
+        }
+        Expr::BoolOp(b) => {
+            for v in &b.values {
+                declare_walrus_targets(c, v);
+            }
+        }
+        Expr::Compare(cmp) => {
+            declare_walrus_targets(c, &cmp.left);
+            for x in &cmp.comparators {
+                declare_walrus_targets(c, x);
+            }
+        }
+        Expr::UnaryOp(u) => declare_walrus_targets(c, &u.operand),
+        Expr::BinOp(b) => {
+            declare_walrus_targets(c, &b.left);
+            declare_walrus_targets(c, &b.right);
+        }
+        _ => {}
+    }
+}
+
 fn collect_narrowings(c: &Checker, test: &Expr, negate: bool) -> Vec<Narrowing> {
     let mut out = Vec::new();
     collect_narrowings_inner(c, test, negate, &mut out);
@@ -12509,9 +12547,17 @@ fn collect_narrowings_inner(c: &Checker, test: &Expr, negate: bool, out: &mut Ve
                             positive_match
                         }
                     };
-                    if let (Expr::Name(n), Expr::NoneLiteral(_)) =
-                        (cmp.left.as_ref(), &cmp.comparators[0])
-                    {
+                    // Unwrap a walrus on the left: `(v := f()) is not None`
+                    // narrows `v` just like `v is not None` would.
+                    let left_name = match cmp.left.as_ref() {
+                        Expr::Name(n) => Some(n),
+                        Expr::Named(nd) => match nd.target.as_ref() {
+                            Expr::Name(n) => Some(n),
+                            _ => None,
+                        },
+                        _ => None,
+                    };
+                    if let (Some(n), Expr::NoneLiteral(_)) = (left_name, &cmp.comparators[0]) {
                         if let Some(b) = c.env.lookup(n.id.as_str()) {
                             // x is None  → name becomes None
                             // x is not None → name becomes declared without None
@@ -13611,6 +13657,36 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
         }
         Expr::BytesLiteral(_) => Type::Bytes,
         Expr::NoneLiteral(_) => Type::None,
+        // Walrus `(target := value)` — bind `target` in the current scope to
+        // the value's type and evaluate to that type. Without this arm the
+        // binding was invisible to the checker (every read of `target`
+        // resolved to a permissive `Unknown`), so a nullable walrus value
+        // escaped its own `is not None` check: `if (v := f()) is not None:` did
+        // not make `v` non-`None` in the body, and post-block reads of `v` (the
+        // very `None` that ended the loop) type-checked clean then crashed.
+        Expr::Named(named) => {
+            let value_type = infer_expr_ctx(c, &named.value, expected);
+            if let Expr::Name(target) = named.target.as_ref() {
+                let span = (
+                    target.range.start().to_usize(),
+                    target.range.start().to_usize() + target.id.as_str().len(),
+                );
+                if c.env.lookup(target.id.as_str()).is_some() {
+                    // Rebinding an existing outer binding — treat like an
+                    // assignment narrow (the declared type is unchanged).
+                    c.env.narrow(target.id.as_str(), value_type.clone());
+                } else {
+                    c.env.declare(TypeBinding {
+                        name: target.id.as_str().to_owned(),
+                        declared: value_type.clone(),
+                        narrowed: value_type.clone(),
+                        span,
+                        from_unsafe: c.unsafe_depth > 0,
+                    });
+                }
+            }
+            value_type
+        }
         // An f-string always evaluates to `str`. Walk the interpolated
         // expressions first so their own diagnostics still surface, then
         // return `str`. Previously there was no `FString` arm, so f-strings
@@ -16897,6 +16973,22 @@ mod tests {
             "narrowing must not leak past the bool-op: {:?}",
             d.errors()
         );
+    }
+
+    #[test]
+    fn walrus_in_if_test_narrows_body_and_leaks_no_further() {
+        // Inside the body the walrus binding is narrowed non-None …
+        let ok = check(
+            "def src() -> int?:\n    return 5\ndef main() -> None:\n    if (v := src()) is not None:\n        let n: int = v + 1\n        print(n)\n",
+        );
+        assert!(!ok.has_errors(), "walrus body should be narrowed: {:?}", ok.errors());
+        // … but past the block `v` is back to its declared `int?`, so using it
+        // as a plain `int` must be rejected (was a silent soundness hole — the
+        // walrus binding was invisible to the checker and read as Unknown).
+        let bad = check(
+            "def src() -> int?:\n    return None\ndef main() -> None:\n    if (v := src()) is not None:\n        print(v)\n    let z: int = v\n    print(z)\n",
+        );
+        assert!(bad.has_errors(), "walrus narrowing must not leak past the block");
     }
 
     #[test]
