@@ -10288,7 +10288,7 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                 };
                 let snap = narrow_to.as_ref().map(|_| c.env.snapshot());
                 c.env.enter();
-                bind_pattern_names(c, &case.pattern);
+                bind_pattern_names(c, &case.pattern, &subject_type);
                 if let (Expr::Name(subj), Some(t)) = (m.subject.as_ref(), narrow_to) {
                     c.env.narrow(subj.id.as_str(), t);
                 }
@@ -16706,24 +16706,104 @@ fn check_pattern_class_fields(c: &mut Checker, pattern: &Pattern) {
 /// that references to them inside the case body do not produce spurious
 /// "unknown name" errors.  Spans are set to the enclosing pattern's range so
 /// that any future narrowing diagnostics point at the right source location.
-fn bind_pattern_names(c: &mut Checker, pattern: &Pattern) {
+/// Positional field types a class pattern `Case(p0, p1, …)` binds, derived from
+/// the subject type. For `Ok`/`Err` the payload comes from the subject's
+/// `Result[T, E]` generic args; for a user variant/class it comes from the
+/// registered shape's `field_order`. Returns an empty vec when unknown (callers
+/// fall back to `Unknown`, the previous behaviour — so this can only *add*
+/// precision, never a false positive on a shape we can't model).
+fn class_pattern_field_types(
+    c: &Checker,
+    mc: &ruff_python_ast::PatternMatchClass,
+    subject_ty: &Type,
+) -> Vec<Type> {
+    let class_name = match mc.cls.as_ref() {
+        Expr::Name(n) => n.id.as_str().to_owned(),
+        Expr::Attribute(a) => a.attr.as_str().to_owned(),
+        _ => return Vec::new(),
+    };
+    let stripped = subject_ty.strip_none();
+    if let Type::Generic(g, args) = &stripped {
+        if g == "Result" && args.len() == 2 {
+            match class_name.as_str() {
+                "Ok" => return vec![args[0].clone()],
+                "Err" => return vec![args[1].clone()],
+                _ => {}
+            }
+        }
+    }
+    if let Some(shape) = c.class_shapes.get(&class_name) {
+        return shape
+            .field_order
+            .iter()
+            .map(|f| shape.fields.get(f).cloned().unwrap_or(Type::Unknown))
+            .collect();
+    }
+    Vec::new()
+}
+
+/// Field type bound by a keyword sub-pattern `Case(field=capture)`.
+fn class_pattern_kw_field_type(
+    c: &Checker,
+    mc: &ruff_python_ast::PatternMatchClass,
+    field: &str,
+) -> Type {
+    let class_name = match mc.cls.as_ref() {
+        Expr::Name(n) => n.id.as_str(),
+        Expr::Attribute(a) => a.attr.as_str(),
+        _ => return Type::Unknown,
+    };
+    c.class_shapes
+        .get(class_name)
+        .and_then(|s| s.fields.get(field).cloned())
+        .unwrap_or(Type::Unknown)
+}
+
+/// Element type produced by destructuring `ty` at sequence-pattern position
+/// `idx`. Handles fixed-arity `tuple[...]` and homogeneous `list`/`set`/`tuple`;
+/// otherwise `Unknown`.
+fn seq_pattern_element_type(ty: &Type, idx: usize) -> Type {
+    match ty {
+        Type::Generic(name, args) => match name.as_str() {
+            "tuple" => {
+                // `tuple[X, ...]` is homogeneous; a fixed tuple indexes by slot.
+                if args.len() == 2 && matches!(args.get(1), Some(Type::Unknown)) {
+                    args[0].clone()
+                } else {
+                    args.get(idx).cloned().unwrap_or(Type::Unknown)
+                }
+            }
+            "list" | "set" | "frozenset" | "Sequence" | "Iterable" => {
+                args.first().cloned().unwrap_or(Type::Unknown)
+            }
+            _ => Type::Unknown,
+        },
+        _ => Type::Unknown,
+    }
+}
+
+fn bind_pattern_names(c: &mut Checker, pattern: &Pattern, ty: &Type) {
     match pattern {
         Pattern::MatchAs(a) => {
             if let Some(name) = &a.name {
+                // `case X(...) as name` / a bare capture `case name` — the
+                // captured value has the matched (subject / sub-field) type.
                 c.env.declare(TypeBinding {
                     name: name.as_str().to_owned(),
-                    declared: Type::Unknown,
-                    narrowed: Type::Unknown,
+                    declared: ty.clone(),
+                    narrowed: ty.clone(),
                     span: (a.range.start().to_usize(), a.range.end().to_usize()),
                     from_unsafe: false,
                 });
             }
             if let Some(inner) = &a.pattern {
-                bind_pattern_names(c, inner);
+                bind_pattern_names(c, inner, ty);
             }
         }
         Pattern::MatchStar(s) => {
             if let Some(name) = &s.name {
+                // `*rest` captures a list of the remaining elements; element
+                // type is hard to pin precisely here, so stay permissive.
                 c.env.declare(TypeBinding {
                     name: name.as_str().to_owned(),
                     declared: Type::Unknown,
@@ -16743,28 +16823,39 @@ fn bind_pattern_names(c: &mut Checker, pattern: &Pattern) {
                     from_unsafe: false,
                 });
             }
+            let val_ty = match ty {
+                Type::Generic(n, args) if n == "dict" && args.len() == 2 => args[1].clone(),
+                _ => Type::Unknown,
+            };
             for p in &m.patterns {
-                bind_pattern_names(c, p);
+                bind_pattern_names(c, p, &val_ty);
             }
         }
         Pattern::MatchClass(mc) => {
             // Ruff bundles the positional and keyword sub-patterns into a
-            // single `PatternArguments` value on `arguments`.
-            for p in &mc.arguments.patterns {
-                bind_pattern_names(c, p);
+            // single `PatternArguments` value on `arguments`. Bind each capture
+            // to the variant's corresponding field type (was always `Unknown`,
+            // so `case Ok(v): v.upper()` on a `Result[int, …]` slipped through
+            // — the flagship sealed-union/`Result` safety hole).
+            let field_types = class_pattern_field_types(c, mc, ty);
+            for (i, p) in mc.arguments.patterns.iter().enumerate() {
+                let ft = field_types.get(i).cloned().unwrap_or(Type::Unknown);
+                bind_pattern_names(c, p, &ft);
             }
             for kw in &mc.arguments.keywords {
-                bind_pattern_names(c, &kw.pattern);
+                let ft = class_pattern_kw_field_type(c, mc, kw.attr.as_str());
+                bind_pattern_names(c, &kw.pattern, &ft);
             }
         }
         Pattern::MatchOr(o) => {
             if let Some(first) = o.patterns.first() {
-                bind_pattern_names(c, first);
+                bind_pattern_names(c, first, ty);
             }
         }
         Pattern::MatchSequence(seq) => {
-            for p in &seq.patterns {
-                bind_pattern_names(c, p);
+            for (i, p) in seq.patterns.iter().enumerate() {
+                let et = seq_pattern_element_type(ty, i);
+                bind_pattern_names(c, p, &et);
             }
         }
         Pattern::MatchValue(_) | Pattern::MatchSingleton(_) => {}
@@ -16973,6 +17064,30 @@ mod tests {
             "narrowing must not leak past the bool-op: {:?}",
             d.errors()
         );
+    }
+
+    #[test]
+    fn match_capture_gets_variant_field_type() {
+        // `case Ok(v)` binds `v` to the Result's value type, `case Err(e)` to
+        // the error type — captures used to be `Any`, so misuse slipped to a
+        // runtime AttributeError while `tyc check` passed.
+        let valid = check(
+            "def get() -> Result[int, str]:\n    return Ok(5)\ndef f() -> None:\n    match get():\n        case Ok(v):\n            let n: int = v + 1\n            print(n)\n        case Err(e):\n            print(e.upper())\n",
+        );
+        assert!(!valid.has_errors(), "valid capture uses should pass: {:?}", valid.errors());
+        // Misusing the captured `int` as a `list[int]` must now be caught.
+        let bad = check(
+            "def get() -> Result[int, str]:\n    return Ok(5)\ndef f() -> None:\n    match get():\n        case Ok(v):\n            let bad: list[int] = v\n            print(bad)\n        case Err(e):\n            print(e)\n",
+        );
+        assert!(bad.has_errors(), "int capture used as list[int] must be rejected");
+    }
+
+    #[test]
+    fn match_sealed_union_capture_typed() {
+        let bad = check(
+            "type Shape = Circle | Square\nclass Circle:\n    radius: float\nclass Square:\n    side: float\ndef area(s: Shape) -> float:\n    match s:\n        case Circle(r):\n            let bad: str = r\n            return 0.0\n        case Square(side):\n            return side * side\n",
+        );
+        assert!(bad.has_errors(), "float field captured as str must be rejected");
     }
 
     #[test]
