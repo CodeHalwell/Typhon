@@ -384,6 +384,31 @@ impl TyphonConfig {
                 allowed: ALLOWED_MODEL_EXTRAS.join(", "),
             });
         }
+        // Reject an unknown `[strictness]` severity string. These take
+        // `"off"` / `"warn"` / `"error"`; a typo (`"eror"`) or wrong case
+        // (`"WARN"`) used to be silently ignored, reverting to the default —
+        // so a user who believed they had CI-gated a check actually had it
+        // off. Surface it instead.
+        const ALLOWED_SEVERITIES: [&str; 3] = ["off", "warn", "error"];
+        let severities = [
+            ("unused-import", &self.strictness.unused_import),
+            ("exhaustive-match", &self.strictness.exhaustive_match),
+            ("methods-in-class-body", &self.strictness.methods_in_class_body),
+            ("require-with", &self.strictness.require_with),
+            ("blocking-in-async", &self.strictness.blocking_in_async),
+            ("stub-check", &self.strictness.stub_check),
+            ("unintrospectable-dependency", &self.strictness.unintrospectable_dependency),
+        ];
+        for (key, value) in severities {
+            if !ALLOWED_SEVERITIES.contains(&value.trim()) {
+                return Err(ConfigError::InvalidSeverity {
+                    path: source_path.to_string_lossy().into_owned(),
+                    key: key.to_owned(),
+                    value: value.clone(),
+                    allowed: ALLOWED_SEVERITIES.join(", "),
+                });
+            }
+        }
         Ok(())
     }
 }
@@ -441,6 +466,12 @@ pub enum ConfigError {
         value: String,
         allowed: String,
     },
+    InvalidSeverity {
+        path: String,
+        key: String,
+        value: String,
+        allowed: String,
+    },
 }
 
 impl std::fmt::Display for ConfigError {
@@ -480,6 +511,17 @@ impl std::fmt::Display for ConfigError {
                 write!(
                     f,
                     "invalid `[emit] model-extra = \"{value}\"` in '{path}': allowed values are {allowed}",
+                )
+            }
+            ConfigError::InvalidSeverity {
+                path,
+                key,
+                value,
+                allowed,
+            } => {
+                write!(
+                    f,
+                    "invalid `[strictness] {key} = \"{value}\"` in '{path}': allowed values are {allowed}",
                 )
             }
         }
@@ -674,6 +716,34 @@ skip-decoration-bases = [\"BaseModel\", \"Enum\"]
             cfg.emit.model_extra = (*v).into();
             cfg.validate(path)
                 .unwrap_or_else(|e| panic!("model-extra {v:?} should be accepted, got {e}"));
+        }
+    }
+
+    #[test]
+    fn validate_rejects_unknown_strictness_severity() {
+        let path = Path::new("typhon.toml");
+        // A typo / wrong-case severity must be rejected, not silently ignored
+        // (which would leave a CI gate the user believes they enabled off).
+        for v in &["eror", "WARN", "loud", "fatal", ""] {
+            let mut cfg = cfg_with_target("3.13");
+            cfg.strictness.exhaustive_match = (*v).into();
+            let err = cfg
+                .validate(path)
+                .expect_err(&format!("severity {v:?} should be rejected"));
+            match err {
+                ConfigError::InvalidSeverity { key, value, .. } => {
+                    assert_eq!(key, "exhaustive-match");
+                    assert_eq!(value, *v);
+                }
+                other => panic!("expected InvalidSeverity for {v:?}, got {other}"),
+            }
+        }
+        // Valid severities pass.
+        for v in &["off", "warn", "error"] {
+            let mut cfg = cfg_with_target("3.13");
+            cfg.strictness.unused_import = (*v).into();
+            cfg.validate(path)
+                .unwrap_or_else(|e| panic!("severity {v:?} should be accepted, got {e}"));
         }
     }
 

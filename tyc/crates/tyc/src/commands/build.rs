@@ -115,6 +115,16 @@ pub fn run(args: BuildArgs) -> Result<()> {
             let err = TycError::invalid_config_value("emit.class-default", value, allowed, path);
             return Err(miette::Report::new_boxed(Box::new(err)));
         }
+        Err(crate::config::ConfigError::InvalidSeverity {
+            path,
+            key,
+            value,
+            allowed,
+        }) => {
+            let field = format!("strictness.{key}");
+            let err = TycError::invalid_config_value(&field, value, allowed, path);
+            return Err(miette::Report::new_boxed(Box::new(err)));
+        }
         Err(e) => return Err(miette!("{e}")),
     };
 
