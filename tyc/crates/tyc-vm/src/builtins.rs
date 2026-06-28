@@ -1302,12 +1302,14 @@ pub fn install(interp: &mut Interpreter) {
 
     // `EXPR as! TYPE` lowers to `__typhon_checked_cast__(EXPR, TYPE)`,
     // resolved on the compile path via `from typhon_runtime.cast import
-    // checked_cast as __typhon_checked_cast__`. The VM treats the cast as an
-    // identity passthrough: the static type is already `TYPE` (the checker
-    // enforced that), and the recursive structural runtime check lives in the
-    // generated `typhon_runtime/cast.py`, so the authoritative enforcement is
-    // on the `tyc build && python` path. Returning the value unchanged keeps
-    // `tyc run` working without needing to interpret the type descriptor.
+    // checked_cast as __typhon_checked_cast__`. The *primary* VM path is the
+    // direct-call intercept in `Interpreter::eval_call`, which interprets the
+    // type-descriptor AST and runs the same recursive structural check as
+    // `typhon_runtime/cast.py` (so `tyc run` rejects a wrong-shaped value just
+    // like `tyc build && python`). This native binding is only the *indirect*
+    // fallback — `checked_cast` referenced as a value rather than called
+    // directly with two args — where the type descriptor isn't available as an
+    // AST, so it degrades to identity.
     root.set(
         "__typhon_checked_cast__",
         Value::Native(Rc::new(NativeFn::new(
@@ -1374,7 +1376,7 @@ fn value_len(v: &Value) -> Result<usize, Unwind> {
     })
 }
 
-fn is_instance_of(val: &Value, cls: &Value) -> bool {
+pub(crate) fn is_instance_of(val: &Value, cls: &Value) -> bool {
     let want_name = match cls {
         Value::Native(n) => Some(n.name.to_owned()),
         Value::Class(c) => Some(c.name.clone()),

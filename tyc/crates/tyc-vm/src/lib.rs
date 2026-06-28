@@ -784,6 +784,59 @@ print("ok")
     }
 
     #[test]
+    fn checked_cast_rejects_wrong_shape_in_vm() {
+        // The `as!` cast must run the same structural check the compile path
+        // does — a wrong-shaped value raises `TypeError` under `tyc run` too
+        // (previously the VM was an identity passthrough, silently letting a
+        // bad value through and diverging from `tyc build && python`). Each
+        // arm catches the expected `TypeError`; if a cast wrongly *passes*,
+        // the `else`-path `raise` makes the run non-zero.
+        let src = r#"
+def expect_reject(thunk_ok: bool) -> None:
+    if not thunk_ok:
+        raise ValueError("as! accepted a wrong-shaped value")
+
+# list is not a dict[str, int]
+let a: object = ["x", "y"]
+mut a_rejected: bool = False
+try:
+    let da: dict[str, int] = a as! dict[str, int]
+except TypeError:
+    a_rejected = True
+expect_reject(a_rejected)
+
+# str is not an int
+let b: object = "nope"
+mut b_rejected: bool = False
+try:
+    let nb: int = b as! int
+except TypeError:
+    b_rejected = True
+expect_reject(b_rejected)
+
+# dict with a str value is not dict[str, int]
+let c: object = {"k": "v"}
+mut c_rejected: bool = False
+try:
+    let dc: dict[str, int] = c as! dict[str, int]
+except TypeError:
+    c_rejected = True
+expect_reject(c_rejected)
+
+# valid casts still pass (int widens to float; None matches int | None)
+let f: float = 5 as! float
+if f != 5.0:
+    raise ValueError("int->float widening cast wrong")
+let n: object = None
+let opt: int | None = n as! int | None
+if opt is not None:
+    raise ValueError("None cast wrong")
+print("ok")
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    #[test]
     fn try_result_bridges_exceptions() {
         // `try_result(thunk[, on_err])` returns `Ok(thunk())`, or catches a
         // raised exception and returns `Err(on_err(exc))` / `Err(exc)`. Drives

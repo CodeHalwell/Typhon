@@ -6,7 +6,28 @@ canonical phase-by-phase status lives in `docs/roadmap.md`.
 
 ## Unreleased
 
-_Nothing yet._
+### Fixed
+
+- **VM now enforces the `as!` checked cast** (was an identity passthrough). The
+  in-process VM interprets the `as!` type descriptor and runs the same recursive
+  structural check as the compiled path's `typhon_runtime/cast.py`, so a
+  wrong-shaped value raises `TypeError` under `tyc run` exactly as it does under
+  `tyc build && python` — closing a VM/CPython divergence on the boundary-cast
+  enforcement path (`tyc run` is the default execution mode). Scalars (with
+  `int→float` / `bool→int` widening), `list`/`set`/`frozenset`/`dict`/`tuple`
+  (fixed and variadic), `Optional`/unions, and user classes are all checked;
+  anything unmodellable stays permissive.
+- **Type checker: flow narrowing of a module global is invalidated by an
+  intervening call.** `if g is not None: clear(); use(g)` (where `clear()`
+  reassigns the global via `global g`) no longer keeps the stale non-`None`
+  narrowing — a silent soundness hole that checked clean and raised at runtime.
+  Local-variable narrowing is unchanged (a call can't rebind a caller's local).
+- **Type checker: short-circuit narrowing reaches later bool-op operands.**
+  `x is not None and x.method()` (and the De Morgan `x is None or x.method()`)
+  no longer false-positive with `tyc::nullable_use` on the method receiver — the
+  canonical Python null-check idiom now type-checks. The narrowing is contained
+  to the expression (it doesn't leak to later uses, and a walrus binding an
+  operand introduces is preserved).
 
 ## 1.0.0-alpha — 2026-06-22 — first feature-complete alpha
 

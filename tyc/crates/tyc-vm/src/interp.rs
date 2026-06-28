@@ -2056,24 +2056,31 @@ impl Interpreter {
                 return self.eval_super_method_call(sup, a.attr.as_str(), c, env);
             }
         }
-        // `EXPR as! TYPE` lowers to `__typhon_checked_cast__(EXPR, TYPE)`. The
-        // VM treats the cast as an identity passthrough (the static type was
-        // pinned by the checker; the recursive structural check runs on the
-        // `tyc build && python` path). Crucially, only the *value* operand is
-        // evaluated — the second argument is a type descriptor (`int | None`,
-        // `dict[str, int]`) for which the VM has no runtime value, so
-        // evaluating it as an ordinary expression would fail (`int | None`
-        // applies `|` to a builtin function). Returning the value directly
-        // keeps `tyc run` working for an `as!` to a union / parametric type, in
-        // any position. Intercepted before argument evaluation, mirroring the
-        // `super(...)` handling above.
+        // `EXPR as! TYPE` lowers to `__typhon_checked_cast__(EXPR, TYPE)`. Only
+        // the *value* operand (arg 0) is evaluated as an expression — the second
+        // argument is a type descriptor (`int | None`, `dict[str, int]`) the VM
+        // can't evaluate as an ordinary value. We interpret that descriptor AST
+        // directly and run the same recursive structural check the compile path
+        // performs in `typhon_runtime/cast.py`, so `tyc run` is a faithful
+        // drop-in: a wrong-shaped value raises `TypeError` here too instead of
+        // slipping through. Intercepted before argument evaluation, mirroring
+        // the `super(...)` handling above.
         if let Expr::Name(n) = c.func.as_ref() {
             if n.id.as_str() == "__typhon_checked_cast__"
                 && c.arguments.args.len() == 2
                 && c.arguments.keywords.is_empty()
                 && !matches!(c.arguments.args[0], Expr::Starred(_))
             {
-                return self.eval_expr(&c.arguments.args[0], env);
+                let value = self.eval_expr(&c.arguments.args[0], env)?;
+                let tp = &c.arguments.args[1];
+                if self.value_matches_cast_type(&value, tp, env) {
+                    return Ok(value);
+                }
+                return Err(type_error(format!(
+                    "as! cast failed: value of type {} does not match {}",
+                    value.type_name(),
+                    format_cast_type(tp),
+                )));
             }
         }
         let func = self.eval_expr(&c.func, env)?;
@@ -2114,6 +2121,138 @@ impl Interpreter {
             }
         }
         self.call_value(func, args, &kwargs)
+    }
+
+    /// Structural runtime check backing `EXPR as! TYPE` in the VM — mirrors
+    /// `typhon_runtime/cast.py::_matches` so `tyc run` and `tyc build && python`
+    /// agree. `tp` is the type-descriptor AST (`int | None`, `dict[str, int]`,
+    /// `Optional[X]`, `tuple[int, ...]`, a user class, …). Conservative: any
+    /// shape it can't model (a TypeVar, an unresolvable name, an unknown
+    /// parameterised origin) is accepted, so the cast only ever rejects a value
+    /// it can prove wrong.
+    fn value_matches_cast_type(&mut self, value: &Value, tp: &Expr, env: &EnvRef) -> bool {
+        match tp {
+            Expr::NoneLiteral(_) => matches!(value, Value::None),
+            Expr::Name(n) => match n.id.as_str() {
+                "Any" | "object" => true,
+                "None" => matches!(value, Value::None),
+                // `isinstance(value, int)` is `True` for `bool` (bool ⊆ int).
+                "int" => matches!(value, Value::Int(_) | Value::Bool(_)),
+                // Typhon/CPython widen int (and bool) into a float/complex target.
+                "float" => matches!(value, Value::Int(_) | Value::Float(_) | Value::Bool(_)),
+                "complex" => {
+                    matches!(
+                        value,
+                        Value::Int(_) | Value::Float(_) | Value::Bool(_) | Value::Complex(..)
+                    )
+                }
+                "bool" => matches!(value, Value::Bool(_)),
+                "str" => matches!(value, Value::Str(_)),
+                "bytes" => matches!(value, Value::Bytes(_)),
+                // User class / unknown — resolve the name and use isinstance;
+                // be permissive when it can't be resolved in the VM env.
+                _ => match self.eval_expr(tp, env) {
+                    Ok(cls) => crate::builtins::is_instance_of(value, &cls),
+                    Err(_) => true,
+                },
+            },
+            Expr::Attribute(_) => match self.eval_expr(tp, env) {
+                Ok(cls) => crate::builtins::is_instance_of(value, &cls),
+                Err(_) => true,
+            },
+            Expr::BinOp(b) if matches!(b.op, Operator::BitOr) => {
+                self.value_matches_cast_type(value, &b.left, env)
+                    || self.value_matches_cast_type(value, &b.right, env)
+            }
+            Expr::Subscript(s) => {
+                let base = match s.value.as_ref() {
+                    Expr::Name(n) => n.id.as_str().to_owned(),
+                    Expr::Attribute(a) => a.attr.as_str().to_owned(),
+                    _ => return true,
+                };
+                let args: Vec<&Expr> = match s.slice.as_ref() {
+                    Expr::Tuple(t) => t.elts.iter().collect(),
+                    other => vec![other],
+                };
+                match base.as_str() {
+                    "Optional" => {
+                        matches!(value, Value::None)
+                            || args
+                                .first()
+                                .is_none_or(|a| self.value_matches_cast_type(value, a, env))
+                    }
+                    "Union" => args
+                        .iter()
+                        .any(|a| self.value_matches_cast_type(value, a, env)),
+                    "list" => match value {
+                        Value::List(l) => {
+                            let Some(elt) = args.first() else { return true };
+                            let items: Vec<Value> = l.borrow().iter().cloned().collect();
+                            items
+                                .iter()
+                                .all(|item| self.value_matches_cast_type(item, elt, env))
+                        }
+                        _ => false,
+                    },
+                    "set" | "frozenset" => match value {
+                        Value::Set(set) => {
+                            let Some(elt) = args.first() else { return true };
+                            let items: Vec<Value> = set
+                                .borrow()
+                                .iter()
+                                .map(|k| k.clone().into_value())
+                                .collect();
+                            items
+                                .iter()
+                                .all(|item| self.value_matches_cast_type(item, elt, env))
+                        }
+                        _ => false,
+                    },
+                    "dict" => match value {
+                        Value::Dict(d) => {
+                            if args.len() != 2 {
+                                return true;
+                            }
+                            let pairs: Vec<(Value, Value)> = d
+                                .borrow()
+                                .iter()
+                                .map(|(k, v)| (k.clone().into_value(), v.clone()))
+                                .collect();
+                            pairs.iter().all(|(k, v)| {
+                                self.value_matches_cast_type(k, args[0], env)
+                                    && self.value_matches_cast_type(v, args[1], env)
+                            })
+                        }
+                        _ => false,
+                    },
+                    "tuple" => match value {
+                        Value::Tuple(t) => {
+                            let items: Vec<Value> = t.iter().cloned().collect();
+                            // `tuple[X, ...]` — homogeneous, any length.
+                            if args.len() == 2 && matches!(args[1], Expr::EllipsisLiteral(_)) {
+                                return items
+                                    .iter()
+                                    .all(|item| self.value_matches_cast_type(item, args[0], env));
+                            }
+                            if args.len() != items.len() {
+                                return false;
+                            }
+                            items
+                                .iter()
+                                .zip(args.iter())
+                                .all(|(item, a)| self.value_matches_cast_type(item, a, env))
+                        }
+                        _ => false,
+                    },
+                    // Unknown parameterised origin (collections.abc.*, etc.) —
+                    // beyond what we model; accept.
+                    _ => true,
+                }
+            }
+            // Anything else (a literal, a call, …) isn't a shape we can check —
+            // be permissive.
+            _ => true,
+        }
     }
 
     /// Recognise an expression that is a call to `super(...)`. Returns that
@@ -6057,6 +6196,34 @@ fn exc_fallback_args(message: &str) -> Vec<Value> {
 /// the standard CPython exception hierarchy. `Exception` / `BaseException`
 /// match everything except the bare base-only kinds. Returns false for
 /// unknown names (user exceptions go through the instance-MRO path instead).
+/// Render a `as!` type-descriptor AST back to a readable string for the
+/// `TypeError` message (`dict[str, int]`, `int | None`, `list[int]`). Kept
+/// close to the `str(tp)` text the compile path's `cast.py` produces.
+fn format_cast_type(tp: &Expr) -> String {
+    match tp {
+        Expr::NoneLiteral(_) => "None".to_owned(),
+        Expr::Name(n) => n.id.as_str().to_owned(),
+        Expr::Attribute(a) => format!("{}.{}", format_cast_type(&a.value), a.attr.as_str()),
+        Expr::EllipsisLiteral(_) => "...".to_owned(),
+        Expr::BinOp(b) if matches!(b.op, Operator::BitOr) => {
+            format!("{} | {}", format_cast_type(&b.left), format_cast_type(&b.right))
+        }
+        Expr::Subscript(s) => {
+            let inner = match s.slice.as_ref() {
+                Expr::Tuple(t) => t
+                    .elts
+                    .iter()
+                    .map(format_cast_type)
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                other => format_cast_type(other),
+            };
+            format!("{}[{}]", format_cast_type(&s.value), inner)
+        }
+        _ => "<type>".to_owned(),
+    }
+}
+
 pub fn builtin_exc_is_a(kind: &str, target: &str) -> bool {
     if target == "BaseException" {
         return true;
