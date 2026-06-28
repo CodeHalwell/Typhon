@@ -13391,9 +13391,37 @@ fn infer_bool_op(c: &mut Checker, b: &ruff_python_ast::ExprBoolOp) -> Type {
     if b.values.is_empty() {
         return Type::Bool;
     }
+    // Short-circuit narrowing: reaching a later operand means every earlier
+    // operand short-circuited in the continuing direction — truthy for `and`,
+    // falsy for `or`. Apply the implied narrowings before inferring each
+    // subsequent operand so the canonical `x is not None and x.method()` /
+    // `x is None or x.method()` idioms see `x` as non-None at the receiver
+    // (previously `tyc::nullable_use` false-positived there). The narrowing is
+    // contained to this expression: we record the prior narrowed state of every
+    // place we touch and restore it afterwards (without wiping a walrus binding
+    // an operand may have introduced, so `(v := d.get(k)) is not None and v.f()`
+    // still works and `v` keeps its type past the expression).
+    let saved_attr = c.env.attr_narrowings.clone();
+    let mut saved_named: HashMap<String, Type> = HashMap::new();
+
     let mut acc = infer_expr(c, &b.values[0]);
-    for next in &b.values[1..] {
-        let rhs = infer_expr(c, next);
+    for i in 1..b.values.len() {
+        let ns = match b.op {
+            ruff_python_ast::BoolOp::And => collect_narrowings(c, &b.values[i - 1], false),
+            ruff_python_ast::BoolOp::Or => collect_narrowings(c, &b.values[i - 1], true),
+        };
+        for n in &ns {
+            if n.attr_path.is_none() && !n.name.is_empty() {
+                saved_named.entry(n.name.clone()).or_insert_with(|| {
+                    c.env
+                        .lookup(&n.name)
+                        .map(|b| b.narrowed.clone())
+                        .unwrap_or(Type::Unknown)
+                });
+            }
+        }
+        apply_narrowings(c, &ns);
+        let rhs = infer_expr(c, &b.values[i]);
         acc = match b.op {
             // `a or b` evaluates to `a` when `a` is truthy, otherwise `b`.
             // `truthy(&acc)` is `None` when `a` can never be truthy (e.g.
@@ -13404,6 +13432,12 @@ fn infer_bool_op(c: &mut Checker, b: &ruff_python_ast::ExprBoolOp) -> Type {
             },
             ruff_python_ast::BoolOp::And => Type::union_of(vec![acc, rhs]),
         };
+    }
+
+    // Restore the pre-expression narrowing state so it cannot leak outward.
+    c.env.attr_narrowings = saved_attr;
+    for (name, ty) in saved_named {
+        c.env.narrow(&name, ty);
     }
     acc
 }
@@ -16799,6 +16833,31 @@ mod tests {
                    def f(x: str?) -> int:\n    if x is not None:\n        helper()\n        return len(x)\n    return 0\n";
         let d = check(src);
         assert!(!d.has_errors(), "local narrowing should survive a call: {:?}", d.errors());
+    }
+
+    #[test]
+    fn and_narrows_receiver_of_method_call() {
+        // `x is not None and x.method()` — the canonical null-check idiom.
+        // The second operand's receiver must see `x` narrowed to non-None.
+        let d = check("def a(x: str?) -> bool:\n    return x is not None and x.startswith(\"a\")\n");
+        assert!(!d.has_errors(), "and-narrowing should reach receiver: {:?}", d.errors());
+    }
+
+    #[test]
+    fn or_de_morgan_narrows_receiver() {
+        // `x is None or x.method()` — reaching the 2nd operand means x is set.
+        let d = check("def a(s: str?) -> bool:\n    return s is None or s.startswith(\"#\")\n");
+        assert!(!d.has_errors(), "or-narrowing should reach receiver: {:?}", d.errors());
+    }
+
+    #[test]
+    fn bool_op_narrowing_does_not_leak() {
+        // Narrowing applied inside the bool-op must not leak to later uses:
+        // `len(x)` after the expression must still see `x` as nullable.
+        let d = check(
+            "def f(x: str?) -> int:\n    let ok: bool = x is not None and x.startswith(\"a\")\n    return len(x)\n",
+        );
+        assert!(d.has_errors(), "narrowing must not leak past the bool-op: {:?}", d.errors());
     }
 
     // ── Variance ─────────────────────────────────────────────────────────
