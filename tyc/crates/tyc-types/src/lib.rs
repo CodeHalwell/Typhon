@@ -17227,7 +17227,10 @@ mod tests {
             "def f() -> None:\n    mut x: int = 5\n    x /= 2\n",
             "def f(d: dict[str, int]) -> None:\n    d[\"a\"] += 0.5\n",
         ] {
-            assert!(check(src).has_errors(), "int-widening aug-assign must error: {src}");
+            assert!(
+                check(src).has_errors(),
+                "int-widening aug-assign must error: {src}"
+            );
         }
         // Valid aug-assigns stay clean.
         for src in [
@@ -17235,7 +17238,11 @@ mod tests {
             "def f() -> None:\n    mut x: float = 5.0\n    x += 3\n",
             "def f() -> None:\n    mut s: str = \"a\"\n    s += \"b\"\n",
         ] {
-            assert!(!check(src).has_errors(), "valid aug-assign must pass: {src} {:?}", check(src).errors());
+            assert!(
+                !check(src).has_errors(),
+                "valid aug-assign must pass: {src} {:?}",
+                check(src).errors()
+            );
         }
     }
 

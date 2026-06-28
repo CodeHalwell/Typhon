@@ -3581,7 +3581,8 @@ fn questionmark_in_unhoistable_position(code: &str, q_idx: usize) -> Option<&'st
         return None;
     }
     let kw_at = |idx: usize, kw: &str| -> bool {
-        let prev_ok = idx == 0 || !(bytes[idx - 1].is_ascii_alphanumeric() || bytes[idx - 1] == b'_');
+        let prev_ok =
+            idx == 0 || !(bytes[idx - 1].is_ascii_alphanumeric() || bytes[idx - 1] == b'_');
         prev_ok
             && code[idx..].starts_with(kw)
             && code[idx + kw.len()..]
@@ -3627,7 +3628,12 @@ fn questionmark_in_unhoistable_position(code: &str, q_idx: usize) -> Option<&'st
             b')' | b']' | b'}' => {
                 f = stack.pop().unwrap_or_default();
             }
-            b',' => f = Flags { lambda_body: f.lambda_body, ..Flags::default() },
+            b',' => {
+                f = Flags {
+                    lambda_body: f.lambda_body,
+                    ..Flags::default()
+                }
+            }
             b':' if f.pending_lambda => {
                 f.pending_lambda = false;
                 f.lambda_body = true;
@@ -10814,11 +10820,26 @@ mod tests {
         // and-or operand) — doing so would crash (lambda) or run a branch that
         // should be skipped (silently wrong result).
         let cases = [
-            ("def f() -> Result[int, str]:\n    let g = (lambda: parse(a)?)\n", "lambda"),
-            ("def f() -> Result[int, str]:\n    let v: int = parse(a)? if c else parse(b)?\n", "conditional"),
-            ("def f() -> Result[int, str]:\n    let v: int = 0 if c else parse(b)?\n", "conditional"),
-            ("def f() -> Result[bool, str]:\n    let v: bool = chk(a)? and chk(b)?\n", "and"),
-            ("def f() -> Result[bool, str]:\n    let v: bool = chk(a)? or chk(b)?\n", "and"),
+            (
+                "def f() -> Result[int, str]:\n    let g = (lambda: parse(a)?)\n",
+                "lambda",
+            ),
+            (
+                "def f() -> Result[int, str]:\n    let v: int = parse(a)? if c else parse(b)?\n",
+                "conditional",
+            ),
+            (
+                "def f() -> Result[int, str]:\n    let v: int = 0 if c else parse(b)?\n",
+                "conditional",
+            ),
+            (
+                "def f() -> Result[bool, str]:\n    let v: bool = chk(a)? and chk(b)?\n",
+                "and",
+            ),
+            (
+                "def f() -> Result[bool, str]:\n    let v: bool = chk(a)? or chk(b)?\n",
+                "and",
+            ),
         ];
         for (src, needle) in cases {
             let errs = validate_question_ops(src);
@@ -10830,7 +10851,10 @@ mod tests {
             );
         }
         // A plain single `?` and a `?` in the ternary TEST stay valid.
-        assert!(validate_question_ops("def f() -> Result[int, str]:\n    let g: int = parse(a)?\n    return Ok(g)\n").is_empty());
+        assert!(validate_question_ops(
+            "def f() -> Result[int, str]:\n    let g: int = parse(a)?\n    return Ok(g)\n"
+        )
+        .is_empty());
     }
 
     #[test]

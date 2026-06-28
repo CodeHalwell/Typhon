@@ -2642,7 +2642,11 @@ comptime let P: tuple[int, int] = pair(1, 2)
         ];
         for (src, name, expected) in cases {
             let (vals, diags) = eval(src);
-            assert!(!diags.has_errors(), "{src} should fold cleanly: {:?}", diags.errors());
+            assert!(
+                !diags.has_errors(),
+                "{src} should fold cleanly: {:?}",
+                diags.errors()
+            );
             let got = vals.get(name).expect("binding folded").to_python_literal();
             assert_eq!(got, expected, "for `{src}`");
         }
