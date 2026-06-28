@@ -5871,10 +5871,18 @@ fn rewrite_inline_question_ops_one_line(
     Some((current, lifted))
 }
 
-/// Find the position of the first `?` in `s` that is an inline
-/// propagation operator (`)?` *not* at the end-of-code position).
-/// Skips chars inside string literals. The end-of-code case is owned by
-/// [`expand_question_ops`], so we deliberately skip it here.
+/// Find the position of the first `?` in `s` that is a `)?` propagation
+/// operator. Skips chars inside string literals.
+///
+/// A trailing `)?` (the last code char on the line) is handled here too, **but
+/// only when the propagated call is not the entire value** — i.e. there is a
+/// top-level binary/bool/compare operator before it (`a + parse(b)?`). Postfix
+/// `?` binds tighter than any binary operator, so `a + b?` means `a + (b?)`;
+/// the inline pass scopes the operand to just `b` via paren-matching, whereas
+/// the end-of-line pass ([`expand_question_ops`]) would wrap the whole `a + b`.
+/// When the call *is* the whole value (`x = parse(a)?`, `return f()?`), the
+/// trailing `?` is left to the end-of-line pass (preserving its temp naming and
+/// `return`/`yield`/`rescue` handling).
 fn find_first_inline_propagation_q(s: &str) -> Option<usize> {
     let trimmed_end = s.trim_end().len();
     let bytes = s.as_bytes();
@@ -5887,16 +5895,66 @@ fn find_first_inline_propagation_q(s: &str) -> Option<usize> {
         if in_str_mask[i] {
             continue;
         }
-        if bytes[i] == b'?'
-            && i > 0
-            && bytes[i - 1] == b')'
-            && !in_str_mask[i - 1]
-            && i + 1 < trimmed_end
-        {
-            return Some(i);
+        if bytes[i] == b'?' && i > 0 && bytes[i - 1] == b')' && !in_str_mask[i - 1] {
+            let is_trailing = i + 1 >= trimmed_end;
+            if !is_trailing || trailing_q_has_binary_prefix(s, i, &in_str_mask) {
+                return Some(i);
+            }
         }
     }
     None
+}
+
+/// For a trailing `)?` at byte `q_pos`, decide whether its propagated call is
+/// only one operand of a larger top-level binary expression (so the inline pass
+/// must scope it) rather than the whole value (left to the end-of-line pass).
+/// Walks left from the matching `(` over the callable, then looks for a
+/// top-level binary operator between the value start and that call.
+fn trailing_q_has_binary_prefix(s: &str, q_pos: usize, in_str_mask: &[bool]) -> bool {
+    let close_paren = q_pos - 1;
+    let Some(open) = find_matching_open_paren(s, close_paren) else {
+        return false;
+    };
+    let call_start = find_callable_start(s, open);
+    if call_start == open {
+        // `(a + b)?` — a parenthesised expression, not a call. Leave it.
+        return false;
+    }
+    // The value begins after an assignment `=`, a `return`/`yield` keyword, or
+    // the first non-whitespace char. Anything between there and `call_start`
+    // that contains a top-level operator means the call is a sub-operand.
+    let value_start = match find_assignment_eq(&s[..call_start]) {
+        Some(eq) => eq + 1,
+        None => s.find(|c: char| !c.is_whitespace()).unwrap_or(0),
+    };
+    let prefix = &s[value_start..call_start];
+    let prefix_bytes = prefix.as_bytes();
+    let mask_off = value_start;
+    let mut depth: i32 = 0;
+    for (k, &b) in prefix_bytes.iter().enumerate() {
+        if in_str_mask[mask_off + k] {
+            continue;
+        }
+        match b {
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => depth -= 1,
+            // Any of these at depth 0 means a binary/compare/bitwise operator
+            // (or an `and`/`or`/`not`/`if`/`else` keyword's surrounding space)
+            // sits before the call, so `?` binds only to the call.
+            b'+' | b'-' | b'*' | b'/' | b'%' | b'@' | b'|' | b'&' | b'^' | b'<' | b'>' | b'='
+                if depth == 0 =>
+            {
+                return true
+            }
+            _ => {}
+        }
+    }
+    // Word operators (`and` / `or` / `not` / `in` / `is` / ternary `if`/`else`)
+    // separated by spaces — a bare space-delimited keyword token before the call.
+    let trimmed = prefix.trim();
+    trimmed.split_whitespace().any(|w| {
+        matches!(w, "and" | "or" | "not" | "in" | "is" | "if" | "else")
+    })
 }
 
 /// Walk backwards from `close_pos` (position of `)`) to find the matching
@@ -10231,6 +10289,39 @@ mod tests {
             "out: {out}"
         );
         assert!(out.contains("let x = __typhon_q_0__.value"), "out: {out}");
+    }
+
+    #[test]
+    fn two_question_ops_in_binary_rhs_both_lift() {
+        // Regression: `let v = parse(a)? + parse(b)?` — postfix `?` binds
+        // tighter than `+`, so BOTH calls must be lifted to their own temps.
+        // The end-of-line pass used to wrap the whole RHS as one `?` operand,
+        // emitting `int + Result` (a runtime TypeError). The inline pass now
+        // owns a trailing `)?` when a top-level binary operator precedes it.
+        let src = "    let v: int = parse(a)? + parse(b)?\n";
+        let out = expand_question_ops(&expand_inline_question_ops(src));
+        // Two distinct lifts, and the final value adds the two `.value`s.
+        assert!(out.contains("= parse(a)"), "out: {out}");
+        assert!(out.contains("= parse(b)"), "out: {out}");
+        assert!(
+            out.contains(".value + ") && out.contains(".value\n"),
+            "both operands must be unwrapped values, got:\n{out}"
+        );
+        // No `__typhon_*__ = <something> + parse(b)` (the mis-scoped form).
+        assert!(
+            !out.contains("+ parse(b)"),
+            "second `?` must be lifted, not left in the expression:\n{out}"
+        );
+    }
+
+    #[test]
+    fn single_question_op_in_assignment_unchanged() {
+        // A trailing `?` with no binary prefix stays with the end-of-line
+        // pass (its temp naming / return handling are unchanged).
+        let src = "    let v: int = parse(a)?\n";
+        let out = expand_question_ops(&expand_inline_question_ops(src));
+        assert!(out.contains("__typhon_q_0__ = parse(a)"), "out: {out}");
+        assert!(out.contains("v: int = __typhon_q_0__.value"), "out: {out}");
     }
 
     #[test]
