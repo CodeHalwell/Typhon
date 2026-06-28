@@ -7496,7 +7496,11 @@ fn collect_gather_bindings(
         let code = body[..code_end].trim_end();
         let eq = find_assignment_eq(code)?;
         let name = code[..eq].trim().to_owned();
-        let expr = code[eq + 1..].trim().to_owned();
+        // A `gather:` binding holds a *coroutine expression* that is wrapped in
+        // `create_task(...)`. Drop a redundant leading `await` (e.g. the user
+        // wrote `a = await fa()`); leaving it would lower to
+        // `create_task(await fa())` and crash CPython.
+        let expr = strip_leading_await(code[eq + 1..].trim());
         if name.is_empty() || expr.is_empty() {
             return None;
         }
@@ -7563,6 +7567,32 @@ fn expr_references_identifier(expr: &str, name: &str) -> bool {
 /// earlier binding — the lowering must demote to sequential awaits.
 fn gather_has_dependent_bindings(bindings: &[GatherBinding]) -> bool {
     (0..bindings.len()).any(|i| gather_binding_depends_on_earlier(bindings, i))
+}
+
+/// Strip a single leading `await ` keyword from a coroutine expression.
+///
+/// A `gather:` binding and a `go` target are lowered by wrapping the
+/// expression in `create_task(...)` / `spawn(...)`, both of which expect a
+/// *coroutine object*, not its awaited result. A user who writes
+/// `a = await fa()` inside a `gather:` block, or `go await bg()`, would
+/// otherwise lower to `create_task(await fa())` / `spawn(await bg())` — which
+/// awaits the coroutine to a plain value first and then crashes CPython with
+/// `TypeError: a coroutine was expected`. Because the wrapper already supplies
+/// the concurrency, the leading `await` is always redundant here; dropping it
+/// produces the correct coroutine expression and keeps the VM and compiled
+/// CPython in agreement.
+///
+/// Only a leading `await` token followed by whitespace is removed, so an
+/// identifier such as `awaitable()` and any inner `await` (e.g. an awaited
+/// sub-argument) are left untouched.
+fn strip_leading_await(expr: &str) -> String {
+    let trimmed = expr.trim_start();
+    if let Some(rest) = trimmed.strip_prefix("await") {
+        if rest.starts_with(|c: char| c.is_whitespace()) {
+            return rest.trim_start().to_owned();
+        }
+    }
+    expr.to_owned()
 }
 
 /// Render a `gather` block into the chosen Python concurrency primitive.
@@ -7792,7 +7822,15 @@ fn parse_go_call(rest: &str) -> Option<(String, Option<String>)> {
         Some(_) => return None,
         None => None,
     };
-    Some((call_part.to_owned(), handle))
+    // `go` wraps its target in `spawn(...)`, which expects a coroutine object.
+    // Drop a redundant leading `await` (e.g. `go await bg()`) so the lowering
+    // emits `spawn(bg())` rather than `spawn(await bg())`, which would crash
+    // CPython with `TypeError: a coroutine was expected`.
+    let call_expr = strip_leading_await(call_part);
+    if !call_expr.ends_with(')') {
+        return None;
+    }
+    Some((call_expr, handle))
 }
 
 /// Fold continuation lines that belong to a multi-line `go fn(...)`
@@ -11778,6 +11816,35 @@ def run() -> Result[str, str]:
             out.contains(".create_task(fetch_b())"),
             "create_task call missing or malformed: {out}"
         );
+    }
+
+    #[test]
+    fn gather_binding_drops_redundant_leading_await() {
+        // Regression: `a = await fa()` inside a `gather:` block used to lower
+        // to `.create_task(await fa())`, which awaits the coroutine to a value
+        // before create_task and crashes CPython with
+        // `TypeError: a coroutine was expected`. The redundant leading `await`
+        // must be stripped so the lowering wraps the bare coroutine.
+        let src = "async def f():\n    gather:\n        a = await fa()\n        b = fb()\n";
+        let out = expand_gather_blocks(src);
+        assert!(
+            out.contains(".create_task(fa())"),
+            "leading await must be stripped from gather binding: {out}"
+        );
+        assert!(
+            !out.contains("create_task(await"),
+            "create_task(await ...) is the bug we are fixing: {out}"
+        );
+    }
+
+    #[test]
+    fn strip_leading_await_leaves_identifiers_and_inner_awaits() {
+        // Only a leading `await ` token is removed; an identifier that merely
+        // starts with "await" and any inner await are untouched.
+        assert_eq!(strip_leading_await("await fa()"), "fa()");
+        assert_eq!(strip_leading_await("  await  fa()"), "fa()");
+        assert_eq!(strip_leading_await("awaitable()"), "awaitable()");
+        assert_eq!(strip_leading_await("g(await h())"), "g(await h())");
     }
 
     #[test]

@@ -4024,6 +4024,22 @@ fn inherit_parent_fields(body: Vec<Stmt>) -> Vec<Stmt> {
                         }
                     }
                     if !inherited.is_empty() {
+                        // FINDINGS #22: a `class!` subclass gets a synthesised
+                        // `__init__` during `desugar_stmts`, *before* these
+                        // inherited fields are injected — so that constructor
+                        // only accepts the child's own fields and calls a
+                        // no-arg `super().__init__()`. For an in-module base
+                        // (the only kind in `field_map`) that no-arg super
+                        // call hits the base's field-requiring dataclass
+                        // `__init__` and raises `TypeError` at runtime, and the
+                        // inherited fields can't be passed at all. Rewrite the
+                        // synthesised constructor here so it accepts the
+                        // inherited fields and assigns them directly, dropping
+                        // the now-broken no-arg super call. Framework bases are
+                        // never in `field_map`, so their synthesised inits
+                        // (which legitimately need `super().__init__()`) are
+                        // left untouched.
+                        patch_synthesised_init_with_inherited_fields(&mut c.body, &inherited);
                         // Insert inherited fields after any leading
                         // docstring so `__doc__` is preserved.
                         let insert_at = if let Some(Stmt::Expr(e)) = c.body.first() {
@@ -4051,6 +4067,133 @@ fn inherit_parent_fields(body: Vec<Stmt>) -> Vec<Stmt> {
             .collect()
     }
     rewrite(body, &field_map)
+}
+
+/// Rewrite a `class!`'s synthesised `__init__` so it also accepts and
+/// assigns fields inherited from an in-module base.
+///
+/// `inherited` is the list of parent-field `AnnAssign` statements about to
+/// be prepended to the class body. The synthesised constructor was built
+/// during `desugar_stmts` *before* those fields were visible, so it only
+/// covers the child's own fields and opens with a no-arg
+/// `super().__init__()` (rewritten to the two-arg `super(C, self).__init__()`
+/// form by the earlier `rewrite_bare_super` pass). That no-arg call hits the
+/// base's field-requiring dataclass constructor and raises `TypeError`, so we
+/// drop it and assign every field directly instead.
+///
+/// Only an `__init__` whose first statement is exactly that argument-less
+/// `super(...).__init__()` call is touched — that uniquely identifies the
+/// synthesised field-assigning constructor and leaves user-written and
+/// `*args/**kwargs` passthrough constructors untouched.
+fn patch_synthesised_init_with_inherited_fields(body: &mut [Stmt], inherited: &[Stmt]) {
+    // Pull (name, annotation, default) out of each inherited field.
+    let inherited_fields: Vec<(Name, Expr, Option<Expr>)> = inherited
+        .iter()
+        .filter_map(|s| {
+            if let Stmt::AnnAssign(a) = s {
+                if let Expr::Name(n) = a.target.as_ref() {
+                    return Some((
+                        n.id.clone(),
+                        (*a.annotation).clone(),
+                        a.value.as_deref().cloned(),
+                    ));
+                }
+            }
+            None
+        })
+        .collect();
+    if inherited_fields.is_empty() {
+        return;
+    }
+
+    for stmt in body.iter_mut() {
+        let Stmt::FunctionDef(f) = stmt else { continue };
+        if f.name.as_str() != "__init__" {
+            continue;
+        }
+        // Match only the synthesised field-assigning constructor: its first
+        // statement is an argument-less `super(...).__init__()` call.
+        if !first_stmt_is_argless_super_init(&f.body) {
+            continue;
+        }
+
+        // Build inherited parameters (these carry their own defaults).
+        let inherited_params: Vec<ParameterWithDefault> = inherited_fields
+            .iter()
+            .map(|(name, annotation, default)| ParameterWithDefault {
+                range: TextRange::default(),
+                node_index: AtomicNodeIndex::NONE,
+                parameter: Parameter {
+                    range: TextRange::default(),
+                    node_index: AtomicNodeIndex::NONE,
+                    name: make_identifier(name.as_str()),
+                    annotation: Some(Box::new(annotation.clone())),
+                },
+                default: default.as_ref().map(|d| Box::new(d.clone())),
+            })
+            .collect();
+
+        // Splice inherited params after `self`, then stable-partition the
+        // whole list so non-defaulted params precede defaulted ones (Python
+        // forbids a required parameter after a defaulted one).
+        let existing: Vec<ParameterWithDefault> = std::mem::take(&mut f.parameters.args);
+        let mut self_param: Vec<ParameterWithDefault> = Vec::new();
+        let mut rest: Vec<ParameterWithDefault> = Vec::new();
+        for (i, p) in existing.into_iter().enumerate() {
+            if i == 0 && p.parameter.name.as_str() == "self" {
+                self_param.push(p);
+            } else {
+                rest.push(p);
+            }
+        }
+        let mut combined: Vec<ParameterWithDefault> = inherited_params;
+        combined.extend(rest);
+        let (no_default, with_default): (Vec<_>, Vec<_>) =
+            combined.into_iter().partition(|p| p.default.is_none());
+        let mut new_args = self_param;
+        new_args.extend(no_default);
+        new_args.extend(with_default);
+        f.parameters.args = new_args;
+
+        // Drop the leading no-arg `super(...).__init__()` and prepend
+        // `self.<field> = <field>` for each inherited field (parent order).
+        if !f.body.is_empty() {
+            f.body.remove(0);
+        }
+        for (i, (name, _, _)) in inherited_fields.iter().enumerate() {
+            f.body.insert(i, make_self_field_assign_stmt(name.as_str()));
+        }
+        // Only one `__init__` per class body.
+        break;
+    }
+}
+
+/// `true` when the first statement of a function body is an argument-less
+/// `super(...).__init__()` expression statement — the marker of a
+/// synthesised field-assigning `class!` constructor.
+fn first_stmt_is_argless_super_init(body: &[Stmt]) -> bool {
+    let Some(Stmt::Expr(e)) = body.first() else {
+        return false;
+    };
+    let Expr::Call(call) = e.value.as_ref() else {
+        return false;
+    };
+    // No arguments to `__init__(...)`.
+    if !call.arguments.args.is_empty() || !call.arguments.keywords.is_empty() {
+        return false;
+    }
+    // `<super-call>.__init__`
+    let Expr::Attribute(attr) = call.func.as_ref() else {
+        return false;
+    };
+    if attr.attr.as_str() != "__init__" {
+        return false;
+    }
+    // The receiver is a call to `super` (bare `super()` or `super(C, self)`).
+    let Expr::Call(super_call) = attr.value.as_ref() else {
+        return false;
+    };
+    matches!(super_call.func.as_ref(), Expr::Name(n) if n.id.as_str() == "super")
 }
 
 /// Inject an implicit receiver parameter into a method from an `impl` block.
@@ -4695,6 +4838,30 @@ mod tests {
         assert!(
             out.contains("self.code = code") && out.contains("self.detail = detail"),
             "synthesised __init__ must assign fields:\n{out}"
+        );
+    }
+
+    #[test]
+    fn synthesised_init_subclass_inits_inherited_inmodule_fields() {
+        // Regression: a synthesised-`__init__` class (here a child exception
+        // whose in-module base also carries fields and a synthesised init)
+        // used to get a constructor that only accepted its OWN field and
+        // opened with a no-arg `super().__init__()`. That super call hits the
+        // base's field-requiring constructor and raises TypeError at runtime —
+        // and the inherited field could not be passed at all. The constructor
+        // must instead accept the inherited fields and assign them directly,
+        // with no super call. (Same code path the `class!` reproducer hits via
+        // the raw-class marker, which is not visible at the desugar unit
+        // level.)
+        let src = "class BaseErr(Exception):\n    code: int\n\nclass ChildErr(BaseErr):\n    detail: str\n";
+        let out = parse_and_desugar(src);
+        assert!(
+            out.contains("def __init__(self, code: int, detail: str)"),
+            "synthesised __init__ must accept inherited fields:\n{out}"
+        );
+        assert!(
+            out.contains("self.code = code") && out.contains("self.detail = detail"),
+            "synthesised __init__ must assign every inherited+own field:\n{out}"
         );
     }
 
