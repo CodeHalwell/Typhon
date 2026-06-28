@@ -49,7 +49,7 @@ Status legend: ✅ fixed · ⏳ pending · 🔁 dup of an already-fixed item.
 - **Status:** ⏳ pending
 - **Root cause:** tyc-types/tyc-analyse handling of `go EXPR -> task`: the synthesized `task` binding is typed without recording the spawned coroutine's result type, so `await task` is not checked against (and does not constrain) the LHS annotation. The task handle's awaited result type should be the callee's return type (str here), conflicting with `let n: int`.
 
-### [4] (soundness / s_augassign) Augmented assignment to a typed dict/list subscript ignores both value-widening and element type — `dict[str,int]` value silently becomes float, then crashes downstream
+### [4] ✅ (soundness / s_augassign) Augmented assignment to a typed dict/list subscript ignores both value-widening and element type — `dict[str,int]` value silently becomes float, then crashes downstream
 - **Status:** ⏳ pending
 - **Root cause:** tyc-types/src/lib.rs `check_stmt` Stmt::AugAssign arm (~line 10213). The aug-assign handler only runs `operator_operands_compatible` and ONLY when the *target's inferred type* is a primitive scalar (`scalar_target` gate, lib.rs:10224). A `Subscript` target like `bad["a"]` is not gated as a scalar local, so no operator check runs at all; and even for scalars the code never checks that the result ty
 
@@ -212,7 +212,7 @@ Status legend: ✅ fixed · ⏳ pending · 🔁 dup of an already-fixed item.
 - **Status:** ⏳ pending
 - **Root cause:** tyc-types await handling for the v0.7.0 async-callable-await feature: when awaiting a call whose callee type is `Callable[..., R]`, the checker unwraps to R unconditionally instead of only when R is `Awaitable[T]`/`Coroutine[Y,S,T]`. A non-awaitable return (plain int) should produce an await-on-non-awaitable error.
 
-### [36] (soundness / s_augassign) Augmented assignment to a typed class field silently widens it (int field becomes float) with a clean check
+### [36] ✅ (soundness / s_augassign) Augmented assignment to a typed class field silently widens it (int field becomes float) with a clean check
 - **Status:** ⏳ pending
 - **Root cause:** tyc-types/src/lib.rs Stmt::AugAssign arm (~10213). The `scalar_target` gate (10224) only matches when `infer_expr(target)` is a bare primitive; an attribute target `self.n` does not trigger the operator-compat check, and there is no check that the BinOp result type (float) is assignable to the field's declared annotation (int). Distinct from the known local-scalar `int += float` issue because attr
 

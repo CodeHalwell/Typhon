@@ -10227,8 +10227,19 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
             );
             if scalar_target {
                 if let Some(op_str) = arithmetic_op_str(a.op) {
+                    let span = (a.range.start().to_usize(), a.range.end().to_usize());
                     if !operator_operands_compatible(a.op, &l_stripped, &r_stripped) {
-                        let span = (a.range.start().to_usize(), a.range.end().to_usize());
+                        c.operator_type_mismatch(op_str, &l_stripped, &r_stripped, span);
+                    } else if matches!(l_stripped, Type::Int)
+                        && (matches!(a.op, ruff_python_ast::Operator::Div)
+                            || matches!(r_stripped, Type::Float))
+                    {
+                        // Numeric widening: `x: int; x += 0.5` (or `x /= 2`)
+                        // makes x a float at runtime, which is not assignable
+                        // back to the int target — exactly like `x = x + 0.5`.
+                        // Catches int fields and dict/list[int] elements too
+                        // (their inferred element type is `int`). Same
+                        // diagnostic the reassignment path uses.
                         c.operator_type_mismatch(op_str, &l_stripped, &r_stripped, span);
                     }
                 }
@@ -17205,6 +17216,27 @@ mod tests {
             bad.has_errors(),
             "walrus narrowing must not leak past the block"
         );
+    }
+
+    #[test]
+    fn augassign_int_widening_to_float_rejected() {
+        // `x: int; x += 0.5` (or `x /= 2`) makes x a float — not assignable
+        // back to the int target. Was silently accepted.
+        for src in [
+            "def f() -> None:\n    mut x: int = 5\n    x += 0.5\n",
+            "def f() -> None:\n    mut x: int = 5\n    x /= 2\n",
+            "def f(d: dict[str, int]) -> None:\n    d[\"a\"] += 0.5\n",
+        ] {
+            assert!(check(src).has_errors(), "int-widening aug-assign must error: {src}");
+        }
+        // Valid aug-assigns stay clean.
+        for src in [
+            "def f() -> None:\n    mut x: int = 5\n    x += 3\n",
+            "def f() -> None:\n    mut x: float = 5.0\n    x += 3\n",
+            "def f() -> None:\n    mut s: str = \"a\"\n    s += \"b\"\n",
+        ] {
+            assert!(!check(src).has_errors(), "valid aug-assign must pass: {src} {:?}", check(src).errors());
+        }
     }
 
     #[test]
