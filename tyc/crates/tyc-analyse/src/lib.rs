@@ -3377,7 +3377,21 @@ fn is_secret_name(name: &str) -> bool {
     // Recognised secret words. Longest-first matters because of
     // `API_KEY` overlapping `KEY` — both fire, but the help text
     // remains the same so the order is purely defensive.
-    const WORDS: &[&str] = &["API_KEY", "PASSWORD", "TOKEN", "SECRET", "PWD", "KEY", "APIKEY"];
+    const WORDS: &[&str] = &[
+        "API_KEY",
+        "PASSWORD",
+        "TOKEN",
+        "SECRET",
+        "PWD",
+        "KEY",
+        "APIKEY",
+        "APITOKEN",
+        "AUTHTOKEN",
+        "ACCESSTOKEN",
+        "CLIENTSECRET",
+        "APPSECRET",
+        "PASSPHRASE",
+    ];
     let upper = name.to_ascii_uppercase();
     for word in WORDS {
         let mut start_idx = 0;
@@ -4542,6 +4556,12 @@ async def load() -> int:
             "KEY_APIKEY = \"sk-foo\"\n",
             "myTokenValue = \"sk-foo\"\n",
             "APIKEY = \"123\"\n",
+            "APITOKEN = \"123\"\n",
+            "AUTHTOKEN = \"123\"\n",
+            "ACCESSTOKEN = \"123\"\n",
+            "CLIENTSECRET = \"123\"\n",
+            "APPSECRET = \"123\"\n",
+            "PASSPHRASE = \"123\"\n",
         ];
         for src in srcs {
             let module = parse(src);
