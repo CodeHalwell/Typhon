@@ -9643,10 +9643,24 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                                 b.span,
                             );
                         }
-                        // Reset any narrowing on the reassigned name, and
-                        // invalidate every attribute narrowing rooted at it
-                        // (`b = …` makes prior `b.value` narrowings stale).
-                        c.env.narrow(n.id.as_str(), b.declared);
+                        // Narrow the binding to the assigned value's type so a
+                        // later read sees the refined type — `mut x: int? =
+                        // None; x = 5; return x + 1` (x is `int` after the
+                        // assignment), matching mypy/pyright assignment
+                        // narrowing and the field-assignment path. The
+                        // snapshot/restore around `if`/`match` arms reverts the
+                        // refinement at a branch boundary, so the declared type
+                        // is correctly restored on the join. `Unknown` (e.g. an
+                        // unsafe-boundary value) falls back to the declared type
+                        // rather than erasing it. Invalidate attribute
+                        // narrowings rooted at the name (`b = …` makes prior
+                        // `b.value` narrowings stale).
+                        let narrowed_to = if matches!(value_type, Type::Unknown) {
+                            b.declared.clone()
+                        } else {
+                            value_type.clone()
+                        };
+                        c.env.narrow(n.id.as_str(), narrowed_to);
                         c.env.clear_attr_narrowing(n.id.as_str());
                     } else {
                         let from_unsafe = c.unsafe_depth > 0;
@@ -16883,6 +16897,28 @@ mod tests {
             "narrowing must not leak past the bool-op: {:?}",
             d.errors()
         );
+    }
+
+    #[test]
+    fn mut_reassignment_narrows_to_value_type() {
+        // `mut x: int? = None; x = 5; x + 1` — after the assignment `x` is
+        // `int`, so the use must type-check (was a false `nullable_use`).
+        let d = check("def f() -> int:\n    mut x: int? = None\n    x = 5\n    return x + 1\n");
+        assert!(!d.has_errors(), "assignment should narrow mut to value: {:?}", d.errors());
+    }
+
+    #[test]
+    fn mut_reassignment_narrows_union() {
+        let d = check("def f() -> int:\n    mut x: int | str = \"hi\"\n    x = 5\n    return x + 1\n");
+        assert!(!d.has_errors(), "union mut narrows on assignment: {:?}", d.errors());
+    }
+
+    #[test]
+    fn mut_reassignment_to_nullable_still_rejected() {
+        // The refinement must not bypass the declared-type assignability check:
+        // assigning an `int?` to a binding declared `int` is still an error.
+        let d = check("def g(o: int?) -> int:\n    mut x: int = 0\n    x = o\n    return x\n");
+        assert!(d.has_errors(), "assigning int? to an int binding must error");
     }
 
     // ── Variance ─────────────────────────────────────────────────────────
