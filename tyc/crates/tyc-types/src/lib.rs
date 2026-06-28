@@ -11457,6 +11457,22 @@ fn check_if(c: &mut Checker, i: &ruff_python_ast::StmtIf) {
         c.unsafe_depth = c.unsafe_depth.saturating_sub(1);
     }
     let body_exits = body_always_exits(&i.body);
+    // Capture the body-end narrowed type of each variable the condition
+    // narrows, for the no-`else` fall-through join below (FP: default-fill
+    // `if x is None: x = d`). `collect_narrowings` is read-only.
+    let neg_targets = collect_narrowings(c, &i.test, /*negate=*/ true);
+    let body_end_types: Vec<(String, Type)> = neg_targets
+        .iter()
+        .filter(|n| n.attr_path.is_none() && !n.name.is_empty())
+        .map(|n| {
+            let t = c
+                .env
+                .lookup(&n.name)
+                .map(|b| b.narrowed.clone())
+                .unwrap_or(Type::Unknown);
+            (n.name.clone(), t)
+        })
+        .collect();
     c.env.restore(snap_pre);
 
     // Apply opposite narrowing for the elif/else cascade. Ruff flattens
@@ -11478,6 +11494,27 @@ fn check_if(c: &mut Checker, i: &ruff_python_ast::StmtIf) {
     // None-check, `expr` is reliably non-None for the rest of the body.
     if body_exits && (i.elif_else_clauses.is_empty() || elif_exits) {
         apply_narrowings(c, &neg);
+    } else if i.elif_else_clauses.is_empty() && !body_exits {
+        // No `else`, body falls through: the two paths reaching the post-`if`
+        // point are (a) the body ran, and (b) the condition was false. For a
+        // variable the condition narrows, its post-`if` type is the union of
+        // its type at the end of the body and its condition-false (`neg`) type.
+        // This makes the default-fill idiom `if x is None: x = "d"` refine `x`
+        // to non-`None` afterwards (`union(str, str) = str`) — while a body
+        // that doesn't assign `x` still joins to `x?` (sound, no spurious
+        // narrowing). Variables the condition doesn't narrow are untouched.
+        for n in &neg {
+            if n.attr_path.is_some() || n.name.is_empty() {
+                continue;
+            }
+            let body_end = body_end_types
+                .iter()
+                .find(|(name, _)| name == &n.name)
+                .map(|(_, t)| t.clone())
+                .unwrap_or(Type::Unknown);
+            let joined = Type::union_of(vec![body_end, n.replacement.clone()]);
+            c.env.narrow(&n.name, joined);
+        }
     }
 }
 
@@ -17168,6 +17205,36 @@ mod tests {
             bad.has_errors(),
             "walrus narrowing must not leak past the block"
         );
+    }
+
+    #[test]
+    fn default_fill_if_none_narrows_after_block() {
+        // `if x is None: x = d` — both paths reaching the post-if point leave
+        // the variable non-None, so it must be usable as the non-null type.
+        let ok = check(
+            "def classify(n: int) -> str:\n    mut label: str? = None\n    if n > 0:\n        label = \"pos\"\n    if label is None:\n        label = \"nonpos\"\n    return label\n",
+        );
+        assert!(!ok.has_errors(), "default-fill should narrow: {:?}", ok.errors());
+    }
+
+    #[test]
+    fn if_none_body_without_assign_does_not_narrow() {
+        // Soundness guard for the join: if the body doesn't make the variable
+        // non-None, the post-if type must stay nullable.
+        let bad = check(
+            "def f(x: str?) -> str:\n    if x is None:\n        print(\"hi\")\n    return x\n",
+        );
+        assert!(bad.has_errors(), "x must remain nullable when the body doesn't fill it");
+    }
+
+    #[test]
+    fn non_narrowing_if_does_not_join() {
+        // The join only applies to variables the condition narrows; a plain
+        // `if cond: x = v` over a non-narrowing condition must not refine x.
+        let bad = check(
+            "def f(n: int) -> int:\n    mut x: int? = None\n    if n > 0:\n        x = 5\n    return x + 1\n",
+        );
+        assert!(bad.has_errors(), "non-narrowing if must not refine x");
     }
 
     #[test]
