@@ -8,6 +8,12 @@ canonical phase-by-phase status lives in `docs/roadmap.md`.
 
 ### Fixed
 
+- **`tyc` no longer aborts (SIGABRT) on deeply-nested or very long
+  expressions.** A long flat `a + b + c + …` chain (plausible generated code)
+  or deeply nested brackets built a deep AST that overflowed the default
+  ~8 MB stack during the recursive type-check / VM walk. The CLI now runs on a
+  256 MiB worker stack (lazily committed), pushing the ceiling far past any
+  realistic program.
 - **Multi-line `freeze let` with a `#` inside a string no longer fails to
   parse.** A continuation line like `"list": ["a#b"],` made the bracket-depth
   scanner treat the in-string `#` as a comment and miss the following `]`, so
