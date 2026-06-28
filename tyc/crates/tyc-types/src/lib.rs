@@ -9762,7 +9762,30 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                 // ordering semantics so the check is skipped for
                 // them; raw `class!` is checked too because its
                 // synthesised `__init__` follows the same rule.
-                let mut prior_default: Option<(String, &ruff_python_ast::StmtAnnAssign)> = None;
+                // Seed the ordering scan with inherited fields (in MRO order):
+                // Python's @dataclass accumulates base fields before the
+                // subclass's own, so `class Base: name; active=True` +
+                // `class Sub(Base): extra` produces `name, active=True, extra`
+                // — a non-default after a default, which raises `TypeError` at
+                // *import*. The single-class scan missed it (Sub's body only
+                // declares `extra`); seeding `prior_default` from a defaulted
+                // inherited field surfaces it at check time instead.
+                let base_names: Vec<String> = cd
+                    .bases()
+                    .iter()
+                    .filter_map(|b| match b {
+                        Expr::Name(n) => Some(n.id.as_str().to_owned()),
+                        _ => None,
+                    })
+                    .collect();
+                let mut inherited: Vec<(String, bool)> = Vec::new();
+                let mut seen_bases: std::collections::HashSet<String> =
+                    std::collections::HashSet::new();
+                collect_inherited_fields(c, &base_names, &mut inherited, &mut seen_bases);
+                let mut prior_default: Option<String> = inherited
+                    .iter()
+                    .find(|(_, has_default)| *has_default)
+                    .map(|(name, _)| name.clone());
                 for s in &cd.body {
                     if let Stmt::AnnAssign(a) = s {
                         let Expr::Name(target) = a.target.as_ref() else {
@@ -9783,9 +9806,9 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                         let name = target.id.as_str().to_owned();
                         if a.value.is_some() {
                             if prior_default.is_none() {
-                                prior_default = Some((name, a));
+                                prior_default = Some(name);
                             }
-                        } else if let Some((prior, _)) = &prior_default {
+                        } else if let Some(prior) = &prior_default {
                             let span = (
                                 target.range.start().to_usize(),
                                 target.range.end().to_usize(),
@@ -16782,6 +16805,30 @@ fn seq_pattern_element_type(ty: &Type, idx: usize) -> Type {
     }
 }
 
+/// Collect a class's inherited dataclass fields in MRO order (grandparent
+/// before parent, base before subclass), each tagged with whether it carries a
+/// default. Backs the cross-inheritance `field_default_ordering` check. Cycles
+/// and re-visited bases are skipped via `seen`.
+fn collect_inherited_fields(
+    c: &Checker,
+    bases: &[String],
+    out: &mut Vec<(String, bool)>,
+    seen: &mut std::collections::HashSet<String>,
+) {
+    for base in bases {
+        if !seen.insert(base.clone()) {
+            continue;
+        }
+        if let Some(shape) = c.class_shapes.get(base) {
+            // A base's own bases contribute their fields first.
+            collect_inherited_fields(c, &shape.bases, out, seen);
+            for fname in &shape.field_order {
+                out.push((fname.clone(), shape.field_defaults.contains(fname)));
+            }
+        }
+    }
+}
+
 fn bind_pattern_names(c: &mut Checker, pattern: &Pattern, ty: &Type) {
     match pattern {
         Pattern::MatchAs(a) => {
@@ -20767,6 +20814,52 @@ class A:
                 .iter()
                 .any(|e| matches!(e, TycError::FieldDefaultOrdering { .. })),
             "non-default-before-default order must not fire: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn inherited_default_then_subclass_required_field_rejected() {
+        // A defaulted field on the base followed by a non-defaulted field on
+        // the subclass produces `name, active=True, extra` in the merged
+        // @dataclass — a non-default after a default, which raises TypeError at
+        // import. Must be caught at check time (was missed: Sub's body only
+        // declares `extra`).
+        let src = "\
+class Base:
+    name: str
+    active: bool = True
+
+class Sub(Base):
+    extra: int
+";
+        let d = check(src);
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::FieldDefaultOrdering { .. })),
+            "inherited-default + subclass-required must fire field_default_ordering: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn inherited_default_then_subclass_defaulted_is_clean() {
+        // Valid: every field after the first default is itself defaulted.
+        let src = "\
+class Base:
+    name: str
+    active: bool = True
+
+class Sub(Base):
+    extra: int = 0
+";
+        let d = check(src);
+        assert!(
+            !d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::FieldDefaultOrdering { .. })),
+            "subclass adding a defaulted field must not fire: {:?}",
             d.errors()
         );
     }
