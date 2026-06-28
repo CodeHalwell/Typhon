@@ -37,6 +37,7 @@ straight from a failed build to the corresponding documentation.
 - [`tyc::invalid_config_value`](./invalid_config_value.md) — `typhon.toml` value outside the allowed enumeration.
 - [`tyc::invalid_question_op`](./invalid_question_op.md) — `?` outside a `Result`-returning function, or inside a comprehension.
 - [`tyc::io`](./io.md) — source file could not be read.
+- [`tyc::kind_mismatch`](./kind_mismatch.md) — higher-kinded type constructor applied with the wrong arity or bound to conflicting constructors.
 - [`tyc::lazy_usage`](./lazy_usage.md) — unsupported form under the `lazy` keyword.
 - [`tyc::main_not_called`](./main_not_called.md) — advice: `def main()` defined but never called.
 - [`tyc::manual_init`](./manual_init.md) — class body declared `__init__` directly.

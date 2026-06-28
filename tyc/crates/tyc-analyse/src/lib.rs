@@ -416,10 +416,30 @@ pub fn evaluate_comptime_with_functions(
 
         match rhs {
             None => {
-                diags.push_error(TycError::comptime(
-                    binding.name.clone(),
-                    format!("comptime binding '{}' has no initialiser", binding.name),
-                ));
+                // Distinguish "no value at all" from "value present but the
+                // binding lacks the required type annotation" — the latter
+                // lowers to a plain `Assign` (not `AnnAssign`), so the RHS
+                // lookup above misses it and the old message ("no initialiser")
+                // was misleading. A `comptime let` requires an explicit
+                // annotation: `comptime let NAME: T = ...`.
+                let has_unannotated_value = body.iter().any(|stmt| {
+                    matches!(
+                        stmt,
+                        Stmt::Assign(a) if a.targets.iter().any(|t| {
+                            matches!(t, Expr::Name(n) if n.id.as_str() == binding.name)
+                        })
+                    )
+                });
+                let message = if has_unannotated_value {
+                    format!(
+                        "comptime binding '{}' needs an explicit type annotation \
+                         (write `comptime let {}: T = ...`)",
+                        binding.name, binding.name
+                    )
+                } else {
+                    format!("comptime binding '{}' has no initialiser", binding.name)
+                };
+                diags.push_error(TycError::comptime(binding.name.clone(), message));
             }
             Some(expr) => {
                 let mut ctx = EvalContext::new(&functions);

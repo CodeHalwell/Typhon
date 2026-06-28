@@ -422,7 +422,7 @@ class Rectangle: width: float; height: float
 class Triangle:  base: float;  height: float
 ```
 
-The cheat-sheet form `sealed union Shape: Circle(radius: float); Square(side: float)` is also accepted. Variants can be parametric (`type EventEnvelope[T] = RecordEnv[T] | WatermarkEnv | BarrierEnv` — some refer to `T`, others don't). For nullary variants, write `class Nil frozen: pass` and match with `case Nil():` (two empty parens, not `case Nil(_):`).
+(There is **no `sealed union NAME:` keyword block form** — a sealed union is written as a `type` alias over separately-declared variant classes, as above. Earlier docs/cheatsheets showed a `sealed union Shape:` block; that does **not** parse and has been corrected.) Variants can be parametric (`type EventEnvelope[T] = RecordEnv[T] | WatermarkEnv | BarrierEnv` — some refer to `T`, others don't). For nullary variants, write `class Nil frozen: pass` and match with `case Nil():` (two empty parens, not `case Nil(_):`).
 
 The match is statically verified exhaustive. Add `Square` to the alias → every match becomes `tyc::non_exhaustive_match` until handled. Cross-module variant flow works (v0.6.0) — variant `A(...)` flows into an `Event`-typed slot in a consumer module even when the alias is declared in another package.
 

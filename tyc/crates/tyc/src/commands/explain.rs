@@ -61,6 +61,7 @@ fn catalog_codes() -> &'static [&'static str] {
         "duplicate_class",
         "duplicate_method",
         "extend_builtin",
+        "field_default_ordering",
         "freeze",
         "frozen_assign",
         "gather_opportunity",
@@ -85,7 +86,9 @@ fn catalog_codes() -> &'static [&'static str] {
         "missing_binding_kind",
         "incompatible_override",
         "is_literal_comparison",
+        "kind_mismatch",
         "loop_closure_capture",
+        "missing_field_init",
         "missing_initialiser",
         "missing_return",
         "mutable_default_param",
@@ -99,6 +102,8 @@ fn catalog_codes() -> &'static [&'static str] {
         "parse",
         "pattern_shadows_outer",
         "pub",
+        "pub_name_collision",
+        "pub_star_outside_init",
         "python_semantic_drift",
         "resource_not_managed",
         "result_error_mismatch",
@@ -115,6 +120,7 @@ fn catalog_codes() -> &'static [&'static str] {
         "unknown_name",
         "unsafe_value_leak",
         "unused_import",
+        "use_of_uninitialised",
     ]
 }
 
@@ -149,6 +155,9 @@ fn catalog_entry(short_code: &str) -> Option<&'static str> {
         "duplicate_class" => include_str!("../../../../../docs/diagnostics/duplicate_class.md"),
         "duplicate_method" => include_str!("../../../../../docs/diagnostics/duplicate_method.md"),
         "extend_builtin" => include_str!("../../../../../docs/diagnostics/extend_builtin.md"),
+        "field_default_ordering" => {
+            include_str!("../../../../../docs/diagnostics/field_default_ordering.md")
+        }
         "freeze" => include_str!("../../../../../docs/diagnostics/freeze.md"),
         "frozen_assign" => include_str!("../../../../../docs/diagnostics/frozen_assign.md"),
         "gather_opportunity" => {
@@ -199,8 +208,12 @@ fn catalog_entry(short_code: &str) -> Option<&'static str> {
         "is_literal_comparison" => {
             include_str!("../../../../../docs/diagnostics/is_literal_comparison.md")
         }
+        "kind_mismatch" => include_str!("../../../../../docs/diagnostics/kind_mismatch.md"),
         "loop_closure_capture" => {
             include_str!("../../../../../docs/diagnostics/loop_closure_capture.md")
+        }
+        "missing_field_init" => {
+            include_str!("../../../../../docs/diagnostics/missing_field_init.md")
         }
         "missing_initialiser" => {
             include_str!("../../../../../docs/diagnostics/missing_initialiser.md")
@@ -227,6 +240,12 @@ fn catalog_entry(short_code: &str) -> Option<&'static str> {
             include_str!("../../../../../docs/diagnostics/pattern_shadows_outer.md")
         }
         "pub" => include_str!("../../../../../docs/diagnostics/pub.md"),
+        "pub_name_collision" => {
+            include_str!("../../../../../docs/diagnostics/pub_name_collision.md")
+        }
+        "pub_star_outside_init" => {
+            include_str!("../../../../../docs/diagnostics/pub_star_outside_init.md")
+        }
         "python_semantic_drift" => {
             include_str!("../../../../../docs/diagnostics/python_semantic_drift.md")
         }
@@ -259,6 +278,9 @@ fn catalog_entry(short_code: &str) -> Option<&'static str> {
             include_str!("../../../../../docs/diagnostics/unsafe_value_leak.md")
         }
         "unused_import" => include_str!("../../../../../docs/diagnostics/unused_import.md"),
+        "use_of_uninitialised" => {
+            include_str!("../../../../../docs/diagnostics/use_of_uninitialised.md")
+        }
         _ => return None,
     })
 }

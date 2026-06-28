@@ -6,10 +6,15 @@ variant and does not have a wildcard arm.
 ## Example
 
 ```ty
-sealed union Shape:
-    Circle(radius: float)
-    Square(side: float)
-    Triangle(base: float, height: float)
+type Shape = Circle | Square | Triangle
+
+class Circle:
+    radius: float
+class Square:
+    side: float
+class Triangle:
+    base: float
+    height: float
 
 def area(s: Shape) -> float:
     match s:
