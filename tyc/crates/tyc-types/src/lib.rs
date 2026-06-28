@@ -17121,12 +17121,19 @@ mod tests {
         let valid = check(
             "def get() -> Result[int, str]:\n    return Ok(5)\ndef f() -> None:\n    match get():\n        case Ok(v):\n            let n: int = v + 1\n            print(n)\n        case Err(e):\n            print(e.upper())\n",
         );
-        assert!(!valid.has_errors(), "valid capture uses should pass: {:?}", valid.errors());
+        assert!(
+            !valid.has_errors(),
+            "valid capture uses should pass: {:?}",
+            valid.errors()
+        );
         // Misusing the captured `int` as a `list[int]` must now be caught.
         let bad = check(
             "def get() -> Result[int, str]:\n    return Ok(5)\ndef f() -> None:\n    match get():\n        case Ok(v):\n            let bad: list[int] = v\n            print(bad)\n        case Err(e):\n            print(e)\n",
         );
-        assert!(bad.has_errors(), "int capture used as list[int] must be rejected");
+        assert!(
+            bad.has_errors(),
+            "int capture used as list[int] must be rejected"
+        );
     }
 
     #[test]
@@ -17134,7 +17141,10 @@ mod tests {
         let bad = check(
             "type Shape = Circle | Square\nclass Circle:\n    radius: float\nclass Square:\n    side: float\ndef area(s: Shape) -> float:\n    match s:\n        case Circle(r):\n            let bad: str = r\n            return 0.0\n        case Square(side):\n            return side * side\n",
         );
-        assert!(bad.has_errors(), "float field captured as str must be rejected");
+        assert!(
+            bad.has_errors(),
+            "float field captured as str must be rejected"
+        );
     }
 
     #[test]
@@ -17143,14 +17153,21 @@ mod tests {
         let ok = check(
             "def src() -> int?:\n    return 5\ndef main() -> None:\n    if (v := src()) is not None:\n        let n: int = v + 1\n        print(n)\n",
         );
-        assert!(!ok.has_errors(), "walrus body should be narrowed: {:?}", ok.errors());
+        assert!(
+            !ok.has_errors(),
+            "walrus body should be narrowed: {:?}",
+            ok.errors()
+        );
         // … but past the block `v` is back to its declared `int?`, so using it
         // as a plain `int` must be rejected (was a silent soundness hole — the
         // walrus binding was invisible to the checker and read as Unknown).
         let bad = check(
             "def src() -> int?:\n    return None\ndef main() -> None:\n    if (v := src()) is not None:\n        print(v)\n    let z: int = v\n    print(z)\n",
         );
-        assert!(bad.has_errors(), "walrus narrowing must not leak past the block");
+        assert!(
+            bad.has_errors(),
+            "walrus narrowing must not leak past the block"
+        );
     }
 
     #[test]
@@ -17158,13 +17175,22 @@ mod tests {
         // `mut x: int? = None; x = 5; x + 1` — after the assignment `x` is
         // `int`, so the use must type-check (was a false `nullable_use`).
         let d = check("def f() -> int:\n    mut x: int? = None\n    x = 5\n    return x + 1\n");
-        assert!(!d.has_errors(), "assignment should narrow mut to value: {:?}", d.errors());
+        assert!(
+            !d.has_errors(),
+            "assignment should narrow mut to value: {:?}",
+            d.errors()
+        );
     }
 
     #[test]
     fn mut_reassignment_narrows_union() {
-        let d = check("def f() -> int:\n    mut x: int | str = \"hi\"\n    x = 5\n    return x + 1\n");
-        assert!(!d.has_errors(), "union mut narrows on assignment: {:?}", d.errors());
+        let d =
+            check("def f() -> int:\n    mut x: int | str = \"hi\"\n    x = 5\n    return x + 1\n");
+        assert!(
+            !d.has_errors(),
+            "union mut narrows on assignment: {:?}",
+            d.errors()
+        );
     }
 
     #[test]
@@ -17172,7 +17198,10 @@ mod tests {
         // The refinement must not bypass the declared-type assignability check:
         // assigning an `int?` to a binding declared `int` is still an error.
         let d = check("def g(o: int?) -> int:\n    mut x: int = 0\n    x = o\n    return x\n");
-        assert!(d.has_errors(), "assigning int? to an int binding must error");
+        assert!(
+            d.has_errors(),
+            "assigning int? to an int binding must error"
+        );
     }
 
     // ── Variance ─────────────────────────────────────────────────────────

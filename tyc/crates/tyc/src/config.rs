@@ -393,11 +393,17 @@ impl TyphonConfig {
         let severities = [
             ("unused-import", &self.strictness.unused_import),
             ("exhaustive-match", &self.strictness.exhaustive_match),
-            ("methods-in-class-body", &self.strictness.methods_in_class_body),
+            (
+                "methods-in-class-body",
+                &self.strictness.methods_in_class_body,
+            ),
             ("require-with", &self.strictness.require_with),
             ("blocking-in-async", &self.strictness.blocking_in_async),
             ("stub-check", &self.strictness.stub_check),
-            ("unintrospectable-dependency", &self.strictness.unintrospectable_dependency),
+            (
+                "unintrospectable-dependency",
+                &self.strictness.unintrospectable_dependency,
+            ),
         ];
         for (key, value) in severities {
             if !ALLOWED_SEVERITIES.contains(&value.trim()) {

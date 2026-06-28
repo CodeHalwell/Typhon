@@ -5952,9 +5952,9 @@ fn trailing_q_has_binary_prefix(s: &str, q_pos: usize, in_str_mask: &[bool]) -> 
     // Word operators (`and` / `or` / `not` / `in` / `is` / ternary `if`/`else`)
     // separated by spaces — a bare space-delimited keyword token before the call.
     let trimmed = prefix.trim();
-    trimmed.split_whitespace().any(|w| {
-        matches!(w, "and" | "or" | "not" | "in" | "is" | "if" | "else")
-    })
+    trimmed
+        .split_whitespace()
+        .any(|w| matches!(w, "and" | "or" | "not" | "in" | "is" | "if" | "else"))
 }
 
 /// Walk backwards from `close_pos` (position of `)`) to find the matching
