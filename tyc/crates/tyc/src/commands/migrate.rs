@@ -2420,8 +2420,14 @@ class Stack(Generic[T]):
         return self.items.pop()
 ";
         let out = migrate_source(src);
-        assert!(out.contains("impl[T] Stack[T]:"), "impl must carry [T]:\n{out}");
-        assert!(!out.contains("impl Stack:"), "bare impl Stack: is the bug:\n{out}");
+        assert!(
+            out.contains("impl[T] Stack[T]:"),
+            "impl must carry [T]:\n{out}"
+        );
+        assert!(
+            !out.contains("impl Stack:"),
+            "bare impl Stack: is the bug:\n{out}"
+        );
     }
 
     #[test]
@@ -2433,8 +2439,14 @@ class Plain:
         return self.x
 ";
         let out = migrate_source(src);
-        assert!(out.contains("impl Plain:"), "non-generic impl stays bare:\n{out}");
-        assert!(!out.contains("impl["), "no type params on a non-generic impl:\n{out}");
+        assert!(
+            out.contains("impl Plain:"),
+            "non-generic impl stays bare:\n{out}"
+        );
+        assert!(
+            !out.contains("impl["),
+            "no type params on a non-generic impl:\n{out}"
+        );
     }
 
     #[test]
@@ -2450,7 +2462,10 @@ class Pair(Generic[K, V]):
         return 0
 ";
         let out = migrate_source(src);
-        assert!(out.contains("impl[K, V] Pair[K, V]:"), "impl must carry [K, V]:\n{out}");
+        assert!(
+            out.contains("impl[K, V] Pair[K, V]:"),
+            "impl must carry [K, V]:\n{out}"
+        );
     }
 
     #[test]

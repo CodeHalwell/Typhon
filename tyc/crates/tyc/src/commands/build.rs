@@ -1448,7 +1448,10 @@ fn scan_relative_py_imports(source: &str) -> Vec<(String, String, usize, usize)>
 /// package), `src/a/mod.ty` → 1, etc. `None` when the path can't be expressed
 /// relative to `src_dir` (so the over-deep-import check is skipped rather than
 /// risking a false positive).
-pub(crate) fn module_depth_below(path: &std::path::Path, src_dir: &std::path::Path) -> Option<usize> {
+pub(crate) fn module_depth_below(
+    path: &std::path::Path,
+    src_dir: &std::path::Path,
+) -> Option<usize> {
     let rel = path.strip_prefix(src_dir).ok()?;
     Some(rel.components().count().saturating_sub(1))
 }

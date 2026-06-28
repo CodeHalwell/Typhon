@@ -73,7 +73,9 @@ impl Default for PythonConfig {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(default, rename_all = "kebab-case")]
 pub struct EmitConfig {
-    /// Default class emission target: `"dataclass"` (default) or `"pydantic"`.
+    /// Default class emission target. Only `"dataclass"` (the default) is
+    /// implemented; a project-wide `"pydantic"` default is rejected by
+    /// [`TyphonConfig::validate`] (use the per-class `model` keyword instead).
     pub class_default: String,
     /// Post-process emitted Python through ruff format.
     pub format: bool,
@@ -647,7 +649,10 @@ mod tests {
         match err {
             ConfigError::InvalidClassDefault { value, allowed, .. } => {
                 assert_eq!(value, "pydantic");
-                assert!(allowed.contains("model"), "message should mention `model`, got {allowed}");
+                assert!(
+                    allowed.contains("model"),
+                    "message should mention `model`, got {allowed}"
+                );
             }
             other => panic!("expected InvalidClassDefault, got {other:?}"),
         }

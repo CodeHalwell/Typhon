@@ -226,16 +226,21 @@ corpus green).
 - ✅ **Unknown `[strictness]` severity strings rejected** (a typo like `"eror"`
   silently disabled a CI gate the user thought they'd enabled).
 
-**Round-2 items still open** (tracked for follow-up):
-- ⏸️ Default-fill `mut` narrowing across an `if` (branch-join dataflow).
-- ⏸️ `tyc migrate` drops the type-param list on `impl` of a generic class
-  (`impl Stack:` should be `impl[T] Stack[T]:`) — migrated code fails `tyc check`.
-- ⏸️ Orphan relative import escaping `src/` (`from ..outside import x`) is
-  accepted and emits crashing Python — should diagnose.
-- ⏸️ `[emit] class-default = "pydantic"` is a dead no-op (never read by emit).
-- ⏸️ `comptime` integer arithmetic is i64-capped (rejects valid bignum
-  constants) — contradicts the bignum promise, but rejects cleanly (no silent
-  wrong value).
+**Round-2/3 follow-ups — all now fixed:**
+- ✅ Default-fill narrowing across a no-`else` `if` (`if x is None: x = d`) —
+  sound branch-join; the post-`if` type is the union of the body and
+  condition-false paths.
+- ✅ `tyc migrate` now emits `impl[T] Stack[T]:` / `impl[K, V] Pair[K, V]:` for
+  generic classes (carries the class's type params onto the `impl`).
+- ✅ Relative imports escaping `src/` (`from ..outside import x`) are flagged
+  `tyc::orphan_py_import` at check/build instead of emitting crashing Python.
+- ✅ `[emit] class-default = "pydantic"` (never wired) is now rejected at config
+  load with a pointer to the per-class `model` keyword, instead of a silent
+  no-op; docs corrected.
+- ✅ `comptime` integer overflow diagnostic now explains the 64-bit limit and
+  the runtime alternative (the value was always rejected cleanly — never
+  silently wrong; only the message was opaque). A full bignum migration of the
+  comptime evaluator is deferred (broad, low-value, current behaviour is safe).
 
 Verified-clean in round 2 (no issue): `?`/`with`-chain/`rescue`/`try_result`
 lowering, newtype arithmetic, `freeze`/`comptime`/pipe/`guard` emit, `gather:`/

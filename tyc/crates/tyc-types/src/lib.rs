@@ -17214,7 +17214,11 @@ mod tests {
         let ok = check(
             "def classify(n: int) -> str:\n    mut label: str? = None\n    if n > 0:\n        label = \"pos\"\n    if label is None:\n        label = \"nonpos\"\n    return label\n",
         );
-        assert!(!ok.has_errors(), "default-fill should narrow: {:?}", ok.errors());
+        assert!(
+            !ok.has_errors(),
+            "default-fill should narrow: {:?}",
+            ok.errors()
+        );
     }
 
     #[test]
@@ -17224,7 +17228,10 @@ mod tests {
         let bad = check(
             "def f(x: str?) -> str:\n    if x is None:\n        print(\"hi\")\n    return x\n",
         );
-        assert!(bad.has_errors(), "x must remain nullable when the body doesn't fill it");
+        assert!(
+            bad.has_errors(),
+            "x must remain nullable when the body doesn't fill it"
+        );
     }
 
     #[test]
