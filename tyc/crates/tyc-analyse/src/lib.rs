@@ -1467,6 +1467,19 @@ fn comptime_as_f64(v: &ComptimeValue) -> f64 {
     }
 }
 
+/// Message for a comptime integer overflow. Comptime arithmetic is evaluated
+/// in 64-bit (unlike Typhon's arbitrary-precision runtime `int`), so a value
+/// that exceeds `i64` can't be a build-time constant. The hint points at the
+/// runtime alternative so the limitation is actionable rather than mysterious.
+#[allow(non_snake_case)]
+fn COMPTIME_INT_OVERFLOW(op: &str) -> String {
+    format!(
+        "integer overflow in comptime {op} — comptime arithmetic is 64-bit, \
+         so a value this large can't be a build-time constant; compute it at \
+         runtime instead (a normal `let` / `lazy let`, not `comptime let`)"
+    )
+}
+
 fn eval_binop(
     op: ruff_python_ast::Operator,
     lhs: ComptimeValue,
@@ -1478,7 +1491,7 @@ fn eval_binop(
         (Add, ComptimeValue::Int(a), ComptimeValue::Int(b)) => a
             .checked_add(*b)
             .map(ComptimeValue::Int)
-            .ok_or_else(|| "integer overflow in comptime addition".to_string()),
+            .ok_or_else(|| COMPTIME_INT_OVERFLOW("addition")),
         (Add, ComptimeValue::Float(a), ComptimeValue::Float(b)) => Ok(ComptimeValue::Float(a + b)),
         (Add, ComptimeValue::Int(a), ComptimeValue::Float(b)) => {
             Ok(ComptimeValue::Float(*a as f64 + b))
@@ -1493,7 +1506,7 @@ fn eval_binop(
         (Sub, ComptimeValue::Int(a), ComptimeValue::Int(b)) => a
             .checked_sub(*b)
             .map(ComptimeValue::Int)
-            .ok_or_else(|| "integer overflow in comptime subtraction".to_string()),
+            .ok_or_else(|| COMPTIME_INT_OVERFLOW("subtraction")),
         (Sub, ComptimeValue::Float(a), ComptimeValue::Float(b)) => Ok(ComptimeValue::Float(a - b)),
         (Sub, ComptimeValue::Int(a), ComptimeValue::Float(b)) => {
             Ok(ComptimeValue::Float(*a as f64 - b))
@@ -1505,7 +1518,7 @@ fn eval_binop(
         (Mult, ComptimeValue::Int(a), ComptimeValue::Int(b)) => a
             .checked_mul(*b)
             .map(ComptimeValue::Int)
-            .ok_or_else(|| "integer overflow in comptime multiplication".to_string()),
+            .ok_or_else(|| COMPTIME_INT_OVERFLOW("multiplication")),
         (Mult, ComptimeValue::Float(a), ComptimeValue::Float(b)) => Ok(ComptimeValue::Float(a * b)),
         (Mult, ComptimeValue::Int(a), ComptimeValue::Float(b)) => {
             Ok(ComptimeValue::Float(*a as f64 * b))
@@ -1610,7 +1623,7 @@ fn eval_binop(
                     .map_err(|_| "exponent too large in comptime power".to_string())?;
                 a.checked_pow(exp)
                     .map(ComptimeValue::Int)
-                    .ok_or_else(|| "integer overflow in comptime power".to_string())
+                    .ok_or_else(|| COMPTIME_INT_OVERFLOW("power"))
             }
         }
         (Pow, _, _)
