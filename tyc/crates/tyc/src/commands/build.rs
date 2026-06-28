@@ -578,9 +578,14 @@ pub fn run(args: BuildArgs) -> Result<()> {
                     let import_line = import_pieces.join("; ");
                     prep.python_source =
                         replace_line(&prep.python_source, marker_line, &import_line);
-                    // Append aggregated names to `prep.pub_names` so
-                    // the desugar pass picks them up for `__all__`.
-                    for name in &accepted_names {
+                    // Append aggregated names to `prep.pub_names` so the
+                    // desugar pass picks them up for `__all__`. Sort first —
+                    // `accepted_names` is a `HashSet`, whose iteration order is
+                    // nondeterministic, which made the synthesised `__all__`
+                    // order flap between builds (non-reproducible output).
+                    let mut sorted_accepted: Vec<&String> = accepted_names.iter().collect();
+                    sorted_accepted.sort();
+                    for name in sorted_accepted {
                         if !prep.pub_names.contains(name) && name != "<package>" {
                             prep.pub_names.push(name.clone());
                         }
