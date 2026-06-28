@@ -1070,6 +1070,20 @@ pub fn run(args: BuildArgs) -> Result<()> {
         }
     }
     for (path, source) in &sources {
+        // Relative imports that escape the source root (`from ..x import …`
+        // from a top-level module) crash at import — surface them here.
+        if let Some(depth) = module_depth_below(path, &src_dir) {
+            for (snippet, offset, length) in scan_overdeep_relative_imports(source, depth) {
+                let warn = TycError::orphan_py_import(
+                    snippet,
+                    path.to_string_lossy().into_owned(),
+                    source.clone(),
+                    offset,
+                    length,
+                );
+                eprintln!("{:?}", miette::Report::new_boxed(Box::new(warn)));
+            }
+        }
         for (module_name, snippet, offset, length) in scan_relative_py_imports(source) {
             if copied_py_module_names.contains(&module_name) {
                 continue;
@@ -1424,6 +1438,53 @@ fn scan_relative_py_imports(source: &str) -> Vec<(String, String, usize, usize)>
         }
         let snippet = trimmed.trim_end().to_owned();
         out.push((name, snippet.clone(), trimmed_start, snippet.len()));
+        line_start += line_len;
+    }
+    out
+}
+
+/// A module's package depth below `src_dir` — the number of package
+/// directories between `src_dir` and the file. `src/main.ty` → 0 (top-level
+/// package), `src/a/mod.ty` → 1, etc. `None` when the path can't be expressed
+/// relative to `src_dir` (so the over-deep-import check is skipped rather than
+/// risking a false positive).
+pub(crate) fn module_depth_below(path: &std::path::Path, src_dir: &std::path::Path) -> Option<usize> {
+    let rel = path.strip_prefix(src_dir).ok()?;
+    Some(rel.components().count().saturating_sub(1))
+}
+
+/// Scan for relative imports whose dot-level escapes the source root — a
+/// top-level module (`depth` 0) may use `from . import …` / `from .sib import`
+/// (level 1) but `from ..x import …` (level 2) reaches above the package root,
+/// which raises `ImportError: attempted relative import beyond top-level
+/// package` at runtime. The emitted Python would crash at import, so flag it at
+/// check/build time. Returns `(snippet, offset, length)` per offending line.
+pub(crate) fn scan_overdeep_relative_imports(
+    source: &str,
+    module_depth: usize,
+) -> Vec<(String, usize, usize)> {
+    let max_level = module_depth + 1;
+    let mut out = Vec::new();
+    let mut line_start = 0usize;
+    for line in source.split_inclusive('\n') {
+        let line_len = line.len();
+        let leading_ws = line
+            .as_bytes()
+            .iter()
+            .take_while(|&&b| b == b' ' || b == b'\t')
+            .count();
+        let trimmed_start = line_start + leading_ws;
+        let trimmed = line.trim_start();
+        if let Some(rest) = trimmed.strip_prefix("from ") {
+            let rest = rest.trim_start();
+            let dots = rest.chars().take_while(|&c| c == '.').count();
+            // Must be an actual `import` statement, not e.g. a string.
+            if dots > max_level && trimmed.contains("import") {
+                let snippet = trimmed.trim_end().to_owned();
+                let len = snippet.len();
+                out.push((snippet, trimmed_start, len));
+            }
+        }
         line_start += line_len;
     }
     out

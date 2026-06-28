@@ -355,6 +355,24 @@ pub fn run(args: CheckArgs) -> Result<()> {
                 if let Some(warning) = check_stdlib_module_shadow(&path, &source, &src_dir_canon) {
                     diags.push_warning(warning);
                 }
+                // Relative imports that escape the source root (`from ..x
+                // import …` from a top-level module) crash at import time;
+                // surface them at check time rather than letting `tyc build`
+                // emit Python that fails on the first import.
+                let depth_path = path.canonicalize().unwrap_or_else(|_| path.clone());
+                if let Some(depth) = super::build::module_depth_below(&depth_path, &src_dir_canon) {
+                    for (snippet, offset, length) in
+                        super::build::scan_overdeep_relative_imports(&source, depth)
+                    {
+                        diags.push_warning(TycError::orphan_py_import(
+                            snippet,
+                            path.to_string_lossy().into_owned(),
+                            source.clone(),
+                            offset,
+                            length,
+                        ));
+                    }
+                }
             }
 
             // Run comptime + purity + (optionally) unknown-module
