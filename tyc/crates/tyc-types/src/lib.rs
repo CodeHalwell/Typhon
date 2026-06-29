@@ -15132,6 +15132,26 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
                         }
                         return Type::Unknown;
                     }
+                    // Instance call: `a(5)` where `a: SomeClass` (the callee is
+                    // NOT a class name, so this isn't a constructor). When the
+                    // class defines `__call__`, the result is that method's
+                    // return type, not the class itself — without this a correct
+                    // `let r: int = a(5)` was wrongly rejected AND a wrong
+                    // `let r: SomeClass = a(5)` was wrongly accepted.
+                    if !func_is_class_name {
+                        if let Some(ret) = c
+                            .find_method(&name, "__call__")
+                            .map(|m| m.return_type.clone())
+                        {
+                            for a in pos_args.iter() {
+                                let _ = infer_expr(c, a);
+                            }
+                            for kw in kw_args.iter() {
+                                let _ = infer_expr(c, &kw.value);
+                            }
+                            return ret;
+                        }
+                    }
                     if let Some(shape) = effective_class_shape(&name, &c.class_shapes) {
                         // `plain class` / `class!` may carry a hand-written
                         // `__init__` whose parameter names need not match the
@@ -17882,6 +17902,34 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e, TycError::TypeMismatch { .. })),
             "str slot passed to int param must be rejected: {:?}",
+            bad.errors()
+        );
+    }
+
+    #[test]
+    fn instance_call_uses_dunder_call_return_type() {
+        // Calling an instance with a user `__call__` yields the method's
+        // return type, not the class. Fixes both the soundness hole (a wrong
+        // annotation accepted) and the false positive (the correct one rejected).
+        let ok = check(
+            "class Adder:\n    base: int\nimpl Adder:\n    def __call__(self, x: int) -> int:\n        return self.base + x\ndef f() -> None:\n    let a: Adder = Adder(base=10)\n    let r: int = a(5)\n    print(r + 1)\n",
+        );
+        assert!(
+            !ok.errors().iter().any(|e| matches!(
+                e,
+                TycError::TypeMismatch { .. } | TycError::OperatorTypeMismatch { .. }
+            )),
+            "correct __call__ result use must be accepted: {:?}",
+            ok.errors()
+        );
+        let bad = check(
+            "class Adder:\n    base: int\nimpl Adder:\n    def __call__(self, x: int) -> int:\n        return self.base + x\ndef f() -> None:\n    let a: Adder = Adder(base=10)\n    let r: Adder = a(5)\n    print(r.base)\n",
+        );
+        assert!(
+            bad.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::TypeMismatch { .. })),
+            "int __call__ result bound to the class must be rejected: {:?}",
             bad.errors()
         );
     }
