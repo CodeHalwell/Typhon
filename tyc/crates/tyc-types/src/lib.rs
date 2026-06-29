@@ -10459,6 +10459,23 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                     }
                 }
             }
+            // `list[T] += rhs`: the in-place extend injects rhs's elements,
+            // which must be assignable to T — `xs: list[int]; xs += ["bad"]`
+            // silently appended str into a list[int]. Only checked when rhs has
+            // a known element type, so an opaque iterable stays permissive.
+            if let Type::Generic(head, args) = &l_stripped {
+                if head == "list"
+                    && args.len() == 1
+                    && matches!(a.op, ruff_python_ast::Operator::Add)
+                {
+                    if let Some(rhs_elem) = iterable_element_type(&r_stripped) {
+                        if !c.is_assignable(&args[0], &rhs_elem) {
+                            let span = (a.range.start().to_usize(), a.range.end().to_usize());
+                            c.mismatch(&args[0], &rhs_elem, span);
+                        }
+                    }
+                }
+            }
         }
         Stmt::With(w) => {
             for item in &w.items {
@@ -16200,10 +16217,34 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
             c.env.enter();
             infer_comprehension_generators(c, &comp.generators);
             let k = match comp.key.as_ref() {
-                Some(key) => infer_expr_ctx(c, key, k_expected.as_ref()),
+                Some(key) => {
+                    // Infer the key honestly (no coercing hint) so its real
+                    // type is checked against the annotated `dict[K, V]` key —
+                    // `{str(x): x for x in r}` bound to `dict[int, int]` used to
+                    // slip through because the result type was biased to the
+                    // expected `K`. A dict *literal* already enforces this.
+                    let kt = infer_expr(c, key);
+                    if let Some(ke) = &k_expected {
+                        if !c.is_assignable(ke, &kt) {
+                            let span =
+                                (key.range().start().to_usize(), key.range().end().to_usize());
+                            c.mismatch(ke, &kt, span);
+                        }
+                    }
+                    kt
+                }
                 None => Type::Unknown,
             };
             let v = infer_expr_ctx(c, &comp.value, v_expected.as_ref());
+            if let Some(ve) = &v_expected {
+                if !c.is_assignable(ve, &v) {
+                    let span = (
+                        comp.value.range().start().to_usize(),
+                        comp.value.range().end().to_usize(),
+                    );
+                    c.mismatch(ve, &v, span);
+                }
+            }
             c.env.leave();
             Type::Generic("dict".into(), vec![k, v])
         }
@@ -17536,6 +17577,61 @@ mod tests {
         assert!(
             bad.has_errors(),
             "int capture used as list[int] must be rejected"
+        );
+    }
+
+    #[test]
+    fn list_augmented_assign_checks_rhs_element_type() {
+        // `xs: list[int]; xs += ["bad"]` injects str into a list[int].
+        let bad = check(
+            "def f() -> None:\n    mut xs: list[int] = [1, 2]\n    xs += [\"bad\", \"worse\"]\n    print(xs)\n",
+        );
+        assert!(
+            bad.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::TypeMismatch { .. })),
+            "list[int] += list[str] must be rejected: {:?}",
+            bad.errors()
+        );
+        let ok = check(
+            "def f() -> None:\n    mut xs: list[int] = [1, 2]\n    xs += [3, 4]\n    mut ss: list[str] = [\"a\"]\n    ss += [\"b\"]\n    print(xs, ss)\n",
+        );
+        assert!(
+            !ok.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::TypeMismatch { .. })),
+            "matching-element `+=` must pass: {:?}",
+            ok.errors()
+        );
+    }
+
+    #[test]
+    fn dict_comprehension_key_and_value_are_checked() {
+        // The key/value expression of a dict-comprehension is checked against
+        // the annotated `dict[K, V]` (was unchecked — the result type was
+        // biased to the expected K/V).
+        for src in [
+            "def f() -> None:\n    let r: list[int] = [1, 2, 3]\n    let d: dict[str, int] = {x: x for x in r}\n    print(d)\n",
+            "def f() -> None:\n    let r: list[int] = [1, 2, 3]\n    let d: dict[int, str] = {x: x for x in r}\n    print(d)\n",
+        ] {
+            let d = check(src);
+            assert!(
+                d.errors()
+                    .iter()
+                    .any(|e| matches!(e, TycError::TypeMismatch { .. })),
+                "wrong dict-comp key/value type must be rejected: {src:?} -> {:?}",
+                d.errors()
+            );
+        }
+        let ok = check(
+            "def f() -> None:\n    let r: list[int] = [1, 2, 3]\n    let d: dict[int, int] = {x: x * 2 for x in r}\n    print(d)\n",
+        );
+        assert!(
+            !ok.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::TypeMismatch { .. })),
+            "valid dict comprehension must pass: {:?}",
+            ok.errors()
         );
     }
 
