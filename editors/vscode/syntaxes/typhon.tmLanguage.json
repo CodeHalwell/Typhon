@@ -49,7 +49,6 @@
         { "include": "#fstrings" },
         { "include": "#numbers" },
         { "include": "#lambda" },
-        { "include": "#keyword-argument" },
         { "include": "#typhon-keywords" },
         { "include": "#checked-cast" },
         { "include": "#python-keywords" },
@@ -82,6 +81,7 @@
         "0": { "name": "punctuation.section.parens.end.typhon" }
       },
       "patterns": [
+        { "include": "#keyword-argument" },
         { "include": "#expression-inner" }
       ]
     },
@@ -711,7 +711,7 @@
     },
 
     "keyword-argument": {
-      "comment": "A keyword/named argument or simple assignment target — an identifier immediately followed by a single `=` (not `==`, and not an augmented `+=`/`-=`/… which carry an operator char before the `=`). Matched in expression context BEFORE `#typhon-keywords` so a kwarg whose name collides with a Typhon soft keyword (`model=`, `enum=`, `with=`, `type=`, `match=`) is scoped as a parameter, not a keyword. Themes that don't style `variable.parameter` fall back to plain text — still better than mis-tagging it as a keyword.",
+      "comment": "A keyword/named argument: an identifier immediately followed by a single `=` (not `==`, and not an augmented `+=`/`-=`/… which carry an operator char before the `=`). Included ONLY inside `#parens` (call argument lists, decorator args, class base lists), ahead of `#expression-inner`, so a kwarg whose name collides with a Typhon soft keyword (`model=`, `enum=`, `with=`, `type=`, `match=`) is scoped as a parameter rather than a keyword. It is deliberately NOT in the general `expression-inner` context, so top-level assignment targets (`x = 2`, a module constant `NAME = …`) keep their normal `variable.*` scope instead of being mis-tagged as parameters. Themes that don't style `variable.parameter` fall back to plain text.",
       "match": "\\b([\\p{L}_][\\p{L}\\p{N}_]*)\\s*(?==(?!=))",
       "captures": {
         "1": { "name": "variable.parameter.typhon" }
