@@ -503,6 +503,16 @@ emit(Sink(), "hi")    # error: Sink lacks `write`
 
 **Fix:** Add the missing method, or pass a conforming value.
 
+### `tyc::frozen_inheritance_conflict` — error (v1.0.0-alpha.2)
+
+A `frozen` dataclass inherits from a non-`frozen` one (or vice versa) across an
+in-module base. The combination type-checked clean but the emitted module
+crashed on import with CPython's `TypeError: cannot inherit frozen dataclass
+from a non-frozen one` (both directions). Only in-module dataclass bases are
+compared, so external / non-dataclass bases are unaffected.
+
+**Fix:** Make both classes `frozen`, or both non-`frozen`.
+
 ---
 
 ## 5. Call-site argument checking
@@ -603,6 +613,18 @@ def classify(n: int) -> str:
 ```
 
 **Fix:** Cover the missing path, or widen the return type.
+
+### `tyc::raise_non_exception` — error (v1.0.0-alpha.2)
+
+`raise 42` or `raise Problem(...)` where `Problem` is a plain dataclass (not a
+`BaseException` subclass). These type-checked clean and then crashed at runtime
+with CPython's `TypeError: exceptions must derive from BaseException`. The check
+is **conservative** — only literals and locally-defined classes with a
+fully-known non-exception ancestry fire; builtin / imported / venv-introspected
+exceptions and `Exception` subclasses stay permissive.
+
+**Fix:** Raise a `BaseException` subclass (give `Problem` an `Exception` base, or
+raise a real exception type).
 
 ---
 
@@ -707,6 +729,17 @@ def parse(raw: object) -> int:
 ```
 
 **Fix:** Annotate inside `unsafe:` (`let value: int = ...`), or re-bind with an annotation outside (`let checked: int = value`).
+
+### `tyc::not_a_context_manager` — error (v1.0.0-alpha.2)
+
+A `with` / `async with` whose subject is a **local** class that lacks the
+context-manager protocol (`__enter__` / `__exit__`, or `__aenter__` /
+`__aexit__` for `async with`). Previously this crashed the compiler; it is now
+rejected at check time. Stdlib / third-party context managers and
+`@contextmanager` / `@asynccontextmanager` factories stay permissive.
+
+**Fix:** Add the protocol methods to the class, or use a `@contextmanager`
+factory.
 
 ---
 
@@ -815,7 +848,7 @@ min(1, 2)             # error: `int` does not satisfy `Comparable`
 
 A higher-kinded type-constructor variable (the `F` in `class Functor[F[_]]:`) is
 applied with the wrong arity, or bound to two different constructors in one call.
-Landed post-v0.15.7 (unreleased) with HKT unification.
+Landed in v1.0.0-alpha with HKT unification.
 
 ```ty
 interface Functor[F[_]]:
