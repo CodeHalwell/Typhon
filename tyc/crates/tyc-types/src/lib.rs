@@ -10017,7 +10017,55 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                 f.returns.as_deref(),
                 &tps,
                 f.is_async,
-            )
+            );
+            // Bind the nested function's name to its callable type so a
+            // reference to it (`return inner`, `let f = inner`) is checked
+            // against a declared `Callable[...]` instead of falling to
+            // `Unknown` — `def inner(x: int) -> int: …; return inner` where the
+            // signature promises `Callable[[int], str]` is now rejected. Only
+            // annotated params/return get concrete types (unannotated stay
+            // `Unknown`, permissive); `variadic` covers *args/**kwargs and any
+            // defaulted parameter so call-shape flexibility is preserved.
+            let classes = c.classes.clone();
+            let all_params = || {
+                f.parameters
+                    .posonlyargs
+                    .iter()
+                    .chain(f.parameters.args.iter())
+                    .chain(f.parameters.kwonlyargs.iter())
+            };
+            let params: Vec<Type> = all_params()
+                .map(|pwd| {
+                    pwd.parameter
+                        .annotation
+                        .as_ref()
+                        .map(|ann| type_from_annotation_with_params(ann, &classes, &tps))
+                        .unwrap_or(Type::Unknown)
+                })
+                .collect();
+            let ret = f
+                .returns
+                .as_deref()
+                .map(|r| type_from_annotation_with_params(r, &classes, &tps))
+                .unwrap_or(Type::Unknown);
+            let variadic = all_params().any(|pwd| pwd.default.is_some())
+                || f.parameters.vararg.is_some()
+                || f.parameters.kwarg.is_some();
+            let fn_type = Type::Function {
+                params,
+                ret: Box::new(ret),
+                variadic,
+            };
+            c.env.declare(TypeBinding {
+                name: f.name.as_str().to_owned(),
+                declared: fn_type.clone(),
+                narrowed: fn_type,
+                span: (
+                    f.name.range.start().to_usize(),
+                    f.name.range.start().to_usize() + f.name.as_str().len(),
+                ),
+                from_unsafe: c.unsafe_depth > 0,
+            });
         }
         Stmt::ClassDef(cd) => {
             // FINDINGS #17: nudge users toward `impl ClassName:` when they
@@ -17981,6 +18029,32 @@ mod tests {
                 .any(|e| matches!(e, TycError::TypeMismatch { .. })),
             "str slot passed to int param must be rejected: {:?}",
             bad.errors()
+        );
+    }
+
+    #[test]
+    fn nested_def_is_typed_against_declared_callable() {
+        // A nested `def` returned where a `Callable[...]` is declared is
+        // checked against it (was Unknown, so a wrong signature slipped).
+        let bad = check(
+            "from typing import Callable\ndef get() -> Callable[[int], str]:\n    def inner(x: int) -> int:\n        return x * 2\n    return inner\n",
+        );
+        assert!(
+            bad.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::TypeMismatch { .. })),
+            "nested def with wrong return must be rejected vs declared Callable: {:?}",
+            bad.errors()
+        );
+        let ok = check(
+            "from typing import Callable\ndef get() -> Callable[[int], str]:\n    def inner(x: int) -> str:\n        return str(x * 2)\n    return inner\n",
+        );
+        assert!(
+            !ok.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::TypeMismatch { .. })),
+            "matching nested def must pass: {:?}",
+            ok.errors()
         );
     }
 
