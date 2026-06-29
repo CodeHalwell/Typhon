@@ -8,6 +8,14 @@ canonical phase-by-phase status lives in `docs/roadmap.md`.
 
 ### Fixed
 
+- **`match` or-pattern captures are typed as the union of alternatives.**
+  `case A(n) | B(n)` over `A | B` bound `n` from the first arm only; it now
+  yields `A.x | B.x`, so a value matching a later arm can't be used at the
+  wrong type.
+- **`list[T] += rhs` checks the RHS element type** (`xs: list[int]; xs +=
+  ["bad"]` is rejected), and **dict-comprehension key/value expressions are
+  checked** against the annotated `dict[K, V]`.
+
 - **Tuple-unpack targets are typed.** `for k, v in d.items()` and
   `let a, b = pair()` bound each slot to `Unknown`; they now destructure the
   element `tuple[K, V]`, so passing a `str` key into an `int` parameter is

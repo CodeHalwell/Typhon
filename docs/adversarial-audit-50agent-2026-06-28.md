@@ -82,7 +82,7 @@ Status legend: ✅ fixed · ⏳ pending · 🔁 dup of an already-fixed item.
 - **Root cause:** tyc-types: the for-statement / assignment target binder does not destructure a tuple element type onto a tuple unpacking target list. When the for-target (or LHS of `let a, b = t`) is a tuple pattern, each element binding is left as Any instead of being projected from the iterable's element type. The single-target path is correctly typed (a single-target control case `for x in list[int]: let s: st
 
 ### [12] (soundness / s_match) match OR-pattern capture is typed from the FIRST alternative only, ignoring the other arms — value matching a later arm gets a wrong concrete capture type (silent unsoundness)
-- **Status:** ⏳ pending
+- **Status:** ✅ fixed — or-pattern capture union typing (branch claude/typhon-adversarial-review-31ep54)
 - **Root cause:** tyc-types/src/lib.rs, fn bind_pattern_names, Pattern::MatchOr arm (lines ~16934-16938): it only recurses into `o.patterns.first()`, binding each name with the FIRST alternative's type. The correct behavior is to bind each name to the UNION of its type across all alternatives (Python requires every alternative to bind the same names). Because only the first arm's type is used, a value that actually
 
 ### [15] (soundness / s_defaults) Function/method parameter default values are never type-checked against the parameter annotation (documented tyc::default_mismatch is absent) — silent runtime TypeError
@@ -193,7 +193,7 @@ Status legend: ✅ fixed · ⏳ pending · 🔁 dup of an already-fixed item.
 - **Root cause:** tyc-types crate, `assignable()` in tyc/crates/tyc-types/src/lib.rs. The structural-generic arm (around lines 364-393) dispatches each type argument by variance; for invariant parameters — which `list`/`set`/`dict` use (line ~384 names `list` explicitly) — line 389-391 does `Variance::Invariant => assignable(formal, actual_arg) && assignable(actual_arg, formal)`. For `list[X]` this makes TWO recurs
 
 ### [30] (soundness / s_compre) dict-comprehension KEY expression type is unchecked — wrong key type silently accepted against dict[K, V] annotation
-- **Status:** ⏳ pending
+- **Status:** ✅ fixed — dict-comp key/value check (branch claude/typhon-adversarial-review-31ep54)
 - **Root cause:** tyc-types comprehension typing: the DictComp key node is not checked against the annotated/expected K. Boundary confirmed sharp: a PLAIN dict literal {"a": 1} against dict[int,int] correctly fires tyc::type_mismatch on BOTH key and value, but the dict-comprehension form {str(x): x for x in r} skips key (and value) assignability. Likely the comprehension element-type inference path (the same code t
 
 ### [31] (soundness / s_slice) Slice read on list/str/tuple is typed Any (or unchecked), letting a slice be assigned to an incompatible type and crash at runtime
@@ -217,7 +217,7 @@ Status legend: ✅ fixed · ⏳ pending · 🔁 dup of an already-fixed item.
 - **Root cause:** tyc-types/src/lib.rs Stmt::AugAssign arm (~10213). The `scalar_target` gate (10224) only matches when `infer_expr(target)` is a bare primitive; an attribute target `self.n` does not trigger the operator-compat check, and there is no check that the BinOp result type (float) is assignable to the field's declared annotation (int). Distinct from the known local-scalar `int += float` issue because attr
 
 ### [37] (soundness / s_augassign) `list[int] += list[str]` injects str elements into a list[int] with no diagnostic — element type of the RHS iterable is never checked
-- **Status:** ⏳ pending
+- **Status:** ✅ fixed — list += element-type check (branch claude/typhon-adversarial-review-31ep54)
 - **Root cause:** tyc-types/src/lib.rs Stmt::AugAssign arm. The comment at lib.rs:10219-10221 deliberately stays permissive for mutable-container targets ('list += any_iterable') to avoid FPs on valid `list[int] += range(...)`. But it makes NO element-type check: it never verifies that the RHS iterable's element type is assignable to the list's element type. `list[int] += list[str]` is therefore accepted, mutating 
 
 ### [38] (soundness / s_generics) Inherited field from a generic base with a fixed type argument is typed `Any` (silent type confusion, soundness hole)
