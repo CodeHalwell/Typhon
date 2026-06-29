@@ -7210,6 +7210,17 @@ fn collect_classes_and_functions(c: &mut Checker, body: &[Stmt]) {
             if !attrs.is_empty() {
                 c.self_attrs.entry(name.clone()).or_default().extend(attrs);
             }
+            // `ClassVar[...]` fields are excluded from the constructor shape
+            // (they aren't `__init__` parameters) but remain real class
+            // attributes — register them here so `Cls.NAME` / `obj.NAME` reads
+            // don't false-positive `tyc::attribute_not_found`.
+            let class_vars = collect_classvar_field_names(cd);
+            if !class_vars.is_empty() {
+                c.self_attrs
+                    .entry(name.clone())
+                    .or_default()
+                    .extend(class_vars);
+            }
             // Record PEP 695 type-parameter names so call-site
             // inference can return `Type::Generic(name, [...])` for
             // generic classes (FINDINGS #46).
@@ -8339,6 +8350,15 @@ fn collect_class_shape(cd: &ruff_python_ast::StmtClassDef, classes: &[String]) -
             }
             Stmt::AnnAssign(a) => {
                 if let Expr::Name(n) = a.target.as_ref() {
+                    // A `ClassVar[...]` (or bare `ClassVar`) field is class
+                    // state, not an instance field: `@dataclass` excludes it
+                    // from the synthesised `__init__`. Skip it here so it never
+                    // enters the constructor's accepted-kwargs / required-
+                    // positional / missing-field sets — otherwise the checker
+                    // accepted `Config(DEFAULT_PORT=…)` that crashes at runtime.
+                    if is_classvar_annotation(a.annotation.as_ref()) {
+                        continue;
+                    }
                     // R3-15: same scope rule — `class RecordEnv[T]:
                     // payload: T` needs `T` recognised as the
                     // class's TypeVar so the field's recorded type
@@ -8404,6 +8424,26 @@ fn collect_class_shape(cd: &ruff_python_ast::StmtClassDef, classes: &[String]) -
 /// `self`-assigned attribute is initialised inside the body, never passed
 /// to a synthesised constructor). Kept off `InterfaceShape` for exactly
 /// that reason, and so the public shape struct stays unchanged.
+/// Collect the names of a class's `ClassVar[...]` (or bare `ClassVar`) fields.
+/// These are excluded from the constructor shape but are real class
+/// attributes, so they're registered into `self_attrs` for attribute
+/// resolution.
+fn collect_classvar_field_names(
+    cd: &ruff_python_ast::StmtClassDef,
+) -> std::collections::HashSet<String> {
+    let mut out = std::collections::HashSet::new();
+    for stmt in &cd.body {
+        if let Stmt::AnnAssign(a) = stmt {
+            if let Expr::Name(n) = a.target.as_ref() {
+                if is_classvar_annotation(a.annotation.as_ref()) {
+                    out.insert(n.id.as_str().to_owned());
+                }
+            }
+        }
+    }
+    out
+}
+
 fn collect_self_assigned_attrs(
     cd: &ruff_python_ast::StmtClassDef,
 ) -> std::collections::HashSet<String> {
@@ -20454,6 +20494,37 @@ def main() -> None:
                 .iter()
                 .any(|e| matches!(e, TycError::OperatorTypeMismatch { .. })),
             "bytes %-formatting must be accepted: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn classvar_is_not_a_constructor_parameter() {
+        // Passing a ClassVar as a constructor kwarg crashes at runtime
+        // (@dataclass omits it from __init__), so it must be rejected.
+        let bad = "from typing import ClassVar\n\nclass Config:\n    DEFAULT_PORT: ClassVar[int] = 8080\n    port: int\n\ndef main() -> None:\n    let c: Config = Config(port=1, DEFAULT_PORT=9000)\n    print(c.port)\n";
+        let d = check(bad);
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::UnknownKwarg { .. })),
+            "ClassVar passed as a constructor kwarg must be rejected: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn classvar_stays_accessible_as_attribute() {
+        // Excluding ClassVar from the constructor must NOT make it vanish as a
+        // class attribute — `Config.DEFAULT_PORT` / `c.DEFAULT_PORT` are valid.
+        let ok = "from typing import ClassVar\n\nclass Config:\n    DEFAULT_PORT: ClassVar[int] = 8080\n    port: int\n\ndef main() -> None:\n    let c: Config = Config(port=1)\n    print(c.port, Config.DEFAULT_PORT, c.DEFAULT_PORT)\n";
+        let d = check(ok);
+        assert!(
+            !d.errors().iter().any(|e| matches!(
+                e,
+                TycError::UnknownKwarg { .. } | TycError::AttributeNotFound { .. }
+            )),
+            "ClassVar must stay an accessible attribute and not be a required ctor arg: {:?}",
             d.errors()
         );
     }
