@@ -10792,6 +10792,33 @@ fn check_function(
         });
     }
 
+    // Type-check each parameter's default value against its annotation. The
+    // default must be assignable to the declared type, so a nullable
+    // `n: int? = None` / `n: int | None = None` is fine but `n: int = None`
+    // or `n: int = "z"` is rejected (both crash at runtime). Compiler helpers
+    // are exempt, and a default whose type can't be pinned infers `Unknown`,
+    // which stays assignable — no false positives on enclosing-scope refs.
+    if !name.starts_with("__typhon_") {
+        for pwd in parameters
+            .posonlyargs
+            .iter()
+            .chain(parameters.args.iter())
+            .chain(parameters.kwonlyargs.iter())
+        {
+            if let (Some(ann), Some(default_expr)) = (&pwd.parameter.annotation, &pwd.default) {
+                let ann_type = type_from_annotation_with_params(ann, &classes, type_params);
+                let default_type = infer_expr(c, default_expr);
+                if !c.is_assignable(&ann_type, &default_type) {
+                    let span = (
+                        default_expr.range().start().to_usize(),
+                        default_expr.range().end().to_usize(),
+                    );
+                    c.mismatch(&ann_type, &default_type, span);
+                }
+            }
+        }
+    }
+
     for stmt in body {
         check_stmt(c, stmt);
     }
@@ -20496,6 +20523,46 @@ def main() -> None:
             "bytes %-formatting must be accepted: {:?}",
             d.errors()
         );
+    }
+
+    #[test]
+    fn parameter_default_mismatch_is_rejected() {
+        // A default that isn't assignable to the parameter annotation crashes
+        // at runtime; reject it at check time.
+        for src in [
+            "def scale(n: int = None) -> int:\n    return n\n",
+            "def bad(n: int = \"z\") -> int:\n    return 0\n",
+        ] {
+            let d = check(src);
+            assert!(
+                d.errors()
+                    .iter()
+                    .any(|e| matches!(e, TycError::TypeMismatch { .. })),
+                "bad parameter default must fire type_mismatch: {:?}",
+                d.errors()
+            );
+        }
+    }
+
+    #[test]
+    fn valid_parameter_defaults_are_accepted() {
+        // Nullable None defaults, int→float widening, and matching literal
+        // defaults must NOT fire type_mismatch.
+        for src in [
+            "def ok(n: int? = None) -> int:\n    return 0\n",
+            "def opt(n: int | None = None) -> int:\n    return 0\n",
+            "def widen(x: float = 0) -> float:\n    return x\n",
+            "def strs(s: str = \"x\") -> str:\n    return s\n",
+        ] {
+            let d = check(src);
+            assert!(
+                !d.errors()
+                    .iter()
+                    .any(|e| matches!(e, TycError::TypeMismatch { .. })),
+                "valid parameter default must be accepted: {src:?} -> {:?}",
+                d.errors()
+            );
+        }
     }
 
     #[test]
