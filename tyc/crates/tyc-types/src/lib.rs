@@ -5563,6 +5563,13 @@ fn check_frozen_inheritance(c: &mut Checker, body: &[Stmt]) {
             if !c.class_shapes.contains_key(parent) {
                 continue;
             }
+            // A `plain class` / `class!` base is recorded in `class_shapes` for
+            // attribute resolution but is emitted WITHOUT `@dataclass`, so a
+            // frozen child of one is valid in CPython (the frozen-ness rule only
+            // applies between two dataclasses). Don't compare frozen-ness here.
+            if c.is_plain_class(parent) || c.is_raw_class(parent) {
+                continue;
+            }
             let parent_frozen = c.frozen_classes.contains(parent);
             if child_frozen != parent_frozen {
                 let span = (
@@ -21494,6 +21501,24 @@ def main() -> None:
                 d.errors()
             );
         }
+    }
+
+    #[test]
+    fn frozen_child_of_plain_class_base_is_accepted() {
+        // A `plain class` base is emitted WITHOUT @dataclass, so a frozen child
+        // of it is valid in CPython — the frozen-ness rule only governs two
+        // dataclasses. Uses `check_class_kinds` so the plain-class marker is
+        // visible (the bare `check` harness doesn't thread that metadata).
+        let src =
+            "plain class Base:\n    name: str\n\nclass Square frozen(Base):\n    side: float\n";
+        let d = check_class_kinds(src);
+        assert!(
+            !d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::FrozenInheritanceConflict { .. })),
+            "frozen child of a plain-class base must be accepted: {:?}",
+            d.errors()
+        );
     }
 
     #[test]

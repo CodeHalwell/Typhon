@@ -125,6 +125,22 @@ pub fn run(args: BuildArgs) -> Result<()> {
             let err = TycError::invalid_config_value(&field, value, allowed, path);
             return Err(miette::Report::new_boxed(Box::new(err)));
         }
+        Err(crate::config::ConfigError::InvalidModelExtra {
+            path,
+            value,
+            allowed,
+        }) => {
+            let err = TycError::invalid_config_value("emit.model-extra", value, allowed, path);
+            return Err(miette::Report::new_boxed(Box::new(err)));
+        }
+        Err(crate::config::ConfigError::InvalidChecker {
+            path,
+            value,
+            allowed,
+        }) => {
+            let err = TycError::invalid_config_value("checker.external", value, allowed, path);
+            return Err(miette::Report::new_boxed(Box::new(err)));
+        }
         Err(e) => return Err(miette!("{e}")),
     };
 

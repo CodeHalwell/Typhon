@@ -433,11 +433,30 @@ print(x + y)
 def main() -> None:
     let a: bytes = b"%d items" % 5
     let b: bytes = b"%d-%s" % (5, b"x")
-    print(a, b)
+    let c: bytes = b"%b!" % b"x"
+    print(a, b, c)
 
 main()
 "#;
         assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    #[test]
+    fn translate_bytes_format_rewrites_only_b_conversion() {
+        // PEP 461 `%b` becomes `%s` (bytes args are latin-1 strings); `%%`,
+        // mapping keys, and other conversions are preserved.
+        assert_eq!(crate::interp::translate_bytes_format("%b"), "%s");
+        assert_eq!(crate::interp::translate_bytes_format("%d-%b"), "%d-%s");
+        assert_eq!(crate::interp::translate_bytes_format("%-5b"), "%-5s");
+        assert_eq!(
+            crate::interp::translate_bytes_format("100%% %b"),
+            "100%% %s"
+        );
+        assert_eq!(crate::interp::translate_bytes_format("%(k)b"), "%(k)s");
+        assert_eq!(
+            crate::interp::translate_bytes_format("%d items"),
+            "%d items"
+        );
     }
 
     #[test]

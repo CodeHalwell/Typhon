@@ -3581,6 +3581,13 @@ fn questionmark_in_unhoistable_position(code: &str, q_idx: usize) -> Option<&'st
         return None;
     }
     let kw_at = |idx: usize, kw: &str| -> bool {
+        // `idx` walks byte-by-byte and may land inside a multi-byte UTF-8
+        // character (e.g. a non-ASCII identifier before the `?`); slicing
+        // `code[idx..]` there would panic. A continuation byte is never a
+        // keyword start, so bail out.
+        if !code.is_char_boundary(idx) {
+            return false;
+        }
         let prev_ok =
             idx == 0 || !(bytes[idx - 1].is_ascii_alphanumeric() || bytes[idx - 1] == b'_');
         prev_ok
@@ -3692,6 +3699,12 @@ fn questionmark_precedes_ternary(code: &str, q_idx: usize) -> bool {
             continue;
         }
         let kw = |idx: usize, kw: &str| -> bool {
+            // `idx` may land inside a multi-byte UTF-8 character; slicing
+            // `code[idx..]` at a non-boundary would panic, and a continuation
+            // byte is never a keyword start.
+            if !code.is_char_boundary(idx) {
+                return false;
+            }
             let prev = bytes[idx - 1];
             !(prev.is_ascii_alphanumeric() || prev == b'_')
                 && code[idx..].starts_with(kw)
@@ -10893,6 +10906,25 @@ mod tests {
             "def f() -> Result[int, str]:\n    let g: int = parse(a)?\n    return Ok(g)\n"
         )
         .is_empty());
+    }
+
+    #[test]
+    fn question_op_validation_handles_multibyte_identifiers() {
+        // Regression: the `?`-placement scan walked the line byte-by-byte and
+        // sliced `code[idx..]` at every position; a multi-byte UTF-8 character
+        // (a non-ASCII identifier) before the `?` landed `idx` mid-character
+        // and panicked. It must scan without panicking and accept the valid
+        // tail `?`.
+        let srcs = [
+            "def f() -> Result[int, str]:\n    let café: int = get()?\n    return Ok(café)\n",
+            "def f() -> Result[int, str]:\n    let δ: int = get()?\n    return Ok(δ)\n",
+            "def f() -> Result[int, str]:\n    let 名前: int = get()?\n    return Ok(名前)\n",
+        ];
+        for src in srcs {
+            // The bug was a panic; reaching the assert at all is the test.
+            let errs = validate_question_ops(src);
+            assert!(errs.is_empty(), "valid tail `?` must be accepted: {src}");
+        }
     }
 
     #[test]

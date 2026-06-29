@@ -3281,17 +3281,21 @@ impl Interpreter {
         }
 
         // PEP 461: bytes printf-style `%` formatting (`b"%d items" % 5`,
-        // `b"%d-%s" % (5, b"x")`). The checker accepts `bytes % args`, so the
-        // VM must too. Format bytes are treated as latin-1 (each byte ↔ one
-        // code point) so any byte sequence round-trips through the shared
-        // `printf_format`, and a bytes argument is decoded the same way so
-        // `%s`/`%b` splice its raw bytes rather than a `b'...'` repr.
+        // `b"%d-%s" % (5, b"x")`, `b"%b" % b"x"`). The checker accepts
+        // `bytes % args`, so the VM must too. Format bytes are treated as
+        // latin-1 (each byte ↔ one code point) so any byte sequence round-trips
+        // through the shared `printf_format`, and a bytes argument is decoded
+        // the same way so `%s`/`%b` splice its raw bytes rather than a `b'...'`
+        // repr. The bytes-only `%b` conversion is rewritten to `%s` before
+        // delegating (the shared formatter has no `b`), which is correct since
+        // the bytes args are already latin-1 strings.
         if let (Bytes(fmt), Mod, _) = (l, op, r) {
             let values: Vec<Value> = match r {
                 Tuple(t) => t.as_ref().clone(),
                 other => vec![other.clone()],
             };
-            let decoded_fmt: String = fmt.iter().map(|&b| b as char).collect();
+            let raw_fmt: String = fmt.iter().map(|&b| b as char).collect();
+            let decoded_fmt = translate_bytes_format(&raw_fmt);
             let decoded_values: Vec<Value> = values
                 .into_iter()
                 .map(|v| match v {
@@ -5467,6 +5471,54 @@ fn builtin_has_attr(value: &Value, attr: &str) -> bool {
 /// Supports `%s %r %d %i %f %e %E %g %G %x %X %o %c %%` with optional
 /// flags (`-`, `+`, ` `, `0`, `#`), width, and `.precision`. Enough to
 /// cover the common cases; matches CPython for those conversions.
+/// Rewrite the bytes-only PEP 461 `%b` conversion to `%s` so the shared
+/// `printf_format` (which has no `b` conversion) can render it. The bytes
+/// arguments are decoded to latin-1 strings before formatting, so `%s`
+/// produces the same bytes. A `%(key)…` mapping key and `%%` literal are
+/// passed through untouched.
+pub(crate) fn translate_bytes_format(fmt: &str) -> String {
+    let mut out = String::with_capacity(fmt.len());
+    let mut chars = fmt.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '%' {
+            out.push(c);
+            continue;
+        }
+        out.push('%');
+        // Copy flags / width / precision / mapping-key until the conversion.
+        while let Some(&nc) = chars.peek() {
+            if nc == '%' {
+                // `%%` literal — second `%` ends this spec.
+                out.push('%');
+                chars.next();
+                break;
+            }
+            if nc == '(' {
+                // Mapping key — copy verbatim through the matching `)`.
+                out.push(nc);
+                chars.next();
+                while let Some(&kc) = chars.peek() {
+                    out.push(kc);
+                    chars.next();
+                    if kc == ')' {
+                        break;
+                    }
+                }
+                continue;
+            }
+            if nc.is_ascii_alphabetic() {
+                // The conversion letter. `%b` → `%s`; everything else as-is.
+                chars.next();
+                out.push(if nc == 'b' { 's' } else { nc });
+                break;
+            }
+            out.push(nc);
+            chars.next();
+        }
+    }
+    out
+}
+
 fn printf_format(fmt: &str, values: &[Value]) -> Result<String, Unwind> {
     let chars: Vec<char> = fmt.chars().collect();
     let mut out = String::new();
