@@ -6,7 +6,30 @@ canonical phase-by-phase status lives in `docs/roadmap.md`.
 
 ## Unreleased
 
+### Added
+
+- **`tyc::not_a_context_manager`** — a `with` / `async with` whose subject is a
+  local class lacking the protocol (`__enter__`/`__exit__`, or
+  `__aenter__`/`__aexit__`) is rejected at check time instead of crashing.
+  Stdlib/third-party CMs and `@contextmanager` factories stay permissive.
+
 ### Fixed
+
+- **Calling an instance with a user `__call__` is typed as that method's
+  return type**, not the class — closing a soundness hole (`let r: Adder =
+  a(5)` accepted) and a false positive (the correct `let r: int = a(5)`
+  rejected).
+- **Nested `def` references are checked against a declared `Callable`.** A
+  closure returned/assigned where a `Callable[[int], str]` was promised is now
+  rejected when its real signature differs (was typed `Unknown`).
+
+### Docs
+
+- Clarified the `as!` checked-cast contract: `Callable` signatures,
+  user-defined generic classes, and abstract collection types
+  (`Sequence[X]`, …) verify only the erased origin at runtime (generics are
+  erased in CPython); the VM enforces the same recursive check as the build
+  path (no longer an identity pass-through).
 
 - **`match` or-pattern captures are typed as the union of alternatives.**
   `case A(n) | B(n)` over `A | B` bound `n` from the first arm only; it now
