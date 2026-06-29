@@ -1447,13 +1447,13 @@ ok = validate(data)
 
 Supported positions (v0.15.0): any expression position — `let`/`mut` RHS, `x = …`, augmented `x += …`, `return …`, `yield …`, bare expression statements, **nested inside call arguments** (`foo(row[0] as! int, y)`), comprehensions / collection literals, and value expressions that **span multiple physical lines** (the left operand may run over several lines as long as it's bracket-balanced). The right operand parses as a type expression, so trailing code after the type stays outside the cast. (Earlier releases restricted `as!` to a single physical line in value position.)
 
-## 82. Expecting `as!` to enforce its check under `tyc run` (v0.14.0)
+## 82. `as!` enforcement under `tyc run` (resolved)
 
 ```python
-let n = some_value as! int    # tyc run: passes even if some_value is a str
+let n = some_value as! int    # tyc run: raises TypeError if some_value is a str
 ```
 
-**Trigger:** relying on the boundary check to fire in the VM. **Why:** the in-process VM treats `as!` as an identity passthrough — the *recursive structural* runtime check lives in `typhon_runtime/cast.py` and runs on the compiled path. **Fix:** the static type is still pinned to the target everywhere; for the *runtime* enforcement, use `tyc build && python build/main.py` (or `tyc run --compile`). `tyc check` already rejects a target that doesn't satisfy the surrounding annotation, so most mistakes are caught before runtime regardless.
+**No longer a pitfall.** The in-process VM now runs the **same recursive structural check** as the compiled path — it interprets the `as!` type descriptor and raises `TypeError` on a wrong-shaped value under `tyc run`, just as `tyc build && python build/main.py` does. (Earlier alpha builds treated the VM cast as an identity passthrough, so a deliberately-wrong `as!` slipped through `tyc run` and was only caught on the compiled path; that VM/CPython divergence is closed.) The only residual identity case is the rare *indirect* reference to `checked_cast` (passed as a value instead of called directly with two args), where the type descriptor isn't available as an AST.
 
 ---
 
