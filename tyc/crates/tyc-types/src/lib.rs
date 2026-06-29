@@ -9888,6 +9888,12 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                             c.env.narrow_attr(path, value_type.clone());
                         }
                     }
+                } else if matches!(target, Expr::Tuple(_) | Expr::List(_)) {
+                    // Tuple/list unpack (`let a, b = pair`): destructure the
+                    // RHS `tuple[...]` per slot so each name gets its real type
+                    // instead of falling to `Unknown`. Shares the comprehension
+                    // / for-loop binder.
+                    bind_unpacking_target(c, target, &value_type);
                 }
             }
         }
@@ -10361,19 +10367,12 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
             // unmodelled shapes (`Unknown`, user classes, bare containers)
             // fall back to `Unknown` so we stay permissive.
             let elem_ty = iterable_element_type(&iter_ty).unwrap_or(Type::Unknown);
-            if let Expr::Name(n) = f.target.as_ref() {
-                let span = (
-                    n.range.start().to_usize(),
-                    n.range.start().to_usize() + n.id.as_str().len(),
-                );
-                c.env.declare(TypeBinding {
-                    name: n.id.as_str().to_owned(),
-                    declared: elem_ty.clone(),
-                    narrowed: elem_ty,
-                    span,
-                    from_unsafe: c.unsafe_depth > 0,
-                });
-            }
+            // Bind the loop target(s). A tuple target (`for k, v in d.items()`)
+            // destructures the element `tuple[K, V]` per slot; previously only
+            // a bare `Expr::Name` target was bound and tuple slots fell to
+            // `Unknown`, so `for k, v in d.items(): let n: int = k` (k is str)
+            // slipped through. Shares the comprehension binder.
+            bind_unpacking_target(c, f.target.as_ref(), &elem_ty);
             for s in &f.body {
                 check_stmt(c, s);
             }
@@ -16164,7 +16163,7 @@ fn infer_comprehension_generators(c: &mut Checker, generators: &[ruff_python_ast
     for gen in generators {
         let iter_ty = infer_expr(c, &gen.iter);
         let elem_ty = iterable_element_type(&iter_ty).unwrap_or(Type::Unknown);
-        bind_comprehension_target(c, &gen.target, &elem_ty);
+        bind_unpacking_target(c, &gen.target, &elem_ty);
         // Type-check / apply narrowing from each `if` filter so that
         // `[x for x in src if x is not None]` strips the `?` from `x` for
         // the element expression and stays a false-positive-free pass.
@@ -16180,7 +16179,7 @@ fn infer_comprehension_generators(c: &mut Checker, generators: &[ruff_python_ast
 /// `Name` binds directly; a tuple/list target (`for k, v in items`)
 /// distributes a fixed-arity tuple element type across its slots, falling
 /// back to `Unknown` per-slot when the element type isn't a matching tuple.
-fn bind_comprehension_target(c: &mut Checker, target: &Expr, elem_ty: &Type) {
+fn bind_unpacking_target(c: &mut Checker, target: &Expr, elem_ty: &Type) {
     match target {
         Expr::Name(n) => {
             let span = (
@@ -16202,12 +16201,12 @@ fn bind_comprehension_target(c: &mut Checker, target: &Expr, elem_ty: &Type) {
             };
             for (i, sub) in t.elts.iter().enumerate() {
                 let sub_ty = slots.map(|a| a[i].clone()).unwrap_or(Type::Unknown);
-                bind_comprehension_target(c, sub, &sub_ty);
+                bind_unpacking_target(c, sub, &sub_ty);
             }
         }
         Expr::List(l) => {
             for sub in &l.elts {
-                bind_comprehension_target(c, sub, &Type::Unknown);
+                bind_unpacking_target(c, sub, &Type::Unknown);
             }
         }
         _ => {}
@@ -17477,6 +17476,47 @@ mod tests {
         assert!(
             bad.has_errors(),
             "int capture used as list[int] must be rejected"
+        );
+    }
+
+    #[test]
+    fn for_loop_tuple_unpack_targets_are_typed() {
+        // `for k, v in d.items()` destructures `tuple[str, int]`: misusing the
+        // `str` key as an int must be caught (was Unknown, so it slipped).
+        let bad = check(
+            "def add_one(n: int) -> int:\n    return n + 1\ndef f() -> None:\n    let d: dict[str, int] = {\"a\": 1}\n    for k, v in d.items():\n        print(add_one(k))\n",
+        );
+        assert!(
+            bad.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::TypeMismatch { .. })),
+            "str key passed to int param must be rejected: {:?}",
+            bad.errors()
+        );
+        // Correct use stays clean.
+        let ok = check(
+            "def f() -> None:\n    let d: dict[str, int] = {\"a\": 1}\n    for k, v in d.items():\n        let kk: str = k\n        let vv: int = v\n        print(kk, vv)\n",
+        );
+        assert!(
+            !ok.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::TypeMismatch { .. })),
+            "correct k:str / v:int unpack must pass: {:?}",
+            ok.errors()
+        );
+    }
+
+    #[test]
+    fn let_tuple_unpack_targets_are_typed() {
+        let bad = check(
+            "def add_one(n: int) -> int:\n    return n + 1\ndef pair() -> tuple[str, int]:\n    return (\"x\", 1)\ndef f() -> None:\n    let a, b = pair()\n    print(add_one(a))\n",
+        );
+        assert!(
+            bad.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::TypeMismatch { .. })),
+            "str slot passed to int param must be rejected: {:?}",
+            bad.errors()
         );
     }
 
