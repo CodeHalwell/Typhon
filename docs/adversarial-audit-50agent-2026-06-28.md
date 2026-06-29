@@ -86,7 +86,7 @@ Status legend: ✅ fixed · ⏳ pending · 🔁 dup of an already-fixed item.
 - **Root cause:** tyc-types/src/lib.rs, fn bind_pattern_names, Pattern::MatchOr arm (lines ~16934-16938): it only recurses into `o.patterns.first()`, binding each name with the FIRST alternative's type. The correct behavior is to bind each name to the UNION of its type across all alternatives (Python requires every alternative to bind the same names). Because only the first arm's type is used, a value that actually
 
 ### [15] (soundness / s_defaults) Function/method parameter default values are never type-checked against the parameter annotation (documented tyc::default_mismatch is absent) — silent runtime TypeError
-- **Status:** ⏳ pending
+- **Status:** ✅ fixed — parameter default value type-check (branch claude/typhon-adversarial-review-31ep54)
 - **Root cause:** tyc-types signature collection (tyc/crates/tyc-types/src/lib.rs, around the FunctionSignature/param-default machinery near lines 2387, 2620-2776) records parameter defaults only for arity purposes (required_arity, field_defaults) and never compares the default expression's inferred type to the parameter's declared annotation. Contrast: dataclass FIELD defaults ARE checked (`class C: n: int = "zero
 
 ### [16] (soundness / s_unsafe) as! checked cast silently accepts wrong element types for collections.abc parametric containers (Sequence/Mapping/Iterable/etc.), allowing mistyped data into typed slots
@@ -245,7 +245,7 @@ Status legend: ✅ fixed · ⏳ pending · 🔁 dup of an already-fixed item.
 - **Root cause:** tyc-types/src/lib.rs, fn bind_pattern_names, Pattern::MatchMapping arm (lines ~16900-16909): the `m.rest` binding is declared Type::Unknown. For a dict[K, V] subject the rest binding is dict[K, V] and should be typed as such; Unknown allows arbitrary misuse.
 
 ### [45] (soundness / s_fieldinit) ClassVar fields are wrongly counted as constructor parameters: ClassVar names accepted as kwargs and as positional slots, producing clean-check programs that crash with TypeError at runtime
-- **Status:** ⏳ pending
+- **Status:** ✅ fixed — ClassVar excluded from constructor (branch claude/typhon-adversarial-review-31ep54)
 - **Root cause:** tyc-types/src/lib.rs: `class_constructor_arity_for` (lines 8703-8733) builds `param_names`, `max_positional`, `required_positional`, and `param_types` directly from `shape.field_order` / `shape.fields` with no ClassVar filtering. The dataclass `InterfaceShape.field_order` includes ClassVar-annotated names, so they become accepted constructor kwargs and positional slots. Note the codebase already h
 
 ### [47] (soundness / s_with) with/async with perform NO context-manager protocol check: any non-CM expression (plain class, list, int) type-checks clean then crashes at runtime with TypeError
@@ -281,7 +281,7 @@ Status legend: ✅ fixed · ⏳ pending · 🔁 dup of an already-fixed item.
 - **Root cause:** tyc-syntax/src/preprocess.rs: expand_checked_casts (line ~3842) and expand_question_ops both call prepend_typhon_runtime_alias_import (line 6120), which physically inserts an import line into the source body, and the `?` rewrite also expands a single statement into a multi-line isinstance-Err ladder. The type-check/diagnostic-rendering path in `tyc check` computes diagnostic spans against this pre
 
 ### [57] (vm_parity / e_pub) Relative import ascending beyond the source root (`from ...x` / `from ..x`) passes `tyc check` clean but crashes at runtime with ImportError, even when the target module does not exist
-- **Status:** ⏳ pending
+- **Status:** ✅ fixed — over-deep relative-import off-by-one (branch claude/typhon-adversarial-review-31ep54)
 - **Root cause:** tyc-resolve/src/lib.rs `check_unknown_modules` (ImportFrom arm, ~line 590) explicitly skips all relative imports (`if imp.level > 0 { /* we don't model relative path resolution at this layer */ skip }`), so dot-depth is never validated against the project root. The build module-graph resolver (tyc/src/commands/build.rs) likewise resolves `..`/`...` relative to src/ as if src/ had a parent package,
 
 ### [60] (vm_parity / r_preprocess) Postfix `rescue` on a semicolon-joined statement line fails to apply the generated `?` unwrap (spurious `type_mismatch` on compiled path; VM crash)
