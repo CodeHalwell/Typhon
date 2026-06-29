@@ -25,8 +25,9 @@ subject, and mixed frozen/non-frozen dataclass inheritance type-checked clean
 before but raised at import/run, and now surface as build-time errors instead. A
 program that type-checked clean *and ran correctly* on `v1.0.0-alpha` is
 unaffected; if you have code that relied on one of those runtime-crashing shapes,
-expect a new (correct) diagnostic. The full `examples/` +
-`examples/apps/` + `stress/` corpus type-checks clean and emits runnable Python;
+expect a new (correct) diagnostic. The full positive corpus (`examples/` +
+`examples/apps/`) type-checks clean and emits runnable Python (the `stress/`
+tree includes deliberately-negative cases and is not a clean-build gate);
 `cargo test --workspace`, `cargo clippy -D warnings`, and `cargo fmt --check` all
 pass. As an alpha, the surface syntax remains *not yet frozen*.
 
