@@ -1456,17 +1456,21 @@ pub(crate) fn module_depth_below(
     Some(rel.components().count().saturating_sub(1))
 }
 
-/// Scan for relative imports whose dot-level escapes the source root — a
-/// top-level module (`depth` 0) may use `from . import …` / `from .sib import`
-/// (level 1) but `from ..x import …` (level 2) reaches above the package root,
-/// which raises `ImportError: attempted relative import beyond top-level
-/// package` at runtime. The emitted Python would crash at import, so flag it at
-/// check/build time. Returns `(snippet, offset, length)` per offending line.
+/// Scan for relative imports whose dot-level escapes the source root. A module
+/// at package depth `D` below the source root can ascend at most `D` levels: a
+/// top-level module (`depth` 0) cannot use *any* relative import (run as
+/// `python build/main.py` it has no parent package, so even `from . import …`
+/// raises `ImportError: attempted relative import with no known parent
+/// package`), a depth-1 module may use `from . import` (level 1) but not
+/// `from .. import` (level 2), and so on. A `from <dots>x` with
+/// `dots > depth` reaches above the package root and crashes the emitted
+/// Python at import, so flag it at check/build time. Returns
+/// `(snippet, offset, length)` per offending line.
 pub(crate) fn scan_overdeep_relative_imports(
     source: &str,
     module_depth: usize,
 ) -> Vec<(String, usize, usize)> {
-    let max_level = module_depth + 1;
+    let max_level = module_depth;
     let mut out = Vec::new();
     let mut line_start = 0usize;
     for line in source.split_inclusive('\n') {
@@ -4463,6 +4467,33 @@ let pet: Animal = Dog(name=\"Rex\")
         assert!(
             imports.is_empty(),
             "two-dot and bare-dot imports should be ignored: {imports:?}"
+        );
+    }
+
+    #[test]
+    fn overdeep_relative_import_bound_matches_runtime() {
+        // A module at package depth D can ascend at most D levels; `dots > D`
+        // crashes the emitted Python with ImportError. Regression: the bound
+        // was `D + 1`, which let a depth-2 `from ...x` (and a depth-0
+        // `from .x`, which has no parent package) slip through to a runtime
+        // crash.
+        // depth 0: even `from .x` is invalid (no parent package).
+        assert_eq!(
+            scan_overdeep_relative_imports("from .helper import h\n", 0).len(),
+            1,
+            "depth-0 `from .` must be flagged"
+        );
+        // depth 1: `from .x` ok, `from ..x` invalid.
+        assert!(scan_overdeep_relative_imports("from .sib import s\n", 1).is_empty());
+        assert_eq!(
+            scan_overdeep_relative_imports("from ..up import u\n", 1).len(),
+            1
+        );
+        // depth 2: `from ..x` ok, `from ...x` invalid (the reported case).
+        assert!(scan_overdeep_relative_imports("from ..pkg import p\n", 2).is_empty());
+        assert_eq!(
+            scan_overdeep_relative_imports("from ...top import t\n", 2).len(),
+            1
         );
     }
 }
