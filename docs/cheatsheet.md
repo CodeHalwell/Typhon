@@ -137,9 +137,12 @@ through values it can't prove wrong. v1: single-line value positions
 
 ## Sealed unions + exhaustive `match`
 
-    sealed union Shape:
-        Circle(radius: float)
-        Square(side: float)
+    type Shape = Circle | Square      # sealed union = alias over the variants
+
+    class Circle:
+        radius: float
+    class Square:
+        side: float
 
     def area(s: Shape) -> float:
         match s:
@@ -173,7 +176,7 @@ Missing variants without a wildcard arm: `tyc::non_exhaustive_match`.
 
 ## Comptime
 
-    comptime let API_URL = env("API_URL", "http://localhost:8080")
+    comptime let API_URL: str = env("API_URL", "http://localhost:8080")
 
 ## Commands
 

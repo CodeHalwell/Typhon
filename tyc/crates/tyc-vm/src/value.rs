@@ -111,6 +111,38 @@ pub struct InstanceKey {
     pub fields: Vec<(String, HashKey)>,
 }
 
+/// CPython treats numerically-equal `bool` / `int` / `float` as the same
+/// mapping/set key: `hash(1) == hash(1.0) == hash(True)` and `1 == 1.0 == True`,
+/// so `{1: a, 1.0: b, True: c}` collapses to a single entry. `Bool ↔ Int`
+/// already shared a slot here; this returns the integer an *integral* float
+/// represents (`1.0 → 1`) so a `Float` key joins the same slot. A non-integral
+/// or non-finite float returns `None` and keeps its own bit-pattern identity.
+fn integral_float_to_bigint(bits: u64) -> Option<BigInt> {
+    let f = f64::from_bits(bits);
+    if f.is_finite() && f.fract() == 0.0 {
+        BigInt::from_f64(f)
+    } else {
+        None
+    }
+}
+
+/// Append the canonical byte encoding of an integer value to `out`, shared by
+/// every numeric `HashKey` variant (`Bool`, `Int`, integral `Float`) so they
+/// sort/canonicalise identically — required for `frozenset` element ordering to
+/// stay consistent across numeric types (e.g. `frozenset({1, 2.0})` must equal
+/// `frozenset({1.0, 2})`).
+fn push_int_canonical(out: &mut Vec<u8>, i: &BigInt) {
+    out.push(2);
+    let (sign, digits) = i.to_bytes_le();
+    out.push(match sign {
+        num_bigint::Sign::Minus => 0,
+        num_bigint::Sign::NoSign => 1,
+        num_bigint::Sign::Plus => 2,
+    });
+    out.extend_from_slice(&(digits.len() as u32).to_be_bytes());
+    out.extend_from_slice(&digits);
+}
+
 impl HashKey {
     /// Stable, collision-safe sort key. Two distinct `HashKey` values
     /// have distinct sort keys (the discriminant byte differs across
@@ -122,29 +154,17 @@ impl HashKey {
         let mut out = Vec::with_capacity(16);
         match self {
             HashKey::None => out.push(0),
-            HashKey::Bool(b) => {
-                out.push(1);
-                out.push(*b as u8);
-            }
-            HashKey::Int(i) => {
-                out.push(2);
-                // BigInt's sign-magnitude form: sign byte then magnitude
-                // little-endian. Add a sentinel between sign and digits
-                // so positive 1-byte values never alias negative-sign
-                // payloads.
-                let (sign, digits) = i.to_bytes_le();
-                out.push(match sign {
-                    num_bigint::Sign::Minus => 0,
-                    num_bigint::Sign::NoSign => 1,
-                    num_bigint::Sign::Plus => 2,
-                });
-                out.extend_from_slice(&(digits.len() as u32).to_be_bytes());
-                out.extend_from_slice(&digits);
-            }
-            HashKey::Float(bits) => {
-                out.push(3);
-                out.extend_from_slice(&bits.to_be_bytes());
-            }
+            // Numeric keys share one canonical encoding so equal values across
+            // bool/int/float sort identically (see `push_int_canonical`).
+            HashKey::Bool(b) => push_int_canonical(&mut out, &BigInt::from(*b as i64)),
+            HashKey::Int(i) => push_int_canonical(&mut out, i),
+            HashKey::Float(bits) => match integral_float_to_bigint(*bits) {
+                Some(bi) => push_int_canonical(&mut out, &bi),
+                None => {
+                    out.push(3);
+                    out.extend_from_slice(&bits.to_be_bytes());
+                }
+            },
             HashKey::Complex(re, im) => {
                 out.push(8);
                 out.extend_from_slice(&re.to_be_bytes());
@@ -232,6 +252,15 @@ impl PartialEq for HashKey {
             }
             (HashKey::Int(a), HashKey::Int(b)) => a == b,
             (HashKey::Float(a), HashKey::Float(b)) => a == b,
+            // Python: an integral float shares a slot with the equal int /
+            // bool (`1 == 1.0 == True`, all hash-equal). A non-integral float
+            // never equals an int/bool.
+            (HashKey::Float(f), HashKey::Int(i)) | (HashKey::Int(i), HashKey::Float(f)) => {
+                integral_float_to_bigint(*f).as_ref() == Some(i)
+            }
+            (HashKey::Float(f), HashKey::Bool(b)) | (HashKey::Bool(b), HashKey::Float(f)) => {
+                f64::from_bits(*f) == (*b as i64) as f64
+            }
             (HashKey::Complex(ar, ai), HashKey::Complex(br, bi)) => ar == br && ai == bi,
             (HashKey::Str(a), HashKey::Str(b)) => a == b,
             (HashKey::Tuple(a), HashKey::Tuple(b)) => a == b,
@@ -261,7 +290,13 @@ impl std::hash::Hash for HashKey {
             // ints just hash through their full BigInt representation.
             HashKey::Bool(b) => BigInt::from(*b as i64).hash(state),
             HashKey::Int(i) => i.hash(state),
-            HashKey::Float(bits) => bits.hash(state),
+            // An integral float hashes like the equal int (`hash(1.0) ==
+            // hash(1)`); a non-integral float hashes by its bit pattern. Keeps
+            // `Hash` consistent with the `Eq` cases above.
+            HashKey::Float(bits) => match integral_float_to_bigint(*bits) {
+                Some(bi) => bi.hash(state),
+                None => bits.hash(state),
+            },
             HashKey::Complex(re, im) => {
                 re.hash(state);
                 im.hash(state);

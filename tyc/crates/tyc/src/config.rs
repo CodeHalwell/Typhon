@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 /// The contents of a `typhon.toml` project file.
 #[derive(Debug, Default, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct TyphonConfig {
     pub project: ProjectConfig,
     pub python: PythonConfig,
@@ -33,7 +33,7 @@ pub struct TyphonConfig {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct ProjectConfig {
     pub name: String,
     pub version: String,
@@ -53,7 +53,7 @@ impl Default for ProjectConfig {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-#[serde(default, rename_all = "kebab-case")]
+#[serde(default, rename_all = "kebab-case", deny_unknown_fields)]
 pub struct PythonConfig {
     /// Target Python version, e.g. `"3.13"`.
     pub target: String,
@@ -71,9 +71,11 @@ impl Default for PythonConfig {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-#[serde(default, rename_all = "kebab-case")]
+#[serde(default, rename_all = "kebab-case", deny_unknown_fields)]
 pub struct EmitConfig {
-    /// Default class emission target: `"dataclass"` (default) or `"pydantic"`.
+    /// Default class emission target. Only `"dataclass"` (the default) is
+    /// implemented; a project-wide `"pydantic"` default is rejected by
+    /// [`TyphonConfig::validate`] (use the per-class `model` keyword instead).
     pub class_default: String,
     /// Post-process emitted Python through ruff format.
     pub format: bool,
@@ -115,11 +117,21 @@ impl Default for EmitConfig {
 /// [`TyphonConfig::validate`] — including the empty string and historical
 /// aliases like `"struct"` / `"regular"` / `"none"` which were never wired
 /// through the emitter.
-pub const ALLOWED_CLASS_DEFAULTS: &[&str] = &["dataclass", "pydantic"];
+// `"pydantic"` is intentionally NOT here: a project-wide pydantic default is
+// not wired into the emitter, so it is rejected with a dedicated message in
+// [`TyphonConfig::validate`] pointing at the per-class `model` keyword.
+pub const ALLOWED_CLASS_DEFAULTS: &[&str] = &["dataclass"];
 
 /// Accepted values for `[emit] model-extra`. Anything else is rejected by
 /// [`TyphonConfig::validate`].
 pub const ALLOWED_MODEL_EXTRAS: &[&str] = &["forbid", "ignore", "allow"];
+
+/// Accepted values for `[checker] external`. `"none"` disables the external
+/// pass; `"ty"` runs Astral's `ty`. Anything else (e.g. `"mypy"`, `"pyright"`)
+/// is rejected by [`TyphonConfig::validate`] rather than silently ignored —
+/// a user who set `external = "mypy"` expecting a second checker would
+/// otherwise get no external checking at all with no indication why.
+pub const ALLOWED_CHECKERS: &[&str] = &["none", "ty"];
 
 fn default_model_extra() -> String {
     "forbid".into()
@@ -130,7 +142,7 @@ fn default_stub_check() -> String {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-#[serde(default, rename_all = "kebab-case")]
+#[serde(default, rename_all = "kebab-case", deny_unknown_fields)]
 pub struct StrictnessConfig {
     pub no_implicit_any: bool,
     pub unused_import: String,
@@ -256,7 +268,7 @@ impl Default for StrictnessConfig {
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct EnvConfig {
     /// Env vars that must be resolvable at build time for `comptime env()`.
     pub required: Vec<String>,
@@ -271,7 +283,7 @@ pub struct EnvConfig {
 /// and typeshed-only annotations that runtime venv introspection cannot see.
 /// See `docs/ty-integration.md`.
 #[derive(Debug, Serialize, Deserialize)]
-#[serde(default, rename_all = "kebab-case")]
+#[serde(default, rename_all = "kebab-case", deny_unknown_fields)]
 pub struct CheckerConfig {
     /// External checker to run after a successful build/check. `"none"`
     /// (default) disables it; `"ty"` runs Astral's `ty check` over the
@@ -368,6 +380,21 @@ impl TyphonConfig {
         // `"regular"`, `"none"`) all surface here rather than silently
         // falling back to dataclass at emit time.
         let cd = self.emit.class_default.trim();
+        if cd == "pydantic" {
+            // Project-wide pydantic default is not wired into the emitter
+            // (it was silently a no-op — every `class` still emitted a
+            // dataclass). Reject it explicitly and point at the per-class
+            // `model` keyword, which IS implemented, rather than letting the
+            // user believe the knob took effect.
+            return Err(ConfigError::InvalidClassDefault {
+                path: source_path.to_string_lossy().into_owned(),
+                value: self.emit.class_default.clone(),
+                allowed:
+                    "dataclass (a project-wide pydantic default is not yet implemented — declare \
+                     a boundary type with the `model` keyword per class instead)"
+                        .to_owned(),
+            });
+        }
         if !ALLOWED_CLASS_DEFAULTS.contains(&cd) {
             return Err(ConfigError::InvalidClassDefault {
                 path: source_path.to_string_lossy().into_owned(),
@@ -382,6 +409,48 @@ impl TyphonConfig {
                 path: source_path.to_string_lossy().into_owned(),
                 value: self.emit.model_extra.clone(),
                 allowed: ALLOWED_MODEL_EXTRAS.join(", "),
+            });
+        }
+        // Reject an unknown `[strictness]` severity string. These take
+        // `"off"` / `"warn"` / `"error"`; a typo (`"eror"`) or wrong case
+        // (`"WARN"`) used to be silently ignored, reverting to the default —
+        // so a user who believed they had CI-gated a check actually had it
+        // off. Surface it instead.
+        const ALLOWED_SEVERITIES: [&str; 3] = ["off", "warn", "error"];
+        let severities = [
+            ("unused-import", &self.strictness.unused_import),
+            ("exhaustive-match", &self.strictness.exhaustive_match),
+            (
+                "methods-in-class-body",
+                &self.strictness.methods_in_class_body,
+            ),
+            ("require-with", &self.strictness.require_with),
+            ("blocking-in-async", &self.strictness.blocking_in_async),
+            ("stub-check", &self.strictness.stub_check),
+            (
+                "unintrospectable-dependency",
+                &self.strictness.unintrospectable_dependency,
+            ),
+        ];
+        for (key, value) in severities {
+            if !ALLOWED_SEVERITIES.contains(&value.trim()) {
+                return Err(ConfigError::InvalidSeverity {
+                    path: source_path.to_string_lossy().into_owned(),
+                    key: key.to_owned(),
+                    value: value.clone(),
+                    allowed: ALLOWED_SEVERITIES.join(", "),
+                });
+            }
+        }
+        // Reject an unknown `[checker] external`. Only `"none"` and `"ty"` are
+        // wired; a typo or an unsupported checker name (`"mypy"`) used to be
+        // accepted and then silently do nothing.
+        let ext = self.checker.external.trim();
+        if !ALLOWED_CHECKERS.contains(&ext) {
+            return Err(ConfigError::InvalidChecker {
+                path: source_path.to_string_lossy().into_owned(),
+                value: self.checker.external.clone(),
+                allowed: ALLOWED_CHECKERS.join(", "),
             });
         }
         Ok(())
@@ -441,6 +510,19 @@ pub enum ConfigError {
         value: String,
         allowed: String,
     },
+    InvalidSeverity {
+        path: String,
+        key: String,
+        value: String,
+        allowed: String,
+    },
+    /// `[checker] external` is set to a value outside [`ALLOWED_CHECKERS`].
+    /// Emitted by [`TyphonConfig::validate`].
+    InvalidChecker {
+        path: String,
+        value: String,
+        allowed: String,
+    },
 }
 
 impl std::fmt::Display for ConfigError {
@@ -480,6 +562,27 @@ impl std::fmt::Display for ConfigError {
                 write!(
                     f,
                     "invalid `[emit] model-extra = \"{value}\"` in '{path}': allowed values are {allowed}",
+                )
+            }
+            ConfigError::InvalidSeverity {
+                path,
+                key,
+                value,
+                allowed,
+            } => {
+                write!(
+                    f,
+                    "invalid `[strictness] {key} = \"{value}\"` in '{path}': allowed values are {allowed}",
+                )
+            }
+            ConfigError::InvalidChecker {
+                path,
+                value,
+                allowed,
+            } => {
+                write!(
+                    f,
+                    "invalid `[checker] external = \"{value}\"` in '{path}': allowed values are {allowed}",
                 )
             }
         }
@@ -560,13 +663,33 @@ mod tests {
     }
 
     #[test]
-    fn validate_accepts_dataclass_and_pydantic() {
+    fn validate_accepts_dataclass() {
         let path = Path::new("typhon.toml");
-        for v in &["dataclass", "pydantic"] {
-            let mut cfg = cfg_with_target("3.13");
-            cfg.emit.class_default = (*v).into();
-            cfg.validate(path)
-                .unwrap_or_else(|e| panic!("class-default {v} should be accepted, got {e}"));
+        let mut cfg = cfg_with_target("3.13");
+        cfg.emit.class_default = "dataclass".into();
+        cfg.validate(path)
+            .unwrap_or_else(|e| panic!("class-default dataclass should be accepted, got {e}"));
+    }
+
+    #[test]
+    fn validate_rejects_pydantic_class_default_with_model_hint() {
+        // A project-wide pydantic default is not wired; it must be rejected
+        // (not a silent no-op) with a pointer to the per-class `model` keyword.
+        let path = Path::new("typhon.toml");
+        let mut cfg = cfg_with_target("3.13");
+        cfg.emit.class_default = "pydantic".into();
+        let err = cfg
+            .validate(path)
+            .expect_err("class-default pydantic should be rejected");
+        match err {
+            ConfigError::InvalidClassDefault { value, allowed, .. } => {
+                assert_eq!(value, "pydantic");
+                assert!(
+                    allowed.contains("model"),
+                    "message should mention `model`, got {allowed}"
+                );
+            }
+            other => panic!("expected InvalidClassDefault, got {other:?}"),
         }
     }
 
@@ -583,8 +706,8 @@ mod tests {
                 ConfigError::InvalidClassDefault { value, allowed, .. } => {
                     assert_eq!(value, *v);
                     assert!(
-                        allowed.contains("dataclass") && allowed.contains("pydantic"),
-                        "expected allowed list to mention dataclass+pydantic, got {allowed}"
+                        allowed.contains("dataclass"),
+                        "expected allowed list to mention dataclass, got {allowed}"
                     );
                 }
                 other => panic!("expected InvalidClassDefault for {v:?}, got {other:?}"),
@@ -603,7 +726,6 @@ mod tests {
         let msg = format!("{err}");
         assert!(msg.contains("msgspec"), "got {msg}");
         assert!(msg.contains("dataclass"), "got {msg}");
-        assert!(msg.contains("pydantic"), "got {msg}");
     }
 
     #[test]
@@ -678,6 +800,34 @@ skip-decoration-bases = [\"BaseModel\", \"Enum\"]
     }
 
     #[test]
+    fn validate_rejects_unknown_strictness_severity() {
+        let path = Path::new("typhon.toml");
+        // A typo / wrong-case severity must be rejected, not silently ignored
+        // (which would leave a CI gate the user believes they enabled off).
+        for v in &["eror", "WARN", "loud", "fatal", ""] {
+            let mut cfg = cfg_with_target("3.13");
+            cfg.strictness.exhaustive_match = (*v).into();
+            let err = cfg
+                .validate(path)
+                .expect_err(&format!("severity {v:?} should be rejected"));
+            match err {
+                ConfigError::InvalidSeverity { key, value, .. } => {
+                    assert_eq!(key, "exhaustive-match");
+                    assert_eq!(value, *v);
+                }
+                other => panic!("expected InvalidSeverity for {v:?}, got {other}"),
+            }
+        }
+        // Valid severities pass.
+        for v in &["off", "warn", "error"] {
+            let mut cfg = cfg_with_target("3.13");
+            cfg.strictness.unused_import = (*v).into();
+            cfg.validate(path)
+                .unwrap_or_else(|e| panic!("severity {v:?} should be accepted, got {e}"));
+        }
+    }
+
+    #[test]
     fn validate_rejects_unknown_model_extra() {
         let path = Path::new("typhon.toml");
         for v in &["strict", "error", "", "FORBID", "yes"] {
@@ -719,6 +869,88 @@ model-extra = \"allow\"
     }
 
     // ── stub-check tests ──────────────────────────────────────────────────
+
+    // ── unknown-key / checker hardening tests ─────────────────────────────
+
+    #[test]
+    fn deny_unknown_top_level_section() {
+        // A typo'd section name (`[pyhton]`) must be a hard parse error, not
+        // silently dropped — otherwise the intended `[python] target` never
+        // takes effect and the user gets a default-3.13 build.
+        let err = toml::from_str::<TyphonConfig>(
+            "[project]\nname = \"x\"\n\n[pyhton]\ntarget = \"3.14\"\n",
+        )
+        .expect_err("unknown section should be rejected");
+        assert!(
+            err.to_string().contains("pyhton") || err.to_string().contains("unknown"),
+            "got {err}"
+        );
+    }
+
+    #[test]
+    fn deny_typod_python_target_key() {
+        // `taget` instead of `target`: must error rather than silently leaving
+        // the default 3.13 in place (finding: typo'd target → wrong build).
+        let err = toml::from_str::<TyphonConfig>(
+            "[project]\nname = \"x\"\n\n[python]\ntaget = \"3.14\"\n",
+        )
+        .expect_err("typo'd key should be rejected");
+        assert!(
+            err.to_string().contains("taget") || err.to_string().contains("unknown"),
+            "got {err}"
+        );
+    }
+
+    #[test]
+    fn deny_unknown_strictness_key() {
+        let err = toml::from_str::<TyphonConfig>(
+            "[project]\nname = \"x\"\n\n[strictness]\nno-implict-any = false\n",
+        )
+        .expect_err("typo'd strictness key should be rejected");
+        assert!(err.to_string().contains("unknown") || err.to_string().contains("implict"));
+    }
+
+    #[test]
+    fn dependencies_section_still_accepts_arbitrary_packages() {
+        // deny_unknown_fields must NOT reject package names inside
+        // [dependencies]/[dev-dependencies] — those are map keys, not struct
+        // fields. Guards against over-tightening the corpus.
+        let cfg: TyphonConfig = toml::from_str(
+            "[project]\nname = \"x\"\n\n[dependencies]\nnumpy = \"*\"\nhttpx = \">=0.27\"\n",
+        )
+        .expect("dependency map keys must parse");
+        assert_eq!(cfg.dependencies.get("numpy").map(String::as_str), Some("*"));
+    }
+
+    #[test]
+    fn validate_accepts_known_checkers() {
+        let path = Path::new("typhon.toml");
+        for v in ALLOWED_CHECKERS {
+            let mut cfg = cfg_with_target("3.13");
+            cfg.checker.external = (*v).into();
+            cfg.validate(path)
+                .unwrap_or_else(|e| panic!("checker {v:?} should be accepted, got {e}"));
+        }
+    }
+
+    #[test]
+    fn validate_rejects_unknown_checker() {
+        let path = Path::new("typhon.toml");
+        for v in &["mypy", "pyright", "pyre", ""] {
+            let mut cfg = cfg_with_target("3.13");
+            cfg.checker.external = (*v).into();
+            let err = cfg
+                .validate(path)
+                .expect_err(&format!("checker {v:?} should be rejected"));
+            match err {
+                ConfigError::InvalidChecker { value, allowed, .. } => {
+                    assert_eq!(value, *v);
+                    assert!(allowed.contains("ty"), "got {allowed}");
+                }
+                other => panic!("expected InvalidChecker for {v:?}, got {other:?}"),
+            }
+        }
+    }
 
     #[test]
     fn stub_check_defaults_to_error() {

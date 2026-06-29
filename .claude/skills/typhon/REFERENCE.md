@@ -573,15 +573,21 @@ def area(s: Shape) -> float:
 
 Exhaustiveness is a compile-time check. `case _:` opts out for the rest of the union.
 
-### 4.2 Cheatsheet form
+### 4.2 The only form — a `type` alias over variant classes
+
+There is **no `sealed union NAME:` keyword block**; a sealed union is just a
+`type` alias over separately-declared variant classes:
 
 ```python
-sealed union Shape:
-    Circle(radius: float)
-    Square(side: float)
+type Shape = Circle | Square
+
+class Circle:
+    radius: float
+class Square:
+    side: float
 ```
 
-Equivalent to declaring `class Circle: radius: float`, `class Square: side: float`, and `type Shape = Circle | Square`.
+(Earlier docs showed a `sealed union Shape:` block form — it does not parse.)
 
 ### 4.3 Parametric sealed unions
 

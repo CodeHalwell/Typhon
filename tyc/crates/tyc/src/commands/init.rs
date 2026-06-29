@@ -151,7 +151,7 @@ target = "3.13"
 # free-threaded = true   # opt into Python 3.13t free-threaded build
 
 [emit]
-class-default = "dataclass"     # "dataclass" (default) or "pydantic" — anything else is rejected
+class-default = "dataclass"     # only "dataclass" today; use the `model` keyword per class for pydantic
 format = true                   # post-process emitted Python through ruff format
 
 [strictness]

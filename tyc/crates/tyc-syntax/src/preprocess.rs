@@ -1422,21 +1422,64 @@ fn bracket_delta_simple(s: &str) -> i32 {
 /// to the wider preprocess loop's string tracker so brackets inside an
 /// active triple-quoted string don't count.
 fn bracket_delta_outside_strings(line: &str, in_string: &mut Option<StringMode>) -> i32 {
+    fn mode_parts(mode: StringMode) -> (u8, bool) {
+        match mode {
+            StringMode::Single => (b'\'', false),
+            StringMode::Double => (b'"', false),
+            StringMode::TripleSingle => (b'\'', true),
+            StringMode::TripleDouble => (b'"', true),
+        }
+    }
+    fn open_mode(quote: u8, triple: bool) -> StringMode {
+        match (triple, quote == b'\'') {
+            (false, true) => StringMode::Single,
+            (false, false) => StringMode::Double,
+            (true, true) => StringMode::TripleSingle,
+            (true, false) => StringMode::TripleDouble,
+        }
+    }
+
     let bytes = line.as_bytes();
     let mut depth: i32 = 0;
     let mut i = 0;
     while i < bytes.len() {
-        if in_string.is_some() {
-            // Conservatively skip — we don't try to count brackets inside
-            // a triple-quoted string. The wider loop handles entering /
-            // leaving these strings via the existing `update_string_state`
-            // path; here we just don't disturb depth counts.
+        // Inside a string (single-line, or a triple-quoted one carried over
+        // from a previous line via `in_string`) — skip its contents so a `#`
+        // or a bracket inside a string never affects the comment/depth scan.
+        // This is what makes `freeze let X = {"list": ["a#b"], ...}` over
+        // several lines balance correctly: the `#` is part of a string, not a
+        // comment, so the `]` after it is still counted.
+        if let Some(mode) = *in_string {
+            let (q, triple) = mode_parts(mode);
+            let b = bytes[i];
+            if b == b'\\' && i + 1 < bytes.len() {
+                i += 2;
+                continue;
+            }
+            if b == q {
+                if triple {
+                    if i + 2 < bytes.len() && bytes[i + 1] == q && bytes[i + 2] == q {
+                        *in_string = None;
+                        i += 3;
+                        continue;
+                    }
+                } else {
+                    *in_string = None;
+                }
+            }
             i += 1;
             continue;
         }
         let b = bytes[i];
         match b {
+            // A `#` outside any string starts a comment to end-of-line.
             b'#' => break,
+            b'"' | b'\'' => {
+                let triple = i + 2 < bytes.len() && bytes[i + 1] == b && bytes[i + 2] == b;
+                *in_string = Some(open_mode(b, triple));
+                i += if triple { 3 } else { 1 };
+                continue;
+            }
             b'(' | b'[' | b'{' => depth += 1,
             b')' | b']' | b'}' => depth -= 1,
             _ => {}
@@ -3342,6 +3385,18 @@ pub fn validate_question_ops(source: &str) -> Vec<QuestionOpError> {
                 });
                 continue;
             }
+            if let Some(ctx) = questionmark_in_unhoistable_position(code, offset) {
+                errors.push(QuestionOpError {
+                    line_index,
+                    offset: q_offset,
+                    message: format!(
+                        "`?` operator cannot appear inside {ctx}; it is lifted to a \
+                         statement-level temp that always runs, which would change evaluation \
+                         order — bind the `Result` with `?` on its own line first, then use it"
+                    ),
+                });
+                continue;
+            }
             match fn_stack.last() {
                 None => {
                     errors.push(QuestionOpError {
@@ -3373,6 +3428,23 @@ pub fn validate_question_ops(source: &str) -> Vec<QuestionOpError> {
             if before_q.ends_with(')') {
                 // Byte offset of the `?` in the original source.
                 let q_offset = byte_offset + code.len() - 1;
+                // A trailing `)?` inside a lambda body / ternary arm / and-or
+                // operand (`lambda: f()?`, `0 if c else f()?`, `a and f()?`)
+                // can't be hoisted without changing evaluation.
+                if let Some(ctx) = questionmark_in_unhoistable_position(code, code.len() - 1) {
+                    errors.push(QuestionOpError {
+                        line_index,
+                        offset: q_offset,
+                        message: format!(
+                            "`?` operator cannot appear inside {ctx}; it is lifted to a \
+                             statement-level temp that always runs, which would change \
+                             evaluation order — bind the `Result` with `?` on its own line \
+                             first, then use it"
+                        ),
+                    });
+                    byte_offset += line.len();
+                    continue;
+                }
                 match fn_stack.last() {
                     None => {
                         errors.push(QuestionOpError {
@@ -3494,6 +3566,178 @@ fn find_mid_expression_questionmarks(code: &str) -> Vec<usize> {
 /// the resulting code lays out very differently from what the user
 /// wrote, so rejecting up-front with a clear message is the cleaner
 /// behaviour.
+/// Detect a `?` that sits in a position the hoisting lowering cannot move it
+/// out of without changing evaluation: a `lambda` body (the operand runs later,
+/// not in the enclosing function), or a conditionally-evaluated slot — a
+/// ternary arm (`x if c else y`) or an `and`/`or` operand (short-circuit). The
+/// hoister lifts the `?` operand to an unconditional statement-level temp, so
+/// in these positions it would run code that should be deferred/skipped
+/// (crash or silently-wrong result). Returns the context name for the message.
+/// Scans the code before `?` with string- and bracket-awareness; analysis is
+/// per (innermost) bracket group, covering the common single-line forms.
+fn questionmark_in_unhoistable_position(code: &str, q_idx: usize) -> Option<&'static str> {
+    let bytes = code.as_bytes();
+    if q_idx > bytes.len() {
+        return None;
+    }
+    let kw_at = |idx: usize, kw: &str| -> bool {
+        // `idx` walks byte-by-byte and may land inside a multi-byte UTF-8
+        // character (e.g. a non-ASCII identifier before the `?`); slicing
+        // `code[idx..]` there would panic. A continuation byte is never a
+        // keyword start, so bail out.
+        if !code.is_char_boundary(idx) {
+            return false;
+        }
+        let prev_ok =
+            idx == 0 || !(bytes[idx - 1].is_ascii_alphanumeric() || bytes[idx - 1] == b'_');
+        prev_ok
+            && code[idx..].starts_with(kw)
+            && code[idx + kw.len()..]
+                .chars()
+                .next()
+                .map(|ch| !(ch.is_alphanumeric() || ch == '_'))
+                .unwrap_or(true)
+    };
+    // Per-depth flags, snapshotted on a stack across bracket groups. A token
+    // only counts if it sits at the `?`'s own (innermost) bracket level — and a
+    // top-level `,` resets the flags because it separates sibling expressions.
+    #[derive(Clone, Copy, Default)]
+    struct Flags {
+        pending_lambda: bool,
+        lambda_body: bool,
+        ternary: bool,
+        boolop: bool,
+    }
+    let mut f = Flags::default();
+    let mut stack: Vec<Flags> = Vec::new();
+    let mut in_str: Option<u8> = None;
+    let mut i = 0;
+    while i < q_idx {
+        let b = bytes[i];
+        if let Some(q) = in_str {
+            if b == b'\\' && i + 1 < bytes.len() {
+                i += 2;
+                continue;
+            }
+            if b == q {
+                in_str = None;
+            }
+            i += 1;
+            continue;
+        }
+        match b {
+            b'#' => break,
+            b'\'' | b'"' => in_str = Some(b),
+            b'(' | b'[' | b'{' => {
+                stack.push(f);
+                f = Flags::default();
+            }
+            b')' | b']' | b'}' => {
+                f = stack.pop().unwrap_or_default();
+            }
+            b',' => {
+                f = Flags {
+                    lambda_body: f.lambda_body,
+                    ..Flags::default()
+                }
+            }
+            b':' if f.pending_lambda => {
+                f.pending_lambda = false;
+                f.lambda_body = true;
+            }
+            _ => {
+                if kw_at(i, "lambda") {
+                    f.pending_lambda = true;
+                } else if kw_at(i, "else") {
+                    // `… if … else <here>` — the false-arm is conditionally
+                    // evaluated. (The true-arm, before `if`, is caught by the
+                    // end-of-line path scanning the whole line.)
+                    f.ternary = true;
+                } else if kw_at(i, "and") || kw_at(i, "or") {
+                    f.boolop = true;
+                }
+            }
+        }
+        i += 1;
+    }
+    if f.lambda_body {
+        return Some("a `lambda` body");
+    }
+    if f.boolop {
+        return Some("an `and` / `or` operand (short-circuit evaluation)");
+    }
+    if f.ternary {
+        return Some("a conditional-expression (`… if … else …`) branch");
+    }
+    // A `?` BEFORE a top-level ternary `if … else` (the true-arm) — scan the
+    // rest of the line at the `?`'s depth for ` if … else `.
+    if questionmark_precedes_ternary(code, q_idx) {
+        return Some("a conditional-expression (`… if … else …`) branch");
+    }
+    None
+}
+
+/// True when, at the `?`'s bracket depth, a ternary `if … else` follows the
+/// `?` on the line — i.e. the `?` is in the true-arm of `X? if C else Y`.
+fn questionmark_precedes_ternary(code: &str, q_idx: usize) -> bool {
+    let bytes = code.as_bytes();
+    let mut depth: i32 = 0;
+    let mut in_str: Option<u8> = None;
+    let mut saw_if = false;
+    let mut j = q_idx + 1;
+    while j < bytes.len() {
+        let b = bytes[j];
+        if let Some(q) = in_str {
+            if b == b'\\' && j + 1 < bytes.len() {
+                j += 2;
+                continue;
+            }
+            if b == q {
+                in_str = None;
+            }
+            j += 1;
+            continue;
+        }
+        let kw = |idx: usize, kw: &str| -> bool {
+            // `idx` may land inside a multi-byte UTF-8 character; slicing
+            // `code[idx..]` at a non-boundary would panic, and a continuation
+            // byte is never a keyword start.
+            if !code.is_char_boundary(idx) {
+                return false;
+            }
+            let prev = bytes[idx - 1];
+            !(prev.is_ascii_alphanumeric() || prev == b'_')
+                && code[idx..].starts_with(kw)
+                && code[idx + kw.len()..]
+                    .chars()
+                    .next()
+                    .map(|c| !(c.is_alphanumeric() || c == '_'))
+                    .unwrap_or(true)
+        };
+        match b {
+            b'#' => break,
+            b'\'' | b'"' => in_str = Some(b),
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => {
+                if depth == 0 {
+                    break;
+                }
+                depth -= 1;
+            }
+            _ if depth == 0 && j > 0 => {
+                if kw(j, "if") {
+                    saw_if = true;
+                } else if saw_if && kw(j, "else") {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+        j += 1;
+    }
+    false
+}
+
 fn questionmark_is_in_comprehension(code: &str, q_idx: usize) -> bool {
     let bytes = code.as_bytes();
     if q_idx >= bytes.len() {
@@ -5828,10 +6072,18 @@ fn rewrite_inline_question_ops_one_line(
     Some((current, lifted))
 }
 
-/// Find the position of the first `?` in `s` that is an inline
-/// propagation operator (`)?` *not* at the end-of-code position).
-/// Skips chars inside string literals. The end-of-code case is owned by
-/// [`expand_question_ops`], so we deliberately skip it here.
+/// Find the position of the first `?` in `s` that is a `)?` propagation
+/// operator. Skips chars inside string literals.
+///
+/// A trailing `)?` (the last code char on the line) is handled here too, **but
+/// only when the propagated call is not the entire value** — i.e. there is a
+/// top-level binary/bool/compare operator before it (`a + parse(b)?`). Postfix
+/// `?` binds tighter than any binary operator, so `a + b?` means `a + (b?)`;
+/// the inline pass scopes the operand to just `b` via paren-matching, whereas
+/// the end-of-line pass ([`expand_question_ops`]) would wrap the whole `a + b`.
+/// When the call *is* the whole value (`x = parse(a)?`, `return f()?`), the
+/// trailing `?` is left to the end-of-line pass (preserving its temp naming and
+/// `return`/`yield`/`rescue` handling).
 fn find_first_inline_propagation_q(s: &str) -> Option<usize> {
     let trimmed_end = s.trim_end().len();
     let bytes = s.as_bytes();
@@ -5844,16 +6096,66 @@ fn find_first_inline_propagation_q(s: &str) -> Option<usize> {
         if in_str_mask[i] {
             continue;
         }
-        if bytes[i] == b'?'
-            && i > 0
-            && bytes[i - 1] == b')'
-            && !in_str_mask[i - 1]
-            && i + 1 < trimmed_end
-        {
-            return Some(i);
+        if bytes[i] == b'?' && i > 0 && bytes[i - 1] == b')' && !in_str_mask[i - 1] {
+            let is_trailing = i + 1 >= trimmed_end;
+            if !is_trailing || trailing_q_has_binary_prefix(s, i, &in_str_mask) {
+                return Some(i);
+            }
         }
     }
     None
+}
+
+/// For a trailing `)?` at byte `q_pos`, decide whether its propagated call is
+/// only one operand of a larger top-level binary expression (so the inline pass
+/// must scope it) rather than the whole value (left to the end-of-line pass).
+/// Walks left from the matching `(` over the callable, then looks for a
+/// top-level binary operator between the value start and that call.
+fn trailing_q_has_binary_prefix(s: &str, q_pos: usize, in_str_mask: &[bool]) -> bool {
+    let close_paren = q_pos - 1;
+    let Some(open) = find_matching_open_paren(s, close_paren) else {
+        return false;
+    };
+    let call_start = find_callable_start(s, open);
+    if call_start == open {
+        // `(a + b)?` — a parenthesised expression, not a call. Leave it.
+        return false;
+    }
+    // The value begins after an assignment `=`, a `return`/`yield` keyword, or
+    // the first non-whitespace char. Anything between there and `call_start`
+    // that contains a top-level operator means the call is a sub-operand.
+    let value_start = match find_assignment_eq(&s[..call_start]) {
+        Some(eq) => eq + 1,
+        None => s.find(|c: char| !c.is_whitespace()).unwrap_or(0),
+    };
+    let prefix = &s[value_start..call_start];
+    let prefix_bytes = prefix.as_bytes();
+    let mask_off = value_start;
+    let mut depth: i32 = 0;
+    for (k, &b) in prefix_bytes.iter().enumerate() {
+        if in_str_mask[mask_off + k] {
+            continue;
+        }
+        match b {
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => depth -= 1,
+            // Any of these at depth 0 means a binary/compare/bitwise operator
+            // (or an `and`/`or`/`not`/`if`/`else` keyword's surrounding space)
+            // sits before the call, so `?` binds only to the call.
+            b'+' | b'-' | b'*' | b'/' | b'%' | b'@' | b'|' | b'&' | b'^' | b'<' | b'>' | b'='
+                if depth == 0 =>
+            {
+                return true
+            }
+            _ => {}
+        }
+    }
+    // Word operators (`and` / `or` / `not` / `in` / `is` / ternary `if`/`else`)
+    // separated by spaces — a bare space-delimited keyword token before the call.
+    let trimmed = prefix.trim();
+    trimmed
+        .split_whitespace()
+        .any(|w| matches!(w, "and" | "or" | "not" | "in" | "is" | "if" | "else"))
 }
 
 /// Walk backwards from `close_pos` (position of `)`) to find the matching
@@ -7207,7 +7509,11 @@ fn collect_gather_bindings(
         let code = body[..code_end].trim_end();
         let eq = find_assignment_eq(code)?;
         let name = code[..eq].trim().to_owned();
-        let expr = code[eq + 1..].trim().to_owned();
+        // A `gather:` binding holds a *coroutine expression* that is wrapped in
+        // `create_task(...)`. Drop a redundant leading `await` (e.g. the user
+        // wrote `a = await fa()`); leaving it would lower to
+        // `create_task(await fa())` and crash CPython.
+        let expr = strip_leading_await(code[eq + 1..].trim());
         if name.is_empty() || expr.is_empty() {
             return None;
         }
@@ -7274,6 +7580,32 @@ fn expr_references_identifier(expr: &str, name: &str) -> bool {
 /// earlier binding — the lowering must demote to sequential awaits.
 fn gather_has_dependent_bindings(bindings: &[GatherBinding]) -> bool {
     (0..bindings.len()).any(|i| gather_binding_depends_on_earlier(bindings, i))
+}
+
+/// Strip a single leading `await ` keyword from a coroutine expression.
+///
+/// A `gather:` binding and a `go` target are lowered by wrapping the
+/// expression in `create_task(...)` / `spawn(...)`, both of which expect a
+/// *coroutine object*, not its awaited result. A user who writes
+/// `a = await fa()` inside a `gather:` block, or `go await bg()`, would
+/// otherwise lower to `create_task(await fa())` / `spawn(await bg())` — which
+/// awaits the coroutine to a plain value first and then crashes CPython with
+/// `TypeError: a coroutine was expected`. Because the wrapper already supplies
+/// the concurrency, the leading `await` is always redundant here; dropping it
+/// produces the correct coroutine expression and keeps the VM and compiled
+/// CPython in agreement.
+///
+/// Only a leading `await` token followed by whitespace is removed, so an
+/// identifier such as `awaitable()` and any inner `await` (e.g. an awaited
+/// sub-argument) are left untouched.
+fn strip_leading_await(expr: &str) -> String {
+    let trimmed = expr.trim_start();
+    if let Some(rest) = trimmed.strip_prefix("await") {
+        if rest.starts_with(|c: char| c.is_whitespace()) {
+            return rest.trim_start().to_owned();
+        }
+    }
+    expr.to_owned()
 }
 
 /// Render a `gather` block into the chosen Python concurrency primitive.
@@ -7503,7 +7835,15 @@ fn parse_go_call(rest: &str) -> Option<(String, Option<String>)> {
         Some(_) => return None,
         None => None,
     };
-    Some((call_part.to_owned(), handle))
+    // `go` wraps its target in `spawn(...)`, which expects a coroutine object.
+    // Drop a redundant leading `await` (e.g. `go await bg()`) so the lowering
+    // emits `spawn(bg())` rather than `spawn(await bg())`, which would crash
+    // CPython with `TypeError: a coroutine was expected`.
+    let call_expr = strip_leading_await(call_part);
+    if !call_expr.ends_with(')') {
+        return None;
+    }
+    Some((call_expr, handle))
 }
 
 /// Fold continuation lines that belong to a multi-line `go fn(...)`
@@ -8896,6 +9236,41 @@ mod tests {
     }
 
     #[test]
+    fn freeze_let_multiline_hash_in_string_before_bracket_parses() {
+        // Regression: in a *multi-line* `freeze let`, a `#` inside a string on
+        // a continuation line that also has a closing bracket after it
+        // (`"list": ["a#b"],`) made the bracket-depth walk treat the `#` as a
+        // comment and miss the `]`, so the synthesised `__typhon_freeze__(`
+        // was left unterminated → `tyc::parse` (whole toolchain rejected a
+        // valid program). The depth scanner now tracks string state.
+        for src in [
+            "freeze let X = {\n    \"list\": [\"a#b\"],\n    \"after\": 1,\n}\n",
+            "freeze let Y = {\n    \"a\": {\"k\": \"v#w\"},\n    \"b\": (\"x#y\", \"z\"),\n}\n",
+        ] {
+            let prep = preprocess(src);
+            // Forward pass must produce a balanced wrapper call.
+            let opens = prep.python_source.matches("__typhon_freeze__(").count();
+            assert_eq!(
+                opens, 1,
+                "expected one freeze wrapper:\n{}",
+                prep.python_source
+            );
+            let parsed = crate::parse_module(&prep.python_source);
+            assert!(
+                parsed.is_ok(),
+                "preprocessed freeze let must parse:\n{}",
+                prep.python_source
+            );
+            // And it must round-trip back to the original surface.
+            let out = postprocess(&prep.python_source, &prep.stripped, &prep.optionals);
+            assert_eq!(
+                out, src,
+                "multi-line freeze let with in-string `#` must round-trip"
+            );
+        }
+    }
+
+    #[test]
     fn freeze_let_indented_is_left_alone() {
         // `freeze let` is module-level only in v1.
         let result = preprocess("    freeze let X = 1\n");
@@ -10156,6 +10531,39 @@ mod tests {
     }
 
     #[test]
+    fn two_question_ops_in_binary_rhs_both_lift() {
+        // Regression: `let v = parse(a)? + parse(b)?` — postfix `?` binds
+        // tighter than `+`, so BOTH calls must be lifted to their own temps.
+        // The end-of-line pass used to wrap the whole RHS as one `?` operand,
+        // emitting `int + Result` (a runtime TypeError). The inline pass now
+        // owns a trailing `)?` when a top-level binary operator precedes it.
+        let src = "    let v: int = parse(a)? + parse(b)?\n";
+        let out = expand_question_ops(&expand_inline_question_ops(src));
+        // Two distinct lifts, and the final value adds the two `.value`s.
+        assert!(out.contains("= parse(a)"), "out: {out}");
+        assert!(out.contains("= parse(b)"), "out: {out}");
+        assert!(
+            out.contains(".value + ") && out.contains(".value\n"),
+            "both operands must be unwrapped values, got:\n{out}"
+        );
+        // No `__typhon_*__ = <something> + parse(b)` (the mis-scoped form).
+        assert!(
+            !out.contains("+ parse(b)"),
+            "second `?` must be lifted, not left in the expression:\n{out}"
+        );
+    }
+
+    #[test]
+    fn single_question_op_in_assignment_unchanged() {
+        // A trailing `?` with no binary prefix stays with the end-of-line
+        // pass (its temp naming / return handling are unchanged).
+        let src = "    let v: int = parse(a)?\n";
+        let out = expand_question_ops(&expand_inline_question_ops(src));
+        assert!(out.contains("__typhon_q_0__ = parse(a)"), "out: {out}");
+        assert!(out.contains("v: int = __typhon_q_0__.value"), "out: {out}");
+    }
+
+    #[test]
     fn model_keyword_with_existing_base_merges_basemodel() {
         // `model User(Timestamped):` → `class User(Timestamped, BaseModel):`
         let result = preprocess("model User(Timestamped):\n    id: int\n");
@@ -10454,6 +10862,69 @@ mod tests {
             "got: {}",
             errs[0].message
         );
+    }
+
+    #[test]
+    fn question_op_rejected_in_unhoistable_positions() {
+        // `?` is lifted to an unconditional statement-level temp, so it cannot
+        // sit in a lambda body or a conditionally-evaluated slot (ternary arm /
+        // and-or operand) — doing so would crash (lambda) or run a branch that
+        // should be skipped (silently wrong result).
+        let cases = [
+            (
+                "def f() -> Result[int, str]:\n    let g = (lambda: parse(a)?)\n",
+                "lambda",
+            ),
+            (
+                "def f() -> Result[int, str]:\n    let v: int = parse(a)? if c else parse(b)?\n",
+                "conditional",
+            ),
+            (
+                "def f() -> Result[int, str]:\n    let v: int = 0 if c else parse(b)?\n",
+                "conditional",
+            ),
+            (
+                "def f() -> Result[bool, str]:\n    let v: bool = chk(a)? and chk(b)?\n",
+                "and",
+            ),
+            (
+                "def f() -> Result[bool, str]:\n    let v: bool = chk(a)? or chk(b)?\n",
+                "and",
+            ),
+        ];
+        for (src, needle) in cases {
+            let errs = validate_question_ops(src);
+            assert!(!errs.is_empty(), "must reject `?` here: {src}");
+            assert!(
+                errs.iter().any(|e| e.message.contains(needle)),
+                "expected a {needle} message for `{src}`, got {:?}",
+                errs.iter().map(|e| &e.message).collect::<Vec<_>>()
+            );
+        }
+        // A plain single `?` and a `?` in the ternary TEST stay valid.
+        assert!(validate_question_ops(
+            "def f() -> Result[int, str]:\n    let g: int = parse(a)?\n    return Ok(g)\n"
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn question_op_validation_handles_multibyte_identifiers() {
+        // Regression: the `?`-placement scan walked the line byte-by-byte and
+        // sliced `code[idx..]` at every position; a multi-byte UTF-8 character
+        // (a non-ASCII identifier) before the `?` landed `idx` mid-character
+        // and panicked. It must scan without panicking and accept the valid
+        // tail `?`.
+        let srcs = [
+            "def f() -> Result[int, str]:\n    let café: int = get()?\n    return Ok(café)\n",
+            "def f() -> Result[int, str]:\n    let δ: int = get()?\n    return Ok(δ)\n",
+            "def f() -> Result[int, str]:\n    let 名前: int = get()?\n    return Ok(名前)\n",
+        ];
+        for src in srcs {
+            // The bug was a panic; reaching the assert at all is the test.
+            let errs = validate_question_ops(src);
+            assert!(errs.is_empty(), "valid tail `?` must be accepted: {src}");
+        }
     }
 
     #[test]
@@ -11377,6 +11848,35 @@ def run() -> Result[str, str]:
             out.contains(".create_task(fetch_b())"),
             "create_task call missing or malformed: {out}"
         );
+    }
+
+    #[test]
+    fn gather_binding_drops_redundant_leading_await() {
+        // Regression: `a = await fa()` inside a `gather:` block used to lower
+        // to `.create_task(await fa())`, which awaits the coroutine to a value
+        // before create_task and crashes CPython with
+        // `TypeError: a coroutine was expected`. The redundant leading `await`
+        // must be stripped so the lowering wraps the bare coroutine.
+        let src = "async def f():\n    gather:\n        a = await fa()\n        b = fb()\n";
+        let out = expand_gather_blocks(src);
+        assert!(
+            out.contains(".create_task(fa())"),
+            "leading await must be stripped from gather binding: {out}"
+        );
+        assert!(
+            !out.contains("create_task(await"),
+            "create_task(await ...) is the bug we are fixing: {out}"
+        );
+    }
+
+    #[test]
+    fn strip_leading_await_leaves_identifiers_and_inner_awaits() {
+        // Only a leading `await ` token is removed; an identifier that merely
+        // starts with "await" and any inner await are untouched.
+        assert_eq!(strip_leading_await("await fa()"), "fa()");
+        assert_eq!(strip_leading_await("  await  fa()"), "fa()");
+        assert_eq!(strip_leading_await("awaitable()"), "awaitable()");
+        assert_eq!(strip_leading_await("g(await h())"), "g(await h())");
     }
 
     #[test]

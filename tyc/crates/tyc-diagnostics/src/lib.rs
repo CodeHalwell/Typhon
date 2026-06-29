@@ -1613,6 +1613,79 @@ pub enum TycError {
         #[label("captured by reference here")]
         span: SourceSpan,
     },
+
+    /// A `frozen` dataclass and its in-module dataclass base disagree on
+    /// frozen-ness. CPython refuses to build either combination — a frozen
+    /// dataclass cannot inherit a non-frozen one, nor a non-frozen a frozen
+    /// one — and raises `TypeError` at class-definition (import) time. Typhon
+    /// accepted it and emitted Python that crashed on import, so reject it at
+    /// check time instead.
+    #[error("class `{child}` is {child_kind} but its base `{parent}` is {parent_kind}: a dataclass and its base must agree on frozen-ness")]
+    #[diagnostic(
+        severity(Error),
+        code(tyc::frozen_inheritance_conflict),
+        url("https://typhon.dev/lang/diagnostics/frozen_inheritance_conflict"),
+        help("CPython forbids a frozen dataclass inheriting from a non-frozen one (and vice-versa); the generated module would raise `TypeError` on import. Make both `frozen` or neither.")
+    )]
+    FrozenInheritanceConflict {
+        child: String,
+        parent: String,
+        child_kind: String,
+        parent_kind: String,
+        #[source_code]
+        src: NamedSource<String>,
+        #[label("frozen-ness conflicts with base here")]
+        span: SourceSpan,
+    },
+
+    /// A `raise` whose operand is provably not a `BaseException` — a literal
+    /// (`raise 42`), another primitive, or an instance of a user class that
+    /// does not derive from `BaseException` (`raise Problem(...)` where
+    /// `Problem` is a plain dataclass). CPython raises
+    /// `TypeError: exceptions must derive from BaseException` at runtime, so
+    /// reject it at check time. Only fired when the operand's type is fully
+    /// resolved and certainly non-exception; builtin/imported/unknown-base
+    /// classes stay permissive.
+    #[error(
+        "cannot raise `{value}`: only exceptions (subclasses of `BaseException`) can be raised"
+    )]
+    #[diagnostic(
+        severity(Error),
+        code(tyc::raise_non_exception),
+        url("https://typhon.dev/lang/diagnostics/raise_non_exception"),
+        help("`raise` requires a `BaseException` (sub)class or instance. If `{value}` is meant to signal an error, make it subclass `Exception`; for a recoverable error value, return `Err(...)` instead of raising.")
+    )]
+    RaiseNonException {
+        value: String,
+        #[source_code]
+        src: NamedSource<String>,
+        #[label("not an exception")]
+        span: SourceSpan,
+    },
+
+    /// A `with` / `async with` subject is a locally-defined class that does
+    /// not implement the context-manager protocol — `__enter__`/`__exit__`
+    /// for `with`, `__aenter__`/`__aexit__` for `async with`. CPython raises
+    /// `TypeError` at the `with` statement; reject it at check time. Only
+    /// fired for a fully-local class with definitely-absent methods, so
+    /// stdlib/third-party CMs and `@contextmanager` factories stay permissive.
+    #[error("`{ty}` is not {desc}: it has no `{method}` method")]
+    #[diagnostic(
+        severity(Error),
+        code(tyc::not_a_context_manager),
+        url("https://typhon.dev/lang/diagnostics/not_a_context_manager"),
+        help("a `{with_kw}` subject must implement the context-manager protocol. Add `{method}` (and its partner) to `{ty}`, or wrap the resource in a `@contextmanager` / `@asynccontextmanager` factory.")
+    )]
+    NotAContextManager {
+        ty: String,
+        desc: String,
+        method: String,
+        with_kw: String,
+        #[source_code]
+        src: NamedSource<String>,
+        #[label("not a context manager")]
+        span: SourceSpan,
+    },
 }
 
 impl TycError {
@@ -2897,6 +2970,77 @@ impl TycError {
             method: method.into(),
             base: base.into(),
             reason: reason.into(),
+            src: NamedSource::new(path.into(), source.into()),
+            span: SourceSpan::new(SourceOffset::from(offset), length.max(1)),
+        }
+    }
+
+    /// Construct a [`TycError::FrozenInheritanceConflict`] diagnostic.
+    /// `child_frozen` is the child's frozen-ness; the base has the opposite.
+    #[allow(clippy::too_many_arguments)]
+    pub fn frozen_inheritance_conflict(
+        child: impl Into<String>,
+        parent: impl Into<String>,
+        child_frozen: bool,
+        path: impl Into<String>,
+        source: impl Into<String>,
+        offset: usize,
+        length: usize,
+    ) -> Self {
+        let (child_kind, parent_kind) = if child_frozen {
+            ("frozen", "not frozen")
+        } else {
+            ("not frozen", "frozen")
+        };
+        Self::FrozenInheritanceConflict {
+            child: child.into(),
+            parent: parent.into(),
+            child_kind: child_kind.to_owned(),
+            parent_kind: parent_kind.to_owned(),
+            src: NamedSource::new(path.into(), source.into()),
+            span: SourceSpan::new(SourceOffset::from(offset), length.max(1)),
+        }
+    }
+
+    /// Construct a [`TycError::RaiseNonException`] diagnostic. `value` is a
+    /// short rendering of the offending operand's type (e.g. `int`, `Problem`).
+    pub fn raise_non_exception(
+        value: impl Into<String>,
+        path: impl Into<String>,
+        source: impl Into<String>,
+        offset: usize,
+        length: usize,
+    ) -> Self {
+        Self::RaiseNonException {
+            value: value.into(),
+            src: NamedSource::new(path.into(), source.into()),
+            span: SourceSpan::new(SourceOffset::from(offset), length.max(1)),
+        }
+    }
+
+    /// Construct a [`TycError::NotAContextManager`] diagnostic. `is_async`
+    /// selects the `async with` wording and the `__aenter__`/`__aexit__`
+    /// protocol; `method` is the specific missing dunder.
+    #[allow(clippy::too_many_arguments)]
+    pub fn not_a_context_manager(
+        ty: impl Into<String>,
+        method: impl Into<String>,
+        is_async: bool,
+        path: impl Into<String>,
+        source: impl Into<String>,
+        offset: usize,
+        length: usize,
+    ) -> Self {
+        let (desc, with_kw) = if is_async {
+            ("an async context manager", "async with")
+        } else {
+            ("a context manager", "with")
+        };
+        Self::NotAContextManager {
+            ty: ty.into(),
+            desc: desc.to_owned(),
+            method: method.into(),
+            with_kw: with_kw.to_owned(),
             src: NamedSource::new(path.into(), source.into()),
             span: SourceSpan::new(SourceOffset::from(offset), length.max(1)),
         }

@@ -115,6 +115,32 @@ pub fn run(args: BuildArgs) -> Result<()> {
             let err = TycError::invalid_config_value("emit.class-default", value, allowed, path);
             return Err(miette::Report::new_boxed(Box::new(err)));
         }
+        Err(crate::config::ConfigError::InvalidSeverity {
+            path,
+            key,
+            value,
+            allowed,
+        }) => {
+            let field = format!("strictness.{key}");
+            let err = TycError::invalid_config_value(&field, value, allowed, path);
+            return Err(miette::Report::new_boxed(Box::new(err)));
+        }
+        Err(crate::config::ConfigError::InvalidModelExtra {
+            path,
+            value,
+            allowed,
+        }) => {
+            let err = TycError::invalid_config_value("emit.model-extra", value, allowed, path);
+            return Err(miette::Report::new_boxed(Box::new(err)));
+        }
+        Err(crate::config::ConfigError::InvalidChecker {
+            path,
+            value,
+            allowed,
+        }) => {
+            let err = TycError::invalid_config_value("checker.external", value, allowed, path);
+            return Err(miette::Report::new_boxed(Box::new(err)));
+        }
         Err(e) => return Err(miette!("{e}")),
     };
 
@@ -578,9 +604,14 @@ pub fn run(args: BuildArgs) -> Result<()> {
                     let import_line = import_pieces.join("; ");
                     prep.python_source =
                         replace_line(&prep.python_source, marker_line, &import_line);
-                    // Append aggregated names to `prep.pub_names` so
-                    // the desugar pass picks them up for `__all__`.
-                    for name in &accepted_names {
+                    // Append aggregated names to `prep.pub_names` so the
+                    // desugar pass picks them up for `__all__`. Sort first —
+                    // `accepted_names` is a `HashSet`, whose iteration order is
+                    // nondeterministic, which made the synthesised `__all__`
+                    // order flap between builds (non-reproducible output).
+                    let mut sorted_accepted: Vec<&String> = accepted_names.iter().collect();
+                    sorted_accepted.sort();
+                    for name in sorted_accepted {
                         if !prep.pub_names.contains(name) && name != "<package>" {
                             prep.pub_names.push(name.clone());
                         }
@@ -1055,6 +1086,20 @@ pub fn run(args: BuildArgs) -> Result<()> {
         }
     }
     for (path, source) in &sources {
+        // Relative imports that escape the source root (`from ..x import …`
+        // from a top-level module) crash at import — surface them here.
+        if let Some(depth) = module_depth_below(path, &src_dir) {
+            for (snippet, offset, length) in scan_overdeep_relative_imports(source, depth) {
+                let warn = TycError::orphan_py_import(
+                    snippet,
+                    path.to_string_lossy().into_owned(),
+                    source.clone(),
+                    offset,
+                    length,
+                );
+                eprintln!("{:?}", miette::Report::new_boxed(Box::new(warn)));
+            }
+        }
         for (module_name, snippet, offset, length) in scan_relative_py_imports(source) {
             if copied_py_module_names.contains(&module_name) {
                 continue;
@@ -1409,6 +1454,60 @@ fn scan_relative_py_imports(source: &str) -> Vec<(String, String, usize, usize)>
         }
         let snippet = trimmed.trim_end().to_owned();
         out.push((name, snippet.clone(), trimmed_start, snippet.len()));
+        line_start += line_len;
+    }
+    out
+}
+
+/// A module's package depth below `src_dir` — the number of package
+/// directories between `src_dir` and the file. `src/main.ty` → 0 (top-level
+/// package), `src/a/mod.ty` → 1, etc. `None` when the path can't be expressed
+/// relative to `src_dir` (so the over-deep-import check is skipped rather than
+/// risking a false positive).
+pub(crate) fn module_depth_below(
+    path: &std::path::Path,
+    src_dir: &std::path::Path,
+) -> Option<usize> {
+    let rel = path.strip_prefix(src_dir).ok()?;
+    Some(rel.components().count().saturating_sub(1))
+}
+
+/// Scan for relative imports whose dot-level escapes the source root. A module
+/// at package depth `D` below the source root can ascend at most `D` levels: a
+/// top-level module (`depth` 0) cannot use *any* relative import (run as
+/// `python build/main.py` it has no parent package, so even `from . import …`
+/// raises `ImportError: attempted relative import with no known parent
+/// package`), a depth-1 module may use `from . import` (level 1) but not
+/// `from .. import` (level 2), and so on. A `from <dots>x` with
+/// `dots > depth` reaches above the package root and crashes the emitted
+/// Python at import, so flag it at check/build time. Returns
+/// `(snippet, offset, length)` per offending line.
+pub(crate) fn scan_overdeep_relative_imports(
+    source: &str,
+    module_depth: usize,
+) -> Vec<(String, usize, usize)> {
+    let max_level = module_depth;
+    let mut out = Vec::new();
+    let mut line_start = 0usize;
+    for line in source.split_inclusive('\n') {
+        let line_len = line.len();
+        let leading_ws = line
+            .as_bytes()
+            .iter()
+            .take_while(|&&b| b == b' ' || b == b'\t')
+            .count();
+        let trimmed_start = line_start + leading_ws;
+        let trimmed = line.trim_start();
+        if let Some(rest) = trimmed.strip_prefix("from ") {
+            let rest = rest.trim_start();
+            let dots = rest.chars().take_while(|&c| c == '.').count();
+            // Must be an actual `import` statement, not e.g. a string.
+            if dots > max_level && trimmed.contains("import") {
+                let snippet = trimmed.trim_end().to_owned();
+                let len = snippet.len();
+                out.push((snippet, trimmed_start, len));
+            }
+        }
         line_start += line_len;
     }
     out
@@ -2254,6 +2353,120 @@ class _LazyValue:
 
     def __len__(self) -> int:
         return len(self._materialise())
+
+    # Forward arithmetic, comparison, bitwise, unary, conversion, index and
+    # membership operators to the materialised value so a `lazy let` of a
+    # primitive (int/float/str/bytes/…) is transparent under every operator,
+    # not just attribute access. Without these, `VALUE + 1`, `VALUE > 10`,
+    # `range(VALUE)`, `NAME + \" world\"` etc. raised TypeError against the
+    # proxy even though the underlying value supports them.
+    def __add__(self, other: object) -> object:
+        return self._materialise() + other
+
+    def __radd__(self, other: object) -> object:
+        return other + self._materialise()
+
+    def __sub__(self, other: object) -> object:
+        return self._materialise() - other
+
+    def __rsub__(self, other: object) -> object:
+        return other - self._materialise()
+
+    def __mul__(self, other: object) -> object:
+        return self._materialise() * other
+
+    def __rmul__(self, other: object) -> object:
+        return other * self._materialise()
+
+    def __truediv__(self, other: object) -> object:
+        return self._materialise() / other
+
+    def __rtruediv__(self, other: object) -> object:
+        return other / self._materialise()
+
+    def __floordiv__(self, other: object) -> object:
+        return self._materialise() // other
+
+    def __rfloordiv__(self, other: object) -> object:
+        return other // self._materialise()
+
+    def __mod__(self, other: object) -> object:
+        return self._materialise() % other
+
+    def __rmod__(self, other: object) -> object:
+        return other % self._materialise()
+
+    def __pow__(self, other: object) -> object:
+        return self._materialise() ** other
+
+    def __rpow__(self, other: object) -> object:
+        return other ** self._materialise()
+
+    def __and__(self, other: object) -> object:
+        return self._materialise() & other
+
+    def __rand__(self, other: object) -> object:
+        return other & self._materialise()
+
+    def __or__(self, other: object) -> object:
+        return self._materialise() | other
+
+    def __ror__(self, other: object) -> object:
+        return other | self._materialise()
+
+    def __xor__(self, other: object) -> object:
+        return self._materialise() ^ other
+
+    def __rxor__(self, other: object) -> object:
+        return other ^ self._materialise()
+
+    def __lshift__(self, other: object) -> object:
+        return self._materialise() << other
+
+    def __rlshift__(self, other: object) -> object:
+        return other << self._materialise()
+
+    def __rshift__(self, other: object) -> object:
+        return self._materialise() >> other
+
+    def __rrshift__(self, other: object) -> object:
+        return other >> self._materialise()
+
+    def __lt__(self, other: object) -> bool:
+        return self._materialise() < other
+
+    def __le__(self, other: object) -> bool:
+        return self._materialise() <= other
+
+    def __gt__(self, other: object) -> bool:
+        return self._materialise() > other
+
+    def __ge__(self, other: object) -> bool:
+        return self._materialise() >= other
+
+    def __neg__(self) -> object:
+        return -self._materialise()
+
+    def __pos__(self) -> object:
+        return +self._materialise()
+
+    def __abs__(self) -> object:
+        return abs(self._materialise())
+
+    def __invert__(self) -> object:
+        return ~self._materialise()
+
+    def __int__(self) -> int:
+        return int(self._materialise())
+
+    def __float__(self) -> float:
+        return float(self._materialise())
+
+    def __index__(self) -> int:
+        return self._materialise().__index__()
+
+    def __contains__(self, item: object) -> bool:
+        return item in self._materialise()
 
 
 _UNSET = object()
@@ -3366,6 +3579,35 @@ let result: int = 3 |> double |> inc
     }
 
     #[test]
+    fn lazy_value_proxy_forwards_operators() {
+        // Regression: a module-level `lazy let` of a primitive emits a
+        // `_LazyValue` proxy. The proxy must forward arithmetic, comparison,
+        // index and conversion dunders so `VALUE + 1`, `VALUE > 10`,
+        // `range(VALUE)` work — not just attribute access. Guards against the
+        // forwarding methods being dropped from the runtime template.
+        for method in [
+            "def __add__",
+            "def __radd__",
+            "def __sub__",
+            "def __mul__",
+            "def __mod__",
+            "def __lt__",
+            "def __gt__",
+            "def __ge__",
+            "def __index__",
+            "def __int__",
+            "def __neg__",
+            "def __contains__",
+        ] {
+            assert!(
+                TYPHON_RUNTIME_LAZY_PY.contains(method),
+                "_LazyValue runtime proxy must forward {method}; lazy let of a \
+                 primitive crashes without it"
+            );
+        }
+    }
+
+    #[test]
     fn build_lazy_let_inside_class_lowers_to_cached_property() {
         let tmp = tempfile::tempdir().unwrap();
         let src = "\
@@ -4241,6 +4483,33 @@ let pet: Animal = Dog(name=\"Rex\")
         assert!(
             imports.is_empty(),
             "two-dot and bare-dot imports should be ignored: {imports:?}"
+        );
+    }
+
+    #[test]
+    fn overdeep_relative_import_bound_matches_runtime() {
+        // A module at package depth D can ascend at most D levels; `dots > D`
+        // crashes the emitted Python with ImportError. Regression: the bound
+        // was `D + 1`, which let a depth-2 `from ...x` (and a depth-0
+        // `from .x`, which has no parent package) slip through to a runtime
+        // crash.
+        // depth 0: even `from .x` is invalid (no parent package).
+        assert_eq!(
+            scan_overdeep_relative_imports("from .helper import h\n", 0).len(),
+            1,
+            "depth-0 `from .` must be flagged"
+        );
+        // depth 1: `from .x` ok, `from ..x` invalid.
+        assert!(scan_overdeep_relative_imports("from .sib import s\n", 1).is_empty());
+        assert_eq!(
+            scan_overdeep_relative_imports("from ..up import u\n", 1).len(),
+            1
+        );
+        // depth 2: `from ..x` ok, `from ...x` invalid (the reported case).
+        assert!(scan_overdeep_relative_imports("from ..pkg import p\n", 2).is_empty());
+        assert_eq!(
+            scan_overdeep_relative_imports("from ...top import t\n", 2).len(),
+            1
         );
     }
 }

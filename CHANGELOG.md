@@ -6,7 +6,157 @@ canonical phase-by-phase status lives in `docs/roadmap.md`.
 
 ## Unreleased
 
-_Nothing yet._
+### Added
+
+- **`tyc::not_a_context_manager`** — a `with` / `async with` whose subject is a
+  local class lacking the protocol (`__enter__`/`__exit__`, or
+  `__aenter__`/`__aexit__`) is rejected at check time instead of crashing.
+  Stdlib/third-party CMs and `@contextmanager` factories stay permissive.
+
+### Fixed
+
+- **Calling an instance with a user `__call__` is typed as that method's
+  return type**, not the class — closing a soundness hole (`let r: Adder =
+  a(5)` accepted) and a false positive (the correct `let r: int = a(5)`
+  rejected).
+- **Nested `def` references are checked against a declared `Callable`.** A
+  closure returned/assigned where a `Callable[[int], str]` was promised is now
+  rejected when its real signature differs (was typed `Unknown`).
+
+### Docs
+
+- Clarified the `as!` checked-cast contract: `Callable` signatures,
+  user-defined generic classes, and abstract collection types
+  (`Sequence[X]`, …) verify only the erased origin at runtime (generics are
+  erased in CPython); the VM enforces the same recursive check as the build
+  path (no longer an identity pass-through).
+
+- **`match` or-pattern captures are typed as the union of alternatives.**
+  `case A(n) | B(n)` over `A | B` bound `n` from the first arm only; it now
+  yields `A.x | B.x`, so a value matching a later arm can't be used at the
+  wrong type.
+- **`list[T] += rhs` checks the RHS element type** (`xs: list[int]; xs +=
+  ["bad"]` is rejected), and **dict-comprehension key/value expressions are
+  checked** against the annotated `dict[K, V]`.
+
+- **Tuple-unpack targets are typed.** `for k, v in d.items()` and
+  `let a, b = pair()` bound each slot to `Unknown`; they now destructure the
+  element `tuple[K, V]`, so passing a `str` key into an `int` parameter is
+  caught instead of crashing at runtime.
+- **`match` star/double-star captures are typed.** `case [a, *rest]` binds
+  `rest` to `list[T]` and `case {"k": v, **rest}` binds `rest` to `dict[K, V]`
+  (were `Unknown`), so `rest.upper()` is now rejected.
+- **Slice reads are typed as their container** (`list[T][a:b]` → `list[T]`,
+  `str[a:b]` → `str`), and **subscript assignments are checked** against the
+  element/value type (`data[0] = "x"` / `data[0:1] = ["x"]` into a `list[int]`,
+  `d[k] = "x"` into a `dict[str, int]` are rejected). All were silent
+  corruptions before.
+
+- **`raise <non-exception>` is rejected at check time** (new
+  `tyc::raise_non_exception`). `raise 42` and `raise Problem(...)` (a plain
+  dataclass) type-checked clean and then crashed with CPython's
+  `TypeError: exceptions must derive from BaseException`. The check is
+  conservative — only literals and locally-defined classes with a fully-known
+  non-exception ancestry fire; builtin/imported/venv-introspected exceptions
+  (e.g. `fastapi.HTTPException`) and `Exception` subclasses stay permissive.
+- **Parameter default values are type-checked against their annotation.**
+  `def f(n: int = None)` / `= "z"` crashed at runtime; now rejected, while
+  `int? = None`, `int | None = None`, and `float = 0` stay valid.
+- **`ClassVar` fields are excluded from the constructor signature.** Passing
+  one as a kwarg (`Config(DEFAULT_PORT=…)`) crashed at runtime; it's now
+  rejected, and the field stays accessible as a class attribute.
+- **Over-deep relative imports are flagged correctly** (off-by-one fix): a
+  depth-0 `from .x` and a depth-2 `from ...x` reach above the package root and
+  crash the emitted Python; both are now caught while in-bounds `from .sibling`
+  still passes.
+
+- **`bytes %`-formatting (PEP 461) is accepted and runs.** `b"%d items" % 5`
+  and `b"%d-%s" % (5, b"x")` were rejected at check time as
+  `operator_type_mismatch`; the `%` carve-out now covers `bytes` (result
+  `bytes`) like `str`, and the VM implements `bytes.__mod__` so `tyc run`,
+  compiled CPython, and reference CPython all agree.
+- **`isinstance()` now narrows an attribute target.** `if isinstance(b.v, int):
+  return b.v` was wrongly rejected — only bare names narrowed. Attribute paths
+  now narrow through the same machinery as `is None`, which already resets on
+  reassignment.
+- **Exhaustive `match` with an or-pattern over a literal union / bool no longer
+  fires a spurious `missing_return`.** `case "red" | "green":` /
+  `case True | False:` are recognised as covering their alternatives.
+- **Bare `Final` / `ClassVar` annotations (PEP 591) infer their type from the
+  value** instead of failing with `type_mismatch`.
+- **`frozen` / non-`frozen` dataclass inheritance is rejected at check time**
+  (new `tyc::frozen_inheritance_conflict`). The combination type-checked clean
+  but the emitted module crashed on import with CPython's `TypeError: cannot
+  inherit frozen dataclass from a non-frozen one` (both directions). Only
+  in-module dataclass bases are compared, so external/non-dataclass bases are
+  unaffected.
+- **Module-level `lazy let` of a primitive is transparent under all
+  operators.** The emitted `_LazyValue` proxy only forwarded attribute access,
+  so `VALUE + 1`, `VALUE > 10`, `range(VALUE)`, `NAME + " world"` crashed the
+  compiled program (while the VM ran). The proxy now forwards arithmetic,
+  reflected, comparison, bitwise, unary, conversion, index and membership
+  dunders; laziness is preserved.
+- **`await` inside a `gather:` binding (and `go await …`) no longer emits
+  crashing CPython.** `a = await fa()` lowered to `create_task(await fa())`,
+  raising `TypeError: a coroutine was expected`; the redundant leading `await`
+  is now stripped before wrapping.
+- **`class!` subclass of an in-module field-bearing base constructs
+  correctly.** Its synthesised `__init__` accepted only its own fields and
+  opened with a no-arg `super().__init__()` that hit the base's field-requiring
+  constructor and raised `TypeError`; the constructor now accepts and assigns
+  the inherited fields directly.
+- **Emitted `.pyi` stubs keep the `@dataclass` decorator** so consumers'
+  type-checkers synthesise `__init__` and accept correct keyword construction
+  (previously stripped, which made every stubbed dataclass reject
+  `Cls(field=…)`).
+- **`typhon.toml` rejects unknown keys and invalid `[checker] external`.** A
+  typo'd section/key (`[pyhton]`, `taget`) silently reverted to defaults (e.g.
+  a default-3.13 build); config structs now `deny_unknown_fields`, and
+  `[checker] external` is validated against `none`/`ty`.
+- **`tyc` no longer aborts (SIGABRT) on deeply-nested or very long
+  expressions.** A long flat `a + b + c + …` chain (plausible generated code)
+  or deeply nested brackets built a deep AST that overflowed the default
+  ~8 MB stack during the recursive type-check / VM walk. The CLI now runs on a
+  256 MiB worker stack (lazily committed), pushing the ceiling far past any
+  realistic program.
+- **Multi-line `freeze let` with a `#` inside a string no longer fails to
+  parse.** A continuation line like `"list": ["a#b"],` made the bracket-depth
+  scanner treat the in-string `#` as a comment and miss the following `]`, so
+  the synthesised `__typhon_freeze__(` was left unterminated and `tyc check` /
+  `run` / `fmt` all rejected a valid program. The scanner now tracks single-
+  and triple-quoted string state.
+- **`tyc explain` now resolves every shipped diagnostic.**
+  `field_default_ordering`, `use_of_uninitialised`, `pub_name_collision`,
+  `missing_field_init`, `pub_star_outside_init`, and `kind_mismatch` (the last
+  with a new doc page) were emitted by the compiler and documented but returned
+  "unknown diagnostic code"; they're now registered in the catalog and
+  `tyc explain --list`.
+- **VM dict/set keys collapse numerically-equal `int` / `float` / `bool`**, matching
+  CPython (`{1: a, 1.0: b, True: c}` is one entry; `1 in {1.0}`; `hash(1) ==
+  hash(1.0)`; `frozenset({1, 2.0}) == frozenset({1.0, 2})`). The `HashKey`
+  equality, hashing, and canonical ordering now treat an integral float like the
+  equal int; non-integral floats keep their own identity. Closes a silent VM/
+  CPython data divergence.
+- **VM now enforces the `as!` checked cast** (was an identity passthrough). The
+  in-process VM interprets the `as!` type descriptor and runs the same recursive
+  structural check as the compiled path's `typhon_runtime/cast.py`, so a
+  wrong-shaped value raises `TypeError` under `tyc run` exactly as it does under
+  `tyc build && python` — closing a VM/CPython divergence on the boundary-cast
+  enforcement path (`tyc run` is the default execution mode). Scalars (with
+  `int→float` / `bool→int` widening), `list`/`set`/`frozenset`/`dict`/`tuple`
+  (fixed and variadic), `Optional`/unions, and user classes are all checked;
+  anything unmodellable stays permissive.
+- **Type checker: flow narrowing of a module global is invalidated by an
+  intervening call.** `if g is not None: clear(); use(g)` (where `clear()`
+  reassigns the global via `global g`) no longer keeps the stale non-`None`
+  narrowing — a silent soundness hole that checked clean and raised at runtime.
+  Local-variable narrowing is unchanged (a call can't rebind a caller's local).
+- **Type checker: short-circuit narrowing reaches later bool-op operands.**
+  `x is not None and x.method()` (and the De Morgan `x is None or x.method()`)
+  no longer false-positive with `tyc::nullable_use` on the method receiver — the
+  canonical Python null-check idiom now type-checks. The narrowing is contained
+  to the expression (it doesn't leak to later uses, and a walrus binding an
+  operand introduces is preserved).
 
 ## 1.0.0-alpha — 2026-06-22 — first feature-complete alpha
 

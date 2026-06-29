@@ -424,6 +424,42 @@ print(x + y)
     }
 
     #[test]
+    fn bytes_percent_formatting_runs() {
+        // Regression (PEP 461): the VM must implement `bytes % args` (it only
+        // had `str % args`), matching the checker which now accepts it and
+        // CPython. Asserting a clean run is enough — a missing arm raised a
+        // VmError before.
+        let src = r#"
+def main() -> None:
+    let a: bytes = b"%d items" % 5
+    let b: bytes = b"%d-%s" % (5, b"x")
+    let c: bytes = b"%b!" % b"x"
+    print(a, b, c)
+
+main()
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    #[test]
+    fn translate_bytes_format_rewrites_only_b_conversion() {
+        // PEP 461 `%b` becomes `%s` (bytes args are latin-1 strings); `%%`,
+        // mapping keys, and other conversions are preserved.
+        assert_eq!(crate::interp::translate_bytes_format("%b"), "%s");
+        assert_eq!(crate::interp::translate_bytes_format("%d-%b"), "%d-%s");
+        assert_eq!(crate::interp::translate_bytes_format("%-5b"), "%-5s");
+        assert_eq!(
+            crate::interp::translate_bytes_format("100%% %b"),
+            "100%% %s"
+        );
+        assert_eq!(crate::interp::translate_bytes_format("%(k)b"), "%(k)s");
+        assert_eq!(
+            crate::interp::translate_bytes_format("%d items"),
+            "%d items"
+        );
+    }
+
+    #[test]
     fn functions_and_recursion() {
         let src = r#"
 def fact(n: int) -> int:
@@ -778,6 +814,94 @@ let m: object = {"a": 1}
 let d = reshape(m)
 if d["a"] != 1:
     raise ValueError("parametric cast wrong")
+print("ok")
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    #[test]
+    fn checked_cast_rejects_wrong_shape_in_vm() {
+        // The `as!` cast must run the same structural check the compile path
+        // does — a wrong-shaped value raises `TypeError` under `tyc run` too
+        // (previously the VM was an identity passthrough, silently letting a
+        // bad value through and diverging from `tyc build && python`). Each
+        // arm catches the expected `TypeError`; if a cast wrongly *passes*,
+        // the `else`-path `raise` makes the run non-zero.
+        let src = r#"
+def expect_reject(thunk_ok: bool) -> None:
+    if not thunk_ok:
+        raise ValueError("as! accepted a wrong-shaped value")
+
+# list is not a dict[str, int]
+let a: object = ["x", "y"]
+mut a_rejected: bool = False
+try:
+    let da: dict[str, int] = a as! dict[str, int]
+except TypeError:
+    a_rejected = True
+expect_reject(a_rejected)
+
+# str is not an int
+let b: object = "nope"
+mut b_rejected: bool = False
+try:
+    let nb: int = b as! int
+except TypeError:
+    b_rejected = True
+expect_reject(b_rejected)
+
+# dict with a str value is not dict[str, int]
+let c: object = {"k": "v"}
+mut c_rejected: bool = False
+try:
+    let dc: dict[str, int] = c as! dict[str, int]
+except TypeError:
+    c_rejected = True
+expect_reject(c_rejected)
+
+# valid casts still pass (int widens to float; None matches int | None)
+let f: float = 5 as! float
+if f != 5.0:
+    raise ValueError("int->float widening cast wrong")
+let n: object = None
+let opt: int | None = n as! int | None
+if opt is not None:
+    raise ValueError("None cast wrong")
+print("ok")
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    #[test]
+    fn numeric_keys_collapse_like_cpython() {
+        // CPython treats numerically-equal bool/int/float as one mapping/set
+        // key: `1 == 1.0 == True`, all hash-equal. The VM used to keep them
+        // distinct (silent data divergence). Regressions `raise` → non-zero run.
+        let src = r#"
+mut d: dict[object, str] = {}
+d[1] = "a"
+d[1.0] = "b"
+d[True] = "c"
+if len(d) != 1:
+    raise ValueError("int/float/bool keys should collapse to one")
+# first-inserted key identity is kept, value updated to last write
+if str(d) != "{1: 'c'}":
+    raise ValueError("expected {1: 'c'}, got " + str(d))
+
+if len({1, 1.0, True, 2}) != 2:
+    raise ValueError("set should collapse numeric duplicates")
+if 1 not in {1.0}:
+    raise ValueError("1 should be in {1.0}")
+if hash(1) != hash(1.0):
+    raise ValueError("hash(1) should equal hash(1.0)")
+# the cross-type frozenset case that the canonical ordering must handle
+if frozenset({1, 2.0}) != frozenset({1.0, 2}):
+    raise ValueError("mixed-type frozensets should compare equal")
+# non-integral floats stay distinct
+if len({1.5, 2.5, 1.5}) != 2:
+    raise ValueError("non-integral floats should not collapse")
+if 1.5 in {1}:
+    raise ValueError("1.5 should not be in {1}")
 print("ok")
 "#;
         assert_eq!(run_capturing(src).unwrap(), 0);

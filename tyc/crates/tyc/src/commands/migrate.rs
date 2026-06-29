@@ -509,7 +509,14 @@ fn move_methods_to_impl(source: &str) -> String {
             }
         }
         out.push('\n');
-        out.push_str(&format!("impl {class_name}:\n"));
+        // Carry the class's type parameters onto the `impl` block so a
+        // generic class migrates to `impl[T] Stack[T]:` (not `impl Stack:`,
+        // which leaves the methods' `T` references unresolved → tyc::unknown_name).
+        let type_params = class_header_type_params(&name_part[name_end..]);
+        match &type_params {
+            Some(tp) => out.push_str(&format!("impl{tp} {class_name}{tp}:\n")),
+            None => out.push_str(&format!("impl {class_name}:\n")),
+        }
         let mut methods_trimmed: Vec<&str> = methods.clone();
         while methods_trimmed.first().is_some_and(|l| l.trim().is_empty()) {
             methods_trimmed.remove(0);
@@ -896,6 +903,46 @@ fn is_typevar_declaration(line: &str) -> bool {
 ///
 /// Also handles the `class!` modifier so a hand-rolled `__init__` class
 /// keeps its raw-class status post-rewrite.
+/// Index of the `]` matching the `[` at `open` in `s` (byte indices, ASCII
+/// brackets). `None` if unbalanced.
+fn matching_close_bracket(s: &str, open: usize) -> Option<usize> {
+    let bytes = s.as_bytes();
+    debug_assert_eq!(bytes.get(open), Some(&b'['));
+    let mut depth = 0i32;
+    for (i, &b) in bytes.iter().enumerate().skip(open) {
+        match b {
+            b'[' => depth += 1,
+            b']' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Extract a class's type-parameter list (with brackets, e.g. `[T]` / `[T, U]`)
+/// from the text following the class name in its header — handling both the
+/// PEP 695 form (`class X[T, U]:` → `[T, U]`) and the legacy
+/// `class X(Generic[T, U]):` form. Returns `None` for a non-generic class.
+/// Used to propagate the params onto the generated `impl` block.
+fn class_header_type_params(after_name: &str) -> Option<String> {
+    let s = after_name.trim_start();
+    if s.starts_with('[') {
+        let end = matching_close_bracket(s, 0)?;
+        return Some(s[..=end].to_owned());
+    }
+    if let Some(gpos) = s.find("Generic[") {
+        let open = gpos + "Generic".len();
+        let end = matching_close_bracket(s, open)?;
+        return Some(s[open..=end].to_owned());
+    }
+    None
+}
+
 fn rewrite_generic_class_base(line: &str) -> Option<String> {
     let (keyword, rest_after_keyword) = if let Some(r) = line.strip_prefix("class!") {
         ("class!", r)
@@ -2358,6 +2405,68 @@ fn walk(dir: &std::path::Path, out: &mut Vec<PathBuf>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn generic_class_impl_carries_type_params() {
+        // `class X(Generic[T])` with a method migrates to `class X[T]:` plus
+        // `impl[T] X[T]:` — the `impl` must carry `[T]` or the methods' `T`
+        // references resolve to nothing (tyc::unknown_name).
+        let src = "\
+from typing import Generic, TypeVar
+T = TypeVar(\"T\")
+class Stack(Generic[T]):
+    items: list[T]
+    def pop(self) -> T:
+        return self.items.pop()
+";
+        let out = migrate_source(src);
+        assert!(
+            out.contains("impl[T] Stack[T]:"),
+            "impl must carry [T]:\n{out}"
+        );
+        assert!(
+            !out.contains("impl Stack:"),
+            "bare impl Stack: is the bug:\n{out}"
+        );
+    }
+
+    #[test]
+    fn non_generic_class_impl_has_no_type_params() {
+        let src = "\
+class Plain:
+    x: int
+    def get(self) -> int:
+        return self.x
+";
+        let out = migrate_source(src);
+        assert!(
+            out.contains("impl Plain:"),
+            "non-generic impl stays bare:\n{out}"
+        );
+        assert!(
+            !out.contains("impl["),
+            "no type params on a non-generic impl:\n{out}"
+        );
+    }
+
+    #[test]
+    fn multi_param_generic_class_impl_carries_all_params() {
+        let src = "\
+from typing import Generic, TypeVar
+K = TypeVar(\"K\")
+V = TypeVar(\"V\")
+class Pair(Generic[K, V]):
+    key: K
+    value: V
+    def swap(self) -> int:
+        return 0
+";
+        let out = migrate_source(src);
+        assert!(
+            out.contains("impl[K, V] Pair[K, V]:"),
+            "impl must carry [K, V]:\n{out}"
+        );
+    }
 
     #[test]
     fn never_prefixes_else_with_binding_keyword() {

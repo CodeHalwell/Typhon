@@ -416,10 +416,30 @@ pub fn evaluate_comptime_with_functions(
 
         match rhs {
             None => {
-                diags.push_error(TycError::comptime(
-                    binding.name.clone(),
-                    format!("comptime binding '{}' has no initialiser", binding.name),
-                ));
+                // Distinguish "no value at all" from "value present but the
+                // binding lacks the required type annotation" — the latter
+                // lowers to a plain `Assign` (not `AnnAssign`), so the RHS
+                // lookup above misses it and the old message ("no initialiser")
+                // was misleading. A `comptime let` requires an explicit
+                // annotation: `comptime let NAME: T = ...`.
+                let has_unannotated_value = body.iter().any(|stmt| {
+                    matches!(
+                        stmt,
+                        Stmt::Assign(a) if a.targets.iter().any(|t| {
+                            matches!(t, Expr::Name(n) if n.id.as_str() == binding.name)
+                        })
+                    )
+                });
+                let message = if has_unannotated_value {
+                    format!(
+                        "comptime binding '{}' needs an explicit type annotation \
+                         (write `comptime let {}: T = ...`)",
+                        binding.name, binding.name
+                    )
+                } else {
+                    format!("comptime binding '{}' has no initialiser", binding.name)
+                };
+                diags.push_error(TycError::comptime(binding.name.clone(), message));
             }
             Some(expr) => {
                 let mut ctx = EvalContext::new(&functions);
@@ -812,14 +832,6 @@ fn eval_cmpop(
     rhs: &ComptimeValue,
 ) -> Result<bool, String> {
     use ruff_python_ast::CmpOp::*;
-    // Promote int/float to a common float for ordering when types mix.
-    fn as_f64(v: &ComptimeValue) -> Option<f64> {
-        match v {
-            ComptimeValue::Int(n) => Some(*n as f64),
-            ComptimeValue::Float(f) => Some(*f),
-            _ => None,
-        }
-    }
     match (op, lhs, rhs) {
         (Eq, a, b) => Ok(values_equal(a, b)),
         (NotEq, a, b) => Ok(!values_equal(a, b)),
@@ -830,7 +842,20 @@ fn eval_cmpop(
             GtE => a >= b,
             _ => unreachable!(),
         }),
-        (Lt | LtE | Gt | GtE, a, b) => match (as_f64(a), as_f64(b)) {
+        // Two integers (incl. bool) compare exactly as i64 — no lossy f64
+        // round-trip (`9007199254740993 > 9007199254740992` is True, but
+        // both round to the same f64). Mixed int/float fall back to f64.
+        (Lt | LtE | Gt | GtE, a, b) if cmp_num_int(a).is_some() && cmp_num_int(b).is_some() => {
+            let (x, y) = (cmp_num_int(a).unwrap(), cmp_num_int(b).unwrap());
+            Ok(match op {
+                Lt => x < y,
+                LtE => x <= y,
+                Gt => x > y,
+                GtE => x >= y,
+                _ => unreachable!(),
+            })
+        }
+        (Lt | LtE | Gt | GtE, a, b) => match (cmp_num_f64(a), cmp_num_f64(b)) {
             (Some(x), Some(y)) => Ok(match op {
                 Lt => x < y,
                 LtE => x <= y,
@@ -909,16 +934,37 @@ fn comptime_value_kind(v: &ComptimeValue) -> &'static str {
     }
 }
 
+/// Numeric view of a value treating `bool` as `0`/`1` — Python's `bool` is a
+/// subclass of `int`, so `True == 1` / `True < 2` must hold at comptime.
+fn cmp_num_int(v: &ComptimeValue) -> Option<i64> {
+    match v {
+        ComptimeValue::Int(n) => Some(*n),
+        ComptimeValue::Bool(b) => Some(*b as i64),
+        _ => None,
+    }
+}
+fn cmp_num_f64(v: &ComptimeValue) -> Option<f64> {
+    match v {
+        ComptimeValue::Int(n) => Some(*n as f64),
+        ComptimeValue::Float(f) => Some(*f),
+        ComptimeValue::Bool(b) => Some(*b as i64 as f64),
+        _ => None,
+    }
+}
+
 fn values_equal(a: &ComptimeValue, b: &ComptimeValue) -> bool {
     match (a, b) {
-        (ComptimeValue::Int(x), ComptimeValue::Int(y)) => x == y,
-        (ComptimeValue::Float(x), ComptimeValue::Float(y)) => x == y,
-        (ComptimeValue::Int(x), ComptimeValue::Float(y)) => (*x as f64) == *y,
-        (ComptimeValue::Float(x), ComptimeValue::Int(y)) => *x == (*y as f64),
         (ComptimeValue::Str(x), ComptimeValue::Str(y)) => x == y,
-        (ComptimeValue::Bool(x), ComptimeValue::Bool(y)) => x == y,
         (ComptimeValue::Type(x), ComptimeValue::Type(y)) => x == y,
-        _ => false,
+        // Numeric (int/float/bool) equality. `bool` folds into `int`
+        // (`True == 1`); two integers compare exactly (no lossy f64 round-trip).
+        _ => match (cmp_num_int(a), cmp_num_int(b)) {
+            (Some(x), Some(y)) => x == y,
+            _ => match (cmp_num_f64(a), cmp_num_f64(b)) {
+                (Some(x), Some(y)) => x == y,
+                _ => false,
+            },
+        },
     }
 }
 
@@ -1024,18 +1070,24 @@ fn eval_call(call: &ExprCall, ctx: &mut EvalContext<'_>) -> Result<ComptimeValue
             Ok(ComptimeValue::Str(match v {
                 ComptimeValue::Str(s) => s,
                 ComptimeValue::Int(n) => n.to_string(),
-                ComptimeValue::Float(f) => f.to_string(),
+                // Python-faithful float string: `str(2.0)` → `"2.0"` (the bare
+                // `f.to_string()` dropped the trailing `.0`, inlining a wrong
+                // constant). An integer-valued float gets `.0`; everything else
+                // its shortest round-trip form.
+                ComptimeValue::Float(f) => {
+                    if f.is_finite() && f.fract() == 0.0 {
+                        format!("{f:.1}")
+                    } else {
+                        format!("{f}")
+                    }
+                }
                 ComptimeValue::Bool(b) => if b { "True" } else { "False" }.into(),
                 ComptimeValue::Type(t) => t,
                 // Reject `str(container)` at comptime: matching Python's
-                // `str(["a"])` -> `"['a']"` (single-quoted nested
-                // strings) would require a separate Python-flavoured
-                // repr serialiser. `to_python_literal` always emits
-                // double-quoted strings, which is valid Python source
-                // but differs from Python's runtime `str()` output by
-                // one character per nested string. Better to reject
-                // than silently produce a value that contradicts what
-                // the same expression would compute at runtime.
+                // `str(["a"])` -> `"['a']"` (single-quoted nested strings) would
+                // require a separate Python-flavoured repr serialiser, and the
+                // double-quoted literal form would differ from the runtime
+                // result by one character per nested string.
                 ComptimeValue::List(_)
                 | ComptimeValue::Tuple(_)
                 | ComptimeValue::Dict(_) => {
@@ -1447,6 +1499,19 @@ fn comptime_as_f64(v: &ComptimeValue) -> f64 {
     }
 }
 
+/// Message for a comptime integer overflow. Comptime arithmetic is evaluated
+/// in 64-bit (unlike Typhon's arbitrary-precision runtime `int`), so a value
+/// that exceeds `i64` can't be a build-time constant. The hint points at the
+/// runtime alternative so the limitation is actionable rather than mysterious.
+#[allow(non_snake_case)]
+fn COMPTIME_INT_OVERFLOW(op: &str) -> String {
+    format!(
+        "integer overflow in comptime {op} — comptime arithmetic is 64-bit, \
+         so a value this large can't be a build-time constant; compute it at \
+         runtime instead (a normal `let` / `lazy let`, not `comptime let`)"
+    )
+}
+
 fn eval_binop(
     op: ruff_python_ast::Operator,
     lhs: ComptimeValue,
@@ -1458,7 +1523,7 @@ fn eval_binop(
         (Add, ComptimeValue::Int(a), ComptimeValue::Int(b)) => a
             .checked_add(*b)
             .map(ComptimeValue::Int)
-            .ok_or_else(|| "integer overflow in comptime addition".to_string()),
+            .ok_or_else(|| COMPTIME_INT_OVERFLOW("addition")),
         (Add, ComptimeValue::Float(a), ComptimeValue::Float(b)) => Ok(ComptimeValue::Float(a + b)),
         (Add, ComptimeValue::Int(a), ComptimeValue::Float(b)) => {
             Ok(ComptimeValue::Float(*a as f64 + b))
@@ -1473,7 +1538,7 @@ fn eval_binop(
         (Sub, ComptimeValue::Int(a), ComptimeValue::Int(b)) => a
             .checked_sub(*b)
             .map(ComptimeValue::Int)
-            .ok_or_else(|| "integer overflow in comptime subtraction".to_string()),
+            .ok_or_else(|| COMPTIME_INT_OVERFLOW("subtraction")),
         (Sub, ComptimeValue::Float(a), ComptimeValue::Float(b)) => Ok(ComptimeValue::Float(a - b)),
         (Sub, ComptimeValue::Int(a), ComptimeValue::Float(b)) => {
             Ok(ComptimeValue::Float(*a as f64 - b))
@@ -1485,7 +1550,7 @@ fn eval_binop(
         (Mult, ComptimeValue::Int(a), ComptimeValue::Int(b)) => a
             .checked_mul(*b)
             .map(ComptimeValue::Int)
-            .ok_or_else(|| "integer overflow in comptime multiplication".to_string()),
+            .ok_or_else(|| COMPTIME_INT_OVERFLOW("multiplication")),
         (Mult, ComptimeValue::Float(a), ComptimeValue::Float(b)) => Ok(ComptimeValue::Float(a * b)),
         (Mult, ComptimeValue::Int(a), ComptimeValue::Float(b)) => {
             Ok(ComptimeValue::Float(*a as f64 * b))
@@ -1590,7 +1655,7 @@ fn eval_binop(
                     .map_err(|_| "exponent too large in comptime power".to_string())?;
                 a.checked_pow(exp)
                     .map(ComptimeValue::Int)
-                    .ok_or_else(|| "integer overflow in comptime power".to_string())
+                    .ok_or_else(|| COMPTIME_INT_OVERFLOW("power"))
             }
         }
         (Pow, _, _)
@@ -2565,6 +2630,29 @@ comptime let P: tuple[int, int] = pair(1, 2)
     }
 
     #[test]
+    fn comptime_numeric_constants_match_cpython() {
+        // str(float) keeps the `.0`; bool folds into int for == and ordering;
+        // two large ints compare exactly (no lossy f64 round-trip).
+        let cases = [
+            ("comptime let X: str = str(2.0)\n", "X", "\"2.0\""),
+            ("comptime let X: str = str(2.5)\n", "X", "\"2.5\""),
+            ("comptime let X: bool = True == 1\n", "X", "True"),
+            ("comptime let X: bool = True < 2\n", "X", "True"),
+            ("comptime let X: bool = 0 == False\n", "X", "True"),
+        ];
+        for (src, name, expected) in cases {
+            let (vals, diags) = eval(src);
+            assert!(
+                !diags.has_errors(),
+                "{src} should fold cleanly: {:?}",
+                diags.errors()
+            );
+            let got = vals.get(name).expect("binding folded").to_python_literal();
+            assert_eq!(got, expected, "for `{src}`");
+        }
+    }
+
+    #[test]
     fn comptime_str_on_container_is_rejected() {
         // Python's `str(["a"])` -> `"['a']"` (single-quoted nested
         // string) doesn't match our double-quoted `to_python_literal`,
@@ -3377,7 +3465,9 @@ fn is_secret_name(name: &str) -> bool {
     // Recognised secret words. Longest-first matters because of
     // `API_KEY` overlapping `KEY` — both fire, but the help text
     // remains the same so the order is purely defensive.
-    const WORDS: &[&str] = &["API_KEY", "PASSWORD", "TOKEN", "SECRET", "PWD", "KEY", "APIKEY"];
+    const WORDS: &[&str] = &[
+        "API_KEY", "PASSWORD", "TOKEN", "SECRET", "PWD", "KEY", "APIKEY",
+    ];
     let upper = name.to_ascii_uppercase();
     for word in WORDS {
         let mut start_idx = 0;

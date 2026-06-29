@@ -422,7 +422,7 @@ class Rectangle: width: float; height: float
 class Triangle:  base: float;  height: float
 ```
 
-The cheat-sheet form `sealed union Shape: Circle(radius: float); Square(side: float)` is also accepted. Variants can be parametric (`type EventEnvelope[T] = RecordEnv[T] | WatermarkEnv | BarrierEnv` — some refer to `T`, others don't). For nullary variants, write `class Nil frozen: pass` and match with `case Nil():` (two empty parens, not `case Nil(_):`).
+(There is **no `sealed union NAME:` keyword block form** — a sealed union is written as a `type` alias over separately-declared variant classes, as above. Earlier docs/cheatsheets showed a `sealed union Shape:` block; that does **not** parse and has been corrected.) Variants can be parametric (`type EventEnvelope[T] = RecordEnv[T] | WatermarkEnv | BarrierEnv` — some refer to `T`, others don't). For nullary variants, write `class Nil frozen: pass` and match with `case Nil():` (two empty parens, not `case Nil(_):`).
 
 The match is statically verified exhaustive. Add `Square` to the alias → every match becomes `tyc::non_exhaustive_match` until handled. Cross-module variant flow works (v0.6.0) — variant `A(...)` flows into an `Event`-typed slot in a consumer module even when the alias is declared in another package.
 
@@ -516,7 +516,7 @@ let uid  = row[0] as! int
 - The checker types the whole expression as `TYPE`, so the boundary value (which may be `Any`) flows in freely — no `unsafe:` region, no `unsafe_value_leak` footgun. It rides the same machinery as `type[T]` generic inference, not a bespoke special case.
 - It lowers (in `tyc-syntax`) to `__typhon_checked_cast__(EXPR, TYPE)`, resolved via an injected `from typhon_runtime.cast import checked_cast as __typhon_checked_cast__`. At runtime `checked_cast` verifies the value's shape against `TYPE` **recursively** (scalars, `list[X]` / `set[X]` / `frozenset[X]`, `dict[K, V]`, fixed- and variadic-`tuple[...]`, unions / `Optional`) and raises `TypeError` on a mismatch. So unlike a static-only re-assertion (which trusts the boundary blindly) or TypeScript's unchecked `as`, an `as!` can only let through values it can't *prove* wrong. `Any` / `object` targets and shapes it can't model fall back to acceptance.
 - `int → float` (and `bool → int`) widening is honoured, so a JSON int cast `as! float` does not spuriously fail.
-- The in-process VM treats `as!` as an identity passthrough (the authoritative structural check runs on the `tyc build && python` path); `tyc fmt` preserves the surface syntax.
+- The in-process VM runs the **same recursive structural check** as the compiled path: it interprets the `as!` type descriptor and raises `TypeError` on a wrong-shaped value under `tyc run` too, so the cast is a faithful drop-in (a wrong cast no longer slips through the VM). `tyc fmt` preserves the surface syntax. (Only the rare *indirect* reference to `checked_cast` — passed as a value rather than called directly with two args — degrades to identity, since the type descriptor isn't available as an AST there.)
 
 **Scope (v0.15.0):** the lowering is **structural** (a fixpoint rewrite with bracket-, string-, and comment-awareness), so `as!` composes wherever an expression can appear — value positions (`=` / `op=` / `return` / `yield` / bare expression), **nested inside call arguments** (`foo(row[0] as! int, y)`), inside comprehensions / collection literals (`[x as! int for x in xs]`), **statement conditions** (`if raw as! bool:`, `while …`, `assert …`), and across a **value expression that spans multiple physical lines** (the left operand may run over several lines as long as it stays bracket-balanced). A quote inside a `#` comment no longer derails the scanner (v0.15.2). The left operand is the whole current syntactic slot — back to the enclosing bracket, a `,` / `;` / `:` separator, an assignment / augmented / walrus `=`, a `return` / `yield` keyword, or the line start (so `a + b as! int` casts `a + b`); the right operand is parsed as a type expression (dotted name, optional `[...]` subscript, `|`-union), so trailing code after the type (`x as! int + 1`, the `for` of a comprehension) stays outside the cast. An `as!` whose right side isn't a type expression is left for the parser to reject cleanly. (Earlier releases restricted `as!` to a single physical line in value position only.) Prefer `model X:` for a boundary you validate repeatedly, a `.dty` stub for a long-lived dependency, and `as!` for an ad-hoc one-off shape assertion.
 
@@ -1223,7 +1223,7 @@ target = "3.13"                  # **required: 3.13+ only**. Valid: "3.13" / "3.
 free-threaded = false            # requires 3.13t/3.14t; off by default
 
 [emit]
-class-default = "dataclass"      # or "pydantic". Unknown values → tyc::invalid_config_value
+class-default = "dataclass"      # only "dataclass" today; project-wide "pydantic" is rejected (use `model` per class). Unknown values → tyc::invalid_config_value
 format = true                    # post-process through ruff format
 model-extra = "forbid"           # "forbid" | "allow" | "ignore"
 skip-decoration-bases = []       # extra base-class names suppressing the auto @dataclass decoration. Matched by last segment.
