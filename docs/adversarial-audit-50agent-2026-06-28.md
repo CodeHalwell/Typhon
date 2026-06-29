@@ -229,7 +229,7 @@ Status legend: ✅ fixed · ⏳ pending · 🔁 dup of an already-fixed item.
 - **Root cause:** tyc-types: the type of `try_result(thunk, on_err)` does not infer its E from the second argument's (on_err) return type; the subsequent `?` therefore propagates an E (here `str`) that is never checked against the enclosing function's declared error type (NetErr). Same family as the map_err hole — the error type produced by a fallible-mapping combinator is not back-checked at the `?` site. Since `r
 
 ### [41] (soundness / s_except) `raise <non-exception>` (plain int, or instance of a non-BaseException class) type-checks clean but is a guaranteed runtime TypeError
-- **Status:** ⏳ pending
+- **Status:** ✅ fixed — raise non-exception diagnostic (branch claude/typhon-adversarial-review-31ep54)
 - **Root cause:** tyc-types / tyc-analyse: the `raise EXPR` statement does not verify that EXPR's type is a subtype of BaseException. Any expression (int literal, or an instance of an ordinary `class`/dataclass that does not inherit Exception) is accepted. CPython enforces `exceptions must derive from BaseException` at runtime, so this is a checkable static error the compiler is missing. The class-shape information
 
 ### [42] (soundness / s_operators) int ** int with a negative exponent is typed `int` but yields `float` at runtime (unsound; crashing emit)

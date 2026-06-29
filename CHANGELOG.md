@@ -8,6 +8,24 @@ canonical phase-by-phase status lives in `docs/roadmap.md`.
 
 ### Fixed
 
+- **`raise <non-exception>` is rejected at check time** (new
+  `tyc::raise_non_exception`). `raise 42` and `raise Problem(...)` (a plain
+  dataclass) type-checked clean and then crashed with CPython's
+  `TypeError: exceptions must derive from BaseException`. The check is
+  conservative — only literals and locally-defined classes with a fully-known
+  non-exception ancestry fire; builtin/imported/venv-introspected exceptions
+  (e.g. `fastapi.HTTPException`) and `Exception` subclasses stay permissive.
+- **Parameter default values are type-checked against their annotation.**
+  `def f(n: int = None)` / `= "z"` crashed at runtime; now rejected, while
+  `int? = None`, `int | None = None`, and `float = 0` stay valid.
+- **`ClassVar` fields are excluded from the constructor signature.** Passing
+  one as a kwarg (`Config(DEFAULT_PORT=…)`) crashed at runtime; it's now
+  rejected, and the field stays accessible as a class attribute.
+- **Over-deep relative imports are flagged correctly** (off-by-one fix): a
+  depth-0 `from .x` and a depth-2 `from ...x` reach above the package root and
+  crash the emitted Python; both are now caught while in-bounds `from .sibling`
+  still passes.
+
 - **`bytes %`-formatting (PEP 461) is accepted and runs.** `b"%d items" % 5`
   and `b"%d-%s" % (5, b"x")` were rejected at check time as
   `operator_type_mismatch`; the `%` carve-out now covers `bytes` (result
