@@ -8,6 +8,49 @@ canonical phase-by-phase status lives in `docs/roadmap.md`.
 
 ### Fixed
 
+- **`bytes %`-formatting (PEP 461) is accepted and runs.** `b"%d items" % 5`
+  and `b"%d-%s" % (5, b"x")` were rejected at check time as
+  `operator_type_mismatch`; the `%` carve-out now covers `bytes` (result
+  `bytes`) like `str`, and the VM implements `bytes.__mod__` so `tyc run`,
+  compiled CPython, and reference CPython all agree.
+- **`isinstance()` now narrows an attribute target.** `if isinstance(b.v, int):
+  return b.v` was wrongly rejected — only bare names narrowed. Attribute paths
+  now narrow through the same machinery as `is None`, which already resets on
+  reassignment.
+- **Exhaustive `match` with an or-pattern over a literal union / bool no longer
+  fires a spurious `missing_return`.** `case "red" | "green":` /
+  `case True | False:` are recognised as covering their alternatives.
+- **Bare `Final` / `ClassVar` annotations (PEP 591) infer their type from the
+  value** instead of failing with `type_mismatch`.
+- **`frozen` / non-`frozen` dataclass inheritance is rejected at check time**
+  (new `tyc::frozen_inheritance_conflict`). The combination type-checked clean
+  but the emitted module crashed on import with CPython's `TypeError: cannot
+  inherit frozen dataclass from a non-frozen one` (both directions). Only
+  in-module dataclass bases are compared, so external/non-dataclass bases are
+  unaffected.
+- **Module-level `lazy let` of a primitive is transparent under all
+  operators.** The emitted `_LazyValue` proxy only forwarded attribute access,
+  so `VALUE + 1`, `VALUE > 10`, `range(VALUE)`, `NAME + " world"` crashed the
+  compiled program (while the VM ran). The proxy now forwards arithmetic,
+  reflected, comparison, bitwise, unary, conversion, index and membership
+  dunders; laziness is preserved.
+- **`await` inside a `gather:` binding (and `go await …`) no longer emits
+  crashing CPython.** `a = await fa()` lowered to `create_task(await fa())`,
+  raising `TypeError: a coroutine was expected`; the redundant leading `await`
+  is now stripped before wrapping.
+- **`class!` subclass of an in-module field-bearing base constructs
+  correctly.** Its synthesised `__init__` accepted only its own fields and
+  opened with a no-arg `super().__init__()` that hit the base's field-requiring
+  constructor and raised `TypeError`; the constructor now accepts and assigns
+  the inherited fields directly.
+- **Emitted `.pyi` stubs keep the `@dataclass` decorator** so consumers'
+  type-checkers synthesise `__init__` and accept correct keyword construction
+  (previously stripped, which made every stubbed dataclass reject
+  `Cls(field=…)`).
+- **`typhon.toml` rejects unknown keys and invalid `[checker] external`.** A
+  typo'd section/key (`[pyhton]`, `taget`) silently reverted to defaults (e.g.
+  a default-3.13 build); config structs now `deny_unknown_fields`, and
+  `[checker] external` is validated against `none`/`ty`.
 - **`tyc` no longer aborts (SIGABRT) on deeply-nested or very long
   expressions.** A long flat `a + b + c + …` chain (plausible generated code)
   or deeply nested brackets built a deep AST that overflowed the default

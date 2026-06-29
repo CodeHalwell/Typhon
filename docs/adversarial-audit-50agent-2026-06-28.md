@@ -18,19 +18,19 @@ Status legend: ✅ fixed · ⏳ pending · 🔁 dup of an already-fixed item.
 - **Root cause:** Two-part: (1) tyc-resolve/tyc-types treats `shout` in `from strext import shout` as an ordinary imported value (it even flags it `unused_import`, proving the checker never connects it to the `title.shout(...)` call) and never validates that `strext` actually exports a value `shout` — it does not, because `extend str: def shout` lowers to a free function `__typhon_ext_str__shout`. (2) tyc-desugar/t
 
 ### [19] (emit / fp_class) Mixed frozen/non-frozen dataclass inheritance type-checks clean but emits import-crashing Python (and the VM silently runs it — parity divergence)
-- **Status:** ⏳ pending
+- **Status:** ✅ fixed — frozen_inheritance_conflict diagnostic (branch claude/typhon-adversarial-review-31ep54)
 - **Root cause:** tyc-types class checking has no rule requiring a `frozen` class's bases to all be frozen (and a non-frozen class's bases to all be non-frozen); the only frozen diagnostic is `tyc::frozen_assign`. tyc-desugar/tyc-emit then stamps `@dataclass(slots=True, frozen=True)` onto a class whose base lacks `frozen`, producing the dataclasses TypeError at import. The tyc-vm class path ignores the frozen modif
 
 ### [21] (emit / e_async) `await` inside a `gather:` binding emits `create_task(await f())`, type-checks clean, crashes compiled CPython AND silently diverges from the VM
-- **Status:** ⏳ pending
+- **Status:** ✅ fixed — gather/go await stripping (branch claude/typhon-adversarial-review-31ep54)
 - **Root cause:** The gather lowering in tyc-desugar/tyc-emit textually wraps each binding's RHS in `_tg.create_task(<rhs>)` without (a) the type checker (tyc-types) verifying the RHS is a coroutine-returning call, or (b) the desugarer stripping/rejecting an `await` already present on the RHS. A `gather:` binding RHS is awaited by the TaskGroup itself, so an explicit `await` (a plausible author mistake) double-eval
 
 ### [22] (emit / e_class) class! with an arg-taking base: checker accepts inherited fields as constructor kwargs, but synthesized __init__ drops them and calls super().__init__() with no args → TypeError at runtime
-- **Status:** ⏳ pending
+- **Status:** ✅ fixed — class! inherited-field __init__ (branch claude/typhon-adversarial-review-31ep54)
 - **Root cause:** tyc-desugar/src/lib.rs synthesise_raw_class_init (called near line 2195): the synthesized class! __init__ always emits `super().__init__()` with no arguments and assigns only the class's OWN annotated fields, ignoring the base class's required constructor parameters. Meanwhile tyc-types computes the constructor signature including inherited base fields, so `tyc check` accepts inherited kwargs the 
 
 ### [23] (emit / e_freeze) Module-level `lazy let` of a primitive type emits a `_LazyValue` proxy that crashes on every operator/index/arithmetic use (clean check, VM/CPython divergence)
-- **Status:** ⏳ pending
+- **Status:** ✅ fixed — _LazyValue operator forwarding (branch claude/typhon-adversarial-review-31ep54)
 - **Root cause:** typhon_runtime/lazy.py `_LazyValue` (emitted by tyc-emit / tyc-desugar for module-level `lazy let`). The proxy only forwards a small set of dunders (__getattr__, __call__, __getitem__, __iter__, __bool__, __eq__, __hash__, __len__, __str__, __repr__). It is missing every numeric dunder (__add__/__radd__/__sub__/__mul__/__truediv__/__floordiv__/__mod__/__pow__ ...), all rich-comparison dunders (__l
 
 ### [0] (soundness / s_dunder) Calling an instance with a user-defined __call__ is typed as the class, not __call__'s return type (soundness hole + false positive)
@@ -165,7 +165,7 @@ Status legend: ✅ fixed · ⏳ pending · 🔁 dup of an already-fixed item.
 - **Root cause:** tyc-types attribute resolution on a `str` receiver does not consult the project-wide cross-module `extend BUILTIN:` registry when the declaring module is brought in via `import mod` (only the desugar/VM paths do). The consumer's checker has no entry for `str.shout`, so it emits attribute_not_found. Same underlying gap as the CRITICAL finding: the extension registry is wired into desugar/codegen/VM
 
 ### [50] (false_positive / fp_narrow) isinstance(x.attr, T) does not narrow the attribute, rejecting valid code (only Name targets narrow; Attribute targets ignored)
-- **Status:** ⏳ pending
+- **Status:** ✅ fixed — isinstance attribute narrowing (branch claude/typhon-adversarial-review-31ep54)
 - **Root cause:** tyc-types/src/lib.rs, narrowing collector ~line 12672: the `isinstance(x, T)` branch matches only `if let Expr::Name(target) = &pos_args[0]` and emits a name-keyed Narrowing. It never handles `Expr::Attribute`, unlike the adjacent `is None` comparison branch (~line 12640) which calls `attr_path_of(cmp.left)` and emits an `attr_path` Narrowing. So `isinstance(b.v, T)` (Attribute first arg) yields n
 
 ### [51] (false_positive / fp_generic) Read-only ABC subtyping lattice missing: Sequence/Collection/Iterator/genexpr not assignable to Iterable[T] (and the broader abc hierarchy)
@@ -173,15 +173,15 @@ Status legend: ✅ fixed · ⏳ pending · 🔁 dup of an already-fixed item.
 - **Root cause:** tyc-types `assignable()` in /home/user/Typhon/tyc/crates/tyc-types/src/lib.rs (~lines 320-366). The `READ_VIEW_HEADS` covariance rule (Sequence/Iterable/Iterator/Collection/Container/Reversible) only fires when the ACTUAL type is a concrete builtin container head (`list`|`tuple`|`set`|`frozenset`, line ~338). There is no rule encoding the abc subtyping lattice itself — Iterator<:Iterable, Sequence
 
 ### [52] (false_positive / fp_match) Exhaustive match with an or-pattern over a string-literal (or bool) union falsely fires tyc::missing_return — or-pattern arms aren't recognized as covering LitStr/bool inhabitants
-- **Status:** ⏳ pending
+- **Status:** ✅ fixed — or-pattern exhaustiveness (branch claude/typhon-adversarial-review-31ep54)
 - **Root cause:** tyc-types/src/lib.rs `cases_cover_type`. The LitStr coverage loop (lines 12000-12012) calls `pattern_str_value(&case.pattern)` to learn which literal an arm covers, but `pattern_str_value` (fn at line 12465) only handles `Pattern::MatchValue` and `Pattern::MatchAs` — it returns None for `Pattern::MatchOr`. So `case "red" | "green":` marks neither variant covered, and the union-recursion at line 11
 
 ### [53] (false_positive / fp_stdlib) Bare `Final` / `ClassVar` annotation (type inferred from value, PEP 591) spuriously rejected with tyc::type_mismatch
-- **Status:** ⏳ pending
+- **Status:** ✅ fixed — bare Final/ClassVar inference (branch claude/typhon-adversarial-review-31ep54)
 - **Root cause:** tyc-types/src/lib.rs, `type_from_annotation_with_params`. The bare-Name arm (around lines 1468-1498) has NO case for `Final`/`ClassVar`, so a bare imported `Final`/`ClassVar` falls through to the catch-all `other => Type::Class(other.to_owned())` (line ~1497) and becomes `Type::Class("Final")` / `Type::Class("ClassVar")`. The annotated-assign assignability check then compares the value type (e.g. 
 
 ### [58] (false_positive / e_strings) bytes %-formatting (PEP 461) rejected as operator_type_mismatch; valid Python blocked at check time (and unsupported in VM)
-- **Status:** ⏳ pending
+- **Status:** ✅ fixed — bytes %-format (checker + VM) (branch claude/typhon-adversarial-review-31ep54)
 - **Root cause:** tyc-types/src/lib.rs line 13848: the early-return that makes `%` yield a string is gated on `matches!(l_stripped, Type::Str | Type::LitStr(_))` and omits `Type::Bytes`. As a result a `bytes` LHS falls through to operator_operands_compatible / the numeric `%` compatibility check (line 13851-13856) and is flagged. Fix: add `Type::Bytes` to that match arm, returning `Type::Bytes` for bytes %-formatti
 
 ### [61] (false_positive / r_crash) Bare enum member with a non-ASCII identifier (accented Latin, Cyrillic, Greek, CJK) is silently dropped — `enum.auto()` lowering is gated on `is_ascii_*`, so the member never exists; `tyc check` rejects valid code with a misleading `unknown_name`
@@ -265,15 +265,15 @@ Status legend: ✅ fixed · ⏳ pending · 🔁 dup of an already-fixed item.
 - **Root cause:** tyc-analyse/src/lib.rs, values_equal (~line 932): there is no (Bool, Int)/(Int, Bool) arm, so any Bool-vs-Int (or Bool-vs-Float) equality falls through to the `_ => false` catch-all. CPython treats True as 1 and False as 0 for ==. Add Bool<->Int and Bool<->Float equality arms coercing bool to its integer value.
 
 ### [64] (tooling / t_dty) Emitted .pyi strips @dataclass, so consumers cannot construct any stubbed class — every .dty class produces an unfaithful stub that type-checkers reject for correct keyword construction
-- **Status:** ⏳ pending
+- **Status:** ✅ fixed — .pyi keeps @dataclass (branch claude/typhon-adversarial-review-31ep54)
 - **Root cause:** tyc-emit/src/stub.rs:72 — `new_c.decorator_list.retain(|d| !is_dataclass_decorator(d));` deliberately strips `@dataclasses.dataclass(...)` from the emitted .pyi (comment: "an implementation choice that doesn't belong on the stub surface"). For a dataclass the decorator IS the surface: it synthesises __init__/__eq__/__match_args__. Stripping it makes the .pyi advertise a no-arg constructor, so ever
 
 ### [65] (tooling / t_config) typhon.toml accepts unknown/typo'd keys silently (no deny_unknown_fields) — a mistyped strictness key downgrades a CI gate and exits 0
-- **Status:** ⏳ pending
+- **Status:** ✅ fixed — typhon.toml deny_unknown_fields (branch claude/typhon-adversarial-review-31ep54)
 - **Root cause:** tyc/crates/tyc/src/config.rs: TyphonConfig and every nested config struct lack `#[serde(deny_unknown_fields)]`. serde's default behaviour is to ignore unknown fields. Fix: add deny_unknown_fields to each #[serde(default, rename_all="kebab-case")] struct (compatible with serde default) and/or post-parse known-key validation.
 
 ### [66] (tooling / t_config) Typo'd [python] target key silently produces a 3.13 build instead of the documented hard rejection — same unknown-key root cause, defeats the runtime-version floor
-- **Status:** ⏳ pending
+- **Status:** ✅ fixed — typhon.toml deny_unknown_fields (branch claude/typhon-adversarial-review-31ep54)
 - **Root cause:** tyc/crates/tyc/src/config.rs PythonConfig (#[serde(default, rename_all="kebab-case")], no deny_unknown_fields). Unknown key `targett` dropped; `target` keeps default "3.13"; TyphonConfig::validate() never sees the user's intended 3.10.
 
 ### [67] (tooling / t_cli) tyc check diagnostics are mislocated (wrong line numbers + blank/desugared source snippet) for any file using the `?` propagation or `as!` cast operators
@@ -351,5 +351,5 @@ Status legend: ✅ fixed · ⏳ pending · 🔁 dup of an already-fixed item.
 - **Root cause:** REFERENCE.md §5.4 states postfix `rescue` 'works after `return`/`if`/`while`/`assert`'. Only `return`/`let`-RHS tail positions are actually implemented in the preprocessor/parser (tyc-syntax rescue lowering). The `if`/`while`/`assert` cases are not handled — the rescue `:` collides with the statement's own `:`. The feature is tagged '(Unreleased)' in the docs, so the parse rejection is arguably ex
 
 ### [83] (tooling / t_config) [checker] external accepts arbitrary unknown values (e.g. "mypy") and silently no-ops instead of validating against the {none, ty} allow-list
-- **Status:** ⏳ pending
+- **Status:** ✅ fixed — [checker] external allow-list (branch claude/typhon-adversarial-review-31ep54)
 - **Root cause:** tyc/crates/tyc/src/config.rs TyphonConfig::validate() validates class-default, model-extra and strictness severities but has no allow-list check for self.checker.external. Add an ALLOWED_EXTERNAL_CHECKERS = ["none","ty"] check mirroring the existing InvalidSeverity pattern.
