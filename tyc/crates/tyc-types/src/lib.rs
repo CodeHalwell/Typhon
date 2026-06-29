@@ -9889,11 +9889,17 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                         }
                     }
                 } else if matches!(target, Expr::Tuple(_) | Expr::List(_)) {
-                    // Tuple/list unpack (`let a, b = pair`): destructure the
-                    // RHS `tuple[...]` per slot so each name gets its real type
-                    // instead of falling to `Unknown`. Shares the comprehension
-                    // / for-loop binder.
-                    bind_unpacking_target(c, target, &value_type);
+                    // Tuple/list unpack. A `let`/`mut` form introduces fresh
+                    // bindings (declare each slot's real type, sharing the
+                    // comprehension/for-loop binder). A bare reassignment
+                    // (`a, b = pair()`) targets already-declared names, so each
+                    // slot is type-checked against the existing declared type
+                    // instead of silently re-declaring.
+                    if a.mutability.is_some() {
+                        bind_unpacking_target(c, target, &value_type);
+                    } else {
+                        assign_unpacking_target(c, target, &value_type);
+                    }
                 } else if let Expr::Subscript(sub) = target {
                     // Indexed / slice assignment into a typed container must
                     // respect the element type, else it silently corrupts the
@@ -16314,6 +16320,45 @@ fn bind_unpacking_target(c: &mut Checker, target: &Expr, elem_ty: &Type) {
     }
 }
 
+/// Like [`bind_unpacking_target`], but for a tuple/list unpack that
+/// REASSIGNS already-declared targets (`a, b = pair()` with no `let`/`mut`).
+/// Each leaf name that already has a binding is type-checked: the slot type
+/// must be assignable to the target's declared type — previously a tuple
+/// reassignment skipped this, so `mut a: str = ""; a, b = (1, 2)` silently
+/// stored an int in `a`. Names not yet bound fall back to a fresh declaration.
+fn assign_unpacking_target(c: &mut Checker, target: &Expr, elem_ty: &Type) {
+    match target {
+        Expr::Name(n) => {
+            let name = n.id.as_str();
+            if let Some(existing) = c.env.lookup(name) {
+                let declared = existing.declared.clone();
+                if !c.is_assignable(&declared, elem_ty) {
+                    let span = (n.range.start().to_usize(), n.range.end().to_usize());
+                    c.mismatch(&declared, elem_ty, span);
+                }
+            } else {
+                bind_unpacking_target(c, target, elem_ty);
+            }
+        }
+        Expr::Tuple(t) => {
+            let slots: Option<&Vec<Type>> = match elem_ty {
+                Type::Generic(h, a) if h == "tuple" && a.len() == t.elts.len() => Some(a),
+                _ => None,
+            };
+            for (i, sub) in t.elts.iter().enumerate() {
+                let sub_ty = slots.map(|a| a[i].clone()).unwrap_or(Type::Unknown);
+                assign_unpacking_target(c, sub, &sub_ty);
+            }
+        }
+        Expr::List(l) => {
+            for sub in &l.elts {
+                assign_unpacking_target(c, sub, &Type::Unknown);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Operators whose operand-type compatibility is checked by
 /// `operator_operands_compatible`. Returns the operator's Python source
 /// form for diagnostic text, or `None` for ops we don't yet check
@@ -17797,6 +17842,32 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e, TycError::TypeMismatch { .. })),
             "correct k:str / v:int unpack must pass: {:?}",
+            ok.errors()
+        );
+    }
+
+    #[test]
+    fn tuple_reassignment_checks_existing_target_types() {
+        // `a, b = pair()` reassigning already-declared targets must check each
+        // slot against the target's declared type (was skipped).
+        let bad = check(
+            "def pair() -> tuple[int, int]:\n    return (1, 2)\ndef f() -> None:\n    mut a: str = \"\"\n    mut b: int = 0\n    a, b = pair()\n    print(a, b)\n",
+        );
+        assert!(
+            bad.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::TypeMismatch { .. })),
+            "int slot reassigned into a str target must be rejected: {:?}",
+            bad.errors()
+        );
+        let ok = check(
+            "def pair() -> tuple[int, str]:\n    return (1, \"x\")\ndef f() -> None:\n    mut a: int = 0\n    mut b: str = \"\"\n    a, b = pair()\n    print(a, b)\n",
+        );
+        assert!(
+            !ok.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::TypeMismatch { .. })),
+            "correctly-typed tuple reassignment must pass: {:?}",
             ok.errors()
         );
     }
