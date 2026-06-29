@@ -17175,23 +17175,33 @@ fn bind_pattern_names(c: &mut Checker, pattern: &Pattern, ty: &Type) {
         }
         Pattern::MatchStar(s) => {
             if let Some(name) = &s.name {
-                // `*rest` captures a list of the remaining elements; element
-                // type is hard to pin precisely here, so stay permissive.
+                // `*rest` captures the remaining elements as a list. The
+                // `MatchSequence` caller passes `list[elem]` (or `Unknown`) as
+                // `ty`; bind to it. Was always `Unknown`, so
+                // `case [a, *rest]: rest.upper()` over a `list[int]` slipped
+                // through (`rest` is a list, not a str).
                 c.env.declare(TypeBinding {
                     name: name.as_str().to_owned(),
-                    declared: Type::Unknown,
-                    narrowed: Type::Unknown,
+                    declared: ty.clone(),
+                    narrowed: ty.clone(),
                     span: (s.range.start().to_usize(), s.range.end().to_usize()),
                     from_unsafe: false,
                 });
             }
         }
         Pattern::MatchMapping(m) => {
+            // `**rest` captures the remaining key/value pairs as a dict of the
+            // subject's own `dict[K, V]` type (was always `Unknown`, so
+            // `case {"k": v, **rest}: rest.upper()` slipped through).
+            let rest_ty = match ty {
+                Type::Generic(n, args) if n == "dict" && args.len() == 2 => ty.clone(),
+                _ => Type::Unknown,
+            };
             if let Some(rest) = &m.rest {
                 c.env.declare(TypeBinding {
                     name: rest.as_str().to_owned(),
-                    declared: Type::Unknown,
-                    narrowed: Type::Unknown,
+                    declared: rest_ty.clone(),
+                    narrowed: rest_ty,
                     span: (m.range.start().to_usize(), m.range.end().to_usize()),
                     from_unsafe: false,
                 });
@@ -17227,7 +17237,15 @@ fn bind_pattern_names(c: &mut Checker, pattern: &Pattern, ty: &Type) {
         }
         Pattern::MatchSequence(seq) => {
             for (i, p) in seq.patterns.iter().enumerate() {
-                let et = seq_pattern_element_type(ty, i);
+                let et = if matches!(p, Pattern::MatchStar(_)) {
+                    // `*rest` binds the remaining elements as `list[elem]`.
+                    match seq_pattern_element_type(ty, 0) {
+                        Type::Unknown => Type::Unknown,
+                        elem => Type::Generic("list".to_owned(), vec![elem]),
+                    }
+                } else {
+                    seq_pattern_element_type(ty, i)
+                };
                 bind_pattern_names(c, p, &et);
             }
         }
@@ -17459,6 +17477,49 @@ mod tests {
         assert!(
             bad.has_errors(),
             "int capture used as list[int] must be rejected"
+        );
+    }
+
+    #[test]
+    fn match_sequence_star_capture_is_typed_list() {
+        // `case [a, *rest]` over a `list[int]` binds `rest` to `list[int]`,
+        // not Unknown — `rest.upper()` must be rejected, `len(rest)` accepted.
+        let bad = check(
+            "def f(xs: list[int]) -> str:\n    match xs:\n        case [a, *rest]:\n            return rest.upper()\n        case _:\n            return \"\"\n",
+        );
+        assert!(
+            bad.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::AttributeNotFound { .. })),
+            "`*rest` (list) used as str must be rejected: {:?}",
+            bad.errors()
+        );
+        let ok = check(
+            "def f(xs: list[int]) -> int:\n    match xs:\n        case [a, *rest]:\n            return a + len(rest)\n        case _:\n            return 0\n",
+        );
+        assert!(
+            !ok.errors().iter().any(|e| matches!(
+                e,
+                TycError::AttributeNotFound { .. } | TycError::TypeMismatch { .. }
+            )),
+            "valid `*rest` use (len) must pass: {:?}",
+            ok.errors()
+        );
+    }
+
+    #[test]
+    fn match_mapping_double_star_capture_is_typed_dict() {
+        // `case {"k": v, **rest}` over a `dict[str, int]` binds `rest` to
+        // `dict[str, int]`, not Unknown — `rest.upper()` must be rejected.
+        let bad = check(
+            "def f(d: dict[str, int]) -> str:\n    match d:\n        case {\"k\": v, **rest}:\n            return rest.upper()\n        case _:\n            return \"\"\n",
+        );
+        assert!(
+            bad.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::AttributeNotFound { .. })),
+            "`**rest` (dict) used as str must be rejected: {:?}",
+            bad.errors()
         );
     }
 
