@@ -2334,6 +2334,120 @@ class _LazyValue:
     def __len__(self) -> int:
         return len(self._materialise())
 
+    # Forward arithmetic, comparison, bitwise, unary, conversion, index and
+    # membership operators to the materialised value so a `lazy let` of a
+    # primitive (int/float/str/bytes/…) is transparent under every operator,
+    # not just attribute access. Without these, `VALUE + 1`, `VALUE > 10`,
+    # `range(VALUE)`, `NAME + \" world\"` etc. raised TypeError against the
+    # proxy even though the underlying value supports them.
+    def __add__(self, other: object) -> object:
+        return self._materialise() + other
+
+    def __radd__(self, other: object) -> object:
+        return other + self._materialise()
+
+    def __sub__(self, other: object) -> object:
+        return self._materialise() - other
+
+    def __rsub__(self, other: object) -> object:
+        return other - self._materialise()
+
+    def __mul__(self, other: object) -> object:
+        return self._materialise() * other
+
+    def __rmul__(self, other: object) -> object:
+        return other * self._materialise()
+
+    def __truediv__(self, other: object) -> object:
+        return self._materialise() / other
+
+    def __rtruediv__(self, other: object) -> object:
+        return other / self._materialise()
+
+    def __floordiv__(self, other: object) -> object:
+        return self._materialise() // other
+
+    def __rfloordiv__(self, other: object) -> object:
+        return other // self._materialise()
+
+    def __mod__(self, other: object) -> object:
+        return self._materialise() % other
+
+    def __rmod__(self, other: object) -> object:
+        return other % self._materialise()
+
+    def __pow__(self, other: object) -> object:
+        return self._materialise() ** other
+
+    def __rpow__(self, other: object) -> object:
+        return other ** self._materialise()
+
+    def __and__(self, other: object) -> object:
+        return self._materialise() & other
+
+    def __rand__(self, other: object) -> object:
+        return other & self._materialise()
+
+    def __or__(self, other: object) -> object:
+        return self._materialise() | other
+
+    def __ror__(self, other: object) -> object:
+        return other | self._materialise()
+
+    def __xor__(self, other: object) -> object:
+        return self._materialise() ^ other
+
+    def __rxor__(self, other: object) -> object:
+        return other ^ self._materialise()
+
+    def __lshift__(self, other: object) -> object:
+        return self._materialise() << other
+
+    def __rlshift__(self, other: object) -> object:
+        return other << self._materialise()
+
+    def __rshift__(self, other: object) -> object:
+        return self._materialise() >> other
+
+    def __rrshift__(self, other: object) -> object:
+        return other >> self._materialise()
+
+    def __lt__(self, other: object) -> bool:
+        return self._materialise() < other
+
+    def __le__(self, other: object) -> bool:
+        return self._materialise() <= other
+
+    def __gt__(self, other: object) -> bool:
+        return self._materialise() > other
+
+    def __ge__(self, other: object) -> bool:
+        return self._materialise() >= other
+
+    def __neg__(self) -> object:
+        return -self._materialise()
+
+    def __pos__(self) -> object:
+        return +self._materialise()
+
+    def __abs__(self) -> object:
+        return abs(self._materialise())
+
+    def __invert__(self) -> object:
+        return ~self._materialise()
+
+    def __int__(self) -> int:
+        return int(self._materialise())
+
+    def __float__(self) -> float:
+        return float(self._materialise())
+
+    def __index__(self) -> int:
+        return self._materialise().__index__()
+
+    def __contains__(self, item: object) -> bool:
+        return item in self._materialise()
+
 
 _UNSET = object()
 
@@ -3442,6 +3556,35 @@ let result: int = 3 |> double |> inc
             py.contains("from typhon_runtime.lazy import lazy_let"),
             "module-level lazy let should inject the runtime import; got:\n{py}"
         );
+    }
+
+    #[test]
+    fn lazy_value_proxy_forwards_operators() {
+        // Regression: a module-level `lazy let` of a primitive emits a
+        // `_LazyValue` proxy. The proxy must forward arithmetic, comparison,
+        // index and conversion dunders so `VALUE + 1`, `VALUE > 10`,
+        // `range(VALUE)` work — not just attribute access. Guards against the
+        // forwarding methods being dropped from the runtime template.
+        for method in [
+            "def __add__",
+            "def __radd__",
+            "def __sub__",
+            "def __mul__",
+            "def __mod__",
+            "def __lt__",
+            "def __gt__",
+            "def __ge__",
+            "def __index__",
+            "def __int__",
+            "def __neg__",
+            "def __contains__",
+        ] {
+            assert!(
+                TYPHON_RUNTIME_LAZY_PY.contains(method),
+                "_LazyValue runtime proxy must forward {method}; lazy let of a \
+                 primitive crashes without it"
+            );
+        }
     }
 
     #[test]
