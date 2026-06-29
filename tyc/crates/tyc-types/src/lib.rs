@@ -17255,6 +17255,60 @@ fn collect_inherited_fields(
     }
 }
 
+/// Push `n` onto `out` unless already present.
+fn push_unique_name(out: &mut Vec<String>, n: &str) {
+    if !out.iter().any(|x| x == n) {
+        out.push(n.to_owned());
+    }
+}
+
+/// Collect the capture (binding) names a pattern introduces, recursing into
+/// sub-patterns. Used to union an or-pattern's per-alternative capture types.
+fn collect_pattern_capture_names(p: &Pattern, out: &mut Vec<String>) {
+    match p {
+        Pattern::MatchAs(a) => {
+            if let Some(name) = &a.name {
+                push_unique_name(out, name.as_str());
+            }
+            if let Some(sub) = &a.pattern {
+                collect_pattern_capture_names(sub, out);
+            }
+        }
+        Pattern::MatchStar(s) => {
+            if let Some(name) = &s.name {
+                push_unique_name(out, name.as_str());
+            }
+        }
+        Pattern::MatchSequence(seq) => {
+            for sub in &seq.patterns {
+                collect_pattern_capture_names(sub, out);
+            }
+        }
+        Pattern::MatchMapping(m) => {
+            for sub in &m.patterns {
+                collect_pattern_capture_names(sub, out);
+            }
+            if let Some(rest) = &m.rest {
+                push_unique_name(out, rest.as_str());
+            }
+        }
+        Pattern::MatchClass(mc) => {
+            for sub in &mc.arguments.patterns {
+                collect_pattern_capture_names(sub, out);
+            }
+            for kw in &mc.arguments.keywords {
+                collect_pattern_capture_names(&kw.pattern, out);
+            }
+        }
+        Pattern::MatchOr(o) => {
+            for sub in &o.patterns {
+                collect_pattern_capture_names(sub, out);
+            }
+        }
+        Pattern::MatchValue(_) | Pattern::MatchSingleton(_) => {}
+    }
+}
+
 fn bind_pattern_names(c: &mut Checker, pattern: &Pattern, ty: &Type) {
     match pattern {
         Pattern::MatchAs(a) => {
@@ -17331,8 +17385,35 @@ fn bind_pattern_names(c: &mut Checker, pattern: &Pattern, ty: &Type) {
             }
         }
         Pattern::MatchOr(o) => {
-            if let Some(first) = o.patterns.first() {
-                bind_pattern_names(c, first, ty);
+            // Bind each capture to the UNION of the type each alternative
+            // assigns it. `case A(n) | B(n)` over `A | B` makes `n` the union
+            // of `A.x` and `B.x`, not just the first arm's type — a value
+            // matching a later arm used to get a wrong concrete capture type
+            // and slip past the checker.
+            let mut names: Vec<String> = Vec::new();
+            collect_pattern_capture_names(pattern, &mut names);
+            let mut acc: Vec<Vec<Type>> = vec![Vec::new(); names.len()];
+            for alt in &o.patterns {
+                bind_pattern_names(c, alt, ty);
+                for (i, name) in names.iter().enumerate() {
+                    if let Some(b) = c.env.lookup(name) {
+                        acc[i].push(b.declared.clone());
+                    }
+                }
+            }
+            for (i, name) in names.iter().enumerate() {
+                if acc[i].is_empty() {
+                    continue;
+                }
+                let span = c.env.lookup(name).map(|b| b.span).unwrap_or((0, 0));
+                let u = Type::union_of(std::mem::take(&mut acc[i]));
+                c.env.declare(TypeBinding {
+                    name: name.clone(),
+                    declared: u.clone(),
+                    narrowed: u,
+                    span,
+                    from_unsafe: false,
+                });
             }
         }
         Pattern::MatchSequence(seq) => {
@@ -17731,6 +17812,36 @@ mod tests {
                 .any(|e| matches!(e, TycError::TypeMismatch { .. })),
             "str slot passed to int param must be rejected: {:?}",
             bad.errors()
+        );
+    }
+
+    #[test]
+    fn match_or_pattern_capture_is_union_of_alternatives() {
+        // `case A(n) | B(n)` over `A | B` types `n` as the UNION of A.x and
+        // B.x. When they differ (int vs str), using `n` as an int must be
+        // rejected (was first-alternative-only, so it slipped).
+        let bad = check(
+            "class A:\n    x: int\nclass B:\n    x: str\ndef f(v: A | B) -> int:\n    match v:\n        case A(n) | B(n):\n            return n + 1\n    return 0\n",
+        );
+        assert!(
+            bad.errors().iter().any(|e| matches!(
+                e,
+                TycError::TypeMismatch { .. } | TycError::OperatorTypeMismatch { .. }
+            )),
+            "or-pattern capture used at the wrong type must be rejected: {:?}",
+            bad.errors()
+        );
+        // When both alternatives bind the same type, no false positive.
+        let ok = check(
+            "class A:\n    x: int\nclass B:\n    x: int\ndef f(v: A | B) -> int:\n    match v:\n        case A(n) | B(n):\n            return n + 1\n    return 0\n",
+        );
+        assert!(
+            !ok.errors().iter().any(|e| matches!(
+                e,
+                TycError::TypeMismatch { .. } | TycError::OperatorTypeMismatch { .. }
+            )),
+            "same-typed or-pattern capture must pass: {:?}",
+            ok.errors()
         );
     }
 
