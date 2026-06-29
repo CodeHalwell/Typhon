@@ -64,6 +64,7 @@ fn catalog_codes() -> &'static [&'static str] {
         "field_default_ordering",
         "freeze",
         "frozen_assign",
+        "frozen_inheritance_conflict",
         "gather_opportunity",
         "generator_return_type",
         "generic",
@@ -160,6 +161,9 @@ fn catalog_entry(short_code: &str) -> Option<&'static str> {
         }
         "freeze" => include_str!("../../../../../docs/diagnostics/freeze.md"),
         "frozen_assign" => include_str!("../../../../../docs/diagnostics/frozen_assign.md"),
+        "frozen_inheritance_conflict" => {
+            include_str!("../../../../../docs/diagnostics/frozen_inheritance_conflict.md")
+        }
         "gather_opportunity" => {
             include_str!("../../../../../docs/diagnostics/gather_opportunity.md")
         }

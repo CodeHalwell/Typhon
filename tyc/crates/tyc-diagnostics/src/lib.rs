@@ -1613,6 +1613,30 @@ pub enum TycError {
         #[label("captured by reference here")]
         span: SourceSpan,
     },
+
+    /// A `frozen` dataclass and its in-module dataclass base disagree on
+    /// frozen-ness. CPython refuses to build either combination — a frozen
+    /// dataclass cannot inherit a non-frozen one, nor a non-frozen a frozen
+    /// one — and raises `TypeError` at class-definition (import) time. Typhon
+    /// accepted it and emitted Python that crashed on import, so reject it at
+    /// check time instead.
+    #[error("class `{child}` is {child_kind} but its base `{parent}` is {parent_kind}: a dataclass and its base must agree on frozen-ness")]
+    #[diagnostic(
+        severity(Error),
+        code(tyc::frozen_inheritance_conflict),
+        url("https://typhon.dev/lang/diagnostics/frozen_inheritance_conflict"),
+        help("CPython forbids a frozen dataclass inheriting from a non-frozen one (and vice-versa); the generated module would raise `TypeError` on import. Make both `frozen` or neither.")
+    )]
+    FrozenInheritanceConflict {
+        child: String,
+        parent: String,
+        child_kind: String,
+        parent_kind: String,
+        #[source_code]
+        src: NamedSource<String>,
+        #[label("frozen-ness conflicts with base here")]
+        span: SourceSpan,
+    },
 }
 
 impl TycError {
@@ -2897,6 +2921,33 @@ impl TycError {
             method: method.into(),
             base: base.into(),
             reason: reason.into(),
+            src: NamedSource::new(path.into(), source.into()),
+            span: SourceSpan::new(SourceOffset::from(offset), length.max(1)),
+        }
+    }
+
+    /// Construct a [`TycError::FrozenInheritanceConflict`] diagnostic.
+    /// `child_frozen` is the child's frozen-ness; the base has the opposite.
+    #[allow(clippy::too_many_arguments)]
+    pub fn frozen_inheritance_conflict(
+        child: impl Into<String>,
+        parent: impl Into<String>,
+        child_frozen: bool,
+        path: impl Into<String>,
+        source: impl Into<String>,
+        offset: usize,
+        length: usize,
+    ) -> Self {
+        let (child_kind, parent_kind) = if child_frozen {
+            ("frozen", "not frozen")
+        } else {
+            ("not frozen", "frozen")
+        };
+        Self::FrozenInheritanceConflict {
+            child: child.into(),
+            parent: parent.into(),
+            child_kind: child_kind.to_owned(),
+            parent_kind: parent_kind.to_owned(),
             src: NamedSource::new(path.into(), source.into()),
             span: SourceSpan::new(SourceOffset::from(offset), length.max(1)),
         }

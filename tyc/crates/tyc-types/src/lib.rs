@@ -5416,6 +5416,7 @@ pub fn check_module_with_imports(
     collect_classes_and_functions(&mut c, &module.body);
     check_override_compatibility(&mut c, &module.body);
     populate_frozen_classes(&mut c, &module.body, &frozen_starts);
+    check_frozen_inheritance(&mut c, &module.body);
     // Cross-function field-init audit pre-pass: identify helper
     // functions whose body is `return X.__new__(X)` (or
     // `obj = X.__new__(X); return obj`). At call sites, the LHS is
@@ -5528,6 +5529,59 @@ fn populate_frozen_classes(c: &mut Checker, body: &[Stmt], frozen_starts: &[u32]
                 c.frozen_classes.insert(format!("__typhon_impl_{}", name));
             }
         }
+    }
+}
+
+/// Reject a `frozen`/non-`frozen` dataclass-inheritance mismatch at check
+/// time. CPython raises `TypeError` at class-definition (import) time for both
+/// "frozen child of non-frozen base" and "non-frozen child of frozen base", so
+/// the emitted module would crash on import. Only in-module dataclass bases
+/// (those with a recorded shape) are compared — an external or non-dataclass
+/// base has unknown/irrelevant frozen-ness, and CPython only forbids the
+/// disagreement between two dataclasses, so skipping them avoids false
+/// positives. Must run after [`populate_frozen_classes`] and
+/// `collect_classes_and_functions` so `frozen_classes` and `class_shapes` are
+/// populated.
+fn check_frozen_inheritance(c: &mut Checker, body: &[Stmt]) {
+    let mut conflicts: Vec<(String, String, bool, usize, usize)> = Vec::new();
+    for stmt in body {
+        let Stmt::ClassDef(cd) = stmt else { continue };
+        let child = cd.name.as_str();
+        let child_frozen = c.frozen_classes.contains(child);
+        for base in cd.bases() {
+            let Expr::Name(bn) = base else { continue };
+            let parent = bn.id.as_str();
+            // Only a known in-module dataclass base (has a shape) is comparable.
+            if !c.class_shapes.contains_key(parent) {
+                continue;
+            }
+            let parent_frozen = c.frozen_classes.contains(parent);
+            if child_frozen != parent_frozen {
+                let span = (
+                    cd.name.range().start().to_usize(),
+                    cd.name.range().end().to_usize(),
+                );
+                conflicts.push((
+                    child.to_owned(),
+                    parent.to_owned(),
+                    child_frozen,
+                    span.0,
+                    span.1.saturating_sub(span.0),
+                ));
+            }
+        }
+    }
+    for (child, parent, child_frozen, offset, length) in conflicts {
+        c.diagnostics
+            .push_error(TycError::frozen_inheritance_conflict(
+                child,
+                parent,
+                child_frozen,
+                c.path.clone(),
+                c.source,
+                offset,
+                length,
+            ));
     }
 }
 
@@ -20402,6 +20456,45 @@ def main() -> None:
             "bytes %-formatting must be accepted: {:?}",
             d.errors()
         );
+    }
+
+    #[test]
+    fn frozen_inheritance_mismatch_is_rejected() {
+        // CPython refuses to build either combination; the emitted module
+        // crashes on import. Both directions must fire at check time.
+        for src in [
+            "class Shape:\n    name: str\n\nclass Square frozen(Shape):\n    side: float\n",
+            "class Base frozen:\n    name: str\n\nclass Derived(Base):\n    extra: int\n",
+        ] {
+            let d = check(src);
+            assert!(
+                d.errors()
+                    .iter()
+                    .any(|e| matches!(e, TycError::FrozenInheritanceConflict { .. })),
+                "frozen/non-frozen inheritance must be rejected: {:?}",
+                d.errors()
+            );
+        }
+    }
+
+    #[test]
+    fn matching_frozenness_and_external_bases_are_accepted() {
+        // Agreement (both frozen) and external/non-dataclass bases must NOT
+        // fire — CPython only forbids the disagreement between two dataclasses.
+        for src in [
+            "class Base frozen:\n    name: str\n\nclass Derived frozen(Base):\n    extra: int\n",
+            "class Shape:\n    name: str\n\nclass Square(Shape):\n    side: float\n",
+            "import enum\n\nclass Color frozen(enum.Enum):\n    RED: int = 1\n",
+        ] {
+            let d = check(src);
+            assert!(
+                !d.errors()
+                    .iter()
+                    .any(|e| matches!(e, TycError::FrozenInheritanceConflict { .. })),
+                "matching frozen-ness / external base must be accepted: {:?}",
+                d.errors()
+            );
+        }
     }
 
     #[test]
