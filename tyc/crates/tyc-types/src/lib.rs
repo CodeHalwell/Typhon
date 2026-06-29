@@ -2525,6 +2525,13 @@ struct Checker<'a> {
     /// as written in the source (`class Dog(Animal):` → `{"Dog": ["Animal"]}`).
     /// Used by `class_inherits_from` to resolve nominal subtype relationships.
     class_parents: HashMap<String, Vec<String>>,
+    /// Names of classes DEFINED in this module via a real `class` statement
+    /// (not imported by name, not seeded from a venv shape). Lets a check
+    /// reason about a class's full ancestry with certainty — e.g.
+    /// `raise_non_exception` only flags a raised class it knows is local, so
+    /// an imported `fastapi.HTTPException` (an exception with no locally-known
+    /// bases) never false-positives.
+    local_classes: std::collections::HashSet<String>,
     /// Per-class set of attribute names assigned through `self`
     /// (`self.NAME = ...`) inside a method body but NOT declared as a
     /// class-level annotated field. Consulted by `find_field` so reads of
@@ -2849,6 +2856,7 @@ impl<'a> Checker<'a> {
             class_param_variance: HashMap::new(),
             frozen_classes: std::collections::HashSet::new(),
             class_parents: HashMap::new(),
+            local_classes: std::collections::HashSet::new(),
             self_attrs: HashMap::new(),
             unsafe_depth: 0,
             unsafe_origin_bindings: HashMap::new(),
@@ -5585,6 +5593,65 @@ fn check_frozen_inheritance(c: &mut Checker, body: &[Stmt]) {
     }
 }
 
+/// If `ty` is provably not a `BaseException`, return a short display string for
+/// the `raise_non_exception` diagnostic; otherwise `None` (stay permissive).
+/// Only literals/primitives and fully-resolved known user classes with no
+/// exception ancestor and no unknown/external base are rejected — builtin,
+/// imported, and unknown-base classes are left alone so valid `raise`s of
+/// them never false-positive.
+fn raise_non_exception_display(c: &Checker, ty: &Type) -> Option<String> {
+    match ty {
+        Type::Int => Some("int".to_owned()),
+        Type::Str | Type::LitStr(_) => Some("str".to_owned()),
+        Type::Bool => Some("bool".to_owned()),
+        Type::Float => Some("float".to_owned()),
+        Type::Bytes => Some("bytes".to_owned()),
+        Type::None => Some("None".to_owned()),
+        Type::Class(name) => {
+            if class_is_certainly_not_exception(c, name) {
+                Some(name.clone())
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+/// True only when `name` is a known local class whose entire ancestry is
+/// resolved and contains no `Exception`/`BaseException` and no unknown/external
+/// base. Returns false (not certain) for builtin/imported/unknown classes and
+/// for any class reachable through an unknown base, so they stay permissive.
+fn class_is_certainly_not_exception(c: &Checker, name: &str) -> bool {
+    let mut stack: Vec<&str> = vec![name];
+    let mut visited: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    while let Some(n) = stack.pop() {
+        if n == "Exception" || n == "BaseException" {
+            return false;
+        }
+        if !visited.insert(n) {
+            continue;
+        }
+        // Only a locally-DEFINED class (a real `class` statement in this
+        // module) has fully-known bases. Anything else — a builtin, an
+        // `import`ed-by-name class, or a venv-introspected one (e.g.
+        // `fastapi.HTTPException`, an exception whose bases we never see) —
+        // may well derive from BaseException, so stay permissive.
+        if !c.local_classes.contains(n) {
+            return false;
+        }
+        if let Some(parents) = c.class_parents.get(n) {
+            for p in parents {
+                if p == "__typhon_unknown_base__" {
+                    return false;
+                }
+                stack.push(p.as_str());
+            }
+        }
+    }
+    true
+}
+
 /// Public sibling of [`populate_frozen_classes`] used by cross-module
 /// shape extraction: given a module's source, parsed body, and the
 /// preprocessor's 0-based `frozen_class_lines`, return the set of
@@ -7023,6 +7090,9 @@ fn collect_classes_and_functions(c: &mut Checker, body: &[Stmt]) {
         match stmt {
             Stmt::ClassDef(cd) => {
                 let name = cd.name.as_str();
+                // Record every class genuinely DEFINED here (a real `class`
+                // statement), distinct from names merely imported by reference.
+                c.local_classes.insert(name.to_owned());
                 if !name.starts_with("__typhon_impl_")
                     && !name.starts_with("__TyphonLazy_")
                     && !seen_class_names.insert(name)
@@ -10476,6 +10546,24 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
             let _ = infer_expr(c, &a.test);
             let pos = collect_narrowings(c, &a.test, /*negate=*/ false);
             apply_narrowings(c, &pos);
+        }
+        Stmt::Raise(r) => {
+            if let Some(exc) = &r.exc {
+                let exc_type = infer_expr(c, exc);
+                if let Some(display) = raise_non_exception_display(c, &exc_type) {
+                    let span = (exc.range().start().to_usize(), exc.range().end().to_usize());
+                    c.diagnostics.push_error(TycError::raise_non_exception(
+                        display,
+                        c.path.clone(),
+                        c.source,
+                        span.0,
+                        span.1.saturating_sub(span.0),
+                    ));
+                }
+            }
+            if let Some(cause) = &r.cause {
+                let _ = infer_expr(c, cause);
+            }
         }
         _ => {}
     }
@@ -20594,6 +20682,43 @@ def main() -> None:
             "ClassVar must stay an accessible attribute and not be a required ctor arg: {:?}",
             d.errors()
         );
+    }
+
+    #[test]
+    fn raising_a_non_exception_is_rejected() {
+        for src in [
+            "class Problem:\n    msg: str\n\ndef f(flag: bool) -> int:\n    if flag:\n        raise Problem(msg=\"bad\")\n    return 1\n",
+            "def f() -> int:\n    raise 42\n",
+        ] {
+            let d = check(src);
+            assert!(
+                d.errors()
+                    .iter()
+                    .any(|e| matches!(e, TycError::RaiseNonException { .. })),
+                "raising a non-exception must be rejected: {:?}",
+                d.errors()
+            );
+        }
+    }
+
+    #[test]
+    fn raising_valid_exceptions_is_accepted() {
+        // Builtin exceptions, user Exception subclasses (incl. deep
+        // hierarchies), and unknown/imported types must all stay permissive.
+        for src in [
+            "def f() -> int:\n    raise ValueError(\"x\")\n",
+            "class MyError(Exception):\n    pass\n\ndef f() -> int:\n    raise MyError(\"x\")\n",
+            "class AppError(Exception):\n    pass\n\nclass NotFound(AppError):\n    pass\n\ndef f() -> int:\n    raise NotFound(\"x\")\n",
+        ] {
+            let d = check(src);
+            assert!(
+                !d.errors()
+                    .iter()
+                    .any(|e| matches!(e, TycError::RaiseNonException { .. })),
+                "valid raise must be accepted: {src:?} -> {:?}",
+                d.errors()
+            );
+        }
     }
 
     #[test]

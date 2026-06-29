@@ -1637,6 +1637,31 @@ pub enum TycError {
         #[label("frozen-ness conflicts with base here")]
         span: SourceSpan,
     },
+
+    /// A `raise` whose operand is provably not a `BaseException` — a literal
+    /// (`raise 42`), another primitive, or an instance of a user class that
+    /// does not derive from `BaseException` (`raise Problem(...)` where
+    /// `Problem` is a plain dataclass). CPython raises
+    /// `TypeError: exceptions must derive from BaseException` at runtime, so
+    /// reject it at check time. Only fired when the operand's type is fully
+    /// resolved and certainly non-exception; builtin/imported/unknown-base
+    /// classes stay permissive.
+    #[error(
+        "cannot raise `{value}`: only exceptions (subclasses of `BaseException`) can be raised"
+    )]
+    #[diagnostic(
+        severity(Error),
+        code(tyc::raise_non_exception),
+        url("https://typhon.dev/lang/diagnostics/raise_non_exception"),
+        help("`raise` requires a `BaseException` (sub)class or instance. If `{value}` is meant to signal an error, make it subclass `Exception`; for a recoverable error value, return `Err(...)` instead of raising.")
+    )]
+    RaiseNonException {
+        value: String,
+        #[source_code]
+        src: NamedSource<String>,
+        #[label("not an exception")]
+        span: SourceSpan,
+    },
 }
 
 impl TycError {
@@ -2948,6 +2973,22 @@ impl TycError {
             parent: parent.into(),
             child_kind: child_kind.to_owned(),
             parent_kind: parent_kind.to_owned(),
+            src: NamedSource::new(path.into(), source.into()),
+            span: SourceSpan::new(SourceOffset::from(offset), length.max(1)),
+        }
+    }
+
+    /// Construct a [`TycError::RaiseNonException`] diagnostic. `value` is a
+    /// short rendering of the offending operand's type (e.g. `int`, `Problem`).
+    pub fn raise_non_exception(
+        value: impl Into<String>,
+        path: impl Into<String>,
+        source: impl Into<String>,
+        offset: usize,
+        length: usize,
+    ) -> Self {
+        Self::RaiseNonException {
+            value: value.into(),
             src: NamedSource::new(path.into(), source.into()),
             span: SourceSpan::new(SourceOffset::from(offset), length.max(1)),
         }

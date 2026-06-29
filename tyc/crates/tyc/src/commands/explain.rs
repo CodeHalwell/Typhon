@@ -106,6 +106,7 @@ fn catalog_codes() -> &'static [&'static str] {
         "pub_name_collision",
         "pub_star_outside_init",
         "python_semantic_drift",
+        "raise_non_exception",
         "resource_not_managed",
         "result_error_mismatch",
         "self_outside_impl",
@@ -252,6 +253,9 @@ fn catalog_entry(short_code: &str) -> Option<&'static str> {
         }
         "python_semantic_drift" => {
             include_str!("../../../../../docs/diagnostics/python_semantic_drift.md")
+        }
+        "raise_non_exception" => {
+            include_str!("../../../../../docs/diagnostics/raise_non_exception.md")
         }
         "resource_not_managed" => {
             include_str!("../../../../../docs/diagnostics/resource_not_managed.md")
