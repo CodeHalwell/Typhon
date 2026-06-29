@@ -74,7 +74,7 @@ Status legend: ✅ fixed · ⏳ pending · 🔁 dup of an already-fixed item.
 - **Root cause:** tyc-types: the `except <type> as <name>` handler binding is given type `Any` (or `Unknown`) instead of the annotated exception type `<type>` from the handler's exception expression. Because the binding is `Any`, attribute access (`e.code`), arithmetic (`e + 1`), and method calls (`e.nonexistent_method()`) all type as `Any`, so the declared field types of `class!`/exception classes never participat
 
 ### [10] (soundness / s_literals) Tuple-unpack assignment to existing/declared targets skips per-slot type checking (incl. for-loop targets) — silent type confusion
-- **Status:** ⏳ pending
+- **Status:** ✅ fixed — tuple-unpack slot typing (for-loop + reassignment) (branch claude/typhon-adversarial-review-31ep54)
 - **Root cause:** tyc-types/src/lib.rs, check_stmt's `Stmt::Assign` handler (~line 9610-9713) and the `Stmt::For` handler (~line 10164): the per-target loop only type-checks/narrows when `target` is `Expr::Name` (re-bind path at 9633 `is_assignable`) or `Expr::Attribute`. When `target` is `Expr::Tuple` (an unpack assignment, including nested unpack and the for-loop variable), the loop performs no per-slot compariso
 
 ### [11] (soundness / s_forloop) For-loop (and let) tuple-unpacking targets are untyped (Any): dict.items()/enumerate/zip/list[tuple] element types lost, allowing silent type confusion and runtime TypeError
