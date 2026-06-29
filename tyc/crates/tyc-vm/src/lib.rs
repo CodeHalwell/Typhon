@@ -424,6 +424,23 @@ print(x + y)
     }
 
     #[test]
+    fn bytes_percent_formatting_runs() {
+        // Regression (PEP 461): the VM must implement `bytes % args` (it only
+        // had `str % args`), matching the checker which now accepts it and
+        // CPython. Asserting a clean run is enough — a missing arm raised a
+        // VmError before.
+        let src = r#"
+def main() -> None:
+    let a: bytes = b"%d items" % 5
+    let b: bytes = b"%d-%s" % (5, b"x")
+    print(a, b)
+
+main()
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    #[test]
     fn functions_and_recursion() {
         let src = r#"
 def fact(n: int) -> int:

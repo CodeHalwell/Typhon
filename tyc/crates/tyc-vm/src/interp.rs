@@ -3280,6 +3280,30 @@ impl Interpreter {
             return Ok(Str(Rc::new(printf_format(fmt, &values)?)));
         }
 
+        // PEP 461: bytes printf-style `%` formatting (`b"%d items" % 5`,
+        // `b"%d-%s" % (5, b"x")`). The checker accepts `bytes % args`, so the
+        // VM must too. Format bytes are treated as latin-1 (each byte ↔ one
+        // code point) so any byte sequence round-trips through the shared
+        // `printf_format`, and a bytes argument is decoded the same way so
+        // `%s`/`%b` splice its raw bytes rather than a `b'...'` repr.
+        if let (Bytes(fmt), Mod, _) = (l, op, r) {
+            let values: Vec<Value> = match r {
+                Tuple(t) => t.as_ref().clone(),
+                other => vec![other.clone()],
+            };
+            let decoded_fmt: String = fmt.iter().map(|&b| b as char).collect();
+            let decoded_values: Vec<Value> = values
+                .into_iter()
+                .map(|v| match v {
+                    Bytes(b) => Str(Rc::new(b.iter().map(|&x| x as char).collect::<String>())),
+                    other => other,
+                })
+                .collect();
+            let formatted = printf_format(&decoded_fmt, &decoded_values)?;
+            let out: Vec<u8> = formatted.chars().map(|c| c as u32 as u8).collect();
+            return Ok(Bytes(Rc::new(out)));
+        }
+
         // Strings.
         if let (Str(a), Add, Str(b)) = (l, op, r) {
             return Ok(Str(Rc::new(format!("{}{}", a, b))));

@@ -9493,10 +9493,25 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                     length,
                 ));
             }
-            let ann_type = type_from_annotation(&a.annotation, &c.classes);
+            // PEP 591: a *bare* `Final` / `ClassVar` annotation (no
+            // subscript) infers its type from the assigned value, not from
+            // the marker itself. Resolving `Final` as a normal annotation
+            // produced a marker type that no value is assignable to, firing a
+            // spurious `type_mismatch` on valid `X: Final = "1.0"`.
+            let bare_final = match a.annotation.as_ref() {
+                Expr::Name(n) => matches!(n.id.as_str(), "Final" | "ClassVar"),
+                _ => false,
+            };
+            let mut ann_type = if bare_final {
+                Type::Unknown
+            } else {
+                type_from_annotation(&a.annotation, &c.classes)
+            };
             if let Some(value) = &a.value {
                 let value_type = infer_expr_ctx(c, value, Some(&ann_type));
-                if !c.is_assignable(&ann_type, &value_type) {
+                if bare_final {
+                    ann_type = value_type.clone();
+                } else if !c.is_assignable(&ann_type, &value_type) {
                     let span = (
                         value.range().start().to_usize(),
                         value.range().end().to_usize(),
@@ -11996,10 +12011,20 @@ fn cases_cover_type(c: &Checker, cases: &[MatchCase], ty: &Type) -> bool {
             if is_wildcard_pattern(&case.pattern) {
                 return true;
             }
-            match pattern_bool_value(&case.pattern) {
-                Some(true) => saw_true = true,
-                Some(false) => saw_false = true,
-                None => {}
+            // Unpack an or-pattern: `case True | False:` covers both
+            // inhabitants, so each alternative must be inspected. Without
+            // this, an exhaustive `case True | False:` arm was seen as
+            // covering neither and `missing_return` fired spuriously.
+            let alts: Vec<&Pattern> = match &case.pattern {
+                Pattern::MatchOr(o) => o.patterns.iter().collect(),
+                p => vec![p],
+            };
+            for p in alts {
+                match pattern_bool_value(p) {
+                    Some(true) => saw_true = true,
+                    Some(false) => saw_false = true,
+                    None => {}
+                }
             }
         }
         return saw_true && saw_false;
@@ -12016,7 +12041,17 @@ fn cases_cover_type(c: &Checker, cases: &[MatchCase], ty: &Type) -> bool {
             if is_wildcard_pattern(&case.pattern) {
                 return true;
             }
-            if pattern_str_value(&case.pattern).as_deref() == Some(want.as_str()) {
+            // Unpack an or-pattern so `case "red" | "green":` is recognised
+            // as covering each of its string-literal alternatives (union
+            // recursion asks about one variant at a time).
+            let covered = match &case.pattern {
+                Pattern::MatchOr(o) => o
+                    .patterns
+                    .iter()
+                    .any(|p| pattern_str_value(p).as_deref() == Some(want.as_str())),
+                p => pattern_str_value(p).as_deref() == Some(want.as_str()),
+            };
+            if covered {
                 return true;
             }
         }
@@ -12700,6 +12735,33 @@ fn collect_narrowings_inner(c: &Checker, test: &Expr, negate: bool, out: &mut Ve
                             out.push(Narrowing {
                                 name: target.id.as_str().to_owned(),
                                 attr_path: None,
+                                replacement,
+                            });
+                        }
+                    } else if let Expr::Attribute(_) = &pos_args[0] {
+                        // `isinstance(b.v, T)` — narrow the attribute access
+                        // path, mirroring the `is None` attribute narrowing
+                        // above. Only `Name` targets were handled before, so a
+                        // valid `if isinstance(b.v, int): return b.v` was
+                        // wrongly rejected (the attribute stayed its declared
+                        // union). Re-uses the same attr-path machinery, which
+                        // already resets the narrowing on attribute/base
+                        // reassignment.
+                        if let Some(path) = attr_path_of(&pos_args[0]) {
+                            let new_type = type_from_annotation(&pos_args[1], &c.classes);
+                            let current = c
+                                .env
+                                .attr_narrowed(&path)
+                                .cloned()
+                                .unwrap_or_else(|| infer_expr_readonly(c, &pos_args[0]));
+                            let replacement = if negate {
+                                strip_variant(&current, &new_type)
+                            } else {
+                                refine_isinstance_target(&current, &new_type)
+                            };
+                            out.push(Narrowing {
+                                name: String::new(),
+                                attr_path: Some(path),
                                 replacement,
                             });
                         }
@@ -13858,6 +13920,13 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
             // numeric-only `%` compatibility check below never fires.
             if matches!(b.op, Operator::Mod) && matches!(l_stripped, Type::Str | Type::LitStr(_)) {
                 return Type::Str;
+            }
+            // PEP 461: `bytes % args` is the same printf-style formatting
+            // operator, yielding `bytes` (`b"%d items" % 5`, `b"%d-%s" %
+            // (5, b"x")`). Without this carve-out the numeric-only `%` check
+            // below wrongly rejected valid bytes formatting.
+            if matches!(b.op, Operator::Mod) && matches!(l_stripped, Type::Bytes) {
+                return Type::Bytes;
             }
             if let Some(op_str) = arithmetic_op_str(b.op) {
                 if !operator_operands_compatible(b.op, &l_stripped, &r_stripped) {
@@ -20224,6 +20293,115 @@ def f(c: Color) -> int:
                 d.errors()
             );
         }
+    }
+
+    #[test]
+    fn or_pattern_arms_make_literal_match_exhaustive() {
+        // Regression: `case "red" | "green":` / `case True | False:` cover
+        // their alternatives, so an or-pattern match over a literal union or
+        // bool must NOT fire missing_return.
+        for src in [
+            "\
+type Color = \"red\" | \"green\" | \"blue\"
+
+def f(c: Color) -> int:
+    match c:
+        case \"red\" | \"green\":
+            return 1
+        case \"blue\":
+            return 3
+",
+            "\
+def g(b: bool) -> int:
+    match b:
+        case True | False:
+            return 1
+",
+        ] {
+            let d = check(src);
+            assert!(
+                !d.errors()
+                    .iter()
+                    .any(|e| matches!(e, TycError::MissingReturn { .. })),
+                "or-pattern exhaustive match must not fire missing_return: {:?}",
+                d.errors()
+            );
+        }
+    }
+
+    #[test]
+    fn isinstance_narrows_attribute_target() {
+        // Regression: `isinstance(b.v, int)` must narrow the attribute, not
+        // just bare-name targets — `return b.v` in the guarded branch is valid.
+        let src = "\
+class Box:
+    v: int | str
+
+def use(b: Box) -> int:
+    if isinstance(b.v, int):
+        return b.v
+    return len(b.v)
+";
+        let d = check(src);
+        assert!(
+            !d.errors().iter().any(|e| matches!(
+                e,
+                TycError::TypeMismatch { .. } | TycError::OperatorTypeMismatch { .. }
+            )),
+            "isinstance attribute narrowing must accept the guarded return: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn bare_final_and_classvar_infer_type_from_value() {
+        // Regression (PEP 591): a bare `Final` / `ClassVar` annotation infers
+        // its type from the value and must not fire type_mismatch.
+        for src in [
+            "\
+from typing import Final
+
+class Service:
+    name: str
+    VERSION: Final = \"1.0\"
+",
+            "\
+from typing import ClassVar
+
+class Counter:
+    LIMIT: ClassVar = 100
+",
+        ] {
+            let d = check(src);
+            assert!(
+                !d.errors()
+                    .iter()
+                    .any(|e| matches!(e, TycError::TypeMismatch { .. })),
+                "bare Final/ClassVar must infer from value, not fire type_mismatch: {:?}",
+                d.errors()
+            );
+        }
+    }
+
+    #[test]
+    fn bytes_percent_formatting_is_accepted() {
+        // Regression (PEP 461): `bytes % args` is printf-style formatting,
+        // yielding bytes — must not fire operator_type_mismatch.
+        let src = "\
+def main() -> None:
+    let count: int = 5
+    let a: bytes = b\"%d items\" % count
+    let b: bytes = b\"%d-%s\" % (5, b\"x\")
+    print(a, b)
+";
+        let d = check(src);
+        assert!(
+            !d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::OperatorTypeMismatch { .. })),
+            "bytes %-formatting must be accepted: {:?}",
+            d.errors()
+        );
     }
 
     #[test]
