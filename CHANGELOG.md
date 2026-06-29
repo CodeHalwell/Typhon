@@ -17,9 +17,15 @@ soundness fixes close two silent-wrong clusters on everyday code: flow narrowing
 of a **non-local** place (global / instance field) is now invalidated across an
 intervening call or alias write, and short-circuit narrowing (`x is not None and
 x.method()`) no longer false-positives on the canonical Python null-check idiom.
-**Additive on the accepted surface** since `v1.0.0-alpha` — every previously-accepted
-program type-checks identically; the new diagnostics are conservative (they fire
-only on code that already crashed at runtime). The full `examples/` +
+**No new syntax, and no previously-*correct* program changes behaviour.** Unlike
+the purely-additive releases before it, this one does narrow the accepted surface
+in one direction: the three new diagnostics reject programs that already crashed
+at runtime — `raise 42` / raising a plain dataclass, an invalid local `with`
+subject, and mixed frozen/non-frozen dataclass inheritance type-checked clean
+before but raised at import/run, and now surface as build-time errors instead. A
+program that type-checked clean *and ran correctly* on `v1.0.0-alpha` is
+unaffected; if you have code that relied on one of those runtime-crashing shapes,
+expect a new (correct) diagnostic. The full `examples/` +
 `examples/apps/` + `stress/` corpus type-checks clean and emits runnable Python;
 `cargo test --workspace`, `cargo clippy -D warnings`, and `cargo fmt --check` all
 pass. As an alpha, the surface syntax remains *not yet frozen*.
