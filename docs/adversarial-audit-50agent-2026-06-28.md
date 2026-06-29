@@ -78,7 +78,7 @@ Status legend: ✅ fixed · ⏳ pending · 🔁 dup of an already-fixed item.
 - **Root cause:** tyc-types/src/lib.rs, check_stmt's `Stmt::Assign` handler (~line 9610-9713) and the `Stmt::For` handler (~line 10164): the per-target loop only type-checks/narrows when `target` is `Expr::Name` (re-bind path at 9633 `is_assignable`) or `Expr::Attribute`. When `target` is `Expr::Tuple` (an unpack assignment, including nested unpack and the for-loop variable), the loop performs no per-slot compariso
 
 ### [11] (soundness / s_forloop) For-loop (and let) tuple-unpacking targets are untyped (Any): dict.items()/enumerate/zip/list[tuple] element types lost, allowing silent type confusion and runtime TypeError
-- **Status:** ⏳ pending
+- **Status:** ✅ fixed — for/let tuple-unpack typing (branch claude/typhon-adversarial-review-31ep54)
 - **Root cause:** tyc-types: the for-statement / assignment target binder does not destructure a tuple element type onto a tuple unpacking target list. When the for-target (or LHS of `let a, b = t`) is a tuple pattern, each element binding is left as Any instead of being projected from the iterable's element type. The single-target path is correctly typed (a single-target control case `for x in list[int]: let s: st
 
 ### [12] (soundness / s_match) match OR-pattern capture is typed from the FIRST alternative only, ignoring the other arms — value matching a later arm gets a wrong concrete capture type (silent unsoundness)
@@ -197,11 +197,11 @@ Status legend: ✅ fixed · ⏳ pending · 🔁 dup of an already-fixed item.
 - **Root cause:** tyc-types comprehension typing: the DictComp key node is not checked against the annotated/expected K. Boundary confirmed sharp: a PLAIN dict literal {"a": 1} against dict[int,int] correctly fires tyc::type_mismatch on BOTH key and value, but the dict-comprehension form {str(x): x for x in r} skips key (and value) assignability. Likely the comprehension element-type inference path (the same code t
 
 ### [31] (soundness / s_slice) Slice read on list/str/tuple is typed Any (or unchecked), letting a slice be assigned to an incompatible type and crash at runtime
-- **Status:** ⏳ pending
+- **Status:** ✅ fixed — slice read typing (branch claude/typhon-adversarial-review-31ep54)
 - **Root cause:** tyc-types subscript/index inference: the slice-subscript case (ExprSubscript with a Slice index) is not given the container type (list[T]->list[T], str->str, tuple->tuple) — it falls back to Any — whereas the scalar-index case correctly yields the element type T. Likely in the binary/subscript expression type rule in tyc-types.
 
 ### [32] (soundness / s_slice) Slice-assignment (and scalar indexed-assignment) into list[T] is not checked against element type T — silently corrupts the container invariant
-- **Status:** ⏳ pending
+- **Status:** ✅ fixed — subscript assignment checking (branch claude/typhon-adversarial-review-31ep54)
 - **Root cause:** tyc-types assignment checker does not validate the RHS against the element type of a subscript assignment target (ExprSubscript on the LHS), for both Slice and scalar index. The element-type compatibility check applied to e.g. `list.append`/literal elements is not applied to `container[idx] = value` / `container[a:b] = seq`. Distinct from the slice-READ hole above (write side vs read side).
 
 ### [34] (soundness / s_async) `gather:` (TaskGroup) block bindings are untyped: downstream misuse of a gather result is unchecked
@@ -237,11 +237,11 @@ Status legend: ✅ fixed · ⏳ pending · 🔁 dup of an already-fixed item.
 - **Root cause:** tyc-types `infer_expr` BinOp arm, /home/user/Typhon/tyc/crates/tyc-types/src/lib.rs ~line 14026: the conservative numeric rule `(Type::Int | Type::Bool, Type::Int | Type::Bool) => Type::Int` is applied to every non-Div operator, including `Operator::Pow`. Python's `int ** int` is `int` only when the exponent is non-negative; a negative exponent returns `float`. Pow on int operands should widen to 
 
 ### [43] (soundness / s_match) Sequence-pattern star capture `*rest` is typed as Unknown/Any — arbitrary misuse type-checks clean
-- **Status:** ⏳ pending
+- **Status:** ✅ fixed — match star capture typing (branch claude/typhon-adversarial-review-31ep54)
 - **Root cause:** tyc-types/src/lib.rs, fn bind_pattern_names, Pattern::MatchStar arm (lines ~16887-16899): declares the binding as Type::Unknown with comment 'element type is hard to pin precisely here, so stay permissive'. For a list[T]/tuple subject the star capture is list[T] and can be typed precisely; binding Unknown lets any misuse slip through.
 
 ### [44] (soundness / s_match) Mapping-pattern double-star capture `**rest` is typed as Unknown/Any — arbitrary misuse type-checks clean
-- **Status:** ⏳ pending
+- **Status:** ✅ fixed — match double-star capture typing (branch claude/typhon-adversarial-review-31ep54)
 - **Root cause:** tyc-types/src/lib.rs, fn bind_pattern_names, Pattern::MatchMapping arm (lines ~16900-16909): the `m.rest` binding is declared Type::Unknown. For a dict[K, V] subject the rest binding is dict[K, V] and should be typed as such; Unknown allows arbitrary misuse.
 
 ### [45] (soundness / s_fieldinit) ClassVar fields are wrongly counted as constructor parameters: ClassVar names accepted as kwargs and as positional slots, producing clean-check programs that crash with TypeError at runtime

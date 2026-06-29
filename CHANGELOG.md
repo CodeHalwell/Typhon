@@ -8,6 +8,19 @@ canonical phase-by-phase status lives in `docs/roadmap.md`.
 
 ### Fixed
 
+- **Tuple-unpack targets are typed.** `for k, v in d.items()` and
+  `let a, b = pair()` bound each slot to `Unknown`; they now destructure the
+  element `tuple[K, V]`, so passing a `str` key into an `int` parameter is
+  caught instead of crashing at runtime.
+- **`match` star/double-star captures are typed.** `case [a, *rest]` binds
+  `rest` to `list[T]` and `case {"k": v, **rest}` binds `rest` to `dict[K, V]`
+  (were `Unknown`), so `rest.upper()` is now rejected.
+- **Slice reads are typed as their container** (`list[T][a:b]` → `list[T]`,
+  `str[a:b]` → `str`), and **subscript assignments are checked** against the
+  element/value type (`data[0] = "x"` / `data[0:1] = ["x"]` into a `list[int]`,
+  `d[k] = "x"` into a `dict[str, int]` are rejected). All were silent
+  corruptions before.
+
 - **`raise <non-exception>` is rejected at check time** (new
   `tyc::raise_non_exception`). `raise 42` and `raise Problem(...)` (a plain
   dataclass) type-checked clean and then crashed with CPython's
