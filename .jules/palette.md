@@ -1,0 +1,3 @@
+## 2024-05-24 - [Pairing `:hover` and `:focus-within` for interactive containers]
+**Learning:** Found that container components (like `<Card>` and `<LinkCard>`) that define custom `:hover` effects (such as elevation via transforms, box-shadows, and border colors) often leave keyboard users with an inferior or indistinguishable experience when navigating internal links if these effects are omitted for focus states.
+**Action:** Always ensure that `:hover` styles on interactive containers are paired with `:focus-within` so that keyboard users receive equitable visual feedback. Remember to update associated `@media (prefers-reduced-motion: reduce)` rules to also disable transforms on `:focus-within`.
