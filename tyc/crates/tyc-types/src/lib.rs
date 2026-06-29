@@ -9894,6 +9894,43 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                     // instead of falling to `Unknown`. Shares the comprehension
                     // / for-loop binder.
                     bind_unpacking_target(c, target, &value_type);
+                } else if let Expr::Subscript(sub) = target {
+                    // Indexed / slice assignment into a typed container must
+                    // respect the element type, else it silently corrupts the
+                    // invariant: `data[0] = "x"` / `data[0:1] = ["x"]` into a
+                    // `list[int]`, or `d[k] = "x"` into a `dict[K, int]`. The
+                    // dict KEY is intentionally not checked here (computed keys
+                    // carry a higher false-positive risk); only the element /
+                    // value type is enforced.
+                    let recv_ty = infer_expr_readonly(c, &sub.value);
+                    let span = (
+                        a.value.range().start().to_usize(),
+                        a.value.range().end().to_usize(),
+                    );
+                    if let Type::Generic(head, args) = &recv_ty {
+                        if head == "list" && args.len() == 1 {
+                            let elem = args[0].clone();
+                            if matches!(sub.slice.as_ref(), Expr::Slice(_)) {
+                                // `xs[a:b] = it`: `it` must be a sequence of T.
+                                // Skip when the RHS element type is unknown.
+                                if let Some(rhs_elem) = subscript_element_type(&value_type) {
+                                    if !c.is_assignable(&elem, &rhs_elem) {
+                                        c.mismatch(&elem, &rhs_elem, span);
+                                    }
+                                }
+                            } else if !c.is_assignable(&elem, &value_type) {
+                                c.mismatch(&elem, &value_type, span);
+                            }
+                        } else if head == "dict"
+                            && args.len() == 2
+                            && !matches!(sub.slice.as_ref(), Expr::Slice(_))
+                        {
+                            let val_ty = args[1].clone();
+                            if !c.is_assignable(&val_ty, &value_type) {
+                                c.mismatch(&val_ty, &value_type, span);
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -13922,6 +13959,24 @@ fn subscript_element_type(ty: &Type) -> Option<Type> {
     }
 }
 
+/// The type of a SLICE read (`xs[a:b]`), which yields the container itself —
+/// `list[T][a:b]` → `list[T]`, `str[a:b]` → `str`, `bytes[a:b]` → `bytes`.
+/// Returns `None` (stay permissive / `Unknown`) for anything else, including
+/// fixed-arity tuples (whose slice type is hard to pin) and `dict` (not
+/// sliceable). Distinct from `subscript_element_type`, which handles a scalar
+/// index.
+fn subscript_slice_type(ty: &Type) -> Option<Type> {
+    match ty {
+        Type::Str => Some(Type::Str),
+        Type::Bytes => Some(Type::Bytes),
+        Type::Generic(head, args) => match head.as_str() {
+            "list" | "Sequence" | "deque" | "tuple_variadic" if args.len() == 1 => Some(ty.clone()),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 /// Resolve the element expectation a container literal should push into
 /// its members: unwrap aliases on the expected type and, when the result
 /// is a union, pick the single member with the requested head and arity.
@@ -15828,12 +15883,17 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
             // `str`, `bytes`). Preserve the full element type — including a
             // trailing `?` — so extracting from a `list[T?]` honestly
             // yields `T?` rather than silently dropping the `None`
-            // (the soundness hole). A slice index (`xs[a:b]`) yields the
-            // container itself, not an element, so leave it permissive.
-            if !matches!(s.slice.as_ref(), Expr::Slice(_)) {
-                if let Some(elem) = subscript_element_type(&value_ty) {
-                    return elem;
+            // (the soundness hole).
+            if matches!(s.slice.as_ref(), Expr::Slice(_)) {
+                // A slice (`xs[a:b]`) yields the container itself, not an
+                // element: `list[int][a:b]` is `list[int]`, `str[a:b]` is
+                // `str`. Was always `Unknown`, so `let s: str = xs[1:3]` (xs:
+                // list[int]) slipped through.
+                if let Some(cont) = subscript_slice_type(&value_ty) {
+                    return cont;
                 }
+            } else if let Some(elem) = subscript_element_type(&value_ty) {
+                return elem;
             }
             Type::Unknown
         }
@@ -17476,6 +17536,64 @@ mod tests {
         assert!(
             bad.has_errors(),
             "int capture used as list[int] must be rejected"
+        );
+    }
+
+    #[test]
+    fn slice_read_is_typed_as_the_container() {
+        // `xs[a:b]` on a `list[int]` is `list[int]`, not Unknown — binding it
+        // to `str` must be rejected; binding to `list[int]` and a `str` slice
+        // to `str` must pass.
+        let bad = check(
+            "def f() -> None:\n    let xs: list[int] = [1, 2, 3, 4]\n    let s: str = xs[1:3]\n    print(s)\n",
+        );
+        assert!(
+            bad.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::TypeMismatch { .. })),
+            "list slice bound to str must be rejected: {:?}",
+            bad.errors()
+        );
+        let ok = check(
+            "def f() -> None:\n    let xs: list[int] = [1, 2, 3, 4]\n    let ys: list[int] = xs[1:3]\n    let name: str = \"hello\"\n    let part: str = name[1:3]\n    print(ys, part)\n",
+        );
+        assert!(
+            !ok.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::TypeMismatch { .. })),
+            "valid list/str slices must pass: {:?}",
+            ok.errors()
+        );
+    }
+
+    #[test]
+    fn subscript_assignment_checks_element_type() {
+        // `data[i] = v` / `data[a:b] = it` into `list[int]`, and `d[k] = v`
+        // into `dict[str, int]`, must check the value against the element type.
+        for src in [
+            "def f() -> None:\n    mut data: list[int] = [1, 2, 3]\n    data[0] = \"oops\"\n    print(data)\n",
+            "def f() -> None:\n    mut data: list[int] = [1, 2, 3]\n    data[0:1] = [\"oops\"]\n    print(data)\n",
+            "def f() -> None:\n    mut d: dict[str, int] = {}\n    d[\"k\"] = \"oops\"\n    print(d)\n",
+        ] {
+            let d = check(src);
+            assert!(
+                d.errors()
+                    .iter()
+                    .any(|e| matches!(e, TycError::TypeMismatch { .. })),
+                "bad subscript assignment must be rejected: {src:?} -> {:?}",
+                d.errors()
+            );
+        }
+        // Valid assignments stay clean.
+        let ok = check(
+            "def f() -> None:\n    mut data: list[int] = [1, 2, 3]\n    data[0] = 99\n    data[0:1] = [7, 8]\n    mut counts: dict[str, int] = {}\n    counts[\"a\"] = 5\n    print(data, counts)\n",
+        );
+        assert!(
+            !ok.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::TypeMismatch { .. })),
+            "valid subscript assignments must pass: {:?}",
+            ok.errors()
         );
     }
 
