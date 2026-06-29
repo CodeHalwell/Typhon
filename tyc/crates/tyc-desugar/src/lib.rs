@@ -4111,9 +4111,10 @@ fn patch_synthesised_init_with_inherited_fields(body: &mut [Stmt], inherited: &[
         if f.name.as_str() != "__init__" {
             continue;
         }
-        // Match only the synthesised field-assigning constructor: its first
-        // statement is an argument-less `super(...).__init__()` call.
-        if !first_stmt_is_argless_super_init(&f.body) {
+        // Match only the synthesised field-assigning constructor: an argless
+        // `super(...).__init__()` followed solely by `self.x = x` assignments.
+        // A hand-written `__init__` with any other logic is left untouched.
+        if !is_synthesised_field_init(&f.body) {
             continue;
         }
 
@@ -4194,6 +4195,38 @@ fn first_stmt_is_argless_super_init(body: &[Stmt]) -> bool {
         return false;
     };
     matches!(super_call.func.as_ref(), Expr::Name(n) if n.id.as_str() == "super")
+}
+
+/// True only for the EXACT shape the desugarer synthesises for a `class!` /
+/// exception-with-fields constructor: an argless `super().__init__()` followed
+/// by zero or more plain `self.NAME = NAME` field assignments and nothing
+/// else. A hand-written `__init__` (which `plain class` / `class!` permit) that
+/// carries any other logic — a literal/computed assignment, a method call, a
+/// conditional — does NOT match, so the inherited-field rewrite never alters or
+/// drops user code or skips arbitrary base initialisation.
+fn is_synthesised_field_init(body: &[Stmt]) -> bool {
+    if !first_stmt_is_argless_super_init(body) {
+        return false;
+    }
+    body[1..].iter().all(|s| {
+        let Stmt::Assign(a) = s else {
+            return false;
+        };
+        if a.targets.len() != 1 {
+            return false;
+        }
+        let Expr::Attribute(attr) = &a.targets[0] else {
+            return false;
+        };
+        let Expr::Name(recv) = attr.value.as_ref() else {
+            return false;
+        };
+        if recv.id.as_str() != "self" {
+            return false;
+        }
+        // RHS must be the bare parameter of the same name (`self.x = x`).
+        matches!(a.value.as_ref(), Expr::Name(val) if val.id.as_str() == attr.attr.as_str())
+    })
 }
 
 /// Inject an implicit receiver parameter into a method from an `impl` block.
@@ -4862,6 +4895,34 @@ mod tests {
         assert!(
             out.contains("self.code = code") && out.contains("self.detail = detail"),
             "synthesised __init__ must assign every inherited+own field:\n{out}"
+        );
+    }
+
+    #[test]
+    fn hand_written_init_with_custom_logic_is_not_rewritten() {
+        // Regression: the inherited-field rewrite must only touch the
+        // SYNTHESISED constructor (argless `super().__init__()` + `self.x = x`
+        // assignments). A hand-written `__init__` carrying any other logic must
+        // be left exactly as written — its signature unchanged, its super call
+        // and custom statements preserved.
+        let src = "class BaseErr(Exception):\n    code: int\n\nclass ChildErr(BaseErr):\n    detail: str\n    def __init__(self) -> None:\n        super().__init__()\n        self.detail = \"x\"\n        print(\"custom\")\n";
+        let out = parse_and_desugar(src);
+        // Inspect ChildErr's body specifically — BaseErr legitimately gets a
+        // synthesised `__init__(self, code)`.
+        let child = out
+            .split_once("class ChildErr")
+            .map(|(_, rest)| rest)
+            .unwrap_or(out.as_str());
+        // A rewritten init would read `def __init__(self, code: int, …)`; the
+        // hand-written one keeps its exact `(self)` signature, super call, and
+        // custom statement.
+        assert!(
+            child.contains("def __init__(self) -> None:"),
+            "hand-written __init__ signature must be unchanged (no spliced fields):\n{out}"
+        );
+        assert!(
+            child.contains("print(\"custom\")") && child.contains("super("),
+            "hand-written __init__ custom logic and super call must be preserved:\n{out}"
         );
     }
 

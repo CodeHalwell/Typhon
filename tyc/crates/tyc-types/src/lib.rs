@@ -17446,6 +17446,14 @@ fn collect_inherited_fields(
         if let Some(shape) = c.class_shapes.get(base) {
             // A base's own bases contribute their fields first.
             collect_inherited_fields(c, &shape.bases, out, seen);
+            // A `plain class` / `class!` base is NOT emitted as a dataclass, so
+            // CPython does not count its annotations as dataclass fields. Skip
+            // its own fields (while still honouring any dataclass ancestor above
+            // it) — otherwise a required child field after a defaulted
+            // plain-base attribute wrongly trips `field_default_ordering`.
+            if c.is_plain_class(base) || c.is_raw_class(base) {
+                continue;
+            }
             for fname in &shape.field_order {
                 out.push((fname.clone(), shape.field_defaults.contains(fname)));
             }
@@ -17615,12 +17623,61 @@ fn bind_pattern_names(c: &mut Checker, pattern: &Pattern, ty: &Type) {
             }
         }
         Pattern::MatchSequence(seq) => {
+            let n = seq.patterns.len();
+            let star_pos = seq
+                .patterns
+                .iter()
+                .position(|p| matches!(p, Pattern::MatchStar(_)));
+            // A FIXED tuple subject binds by SLOT POSITION; the homogeneous
+            // `tuple[X, ...]` form (args == [X, Unknown]) and list/Sequence/…
+            // bind every element to their single element type and so are
+            // handled by `seq_pattern_element_type`.
+            let fixed_slots: Option<&Vec<Type>> = match ty {
+                Type::Generic(name, args)
+                    if name == "tuple"
+                        && !(args.len() == 2 && matches!(args.get(1), Some(Type::Unknown))) =>
+                {
+                    Some(args)
+                }
+                _ => None,
+            };
             for (i, p) in seq.patterns.iter().enumerate() {
                 let et = if matches!(p, Pattern::MatchStar(_)) {
-                    // `*rest` binds the remaining elements as `list[elem]`.
-                    match seq_pattern_element_type(ty, 0) {
-                        Type::Unknown => Type::Unknown,
-                        elem => Type::Generic("list".to_owned(), vec![elem]),
+                    // `*rest` binds the remaining elements as a list. For a
+                    // fixed tuple it captures the MIDDLE slots between the
+                    // fixed prefix and suffix (not slot 0); for a homogeneous
+                    // sequence it is `list[elem]`.
+                    match (fixed_slots, star_pos) {
+                        (Some(slots), Some(sp)) => {
+                            let num_after = n - sp - 1;
+                            let end = slots.len().saturating_sub(num_after);
+                            let mids: Vec<Type> = if sp <= end {
+                                slots[sp..end].to_vec()
+                            } else {
+                                Vec::new()
+                            };
+                            let elem = if mids.is_empty() {
+                                Type::Unknown
+                            } else {
+                                Type::union_of(mids)
+                            };
+                            Type::Generic("list".to_owned(), vec![elem])
+                        }
+                        _ => match seq_pattern_element_type(ty, 0) {
+                            Type::Unknown => Type::Unknown,
+                            elem => Type::Generic("list".to_owned(), vec![elem]),
+                        },
+                    }
+                } else if let (Some(slots), Some(sp)) = (fixed_slots, star_pos) {
+                    // Fixed tuple with a star: elements AFTER the star bind to
+                    // the trailing slots, not their pattern index.
+                    if i < sp {
+                        slots.get(i).cloned().unwrap_or(Type::Unknown)
+                    } else {
+                        let num_after = n - sp - 1;
+                        let from_end = i - sp - 1;
+                        let slot_idx = slots.len().saturating_sub(num_after) + from_end;
+                        slots.get(slot_idx).cloned().unwrap_or(Type::Unknown)
                     }
                 } else {
                     seq_pattern_element_type(ty, i)
@@ -21501,6 +21558,51 @@ def main() -> None:
                 d.errors()
             );
         }
+    }
+
+    #[test]
+    fn field_default_ordering_ignores_plain_class_base_fields() {
+        // A `plain class` base's annotations are NOT dataclass fields, so a
+        // required child field after a defaulted plain-base attribute must not
+        // trip `field_default_ordering`.
+        let src =
+            "plain class Base:\n    label: str = \"x\"\n\nclass Child(Base):\n    count: int\n";
+        let d = check_class_kinds(src);
+        assert!(
+            !d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::FieldDefaultOrdering { .. })),
+            "plain-base defaulted attr must not force child field ordering: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn match_star_over_fixed_tuple_uses_remaining_slots() {
+        // `case [first, *rest]` over `tuple[int, str]` binds `rest` to
+        // `list[str]` (the remaining slot), not `list[int]` (slot 0).
+        let bad = check(
+            "def f(t: tuple[int, str]) -> int:\n    match t:\n        case [first, *rest]:\n            return rest[0]\n        case _:\n            return 0\n",
+        );
+        assert!(
+            bad.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::TypeMismatch { .. })),
+            "rest[0] (str) returned as int must be rejected: {:?}",
+            bad.errors()
+        );
+        // Over a homogeneous list it stays `list[T]` (no regression).
+        let ok = check(
+            "def f(xs: list[int]) -> int:\n    match xs:\n        case [first, *rest]:\n            return first + len(rest)\n        case _:\n            return 0\n",
+        );
+        assert!(
+            !ok.errors().iter().any(|e| matches!(
+                e,
+                TycError::TypeMismatch { .. } | TycError::AttributeNotFound { .. }
+            )),
+            "homogeneous-list `*rest` must stay list[T]: {:?}",
+            ok.errors()
+        );
     }
 
     #[test]
