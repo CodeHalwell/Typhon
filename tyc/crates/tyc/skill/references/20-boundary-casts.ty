@@ -7,8 +7,9 @@
 # through values it cannot prove wrong. Together they replace the old try-shim
 # plus re-assertion dance when reading JSON, a DB row, or any untyped payload.
 #
-# Run this with tyc build then python build/main.py to see the structural check
-# fire: the in-process VM (tyc run) treats the cast as an identity passthrough.
+# Run this with tyc run (or tyc build then python build/main.py) to see the
+# structural check fire: as of v1.0.0-alpha.2 the in-process VM enforces the
+# same recursive cast check as the compiled path.
 
 import json
 

@@ -6,6 +6,31 @@ canonical phase-by-phase status lives in `docs/roadmap.md`.
 
 ## Unreleased
 
+## 1.0.0-alpha.2 — 2026-06-29 — type-checker soundness sweep + VM parity
+
+The remediation of the [2026-06-28 adversarial pre-release review](docs/adversarial-review-2026-06-28.md):
+a sweep of type-checker **soundness** holes, **false positives** on idiomatic
+code, **VM ↔ CPython** parity gaps, and parser / config / crash robustness — plus
+three new conservative diagnostics (`tyc::not_a_context_manager`,
+`tyc::raise_non_exception`, `tyc::frozen_inheritance_conflict`). The headline
+soundness fixes close two silent-wrong clusters on everyday code: flow narrowing
+of a **non-local** place (global / instance field) is now invalidated across an
+intervening call or alias write, and short-circuit narrowing (`x is not None and
+x.method()`) no longer false-positives on the canonical Python null-check idiom.
+**No new syntax, and no previously-*correct* program changes behaviour.** Unlike
+the purely-additive releases before it, this one does narrow the accepted surface
+in one direction: the three new diagnostics reject programs that already crashed
+at runtime — `raise 42` / raising a plain dataclass, an invalid local `with`
+subject, and mixed frozen/non-frozen dataclass inheritance type-checked clean
+before but raised at import/run, and now surface as build-time errors instead. A
+program that type-checked clean *and ran correctly* on `v1.0.0-alpha` is
+unaffected; if you have code that relied on one of those runtime-crashing shapes,
+expect a new (correct) diagnostic. The full positive corpus (`examples/` +
+`examples/apps/`) type-checks clean and emits runnable Python (the `stress/`
+tree includes deliberately-negative cases and is not a clean-build gate);
+`cargo test --workspace`, `cargo clippy -D warnings`, and `cargo fmt --check` all
+pass. As an alpha, the surface syntax remains *not yet frozen*.
+
 ### Added
 
 - **`tyc::not_a_context_manager`** — a `with` / `async with` whose subject is a
