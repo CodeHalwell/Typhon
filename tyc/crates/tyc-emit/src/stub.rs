@@ -14,9 +14,7 @@
 //! consume directly. The `.dty` source remains the authoritative document for
 //! Typhon-internal use; `.pyi` is for the outside world.
 
-use ruff_python_ast::{
-    AtomicNodeIndex, Decorator, Expr, ExprEllipsisLiteral, ModModule, Stmt, StmtExpr,
-};
+use ruff_python_ast::{AtomicNodeIndex, Expr, ExprEllipsisLiteral, ModModule, Stmt, StmtExpr};
 use ruff_text_size::TextRange;
 
 use crate::printer::Emitter;
@@ -64,12 +62,15 @@ fn stub_stmt(stmt: &Stmt) -> Option<Stmt> {
         }
         Stmt::ClassDef(c) => {
             let mut new_c = c.clone();
-            // Strip `@dataclasses.dataclass(...)` / `@dataclass(...)`
-            // decorators — they're an implementation choice that doesn't
-            // belong on the stub surface. Other decorators
-            // (`@functools.cached_property`, user-authored ones) stay
-            // because they're part of the consumer-visible API.
-            new_c.decorator_list.retain(|d| !is_dataclass_decorator(d));
+            // Keep the `@dataclasses.dataclass(...)` decorator the desugarer
+            // inserted. It is load-bearing on the stub surface: type-checkers
+            // (mypy/pyright) synthesise the class's `__init__` from it, so
+            // stripping it made every stubbed dataclass reject its own correct
+            // keyword construction (`Redis(host=..., port=...)`). Because the
+            // decorator is present on exactly the classes that become
+            // dataclasses at runtime — and absent from enums, protocols,
+            // exceptions, `class!`/`plain` classes, etc. — keeping it mirrors
+            // the runtime shape precisely and `frozen=`/`slots=` carry through.
             let mut body = Vec::new();
             for s in &c.body {
                 if let Some(kept) = stub_stmt(s) {
@@ -85,27 +86,6 @@ fn stub_stmt(stmt: &Stmt) -> Option<Stmt> {
         // Plain `Assign` is dropped — without an annotation we can't infer the
         // consumer-visible type, so it's not stub material.
         _ => None,
-    }
-}
-
-fn is_dataclass_decorator(d: &Decorator) -> bool {
-    // Accept the call form `@dataclasses.dataclass(...)` /
-    // `@dataclass(...)` and the bare-reference form
-    // `@dataclasses.dataclass` / `@dataclass`.
-    let target = match &d.expression {
-        Expr::Call(call) => call.func.as_ref(),
-        other => other,
-    };
-    match target {
-        Expr::Attribute(attr) => {
-            let head_is_dataclasses = matches!(
-                attr.value.as_ref(),
-                Expr::Name(n) if n.id.as_str() == "dataclasses"
-            );
-            head_is_dataclasses && attr.attr.as_str() == "dataclass"
-        }
-        Expr::Name(n) => n.id.as_str() == "dataclass",
-        _ => false,
     }
 }
 
@@ -235,13 +215,29 @@ mod tests {
     }
 
     #[test]
-    fn dataclass_decorator_stripped() {
+    fn dataclass_decorator_kept_on_stub() {
+        // Regression: the `@dataclasses.dataclass` decorator must survive into
+        // the stub so consumers' type-checkers synthesise `__init__` and
+        // accept keyword construction. The decorator is present only on
+        // runtime dataclasses (the desugarer adds it), so keeping it mirrors
+        // the runtime shape exactly. The `import dataclasses` it needs must
+        // also be retained.
         let s =
             stub("import dataclasses\n@dataclasses.dataclass(slots=True)\nclass C:\n    x: int\n");
-        assert!(!s.contains("@dataclasses.dataclass"), "got: {s}");
-        assert!(!s.contains("import dataclasses"), "got: {s}");
+        assert!(s.contains("@dataclasses.dataclass"), "got: {s}");
+        assert!(s.contains("import dataclasses"), "got: {s}");
         assert!(s.contains("class C:"), "got: {s}");
         assert!(s.contains("x: int"), "got: {s}");
+    }
+
+    #[test]
+    fn frozen_dataclass_decorator_args_preserved_in_stub() {
+        // `frozen=`/`slots=` are part of the consumer-visible contract (frozen
+        // affects assignability), so the decorator's args carry through.
+        let s = stub(
+            "import dataclasses\n@dataclasses.dataclass(slots=True, frozen=True)\nclass C:\n    x: int\n",
+        );
+        assert!(s.contains("frozen=True"), "frozen must survive: {s}");
     }
 
     #[test]
