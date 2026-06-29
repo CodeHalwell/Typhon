@@ -5618,6 +5618,64 @@ fn raise_non_exception_display(c: &Checker, ty: &Type) -> Option<String> {
     }
 }
 
+/// True when `name` and its ENTIRE ancestry are locally-defined classes with
+/// no unknown/external base — i.e. the checker has seen every method the class
+/// can possibly have. Used by checks that must only fire on definite absence
+/// (a missing context-manager dunder) and stay permissive for any class whose
+/// methods might come from an unseen base.
+fn class_ancestry_fully_local(c: &Checker, name: &str) -> bool {
+    let mut stack: Vec<&str> = vec![name];
+    let mut visited: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    while let Some(n) = stack.pop() {
+        if !visited.insert(n) {
+            continue;
+        }
+        if !c.local_classes.contains(n) {
+            return false;
+        }
+        if let Some(parents) = c.class_parents.get(n) {
+            for p in parents {
+                if p == "__typhon_unknown_base__" {
+                    return false;
+                }
+                stack.push(p.as_str());
+            }
+        }
+    }
+    true
+}
+
+/// If the `with`/`async with` subject type is a fully-local class that does
+/// NOT implement the required context-manager protocol, return `(class, the
+/// missing dunder)`. Returns `None` (permissive) for Unknown/Generic/external
+/// types and `@contextmanager` factories (whose call type is never a bare
+/// local class), so stdlib and third-party context managers are unaffected.
+fn with_protocol_missing(
+    c: &Checker,
+    ctx_ty: &Type,
+    is_async: bool,
+) -> Option<(String, &'static str)> {
+    let name = match ctx_ty {
+        Type::Class(n) => n.as_str(),
+        _ => return None,
+    };
+    if !class_ancestry_fully_local(c, name) {
+        return None;
+    }
+    let (enter, exit) = if is_async {
+        ("__aenter__", "__aexit__")
+    } else {
+        ("__enter__", "__exit__")
+    };
+    if c.find_method(name, enter).is_none() {
+        return Some((name.to_owned(), enter));
+    }
+    if c.find_method(name, exit).is_none() {
+        return Some((name.to_owned(), exit));
+    }
+    None
+}
+
 /// True only when `name` is a known local class whose entire ancestry is
 /// resolved and contains no `Exception`/`BaseException` and no unknown/external
 /// base. Returns false (not certain) for builtin/imported/unknown classes and
@@ -10486,6 +10544,26 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
         Stmt::With(w) => {
             for item in &w.items {
                 let ctx_ty = infer_expr(c, &item.context_expr);
+                // Reject a `with`/`async with` subject that is a fully-local
+                // class definitely missing the context-manager protocol
+                // (`__enter__`/`__exit__`, or `__aenter__`/`__aexit__` for
+                // `async with`). CPython raises TypeError at the `with`;
+                // external/`@contextmanager` subjects stay permissive.
+                if let Some((cls, method)) = with_protocol_missing(c, &ctx_ty, w.is_async) {
+                    let span = (
+                        item.context_expr.range().start().to_usize(),
+                        item.context_expr.range().end().to_usize(),
+                    );
+                    c.diagnostics.push_error(TycError::not_a_context_manager(
+                        cls,
+                        method,
+                        w.is_async,
+                        c.path.clone(),
+                        c.source,
+                        span.0,
+                        span.1.saturating_sub(span.0),
+                    ));
+                }
                 // R3-3: bind the `as r:` target to the context manager's
                 // entry type. Three paths, in priority order:
                 //   1. `@contextmanager` / `@asynccontextmanager`-decorated
@@ -17903,6 +17981,45 @@ mod tests {
                 .any(|e| matches!(e, TycError::TypeMismatch { .. })),
             "str slot passed to int param must be rejected: {:?}",
             bad.errors()
+        );
+    }
+
+    #[test]
+    fn with_requires_context_manager_protocol() {
+        // `with X` on a local class lacking __enter__/__exit__, and
+        // `async with X` on a sync-only CM, are rejected.
+        let bad_sync = check(
+            "class Plain:\n    label: str\nimpl Plain:\n    def greet(self) -> str:\n        return self.label\ndef f() -> None:\n    with Plain(label=\"w\") as p:\n        print(p.greet())\n",
+        );
+        assert!(
+            bad_sync
+                .errors()
+                .iter()
+                .any(|e| matches!(e, TycError::NotAContextManager { .. })),
+            "non-CM in `with` must be rejected: {:?}",
+            bad_sync.errors()
+        );
+        let bad_async = check(
+            "class NotAsync:\n    pass\nimpl NotAsync:\n    def __enter__(self) -> NotAsync:\n        return self\n    def __exit__(self, a: object, b: object, c: object) -> None:\n        return None\nasync def f() -> None:\n    async with NotAsync() as m:\n        print(m)\n",
+        );
+        assert!(
+            bad_async
+                .errors()
+                .iter()
+                .any(|e| matches!(e, TycError::NotAContextManager { .. })),
+            "sync-only CM in `async with` must be rejected: {:?}",
+            bad_async.errors()
+        );
+        // A proper sync CM passes.
+        let ok = check(
+            "class Res:\n    name: str\nimpl Res:\n    def __enter__(self) -> Res:\n        return self\n    def __exit__(self, a: object, b: object, c: object) -> None:\n        return None\ndef f() -> None:\n    with Res(name=\"x\") as r:\n        print(r.name)\n",
+        );
+        assert!(
+            !ok.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::NotAContextManager { .. })),
+            "proper context manager must pass: {:?}",
+            ok.errors()
         );
     }
 

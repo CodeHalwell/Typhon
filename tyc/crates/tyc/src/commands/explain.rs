@@ -96,6 +96,7 @@ fn catalog_codes() -> &'static [&'static str] {
         "newtype_violation",
         "no_block_shadow",
         "non_exhaustive_match",
+        "not_a_context_manager",
         "not_callable",
         "nullable_use",
         "operator_type_mismatch",
@@ -233,6 +234,9 @@ fn catalog_entry(short_code: &str) -> Option<&'static str> {
         "no_block_shadow" => include_str!("../../../../../docs/diagnostics/no_block_shadow.md"),
         "non_exhaustive_match" => {
             include_str!("../../../../../docs/diagnostics/non_exhaustive_match.md")
+        }
+        "not_a_context_manager" => {
+            include_str!("../../../../../docs/diagnostics/not_a_context_manager.md")
         }
         "not_callable" => include_str!("../../../../../docs/diagnostics/not_callable.md"),
         "nullable_use" => include_str!("../../../../../docs/diagnostics/nullable_use.md"),

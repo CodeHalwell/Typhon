@@ -1662,6 +1662,30 @@ pub enum TycError {
         #[label("not an exception")]
         span: SourceSpan,
     },
+
+    /// A `with` / `async with` subject is a locally-defined class that does
+    /// not implement the context-manager protocol — `__enter__`/`__exit__`
+    /// for `with`, `__aenter__`/`__aexit__` for `async with`. CPython raises
+    /// `TypeError` at the `with` statement; reject it at check time. Only
+    /// fired for a fully-local class with definitely-absent methods, so
+    /// stdlib/third-party CMs and `@contextmanager` factories stay permissive.
+    #[error("`{ty}` is not {desc}: it has no `{method}` method")]
+    #[diagnostic(
+        severity(Error),
+        code(tyc::not_a_context_manager),
+        url("https://typhon.dev/lang/diagnostics/not_a_context_manager"),
+        help("a `{with_kw}` subject must implement the context-manager protocol. Add `{method}` (and its partner) to `{ty}`, or wrap the resource in a `@contextmanager` / `@asynccontextmanager` factory.")
+    )]
+    NotAContextManager {
+        ty: String,
+        desc: String,
+        method: String,
+        with_kw: String,
+        #[source_code]
+        src: NamedSource<String>,
+        #[label("not a context manager")]
+        span: SourceSpan,
+    },
 }
 
 impl TycError {
@@ -2989,6 +3013,34 @@ impl TycError {
     ) -> Self {
         Self::RaiseNonException {
             value: value.into(),
+            src: NamedSource::new(path.into(), source.into()),
+            span: SourceSpan::new(SourceOffset::from(offset), length.max(1)),
+        }
+    }
+
+    /// Construct a [`TycError::NotAContextManager`] diagnostic. `is_async`
+    /// selects the `async with` wording and the `__aenter__`/`__aexit__`
+    /// protocol; `method` is the specific missing dunder.
+    #[allow(clippy::too_many_arguments)]
+    pub fn not_a_context_manager(
+        ty: impl Into<String>,
+        method: impl Into<String>,
+        is_async: bool,
+        path: impl Into<String>,
+        source: impl Into<String>,
+        offset: usize,
+        length: usize,
+    ) -> Self {
+        let (desc, with_kw) = if is_async {
+            ("an async context manager", "async with")
+        } else {
+            ("a context manager", "with")
+        };
+        Self::NotAContextManager {
+            ty: ty.into(),
+            desc: desc.to_owned(),
+            method: method.into(),
+            with_kw: with_kw.to_owned(),
             src: NamedSource::new(path.into(), source.into()),
             span: SourceSpan::new(SourceOffset::from(offset), length.max(1)),
         }
