@@ -10,6 +10,21 @@ Realistic milestones for one person plus AI assistance. The headline target is a
 
 ## Current release
 
+**[v1.0.0-alpha.2](https://github.com/CodeHalwell/Typhon/releases/tag/v1.0.0-alpha.2) — 2026-06-29.**
+The remediation of the [2026-06-28 adversarial pre-release review](adversarial-review-2026-06-28.md):
+a type-checker soundness sweep (non-local flow-narrowing invalidated across an
+intervening call or alias write; short-circuit `and`/`or` narrowing no longer
+false-positives on `x is not None and x.method()`), a batch of newly-typed
+positions (slice reads, subscript assignments, tuple-unpack and `match` captures,
+walrus bindings, parameter defaults), VM↔CPython parity fixes (`bytes %`,
+numeric dict-key collapse, VM `as!` enforcement), three conservative diagnostics
+(`tyc::not_a_context_manager`, `tyc::raise_non_exception`,
+`tyc::frozen_inheritance_conflict`), and config / crash robustness. No new syntax
+and no previously-*correct* program changes behaviour, but — unlike the
+purely-additive releases before it — those three diagnostics narrow the accepted
+surface for programs that already crashed at runtime, which now surface as
+build-time errors instead.
+
 **[v1.0.0-alpha](https://github.com/CodeHalwell/Typhon/releases/tag/v1.0.0-alpha) — 2026-06-22.**
 Typhon's first tagged alpha and first *feature-complete* milestone — the proven
 production surface plus the previously-deferred type-system frontier. Rolls up
