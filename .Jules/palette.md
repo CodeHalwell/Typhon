@@ -52,3 +52,7 @@
 ## 2026-06-25 - [Modern thin scrollbars for technical documentation]
 **Learning:** Default OS scrollbars (especially on Windows/Linux) are bulky and visually clash with custom, modern documentation themes. They are particularly detrimental when dealing with horizontally scrollable technical content, like `.expressive-code pre` blocks, as thick default scrollbars can overlap or reduce the visibility of code content.
 **Action:** Added global `scrollbar-width: thin` and `::-webkit-scrollbar` styling in `custom.css` with a matching theme color. Included a specific fix for `.expressive-code pre::-webkit-scrollbar-corner` to prevent unsightly corner boxes on code blocks with both horizontal and vertical overflow.
+
+## 2024-05-24 - Equitable Keyboard Focus Feedback
+**Learning:** Container components (like Cards and LinkCards) that have complex interactive visual states (elevations, shadows) on hover often leave keyboard users behind with only a basic outline on `:focus-visible`. This creates an inequitable experience.
+**Action:** Always mirror `:hover` visual state changes (like transforms and box-shadows) to `:focus-within` for container components that wrap interactive elements, ensuring equitable feedback for keyboard navigation. Additionally, ensure these states are bundled together in `@media (prefers-reduced-motion: reduce)` queries.
