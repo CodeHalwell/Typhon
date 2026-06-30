@@ -81,6 +81,7 @@
         "0": { "name": "punctuation.section.parens.end.typhon" }
       },
       "patterns": [
+        { "include": "#keyword-argument" },
         { "include": "#expression-inner" }
       ]
     },
@@ -709,6 +710,14 @@
       }
     },
 
+    "keyword-argument": {
+      "comment": "A keyword/named argument: an identifier immediately followed by a single `=` (not `==`, and not an augmented `+=`/`-=`/… which carry an operator char before the `=`). Included ONLY inside `#parens` (call argument lists, decorator args, class base lists), ahead of `#expression-inner`, so a kwarg whose name collides with a Typhon soft keyword (`model=`, `enum=`, `with=`, `type=`, `match=`) is scoped as a parameter rather than a keyword. It is deliberately NOT in the general `expression-inner` context, so top-level assignment targets (`x = 2`, a module constant `NAME = …`) keep their normal `variable.*` scope instead of being mis-tagged as parameters. Themes that don't style `variable.parameter` fall back to plain text.",
+      "match": "\\b([\\p{L}_][\\p{L}\\p{N}_]*)\\s*(?==(?!=))",
+      "captures": {
+        "1": { "name": "variable.parameter.typhon" }
+      }
+    },
+
     "identifiers": {
       "comment": "Bare identifiers in expressions. Order: `self`/`cls` first; then ALL_CAPS constants; then PascalCase/uppercase-leading types; then lowercase variables. The lowercase fallback uses `\\p{L}` so Unicode identifiers (`греет`, `π`, `数`) get the regular variable scope instead of falling through to no-scope.",
       "patterns": [
@@ -717,7 +726,7 @@
           "match": "\\b(self|cls)\\b"
         },
         {
-          "name": "entity.name.type.typhon",
+          "name": "variable.other.constant.typhon",
           "match": "\\b[A-Z][A-Z0-9_]+\\b"
         },
         {
