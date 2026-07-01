@@ -212,23 +212,6 @@ fn class_name_tail(name: &str) -> &str {
     name.rsplit('.').next().unwrap_or(name)
 }
 
-/// Check whether a value of type `actual` is assignable to a target of
-/// type `expected`.
-///
-/// Phase-1 rules (loose but useful):
-///
-/// - `expected = Any` or `actual = Any` ⇒ allowed.
-/// - `expected = Unknown` or `actual = Unknown` ⇒ allowed (skip).
-/// - `expected = Float`, `actual = Int` ⇒ allowed (numeric widening).
-/// - `expected = Union`, `actual` ⇒ allowed if `actual` is assignable
-///   to any variant.
-/// - `actual = Union` ⇒ allowed only if every variant is assignable
-///   to `expected`.
-/// - Generic types match on the head name and check each arg pairwise,
-///   consulting [`generic_param_variance`] per parameter so
-///   `list[T]` (mutable container) stays invariant while
-///   `Sequence[T]` / `Iterable[T]` (read-only view) flow covariantly.
-/// - Otherwise structural equality.
 /// Mutual assignability — `assignable(a, b) && assignable(b, a)` — computed in
 /// a single structural pass.
 ///
@@ -252,6 +235,23 @@ fn types_equivalent(a: &Type, b: &Type) -> bool {
     assignable(a, b) && assignable(b, a)
 }
 
+/// Check whether a value of type `actual` is assignable to a target of
+/// type `expected`.
+///
+/// Phase-1 rules (loose but useful):
+///
+/// - `expected = Any` or `actual = Any` ⇒ allowed.
+/// - `expected = Unknown` or `actual = Unknown` ⇒ allowed (skip).
+/// - `expected = Float`, `actual = Int` ⇒ allowed (numeric widening).
+/// - `expected = Union`, `actual` ⇒ allowed if `actual` is assignable
+///   to any variant.
+/// - `actual = Union` ⇒ allowed only if every variant is assignable
+///   to `expected`.
+/// - Generic types match on the head name and check each arg pairwise,
+///   consulting [`generic_param_variance`] per parameter so
+///   `list[T]` (mutable container) stays invariant while
+///   `Sequence[T]` / `Iterable[T]` (read-only view) flow covariantly.
+/// - Otherwise structural equality.
 pub fn assignable(expected: &Type, actual: &Type) -> bool {
     match (expected, actual) {
         (Type::Any, _) | (_, Type::Any) => true,
@@ -2346,6 +2346,21 @@ impl TypeEnv {
             }
         }
     }
+    /// Reset `name`'s narrowing back to its declared type. Used to invalidate a
+    /// loop-carried narrowing for a variable reassigned inside the loop body:
+    /// on the second and later iterations the value read at the top of the body
+    /// is whatever the previous iteration's bottom assigned, not the pre-loop
+    /// narrowed value.
+    fn widen_to_declared(&mut self, name: &str) {
+        for scope in self.scopes.iter_mut().rev() {
+            if let Some(b) = scope.get_mut(name) {
+                if b.narrowed != b.declared {
+                    b.narrowed = b.declared.clone();
+                }
+                return;
+            }
+        }
+    }
     fn snapshot(&self) -> TypeEnv {
         self.clone()
     }
@@ -2385,6 +2400,23 @@ impl TypeEnv {
                 }
             }
         }
+    }
+
+    /// Widen every binding's narrowing back to its declared type across all
+    /// scopes, and drop all attribute narrowings — but keep the bindings
+    /// themselves. Used at `except`-handler entry: the `try` body may have
+    /// raised at any point, so no narrowing it established is guaranteed, yet a
+    /// name assigned earlier in the body is still visible in the handler (so we
+    /// must not remove it, which would fire a spurious unknown-name).
+    fn reset_all_narrowings(&mut self) {
+        for scope in &mut self.scopes {
+            for b in scope.values_mut() {
+                if b.narrowed != b.declared {
+                    b.narrowed = b.declared.clone();
+                }
+            }
+        }
+        self.attr_narrowings.clear();
     }
 }
 
@@ -9686,6 +9718,61 @@ fn seed_env_from_scope(c: &mut Checker, scope: ScopeId) {
     }
 }
 
+/// Collect the names *reassigned* (via `=`, `:`-annotated `=`, or augmented
+/// assignment to a bare `Name`) anywhere in `stmts`, recursing into nested
+/// compound statements. Used to invalidate loop-carried narrowings: a variable
+/// reassigned inside a loop body is, at the top of the second and later
+/// iterations, whatever the previous pass last assigned — not the pre-loop
+/// narrowed value.
+fn collect_reassigned_names(stmts: &[Stmt], acc: &mut std::collections::HashSet<String>) {
+    fn add_target(t: &Expr, acc: &mut std::collections::HashSet<String>) {
+        if let Expr::Name(n) = t {
+            acc.insert(n.id.as_str().to_owned());
+        }
+    }
+    for s in stmts {
+        match s {
+            Stmt::Assign(a) => {
+                for t in &a.targets {
+                    add_target(t, acc);
+                }
+            }
+            Stmt::AnnAssign(a) => add_target(&a.target, acc),
+            Stmt::AugAssign(a) => add_target(&a.target, acc),
+            Stmt::If(i) => {
+                collect_reassigned_names(&i.body, acc);
+                for clause in &i.elif_else_clauses {
+                    collect_reassigned_names(&clause.body, acc);
+                }
+            }
+            Stmt::For(f) => {
+                collect_reassigned_names(&f.body, acc);
+                collect_reassigned_names(&f.orelse, acc);
+            }
+            Stmt::While(w) => {
+                collect_reassigned_names(&w.body, acc);
+                collect_reassigned_names(&w.orelse, acc);
+            }
+            Stmt::With(w) => collect_reassigned_names(&w.body, acc),
+            Stmt::Try(t) => {
+                collect_reassigned_names(&t.body, acc);
+                for h in &t.handlers {
+                    let ruff_python_ast::ExceptHandler::ExceptHandler(h) = h;
+                    collect_reassigned_names(&h.body, acc);
+                }
+                collect_reassigned_names(&t.orelse, acc);
+                collect_reassigned_names(&t.finalbody, acc);
+            }
+            Stmt::Match(m) => {
+                for case in &m.cases {
+                    collect_reassigned_names(&case.body, acc);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 /// Whether an expression contains a call anywhere in evaluation position —
 /// used to decide if a bare expression statement could have side-effected a
 /// module global (and thus invalidate global narrowing). Conservative: any
@@ -9754,6 +9841,13 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
             };
             if let Some(value) = &a.value {
                 let value_type = infer_expr_ctx(c, value, Some(&ann_type));
+                // A call in the RHS may reassign a module global via
+                // `global NAME` in the callee, staling a caller narrowing on
+                // that global. Reset for subsequent statements (mirrors the
+                // `Stmt::Assign` / `Stmt::Expr` resets). Locals are immune.
+                if expr_contains_call(value) {
+                    c.env.reset_global_narrowings();
+                }
                 if bare_final {
                     ann_type = value_type.clone();
                 } else if !c.is_assignable(&ann_type, &value_type) {
@@ -9867,6 +9961,15 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
             c.in_question_temp_rhs = a.targets.len() == 1 && is_question_op_temp(&a.targets[0]);
             let value_type = infer_expr(c, &a.value);
             c.in_question_temp_rhs = saved_q;
+            // A call in the RHS (`let n = clear()`) may reassign a module global
+            // via a `global NAME` in the callee, invalidating any narrowing the
+            // caller established on that global. Reset here — before this
+            // assignment applies its own target narrowing below, so that fresh
+            // narrowing survives — mirroring the bare-call `Stmt::Expr` reset.
+            // Locals are immune (a call can't rebind a caller's local).
+            if expr_contains_call(&a.value) {
+                c.env.reset_global_narrowings();
+            }
             for target in &a.targets {
                 check_attr_assign_not_frozen(c, target);
                 audit_record_field_set(c, target);
@@ -10487,6 +10590,18 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
             // narrowing snapshot has been restored.
             let narrowings = collect_narrowings(c, &w.test, /*negate=*/ false);
             let snap_pre = c.env.snapshot();
+            // Iteration-2 soundness: a name reassigned inside the body holds,
+            // at the top of the second and later passes, whatever the previous
+            // pass last assigned — not the pre-loop narrowed value. Widen those
+            // names to their declared type before checking the body. The test
+            // narrowing below re-applies on top (so `while cur is not None:` is
+            // unaffected), and an unconditional in-body assignment re-narrows at
+            // its own site, so only genuinely loop-carried narrowings are lost.
+            let mut loop_reassigned = std::collections::HashSet::new();
+            collect_reassigned_names(&w.body, &mut loop_reassigned);
+            for name in &loop_reassigned {
+                c.env.widen_to_declared(name);
+            }
             apply_narrowings(c, &narrowings);
             for s in &w.body {
                 check_stmt(c, s);
@@ -10545,6 +10660,16 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
             // `Unknown`, so `for k, v in d.items(): let n: int = k` (k is str)
             // slipped through. Shares the comprehension binder.
             bind_unpacking_target(c, f.target.as_ref(), &elem_ty);
+            // Iteration-2 soundness (see the `While` arm): widen any name
+            // reassigned in the body to its declared type before checking, so a
+            // loop-carried narrowing read at the top of a later pass isn't
+            // treated with the stale pre-loop type. The loop target itself is
+            // rebound per iteration by `bind_unpacking_target` above.
+            let mut loop_reassigned = std::collections::HashSet::new();
+            collect_reassigned_names(&f.body, &mut loop_reassigned);
+            for name in &loop_reassigned {
+                c.env.widen_to_declared(name);
+            }
             for s in &f.body {
                 check_stmt(c, s);
             }
@@ -10558,6 +10683,20 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
             // local.) See `reset_global_narrowings`.
             if expr_contains_call(&e.value) {
                 c.env.reset_global_narrowings();
+            }
+            // A bare method-call statement (`self.reset()`, `conn.close()`) may
+            // mutate a field of its receiver, so a prior attribute narrowing
+            // (`if self.x is not None:`) is stale afterwards. Clear narrowings
+            // rooted at the receiver. Scoped to a call in *statement* position
+            // (an almost-always-mutating side-effect call) to avoid the
+            // false positives that invalidating on every nested method call
+            // would cause on the common `self.helper(); self.x.foo()` shape.
+            if let Expr::Call(call) = e.value.as_ref() {
+                if let Expr::Attribute(recv_attr) = call.func.as_ref() {
+                    if let Some(recv_path) = attr_path_of(&recv_attr.value) {
+                        c.env.clear_attr_narrowing(&recv_path);
+                    }
+                }
             }
         }
         Stmt::AugAssign(a) => {
@@ -10670,12 +10809,21 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
             for s in &t.body {
                 check_stmt(c, s);
             }
+            // The body may raise at any point, so a narrowing it established
+            // (`x = get_int()` making `x` non-None) is NOT guaranteed to hold
+            // when a handler runs. Check each handler with narrowings widened
+            // back to declared types (bindings kept). `else` runs only when the
+            // body completed without raising, so it sees the body-end state.
+            let body_end = c.env.snapshot();
             for h in &t.handlers {
                 let ruff_python_ast::ExceptHandler::ExceptHandler(h) = h;
+                c.env.restore(body_end.clone());
+                c.env.reset_all_narrowings();
                 for s in &h.body {
                     check_stmt(c, s);
                 }
             }
+            c.env.restore(body_end);
             for s in &t.orelse {
                 check_stmt(c, s);
             }
@@ -22075,6 +22223,197 @@ def use(x: int | None) -> int:
                 .iter()
                 .any(|e| matches!(e, TycError::NullableUse { .. })),
             "ternary `is not None` narrowing must strip None on truthy: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn narrowing_global_invalidated_by_call_in_assign_rhs() {
+        // H6#3: a call in an assignment RHS may reassign a module global via
+        // `global NAME`, staling a prior narrowing on that global.
+        let src = "\
+mut g: int | None = 1
+
+def clear() -> int:
+    global g
+    g = None
+    return 0
+
+def use_it() -> int:
+    if g is None:
+        return -1
+    let n: int = clear()
+    return g
+";
+        let d = check(src);
+        assert!(
+            d.errors().iter().any(|e| matches!(
+                e,
+                TycError::NullableUse { .. } | TycError::TypeMismatch { .. }
+            )),
+            "global narrowing must be invalidated after a call in the RHS: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn narrowing_attr_invalidated_by_method_call() {
+        // H6#4: a bare method-call statement may mutate a field of its
+        // receiver, staling a prior `if self.x is not None:` narrowing.
+        let src = "\
+class Box:
+    x: int | None
+
+impl Box:
+    def reset(self) -> None:
+        self.x = None
+    def use_it(self) -> int:
+        if self.x is None:
+            return -1
+        self.reset()
+        return self.x
+";
+        let d = check(src);
+        assert!(
+            d.errors().iter().any(|e| matches!(
+                e,
+                TycError::NullableUse { .. } | TycError::TypeMismatch { .. }
+            )),
+            "attr narrowing must be invalidated after a method call on the receiver: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn narrowing_attr_survives_without_intervening_call() {
+        // H6#4 control: without an intervening mutating call, the attribute
+        // narrowing must still hold (no false positive).
+        let src = "\
+class Box:
+    x: int | None
+
+impl Box:
+    def use_it(self) -> int:
+        if self.x is None:
+            return -1
+        return self.x
+";
+        let d = check(src);
+        assert!(
+            !d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::NullableUse { .. })),
+            "attr narrowing must survive when no call intervenes: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn narrowing_try_handler_sees_pre_narrowing_state() {
+        // H6#1: an `except` handler may run because the body raised partway
+        // through, so a narrowing the body established is not guaranteed.
+        let src = "\
+def get_int() -> int:
+    return 5
+
+def risky() -> None:
+    pass
+
+def demo() -> int:
+    mut x: int | None = None
+    try:
+        x = get_int()
+        risky()
+    except ValueError:
+        return x + 1
+    return 0
+";
+        let d = check(src);
+        assert!(
+            d.errors().iter().any(|e| matches!(
+                e,
+                TycError::NullableUse { .. } | TycError::TypeMismatch { .. }
+            )),
+            "try-handler must see x as still-nullable (body may have raised): {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn narrowing_try_handler_keeps_body_assigned_binding() {
+        // H6#1 control: a name assigned in the body is still visible in the
+        // handler — widening narrowings must not remove the binding.
+        let src = "\
+def compute() -> int:
+    return 5
+
+def demo() -> None:
+    try:
+        let y: int = compute()
+        print(y)
+    except ValueError as e:
+        print(str(e))
+";
+        let d = check(src);
+        assert!(
+            !d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::UnknownName { .. })),
+            "body-assigned name must stay visible in the handler: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn narrowing_loop_carried_stale_narrowing_fires() {
+        // H6#2: a variable reassigned to a nullable value at the bottom of a
+        // loop body is nullable again at the top on the second iteration.
+        let src = "\
+def maybe() -> str | None:
+    return None
+
+def demo(items: list[int]) -> None:
+    mut x: str | None = \"a\"
+    if x is None:
+        return
+    for _ in items:
+        print(x.upper())
+        x = maybe()
+";
+        let d = check(src);
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::NullableUse { .. })),
+            "loop-carried narrowing must be widened for iteration 2+: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn narrowing_loop_while_test_still_narrows_body() {
+        // H6#2 control: the classic `while cur is not None:` linked-list walk
+        // must stay clean — the test narrowing re-applies each pass on top of
+        // the iteration-2 widening.
+        let src = "\
+class Node:
+    value: int
+    next: Node | None
+
+def total(head: Node | None) -> int:
+    mut cur: Node | None = head
+    mut acc: int = 0
+    while cur is not None:
+        acc += cur.value
+        cur = cur.next
+    return acc
+";
+        let d = check(src);
+        assert!(
+            !d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::NullableUse { .. })),
+            "while-test narrowing must survive the iteration-2 widening: {:?}",
             d.errors()
         );
     }
