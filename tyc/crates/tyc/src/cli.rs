@@ -17,8 +17,8 @@ use crate::commands;
         "dependency on the toolchain."
     ),
     after_help = concat!(
-        "Documentation:        https://typhon.dev\n",
-        "Language reference:   https://typhon.dev/lang\n",
+        "Documentation:        https://codehalwell.github.io/Typhon/\n",
+        "Language reference:   https://codehalwell.github.io/Typhon/\n",
         "Migrate Python:       tyc migrate <path.py>\n",
         "Cheat sheet:          tyc cheatsheet\n",
         "Diagnostic catalog:   tyc explain <code>\n",

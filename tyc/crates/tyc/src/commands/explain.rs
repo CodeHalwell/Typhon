@@ -35,7 +35,7 @@ pub fn run(args: ExplainArgs) -> Result<()> {
             Ok(())
         }
         None => Err(miette!(
-            "unknown diagnostic code `{}`. Run `tyc explain --list` to see every code, or browse https://typhon.dev/lang/diagnostics for the catalog.",
+            "unknown diagnostic code `{}`. Run `tyc explain --list` to see every code, or browse https://github.com/CodeHalwell/Typhon/tree/main/docs/diagnostics for the catalog.",
             raw
         )),
     }
@@ -60,9 +60,11 @@ fn catalog_codes() -> &'static [&'static str] {
         "div_by_zero_literal",
         "duplicate_class",
         "duplicate_method",
+        "empty_collection_no_annotation",
         "extend_builtin",
         "field_default_ordering",
         "freeze",
+        "freeze_not_freezable",
         "frozen_assign",
         "frozen_inheritance_conflict",
         "gather_opportunity",
@@ -93,6 +95,7 @@ fn catalog_codes() -> &'static [&'static str] {
         "missing_initialiser",
         "missing_return",
         "mutable_default_param",
+        "newtype_invalid_base",
         "newtype_violation",
         "no_block_shadow",
         "non_exhaustive_match",
@@ -118,6 +121,7 @@ fn catalog_codes() -> &'static [&'static str] {
         "typevar_bound",
         "typevar_import_rejected",
         "typing_alias_deprecated",
+        "typing_alias_in_annotation",
         "unknown_kwarg",
         "unknown_module",
         "unknown_name",
@@ -157,11 +161,17 @@ fn catalog_entry(short_code: &str) -> Option<&'static str> {
         }
         "duplicate_class" => include_str!("../../../../../docs/diagnostics/duplicate_class.md"),
         "duplicate_method" => include_str!("../../../../../docs/diagnostics/duplicate_method.md"),
+        "empty_collection_no_annotation" => {
+            include_str!("../../../../../docs/diagnostics/empty_collection_no_annotation.md")
+        }
         "extend_builtin" => include_str!("../../../../../docs/diagnostics/extend_builtin.md"),
         "field_default_ordering" => {
             include_str!("../../../../../docs/diagnostics/field_default_ordering.md")
         }
         "freeze" => include_str!("../../../../../docs/diagnostics/freeze.md"),
+        "freeze_not_freezable" => {
+            include_str!("../../../../../docs/diagnostics/freeze_not_freezable.md")
+        }
         "frozen_assign" => include_str!("../../../../../docs/diagnostics/frozen_assign.md"),
         "frozen_inheritance_conflict" => {
             include_str!("../../../../../docs/diagnostics/frozen_inheritance_conflict.md")
@@ -228,6 +238,9 @@ fn catalog_entry(short_code: &str) -> Option<&'static str> {
         "mutable_default_param" => {
             include_str!("../../../../../docs/diagnostics/mutable_default_param.md")
         }
+        "newtype_invalid_base" => {
+            include_str!("../../../../../docs/diagnostics/newtype_invalid_base.md")
+        }
         "newtype_violation" => {
             include_str!("../../../../../docs/diagnostics/newtype_violation.md")
         }
@@ -282,6 +295,9 @@ fn catalog_entry(short_code: &str) -> Option<&'static str> {
         }
         "typing_alias_deprecated" => {
             include_str!("../../../../../docs/diagnostics/typing_alias_deprecated.md")
+        }
+        "typing_alias_in_annotation" => {
+            include_str!("../../../../../docs/diagnostics/typing_alias_in_annotation.md")
         }
         "unknown_kwarg" => include_str!("../../../../../docs/diagnostics/unknown_kwarg.md"),
         "unknown_module" => include_str!("../../../../../docs/diagnostics/unknown_module.md"),
