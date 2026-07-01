@@ -237,6 +237,23 @@ impl Interpreter {
             Stmt::AugAssign(a) => {
                 let current = self.eval_expr(&a.target, env)?;
                 let rhs = self.eval_expr(&a.value, env)?;
+                // In-place mutation for a mutable list target: CPython's
+                // `list.__iadd__` extends the existing object rather than
+                // rebinding, so aliases (`b = a; b += [x]`) and field targets
+                // (`self.items += [x]`) observe the change. `+=` accepts any
+                // iterable RHS, matching `list.extend`. All other targets
+                // (immutable scalars/tuples, and other ops) fall through to the
+                // binop + rebind path unchanged.
+                if let (Value::List(target), Operator::Add) = (&current, a.op) {
+                    let target = target.clone();
+                    let it = self.make_iter(rhs)?;
+                    let mut items = Vec::new();
+                    while let Some(v) = self.iter_next(&it)? {
+                        items.push(v);
+                    }
+                    target.borrow_mut().extend(items);
+                    return Ok(());
+                }
                 let new = self.binop(&current, a.op, &rhs)?;
                 self.assign_target(&a.target, new, env, None)?;
                 Ok(())
@@ -3198,8 +3215,23 @@ impl Interpreter {
                 }
                 return Ok(Float(a / b));
             }
+            (Float(_), FloorDiv, Float(b)) if *b == 0.0 => {
+                return Err(zero_division_floor_mod());
+            }
             (Float(a), FloorDiv, Float(b)) => return Ok(Float((a / b).floor())),
-            (Float(a), Mod, Float(b)) => return Ok(Float(a.rem_euclid(*b))),
+            (Float(_), Mod, Float(b)) if *b == 0.0 => return Err(zero_division_floor_mod()),
+            (Float(a), Mod, Float(b)) => {
+                // CPython's float `%` takes the sign of the *divisor*
+                // (`7.0 % -3.0 == -2.0`). Rust's `%` is C `fmod` (sign of the
+                // dividend), so adjust toward the divisor when they differ —
+                // mirroring CPython's `float_rem`. `rem_euclid` was wrong: it
+                // always returns a non-negative result.
+                let mut m = a % b;
+                if m != 0.0 && ((*b < 0.0) != (m < 0.0)) {
+                    m += b;
+                }
+                return Ok(Float(m));
+            }
             (Float(a), Pow, Float(b)) => {
                 // A negative base raised to a non-integer power is complex in
                 // Python (`(-8) ** (1/3)` → ~`1+1.732j`), not `nan`.

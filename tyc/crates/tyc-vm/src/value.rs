@@ -10,6 +10,7 @@
 //! under CPython — making `tyc run` diverge from `tyc build && python`
 //! for any program that does big-number arithmetic.
 
+use std::cell::Cell;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt;
@@ -20,6 +21,36 @@ use num_bigint::BigInt;
 use num_traits::{FromPrimitive, Signed, ToPrimitive, Zero};
 
 use crate::error::{type_error, value_error, Unwind};
+
+/// Maximum structural-recursion depth for the value comparison/ordering
+/// routines (`py_eq` / `py_cmp`). Cyclic containers would otherwise recurse
+/// without bound and overflow the native stack, aborting the process. The
+/// bound is far deeper than any realistic data structure but shallow enough to
+/// stay well within the VM's worker stack.
+const MAX_STRUCTURAL_DEPTH: usize = 10_000;
+
+thread_local! {
+    static STRUCTURAL_DEPTH: Cell<usize> = const { Cell::new(0) };
+}
+
+/// Enter one level of structural recursion. Returns `false` when the depth
+/// bound has been reached (caller should bail without recursing); on `true`
+/// the caller must pair it with [`structural_depth_exit`].
+fn structural_depth_enter() -> bool {
+    STRUCTURAL_DEPTH.with(|d| {
+        let cur = d.get();
+        if cur >= MAX_STRUCTURAL_DEPTH {
+            false
+        } else {
+            d.set(cur + 1);
+            true
+        }
+    })
+}
+
+fn structural_depth_exit() {
+    STRUCTURAL_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+}
 use ruff_python_ast::{Parameters, Stmt};
 
 /// Reference-counted, interior-mutable list. Cloning a `Value::List` aliases
@@ -776,7 +807,23 @@ impl Value {
 
     /// Python-style equality. Unlike `PartialEq` we cross between `int` and
     /// `float`, and between `bool` and the numeric types.
+    ///
+    /// Guards against cyclic / pathologically deep structures: without a bound,
+    /// `a = []; a.append(a); b = []; b.append(b); a == b` recurses forever and
+    /// overflows the native stack, aborting the whole process. CPython raises
+    /// `RecursionError` there; we can't from a `bool` fn, so we treat
+    /// beyond-bound comparisons as not-provably-equal (`false`). The bound is
+    /// far deeper than any real data.
     pub fn py_eq(&self, other: &Value) -> bool {
+        if !structural_depth_enter() {
+            return false;
+        }
+        let result = self.py_eq_inner(other);
+        structural_depth_exit();
+        result
+    }
+
+    fn py_eq_inner(&self, other: &Value) -> bool {
         use Value::*;
         match (self, other) {
             (None, None) => true,
@@ -799,6 +846,12 @@ impl Value {
             (Str(a), Str(b)) => a == b,
             (Bytes(a), Bytes(b)) => a == b,
             (List(a), List(b)) => {
+                // Identity short-circuit: the same list object is equal to
+                // itself without recursing into its (possibly self-cyclic)
+                // elements.
+                if Rc::ptr_eq(a, b) {
+                    return true;
+                }
                 let a = a.borrow();
                 let b = b.borrow();
                 a.len() == b.len() && a.iter().zip(b.iter()).all(|(x, y)| x.py_eq(y))
@@ -807,6 +860,9 @@ impl Value {
                 a.len() == b.len() && a.iter().zip(b.iter()).all(|(x, y)| x.py_eq(y))
             }
             (Dict(a), Dict(b)) => {
+                if Rc::ptr_eq(a, b) {
+                    return true;
+                }
                 let a = a.borrow();
                 let b = b.borrow();
                 if a.len() != b.len() {
@@ -871,7 +927,20 @@ impl Value {
     }
 
     /// Python-style ordering. Returns None for incomparable types.
+    ///
+    /// Depth-guarded like [`py_eq`]: a cyclic list/tuple would otherwise
+    /// recurse without bound. Beyond the bound we return `None` (treat as
+    /// incomparable) rather than overflowing the stack.
     pub fn py_cmp(&self, other: &Value) -> Option<std::cmp::Ordering> {
+        if !structural_depth_enter() {
+            return None;
+        }
+        let result = self.py_cmp_inner(other);
+        structural_depth_exit();
+        result
+    }
+
+    fn py_cmp_inner(&self, other: &Value) -> Option<std::cmp::Ordering> {
         use std::cmp::Ordering::*;
         use Value::*;
         match (self, other) {

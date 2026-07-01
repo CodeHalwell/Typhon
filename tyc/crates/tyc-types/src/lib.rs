@@ -229,6 +229,29 @@ fn class_name_tail(name: &str) -> &str {
 ///   `list[T]` (mutable container) stays invariant while
 ///   `Sequence[T]` / `Iterable[T]` (read-only view) flow covariantly.
 /// - Otherwise structural equality.
+/// Mutual assignability — `assignable(a, b) && assignable(b, a)` — computed in
+/// a single structural pass.
+///
+/// The naive two-call form is exponential on nested invariant generics: each
+/// level spawns two full `assignable` re-traversals, so a
+/// `list[list[…list[int]]]` annotation of depth *d* costs O(2^d) and can hang
+/// `tyc check` / the LSP on ~30-deep input. Two types with the *same* generic
+/// head are mutually assignable iff their arguments are pairwise mutually
+/// assignable — and, because mutual assignability is symmetric, that holds
+/// regardless of each parameter's variance. Recursing once per argument (via
+/// `types_equivalent`) instead of twice (via `assignable`) removes the
+/// blow-up while preserving identical results; any non-matching-head or
+/// non-generic pair falls back to the exact two-call definition, which does
+/// not recurse deeply.
+fn types_equivalent(a: &Type, b: &Type) -> bool {
+    if let (Type::Generic(an, aa), Type::Generic(bn, bb)) = (a, b) {
+        if an == bn && aa.len() == bb.len() {
+            return aa.iter().zip(bb).all(|(x, y)| types_equivalent(x, y));
+        }
+    }
+    assignable(a, b) && assignable(b, a)
+}
+
 pub fn assignable(expected: &Type, actual: &Type) -> bool {
     match (expected, actual) {
         (Type::Any, _) | (_, Type::Any) => true,
@@ -351,15 +374,10 @@ pub fn assignable(expected: &Type, actual: &Type) -> bool {
             // for MutableMapping. (See review thread on PR #147 from
             // gemini-code-assist / copilot.)
             if an == "Mapping" && aa.len() == 2 && bn == "dict" && bb.len() == 2 {
-                return assignable(&aa[0], &bb[0])
-                    && assignable(&bb[0], &aa[0])
-                    && assignable(&aa[1], &bb[1]);
+                return types_equivalent(&aa[0], &bb[0]) && assignable(&aa[1], &bb[1]);
             }
             if an == "MutableMapping" && aa.len() == 2 && bn == "dict" && bb.len() == 2 {
-                return assignable(&aa[0], &bb[0])
-                    && assignable(&bb[0], &aa[0])
-                    && assignable(&aa[1], &bb[1])
-                    && assignable(&bb[1], &aa[1]);
+                return types_equivalent(&aa[0], &bb[0]) && types_equivalent(&aa[1], &bb[1]);
             }
             if an != bn || aa.len() != bb.len() {
                 return false;
@@ -386,9 +404,7 @@ pub fn assignable(expected: &Type, actual: &Type) -> bool {
                         // readers of the narrower view. Bidirectional
                         // assignability captures structural equality without
                         // forcing `PartialEq` on every `Type` arm.
-                        Variance::Invariant => {
-                            assignable(formal, actual_arg) && assignable(actual_arg, formal)
-                        }
+                        Variance::Invariant => types_equivalent(formal, actual_arg),
                     }
                 })
         }

@@ -2455,8 +2455,17 @@ impl LogLevel {
 /// forwards to the editor via `client.log_message`. Messages below the
 /// threshold are dropped.
 pub fn run_stdio(log_level: LogLevel) {
+    // Match the CLI's deep-recursion headroom (see `tyc/src/main.rs`): the
+    // recursive-descent parser and the AST/type walkers can recurse as deep
+    // as the user nests brackets/expressions, which overflows the default
+    // ~2 MiB tokio blocking-thread stack and aborts the whole language
+    // server. `check_and_publish` runs the pipeline inside `spawn_blocking`,
+    // and `thread_stack_size` applies to the blocking pool, so this gives the
+    // check path the same 256 MiB stack the CLI reserves for its worker.
+    const LSP_STACK_SIZE: usize = 256 * 1024 * 1024;
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
+        .thread_stack_size(LSP_STACK_SIZE)
         .build()
         .expect("failed to start tokio runtime for tyc-lsp");
 

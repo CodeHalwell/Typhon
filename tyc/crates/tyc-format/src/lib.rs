@@ -1204,6 +1204,11 @@ fn run_ruff_format(source: &str, path: &str) -> Result<String, String> {
 /// Format the `.ty` file at `path` in place.
 ///
 /// Returns `true` if the file was changed.
+///
+/// The write is atomic: the formatted output is written to a temporary file in
+/// the same directory and then `rename`d over the target. A crash, disk-full,
+/// or interruption mid-write therefore leaves the original file intact rather
+/// than truncating a user's source (a bare `fs::write` is not crash-safe).
 #[allow(clippy::result_large_err)]
 pub fn format_file(path: &Path) -> Result<bool, TycError> {
     let source = std::fs::read_to_string(path)
@@ -1213,11 +1218,46 @@ pub fn format_file(path: &Path) -> Result<bool, TycError> {
     let result = format_source(&source, &path_str)?;
 
     if result.changed {
-        std::fs::write(path, result.output.as_bytes())
+        atomic_write(path, result.output.as_bytes())
             .map_err(|e| TycError::io(path.to_string_lossy().into_owned(), &e))?;
     }
 
     Ok(result.changed)
+}
+
+/// Write `bytes` to `path` atomically: write a sibling temp file in the same
+/// directory, flush it, then `rename` it over the target. Because the temp file
+/// lives on the same filesystem as the target, the rename is atomic, so readers
+/// see either the old or the new content — never a half-written file.
+fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "out".to_string());
+    // Unique-enough within a run: fmt processes each path at most once, and the
+    // pid disambiguates concurrent `tyc fmt` invocations. (No randomness/clock
+    // is available in this crate's environment.)
+    let tmp = dir.join(format!(".{}.tycfmt-{}.tmp", file_name, std::process::id()));
+
+    // Scope the handle so it is closed before the rename.
+    {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(bytes)?;
+        f.flush()?;
+    }
+
+    match std::fs::rename(&tmp, path) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            // Best-effort cleanup of the temp file on failure; keep the
+            // original error.
+            let _ = std::fs::remove_file(&tmp);
+            Err(e)
+        }
+    }
 }
 
 #[cfg(test)]

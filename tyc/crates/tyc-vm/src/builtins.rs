@@ -17,6 +17,24 @@ use crate::interp::{normalize_index, Interpreter};
 use crate::value::{DictMap, HashKey, IterState, Module, NativeFn, Value};
 use num_traits::ToPrimitive as _;
 
+/// Write `text` to stdout, tolerating a broken pipe.
+///
+/// A plain `print!`/`println!` panics ("failed printing to stdout: Broken
+/// pipe") when the downstream consumer of a pipe exits early — e.g.
+/// `tyc run app | head`. CPython instead terminates cleanly, so on
+/// `BrokenPipe` we exit the process with status 0 rather than unwinding with a
+/// Rust panic. Other write errors are ignored (best-effort, as the previous
+/// code was via `.ok()`).
+fn vm_write_stdout(text: &str) {
+    use std::io::Write;
+    let mut out = std::io::stdout();
+    match out.write_all(text.as_bytes()) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => std::process::exit(0),
+        Err(_) => {}
+    }
+}
+
 /// Round a float to the nearest integer value using round-half-to-even
 /// (banker's rounding), matching CPython's `round()`.
 fn round_half_even(x: f64) -> f64 {
@@ -151,7 +169,8 @@ pub fn install(interp: &mut Interpreter) {
             }
             out.push_str(&interp.str_of(a)?);
         }
-        println!("{}", out);
+        out.push('\n');
+        vm_write_stdout(&out);
         Ok(Value::None)
     });
 
@@ -5808,14 +5827,21 @@ fn str_method(
         "endswith" => Value::Bool(s.ends_with(&single(args, "endswith")?.py_str())),
         "find" => {
             let needle = single(args, "find")?.py_str();
+            // CPython indices are character offsets, but Rust's `str::find`
+            // returns a byte offset. Convert so `s[s.find(x):]` matches
+            // CPython on non-ASCII text (the byte index is a char boundary).
             Value::Int(num_bigint::BigInt::from(
-                s.find(&needle).map(|i| i as i64).unwrap_or(-1),
+                s.find(&needle)
+                    .map(|i| s[..i].chars().count() as i64)
+                    .unwrap_or(-1),
             ))
         }
         "rfind" => {
             let needle = single(args, "rfind")?.py_str();
             Value::Int(num_bigint::BigInt::from(
-                s.rfind(&needle).map(|i| i as i64).unwrap_or(-1),
+                s.rfind(&needle)
+                    .map(|i| s[..i].chars().count() as i64)
+                    .unwrap_or(-1),
             ))
         }
         "count" => {
@@ -5856,15 +5882,16 @@ fn str_method(
         )),
         "index" => {
             let needle = single(args, "index")?.py_str();
+            // Char offset, not byte offset (see `find`).
             match s.find(&needle) {
-                Some(i) => Value::Int(num_bigint::BigInt::from(i as i64)),
+                Some(i) => Value::Int(num_bigint::BigInt::from(s[..i].chars().count() as i64)),
                 None => return Err(value_error("substring not found")),
             }
         }
         "rindex" => {
             let needle = single(args, "rindex")?.py_str();
             match s.rfind(&needle) {
-                Some(i) => Value::Int(num_bigint::BigInt::from(i as i64)),
+                Some(i) => Value::Int(num_bigint::BigInt::from(s[..i].chars().count() as i64)),
                 None => return Err(value_error("substring not found")),
             }
         }
@@ -7032,7 +7059,7 @@ fn json_dumps_indent(v: &Value, indent: usize, level: usize, sort: bool) -> Stri
                 .iter()
                 .map(|(k, val)| {
                     (
-                        json_dumps(&k.clone().into_value(), sort),
+                        json_dumps_key(&k.clone().into_value()),
                         json_dumps_indent(val, indent, level + 1, sort),
                     )
                 })
@@ -7079,12 +7106,7 @@ fn json_dumps(v: &Value, sort: bool) -> String {
                 .borrow()
                 .iter()
                 .filter(|(k, _)| !matches!(k, HashKey::Str(s) if s.as_str() == "__typhon_frozen__"))
-                .map(|(k, v)| {
-                    (
-                        json_dumps(&k.clone().into_value(), sort),
-                        json_dumps(v, sort),
-                    )
-                })
+                .map(|(k, v)| (json_dumps_key(&k.clone().into_value()), json_dumps(v, sort)))
                 .collect();
             if sort {
                 pairs.sort_by(|a, b| a.0.cmp(&b.0));
@@ -7092,6 +7114,26 @@ fn json_dumps(v: &Value, sort: bool) -> String {
             let items: Vec<String> = pairs.iter().map(|(k, v)| format!("{}: {}", k, v)).collect();
             format!("{{{}}}", items.join(", "))
         }
+        other => json_string(&other.py_repr()),
+    }
+}
+
+/// Render a dict key as a JSON object key (always a quoted string).
+///
+/// CPython coerces scalar dict keys to strings (`json.dumps({1: "a"})` →
+/// `{"1": "a"}`, `True` → `"true"`, `None` → `"null"`, floats via `repr`),
+/// which keeps the output valid JSON. Previously the VM emitted keys via the
+/// value serializer, producing unquoted (invalid) keys like `{1: "a"}`.
+fn json_dumps_key(v: &Value) -> String {
+    match v {
+        Value::Str(s) => json_string(s),
+        Value::Int(i) => json_string(&i.to_string()),
+        Value::Bool(b) => json_string(if *b { "true" } else { "false" }),
+        Value::Float(x) => json_string(&format!("{}", x)),
+        Value::None => json_string("null"),
+        // Non-scalar keys aren't valid JSON keys in CPython either (it raises
+        // TypeError); fall back to the repr string so we at least stay
+        // syntactically valid rather than emitting a bare object/array key.
         other => json_string(&other.py_repr()),
     }
 }
@@ -7719,7 +7761,7 @@ pub fn call_with_kwargs(
             if to_stderr {
                 eprint!("{out}");
             } else {
-                print!("{out}");
+                vm_write_stdout(&out);
                 if !end.ends_with('\n') {
                     use std::io::Write;
                     let _ = std::io::stdout().flush();
