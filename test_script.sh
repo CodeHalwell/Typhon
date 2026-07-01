@@ -1,0 +1,1 @@
+sed -i 's/fn collect_names_in_expr(expr: &Expr) -> std::collections::HashSet<String> {/fn collect_names_in_expr<'"'"'a>(expr: &'"'"'a Expr) -> std::collections::HashSet<&'"'"'a str> {/' tyc/crates/tyc-types/src/lib.rs

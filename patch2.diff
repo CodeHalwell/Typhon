@@ -1,0 +1,11 @@
+--- tyc/crates/tyc-types/src/lib.rs
++++ tyc/crates/tyc-types/src/lib.rs
+@@ -6540,7 +6540,7 @@
+             }
+         }
+     }
+-    let mut v = V {
++    let mut v = V::<'a> {
+         names: std::collections::HashSet::new(),
+     };
+     v.visit_expr(expr);

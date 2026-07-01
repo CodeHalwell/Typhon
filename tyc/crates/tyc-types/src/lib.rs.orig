@@ -5929,7 +5929,7 @@ fn summarise_partial_return(
                         // Anything else referencing a tracked name is
                         // an escape we can't follow — drop those names.
                         for n in collect_names_in_expr(other) {
-                            tracked.remove(n);
+                            tracked.remove(&n);
                         }
                     }
                 }
@@ -6077,12 +6077,12 @@ fn summary_observe_call(
     // callee — drop it conservatively.
     for arg in &call.arguments.args {
         for n in collect_names_in_expr(arg) {
-            tracked.remove(n);
+            tracked.remove(&n);
         }
     }
     for kw in &call.arguments.keywords {
         for n in collect_names_in_expr(&kw.value) {
-            tracked.remove(n);
+            tracked.remove(&n);
         }
     }
 }
@@ -6118,7 +6118,7 @@ fn summary_observe_value(
         return;
     }
     for n in collect_names_in_expr(value) {
-        tracked.remove(n);
+        tracked.remove(&n);
     }
 }
 
@@ -6372,9 +6372,9 @@ fn audit_check_escape(c: &mut Checker, expr: &Expr) {
         .iter()
         .filter_map(|n| {
             c.uninit_instances
-                .get(*n)
+                .get(n)
                 .filter(|info| !info.missing.is_empty())
-                .map(|info| (n.to_string(), info.clone()))
+                .map(|info| (n.clone(), info.clone()))
         })
         .collect();
     for (binding, info) in snapshot {
@@ -6541,7 +6541,7 @@ fn collect_names_in_expr<'a>(expr: &'a Expr) -> std::collections::HashSet<&'a st
             }
         }
     }
-    let mut v = V::<'a> {
+    let mut v = V {
         names: std::collections::HashSet::new(),
     };
     v.visit_expr(expr);
@@ -9779,7 +9779,7 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                 let names_in_value = collect_names_in_expr(value);
                 if names_in_value
                     .iter()
-                    .any(|n| c.uninit_instances.contains_key(*n))
+                    .any(|n| c.uninit_instances.contains_key(n))
                 {
                     audit_check_escape(c, value);
                 }

@@ -1,0 +1,21 @@
+--- tyc/crates/tyc-types/src/lib.rs
++++ tyc/crates/tyc-types/src/lib.rs
+@@ -6504,13 +6504,13 @@
+ ///
+ /// FINDINGS — gemini + copilot review of v0.2.0.
+-fn collect_names_in_expr(expr: &Expr) -> std::collections::HashSet<String> {
++fn collect_names_in_expr<'a>(expr: &'a Expr) -> std::collections::HashSet<&'a str> {
+     use ruff_python_ast::visitor::source_order::{walk_expr, SourceOrderVisitor};
+-    struct V {
+-        names: std::collections::HashSet<String>,
++    struct V<'a> {
++        names: std::collections::HashSet<&'a str>,
+     }
+-    impl<'a> SourceOrderVisitor<'a> for V {
++    impl<'a> SourceOrderVisitor<'a> for V<'a> {
+         fn visit_expr(&mut self, e: &'a Expr) {
+             match e {
+                 Expr::Name(n) => {
+-                    self.names.insert(n.id.as_str().to_owned());
++                    self.names.insert(n.id.as_str());
+                 }

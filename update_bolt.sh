@@ -1,0 +1,3 @@
+echo '## 2024-07-02 - Avoiding String allocations in AST traversal' >> .jules/bolt.md
+echo '**Learning:** In `tyc/crates/tyc-types`, hot paths like `collect_names_in_expr` can generate massive numbers of short-lived `String` heap allocations by calling `.to_owned()` on identifiers from the AST. Returning `HashSet<&str>` instead of `HashSet<String>` avoids this.' >> .jules/bolt.md
+echo '**Action:** When extracting names from borrowed AST nodes into temporary collections, use string slices (`&str`) with the node'\''s lifetime instead of allocating owned `String`s, especially in recursive walkers.' >> .jules/bolt.md
