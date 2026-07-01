@@ -46,6 +46,17 @@ behaviour.
   instead of a Rust panic).
 - **VM: `json.dumps` coerces scalar dict keys to strings** (valid JSON;
   `{1: "a"}` → `{"1": "a"}`).
+- **Type checker: flow-narrowing invalidation holes closed.** Four cases where a
+  narrowing was unsoundly carried past the point it could still hold: (1) an
+  `except` handler is now checked with narrowings widened to declared types (the
+  `try` body may have raised before establishing them); (2) a variable
+  reassigned inside a loop body is widened before the body is checked, so a read
+  at the top of a later iteration isn't treated with the stale pre-loop type;
+  (3) a call in an assignment RHS (not just a bare-call statement) invalidates a
+  narrowing on a module global it may reassign via `global`; (4) a bare
+  method-call statement (`self.reset()`) invalidates attribute narrowings rooted
+  at its receiver. Each is a conservative widening that only affects programs
+  relying on the previously-unsound narrowing; the example corpus is unchanged.
 
 ### Tooling / LSP
 

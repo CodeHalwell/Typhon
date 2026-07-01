@@ -38,15 +38,17 @@ test suite pass, and the perf gate is within threshold.
 | MEDIUM — GitHub Actions unpinned | ⚠️ Partial | Added `dependabot.yml` (github-actions/cargo/npm); SHA-pinning left to a maintainer with network access (SHAs unverifiable offline here) |
 | Docs/packaging (stale versions, README quickstart, docs-site pydantic/toolchain/installers, examples #60, VS Code `val`/`var`+icon+install, stress README, SECURITY/CONTRIBUTING, `.Jules` case-collision) | ✅ Fixed | See the diff |
 | Diagnostics catalog: 4 codes missing docs + `explain` | ✅ Fixed | Added the 4 pages + wired into `tyc explain` |
-| **H5** — scope-blind class unification | ⛔ Deferred | Tightening risks *rejecting currently-valid programs* (violates the hard additive-compatibility rule); needs dedicated shape-conflict logic + false-positive testing |
-| **H6** — flow-narrowing soundness holes | ⛔ Deferred | Same reason — soundness fixes here carry real false-positive risk and need a focused pass with corpus + targeted tests |
+| **H6** — flow-narrowing soundness holes | ✅ Fixed | All four sub-holes closed in `tyc-types`: (1) `except` handlers now check against pre-narrowing state (a body raise can happen anywhere); (2) loop bodies widen names reassigned inside them so iteration-2 reads aren't treated with the stale pre-loop type; (3) a call in an assign/ann-assign RHS invalidates global narrowing (not just bare-call statements); (4) a bare method-call statement invalidates attribute narrowing rooted at its receiver. 7 new regression tests; corpus unchanged (998/132); full suite green |
+| **H5** — scope-blind class unification | ⛔ Deferred (with finding) | Attempted a safe tightening (reject the tail-unification only when both sides are non-partial project classes with different field sets). **Empirically found it introduces a false positive** and reverted: a value typed as a bare `Class("Node")` has lost its module origin, so the incompatibility check misresolves an ambiguous bare name and rejects a *correct-type* assignment (verified: passing a genuine `graph.Node` into a `graph.Node` param errored). The common bug (user class vs a *partial* library class) also can't be caught soundly — a partial shape can't be proven incompatible. A safe fix needs the larger "carry qualified module origin through inference" refactor, not a quick edit |
 | LOW — BOM not stripped; comptime "(no location)" | ⛔ Deferred | Low value; the safe fix touches offset-mapping and isn't worth the risk in this pass |
 
-The two deferred HIGH items (H5, H6) are genuine soundness gaps, but they are *silent-acceptance*
-gaps (they let a rare wrong program through), not crashes or data loss. Fixing them safely means
-tightening the checker without rejecting any currently-valid program — the project's hardest
-constraint — so they warrant their own change with dedicated corpus + false-positive testing
-rather than a quick edit here.
+H6 is now fixed (four sub-holes, seven regression tests, corpus unchanged). H5 remains the one
+deferred HIGH item — not for lack of trying: a tightening was implemented and then reverted when
+it was empirically shown to reject a correct-type assignment, because Typhon's bare-`Class(name)`
+representation drops the module origin a sound check needs. That's a design-level refactor
+(thread qualified origin through inference), not a quick edit, and shipping the false-positive
+version would have violated the project's hardest constraint (never reject a currently-valid
+program).
 
 ---
 
