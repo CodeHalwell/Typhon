@@ -151,8 +151,11 @@ jobs:
           name="tyc-${version}-${target}"
           mkdir -p "$stage/$name"
           cp "tyc/target/${target}/release/tyc" "$stage/$name/tyc"
+          # LICENSE is mandatory — fail the release if it is missing rather
+          # than silently shipping binaries with no license text.
+          cp LICENSE "$stage/$name/LICENSE"
+          cp tyc/vendor/LICENSE "$stage/$name/LICENSE-ruff"
           cp README.md "$stage/$name/README.md" 2>/dev/null || true
-          cp LICENSE "$stage/$name/LICENSE" 2>/dev/null || true
 
           mkdir -p dist
           tar -C "$stage" -czf "dist/${name}.tar.gz" "$name"
@@ -181,8 +184,10 @@ jobs:
           $name    = "tyc-$version-$target"
           $stage   = New-Item -ItemType Directory -Path (Join-Path $env:RUNNER_TEMP $name) -Force
           Copy-Item "tyc/target/$target/release/tyc.exe" (Join-Path $stage.FullName 'tyc.exe')
+          # LICENSE is mandatory — Copy-Item throws (Stop) if it is missing.
+          Copy-Item 'LICENSE'           (Join-Path $stage.FullName 'LICENSE')
+          Copy-Item 'tyc/vendor/LICENSE' (Join-Path $stage.FullName 'LICENSE-ruff')
           if (Test-Path 'README.md') { Copy-Item 'README.md' (Join-Path $stage.FullName 'README.md') }
-          if (Test-Path 'LICENSE')   { Copy-Item 'LICENSE'   (Join-Path $stage.FullName 'LICENSE') }
 
           New-Item -ItemType Directory -Path 'dist' -Force | Out-Null
           $zipPath = "dist/$name.zip"
@@ -266,7 +271,10 @@ jobs:
           name: ${{ steps.tag.outputs.tag }}
           target_commitish: ${{ steps.tag.outputs.sha }}
           draft: false
-          prerelease: false
+          # A tag containing a hyphen (v1.0.0-alpha.2, -beta, -rc.1) is a
+          # pre-release; a bare vX.Y.Z is a stable release. This keeps
+          # alpha/beta tags from carrying the green "Latest" badge.
+          prerelease: ${{ contains(steps.tag.outputs.tag, '-') }}
           fail_on_unmatched_files: true
           generate_release_notes: true
           files: |

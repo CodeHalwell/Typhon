@@ -18,13 +18,15 @@ name: Auto-tag on main
 # unrelated commits to main is a no-op.
 
 on:
-  push:
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
     branches: [main]
 
-# Only one auto-tag run at a time per ref — back-to-back merges would
-# otherwise race on tag creation.
+# Only one auto-tag run at a time per validated commit — back-to-back
+# merges would otherwise race on tag creation.
 concurrency:
-  group: auto-tag-${{ github.ref }}
+  group: auto-tag-${{ github.event.workflow_run.head_sha }}
   cancel-in-progress: false
 
 permissions:
@@ -35,10 +37,14 @@ jobs:
   tag-and-release:
     name: Tag + dispatch release
     runs-on: ubuntu-latest
+    # Only tag/publish a commit whose CI run on main actually passed.
+    if: github.event.workflow_run.conclusion == 'success'
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          # Tag the exact commit CI validated, not the current tip of main.
+          ref: ${{ github.event.workflow_run.head_sha }}
 
       - name: Read workspace version
         id: ver

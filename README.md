@@ -95,11 +95,15 @@ cargo build --release
 
 # Scaffold a new project
 ./target/release/tyc init myapp
+cd myapp
 
-# Check and format Typhon source
-./target/release/tyc fmt src/
-./target/release/tyc check src/
+# Check and format Typhon source (the tyc binary is one level up, in tyc/)
+../target/release/tyc fmt src/
+../target/release/tyc check src/
 ```
+
+> Tip: `alias tyc="$PWD/target/release/tyc"` from `tyc/` (before `cd myapp`) so you
+> can just run `tyc fmt src/` / `tyc check src/` from anywhere.
 
 ## The `tyc` binary
 
@@ -356,3 +360,20 @@ tyc/
 ```
 
 See [docs/architecture.md](docs/architecture.md) for the pipeline and crate-by-crate breakdown.
+
+## License
+
+Typhon is released under the [MIT License](LICENSE).
+
+It vendors a fork of [Ruff](https://github.com/astral-sh/ruff) under `tyc/vendor/`,
+redistributed under Ruff's own MIT license (© 2022 Charlie Marsh) — see
+[`tyc/vendor/LICENSE`](tyc/vendor/LICENSE). The release archives ship both notices.
+
+## Security
+
+Typhon is a compiler and language runtime: `tyc build` installs your declared
+dependencies (`uv sync`), and `tyc check`/`tyc build`/the LSP introspect and
+**import** installed packages to type-check third-party calls — so running them
+on an untrusted project executes that project's code, the same trust boundary as
+`pip install` / running the code itself. Treat a cloned project as you would any
+other untrusted code. To report a vulnerability, see [SECURITY.md](SECURITY.md).
