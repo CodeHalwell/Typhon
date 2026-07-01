@@ -7,11 +7,41 @@ sidebar:
 
 import { Tabs, TabItem, Aside, Steps } from '@astrojs/starlight/components';
 
-Typhon ships as a single Rust binary called `tyc`. Building it is one `cargo` command; there are no other dependencies for the compiler itself. Optional integrations (`tyc ty`, `tyc stubtest`) shell out to Python tools you can install on demand.
+Typhon ships as a single Rust binary called `tyc`. The fastest way to get it is a pre-built binary from the latest GitHub Release; you can also build from source with one `cargo` command. Optional integrations (`tyc ty`, `tyc stubtest`) shell out to Python tools you can install on demand.
 
-## Prerequisites
+## Install a pre-built binary (recommended)
 
-- **A Rust toolchain** — `cargo` 1.85+ recommended. Install via [rustup](https://rustup.rs/) if you don't already have it.
+Pre-built, checksum-verified binaries ship on every [GitHub Release](https://github.com/CodeHalwell/Typhon/releases) for Linux (x86_64/aarch64), macOS (Apple Silicon/Intel), and Windows (x86_64).
+
+<Tabs>
+<TabItem label="macOS / Linux">
+
+```bash
+curl -sSL https://raw.githubusercontent.com/codehalwell/typhon/main/install.sh | sh
+```
+
+The installer detects your platform, downloads the matching archive, verifies its SHA-256 against the release manifest over TLS, and installs `tyc` to a per-user directory (no `sudo`). Pin a version with `--version v1.0.0-alpha.2` (or `TYPHON_VERSION=…`).
+
+</TabItem>
+<TabItem label="Windows (PowerShell)">
+
+```powershell
+iwr -useb https://raw.githubusercontent.com/codehalwell/typhon/main/install.ps1 | iex
+```
+
+</TabItem>
+<TabItem label="Manual download">
+
+Download the archive for your platform from the [latest release](https://github.com/CodeHalwell/Typhon/releases/latest), verify it against `SHA256SUMS`, extract it, and put `tyc` on your `PATH`.
+
+</TabItem>
+</Tabs>
+
+If your platform isn't listed (FreeBSD, Linux MUSL, Windows ARM64), build from source below.
+
+## Prerequisites (build from source)
+
+- **A Rust toolchain** — the repo pins Rust **1.94** (`tyc/rust-toolchain.toml`); the vendored crates require **1.93+**, so an older `cargo` will refuse to build. Install via [rustup](https://rustup.rs/) if you don't already have it.
 - **A Python interpreter** — CPython 3.13 (or 3.14, or the free-threaded `t` variants). Typhon emits code targeting 3.13 by default; you can change the target in `typhon.toml`.
 - **(Optional) `uv`** — Astral's package manager. Used by `tyc add` / `tyc remove` / `tyc sync` for dependency installation. Install with `pipx install uv` or via [the uv install script](https://docs.astral.sh/uv/getting-started/installation/).
 - **(Optional) `ty`** — Astral's Python type checker. Used by `tyc ty` for a second-opinion typing pass against the emitted Python. Install with `pip install ty` or `uv tool install ty`.

@@ -18,7 +18,7 @@ traceback-remap = false
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `class-default` | `"dataclass"` \| `"pydantic"` | `"dataclass"` | Default emission target for `class` declarations. Overridable per-class via the `model` keyword. |
+| `class-default` | `"dataclass"` | `"dataclass"` | Default emission target for `class` declarations. Only `"dataclass"` is accepted today; use the per-class `model` keyword for Pydantic. |
 | `format` | bool | `true` | Post-process emitted `.py` through `ruff format`. |
 | `skip-decoration-bases` | list of strings | `[]` | Extra base-class names that suppress the automatic `@dataclass(slots=True)` decorator. |
 | `model-extra` | `"forbid"` \| `"ignore"` \| `"allow"` | `"forbid"` | Value for `ConfigDict(extra=…)` injected into every `model` class. |
@@ -26,12 +26,11 @@ traceback-remap = false
 
 ## `class-default`
 
-- `"dataclass"` — `class Foo:` emits `@dataclass(slots=True)`. The recommended default — performance-cheap, no PyPI dependency.
-- `"pydantic"` — `class Foo:` emits a Pydantic `BaseModel(extra="forbid")`. Use when *every* class in the project crosses a trust boundary. (Rare.)
+- `"dataclass"` — `class Foo:` emits `@dataclass(slots=True)`. This is the only accepted value today: performance-cheap, no PyPI dependency.
 
-You can mix both freely regardless of the default. `class` follows the default; `model` always emits Pydantic.
+A project-wide Pydantic default (`class-default = "pydantic"`) is **not** supported — it is rejected at config load. Choose Pydantic per class with the `model` keyword instead (`model Foo:` emits a `BaseModel(extra="forbid")`); you can mix `class` and `model` freely in the same project.
 
-Unknown values (`"struct"`, `"plain"`, `"regular"`, `"none"`, the empty string, …) are rejected at config load with `tyc::invalid_config_value` and the allowed-values list. They used to be silently treated as `"dataclass"`, which made typos invisible.
+Any other value (`"pydantic"`, `"struct"`, `"plain"`, `"none"`, the empty string, …) is rejected at config load with `tyc::invalid_config_value` and the allowed-values list.
 
 ## `format`
 

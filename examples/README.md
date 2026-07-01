@@ -99,13 +99,14 @@ build/run steps. The full production-shaped apps live under
 |---|---|---|
 | 47 | Mini app — research assistant | multi-file project: API, DB, LLM, agent |
 
-### Language features (48, 49, 59)
+### Language features (48, 49, 59, 60)
 
 | # | Topic | Highlights |
 |---|---|---|
 | 48 | `newtype` IDs | nominal aliases, `UserId`/`PostId`/`Email`, escape-upward rule, `tyc::newtype_violation` |
 | 49 | Enums | `enum` keyword (v0.11), `enum.auto()` numbering, explicit values + resume, `match` on members, `.name`/`.value` |
 | 59 | Boundary casts | `try_result` (v0.15) exception→`Result`, `as!` (v0.14/v0.15) sound runtime-checked cast at an untyped JSON boundary |
+| 60 | `rescue` boundaries | `rescue` (v1.0-alpha) lambda-free exception→`Result`: postfix `EXPR rescue e: ERR` and block `rescue e: ERR:` over a suite |
 
 ### High-signal algorithms & patterns (50, 56, 57, 58, 68)
 

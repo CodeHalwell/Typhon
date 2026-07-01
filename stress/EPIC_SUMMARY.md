@@ -1,7 +1,11 @@
 # Epic: Corpus Coverage — Third-Party PyPI Sweep + Drift Round 4 + Inter-Procedural Audit
 
-**Issue:** CodeHalwell/Typhon#<issue-number>
-**Status:** Partially complete (2 of 3 sub-items done)
+> Internal stress-campaign summary (historical). The inter-procedural
+> field-init audit referenced below as future work subsequently landed in
+> v1.0.0-alpha — see `CHANGELOG.md` and `TYPE_SYSTEM_FRONTIER.md`.
+
+**Status:** Historical record — 2 of 3 sub-items completed in this round;
+the third (inter-procedural audit) landed later in v1.0.0-alpha.
 
 ## Overview
 

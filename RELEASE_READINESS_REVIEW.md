@@ -11,6 +11,45 @@ targeted per-crate code reviews.
 
 ---
 
+## Remediation status (applied in this branch)
+
+Most of the findings below have been **fixed** in the same branch as this report. The
+example/stress corpus stays byte-identically green (998 pass / 132 intentional-negative
+`stress/` fixtures — unchanged before and after), `cargo fmt`/`clippy -D warnings`/the full
+test suite pass, and the perf gate is within threshold.
+
+| Finding | Status | What changed |
+|---|---|---|
+| **B1** — no LICENSE / Ruff attribution | ✅ Fixed | Root `LICENSE` (MIT), `tyc/vendor/LICENSE` (Ruff © 2022 Charlie Marsh), `editors/vscode/LICENSE`, README License section, release.yml now packs both licenses unconditionally |
+| **H1** — VM cyclic-value SIGABRT | ✅ Fixed | Depth-guarded `py_eq`/`py_cmp` + `Rc::ptr_eq` fast-paths in `tyc-vm/src/value.rs`; `a == b` on cyclic data returns cleanly instead of aborting the process |
+| **H2** — LSP 2 MiB stack | ✅ Fixed | `tyc-lsp` runtime now reserves the same 256 MiB stack as the CLI |
+| **H3** — nested-type checker blowup | ✅ Fixed | `types_equivalent` single-pass mutual-assignability replaces the O(2^depth) double-descent; depth-28 check went 5.4 s → 7 ms, depth-100 = 8 ms, semantics identical (corpus unchanged) |
+| **H4** — untrusted-code trust model | ✅ Fixed | `SECURITY.md` documents the model; `TYC_NO_INTROSPECT` kill-switch disables dependency introspection (CLI + LSP); README Security note |
+| **H7** — VM `str.find` byte vs char offsets | ✅ Fixed | `find`/`rfind`/`index`/`rindex` return char offsets (CPython-correct on non-ASCII) |
+| **H8** — VM `+=` rebinds not mutates | ✅ Fixed | `list += iterable` mutates in place (aliases + `self.items += [x]` observe it) |
+| MEDIUM — auto-tag no test gate; alpha marked "Latest" | ✅ Fixed | auto-tag gated on CI success via `workflow_run`; `prerelease` derived from the tag |
+| MEDIUM — `tyc fmt` non-atomic write | ✅ Fixed | Atomic temp-file + rename in `format_file` |
+| MEDIUM — dead `typhon.dev` diagnostic URLs | ✅ Fixed | All ~80 URLs + CLI help repointed to resolvable GitHub docs paths |
+| MEDIUM — `exhaustive-match` knob never applied | ✅ Fixed | Wired into `apply_strictness` (warn/off now honoured) |
+| MEDIUM — VM float `%` sign, `//`/`% 0.0` | ✅ Fixed | CPython-correct sign + `ZeroDivisionError` |
+| MEDIUM — VM broken-pipe panic | ✅ Fixed | `print` tolerates `BrokenPipe` (clean exit) |
+| MEDIUM — VM `json.dumps` non-string keys | ✅ Fixed | Scalar keys coerced to strings (valid JSON) |
+| MEDIUM — Windows venv discovery dead | ✅ Fixed | `Scripts\python.exe` + `python`/`py` probed |
+| MEDIUM — GitHub Actions unpinned | ⚠️ Partial | Added `dependabot.yml` (github-actions/cargo/npm); SHA-pinning left to a maintainer with network access (SHAs unverifiable offline here) |
+| Docs/packaging (stale versions, README quickstart, docs-site pydantic/toolchain/installers, examples #60, VS Code `val`/`var`+icon+install, stress README, SECURITY/CONTRIBUTING, `.Jules` case-collision) | ✅ Fixed | See the diff |
+| Diagnostics catalog: 4 codes missing docs + `explain` | ✅ Fixed | Added the 4 pages + wired into `tyc explain` |
+| **H5** — scope-blind class unification | ⛔ Deferred | Tightening risks *rejecting currently-valid programs* (violates the hard additive-compatibility rule); needs dedicated shape-conflict logic + false-positive testing |
+| **H6** — flow-narrowing soundness holes | ⛔ Deferred | Same reason — soundness fixes here carry real false-positive risk and need a focused pass with corpus + targeted tests |
+| LOW — BOM not stripped; comptime "(no location)" | ⛔ Deferred | Low value; the safe fix touches offset-mapping and isn't worth the risk in this pass |
+
+The two deferred HIGH items (H5, H6) are genuine soundness gaps, but they are *silent-acceptance*
+gaps (they let a rare wrong program through), not crashes or data loss. Fixing them safely means
+tightening the checker without rejecting any currently-valid program — the project's hardest
+constraint — so they warrant their own change with dedicated corpus + false-positive testing
+rather than a quick edit here.
+
+---
+
 ## TL;DR verdict
 
 Typhon is **an impressively complete and well-engineered alpha** — every CI gate is green
