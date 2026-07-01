@@ -220,6 +220,12 @@ textarea:focus-visible,
 }
 
 /* Starlight specific focus fixes */
+.card:focus-within {
+  border-color: var(--sl-color-accent);
+  transform: translateY(-2px);
+  box-shadow: 0 4px 12px color-mix(in srgb, var(--sl-color-accent) 20%, transparent);
+}
+
 .sl-link-card:focus-within {
   background: var(--sl-color-gray-7, var(--sl-color-gray-6));
   border-color: var(--sl-color-gray-2);
@@ -232,7 +238,9 @@ textarea:focus-visible,
 /* Respect user's motion preferences */
 @media (prefers-reduced-motion: reduce) {
   .card:hover,
-  .sl-link-card:hover {
+  .card:focus-within,
+  .sl-link-card:hover,
+  .sl-link-card:focus-within {
     transform: none;
   }
 }
