@@ -7087,7 +7087,10 @@ fn json_dumps(v: &Value, sort: bool) -> String {
         Value::None => "null".into(),
         Value::Bool(b) => if *b { "true" } else { "false" }.into(),
         Value::Int(i) => i.to_string(),
-        Value::Float(x) => format!("{}", x),
+        // Use the VM's canonical float formatter (shortest round-trip, keeps a
+        // trailing `.0`) rather than Rust's `Display`, so `json.dumps(1.0)`
+        // emits `1.0` like CPython instead of `1`.
+        Value::Float(x) => Value::Float(*x).py_str(),
         Value::Str(s) => json_string(s),
         Value::List(l) => {
             let items: Vec<String> = l.borrow().iter().map(|x| json_dumps(x, sort)).collect();
@@ -7129,7 +7132,7 @@ fn json_dumps_key(v: &Value) -> String {
         Value::Str(s) => json_string(s),
         Value::Int(i) => json_string(&i.to_string()),
         Value::Bool(b) => json_string(if *b { "true" } else { "false" }),
-        Value::Float(x) => json_string(&format!("{}", x)),
+        Value::Float(x) => json_string(&Value::Float(*x).py_str()),
         Value::None => json_string("null"),
         // Non-scalar keys aren't valid JSON keys in CPython either (it raises
         // TypeError); fall back to the repr string so we at least stay

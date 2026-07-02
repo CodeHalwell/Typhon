@@ -2418,6 +2418,29 @@ impl TypeEnv {
         }
         self.attr_narrowings.clear();
     }
+
+    /// Conservatively merge `other`'s narrowings into `self`, keeping only the
+    /// narrowings the two agree on. Any binding whose narrowed type differs
+    /// between the two envs is widened to its declared type; any attribute
+    /// narrowing not present-and-equal in `other` is dropped. Used to join the
+    /// alternative control-flow paths out of a `try` (the body completed vs a
+    /// handler ran) into a sound post-statement state — the dual of the
+    /// `if`/`else` branch join.
+    fn intersect_narrowings(&mut self, other: &TypeEnv) {
+        for (i, scope) in self.scopes.iter_mut().enumerate() {
+            let other_scope = other.scopes.get(i);
+            for (name, b) in scope.iter_mut() {
+                let agree = other_scope
+                    .and_then(|s| s.get(name))
+                    .is_some_and(|ob| ob.narrowed == b.narrowed);
+                if !agree && b.narrowed != b.declared {
+                    b.narrowed = b.declared.clone();
+                }
+            }
+        }
+        self.attr_narrowings
+            .retain(|k, v| other.attr_narrowings.get(k) == Some(v));
+    }
 }
 
 /// Per-module check state.
@@ -10812,9 +10835,15 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
             // The body may raise at any point, so a narrowing it established
             // (`x = get_int()` making `x` non-None) is NOT guaranteed to hold
             // when a handler runs. Check each handler with narrowings widened
-            // back to declared types (bindings kept). `else` runs only when the
-            // body completed without raising, so it sees the body-end state.
+            // back to declared types (bindings kept).
             let body_end = c.env.snapshot();
+
+            // Collect the env states that can flow to the code *after* the try:
+            // each handler that ran to completion, plus the body-completed path
+            // (after `else`). The post-try state is their join, so a handler
+            // that mutates a narrowed variable (`except: x = None`) is reflected
+            // downstream — restoring only `body_end` would silently drop it.
+            let mut post_states: Vec<TypeEnv> = Vec::new();
             for h in &t.handlers {
                 let ruff_python_ast::ExceptHandler::ExceptHandler(h) = h;
                 c.env.restore(body_end.clone());
@@ -10822,11 +10851,36 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                 for s in &h.body {
                     check_stmt(c, s);
                 }
+                if !body_always_exits(&h.body) {
+                    post_states.push(c.env.snapshot());
+                }
             }
-            c.env.restore(body_end);
+
+            // `else` runs only when the body completed without raising, so it
+            // sees the body-end state. That path contributes to the post-try
+            // join unless the body (or `else`) always diverges.
+            c.env.restore(body_end.clone());
             for s in &t.orelse {
                 check_stmt(c, s);
             }
+            let else_exits = !t.orelse.is_empty() && body_always_exits(&t.orelse);
+            if !body_always_exits(&t.body) && !else_exits {
+                post_states.push(c.env.snapshot());
+            }
+
+            // Join the reachable paths (widen any narrowing they disagree on).
+            // If every path diverges, the post-try point is unreachable; keep
+            // `body_end` so `finally` still has a sane env to check against.
+            if let Some((first, rest)) = post_states.split_first() {
+                let mut joined = first.clone();
+                for s in rest {
+                    joined.intersect_narrowings(s);
+                }
+                c.env.restore(joined);
+            } else {
+                c.env.restore(body_end);
+            }
+
             for s in &t.finalbody {
                 check_stmt(c, s);
             }
@@ -22360,6 +22414,63 @@ def demo() -> None:
                 .iter()
                 .any(|e| matches!(e, TycError::UnknownName { .. })),
             "body-assigned name must stay visible in the handler: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn narrowing_try_handler_mutation_flows_past_try() {
+        // PR#249 (chatgpt-codex): a handler that mutates a narrowed variable
+        // must be reflected in the post-`try` state — restoring only the
+        // body-completed state would silently drop the handler's effect.
+        let src = "\
+def risky() -> None:
+    pass
+
+def demo(x: int | None) -> int:
+    if x is None:
+        return 0
+    try:
+        risky()
+    except ValueError:
+        x = None
+    return x
+";
+        let d = check(src);
+        assert!(
+            d.errors().iter().any(|e| matches!(
+                e,
+                TycError::NullableUse { .. } | TycError::TypeMismatch { .. }
+            )),
+            "handler mutation (x = None) must widen x in the post-try join: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn narrowing_try_no_handler_mutation_stays_clean() {
+        // PR#249 control: when neither the body nor the handler disturbs a
+        // pre-try narrowing, it must survive the post-try join (no false
+        // positive from the widening).
+        let src = "\
+def risky() -> None:
+    pass
+
+def demo(x: int | None) -> int:
+    if x is None:
+        return 0
+    try:
+        risky()
+    except ValueError:
+        print(\"failed\")
+    return x
+";
+        let d = check(src);
+        assert!(
+            !d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::NullableUse { .. })),
+            "an untouched narrowing must survive the post-try join: {:?}",
             d.errors()
         );
     }

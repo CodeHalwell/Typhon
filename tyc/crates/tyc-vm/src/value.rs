@@ -33,23 +33,34 @@ thread_local! {
     static STRUCTURAL_DEPTH: Cell<usize> = const { Cell::new(0) };
 }
 
-/// Enter one level of structural recursion. Returns `false` when the depth
-/// bound has been reached (caller should bail without recursing); on `true`
-/// the caller must pair it with [`structural_depth_exit`].
-fn structural_depth_enter() -> bool {
+/// RAII guard that decrements the structural-recursion depth on drop. Using a
+/// guard (rather than a manual paired call) means a panic partway through a
+/// comparison can't leave the thread-local counter stuck incremented — which
+/// would otherwise make every later comparison on that thread spuriously bail
+/// once the (now-unreachable) limit is hit. Thread-locals persist across tasks
+/// on a reused thread, so this matters in the LSP / test harness where a
+/// panic may be caught.
+struct StructuralDepthGuard;
+
+impl Drop for StructuralDepthGuard {
+    fn drop(&mut self) {
+        STRUCTURAL_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+    }
+}
+
+/// Enter one level of structural recursion, returning a guard that restores the
+/// depth on drop. Returns `None` when the depth bound has been reached (the
+/// caller should bail without recursing).
+fn structural_depth_enter() -> Option<StructuralDepthGuard> {
     STRUCTURAL_DEPTH.with(|d| {
         let cur = d.get();
         if cur >= MAX_STRUCTURAL_DEPTH {
-            false
+            None
         } else {
             d.set(cur + 1);
-            true
+            Some(StructuralDepthGuard)
         }
     })
-}
-
-fn structural_depth_exit() {
-    STRUCTURAL_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
 }
 use ruff_python_ast::{Parameters, Stmt};
 
@@ -815,12 +826,10 @@ impl Value {
     /// beyond-bound comparisons as not-provably-equal (`false`). The bound is
     /// far deeper than any real data.
     pub fn py_eq(&self, other: &Value) -> bool {
-        if !structural_depth_enter() {
+        let Some(_guard) = structural_depth_enter() else {
             return false;
-        }
-        let result = self.py_eq_inner(other);
-        structural_depth_exit();
-        result
+        };
+        self.py_eq_inner(other)
     }
 
     fn py_eq_inner(&self, other: &Value) -> bool {
@@ -932,12 +941,8 @@ impl Value {
     /// recurse without bound. Beyond the bound we return `None` (treat as
     /// incomparable) rather than overflowing the stack.
     pub fn py_cmp(&self, other: &Value) -> Option<std::cmp::Ordering> {
-        if !structural_depth_enter() {
-            return None;
-        }
-        let result = self.py_cmp_inner(other);
-        structural_depth_exit();
-        result
+        let _guard = structural_depth_enter()?;
+        self.py_cmp_inner(other)
     }
 
     fn py_cmp_inner(&self, other: &Value) -> Option<std::cmp::Ordering> {

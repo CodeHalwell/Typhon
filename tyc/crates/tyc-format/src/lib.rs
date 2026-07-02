@@ -1242,11 +1242,14 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     // is available in this crate's environment.)
     let tmp = dir.join(format!(".{}.tycfmt-{}.tmp", file_name, std::process::id()));
 
-    // Scope the handle so it is closed before the rename.
+    // Scope the handle so it is closed before the rename. `sync_all` (not
+    // `flush`, which is a no-op on a bufferless `std::fs::File`) forces the
+    // bytes to disk before the rename, so a crash / power loss immediately
+    // after can't leave a rename pointing at unwritten data.
     {
         let mut f = std::fs::File::create(&tmp)?;
         f.write_all(bytes)?;
-        f.flush()?;
+        f.sync_all()?;
     }
 
     match std::fs::rename(&tmp, path) {

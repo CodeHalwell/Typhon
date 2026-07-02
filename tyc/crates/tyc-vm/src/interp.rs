@@ -238,21 +238,47 @@ impl Interpreter {
                 let current = self.eval_expr(&a.target, env)?;
                 let rhs = self.eval_expr(&a.value, env)?;
                 // In-place mutation for a mutable list target: CPython's
-                // `list.__iadd__` extends the existing object rather than
-                // rebinding, so aliases (`b = a; b += [x]`) and field targets
-                // (`self.items += [x]`) observe the change. `+=` accepts any
-                // iterable RHS, matching `list.extend`. All other targets
-                // (immutable scalars/tuples, and other ops) fall through to the
-                // binop + rebind path unchanged.
-                if let (Value::List(target), Operator::Add) = (&current, a.op) {
+                // `list.__iadd__` (`+=`) and `list.__imul__` (`*=`) mutate the
+                // existing object rather than rebinding, so aliases
+                // (`b = a; b += [x]`) and field targets (`self.items += [x]`)
+                // observe the change. `+=` accepts any iterable RHS (matching
+                // `list.extend`); `*=` repeats in place. All other targets
+                // (immutable scalars/tuples) fall through to binop + rebind.
+                if let Value::List(target) = &current {
                     let target = target.clone();
-                    let it = self.make_iter(rhs)?;
-                    let mut items = Vec::new();
-                    while let Some(v) = self.iter_next(&it)? {
-                        items.push(v);
+                    let mutated = match a.op {
+                        Operator::Add => {
+                            let it = self.make_iter(rhs.clone())?;
+                            let mut items = Vec::new();
+                            while let Some(v) = self.iter_next(&it)? {
+                                items.push(v);
+                            }
+                            target.borrow_mut().extend(items);
+                            true
+                        }
+                        Operator::Mult => {
+                            // Reuse binop's `list * n` semantics, then splice the
+                            // result back into the existing object in place.
+                            let new = self.binop(&current, a.op, &rhs)?;
+                            if let Value::List(new_list) = &new {
+                                let items: Vec<Value> = new_list.borrow().clone();
+                                *target.borrow_mut() = items;
+                                true
+                            } else {
+                                false
+                            }
+                        }
+                        _ => false,
+                    };
+                    if mutated {
+                        // Store the (same, now-mutated) object back so a
+                        // subscript / attribute / property target still runs its
+                        // setter, matching CPython's store-after-in-place. For a
+                        // bare name this rebinds to the same `Rc`, so aliases are
+                        // preserved.
+                        self.assign_target(&a.target, Value::List(target), env, None)?;
+                        return Ok(());
                     }
-                    target.borrow_mut().extend(items);
-                    return Ok(());
                 }
                 let new = self.binop(&current, a.op, &rhs)?;
                 self.assign_target(&a.target, new, env, None)?;

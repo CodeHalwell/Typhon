@@ -308,10 +308,16 @@ fn discover_python(project_root: &Path) -> Option<PathBuf> {
         return None;
     }
     let venv = project_root.join(".venv");
-    let candidates = [
-        venv.join("bin").join("python"),         // Unix
-        venv.join("Scripts").join("python.exe"), // Windows
-    ];
+    // Probe the current platform's native layout first. On WSL / Docker mounts
+    // / shared folders both layouts can be present, and picking the foreign
+    // one yields an interpreter that won't run.
+    let unix = venv.join("bin").join("python");
+    let windows = venv.join("Scripts").join("python.exe");
+    let candidates = if cfg!(windows) {
+        [windows, unix]
+    } else {
+        [unix, windows]
+    };
     for candidate in candidates {
         if candidate.is_file() {
             return Some(candidate);
@@ -334,9 +340,10 @@ fn stat_pyvenv_cfg(project_root: &Path) -> Option<std::time::SystemTime> {
 /// becomes a silent no-op.
 fn which_python3() -> Option<PathBuf> {
     let path_var = std::env::var_os("PATH")?;
-    // `python3` first (Unix convention), then `python` / `python.exe` for
-    // Windows and minimal installs that ship only the unsuffixed name.
-    let names: [&str; 3] = ["python3", "python", "python.exe"];
+    // `python3` first (Unix convention), then `python` / `python.exe`, then the
+    // Windows `py` launcher — covering Windows and minimal installs that ship
+    // only the unsuffixed name.
+    let names: [&str; 5] = ["python3", "python", "python.exe", "py.exe", "py"];
     for dir in std::env::split_paths(&path_var) {
         for name in names {
             let candidate = dir.join(name);
