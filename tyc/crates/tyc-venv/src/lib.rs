@@ -293,14 +293,37 @@ pub fn which_python3_for_test() -> Option<PathBuf> {
 }
 
 /// The Python a project's introspection should use: prefer the project's
-/// own `.venv/bin/python`, falling back to a `python3` on PATH.
+/// own venv interpreter, falling back to a `python3` (or `python`) on PATH.
+///
+/// The venv interpreter lives at `.venv/bin/python` on Unix and
+/// `.venv\Scripts\python.exe` on Windows; both are probed so third-party
+/// introspection and editor completion work on every shipped platform.
 fn discover_python(project_root: &Path) -> Option<PathBuf> {
-    let venv_python = project_root.join(".venv").join("bin").join("python");
-    if venv_python.is_file() {
-        Some(venv_python)
-    } else {
-        which_python3()
+    // Opt-out kill-switch: introspection imports the project's declared
+    // dependencies in a subprocess to recover their type signatures, which
+    // executes those packages' import-time code. On an untrusted project a
+    // user can disable it entirely (introspection then silently no-ops, as it
+    // does when no interpreter is found) by setting `TYC_NO_INTROSPECT`.
+    if std::env::var_os("TYC_NO_INTROSPECT").is_some() {
+        return None;
     }
+    let venv = project_root.join(".venv");
+    // Probe the current platform's native layout first. On WSL / Docker mounts
+    // / shared folders both layouts can be present, and picking the foreign
+    // one yields an interpreter that won't run.
+    let unix = venv.join("bin").join("python");
+    let windows = venv.join("Scripts").join("python.exe");
+    let candidates = if cfg!(windows) {
+        [windows, unix]
+    } else {
+        [unix, windows]
+    };
+    for candidate in candidates {
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    which_python3()
 }
 
 /// mtime of `.venv/pyvenv.cfg` — the file `uv`/`venv` writes when
@@ -317,10 +340,16 @@ fn stat_pyvenv_cfg(project_root: &Path) -> Option<std::time::SystemTime> {
 /// becomes a silent no-op.
 fn which_python3() -> Option<PathBuf> {
     let path_var = std::env::var_os("PATH")?;
+    // `python3` first (Unix convention), then `python` / `python.exe`, then the
+    // Windows `py` launcher — covering Windows and minimal installs that ship
+    // only the unsuffixed name.
+    let names: [&str; 5] = ["python3", "python", "python.exe", "py.exe", "py"];
     for dir in std::env::split_paths(&path_var) {
-        let candidate = dir.join("python3");
-        if candidate.is_file() {
-            return Some(candidate);
+        for name in names {
+            let candidate = dir.join(name);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
         }
     }
     None

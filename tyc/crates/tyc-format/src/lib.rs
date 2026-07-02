@@ -1204,6 +1204,11 @@ fn run_ruff_format(source: &str, path: &str) -> Result<String, String> {
 /// Format the `.ty` file at `path` in place.
 ///
 /// Returns `true` if the file was changed.
+///
+/// The write is atomic: the formatted output is written to a temporary file in
+/// the same directory and then `rename`d over the target. A crash, disk-full,
+/// or interruption mid-write therefore leaves the original file intact rather
+/// than truncating a user's source (a bare `fs::write` is not crash-safe).
 #[allow(clippy::result_large_err)]
 pub fn format_file(path: &Path) -> Result<bool, TycError> {
     let source = std::fs::read_to_string(path)
@@ -1213,11 +1218,65 @@ pub fn format_file(path: &Path) -> Result<bool, TycError> {
     let result = format_source(&source, &path_str)?;
 
     if result.changed {
-        std::fs::write(path, result.output.as_bytes())
+        atomic_write(path, result.output.as_bytes())
             .map_err(|e| TycError::io(path.to_string_lossy().into_owned(), &e))?;
     }
 
     Ok(result.changed)
+}
+
+/// Write `bytes` to `path` atomically: write a sibling temp file in the same
+/// directory, flush it, then `rename` it over the target. Because the temp file
+/// lives on the same filesystem as the target, the rename is atomic, so readers
+/// see either the old or the new content — never a half-written file.
+fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+
+    // Resolve symlinks so we rename over the *real* file. A bare `fs::write`
+    // followed the link and preserved it; renaming over the link path would
+    // instead replace the symlink with a regular file. Canonicalising and
+    // renaming over the target keeps the link intact (it still points at the
+    // freshly-written target). Falls back to the path itself if it can't be
+    // resolved (e.g. a broken link) — writing through then behaves like the
+    // previous in-place write.
+    let target = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+
+    let dir = target.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = target
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "out".to_string());
+    // Unique-enough within a run: fmt processes each path at most once, and the
+    // pid disambiguates concurrent `tyc fmt` invocations. (No randomness/clock
+    // is available in this crate's environment.)
+    let tmp = dir.join(format!(".{}.tycfmt-{}.tmp", file_name, std::process::id()));
+
+    // Scope the handle so it is closed before the rename. `sync_all` (not
+    // `flush`, which is a no-op on a bufferless `std::fs::File`) forces the
+    // bytes to disk before the rename, so a crash / power loss immediately
+    // after can't leave a rename pointing at unwritten data.
+    {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+    }
+
+    // Preserve the original file's permission bits (e.g. `+x` on a shebang
+    // script) — the fresh temp file is created with default perms, so without
+    // this the rename would silently strip the executable bit.
+    if let Ok(meta) = std::fs::metadata(&target) {
+        let _ = std::fs::set_permissions(&tmp, meta.permissions());
+    }
+
+    match std::fs::rename(&tmp, &target) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            // Best-effort cleanup of the temp file on failure; keep the
+            // original error.
+            let _ = std::fs::remove_file(&tmp);
+            Err(e)
+        }
+    }
 }
 
 #[cfg(test)]

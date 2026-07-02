@@ -4,7 +4,88 @@ All notable changes to Typhon are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely; the
 canonical phase-by-phase status lives in `docs/roadmap.md`.
 
-## Unreleased
+## Unreleased — release-readiness remediation
+
+A full-codebase release-readiness review (`RELEASE_READINESS_REVIEW.md`) and the
+fixes it drove. The positive corpus (`examples/`) stays clean and the `stress/`
+negative-fixture counts are unchanged, so no previously-correct program changes
+behaviour.
+
+### Licensing / packaging
+
+- **Added the missing licenses.** A repository-root MIT `LICENSE`, the upstream
+  Ruff MIT notice at `tyc/vendor/LICENSE` (© 2022 Charlie Marsh), and a copy under
+  `editors/vscode/`. Release archives now pack both `LICENSE` and `LICENSE-ruff`
+  unconditionally (a missing file fails the release instead of being skipped).
+- **Community/security scaffolding.** New `SECURITY.md` (with the trust model),
+  `CONTRIBUTING.md`, and `.github/dependabot.yml` (github-actions / cargo / npm).
+- **Release hygiene.** Alpha/pre-release tags are now published with
+  `prerelease: true` (derived from a `-` in the tag) instead of carrying the
+  "Latest" badge, and auto-tag only fires after CI succeeds on the commit
+  (`workflow_run` gate) so an untested merge can't auto-publish binaries.
+
+### Compiler / VM fixes
+
+- **Type checker: nested-generic assignability is no longer exponential.** The
+  invariant-container check used `assignable(a,b) && assignable(b,a)`, doubling
+  the recursion at every level (O(2^depth)); a deeply-nested annotation like
+  `list[list[…list[int]]]` could hang `tyc check` / the LSP. A single-pass
+  `types_equivalent` with identical semantics makes it linear (depth-28 check:
+  5.4 s → 7 ms).
+- **VM: cyclic values no longer abort the process.** `Value::py_eq` / `py_cmp`
+  recursed without bound on self-referential containers, overflowing the native
+  stack (`a=[]; a.append(a); b=[]; b.append(b); a == b`). They are now
+  depth-guarded with an `Rc::ptr_eq` identity fast-path.
+- **VM: `str.find` / `rfind` / `index` / `rindex` return character offsets**, not
+  byte offsets — so `s[s.find(x):]` is correct on non-ASCII text.
+- **VM: augmented assignment on a list mutates in place** (`b = a; b += [x]` and
+  `self.items += [x]` now match CPython's `list.__iadd__`).
+- **VM: float `%` follows the divisor's sign**, and float `//` / `%` by `0.0`
+  raise `ZeroDivisionError` instead of returning `inf` / `nan`.
+- **VM: `print` tolerates a broken pipe** (clean exit on `tyc run app | head`
+  instead of a Rust panic).
+- **VM: `json.dumps` coerces scalar dict keys to strings** (valid JSON;
+  `{1: "a"}` → `{"1": "a"}`).
+- **Type checker: flow-narrowing invalidation holes closed.** Four cases where a
+  narrowing was unsoundly carried past the point it could still hold: (1) an
+  `except` handler is now checked with narrowings widened to declared types (the
+  `try` body may have raised before establishing them); (2) a variable
+  reassigned inside a loop body is widened before the body is checked, so a read
+  at the top of a later iteration isn't treated with the stale pre-loop type;
+  (3) a call in an assignment RHS (not just a bare-call statement) invalidates a
+  narrowing on a module global it may reassign via `global`; (4) a bare
+  method-call statement (`self.reset()`) invalidates attribute narrowings rooted
+  at its receiver. Each is a conservative widening that only affects programs
+  relying on the previously-unsound narrowing; the example corpus is unchanged.
+
+### Tooling / LSP
+
+- **LSP reserves a 256 MiB stack** (matching the CLI), so deeply-nested input
+  can't overflow the tokio blocking-pool stack and kill the language server.
+- **`tyc fmt` writes atomically** (temp file + rename), so a crash mid-write can
+  no longer truncate a source file.
+- **`TYC_NO_INTROSPECT`** disables venv dependency introspection in the CLI and
+  LSP — a kill-switch for the "opening a project imports its dependencies" trust
+  boundary (documented in `SECURITY.md`).
+- **Windows venv discovery** now probes `.venv\Scripts\python.exe` and
+  `python` / `py`, not just the Unix `.venv/bin/python` and `python3`.
+- **`[strictness] exhaustive-match`** is now actually applied — `"warn"` demotes
+  `tyc::non_exhaustive_match` to a warning and `"off"` drops it (previously the
+  validated knob silently did nothing).
+
+### Diagnostics / docs
+
+- **Diagnostic doc URLs** point at resolvable GitHub docs paths instead of the
+  never-deployed `typhon.dev`.
+- **Four diagnostics gained doc pages + `tyc explain` entries**
+  (`empty_collection_no_annotation`, `freeze_not_freezable`,
+  `newtype_invalid_base`, `typing_alias_in_annotation`), completing the catalog.
+- **Docs corrections:** stale "current release" pointers (`docs/install.md`,
+  `docs/long-term-plan.md`), the README quickstart (`cd myapp`), the docs-site
+  install page (pre-built-binary path + correct Rust floor), the emit config page
+  (`class-default = "pydantic"` is rejected, not accepted), examples index
+  (`60-rescue-boundaries`), and the VS Code grammar (dropped the non-existent
+  `val` / `var` / `Option` / `Some` keywords; added an Install section).
 
 ## 1.0.0-alpha.2 — 2026-06-29 — type-checker soundness sweep + VM parity
 

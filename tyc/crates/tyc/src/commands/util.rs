@@ -45,18 +45,32 @@ pub fn apply_strictness(diags: Diagnostics, config: &TyphonConfig) -> Diagnostic
     // Default is "error" — stub drift is promoted to error by default.
     // Only skip reclassification when the setting is explicitly "warn" or empty.
     let stub_check_default = stub_check == "warn" || stub_check.is_empty();
+    // `exhaustive-match` defaults to "error". `NonExhaustiveMatch` is emitted
+    // by the checker as an error, so honouring "warn"/"off" means reclassifying
+    // it out of the errors bucket below.
+    let exhaustive_match = config.strictness.exhaustive_match.as_str();
+    let exhaustive_match_default = exhaustive_match == "error" || exhaustive_match.is_empty();
     if !promote_unused_import
         && (methods_in_class_body == "warn" || methods_in_class_body.is_empty())
         && require_with_default
         && blocking_in_async_default
         && stub_check_default
+        && exhaustive_match_default
     {
         return diags;
     }
     let (errors, warnings) = diags.into_parts();
     let mut new_diags = Diagnostics::new();
     for err in errors {
-        new_diags.push_error(err);
+        if matches!(err, TycError::NonExhaustiveMatch { .. }) && !exhaustive_match_default {
+            match exhaustive_match {
+                "off" => {}                            // drop entirely
+                "warn" => new_diags.push_warning(err), // demote to warning
+                _ => new_diags.push_error(err),        // any other value stays an error
+            }
+        } else {
+            new_diags.push_error(err);
+        }
     }
     for warn in warnings {
         if promote_unused_import && matches!(warn, TycError::UnusedImport { .. }) {

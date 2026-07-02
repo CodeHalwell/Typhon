@@ -212,6 +212,29 @@ fn class_name_tail(name: &str) -> &str {
     name.rsplit('.').next().unwrap_or(name)
 }
 
+/// Mutual assignability — `assignable(a, b) && assignable(b, a)` — computed in
+/// a single structural pass.
+///
+/// The naive two-call form is exponential on nested invariant generics: each
+/// level spawns two full `assignable` re-traversals, so a
+/// `list[list[…list[int]]]` annotation of depth *d* costs O(2^d) and can hang
+/// `tyc check` / the LSP on ~30-deep input. Two types with the *same* generic
+/// head are mutually assignable iff their arguments are pairwise mutually
+/// assignable — and, because mutual assignability is symmetric, that holds
+/// regardless of each parameter's variance. Recursing once per argument (via
+/// `types_equivalent`) instead of twice (via `assignable`) removes the
+/// blow-up while preserving identical results; any non-matching-head or
+/// non-generic pair falls back to the exact two-call definition, which does
+/// not recurse deeply.
+fn types_equivalent(a: &Type, b: &Type) -> bool {
+    if let (Type::Generic(an, aa), Type::Generic(bn, bb)) = (a, b) {
+        if an == bn && aa.len() == bb.len() {
+            return aa.iter().zip(bb).all(|(x, y)| types_equivalent(x, y));
+        }
+    }
+    assignable(a, b) && assignable(b, a)
+}
+
 /// Check whether a value of type `actual` is assignable to a target of
 /// type `expected`.
 ///
@@ -351,15 +374,10 @@ pub fn assignable(expected: &Type, actual: &Type) -> bool {
             // for MutableMapping. (See review thread on PR #147 from
             // gemini-code-assist / copilot.)
             if an == "Mapping" && aa.len() == 2 && bn == "dict" && bb.len() == 2 {
-                return assignable(&aa[0], &bb[0])
-                    && assignable(&bb[0], &aa[0])
-                    && assignable(&aa[1], &bb[1]);
+                return types_equivalent(&aa[0], &bb[0]) && assignable(&aa[1], &bb[1]);
             }
             if an == "MutableMapping" && aa.len() == 2 && bn == "dict" && bb.len() == 2 {
-                return assignable(&aa[0], &bb[0])
-                    && assignable(&bb[0], &aa[0])
-                    && assignable(&aa[1], &bb[1])
-                    && assignable(&bb[1], &aa[1]);
+                return types_equivalent(&aa[0], &bb[0]) && types_equivalent(&aa[1], &bb[1]);
             }
             if an != bn || aa.len() != bb.len() {
                 return false;
@@ -386,9 +404,7 @@ pub fn assignable(expected: &Type, actual: &Type) -> bool {
                         // readers of the narrower view. Bidirectional
                         // assignability captures structural equality without
                         // forcing `PartialEq` on every `Type` arm.
-                        Variance::Invariant => {
-                            assignable(formal, actual_arg) && assignable(actual_arg, formal)
-                        }
+                        Variance::Invariant => types_equivalent(formal, actual_arg),
                     }
                 })
         }
@@ -2330,6 +2346,21 @@ impl TypeEnv {
             }
         }
     }
+    /// Reset `name`'s narrowing back to its declared type. Used to invalidate a
+    /// loop-carried narrowing for a variable reassigned inside the loop body:
+    /// on the second and later iterations the value read at the top of the body
+    /// is whatever the previous iteration's bottom assigned, not the pre-loop
+    /// narrowed value.
+    fn widen_to_declared(&mut self, name: &str) {
+        for scope in self.scopes.iter_mut().rev() {
+            if let Some(b) = scope.get_mut(name) {
+                if b.narrowed != b.declared {
+                    b.narrowed = b.declared.clone();
+                }
+                return;
+            }
+        }
+    }
     fn snapshot(&self) -> TypeEnv {
         self.clone()
     }
@@ -2369,6 +2400,54 @@ impl TypeEnv {
                 }
             }
         }
+    }
+
+    /// Reset every binding's narrowing to the value it had in `base`, keeping
+    /// `self`'s binding *set* (so names declared since `base` are retained, just
+    /// widened to their declared type). Attribute narrowings are replaced with
+    /// `base`'s.
+    ///
+    /// Used at `except`-handler entry with `base` = the pre-`try` state: the
+    /// `try` body may have raised at any point, so a narrowing *it* established
+    /// isn't guaranteed — but a narrowing that held *before* the `try` still
+    /// does (`if x is None: return` before the `try` keeps `x` non-None in the
+    /// handler). A name assigned inside the body stays visible (not in `base` →
+    /// widened to declared) so referencing it doesn't fire a spurious
+    /// unknown-name.
+    fn reset_narrowings_to(&mut self, base: &TypeEnv) {
+        for (i, scope) in self.scopes.iter_mut().enumerate() {
+            let base_scope = base.scopes.get(i);
+            for (name, b) in scope.iter_mut() {
+                match base_scope.and_then(|s| s.get(name)) {
+                    Some(bb) => b.narrowed = bb.narrowed.clone(),
+                    None => b.narrowed = b.declared.clone(),
+                }
+            }
+        }
+        self.attr_narrowings = base.attr_narrowings.clone();
+    }
+
+    /// Conservatively merge `other`'s narrowings into `self`, keeping only the
+    /// narrowings the two agree on. Any binding whose narrowed type differs
+    /// between the two envs is widened to its declared type; any attribute
+    /// narrowing not present-and-equal in `other` is dropped. Used to join the
+    /// alternative control-flow paths out of a `try` (the body completed vs a
+    /// handler ran) into a sound post-statement state — the dual of the
+    /// `if`/`else` branch join.
+    fn intersect_narrowings(&mut self, other: &TypeEnv) {
+        for (i, scope) in self.scopes.iter_mut().enumerate() {
+            let other_scope = other.scopes.get(i);
+            for (name, b) in scope.iter_mut() {
+                let agree = other_scope
+                    .and_then(|s| s.get(name))
+                    .is_some_and(|ob| ob.narrowed == b.narrowed);
+                if !agree && b.narrowed != b.declared {
+                    b.narrowed = b.declared.clone();
+                }
+            }
+        }
+        self.attr_narrowings
+            .retain(|k, v| other.attr_narrowings.get(k) == Some(v));
     }
 }
 
@@ -9670,10 +9749,91 @@ fn seed_env_from_scope(c: &mut Checker, scope: ScopeId) {
     }
 }
 
+/// Collect the names *reassigned* (via `=`, `:`-annotated `=`, or augmented
+/// assignment to a bare `Name`) on a path that can reach the enclosing loop's
+/// back-edge. Used to invalidate loop-carried narrowings: a variable reassigned
+/// inside a loop body is, at the top of the second and later iterations,
+/// whatever the previous pass last assigned — not the pre-loop narrowed value.
+///
+/// Reachability-aware so it doesn't over-widen: it stops at an unconditional
+/// exit (`break` / `return` / `raise` / `continue` — the rest of that block
+/// can't reach the back-edge with a later value), and it recurses into a
+/// branch only when that branch can fall through (`!body_always_exits`). So a
+/// reassignment confined to a branch that breaks (`if c: x = None; break`) is
+/// not collected, and the pre-loop narrowing of `x` survives for the paths that
+/// do reach the back-edge. Conservative: over-skipping only ever *keeps* a
+/// narrowing (a sound false negative), never introduces a false positive.
+fn collect_reassigned_names(stmts: &[Stmt], acc: &mut std::collections::HashSet<String>) {
+    fn add_target(t: &Expr, acc: &mut std::collections::HashSet<String>) {
+        if let Expr::Name(n) = t {
+            acc.insert(n.id.as_str().to_owned());
+        }
+    }
+    for s in stmts {
+        match s {
+            Stmt::Assign(a) => {
+                for t in &a.targets {
+                    add_target(t, acc);
+                }
+            }
+            Stmt::AnnAssign(a) => add_target(&a.target, acc),
+            Stmt::AugAssign(a) => add_target(&a.target, acc),
+            Stmt::If(i) => {
+                if !body_always_leaves_loop(&i.body) {
+                    collect_reassigned_names(&i.body, acc);
+                }
+                for clause in &i.elif_else_clauses {
+                    if !body_always_leaves_loop(&clause.body) {
+                        collect_reassigned_names(&clause.body, acc);
+                    }
+                }
+            }
+            Stmt::For(f) => {
+                collect_reassigned_names(&f.body, acc);
+                collect_reassigned_names(&f.orelse, acc);
+            }
+            Stmt::While(w) => {
+                collect_reassigned_names(&w.body, acc);
+                collect_reassigned_names(&w.orelse, acc);
+            }
+            Stmt::With(w) => {
+                if !body_always_leaves_loop(&w.body) {
+                    collect_reassigned_names(&w.body, acc);
+                }
+            }
+            Stmt::Try(t) => {
+                collect_reassigned_names(&t.body, acc);
+                for h in &t.handlers {
+                    let ruff_python_ast::ExceptHandler::ExceptHandler(h) = h;
+                    if !body_always_leaves_loop(&h.body) {
+                        collect_reassigned_names(&h.body, acc);
+                    }
+                }
+                collect_reassigned_names(&t.orelse, acc);
+                collect_reassigned_names(&t.finalbody, acc);
+            }
+            Stmt::Match(m) => {
+                for case in &m.cases {
+                    if !body_always_leaves_loop(&case.body) {
+                        collect_reassigned_names(&case.body, acc);
+                    }
+                }
+            }
+            // An unconditional exit ends this block's contribution to the
+            // back-edge: statements after it can't carry a value to the next
+            // iteration, so stop collecting here.
+            Stmt::Break(_) | Stmt::Return(_) | Stmt::Raise(_) | Stmt::Continue(_) => return,
+            _ => {}
+        }
+    }
+}
+
 /// Whether an expression contains a call anywhere in evaluation position —
-/// used to decide if a bare expression statement could have side-effected a
-/// module global (and thus invalidate global narrowing). Conservative: any
-/// `Call`/`Await` node counts.
+/// used to decide if a statement could have side-effected a module global (and
+/// thus invalidate global narrowing). Conservative: any `Call`/`Await` node
+/// counts, and every sub-expression that is evaluated is visited (including
+/// container literals, comprehensions, and f-strings — a call nested there,
+/// `let n = {"k": clear()}`, still runs).
 fn expr_contains_call(e: &Expr) -> bool {
     use ruff_python_ast::Expr as E;
     match e {
@@ -9695,8 +9855,39 @@ fn expr_contains_call(e: &Expr) -> bool {
         E::Starred(s) => expr_contains_call(&s.value),
         E::Tuple(t) => t.elts.iter().any(expr_contains_call),
         E::List(l) => l.elts.iter().any(expr_contains_call),
+        E::Set(s) => s.elts.iter().any(expr_contains_call),
+        E::Slice(s) => {
+            s.lower.as_deref().is_some_and(expr_contains_call)
+                || s.upper.as_deref().is_some_and(expr_contains_call)
+                || s.step.as_deref().is_some_and(expr_contains_call)
+        }
+        E::Dict(d) => d.items.iter().any(|item| {
+            item.key.as_ref().is_some_and(expr_contains_call) || expr_contains_call(&item.value)
+        }),
+        E::ListComp(c) => expr_contains_call(&c.elt) || comprehensions_contain_call(&c.generators),
+        E::SetComp(c) => expr_contains_call(&c.elt) || comprehensions_contain_call(&c.generators),
+        E::Generator(c) => expr_contains_call(&c.elt) || comprehensions_contain_call(&c.generators),
+        E::DictComp(c) => {
+            c.key.as_deref().is_some_and(expr_contains_call)
+                || expr_contains_call(&c.value)
+                || comprehensions_contain_call(&c.generators)
+        }
+        E::FString(f) => f.value.elements().any(|el| match el {
+            ruff_python_ast::InterpolatedStringElement::Interpolation(i) => {
+                expr_contains_call(&i.expression)
+            }
+            ruff_python_ast::InterpolatedStringElement::Literal(_) => false,
+        }),
         _ => false,
     }
+}
+
+/// Whether any comprehension clause (`for … in ITER if COND`) evaluates a call —
+/// in the iterables or the filter conditions.
+fn comprehensions_contain_call(generators: &[ruff_python_ast::Comprehension]) -> bool {
+    generators
+        .iter()
+        .any(|g| expr_contains_call(&g.iter) || g.ifs.iter().any(expr_contains_call))
 }
 
 fn check_stmt(c: &mut Checker, stmt: &Stmt) {
@@ -9738,6 +9929,13 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
             };
             if let Some(value) = &a.value {
                 let value_type = infer_expr_ctx(c, value, Some(&ann_type));
+                // A call in the RHS may reassign a module global via
+                // `global NAME` in the callee, staling a caller narrowing on
+                // that global. Reset for subsequent statements (mirrors the
+                // `Stmt::Assign` / `Stmt::Expr` resets). Locals are immune.
+                if expr_contains_call(value) {
+                    c.env.reset_global_narrowings();
+                }
                 if bare_final {
                     ann_type = value_type.clone();
                 } else if !c.is_assignable(&ann_type, &value_type) {
@@ -9851,6 +10049,15 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
             c.in_question_temp_rhs = a.targets.len() == 1 && is_question_op_temp(&a.targets[0]);
             let value_type = infer_expr(c, &a.value);
             c.in_question_temp_rhs = saved_q;
+            // A call in the RHS (`let n = clear()`) may reassign a module global
+            // via a `global NAME` in the callee, invalidating any narrowing the
+            // caller established on that global. Reset here — before this
+            // assignment applies its own target narrowing below, so that fresh
+            // narrowing survives — mirroring the bare-call `Stmt::Expr` reset.
+            // Locals are immune (a call can't rebind a caller's local).
+            if expr_contains_call(&a.value) {
+                c.env.reset_global_narrowings();
+            }
             for target in &a.targets {
                 check_attr_assign_not_frozen(c, target);
                 audit_record_field_set(c, target);
@@ -10471,6 +10678,28 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
             // narrowing snapshot has been restored.
             let narrowings = collect_narrowings(c, &w.test, /*negate=*/ false);
             let snap_pre = c.env.snapshot();
+            // Iteration-2 soundness: a name reassigned inside the body holds,
+            // at the top of the second and later passes, whatever the previous
+            // pass last assigned — not the pre-loop narrowed value. Widen those
+            // names to their declared type before checking the body. The test
+            // narrowing below re-applies on top (so `while cur is not None:` is
+            // unaffected), and an unconditional in-body assignment re-narrows at
+            // its own site, so only genuinely loop-carried narrowings are lost.
+            //
+            // Only widen when the body can actually reach the loop back-edge. If
+            // every path leaves the loop (`break`/`return`/`raise`), it runs at
+            // most one full iteration, so the reassignment never flows back to
+            // the top and the pre-loop narrowing still holds for that single
+            // pass — widening there would be a false positive (`while f: y = x;
+            // x = None; break`). A `continue` does NOT leave the loop, so a body
+            // ending in one is still widened (`body_always_leaves_loop`).
+            if !body_always_leaves_loop(&w.body) {
+                let mut loop_reassigned = std::collections::HashSet::new();
+                collect_reassigned_names(&w.body, &mut loop_reassigned);
+                for name in &loop_reassigned {
+                    c.env.widen_to_declared(name);
+                }
+            }
             apply_narrowings(c, &narrowings);
             for s in &w.body {
                 check_stmt(c, s);
@@ -10529,6 +10758,21 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
             // `Unknown`, so `for k, v in d.items(): let n: int = k` (k is str)
             // slipped through. Shares the comprehension binder.
             bind_unpacking_target(c, f.target.as_ref(), &elem_ty);
+            // Iteration-2 soundness (see the `While` arm): widen any name
+            // reassigned in the body to its declared type before checking, so a
+            // loop-carried narrowing read at the top of a later pass isn't
+            // treated with the stale pre-loop type. The loop target itself is
+            // rebound per iteration by `bind_unpacking_target` above. Skipped
+            // when the body always leaves the loop (`break`/`return`/`raise` on
+            // every path) — there is then no back-edge, so no stale carry to
+            // widen. A `continue` still reaches the back-edge, so it is widened.
+            if !body_always_leaves_loop(&f.body) {
+                let mut loop_reassigned = std::collections::HashSet::new();
+                collect_reassigned_names(&f.body, &mut loop_reassigned);
+                for name in &loop_reassigned {
+                    c.env.widen_to_declared(name);
+                }
+            }
             for s in &f.body {
                 check_stmt(c, s);
             }
@@ -10542,6 +10786,20 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
             // local.) See `reset_global_narrowings`.
             if expr_contains_call(&e.value) {
                 c.env.reset_global_narrowings();
+            }
+            // A bare method-call statement (`self.reset()`, `conn.close()`) may
+            // mutate a field of its receiver, so a prior attribute narrowing
+            // (`if self.x is not None:`) is stale afterwards. Clear narrowings
+            // rooted at the receiver. Scoped to a call in *statement* position
+            // (an almost-always-mutating side-effect call) to avoid the
+            // false positives that invalidating on every nested method call
+            // would cause on the common `self.helper(); self.x.foo()` shape.
+            if let Expr::Call(call) = e.value.as_ref() {
+                if let Expr::Attribute(recv_attr) = call.func.as_ref() {
+                    if let Some(recv_path) = attr_path_of(&recv_attr.value) {
+                        c.env.clear_attr_narrowing(&recv_path);
+                    }
+                }
             }
         }
         Stmt::AugAssign(a) => {
@@ -10651,18 +10909,62 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
             }
         }
         Stmt::Try(t) => {
+            // Narrowing state as it stood *before* the body — the facts still
+            // guaranteed on the exception path (a narrowing established before
+            // the `try` survives; one established inside the body may not,
+            // because the body can raise at any point).
+            let pre_try = c.env.snapshot();
             for s in &t.body {
                 check_stmt(c, s);
             }
+            let body_end = c.env.snapshot();
+
+            // Collect the env states that can flow to the code *after* the try:
+            // each handler that ran to completion, plus the body-completed path
+            // (after `else`). The post-try state is their join, so a handler
+            // that mutates a narrowed variable (`except: x = None`) is reflected
+            // downstream — restoring only `body_end` would silently drop it.
+            let mut post_states: Vec<TypeEnv> = Vec::new();
             for h in &t.handlers {
                 let ruff_python_ast::ExceptHandler::ExceptHandler(h) = h;
+                // Enter the handler with the pre-`try` narrowings (keeping any
+                // body-declared bindings, widened) — discarding only the facts
+                // the body established, which a raise may have skipped.
+                c.env.restore(body_end.clone());
+                c.env.reset_narrowings_to(&pre_try);
                 for s in &h.body {
                     check_stmt(c, s);
                 }
+                if !body_always_exits(&h.body) {
+                    post_states.push(c.env.snapshot());
+                }
             }
+
+            // `else` runs only when the body completed without raising, so it
+            // sees the body-end state. That path contributes to the post-try
+            // join unless the body (or `else`) always diverges.
+            c.env.restore(body_end.clone());
             for s in &t.orelse {
                 check_stmt(c, s);
             }
+            let else_exits = !t.orelse.is_empty() && body_always_exits(&t.orelse);
+            if !body_always_exits(&t.body) && !else_exits {
+                post_states.push(c.env.snapshot());
+            }
+
+            // Join the reachable paths (widen any narrowing they disagree on).
+            // If every path diverges, the post-try point is unreachable; keep
+            // `body_end` so `finally` still has a sane env to check against.
+            if let Some((first, rest)) = post_states.split_first() {
+                let mut joined = first.clone();
+                for s in rest {
+                    joined.intersect_narrowings(s);
+                }
+                c.env.restore(joined);
+            } else {
+                c.env.restore(body_end);
+            }
+
             for s in &t.finalbody {
                 check_stmt(c, s);
             }
@@ -11951,6 +12253,34 @@ fn check_if(c: &mut Checker, i: &ruff_python_ast::StmtIf) {
 /// narrowing of the `if`'s test into the post-`if` scope.
 fn body_always_exits(stmts: &[Stmt]) -> bool {
     stmts.last().is_some_and(stmt_always_exits)
+}
+
+/// Loop-back-edge variant of [`body_always_exits`]: does every path *leave the
+/// enclosing loop* (via `break` / `return` / `raise`) rather than reach its
+/// back-edge? Unlike `body_always_exits`, a terminal `continue` does NOT count
+/// as leaving — it re-enters the loop, so a value assigned before it carries to
+/// the next iteration. Used by the loop iteration-2 narrowing so an assignment
+/// on a `continue` path is still recognised as loop-carried. Exotic terminals
+/// (`with` / `match` / `try` ending in `continue`) fall back to
+/// `stmt_always_exits`, i.e. are treated as leaving — a sound over-skip (a
+/// missed widening is a safe false negative, never a false positive).
+fn body_always_leaves_loop(stmts: &[Stmt]) -> bool {
+    match stmts.last() {
+        Some(Stmt::Continue(_)) => false,
+        Some(Stmt::If(s)) => {
+            if is_constant_true(&s.test) {
+                return body_always_leaves_loop(&s.body);
+            }
+            let has_else = s.elif_else_clauses.iter().any(|c| c.test.is_none());
+            body_always_leaves_loop(&s.body)
+                && has_else
+                && s.elif_else_clauses
+                    .iter()
+                    .all(|c| body_always_leaves_loop(&c.body))
+        }
+        Some(other) => stmt_always_exits(other),
+        None => false,
+    }
 }
 
 /// True when every branch of an elif/else chain always exits.
@@ -22059,6 +22389,403 @@ def use(x: int | None) -> int:
                 .iter()
                 .any(|e| matches!(e, TycError::NullableUse { .. })),
             "ternary `is not None` narrowing must strip None on truthy: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn narrowing_global_invalidated_by_call_in_assign_rhs() {
+        // H6#3: a call in an assignment RHS may reassign a module global via
+        // `global NAME`, staling a prior narrowing on that global.
+        let src = "\
+mut g: int | None = 1
+
+def clear() -> int:
+    global g
+    g = None
+    return 0
+
+def use_it() -> int:
+    if g is None:
+        return -1
+    let n: int = clear()
+    return g
+";
+        let d = check(src);
+        assert!(
+            d.errors().iter().any(|e| matches!(
+                e,
+                TycError::NullableUse { .. } | TycError::TypeMismatch { .. }
+            )),
+            "global narrowing must be invalidated after a call in the RHS: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn narrowing_attr_invalidated_by_method_call() {
+        // H6#4: a bare method-call statement may mutate a field of its
+        // receiver, staling a prior `if self.x is not None:` narrowing.
+        let src = "\
+class Box:
+    x: int | None
+
+impl Box:
+    def reset(self) -> None:
+        self.x = None
+    def use_it(self) -> int:
+        if self.x is None:
+            return -1
+        self.reset()
+        return self.x
+";
+        let d = check(src);
+        assert!(
+            d.errors().iter().any(|e| matches!(
+                e,
+                TycError::NullableUse { .. } | TycError::TypeMismatch { .. }
+            )),
+            "attr narrowing must be invalidated after a method call on the receiver: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn narrowing_attr_survives_without_intervening_call() {
+        // H6#4 control: without an intervening mutating call, the attribute
+        // narrowing must still hold (no false positive).
+        let src = "\
+class Box:
+    x: int | None
+
+impl Box:
+    def use_it(self) -> int:
+        if self.x is None:
+            return -1
+        return self.x
+";
+        let d = check(src);
+        assert!(
+            !d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::NullableUse { .. })),
+            "attr narrowing must survive when no call intervenes: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn narrowing_try_handler_sees_pre_narrowing_state() {
+        // H6#1: an `except` handler may run because the body raised partway
+        // through, so a narrowing the body established is not guaranteed.
+        let src = "\
+def get_int() -> int:
+    return 5
+
+def risky() -> None:
+    pass
+
+def demo() -> int:
+    mut x: int | None = None
+    try:
+        x = get_int()
+        risky()
+    except ValueError:
+        return x + 1
+    return 0
+";
+        let d = check(src);
+        assert!(
+            d.errors().iter().any(|e| matches!(
+                e,
+                TycError::NullableUse { .. } | TycError::TypeMismatch { .. }
+            )),
+            "try-handler must see x as still-nullable (body may have raised): {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn narrowing_try_handler_keeps_body_assigned_binding() {
+        // H6#1 control: a name assigned in the body is still visible in the
+        // handler — widening narrowings must not remove the binding.
+        let src = "\
+def compute() -> int:
+    return 5
+
+def demo() -> None:
+    try:
+        let y: int = compute()
+        print(y)
+    except ValueError as e:
+        print(str(e))
+";
+        let d = check(src);
+        assert!(
+            !d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::UnknownName { .. })),
+            "body-assigned name must stay visible in the handler: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn narrowing_try_handler_keeps_pre_try_narrowing() {
+        // PR#249 (chatgpt-codex): a narrowing established BEFORE the `try` is
+        // still guaranteed on the exception path — only body-established
+        // narrowings must be discarded at handler entry.
+        let src = "\
+def risky() -> None:
+    pass
+
+def demo(x: int | None) -> int:
+    if x is None:
+        return 0
+    try:
+        risky()
+    except ValueError:
+        return x
+    return x
+";
+        let d = check(src);
+        assert!(
+            !d.errors().iter().any(|e| matches!(
+                e,
+                TycError::NullableUse { .. } | TycError::TypeMismatch { .. }
+            )),
+            "a pre-try narrowing must survive into the handler: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn narrowing_loop_nested_break_branch_keeps_narrowing() {
+        // PR#249 (chatgpt-codex): a reassignment confined to a branch that
+        // breaks never reaches the back-edge, so it must not widen the pre-loop
+        // narrowing on the fall-through path.
+        let src = "\
+def get() -> int | None:
+    return 5
+
+def demo(flag: bool, other: bool) -> None:
+    mut x: int | None = get()
+    if x is None:
+        return
+    while flag:
+        if other:
+            x = None
+            break
+        let y: int = x
+";
+        let d = check(src);
+        assert!(
+            !d.errors().iter().any(|e| matches!(
+                e,
+                TycError::NullableUse { .. } | TycError::TypeMismatch { .. }
+            )),
+            "a reassignment in a break-branch must not widen the fall-through \
+             narrowing: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn narrowing_try_handler_mutation_flows_past_try() {
+        // PR#249 (chatgpt-codex): a handler that mutates a narrowed variable
+        // must be reflected in the post-`try` state — restoring only the
+        // body-completed state would silently drop the handler's effect.
+        let src = "\
+def risky() -> None:
+    pass
+
+def demo(x: int | None) -> int:
+    if x is None:
+        return 0
+    try:
+        risky()
+    except ValueError:
+        x = None
+    return x
+";
+        let d = check(src);
+        assert!(
+            d.errors().iter().any(|e| matches!(
+                e,
+                TycError::NullableUse { .. } | TycError::TypeMismatch { .. }
+            )),
+            "handler mutation (x = None) must widen x in the post-try join: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn narrowing_try_no_handler_mutation_stays_clean() {
+        // PR#249 control: when neither the body nor the handler disturbs a
+        // pre-try narrowing, it must survive the post-try join (no false
+        // positive from the widening).
+        let src = "\
+def risky() -> None:
+    pass
+
+def demo(x: int | None) -> int:
+    if x is None:
+        return 0
+    try:
+        risky()
+    except ValueError:
+        print(\"failed\")
+    return x
+";
+        let d = check(src);
+        assert!(
+            !d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::NullableUse { .. })),
+            "an untouched narrowing must survive the post-try join: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn narrowing_loop_carried_stale_narrowing_fires() {
+        // H6#2: a variable reassigned to a nullable value at the bottom of a
+        // loop body is nullable again at the top on the second iteration.
+        let src = "\
+def maybe() -> str | None:
+    return None
+
+def demo(items: list[int]) -> None:
+    mut x: str | None = \"a\"
+    if x is None:
+        return
+    for _ in items:
+        print(x.upper())
+        x = maybe()
+";
+        let d = check(src);
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::NullableUse { .. })),
+            "loop-carried narrowing must be widened for iteration 2+: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn narrowing_loop_break_body_keeps_pre_loop_narrowing() {
+        // PR#249 (chatgpt-codex): a reassignment followed by an unconditional
+        // `break` never reaches the loop back-edge, so the pre-loop narrowing
+        // still holds for the single iteration — widening it would be a false
+        // positive.
+        let src = "\
+def get() -> int | None:
+    return 5
+
+def demo(flag: bool) -> None:
+    mut x: int | None = get()
+    if x is None:
+        return
+    while flag:
+        let y: int = x
+        x = None
+        break
+";
+        let d = check(src);
+        assert!(
+            !d.errors().iter().any(|e| matches!(
+                e,
+                TycError::NullableUse { .. } | TycError::TypeMismatch { .. }
+            )),
+            "a reassignment before an unconditional break must not widen the \
+             pre-loop narrowing: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn narrowing_loop_continue_branch_reaches_backedge() {
+        // PR#249 (chatgpt-codex): a reassignment on a `continue` path DOES reach
+        // the next iteration, so it must widen the loop-carried narrowing.
+        let src = "\
+def maybe() -> str | None:
+    return None
+
+def demo(flag: bool, cond: bool) -> None:
+    mut x: str | None = \"a\"
+    if x is None:
+        return
+    while flag:
+        if cond:
+            x = maybe()
+            continue
+        print(x.upper())
+";
+        let d = check(src);
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::NullableUse { .. })),
+            "a reassignment on a continue path must widen the loop narrowing: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn narrowing_global_reset_sees_call_in_container_rhs() {
+        // PR#249 (chatgpt-codex): a call nested in a dict/list/comprehension RHS
+        // can still reassign a module global, so it must invalidate the global
+        // narrowing just like a top-level call.
+        let src = "\
+mut g: int | None = 1
+
+def clear() -> int:
+    global g
+    g = None
+    return 0
+
+def use_it() -> int:
+    if g is None:
+        return -1
+    let n: dict[str, int] = {\"x\": clear()}
+    return g
+";
+        let d = check(src);
+        assert!(
+            d.errors().iter().any(|e| matches!(
+                e,
+                TycError::NullableUse { .. } | TycError::TypeMismatch { .. }
+            )),
+            "a call nested in a container RHS must invalidate global narrowing: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn narrowing_loop_while_test_still_narrows_body() {
+        // H6#2 control: the classic `while cur is not None:` linked-list walk
+        // must stay clean — the test narrowing re-applies each pass on top of
+        // the iteration-2 widening.
+        let src = "\
+class Node:
+    value: int
+    next: Node | None
+
+def total(head: Node | None) -> int:
+    mut cur: Node | None = head
+    mut acc: int = 0
+    while cur is not None:
+        acc += cur.value
+        cur = cur.next
+    return acc
+";
+        let d = check(src);
+        assert!(
+            !d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::NullableUse { .. })),
+            "while-test narrowing must survive the iteration-2 widening: {:?}",
             d.errors()
         );
     }

@@ -1,0 +1,32 @@
+version: 2
+updates:
+  # Keep GitHub Actions pins current (and surface any that should move to
+  # SHA pins). Third-party actions in release.yml/ci.yml handle the exact
+  # bytes users curl|sh, so patching them promptly matters.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    labels: ["dependencies", "ci"]
+
+  # Rust workspace.
+  - package-ecosystem: "cargo"
+    directory: "/tyc"
+    schedule:
+      interval: "weekly"
+    labels: ["dependencies", "rust"]
+    open-pull-requests-limit: 5
+
+  # Docs site (Astro + Starlight).
+  - package-ecosystem: "npm"
+    directory: "/docs-site"
+    schedule:
+      interval: "weekly"
+    labels: ["dependencies", "docs"]
+
+  # VS Code extension.
+  - package-ecosystem: "npm"
+    directory: "/editors/vscode"
+    schedule:
+      interval: "weekly"
+    labels: ["dependencies", "editor"]

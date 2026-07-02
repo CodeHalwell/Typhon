@@ -5,7 +5,7 @@ Language support for [Typhon](https://github.com/codehalwell/typhon) — a stati
 ## Features
 
 - **Syntax highlighting** for `.ty` and `.dty` files, including Typhon-specific keywords:
-  - Bindings: `let`, `mut`, `val`, `var`
+  - Bindings: `let`, `mut`
   - Modifiers: `pub`, `comptime`, `lazy`, `unsafe`, `pure`, `memo`, `freeze`, `frozen`, `plain`
   - Constructs: `impl`, `interface`, `model`, `extend`, `gather`, `go`, `guard`, `newtype`, `rescue`, `with`-chains
   - Visibility: `pub` on `let` / `def` / `class` / `model` / `class!`, plus `pub *` wildcard re-export in `__init__.ty`
@@ -17,6 +17,22 @@ Language support for [Typhon](https://github.com/codehalwell/typhon) — a stati
   - Go-to-definition
   - Completion (Typhon keywords + visible bindings)
 - **Editor configuration**: 4-space indent, `#` comments, bracket matching, indentation rules for `def`, `class`, `match`, `impl`, `gather`, etc.
+
+## Install
+
+This extension is not yet on the VS Code Marketplace. Install it from a
+packaged `.vsix`:
+
+```bash
+cd editors/vscode
+npm install
+npx @vscode/vsce package        # produces typhon-<version>.vsix
+code --install-extension typhon-*.vsix
+```
+
+Then make sure the `tyc` binary is on your `PATH` (see Requirements below) so
+the language-server features activate; without it the extension still provides
+grammar-only syntax highlighting.
 
 ## Requirements
 

@@ -1,4 +1,16 @@
-# Stress-test corpus — 2026-05-19 campaign
+# Stress-test corpus (internal)
+
+> **Internal reproduction corpus.** This directory holds the raw artifacts
+> from Typhon's adversarial stress-test campaigns — deliberately including
+> programs that are *expected to fail* (negative fixtures, torture cases,
+> minimised bug reproducers). It is not a tutorial or an example set; for
+> curated, compile-clean programs see [`../examples/`](../examples/). The
+> campaigns run from May 2026 onward and live in the dated `round-*/`
+> directories plus `pypi-sweep/` and `third-party-py-corpus/`; the most
+> recent round doubles as release-verification input. Consolidated findings
+> are in [`docs/findings.md`](../docs/findings.md).
+
+## 2026-05-19 campaign
 
 Repro artifacts for the May 19 stress-test campaign (originally findings
 #57–#96, now consolidated under [`docs/findings.md`](../docs/findings.md)

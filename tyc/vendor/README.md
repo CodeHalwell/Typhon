@@ -13,6 +13,15 @@ here as a permanent vendored fork:
 
 The exact upstream revision is pinned in [`UPSTREAM`](./UPSTREAM).
 
+## License
+
+Ruff is MIT-licensed (© 2022 Charlie Marsh). These vendored crates are
+redistributed under that same license, and Typhon's local modifications to them
+are likewise MIT. The upstream copyright notice and full license text are
+reproduced in [`LICENSE`](./LICENSE) alongside this file, and the release
+archives ship it. To pull upstream security fixes, bump the pin in `UPSTREAM`
+and re-apply the Typhon-specific extensions described below.
+
 ## Typhon-specific extensions
 
 Two source-level changes ride on top of the upstream code:
