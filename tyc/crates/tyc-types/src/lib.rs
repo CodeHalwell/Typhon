@@ -2402,21 +2402,29 @@ impl TypeEnv {
         }
     }
 
-    /// Widen every binding's narrowing back to its declared type across all
-    /// scopes, and drop all attribute narrowings — but keep the bindings
-    /// themselves. Used at `except`-handler entry: the `try` body may have
-    /// raised at any point, so no narrowing it established is guaranteed, yet a
-    /// name assigned earlier in the body is still visible in the handler (so we
-    /// must not remove it, which would fire a spurious unknown-name).
-    fn reset_all_narrowings(&mut self) {
-        for scope in &mut self.scopes {
-            for b in scope.values_mut() {
-                if b.narrowed != b.declared {
-                    b.narrowed = b.declared.clone();
+    /// Reset every binding's narrowing to the value it had in `base`, keeping
+    /// `self`'s binding *set* (so names declared since `base` are retained, just
+    /// widened to their declared type). Attribute narrowings are replaced with
+    /// `base`'s.
+    ///
+    /// Used at `except`-handler entry with `base` = the pre-`try` state: the
+    /// `try` body may have raised at any point, so a narrowing *it* established
+    /// isn't guaranteed — but a narrowing that held *before* the `try` still
+    /// does (`if x is None: return` before the `try` keeps `x` non-None in the
+    /// handler). A name assigned inside the body stays visible (not in `base` →
+    /// widened to declared) so referencing it doesn't fire a spurious
+    /// unknown-name.
+    fn reset_narrowings_to(&mut self, base: &TypeEnv) {
+        for (i, scope) in self.scopes.iter_mut().enumerate() {
+            let base_scope = base.scopes.get(i);
+            for (name, b) in scope.iter_mut() {
+                match base_scope.and_then(|s| s.get(name)) {
+                    Some(bb) => b.narrowed = bb.narrowed.clone(),
+                    None => b.narrowed = b.declared.clone(),
                 }
             }
         }
-        self.attr_narrowings.clear();
+        self.attr_narrowings = base.attr_narrowings.clone();
     }
 
     /// Conservatively merge `other`'s narrowings into `self`, keeping only the
@@ -9742,11 +9750,19 @@ fn seed_env_from_scope(c: &mut Checker, scope: ScopeId) {
 }
 
 /// Collect the names *reassigned* (via `=`, `:`-annotated `=`, or augmented
-/// assignment to a bare `Name`) anywhere in `stmts`, recursing into nested
-/// compound statements. Used to invalidate loop-carried narrowings: a variable
-/// reassigned inside a loop body is, at the top of the second and later
-/// iterations, whatever the previous pass last assigned — not the pre-loop
-/// narrowed value.
+/// assignment to a bare `Name`) on a path that can reach the enclosing loop's
+/// back-edge. Used to invalidate loop-carried narrowings: a variable reassigned
+/// inside a loop body is, at the top of the second and later iterations,
+/// whatever the previous pass last assigned — not the pre-loop narrowed value.
+///
+/// Reachability-aware so it doesn't over-widen: it stops at an unconditional
+/// exit (`break` / `return` / `raise` / `continue` — the rest of that block
+/// can't reach the back-edge with a later value), and it recurses into a
+/// branch only when that branch can fall through (`!body_always_exits`). So a
+/// reassignment confined to a branch that breaks (`if c: x = None; break`) is
+/// not collected, and the pre-loop narrowing of `x` survives for the paths that
+/// do reach the back-edge. Conservative: over-skipping only ever *keeps* a
+/// narrowing (a sound false negative), never introduces a false positive.
 fn collect_reassigned_names(stmts: &[Stmt], acc: &mut std::collections::HashSet<String>) {
     fn add_target(t: &Expr, acc: &mut std::collections::HashSet<String>) {
         if let Expr::Name(n) = t {
@@ -9763,9 +9779,13 @@ fn collect_reassigned_names(stmts: &[Stmt], acc: &mut std::collections::HashSet<
             Stmt::AnnAssign(a) => add_target(&a.target, acc),
             Stmt::AugAssign(a) => add_target(&a.target, acc),
             Stmt::If(i) => {
-                collect_reassigned_names(&i.body, acc);
+                if !body_always_exits(&i.body) {
+                    collect_reassigned_names(&i.body, acc);
+                }
                 for clause in &i.elif_else_clauses {
-                    collect_reassigned_names(&clause.body, acc);
+                    if !body_always_exits(&clause.body) {
+                        collect_reassigned_names(&clause.body, acc);
+                    }
                 }
             }
             Stmt::For(f) => {
@@ -9776,21 +9796,33 @@ fn collect_reassigned_names(stmts: &[Stmt], acc: &mut std::collections::HashSet<
                 collect_reassigned_names(&w.body, acc);
                 collect_reassigned_names(&w.orelse, acc);
             }
-            Stmt::With(w) => collect_reassigned_names(&w.body, acc),
+            Stmt::With(w) => {
+                if !body_always_exits(&w.body) {
+                    collect_reassigned_names(&w.body, acc);
+                }
+            }
             Stmt::Try(t) => {
                 collect_reassigned_names(&t.body, acc);
                 for h in &t.handlers {
                     let ruff_python_ast::ExceptHandler::ExceptHandler(h) = h;
-                    collect_reassigned_names(&h.body, acc);
+                    if !body_always_exits(&h.body) {
+                        collect_reassigned_names(&h.body, acc);
+                    }
                 }
                 collect_reassigned_names(&t.orelse, acc);
                 collect_reassigned_names(&t.finalbody, acc);
             }
             Stmt::Match(m) => {
                 for case in &m.cases {
-                    collect_reassigned_names(&case.body, acc);
+                    if !body_always_exits(&case.body) {
+                        collect_reassigned_names(&case.body, acc);
+                    }
                 }
             }
+            // An unconditional exit ends this block's contribution to the
+            // back-edge: statements after it can't carry a value to the next
+            // iteration, so stop collecting here.
+            Stmt::Break(_) | Stmt::Return(_) | Stmt::Raise(_) | Stmt::Continue(_) => return,
             _ => {}
         }
     }
@@ -10842,13 +10874,14 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
             }
         }
         Stmt::Try(t) => {
+            // Narrowing state as it stood *before* the body — the facts still
+            // guaranteed on the exception path (a narrowing established before
+            // the `try` survives; one established inside the body may not,
+            // because the body can raise at any point).
+            let pre_try = c.env.snapshot();
             for s in &t.body {
                 check_stmt(c, s);
             }
-            // The body may raise at any point, so a narrowing it established
-            // (`x = get_int()` making `x` non-None) is NOT guaranteed to hold
-            // when a handler runs. Check each handler with narrowings widened
-            // back to declared types (bindings kept).
             let body_end = c.env.snapshot();
 
             // Collect the env states that can flow to the code *after* the try:
@@ -10859,8 +10892,11 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
             let mut post_states: Vec<TypeEnv> = Vec::new();
             for h in &t.handlers {
                 let ruff_python_ast::ExceptHandler::ExceptHandler(h) = h;
+                // Enter the handler with the pre-`try` narrowings (keeping any
+                // body-declared bindings, widened) — discarding only the facts
+                // the body established, which a raise may have skipped.
                 c.env.restore(body_end.clone());
-                c.env.reset_all_narrowings();
+                c.env.reset_narrowings_to(&pre_try);
                 for s in &h.body {
                     check_stmt(c, s);
                 }
@@ -22427,6 +22463,66 @@ def demo() -> None:
                 .iter()
                 .any(|e| matches!(e, TycError::UnknownName { .. })),
             "body-assigned name must stay visible in the handler: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn narrowing_try_handler_keeps_pre_try_narrowing() {
+        // PR#249 (chatgpt-codex): a narrowing established BEFORE the `try` is
+        // still guaranteed on the exception path — only body-established
+        // narrowings must be discarded at handler entry.
+        let src = "\
+def risky() -> None:
+    pass
+
+def demo(x: int | None) -> int:
+    if x is None:
+        return 0
+    try:
+        risky()
+    except ValueError:
+        return x
+    return x
+";
+        let d = check(src);
+        assert!(
+            !d.errors().iter().any(|e| matches!(
+                e,
+                TycError::NullableUse { .. } | TycError::TypeMismatch { .. }
+            )),
+            "a pre-try narrowing must survive into the handler: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn narrowing_loop_nested_break_branch_keeps_narrowing() {
+        // PR#249 (chatgpt-codex): a reassignment confined to a branch that
+        // breaks never reaches the back-edge, so it must not widen the pre-loop
+        // narrowing on the fall-through path.
+        let src = "\
+def get() -> int | None:
+    return 5
+
+def demo(flag: bool, other: bool) -> None:
+    mut x: int | None = get()
+    if x is None:
+        return
+    while flag:
+        if other:
+            x = None
+            break
+        let y: int = x
+";
+        let d = check(src);
+        assert!(
+            !d.errors().iter().any(|e| matches!(
+                e,
+                TycError::NullableUse { .. } | TycError::TypeMismatch { .. }
+            )),
+            "a reassignment in a break-branch must not widen the fall-through \
+             narrowing: {:?}",
             d.errors()
         );
     }
