@@ -10620,10 +10620,19 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
             // narrowing below re-applies on top (so `while cur is not None:` is
             // unaffected), and an unconditional in-body assignment re-narrows at
             // its own site, so only genuinely loop-carried narrowings are lost.
-            let mut loop_reassigned = std::collections::HashSet::new();
-            collect_reassigned_names(&w.body, &mut loop_reassigned);
-            for name in &loop_reassigned {
-                c.env.widen_to_declared(name);
+            //
+            // Only widen when the body can actually reach the loop back-edge. If
+            // every path ends in `break`/`return`/`raise`, the loop runs at most
+            // one full iteration, so the reassignment never flows back to the top
+            // and the pre-loop narrowing still holds for that single pass —
+            // widening there would be a false positive (`while f: y = x; x = None;
+            // break` with `x` pre-narrowed non-None).
+            if !body_always_exits(&w.body) {
+                let mut loop_reassigned = std::collections::HashSet::new();
+                collect_reassigned_names(&w.body, &mut loop_reassigned);
+                for name in &loop_reassigned {
+                    c.env.widen_to_declared(name);
+                }
             }
             apply_narrowings(c, &narrowings);
             for s in &w.body {
@@ -10687,11 +10696,15 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
             // reassigned in the body to its declared type before checking, so a
             // loop-carried narrowing read at the top of a later pass isn't
             // treated with the stale pre-loop type. The loop target itself is
-            // rebound per iteration by `bind_unpacking_target` above.
-            let mut loop_reassigned = std::collections::HashSet::new();
-            collect_reassigned_names(&f.body, &mut loop_reassigned);
-            for name in &loop_reassigned {
-                c.env.widen_to_declared(name);
+            // rebound per iteration by `bind_unpacking_target` above. Skipped
+            // when the body always exits (`break`/`return`/`raise` on every
+            // path) — there is then no back-edge, so no stale carry to widen.
+            if !body_always_exits(&f.body) {
+                let mut loop_reassigned = std::collections::HashSet::new();
+                collect_reassigned_names(&f.body, &mut loop_reassigned);
+                for name in &loop_reassigned {
+                    c.env.widen_to_declared(name);
+                }
             }
             for s in &f.body {
                 check_stmt(c, s);
@@ -22497,6 +22510,37 @@ def demo(items: list[int]) -> None:
                 .iter()
                 .any(|e| matches!(e, TycError::NullableUse { .. })),
             "loop-carried narrowing must be widened for iteration 2+: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn narrowing_loop_break_body_keeps_pre_loop_narrowing() {
+        // PR#249 (chatgpt-codex): a reassignment followed by an unconditional
+        // `break` never reaches the loop back-edge, so the pre-loop narrowing
+        // still holds for the single iteration — widening it would be a false
+        // positive.
+        let src = "\
+def get() -> int | None:
+    return 5
+
+def demo(flag: bool) -> None:
+    mut x: int | None = get()
+    if x is None:
+        return
+    while flag:
+        let y: int = x
+        x = None
+        break
+";
+        let d = check(src);
+        assert!(
+            !d.errors().iter().any(|e| matches!(
+                e,
+                TycError::NullableUse { .. } | TycError::TypeMismatch { .. }
+            )),
+            "a reassignment before an unconditional break must not widen the \
+             pre-loop narrowing: {:?}",
             d.errors()
         );
     }

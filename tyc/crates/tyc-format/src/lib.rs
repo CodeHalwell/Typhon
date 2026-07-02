@@ -1232,8 +1232,17 @@ pub fn format_file(path: &Path) -> Result<bool, TycError> {
 fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
 
-    let dir = path.parent().unwrap_or_else(|| Path::new("."));
-    let file_name = path
+    // Resolve symlinks so we rename over the *real* file. A bare `fs::write`
+    // followed the link and preserved it; renaming over the link path would
+    // instead replace the symlink with a regular file. Canonicalising and
+    // renaming over the target keeps the link intact (it still points at the
+    // freshly-written target). Falls back to the path itself if it can't be
+    // resolved (e.g. a broken link) — writing through then behaves like the
+    // previous in-place write.
+    let target = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+
+    let dir = target.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = target
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| "out".to_string());
@@ -1252,7 +1261,14 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         f.sync_all()?;
     }
 
-    match std::fs::rename(&tmp, path) {
+    // Preserve the original file's permission bits (e.g. `+x` on a shebang
+    // script) — the fresh temp file is created with default perms, so without
+    // this the rename would silently strip the executable bit.
+    if let Ok(meta) = std::fs::metadata(&target) {
+        let _ = std::fs::set_permissions(&tmp, meta.permissions());
+    }
+
+    match std::fs::rename(&tmp, &target) {
         Ok(()) => Ok(()),
         Err(e) => {
             // Best-effort cleanup of the temp file on failure; keep the

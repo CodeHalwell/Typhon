@@ -7087,10 +7087,7 @@ fn json_dumps(v: &Value, sort: bool) -> String {
         Value::None => "null".into(),
         Value::Bool(b) => if *b { "true" } else { "false" }.into(),
         Value::Int(i) => i.to_string(),
-        // Use the VM's canonical float formatter (shortest round-trip, keeps a
-        // trailing `.0`) rather than Rust's `Display`, so `json.dumps(1.0)`
-        // emits `1.0` like CPython instead of `1`.
-        Value::Float(x) => Value::Float(*x).py_str(),
+        Value::Float(x) => json_float(*x),
         Value::Str(s) => json_string(s),
         Value::List(l) => {
             let items: Vec<String> = l.borrow().iter().map(|x| json_dumps(x, sort)).collect();
@@ -7132,12 +7129,33 @@ fn json_dumps_key(v: &Value) -> String {
         Value::Str(s) => json_string(s),
         Value::Int(i) => json_string(&i.to_string()),
         Value::Bool(b) => json_string(if *b { "true" } else { "false" }),
-        Value::Float(x) => json_string(&Value::Float(*x).py_str()),
+        Value::Float(x) => json_string(&json_float(*x)),
         Value::None => json_string("null"),
         // Non-scalar keys aren't valid JSON keys in CPython either (it raises
         // TypeError); fall back to the repr string so we at least stay
         // syntactically valid rather than emitting a bare object/array key.
         other => json_string(&other.py_repr()),
+    }
+}
+
+/// Render a float as a JSON number token, matching CPython's `json` encoder.
+///
+/// Finite values use the VM's canonical formatter (shortest round-trip, keeps a
+/// trailing `.0`, so `1.0` stays `1.0` rather than Rust `Display`'s `1`).
+/// Non-finite values use CPython's `json.dumps` spellings (`NaN`, `Infinity`,
+/// `-Infinity`) rather than Python `repr`'s `nan` / `inf` / `-inf`, which are
+/// not valid JSON tokens.
+fn json_float(x: f64) -> String {
+    if x.is_nan() {
+        "NaN".to_string()
+    } else if x.is_infinite() {
+        if x > 0.0 {
+            "Infinity".to_string()
+        } else {
+            "-Infinity".to_string()
+        }
+    } else {
+        Value::Float(x).py_str()
     }
 }
 
