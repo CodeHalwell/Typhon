@@ -20,3 +20,6 @@
 ## 2024-05-19 - Use `&str` instead of `String` for HashSet duplicate tracking
 **Learning:** Using `HashSet<String>` combined with `.to_owned()` during hot loops (like scanning class definitions in an AST) introduces unnecessary heap allocations that can be avoided by borrowing slices `HashSet<&str>` directly from the nodes.
 **Action:** When tracking unique occurrences of names in AST nodes or strings in short-lived localized scopes, use `HashSet<&str>` to borrow without allocating, converting to owned strings only when they must be passed to long-lived containers.
+## 2024-03-24 - Zero-Allocation AST Traversal
+**Learning:** Using `HashSet<&str>` instead of `HashSet<String>` by capturing the lifetime of `Expr` nodes avoids significant allocation overhead in hot paths like `collect_names_in_expr`.
+**Action:** When writing Rust traversal logic over the AST, borrow identifiers as `&str` instead of collecting owned `String` instances wherever possible to reduce heap allocations.

@@ -6008,7 +6008,7 @@ fn summarise_partial_return(
                         // Anything else referencing a tracked name is
                         // an escape we can't follow — drop those names.
                         for n in collect_names_in_expr(other) {
-                            tracked.remove(&n);
+                            tracked.remove(n);
                         }
                     }
                 }
@@ -6156,12 +6156,12 @@ fn summary_observe_call(
     // callee — drop it conservatively.
     for arg in &call.arguments.args {
         for n in collect_names_in_expr(arg) {
-            tracked.remove(&n);
+            tracked.remove(n);
         }
     }
     for kw in &call.arguments.keywords {
         for n in collect_names_in_expr(&kw.value) {
-            tracked.remove(&n);
+            tracked.remove(n);
         }
     }
 }
@@ -6197,7 +6197,7 @@ fn summary_observe_value(
         return;
     }
     for n in collect_names_in_expr(value) {
-        tracked.remove(&n);
+        tracked.remove(n);
     }
 }
 
@@ -6451,9 +6451,9 @@ fn audit_check_escape(c: &mut Checker, expr: &Expr) {
         .iter()
         .filter_map(|n| {
             c.uninit_instances
-                .get(n)
+                .get(*n)
                 .filter(|info| !info.missing.is_empty())
-                .map(|info| (n.clone(), info.clone()))
+                .map(|info| ((*n).to_string(), info.clone()))
         })
         .collect();
     for (binding, info) in snapshot {
@@ -6582,16 +6582,16 @@ fn check_unsafe_leak_into(c: &mut Checker, expr: &Expr, target_ty: &Type) {
 /// diagnostics for one escape site (e.g. `return c if cond else c`).
 ///
 /// FINDINGS — gemini + copilot review of v0.2.0.
-fn collect_names_in_expr(expr: &Expr) -> std::collections::HashSet<String> {
+fn collect_names_in_expr(expr: &Expr) -> std::collections::HashSet<&str> {
     use ruff_python_ast::visitor::source_order::{walk_expr, SourceOrderVisitor};
-    struct V {
-        names: std::collections::HashSet<String>,
+    struct V<'a> {
+        names: std::collections::HashSet<&'a str>,
     }
-    impl<'a> SourceOrderVisitor<'a> for V {
+    impl<'a> SourceOrderVisitor<'a> for V<'a> {
         fn visit_expr(&mut self, e: &'a Expr) {
             match e {
                 Expr::Name(n) => {
-                    self.names.insert(n.id.as_str().to_owned());
+                    self.names.insert(n.id.as_str());
                 }
                 // Skip the receiver of `recv.attr` — `c.field` reads
                 // off `c`, it doesn't escape `c` itself. The other
@@ -9977,7 +9977,7 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                 let names_in_value = collect_names_in_expr(value);
                 if names_in_value
                     .iter()
-                    .any(|n| c.uninit_instances.contains_key(n))
+                    .any(|n| c.uninit_instances.contains_key(*n))
                 {
                     audit_check_escape(c, value);
                 }
