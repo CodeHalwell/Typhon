@@ -9779,11 +9779,11 @@ fn collect_reassigned_names(stmts: &[Stmt], acc: &mut std::collections::HashSet<
             Stmt::AnnAssign(a) => add_target(&a.target, acc),
             Stmt::AugAssign(a) => add_target(&a.target, acc),
             Stmt::If(i) => {
-                if !body_always_exits(&i.body) {
+                if !body_always_leaves_loop(&i.body) {
                     collect_reassigned_names(&i.body, acc);
                 }
                 for clause in &i.elif_else_clauses {
-                    if !body_always_exits(&clause.body) {
+                    if !body_always_leaves_loop(&clause.body) {
                         collect_reassigned_names(&clause.body, acc);
                     }
                 }
@@ -9797,7 +9797,7 @@ fn collect_reassigned_names(stmts: &[Stmt], acc: &mut std::collections::HashSet<
                 collect_reassigned_names(&w.orelse, acc);
             }
             Stmt::With(w) => {
-                if !body_always_exits(&w.body) {
+                if !body_always_leaves_loop(&w.body) {
                     collect_reassigned_names(&w.body, acc);
                 }
             }
@@ -9805,7 +9805,7 @@ fn collect_reassigned_names(stmts: &[Stmt], acc: &mut std::collections::HashSet<
                 collect_reassigned_names(&t.body, acc);
                 for h in &t.handlers {
                     let ruff_python_ast::ExceptHandler::ExceptHandler(h) = h;
-                    if !body_always_exits(&h.body) {
+                    if !body_always_leaves_loop(&h.body) {
                         collect_reassigned_names(&h.body, acc);
                     }
                 }
@@ -9814,7 +9814,7 @@ fn collect_reassigned_names(stmts: &[Stmt], acc: &mut std::collections::HashSet<
             }
             Stmt::Match(m) => {
                 for case in &m.cases {
-                    if !body_always_exits(&case.body) {
+                    if !body_always_leaves_loop(&case.body) {
                         collect_reassigned_names(&case.body, acc);
                     }
                 }
@@ -9829,9 +9829,11 @@ fn collect_reassigned_names(stmts: &[Stmt], acc: &mut std::collections::HashSet<
 }
 
 /// Whether an expression contains a call anywhere in evaluation position —
-/// used to decide if a bare expression statement could have side-effected a
-/// module global (and thus invalidate global narrowing). Conservative: any
-/// `Call`/`Await` node counts.
+/// used to decide if a statement could have side-effected a module global (and
+/// thus invalidate global narrowing). Conservative: any `Call`/`Await` node
+/// counts, and every sub-expression that is evaluated is visited (including
+/// container literals, comprehensions, and f-strings — a call nested there,
+/// `let n = {"k": clear()}`, still runs).
 fn expr_contains_call(e: &Expr) -> bool {
     use ruff_python_ast::Expr as E;
     match e {
@@ -9853,8 +9855,39 @@ fn expr_contains_call(e: &Expr) -> bool {
         E::Starred(s) => expr_contains_call(&s.value),
         E::Tuple(t) => t.elts.iter().any(expr_contains_call),
         E::List(l) => l.elts.iter().any(expr_contains_call),
+        E::Set(s) => s.elts.iter().any(expr_contains_call),
+        E::Slice(s) => {
+            s.lower.as_deref().is_some_and(expr_contains_call)
+                || s.upper.as_deref().is_some_and(expr_contains_call)
+                || s.step.as_deref().is_some_and(expr_contains_call)
+        }
+        E::Dict(d) => d.items.iter().any(|item| {
+            item.key.as_ref().is_some_and(expr_contains_call) || expr_contains_call(&item.value)
+        }),
+        E::ListComp(c) => expr_contains_call(&c.elt) || comprehensions_contain_call(&c.generators),
+        E::SetComp(c) => expr_contains_call(&c.elt) || comprehensions_contain_call(&c.generators),
+        E::Generator(c) => expr_contains_call(&c.elt) || comprehensions_contain_call(&c.generators),
+        E::DictComp(c) => {
+            c.key.as_deref().is_some_and(expr_contains_call)
+                || expr_contains_call(&c.value)
+                || comprehensions_contain_call(&c.generators)
+        }
+        E::FString(f) => f.value.elements().any(|el| match el {
+            ruff_python_ast::InterpolatedStringElement::Interpolation(i) => {
+                expr_contains_call(&i.expression)
+            }
+            ruff_python_ast::InterpolatedStringElement::Literal(_) => false,
+        }),
         _ => false,
     }
+}
+
+/// Whether any comprehension clause (`for … in ITER if COND`) evaluates a call —
+/// in the iterables or the filter conditions.
+fn comprehensions_contain_call(generators: &[ruff_python_ast::Comprehension]) -> bool {
+    generators
+        .iter()
+        .any(|g| expr_contains_call(&g.iter) || g.ifs.iter().any(expr_contains_call))
 }
 
 fn check_stmt(c: &mut Checker, stmt: &Stmt) {
@@ -10654,12 +10687,13 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
             // its own site, so only genuinely loop-carried narrowings are lost.
             //
             // Only widen when the body can actually reach the loop back-edge. If
-            // every path ends in `break`/`return`/`raise`, the loop runs at most
-            // one full iteration, so the reassignment never flows back to the top
-            // and the pre-loop narrowing still holds for that single pass —
-            // widening there would be a false positive (`while f: y = x; x = None;
-            // break` with `x` pre-narrowed non-None).
-            if !body_always_exits(&w.body) {
+            // every path leaves the loop (`break`/`return`/`raise`), it runs at
+            // most one full iteration, so the reassignment never flows back to
+            // the top and the pre-loop narrowing still holds for that single
+            // pass — widening there would be a false positive (`while f: y = x;
+            // x = None; break`). A `continue` does NOT leave the loop, so a body
+            // ending in one is still widened (`body_always_leaves_loop`).
+            if !body_always_leaves_loop(&w.body) {
                 let mut loop_reassigned = std::collections::HashSet::new();
                 collect_reassigned_names(&w.body, &mut loop_reassigned);
                 for name in &loop_reassigned {
@@ -10729,9 +10763,10 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
             // loop-carried narrowing read at the top of a later pass isn't
             // treated with the stale pre-loop type. The loop target itself is
             // rebound per iteration by `bind_unpacking_target` above. Skipped
-            // when the body always exits (`break`/`return`/`raise` on every
-            // path) — there is then no back-edge, so no stale carry to widen.
-            if !body_always_exits(&f.body) {
+            // when the body always leaves the loop (`break`/`return`/`raise` on
+            // every path) — there is then no back-edge, so no stale carry to
+            // widen. A `continue` still reaches the back-edge, so it is widened.
+            if !body_always_leaves_loop(&f.body) {
                 let mut loop_reassigned = std::collections::HashSet::new();
                 collect_reassigned_names(&f.body, &mut loop_reassigned);
                 for name in &loop_reassigned {
@@ -12218,6 +12253,34 @@ fn check_if(c: &mut Checker, i: &ruff_python_ast::StmtIf) {
 /// narrowing of the `if`'s test into the post-`if` scope.
 fn body_always_exits(stmts: &[Stmt]) -> bool {
     stmts.last().is_some_and(stmt_always_exits)
+}
+
+/// Loop-back-edge variant of [`body_always_exits`]: does every path *leave the
+/// enclosing loop* (via `break` / `return` / `raise`) rather than reach its
+/// back-edge? Unlike `body_always_exits`, a terminal `continue` does NOT count
+/// as leaving — it re-enters the loop, so a value assigned before it carries to
+/// the next iteration. Used by the loop iteration-2 narrowing so an assignment
+/// on a `continue` path is still recognised as loop-carried. Exotic terminals
+/// (`with` / `match` / `try` ending in `continue`) fall back to
+/// `stmt_always_exits`, i.e. are treated as leaving — a sound over-skip (a
+/// missed widening is a safe false negative, never a false positive).
+fn body_always_leaves_loop(stmts: &[Stmt]) -> bool {
+    match stmts.last() {
+        Some(Stmt::Continue(_)) => false,
+        Some(Stmt::If(s)) => {
+            if is_constant_true(&s.test) {
+                return body_always_leaves_loop(&s.body);
+            }
+            let has_else = s.elif_else_clauses.iter().any(|c| c.test.is_none());
+            body_always_leaves_loop(&s.body)
+                && has_else
+                && s.elif_else_clauses
+                    .iter()
+                    .all(|c| body_always_leaves_loop(&c.body))
+        }
+        Some(other) => stmt_always_exits(other),
+        None => false,
+    }
 }
 
 /// True when every branch of an elif/else chain always exits.
@@ -22637,6 +22700,64 @@ def demo(flag: bool) -> None:
             )),
             "a reassignment before an unconditional break must not widen the \
              pre-loop narrowing: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn narrowing_loop_continue_branch_reaches_backedge() {
+        // PR#249 (chatgpt-codex): a reassignment on a `continue` path DOES reach
+        // the next iteration, so it must widen the loop-carried narrowing.
+        let src = "\
+def maybe() -> str | None:
+    return None
+
+def demo(flag: bool, cond: bool) -> None:
+    mut x: str | None = \"a\"
+    if x is None:
+        return
+    while flag:
+        if cond:
+            x = maybe()
+            continue
+        print(x.upper())
+";
+        let d = check(src);
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::NullableUse { .. })),
+            "a reassignment on a continue path must widen the loop narrowing: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn narrowing_global_reset_sees_call_in_container_rhs() {
+        // PR#249 (chatgpt-codex): a call nested in a dict/list/comprehension RHS
+        // can still reassign a module global, so it must invalidate the global
+        // narrowing just like a top-level call.
+        let src = "\
+mut g: int | None = 1
+
+def clear() -> int:
+    global g
+    g = None
+    return 0
+
+def use_it() -> int:
+    if g is None:
+        return -1
+    let n: dict[str, int] = {\"x\": clear()}
+    return g
+";
+        let d = check(src);
+        assert!(
+            d.errors().iter().any(|e| matches!(
+                e,
+                TycError::NullableUse { .. } | TycError::TypeMismatch { .. }
+            )),
+            "a call nested in a container RHS must invalidate global narrowing: {:?}",
             d.errors()
         );
     }
