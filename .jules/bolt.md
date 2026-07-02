@@ -20,3 +20,6 @@
 ## 2024-05-19 - Use `&str` instead of `String` for HashSet duplicate tracking
 **Learning:** Using `HashSet<String>` combined with `.to_owned()` during hot loops (like scanning class definitions in an AST) introduces unnecessary heap allocations that can be avoided by borrowing slices `HashSet<&str>` directly from the nodes.
 **Action:** When tracking unique occurrences of names in AST nodes or strings in short-lived localized scopes, use `HashSet<&str>` to borrow without allocating, converting to owned strings only when they must be passed to long-lived containers.
+## 2024-07-02 - Avoid String allocations in hot paths like collect_names_in_expr
+**Learning:** Returning `HashSet<String>` from `collect_names_in_expr` creates unnecessary temporary heap allocations in hot paths like `audit_check_escape` and type-checking loops.
+**Action:** Tie the lifetime of the temporary hashset to the AST nodes and use `HashSet<&str>` instead of `.to_owned()` for strings collected in hot type-checking paths to avoid heap allocations.
