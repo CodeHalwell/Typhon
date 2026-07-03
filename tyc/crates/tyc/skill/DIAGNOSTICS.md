@@ -964,7 +964,7 @@ Standard values for severity keys are `"off"`, `"warn"`, `"error"`.
 
 ## Quick lookup
 
-When in doubt about a diagnostic, prefer `tyc explain <code>` over guessing — it prints the catalog entry directly from the binary. `tyc explain --list` enumerates every code. The docs site mirror is at `https://github.com/CodeHalwell/Typhon/blob/main/docs/diagnostics/<code>.md`.
+When in doubt about a diagnostic, prefer `tyc explain <code>` over guessing — it prints the catalog entry directly from the binary. `tyc explain --list` enumerates every code. The canonical page for each code is at `https://github.com/CodeHalwell/Typhon/blob/main/docs/diagnostics/<code>.md`.
 
 To find every site that emits a given code in the Rust source:
 
