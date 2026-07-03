@@ -39,8 +39,13 @@ behaviour.
   first block before keying (the preprocessor's recorded
   `impl_distributed_lines` is now threaded through
   `check_module_with[_imports]`), so a 10-variant union still reports one
-  diagnostic, not ten. Corpus counts are unchanged (`examples/` 48/48 clean,
-  `stress/` 951 pass / 132 intentional negatives).
+  diagnostic, not ten. The same hole existed in the resolver/CLI dedup
+  (`dedup_vec`), which keyed on the *first* label only — a multi-label
+  diagnostic like `immutable_assign` shares its first label (the declaration)
+  across every offending site, so `x = 2` and `x = 3` against one `let x`
+  reported a single error; it now keys on every label span. Corpus counts are
+  unchanged (`examples/` 48/48 clean, `stress/` 951 pass / 132 intentional
+  negatives).
 - **Type checker: nested-generic assignability is no longer exponential.** The
   invariant-container check used `assignable(a,b) && assignable(b,a)`, doubling
   the recursion at every level (O(2^depth)); a deeply-nested annotation like

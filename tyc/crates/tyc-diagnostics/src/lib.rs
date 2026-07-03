@@ -3189,7 +3189,7 @@ impl Diagnostics {
     /// Drop diagnostics that duplicate an earlier one in the same list.
     ///
     /// The dedup key is `(diagnostic code, rendered top-line message,
-    /// primary-label span)` — span-aware, so two genuinely distinct
+    /// every label span)` — span-aware, so two genuinely distinct
     /// occurrences of the same mistake on different source lines are BOTH
     /// reported (previously a `(code, message)`-only key silently swallowed
     /// every repeat of an identical error at a different location).
@@ -3789,9 +3789,12 @@ impl BlockRemap {
     /// Build a remap table from the *sanitised* source text (the form
     /// `sanitize_synthetic_source` produces, where each distributed
     /// `class __typhon_impl_<Variant>(object):` header has already been
-    /// restored to `impl <Variant>:`). Returns `None` when the source
-    /// contains no distributed impl group (the overwhelmingly common
-    /// case), so normal diagnostics pay only a cheap scan.
+    /// restored to `impl <Variant>:`) — or from the *preprocessed*
+    /// buffer itself, whose headers still carry the `__typhon_impl_`
+    /// form (the buffer `Diagnostics::dedupe_distributed` keys spans
+    /// against). Returns `None` when the source contains no distributed
+    /// impl group (the overwhelmingly common case), so normal
+    /// diagnostics pay only a cheap scan.
     ///
     /// Detection: a *group* is a maximal run of two or more `impl <Name>:`
     /// header lines at the same indent whose bodies (every more-indented
@@ -4401,11 +4404,12 @@ fn dedup_vec(v: &mut Vec<TycError>) {
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     v.retain(|e| {
         let code = e.code().map(|c| c.to_string()).unwrap_or_default();
-        let span = e
-            .labels()
-            .and_then(|mut it| it.next())
-            .map(|l| format!("{}:{}", l.inner().offset(), l.inner().len()))
-            .unwrap_or_default();
+        // Key on EVERY label span, not just the first. A multi-label
+        // diagnostic like `immutable_assign` shares its first label (the
+        // declaration) across every offending site; keying on the first
+        // label alone collapsed `x = 2` and `x = 3` against one `let x`
+        // into a single reported error, hiding the second site.
+        let span = diag_span_key(e, None);
         seen.insert(format!("{}\x00{}\x00{}", e, code, span))
     });
 }
@@ -5097,6 +5101,26 @@ mod tests {
             d.warning_count(),
             2,
             "distinct warnings should both survive dedup"
+        );
+    }
+
+    #[test]
+    fn dedup_keeps_shared_first_label_distinct_second_label() {
+        // Regression: `dedup_vec` keyed on the FIRST label only. A
+        // multi-label diagnostic like `immutable_assign` shares its first
+        // label (the declaration) across every offending assignment, so
+        // `x = 2` and `x = 3` against one `let x` collapsed into a single
+        // reported error — the second site stayed hidden until the user
+        // fixed the first and re-ran.
+        let src = "let x = 1\nx = 2\nx = 3\n";
+        let mut d = Diagnostics::new();
+        d.push_error(TycError::immutable_assign("x", "a.ty", src, 4, 1, 10, 1));
+        d.push_error(TycError::immutable_assign("x", "a.ty", src, 4, 1, 16, 1));
+        d.dedup();
+        assert_eq!(
+            d.error_count(),
+            2,
+            "each offending assignment site must be reported"
         );
     }
 
