@@ -84,4 +84,4 @@ intra-function mutation, not an escape.
   uses the fields declared on the class named in
   `<ClassName>.__new__(<ClassName>)`.
 
-See https://typhon.dev/lang/diagnostics/missing_field_init
+See https://github.com/CodeHalwell/Typhon/blob/main/docs/diagnostics/missing_field_init.md

@@ -189,4 +189,4 @@ Missing variants without a wildcard arm: `tyc::non_exhaustive_match`.
     tyc explain <code>        # describe a diagnostic (tyc::immutable_assign, ...)
     tyc lsp                   # speak LSP on stdio
 
-See https://typhon.dev/lang for the full reference.
+See https://github.com/CodeHalwell/Typhon/tree/main/docs for the full reference.

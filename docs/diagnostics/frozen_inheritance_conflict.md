@@ -54,4 +54,4 @@ class Square frozen(Shape):   # ok: both frozen
     side: float
 ```
 
-See https://typhon.dev/lang/diagnostics/frozen_inheritance_conflict
+See https://github.com/CodeHalwell/Typhon/blob/main/docs/diagnostics/frozen_inheritance_conflict.md

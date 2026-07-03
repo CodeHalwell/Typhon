@@ -35,4 +35,4 @@ Decorate every same-module async callee in the run with `@gatherable`:
 async def fetch_a() -> int: ...
 ```
 
-See https://typhon.dev/lang/diagnostics/auto_gather_missed
+See https://github.com/CodeHalwell/Typhon/blob/main/docs/diagnostics/auto_gather_missed.md

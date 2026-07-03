@@ -37,4 +37,4 @@ def main() -> int:
     return asyncio.run(main_async())
 ```
 
-See https://typhon.dev/lang/diagnostics/missing_await
+See https://github.com/CodeHalwell/Typhon/blob/main/docs/diagnostics/missing_await.md

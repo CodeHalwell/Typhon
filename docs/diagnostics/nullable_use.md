@@ -29,4 +29,4 @@ def length_of(name: str?) -> int:
     return 0
 ```
 
-See https://typhon.dev/lang/diagnostics/nullable_use
+See https://github.com/CodeHalwell/Typhon/blob/main/docs/diagnostics/nullable_use.md

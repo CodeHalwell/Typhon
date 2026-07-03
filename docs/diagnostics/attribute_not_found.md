@@ -33,4 +33,4 @@ class Point:
     z: int
 ```
 
-See https://typhon.dev/lang/diagnostics/attribute_not_found
+See https://github.com/CodeHalwell/Typhon/blob/main/docs/diagnostics/attribute_not_found.md

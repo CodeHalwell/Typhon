@@ -26,7 +26,7 @@ tyc explain missing_field_init         # __new__ bypass audit (v0.2.0)
 
 Every Markdown file under `docs/diagnostics/` is embedded into the `tyc` binary at build time. `tyc explain <code>` looks up the page by short code (the part after `tyc::`) and writes it to stdout. The catalog pages also live on the docs site under `/lang/diagnostics/<code>/` and are linked from each diagnostic via miette's `url(...)` attribute, so the same content is one click away in any terminal that linkifies URLs.
 
-When a code is misspelled or doesn't yet have a catalog page, `tyc explain` exits non-zero with a pointer to [typhon.dev/lang/diagnostics](https://typhon.dev/lang/diagnostics) for the full catalog.
+When a code is misspelled or doesn't yet have a catalog page, `tyc explain` exits non-zero with a pointer to the [diagnostics catalog](https://github.com/CodeHalwell/Typhon/tree/main/docs/diagnostics) for the full catalog.
 
 ## The catalog
 

@@ -62,4 +62,4 @@ Pick one of the conflicting `pub` declarations and either:
 - `tyc::pub_star_outside_init` — companion advice when `pub *` lands
   in a regular `.ty` module rather than the package's `__init__.ty`.
 
-See https://typhon.dev/lang/diagnostics/pub_name_collision
+See https://github.com/CodeHalwell/Typhon/blob/main/docs/diagnostics/pub_name_collision.md

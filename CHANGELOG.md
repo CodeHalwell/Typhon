@@ -4,12 +4,28 @@ All notable changes to Typhon are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely; the
 canonical phase-by-phase status lives in `docs/roadmap.md`.
 
-## Unreleased — release-readiness remediation
+## 1.0.0-alpha.3 — 2026-07-03 — release-readiness remediation: licensing, packaging & robustness
 
 A full-codebase release-readiness review (`RELEASE_READINESS_REVIEW.md`) and the
-fixes it drove. The positive corpus (`examples/`) stays clean and the `stress/`
-negative-fixture counts are unchanged, so no previously-correct program changes
-behaviour.
+fixes it drove — the release-engineering and robustness counterpart to alpha.2's
+soundness sweep. **Licensing & packaging** close the gaps that would block a
+clean public release: a repository-root MIT `LICENSE`, the upstream Ruff MIT
+notice vendored alongside the fork, `SECURITY.md` / `CONTRIBUTING.md` /
+Dependabot, and release-workflow hygiene (pre-release tags are flagged as such;
+auto-tag is gated on green CI). **Compiler & VM** fixes remove three
+diagnostic-reporting and complexity bugs — identical errors at distinct
+locations are all reported now, nested-generic assignability is linear again
+(not O(2^depth)), and four more flow-narrowing invalidation holes are closed —
+plus six VM ↔ CPython parity gaps (cyclic-value comparison, `str.find`
+character offsets, in-place list `+=`, float `%` / `//` sign & zero-division,
+broken-pipe `print`, `json.dumps` key coercion). **Tooling** hardens the LSP
+(256 MiB stack) and formatter (atomic writes), adds a `TYC_NO_INTROSPECT`
+kill-switch and Windows venv discovery, and finally wires up the
+`[strictness] exhaustive-match` knob. **No new syntax.** The four flow-narrowing
+fixes are conservative widenings that only affect programs relying on a
+previously-*unsound* narrowing; the positive corpus (`examples/`) stays clean
+and the `stress/` negative-fixture counts are unchanged, so no
+previously-*correct* program changes behaviour.
 
 ### Licensing / packaging
 
@@ -95,17 +111,26 @@ behaviour.
 
 ### Diagnostics / docs
 
-- **Diagnostic doc URLs** point at resolvable GitHub docs paths instead of the
-  never-deployed `typhon.dev`.
+- **Diagnostic doc URLs** point at resolvable GitHub docs paths
+  (`github.com/CodeHalwell/Typhon/blob/main/docs/diagnostics/<code>.md`) instead
+  of the never-deployed `typhon.dev` — the compiler's miette `url(...)`
+  deep-links, every `docs/diagnostics/*.md` footer, the docs-site pages, and the
+  bundled `typhon` skill now all use the resolvable path.
 - **Four diagnostics gained doc pages + `tyc explain` entries**
   (`empty_collection_no_annotation`, `freeze_not_freezable`,
   `newtype_invalid_base`, `typing_alias_in_annotation`), completing the catalog.
+- **Bundled skill + reference docs refreshed for v1.0.0-alpha.3** — the embedded
+  `typhon` skill (and its vendored `.claude/skills/typhon/` copy) carry the
+  alpha.3 release banner, the `TYC_NO_INTROSPECT` env-var kill-switch, and the
+  repointed diagnostic URLs; `docs/configuration.md` documents `TYC_NO_INTROSPECT`.
 - **Docs corrections:** stale "current release" pointers (`docs/install.md`,
   `docs/long-term-plan.md`), the README quickstart (`cd myapp`), the docs-site
   install page (pre-built-binary path + correct Rust floor), the emit config page
   (`class-default = "pydantic"` is rejected, not accepted), examples index
   (`60-rescue-boundaries`), and the VS Code grammar (dropped the non-existent
-  `val` / `var` / `Option` / `Some` keywords; added an Install section).
+  `val` / `var` / `Option` / `Some` keywords; corrected constant and
+  keyword-argument highlighting so kwargs are only styled inside call parens;
+  added an Install section).
 
 ## 1.0.0-alpha.2 — 2026-06-29 — type-checker soundness sweep + VM parity
 

@@ -31,4 +31,4 @@ def first[T](xs: list[T]) -> T:
     return xs[0]
 ```
 
-See https://typhon.dev/lang/diagnostics/typevar_import_rejected
+See https://github.com/CodeHalwell/Typhon/blob/main/docs/diagnostics/typevar_import_rejected.md

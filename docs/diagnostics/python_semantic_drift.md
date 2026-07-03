@@ -85,4 +85,4 @@ list concat, `enumerate` / `zip` / `dict.items` iteration, list/dict
 comprehensions, ternary type unification, tuple unpacking with mixed
 types.
 
-See https://typhon.dev/lang/diagnostics/python_semantic_drift
+See https://github.com/CodeHalwell/Typhon/blob/main/docs/diagnostics/python_semantic_drift.md

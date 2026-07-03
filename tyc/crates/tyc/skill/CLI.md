@@ -277,7 +277,7 @@ tyc explain --list                # print every code one per line
 tyc explain --list | fzf | xargs tyc explain   # interactive picker
 ```
 
-Every diagnostic carries a `url(https://typhon.dev/lang/diagnostics/<code>)` miette attribute; catalog pages also live under `docs/diagnostics/<code>.md`.
+Every diagnostic carries a `url(https://github.com/CodeHalwell/Typhon/blob/main/docs/diagnostics/<code>.md)` miette attribute; catalog pages also live under `docs/diagnostics/<code>.md`.
 
 ### `tyc cheatsheet`
 
@@ -422,3 +422,4 @@ For `tyc run` / `tyc debug`, the child's exit code propagates verbatim.
 | `TYPHON_INSTALL_DIR` | Used by installers to override the install location |
 | `TYC_SKIP_CHECK=1` | Skip the pre-VM static check in `tyc run` (v0.3.1) — does NOT affect `--compile` mode |
 | `TYC_NO_SYNC=1` | Equivalent to `--no-sync` on `tyc build` and `tyc add`/`tyc remove` |
+| `TYC_NO_INTROSPECT=1` | (v1.0.0-alpha.3) Disable venv dependency introspection in `tyc check` / `tyc build` / the LSP — a kill-switch for the "opening a project imports its dependencies" trust boundary. Third-party calls degrade to permissive `Unknown`. See `SECURITY.md`. |

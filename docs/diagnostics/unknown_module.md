@@ -27,4 +27,4 @@ Either correct the spelling, add the dependency to `typhon.toml` and run
 flask = "^3.0"
 ```
 
-See https://typhon.dev/lang/diagnostics/unknown_module
+See https://github.com/CodeHalwell/Typhon/blob/main/docs/diagnostics/unknown_module.md

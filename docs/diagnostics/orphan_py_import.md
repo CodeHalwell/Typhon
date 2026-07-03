@@ -29,4 +29,4 @@ absolute import that names a module the build does package:
 from myproject.helper import do_thing
 ```
 
-See https://typhon.dev/lang/diagnostics/orphan_py_import
+See https://github.com/CodeHalwell/Typhon/blob/main/docs/diagnostics/orphan_py_import.md

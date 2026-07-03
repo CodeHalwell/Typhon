@@ -53,4 +53,4 @@ impl Sink:
         return len(data)
 ```
 
-See https://typhon.dev/lang/diagnostics/interface_not_conforming
+See https://github.com/CodeHalwell/Typhon/blob/main/docs/diagnostics/interface_not_conforming.md
