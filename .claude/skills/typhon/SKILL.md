@@ -600,7 +600,57 @@ Plus `tyc::unsafe_value_leak`, `tyc::pattern_shadows_outer`, and `tyc::extend_bu
 
 ## 7. Release highlights (newest first)
 
-The v0.3.0 → v0.15.2 line is **additive** on the accepted surface. Every previously-accepted program continues to type-check identically; the new language forms in the whole window are the **`enum` keyword** (v0.11.0) and the **`as!` checked boundary cast** (v0.14.0, made to compose everywhere in v0.15.0). The behaviour changes are all in the **VM**: the v0.8.0 switch to arbitrary-precision integers, and the v0.11.0 alignment of VM value semantics with CPython (value-based dataclass equality / repr / hashing, order-independent set equality, CPython-matching float repr) — programs that relied on the old VM behaviour now compute different (correct) results. Highlights newest-first:
+The v0.3.0 → v1.0.0-alpha.3 line is **additive on *correct* programs**. Every program that type-checked *and ran correctly* continues to behave identically; the new language forms in the whole window are the **`enum` keyword** (v0.11.0), the **`as!` checked boundary cast** (v0.14.0, made to compose everywhere in v0.15.0), and the **`rescue` exception-boundary sugar** (v1.0.0-alpha). Two deliberate narrowings exist, each rejecting only programs that already crashed at runtime (or relied on an unsound narrowing): v1.0.0-alpha.2's three conservative diagnostics, and v1.0.0-alpha.3's four flow-narrowing invalidation fixes. The behaviour changes are all in the **VM**: the v0.8.0 switch to arbitrary-precision integers, and the v0.11.0 alignment of VM value semantics with CPython (value-based dataclass equality / repr / hashing, order-independent set equality, CPython-matching float repr) — programs that relied on the old VM behaviour now compute different (correct) results. Highlights newest-first:
+
+### v1.0.0-alpha.3 — release-readiness remediation: licensing, packaging & robustness
+
+A full-codebase release-readiness review (`RELEASE_READINESS_REVIEW.md`) and the fixes it drove — the release-engineering / robustness counterpart to alpha.2's soundness sweep. **No new syntax; no previously-*correct* program changes behaviour** (the four flow-narrowing fixes are conservative widenings that only affect programs relying on a previously-unsound narrowing).
+
+- **Licensing & packaging** close the gaps that would block a clean public release: a repository-root MIT `LICENSE`, the upstream Ruff MIT notice vendored beside the fork (`tyc/vendor/LICENSE`), `SECURITY.md` / `CONTRIBUTING.md` / `.github/dependabot.yml`, and release-workflow hygiene — pre-release tags (a `-` in the tag) publish with `prerelease: true`, and auto-tag only fires after CI succeeds on the commit (`workflow_run` gate) so an untested merge can't auto-publish binaries.
+- **Type checker** — three reporting / complexity fixes: identical errors at *distinct* source locations are all reported now (the module- and resolver-level dedupe keyed too coarsely and swallowed the 2nd-and-later occurrence; the B24 sealed-union `impl`-distribution collapse is preserved by remapping the synthetic copy's spans before keying); nested-generic assignability is linear again instead of O(2^depth) (a single-pass `types_equivalent` replaces `assignable(a,b) && assignable(b,a)` — a depth-28 check drops 5.4 s → 7 ms); and four more flow-narrowing invalidation holes are closed (an `except` handler is checked with narrowings widened to declared types; a loop-reassigned variable is widened before the body; an assignment-RHS call invalidates a `global` narrowing; a bare method-call statement invalidates attribute narrowings rooted at its receiver).
+- **VM ↔ CPython parity** (six gaps): cyclic-value `==` / `<` no longer overflows the native stack (depth-guarded, with an `Rc::ptr_eq` identity fast-path); `str.find` / `rfind` / `index` / `rindex` return **character** offsets, not byte offsets; augmented assignment on a list mutates in place (`b = a; b += [x]`); float `%` follows the divisor's sign and float `//` / `%` by `0.0` raise `ZeroDivisionError`; `print` tolerates a broken pipe (`tyc run app | head`); and `json.dumps` coerces scalar dict keys to strings.
+- **Tooling** — the LSP reserves a 256 MiB stack (matching the CLI); `tyc fmt` writes atomically (temp-file + rename); **`TYC_NO_INTROSPECT`** disables venv dependency introspection in the CLI and LSP (a kill-switch for the "opening a project imports its dependencies" trust boundary, documented in `SECURITY.md`); Windows venv discovery probes `.venv\Scripts\python.exe` and `python` / `py`; and **`[strictness] exhaustive-match` is now actually applied** — `"warn"` demotes `tyc::non_exhaustive_match` and `"off"` drops it (previously the validated knob silently did nothing).
+- **Diagnostics / docs** — diagnostic doc URLs point at resolvable GitHub paths (`github.com/CodeHalwell/Typhon/blob/main/docs/diagnostics/<code>.md`) instead of the never-deployed `typhon.dev`; four diagnostics gained doc pages + `tyc explain` entries (`empty_collection_no_annotation`, `freeze_not_freezable`, `newtype_invalid_base`, `typing_alias_in_annotation`), completing the catalog.
+
+### v1.0.0-alpha.2 — type-checker soundness sweep + VM parity
+
+Remediation of a 2026-06-28 adversarial pre-release review, and the first release to deliberately narrow the accepted surface — but only for programs that already crashed at runtime. **No new syntax; no previously-*correct* program changes behaviour.**
+
+- **Soundness:** flow narrowing of a **non-local** place (a global or instance field) is invalidated across an intervening call or alias write (a narrowed `self.val` no longer survives a method that nulls it, then crashes at runtime); short-circuit narrowing (`x is not None and x.method()`, and the De Morgan `x is None or x.method()`) no longer false-positives on the canonical Python null-check idiom.
+- **Newly-typed positions:** slice reads, subscript assignments, `for` / `let` tuple-unpack targets, `match` star / or-pattern captures, walrus bindings, and parameter defaults are all typed and checked instead of degrading to `Unknown`.
+- **Three conservative diagnostics** — `tyc::not_a_context_manager` (a `with` over a local class lacking the protocol), `tyc::raise_non_exception` (`raise 42` / raising a plain dataclass), `tyc::frozen_inheritance_conflict` (mixed frozen / non-frozen dataclass bases) — each firing only where the emitted Python already crashed.
+- **VM ↔ CPython parity:** `bytes %`-formatting, numeric int / float / bool dict-key collapse, and VM `as!` enforcement (a wrong cast no longer slips through the VM).
+- **Robustness:** `typhon.toml` rejects unknown keys and invalid `[checker] external` / `[strictness]` severities (instead of silently reverting to defaults); the CLI runs on a 256 MiB worker stack so deeply-nested or very long expressions no longer abort.
+
+### v1.0.0-alpha — first feature-complete alpha
+
+Typhon's first tagged alpha and first *feature-complete* milestone: the proven production surface plus the previously-deferred type-system frontier. Rolls up milestones M1 + M2 of the alpha release plan, the early M3 polish (formatter idempotence, the perf-regression CI gate), and the **`rescue`** exception-boundary sugar (see [§9](#9-error-handling-with-resultt-e)). Frontier work landed:
+
+- **Higher-kinded type unification** — a constructor variable `F` in `class Functor[F[_]]:` binds against a concrete head like `list`, with `tyc::kind_mismatch` on wrong arity / conflicting binding. (Function-level `F[_]` params remain deferred — see `TYPE_SYSTEM_FRONTIER.md`.)
+- **User-generic variance inference** — covariant / contravariant type-params inferred from usage, across module boundaries, with `@covariant` / `@contravariant` overrides; variance flows through generic interface bounds.
+- **General inter-procedural field-init audit** (partial instances tracked across helper chains) and **2-member non-nullable union modelling** at the introspection boundary.
+
+The production path (`tyc build` → CPython 3.13+) is stable and carries no runtime dependency on the toolchain. As an **alpha** the surface syntax is *not yet frozen* and may change before `1.0.0` with a documented migration note. Deferred to beta: embedded `ty` Phase 2 (the Phase 1 subprocess path ships), typeshed-backed pure-extension checking, and the function-level HKT tail. Additive on the accepted surface — every previously-accepted program type-checks identically.
+
+### v0.15.7 — third-party introspection depth + stress-round robustness
+
+Deepens compile-time checking of third-party code and clears a batch of false positives (2026-06-21 stress round + a 43-library introspection audit). **Third-party *method* calls are now arity-checked** — a missing required argument to `PCA(n_components=2).fit()` (sklearn `fit(self, X, y=None)`) or `df.merge()` is caught at `tyc check` / `tyc build` time, the way constructor and free-function calls already were. Introspection-robustness fixes remove build-blockers on valid code: a re-exported proxy that raises from `inspect.signature` (Flask's `current_app`, Django's `settings`) no longer disables a whole module's checks; the implicit-Optional `x: T = None` idiom no longer false-positives; `pkg.sub.Thing()` multi-segment attribute calls are checked. Three pure type-checker false positives fixed (`Counter + Counter` / `Counter - Counter`, a `plain class` / `class!` with a hand-written `__init__`, a `__call__`-bearing instance passed where a `Callable` is expected) plus a VM `str.isupper()` / `islower()` parity gap.
+
+### v0.15.6 — stress-test robustness sweep
+
+A ~198-program stress-robustness sweep clearing a cluster of type-checker false positives: custom exception classes (`class FooError(Exception):` is no longer auto-`@dataclass`'d, so `raise FooError("msg")` works), nested / list-star / tuple-of-union `match` exhaustiveness, `isinstance`-narrowed bare containers usable parametrically, iterator-protocol classes conforming to `Iterator[T]`, and `dict`-view set operations — plus VM parity gaps (`**kwargs` order, slice deletion, `__format__` dispatch, `bytes` operators, exception `str` / `repr`). Two small additive features: flow-sensitive attribute narrowing (`if self.x is None: return …`) and a VM `abc` module shim.
+
+### v0.15.5 — cross-module `extend BUILTIN:` propagation
+
+`extend BUILTIN:` now crosses module boundaries end-to-end (type checker, build / codegen, and VM runtime): importing a module that declares `extend str: def slug(...)` makes `title.slug()` resolve in the consumer. Previously module-local — the free-function workaround (`pub def to_slug(s: str) -> str: …`) still works but is no longer necessary.
+
+### v0.15.4 — cross-module interface conformance + `pub comptime let`
+
+Closes the cross-module structural-interface-conformance gap: a concrete class reaching a consumer only via an imported provider's return type or a `mod.Iface`-qualified annotation now conforms (the checker resolves class / interface shapes through the project-wide registry, not just directly-imported names; a non-conforming concrete still errors). Also fixes a `pub comptime let` / `pub comptime def` parse error — `pub` now stacks with `comptime`.
+
+### v0.15.3 — `tyc install skill` + bundled-skill refresh
+
+A tooling release with no language, type-checker, VM, or emitted-runtime change: the `typhon` Claude skill now ships embedded in the compiler, and `tyc install skill` vendors it (with its `references/` examples) into any project's `.claude/skills/typhon/`. The bundled skill was brought current with the v0.14.1 → v0.15.2 surface.
 
 ### v0.15.2 — `as!` comment-awareness fix
 
