@@ -4772,7 +4772,7 @@ pub fn check_module(
     resolved: &ResolvedModule,
     module: &ModModule,
 ) -> Diagnostics {
-    check_module_with(path, source, resolved, module, &[], &[])
+    check_module_with(path, source, resolved, module, &[], &[], &[])
 }
 
 /// Snapshot of a module's exported class shapes and free-function
@@ -5246,6 +5246,7 @@ pub fn check_module_with(
     module: &ModModule,
     unsafe_lines: &[usize],
     frozen_class_lines: &[usize],
+    impl_distributed_lines: &[usize],
 ) -> Diagnostics {
     check_module_with_imports(
         path,
@@ -5254,6 +5255,7 @@ pub fn check_module_with(
         module,
         unsafe_lines,
         frozen_class_lines,
+        impl_distributed_lines,
         None,
     )
 }
@@ -5310,6 +5312,7 @@ fn seed_external_class_with_bases(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn check_module_with_imports(
     path: impl Into<String>,
     source: &str,
@@ -5317,6 +5320,7 @@ pub fn check_module_with_imports(
     module: &ModModule,
     unsafe_lines: &[usize],
     frozen_class_lines: &[usize],
+    impl_distributed_lines: &[usize],
     external: Option<&ExternalShapes>,
 ) -> Diagnostics {
     let mut c = Checker::new(path.into(), source, resolved);
@@ -5539,11 +5543,17 @@ pub fn check_module_with_imports(
     // method body across every variant, so every method-level
     // diagnostic (missing_return, non_exhaustive_match, type_mismatch)
     // fires once per copy. Without this pass, a 10-variant union
-    // produces 10 identical errors in the report. The dedup key is
-    // (code, message), stable across copies because impl distribution
-    // doesn't touch the user-visible source text — only the byte
-    // ranges in the preprocessed buffer.
-    c.diagnostics.dedupe();
+    // produces 10 identical errors in the report.
+    //
+    // The dedup key is (code, message, span) with spans inside a
+    // synthetic distributed copy remapped onto the first block, so the
+    // per-variant copies collapse while two genuinely distinct
+    // occurrences of the same mistake on different real-source lines
+    // are BOTH reported (a span-blind (code, message) key used to
+    // swallow every repeat of an identical error at a different
+    // location).
+    c.diagnostics
+        .dedupe_distributed(source, impl_distributed_lines);
 
     // Phase D: freezable-shape audit (B36). Every `freeze let X = …`
     // lowers to `X = __typhon_freeze__(rhs)`; at runtime that helper
@@ -18038,6 +18048,7 @@ mod tests {
             &module,
             &prep.unsafe_lines,
             &prep.frozen_class_lines,
+            &prep.impl_distributed_lines,
         )
     }
 
@@ -18069,6 +18080,7 @@ mod tests {
             &module,
             &prep.unsafe_lines,
             &prep.frozen_class_lines,
+            &prep.impl_distributed_lines,
         )
     }
 
@@ -18093,6 +18105,7 @@ mod tests {
             &module,
             &prep.unsafe_lines,
             &prep.frozen_class_lines,
+            &prep.impl_distributed_lines,
         );
         diags.extend(resolver_diags);
         diags
@@ -19056,6 +19069,72 @@ let r: int = add(1)
             msg.contains("missing required argument") || msg.contains("wrong number of arguments"),
             "got {}",
             msg
+        );
+    }
+
+    #[test]
+    fn identical_mistake_on_two_lines_reports_both() {
+        // Regression: the module-level dedupe used a span-blind
+        // (code, message) key, so the SECOND occurrence of an identical
+        // mistake on a different line was silently swallowed — the user
+        // fixed one call, re-ran, and only then discovered the next.
+        // The dedupe key is now span-aware.
+        let src = "\
+def add(a: int, b: int) -> int:
+    return a + b
+
+def main() -> None:
+    let x: int = add(1)
+    let y: int = add(1)
+";
+        let d = check(src);
+        let arg_errors = d
+            .errors()
+            .iter()
+            .filter(|e| e.to_string().contains("missing required argument"))
+            .count();
+        assert_eq!(
+            arg_errors,
+            2,
+            "both wrong calls must be reported, got: {:?}",
+            d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn sealed_union_distribution_still_dedupes_identical_copies() {
+        // B24 guard: distributing `impl Alias:` over a sealed union
+        // byte-duplicates the method body once per variant, so a
+        // method-level diagnostic with an identical rendered message
+        // fires once per synthetic copy. The span-aware dedupe must
+        // still collapse those copies (their spans remap onto the first
+        // block) — exactly one error, not one per variant.
+        let src = "\
+type Shape = Circle | Square
+
+class Circle:
+    r: float
+
+class Square:
+    s: float
+
+impl Shape:
+    def describe(self) -> int:
+        if 1 > 2:
+            return 1
+";
+        let d = check(src);
+        let missing_return: Vec<String> = d
+            .errors()
+            .iter()
+            .filter(|e| matches!(e, TycError::MissingReturn { .. }))
+            .map(|e| e.to_string())
+            .collect();
+        assert_eq!(
+            missing_return.len(),
+            1,
+            "per-variant distributed copies must collapse to one \
+             diagnostic, got: {missing_return:?}"
         );
     }
 
@@ -27529,6 +27608,7 @@ def main(dogs: list[Dog]) -> None:
             &consumer_module,
             &consumer_prep.unsafe_lines,
             &consumer_prep.frozen_class_lines,
+            &consumer_prep.impl_distributed_lines,
             Some(external),
         )
     }
@@ -29019,6 +29099,7 @@ def describe(e: HttpError) -> str:
             &consumer_module,
             &consumer_prep.unsafe_lines,
             &consumer_prep.frozen_class_lines,
+            &consumer_prep.impl_distributed_lines,
             Some(&external),
         );
         let attr_errors: Vec<String> = d
@@ -29096,6 +29177,7 @@ def label(s: Sub) -> str:
             &consumer_module,
             &consumer_prep.unsafe_lines,
             &consumer_prep.frozen_class_lines,
+            &consumer_prep.impl_distributed_lines,
             Some(&external),
         );
         assert!(
@@ -29230,6 +29312,7 @@ def first_key(spend: AttributedSpend) -> str:
             &consumer_module,
             &consumer_prep.unsafe_lines,
             &consumer_prep.frozen_class_lines,
+            &consumer_prep.impl_distributed_lines,
             Some(&external),
         );
         // The widening must produce a completely clean check — no
@@ -29286,6 +29369,7 @@ def bad() -> str:
             &consumer_module,
             &consumer_prep.unsafe_lines,
             &consumer_prep.frozen_class_lines,
+            &consumer_prep.impl_distributed_lines,
             Some(&external),
         );
         let errors: Vec<String> = d.errors().iter().map(|e| e.to_string()).collect();
@@ -29365,6 +29449,7 @@ def label(f: Foo) -> int:
             &consumer_module,
             &consumer_prep.unsafe_lines,
             &consumer_prep.frozen_class_lines,
+            &consumer_prep.impl_distributed_lines,
             Some(&external),
         );
         assert!(
@@ -29425,6 +29510,7 @@ def label(p: Point) -> float:
             &consumer_module,
             &consumer_prep.unsafe_lines,
             &consumer_prep.frozen_class_lines,
+            &consumer_prep.impl_distributed_lines,
             Some(&external),
         );
         assert!(
@@ -29527,6 +29613,7 @@ def use() -> str | None:
             &consumer_module,
             &consumer_prep.unsafe_lines,
             &consumer_prep.frozen_class_lines,
+            &consumer_prep.impl_distributed_lines,
             Some(&external),
         );
         let errs: Vec<String> = d.errors().iter().map(|e| e.to_string()).collect();
@@ -29611,6 +29698,7 @@ def use() -> str | None:
             &consumer_module,
             &consumer_prep.unsafe_lines,
             &consumer_prep.frozen_class_lines,
+            &consumer_prep.impl_distributed_lines,
             Some(&external),
         );
         assert!(
@@ -29680,6 +29768,7 @@ def use() -> str | None:
             &consumer_module,
             &consumer_prep.unsafe_lines,
             &consumer_prep.frozen_class_lines,
+            &consumer_prep.impl_distributed_lines,
             Some(&external),
         );
         let errs: Vec<String> = d.errors().iter().map(|e| e.to_string()).collect();
@@ -29747,6 +29836,7 @@ def use() -> str | None:
             &consumer_module,
             &consumer_prep.unsafe_lines,
             &consumer_prep.frozen_class_lines,
+            &consumer_prep.impl_distributed_lines,
             Some(&external),
         );
         let errs: Vec<String> = d.errors().iter().map(|e| e.to_string()).collect();
@@ -29809,6 +29899,7 @@ def use() -> None:
             &consumer_module,
             &consumer_prep.unsafe_lines,
             &consumer_prep.frozen_class_lines,
+            &consumer_prep.impl_distributed_lines,
             Some(&external),
         );
         let errs: Vec<String> = d.errors().iter().map(|e| e.to_string()).collect();

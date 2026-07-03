@@ -3124,6 +3124,31 @@ fn diag_dedupe_key(e: &TycError) -> (String, String) {
     (code, message)
 }
 
+/// Compute the label-span key for `e` — every label's `offset:len`,
+/// joined in order — remapping an offset that falls inside a synthetic
+/// distributed `impl` copy back onto the first (real-source-aligned)
+/// block when a [`BlockRemap`] is available. All labels participate:
+/// a multi-label diagnostic like `immutable_assign` (declaration +
+/// assignment) reports two different assignment sites as two distinct
+/// errors even though the declaration label is shared. Diagnostics
+/// with no labels yield an empty key (they dedupe on code + message
+/// alone, as before).
+fn diag_span_key(e: &TycError, remap: Option<&BlockRemap>) -> String {
+    use miette::Diagnostic;
+    let mut key = String::new();
+    if let Some(labels) = e.labels() {
+        for l in labels {
+            let offset = match remap {
+                Some(r) => r.remap_offset(l.inner().offset()),
+                None => l.inner().offset(),
+            };
+            use std::fmt::Write;
+            let _ = write!(key, "{}:{};", offset, l.inner().len());
+        }
+    }
+    key
+}
+
 /// A list of diagnostics collected during a compiler phase.
 #[derive(Debug, Default, Clone)]
 pub struct Diagnostics {
@@ -3161,28 +3186,41 @@ impl Diagnostics {
         &self.warnings
     }
 
-    /// Drop diagnostics that are exact duplicates of an earlier one in
-    /// the same list. Used by callers that synthesise per-variant copies
-    /// of a sealed-union impl block — without dedup, every variant
-    /// produces the same `tyc::missing_return` / `tyc::non_exhaustive_match`
-    /// once, so a 10-variant union prints 10 identical errors (B24).
+    /// Drop diagnostics that duplicate an earlier one in the same list.
     ///
-    /// The dedup key is `(diagnostic code, rendered top-line message)`.
-    /// Both are stable across copies of the same user-written method
-    /// after preprocess expansion. Diagnostics with no code (the
-    /// `Generic` variant) compare by message alone.
-    pub fn dedupe(&mut self) {
-        let mut seen: std::collections::HashSet<(String, String)> =
+    /// The dedup key is `(diagnostic code, rendered top-line message,
+    /// primary-label span)` — span-aware, so two genuinely distinct
+    /// occurrences of the same mistake on different source lines are BOTH
+    /// reported (previously a `(code, message)`-only key silently swallowed
+    /// every repeat of an identical error at a different location).
+    ///
+    /// The one place identical messages at *different* offsets must still
+    /// collapse is B24: sealed-union `impl Alias:` distribution
+    /// byte-duplicates the user's method body once per variant, so a
+    /// method-level diagnostic (`missing_return`,
+    /// `non_exhaustive_match`, …) fires once per synthetic copy. Callers
+    /// pass the checked buffer plus the preprocessor's recorded
+    /// `impl_distributed_lines`; spans inside a synthetic copy are
+    /// remapped onto the first (real-source-aligned) block before keying,
+    /// so per-copy duplicates share a key and collapse, while diagnostics
+    /// in real source keep their own span. Pass an empty
+    /// `distributed_lines` for a buffer with no distribution — the dedupe
+    /// is then purely span-aware.
+    pub fn dedupe_distributed(&mut self, source: &str, distributed_lines: &[usize]) {
+        let remap = BlockRemap::from_sanitised(source, distributed_lines);
+        let mut seen: std::collections::HashSet<(String, String, String)> =
             std::collections::HashSet::new();
         self.errors.retain(|e| {
-            let key = diag_dedupe_key(e);
-            seen.insert(key)
+            let (code, message) = diag_dedupe_key(e);
+            let span = diag_span_key(e, remap.as_ref());
+            seen.insert((code, message, span))
         });
-        let mut seen_warn: std::collections::HashSet<(String, String)> =
+        let mut seen_warn: std::collections::HashSet<(String, String, String)> =
             std::collections::HashSet::new();
         self.warnings.retain(|e| {
-            let key = diag_dedupe_key(e);
-            seen_warn.insert(key)
+            let (code, message) = diag_dedupe_key(e);
+            let span = diag_span_key(e, remap.as_ref());
+            seen_warn.insert((code, message, span))
         });
     }
 
@@ -3778,7 +3816,9 @@ impl BlockRemap {
         // the non-generic `impl <Name>:` form and the generic
         // `impl[T,…] <Name>[…]:` form (mirroring `expand_impl_sealed_unions`
         // in tyc-syntax) so an all-generic distributed buffer isn't dropped.
-        if distributed_lines.is_empty() || !source_has_impl_header(source) {
+        if distributed_lines.is_empty()
+            || !(source_has_impl_header(source) || source.contains("class __typhon_impl_"))
+        {
             return None;
         }
         let is_distributed = |line: usize| distributed_lines.contains(&line);
@@ -3800,7 +3840,20 @@ impl BlockRemap {
             // strips any `impl[…]` type-param prefix and the trailing `:`,
             // so a successful parse means this *is* an impl header line, not
             // a method body line that merely starts with the word.
-            impl_header_name(raw).map(|_| indent)
+            //
+            // Additionally recognise the *preprocessed* header form
+            // (`class __typhon_impl_<Name>…(object):`) so the same remap
+            // works on the checker's buffer, where `make_impl_class_line`
+            // has already rewritten every impl header — that's the buffer
+            // `Diagnostics::dedupe_distributed` keys spans against.
+            if impl_header_name(raw).is_some() {
+                return Some(indent);
+            }
+            let trimmed = raw.trim_start();
+            if trimmed.starts_with("class __typhon_impl_") && trimmed.trim_end().ends_with(':') {
+                return Some(indent);
+            }
+            None
         };
 
         // The (header_line, body_start_line, body_end_line) of each impl
@@ -5045,6 +5098,35 @@ mod tests {
             2,
             "distinct warnings should both survive dedup"
         );
+    }
+
+    #[test]
+    fn dedupe_distributed_keeps_same_message_at_distinct_spans() {
+        // Two occurrences of the *same* mistake on *different* source
+        // lines render the same (code, message) but different spans.
+        // Both must survive — a span-blind key used to swallow the
+        // second occurrence, hiding a real error from the user.
+        let src = "let x = 1\nx = 2\nx = 3\n";
+        let mut d = Diagnostics::new();
+        d.push_error(TycError::immutable_assign("x", "a.ty", src, 4, 1, 10, 1));
+        d.push_error(TycError::immutable_assign("x", "a.ty", src, 4, 1, 16, 1));
+        d.dedupe_distributed(src, &[]);
+        assert_eq!(
+            d.error_count(),
+            2,
+            "identical errors at distinct spans must both be reported"
+        );
+    }
+
+    #[test]
+    fn dedupe_distributed_collapses_identical_span_duplicates() {
+        // Exact duplicates (same code, message, AND span) still collapse.
+        let src = "let x = 1\nx = 2\n";
+        let mut d = Diagnostics::new();
+        d.push_error(TycError::immutable_assign("x", "a.ty", src, 4, 1, 10, 1));
+        d.push_error(TycError::immutable_assign("x", "a.ty", src, 4, 1, 10, 1));
+        d.dedupe_distributed(src, &[]);
+        assert_eq!(d.error_count(), 1, "exact duplicates must collapse");
     }
 
     // ── Doc URLs are wired to every variant ───────────────────────────────────

@@ -26,6 +26,21 @@ behaviour.
 
 ### Compiler / VM fixes
 
+- **Type checker: identical errors on different lines are all reported.** The
+  module-level diagnostic dedupe keyed on `(code, message)` only, so the second
+  (and every later) occurrence of an identical mistake at a *different* source
+  location was silently swallowed — e.g. two `add(1)` calls each missing the
+  same required argument produced a single error, and the survivor's location
+  was the only one shown (`tyc check` and the LSP both under-reported). The
+  dedupe key now includes every label span. The one case identical messages at
+  different offsets must still collapse — sealed-union `impl Alias:`
+  distribution, which byte-duplicates a method body once per variant (B24) —
+  is preserved by remapping spans inside a synthetic distributed copy onto the
+  first block before keying (the preprocessor's recorded
+  `impl_distributed_lines` is now threaded through
+  `check_module_with[_imports]`), so a 10-variant union still reports one
+  diagnostic, not ten. Corpus counts are unchanged (`examples/` 48/48 clean,
+  `stress/` 951 pass / 132 intentional negatives).
 - **Type checker: nested-generic assignability is no longer exponential.** The
   invariant-container check used `assignable(a,b) && assignable(b,a)`, doubling
   the recursion at every level (O(2^depth)); a deeply-nested annotation like
