@@ -1,0 +1,3 @@
+## 2024-05-24 - Equitable Visual Feedback for Container Components
+**Learning:** Container components (like `<Card>` and `<LinkCard>`) that have `:hover` styling (like translate or drop shadows) often lack equivalent `:focus-within` styles. This creates an inequitable experience where mouse users get spatial depth feedback but keyboard users do not, which violates intuitive navigation principles.
+**Action:** Always ensure any structural hover effects (like elevations, box shadows, and border color changes) are paired with corresponding `:focus-within` rules for interactive container elements. Simultaneously, ensure both `:hover` and `:focus-within` are included in `prefers-reduced-motion` resets.
