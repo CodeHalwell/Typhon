@@ -57,4 +57,4 @@ match b:
         print(value)
 ```
 
-See https://typhon.dev/lang/diagnostics/pattern_shadows_outer
+See https://github.com/CodeHalwell/Typhon/blob/main/docs/diagnostics/pattern_shadows_outer.md

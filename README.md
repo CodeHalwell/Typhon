@@ -288,7 +288,7 @@ Full release notes: [CHANGELOG.md](CHANGELOG.md#090--2026-05-27). v0.9.0 is addi
 - ✅ `tyc explain <code>` prints diagnostic catalog entries (mirrors `rustc --explain`); `tyc cheatsheet` prints the 30-second syntax refresher.
 - ✅ `tyc init` scaffold ships a frozen-dataclass + `impl` block + `Result`/`?`/`match` example, plus a fully-commented `typhon.toml`.
 - ✅ `.py` files in `src/` are copied verbatim into the build output; a relative `.py` import that resolves outside `src/` fires `tyc::orphan_py_import`.
-- ✅ Diagnostic deep-links: every `tyc::` diagnostic carries a miette `url(https://typhon.dev/lang/diagnostics/<code>)` clause and the 50+ catalog pages under [docs/diagnostics/](docs/diagnostics/) are embedded into the binary for `tyc explain`.
+- ✅ Diagnostic deep-links: every `tyc::` diagnostic carries a miette `url(https://github.com/CodeHalwell/Typhon/blob/main/docs/diagnostics/<code>.md)` clause and the 50+ catalog pages under [docs/diagnostics/](docs/diagnostics/) are embedded into the binary for `tyc explain`.
 - ✅ `tyc build --check` dry-run mode lists every file that would be written without touching disk; `tyc::contains_secret_literal` flags inlined env values whose binding name matches a credential suffix.
 - ✅ `tyc fmt` wraps `ruff format` after the in-process whitespace pass (when `ruff` is on `PATH` and the buffer contains no Typhon-only tokens).
 - ✅ `tyc debug --break <ty-file>:<line>` translates Typhon source locations through `.py.map` and injects `-c "break …"` into the chosen debugger session.

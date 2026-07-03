@@ -46,4 +46,4 @@ def area(s: Shape) -> float:
             return 0.5 * base * height
 ```
 
-See https://typhon.dev/lang/diagnostics/non_exhaustive_match
+See https://github.com/CodeHalwell/Typhon/blob/main/docs/diagnostics/non_exhaustive_match.md

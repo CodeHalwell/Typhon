@@ -111,11 +111,18 @@ previously-*correct* program changes behaviour.
 
 ### Diagnostics / docs
 
-- **Diagnostic doc URLs** point at resolvable GitHub docs paths instead of the
-  never-deployed `typhon.dev`.
+- **Diagnostic doc URLs** point at resolvable GitHub docs paths
+  (`github.com/CodeHalwell/Typhon/blob/main/docs/diagnostics/<code>.md`) instead
+  of the never-deployed `typhon.dev` — the compiler's miette `url(...)`
+  deep-links, every `docs/diagnostics/*.md` footer, the docs-site pages, and the
+  bundled `typhon` skill now all use the resolvable path.
 - **Four diagnostics gained doc pages + `tyc explain` entries**
   (`empty_collection_no_annotation`, `freeze_not_freezable`,
   `newtype_invalid_base`, `typing_alias_in_annotation`), completing the catalog.
+- **Bundled skill + reference docs refreshed for v1.0.0-alpha.3** — the embedded
+  `typhon` skill (and its vendored `.claude/skills/typhon/` copy) carry the
+  alpha.3 release banner, the `TYC_NO_INTROSPECT` env-var kill-switch, and the
+  repointed diagnostic URLs; `docs/configuration.md` documents `TYC_NO_INTROSPECT`.
 - **Docs corrections:** stale "current release" pointers (`docs/install.md`,
   `docs/long-term-plan.md`), the README quickstart (`cd myapp`), the docs-site
   install page (pre-built-binary path + correct Rust floor), the emit config page

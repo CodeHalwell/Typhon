@@ -108,4 +108,4 @@ Two consequences follow from how this works:
   annotations. The roadmap item for that is the typeshed-backed `ty`
   second-stage checker (see `docs/ty-integration.md`).
 
-See https://typhon.dev/lang/diagnostics/missing_argument
+See https://github.com/CodeHalwell/Typhon/blob/main/docs/diagnostics/missing_argument.md

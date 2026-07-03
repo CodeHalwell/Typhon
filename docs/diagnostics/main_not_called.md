@@ -32,4 +32,4 @@ if __name__ == "__main__":
     main()
 ```
 
-See https://typhon.dev/lang/diagnostics/main_not_called
+See https://github.com/CodeHalwell/Typhon/blob/main/docs/diagnostics/main_not_called.md

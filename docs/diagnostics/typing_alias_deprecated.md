@@ -29,4 +29,4 @@ def main() -> None:
     let xs: list[int] = [1, 2, 3]
 ```
 
-See https://typhon.dev/lang/diagnostics/typing_alias_deprecated
+See https://github.com/CodeHalwell/Typhon/blob/main/docs/diagnostics/typing_alias_deprecated.md

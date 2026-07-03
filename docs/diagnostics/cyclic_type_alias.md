@@ -28,4 +28,4 @@ type A = int
 type B = A
 ```
 
-See https://typhon.dev/lang/diagnostics/cyclic_type_alias
+See https://github.com/CodeHalwell/Typhon/blob/main/docs/diagnostics/cyclic_type_alias.md

@@ -712,7 +712,7 @@ diagnostic-specific docs URL to every `tyc::CODE` (via `miette`'s
 
 ```
 warning[tyc::method_in_class_body]: method 'compose' defined inside …
-  see https://typhon.dev/lang/impl for the full pattern
+  see https://github.com/CodeHalwell/Typhon/blob/main/docs/diagnostics/method_in_class_body.md for the full pattern
 ```
 
 Deliverables:

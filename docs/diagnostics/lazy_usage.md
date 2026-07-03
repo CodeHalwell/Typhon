@@ -26,4 +26,4 @@ Use one of the supported forms:
 lazy import thing = heavy.Thing
 ```
 
-See https://typhon.dev/lang/diagnostics/lazy_usage
+See https://github.com/CodeHalwell/Typhon/blob/main/docs/diagnostics/lazy_usage.md
