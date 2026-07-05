@@ -1,11 +1,14 @@
 /* Typhon docs custom theme */
 
 :root {
-  --sl-font: 'Inter', system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-  --sl-font-mono: 'JetBrains Mono', 'SF Mono', Monaco, Consolas, 'Liberation Mono', monospace;
+  --sl-font:
+    "Inter", system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+    sans-serif;
+  --sl-font-mono:
+    "JetBrains Mono", "SF Mono", Monaco, Consolas, "Liberation Mono", monospace;
 }
 
-:root[data-theme='dark'] {
+:root[data-theme="dark"] {
   --sl-color-accent-low: #1c2a4a;
   --sl-color-accent: #4f8cff;
   --sl-color-accent-high: #b6cdff;
@@ -19,7 +22,7 @@
   --sl-color-black: #0b0c20;
 }
 
-:root[data-theme='light'] {
+:root[data-theme="light"] {
   --sl-color-accent-low: #d4e2ff;
   --sl-color-accent: #2563eb;
   --sl-color-accent-high: #143173;
@@ -37,8 +40,16 @@
 /* Page hero on the landing page */
 .hero {
   background:
-    radial-gradient(1200px 600px at 0% 0%, color-mix(in srgb, var(--sl-color-accent) 22%, transparent), transparent 60%),
-    radial-gradient(900px 500px at 100% 0%, color-mix(in srgb, var(--sl-color-accent) 12%, transparent), transparent 60%);
+    radial-gradient(
+      1200px 600px at 0% 0%,
+      color-mix(in srgb, var(--sl-color-accent) 22%, transparent),
+      transparent 60%
+    ),
+    radial-gradient(
+      900px 500px at 100% 0%,
+      color-mix(in srgb, var(--sl-color-accent) 12%, transparent),
+      transparent 60%
+    );
   border-radius: 1.25rem;
   padding: 3rem clamp(1.5rem, 4vw, 4rem);
   margin-bottom: 1.5rem;
@@ -48,7 +59,11 @@
   font-size: clamp(2.25rem, 5vw, 3.75rem);
   letter-spacing: -0.03em;
   line-height: 1.05;
-  background: linear-gradient(135deg, var(--sl-color-white), var(--sl-color-accent));
+  background: linear-gradient(
+    135deg,
+    var(--sl-color-white),
+    var(--sl-color-accent)
+  );
   -webkit-background-clip: text;
   background-clip: text;
   -webkit-text-fill-color: transparent;
@@ -80,13 +95,19 @@
   border: 1px solid var(--sl-color-gray-5);
   border-radius: 0.75rem;
   padding: 1rem 1.1rem;
-  transition: border-color 120ms ease, transform 120ms ease;
+  transition:
+    border-color 120ms ease,
+    transform 120ms ease;
 }
 
-.card:hover {
+.card:hover,
+.card:focus-within,
+.sl-link-card:hover,
+.sl-link-card:focus-within {
   border-color: var(--sl-color-accent);
   transform: translateY(-2px);
-  box-shadow: 0 4px 12px color-mix(in srgb, var(--sl-color-accent) 20%, transparent);
+  box-shadow: 0 4px 12px
+    color-mix(in srgb, var(--sl-color-accent) 20%, transparent);
 }
 
 .card h3 {
@@ -203,7 +224,6 @@ table tbody tr:hover {
   outline-offset: 2px;
 }
 
-
 /* Accessibility: Improve keyboard focus indication for interactive elements */
 /* Selects in theme dropdown, pagination links, and card components */
 a:focus-visible,
@@ -222,7 +242,6 @@ textarea:focus-visible,
 /* Starlight specific focus fixes */
 .sl-link-card:focus-within {
   background: var(--sl-color-gray-7, var(--sl-color-gray-6));
-  border-color: var(--sl-color-gray-2);
 }
 
 .sl-link-card:focus-within .icon {
@@ -232,7 +251,9 @@ textarea:focus-visible,
 /* Respect user's motion preferences */
 @media (prefers-reduced-motion: reduce) {
   .card:hover,
-  .sl-link-card:hover {
+  .card:focus-within,
+  .sl-link-card:hover,
+  .sl-link-card:focus-within {
     transform: none;
   }
 }
@@ -240,7 +261,11 @@ textarea:focus-visible,
 /* Accessibility: Ensure links in markdown content do not rely on color alone (WCAG 1.4.1) */
 .sl-markdown-content a:not(:where(.not-content *)) {
   text-decoration: underline;
-  text-decoration-color: color-mix(in srgb, var(--sl-color-accent) 50%, transparent);
+  text-decoration-color: color-mix(
+    in srgb,
+    var(--sl-color-accent) 50%,
+    transparent
+  );
   text-underline-offset: 3px;
   text-decoration-thickness: 1px;
   transition: text-decoration-color 150ms ease;
@@ -265,8 +290,13 @@ abbr[title] {
 /* Enhance spatial orientation upon anchor navigation */
 @keyframes highlight-target {
   0% {
-    background-color: color-mix(in srgb, var(--sl-color-accent) 40%, transparent);
-    box-shadow: 0 0 0 4px color-mix(in srgb, var(--sl-color-accent) 40%, transparent);
+    background-color: color-mix(
+      in srgb,
+      var(--sl-color-accent) 40%,
+      transparent
+    );
+    box-shadow: 0 0 0 4px
+      color-mix(in srgb, var(--sl-color-accent) 40%, transparent);
     border-radius: 0.25rem;
   }
   100% {
@@ -304,7 +334,9 @@ abbr[title] {
 
 /* UX: Add hover feedback and smooth transitions to Starlight tabs */
 starlight-tabs .tab > [role="tab"] {
-  transition: color 150ms ease, border-color 150ms ease;
+  transition:
+    color 150ms ease,
+    border-color 150ms ease;
 }
 
 starlight-tabs .tab > [role="tab"]:not([aria-selected="true"]):hover {
