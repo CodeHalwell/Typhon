@@ -12,3 +12,7 @@
 **Vulnerability:** A hardcoded secrets check (`contains_secret_literal`) failed to detect `APIKEY` as a secret, despite catching `API_KEY` and similar variations.
 **Learning:** Case-boundary heuristics and substring matching logic may miss fully capitalized squashed acronyms like `APIKEY` if they are not explicitly registered as standalone keywords, leading to potential false negatives for common secret variable names.
 **Prevention:** When updating or adding to the `tyc::contains_secret_literal` diagnostic (e.g., in `is_secret_name` or `secret_suffix`), explicitly register all common permutations of high-risk security keywords (like `APIKEY` and `API_KEY`), as boundary heuristics cannot be fully relied upon to catch all variations.
+## 2024-05-24 - Secret Detection Order matters
+**Vulnerability:** The hardcoded secret detector checked `KEY` before `APIKEY`. Any secret matching `APIKEY` matched the shorter `KEY` first, producing an inaccurate diagnostic.
+**Learning:** When matching overlapping substrings to categorise a vulnerability, longer/more specific strings must be checked before shorter/more generic ones.
+**Prevention:** Order substring lists by string length, descending. Ensure corresponding tests cover overlapping secrets (e.g. `KEY_APIKEY`).
