@@ -1,0 +1,3 @@
+## 2024-05-23 - Docs Cards Keyboard Navigation
+**Learning:** In Astro/Starlight docs, container elements like `.card` and `.sl-link-card` that only apply visual transitions (elevation/color change) on `:hover` make it difficult for keyboard users to track their current position or perceive the element as interactive.
+**Action:** Always ensure container components that change visually on `:hover` have equivalent `:focus-within` styles to ensure equitable visual feedback for keyboard users navigating internal links. Always ensure these transitions also respect `@media (prefers-reduced-motion: reduce)` rules.
