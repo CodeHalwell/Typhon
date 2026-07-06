@@ -917,8 +917,8 @@ const ABC_PRELUDE_NAMES: &[&str] = &[
 
 /// Names bound at module level (imports, defs, classes, assignments) —
 /// anything here doesn't need an injected import.
-fn module_level_bound_names(body: &[Stmt]) -> HashSet<String> {
-    let mut bound: HashSet<String> = HashSet::new();
+fn module_level_bound_names<'a>(body: &'a [Stmt]) -> HashSet<&'a str> {
+    let mut bound: HashSet<&'a str> = HashSet::new();
     for stmt in body {
         match stmt {
             Stmt::Import(i) => {
@@ -926,9 +926,9 @@ fn module_level_bound_names(body: &[Stmt]) -> HashSet<String> {
                     let n = a
                         .asname
                         .as_ref()
-                        .map(|n| n.as_str().to_owned())
+                        .map(|n| n.as_str())
                         .unwrap_or_else(|| {
-                            a.name.as_str().split('.').next().unwrap_or("").to_owned()
+                            a.name.as_str().split('.').next().unwrap_or("")
                         });
                     bound.insert(n);
                 }
@@ -938,32 +938,32 @@ fn module_level_bound_names(body: &[Stmt]) -> HashSet<String> {
                     let n = a
                         .asname
                         .as_ref()
-                        .map(|n| n.as_str().to_owned())
-                        .unwrap_or_else(|| a.name.as_str().to_owned());
+                        .map(|n| n.as_str())
+                        .unwrap_or_else(|| a.name.as_str());
                     bound.insert(n);
                 }
             }
             Stmt::FunctionDef(f) => {
-                bound.insert(f.name.as_str().to_owned());
+                bound.insert(f.name.as_str());
             }
             Stmt::ClassDef(c) => {
-                bound.insert(c.name.as_str().to_owned());
+                bound.insert(c.name.as_str());
             }
             Stmt::Assign(a) => {
                 for t in &a.targets {
                     if let Expr::Name(n) = t {
-                        bound.insert(n.id.as_str().to_owned());
+                        bound.insert(n.id.as_str());
                     }
                 }
             }
             Stmt::AnnAssign(a) => {
                 if let Expr::Name(n) = a.target.as_ref() {
-                    bound.insert(n.id.as_str().to_owned());
+                    bound.insert(n.id.as_str());
                 }
             }
             Stmt::TypeAlias(ta) => {
                 if let Expr::Name(n) = ta.name.as_ref() {
-                    bound.insert(n.id.as_str().to_owned());
+                    bound.insert(n.id.as_str());
                 }
             }
             _ => {}
@@ -1098,7 +1098,7 @@ fn collect_unimported_abc_annotation_names(body: &[Stmt]) -> Vec<&'static str> {
     walk(body, &mut used);
     ABC_PRELUDE_NAMES
         .iter()
-        .filter(|n| used.contains(*n) && !bound.contains(**n))
+        .filter(|n| used.contains(*n) && !bound.contains(*n))
         .copied()
         .collect()
 }
@@ -1718,11 +1718,11 @@ fn desugar_mod_module_with(m: &ModModule, options: &DesugarOptions) -> ModModule
     let mut multi_base_parents = multi_base_parents;
     collect_cached_property_targets_into(&m.body, &mut multi_base_parents);
     // Module-level classes and the transitive exception subset among them.
-    let mut module_level_classes: Vec<(String, Vec<String>)> = Vec::new();
+    let mut module_level_classes: Vec<(&str, Vec<&str>)> = Vec::new();
     collect_class_bases_into(&m.body, &mut module_level_classes);
-    let module_class_names: std::collections::HashSet<String> = module_level_classes
+    let module_class_names: std::collections::HashSet<&str> = module_level_classes
         .iter()
-        .map(|(n, _)| n.clone())
+        .map(|(n, _)| *n)
         .collect();
     let exception_class_names =
         exception_class_names_from(&module_level_classes, &module_class_names);
@@ -1982,7 +1982,7 @@ struct ClassMarkers<'a> {
     /// definition to raise `TypeError: multiple bases have instance
     /// lay-out conflict`, so those classes are emitted without
     /// `slots=True`. FINDINGS #102.
-    multi_base_parents: &'a std::collections::HashSet<String>,
+    multi_base_parents: &'a std::collections::HashSet<&'a str>,
     /// User-supplied list of base names whose subclasses should skip the
     /// auto `@dataclass` decoration. Matched by last identifier segment
     /// against each base in the class header.
@@ -1995,11 +1995,11 @@ struct ClassMarkers<'a> {
     /// Names of every module-level class that is (transitively) an exception
     /// subclass — so a subclass of a non-suffix-named user exception base
     /// (`class Timeout(Failure)` where `Failure(Exception)`) is recognised.
-    exception_class_names: &'a std::collections::HashSet<String>,
+    exception_class_names: &'a std::collections::HashSet<&'a str>,
     /// Names of every module-level class. Used to tell an *external*
     /// (builtin/imported) exception base apart from a `*Error`-named module
     /// dataclass when classifying a class as an exception per-class.
-    module_class_names: &'a std::collections::HashSet<String>,
+    module_class_names: &'a std::collections::HashSet<&'a str>,
 }
 
 impl ClassMarkers<'_> {
@@ -2518,9 +2518,9 @@ fn class_inherits_protocol(c: &ruff_python_ast::StmtClassDef) -> bool {
 /// method decorated with `cached_property` (or its aliased import name) or a
 /// plain class with such a method, and record the underlying class names.
 /// `cached_property` requires `__dict__`, which conflicts with `slots=True`.
-fn collect_cached_property_targets_into(
-    body: &[Stmt],
-    parents: &mut std::collections::HashSet<String>,
+fn collect_cached_property_targets_into<'a>(
+    body: &'a [Stmt],
+    parents: &mut std::collections::HashSet<&'a str>,
 ) {
     for stmt in body {
         if let Stmt::ClassDef(c) = stmt {
@@ -2528,8 +2528,7 @@ fn collect_cached_property_targets_into(
                 .name
                 .as_str()
                 .strip_prefix("__typhon_impl_")
-                .unwrap_or(c.name.as_str())
-                .to_owned();
+                .unwrap_or(c.name.as_str());
             if class_body_has_cached_property(&c.body) {
                 parents.insert(target);
             }
@@ -2560,13 +2559,13 @@ fn class_body_has_cached_property(body: &[Stmt]) -> bool {
     false
 }
 
-fn collect_multi_base_parents(body: &[Stmt]) -> std::collections::HashSet<String> {
-    let mut parents: std::collections::HashSet<String> = std::collections::HashSet::new();
+fn collect_multi_base_parents<'a>(body: &'a [Stmt]) -> std::collections::HashSet<&'a str> {
+    let mut parents: std::collections::HashSet<&'a str> = std::collections::HashSet::new();
     collect_multi_base_parents_into(body, &mut parents);
     parents
 }
 
-fn collect_multi_base_parents_into(body: &[Stmt], parents: &mut std::collections::HashSet<String>) {
+fn collect_multi_base_parents_into<'a>(body: &'a [Stmt], parents: &mut std::collections::HashSet<&'a str>) {
     for stmt in body {
         match stmt {
             Stmt::ClassDef(c) => {
@@ -2578,7 +2577,7 @@ fn collect_multi_base_parents_into(body: &[Stmt], parents: &mut std::collections
                 if concrete_bases.len() > 1 {
                     for b in &concrete_bases {
                         if let Expr::Name(n) = b {
-                            parents.insert(n.id.as_str().to_owned());
+                            parents.insert(n.id.as_str());
                         }
                     }
                 }
@@ -2793,27 +2792,27 @@ fn name_is_exception_base(name: &str) -> bool {
 /// dataclass, so `class Detailed(LexError):` stays a dataclass too. But
 /// `class Failure(Exception): pass` then `class Timeout(Failure): pass` both
 /// qualify, since `Failure` is rooted in the builtin `Exception`.
-fn exception_class_names_from(
-    classes: &[(String, Vec<String>)],
-    module_classes: &std::collections::HashSet<String>,
-) -> std::collections::HashSet<String> {
-    let mut exc: std::collections::HashSet<String> = std::collections::HashSet::new();
+fn exception_class_names_from<'a>(
+    classes: &'a [(&'a str, Vec<&'a str>)],
+    module_classes: &std::collections::HashSet<&'a str>,
+) -> std::collections::HashSet<&'a str> {
+    let mut exc: std::collections::HashSet<&str> = std::collections::HashSet::new();
     // Seed only from external exception bases — a `*Error`-named *module*
     // class is left to the fixpoint (it qualifies only if rooted in a builtin
     // exception), so a plain `*Error` dataclass base doesn't taint subclasses.
     for (name, bases) in classes {
         if bases
             .iter()
-            .any(|b| !module_classes.contains(b.as_str()) && name_is_exception_base(b))
+            .any(|b| !module_classes.contains(*b) && name_is_exception_base(*b))
         {
-            exc.insert(name.clone());
+            exc.insert(*name);
         }
     }
     loop {
         let mut changed = false;
         for (name, bases) in classes {
             if !exc.contains(name) && bases.iter().any(|b| exc.contains(b)) {
-                exc.insert(name.clone());
+                exc.insert(*name);
                 changed = true;
             }
         }
@@ -2832,16 +2831,16 @@ fn exception_class_names_from(
 /// `class Failure:` dataclass of the same name. Nested-scope exception
 /// classes are recognised per-class at decoration time via their *external*
 /// base (see `is_exception_subclass` in `desugar_stmts`).
-fn collect_class_bases_into(body: &[Stmt], out: &mut Vec<(String, Vec<String>)>) {
+fn collect_class_bases_into<'a>(body: &'a [Stmt], out: &mut Vec<(&'a str, Vec<&'a str>)>) {
     for stmt in body {
         match stmt {
             Stmt::ClassDef(c) => {
-                let bases: Vec<String> = c
+                let bases: Vec<&str> = c
                     .bases()
                     .iter()
-                    .filter_map(|b| base_last_segment(b).map(|s| s.to_owned()))
+                    .filter_map(|b| base_last_segment(b))
                     .collect();
-                out.push((c.name.as_str().to_owned(), bases));
+                out.push((c.name.as_str(), bases));
                 // Do NOT descend into the class body — a class nested inside a
                 // class is a different scope.
             }
@@ -3659,13 +3658,13 @@ fn merge_impl_blocks(body: Vec<Stmt>) -> (Vec<Stmt>, bool) {
     // those blocks lower to module-level attribute patches instead
     // (`Record.label = __typhon_extend_Record__label`). Previously they
     // were silently dropped, so the method vanished from the build output.
-    let local_classes: HashSet<String> = body
+    let local_classes: HashSet<&str> = body
         .iter()
         .filter_map(|stmt| {
             if let Stmt::ClassDef(c) = stmt {
                 let n = c.name.as_str();
                 if !n.starts_with(IMPL_PREFIX) {
-                    return Some(n.to_owned());
+                    return Some(n);
                 }
             }
             None
@@ -3698,7 +3697,7 @@ fn merge_impl_blocks(body: Vec<Stmt>) -> (Vec<Stmt>, bool) {
             };
             let all_local = targets
                 .iter()
-                .all(|t| local_classes.contains(t) || union_aliases.contains_key(t));
+                .all(|t| local_classes.contains(t.as_str()) || union_aliases.contains_key(t));
             if all_local {
                 for target in targets {
                     impl_methods_map
@@ -3989,12 +3988,12 @@ fn inherit_parent_fields(body: Vec<Stmt>) -> Vec<Stmt> {
 
                     // Names already declared as fields on `c` — never
                     // shadow a child field with the parent's annotation.
-                    let mut own_field_names: std::collections::HashSet<String> =
+                    let mut own_field_names: std::collections::HashSet<&str> =
                         std::collections::HashSet::new();
                     for s in &c.body {
                         if let Stmt::AnnAssign(a) = s {
                             if let Expr::Name(n) = a.target.as_ref() {
-                                own_field_names.insert(n.id.as_str().to_owned());
+                                own_field_names.insert(n.id.as_str());
                             }
                         }
                     }
@@ -4015,7 +4014,7 @@ fn inherit_parent_fields(body: Vec<Stmt>) -> Vec<Stmt> {
                                             if own_field_names.contains(nf.id.as_str()) {
                                                 continue;
                                             }
-                                            own_field_names.insert(nf.id.as_str().to_owned());
+                                            own_field_names.insert(nf.id.as_str());
                                             inherited.push(pf.clone());
                                         }
                                     }
