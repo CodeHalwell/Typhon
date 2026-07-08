@@ -115,6 +115,12 @@ pytest = "8.2"              # bare version → ==8.2
 | `unintrospectable-dependency` | `"warn"` \| `"error"` \| `"off"` | Severity when a declared dependency is imported but its signatures can't be recovered (no reachable `.venv`/`python3`, the package isn't installed, or it exposes no introspectable signatures) — so its third-party arity/type checks are skipped. `"warn"` (default) surfaces the skipped coverage; `"error"` fails the build/check (CI-gating); `"off"` restores the prior silent behaviour. Install the project's dependencies (`uv sync`) or ship a `.dty` stub to clear it. |
 | `allow-secret-comptime` | bool | When `true`, silences `tyc::contains_secret_literal` — the warning that fires when a `comptime let` binding whose name looks like a secret (`*KEY` / `*TOKEN` / `*PASSWORD` / `*SECRET` / `*PASS` / `*PWD`) would inline the resolved env-var value as a string literal into the build artifact. Default `false`; `tyc init` seeds it explicitly. Prefer reading secrets at runtime via `os.environ[...]` over enabling this. |
 
+> **`TYC_NO_INTROSPECT=1`** (v1.0.0-alpha.3) — an environment kill-switch that disables venv
+> dependency introspection entirely in `tyc check` / `tyc build` / the LSP. Third-party calls
+> then degrade to a permissive `Unknown` (their arity/type checks are skipped, and the
+> `unintrospectable-dependency` warning is suppressed). It exists for the "opening a project
+> imports its dependencies" trust boundary — see [`SECURITY.md`](../SECURITY.md).
+
 ### `[env]`
 
 | Key | Type | Description |

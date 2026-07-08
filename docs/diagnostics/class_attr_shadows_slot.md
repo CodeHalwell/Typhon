@@ -73,4 +73,4 @@ class Bucket:
 The warning still fires on immutable literals (`int = 3`, `str = "x"`),
 where the slot-descriptor pitfall actually applies.
 
-See https://typhon.dev/lang/diagnostics/class_attr_shadows_slot
+See https://github.com/CodeHalwell/Typhon/blob/main/docs/diagnostics/class_attr_shadows_slot.md

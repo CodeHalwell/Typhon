@@ -1,6 +1,6 @@
 # Typhon Diagnostics — Exhaustive Catalog
 
-Every Typhon compiler error or warning carries a stable code of the form `tyc::<short_code>`. The URL pattern `https://typhon.dev/lang/diagnostics/<short_code>` resolves to the canonical doc page. `tyc explain <code>` prints the catalog entry offline. `tyc explain --list` prints every code.
+Every Typhon compiler error or warning carries a stable code of the form `tyc::<short_code>`. The URL pattern `https://github.com/CodeHalwell/Typhon/blob/main/docs/diagnostics/<short_code>.md` resolves to the canonical doc page. `tyc explain <code>` prints the catalog entry offline. `tyc explain --list` prints every code.
 
 This file is the field guide. Where a diagnostic's severity is configurable, the controlling `[strictness]` key is named in parentheses.
 
@@ -964,7 +964,7 @@ Standard values for severity keys are `"off"`, `"warn"`, `"error"`.
 
 ## Quick lookup
 
-When in doubt about a diagnostic, prefer `tyc explain <code>` over guessing — it prints the catalog entry directly from the binary. `tyc explain --list` enumerates every code. The docs site mirror is at `https://typhon.dev/lang/diagnostics/<code>`.
+When in doubt about a diagnostic, prefer `tyc explain <code>` over guessing — it prints the catalog entry directly from the binary. `tyc explain --list` enumerates every code. The docs site mirror is at `https://github.com/CodeHalwell/Typhon/blob/main/docs/diagnostics/<code>.md`.
 
 To find every site that emits a given code in the Rust source:
 

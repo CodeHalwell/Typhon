@@ -10,6 +10,26 @@ Realistic milestones for one person plus AI assistance. The headline target is a
 
 ## Current release
 
+**[v1.0.0-alpha.3](https://github.com/CodeHalwell/Typhon/releases/tag/v1.0.0-alpha.3) — 2026-07-03.**
+A release-readiness remediation pass (`RELEASE_READINESS_REVIEW.md`) — the
+licensing, packaging, and robustness counterpart to alpha.2's soundness sweep.
+Licensing / packaging gaps that would block a clean public release are closed
+(a repository-root MIT `LICENSE`, the upstream Ruff MIT notice vendored beside
+the fork, `SECURITY.md` / `CONTRIBUTING.md` / Dependabot, and release-workflow
+hygiene — pre-release tags flagged as such, auto-tag gated on green CI). The
+compiler and VM gain diagnostic-reporting and complexity fixes (identical errors
+at distinct source locations are all reported; nested-generic assignability is
+linear again instead of O(2^depth); four more flow-narrowing invalidation holes
+closed) plus six VM ↔ CPython parity fixes (cyclic-value comparison, `str.find`
+character offsets, in-place list `+=`, float `%` / `//` sign & zero-division,
+broken-pipe `print`, `json.dumps` key coercion). Tooling hardens the LSP
+(256 MiB stack) and formatter (atomic writes), adds a `TYC_NO_INTROSPECT`
+kill-switch and Windows venv discovery, and wires up the
+`[strictness] exhaustive-match` knob. No new syntax; the flow-narrowing fixes
+are conservative widenings that only affect programs relying on a
+previously-*unsound* narrowing, so no previously-*correct* program changes
+behaviour.
+
 **[v1.0.0-alpha.2](https://github.com/CodeHalwell/Typhon/releases/tag/v1.0.0-alpha.2) — 2026-06-29.**
 The remediation of the [2026-06-28 adversarial pre-release review](adversarial-review-2026-06-28.md):
 a type-checker soundness sweep (non-local flow-narrowing invalidated across an
@@ -692,7 +712,7 @@ diagnostic-specific docs URL to every `tyc::CODE` (via `miette`'s
 
 ```
 warning[tyc::method_in_class_body]: method 'compose' defined inside …
-  see https://typhon.dev/lang/impl for the full pattern
+  see https://github.com/CodeHalwell/Typhon/blob/main/docs/diagnostics/method_in_class_body.md for the full pattern
 ```
 
 Deliverables:

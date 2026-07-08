@@ -21,4 +21,4 @@ keep emitting useful errors before the full diagnostic plumbing is in place.
 Read the message. The condition described is what you need to address;
 there's no separate language rule attached to the code itself.
 
-See https://typhon.dev/lang/diagnostics/generic
+See https://github.com/CodeHalwell/Typhon/blob/main/docs/diagnostics/generic.md

@@ -42,4 +42,4 @@ of Rule 1 (every parameter is annotated). The diagnostic text in v0.9.0
 also drops the double-backtick wrapping the previous renderer produced
 (was rendered as `` `parameter `x`` ``).
 
-See https://typhon.dev/lang/diagnostics/missing_annotation
+See https://github.com/CodeHalwell/Typhon/blob/main/docs/diagnostics/missing_annotation.md

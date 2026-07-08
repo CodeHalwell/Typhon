@@ -32,4 +32,4 @@ def main() -> None:
     print(t[0])
 ```
 
-See https://typhon.dev/lang/diagnostics/tuple_index_out_of_range
+See https://github.com/CodeHalwell/Typhon/blob/main/docs/diagnostics/tuple_index_out_of_range.md

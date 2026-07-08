@@ -20,7 +20,7 @@ Pre-built, checksum-verified binaries ship on every [GitHub Release](https://git
 curl -sSL https://raw.githubusercontent.com/codehalwell/typhon/main/install.sh | sh
 ```
 
-The installer detects your platform, downloads the matching archive, verifies its SHA-256 against the release manifest over TLS, and installs `tyc` to a per-user directory (no `sudo`). Pin a version with `--version v1.0.0-alpha.2` (or `TYPHON_VERSION=…`).
+The installer detects your platform, downloads the matching archive, verifies its SHA-256 against the release manifest over TLS, and installs `tyc` to a per-user directory (no `sudo`). Pin a version with `--version v1.0.0-alpha.3` (or `TYPHON_VERSION=…`).
 
 </TabItem>
 <TabItem label="Windows (PowerShell)">
@@ -32,7 +32,7 @@ iwr -useb https://raw.githubusercontent.com/codehalwell/typhon/main/install.ps1 
 </TabItem>
 <TabItem label="Manual download">
 
-Download the archive for your platform from the [latest release](https://github.com/CodeHalwell/Typhon/releases/latest), verify it against `SHA256SUMS`, extract it, and put `tyc` on your `PATH`.
+Download the archive for your platform from the newest entry on the [releases page](https://github.com/CodeHalwell/Typhon/releases) (GitHub's "latest release" link skips pre-releases, so use the full list while Typhon is in alpha), verify it against `SHA256SUMS`, extract it, and put `tyc` on your `PATH`.
 
 </TabItem>
 </Tabs>

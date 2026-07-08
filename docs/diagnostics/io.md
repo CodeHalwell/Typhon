@@ -22,4 +22,4 @@ Verify the path exists, check filesystem permissions, and re-run the
 command. If the file was deleted or moved, update the import (or the
 project layout) to match.
 
-See https://typhon.dev/lang/diagnostics/io
+See https://github.com/CodeHalwell/Typhon/blob/main/docs/diagnostics/io.md

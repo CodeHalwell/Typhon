@@ -722,6 +722,7 @@ pub fn check_source_file_with_imports(
         &module,
         &prep.unsafe_lines,
         &prep.frozen_class_lines,
+        &prep.impl_distributed_lines,
         Some(&external),
     );
     diags.extend(type_diags);
@@ -1179,6 +1180,7 @@ fn check_impl(path: &str, text: &str) -> Diagnostics {
         &module,
         &prep.unsafe_lines,
         &prep.frozen_class_lines,
+        &prep.impl_distributed_lines,
     );
     diags.extend(type_diags);
 

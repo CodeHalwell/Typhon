@@ -30,4 +30,4 @@ def main() -> None:
     count = count + 1  # ok
 ```
 
-See https://typhon.dev/lang/diagnostics/immutable_assign
+See https://github.com/CodeHalwell/Typhon/blob/main/docs/diagnostics/immutable_assign.md

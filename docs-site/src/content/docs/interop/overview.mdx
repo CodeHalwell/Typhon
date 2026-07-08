@@ -83,7 +83,9 @@ import httpx
 let r: httpx.Response = client.get("https://example.com")   # ✅ no mismatch
 ```
 
-The same holds for any project module — `import lib; let x: lib.Foo = lib.make()` checks cleanly. `Checker::is_assignable` matches two class types by their final `.`-separated segment **when at least one side is bare**. Two *different* qualified classes stay distinct (`httpx.Response` is not assignable to `requests.Response` — the bundled stubs qualify their own return types, so a cross-module mix-up is still caught), and a genuine mismatch (`Response` vs `int`) is still caught. The relaxation only ever *adds* assignability between differently-spelled names.
+The same holds for any project module — `import lib; let x: lib.Foo = lib.make()` checks cleanly. `Checker::is_assignable` matches two class types by their final `.`-separated segment **when at least one side is bare**. Two *different* qualified classes stay distinct (`httpx.Response` is not assignable to `requests.Response` — the bundled stubs qualify their own return types, so a cross-module mix-up is still caught), and a genuine mismatch (`Response` vs `int`) is still caught.
+
+One deliberate exception guards the user/library boundary: a bare name that refers to a class **declared in the module being checked** does not unify with a same-named class another module provably declares. A `class` statement always creates a fresh class, so declaring your own `class Response:` and passing it where `httpx.Response` is expected is a real mismatch — and is reported as one. The guard is evidence-gated: it fires only when both declarations resolve through exact module keys and their shapes differ, so an `__init__.ty` facade re-export (same shape) or a bare name of unknown origin keeps unifying as before.
 
 ## Mixed-language projects
 
