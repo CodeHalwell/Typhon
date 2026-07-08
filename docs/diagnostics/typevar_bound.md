@@ -37,4 +37,4 @@ def main() -> None:
     min(a, b)
 ```
 
-See https://typhon.dev/lang/diagnostics/typevar_bound
+See https://github.com/CodeHalwell/Typhon/blob/main/docs/diagnostics/typevar_bound.md

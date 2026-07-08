@@ -33,4 +33,4 @@ def main() -> None:
     print(json.dumps({"ok": True}))
 ```
 
-See https://typhon.dev/lang/diagnostics/unused_import
+See https://github.com/CodeHalwell/Typhon/blob/main/docs/diagnostics/unused_import.md

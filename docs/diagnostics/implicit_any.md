@@ -29,4 +29,4 @@ def keys(d: dict[str, int]) -> list[str]:
     return list(d.keys())
 ```
 
-See https://typhon.dev/lang/diagnostics/implicit_any
+See https://github.com/CodeHalwell/Typhon/blob/main/docs/diagnostics/implicit_any.md

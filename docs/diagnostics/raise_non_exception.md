@@ -49,4 +49,4 @@ def do_work(flag: bool) -> int:
     return 1
 ```
 
-See https://typhon.dev/lang/diagnostics/raise_non_exception
+See https://github.com/CodeHalwell/Typhon/blob/main/docs/diagnostics/raise_non_exception.md

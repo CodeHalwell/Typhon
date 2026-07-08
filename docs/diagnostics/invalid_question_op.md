@@ -54,4 +54,4 @@ def collect(xs: list[str]) -> Result[list[int], str]:
     return Ok(out)
 ```
 
-See https://typhon.dev/lang/diagnostics/invalid_question_op
+See https://github.com/CodeHalwell/Typhon/blob/main/docs/diagnostics/invalid_question_op.md

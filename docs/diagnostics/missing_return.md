@@ -34,4 +34,4 @@ def classify(n: int) -> str:
     return "zero"
 ```
 
-See https://typhon.dev/lang/diagnostics/missing_return
+See https://github.com/CodeHalwell/Typhon/blob/main/docs/diagnostics/missing_return.md

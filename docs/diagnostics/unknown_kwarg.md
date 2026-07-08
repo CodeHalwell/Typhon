@@ -30,4 +30,4 @@ def main() -> None:
     connect(host="localhost", port=80)
 ```
 
-See https://typhon.dev/lang/diagnostics/unknown_kwarg
+See https://github.com/CodeHalwell/Typhon/blob/main/docs/diagnostics/unknown_kwarg.md

@@ -30,4 +30,4 @@ def main() -> None:
 If you intended to reference `self`, you'll see `tyc::self_outside_impl`
 instead — `self` is only available inside `impl Name:` method bodies.
 
-See https://typhon.dev/lang/diagnostics/unknown_name
+See https://github.com/CodeHalwell/Typhon/blob/main/docs/diagnostics/unknown_name.md

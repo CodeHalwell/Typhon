@@ -35,11 +35,11 @@ test suite pass, and the perf gate is within threshold.
 | MEDIUM — VM broken-pipe panic | ✅ Fixed | `print` tolerates `BrokenPipe` (clean exit) |
 | MEDIUM — VM `json.dumps` non-string keys | ✅ Fixed | Scalar keys coerced to strings (valid JSON) |
 | MEDIUM — Windows venv discovery dead | ✅ Fixed | `Scripts\python.exe` + `python`/`py` probed |
-| MEDIUM — GitHub Actions unpinned | ⚠️ Partial | Added `dependabot.yml` (github-actions/cargo/npm); SHA-pinning left to a maintainer with network access (SHAs unverifiable offline here) |
+| MEDIUM — GitHub Actions unpinned | ✅ Fixed (2026-07-08) | `dependabot.yml` added in this pass (github-actions/cargo/npm); every third-party action across the five workflows SHA-pinned in the follow-up branch (version noted in a trailing comment; Dependabot keeps the pins fresh) |
 | Docs/packaging (stale versions, README quickstart, docs-site pydantic/toolchain/installers, examples #60, VS Code `val`/`var`+icon+install, stress README, SECURITY/CONTRIBUTING, `.Jules` case-collision) | ✅ Fixed | See the diff |
 | Diagnostics catalog: 4 codes missing docs + `explain` | ✅ Fixed | Added the 4 pages + wired into `tyc explain` |
 | **H6** — flow-narrowing soundness holes | ✅ Fixed | All four sub-holes closed in `tyc-types`: (1) `except` handlers now check against pre-narrowing state (a body raise can happen anywhere); (2) loop bodies widen names reassigned inside them so iteration-2 reads aren't treated with the stale pre-loop type; (3) a call in an assign/ann-assign RHS invalidates global narrowing (not just bare-call statements); (4) a bare method-call statement invalidates attribute narrowing rooted at its receiver. 7 new regression tests; corpus unchanged (998/132); full suite green |
-| **H5** — scope-blind class unification | ⛔ Deferred (with finding) | Attempted a safe tightening (reject the tail-unification only when both sides are non-partial project classes with different field sets). **Empirically found it introduces a false positive** and reverted: a value typed as a bare `Class("Node")` has lost its module origin, so the incompatibility check misresolves an ambiguous bare name and rejects a *correct-type* assignment (verified: passing a genuine `graph.Node` into a `graph.Node` param errored). The common bug (user class vs a *partial* library class) also can't be caught soundly — a partial shape can't be proven incompatible. A safe fix needs the larger "carry qualified module origin through inference" refactor, not a quick edit |
+| **H5** — scope-blind class unification | ✅ Fixed (2026-07-08 — see addendum below; was deferred in this pass) | Attempted a safe tightening (reject the tail-unification only when both sides are non-partial project classes with different field sets). **Empirically found it introduces a false positive** and reverted: a value typed as a bare `Class("Node")` has lost its module origin, so the incompatibility check misresolves an ambiguous bare name and rejects a *correct-type* assignment (verified: passing a genuine `graph.Node` into a `graph.Node` param errored). The common bug (user class vs a *partial* library class) also can't be caught soundly — a partial shape can't be proven incompatible. A safe fix needs the larger "carry qualified module origin through inference" refactor, not a quick edit |
 | LOW — BOM not stripped; comptime "(no location)" | ⛔ Deferred | Low value; the safe fix touches offset-mapping and isn't worth the risk in this pass |
 
 H6 is now fixed (four sub-holes, seven regression tests, corpus unchanged). H5 remains the one
@@ -49,6 +49,26 @@ representation drops the module origin a sound check needs. That's a design-leve
 (thread qualified origin through inference), not a quick edit, and shipping the false-positive
 version would have violated the project's hardest constraint (never reject a currently-valid
 program).
+
+> **2026-07-08 addendum — H5 is now fixed** (post-alpha.3 branch). The key insight that unblocked
+> it without the full origin-threading refactor: a bare name is unambiguous in exactly one case —
+> when it names a class **declared in the module being checked** (`local_classes`), because a
+> `class` statement always creates a fresh class and local declarations shadow imports. The new
+> `tail_unification_provably_distinct` guard in `is_assignable` refuses the qualified ↔ bare
+> unification only when (a) the bare side is such a local declaration, and (b) the qualified
+> side's declaration — resolved through its **exact** module-registry key, never the reverse scan
+> that misfired in the reverted attempt — has a non-equivalent shape. Everything uncertain
+> (unknown modules, partial-vs-partial, facade re-export copies with equal shapes, interfaces,
+> bare names of unknown provenance such as provider return types) degrades to the previous
+> permissive unification. Three collision shapes remain open, each needing the origin-threading
+> refactor rather than a guard-level edit: (1) fully-bare ↔ fully-bare (two `from a import Node`
+> / `from b import Node` values); (2) a genuinely-distinct redeclaration whose shape is
+> byte-identical to the foreign class (indistinguishable from a `pub *` facade self-reference
+> without per-class provenance — see the guard's soundness contract); and (3) **generic** classes
+> (`producer.Box[int]` loses its module prefix at annotation parsing — both sides become
+> `Generic("Box", [int])` and unify in the plain nominal check; preserving qualified generic
+> heads touches head-keyed variance/dispatch tables project-wide, flagged by Codex on PR #285).
+> Corpus byte-identically unchanged; five regression tests added.
 
 ---
 

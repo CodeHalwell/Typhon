@@ -179,12 +179,20 @@ fi
 
 if [ -z "$version" ]; then
     say "Resolving latest release from GitHub API"
-    api_url="https://api.github.com/repos/$REPO/releases/latest"
-    # `tag_name` is a stable field on the release object.
+    # /releases/latest excludes pre-releases, and every alpha/beta tag is
+    # (correctly) published as a pre-release — so it would resolve to a
+    # stale build during the pre-1.0 line. The release list is ordered
+    # newest-first and includes pre-releases. Unauthenticated requests
+    # never receive draft releases, but filter them defensively anyway:
+    # within each release object `tag_name` precedes `draft`, so remember
+    # the most recent tag and emit it at the first `"draft": false`.
+    api_url="https://api.github.com/repos/$REPO/releases?per_page=5"
     version="$(
         curl -fsSL "$api_url" \
-        | sed -n 's/^[[:space:]]*"tag_name":[[:space:]]*"\([^"]*\)".*/\1/p' \
-        | head -n 1
+        | awk -F'"' '
+            /"tag_name":/          { tag = $4 }
+            /"draft":[[:space:]]*false/ { if (tag != "") { print tag; exit } }
+          '
     )"
     if [ -z "$version" ]; then
         die "could not determine latest release tag from $api_url"

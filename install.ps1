@@ -120,14 +120,20 @@ if ($PSVersionTable.PSVersion.Major -lt 6) {
 
 if (-not $Version -or $Version.Trim() -eq '') {
     Write-Step "Resolving latest release from GitHub API"
-    $apiUrl = "https://api.github.com/repos/$Repo/releases/latest"
+    # /releases/latest excludes pre-releases, and every alpha/beta tag is
+    # (correctly) published as a pre-release — so it would resolve to a
+    # stale build during the pre-1.0 line. The release list is ordered
+    # newest-first and includes pre-releases. Unauthenticated requests
+    # never receive draft releases, but filter them defensively anyway.
+    $apiUrl = "https://api.github.com/repos/$Repo/releases?per_page=5"
     try {
-        $release = Invoke-RestMethod -Uri $apiUrl -Headers @{
+        $releases = Invoke-RestMethod -Uri $apiUrl -Headers @{
             'User-Agent' = 'typhon-install-ps1'
         } @WebRequestExtra
     } catch {
         Stop-WithError "Could not query GitHub Releases: $_"
     }
+    $release = @($releases) | Where-Object { -not $_.draft } | Select-Object -First 1
     $Version = $release.tag_name
     if (-not $Version) {
         Stop-WithError "Could not determine latest release tag from $apiUrl"

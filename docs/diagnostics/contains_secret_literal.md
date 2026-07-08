@@ -32,4 +32,4 @@ import os
 let API_KEY: str = os.environ["MY_API_KEY"]
 ```
 
-See https://typhon.dev/lang/diagnostics/contains_secret_literal
+See https://github.com/CodeHalwell/Typhon/blob/main/docs/diagnostics/contains_secret_literal.md

@@ -212,6 +212,25 @@ fn class_name_tail(name: &str) -> &str {
     name.rsplit('.').next().unwrap_or(name)
 }
 
+/// Whether two class shapes describe the same declaration for the purposes of
+/// the H5 tail-unification guard ([`Checker::tail_unification_provably_distinct`]).
+/// A facade re-export (`pub *` in `__init__.ty`) carries a *copy* of the
+/// declaring module's shape, so component equality — not pointer identity —
+/// is the right notion of "same class". Methods are compared by name set
+/// only ([`MethodSig`] carries no `PartialEq`); two genuinely distinct
+/// classes that agree on every field, default, base, and method name are
+/// conservatively treated as equivalent, which can only *permit* (never
+/// reject) an assignment.
+fn shapes_equivalent(a: &InterfaceShape, b: &InterfaceShape) -> bool {
+    a.partial == b.partial
+        && a.fields == b.fields
+        && a.field_order == b.field_order
+        && a.field_defaults == b.field_defaults
+        && a.bases == b.bases
+        && a.methods.len() == b.methods.len()
+        && a.methods.keys().all(|k| b.methods.contains_key(k))
+}
+
 /// Mutual assignability — `assignable(a, b) && assignable(b, a)` — computed in
 /// a single structural pass.
 ///
@@ -3060,16 +3079,22 @@ impl<'a> Checker<'a> {
         // module's bare return type when their final `.`-separated segments
         // match — but only when at least one side is *bare*. Two distinct
         // *qualified* names never unify (`a.Response` stays distinct from
-        // `b.Response`), so same-named classes from different modules aren't
-        // accidentally conflated. This only *relaxes* assignability between
-        // two differently-spelled names — it never turns a previously-accepted
-        // assignment into a mismatch, so it can't introduce a false positive —
-        // and mirrors Typhon's bare-name class model (a `from M import C`
-        // already brings `C` in bare and unifies).
+        // `b.Response`), and — H5 (RELEASE_READINESS_REVIEW.md) — a bare name
+        // that refers to a class *declared in the module being checked* does
+        // not unify with a same-named class another module provably declares:
+        // a `class` statement always creates a fresh class, so a local
+        // `class Response:` can never be `httpx.Response`. That guard is
+        // evidence-gated (see `tail_unification_provably_distinct`): it fires
+        // only when both class declarations are resolved through exact module
+        // keys and their shapes differ, and degrades to the permissive
+        // unification whenever provenance is uncertain — so an import-facade
+        // re-export (same shape) or a bare name of unknown origin (provider
+        // return types, `from M import C`) keeps unifying exactly as before.
         if let (Type::Class(exp_name), Type::Class(act_name)) = (expected, actual) {
             if exp_name != act_name
                 && (!exp_name.contains('.') || !act_name.contains('.'))
                 && class_name_tail(exp_name) == class_name_tail(act_name)
+                && !self.tail_unification_provably_distinct(exp_name, act_name)
             {
                 return true;
             }
@@ -3551,6 +3576,123 @@ impl<'a> Checker<'a> {
             },
             other => other.clone(),
         }
+    }
+
+    /// H5 guard for the qualified ↔ bare tail-unification in
+    /// [`Checker::is_assignable`]: returns `true` only when there is *exact*
+    /// evidence that `exp_name` and `act_name` denote two different class
+    /// declarations, in which case the caller refuses to unify them and the
+    /// assignment falls through to the normal mismatch path.
+    ///
+    /// Soundness contract (this must never reject a correct program):
+    ///
+    /// - The bare side must name a class **declared** in the module being
+    ///   checked (`local_classes`). Local declarations shadow imports, so
+    ///   every shape-consulting path in the checker already resolves that
+    ///   bare name to the local class — and a `class` statement always
+    ///   creates a fresh class, so it cannot be the class another module
+    ///   declares. Bare names of unknown provenance (provider return types,
+    ///   `from M import C` bindings) keep today's permissive unification.
+    /// - The qualified side is resolved through its **exact** module key in
+    ///   the project-wide registry (alias-canonicalised first) — never a
+    ///   reverse scan over same-named classes, which is the ambiguity that
+    ///   sank the first fix attempt (see RELEASE_READINESS_REVIEW.md, H5).
+    /// - If the two resolved shapes are equivalent, the names are treated as
+    ///   the same class and unification proceeds. This escape is
+    ///   load-bearing: a `pub *` facade copies its members' class shapes
+    ///   into the package's `ModuleShapes` (verified empirically — a
+    ///   different-shaped collision *through* a facade is caught), so a
+    ///   module that declares a class and also references it through its
+    ///   own package facade (`pkg/models.ty` declaring `Response` and
+    ///   annotating `pkg.Response` — legal today) sees "origins differ,
+    ///   shapes equal" for what is genuinely ONE class. Rejecting on equal
+    ///   shapes (suggested in PR #285 review) would break that correct
+    ///   program; the cost is that a genuinely-distinct redeclaration with
+    ///   a byte-identical shape keeps unifying — a documented conservative
+    ///   miss, distinguishable only with per-class provenance metadata the
+    ///   registry does not carry today.
+    /// - A local class that (transitively) subclasses a base whose tail
+    ///   matches the qualified name — or whose ancestry contains an
+    ///   unresolvable `__typhon_unknown_base__` marker — is (or may be) a
+    ///   genuine subtype of the qualified class, and keeps unifying.
+    /// - Any missing information — unresolvable module, unknown shape,
+    ///   partial local shape, interface, `impl` pseudo-class — degrades to
+    ///   `false` (permissive, today's behaviour).
+    fn tail_unification_provably_distinct(&self, exp_name: &str, act_name: &str) -> bool {
+        // Exactly one side is qualified here: two bare unequal names with
+        // equal tails cannot reach this guard (a bare name IS its tail), and
+        // the caller's gate already excludes two qualified names.
+        let (qualified, bare) = if exp_name.contains('.') {
+            (exp_name, act_name)
+        } else {
+            (act_name, exp_name)
+        };
+        if bare.contains('.') || !qualified.contains('.') {
+            return false;
+        }
+        if bare.starts_with("__typhon_") || !self.local_classes.contains(bare) {
+            return false;
+        }
+        // Interfaces conform structurally — leave them to the dedicated
+        // conformance rules. Sealed-union aliases and newtypes never appear
+        // in `local_classes` (they are not `class` statements).
+        if self.interfaces.contains_key(bare) {
+            return false;
+        }
+        let Some(local_shape) = self.class_shapes.get(bare) else {
+            return false;
+        };
+        if local_shape.partial {
+            return false;
+        }
+        let Some((prefix, tail)) = qualified.rsplit_once('.') else {
+            return false;
+        };
+        // A local class may legitimately SUBCLASS the qualified class
+        // (`class Response(producer.Response):` passed where
+        // `producer.Response` is expected). Walk the local ancestry: if any
+        // ancestor tail-matches the qualified name, the local class is (or
+        // may be) a genuine subtype — and an `__typhon_unknown_base__`
+        // marker (an `Expr::Attribute` base the collector could not
+        // resolve) means the ancestry is not fully known, so distinctness
+        // cannot be proven. Both keep the permissive unification.
+        {
+            let mut stack: Vec<&str> = vec![bare];
+            let mut visited: std::collections::HashSet<&str> = std::collections::HashSet::new();
+            while let Some(n) = stack.pop() {
+                if !visited.insert(n) {
+                    continue;
+                }
+                if n != bare && class_name_tail(n) == tail {
+                    return false;
+                }
+                if let Some(parents) = self.class_parents.get(n) {
+                    for p in parents {
+                        if p == "__typhon_unknown_base__" {
+                            return false;
+                        }
+                        stack.push(p.as_str());
+                    }
+                }
+            }
+        }
+        // Canonicalise an import alias prefix (`import producer as p`).
+        let module = match self.env.lookup(prefix) {
+            Some(binding) => match &binding.declared {
+                Type::Module(canonical) => canonical.as_str(),
+                _ => prefix,
+            },
+            None => prefix,
+        };
+        let foreign_shape = self
+            .module_registry
+            .get(module)
+            .and_then(|ms| ms.class_shapes.get(tail))
+            .or_else(|| self.class_shapes.get(qualified));
+        let Some(foreign_shape) = foreign_shape else {
+            return false;
+        };
+        !shapes_equivalent(local_shape, foreign_shape)
     }
 
     /// Unwrap a chain of `newtype Foo = …` declarations until a non-
@@ -4772,7 +4914,7 @@ pub fn check_module(
     resolved: &ResolvedModule,
     module: &ModModule,
 ) -> Diagnostics {
-    check_module_with(path, source, resolved, module, &[], &[])
+    check_module_with(path, source, resolved, module, &[], &[], &[])
 }
 
 /// Snapshot of a module's exported class shapes and free-function
@@ -5246,6 +5388,7 @@ pub fn check_module_with(
     module: &ModModule,
     unsafe_lines: &[usize],
     frozen_class_lines: &[usize],
+    impl_distributed_lines: &[usize],
 ) -> Diagnostics {
     check_module_with_imports(
         path,
@@ -5254,6 +5397,7 @@ pub fn check_module_with(
         module,
         unsafe_lines,
         frozen_class_lines,
+        impl_distributed_lines,
         None,
     )
 }
@@ -5310,6 +5454,7 @@ fn seed_external_class_with_bases(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn check_module_with_imports(
     path: impl Into<String>,
     source: &str,
@@ -5317,6 +5462,7 @@ pub fn check_module_with_imports(
     module: &ModModule,
     unsafe_lines: &[usize],
     frozen_class_lines: &[usize],
+    impl_distributed_lines: &[usize],
     external: Option<&ExternalShapes>,
 ) -> Diagnostics {
     let mut c = Checker::new(path.into(), source, resolved);
@@ -5539,11 +5685,17 @@ pub fn check_module_with_imports(
     // method body across every variant, so every method-level
     // diagnostic (missing_return, non_exhaustive_match, type_mismatch)
     // fires once per copy. Without this pass, a 10-variant union
-    // produces 10 identical errors in the report. The dedup key is
-    // (code, message), stable across copies because impl distribution
-    // doesn't touch the user-visible source text — only the byte
-    // ranges in the preprocessed buffer.
-    c.diagnostics.dedupe();
+    // produces 10 identical errors in the report.
+    //
+    // The dedup key is (code, message, span) with spans inside a
+    // synthetic distributed copy remapped onto the first block, so the
+    // per-variant copies collapse while two genuinely distinct
+    // occurrences of the same mistake on different real-source lines
+    // are BOTH reported (a span-blind (code, message) key used to
+    // swallow every repeat of an identical error at a different
+    // location).
+    c.diagnostics
+        .dedupe_distributed(source, impl_distributed_lines);
 
     // Phase D: freezable-shape audit (B36). Every `freeze let X = …`
     // lowers to `X = __typhon_freeze__(rhs)`; at runtime that helper
@@ -18038,6 +18190,7 @@ mod tests {
             &module,
             &prep.unsafe_lines,
             &prep.frozen_class_lines,
+            &prep.impl_distributed_lines,
         )
     }
 
@@ -18069,6 +18222,7 @@ mod tests {
             &module,
             &prep.unsafe_lines,
             &prep.frozen_class_lines,
+            &prep.impl_distributed_lines,
         )
     }
 
@@ -18093,6 +18247,7 @@ mod tests {
             &module,
             &prep.unsafe_lines,
             &prep.frozen_class_lines,
+            &prep.impl_distributed_lines,
         );
         diags.extend(resolver_diags);
         diags
@@ -19056,6 +19211,72 @@ let r: int = add(1)
             msg.contains("missing required argument") || msg.contains("wrong number of arguments"),
             "got {}",
             msg
+        );
+    }
+
+    #[test]
+    fn identical_mistake_on_two_lines_reports_both() {
+        // Regression: the module-level dedupe used a span-blind
+        // (code, message) key, so the SECOND occurrence of an identical
+        // mistake on a different line was silently swallowed — the user
+        // fixed one call, re-ran, and only then discovered the next.
+        // The dedupe key is now span-aware.
+        let src = "\
+def add(a: int, b: int) -> int:
+    return a + b
+
+def main() -> None:
+    let x: int = add(1)
+    let y: int = add(1)
+";
+        let d = check(src);
+        let arg_errors = d
+            .errors()
+            .iter()
+            .filter(|e| e.to_string().contains("missing required argument"))
+            .count();
+        assert_eq!(
+            arg_errors,
+            2,
+            "both wrong calls must be reported, got: {:?}",
+            d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn sealed_union_distribution_still_dedupes_identical_copies() {
+        // B24 guard: distributing `impl Alias:` over a sealed union
+        // byte-duplicates the method body once per variant, so a
+        // method-level diagnostic with an identical rendered message
+        // fires once per synthetic copy. The span-aware dedupe must
+        // still collapse those copies (their spans remap onto the first
+        // block) — exactly one error, not one per variant.
+        let src = "\
+type Shape = Circle | Square
+
+class Circle:
+    r: float
+
+class Square:
+    s: float
+
+impl Shape:
+    def describe(self) -> int:
+        if 1 > 2:
+            return 1
+";
+        let d = check(src);
+        let missing_return: Vec<String> = d
+            .errors()
+            .iter()
+            .filter(|e| matches!(e, TycError::MissingReturn { .. }))
+            .map(|e| e.to_string())
+            .collect();
+        assert_eq!(
+            missing_return.len(),
+            1,
+            "per-variant distributed copies must collapse to one \
+             diagnostic, got: {missing_return:?}"
         );
     }
 
@@ -27529,6 +27750,7 @@ def main(dogs: list[Dog]) -> None:
             &consumer_module,
             &consumer_prep.unsafe_lines,
             &consumer_prep.frozen_class_lines,
+            &consumer_prep.impl_distributed_lines,
             Some(external),
         )
     }
@@ -27829,6 +28051,171 @@ def main(animals: producer.Producer[Animal]) -> None:
                 .iter()
                 .any(|e| matches!(e, TycError::TypeMismatch { .. })),
             "qualified covariant producer.Producer[Animal] -> [Dog] must still be rejected; got {:?}",
+            d.errors()
+        );
+    }
+
+    // ── H5: scope-blind class unification guard ─────────────────────────
+    // RELEASE_READINESS_REVIEW.md H5 — a bare name that refers to a class
+    // *declared in the module being checked* must not tail-unify with a
+    // same-named class another module provably declares; every uncertain
+    // provenance keeps the permissive v0.15.0 unification.
+
+    #[test]
+    fn h5_local_class_rejected_against_same_named_foreign_class() {
+        // A locally-declared `class Response` is a fresh class — it can
+        // never be `producer.Response`, whose declaration (with a
+        // different shape) is resolved through the exact module key.
+        let external = cross_module_qualified_external(
+            "\
+class Response:
+    text: str
+",
+        );
+        let consumer_src = "\
+import producer
+class Response:
+    status: int
+def take(r: producer.Response) -> None:
+    ...
+def main() -> None:
+    let mine: Response = Response(status=3)
+    take(mine)
+";
+        let d = check_consumer(consumer_src, &external);
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::TypeMismatch { .. })),
+            "local `Response` into a `producer.Response` slot must be rejected (H5); got {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn h5_qualified_foreign_value_rejected_against_local_class_slot() {
+        // The reverse direction: a `producer.Response`-typed value must
+        // not satisfy a slot annotated with the local `Response` class.
+        let external = cross_module_qualified_external(
+            "\
+class Response:
+    text: str
+
+def fetch() -> Response:
+    return Response(text=\"x\")
+",
+        );
+        let consumer_src = "\
+import producer
+class Response:
+    status: int
+def take_local(r: Response) -> None:
+    ...
+def main(remote: producer.Response) -> None:
+    take_local(remote)
+";
+        let d = check_consumer(consumer_src, &external);
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::TypeMismatch { .. })),
+            "`producer.Response` into a local `Response` slot must be rejected (H5); got {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn h5_equivalent_shape_reexport_still_unifies() {
+        // A facade re-export carries a *copy* of the declaring module's
+        // shape. When the local and foreign shapes are equivalent, the
+        // names are treated as the same class and unification proceeds —
+        // this is the branch that keeps `pub *` facades working.
+        let external = cross_module_qualified_external(
+            "\
+class Node:
+    label: str
+",
+        );
+        let consumer_src = "\
+import producer
+class Node:
+    label: str
+def take(n: producer.Node) -> None:
+    ...
+def main() -> None:
+    let mine: Node = Node(label=\"a\")
+    take(mine)
+";
+        let d = check_consumer(consumer_src, &external);
+        assert!(
+            !d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::TypeMismatch { .. })),
+            "equivalent shapes must keep unifying (facade re-export); got {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn h5_local_subclass_of_qualified_base_still_unifies() {
+        // Codex review of PR #285: a local class that SUBCLASSES the
+        // qualified class is a genuine subtype and must keep unifying —
+        // qualified (`Expr::Attribute`) bases are collected as
+        // `__typhon_unknown_base__`, so the guard must treat an unknown
+        // base as "distinctness not provable".
+        let external = cross_module_qualified_external(
+            "\
+class Response:
+    text: str
+",
+        );
+        let consumer_src = "\
+import producer
+class! Response(producer.Response):
+    status: int
+def take(r: producer.Response) -> None:
+    ...
+def main() -> None:
+    let mine: Response = Response(status=3)
+    take(mine)
+";
+        let d = check_consumer(consumer_src, &external);
+        assert!(
+            !d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::TypeMismatch { .. })),
+            "a local subclass of the qualified class must keep unifying; got {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn h5_bare_name_of_unknown_origin_keeps_unifying() {
+        // A bare class name the consumer does NOT declare (an import of
+        // unknown provenance) keeps the permissive v0.15.0 unification —
+        // this is the shape of the reverted first fix's false positive.
+        let external = cross_module_qualified_external(
+            "\
+class Response:
+    text: str
+
+def fetch() -> Response:
+    return Response(text=\"x\")
+",
+        );
+        let consumer_src = "\
+import producer
+def take(r: producer.Response) -> None:
+    ...
+def relay(r: Response) -> None:
+    take(r)
+";
+        let d = check_consumer(consumer_src, &external);
+        assert!(
+            !d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::TypeMismatch { .. })),
+            "bare name of unknown origin must keep unifying; got {:?}",
             d.errors()
         );
     }
@@ -29019,6 +29406,7 @@ def describe(e: HttpError) -> str:
             &consumer_module,
             &consumer_prep.unsafe_lines,
             &consumer_prep.frozen_class_lines,
+            &consumer_prep.impl_distributed_lines,
             Some(&external),
         );
         let attr_errors: Vec<String> = d
@@ -29096,6 +29484,7 @@ def label(s: Sub) -> str:
             &consumer_module,
             &consumer_prep.unsafe_lines,
             &consumer_prep.frozen_class_lines,
+            &consumer_prep.impl_distributed_lines,
             Some(&external),
         );
         assert!(
@@ -29230,6 +29619,7 @@ def first_key(spend: AttributedSpend) -> str:
             &consumer_module,
             &consumer_prep.unsafe_lines,
             &consumer_prep.frozen_class_lines,
+            &consumer_prep.impl_distributed_lines,
             Some(&external),
         );
         // The widening must produce a completely clean check — no
@@ -29286,6 +29676,7 @@ def bad() -> str:
             &consumer_module,
             &consumer_prep.unsafe_lines,
             &consumer_prep.frozen_class_lines,
+            &consumer_prep.impl_distributed_lines,
             Some(&external),
         );
         let errors: Vec<String> = d.errors().iter().map(|e| e.to_string()).collect();
@@ -29365,6 +29756,7 @@ def label(f: Foo) -> int:
             &consumer_module,
             &consumer_prep.unsafe_lines,
             &consumer_prep.frozen_class_lines,
+            &consumer_prep.impl_distributed_lines,
             Some(&external),
         );
         assert!(
@@ -29425,6 +29817,7 @@ def label(p: Point) -> float:
             &consumer_module,
             &consumer_prep.unsafe_lines,
             &consumer_prep.frozen_class_lines,
+            &consumer_prep.impl_distributed_lines,
             Some(&external),
         );
         assert!(
@@ -29527,6 +29920,7 @@ def use() -> str | None:
             &consumer_module,
             &consumer_prep.unsafe_lines,
             &consumer_prep.frozen_class_lines,
+            &consumer_prep.impl_distributed_lines,
             Some(&external),
         );
         let errs: Vec<String> = d.errors().iter().map(|e| e.to_string()).collect();
@@ -29611,6 +30005,7 @@ def use() -> str | None:
             &consumer_module,
             &consumer_prep.unsafe_lines,
             &consumer_prep.frozen_class_lines,
+            &consumer_prep.impl_distributed_lines,
             Some(&external),
         );
         assert!(
@@ -29680,6 +30075,7 @@ def use() -> str | None:
             &consumer_module,
             &consumer_prep.unsafe_lines,
             &consumer_prep.frozen_class_lines,
+            &consumer_prep.impl_distributed_lines,
             Some(&external),
         );
         let errs: Vec<String> = d.errors().iter().map(|e| e.to_string()).collect();
@@ -29747,6 +30143,7 @@ def use() -> str | None:
             &consumer_module,
             &consumer_prep.unsafe_lines,
             &consumer_prep.frozen_class_lines,
+            &consumer_prep.impl_distributed_lines,
             Some(&external),
         );
         let errs: Vec<String> = d.errors().iter().map(|e| e.to_string()).collect();
@@ -29809,6 +30206,7 @@ def use() -> None:
             &consumer_module,
             &consumer_prep.unsafe_lines,
             &consumer_prep.frozen_class_lines,
+            &consumer_prep.impl_distributed_lines,
             Some(&external),
         );
         let errs: Vec<String> = d.errors().iter().map(|e| e.to_string()).collect();
