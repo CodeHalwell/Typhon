@@ -10,6 +10,21 @@ Realistic milestones for one person plus AI assistance. The headline target is a
 
 ## Current release
 
+**[v1.0.0-alpha.4](https://github.com/CodeHalwell/Typhon/releases/tag/v1.0.0-alpha.4) — 2026-07-08.**
+A focused hardening release on top of alpha.3. It closes the one HIGH finding
+the release-readiness review deferred — **H5**, scope-blind class unification: a
+locally declared class no longer unifies with a same-named foreign class of a
+provably different shape (evidence-gated, degrading to the previous permissive
+behaviour on any uncertainty, so the example/stress corpus is byte-identically
+unchanged). The secret-name diagnostics match longest-first again (`APIKEY`
+before `KEY`), the release-engineering hygiene from the alpha.3 review is
+finished (SHA-pinned GitHub Actions, a pre-release-aware installer), and a round
+of dependency / advisory bumps lands (`crossbeam-epoch` RUSTSEC-2026-0204,
+`regex`, `memchr`, `compact_str`). No new syntax; like the alpha.2 diagnostics,
+the H5 fix is a conservative narrowing that only rejects programs passing a
+provably-different-shaped class across a module boundary, so no
+previously-*correct* program changes behaviour.
+
 **[v1.0.0-alpha.3](https://github.com/CodeHalwell/Typhon/releases/tag/v1.0.0-alpha.3) — 2026-07-03.**
 A release-readiness remediation pass (`RELEASE_READINESS_REVIEW.md`) — the
 licensing, packaging, and robustness counterpart to alpha.2's soundness sweep.
