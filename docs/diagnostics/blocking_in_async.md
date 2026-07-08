@@ -99,4 +99,4 @@ blocking-in-async = "warn"    # default — visible but doesn't break CI
 # blocking-in-async = "off"   # drop entirely
 ```
 
-See https://typhon.dev/lang/diagnostics/blocking_in_async
+See https://github.com/CodeHalwell/Typhon/blob/main/docs/diagnostics/blocking_in_async.md

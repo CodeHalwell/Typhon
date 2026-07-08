@@ -29,4 +29,4 @@ def doubled(n: int) -> int:
     return n * 2
 ```
 
-See https://typhon.dev/lang/diagnostics/extend_builtin
+See https://github.com/CodeHalwell/Typhon/blob/main/docs/diagnostics/extend_builtin.md

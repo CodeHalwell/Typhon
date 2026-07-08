@@ -33,4 +33,4 @@ def counts() -> Iterator[int]:
     yield 2
 ```
 
-See https://typhon.dev/lang/diagnostics/generator_return_type
+See https://github.com/CodeHalwell/Typhon/blob/main/docs/diagnostics/generator_return_type.md

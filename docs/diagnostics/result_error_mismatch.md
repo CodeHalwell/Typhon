@@ -34,4 +34,4 @@ def main() -> Result[int, IOErr]:
         case Err(e): return Err(IOErr(str(e)))
 ```
 
-See https://typhon.dev/lang/diagnostics/result_error_mismatch
+See https://github.com/CodeHalwell/Typhon/blob/main/docs/diagnostics/result_error_mismatch.md

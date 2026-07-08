@@ -72,4 +72,4 @@ The current registry of resource-returning callees:
 Project-specific classes can opt in via a `.dty` annotation in a
 future release.
 
-See https://typhon.dev/lang/diagnostics/resource_not_managed
+See https://github.com/CodeHalwell/Typhon/blob/main/docs/diagnostics/resource_not_managed.md

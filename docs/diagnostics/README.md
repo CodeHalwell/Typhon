@@ -5,7 +5,7 @@ code of the form `tyc::<short_code>`. Each code below links to a page
 explaining when it fires, the underlying language rule, and how to fix it.
 
 The same URL pattern is rendered next to the code in terminal output —
-`https://typhon.dev/lang/diagnostics/<short_code>` — so users can jump
+`https://github.com/CodeHalwell/Typhon/blob/main/docs/diagnostics/<short_code>.md` — so users can jump
 straight from a failed build to the corresponding documentation.
 
 ## Codes

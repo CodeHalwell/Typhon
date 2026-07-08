@@ -123,4 +123,4 @@ def f() -> None:
 In-function freezing and the `freeze class X:` deep-freeze
 field-initialiser form are tracked follow-ups.
 
-See https://typhon.dev/lang/diagnostics/freeze
+See https://github.com/CodeHalwell/Typhon/blob/main/docs/diagnostics/freeze.md

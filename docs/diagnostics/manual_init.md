@@ -38,4 +38,4 @@ def origin() -> Point:
     return Point()
 ```
 
-See https://typhon.dev/lang/diagnostics/manual_init
+See https://github.com/CodeHalwell/Typhon/blob/main/docs/diagnostics/manual_init.md

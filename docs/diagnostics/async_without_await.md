@@ -60,4 +60,4 @@ The warning is suppressed when the `async def` has a legitimate reason to be
   This is gated on the *interface* method being `async`: an `async` impl of a
   *sync* interface method is async by choice, so it still warns.
 
-See https://typhon.dev/lang/diagnostics/async_without_await
+See https://github.com/CodeHalwell/Typhon/blob/main/docs/diagnostics/async_without_await.md
