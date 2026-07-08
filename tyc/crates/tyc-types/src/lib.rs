@@ -3600,6 +3600,10 @@ impl<'a> Checker<'a> {
     /// - If the two resolved shapes are equivalent, the names are treated as
     ///   the same class (an `__init__.ty` facade re-exports a class by
     ///   copying its shape), and unification proceeds.
+    /// - A local class that (transitively) subclasses a base whose tail
+    ///   matches the qualified name — or whose ancestry contains an
+    ///   unresolvable `__typhon_unknown_base__` marker — is (or may be) a
+    ///   genuine subtype of the qualified class, and keeps unifying.
     /// - Any missing information — unresolvable module, unknown shape,
     ///   partial local shape, interface, `impl` pseudo-class — degrades to
     ///   `false` (permissive, today's behaviour).
@@ -3633,6 +3637,34 @@ impl<'a> Checker<'a> {
         let Some((prefix, tail)) = qualified.rsplit_once('.') else {
             return false;
         };
+        // A local class may legitimately SUBCLASS the qualified class
+        // (`class Response(producer.Response):` passed where
+        // `producer.Response` is expected). Walk the local ancestry: if any
+        // ancestor tail-matches the qualified name, the local class is (or
+        // may be) a genuine subtype — and an `__typhon_unknown_base__`
+        // marker (an `Expr::Attribute` base the collector could not
+        // resolve) means the ancestry is not fully known, so distinctness
+        // cannot be proven. Both keep the permissive unification.
+        {
+            let mut stack: Vec<&str> = vec![bare];
+            let mut visited: std::collections::HashSet<&str> = std::collections::HashSet::new();
+            while let Some(n) = stack.pop() {
+                if !visited.insert(n) {
+                    continue;
+                }
+                if n != bare && class_name_tail(n) == tail {
+                    return false;
+                }
+                if let Some(parents) = self.class_parents.get(n) {
+                    for p in parents {
+                        if p == "__typhon_unknown_base__" {
+                            return false;
+                        }
+                        stack.push(p.as_str());
+                    }
+                }
+            }
+        }
         // Canonicalise an import alias prefix (`import producer as p`).
         let module = match self.env.lookup(prefix) {
             Some(binding) => match &binding.declared {
@@ -28109,6 +28141,39 @@ def main() -> None:
                 .iter()
                 .any(|e| matches!(e, TycError::TypeMismatch { .. })),
             "equivalent shapes must keep unifying (facade re-export); got {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn h5_local_subclass_of_qualified_base_still_unifies() {
+        // Codex review of PR #285: a local class that SUBCLASSES the
+        // qualified class is a genuine subtype and must keep unifying —
+        // qualified (`Expr::Attribute`) bases are collected as
+        // `__typhon_unknown_base__`, so the guard must treat an unknown
+        // base as "distinctness not provable".
+        let external = cross_module_qualified_external(
+            "\
+class Response:
+    text: str
+",
+        );
+        let consumer_src = "\
+import producer
+class! Response(producer.Response):
+    status: int
+def take(r: producer.Response) -> None:
+    ...
+def main() -> None:
+    let mine: Response = Response(status=3)
+    take(mine)
+";
+        let d = check_consumer(consumer_src, &external);
+        assert!(
+            !d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::TypeMismatch { .. })),
+            "a local subclass of the qualified class must keep unifying; got {:?}",
             d.errors()
         );
     }
