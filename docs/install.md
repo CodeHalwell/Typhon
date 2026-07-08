@@ -154,8 +154,10 @@ yourself.
 ## Manual download
 
 If you'd rather not pipe a script into `sh` or `iex`, grab the archive
-directly from the
-[releases page](https://github.com/codehalwell/typhon/releases/latest).
+directly from the newest entry on the
+[releases page](https://github.com/codehalwell/typhon/releases).
+(GitHub's "latest release" link skips pre-releases, so use the full
+list while Typhon is in alpha.)
 
 1. Pick the asset matching your platform:
    - Apple Silicon: `tyc-<version>-aarch64-apple-darwin.tar.gz`
