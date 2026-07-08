@@ -6,6 +6,18 @@ canonical phase-by-phase status lives in `docs/roadmap.md`.
 
 ## Unreleased
 
+## 1.0.0-alpha.4 — 2026-07-08 — post-alpha.3 hardening: H5 soundness, secret-detection correctness & supply-chain hygiene
+
+A focused hardening release on top of alpha.3. It closes the **one HIGH
+finding the release-readiness review deferred** (H5 — scope-blind class
+unification), corrects the secret-name diagnostic's longest-first matching,
+and finishes the release-engineering hygiene the alpha.3 review opened
+(SHA-pinned GitHub Actions, a pre-release-aware installer), on top of a
+round of dependency and security-advisory bumps. **No new syntax, and no
+previously-*correct* program changes behaviour** — like the alpha.2
+diagnostics, the H5 fix is a conservative narrowing that only rejects
+programs passing a provably-different-shaped class across a module boundary.
+
 ### Fixed
 
 - **H5 — scope-blind class unification closed at the declaration boundary.**
@@ -28,6 +40,14 @@ canonical phase-by-phase status lives in `docs/roadmap.md`.
   a conservative narrowing: it only rejects programs that pass a
   provably-different-shaped class across the boundary.
 
+- **Secret-name diagnostics match longest-first.** The keyword tables
+  behind the `contains_secret_literal` / secret-name checks (in both
+  `tyc-analyse` and the `tyc build` secret-suffix scan) ordered the bare
+  `KEY` ahead of `APIKEY`, so a name like `KEY_APIKEY` matched the shorter
+  `KEY` and reported the less-specific suffix. `APIKEY` now precedes `KEY`,
+  restoring the intended longest-first heuristic; regression tests assert
+  `secret_suffix("KEY_APIKEY") == "APIKEY"`.
+
 - **GitHub Actions are SHA-pinned.** Every third-party action across the
   five workflows is pinned to a full commit SHA (version noted in a
   trailing comment; Dependabot's `github-actions` ecosystem keeps the pins
@@ -45,6 +65,22 @@ canonical phase-by-phase status lives in `docs/roadmap.md`.
   (`RELEASE_READINESS_REVIEW.md`). The manual-download links in `docs/install.md` and
   the docs-site installation page now point at the full releases list for the same
   reason.
+
+### Changed
+
+- **Docs-site container components gain equitable focus-within styling.** The
+  Starlight custom CSS now renders a consistent focus ring on container
+  components when a descendant is focused (`:focus-within`), matching the
+  keyboard-focus treatment introduced in v0.15.1. Presentation-only; no
+  language, compiler, or emitted-runtime change.
+
+### Security
+
+- **Dependency & advisory bumps.** Compiler crates: `crossbeam-epoch`
+  0.9.18 → 0.9.20 (RUSTSEC-2026-0204), `regex` 1.12.3 → 1.12.4, `memchr`
+  2.8.0 → 2.8.2, `compact_str` 0.9.0 → 0.9.1. Docs-site: `astro`
+  5.18.1 → 5.18.2, `eslint` 10.4.1 → 10.6.0. No source changes accompany
+  these; `cargo-deny` (advisories / licences / sources) stays green.
 
 ## 1.0.0-alpha.3 — 2026-07-03 — release-readiness remediation: licensing, packaging & robustness
 
