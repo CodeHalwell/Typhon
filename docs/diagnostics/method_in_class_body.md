@@ -38,4 +38,4 @@ impl Point:
         return (self.x * self.x + self.y * self.y) ** 0.5
 ```
 
-See https://typhon.dev/lang/diagnostics/method_in_class_body
+See https://github.com/CodeHalwell/Typhon/blob/main/docs/diagnostics/method_in_class_body.md

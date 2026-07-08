@@ -29,4 +29,4 @@ def main() -> None:
     let x: int = 1
 ```
 
-See https://typhon.dev/lang/diagnostics/missing_initialiser
+See https://github.com/CodeHalwell/Typhon/blob/main/docs/diagnostics/missing_initialiser.md

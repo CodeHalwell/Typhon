@@ -3,7 +3,7 @@
 This guide covers installing the `tyc` compiler binary on **macOS,
 Linux, and Windows**. Pre-built binaries ship on every GitHub Release
 since v0.3.0; the current release is
-[v1.0.0-alpha.2](https://github.com/CodeHalwell/Typhon/releases/tag/v1.0.0-alpha.2).
+[v1.0.0-alpha.3](https://github.com/CodeHalwell/Typhon/releases/tag/v1.0.0-alpha.3).
 If your platform isn't listed (FreeBSD, Linux MUSL, Windows ARM64),
 build from source — see the
 [Quick start](../README.md#quick-start) section of the README.
@@ -154,8 +154,10 @@ yourself.
 ## Manual download
 
 If you'd rather not pipe a script into `sh` or `iex`, grab the archive
-directly from the
-[releases page](https://github.com/codehalwell/typhon/releases/latest).
+directly from the newest entry on the
+[releases page](https://github.com/codehalwell/typhon/releases).
+(GitHub's "latest release" link skips pre-releases, so use the full
+list while Typhon is in alpha.)
 
 1. Pick the asset matching your platform:
    - Apple Silicon: `tyc-<version>-aarch64-apple-darwin.tar.gz`

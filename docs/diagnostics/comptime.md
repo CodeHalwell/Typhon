@@ -28,4 +28,4 @@ import os
 let PORT: int = int(os.environ.get("PORT", "8080"))
 ```
 
-See https://typhon.dev/lang/diagnostics/comptime
+See https://github.com/CodeHalwell/Typhon/blob/main/docs/diagnostics/comptime.md

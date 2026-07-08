@@ -36,4 +36,4 @@ impl Point:
         return (self.x * self.x + self.y * self.y) ** 0.5
 ```
 
-See https://typhon.dev/lang/diagnostics/duplicate_class
+See https://github.com/CodeHalwell/Typhon/blob/main/docs/diagnostics/duplicate_class.md

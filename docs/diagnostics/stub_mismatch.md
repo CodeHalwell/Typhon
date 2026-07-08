@@ -28,4 +28,4 @@ Sync the stub with the implementation, or — if the symbol is intentionally
 private — rename it with a leading underscore so it's excluded from the
 stub-coverage check.
 
-See https://typhon.dev/lang/diagnostics/stub_mismatch
+See https://github.com/CodeHalwell/Typhon/blob/main/docs/diagnostics/stub_mismatch.md

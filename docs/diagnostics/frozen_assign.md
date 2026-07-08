@@ -32,4 +32,4 @@ def main() -> None:
     let id2: Identity = Identity(name="Bob")  # new value, not a mutation
 ```
 
-See https://typhon.dev/lang/diagnostics/frozen_assign
+See https://github.com/CodeHalwell/Typhon/blob/main/docs/diagnostics/frozen_assign.md

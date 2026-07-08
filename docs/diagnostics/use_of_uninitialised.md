@@ -83,4 +83,4 @@ return Ok(x)            # ✅ `x` is assigned on every non-diverging path
   (the Result `case Ok(v): x = v / case Err(e): return Err(e)`
   pattern works without a `case _:`).
 
-See https://typhon.dev/lang/diagnostics/use_of_uninitialised
+See https://github.com/CodeHalwell/Typhon/blob/main/docs/diagnostics/use_of_uninitialised.md

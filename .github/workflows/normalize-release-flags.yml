@@ -1,0 +1,40 @@
+name: Normalize release pre-release flags
+
+# One-click hygiene: mark every published release whose tag contains a
+# hyphen (v1.0.0-alpha, v1.0.0-alpha.2, -beta, -rc.1, ...) as a
+# pre-release, matching the policy release.yml has applied since
+# v1.0.0-alpha.3. Idempotent — releases already flagged correctly are
+# left untouched.
+#
+# IMPORTANT — run this only AFTER the installer fix (install.sh /
+# install.ps1 resolving the release list instead of /releases/latest)
+# is on `main`. Flipping the last non-pre-release to pre-release makes
+# GitHub's /releases/latest endpoint 404, which the OLD installers
+# depended on.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  normalize:
+    name: Flag hyphenated tags as pre-releases
+    runs-on: ubuntu-latest
+    steps:
+      - name: Normalize flags
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release list --limit 200 --json tagName,isPrerelease \
+            --jq '.[] | select((.tagName | contains("-")) and (.isPrerelease | not)) | .tagName' \
+          | while read -r tag; do
+              echo "Marking ${tag} as pre-release"
+              gh release edit "${tag}" --prerelease
+            done
+          echo "Done. Current state:"
+          gh release list --limit 200

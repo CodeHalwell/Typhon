@@ -29,4 +29,4 @@ message:
 class-default = "dataclass"
 ```
 
-See https://typhon.dev/lang/diagnostics/invalid_config_value
+See https://github.com/CodeHalwell/Typhon/blob/main/docs/diagnostics/invalid_config_value.md

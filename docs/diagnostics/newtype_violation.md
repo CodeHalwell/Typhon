@@ -75,4 +75,4 @@ injected into the emitted module as needed. The wrapper call is a no-op
 at runtime — `NewType` returns its argument unchanged — so the nominal
 distinction has zero runtime cost.
 
-See https://typhon.dev/lang/diagnostics/newtype_violation
+See https://github.com/CodeHalwell/Typhon/blob/main/docs/diagnostics/newtype_violation.md
