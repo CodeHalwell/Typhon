@@ -28,4 +28,4 @@ def main() -> None:
     print("ok")
 ```
 
-See https://typhon.dev/lang/diagnostics/parse
+See https://github.com/CodeHalwell/Typhon/blob/main/docs/diagnostics/parse.md

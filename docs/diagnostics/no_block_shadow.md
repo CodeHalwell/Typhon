@@ -34,4 +34,4 @@ def main() -> None:
         print(inner_x)
 ```
 
-See https://typhon.dev/lang/diagnostics/no_block_shadow
+See https://github.com/CodeHalwell/Typhon/blob/main/docs/diagnostics/no_block_shadow.md

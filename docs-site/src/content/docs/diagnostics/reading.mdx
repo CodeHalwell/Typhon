@@ -19,7 +19,7 @@ error[tyc::nullable_use]: cannot pass `str | None` where `str` is required
  │           ^^^^^ check this is not `None` before passing it
  │
  = help: narrow with `if found is not None:` or use `guard found = ... else: ...`
- = url: https://typhon.dev/lang/diagnostics/nullable_use
+ = url: https://github.com/CodeHalwell/Typhon/blob/main/docs/diagnostics/nullable_use.md
 ```
 
 | Part | Meaning |
@@ -106,7 +106,7 @@ The LSP publishes diagnostics directly to your editor; the editor renders them.
 When you hit `error[tyc::some_code]`:
 
 1. **`tyc explain <code>`** — print the catalog entry directly to your terminal (mirrors `rustc --explain`). Accepts short (`nullable_use`) or fully-qualified (`tyc::nullable_use`) forms.
-2. **Click the `url:` deep-link** on the diagnostic — every `tyc::` diagnostic carries a `url(https://typhon.dev/lang/diagnostics/<code>)` clause that linkifies in modern terminals.
+2. **Click the `url:` deep-link** on the diagnostic — every `tyc::` diagnostic carries a `url(https://github.com/CodeHalwell/Typhon/blob/main/docs/diagnostics/<code>.md)` clause that linkifies in modern terminals.
 3. **Look up the page** in the sidebar — the catalog groups codes by what triggers them.
 4. **`rg "tyc::some_code" tyc/crates`** in the compiler source if you're hacking on `tyc` — every code is registered once.
 5. **`tyc lsp` "Remove unused import" code action** fires on the relevant diagnostics; check your editor's quick-fix menu.

@@ -36,4 +36,4 @@ interface Writer:
     def write(self, data: str) -> int
 ```
 
-See https://typhon.dev/lang/diagnostics/interface_isinstance
+See https://github.com/CodeHalwell/Typhon/blob/main/docs/diagnostics/interface_isinstance.md

@@ -59,4 +59,4 @@ Update every `from <old> import …` site to the new name. The warning is
 it if you're certain the emitted `build/` directory will not be on
 `sys.path` at runtime (for example, you ship via an installed wheel).
 
-See https://typhon.dev/lang/diagnostics/stdlib_module_shadow
+See https://github.com/CodeHalwell/Typhon/blob/main/docs/diagnostics/stdlib_module_shadow.md

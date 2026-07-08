@@ -99,7 +99,7 @@ tyc explain --list                     # print every code the explainer knows ab
 The `--list` flag prints one fully-qualified code per line, suitable for piping
 to `grep` or `fzf` (`tyc explain --list | fzf | xargs tyc explain`).
 
-Every diagnostic emitted by `tyc` also carries a `url(https://typhon.dev/lang/diagnostics/<code>)`
+Every diagnostic emitted by `tyc` also carries a `url(https://github.com/CodeHalwell/Typhon/blob/main/docs/diagnostics/<code>.md)`
 attribute (rendered inline by miette), so the same page is one click away
 in any terminal that linkifies URLs. The full catalog lives under
 [`docs/diagnostics/`](diagnostics/README.md).

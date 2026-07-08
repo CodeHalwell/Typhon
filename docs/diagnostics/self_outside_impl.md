@@ -33,4 +33,4 @@ impl Point:
         return (self.x * self.x + self.y * self.y) ** 0.5
 ```
 
-See https://typhon.dev/lang/diagnostics/self_outside_impl
+See https://github.com/CodeHalwell/Typhon/blob/main/docs/diagnostics/self_outside_impl.md

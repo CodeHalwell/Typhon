@@ -71,4 +71,4 @@ def main() -> None:
         print(p)
 ```
 
-See https://typhon.dev/lang/diagnostics/not_a_context_manager
+See https://github.com/CodeHalwell/Typhon/blob/main/docs/diagnostics/not_a_context_manager.md

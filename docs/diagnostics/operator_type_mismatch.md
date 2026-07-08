@@ -56,4 +56,4 @@ Wrap explicitly at the boundary if the cross is intentional:
 let bumped: LogIndex = idx + LogIndex(int(t))
 ```
 
-See https://typhon.dev/lang/diagnostics/operator_type_mismatch
+See https://github.com/CodeHalwell/Typhon/blob/main/docs/diagnostics/operator_type_mismatch.md

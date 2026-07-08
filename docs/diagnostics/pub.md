@@ -172,4 +172,4 @@ declaration is treated as the canonical definition.
   previous (explicit) behaviour: `__init__.ty` is emitted unchanged
   and only re-exports what the author wrote.
 
-See https://typhon.dev/lang/diagnostics/pub
+See https://github.com/CodeHalwell/Typhon/blob/main/docs/diagnostics/pub.md

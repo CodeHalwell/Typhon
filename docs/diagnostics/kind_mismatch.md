@@ -42,4 +42,4 @@ than producing an unusable inferred type.
 - Pass arguments whose outer constructors agree, so the constructor variable
   resolves to a single type.
 
-See https://typhon.dev/lang/diagnostics/kind_mismatch
+See https://github.com/CodeHalwell/Typhon/blob/main/docs/diagnostics/kind_mismatch.md

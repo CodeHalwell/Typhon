@@ -46,4 +46,4 @@ already control its public surface, and the wildcard adds nothing.
 - `tyc::pub_name_collision` — fires when the aggregated `pub *` block
   in `__init__.ty` would re-export the same name from two siblings.
 
-See https://typhon.dev/lang/diagnostics/pub_star_outside_init
+See https://github.com/CodeHalwell/Typhon/blob/main/docs/diagnostics/pub_star_outside_init.md
