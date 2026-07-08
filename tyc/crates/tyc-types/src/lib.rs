@@ -3598,8 +3598,19 @@ impl<'a> Checker<'a> {
     ///   reverse scan over same-named classes, which is the ambiguity that
     ///   sank the first fix attempt (see RELEASE_READINESS_REVIEW.md, H5).
     /// - If the two resolved shapes are equivalent, the names are treated as
-    ///   the same class (an `__init__.ty` facade re-exports a class by
-    ///   copying its shape), and unification proceeds.
+    ///   the same class and unification proceeds. This escape is
+    ///   load-bearing: a `pub *` facade copies its members' class shapes
+    ///   into the package's `ModuleShapes` (verified empirically — a
+    ///   different-shaped collision *through* a facade is caught), so a
+    ///   module that declares a class and also references it through its
+    ///   own package facade (`pkg/models.ty` declaring `Response` and
+    ///   annotating `pkg.Response` — legal today) sees "origins differ,
+    ///   shapes equal" for what is genuinely ONE class. Rejecting on equal
+    ///   shapes (suggested in PR #285 review) would break that correct
+    ///   program; the cost is that a genuinely-distinct redeclaration with
+    ///   a byte-identical shape keeps unifying — a documented conservative
+    ///   miss, distinguishable only with per-class provenance metadata the
+    ///   registry does not carry today.
     /// - A local class that (transitively) subclasses a base whose tail
     ///   matches the qualified name — or whose ancestry contains an
     ///   unresolvable `__typhon_unknown_base__` marker — is (or may be) a
