@@ -179,7 +179,11 @@ fi
 
 if [ -z "$version" ]; then
     say "Resolving latest release from GitHub API"
-    api_url="https://api.github.com/repos/$REPO/releases/latest"
+    # /releases/latest excludes pre-releases, and every alpha/beta tag is
+    # (correctly) published as a pre-release — so it would resolve to a
+    # stale build during the pre-1.0 line. /releases?per_page=1 returns
+    # the most recently published release *including* pre-releases.
+    api_url="https://api.github.com/repos/$REPO/releases?per_page=1"
     # `tag_name` is a stable field on the release object.
     version="$(
         curl -fsSL "$api_url" \

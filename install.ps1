@@ -120,7 +120,11 @@ if ($PSVersionTable.PSVersion.Major -lt 6) {
 
 if (-not $Version -or $Version.Trim() -eq '') {
     Write-Step "Resolving latest release from GitHub API"
-    $apiUrl = "https://api.github.com/repos/$Repo/releases/latest"
+    # /releases/latest excludes pre-releases, and every alpha/beta tag is
+    # (correctly) published as a pre-release — so it would resolve to a
+    # stale build during the pre-1.0 line. /releases?per_page=1 returns
+    # the most recently published release *including* pre-releases.
+    $apiUrl = "https://api.github.com/repos/$Repo/releases?per_page=1"
     try {
         $release = Invoke-RestMethod -Uri $apiUrl -Headers @{
             'User-Agent' = 'typhon-install-ps1'
@@ -128,7 +132,7 @@ if (-not $Version -or $Version.Trim() -eq '') {
     } catch {
         Stop-WithError "Could not query GitHub Releases: $_"
     }
-    $Version = $release.tag_name
+    $Version = @($release)[0].tag_name
     if (-not $Version) {
         Stop-WithError "Could not determine latest release tag from $apiUrl"
     }

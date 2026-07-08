@@ -4,6 +4,20 @@ All notable changes to Typhon are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely; the
 canonical phase-by-phase status lives in `docs/roadmap.md`.
 
+## Unreleased
+
+### Fixed
+
+- **Installers resolve the newest release including pre-releases.** `install.sh` and
+  `install.ps1` resolved "latest" via GitHub's `/releases/latest` API, which excludes
+  pre-releases — so once v1.0.0-alpha.3 (correctly) shipped with `prerelease: true`, a
+  default install silently fetched the older v1.0.0-alpha.2 binaries. Both scripts now
+  query the release list (`/releases?per_page=1`, newest first, pre-releases included).
+  This completes the installer leg of the alpha.3 release-process fix pair
+  (`RELEASE_READINESS_REVIEW.md`). The manual-download links in `docs/install.md` and
+  the docs-site installation page now point at the full releases list for the same
+  reason.
+
 ## 1.0.0-alpha.3 — 2026-07-03 — release-readiness remediation: licensing, packaging & robustness
 
 A full-codebase release-readiness review (`RELEASE_READINESS_REVIEW.md`) and the
