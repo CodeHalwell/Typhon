@@ -60,9 +60,15 @@ program).
 > that misfired in the reverted attempt — has a non-equivalent shape. Everything uncertain
 > (unknown modules, partial-vs-partial, facade re-export copies with equal shapes, interfaces,
 > bare names of unknown provenance such as provider return types) degrades to the previous
-> permissive unification. The fully-bare ↔ fully-bare collision (two `from a import Node` /
-> `from b import Node` values) still unifies — closing it does need the origin-threading
-> refactor. Corpus byte-identically unchanged; four regression tests added.
+> permissive unification. Three collision shapes remain open, each needing the origin-threading
+> refactor rather than a guard-level edit: (1) fully-bare ↔ fully-bare (two `from a import Node`
+> / `from b import Node` values); (2) a genuinely-distinct redeclaration whose shape is
+> byte-identical to the foreign class (indistinguishable from a `pub *` facade self-reference
+> without per-class provenance — see the guard's soundness contract); and (3) **generic** classes
+> (`producer.Box[int]` loses its module prefix at annotation parsing — both sides become
+> `Generic("Box", [int])` and unify in the plain nominal check; preserving qualified generic
+> heads touches head-keyed variance/dispatch tables project-wide, flagged by Codex on PR #285).
+> Corpus byte-identically unchanged; five regression tests added.
 
 ---
 
