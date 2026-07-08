@@ -37,4 +37,4 @@ def main() -> None:
     print(result)
 ```
 
-See https://typhon.dev/lang/diagnostics/type_mismatch
+See https://github.com/CodeHalwell/Typhon/blob/main/docs/diagnostics/type_mismatch.md

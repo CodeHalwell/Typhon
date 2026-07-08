@@ -125,4 +125,4 @@ fire correctly. Only multi-segment paths (`a.b.Cls`) still fall back
 to `Type::Unknown` because they need full module-registry resolution
 that is out of scope for the annotation pass.
 
-See https://typhon.dev/lang/diagnostics/arg_count
+See https://github.com/CodeHalwell/Typhon/blob/main/docs/diagnostics/arg_count.md

@@ -493,8 +493,8 @@ Realistic milestones for one person plus AI assistance. The headline target is a
 > the long tail of missing builtins, pydantic `model_validate` /
 > `model_dump`, and three type-checker exhaustiveness / augmented-assign
 > fixes). The current release is
-> **[v1.0.0-alpha.2](https://github.com/CodeHalwell/Typhon/releases/tag/v1.0.0-alpha.2)**
-> (see `CHANGELOG.md` for the full v0.13.0 → v1.0.0-alpha.2 line). The
+> **[v1.0.0-alpha.3](https://github.com/CodeHalwell/Typhon/releases/tag/v1.0.0-alpha.3)**
+> (see `CHANGELOG.md` for the full v0.13.0 → v1.0.0-alpha.3 line). The
 > milestone below,
 > **[v0.12.0](https://github.com/CodeHalwell/Typhon/releases/tag/v0.12.0)**, brought
 > VM comparison-protocol parity (`sorted` / `min` / `max` honour a user

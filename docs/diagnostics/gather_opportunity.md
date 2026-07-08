@@ -49,4 +49,4 @@ If the awaits must stay ordered (shared state, side-effect ordering), leave them
 sequential — and silence the nudge project-wide with `[strictness]
 suggest-gather = false`.
 
-See https://typhon.dev/lang/diagnostics/gather_opportunity
+See https://github.com/CodeHalwell/Typhon/blob/main/docs/diagnostics/gather_opportunity.md

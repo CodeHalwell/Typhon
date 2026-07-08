@@ -28,4 +28,4 @@ def main() -> None:
     print(n)
 ```
 
-See https://typhon.dev/lang/diagnostics/not_callable
+See https://github.com/CodeHalwell/Typhon/blob/main/docs/diagnostics/not_callable.md

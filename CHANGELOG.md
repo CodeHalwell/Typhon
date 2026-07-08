@@ -4,12 +4,70 @@ All notable changes to Typhon are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely; the
 canonical phase-by-phase status lives in `docs/roadmap.md`.
 
-## Unreleased — release-readiness remediation
+## Unreleased
+
+### Fixed
+
+- **H5 — scope-blind class unification closed at the declaration boundary.**
+  The v0.15.0 qualified ↔ bare tail-unification let a *locally declared*
+  class satisfy a same-named class from another module (a user
+  `class Response:` type-checked into an `httpx.Response`-typed slot, and
+  vice versa) — the one HIGH finding `RELEASE_READINESS_REVIEW.md` deferred.
+  `is_assignable` now refuses that unification when the bare side names a
+  class declared in the module being checked and the qualified side's
+  declaration — resolved through its **exact** module key, never the
+  ambiguous reverse scan that sank the first fix attempt — has a different
+  shape. The guard is evidence-gated and degrades to the previous permissive
+  unification on any uncertainty (unresolvable module, unknown shape,
+  facade re-export with an equivalent shape, interfaces, bare names of
+  unknown provenance such as provider return types), so the
+  example/stress corpus is byte-identically unchanged (49 example targets
+  green / 132 intentional-negative stress fixtures). Four regression tests
+  cover both rejection directions, the facade-equivalence carve-out, and
+  the unknown-provenance carve-out. Like the alpha.2 diagnostics, this is
+  a conservative narrowing: it only rejects programs that pass a
+  provably-different-shaped class across the boundary.
+
+- **GitHub Actions are SHA-pinned.** Every third-party action across the
+  five workflows is pinned to a full commit SHA (version noted in a
+  trailing comment; Dependabot's `github-actions` ecosystem keeps the pins
+  fresh), closing the remaining supply-chain item from the alpha.3 review.
+  A new dispatch-only `normalize-release-flags` workflow retro-flags
+  hyphenated release tags (v1.0.0-alpha, v1.0.0-alpha.2) as pre-releases —
+  to be run once after the installer fix below is on `main`.
+
+- **Installers resolve the newest release including pre-releases.** `install.sh` and
+  `install.ps1` resolved "latest" via GitHub's `/releases/latest` API, which excludes
+  pre-releases — so once v1.0.0-alpha.3 (correctly) shipped with `prerelease: true`, a
+  default install silently fetched the older v1.0.0-alpha.2 binaries. Both scripts now
+  query the release list (`/releases?per_page=1`, newest first, pre-releases included).
+  This completes the installer leg of the alpha.3 release-process fix pair
+  (`RELEASE_READINESS_REVIEW.md`). The manual-download links in `docs/install.md` and
+  the docs-site installation page now point at the full releases list for the same
+  reason.
+
+## 1.0.0-alpha.3 — 2026-07-03 — release-readiness remediation: licensing, packaging & robustness
 
 A full-codebase release-readiness review (`RELEASE_READINESS_REVIEW.md`) and the
-fixes it drove. The positive corpus (`examples/`) stays clean and the `stress/`
-negative-fixture counts are unchanged, so no previously-correct program changes
-behaviour.
+fixes it drove — the release-engineering and robustness counterpart to alpha.2's
+soundness sweep. **Licensing & packaging** close the gaps that would block a
+clean public release: a repository-root MIT `LICENSE`, the upstream Ruff MIT
+notice vendored alongside the fork, `SECURITY.md` / `CONTRIBUTING.md` /
+Dependabot, and release-workflow hygiene (pre-release tags are flagged as such;
+auto-tag is gated on green CI). **Compiler & VM** fixes remove three
+diagnostic-reporting and complexity bugs — identical errors at distinct
+locations are all reported now, nested-generic assignability is linear again
+(not O(2^depth)), and four more flow-narrowing invalidation holes are closed —
+plus six VM ↔ CPython parity gaps (cyclic-value comparison, `str.find`
+character offsets, in-place list `+=`, float `%` / `//` sign & zero-division,
+broken-pipe `print`, `json.dumps` key coercion). **Tooling** hardens the LSP
+(256 MiB stack) and formatter (atomic writes), adds a `TYC_NO_INTROSPECT`
+kill-switch and Windows venv discovery, and finally wires up the
+`[strictness] exhaustive-match` knob. **No new syntax.** The four flow-narrowing
+fixes are conservative widenings that only affect programs relying on a
+previously-*unsound* narrowing; the positive corpus (`examples/`) stays clean
+and the `stress/` negative-fixture counts are unchanged, so no
+previously-*correct* program changes behaviour.
 
 ### Licensing / packaging
 
@@ -26,6 +84,26 @@ behaviour.
 
 ### Compiler / VM fixes
 
+- **Type checker: identical errors on different lines are all reported.** The
+  module-level diagnostic dedupe keyed on `(code, message)` only, so the second
+  (and every later) occurrence of an identical mistake at a *different* source
+  location was silently swallowed — e.g. two `add(1)` calls each missing the
+  same required argument produced a single error, and the survivor's location
+  was the only one shown (`tyc check` and the LSP both under-reported). The
+  dedupe key now includes every label span. The one case identical messages at
+  different offsets must still collapse — sealed-union `impl Alias:`
+  distribution, which byte-duplicates a method body once per variant (B24) —
+  is preserved by remapping spans inside a synthetic distributed copy onto the
+  first block before keying (the preprocessor's recorded
+  `impl_distributed_lines` is now threaded through
+  `check_module_with[_imports]`), so a 10-variant union still reports one
+  diagnostic, not ten. The same hole existed in the resolver/CLI dedup
+  (`dedup_vec`), which keyed on the *first* label only — a multi-label
+  diagnostic like `immutable_assign` shares its first label (the declaration)
+  across every offending site, so `x = 2` and `x = 3` against one `let x`
+  reported a single error; it now keys on every label span. Corpus counts are
+  unchanged (`examples/` 48/48 clean, `stress/` 951 pass / 132 intentional
+  negatives).
 - **Type checker: nested-generic assignability is no longer exponential.** The
   invariant-container check used `assignable(a,b) && assignable(b,a)`, doubling
   the recursion at every level (O(2^depth)); a deeply-nested annotation like
@@ -75,17 +153,26 @@ behaviour.
 
 ### Diagnostics / docs
 
-- **Diagnostic doc URLs** point at resolvable GitHub docs paths instead of the
-  never-deployed `typhon.dev`.
+- **Diagnostic doc URLs** point at resolvable GitHub docs paths
+  (`github.com/CodeHalwell/Typhon/blob/main/docs/diagnostics/<code>.md`) instead
+  of the never-deployed `typhon.dev` — the compiler's miette `url(...)`
+  deep-links, every `docs/diagnostics/*.md` footer, the docs-site pages, and the
+  bundled `typhon` skill now all use the resolvable path.
 - **Four diagnostics gained doc pages + `tyc explain` entries**
   (`empty_collection_no_annotation`, `freeze_not_freezable`,
   `newtype_invalid_base`, `typing_alias_in_annotation`), completing the catalog.
+- **Bundled skill + reference docs refreshed for v1.0.0-alpha.3** — the embedded
+  `typhon` skill (and its vendored `.claude/skills/typhon/` copy) carry the
+  alpha.3 release banner, the `TYC_NO_INTROSPECT` env-var kill-switch, and the
+  repointed diagnostic URLs; `docs/configuration.md` documents `TYC_NO_INTROSPECT`.
 - **Docs corrections:** stale "current release" pointers (`docs/install.md`,
   `docs/long-term-plan.md`), the README quickstart (`cd myapp`), the docs-site
   install page (pre-built-binary path + correct Rust floor), the emit config page
   (`class-default = "pydantic"` is rejected, not accepted), examples index
   (`60-rescue-boundaries`), and the VS Code grammar (dropped the non-existent
-  `val` / `var` / `Option` / `Some` keywords; added an Install section).
+  `val` / `var` / `Option` / `Some` keywords; corrected constant and
+  keyword-argument highlighting so kwargs are only styled inside call parens;
+  added an Install section).
 
 ## 1.0.0-alpha.2 — 2026-06-29 — type-checker soundness sweep + VM parity
 

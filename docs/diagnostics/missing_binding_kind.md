@@ -31,4 +31,4 @@ def main() -> None:
     count = count + 1  # ok
 ```
 
-See https://typhon.dev/lang/diagnostics/missing_binding_kind
+See https://github.com/CodeHalwell/Typhon/blob/main/docs/diagnostics/missing_binding_kind.md

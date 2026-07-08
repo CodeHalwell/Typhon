@@ -46,4 +46,4 @@ def trigger_error() -> None:
         _ = 1 / 0
 ```
 
-See https://typhon.dev/lang/diagnostics/div_by_zero_literal
+See https://github.com/CodeHalwell/Typhon/blob/main/docs/diagnostics/div_by_zero_literal.md

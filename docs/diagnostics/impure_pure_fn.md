@@ -45,4 +45,4 @@ def add(a: float, b: float) -> float:
     return a + b
 ```
 
-See https://typhon.dev/lang/diagnostics/impure_pure_fn
+See https://github.com/CodeHalwell/Typhon/blob/main/docs/diagnostics/impure_pure_fn.md
