@@ -212,6 +212,25 @@ fn class_name_tail(name: &str) -> &str {
     name.rsplit('.').next().unwrap_or(name)
 }
 
+/// Whether two class shapes describe the same declaration for the purposes of
+/// the H5 tail-unification guard ([`Checker::tail_unification_provably_distinct`]).
+/// A facade re-export (`pub *` in `__init__.ty`) carries a *copy* of the
+/// declaring module's shape, so component equality — not pointer identity —
+/// is the right notion of "same class". Methods are compared by name set
+/// only ([`MethodSig`] carries no `PartialEq`); two genuinely distinct
+/// classes that agree on every field, default, base, and method name are
+/// conservatively treated as equivalent, which can only *permit* (never
+/// reject) an assignment.
+fn shapes_equivalent(a: &InterfaceShape, b: &InterfaceShape) -> bool {
+    a.partial == b.partial
+        && a.fields == b.fields
+        && a.field_order == b.field_order
+        && a.field_defaults == b.field_defaults
+        && a.bases == b.bases
+        && a.methods.len() == b.methods.len()
+        && a.methods.keys().all(|k| b.methods.contains_key(k))
+}
+
 /// Mutual assignability — `assignable(a, b) && assignable(b, a)` — computed in
 /// a single structural pass.
 ///
@@ -3060,16 +3079,22 @@ impl<'a> Checker<'a> {
         // module's bare return type when their final `.`-separated segments
         // match — but only when at least one side is *bare*. Two distinct
         // *qualified* names never unify (`a.Response` stays distinct from
-        // `b.Response`), so same-named classes from different modules aren't
-        // accidentally conflated. This only *relaxes* assignability between
-        // two differently-spelled names — it never turns a previously-accepted
-        // assignment into a mismatch, so it can't introduce a false positive —
-        // and mirrors Typhon's bare-name class model (a `from M import C`
-        // already brings `C` in bare and unifies).
+        // `b.Response`), and — H5 (RELEASE_READINESS_REVIEW.md) — a bare name
+        // that refers to a class *declared in the module being checked* does
+        // not unify with a same-named class another module provably declares:
+        // a `class` statement always creates a fresh class, so a local
+        // `class Response:` can never be `httpx.Response`. That guard is
+        // evidence-gated (see `tail_unification_provably_distinct`): it fires
+        // only when both class declarations are resolved through exact module
+        // keys and their shapes differ, and degrades to the permissive
+        // unification whenever provenance is uncertain — so an import-facade
+        // re-export (same shape) or a bare name of unknown origin (provider
+        // return types, `from M import C`) keeps unifying exactly as before.
         if let (Type::Class(exp_name), Type::Class(act_name)) = (expected, actual) {
             if exp_name != act_name
                 && (!exp_name.contains('.') || !act_name.contains('.'))
                 && class_name_tail(exp_name) == class_name_tail(act_name)
+                && !self.tail_unification_provably_distinct(exp_name, act_name)
             {
                 return true;
             }
@@ -3551,6 +3576,80 @@ impl<'a> Checker<'a> {
             },
             other => other.clone(),
         }
+    }
+
+    /// H5 guard for the qualified ↔ bare tail-unification in
+    /// [`Checker::is_assignable`]: returns `true` only when there is *exact*
+    /// evidence that `exp_name` and `act_name` denote two different class
+    /// declarations, in which case the caller refuses to unify them and the
+    /// assignment falls through to the normal mismatch path.
+    ///
+    /// Soundness contract (this must never reject a correct program):
+    ///
+    /// - The bare side must name a class **declared** in the module being
+    ///   checked (`local_classes`). Local declarations shadow imports, so
+    ///   every shape-consulting path in the checker already resolves that
+    ///   bare name to the local class — and a `class` statement always
+    ///   creates a fresh class, so it cannot be the class another module
+    ///   declares. Bare names of unknown provenance (provider return types,
+    ///   `from M import C` bindings) keep today's permissive unification.
+    /// - The qualified side is resolved through its **exact** module key in
+    ///   the project-wide registry (alias-canonicalised first) — never a
+    ///   reverse scan over same-named classes, which is the ambiguity that
+    ///   sank the first fix attempt (see RELEASE_READINESS_REVIEW.md, H5).
+    /// - If the two resolved shapes are equivalent, the names are treated as
+    ///   the same class (an `__init__.ty` facade re-exports a class by
+    ///   copying its shape), and unification proceeds.
+    /// - Any missing information — unresolvable module, unknown shape,
+    ///   partial local shape, interface, `impl` pseudo-class — degrades to
+    ///   `false` (permissive, today's behaviour).
+    fn tail_unification_provably_distinct(&self, exp_name: &str, act_name: &str) -> bool {
+        // Exactly one side is qualified here: two bare unequal names with
+        // equal tails cannot reach this guard (a bare name IS its tail), and
+        // the caller's gate already excludes two qualified names.
+        let (qualified, bare) = if exp_name.contains('.') {
+            (exp_name, act_name)
+        } else {
+            (act_name, exp_name)
+        };
+        if bare.contains('.') || !qualified.contains('.') {
+            return false;
+        }
+        if bare.starts_with("__typhon_") || !self.local_classes.contains(bare) {
+            return false;
+        }
+        // Interfaces conform structurally — leave them to the dedicated
+        // conformance rules. Sealed-union aliases and newtypes never appear
+        // in `local_classes` (they are not `class` statements).
+        if self.interfaces.contains_key(bare) {
+            return false;
+        }
+        let Some(local_shape) = self.class_shapes.get(bare) else {
+            return false;
+        };
+        if local_shape.partial {
+            return false;
+        }
+        let Some((prefix, tail)) = qualified.rsplit_once('.') else {
+            return false;
+        };
+        // Canonicalise an import alias prefix (`import producer as p`).
+        let module = match self.env.lookup(prefix) {
+            Some(binding) => match &binding.declared {
+                Type::Module(canonical) => canonical.as_str(),
+                _ => prefix,
+            },
+            None => prefix,
+        };
+        let foreign_shape = self
+            .module_registry
+            .get(module)
+            .and_then(|ms| ms.class_shapes.get(tail))
+            .or_else(|| self.class_shapes.get(qualified));
+        let Some(foreign_shape) = foreign_shape else {
+            return false;
+        };
+        !shapes_equivalent(local_shape, foreign_shape)
     }
 
     /// Unwrap a chain of `newtype Foo = …` declarations until a non-
@@ -27909,6 +28008,138 @@ def main(animals: producer.Producer[Animal]) -> None:
                 .iter()
                 .any(|e| matches!(e, TycError::TypeMismatch { .. })),
             "qualified covariant producer.Producer[Animal] -> [Dog] must still be rejected; got {:?}",
+            d.errors()
+        );
+    }
+
+    // ── H5: scope-blind class unification guard ─────────────────────────
+    // RELEASE_READINESS_REVIEW.md H5 — a bare name that refers to a class
+    // *declared in the module being checked* must not tail-unify with a
+    // same-named class another module provably declares; every uncertain
+    // provenance keeps the permissive v0.15.0 unification.
+
+    #[test]
+    fn h5_local_class_rejected_against_same_named_foreign_class() {
+        // A locally-declared `class Response` is a fresh class — it can
+        // never be `producer.Response`, whose declaration (with a
+        // different shape) is resolved through the exact module key.
+        let external = cross_module_qualified_external(
+            "\
+class Response:
+    text: str
+",
+        );
+        let consumer_src = "\
+import producer
+class Response:
+    status: int
+def take(r: producer.Response) -> None:
+    ...
+def main() -> None:
+    let mine: Response = Response(status=3)
+    take(mine)
+";
+        let d = check_consumer(consumer_src, &external);
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::TypeMismatch { .. })),
+            "local `Response` into a `producer.Response` slot must be rejected (H5); got {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn h5_qualified_foreign_value_rejected_against_local_class_slot() {
+        // The reverse direction: a `producer.Response`-typed value must
+        // not satisfy a slot annotated with the local `Response` class.
+        let external = cross_module_qualified_external(
+            "\
+class Response:
+    text: str
+
+def fetch() -> Response:
+    return Response(text=\"x\")
+",
+        );
+        let consumer_src = "\
+import producer
+class Response:
+    status: int
+def take_local(r: Response) -> None:
+    ...
+def main(remote: producer.Response) -> None:
+    take_local(remote)
+";
+        let d = check_consumer(consumer_src, &external);
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::TypeMismatch { .. })),
+            "`producer.Response` into a local `Response` slot must be rejected (H5); got {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn h5_equivalent_shape_reexport_still_unifies() {
+        // A facade re-export carries a *copy* of the declaring module's
+        // shape. When the local and foreign shapes are equivalent, the
+        // names are treated as the same class and unification proceeds —
+        // this is the branch that keeps `pub *` facades working.
+        let external = cross_module_qualified_external(
+            "\
+class Node:
+    label: str
+",
+        );
+        let consumer_src = "\
+import producer
+class Node:
+    label: str
+def take(n: producer.Node) -> None:
+    ...
+def main() -> None:
+    let mine: Node = Node(label=\"a\")
+    take(mine)
+";
+        let d = check_consumer(consumer_src, &external);
+        assert!(
+            !d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::TypeMismatch { .. })),
+            "equivalent shapes must keep unifying (facade re-export); got {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn h5_bare_name_of_unknown_origin_keeps_unifying() {
+        // A bare class name the consumer does NOT declare (an import of
+        // unknown provenance) keeps the permissive v0.15.0 unification —
+        // this is the shape of the reverted first fix's false positive.
+        let external = cross_module_qualified_external(
+            "\
+class Response:
+    text: str
+
+def fetch() -> Response:
+    return Response(text=\"x\")
+",
+        );
+        let consumer_src = "\
+import producer
+def take(r: producer.Response) -> None:
+    ...
+def relay(r: Response) -> None:
+    take(r)
+";
+        let d = check_consumer(consumer_src, &external);
+        assert!(
+            !d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::TypeMismatch { .. })),
+            "bare name of unknown origin must keep unifying; got {:?}",
             d.errors()
         );
     }

@@ -8,6 +8,34 @@ canonical phase-by-phase status lives in `docs/roadmap.md`.
 
 ### Fixed
 
+- **H5 — scope-blind class unification closed at the declaration boundary.**
+  The v0.15.0 qualified ↔ bare tail-unification let a *locally declared*
+  class satisfy a same-named class from another module (a user
+  `class Response:` type-checked into an `httpx.Response`-typed slot, and
+  vice versa) — the one HIGH finding `RELEASE_READINESS_REVIEW.md` deferred.
+  `is_assignable` now refuses that unification when the bare side names a
+  class declared in the module being checked and the qualified side's
+  declaration — resolved through its **exact** module key, never the
+  ambiguous reverse scan that sank the first fix attempt — has a different
+  shape. The guard is evidence-gated and degrades to the previous permissive
+  unification on any uncertainty (unresolvable module, unknown shape,
+  facade re-export with an equivalent shape, interfaces, bare names of
+  unknown provenance such as provider return types), so the
+  example/stress corpus is byte-identically unchanged (49 example targets
+  green / 132 intentional-negative stress fixtures). Four regression tests
+  cover both rejection directions, the facade-equivalence carve-out, and
+  the unknown-provenance carve-out. Like the alpha.2 diagnostics, this is
+  a conservative narrowing: it only rejects programs that pass a
+  provably-different-shaped class across the boundary.
+
+- **GitHub Actions are SHA-pinned.** Every third-party action across the
+  five workflows is pinned to a full commit SHA (version noted in a
+  trailing comment; Dependabot's `github-actions` ecosystem keeps the pins
+  fresh), closing the remaining supply-chain item from the alpha.3 review.
+  A new dispatch-only `normalize-release-flags` workflow retro-flags
+  hyphenated release tags (v1.0.0-alpha, v1.0.0-alpha.2) as pre-releases —
+  to be run once after the installer fix below is on `main`.
+
 - **Installers resolve the newest release including pre-releases.** `install.sh` and
   `install.ps1` resolved "latest" via GitHub's `/releases/latest` API, which excludes
   pre-releases — so once v1.0.0-alpha.3 (correctly) shipped with `prerelease: true`, a
