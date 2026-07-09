@@ -67,6 +67,14 @@ pub struct BuildArgs {
     /// `ty` on `PATH` (`pip install ty` / `uv tool install ty`).
     #[arg(long)]
     pub with_ty: bool,
+
+    /// Enable level-1 optimisation for this invocation, as if
+    /// `[optimise] level = 1` were set in `typhon.toml` — flips the default
+    /// of `auto-memoise`, `auto-gather`, `auto-parallel`, and `pgo-memoise`
+    /// to on. An explicit `[strictness]` entry for any of those still wins,
+    /// so `-O` never overrides a knob you set by hand.
+    #[arg(short = 'O', long = "optimise", visible_alias = "optimize")]
+    pub optimise: bool,
 }
 
 pub fn run(args: BuildArgs) -> Result<()> {
@@ -141,6 +149,24 @@ pub fn run(args: BuildArgs) -> Result<()> {
             let err = TycError::invalid_config_value("checker.external", value, allowed, path);
             return Err(miette::Report::new_boxed(Box::new(err)));
         }
+        Err(crate::config::ConfigError::InvalidOptimiseLevel { path, value }) => {
+            let err = TycError::invalid_config_value(
+                "optimise.level",
+                value.to_string(),
+                "0, 1".to_owned(),
+                path,
+            );
+            return Err(miette::Report::new_boxed(Box::new(err)));
+        }
+        Err(crate::config::ConfigError::InvalidParallelBackend {
+            path,
+            value,
+            allowed,
+        }) => {
+            let err =
+                TycError::invalid_config_value("strictness.parallel-backend", value, allowed, path);
+            return Err(miette::Report::new_boxed(Box::new(err)));
+        }
         Err(e) => return Err(miette!("{e}")),
     };
 
@@ -205,6 +231,12 @@ pub fn run(args: BuildArgs) -> Result<()> {
     // time with ModuleNotFoundError when the user hasn't declared pydantic
     // explicitly.
     let mut config = config;
+    // Resolve the optimise-gated strictness knobs to concrete bools now that
+    // both the config's `[optimise] level` and the CLI `-O`/`--optimise` flag
+    // are known. After this, `config.strictness.{auto_memoise,auto_gather,
+    // auto_parallel,pgo_memoise}` are `Some(_)` and read with `.unwrap_or(false)`.
+    // An explicit `[strictness]` entry always wins over the level default.
+    config.resolve_optimise(args.optimise);
     if sources_use_model_keyword(&sources) && !config.dependencies.contains_key("pydantic") {
         config
             .dependencies
@@ -384,11 +416,12 @@ pub fn run(args: BuildArgs) -> Result<()> {
     // yields an empty map (PGO is best-effort), so projects that have not
     // yet run `tyc profile` simply fall through to the explicit-decorator
     // path.
-    let profile_samples: HashMap<String, ProfileSample> = if config.strictness.pgo_memoise {
-        load_profile_samples(&config_dir.join("typhon-profile.json"))
-    } else {
-        HashMap::new()
-    };
+    let profile_samples: HashMap<String, ProfileSample> =
+        if config.strictness.pgo_memoise.unwrap_or(false) {
+            load_profile_samples(&config_dir.join("typhon-profile.json"))
+        } else {
+            HashMap::new()
+        };
 
     // Phase 1.5: pre-collect every submodule's `pub`-marked names so
     // package `__init__.ty` files that opt in with `pub *` can have
@@ -677,7 +710,8 @@ pub fn run(args: BuildArgs) -> Result<()> {
         // Phase 3 purity analysis: every `@pure` / `@memo` function is verified
         // against the six-condition rule, and the desugarer is told which
         // functions to wrap in `@functools.cache`.
-        let purity_findings = analyse_purity(&module, config.strictness.auto_memoise);
+        let purity_findings =
+            analyse_purity(&module, config.strictness.auto_memoise.unwrap_or(false));
         let purity_diags = purity_diagnostics(&purity_findings, &path.to_string_lossy(), source);
         if purity_diags.has_errors() {
             for err in purity_diags.errors() {
@@ -732,7 +766,7 @@ pub fn run(args: BuildArgs) -> Result<()> {
         // `import asyncio` if it isn't already in scope, so no extra
         // wiring is needed here.
         let mut module = module;
-        if config.strictness.auto_gather {
+        if config.strictness.auto_gather.unwrap_or(false) {
             // Surface runs that would have been gathered if every callee
             // carried `@gatherable`. Advice-only; doesn't block builds.
             // Print directly through miette so the rendered output shows
@@ -892,7 +926,7 @@ pub fn run(args: BuildArgs) -> Result<()> {
         // Combine with `[python] free-threaded = true` for real parallelism;
         // on stock CPython the rewrite still happens but the GIL serialises
         // the workers (correctness preserved, no speedup).
-        if config.strictness.auto_parallel {
+        if config.strictness.auto_parallel.unwrap_or(false) {
             let pure_names: std::collections::HashSet<String> = purity_findings
                 .iter()
                 .filter(|f| f.violation.is_none())
@@ -3281,6 +3315,7 @@ mod tests {
             check: false,
             no_sync: false,
             with_ty: false,
+            optimise: false,
         })
         .expect("build must succeed despite the stdlib-shadow warning");
         assert!(
@@ -3300,6 +3335,7 @@ mod tests {
             check: false,
             no_sync: false,
             with_ty: false,
+            optimise: false,
         })
         .unwrap();
         assert!(
@@ -3320,6 +3356,7 @@ mod tests {
             check: false,
             no_sync: false,
             with_ty: false,
+            optimise: false,
         })
         .unwrap();
         assert!(
@@ -3339,6 +3376,7 @@ mod tests {
             check: false,
             no_sync: false,
             with_ty: false,
+            optimise: false,
         });
         assert!(result.is_err(), "build should fail on type mismatch");
     }
@@ -3381,6 +3419,7 @@ mod tests {
             check: false,
             no_sync: false,
             with_ty: false,
+            optimise: false,
         })
         .unwrap();
         let init_py =
@@ -3428,6 +3467,7 @@ mod tests {
             check: false,
             no_sync: false,
             with_ty: false,
+            optimise: false,
         })
         .unwrap();
         let py = std::fs::read_to_string(out_dir.join("main.py")).unwrap();
@@ -3452,6 +3492,7 @@ mod tests {
             check: false,
             no_sync: false,
             with_ty: false,
+            optimise: false,
         })
         .unwrap();
         // Phase 3 made `typhon_runtime` a package (with submodules `tasks`
@@ -3497,6 +3538,7 @@ async def load(id: int) -> None:
             check: false,
             no_sync: false,
             with_ty: false,
+            optimise: false,
         })
         .unwrap();
         let py = std::fs::read_to_string(out_dir.join("main.py")).unwrap();
@@ -3530,6 +3572,7 @@ let result: int = 3 |> double |> inc
             check: false,
             no_sync: false,
             with_ty: false,
+            optimise: false,
         })
         .unwrap();
         let py = std::fs::read_to_string(out_dir.join("main.py")).unwrap();
@@ -3558,6 +3601,7 @@ let result: int = 3 |> double |> inc
             check: false,
             no_sync: false,
             with_ty: false,
+            optimise: false,
         })
         .unwrap();
         let py = std::fs::read_to_string(out_dir.join("main.py")).unwrap();
@@ -3623,6 +3667,7 @@ class Foo:
             check: false,
             no_sync: false,
             with_ty: false,
+            optimise: false,
         })
         .unwrap();
         let py = std::fs::read_to_string(out_dir.join("main.py")).unwrap();
@@ -3649,6 +3694,7 @@ class Foo:
             check: false,
             no_sync: false,
             with_ty: false,
+            optimise: false,
         })
         .unwrap();
         let py = std::fs::read_to_string(out_dir.join("main.py")).unwrap();
@@ -3709,6 +3755,7 @@ def area(s: Shape) -> float:
             check: false,
             no_sync: false,
             with_ty: false,
+            optimise: false,
         })
         .unwrap();
         let py = std::fs::read_to_string(out_dir.join("main.py")).unwrap();
@@ -3743,6 +3790,7 @@ def area(s: Shape) -> float:
             check: false,
             no_sync: false,
             with_ty: false,
+            optimise: false,
         });
         // Verify the failure is specifically a type-checking error, not a
         // configuration or I/O error, by checking the returned error message.
@@ -3770,6 +3818,7 @@ def fib(n: int) -> int:
             check: false,
             no_sync: false,
             with_ty: false,
+            optimise: false,
         })
         .unwrap();
         let py = std::fs::read_to_string(out_dir.join("main.py")).unwrap();
@@ -3805,6 +3854,7 @@ let pet: Animal = Dog(name=\"Rex\")
             check: false,
             no_sync: false,
             with_ty: false,
+            optimise: false,
         });
         // Verify the failure is specifically a type-checking error (structural
         // conformance failure), not a configuration or I/O error.
@@ -3835,6 +3885,7 @@ def hot(n: int) -> int:
             check: false,
             no_sync: false,
             with_ty: false,
+            optimise: false,
         })
         .unwrap();
         let py = std::fs::read_to_string(out_dir.join("main.py")).unwrap();
@@ -3867,6 +3918,7 @@ def cold(n: int) -> int:
             check: false,
             no_sync: false,
             with_ty: false,
+            optimise: false,
         })
         .unwrap();
         let py = std::fs::read_to_string(out_dir.join("main.py")).unwrap();
@@ -3907,6 +3959,7 @@ def cold(n: int) -> int:
             check: false,
             no_sync: false,
             with_ty: false,
+            optimise: false,
         })
         .unwrap();
         let py = std::fs::read_to_string(out_dir.join("main.py")).unwrap();
@@ -3941,6 +3994,7 @@ async def load() -> int:
             check: false,
             no_sync: false,
             with_ty: false,
+            optimise: false,
         })
         .unwrap();
         let py = std::fs::read_to_string(out_dir.join("main.py")).unwrap();
@@ -3976,6 +4030,7 @@ async def load() -> int:
             check: false,
             no_sync: false,
             with_ty: false,
+            optimise: false,
         })
         .unwrap();
         let py = std::fs::read_to_string(out_dir.join("main.py")).unwrap();
@@ -4013,6 +4068,7 @@ async def load() -> int:
             check: false,
             no_sync: false,
             with_ty: false,
+            optimise: false,
         })
         .unwrap();
         let py = std::fs::read_to_string(out_dir.join("main.py")).unwrap();
@@ -4056,6 +4112,7 @@ async def load() -> int:
             check: false,
             no_sync: false,
             with_ty: false,
+            optimise: false,
         })
         .unwrap();
         let py = std::fs::read_to_string(out_dir.join("main.py")).unwrap();
@@ -4121,6 +4178,7 @@ async def load(uid: int) -> int:
             check: false,
             no_sync: true,
             with_ty: false,
+            optimise: false,
         })
         .unwrap();
         let py = std::fs::read_to_string(out_dir.join("main.py")).unwrap();
@@ -4163,6 +4221,7 @@ async def load(uid: int) -> int:
             check: false,
             no_sync: true,
             with_ty: false,
+            optimise: false,
         })
         .unwrap();
         let py = std::fs::read_to_string(out_dir.join("main.py")).unwrap();
@@ -4213,6 +4272,7 @@ async def load(uid: int) -> int:
             check: false,
             no_sync: false,
             with_ty: false,
+            optimise: false,
         })
         .unwrap();
         let map_path = out_dir.join(".sourcemaps").join("main.py.map");
@@ -4261,6 +4321,7 @@ let pet: Animal = Dog(name=\"Rex\")
             check: false,
             no_sync: false,
             with_ty: false,
+            optimise: false,
         })
         .unwrap();
         let py = std::fs::read_to_string(out_dir.join("main.py")).unwrap();
@@ -4289,6 +4350,7 @@ let pet: Animal = Dog(name=\"Rex\")
             check: false,
             no_sync: false,
             with_ty: false,
+            optimise: false,
         })
         .unwrap();
         assert!(
@@ -4325,6 +4387,7 @@ let pet: Animal = Dog(name=\"Rex\")
             check: false,
             no_sync: false,
             with_ty: false,
+            optimise: false,
         })
         .unwrap();
         assert!(
@@ -4350,6 +4413,7 @@ let pet: Animal = Dog(name=\"Rex\")
             check: true,
             no_sync: false,
             with_ty: false,
+            optimise: false,
         })
         .unwrap();
         assert!(
@@ -4373,6 +4437,7 @@ let pet: Animal = Dog(name=\"Rex\")
             check: true,
             no_sync: false,
             with_ty: false,
+            optimise: false,
         })
         .unwrap();
         assert!(!out_dir.join("main.py").exists());
@@ -4390,6 +4455,7 @@ let pet: Animal = Dog(name=\"Rex\")
             check: true,
             no_sync: false,
             with_ty: false,
+            optimise: false,
         });
         assert!(
             result.is_err(),
@@ -4429,6 +4495,7 @@ let pet: Animal = Dog(name=\"Rex\")
             check: false,
             no_sync: false,
             with_ty: false,
+            optimise: false,
         });
         std::env::remove_var("FAKE_API_KEY");
         assert!(

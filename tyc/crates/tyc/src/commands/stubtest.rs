@@ -123,6 +123,7 @@ pub fn run(args: StubtestArgs) -> Result<()> {
             check: false,
             no_sync: false,
             with_ty: false,
+            optimise: false,
         })?;
     }
 

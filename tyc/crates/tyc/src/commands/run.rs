@@ -186,6 +186,7 @@ pub fn run(args: RunArgs) -> Result<()> {
             // Single-file scaffolds have no dependencies — skip `uv sync`.
             no_sync: scaffold_no_sync,
             with_ty: false,
+            optimise: false,
         })?;
     }
 
