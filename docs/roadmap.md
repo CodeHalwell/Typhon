@@ -939,3 +939,15 @@ shipped in v0.1.6. Phase 4+ work (everything not on the headline path):
    frame. `--break TY:LINE` translation still drives the breakpoints
    themselves. Pass `--raw-pdb` to opt out and launch
    `python -m pdb` directly.
+7. **VM performance plan — Tier 1 landed.** `tyc run`'s tree-walking VM
+   measured ~5–18× slower than `tyc build` + CPython at steady-state
+   compute (startup-adjusted) at the start of this plan. Tier 1 — a
+   small-int fast path, a per-class method cache, a direct method-call
+   path, and slot-resolved locals — has since landed, compressing that
+   to roughly 3–14× startup-adjusted (~2.7–6× end-to-end wall clock);
+   loop-shaped code gained the most, recursive call-heavy code (`fib`)
+   the least. A bytecode compilation tier (Tier 2, where rough CPython
+   parity on most code becomes realistic) is designed but not started.
+   See [`docs/vm-performance-plan.md`](vm-performance-plan.md) for the
+   measured baseline, the Tier 1 measured-outcome table, the root-cause
+   breakdown, and the full tiered plan.

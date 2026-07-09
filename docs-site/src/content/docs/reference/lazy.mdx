@@ -5,7 +5,7 @@ sidebar:
   order: 13
 ---
 
-import { Tabs, TabItem } from '@astrojs/starlight/components';
+import { Tabs, TabItem, Aside } from '@astrojs/starlight/components';
 
 `lazy` is Typhon's deferred-evaluation keyword. It comes in three forms: `lazy import`, `lazy let`, and `lazy[T]` return type.
 
@@ -47,6 +47,12 @@ Defer module loading until first attribute access:
 </Tabs>
 
 `np` is a proxy until first access. Subsequent accesses pass through to the loaded module. The desugarer generates a per-module proxy class with double-checked locking — thread-safe, one-shot, and no runtime dependency required (the proxy is inlined).
+
+### Native lowering on a 3.15+ target (PEP 810)
+
+<Aside type="tip">
+  On `[python] target = "3.15"` / `"3.15t"`, `lazy import np = numpy` skips the proxy class shown above entirely and emits the native [PEP 810](https://peps.python.org/pep-0810/) statement `lazy import numpy as np` — no `typhon_runtime` involvement. A project whose only runtime-touching feature was `lazy import` ships no generated `typhon_runtime/` package at all on that target. `3.13` / `3.14` output is unaffected — byte-for-byte unchanged — and `tyc check` / `tyc run` behave the same on every target.
+</Aside>
 
 ### Under `tyc run` (v0.9.0)
 

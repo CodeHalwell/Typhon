@@ -14,8 +14,7 @@ use crate::error::{
     attribute_error, index_error, key_error, stop_iteration, type_error, value_error, Unwind,
 };
 use crate::interp::{normalize_index, Interpreter};
-use crate::value::{DictMap, HashKey, IterState, Module, NativeFn, Value};
-use num_traits::ToPrimitive as _;
+use crate::value::{DictMap, HashKey, IterState, Module, NativeFn, Value, VmInt};
 
 /// Write `text` to stdout, tolerating a broken pipe.
 ///
@@ -175,7 +174,6 @@ pub fn install(interp: &mut Interpreter) {
     });
 
     native!("len", |interp, args| {
-        use num_traits::Signed;
         let v = single(&args, "len")?;
         if let Value::Instance(_) = v {
             if let Some(r) = interp.call_dunder0(v, "__len__")? {
@@ -183,7 +181,7 @@ pub fn install(interp: &mut Interpreter) {
                 // TypeError for non-int, ValueError for negative).
                 let n = match r {
                     Value::Int(i) => i,
-                    Value::Bool(b) => num_bigint::BigInt::from(b as i64),
+                    Value::Bool(b) => VmInt::from(b as i64),
                     other => {
                         return Err(type_error(format!(
                             "'{}' object cannot be interpreted as an integer",
@@ -197,7 +195,7 @@ pub fn install(interp: &mut Interpreter) {
                 return Ok(Value::Int(n));
             }
         }
-        Ok(Value::Int(num_bigint::BigInt::from(value_len(v)? as i64)))
+        Ok(Value::Int(VmInt::from(value_len(v)? as i64)))
     });
 
     native!("range", |_i, args| match args.len() {
@@ -236,7 +234,7 @@ pub fn install(interp: &mut Interpreter) {
         // `int()` with no argument is 0 (matches CPython; used by
         // `defaultdict(int)` as a zero-factory).
         if args.is_empty() {
-            return Ok(Value::Int(num_bigint::BigInt::from(0)));
+            return Ok(Value::Int(VmInt::from(0)));
         }
         let v = single(&args, "int")?;
         // `int(str, base)` — parse a string in the given radix.
@@ -299,19 +297,17 @@ pub fn install(interp: &mut Interpreter) {
             };
             let cleaned: String = digits.chars().filter(|&c| c != '_').collect();
             return match num_bigint::BigInt::parse_bytes(cleaned.as_bytes(), base as u32) {
-                Some(n) => Ok(Value::Int(if neg { -n } else { n })),
+                Some(n) => Ok(Value::Int(VmInt::from(if neg { -n } else { n }))),
                 None => Err(value_error(format!(
                     "invalid literal for int() with base {}: '{}'",
                     base, s
                 ))),
             };
         }
-        Ok(Value::Int(v.to_bigint()?))
+        Ok(Value::Int(VmInt::from(v.to_bigint()?)))
     });
 
     native!("divmod", |_i, args| {
-        use num_integer::Integer;
-        use num_traits::Zero;
         let a = args
             .first()
             .ok_or_else(|| type_error("divmod expected 2 arguments"))?;
@@ -359,7 +355,6 @@ pub fn install(interp: &mut Interpreter) {
         // 3-arg form: modular exponentiation (ints only).
         if let Some(m) = args.get(2) {
             if let (Value::Int(base), Value::Int(exp), Value::Int(modv)) = (a, b, m) {
-                use num_traits::{Signed, Zero};
                 if modv.is_zero() {
                     return Err(value_error("pow() 3rd argument cannot be 0"));
                 }
@@ -606,8 +601,7 @@ pub fn install(interp: &mut Interpreter) {
             Some(Value::Bytes(b)) => Ok(Value::Bytes(b)),
             // bytes(int) -> that many zero bytes.
             Some(Value::Int(n)) => {
-                let n = num_traits::ToPrimitive::to_usize(&n)
-                    .ok_or_else(|| value_error("negative count"))?;
+                let n = n.to_usize().ok_or_else(|| value_error("negative count"))?;
                 Ok(Value::Bytes(Rc::new(vec![0u8; n])))
             }
             // bytes(str) requires an encoding in Python; not supported here.
@@ -725,9 +719,9 @@ pub fn install(interp: &mut Interpreter) {
     });
 
     native!("abs", |i, args| match single(&args, "abs")? {
-        Value::Int(n) => Ok(Value::Int(num_traits::Signed::abs(n))),
+        Value::Int(n) => Ok(Value::Int(n.abs())),
         Value::Float(x) => Ok(Value::Float(x.abs())),
-        Value::Bool(b) => Ok(Value::Int(num_bigint::BigInt::from(*b as i64))),
+        Value::Bool(b) => Ok(Value::Int(VmInt::from(*b as i64))),
         // `abs(complex)` is the Euclidean magnitude (a float), matching CPython.
         Value::Complex(re, im) => Ok(Value::Float((re * re + im * im).sqrt())),
         v @ Value::Instance(_) => {
@@ -752,7 +746,7 @@ pub fn install(interp: &mut Interpreter) {
     native!("complex", |_i, args| {
         fn part(v: &Value, what: &str) -> Result<f64, Unwind> {
             match v {
-                Value::Int(n) => Ok(crate::value::bigint_to_f64(n)),
+                Value::Int(n) => Ok(n.to_f64()),
                 Value::Float(x) => Ok(*x),
                 Value::Bool(b) => Ok(*b as i64 as f64),
                 _ => Err(type_error(format!(
@@ -789,7 +783,7 @@ pub fn install(interp: &mut Interpreter) {
                 .next()
                 .ok_or_else(|| type_error("sum() requires an iterable"))?,
         )?;
-        let mut acc = Value::Int(num_bigint::BigInt::from(0));
+        let mut acc = Value::Int(VmInt::from(0));
         while let Some(v) = i.iter_next(&it)? {
             acc = i.binop(&acc, ruff_python_ast::Operator::Add, &v)?;
         }
@@ -975,7 +969,7 @@ pub fn install(interp: &mut Interpreter) {
             Value::Str(s) => {
                 let mut it = s.chars();
                 match (it.next(), it.next()) {
-                    (Some(c), None) => Ok(Value::Int(num_bigint::BigInt::from(c as i64))),
+                    (Some(c), None) => Ok(Value::Int(VmInt::from(c as i64))),
                     _ => Err(type_error("ord() expected a single-character string")),
                 }
             }
@@ -998,12 +992,13 @@ pub fn install(interp: &mut Interpreter) {
                         // Any in-memory integer rounds to 0 once the place
                         // value exceeds its digit count; cap to avoid an
                         // OOM/DoS building 10**(huge) (review: gemini).
-                        Ok(Value::Int(num_bigint::BigInt::zero()))
+                        Ok(Value::Int(VmInt::from(0i64)))
                     } else {
+                        let ib = i.to_bigint();
                         let p = num_bigint::BigInt::from(10).pow((-nd) as u32);
                         // Floor-divide so the remainder is always in [0, p).
-                        let q = i.div_floor(&p);
-                        let r = i - &q * &p;
+                        let q = ib.div_floor(&p);
+                        let r = &ib - &q * &p;
                         let two_r = &r * 2;
                         let rounded = if two_r < p {
                             q
@@ -1014,7 +1009,7 @@ pub fn install(interp: &mut Interpreter) {
                         } else {
                             q + 1
                         };
-                        Ok(Value::Int(rounded * &p))
+                        Ok(Value::Int(VmInt::from(rounded * &p)))
                     }
                 }
                 _ => Ok(Value::Int(i.clone())),
@@ -1044,10 +1039,10 @@ pub fn install(interp: &mut Interpreter) {
                 // round(x) -> int, round-half-to-even.
                 _ => {
                     let r = round_half_even(x);
-                    Ok(Value::Int(
+                    Ok(Value::Int(VmInt::from(
                         <num_bigint::BigInt as num_traits::FromPrimitive>::from_f64(r)
                             .unwrap_or_else(|| num_bigint::BigInt::from(r as i64)),
-                    ))
+                    )))
                 }
             }
         }
@@ -1103,7 +1098,7 @@ pub fn install(interp: &mut Interpreter) {
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
         key.hash(&mut h);
-        Ok(Value::Int(num_bigint::BigInt::from(h.finish() as i64)))
+        Ok(Value::Int(VmInt::from(h.finish() as i64)))
     });
 
     native!("id", |_i, args| {
@@ -1129,7 +1124,7 @@ pub fn install(interp: &mut Interpreter) {
             Value::Iter(it) => Rc::as_ptr(it) as usize,
             other => other as *const _ as usize,
         };
-        Ok(Value::Int(num_bigint::BigInt::from(addr as i64)))
+        Ok(Value::Int(VmInt::from(addr as i64)))
     });
 
     native!("callable", |_i, args| {
@@ -1970,7 +1965,7 @@ fn make_math_module() -> Value {
     // integral one like `5.0`).
     fn require_int(v: &Value, func: &str) -> Result<num_bigint::BigInt, Unwind> {
         match v {
-            Value::Int(i) => Ok(i.clone()),
+            Value::Int(i) => Ok(i.to_bigint()),
             Value::Bool(b) => Ok(num_bigint::BigInt::from(*b as i64)),
             _ => Err(type_error(format!(
                 "'{}' object cannot be interpreted as an integer (math.{}())",
@@ -2120,7 +2115,7 @@ fn make_math_module() -> Value {
             (
                 "floor",
                 nf("floor", |_i, args| {
-                    Ok(Value::Int(num_bigint::BigInt::from(
+                    Ok(Value::Int(VmInt::from(
                         single(&args, "floor")?.to_float()?.floor() as i64,
                     )))
                 }),
@@ -2128,7 +2123,7 @@ fn make_math_module() -> Value {
             (
                 "ceil",
                 nf("ceil", |_i, args| {
-                    Ok(Value::Int(num_bigint::BigInt::from(
+                    Ok(Value::Int(VmInt::from(
                         single(&args, "ceil")?.to_float()?.ceil() as i64,
                     )))
                 }),
@@ -2137,7 +2132,7 @@ fn make_math_module() -> Value {
                 "trunc",
                 nf("trunc", |_i, args| {
                     // Returns an int, consistent with CPython math.trunc.
-                    Ok(Value::Int(num_bigint::BigInt::from(
+                    Ok(Value::Int(VmInt::from(
                         single(&args, "trunc")?.to_float()?.trunc() as i64,
                     )))
                 }),
@@ -2167,7 +2162,7 @@ fn make_math_module() -> Value {
                 nf("prod", |i, args| {
                     // math.prod(iterable, *, start=1) — multiply all elements.
                     let it = i.make_iter(single(&args, "prod")?.clone())?;
-                    let mut acc = Value::Int(num_bigint::BigInt::from(1));
+                    let mut acc = Value::Int(VmInt::from(1));
                     while let Some(v) = i.iter_next(&it)? {
                         acc = i.binop(&acc, ruff_python_ast::Operator::Mult, &v)?;
                     }
@@ -2389,13 +2384,13 @@ fn make_math_module() -> Value {
                 "gcd",
                 nf("gcd", |_i, args| {
                     if args.is_empty() {
-                        return Ok(Value::Int(num_bigint::BigInt::from(0)));
+                        return Ok(Value::Int(VmInt::from(0)));
                     }
                     let mut acc = require_int(&args[0], "gcd")?;
                     for v in &args[1..] {
                         acc = bigint_gcd(acc, require_int(v, "gcd")?);
                     }
-                    Ok(Value::Int(acc))
+                    Ok(Value::Int(VmInt::from(acc)))
                 }),
             ),
             (
@@ -2403,7 +2398,7 @@ fn make_math_module() -> Value {
                 nf("lcm", |_i, args| {
                     use num_traits::{Signed, Zero};
                     if args.is_empty() {
-                        return Ok(Value::Int(num_bigint::BigInt::from(1)));
+                        return Ok(Value::Int(VmInt::from(1)));
                     }
                     let mut acc = require_int(&args[0], "lcm")?;
                     for v in &args[1..] {
@@ -2415,21 +2410,21 @@ fn make_math_module() -> Value {
                             acc = (acc / g) * b;
                         }
                     }
-                    Ok(Value::Int(acc.abs()))
+                    Ok(Value::Int(VmInt::from(acc.abs())))
                 }),
             ),
             (
                 "factorial",
                 nf("factorial", |_i, args| {
                     let n = require_int(single(&args, "factorial")?, "factorial")?;
-                    Ok(Value::Int(bigint_factorial(&n)?))
+                    Ok(Value::Int(VmInt::from(bigint_factorial(&n)?)))
                 }),
             ),
             (
                 "isqrt",
                 nf("isqrt", |_i, args| {
                     let n = require_int(single(&args, "isqrt")?, "isqrt")?;
-                    Ok(Value::Int(bigint_isqrt(&n)?))
+                    Ok(Value::Int(VmInt::from(bigint_isqrt(&n)?)))
                 }),
             ),
             (
@@ -2444,7 +2439,7 @@ fn make_math_module() -> Value {
                         args.get(1).ok_or_else(|| type_error("comb() needs args"))?,
                         "comb",
                     )?;
-                    Ok(Value::Int(bigint_comb_full(n, k)?))
+                    Ok(Value::Int(VmInt::from(bigint_comb_full(n, k)?)))
                 }),
             ),
             (
@@ -2460,7 +2455,7 @@ fn make_math_module() -> Value {
                         Some(v) => require_int(v, "perm")?,
                         None => n.clone(),
                     };
-                    Ok(Value::Int(bigint_perm(n, k)?))
+                    Ok(Value::Int(VmInt::from(bigint_perm(n, k)?)))
                 }),
             ),
         ],
@@ -2758,9 +2753,7 @@ fn make_std_stream(name: &'static str, is_err: bool) -> Value {
                     }
                     // CPython's `write()` returns the number of *characters*
                     // written, not the UTF-8 byte length.
-                    Ok(Value::Int(num_bigint::BigInt::from(
-                        text.chars().count() as i64
-                    )))
+                    Ok(Value::Int(VmInt::from(text.chars().count() as i64)))
                 }),
             ),
             ("flush", nf("flush", |_i, _args| Ok(Value::None))),
@@ -3040,7 +3033,7 @@ fn make_random_module() -> Value {
                 "seed",
                 nf("seed", |_i, args| {
                     match args.first() {
-                        Some(Value::Int(n)) => with_mt(|m| m.seed_int(n)),
+                        Some(Value::Int(n)) => with_mt(|m| m.seed_int(&n.to_bigint())),
                         Some(Value::Bool(b)) => {
                             with_mt(|m| m.seed_int(&num_bigint::BigInt::from(*b as i64)))
                         }
@@ -3081,9 +3074,7 @@ fn make_random_module() -> Value {
                             "VM getrandbits() supports k <= 64 — use `tyc run --compile`",
                         ));
                     }
-                    Ok(Value::Int(num_bigint::BigInt::from(with_mt(|m| {
-                        m.getrandbits(k)
-                    }))))
+                    Ok(Value::Int(VmInt::from(with_mt(|m| m.getrandbits(k)))))
                 }),
             ),
             (
@@ -3102,7 +3093,7 @@ fn make_random_module() -> Value {
                     }
                     let span = (b - a + 1) as u64;
                     let pick = with_mt(|m| m.randbelow(span)) as i64;
-                    Ok(Value::Int(num_bigint::BigInt::from(a + pick)))
+                    Ok(Value::Int(VmInt::from(a + pick)))
                 }),
             ),
             (
@@ -3134,7 +3125,7 @@ fn make_random_module() -> Value {
                         return Err(value_error("empty range for randrange()"));
                     }
                     let pick = with_mt(|m| m.randbelow(n as u64)) as i64;
-                    Ok(Value::Int(num_bigint::BigInt::from(start + pick * step)))
+                    Ok(Value::Int(VmInt::from(start + pick * step)))
                 }),
             ),
             (
@@ -3657,7 +3648,7 @@ fn make_re_module() -> Value {
                 let (out, n) = re_sub_apply(i, &p4n, &repl, &s, 0)?;
                 Ok(Value::Tuple(Rc::new(vec![
                     Value::Str(Rc::new(out)),
-                    Value::Int(num_bigint::BigInt::from(n as i64)),
+                    Value::Int(VmInt::from(n as i64)),
                 ])))
             }))),
         );
@@ -3780,21 +3771,21 @@ fn make_re_module() -> Value {
         attrs.insert(
             "start".into(),
             Value::Native(Rc::new(NativeFn::new("start", move |_i, _args| {
-                Ok(Value::Int(num_bigint::BigInt::from(start)))
+                Ok(Value::Int(VmInt::from(start)))
             }))),
         );
         attrs.insert(
             "end".into(),
             Value::Native(Rc::new(NativeFn::new("end", move |_i, _args| {
-                Ok(Value::Int(num_bigint::BigInt::from(end)))
+                Ok(Value::Int(VmInt::from(end)))
             }))),
         );
         attrs.insert(
             "span".into(),
             Value::Native(Rc::new(NativeFn::new("span", move |_i, _args| {
                 Ok(Value::Tuple(Rc::new(vec![
-                    Value::Int(num_bigint::BigInt::from(start)),
-                    Value::Int(num_bigint::BigInt::from(end)),
+                    Value::Int(VmInt::from(start)),
+                    Value::Int(VmInt::from(end)),
                 ])))
             }))),
         );
@@ -3921,7 +3912,7 @@ fn make_re_module() -> Value {
                     let (out, n) = re_sub_apply(i, &r, &repl, &s, 0)?;
                     Ok(Value::Tuple(Rc::new(vec![
                         Value::Str(Rc::new(out)),
-                        Value::Int(num_bigint::BigInt::from(n as i64)),
+                        Value::Int(VmInt::from(n as i64)),
                     ])))
                 }),
             ),
@@ -3996,11 +3987,11 @@ fn make_re_module() -> Value {
             // engine has no flag plumbing; users that rely on
             // IGNORECASE/MULTILINE will see incorrect behaviour and
             // should fall back to `tyc run --compile`.
-            ("IGNORECASE", Value::Int(num_bigint::BigInt::from(2))),
-            ("MULTILINE", Value::Int(num_bigint::BigInt::from(8))),
-            ("DOTALL", Value::Int(num_bigint::BigInt::from(16))),
-            ("VERBOSE", Value::Int(num_bigint::BigInt::from(64))),
-            ("ASCII", Value::Int(num_bigint::BigInt::from(256))),
+            ("IGNORECASE", Value::Int(VmInt::from(2))),
+            ("MULTILINE", Value::Int(VmInt::from(8))),
+            ("DOTALL", Value::Int(VmInt::from(16))),
+            ("VERBOSE", Value::Int(VmInt::from(64))),
+            ("ASCII", Value::Int(VmInt::from(256))),
         ],
     )
 }
@@ -4248,9 +4239,7 @@ fn make_asyncio_queue(args: &[Value], kwargs: &[(String, Value)]) -> Value {
         members.insert(
             "qsize".to_owned(),
             Value::Native(Rc::new(NativeFn::new("qsize", move |_i, _args| {
-                Ok(Value::Int(
-                    num_bigint::BigInt::from(b.borrow().len() as i64),
-                ))
+                Ok(Value::Int(VmInt::from(b.borrow().len() as i64)))
             }))),
         );
         let b = buf.clone();
@@ -4325,12 +4314,10 @@ fn make_collections_module() -> Value {
             let it = i.make_iter(v)?;
             while let Some(x) = i.iter_next(&it)? {
                 let key = x.to_hash_key()?;
-                let entry = counts
-                    .entry(key)
-                    .or_insert(Value::Int(num_bigint::BigInt::from(0)));
+                let entry = counts.entry(key).or_insert(Value::Int(VmInt::from(0)));
                 *entry = match entry {
-                    Value::Int(n) => Value::Int(&*n + 1),
-                    _ => Value::Int(num_bigint::BigInt::from(1)),
+                    Value::Int(n) => Value::Int(n.add(&VmInt::from(1i64))),
+                    _ => Value::Int(VmInt::from(1)),
                 };
             }
         }
@@ -4474,12 +4461,8 @@ fn make_heapq_module() -> Value {
         match (a, b) {
             (Value::Int(x), Value::Int(y)) => x < y,
             (Value::Float(x), Value::Float(y)) => x < y,
-            (Value::Int(x), Value::Float(y)) => {
-                num_traits::ToPrimitive::to_f64(x).is_some_and(|xf| xf < *y)
-            }
-            (Value::Float(x), Value::Int(y)) => {
-                num_traits::ToPrimitive::to_f64(y).is_some_and(|yf| *x < yf)
-            }
+            (Value::Int(x), Value::Float(y)) => x.to_f64() < *y,
+            (Value::Float(x), Value::Int(y)) => *x < y.to_f64(),
             (Value::Str(x), Value::Str(y)) => x < y,
             (Value::Tuple(x), Value::Tuple(y)) => {
                 for (xi, yi) in x.iter().zip(y.iter()) {
@@ -4913,7 +4896,7 @@ fn make_itertools_module() -> Value {
         let start = args.first().and_then(|x| x.to_int().ok()).unwrap_or(0);
         let step = args.get(1).and_then(|x| x.to_int().ok()).unwrap_or(1);
         let out: Vec<Value> = (0..1024)
-            .map(|n| Value::Int(num_bigint::BigInt::from(start + n * step)))
+            .map(|n| Value::Int(VmInt::from(start + n * step)))
             .collect();
         Ok(Value::List(Rc::new(RefCell::new(out))))
     });
@@ -5354,7 +5337,7 @@ fn make_pathlib_module(interp: &mut Interpreter) -> Result<Value, Unwind> {
                 let text = single(&args, "write_text")?.py_str();
                 std::fs::write(&s_for_write, text.as_bytes())
                     // `Path.write_text` returns the number of characters written.
-                    .map(|_| Value::Int(num_bigint::BigInt::from(text.chars().count() as i64)))
+                    .map(|_| Value::Int(VmInt::from(text.chars().count() as i64)))
                     .map_err(|e| {
                         crate::error::Unwind::Exception(crate::error::VmException::new(
                             "OSError",
@@ -5492,7 +5475,7 @@ fn make_pathlib_module(interp: &mut Interpreter) -> Result<Value, Unwind> {
                 };
                 let n = data.len();
                 std::fs::write(&s_for_write_b, data).map_err(|e| fs_unwind(&s_for_write_b, e))?;
-                Ok(Value::Int(num_bigint::BigInt::from(n as i64)))
+                Ok(Value::Int(VmInt::from(n as i64)))
             }))),
         );
         Value::Instance(Rc::new(Instance {
@@ -5615,7 +5598,6 @@ pub fn dict_fromkeys(interp: &mut Interpreter, args: Vec<Value>) -> Result<Value
 /// to `None` (deleted). A staticmethod on the `str` type object, so
 /// `interp.rs` intercepts it the same way as `dict.fromkeys`.
 pub fn str_maketrans(args: &[Value]) -> Result<Value, Unwind> {
-    use num_bigint::BigInt;
     let as_str = |v: &Value| -> Result<String, Unwind> {
         match v {
             Value::Str(s) => Ok((**s).clone()),
@@ -5639,7 +5621,7 @@ pub fn str_maketrans(args: &[Value]) -> Result<Value, Unwind> {
                     HashKey::Str(s) => {
                         let mut chars = s.chars();
                         match (chars.next(), chars.next()) {
-                            (Some(c), None) => HashKey::Int(BigInt::from(c as u32)),
+                            (Some(c), None) => HashKey::Int(VmInt::from(c as u32)),
                             _ => {
                                 return Err(value_error(
                                     "string keys in translate table must be of length 1",
@@ -5666,13 +5648,13 @@ pub fn str_maketrans(args: &[Value]) -> Result<Value, Unwind> {
             }
             for (fc, tc) in from.chars().zip(to.chars()) {
                 map.insert(
-                    HashKey::Int(BigInt::from(fc as u32)),
-                    Value::Int(BigInt::from(tc as u32)),
+                    HashKey::Int(VmInt::from(fc as u32)),
+                    Value::Int(VmInt::from(tc as u32)),
                 );
             }
             if let Some(third) = args.get(2) {
                 for dc in as_str(third)?.chars() {
-                    map.insert(HashKey::Int(BigInt::from(dc as u32)), Value::None);
+                    map.insert(HashKey::Int(VmInt::from(dc as u32)), Value::None);
                 }
             }
         }
@@ -5709,7 +5691,7 @@ fn str_method(
             let table = table.borrow();
             let mut out = String::with_capacity(s.len());
             for ch in s.chars() {
-                let key = HashKey::Int(num_bigint::BigInt::from(ch as u32));
+                let key = HashKey::Int(VmInt::from(ch as u32));
                 match table.get(&key) {
                     None => out.push(ch),
                     Some(Value::None) => {} // mapped to None → delete
@@ -5830,7 +5812,7 @@ fn str_method(
             // CPython indices are character offsets, but Rust's `str::find`
             // returns a byte offset. Convert so `s[s.find(x):]` matches
             // CPython on non-ASCII text (the byte index is a char boundary).
-            Value::Int(num_bigint::BigInt::from(
+            Value::Int(VmInt::from(
                 s.find(&needle)
                     .map(|i| s[..i].chars().count() as i64)
                     .unwrap_or(-1),
@@ -5838,7 +5820,7 @@ fn str_method(
         }
         "rfind" => {
             let needle = single(args, "rfind")?.py_str();
-            Value::Int(num_bigint::BigInt::from(
+            Value::Int(VmInt::from(
                 s.rfind(&needle)
                     .map(|i| s[..i].chars().count() as i64)
                     .unwrap_or(-1),
@@ -5847,9 +5829,9 @@ fn str_method(
         "count" => {
             let needle = single(args, "count")?.py_str();
             if needle.is_empty() {
-                Value::Int(num_bigint::BigInt::from(s.chars().count() as i64 + 1))
+                Value::Int(VmInt::from(s.chars().count() as i64 + 1))
             } else {
-                Value::Int(num_bigint::BigInt::from(s.matches(&needle).count() as i64))
+                Value::Int(VmInt::from(s.matches(&needle).count() as i64))
             }
         }
         "isdigit" => Value::Bool(!s.is_empty() && s.chars().all(|c| c.is_ascii_digit())),
@@ -5884,14 +5866,14 @@ fn str_method(
             let needle = single(args, "index")?.py_str();
             // Char offset, not byte offset (see `find`).
             match s.find(&needle) {
-                Some(i) => Value::Int(num_bigint::BigInt::from(s[..i].chars().count() as i64)),
+                Some(i) => Value::Int(VmInt::from(s[..i].chars().count() as i64)),
                 None => return Err(value_error("substring not found")),
             }
         }
         "rindex" => {
             let needle = single(args, "rindex")?.py_str();
             match s.rfind(&needle) {
-                Some(i) => Value::Int(num_bigint::BigInt::from(s[..i].chars().count() as i64)),
+                Some(i) => Value::Int(VmInt::from(s[..i].chars().count() as i64)),
                 None => return Err(value_error("substring not found")),
             }
         }
@@ -6241,8 +6223,8 @@ fn bytes_method(b: &Rc<Vec<u8>>, name: &str, args: &[Value]) -> Result<Value, Un
         "find" | "index" if !args.is_empty() => {
             let needle = bytes_arg(single(args, name)?)?;
             match find_subslice(b, &needle) {
-                Some(i) => Value::Int(num_bigint::BigInt::from(i as i64)),
-                None if name == "find" => Value::Int(num_bigint::BigInt::from(-1)),
+                Some(i) => Value::Int(VmInt::from(i as i64)),
+                None if name == "find" => Value::Int(VmInt::from(-1)),
                 None => return Err(value_error("subsection not found")),
             }
         }
@@ -6467,7 +6449,7 @@ fn list_method(
             let items = l.borrow().clone();
             for (i, v) in items.iter().enumerate() {
                 if interp.values_equal(v, &target)? {
-                    return Ok(Value::Int(num_bigint::BigInt::from(i as i64)));
+                    return Ok(Value::Int(VmInt::from(i as i64)));
                 }
             }
             Err(value_error("list.index(x): x not in list"))
@@ -6481,7 +6463,7 @@ fn list_method(
                     n += 1;
                 }
             }
-            Ok(Value::Int(num_bigint::BigInt::from(n)))
+            Ok(Value::Int(VmInt::from(n)))
         }
         "clear" => {
             l.borrow_mut().clear();
@@ -6810,12 +6792,7 @@ fn dict_method(
             let result: Vec<Value> = pairs
                 .into_iter()
                 .take(limit.unwrap_or(usize::MAX))
-                .map(|(k, count)| {
-                    Value::Tuple(Rc::new(vec![
-                        k,
-                        Value::Int(num_bigint::BigInt::from(count)),
-                    ]))
-                })
+                .map(|(k, count)| Value::Tuple(Rc::new(vec![k, Value::Int(VmInt::from(count))])))
                 .collect();
             Ok(Value::List(Rc::new(RefCell::new(result))))
         }
@@ -6958,7 +6935,7 @@ fn tuple_method(t: &Rc<Vec<Value>>, name: &str, args: &[Value]) -> Result<Value,
     match name {
         "count" => {
             let target = single(args, "count")?;
-            Ok(Value::Int(num_bigint::BigInt::from(
+            Ok(Value::Int(VmInt::from(
                 t.iter().filter(|v| v.py_eq(target)).count() as i64,
             )))
         }
@@ -6966,7 +6943,7 @@ fn tuple_method(t: &Rc<Vec<Value>>, name: &str, args: &[Value]) -> Result<Value,
             let target = single(args, "index")?;
             t.iter()
                 .position(|v| v.py_eq(target))
-                .map(|p| Value::Int(num_bigint::BigInt::from(p as i64)))
+                .map(|p| Value::Int(VmInt::from(p as i64)))
                 .ok_or_else(|| value_error("tuple.index(x): x not in tuple"))
         }
         _ => Err(attribute_error(format!("tuple has no method '{}'", name))),
@@ -6976,16 +6953,15 @@ fn tuple_method(t: &Rc<Vec<Value>>, name: &str, args: &[Value]) -> Result<Value,
 fn num_method(v: &Value, name: &str, args: &[Value]) -> Result<Value, Unwind> {
     match (v, name) {
         (Value::Float(x), "is_integer") => Ok(Value::Bool(x.fract() == 0.0 && x.is_finite())),
-        (Value::Int(i), "bit_length") => Ok(Value::Int(num_bigint::BigInt::from(i.bits() as i64))),
+        (Value::Int(i), "bit_length") => Ok(Value::Int(VmInt::from(i.bits() as i64))),
         // `(n).bit_count()` — number of set bits in the absolute value.
         (Value::Int(i), "bit_count") => {
-            let (_, bytes) = i.to_bytes_be();
+            let (_, bytes) = i.as_bigint().to_bytes_be();
             let count: u32 = bytes.iter().map(|b| b.count_ones()).sum();
-            Ok(Value::Int(num_bigint::BigInt::from(count)))
+            Ok(Value::Int(VmInt::from(count)))
         }
         // `(n).to_bytes(length, byteorder="big")` — non-negative ints.
         (Value::Int(i), "to_bytes") => {
-            use num_traits::Signed;
             if i.is_negative() {
                 return Err(value_error("to_bytes: negative ints not supported"));
             }
@@ -6997,7 +6973,7 @@ fn num_method(v: &Value, name: &str, args: &[Value]) -> Result<Value, Unwind> {
                 Some(Value::Str(s)) => s.as_str() != "little",
                 _ => true,
             };
-            let (_, mut raw) = i.to_bytes_be();
+            let (_, mut raw) = i.as_bigint().to_bytes_be();
             if raw.len() > length {
                 return Err(value_error("int too big to convert"));
             }
@@ -7347,11 +7323,11 @@ impl<'a> JsonParser<'a> {
                 slice.parse().map_err(|_| value_error("bad number"))?,
             ))
         } else {
-            Ok(Value::Int(
+            Ok(Value::Int(VmInt::from(
                 slice
                     .parse::<num_bigint::BigInt>()
                     .map_err(|_| value_error("bad number"))?,
-            ))
+            )))
         }
     }
     fn peek(&self) -> Option<u8> {
@@ -7793,7 +7769,7 @@ pub fn call_with_kwargs(
         // sum(iterable, start=X) — keyword form (positional start already
         // works through the plain native).
         "sum" => {
-            let mut acc = Value::Int(num_bigint::BigInt::from(0));
+            let mut acc = Value::Int(VmInt::from(0));
             for (k, v) in kwargs {
                 if k == "start" {
                     acc = v.clone();

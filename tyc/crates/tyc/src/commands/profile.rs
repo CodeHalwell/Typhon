@@ -40,6 +40,7 @@ pub fn run(args: ProfileArgs) -> Result<()> {
         check: false,
         no_sync: false,
         with_ty: false,
+        optimise: false,
     })?;
 
     // Discover the build directory.  We mirror the resolution rules from

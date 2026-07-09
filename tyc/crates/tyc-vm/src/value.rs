@@ -10,6 +10,7 @@
 //! under CPython — making `tyc run` diverge from `tyc build && python`
 //! for any program that does big-number arithmetic.
 
+use std::borrow::Cow;
 use std::cell::Cell;
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -18,7 +19,8 @@ use std::rc::Rc;
 
 use indexmap::IndexMap;
 use num_bigint::BigInt;
-use num_traits::{FromPrimitive, Signed, ToPrimitive, Zero};
+use num_integer::Integer;
+use num_traits::{FromPrimitive, Signed, ToPrimitive};
 
 use crate::error::{type_error, value_error, Unwind};
 
@@ -77,13 +79,454 @@ pub type RcDict = Rc<RefCell<DictMap>>;
 pub type RcSet = Rc<RefCell<std::collections::HashSet<HashKey>>>;
 pub type RcStr = Rc<String>;
 
+/// The VM's arbitrary-precision integer, with a small-value fast path.
+///
+/// `Value::Int` used to be a bare `num_bigint::BigInt`, so every integer op —
+/// even `i + 1` in a tight loop — allocated a fresh heap `BigInt`. `VmInt`
+/// keeps CPython's exact arbitrary-precision semantics while representing any
+/// value that fits in `i64` inline, so the common case never touches the heap.
+///
+/// # Invariant
+///
+/// `Small(n)` is used for **every** value in `i64` range; `Big` only ever holds
+/// a value strictly outside `[i64::MIN, i64::MAX]`. Every constructor and every
+/// arithmetic result funnels through [`VmInt::from_bigint`], which demotes an
+/// in-range `BigInt` back to `Small`. This canonicalisation is what makes
+/// `Eq` / `Ord` / hashing trivial: a `Small` and a `Big` can never be
+/// numerically equal, so cross-representation comparison is always `false` /
+/// decided-by-sign, with no value inspection.
+#[derive(Clone)]
+pub enum VmInt {
+    Small(i64),
+    /// Held behind an `Rc` so cloning a huge integer is a refcount bump, not a
+    /// limb-vector copy. Always outside `i64` range (see the type invariant).
+    Big(Rc<BigInt>),
+}
+
+impl VmInt {
+    /// Normalising constructor — the single choke point that upholds the type
+    /// invariant. An in-range `BigInt` becomes `Small`; anything else `Big`.
+    #[inline]
+    pub fn from_bigint(b: BigInt) -> VmInt {
+        match b.to_i64() {
+            Some(n) => VmInt::Small(n),
+            None => VmInt::Big(Rc::new(b)),
+        }
+    }
+
+    /// Borrow as a `BigInt` without allocating when already `Big`. Used by the
+    /// cold arithmetic / formatting paths that want the full `BigInt` API.
+    #[inline]
+    pub fn as_bigint(&self) -> Cow<'_, BigInt> {
+        match self {
+            VmInt::Small(n) => Cow::Owned(BigInt::from(*n)),
+            VmInt::Big(b) => Cow::Borrowed(b),
+        }
+    }
+
+    /// Owned `BigInt` copy (allocates for `Small`; clones the limbs for `Big`).
+    #[inline]
+    pub fn to_bigint(&self) -> BigInt {
+        match self {
+            VmInt::Small(n) => BigInt::from(*n),
+            VmInt::Big(b) => (**b).clone(),
+        }
+    }
+
+    /// `Some(i64)` iff the value fits `i64` — always `Some` for `Small`, always
+    /// `None` for `Big` (the invariant guarantees `Big` is out of range).
+    #[inline]
+    pub fn to_i64(&self) -> Option<i64> {
+        match self {
+            VmInt::Small(n) => Some(*n),
+            VmInt::Big(_) => None,
+        }
+    }
+
+    #[inline]
+    pub fn to_usize(&self) -> Option<usize> {
+        match self {
+            VmInt::Small(n) => usize::try_from(*n).ok(),
+            // A positive `Big` may still fit `usize` (e.g. 2^63 on a 64-bit
+            // target), so defer to the `BigInt` conversion here.
+            VmInt::Big(b) => b.to_usize(),
+        }
+    }
+
+    #[inline]
+    pub fn to_u32(&self) -> Option<u32> {
+        match self {
+            VmInt::Small(n) => u32::try_from(*n).ok(),
+            VmInt::Big(b) => b.to_u32(),
+        }
+    }
+
+    /// Lossy `f64` conversion matching CPython's quiet `int → float` down-cast.
+    #[inline]
+    pub fn to_f64(&self) -> f64 {
+        match self {
+            VmInt::Small(n) => *n as f64,
+            VmInt::Big(b) => bigint_to_f64(b),
+        }
+    }
+
+    #[inline]
+    pub fn is_zero(&self) -> bool {
+        // `Big` is never in `i64` range, so never zero.
+        matches!(self, VmInt::Small(0))
+    }
+
+    #[inline]
+    pub fn is_negative(&self) -> bool {
+        match self {
+            VmInt::Small(n) => *n < 0,
+            VmInt::Big(b) => b.is_negative(),
+        }
+    }
+
+    #[inline]
+    pub fn is_positive(&self) -> bool {
+        match self {
+            VmInt::Small(n) => *n > 0,
+            VmInt::Big(b) => b.is_positive(),
+        }
+    }
+
+    /// Number of bits in the minimal representation of the absolute value —
+    /// matches `BigInt::bits` (and backs `int.bit_length()`).
+    #[inline]
+    pub fn bits(&self) -> u64 {
+        match self {
+            VmInt::Small(0) => 0,
+            VmInt::Small(n) => 64 - n.unsigned_abs().leading_zeros() as u64,
+            VmInt::Big(b) => b.bits(),
+        }
+    }
+
+    /// Decimal (or arbitrary-radix) string, matching `BigInt::to_str_radix`.
+    /// The radix-10 `Small` case — by far the hottest, used by every `print` /
+    /// `str()` / f-string — formats the `i64` directly without a `BigInt`.
+    pub fn to_str_radix(&self, radix: u32) -> String {
+        match self {
+            VmInt::Small(n) if radix == 10 => n.to_string(),
+            VmInt::Small(n) => BigInt::from(*n).to_str_radix(radix),
+            VmInt::Big(b) => b.to_str_radix(radix),
+        }
+    }
+
+    pub fn abs(&self) -> VmInt {
+        match self {
+            // `i64::MIN.checked_abs()` is `None` — that magnitude is `Big`.
+            VmInt::Small(n) => match n.checked_abs() {
+                Some(v) => VmInt::Small(v),
+                None => VmInt::from_bigint(BigInt::from(*n).abs()),
+            },
+            VmInt::Big(b) => VmInt::from_bigint(b.abs()),
+        }
+    }
+
+    #[inline]
+    pub fn add(&self, other: &VmInt) -> VmInt {
+        if let (VmInt::Small(a), VmInt::Small(b)) = (self, other) {
+            if let Some(v) = a.checked_add(*b) {
+                return VmInt::Small(v);
+            }
+        }
+        VmInt::from_bigint(&*self.as_bigint() + &*other.as_bigint())
+    }
+
+    #[inline]
+    pub fn sub(&self, other: &VmInt) -> VmInt {
+        if let (VmInt::Small(a), VmInt::Small(b)) = (self, other) {
+            if let Some(v) = a.checked_sub(*b) {
+                return VmInt::Small(v);
+            }
+        }
+        VmInt::from_bigint(&*self.as_bigint() - &*other.as_bigint())
+    }
+
+    #[inline]
+    pub fn mul(&self, other: &VmInt) -> VmInt {
+        if let (VmInt::Small(a), VmInt::Small(b)) = (self, other) {
+            if let Some(v) = a.checked_mul(*b) {
+                return VmInt::Small(v);
+            }
+        }
+        VmInt::from_bigint(&*self.as_bigint() * &*other.as_bigint())
+    }
+
+    /// Floor division (rounds toward negative infinity, like Python `//` and
+    /// `BigInt::div_floor`). The caller guarantees `other` is non-zero.
+    pub fn div_floor(&self, other: &VmInt) -> VmInt {
+        if let (VmInt::Small(a), VmInt::Small(b)) = (self, other) {
+            // `checked_*` guards the single overflow case, `i64::MIN / -1`.
+            if let (Some(q), Some(r)) = (a.checked_div(*b), a.checked_rem(*b)) {
+                // Adjust the truncating quotient toward -inf when the remainder
+                // is non-zero and its sign differs from the divisor's. When the
+                // adjustment fires, `|q| < 2^63`, so `q - 1` cannot overflow.
+                let q = if r != 0 && ((r < 0) != (*b < 0)) {
+                    q - 1
+                } else {
+                    q
+                };
+                return VmInt::Small(q);
+            }
+        }
+        VmInt::from_bigint(self.as_bigint().div_floor(&other.as_bigint()))
+    }
+
+    /// Python `%` — result takes the sign of the divisor (like
+    /// `BigInt::mod_floor`). The caller guarantees `other` is non-zero.
+    pub fn mod_floor(&self, other: &VmInt) -> VmInt {
+        if let (VmInt::Small(a), VmInt::Small(b)) = (self, other) {
+            if let Some(r) = a.checked_rem(*b) {
+                // `r` has the dividend's sign; nudge toward the divisor's sign.
+                // `r + b` cannot overflow: `|r| < |b|`, both `i64`.
+                let m = if r != 0 && ((r < 0) != (*b < 0)) {
+                    r + *b
+                } else {
+                    r
+                };
+                return VmInt::Small(m);
+            }
+            // `i64::MIN % -1` overflows `checked_rem`; the true result is 0,
+            // which the `BigInt` path below computes correctly.
+        }
+        VmInt::from_bigint(self.as_bigint().mod_floor(&other.as_bigint()))
+    }
+
+    /// `self ** exp` for a non-negative exponent.
+    pub fn pow(&self, exp: u32) -> VmInt {
+        if let VmInt::Small(a) = self {
+            if let Some(v) = a.checked_pow(exp) {
+                return VmInt::Small(v);
+            }
+        }
+        VmInt::from_bigint(self.as_bigint().pow(exp))
+    }
+
+    /// Three-argument modular exponentiation (`pow(base, exp, modulus)`).
+    pub fn modpow(&self, exp: &VmInt, modulus: &VmInt) -> VmInt {
+        VmInt::from_bigint(
+            self.as_bigint()
+                .modpow(&exp.as_bigint(), &modulus.as_bigint()),
+        )
+    }
+
+    #[inline]
+    pub fn bitand(&self, other: &VmInt) -> VmInt {
+        // Bitwise ops on two `i64`s stay within `i64` (the two's-complement bit
+        // pattern is unchanged), and match Python's infinite-precision result
+        // for in-range operands, so `Small & Small` needs no overflow check.
+        if let (VmInt::Small(a), VmInt::Small(b)) = (self, other) {
+            return VmInt::Small(a & b);
+        }
+        VmInt::from_bigint(&*self.as_bigint() & &*other.as_bigint())
+    }
+
+    #[inline]
+    pub fn bitor(&self, other: &VmInt) -> VmInt {
+        if let (VmInt::Small(a), VmInt::Small(b)) = (self, other) {
+            return VmInt::Small(a | b);
+        }
+        VmInt::from_bigint(&*self.as_bigint() | &*other.as_bigint())
+    }
+
+    #[inline]
+    pub fn bitxor(&self, other: &VmInt) -> VmInt {
+        if let (VmInt::Small(a), VmInt::Small(b)) = (self, other) {
+            return VmInt::Small(a ^ b);
+        }
+        VmInt::from_bigint(&*self.as_bigint() ^ &*other.as_bigint())
+    }
+
+    /// Left shift by `shift` bits. Always routed through `BigInt` (a left shift
+    /// grows without bound and isn't on any hot path), then normalised.
+    pub fn shl(&self, shift: usize) -> VmInt {
+        VmInt::from_bigint(&*self.as_bigint() << shift)
+    }
+
+    /// Arithmetic right shift by `shift` bits (floor-toward-negative for
+    /// negatives, matching Python and `BigInt`).
+    pub fn shr(&self, shift: usize) -> VmInt {
+        if let VmInt::Small(a) = self {
+            if shift >= 64 {
+                return VmInt::Small(if *a < 0 { -1 } else { 0 });
+            }
+            return VmInt::Small(a >> shift);
+        }
+        VmInt::from_bigint(&*self.as_bigint() >> shift)
+    }
+}
+
+impl From<i64> for VmInt {
+    #[inline]
+    fn from(n: i64) -> Self {
+        VmInt::Small(n)
+    }
+}
+impl From<i32> for VmInt {
+    #[inline]
+    fn from(n: i32) -> Self {
+        VmInt::Small(n as i64)
+    }
+}
+impl From<u8> for VmInt {
+    #[inline]
+    fn from(n: u8) -> Self {
+        VmInt::Small(n as i64)
+    }
+}
+impl From<u32> for VmInt {
+    #[inline]
+    fn from(n: u32) -> Self {
+        VmInt::Small(n as i64)
+    }
+}
+impl From<usize> for VmInt {
+    #[inline]
+    fn from(n: usize) -> Self {
+        match i64::try_from(n) {
+            Ok(v) => VmInt::Small(v),
+            Err(_) => VmInt::Big(Rc::new(BigInt::from(n))),
+        }
+    }
+}
+impl From<u64> for VmInt {
+    #[inline]
+    fn from(n: u64) -> Self {
+        match i64::try_from(n) {
+            Ok(v) => VmInt::Small(v),
+            Err(_) => VmInt::Big(Rc::new(BigInt::from(n))),
+        }
+    }
+}
+impl From<BigInt> for VmInt {
+    #[inline]
+    fn from(b: BigInt) -> Self {
+        VmInt::from_bigint(b)
+    }
+}
+impl From<&BigInt> for VmInt {
+    #[inline]
+    fn from(b: &BigInt) -> Self {
+        match b.to_i64() {
+            Some(n) => VmInt::Small(n),
+            None => VmInt::Big(Rc::new(b.clone())),
+        }
+    }
+}
+
+impl std::ops::Neg for &VmInt {
+    type Output = VmInt;
+    fn neg(self) -> VmInt {
+        match self {
+            // `-i64::MIN` overflows into `Big`; every `-Big` re-normalises
+            // because e.g. `-(2^63)` lands back in `i64` range.
+            VmInt::Small(n) => match n.checked_neg() {
+                Some(v) => VmInt::Small(v),
+                None => VmInt::from_bigint(-BigInt::from(*n)),
+            },
+            VmInt::Big(b) => VmInt::from_bigint(-&**b),
+        }
+    }
+}
+
+impl std::ops::Not for &VmInt {
+    type Output = VmInt;
+    fn not(self) -> VmInt {
+        match self {
+            // `!n` == `-n - 1` for `i64`, always in range.
+            VmInt::Small(n) => VmInt::Small(!n),
+            VmInt::Big(b) => VmInt::from_bigint(!&**b),
+        }
+    }
+}
+
+impl PartialEq for VmInt {
+    #[inline]
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (VmInt::Small(a), VmInt::Small(b)) => a == b,
+            (VmInt::Big(a), VmInt::Big(b)) => a == b,
+            // A `Small` and a `Big` can never be numerically equal (invariant).
+            _ => false,
+        }
+    }
+}
+impl Eq for VmInt {}
+
+impl Ord for VmInt {
+    #[inline]
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        use std::cmp::Ordering;
+        match (self, other) {
+            (VmInt::Small(a), VmInt::Small(b)) => a.cmp(b),
+            (VmInt::Big(a), VmInt::Big(b)) => a.cmp(b),
+            // A `Big` is out of `i64` range, so its sign alone orders it
+            // against any `Small` (`Big` is never zero).
+            (VmInt::Small(_), VmInt::Big(b)) => {
+                if b.is_positive() {
+                    Ordering::Less
+                } else {
+                    Ordering::Greater
+                }
+            }
+            (VmInt::Big(a), VmInt::Small(_)) => {
+                if a.is_positive() {
+                    Ordering::Greater
+                } else {
+                    Ordering::Less
+                }
+            }
+        }
+    }
+}
+impl PartialOrd for VmInt {
+    #[inline]
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl fmt::Display for VmInt {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            VmInt::Small(n) => write!(f, "{n}"),
+            VmInt::Big(b) => write!(f, "{b}"),
+        }
+    }
+}
+
+impl fmt::Debug for VmInt {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Print the numeric value (like the old bare-`BigInt` payload) so a
+        // derived `Debug` on `HashKey` / `Value` reads `Int(5)`, not
+        // `Int(Small(5))`.
+        write!(f, "{self}")
+    }
+}
+
+/// Compare a [`VmInt`] to an `f64` with the exact semantics CPython uses for
+/// `int == float` — delegating to the proven `BigInt` routine so large-value
+/// precision handling is identical. Not on any hot path (numeric literals in
+/// loops are int-vs-int), so the `Small → BigInt` lift is acceptable.
+pub fn vmint_eq_f64(a: &VmInt, b: f64) -> bool {
+    bigint_eq_f64(&a.as_bigint(), b)
+}
+
+/// Ordering counterpart to [`vmint_eq_f64`].
+pub fn vmint_cmp_f64(a: &VmInt, b: f64) -> Option<std::cmp::Ordering> {
+    bigint_cmp_f64(&a.as_bigint(), b)
+}
+
 /// Hashable wrapper around a subset of `Value`s. Used as dict keys and set
 /// elements. Floats are stored bitwise so `NaN != NaN` (matching Python).
 #[derive(Debug, Clone)]
 pub enum HashKey {
     None,
     Bool(bool),
-    Int(BigInt),
+    Int(VmInt),
     Float(u64),
     /// A complex number stored as the bit patterns of its real and
     /// imaginary `f64` parts (bitwise, like `Float`). Python's `complex`
@@ -173,6 +616,21 @@ fn integral_float_to_bigint(bits: u64) -> Option<BigInt> {
 /// sort/canonicalise identically — required for `frozenset` element ordering to
 /// stay consistent across numeric types (e.g. `frozenset({1, 2.0})` must equal
 /// `frozenset({1.0, 2})`).
+/// Feed an integer key into a hasher with a representation-independent
+/// encoding: values in `i64` range hash through the `i64` (they can only be
+/// `Small`, bool, or an in-range integral float), larger values through their
+/// `BigInt` limbs. The two partitions can never contain numerically-equal
+/// values (an `i64`-representable integer can't equal one that isn't), so they
+/// need no cross-consistency — while every member of one equivalence class
+/// (`1`, `1.0`, `True`) reaches the same branch and hashes identically.
+fn hash_int_key<H: std::hash::Hasher>(state: &mut H, v: &VmInt) {
+    use std::hash::Hash;
+    match v {
+        VmInt::Small(n) => n.hash(state),
+        VmInt::Big(b) => b.hash(state),
+    }
+}
+
 fn push_int_canonical(out: &mut Vec<u8>, i: &BigInt) {
     out.push(2);
     let (sign, digits) = i.to_bytes_le();
@@ -199,7 +657,7 @@ impl HashKey {
             // Numeric keys share one canonical encoding so equal values across
             // bool/int/float sort identically (see `push_int_canonical`).
             HashKey::Bool(b) => push_int_canonical(&mut out, &BigInt::from(*b as i64)),
-            HashKey::Int(i) => push_int_canonical(&mut out, i),
+            HashKey::Int(i) => push_int_canonical(&mut out, &i.to_bigint()),
             HashKey::Float(bits) => match integral_float_to_bigint(*bits) {
                 Some(bi) => push_int_canonical(&mut out, &bi),
                 None => {
@@ -298,7 +756,7 @@ impl PartialEq for HashKey {
             // bool (`1 == 1.0 == True`, all hash-equal). A non-integral float
             // never equals an int/bool.
             (HashKey::Float(f), HashKey::Int(i)) | (HashKey::Int(i), HashKey::Float(f)) => {
-                integral_float_to_bigint(*f).as_ref() == Some(i)
+                integral_float_to_bigint(*f).map(VmInt::from).as_ref() == Some(i)
             }
             (HashKey::Float(f), HashKey::Bool(b)) | (HashKey::Bool(b), HashKey::Float(f)) => {
                 f64::from_bits(*f) == (*b as i64) as f64
@@ -330,13 +788,13 @@ impl std::hash::Hash for HashKey {
             // A bool widens to a BigInt before hashing so it produces the
             // same hash as the equivalent `Int(BigInt::from(b))`. Large
             // ints just hash through their full BigInt representation.
-            HashKey::Bool(b) => BigInt::from(*b as i64).hash(state),
-            HashKey::Int(i) => i.hash(state),
+            HashKey::Bool(b) => hash_int_key(state, &VmInt::from(*b as i64)),
+            HashKey::Int(i) => hash_int_key(state, i),
             // An integral float hashes like the equal int (`hash(1.0) ==
             // hash(1)`); a non-integral float hashes by its bit pattern. Keeps
             // `Hash` consistent with the `Eq` cases above.
             HashKey::Float(bits) => match integral_float_to_bigint(*bits) {
-                Some(bi) => bi.hash(state),
+                Some(bi) => hash_int_key(state, &VmInt::from(bi)),
                 None => bits.hash(state),
             },
             HashKey::Complex(re, im) => {
@@ -357,7 +815,7 @@ impl std::hash::Hash for HashKey {
 pub enum Value {
     None,
     Bool(bool),
-    Int(BigInt),
+    Int(VmInt),
     Float(f64),
     /// A complex number `(real, imag)`. Constructed from imaginary literals
     /// (`2j` → `Complex(0.0, 2.0)`) and the builtins agent's `complex(re, im)`
@@ -467,6 +925,10 @@ pub struct Function {
     /// runs) attribute to the right file when a function defined in one
     /// module is called from another.
     pub source: Option<std::rc::Rc<crate::interp::SourceInfo>>,
+    /// Slot-resolved-locals layout + eligibility (VM performance Tier 1b),
+    /// computed once from `params` + `body` when the function value is built.
+    /// Ineligible functions use the classic per-call `Env` HashMap path.
+    pub slot_info: std::rc::Rc<crate::slots::SlotInfo>,
 }
 
 pub struct Class {
@@ -837,17 +1299,17 @@ impl Value {
         match (self, other) {
             (None, None) => true,
             (Bool(a), Bool(b)) => a == b,
-            (Bool(a), Int(b)) | (Int(b), Bool(a)) => &BigInt::from(*a as i64) == b,
+            (Bool(a), Int(b)) | (Int(b), Bool(a)) => &VmInt::from(*a as i64) == b,
             (Bool(a), Float(b)) | (Float(b), Bool(a)) => (*a as i64 as f64) == *b,
             (Int(a), Int(b)) => a == b,
             (Float(a), Float(b)) => a == b,
-            (Int(a), Float(b)) | (Float(b), Int(a)) => bigint_eq_f64(a, *b),
+            (Int(a), Float(b)) | (Float(b), Int(a)) => vmint_eq_f64(a, *b),
             (Complex(ar, ai), Complex(br, bi)) => ar == br && ai == bi,
             // `complex == float` / `complex == int` only when the imaginary
             // part is zero (matching CPython).
             (Complex(re, im), Float(f)) | (Float(f), Complex(re, im)) => *im == 0.0 && re == f,
             (Complex(re, im), Int(i)) | (Int(i), Complex(re, im)) => {
-                *im == 0.0 && bigint_eq_f64(i, *re)
+                *im == 0.0 && vmint_eq_f64(i, *re)
             }
             (Complex(re, im), Bool(b)) | (Bool(b), Complex(re, im)) => {
                 *im == 0.0 && *re == (*b as i64 as f64)
@@ -951,11 +1413,11 @@ impl Value {
         match (self, other) {
             (Int(a), Int(b)) => a.partial_cmp(b),
             (Float(a), Float(b)) => a.partial_cmp(b),
-            (Int(a), Float(b)) => bigint_cmp_f64(a, *b),
-            (Float(a), Int(b)) => bigint_cmp_f64(b, *a).map(|o| o.reverse()),
+            (Int(a), Float(b)) => vmint_cmp_f64(a, *b),
+            (Float(a), Int(b)) => vmint_cmp_f64(b, *a).map(|o| o.reverse()),
             (Bool(a), Bool(b)) => a.partial_cmp(b),
-            (Bool(a), Int(b)) => BigInt::from(*a as i64).partial_cmp(b),
-            (Int(a), Bool(b)) => a.partial_cmp(&BigInt::from(*b as i64)),
+            (Bool(a), Int(b)) => VmInt::from(*a as i64).partial_cmp(b),
+            (Int(a), Bool(b)) => a.partial_cmp(&VmInt::from(*b as i64)),
             (Str(a), Str(b)) => a.partial_cmp(b),
             (Tuple(a), Tuple(b)) => {
                 for (x, y) in a.iter().zip(b.iter()) {
@@ -1011,7 +1473,7 @@ impl Value {
     /// arbitrary precision (FINDINGS #19).
     pub fn to_bigint(&self) -> Result<BigInt, Unwind> {
         match self {
-            Value::Int(i) => Ok(i.clone()),
+            Value::Int(i) => Ok(i.to_bigint()),
             Value::Bool(b) => Ok(BigInt::from(*b as i64)),
             Value::Float(x) => Ok(BigInt::from(*x as i64)),
             Value::Str(s) => s
@@ -1028,7 +1490,7 @@ impl Value {
     pub fn to_float(&self) -> Result<f64, Unwind> {
         match self {
             Value::Float(x) => Ok(*x),
-            Value::Int(i) => Ok(bigint_to_f64(i)),
+            Value::Int(i) => Ok(i.to_f64()),
             Value::Bool(b) => Ok(*b as i64 as f64),
             Value::Str(s) => s.trim().parse::<f64>().map_err(|_| {
                 value_error(format!(
@@ -1575,6 +2037,177 @@ fn format_float_scientific(x: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn is_small(v: &VmInt) -> bool {
+        matches!(v, VmInt::Small(_))
+    }
+    fn is_big(v: &VmInt) -> bool {
+        matches!(v, VmInt::Big(_))
+    }
+
+    #[test]
+    fn vmint_i64_boundary_promotion() {
+        // i64::MAX + 1 overflows i64 → must promote to Big and hold the exact
+        // arbitrary-precision value.
+        let max = VmInt::from(i64::MAX);
+        let one = VmInt::from(1i64);
+        let over = max.add(&one);
+        assert!(is_big(&over), "i64::MAX + 1 must be Big");
+        assert_eq!(
+            over.to_string(),
+            (BigInt::from(i64::MAX) + BigInt::from(1i64)).to_string()
+        );
+
+        // i64::MIN - 1 underflows → Big.
+        let min = VmInt::from(i64::MIN);
+        let under = min.sub(&one);
+        assert!(is_big(&under), "i64::MIN - 1 must be Big");
+        assert_eq!(
+            under.to_string(),
+            (BigInt::from(i64::MIN) - BigInt::from(1i64)).to_string()
+        );
+
+        // i64::MIN / -1 overflows the machine div → Big (= 2^63).
+        let neg_one = VmInt::from(-1i64);
+        let q = min.div_floor(&neg_one);
+        assert!(is_big(&q), "i64::MIN / -1 must be Big");
+        assert_eq!(q.to_string(), "9223372036854775808");
+
+        // -(i64::MIN) overflows negation → Big.
+        let negated = -&min;
+        assert!(is_big(&negated), "-(i64::MIN) must be Big");
+        assert_eq!(negated.to_string(), "9223372036854775808");
+
+        // abs(i64::MIN) likewise.
+        assert!(is_big(&min.abs()));
+        assert_eq!(min.abs().to_string(), "9223372036854775808");
+
+        // i64::MIN % -1 == 0 (the overflow-prone case), and normalises to Small.
+        let m = min.mod_floor(&neg_one);
+        assert!(is_small(&m));
+        assert!(m.is_zero());
+    }
+
+    #[test]
+    fn vmint_normalises_in_range_bigint_to_small() {
+        // A `BigInt` that fits i64 must land back in `Small` — the whole
+        // invariant that makes Eq/Ord/Hash trivial.
+        assert!(is_small(&VmInt::from(BigInt::from(5i64))));
+        assert!(is_small(&VmInt::from(BigInt::from(i64::MAX))));
+        assert!(is_small(&VmInt::from(BigInt::from(i64::MIN))));
+        let two_pow_63 = BigInt::from(i64::MAX) + BigInt::from(1i64); // 2^63
+        assert!(is_big(&VmInt::from(two_pow_63.clone())));
+
+        // Big + Big whose result fits i64 must demote back to Small
+        // (2^63 + (-(2^63) - 1) = -1).
+        let a = VmInt::from(two_pow_63.clone()); // 2^63, Big
+        let b = VmInt::from(-two_pow_63 - BigInt::from(1i64)); // -(2^63)-1, Big
+        assert!(is_big(&a) && is_big(&b));
+        let sum = a.add(&b);
+        assert!(is_small(&sum), "Big+Big landing in range must renormalise");
+        assert_eq!(sum, VmInt::from(-1i64));
+    }
+
+    #[test]
+    fn vmint_2_pow_100() {
+        let two = VmInt::from(2i64);
+        let r = two.pow(100);
+        assert!(is_big(&r));
+        assert_eq!(r.to_string(), "1267650600228229401496703205376");
+    }
+
+    #[test]
+    fn vmint_floordiv_mod_sign_matrix_small_and_big() {
+        // Exhaustive sign matrix, checked against the BigInt reference for both
+        // in-range (`Small`) and out-of-range (`Big`) operands. Python `//`
+        // floors toward -inf and `%` takes the divisor's sign.
+        let base: [i64; 6] = [7, -7, 8, -8, 1, -1];
+        let scales: [i64; 2] = [1, 5_000_000_000]; // 2nd scale forces Big
+        for &sa in &base {
+            for &sb in &base {
+                for &scale in &scales {
+                    let ba = BigInt::from(sa) * scale;
+                    let bb = BigInt::from(sb) * scale;
+                    if bb == BigInt::from(0) {
+                        continue;
+                    }
+                    let va = VmInt::from(ba.clone());
+                    let vb = VmInt::from(bb.clone());
+                    assert_eq!(
+                        va.div_floor(&vb).to_string(),
+                        ba.div_floor(&bb).to_string(),
+                        "div_floor {ba} // {bb}"
+                    );
+                    assert_eq!(
+                        va.mod_floor(&vb).to_string(),
+                        ba.mod_floor(&bb).to_string(),
+                        "mod_floor {ba} % {bb}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn vmint_eq_ord_across_representations() {
+        let small = VmInt::from(5i64);
+        let big = VmInt::from(BigInt::from(i64::MAX) + 10); // positive Big
+        let neg_big = VmInt::from(BigInt::from(i64::MIN) - 10); // negative Big
+                                                                // A Small and a Big are never equal.
+        assert_ne!(small, big);
+        assert_ne!(small, neg_big);
+        // Sign of the Big alone orders it against any Small.
+        assert!(small < big);
+        assert!(small > neg_big);
+        assert!(neg_big < big);
+        // Same-representation ordering still holds.
+        assert!(VmInt::from(3i64) < VmInt::from(4i64));
+        assert_eq!(VmInt::from(42i64), VmInt::from(BigInt::from(42)));
+    }
+
+    fn hash_of(k: &HashKey) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        k.hash(&mut h);
+        h.finish()
+    }
+
+    #[test]
+    fn hashkey_numeric_collapse_holds_with_vmint() {
+        // CPython: `1 == 1.0 == True` as dict keys, and their hashes agree.
+        let ki = HashKey::Int(VmInt::from(1i64));
+        let kf = HashKey::Float(1.0f64.to_bits());
+        let kb = HashKey::Bool(true);
+        assert_eq!(ki, kf);
+        assert_eq!(ki, kb);
+        assert_eq!(kf, kb);
+        assert_eq!(hash_of(&ki), hash_of(&kf));
+        assert_eq!(hash_of(&ki), hash_of(&kb));
+
+        // A Small int and the same value arriving as a normalised BigInt are
+        // the same key (invariant: both are `Small`).
+        assert_eq!(
+            HashKey::Int(VmInt::from(7i64)),
+            HashKey::Int(VmInt::from(BigInt::from(7)))
+        );
+        assert_eq!(
+            hash_of(&HashKey::Int(VmInt::from(7i64))),
+            hash_of(&HashKey::Int(VmInt::from(BigInt::from(7))))
+        );
+
+        // A large integral float collapses with the equal Big int key.
+        let big = BigInt::from(1u64 << 60) * BigInt::from(16i64); // 2^64, exactly representable as f64
+        let kbig_int = HashKey::Int(VmInt::from(big.clone()));
+        let kbig_float = HashKey::Float((2f64.powi(64)).to_bits());
+        assert_eq!(kbig_int, kbig_float);
+        assert_eq!(hash_of(&kbig_int), hash_of(&kbig_float));
+
+        // A non-integral float is a distinct key from any int.
+        assert_ne!(
+            HashKey::Int(VmInt::from(1i64)),
+            HashKey::Float(1.5f64.to_bits())
+        );
+    }
     use std::rc::Rc;
 
     #[test]
@@ -1601,7 +2234,7 @@ mod tests {
         // CPython dataclass default `Ok(value=20)`. The two must match
         // so `tyc run` and `tyc run --compile` produce byte-identical
         // stdout for documented Result programs.
-        let v = Value::ResultOk(Box::new(Value::Int(BigInt::from(20))));
+        let v = Value::ResultOk(Box::new(Value::Int(VmInt::from(20))));
         assert_eq!(v.py_repr(), "Ok(value=20)");
         let e = Value::ResultErr(Box::new(Value::Str(Rc::new("oops".to_owned()))));
         assert_eq!(e.py_repr(), "Err(error='oops')");

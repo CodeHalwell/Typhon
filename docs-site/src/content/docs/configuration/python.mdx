@@ -13,13 +13,14 @@ free-threaded = false
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `target` | `"3.13"` \| `"3.14"` | `"3.13"` | Target CPython version. Drives syntax choices and a few lowering decisions. |
-| `free-threaded` | bool | `false` | Allow emit paths that use threads for parallelism (requires 3.13t/3.14t). Default `false` until 3.14 ships as the default Python. |
+| `target` | `"3.13"` \| `"3.13t"` \| `"3.14"` \| `"3.14t"` \| `"3.15"` \| `"3.15t"` | `"3.13"` | Target CPython version. Drives syntax choices and a few lowering decisions. The `t` suffix selects free-threaded emission paths — see `free-threaded` below. A `3.15`+ target additionally unlocks native [PEP 810](https://peps.python.org/pep-0810/) lazy-import lowering — see [`lazy`](/Typhon/reference/lazy/). |
+| `free-threaded` | bool | `false` | Allow emit paths that use threads for parallelism (requires 3.13t/3.14t/3.15t). Default `false` until 3.14 ships as the default Python. |
 
 ## Targets
 
 - **`"3.13"`** — default. Supports PEP 695 generics natively. Most projects.
 - **`"3.14"`** — same, plus any 3.14-specific syntax the emitter takes advantage of.
+- **`"3.15"`** — same, plus native [PEP 810](https://peps.python.org/pep-0810/) lowering for `lazy import`: the emitter drops the `typhon_runtime` proxy-class helper entirely and emits the native `lazy import MODULE as ALIAS` statement instead. A project whose only runtime-touching feature was `lazy import` ships no generated `typhon_runtime/` package at all on this target. `3.13` / `3.14` output is unaffected — byte-for-byte unchanged.
 
 Older targets (`"3.12"`, `"3.11"`) are not supported in v1 — they would need a PEP 695 → `TypeVar` rewrite that we haven't built.
 
@@ -28,9 +29,12 @@ Older targets (`"3.12"`, `"3.11"`) are not supported in v1 — they would need a
 Opts into the threading-based parallelism emit paths:
 
 - `go` on a CPU-bound function lowers to `ThreadPoolExecutor.submit` instead of `asyncio.Task`.
-- The analyser may emit `ThreadPoolExecutor.map(...)` for pure-function comprehensions over large collections (`[strictness] auto-parallel`).
+- The analyser may emit a thread-pool (or, with `parallel-backend = "interpreters"`, a PEP 734 sub-interpreter pool) map for pure-function comprehensions over large collections (`[strictness] auto-parallel`) — including comprehensions with a pure filter, extra invariant call arguments, or nested pure calls — and, with `[strictness] auto-parallel-reductions`, `int`-only accumulator loops (`for x in xs: total += f(x)`).
 - Every emitted parallel block first checks `sys._is_gil_enabled()` and falls back to sequential if a GIL build is detected.
+- Two advice-only lints nudge free-threaded projects toward the above: `tyc::parallel_opportunity` (a parallelisable loop whose enabling knob is off) and `tyc::shared_mut_across_tasks` (a `go`-spawned function racing on shared module state). Both gated by `[strictness] suggest-parallel` (default `true`) and both silent unless `free-threaded = true`.
 
-Requires the special `python3.13t` / `python3.14t` interpreter build. On a stock GIL build, the runtime fallback keeps the code correct (sequential execution).
+Requires the special `python3.13t` / `python3.14t` / `python3.15t` interpreter build. On a stock GIL build, the runtime fallback keeps the code correct (sequential execution).
+
+See [`async`, `await`, `gather`, `go`](/Typhon/reference/async/#free-threaded-parallelism) for the full parallelism surface, and [`[strictness]`](/Typhon/configuration/strictness/) for every knob.
 
 **Default off until 3.14 ships as the default Python.**

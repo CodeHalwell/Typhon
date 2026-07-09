@@ -936,6 +936,126 @@ if __name__ == "__main__":
 
 ---
 
+## 15. Performance & parallelism advice
+
+Nine advice-level lints — never block a build, never rewrite code. Seven form the `tyc::perf_*` family (controlled by `[strictness] suggest-perf`, default `true`); two fire only on a free-threaded target (controlled by `[strictness] suggest-parallel`, default `true`, AND `[python] free-threaded = true`).
+
+### `tyc::perf_membership_in_loop` — advice (`suggest-perf`)
+
+A linear `x in NAME` / `x not in NAME` test inside a loop's `if`/`while` condition, where `NAME` is a loop-invariant `list`-typed binding. Each iteration rescans the whole list — O(n) per test, O(n·m) over the loop.
+
+```ty
+for e in events:
+    if e.kind in allowed:      # advice: hoist `set(allowed)` before the loop
+        hits += 1
+```
+
+Silent unless the container is provably a `list`, is never mutated in the loop, and the test sits in an `if`/`while` condition.
+
+**Fix:** Build a `set` once outside the loop.
+
+### `tyc::perf_list_shift_in_loop` — advice (`suggest-perf`)
+
+`LIST.insert(0, …)` / `LIST.pop(0)` on a bare `list`-annotated name inside a loop — an O(n) front-shift every iteration, O(n²) overall.
+
+```ty
+while queue:
+    let task: Task = queue.pop(0)    # advice: use collections.deque
+```
+
+**Fix:** Use `collections.deque` (`popleft()` / `appendleft()`).
+
+### `tyc::perf_str_concat_in_loop` — advice (`suggest-perf`)
+
+`NAME += …` on a `str`-typed binding inside a loop — each `+=` allocates a fresh string and copies the accumulator, quadratic overall.
+
+```ty
+mut out: str = ""
+for row in rows:
+    out += row + "\n"                # advice: collect + "".join(...)
+```
+
+**Fix:** Collect parts into a `list[str]` and `"".join(...)` once after the loop.
+
+### `tyc::perf_sort_in_loop` — advice (`suggest-perf`)
+
+`sorted(NAME)` / `NAME.sort()` inside a loop where `NAME` is a bare name the loop never content-mutates — the same data gets re-sorted (O(n log n)) every iteration.
+
+```ty
+for q in queries:
+    let ordered: list[Point] = sorted(points)   # advice: `points` never changes here
+```
+
+Doesn't fire when the argument is content-mutated in the loop, is the loop's own target variable, or the `sorted(...)` sits in the loop's `for … in sorted(xs):` header (that runs once already).
+
+**Fix:** Sort once before the loop, or use `heapq.nsmallest` / `nlargest` for a running top-k.
+
+### `tyc::perf_sorted_first` — advice (`suggest-perf`)
+
+`sorted(EXPR)[0]` / `sorted(EXPR)[-1]` (bare form — no `key=`/`reverse=`) — sorts the whole sequence to read one element.
+
+```ty
+return sorted(items)[0]              # advice: use min(items)
+```
+
+**Fix:** `min(...)` / `max(...)`.
+
+### `tyc::perf_keys_membership` — advice (`suggest-perf`)
+
+`EXPR in NAME.keys()` — testing against the dict directly is equivalent and skips materialising the view. Not loop-gated; fires anywhere.
+
+```ty
+return name in config.keys()         # advice: drop `.keys()`
+```
+
+**Fix:** `name in config`.
+
+### `tyc::lazy_import_opportunity` — advice (`suggest-perf`)
+
+A module-level `import X` / `import X as Y` whose bound name is referenced only inside function/method bodies — never at module scope, an annotation, a decorator, or a re-export. Deferring it moves the import cost from process startup to first use.
+
+```ty
+import numpy as np
+
+def embed(text: str) -> object:
+    return np.asarray(tokenize(text))   # advice: `np` only used inside functions
+```
+
+Silent on stdlib modules, eager uses, script-shaped modules (an `if __name__ == "__main__":` guard or a top-level `def main()` — the lint targets *library* modules), re-exported names (`pub`, `__all__`, `pub *`, or the file is an `__init__`), and files already using `lazy import`.
+
+**Fix:** `lazy import np = numpy`. (`lazy from numpy import asarray` stays rejected — use dotted access.) On a Python 3.15 target this lowers to a native PEP 810 `lazy import` statement instead of the `typhon_runtime` helper.
+
+### `tyc::parallel_opportunity` — advice (`suggest-parallel`; only when `[python] free-threaded = true`)
+
+A comprehension or integer accumulator loop that could be parallelised on a free-threaded build, but the enabling knob (`auto-parallel` / `auto-parallel-reductions`) is off — or a `float` accumulator loop that matches every reduction condition except the required `int` annotation (floats are never auto-parallelised: reordering IEEE-754 addition changes the result).
+
+```ty
+# [python] free-threaded = true, auto-parallel not set
+ys: list[int] = [transform(x) for x in xs]     # advice: could be parallelised
+```
+
+**Fix:** Flip the named `[strictness]` knob, or (for the float case) accept the sequential loop, or write the parallel reduction explicitly with `sum(typhon_runtime.parallel.map_pure(lambda x: EXPR, ITER))` so the reordering is a deliberate, visible choice.
+
+### `tyc::shared_mut_across_tasks` — advice (`suggest-parallel`; only when `[python] free-threaded = true`)
+
+A `go`-spawned same-module function that writes module-level mutable state — a `global NAME` assignment, or a write to a module-level `mut` binding. Under free-threaded Python the spawned task runs concurrently with the spawner, so an unguarded write is a data race (lost updates, torn reads, corrupt containers).
+
+```ty
+# [python] free-threaded = true
+async def record() -> None:
+    global hits
+    hits = hits + 1
+
+async def serve() -> None:
+    go record()                       # advice: concurrent write to `hits`
+```
+
+Conservative by design: only fires for a bare-name callee resolving to a same-module `def` that *directly* writes a `global` or module-level `mut` binding. `go obj.method()` (attribute callee) or indirect shared writes are not flagged.
+
+**Fix:** Guard the shared state (e.g. `asyncio.Lock`), or have the task **return** its result instead of writing a global.
+
+---
+
 ## Configurable strictness keys
 
 | Diagnostic | Key | Default |
@@ -947,8 +1067,10 @@ if __name__ == "__main__":
 | `tyc::non_exhaustive_match` | `[strictness] exhaustive-match` | `"error"` |
 | `tyc::method_in_class_body` | `[strictness] methods-in-class-body` | `"warn"` |
 | `tyc::stub_mismatch` | `[strictness] stub-check` | `"error"` |
+| `tyc::perf_membership_in_loop` / `perf_list_shift_in_loop` / `perf_str_concat_in_loop` / `perf_sort_in_loop` / `perf_sorted_first` / `perf_keys_membership` / `lazy_import_opportunity` | `[strictness] suggest-perf` | `true` |
+| `tyc::parallel_opportunity` / `shared_mut_across_tasks` | `[strictness] suggest-parallel` (also requires `[python] free-threaded = true`) | `true` |
 
-Standard values for severity keys are `"off"`, `"warn"`, `"error"`.
+Standard values for severity keys are `"off"`, `"warn"`, `"error"`. The `suggest-*` knobs above are boolean (on/off), not severity enums — they gate whether the advice fires at all.
 
 ---
 
@@ -958,7 +1080,7 @@ Standard values for severity keys are `"off"`, `"warn"`, `"error"`.
 
 **Warnings**: `async_without_await`, `class_attr_shadows_slot`, `blocking_in_async`, `contains_secret_literal`, `orphan_py_import`, `python_semantic_drift`, `resource_not_managed`, `stdlib_module_shadow`.
 
-**Advice**: `auto_gather_missed`, `gather_opportunity`, `main_not_called`, `pub_star_outside_init`.
+**Advice**: `auto_gather_missed`, `gather_opportunity`, `lazy_import_opportunity`, `main_not_called`, `parallel_opportunity`, `perf_keys_membership`, `perf_list_shift_in_loop`, `perf_membership_in_loop`, `perf_sort_in_loop`, `perf_sorted_first`, `perf_str_concat_in_loop`, `pub_star_outside_init`, `shared_mut_across_tasks`.
 
 ---
 

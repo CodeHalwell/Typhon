@@ -6,6 +6,164 @@ canonical phase-by-phase status lives in `docs/roadmap.md`.
 
 ## Unreleased
 
+- **VM performance: Tier 1 representation and dispatch tuning (`tyc run`).**
+  `Value::Int` now wraps a `VmInt` two-representation integer — any value
+  that fits `i64` is stored inline (`Small`), only overflowing to a
+  reference-counted `BigInt` (`Big`) — so integer arithmetic on the common
+  path no longer allocates, while CPython's exact arbitrary-precision
+  semantics (floor-div/mod sign rules, `2 ** 100`, big-int↔float
+  comparison, numeric int/float/bool dict-key collapse) are preserved
+  exactly. A per-class resolved-method cache (negative results included)
+  means repeated `find_method` misses don't re-walk the base chain, and a
+  direct `obj.method(args)` dispatch path for user instances skips the
+  intermediate `BoundMethod` allocation (Tier 1a). Functions with no
+  `global`/`nonlocal` declarations and no captured closure variables now
+  resolve locals to a fixed slot computed once at function-definition time
+  instead of a `HashMap` lookup on every read/write (Tier 1b). Measured
+  cumulative effect on the VM performance plan's corpus: a 3M-iteration
+  `while`-accumulator loop drops 2168ms → ~670ms, object-construction- and
+  method-call-heavy code 733ms → ~575ms, `fib(27)` 569ms → ~430ms, and
+  dict-writes-plus-list-comprehension 387ms → ~240ms (`tyc build` +
+  CPython 3.13 on the same benchmarks: 273ms / 189ms / 68ms / 85ms
+  respectively, unchanged). The VM still wins on startup (~21ms vs
+  ~38ms). VM↔CPython output parity is unchanged throughout.
+- **`[optimise]` config section + `tyc build -O`.** A single project-wide
+  dial: `[optimise] level = 0` (default) leaves every optimisation knob at
+  its own default; `level = 1` flips the *default* of `auto-memoise`,
+  `auto-gather`, `auto-parallel`, and `pgo-memoise` to `true`. An explicit
+  `[strictness]` entry for any of those four always wins over the
+  level-derived default, so a project can opt into `level = 1` and still
+  keep one knob off deliberately. `tyc build -O` / `--optimise` (alias
+  `--optimize`) applies `level = 1` for a single invocation without
+  editing `typhon.toml`; it overrides a config `level = 0` but, like the
+  file-level `level` itself, never overrides an explicit `[strictness]`
+  setting.
+- **New performance-advice lint family.** Six advice-level `tyc::perf_*`
+  lints plus `tyc::lazy_import_opportunity` — all on by default, gated by
+  `[strictness] suggest-perf`, surfaced by `tyc check` / `tyc build` and
+  live in the editor (the LSP), exactly like `tyc::gather_opportunity`:
+  `perf_membership_in_loop` (a linear `in` scan of a loop-invariant `list`
+  in an `if`/`while` condition → build a `set` once outside the loop),
+  `perf_list_shift_in_loop` (`list.insert(0, …)` / `list.pop(0)` in a loop
+  → `collections.deque`), `perf_str_concat_in_loop` (`s += …` on a `str`
+  in a loop → collect a `list[str]` and `"".join(...)`),
+  `perf_sort_in_loop` (`sorted(x)` / `x.sort()` of a loop-invariant `x` in
+  a loop → sort once, or `heapq`), `perf_sorted_first` (`sorted(...)[0]` /
+  `[-1]` → `min` / `max`), `perf_keys_membership` (`k in d.keys()` →
+  `k in d`), and `lazy_import_opportunity` (a module-level `import X` used
+  only inside function bodies → `lazy import`). Detectors live in the new
+  `tyc-analyse/src/perf.rs`; each fires only on unambiguous local AST
+  evidence (annotated receiver types, loop-invariance proofs) so the
+  example/stress corpus stays advice-noise-free. Advice only — the
+  accepted surface is unchanged. Each code ships a
+  `docs/diagnostics/<code>.md` page and a `tyc explain` entry. The Python
+  3.13 stdlib top-level module table now lives once in `tyc-analyse`
+  (`is_stdlib_top_level`), shared by `tyc::stdlib_module_shadow` and
+  `tyc::lazy_import_opportunity` so the two checks can't drift.
+- **Free-threading parallelisation wave.** For projects that target
+  free-threaded Python (`[python] free-threaded = true`):
+  - **Widened `auto-parallel` comprehension shapes** (semantics-preserving).
+    The `[strictness] auto-parallel` rewrite now handles, in addition to the
+    baseline `[f(x) for x in xs]`: **filters** `[f(x) for x in xs if COND]`
+    (a pure `COND` runs sequentially in the map's source list, the pure
+    element map runs in parallel); **multi-argument calls**
+    `[f(x, k) for x in xs]` where the extra arguments are literals or
+    `let`-bound loop invariants (a `mut`-bound name is never captured); and
+    **nested pure calls** `[g(f(x)) for x in xs]`. Applies to list, set, and
+    dict comprehensions. Every widening is sound because the element, its
+    captured arguments, and the filters are all side-effect-free.
+    (Cross-module pure callees are **deferred** — see the type-system
+    frontier.)
+  - **Integer accumulator-loop reductions** (`[strictness]
+    auto-parallel-reductions = true`, which also requires `auto-parallel`). A
+    `for x in ITER: total += EXPR` loop with a **`mut total: int`** accumulator,
+    a pure `EXPR`, and an invariant `ITER` folds into `total +=
+    sum(typhon_runtime.parallel.map_pure(lambda x: EXPR, ITER))`. Integers only
+    — integer addition is associative/commutative and Python ints are exact, so
+    parallel partial sums are identical; **floats are never rewritten**
+    (reordering IEEE-754 addition changes the result). The accumulator's
+    `mut NAME: int` declaration is resolved **within the loop's own scope**
+    (the enclosing function, or module scope), never against a same-named
+    binding in another function — so an `int` accumulator in one function can
+    never make a same-named `float` accumulator elsewhere eligible. The
+    rewrite also suppresses itself when user code binds the name `sum`
+    anywhere visible to the loop (module scope or the enclosing function,
+    parameters included), since the emitted bare `sum(...)` call would
+    otherwise resolve to the user binding instead of the builtin. And because
+    `map_pure` materialises `list(ITER)` before evaluating a single element,
+    the iterable must be provably bounded and effect-free to materialise — a
+    `list`/`tuple`/`set` literal, a bare name annotated `list[...]` /
+    `tuple[...]` / `set[...]` / `frozenset[...]` in the loop's scope, or a
+    direct builtin `range(...)` call (parallelising a `range` loop
+    materialises the range, an inherent cost of the map-based design); call
+    results, unannotated names, and generators never rewrite, so an unbounded
+    iterator can't turn a first-element exception into a hang, and a stateful
+    iterator's side effects can't run past where the sequential loop stopped.
+    The `tyc::parallel_opportunity` advice mirrors every one of these
+    conditions, so it only ever names loops the rewrite would actually
+    transform.
+  - **`tyc::parallel_opportunity`** — new advice lint (severity Advice, on by
+    default, gated by `[strictness] suggest-parallel`). Fires only under
+    `free-threaded = true` on a comprehension / integer accumulator loop that
+    *would* be rewritten if the relevant knob were on, or a `float` accumulator
+    loop that matches every reduction condition except the required `int`
+    annotation.
+  - **`tyc::shared_mut_across_tasks`** — new advice lint (same gating). Flags a
+    `go`-spawned same-module function that writes module-level mutable state (a
+    `global` assignment or a write to a module-level `mut` binding), which under
+    free-threaded Python races with the spawner.
+  - **Interpreters backend** — `[strictness] parallel-backend = "interpreters"`
+    bakes a `_BACKEND` constant into the generated `typhon_runtime/parallel.py`
+    and makes `map_pure` try a PEP 734 `concurrent.futures.InterpreterPoolExecutor`
+    (Python 3.14+), falling back **transparently** to the thread pool on
+    `ImportError` / `AttributeError` (older runtimes) or when the mapped
+    function can't be pickled across the interpreter boundary: the helper
+    probes `pickle.dumps(fn)` *before* creating a pool, so an unshareable
+    callable — whose pickling raises `PicklingError` / `AttributeError`, not
+    just `TypeError` — falls back cleanly instead of crashing, while
+    exceptions raised *by* the mapped function inside a worker still
+    propagate exactly as the thread path propagates them. The lambdas the
+    auto-parallel rewrites emit never pickle, so rewritten call sites always
+    run on the thread pool under this backend today; the interpreters pool
+    benefits hand-written `map_pure` calls passing top-level named functions.
+    Order is preserved on every path; the default `"threads"` backend is
+    behaviourally unchanged.
+  - Wiring mirrors the `tyc::perf_*` family: diagnostics registration + doc
+    pages (`docs/diagnostics/parallel_opportunity.md`,
+    `shared_mut_across_tasks.md`) + `tyc explain` entries + `LintOptions` fields
+    + `tyc check` / `tyc build` / LSP surfacing. The two lints are silent across
+    the example / stress corpus by construction (it never sets `free-threaded`).
+    New rewrites live in `tyc-analyse/src/parallel.rs` (widened) and
+    `tyc-analyse/src/reductions.rs` (new); the lints in
+    `tyc-analyse/src/parallel_lints.rs` (new).
+- **Native PEP 810 lazy imports on Python 3.15 targets.** `3.15` and
+  `3.15t` become accepted `[python] target` values. When a project targets
+  one, `tyc build` lowers `lazy import ALIAS = MODULE` to the native
+  `lazy import MODULE as ALIAS` statement CPython 3.15 ships (PEP 810),
+  instead of the `typhon_runtime.lazy.lazy_import` helper call. The
+  lowering reuses the same `import MODULE as ALIAS` rewrite the VM /
+  check paths already run (`expand_lazy_lets` + the main preprocessor),
+  then stamps the `lazy ` keyword onto the emitted line as a post-emit
+  pass that runs *after* the formatter (the vendored/`$PATH` ruff can't
+  parse the native keyword yet). A project whose only runtime-touching
+  feature was `lazy import` no longer ships a generated `typhon_runtime/`
+  package on a 3.15+ target. **3.13 / 3.14 output is byte-for-byte
+  unchanged** (the helper-call lowering is retained below the 3.15 gate),
+  and `tyc check` / `tyc run` / the REPL are unaffected. `lazy from …
+  import` stays rejected (Typhon keeps the single `lazy import` surface
+  for now). If `[checker] external = "ty"` is enabled on a 3.15 target,
+  run it with a PEP 810-aware `ty`.
+- **Docs corrections.** `docs/vm.md`'s Performance section no longer
+  claims the VM "hits roughly CPython 3.13 speed" — it now states the
+  measured reality against `tyc build` + CPython 3.13: **~5–18× slower**
+  (startup-adjusted) before this release's Tier 1 work, **~3–14×
+  startup-adjusted / ~2.7–6× end-to-end** after it, with the VM winning
+  on startup latency throughout. A new `docs/vm-performance-plan.md`
+  documents the measured baseline and Tier 1 outcome tables, the four
+  architectural cost centres, and the tiered plan (Tier 1
+  representation/dispatch tuning — landed above; Tier 2 bytecode
+  compilation; Tier 3 type-directed specialization) driving future work.
+
 ## 1.0.0-alpha.4 — 2026-07-08 — post-alpha.3 hardening: H5 soundness, secret-detection correctness & supply-chain hygiene
 
 A focused hardening release on top of alpha.3. It closes the **one HIGH

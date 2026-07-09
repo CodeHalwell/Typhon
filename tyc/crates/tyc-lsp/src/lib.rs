@@ -393,11 +393,28 @@ impl Backend {
                         opts
                     })
                     .unwrap_or_default();
+                // `lazy_import_opportunity` needs preprocess-derived facts
+                // that don't survive into the AST (already-lazy import
+                // aliases, `pub` names, `pub *`). Pull them from the cached
+                // full-preprocess Salsa query — a hit for the file we just
+                // checked — so the perf family behaves identically to
+                // `tyc check`.
+                let prep_full = tyc_db::preprocessed_full(&*db, source_file);
+                let perf_ctx = tyc_analyse::PerfLintContext {
+                    lazy_import_aliases: prep_full
+                        .lazy_imports
+                        .iter()
+                        .map(|li| li.alias.clone())
+                        .collect(),
+                    pub_names: prep_full.pub_names.clone(),
+                    has_pub_star: !prep_full.pub_star_lines.is_empty(),
+                };
                 diags.extend(tyc_analyse::editor_lint_diagnostics(
                     &parsed.into_syntax(),
                     &uri_str_for_check,
                     &mapping_source,
                     opts,
+                    &perf_ctx,
                 ));
             }
             (diags, mapping_source)
@@ -1978,12 +1995,12 @@ fn parse_src_dir(toml_path: &std::path::Path) -> Option<String> {
     Some(src.to_owned())
 }
 
-/// Read the two `[strictness]` knobs that gate the editor advisory lints
-/// (`suggest-gather`, `allow-secret-comptime`) from the project's
-/// `typhon.toml`. Any missing file / key falls back to
+/// Read the `[strictness]` knobs that gate the editor advisory lints
+/// (`suggest-gather`, `suggest-perf`, `allow-secret-comptime`) from the
+/// project's `typhon.toml`. Any missing file / key falls back to
 /// [`tyc_analyse::LintOptions::default`], which reproduces the default
-/// `typhon.toml` behaviour (gather on, secret-literal lint on) — so an
-/// editor buffer in a project without an explicit `[strictness]` table
+/// `typhon.toml` behaviour (gather on, perf on, secret-literal lint on) — so
+/// an editor buffer in a project without an explicit `[strictness]` table
 /// still gets the on-by-default advice, exactly like `tyc check`.
 fn read_lint_options(root: &std::path::Path) -> tyc_analyse::LintOptions {
     let mut opts = tyc_analyse::LintOptions::default();
@@ -1993,17 +2010,60 @@ fn read_lint_options(root: &std::path::Path) -> tyc_analyse::LintOptions {
     let Ok(parsed) = toml::from_str::<toml::Value>(&text) else {
         return opts;
     };
+    // `[python] free-threaded` gates the parallel advice lints.
+    if let Some(b) = parsed
+        .get("python")
+        .and_then(|p| p.as_table())
+        .and_then(|t| t.get("free-threaded"))
+        .and_then(|v| v.as_bool())
+    {
+        opts.free_threaded = b;
+    }
+    // `[optimise] level = 1` flips the `auto-parallel` default on.
+    let optimise_level1 = parsed
+        .get("optimise")
+        .and_then(|o| o.as_table())
+        .and_then(|t| t.get("level"))
+        .and_then(|v| v.as_integer())
+        .is_some_and(|n| n >= 1);
     let Some(strictness) = parsed.get("strictness").and_then(|s| s.as_table()) else {
+        // No `[strictness]` table — `auto-parallel` still takes the
+        // optimise-level default so the advice matches the build.
+        opts.auto_parallel = optimise_level1;
         return opts;
     };
     if let Some(b) = strictness.get("suggest-gather").and_then(|v| v.as_bool()) {
         opts.suggest_gather = b;
+    }
+    if let Some(b) = strictness.get("suggest-perf").and_then(|v| v.as_bool()) {
+        opts.suggest_perf = b;
+    }
+    if let Some(b) = strictness.get("suggest-parallel").and_then(|v| v.as_bool()) {
+        opts.suggest_parallel = b;
     }
     if let Some(b) = strictness
         .get("allow-secret-comptime")
         .and_then(|v| v.as_bool())
     {
         opts.allow_secret_comptime = b;
+    }
+    // `auto-parallel` and `auto-parallel-reductions` silence the
+    // `parallel_opportunity` advice when the rewrite is already enabled.
+    opts.auto_parallel = strictness
+        .get("auto-parallel")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(optimise_level1);
+    if let Some(b) = strictness
+        .get("auto-parallel-reductions")
+        .and_then(|v| v.as_bool())
+    {
+        opts.auto_parallel_reductions = b;
+    }
+    if let Some(n) = strictness
+        .get("parallel-min-size")
+        .and_then(|v| v.as_integer())
+    {
+        opts.parallel_min_size = n.max(0) as u64;
     }
     opts
 }

@@ -26,6 +26,7 @@ pub mod env;
 pub mod error;
 pub mod ffi;
 pub mod interp;
+pub mod slots;
 pub mod value;
 
 use std::path::Path;
@@ -419,6 +420,102 @@ mod tests {
 let x: int = 2
 let y: int = 3
 print(x + y)
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    /// Small-int fast path: i64-boundary arithmetic and 2**100 must produce the
+    /// exact arbitrary-precision result (CPython parity), driven through the
+    /// full public run path. The program raises on any wrong value, so a clean
+    /// exit code is the assertion.
+    #[test]
+    fn small_int_fast_path_matches_cpython_semantics() {
+        let src = r#"
+def main() -> None:
+    # Crossing the i64 boundary must not wrap.
+    let big: int = 9223372036854775807 + 1
+    if big != 9223372036854775808:
+        raise ValueError("i64::MAX + 1 wrong")
+    let small_again: int = big - 1
+    if small_again != 9223372036854775807:
+        raise ValueError("demotion wrong")
+    if 2 ** 100 != 1267650600228229401496703205376:
+        raise ValueError("2**100 wrong")
+    # Floor-div / mod sign rules (divisor's sign for %).
+    if 7 // -3 != -3 or 7 % -3 != -2:
+        raise ValueError("floordiv/mod sign wrong")
+    if -7 // 3 != -3 or -7 % 3 != 2:
+        raise ValueError("neg floordiv/mod wrong")
+    # pow with negative exponent widens to float.
+    if 2 ** -1 != 0.5:
+        raise ValueError("negative pow wrong")
+
+main()
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    /// CPython collapses numerically-equal int / float / bool dict keys onto a
+    /// single slot (`hash(1) == hash(1.0) == hash(True)`). The `VmInt`-backed
+    /// `HashKey` must preserve that.
+    #[test]
+    fn numeric_dict_key_collapse_preserved() {
+        let src = r#"
+def main() -> None:
+    mut d: dict[int, int] = {}
+    d[1] = 1
+    d[1.0] = 2
+    d[True] = 3
+    if len(d) != 1:
+        raise ValueError("numeric keys did not collapse to one slot")
+    if d[1] != 3:
+        raise ValueError("collapse did not overwrite the shared slot")
+    # A distinct big int and a non-integral float stay separate keys.
+    d[10000000000000000000] = 7
+    d[1.5] = 8
+    if len(d) != 3:
+        raise ValueError("distinct numeric keys wrongly merged")
+
+main()
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    /// Task 3 direct method-call path must preserve every dispatch flavour:
+    /// plain method (fast path), method with args, `@staticmethod` and
+    /// `@classmethod` (which fall back to the general path).
+    #[test]
+    fn method_dispatch_flavours_preserved() {
+        let src = r#"
+class Counter:
+    n: int
+
+impl Counter:
+    def get(self) -> int:
+        return self.n
+    def plus(self, k: int) -> int:
+        return self.n + k
+    @staticmethod
+    def stat() -> int:
+        return 42
+    @classmethod
+    def twice(cls, v: int) -> int:
+        return v * 2
+
+def main() -> None:
+    let c: Counter = Counter(n=10)
+    if c.get() != 10:
+        raise ValueError("plain method broken")
+    if c.plus(5) != 15:
+        raise ValueError("method with arg broken")
+    if Counter.stat() != 42:
+        raise ValueError("staticmethod on class broken")
+    if c.stat() != 42:
+        raise ValueError("staticmethod via instance broken")
+    if Counter.twice(3) != 6:
+        raise ValueError("classmethod broken")
+
+main()
 "#;
         assert_eq!(run_capturing(src).unwrap(), 0);
     }
@@ -2161,6 +2258,329 @@ fs = frozenset([1])
 r2 = repr(fs)
 if not r2.startswith("frozenset("):
     raise ValueError("frozenset repr wrong: " + r2)
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    // ── Slot-resolved locals (VM performance Tier 1b) ────────────────────────
+
+    /// Slot-eligible recursion: the classic fib exercises per-call slot frames
+    /// (parameter `n` in slot 0) plus the recursion depth counter.
+    #[test]
+    fn slot_recursion_fib() {
+        let src = r#"
+def fib(n: int) -> int:
+    if n < 2:
+        return n
+    return fib(n - 1) + fib(n - 2)
+
+def main() -> None:
+    if fib(10) != 55:
+        raise ValueError("fib(10) wrong")
+    if fib(20) != 6765:
+        raise ValueError("fib(20) wrong")
+
+main()
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    /// A local binding may shadow a module-level name of the same identifier;
+    /// the slot must win over the outer name once assigned.
+    #[test]
+    fn slot_shadows_module_name() {
+        let src = r#"
+value: int = 100
+
+def f() -> int:
+    let value: int = 7
+    return value
+
+def main() -> None:
+    if f() != 7:
+        raise ValueError("local slot did not shadow module name")
+    if value != 100:
+        raise ValueError("module name was clobbered")
+
+main()
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    /// Parameter defaults, `*args`, and `**kwargs` all bind into slots.
+    #[test]
+    fn slot_param_defaults_and_variadics() {
+        let src = r#"
+def g(a: int, b: int = 10, *args: int, **kwargs: int) -> int:
+    mut total: int = a + b
+    for v in args:
+        total = total + v
+    for k in kwargs:
+        total = total + kwargs[k]
+    return total
+
+def main() -> None:
+    if g(1) != 11:
+        raise ValueError("default b wrong")
+    if g(1, 2) != 3:
+        raise ValueError("explicit b wrong")
+    if g(1, 2, 3, 4) != 10:
+        raise ValueError("args wrong")
+    if g(1, 2, 3, x=5, y=6) != 17:
+        raise ValueError("kwargs wrong")
+
+main()
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    /// Augmented assignment rebinds the same slot in place.
+    #[test]
+    fn slot_augmented_assignment() {
+        let src = r#"
+def f() -> int:
+    mut a: int = 1
+    a += 4
+    a *= 3
+    a -= 2
+    return a
+
+def main() -> None:
+    if f() != 13:
+        raise ValueError("augmented slot wrong")
+
+main()
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    /// `for` / `with` / `except` / `match`-capture targets are all slot binds.
+    #[test]
+    fn slot_for_with_except_match_captures() {
+        let src = r#"
+def classify(v: object) -> str:
+    match v:
+        case [a, *rest]:
+            return "seq:" + str(a) + ":" + str(len(rest))
+        case {"k": val, **others}:
+            return "map:" + str(val) + ":" + str(len(others))
+        case int() as num:
+            return "int:" + str(num)
+        case _:
+            return "other"
+
+def f() -> int:
+    mut total: int = 0
+    for k in range(4):
+        total = total + k
+    try:
+        raise ValueError("boom")
+    except ValueError as e:
+        total = total + len(str(e))
+    return total
+
+def main() -> None:
+    if f() != 10:
+        raise ValueError("for/except slots wrong")
+    if classify([10, 20, 30]) != "seq:10:2":
+        raise ValueError("seq capture wrong")
+    if classify({"k": 1, "a": 2, "b": 3}) != "map:1:2":
+        raise ValueError("map capture wrong")
+    if classify(42) != "int:42":
+        raise ValueError("int capture wrong")
+
+main()
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    /// Tuple / starred unpacking binds each element into its own slot.
+    #[test]
+    fn slot_tuple_unpacking() {
+        let src = r#"
+def f() -> int:
+    let (a, b) = (1, 2)
+    let (c, *mid, d) = (10, 20, 30, 40)
+    mut s: int = a + b + c + d
+    for x in mid:
+        s = s + x
+    return s
+
+def main() -> None:
+    if f() != 103:
+        raise ValueError("tuple unpack slots wrong")
+
+main()
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    /// Walrus assignment inside a slot frame binds the target into a slot and
+    /// remains visible after the enclosing statement.
+    #[test]
+    fn slot_walrus_binding() {
+        let src = r#"
+def f(xs: list[int]) -> int:
+    mut acc: int = 0
+    if (n := len(xs)) > 0:
+        acc = acc + n
+    return acc + n
+
+def main() -> None:
+    if f([1, 2, 3]) != 6:
+        raise ValueError("walrus slot wrong")
+
+main()
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    /// Read-before-assign: with a module-level `x` present, reading a
+    /// function-local `x` *before* its first assignment falls through to the
+    /// module binding (the VM does NOT raise `UnboundLocalError` — CPython
+    /// would). This test pins the pre-existing VM behaviour so the slot path
+    /// reproduces it exactly.
+    #[test]
+    fn slot_read_before_assign_reads_outer() {
+        let src = r#"
+x: int = 100
+
+def f() -> int:
+    let before: int = x
+    let x: int = 1
+    return before + x
+
+def main() -> None:
+    if f() != 101:
+        raise ValueError("read-before-assign did not read the outer x")
+
+main()
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    /// `del` on a slot local unbinds it; a later read falls through to the
+    /// module scope, matching the pre-slot behaviour.
+    #[test]
+    fn slot_del_unbinds() {
+        let src = r#"
+x: int = 7
+
+def f() -> int:
+    let x: int = 1
+    del x
+    return x
+
+def main() -> None:
+    if f() != 7:
+        raise ValueError("del did not unbind the slot")
+
+main()
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    /// Ineligible fallbacks: functions using `global`, `nonlocal`, a nested
+    /// `def`, or a comprehension keep the classic Env path and behave
+    /// identically.
+    #[test]
+    fn slot_ineligible_fallbacks() {
+        let src = r#"
+counter: int = 0
+
+def bump() -> None:
+    global counter
+    counter = counter + 1
+
+def make_adder(base: int) -> object:
+    def add(x: int) -> int:
+        return base + x
+    return add
+
+def with_comprehension(n: int) -> int:
+    let squares: list[int] = [i * i for i in range(n)]
+    mut total: int = 0
+    for s in squares:
+        total = total + s
+    return total
+
+def outer() -> int:
+    mut acc: int = 0
+    def inner() -> None:
+        nonlocal acc
+        acc = acc + 5
+    inner()
+    inner()
+    return acc
+
+def main() -> None:
+    bump()
+    bump()
+    if counter != 2:
+        raise ValueError("global fallback wrong")
+    let add3 = make_adder(3)
+    if add3(4) != 7:
+        raise ValueError("closure fallback wrong")
+    if with_comprehension(4) != 14:
+        raise ValueError("comprehension fallback wrong")
+    if outer() != 10:
+        raise ValueError("nonlocal fallback wrong")
+
+main()
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    /// Closures still capture the enclosing frame correctly even though the
+    /// capturing function itself is ineligible (nested def).
+    #[test]
+    fn slot_closures_capture_correctly() {
+        let src = r#"
+def make_counter() -> object:
+    mut n: int = 0
+    def inc() -> int:
+        nonlocal n
+        n = n + 1
+        return n
+    return inc
+
+def main() -> None:
+    let c = make_counter()
+    if c() != 1 or c() != 2 or c() != 3:
+        raise ValueError("closure capture wrong")
+    let d = make_counter()
+    if d() != 1:
+        raise ValueError("second closure shares state")
+
+main()
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    /// A slot-eligible method (its `self` parameter is slot 0) dispatches and
+    /// reads instance fields correctly across many calls.
+    #[test]
+    fn slot_eligible_method() {
+        let src = r#"
+class Point:
+    x: float
+    y: float
+
+impl Point:
+    def dist2(self) -> float:
+        return self.x * self.x + self.y * self.y
+
+def main() -> None:
+    mut total: float = 0.0
+    mut i: int = 0
+    while i < 5:
+        let p: Point = Point(x=1.5, y=2.0)
+        total = total + p.dist2()
+        i = i + 1
+    if total != 31.25:
+        raise ValueError("method slot dispatch wrong")
+
+main()
 "#;
         assert_eq!(run_capturing(src).unwrap(), 0);
     }

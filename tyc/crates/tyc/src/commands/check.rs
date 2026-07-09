@@ -381,12 +381,29 @@ pub fn run(args: CheckArgs) -> Result<()> {
             // 100-LOC files this is a small win, but on larger trees
             // it adds up — each preprocess walks the full source and
             // each `parse_module` call rebuilds the ruff AST.
+            // Resolve the optimise-gated `auto-parallel` knob the same way
+            // `TyphonConfig::resolve_optimise` would (level 1 flips its default
+            // on) without mutating the loaded config, so the
+            // `parallel_opportunity` advice stays silent when the rewrite is
+            // already enabled.
+            let auto_parallel = config
+                .strictness
+                .auto_parallel
+                .unwrap_or(config.optimise.level >= 1);
             let analysis_diags = run_secondary_passes(
                 &path.to_string_lossy(),
                 &source,
                 has_project_config.then_some(&vetting_ctx),
-                config.strictness.allow_secret_comptime,
-                config.strictness.suggest_gather,
+                tyc_analyse::LintOptions {
+                    allow_secret_comptime: config.strictness.allow_secret_comptime,
+                    suggest_gather: config.strictness.suggest_gather,
+                    suggest_perf: config.strictness.suggest_perf,
+                    suggest_parallel: config.strictness.suggest_parallel,
+                    free_threaded: config.python.free_threaded,
+                    auto_parallel,
+                    auto_parallel_reductions: config.strictness.auto_parallel_reductions,
+                    parallel_min_size: config.strictness.parallel_min_size,
+                },
             );
             diags.extend(analysis_diags);
         }
@@ -545,6 +562,7 @@ pub fn run(args: CheckArgs) -> Result<()> {
                 check: false,
                 no_sync: true,
                 with_ty: true,
+                optimise: false,
             })?;
         }
     }
@@ -794,208 +812,12 @@ fn unique_code_count(items: &[TycError]) -> usize {
     codes.len()
 }
 
-/// Python 3.13 stdlib top-level module names. A project `.ty` file
-/// whose stem matches one of these will be emitted as `build/<name>.py`,
-/// and when `build/` is on `sys.path` (the default for `python
-/// build/main.py`) any transitive stdlib `import <name>` will resolve
-/// to the user module instead of the stdlib — leading to mystifying
-/// `ImportError`s blamed on innocent stdlib packages. R2-4.
-///
-/// The list is intentionally restricted to top-level modules whose
-/// names collide with names users naturally pick for application
-/// modules. Subpackages (`urllib.parse`, `xml.etree`) are excluded
-/// because a top-level `.ty` file with that name is impossible.
-const STDLIB_TOP_LEVEL: &[&str] = &[
-    "abc",
-    "argparse",
-    "array",
-    "ast",
-    "asyncio",
-    "atexit",
-    "audioop",
-    "base64",
-    "bdb",
-    "bisect",
-    "builtins",
-    "bz2",
-    "calendar",
-    "cmath",
-    "cmd",
-    "code",
-    "codecs",
-    "codeop",
-    "collections",
-    "colorsys",
-    "compileall",
-    "concurrent",
-    "configparser",
-    "contextlib",
-    "contextvars",
-    "copy",
-    "copyreg",
-    "cProfile",
-    "csv",
-    "ctypes",
-    "curses",
-    "dataclasses",
-    "datetime",
-    "dbm",
-    "decimal",
-    "difflib",
-    "dis",
-    "doctest",
-    "email",
-    "encodings",
-    "enum",
-    "errno",
-    "faulthandler",
-    "fcntl",
-    "filecmp",
-    "fileinput",
-    "fnmatch",
-    "fractions",
-    "ftplib",
-    "functools",
-    "gc",
-    "getopt",
-    "getpass",
-    "gettext",
-    "glob",
-    "graphlib",
-    "gzip",
-    "hashlib",
-    "heapq",
-    "hmac",
-    "html",
-    "http",
-    "imaplib",
-    "importlib",
-    "inspect",
-    "io",
-    "ipaddress",
-    "itertools",
-    "json",
-    "keyword",
-    "linecache",
-    "locale",
-    "logging",
-    "lzma",
-    "mailbox",
-    "marshal",
-    "math",
-    "mimetypes",
-    "mmap",
-    "modulefinder",
-    "multiprocessing",
-    "netrc",
-    "numbers",
-    "operator",
-    "optparse",
-    "os",
-    // `parser` was removed in Python 3.10 but is still a name users
-    // reach for (and historically a stdlib module), so we keep warning
-    // on it — `parser.py` on `sys.path` is confusing regardless. B3.
-    "parser",
-    "pathlib",
-    "pdb",
-    "pickle",
-    "pickletools",
-    "pkgutil",
-    "platform",
-    "plistlib",
-    "poplib",
-    "posix",
-    "posixpath",
-    "pprint",
-    "profile",
-    "pstats",
-    "pty",
-    "pwd",
-    "py_compile",
-    "pyclbr",
-    "pydoc",
-    "queue",
-    "quopri",
-    "random",
-    "re",
-    "readline",
-    "reprlib",
-    "resource",
-    "rlcompleter",
-    "runpy",
-    "sched",
-    "secrets",
-    "select",
-    "selectors",
-    "shelve",
-    "shlex",
-    "shutil",
-    "signal",
-    "site",
-    "smtplib",
-    "socket",
-    "socketserver",
-    "sqlite3",
-    "ssl",
-    "stat",
-    "statistics",
-    "string",
-    "stringprep",
-    "struct",
-    "subprocess",
-    "symtable",
-    "sys",
-    "sysconfig",
-    "syslog",
-    "tabnanny",
-    "tarfile",
-    "telnetlib",
-    "tempfile",
-    "termios",
-    "test",
-    "textwrap",
-    "this",
-    "threading",
-    "time",
-    "timeit",
-    "tkinter",
-    "token",
-    "tokenize",
-    "tomllib",
-    "trace",
-    "traceback",
-    "tracemalloc",
-    "tty",
-    "turtle",
-    "types",
-    "typing",
-    "unicodedata",
-    "unittest",
-    "urllib",
-    "uu",
-    "uuid",
-    "venv",
-    "warnings",
-    "wave",
-    "weakref",
-    "webbrowser",
-    "winreg",
-    "winsound",
-    "wsgiref",
-    "xdrlib",
-    "xml",
-    "xmlrpc",
-    "zipapp",
-    "zipfile",
-    "zipimport",
-    "zlib",
-    "zoneinfo",
-];
-
 /// True when `name` is the top-level name of a Python stdlib module
-/// that would be shadowed by an emitted `build/<name>.py`.
+/// that would be shadowed by an emitted `build/<name>.py`. Delegates to
+/// the single shared table in `tyc-analyse` (also consumed by
+/// `tyc::lazy_import_opportunity`) so the two lints can't drift apart.
 pub(crate) fn stdlib_top_level_contains(name: &str) -> bool {
-    STDLIB_TOP_LEVEL.contains(&name)
+    tyc_analyse::is_stdlib_top_level(name)
 }
 
 /// Emit a `stdlib_module_shadow` warning if `path`'s stem collides
@@ -1084,8 +906,7 @@ fn run_secondary_passes(
     path: &str,
     source: &str,
     vetting_ctx: Option<&ImportVettingContext>,
-    allow_secret_comptime: bool,
-    suggest_gather: bool,
+    lint_opts: tyc_analyse::LintOptions,
 ) -> Diagnostics {
     let mut diags = Diagnostics::new();
     let expanded = expand_for_check(source);
@@ -1135,19 +956,29 @@ fn run_secondary_passes(
     diags.extend(purity_diags);
 
     // The pure-AST advisory lints (empty-collection, typing-alias,
-    // mutable-default, `is`-literal, loop-closure, secret-literal, and the
-    // `gather_opportunity` concurrency nudge) are shared verbatim with the
-    // LSP via `editor_lint_diagnostics`, so the editor and `tyc check`
-    // never drift. Spans are offsets into `prep.python_source`, the
-    // preprocessed module these were parsed from.
+    // mutable-default, `is`-literal, loop-closure, secret-literal, the
+    // `gather_opportunity` concurrency nudge, and the `perf_*` /
+    // `lazy_import_opportunity` family) are shared verbatim with the LSP via
+    // `editor_lint_diagnostics`, so the editor and `tyc check` never drift.
+    // Spans are offsets into `prep.python_source`, the preprocessed module
+    // these were parsed from. `perf_ctx` carries the preprocess-derived facts
+    // `lazy_import_opportunity` needs (already-lazy aliases, `pub` names,
+    // `pub *`).
+    let perf_ctx = tyc_analyse::PerfLintContext {
+        lazy_import_aliases: prep
+            .lazy_imports
+            .iter()
+            .map(|li| li.alias.clone())
+            .collect(),
+        pub_names: prep.pub_names.clone(),
+        has_pub_star: !prep.pub_star_lines.is_empty(),
+    };
     diags.extend(editor_lint_diagnostics(
         &module,
         path,
         &prep.python_source,
-        tyc_analyse::LintOptions {
-            allow_secret_comptime,
-            suggest_gather,
-        },
+        lint_opts,
+        &perf_ctx,
     ));
 
     if let Some(ctx) = vetting_ctx {

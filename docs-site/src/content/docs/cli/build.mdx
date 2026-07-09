@@ -6,7 +6,7 @@ sidebar:
 ---
 
 ```
-tyc build [--out DIR] [--no-format] [--check]
+tyc build [--out DIR] [--no-format] [--check] [--optimise]
 ```
 
 Runs the full compilation pipeline and writes the emitted Python to the output directory (default `build/`, configurable via `[project] out`).
@@ -18,6 +18,7 @@ tyc build                       # full project → build/
 tyc build --out dist/           # → dist/ instead
 tyc build --no-format           # skip the ruff format post-process
 tyc build --check               # dry-run: list every file that would be written
+tyc build -O                    # apply [optimise] level = 1 for this invocation
 ```
 
 ## What it produces
@@ -64,6 +65,7 @@ Each stage is a Salsa query; on incremental rebuilds, only invalidated outputs a
 | `--out DIR` (`-o`) | Override the `[project] out` directory. Relative paths resolve against the project root. |
 | `--no-format` | Skip the `ruff format` post-process. |
 | `--check` | Dry-run mode. The full pipeline still runs (so type errors continue to surface), but no files are written — instead, every file that *would* be created or overwritten is listed. Useful for previewing the effect of a `class-default` or `skip-decoration-bases` change before committing to disk. |
+| `--optimise` / `-O` (alias `--optimize`) | Apply [`[optimise] level = 1`](/Typhon/configuration/overview/#optimise) for this invocation — flips the default of `auto-memoise`, `auto-gather`, `auto-parallel`, and `pgo-memoise` to on. Overrides a config `level = 0`, but an explicit [`[strictness]`](/Typhon/configuration/strictness/) entry for any of those knobs still wins. |
 
 ## `.py` files alongside `.ty`
 

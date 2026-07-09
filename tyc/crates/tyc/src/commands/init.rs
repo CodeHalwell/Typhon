@@ -150,6 +150,9 @@ out = "build"
 target = "3.13"
 # free-threaded = true   # opt into Python 3.13t free-threaded build
 
+# [optimise]
+# level = 1   # enable auto-memoise/auto-gather/auto-parallel/pgo-memoise
+
 [emit]
 class-default = "dataclass"     # only "dataclass" today; use the `model` keyword per class for pydantic
 format = true                   # post-process emitted Python through ruff format
@@ -336,5 +339,31 @@ mod tests {
             toml.contains("allow-secret-comptime = false"),
             "allow-secret-comptime missing from generated typhon.toml:\n{toml}"
         );
+    }
+
+    #[test]
+    fn scaffold_typhon_toml_hints_optimise_level_and_still_parses() {
+        let tmp = tempfile::tempdir().unwrap();
+        run(InitArgs {
+            name: Some("opt".into()),
+            dir: tmp.path().to_path_buf(),
+        })
+        .unwrap();
+        let toml = std::fs::read_to_string(tmp.path().join("opt/typhon.toml")).unwrap();
+        // The hint is present, commented (so the default stays level 0), and
+        // names the four knobs it flips.
+        assert!(
+            toml.contains("# [optimise]") && toml.contains("# level = 1"),
+            "commented [optimise] hint missing from generated typhon.toml:\n{toml}"
+        );
+        assert!(
+            toml.contains("auto-memoise") && toml.contains("pgo-memoise"),
+            "optimise hint should name the flipped knobs:\n{toml}"
+        );
+        // The generated scaffold must remain valid, parseable config with the
+        // hint commented out (level defaults to 0).
+        let cfg: crate::config::TyphonConfig =
+            toml::from_str(&toml).expect("generated typhon.toml must parse");
+        assert_eq!(cfg.optimise.level, 0);
     }
 }

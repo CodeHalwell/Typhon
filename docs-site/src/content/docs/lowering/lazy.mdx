@@ -50,6 +50,16 @@ import { Tabs, TabItem } from '@astrojs/starlight/components';
 
 Thread-safe (double-checked locking), one-shot. No `typhon_runtime` dependency — the proxy is inlined.
 
+### On a 3.15+ target: native PEP 810 instead
+
+When `[python] target` is `"3.15"` / `"3.15t"`, the proxy-class lowering above is skipped entirely. `tyc build` instead emits the native [PEP 810](https://peps.python.org/pep-0810/) statement:
+
+```python
+lazy import numpy as np
+```
+
+No proxy class, no `typhon_runtime` dependency at all for this feature — a project whose only runtime-touching construct was `lazy import` ships no generated `typhon_runtime/` package on a 3.15+ target. `3.13` / `3.14` targets keep the proxy-class emission above, byte-for-byte unchanged.
+
 ## `lazy let` (module-level) → `lazy_let`
 
 <Tabs>

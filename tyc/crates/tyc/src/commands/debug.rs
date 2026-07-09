@@ -227,6 +227,7 @@ pub fn run(args: DebugArgs) -> Result<()> {
             check: false,
             no_sync: false,
             with_ty: false,
+            optimise: false,
         })?;
     }
 

@@ -12,9 +12,10 @@ use miette::{miette, Result};
 use tyc_analyse::{
     analyse_purity, collect_gatherable_async_fn_names, detect_missed_gathers,
     evaluate_comptime_with_functions, extract_builtin_extensions, load_profile_samples,
-    pgo_memoise_targets, purity_diagnostics, rewrite_auto_gather,
+    parallel_opportunity_diagnostics, pgo_memoise_targets, purity_diagnostics, rewrite_auto_gather,
     rewrite_builtin_extension_calls_tracking, rewrite_parallel_comprehensions,
-    substitute_comptime_literals, ProfileSample,
+    rewrite_reduction_loops, shared_mut_across_tasks_diagnostics, substitute_comptime_literals,
+    ProfileSample,
 };
 use tyc_db::{check_file_with_imports, extract_shapes_for_path, TycDatabase};
 use tyc_desugar::{desugar_module_with, DesugarOptions};
@@ -23,8 +24,8 @@ use tyc_emit::{emit_python_with_source_for_target, emit_stub};
 use tyc_format::format_source;
 use tyc_syntax::preprocess::{
     expand_gather_blocks, expand_go_calls, expand_inline_question_ops, expand_lazy_imports,
-    expand_multiline_guards, expand_pipes, expand_question_ops, expand_typed_let_unpack,
-    expand_with_chains, line_byte_starts, preprocess,
+    expand_lazy_lets, expand_multiline_guards, expand_pipes, expand_question_ops,
+    expand_typed_let_unpack, expand_with_chains, line_byte_starts, preprocess, LazyImport,
 };
 
 use crate::commands::util::{
@@ -67,6 +68,14 @@ pub struct BuildArgs {
     /// `ty` on `PATH` (`pip install ty` / `uv tool install ty`).
     #[arg(long)]
     pub with_ty: bool,
+
+    /// Enable level-1 optimisation for this invocation, as if
+    /// `[optimise] level = 1` were set in `typhon.toml` — flips the default
+    /// of `auto-memoise`, `auto-gather`, `auto-parallel`, and `pgo-memoise`
+    /// to on. An explicit `[strictness]` entry for any of those still wins,
+    /// so `-O` never overrides a knob you set by hand.
+    #[arg(short = 'O', long = "optimise", visible_alias = "optimize")]
+    pub optimise: bool,
 }
 
 pub fn run(args: BuildArgs) -> Result<()> {
@@ -141,6 +150,24 @@ pub fn run(args: BuildArgs) -> Result<()> {
             let err = TycError::invalid_config_value("checker.external", value, allowed, path);
             return Err(miette::Report::new_boxed(Box::new(err)));
         }
+        Err(crate::config::ConfigError::InvalidOptimiseLevel { path, value }) => {
+            let err = TycError::invalid_config_value(
+                "optimise.level",
+                value.to_string(),
+                "0, 1".to_owned(),
+                path,
+            );
+            return Err(miette::Report::new_boxed(Box::new(err)));
+        }
+        Err(crate::config::ConfigError::InvalidParallelBackend {
+            path,
+            value,
+            allowed,
+        }) => {
+            let err =
+                TycError::invalid_config_value("strictness.parallel-backend", value, allowed, path);
+            return Err(miette::Report::new_boxed(Box::new(err)));
+        }
         Err(e) => return Err(miette!("{e}")),
     };
 
@@ -160,6 +187,17 @@ pub fn run(args: BuildArgs) -> Result<()> {
     };
 
     let do_format = config.emit.format && !args.no_format;
+    // PEP 810 (Python 3.15) ships native `lazy import` syntax with exactly
+    // the deferred-until-first-use semantics Typhon's bespoke lowering
+    // emulates. On a 3.15+ target, lower `lazy import ALIAS = MODULE` to the
+    // native `lazy import MODULE as ALIAS` form instead of the runtime-helper
+    // call. For 3.13 / 3.14 targets this is `false` and the emitted Python is
+    // byte-identical to before (a hard regression requirement). The check
+    // uses the full `(major, minor)` tuple so a future major bump still gates
+    // correctly. `tyc check` / `tyc run` / the REPL are unaffected — only
+    // `tyc build`'s emitted `.py` changes, and only on 3.15+.
+    let native_lazy_imports = crate::config::parse_python_target(&config.python.target)
+        .is_some_and(|major_minor| major_minor >= (3, 15));
     let check_mode = args.check;
     // Counter for `would write …` lines so the final summary is honest.
     let mut would_write_count: usize = 0;
@@ -205,6 +243,12 @@ pub fn run(args: BuildArgs) -> Result<()> {
     // time with ModuleNotFoundError when the user hasn't declared pydantic
     // explicitly.
     let mut config = config;
+    // Resolve the optimise-gated strictness knobs to concrete bools now that
+    // both the config's `[optimise] level` and the CLI `-O`/`--optimise` flag
+    // are known. After this, `config.strictness.{auto_memoise,auto_gather,
+    // auto_parallel,pgo_memoise}` are `Some(_)` and read with `.unwrap_or(false)`.
+    // An explicit `[strictness]` entry always wins over the level default.
+    config.resolve_optimise(args.optimise);
     if sources_use_model_keyword(&sources) && !config.dependencies.contains_key("pydantic") {
         config
             .dependencies
@@ -384,11 +428,12 @@ pub fn run(args: BuildArgs) -> Result<()> {
     // yields an empty map (PGO is best-effort), so projects that have not
     // yet run `tyc profile` simply fall through to the explicit-decorator
     // path.
-    let profile_samples: HashMap<String, ProfileSample> = if config.strictness.pgo_memoise {
-        load_profile_samples(&config_dir.join("typhon-profile.json"))
-    } else {
-        HashMap::new()
-    };
+    let profile_samples: HashMap<String, ProfileSample> =
+        if config.strictness.pgo_memoise.unwrap_or(false) {
+            load_profile_samples(&config_dir.join("typhon-profile.json"))
+        } else {
+            HashMap::new()
+        };
 
     // Phase 1.5: pre-collect every submodule's `pub`-marked names so
     // package `__init__.ty` files that opt in with `pub *` can have
@@ -444,15 +489,27 @@ pub fn run(args: BuildArgs) -> Result<()> {
         // Typhon line-prefix keywords (`val`/`var`/`model`/`impl`/`extend`/
         // `interface`/`unsafe`/`comptime`/`lazy`) stripped by `preprocess`.
         //
-        // Note `expand_lazy_imports` runs first so that `lazy import` lines
-        // become a full inline proxy class before the other sugar passes see
-        // them.
+        // Note the lazy-import pass runs first so that `lazy import` lines are
+        // handled before the other sugar passes see them. On a pre-3.15 target
+        // `expand_lazy_imports` rewrites each `lazy import ALIAS = MODULE` into
+        // a runtime-helper call here; on a 3.15+ target we instead run
+        // `expand_lazy_lets` (which touches only `lazy let`), leaving the
+        // `lazy import` line for the main `preprocess` pass below to convert to
+        // `import MODULE as ALIAS` and record in `prep.lazy_imports`. The
+        // recorded aliases drive the post-emit rewrite to native PEP 810
+        // syntax further down. (This mirrors the VM / check paths, which
+        // already use `expand_lazy_lets` + the `import … as …` rewrite.)
+        let lazy_expanded = if native_lazy_imports {
+            expand_lazy_lets(&expand_typed_let_unpack(source))
+        } else {
+            expand_lazy_imports(&expand_typed_let_unpack(source))
+        };
         // The inline `?` pass runs before the end-of-line `?` pass so
         // `Ok(f(x)?)`-shaped sub-expressions get lifted into temps
         // first. O17 / FINDINGS #66 / R3.13 / E9.
         let expanded = expand_question_ops(&expand_inline_question_ops(&expand_pipes(
             &expand_with_chains(&expand_go_calls(&expand_gather_blocks(
-                &expand_multiline_guards(&expand_lazy_imports(&expand_typed_let_unpack(source))),
+                &expand_multiline_guards(&lazy_expanded),
             ))),
         )));
         let mut prep = preprocess(&expanded);
@@ -677,7 +734,8 @@ pub fn run(args: BuildArgs) -> Result<()> {
         // Phase 3 purity analysis: every `@pure` / `@memo` function is verified
         // against the six-condition rule, and the desugarer is told which
         // functions to wrap in `@functools.cache`.
-        let purity_findings = analyse_purity(&module, config.strictness.auto_memoise);
+        let purity_findings =
+            analyse_purity(&module, config.strictness.auto_memoise.unwrap_or(false));
         let purity_diags = purity_diagnostics(&purity_findings, &path.to_string_lossy(), source);
         if purity_diags.has_errors() {
             for err in purity_diags.errors() {
@@ -732,7 +790,7 @@ pub fn run(args: BuildArgs) -> Result<()> {
         // `import asyncio` if it isn't already in scope, so no extra
         // wiring is needed here.
         let mut module = module;
-        if config.strictness.auto_gather {
+        if config.strictness.auto_gather.unwrap_or(false) {
             // Surface runs that would have been gathered if every callee
             // carried `@gatherable`. Advice-only; doesn't block builds.
             // Print directly through miette so the rendered output shows
@@ -805,6 +863,70 @@ pub fn run(args: BuildArgs) -> Result<()> {
                 &module,
                 &path.to_string_lossy(),
                 &prep.python_source,
+            )
+            .warnings()
+            {
+                eprintln!("{:?}", miette::Report::new_boxed(Box::new(advice.clone())));
+            }
+        }
+
+        // Default-on performance-advice family (`tyc::perf_*` +
+        // `tyc::lazy_import_opportunity`). Same detectors the `check` command
+        // and the LSP run via `editor_lint_diagnostics`; advice-only, never
+        // blocks a build, silenced by `[strictness] suggest-perf = false`.
+        if config.strictness.suggest_perf {
+            let perf_ctx = tyc_analyse::PerfLintContext {
+                lazy_import_aliases: prep
+                    .lazy_imports
+                    .iter()
+                    .map(|li| li.alias.clone())
+                    .collect(),
+                pub_names: prep.pub_names.clone(),
+                has_pub_star: !prep.pub_star_lines.is_empty(),
+            };
+            for advice in tyc_analyse::perf_diagnostics(
+                &module,
+                &path.to_string_lossy(),
+                &prep.python_source,
+                &perf_ctx,
+            )
+            .warnings()
+            {
+                eprintln!("{:?}", miette::Report::new_boxed(Box::new(advice.clone())));
+            }
+        }
+
+        // Default-on free-threading advice: `tyc::parallel_opportunity`
+        // (a comprehension / accumulator loop that could be parallelised) and
+        // `tyc::shared_mut_across_tasks` (a `go`-spawned callee that writes
+        // shared mutable state). Both only fire when the project targets
+        // free-threaded Python — the gate that keeps the example / stress
+        // corpus quiet — and are silenced by `[strictness] suggest-parallel =
+        // false`. Run *before* the auto-parallel / reduction rewrites so the
+        // original comprehension / loop shapes are still present.
+        if config.strictness.suggest_parallel && config.python.free_threaded {
+            for advice in shared_mut_across_tasks_diagnostics(
+                &module,
+                &path.to_string_lossy(),
+                &prep.python_source,
+            )
+            .warnings()
+            {
+                eprintln!("{:?}", miette::Report::new_boxed(Box::new(advice.clone())));
+            }
+            let pure_names: std::collections::HashSet<String> = purity_findings
+                .iter()
+                .filter(|f| f.violation.is_none())
+                .map(|f| f.name.clone())
+                .collect();
+            for advice in parallel_opportunity_diagnostics(
+                &module,
+                &path.to_string_lossy(),
+                &prep.python_source,
+                &pure_names,
+                config.strictness.parallel_min_size,
+                config.strictness.auto_parallel.unwrap_or(false),
+                config.strictness.auto_parallel_reductions,
             )
             .warnings()
             {
@@ -892,19 +1014,34 @@ pub fn run(args: BuildArgs) -> Result<()> {
         // Combine with `[python] free-threaded = true` for real parallelism;
         // on stock CPython the rewrite still happens but the GIL serialises
         // the workers (correctness preserved, no speedup).
-        if config.strictness.auto_parallel {
+        if config.strictness.auto_parallel.unwrap_or(false) {
             let pure_names: std::collections::HashSet<String> = purity_findings
                 .iter()
                 .filter(|f| f.violation.is_none())
                 .map(|f| f.name.clone())
                 .collect();
-            if !pure_names.is_empty() {
-                let stats = rewrite_parallel_comprehensions(
+            let stats = rewrite_parallel_comprehensions(
+                &mut module,
+                &pure_names,
+                config.strictness.parallel_min_size,
+            );
+            if stats.rewrites > 0 {
+                needs_runtime = true;
+            }
+            // Integer accumulator-loop reductions, gated additionally on
+            // `[strictness] auto-parallel-reductions`. Shares the pure-name
+            // set with the comprehension rewrite; `total += EXPR` over a pure
+            // body and a `mut total: int` accumulator becomes
+            // `total += sum(map_pure(lambda x: EXPR, ITER))`. Integers only —
+            // reordering float addition changes results, so floats are never
+            // rewritten (they surface as `tyc::parallel_opportunity` advice).
+            if config.strictness.auto_parallel_reductions {
+                let rstats = rewrite_reduction_loops(
                     &mut module,
                     &pure_names,
                     config.strictness.parallel_min_size,
                 );
-                if stats.rewrites > 0 {
+                if rstats.rewrites > 0 {
                     needs_runtime = true;
                 }
             }
@@ -959,6 +1096,21 @@ pub fn run(args: BuildArgs) -> Result<()> {
             if let Ok(result) = format_source(&python_src, &path_str) {
                 python_src = result.output;
             }
+        }
+
+        // PEP 810 native lazy-import lowering (3.15+ targets only). The
+        // emitter has printed each recorded `lazy import ALIAS = MODULE` as a
+        // plain `import MODULE as ALIAS`; prefix `lazy ` on the matching
+        // module-level line so the artifact carries the native syntax. This
+        // runs AFTER the formatter deliberately: the vendored ruff parser
+        // (and an installed `ruff` on `$PATH`) can't parse `lazy import`, so
+        // prefixing earlier would make `format_source` fail its parse step and
+        // silently drop all formatting. Prefixing here keeps the plain-Python
+        // buffer formattable and only stamps the keyword on at the very end.
+        // The rewrite prepends to existing lines (no line-count change), so
+        // the `.py.map` sidecar stays valid at line granularity.
+        if native_lazy_imports && !prep.lazy_imports.is_empty() {
+            python_src = prefix_native_lazy_imports(&python_src, &prep.lazy_imports);
         }
 
         let rel = path
@@ -1195,13 +1347,16 @@ pub fn run(args: BuildArgs) -> Result<()> {
     // separate PyPI package.
     if needs_runtime {
         let runtime_dir = out_dir.join("typhon_runtime");
+        // `parallel.py` is parameterised by the configured execution backend
+        // (`[strictness] parallel-backend`); the rest are static.
+        let parallel_py = typhon_runtime_parallel_py(&config.strictness.parallel_backend);
         let files = [
             ("__init__.py", TYPHON_RUNTIME_INIT_PY),
             ("tasks.py", TYPHON_RUNTIME_TASKS_PY),
             ("lazy.py", TYPHON_RUNTIME_LAZY_PY),
             ("stdlib.py", TYPHON_RUNTIME_STDLIB_PY),
             ("result.py", TYPHON_RUNTIME_RESULT_PY),
-            ("parallel.py", TYPHON_RUNTIME_PARALLEL_PY),
+            ("parallel.py", parallel_py.as_str()),
             ("freeze.py", TYPHON_RUNTIME_FREEZE_PY),
             ("cast.py", TYPHON_RUNTIME_CAST_PY),
             ("traceback.py", TYPHON_RUNTIME_TRACEBACK_PY),
@@ -2010,6 +2165,65 @@ fn parse_python_minor(target: &str) -> u8 {
     // Strip any trailing alphabetical suffix ("t" for free-threaded).
     let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
     digits.parse::<u8>().unwrap_or(0)
+}
+
+/// Rewrite the emitted Python so each recorded `lazy import ALIAS = MODULE`
+/// carries native PEP 810 syntax on a Python 3.15+ target.
+///
+/// On the 3.15+ build path the main preprocessor lowered every
+/// `lazy import ALIAS = MODULE` to a plain `import MODULE as ALIAS`
+/// statement and recorded the `(alias, module)` pair in
+/// `prep.lazy_imports`. This pass finds the matching emitted line and
+/// prepends the `lazy ` keyword, producing `lazy import MODULE as ALIAS`
+/// — the native deferred-import form CPython 3.15 understands directly.
+///
+/// Matching rules (deliberately conservative):
+///   * Only **module-level** lines (no leading indentation) are eligible —
+///     a `lazy import` is only recognised at column 0 upstream, so an
+///     indented `import numpy as np` inside a function is never a lazy one.
+///   * The line's code must equal exactly `import MODULE as ALIAS`. For the
+///     `alias == module` case the emitter prints `import numpy as numpy`
+///     (it never elides a redundant `as`); a bare `import MODULE` is also
+///     accepted there as a defensive fallback in case a formatter collapses
+///     the redundant alias.
+///   * Each recorded lazy import claims the **first** unclaimed matching
+///     line, and at most one line. A recorded import with no matching line
+///     is skipped, leaving that line untouched rather than corrupting the
+///     file.
+///
+/// Prepending never changes the line count, so the `.py.map` sidecar (built
+/// from the pre-format emit offsets) stays valid at line granularity.
+fn prefix_native_lazy_imports(src: &str, lazy_imports: &[LazyImport]) -> String {
+    let mut claimed = vec![false; lazy_imports.len()];
+    let mut out = String::with_capacity(src.len() + lazy_imports.len() * 5);
+    for line in src.split_inclusive('\n') {
+        let content = line.trim_end_matches(['\n', '\r']);
+        let trailing = &line[content.len()..];
+        let mut prefixed = false;
+        // Module level only: reject any line that starts with whitespace.
+        if !content.starts_with([' ', '\t']) {
+            for (i, li) in lazy_imports.iter().enumerate() {
+                if claimed[i] {
+                    continue;
+                }
+                let want_as = format!("import {} as {}", li.module, li.alias);
+                let matches = content == want_as
+                    || (li.alias == li.module && content == format!("import {}", li.module));
+                if matches {
+                    out.push_str("lazy ");
+                    out.push_str(content);
+                    out.push_str(trailing);
+                    claimed[i] = true;
+                    prefixed = true;
+                    break;
+                }
+            }
+        }
+        if !prefixed {
+            out.push_str(line);
+        }
+    }
+    out
 }
 
 /// Minimal JSON string escape for paths used in the `.py.map` body.  Only
@@ -3109,9 +3323,48 @@ def _remap(text, state):
     return _FRAME_RE.sub(repl, text)
 ";
 
-const TYPHON_RUNTIME_PARALLEL_PY: &str = "\
+/// Render `typhon_runtime/parallel.py`, baking the auto-parallel execution
+/// backend (`[strictness] parallel-backend`) in as the module-level
+/// `_BACKEND` constant.
+///
+/// * `"threads"` (the default) runs `map_pure` on a `ThreadPoolExecutor` —
+///   order-preserving, and on a free-threaded CPython build (3.13t/3.14t) it
+///   escapes the GIL for real parallelism; on the stock GIL build the workers
+///   serialise but the results are identical.
+/// * `"interpreters"` first tries a PEP 734
+///   `concurrent.futures.InterpreterPoolExecutor` (Python 3.14+) and falls
+///   back **transparently** to the thread pool on `ImportError` /
+///   `AttributeError` (older runtimes) or when the mapped function can't be
+///   pickled across the interpreter boundary. Pickling an unshareable
+///   callable raises `pickle.PicklingError` / `AttributeError` (a lambda or
+///   closure), not the `TypeError` an earlier revision caught — so the
+///   generated helper *probes* `pickle.dumps(fn)` up front and falls back on
+///   any serialisation failure, without ever wrapping the task execution in
+///   a broad `except` (an exception raised *by* `fn` in a worker still
+///   propagates exactly as the thread path propagates it). Because the
+///   auto-parallel rewrites always pass lambdas, rewritten call sites run on
+///   the thread pool even under this backend today; the interpreters pool
+///   benefits hand-written `map_pure` calls passing top-level named
+///   functions.
+///
+/// Order is preserved on every path. The `_try_interpreters` helper and the
+/// backend switch are emitted for both settings, so the only difference
+/// between the two generated files is the `_BACKEND` value — the thread path
+/// is behaviourally identical to the historical single-backend runtime.
+fn typhon_runtime_parallel_py(backend: &str) -> String {
+    // Config load already validated the value; guard anyway so an unexpected
+    // string degrades to the safe thread pool rather than an unknown backend.
+    let backend = if backend == "interpreters" {
+        "interpreters"
+    } else {
+        "threads"
+    };
+    TYPHON_RUNTIME_PARALLEL_PY_TEMPLATE.replace("@BACKEND@", backend)
+}
+
+const TYPHON_RUNTIME_PARALLEL_PY_TEMPLATE: &str = "\
 # generated by tyc — do not edit
-\"\"\"Thread-pool helpers backing Typhon's auto-parallel rewrite.\"\"\"
+\"\"\"Parallel-map helpers backing Typhon's auto-parallel rewrite.\"\"\"
 from __future__ import annotations
 
 import os
@@ -3121,6 +3374,9 @@ from typing import Callable, Iterable, TypeVar
 _T = TypeVar(\"_T\")
 _R = TypeVar(\"_R\")
 
+# Execution backend, baked in at build time from `[strictness] parallel-backend`.
+_BACKEND = \"@BACKEND@\"
+
 
 def map_pure(
     fn: Callable[[_T], _R],
@@ -3128,26 +3384,83 @@ def map_pure(
     *,
     max_workers: int | None = None,
 ) -> list[_R]:
-    \"\"\"Apply ``fn`` to every element of ``iterable`` across a thread pool.
+    \"\"\"Apply ``fn`` to every element of ``iterable``, preserving input order.
 
-    The result list preserves input order. ``fn`` must be pure (the
-    Typhon analyser proves this before emitting calls into this
-    helper); calling with a side-effecting function defeats the
+    ``fn`` must be pure (the Typhon analyser proves this before emitting calls
+    into this helper); calling with a side-effecting function defeats the
     parallelism guarantees.
 
-    On a free-threaded CPython build (3.13t / 3.14t) workers run with
-    no GIL contention. On the stock CPython build the GIL serialises
-    the workers — correctness is preserved but no speedup is observed.
+    With the ``\"threads\"`` backend, or when the ``\"interpreters\"`` backend
+    can't be used, work runs on a ``ThreadPoolExecutor``. On a free-threaded
+    CPython build (3.13t / 3.14t) the workers run with no GIL contention; on the
+    stock CPython build the GIL serialises them — correctness is preserved but
+    no speedup is observed. With the ``\"interpreters\"`` backend a PEP 734
+    ``InterpreterPoolExecutor`` (Python 3.14+) is tried first, falling back to
+    the thread pool transparently. Note: crossing the interpreter boundary
+    requires ``fn`` to pickle, and the lambdas Typhon's auto-parallel rewrites
+    emit never do — so rewritten call sites always run on the thread pool
+    today; the interpreters pool benefits hand-written ``map_pure`` calls that
+    pass a top-level named function.
     \"\"\"
-    # Materialise once to size the work and to keep ``ThreadPoolExecutor.map``
-    # from blocking on a slow generator while workers idle.
+    # Materialise once to size the work and to keep ``.map`` from blocking on a
+    # slow generator while workers idle.
     items = list(iterable)
     if not items:
         return []
     if max_workers is None:
         max_workers = min(32, (os.cpu_count() or 1) + 4)
+    if _BACKEND == \"interpreters\":
+        result = _try_interpreters(fn, items, max_workers)
+        if result is not None:
+            return result
+    # Thread-pool path: the default backend, and the interpreters fallback.
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
         return list(pool.map(fn, items))
+
+
+def _try_interpreters(
+    fn: Callable[[_T], _R],
+    items: list[_T],
+    max_workers: int,
+) -> list[_R] | None:
+    \"\"\"Attempt a PEP 734 sub-interpreter pool; return ``None`` to fall back.
+
+    Falls back (returns ``None``) when ``InterpreterPoolExecutor`` is
+    unavailable (Python < 3.14) or when the mapped function can't cross the
+    interpreter boundary. Crossing requires ``fn`` to pickle, and pickling an
+    unshareable callable raises ``pickle.PicklingError`` or ``AttributeError``
+    (a lambda / closure / local def), sometimes ``TypeError`` — so ``fn`` is
+    probed with ``pickle.dumps`` *before* any pool is created, where a failure
+    can only mean \"can't serialise fn\". The caller then reruns on the thread
+    pool; ``fn`` is pure, so the retry is free of observable effects and order
+    is preserved. In particular the lambdas Typhon's auto-parallel rewrites
+    emit never pickle, so rewritten call sites always take the thread pool.
+    \"\"\"
+    try:
+        from concurrent.futures import InterpreterPoolExecutor
+    except (ImportError, AttributeError):
+        return None
+    import pickle
+
+    # Pre-flight serialisation probe. Deliberately broad: any failure to
+    # pickle ``fn`` means it can't reach a sub-interpreter, whatever the
+    # exception type. This must stay a *probe* — never wrap the task
+    # execution below in a broad ``except``, or real exceptions raised by
+    # ``fn`` inside a worker would be swallowed instead of propagating the
+    # way the thread path propagates them.
+    try:
+        pickle.dumps(fn)
+    except Exception:
+        return None
+    try:
+        with InterpreterPoolExecutor(max_workers=max_workers) as pool:
+            return list(pool.map(fn, items))
+    except (TypeError, pickle.PicklingError):
+        # Submission-time serialisation failures only (e.g. an unpicklable
+        # *item*); ``fn`` is pure, so retrying on threads is observably
+        # identical — and a pure ``fn`` that itself raises one of these
+        # re-raises identically on the thread path.
+        return None
 ";
 
 #[cfg(test)]
@@ -3281,6 +3594,7 @@ mod tests {
             check: false,
             no_sync: false,
             with_ty: false,
+            optimise: false,
         })
         .expect("build must succeed despite the stdlib-shadow warning");
         assert!(
@@ -3300,6 +3614,7 @@ mod tests {
             check: false,
             no_sync: false,
             with_ty: false,
+            optimise: false,
         })
         .unwrap();
         assert!(
@@ -3320,6 +3635,7 @@ mod tests {
             check: false,
             no_sync: false,
             with_ty: false,
+            optimise: false,
         })
         .unwrap();
         assert!(
@@ -3339,6 +3655,7 @@ mod tests {
             check: false,
             no_sync: false,
             with_ty: false,
+            optimise: false,
         });
         assert!(result.is_err(), "build should fail on type mismatch");
     }
@@ -3381,6 +3698,7 @@ mod tests {
             check: false,
             no_sync: false,
             with_ty: false,
+            optimise: false,
         })
         .unwrap();
         let init_py =
@@ -3428,6 +3746,7 @@ mod tests {
             check: false,
             no_sync: false,
             with_ty: false,
+            optimise: false,
         })
         .unwrap();
         let py = std::fs::read_to_string(out_dir.join("main.py")).unwrap();
@@ -3452,6 +3771,7 @@ mod tests {
             check: false,
             no_sync: false,
             with_ty: false,
+            optimise: false,
         })
         .unwrap();
         // Phase 3 made `typhon_runtime` a package (with submodules `tasks`
@@ -3497,6 +3817,7 @@ async def load(id: int) -> None:
             check: false,
             no_sync: false,
             with_ty: false,
+            optimise: false,
         })
         .unwrap();
         let py = std::fs::read_to_string(out_dir.join("main.py")).unwrap();
@@ -3530,6 +3851,7 @@ let result: int = 3 |> double |> inc
             check: false,
             no_sync: false,
             with_ty: false,
+            optimise: false,
         })
         .unwrap();
         let py = std::fs::read_to_string(out_dir.join("main.py")).unwrap();
@@ -3558,6 +3880,7 @@ let result: int = 3 |> double |> inc
             check: false,
             no_sync: false,
             with_ty: false,
+            optimise: false,
         })
         .unwrap();
         let py = std::fs::read_to_string(out_dir.join("main.py")).unwrap();
@@ -3623,6 +3946,7 @@ class Foo:
             check: false,
             no_sync: false,
             with_ty: false,
+            optimise: false,
         })
         .unwrap();
         let py = std::fs::read_to_string(out_dir.join("main.py")).unwrap();
@@ -3649,6 +3973,7 @@ class Foo:
             check: false,
             no_sync: false,
             with_ty: false,
+            optimise: false,
         })
         .unwrap();
         let py = std::fs::read_to_string(out_dir.join("main.py")).unwrap();
@@ -3709,6 +4034,7 @@ def area(s: Shape) -> float:
             check: false,
             no_sync: false,
             with_ty: false,
+            optimise: false,
         })
         .unwrap();
         let py = std::fs::read_to_string(out_dir.join("main.py")).unwrap();
@@ -3743,6 +4069,7 @@ def area(s: Shape) -> float:
             check: false,
             no_sync: false,
             with_ty: false,
+            optimise: false,
         });
         // Verify the failure is specifically a type-checking error, not a
         // configuration or I/O error, by checking the returned error message.
@@ -3770,6 +4097,7 @@ def fib(n: int) -> int:
             check: false,
             no_sync: false,
             with_ty: false,
+            optimise: false,
         })
         .unwrap();
         let py = std::fs::read_to_string(out_dir.join("main.py")).unwrap();
@@ -3805,6 +4133,7 @@ let pet: Animal = Dog(name=\"Rex\")
             check: false,
             no_sync: false,
             with_ty: false,
+            optimise: false,
         });
         // Verify the failure is specifically a type-checking error (structural
         // conformance failure), not a configuration or I/O error.
@@ -3835,6 +4164,7 @@ def hot(n: int) -> int:
             check: false,
             no_sync: false,
             with_ty: false,
+            optimise: false,
         })
         .unwrap();
         let py = std::fs::read_to_string(out_dir.join("main.py")).unwrap();
@@ -3867,6 +4197,7 @@ def cold(n: int) -> int:
             check: false,
             no_sync: false,
             with_ty: false,
+            optimise: false,
         })
         .unwrap();
         let py = std::fs::read_to_string(out_dir.join("main.py")).unwrap();
@@ -3907,6 +4238,7 @@ def cold(n: int) -> int:
             check: false,
             no_sync: false,
             with_ty: false,
+            optimise: false,
         })
         .unwrap();
         let py = std::fs::read_to_string(out_dir.join("main.py")).unwrap();
@@ -3941,6 +4273,7 @@ async def load() -> int:
             check: false,
             no_sync: false,
             with_ty: false,
+            optimise: false,
         })
         .unwrap();
         let py = std::fs::read_to_string(out_dir.join("main.py")).unwrap();
@@ -3976,6 +4309,7 @@ async def load() -> int:
             check: false,
             no_sync: false,
             with_ty: false,
+            optimise: false,
         })
         .unwrap();
         let py = std::fs::read_to_string(out_dir.join("main.py")).unwrap();
@@ -4013,6 +4347,7 @@ async def load() -> int:
             check: false,
             no_sync: false,
             with_ty: false,
+            optimise: false,
         })
         .unwrap();
         let py = std::fs::read_to_string(out_dir.join("main.py")).unwrap();
@@ -4056,6 +4391,7 @@ async def load() -> int:
             check: false,
             no_sync: false,
             with_ty: false,
+            optimise: false,
         })
         .unwrap();
         let py = std::fs::read_to_string(out_dir.join("main.py")).unwrap();
@@ -4121,6 +4457,7 @@ async def load(uid: int) -> int:
             check: false,
             no_sync: true,
             with_ty: false,
+            optimise: false,
         })
         .unwrap();
         let py = std::fs::read_to_string(out_dir.join("main.py")).unwrap();
@@ -4163,6 +4500,7 @@ async def load(uid: int) -> int:
             check: false,
             no_sync: true,
             with_ty: false,
+            optimise: false,
         })
         .unwrap();
         let py = std::fs::read_to_string(out_dir.join("main.py")).unwrap();
@@ -4213,6 +4551,7 @@ async def load(uid: int) -> int:
             check: false,
             no_sync: false,
             with_ty: false,
+            optimise: false,
         })
         .unwrap();
         let map_path = out_dir.join(".sourcemaps").join("main.py.map");
@@ -4261,6 +4600,7 @@ let pet: Animal = Dog(name=\"Rex\")
             check: false,
             no_sync: false,
             with_ty: false,
+            optimise: false,
         })
         .unwrap();
         let py = std::fs::read_to_string(out_dir.join("main.py")).unwrap();
@@ -4289,6 +4629,7 @@ let pet: Animal = Dog(name=\"Rex\")
             check: false,
             no_sync: false,
             with_ty: false,
+            optimise: false,
         })
         .unwrap();
         assert!(
@@ -4325,6 +4666,7 @@ let pet: Animal = Dog(name=\"Rex\")
             check: false,
             no_sync: false,
             with_ty: false,
+            optimise: false,
         })
         .unwrap();
         assert!(
@@ -4350,6 +4692,7 @@ let pet: Animal = Dog(name=\"Rex\")
             check: true,
             no_sync: false,
             with_ty: false,
+            optimise: false,
         })
         .unwrap();
         assert!(
@@ -4373,6 +4716,7 @@ let pet: Animal = Dog(name=\"Rex\")
             check: true,
             no_sync: false,
             with_ty: false,
+            optimise: false,
         })
         .unwrap();
         assert!(!out_dir.join("main.py").exists());
@@ -4390,6 +4734,7 @@ let pet: Animal = Dog(name=\"Rex\")
             check: true,
             no_sync: false,
             with_ty: false,
+            optimise: false,
         });
         assert!(
             result.is_err(),
@@ -4429,6 +4774,7 @@ let pet: Animal = Dog(name=\"Rex\")
             check: false,
             no_sync: false,
             with_ty: false,
+            optimise: false,
         });
         std::env::remove_var("FAKE_API_KEY");
         assert!(

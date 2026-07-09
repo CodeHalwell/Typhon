@@ -1175,10 +1175,13 @@ async def middleware(next: Callable[[Req], Awaitable[Resp]], req: Req) -> Resp:
 
 ### Free-threaded mode
 
-`[python] free-threaded = true` (requires 3.13t / 3.14t):
+`[python] free-threaded = true` (requires 3.13t / 3.14t / 3.15t):
 
 - `go` on CPU-bound functions lowers to `ThreadPoolExecutor.submit`.
-- The analyser may parallelise pure-function comprehensions via `typhon_runtime.parallel.map_pure(...)`, gated by `[strictness] auto-parallel` and `[strictness] parallel-min-size` (default 64). Set, dict, and list comprehensions are all eligible (v0.5.0).
+- The analyser may parallelise pure-function comprehensions via `typhon_runtime.parallel.map_pure(...)`, gated by `[strictness] auto-parallel` and `[strictness] parallel-min-size` (default 64). Set, dict, and list comprehensions are all eligible (v0.5.0), including a pure `if` filter, extra literal/`let`-bound-invariant call arguments, and nested pure calls (`g(f(x))`).
+- `[strictness] auto-parallel-reductions` (requires `auto-parallel`) additionally parallelises `for x in xs: total += EXPR` accumulator loops with a **plain `int`** accumulator (`mut total: int`) and a pure `EXPR` — integer addition is exact/associative so partial sums combine identically in any order; `float` accumulators are never rewritten.
+- `[strictness] parallel-backend` (default `"threads"`) selects the executor `map_pure` uses; `"interpreters"` tries a PEP 734 `InterpreterPoolExecutor` (3.14+) first, falling back transparently to the thread pool on an older runtime or an unshareable mapped callable.
+- Two advice lints, both gated by `[strictness] suggest-parallel` (default `true`) and both silent unless `free-threaded = true`: `tyc::parallel_opportunity` nudges a parallelisable comprehension/reduction whose enabling knob is off (or a `float` accumulator that's ineligible only for its type); `tyc::shared_mut_across_tasks` flags a `go`-spawned same-module function that writes a `global` or module-level `mut` binding — a data race under real concurrency.
 - Every parallel block runtime-checks `sys._is_gil_enabled()` and falls back to sequential if a GIL build is detected.
 
 Default off until 3.14 is the default Python.
@@ -1193,6 +1196,8 @@ lazy from numpy import array     # ❌ rejected at parse time (PEP 690 reasoning
 ```
 
 `lazy from ... import` defeats deferral (it eagerly touches attributes on the source module) and is a hard parse error. Redirect to `lazy import` + dotted access.
+
+On a **3.15+ target**, `lazy import ALIAS = MODULE` lowers to the native [PEP 810](https://peps.python.org/pep-0810/) `lazy import MODULE as ALIAS` statement instead of the `__TyphonLazy_*` proxy class — no `typhon_runtime` dependency, and a project whose only runtime-touching feature was `lazy import` ships no generated `typhon_runtime/` package at all on that target. 3.13 / 3.14 output is unchanged.
 
 Other lazy forms:
 
@@ -1277,8 +1282,11 @@ src = "src"
 out = "build"
 
 [python]
-target = "3.13"                  # **required: 3.13+ only**. Valid: "3.13" / "3.13t" / "3.14" / "3.14t". Older values are rejected at config load.
-free-threaded = false            # requires 3.13t/3.14t; off by default
+target = "3.13"                  # **required: 3.13+ only**. Valid: "3.13" / "3.13t" / "3.14" / "3.14t" / "3.15" / "3.15t". Older values are rejected at config load. 3.15+ unlocks native PEP 810 lazy-import lowering (see §11).
+free-threaded = false            # requires 3.13t/3.14t/3.15t; off by default
+
+[optimise]
+level = 0                        # 0 (default) | 1 — flips auto-memoise/auto-gather/auto-parallel/pgo-memoise defaults to true. Explicit [strictness] entries always win. `tyc build -O` applies level 1 for one invocation.
 
 [emit]
 class-default = "dataclass"      # only "dataclass" today; project-wide "pydantic" is rejected (use `model` per class). Unknown values → tyc::invalid_config_value
@@ -1296,12 +1304,16 @@ methods-in-class-body = "warn"   # or "error" (break CI) | "off"
 require-with = "warn"            # severity for tyc::resource_not_managed
 blocking-in-async = "warn"       # severity for tyc::blocking_in_async
 stub-check = "error"             # severity for tyc::stub_mismatch
-auto-memoise = false             # opt-in; inserts @functools.cache on inferred pure fns
-auto-gather = false              # opt-in; folds independent awaits into TaskGroup (needs @gatherable)
-auto-parallel = false            # opt-in; pure list/set/dict comprehensions → thread-pool map
+auto-memoise = false             # opt-in; inserts @functools.cache on inferred pure fns (defaults true at [optimise] level = 1)
+auto-gather = false              # opt-in; folds independent awaits into TaskGroup (needs @gatherable; defaults true at level = 1)
+auto-parallel = false            # opt-in; pure list/set/dict comprehensions → thread-pool map (defaults true at level = 1)
+auto-parallel-reductions = false # opt-in; parallelises `mut total: int` accumulator loops (requires auto-parallel; int-only — exact/associative, floats never reordered)
 parallel-min-size = 64
-pgo-memoise = false              # opt-in; promotes hot pure fns from typhon-profile.json
+parallel-backend = "threads"     # or "interpreters" — PEP 734 InterpreterPoolExecutor (3.14+) with transparent fallback to threads
+pgo-memoise = false              # opt-in; promotes hot pure fns from typhon-profile.json (defaults true at level = 1)
 pgo-min-calls = 100
+suggest-perf = true              # advice: surfaces the tyc::perf_* micro-optimisation lint family
+suggest-parallel = true          # advice: surfaces tyc::parallel_opportunity / tyc::shared_mut_across_tasks (free-threaded only)
 unintrospectable-dependency = "warn"  # (v0.12.0) "warn" | "error" | "off" — declared dep imported but not introspectable
 allow-secret-comptime = false    # set true to silence tyc::contains_secret_literal
 
@@ -1326,6 +1338,8 @@ Notes on always-on behaviour:
 - **Pydantic emissions inject `model_config = ConfigDict(extra=…)`**, controlled by `model-extra`.
 - **`tyc::stdlib_module_shadow`** is gated on the presence of `typhon.toml` (standalone-file checks skip it).
 
+`[optimise] level` (default `0`) is a single project-wide dial: `level = 1` flips the *default* of `auto-memoise` / `auto-gather` / `auto-parallel` / `pgo-memoise` to `true`, but an explicit `[strictness]` entry for any of those four always wins over the level-derived default — so a project can opt into level 1 and still keep one knob off by setting it explicitly. `tyc build -O` / `--optimise` (alias `--optimize`) applies `level = 1` for a single invocation without editing `typhon.toml`; it overrides a config `level = 0` but never an explicit `[strictness]` setting.
+
 `[checker] external = "ty"` (v0.12.0) is the only path that type-checks against **typeshed**, so it covers C-extension and stdlib APIs that runtime venv introspection can't model. It spawns `ty check` over the build output and re-attributes diagnostics to `.ty` via `.py.map`. Requires `ty` on `PATH` (`pip install ty` / `uv tool install ty`); most useful with the project's deps installed in a venv. `--with-ty` on `tyc build` / `tyc check` runs the same pass for one invocation without editing `typhon.toml`.
 
 `unintrospectable-dependency` (v0.12.0) covers the most dangerous failure mode of third-party checking: a *skipped* check looked identical to a clean pass. It fires when a declared, imported dependency can't be introspected (no reachable `.venv` / `python3`, not installed, or no introspectable signatures). Clear it by installing deps (`uv sync`) or shipping a `.dty` stub. Per-top-level success tracking means a package whose root introspects fine isn't flagged because one submodule failed.
@@ -1333,6 +1347,8 @@ Notes on always-on behaviour:
 `allow-secret-comptime` (lives in `[strictness]`; wired through in v0.10.0, seeded into `tyc init`'s scaffold in v0.11.0) silences `tyc::contains_secret_literal` when set `true`.
 
 `traceback-remap` (v0.14.0, `[emit]`, default `false`) injects `typhon_runtime.traceback.install()` at the top of the entry module's `if __name__ == "__main__":` block. The installed `sys.excepthook` loads the emitted `.py.map` sidecars and rewrites each `File "…​.py", line N` traceback frame to the corresponding `.ty` location — the same mapping `tyc trace` applies, but automatically and only for the entry script (library imports never trip the `__main__` guard). It falls back to the previous hook on any failure, so it can only improve a traceback, never suppress one. Default-off keeps existing projects and runtime-free entry points byte-for-byte unchanged (a project with no other runtime feature stays free of the generated `typhon_runtime/` package).
+
+`auto-parallel-reductions` (requires `auto-parallel`) additionally parallelises integer accumulator loops — `for x in xs: total += EXPR` with `mut total: int` and a pure `EXPR` lowers to `total += sum(map_pure(lambda x: EXPR, xs))`. Integer addition is exact and associative/commutative, so partial sums combine correctly in any order; `float` accumulators are never rewritten (reordering IEEE-754 addition changes the result). `parallel-backend = "interpreters"` makes the generated `typhon_runtime/parallel.py` try a PEP 734 `InterpreterPoolExecutor` (3.14+) first, falling back transparently to the thread pool on an older runtime or an unshareable mapped callable — order is preserved on every path. `suggest-perf` (default `true`) gates the `tyc::perf_*` micro-optimisation family (six lints) plus `tyc::lazy_import_opportunity` — seven advice lints in total; `suggest-parallel` (default `true`) gates `tyc::parallel_opportunity` and `tyc::shared_mut_across_tasks`, both of which additionally require `[python] free-threaded = true` to fire. All are advice-only — never block a build. See [DIAGNOSTICS.md](DIAGNOSTICS.md).
 
 `auto-gather` independence rules:
 
@@ -1349,7 +1365,7 @@ See [CLI.md](CLI.md) and `docs/cli.md` for the full surface. The most-used comma
 | Command | What it runs | When |
 |---|---|---|
 | `tyc check src/` | parse → resolve → type → analyse (no emit) | CI; daily editing |
-| `tyc build` | full pipeline through emit + ruff format; `--check` for dry-run | local run; produces `build/*.py` + `build/.sourcemaps/*.py.map` |
+| `tyc build` | full pipeline through emit + ruff format; `--check` for dry-run; `-O`/`--optimise` applies `[optimise] level = 1` for one invocation | local run; produces `build/*.py` + `build/.sourcemaps/*.py.map` |
 | `tyc fmt src/` | in-process whitespace pass + `ruff format` wrap (when on PATH) | pre-commit |
 | `tyc run` | execute a Typhon program in the in-process VM by default; `--compile` (alias `--no-vm`) falls back to build-then-exec for CPython library interop | iterating on pure-Typhon code |
 | `tyc lsp` | LSP on stdio (diagnostics, hover, go-to-def, member completions via venv introspection, from-import members from sibling files, "Remove unused import"; v0.12.0 also surfaces live third-party arg/type diagnostics via `tyc-venv`) | editor |
@@ -1372,6 +1388,7 @@ Notable flags:
 - `tyc check --with-ty` / `tyc build --with-ty` (v0.12.0) — run the `ty` typeshed pass for this one invocation without editing `typhon.toml`. `tyc check --with-ty` (normally emit-free) builds to a throwaway directory first.
 - `tyc build --check` — dry-run, lists every file that would be written without touching disk.
 - `tyc build --no-sync` (or `TYC_NO_SYNC=1`) — skip `uv sync` but still merge `pyproject.toml`.
+- `tyc build -O` / `--optimise` (alias `--optimize`) — apply `[optimise] level = 1` for this invocation; an explicit `[strictness]` entry still wins.
 - `tyc run --compile` (alias `--no-vm`) — fall back to build-then-exec when the program imports CPython-only libraries.
 - `tyc run --temp` — compile mode only; build into a tempdir deleted on exit.
 - `tyc ty --watch` / `tyc ty --out DIR` / `tyc ty -- --strict` / `tyc ty --raw`
@@ -1523,7 +1540,7 @@ Consumers:
 
 ## 19. Diagnostics catalog (top tier)
 
-The recurring diagnostic codes and what they actually mean. **See [DIAGNOSTICS.md](DIAGNOSTICS.md) for the exhaustive 74-code reference** — what follows is the daily-driver subset.
+The recurring diagnostic codes and what they actually mean. **See [DIAGNOSTICS.md](DIAGNOSTICS.md) for the exhaustive 83-code reference** — what follows is the daily-driver subset.
 
 | Code | Meaning | Fix |
 |---|---|---|

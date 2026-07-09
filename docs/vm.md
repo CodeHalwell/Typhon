@@ -422,15 +422,50 @@ on `Foo`."
 
 ## Performance
 
-Tree-walking is intentionally simple. Expect roughly CPython-3.13
-performance on arithmetic-heavy microbenchmarks (sometimes faster because
-there is no per-call bytecode dispatch overhead, sometimes slower because
-the AST nodes are not cache-friendly). On allocation-heavy code (lots of
-`list`/`dict` construction) the VM is competitive but uses single-threaded
-`Rc` — there is no parallelism today.
+The tree-walking VM optimizes for correctness/parity with CPython and for
+startup latency, not for steady-state compute throughput. On a
+hello-world program the VM starts and exits in ~21 ms against ~38 ms for
+`tyc build` + a CPython 3.13 process spawn — and the VM skips the build
+step entirely, so there's no `build/` directory or `typhon_runtime.py` to
+generate first. For short scripts, the REPL, and (eventually) LSP-driven
+expression evaluation, the VM wins.
 
-A bytecode VM and/or PyO3-backed FFI for unsupported modules are tracked
-in `docs/roadmap.md`.
+Steady-state compute is the opposite story. Before the Tier 1 work the
+VM measured **~5–18× slower** than `tyc build` + CPython 3.13 once fixed
+startup cost was factored out (release binary, median of 3 runs, outputs
+parity-checked), driven by four architectural costs: every `int` was a
+heap-allocated arbitrary-precision `BigInt`, every variable read was a
+string-hash `HashMap` lookup walking a parent scope chain, every call
+allocated a fresh `Env` (a `HashMap`), and method resolution re-walked
+the base-class chain on every miss.
+
+Tier 1 (landed) attacks all four without changing the execution model:
+
+- `Value::Int` wraps a `VmInt` that keeps any `i64`-range value inline
+  and only promotes to a heap `BigInt` on overflow — integer arithmetic
+  no longer allocates on the common path, and CPython's
+  arbitrary-precision semantics are preserved exactly.
+- Functions with no `global`/`nonlocal` and no captured closure
+  variables resolve locals to fixed slots computed once at definition
+  time; other functions keep the `HashMap` path unchanged.
+- Method resolution memoises base-chain / negative lookups in a
+  per-class cache, and `obj.method(args)` on a user instance dispatches
+  directly without building an intermediate `BoundMethod`.
+
+Measured after Tier 1 (same methodology): **~3–14× slower
+startup-adjusted, ~2.7–6× end-to-end wall clock**. Tight loops improved
+the most (a 3M-iteration accumulator went 2168ms → ~650ms, now ~3×
+adjusted); recursive, call-heavy code remains the worst case (~14×
+adjusted on a naive recursive `fib`) because each Typhon call still pays
+a real Rust frame plus argument binding — exactly the cost Tier 2 (a
+bytecode VM) targets. [`docs/vm-performance-plan.md`](vm-performance-plan.md)
+has the full measured tables, the root-cause breakdown, and the tiers.
+
+A bytecode VM — the point at which rough CPython parity on most code
+becomes realistic — is designed as Tier 2 of that plan but not yet
+started; see [`docs/vm-performance-plan.md`](vm-performance-plan.md).
+PyO3-backed FFI for unsupported modules is not currently planned; it's
+listed there as a non-goal for now.
 
 ## Diagnostics
 
@@ -449,7 +484,9 @@ use tyc_vm::{Interpreter, run_source};
 let code = run_source("print(1 + 2)\n", None)?;   // returns process exit code
 // or, for finer control:
 let mut interp = Interpreter::new();
-interp.root.set("custom", tyc_vm::Value::Int(42));
+// `Value::Int` wraps a `VmInt` (a small-int/`BigInt` two-representation
+// integer); build one with `.into()` from any primitive integer.
+interp.root.set("custom", tyc_vm::Value::Int(42.into()));
 // … run a parsed module …
 ```
 

@@ -72,6 +72,22 @@ fn scaffold_parallel(dir: &Path, src_content: &str) {
     std::fs::write(dir.join("src").join("main.ty"), src_content).unwrap();
 }
 
+/// Scaffold a project with an explicit `[python] target`, keeping
+/// `[emit] format = false` so the emitted Python is deterministic
+/// (no ruff line-shifting) for byte-level assertions.
+fn scaffold_target(dir: &Path, target: &str, src_content: &str) {
+    std::fs::create_dir_all(dir.join("src")).unwrap();
+    std::fs::write(
+        dir.join("typhon.toml"),
+        format!(
+            "[project]\nname = \"feat\"\nversion = \"0.1.0\"\nsrc = \"src\"\nout = \"build\"\n\
+             [python]\ntarget = \"{target}\"\n[emit]\nformat = false\n[strictness]\n[env]\n",
+        ),
+    )
+    .unwrap();
+    std::fs::write(dir.join("src").join("main.ty"), src_content).unwrap();
+}
+
 /// Run `tyc build` only when a usable Python interpreter is present.
 ///
 /// Tests that subsequently execute the emitted Python use this gate so a
@@ -802,6 +818,295 @@ fn build_skips_rewrite_when_auto_parallel_off() {
     assert!(
         !py.contains("typhon_runtime.parallel.map_pure"),
         "rewrite must require the auto-parallel opt-in; got:\n{py}"
+    );
+}
+
+// ── auto-parallel widened shapes + reductions ───────────────────────────────
+
+/// Scaffold a project with `free-threaded = true`, `auto-parallel = true`,
+/// `auto-parallel-reductions = true`, and the given `parallel-backend`.
+fn scaffold_parallel_full(dir: &Path, backend: &str, src_content: &str) {
+    std::fs::create_dir_all(dir.join("src")).unwrap();
+    std::fs::write(
+        dir.join("typhon.toml"),
+        format!(
+            "[project]\nname = \"feat\"\nversion = \"0.1.0\"\nsrc = \"src\"\nout = \"build\"\n\
+             [python]\ntarget = \"3.13\"\nfree-threaded = true\n\
+             [emit]\nformat = false\n\
+             [strictness]\nauto-parallel = true\nauto-parallel-reductions = true\n\
+             parallel-backend = \"{backend}\"\n[env]\n"
+        ),
+    )
+    .unwrap();
+    std::fs::write(dir.join("src").join("main.ty"), src_content).unwrap();
+}
+
+#[test]
+fn build_rewrites_widened_comprehension_shapes() {
+    let tmp = tempfile::tempdir().unwrap();
+    scaffold_parallel(
+        tmp.path(),
+        "@pure\ndef sq(n: int) -> int:\n    return n * n\n\n\
+         def run(xs: list[int]) -> list[int]:\n    let k: int = 2\n    \
+         return [sq(x) for x in xs if x > 0]\n",
+    );
+    build(tmp.path());
+    let py = main_py(tmp.path());
+    assert!(
+        py.contains("typhon_runtime.parallel.map_pure"),
+        "filtered comprehension should be parallelised; got:\n{py}"
+    );
+    assert!(
+        py.contains("for x in xs if x > 0"),
+        "filter should run sequentially in the map source; got:\n{py}"
+    );
+}
+
+#[test]
+fn build_rewrites_int_reduction_under_auto_parallel_reductions() {
+    let tmp = tempfile::tempdir().unwrap();
+    scaffold_parallel_full(
+        tmp.path(),
+        "threads",
+        "def run(xs: list[int]) -> int:\n    mut total: int = 0\n    \
+         for x in xs:\n        total += x * x\n    return total\n",
+    );
+    build(tmp.path());
+    let py = main_py(tmp.path());
+    assert!(
+        py.contains("total += sum(typhon_runtime.parallel.map_pure"),
+        "int reduction should be folded into sum(map_pure(...)); got:\n{py}"
+    );
+}
+
+#[test]
+fn build_leaves_float_reduction_alone() {
+    let tmp = tempfile::tempdir().unwrap();
+    scaffold_parallel_full(
+        tmp.path(),
+        "threads",
+        "def run(xs: list[float]) -> float:\n    mut total: float = 0.0\n    \
+         for x in xs:\n        total += x\n    return total\n",
+    );
+    build(tmp.path());
+    let py = main_py(tmp.path());
+    assert!(
+        !py.contains("map_pure"),
+        "float reduction must NOT be parallelised; got:\n{py}"
+    );
+    // The original sequential loop is preserved.
+    assert!(
+        py.contains("total += x"),
+        "float loop should be untouched; got:\n{py}"
+    );
+}
+
+// ── interpreters backend ────────────────────────────────────────────────────
+
+#[test]
+fn parallel_backend_threads_bakes_backend_constant_and_fallback() {
+    let tmp = tempfile::tempdir().unwrap();
+    scaffold_parallel_full(
+        tmp.path(),
+        "threads",
+        "@pure\ndef sq(n: int) -> int:\n    return n * n\n\n\
+         xs: list[int] = [1, 2, 3]\nys: list[int] = [sq(x) for x in xs]\n",
+    );
+    build(tmp.path());
+    let parallel_py =
+        std::fs::read_to_string(tmp.path().join("build/typhon_runtime/parallel.py")).unwrap();
+    assert!(
+        parallel_py.contains("_BACKEND = \"threads\""),
+        "threads backend constant missing:\n{parallel_py}"
+    );
+    // The fallback chain is present for both settings; only the constant differs.
+    assert!(
+        parallel_py.contains("InterpreterPoolExecutor")
+            && parallel_py.contains("ThreadPoolExecutor")
+            && parallel_py.contains("_try_interpreters"),
+        "fallback chain missing:\n{parallel_py}"
+    );
+}
+
+#[test]
+fn parallel_backend_interpreters_bakes_backend_constant_and_fallback() {
+    let tmp = tempfile::tempdir().unwrap();
+    scaffold_parallel_full(
+        tmp.path(),
+        "interpreters",
+        "@pure\ndef sq(n: int) -> int:\n    return n * n\n\n\
+         xs: list[int] = [1, 2, 3]\nys: list[int] = [sq(x) for x in xs]\n",
+    );
+    build(tmp.path());
+    let parallel_py =
+        std::fs::read_to_string(tmp.path().join("build/typhon_runtime/parallel.py")).unwrap();
+    assert!(
+        parallel_py.contains("_BACKEND = \"interpreters\""),
+        "interpreters backend constant missing:\n{parallel_py}"
+    );
+    assert!(
+        parallel_py.contains("from concurrent.futures import InterpreterPoolExecutor")
+            && parallel_py.contains("except (ImportError, AttributeError)")
+            && parallel_py.contains("except (TypeError, pickle.PicklingError)")
+            && parallel_py.contains("with ThreadPoolExecutor(max_workers=max_workers) as pool"),
+        "interpreters fallback chain missing:\n{parallel_py}"
+    );
+    // The pre-flight serialisation probe: an unpicklable callable (every
+    // lambda the rewrites emit) must be rejected *before* a pool is created,
+    // whatever exception pickling raises — PicklingError / AttributeError,
+    // not just the TypeError the pool-block catch covers.
+    assert!(
+        parallel_py.contains("pickle.dumps(fn)") && parallel_py.contains("except Exception:"),
+        "pre-flight pickle probe missing:\n{parallel_py}"
+    );
+}
+
+#[test]
+fn reduction_and_comprehension_rewrites_match_sequential_output() {
+    // Execution-equivalence: the parallel build and the sequential (knobs-off)
+    // build must produce identical stdout. On a GIL / 3.13 build the map_pure
+    // helper serialises the workers, so the point is correctness, not speed.
+    let Some(_py) = python() else {
+        return; // skip without an interpreter
+    };
+    let program = "\
+@pure
+def sq(n: int) -> int:
+    return n * n
+
+def main() -> None:
+    let xs: list[int] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+    let squared: list[int] = [sq(x) for x in xs if x % 2 == 0]
+    mut total: int = 0
+    for x in xs:
+        total += sq(x)
+    print(squared)
+    print(total)
+
+if __name__ == \"__main__\":
+    main()
+";
+    // Parallel build (auto-parallel + reductions + free-threaded).
+    let par = tempfile::tempdir().unwrap();
+    scaffold_parallel_full(par.path(), "threads", program);
+    build(par.path());
+    let par_out = run_main(par.path()).expect("parallel build should run");
+
+    // Sequential build (default scaffold: all parallel knobs off).
+    let seq = tempfile::tempdir().unwrap();
+    scaffold(seq.path(), program);
+    build(seq.path());
+    let seq_out = run_main(seq.path()).expect("sequential build should run");
+
+    assert_eq!(
+        par_out, seq_out,
+        "parallel and sequential builds must produce identical output"
+    );
+    // Sanity: the parallel build actually applied both rewrites.
+    let par_py = main_py(par.path());
+    assert!(
+        par_py.contains("map_pure"),
+        "comprehension rewrite missing:\n{par_py}"
+    );
+    assert!(
+        par_py.contains("total += sum(typhon_runtime.parallel.map_pure"),
+        "reduction rewrite missing:\n{par_py}"
+    );
+}
+
+#[test]
+fn interpreters_backend_falls_back_and_runs_on_gil_build() {
+    // With backend=interpreters on a 3.13 interpreter (no InterpreterPoolExecutor),
+    // map_pure must fall back to the thread pool and still produce correct output.
+    let Some(_py) = python() else {
+        return;
+    };
+    let program = "\
+@pure
+def sq(n: int) -> int:
+    return n * n
+
+def main() -> None:
+    let xs: list[int] = [1, 2, 3, 4, 5]
+    print([sq(x) for x in xs])
+
+if __name__ == \"__main__\":
+    main()
+";
+    let tmp = tempfile::tempdir().unwrap();
+    scaffold_parallel_full(tmp.path(), "interpreters", program);
+    build(tmp.path());
+    let out = run_main(tmp.path()).expect("interpreters build should run (falls back to threads)");
+    assert_eq!(out.trim(), "[1, 4, 9, 16, 25]", "unexpected output: {out}");
+}
+
+#[test]
+fn interpreters_backend_probe_rejects_lambda_before_pool_creation() {
+    // Regression for the P1 fallback hole: pickling a lambda raises
+    // `pickle.PicklingError` (module level) or `AttributeError` (closure) —
+    // NOT the `TypeError` the pool-block catch handles — so before the
+    // pre-flight probe, a 3.14+ runtime (InterpreterPoolExecutor importable)
+    // crashed instead of falling back to threads. Simulate that runtime on
+    // any Python by injecting a fake executor whose *construction* aborts:
+    // the probe must reject the lambda first, never touch the pool, and the
+    // thread fallback must produce the correct result.
+    let Some(py) = python() else {
+        return;
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    scaffold_parallel_full(
+        tmp.path(),
+        "interpreters",
+        "@pure\ndef sq(n: int) -> int:\n    return n * n\n\n\
+         xs: list[int] = [1, 2, 3]\nys: list[int] = [sq(x) for x in xs]\n",
+    );
+    build(tmp.path());
+    let driver = r#"
+import sys
+import concurrent.futures as cf
+
+class _MustNotConstruct:
+    def __init__(self, *args, **kwargs):
+        raise SystemExit("BUG: pool constructed for an unpicklable lambda")
+
+# Simulate Python 3.14+: make `from concurrent.futures import
+# InterpreterPoolExecutor` succeed, so only the pickle probe stands between
+# a lambda and the (fatal) pool construction.
+cf.InterpreterPoolExecutor = _MustNotConstruct
+
+sys.path.insert(0, sys.argv[1])
+from typhon_runtime.parallel import map_pure, _BACKEND
+
+assert _BACKEND == "interpreters", _BACKEND
+print(map_pure(lambda x: x * x, [1, 2, 3, 4, 5]))
+
+# The probe must only guard serialisation: an exception raised BY the mapped
+# function (here on the thread path a lambda falls back to) must propagate,
+# never be swallowed by the fallback machinery.
+try:
+    map_pure(lambda x: 1 // (x - x), [7])
+except ZeroDivisionError:
+    pass
+else:
+    raise SystemExit("BUG: worker exception was swallowed")
+"#;
+    let driver_path = tmp.path().join("probe_driver.py");
+    std::fs::write(&driver_path, driver).unwrap();
+    let out = Command::new(py)
+        .arg(&driver_path)
+        .arg(tmp.path().join("build"))
+        .output()
+        .expect("python should spawn");
+    assert!(
+        out.status.success(),
+        "probe driver crashed (fallback hole regressed):\nstdout={}\nstderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "[1, 4, 9, 16, 25]",
+        "thread fallback produced wrong output"
     );
 }
 
@@ -1669,6 +1974,219 @@ fn build_emits_typhon_runtime_when_only_lazy_import_used() {
         tmp.path().join("build/typhon_runtime/lazy.py").exists(),
         "typhon_runtime/lazy.py must ship with the package",
     );
+}
+
+// ── PEP 810 native lazy imports (3.15+ targets) ───────────────────────────────
+
+#[test]
+fn build_lazy_import_lowers_to_native_pep810_on_3_15() {
+    // On a 3.15 target, `lazy import ALIAS = MODULE` lowers to the native
+    // deferred-import syntax `lazy import MODULE as ALIAS` — not the
+    // runtime-helper call (nor the historical `__TyphonLazy_` proxy class).
+    let tmp = tempfile::tempdir().unwrap();
+    scaffold_target(
+        tmp.path(),
+        "3.15",
+        "lazy import np = numpy\nlet arr: object = np.array([1])\n",
+    );
+    build(tmp.path());
+    let py = main_py(tmp.path());
+    assert!(
+        py.contains("lazy import numpy as np"),
+        "3.15 target must emit native `lazy import MODULE as ALIAS`; got:\n{py}"
+    );
+    assert!(
+        !py.contains("__TyphonLazy_"),
+        "native lowering must not emit the historical proxy class; got:\n{py}"
+    );
+    assert!(
+        !py.contains("__typhon_lazy_import"),
+        "native lowering must not emit the runtime-helper call; got:\n{py}"
+    );
+    assert!(
+        !py.contains("from typhon_runtime.lazy import"),
+        "native lowering must not inject the runtime-helper import; got:\n{py}"
+    );
+}
+
+#[test]
+fn build_lazy_import_stays_runtime_helper_on_3_13() {
+    // Regression pin: a 3.13 target is byte-for-byte unchanged by the PEP 810
+    // work — it keeps the runtime-helper lowering and never emits the native
+    // `lazy import MODULE as ALIAS` keyword form.
+    let tmp = tempfile::tempdir().unwrap();
+    scaffold_target(
+        tmp.path(),
+        "3.13",
+        "lazy import np = numpy\nlet arr: object = np.array([1])\n",
+    );
+    build(tmp.path());
+    let py = main_py(tmp.path());
+    assert!(
+        py.contains("from typhon_runtime.lazy import lazy_import as __typhon_lazy_import"),
+        "3.13 target must keep the runtime-helper import; got:\n{py}"
+    );
+    assert!(
+        py.contains("np = __typhon_lazy_import(\"numpy\")"),
+        "3.13 target must keep the runtime-helper call; got:\n{py}"
+    );
+    // The native keyword form must NOT appear. (The injected header
+    // `from typhon_runtime.lazy import …` contains the substring "lazy
+    // import", so match the whole native statement, anchored at column 0.)
+    assert!(
+        !py.lines().any(|l| l.starts_with("lazy import ")),
+        "3.13 target must not emit the native `lazy import` keyword form; got:\n{py}"
+    );
+}
+
+#[test]
+fn build_lazy_import_stays_runtime_helper_on_3_14() {
+    // Native lowering is gated on `>= (3, 15)`, so 3.14 stays on the
+    // runtime-helper path exactly like 3.13.
+    let tmp = tempfile::tempdir().unwrap();
+    scaffold_target(
+        tmp.path(),
+        "3.14",
+        "lazy import np = numpy\nlet arr: object = np.array([1])\n",
+    );
+    build(tmp.path());
+    let py = main_py(tmp.path());
+    assert!(
+        py.contains("np = __typhon_lazy_import(\"numpy\")"),
+        "3.14 target must keep the runtime-helper call; got:\n{py}"
+    );
+    assert!(
+        !py.lines().any(|l| l.starts_with("lazy import ")),
+        "3.14 target must not emit the native `lazy import` keyword form; got:\n{py}"
+    );
+}
+
+#[test]
+fn build_lazy_import_alias_equals_module_native_on_3_15() {
+    // The alias==module case: `lazy import numpy = numpy` lowers (via the
+    // main preprocessor) to `import numpy as numpy`, which the emitter prints
+    // verbatim (it never elides the redundant `as`). The native rewrite then
+    // prefixes it to `lazy import numpy as numpy`.
+    let tmp = tempfile::tempdir().unwrap();
+    scaffold_target(
+        tmp.path(),
+        "3.15",
+        "lazy import numpy = numpy\nlet arr: object = numpy.array([1])\n",
+    );
+    build(tmp.path());
+    let py = main_py(tmp.path());
+    assert!(
+        py.contains("lazy import numpy as numpy"),
+        "alias==module must emit `lazy import numpy as numpy`; got:\n{py}"
+    );
+    assert!(
+        !py.contains("__typhon_lazy_import"),
+        "alias==module native form must not emit the runtime helper; got:\n{py}"
+    );
+}
+
+#[test]
+fn build_lazy_import_dotted_module_native_on_3_15() {
+    // Dotted submodule targets round-trip through the native form.
+    let tmp = tempfile::tempdir().unwrap();
+    scaffold_target(
+        tmp.path(),
+        "3.15",
+        "lazy import nn = torch.nn\nlet layer: object = nn.Linear(1, 1)\n",
+    );
+    build(tmp.path());
+    let py = main_py(tmp.path());
+    assert!(
+        py.contains("lazy import torch.nn as nn"),
+        "dotted module must emit `lazy import torch.nn as nn`; got:\n{py}"
+    );
+}
+
+#[test]
+fn build_native_lazy_import_skips_typhon_runtime_on_3_15() {
+    // Payoff of native lowering: when `lazy import` is the ONLY runtime-needing
+    // feature, a 3.15 build no longer emits `typhon_runtime/` at all (there is
+    // no `from typhon_runtime.lazy import …` to satisfy). Contrast with
+    // `build_emits_typhon_runtime_when_only_lazy_import_used`, which pins the
+    // opposite for the 3.13 runtime-helper path.
+    let tmp = tempfile::tempdir().unwrap();
+    scaffold_target(
+        tmp.path(),
+        "3.15",
+        "lazy import np = numpy\nlet arr: object = np.array([1])\n",
+    );
+    build(tmp.path());
+    assert!(
+        tmp.path().join("build/main.py").exists(),
+        "main.py must be emitted",
+    );
+    assert!(
+        !tmp.path().join("build/typhon_runtime").exists(),
+        "native lazy imports must not force `typhon_runtime/` emission on 3.15",
+    );
+}
+
+#[test]
+fn build_native_lazy_import_sourcemap_round_trips_on_3_15() {
+    // The native rewrite only prepends `lazy ` to existing lines (no line-count
+    // change), so the `.py.map` sidecar stays valid: its `lines` table has one
+    // entry per emitted output line. (format=false keeps emit line count and
+    // map entries in lock-step, unlike the ruff pass which may add blank lines.)
+    let tmp = tempfile::tempdir().unwrap();
+    scaffold_target(
+        tmp.path(),
+        "3.15",
+        "lazy import np = numpy\nlet arr: object = np.array([1])\n",
+    );
+    build(tmp.path());
+    let map_path = tmp
+        .path()
+        .join("build")
+        .join(".sourcemaps")
+        .join("main.py.map");
+    assert!(
+        map_path.exists(),
+        "3.15 build must write the .py.map sidecar"
+    );
+    let body = std::fs::read_to_string(&map_path).unwrap();
+    assert!(
+        body.contains("\"version\":2"),
+        "map must be v2; got: {body}"
+    );
+    assert!(
+        body.contains("\"lines\":["),
+        "map must carry a lines table; got: {body}"
+    );
+
+    // Parse the `lines` array and assert one entry per emitted output line.
+    let arr = body
+        .split("\"lines\":[")
+        .nth(1)
+        .and_then(|s| s.split(']').next())
+        .expect("lines array present");
+    let map_entries = arr.split(',').filter(|s| !s.trim().is_empty()).count();
+    let py_lines = main_py(tmp.path()).lines().count();
+    assert_eq!(
+        map_entries, py_lines,
+        "source-map `lines` entries ({map_entries}) must match emitted line count ({py_lines})",
+    );
+}
+
+#[test]
+fn build_native_lazy_import_3_13_output_runs() {
+    // The 3.13 runtime-helper path still produces runnable Python. Use a
+    // stdlib module (`json`) so the lazy import resolves at first use without
+    // any third-party dependency, and execute the emitted script.
+    let tmp = tempfile::tempdir().unwrap();
+    scaffold_target(
+        tmp.path(),
+        "3.13",
+        "lazy import js = json\n\ndef main() -> None:\n    let payload: str = js.dumps({\"ok\": True})\n    print(payload)\n\nif __name__ == \"__main__\":\n    main()\n",
+    );
+    let Some(out) = build_and_run_main(tmp.path()) else {
+        return; // no Python interpreter — skip cleanly
+    };
+    assert_eq!(out.trim(), "{\"ok\": true}");
 }
 
 #[test]

@@ -12,6 +12,13 @@ pub struct TyphonConfig {
     pub python: PythonConfig,
     pub emit: EmitConfig,
     pub strictness: StrictnessConfig,
+    /// `[optimise]` — project-wide optimisation level. Level 1 flips the
+    /// default of the four optimisation strictness knobs (`auto-memoise`,
+    /// `auto-gather`, `auto-parallel`, `pgo-memoise`) to `true`; an explicit
+    /// `[strictness]` entry for any of them always wins. Resolved after load
+    /// (and after a CLI `-O`/`--optimise`) via [`TyphonConfig::resolve_optimise`].
+    #[serde(default)]
+    pub optimise: OptimiseConfig,
     pub env: EnvConfig,
     #[serde(default)]
     pub checker: CheckerConfig,
@@ -141,6 +148,31 @@ fn default_stub_check() -> String {
     "error".into()
 }
 
+/// `[optimise]` — project-wide optimisation level.
+///
+/// `level = 0` (the default) leaves every optimisation knob at its own
+/// default. `level = 1` flips the *default* of `auto-memoise`, `auto-gather`,
+/// `auto-parallel`, and `pgo-memoise` to `true`. An explicit `[strictness]`
+/// entry for any of those four always wins over the level-derived default,
+/// so a user can set `level = 1` and still write `auto-parallel = false` to
+/// keep that one knob off. Only `0` and `1` are accepted — any other integer
+/// is rejected by [`TyphonConfig::validate`] with
+/// [`ConfigError::InvalidOptimiseLevel`], and a non-integer value is rejected
+/// at parse time.
+#[derive(Debug, Default, Serialize, Deserialize)]
+#[serde(default, rename_all = "kebab-case", deny_unknown_fields)]
+pub struct OptimiseConfig {
+    /// Optimisation level: `0` (default) or `1`.
+    pub level: u8,
+}
+
+/// Accepted values for `[strictness] parallel-backend`. `"threads"` (the
+/// default) runs auto-parallel maps on a `ThreadPoolExecutor`; `"interpreters"`
+/// targets PEP 734 sub-interpreters. Anything else is rejected by
+/// [`TyphonConfig::validate`] — mirroring how `[checker] external` is validated
+/// — rather than silently falling back to threads.
+pub const ALLOWED_PARALLEL_BACKENDS: &[&str] = &["threads", "interpreters"];
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(default, rename_all = "kebab-case", deny_unknown_fields)]
 pub struct StrictnessConfig {
@@ -157,7 +189,14 @@ pub struct StrictnessConfig {
     /// When true, every function that passes the six-condition purity check
     /// is treated as if the user had written `@memo` — the desugarer emits a
     /// `@functools.cache` decorator. Off by default; opt in per-project.
-    pub auto_memoise: bool,
+    ///
+    /// `Option<bool>` to distinguish "absent" from "explicitly set": `None`
+    /// takes the [`OptimiseConfig`]-derived default (off at level 0, on at
+    /// level 1), while `Some(v)` is an explicit toml entry that always wins.
+    /// [`TyphonConfig::resolve_optimise`] collapses this to a concrete value
+    /// after load; read it with `.unwrap_or(false)`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auto_memoise: Option<bool>,
     /// When true, runs of two-or-more consecutive independent `await` calls
     /// inside an `async def` are rewritten into an `asyncio.TaskGroup` block
     /// so they execute concurrently. Independence is determined by static
@@ -167,7 +206,11 @@ pub struct StrictnessConfig {
     /// seeded from each module's published `@gatherable` names). Off by
     /// default — flip on per-project to apply the rewrite globally. (Phase 4
     /// auto-gather inference; explicit `gather:` blocks are unaffected.)
-    pub auto_gather: bool,
+    ///
+    /// `Option<bool>`: see [`StrictnessConfig::auto_memoise`] — `None` takes
+    /// the optimise-level default, `Some(v)` is an explicit override.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auto_gather: Option<bool>,
     /// When true (the default), `tyc check` and `tyc build` surface a
     /// `tyc::gather_opportunity` advice for every run of 2+ adjacent
     /// independent awaited calls inside an `async def` — including awaited
@@ -184,7 +227,11 @@ pub struct StrictnessConfig {
     /// even if the user did not write `@memo`. Off by default. (Phase 4
     /// profile-guided optimisation; complements `auto-memoise` which acts
     /// on every pure function regardless of profile data.)
-    pub pgo_memoise: bool,
+    ///
+    /// `Option<bool>`: see [`StrictnessConfig::auto_memoise`] — `None` takes
+    /// the optimise-level default, `Some(v)` is an explicit override.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pgo_memoise: Option<bool>,
     /// Minimum observed call count for a function to be promoted by
     /// [`StrictnessConfig::pgo_memoise`]. Defaults to 100 — high enough
     /// that one-off entry points stay un-cached, low enough that an
@@ -196,7 +243,11 @@ pub struct StrictnessConfig {
     /// [`PythonConfig::free_threaded`] to release the GIL across workers
     /// and get real parallelism; on a stock CPython the rewrite still
     /// runs but the GIL serialises the workers.  Off by default.
-    pub auto_parallel: bool,
+    ///
+    /// `Option<bool>`: see [`StrictnessConfig::auto_memoise`] — `None` takes
+    /// the optimise-level default, `Some(v)` is an explicit override.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auto_parallel: Option<bool>,
     /// Minimum statically-detectable iterable length for a comprehension
     /// to qualify for parallelisation.  Below this threshold the
     /// thread-pool overhead exceeds any wins, so the rewrite is skipped.
@@ -242,6 +293,32 @@ pub struct StrictnessConfig {
     /// silently skipped. `"warn"` (default) surfaces it, `"error"` fails the
     /// build/check (CI-gating), `"off"` restores the old silent behaviour.
     pub unintrospectable_dependency: String,
+    /// When true (the default), the compiler surfaces the `tyc::perf_*`
+    /// advice-lint family — micro-optimisation nudges (redundant work in a
+    /// hot path, an avoidable allocation, …). Advice-only; never blocks a
+    /// build. Set `false` to silence the whole family. (No consumer yet —
+    /// parsed and reachable for the wave that lands the lints.)
+    pub suggest_perf: bool,
+    /// When true (the default), the compiler surfaces `tyc::parallel_opportunity`
+    /// advice — a loop or comprehension that could be parallelised (see
+    /// `auto-parallel`). Advice-only; never blocks a build. Set `false` to
+    /// silence it. (No consumer yet — parsed and reachable for the wave that
+    /// lands the lint.)
+    pub suggest_parallel: bool,
+    /// When true, integer accumulator loops (`for x in xs: total += f(x)`)
+    /// over a pure body are eligible for parallel reduction. Off by default.
+    /// **Requires `auto-parallel` to have any effect** — it gates the same
+    /// build-time rewrite pass, extending it from pure comprehensions to
+    /// accumulator loops. (No consumer yet — parsed and reachable for the
+    /// wave that lands the rewrite.)
+    pub auto_parallel_reductions: bool,
+    /// Execution backend for auto-parallel rewrites. `"threads"` (the
+    /// default) uses a `concurrent.futures.ThreadPoolExecutor`;
+    /// `"interpreters"` targets PEP 734 sub-interpreters. Validated against
+    /// [`ALLOWED_PARALLEL_BACKENDS`] — an unknown value is rejected at config
+    /// load rather than silently falling back to threads. (No consumer yet —
+    /// parsed and reachable for the wave that threads it through the rewrite.)
+    pub parallel_backend: String,
 }
 
 impl Default for StrictnessConfig {
@@ -251,18 +328,26 @@ impl Default for StrictnessConfig {
             unused_import: "warn".into(),
             exhaustive_match: "error".into(),
             methods_in_class_body: "warn".into(),
-            auto_memoise: false,
-            auto_gather: false,
+            // `None` = "absent from toml": resolved to a concrete bool by
+            // `TyphonConfig::resolve_optimise` (off at optimise level 0, on at
+            // level 1). An explicit toml entry deserialises to `Some(v)` and
+            // always wins.
+            auto_memoise: None,
+            auto_gather: None,
             suggest_gather: true,
-            pgo_memoise: false,
+            pgo_memoise: None,
             pgo_min_calls: 100,
-            auto_parallel: false,
+            auto_parallel: None,
             parallel_min_size: 64,
             require_with: "warn".into(),
             blocking_in_async: "warn".into(),
             allow_secret_comptime: false,
             stub_check: "error".into(),
             unintrospectable_dependency: "warn".into(),
+            suggest_perf: true,
+            suggest_parallel: true,
+            auto_parallel_reductions: false,
+            parallel_backend: "threads".into(),
         }
     }
 }
@@ -353,11 +438,14 @@ impl TyphonConfig {
     /// specifically. Older targets are not supported and would
     /// silently emit code the user's runtime refuses.
     ///
-    /// Accepts the bare-major form (`"3.13"`, `"3.14"`) and the
-    /// free-threaded suffix (`"3.13t"`, `"3.14t"`). Anything that
+    /// Accepts the bare-major form (`"3.13"`, `"3.14"`, `"3.15"`) and the
+    /// free-threaded suffix (`"3.13t"`, `"3.14t"`, `"3.15t"`). Anything that
     /// parses below 3.13 — including the still-supported-by-CPython
     /// 3.11 and 3.12 — is a hard error pointing at the offending
     /// `typhon.toml`.
+    ///
+    /// Also validates `[optimise] level` (only `0` / `1`) and
+    /// `[strictness] parallel-backend` (only `"threads"` / `"interpreters"`).
     pub fn validate(&self, source_path: &Path) -> Result<(), ConfigError> {
         let raw = self.python.target.trim();
         let (major, minor) =
@@ -453,15 +541,63 @@ impl TyphonConfig {
                 allowed: ALLOWED_CHECKERS.join(", "),
             });
         }
+        // Reject an `[optimise] level` outside `0` / `1`. A non-integer value
+        // (`level = "1"`, `level = 1.5`) is already rejected at parse time by
+        // the `u8` deserialisation; here we catch an in-range-for-`u8` but
+        // out-of-range-for-the-feature integer like `2`.
+        if self.optimise.level > 1 {
+            return Err(ConfigError::InvalidOptimiseLevel {
+                path: source_path.to_string_lossy().into_owned(),
+                value: self.optimise.level,
+            });
+        }
+        // Reject an unknown `[strictness] parallel-backend`. Only `"threads"`
+        // and `"interpreters"` are wired; a typo used to silently fall back to
+        // threads.
+        let backend = self.strictness.parallel_backend.trim();
+        if !ALLOWED_PARALLEL_BACKENDS.contains(&backend) {
+            return Err(ConfigError::InvalidParallelBackend {
+                path: source_path.to_string_lossy().into_owned(),
+                value: self.strictness.parallel_backend.clone(),
+                allowed: ALLOWED_PARALLEL_BACKENDS.join(", "),
+            });
+        }
         Ok(())
+    }
+
+    /// Resolve the four optimise-gated strictness knobs (`auto-memoise`,
+    /// `auto-gather`, `auto-parallel`, `pgo-memoise`) to concrete values,
+    /// honouring `[optimise] level` and an optional CLI `-O`/`--optimise`
+    /// override (`tyc build` only).
+    ///
+    /// Level 1 (from either the toml or `cli_force_level1`) flips each knob's
+    /// default to `true`; an explicit `[strictness]` entry — deserialised as
+    /// `Some(v)` — always wins over the level-derived default. After this
+    /// call every one of the four `Option<bool>` fields is `Some(_)`, so
+    /// consumers read them with `.unwrap_or(false)`. Idempotent.
+    pub fn resolve_optimise(&mut self, cli_force_level1: bool) {
+        let level1 = cli_force_level1 || self.optimise.level >= 1;
+        let s = &mut self.strictness;
+        s.auto_memoise = Some(s.auto_memoise.unwrap_or(level1));
+        s.auto_gather = Some(s.auto_gather.unwrap_or(level1));
+        s.auto_parallel = Some(s.auto_parallel.unwrap_or(level1));
+        s.pgo_memoise = Some(s.pgo_memoise.unwrap_or(level1));
     }
 }
 
 /// Parse a `[python] target` value into `(major, minor)`. Accepts the
-/// `"3.13"` bare form, the `"3.13t"` free-threaded suffix, and tolerates
-/// patch-level strings like `"3.13.2"` by ignoring everything past
-/// the second segment. Returns `None` for malformed input.
-fn parse_python_target(s: &str) -> Option<(u32, u32)> {
+/// bare form (`"3.13"`, `"3.14"`, `"3.15"`), the free-threaded suffix
+/// (`"3.13t"` … `"3.15t"`), and tolerates patch-level strings like
+/// `"3.15.2"` by ignoring everything past the second segment. Returns
+/// `None` for malformed input.
+///
+/// Exposed at `pub(crate)` so `tyc build` can gate PEP 810 native
+/// lazy-import lowering on a `(major, minor) >= (3, 15)` target without
+/// duplicating the suffix-tolerant parse. The `(major, minor)` tuple —
+/// rather than the minor-only [`parse_python_minor`] in `build.rs` — is
+/// the correct comparison basis: a hypothetical future `"4.0"` compares
+/// `>= (3, 15)` as a version, whereas its minor `0` would not.
+pub(crate) fn parse_python_target(s: &str) -> Option<(u32, u32)> {
     let mut parts = s.split('.');
     let major: u32 = parts.next()?.parse().ok()?;
     let minor_raw = parts.next()?;
@@ -519,6 +655,19 @@ pub enum ConfigError {
     /// `[checker] external` is set to a value outside [`ALLOWED_CHECKERS`].
     /// Emitted by [`TyphonConfig::validate`].
     InvalidChecker {
+        path: String,
+        value: String,
+        allowed: String,
+    },
+    /// `[optimise] level` is an integer outside `0` / `1`. Emitted by
+    /// [`TyphonConfig::validate`].
+    InvalidOptimiseLevel {
+        path: String,
+        value: u8,
+    },
+    /// `[strictness] parallel-backend` is set to a value outside
+    /// [`ALLOWED_PARALLEL_BACKENDS`]. Emitted by [`TyphonConfig::validate`].
+    InvalidParallelBackend {
         path: String,
         value: String,
         allowed: String,
@@ -585,6 +734,22 @@ impl std::fmt::Display for ConfigError {
                     "invalid `[checker] external = \"{value}\"` in '{path}': allowed values are {allowed}",
                 )
             }
+            ConfigError::InvalidOptimiseLevel { path, value } => {
+                write!(
+                    f,
+                    "invalid `[optimise] level = {value}` in '{path}': allowed values are 0, 1",
+                )
+            }
+            ConfigError::InvalidParallelBackend {
+                path,
+                value,
+                allowed,
+            } => {
+                write!(
+                    f,
+                    "invalid `[strictness] parallel-backend = \"{value}\"` in '{path}': allowed values are {allowed}",
+                )
+            }
         }
     }
 }
@@ -625,7 +790,9 @@ mod tests {
     #[test]
     fn validate_accepts_supported_targets() {
         let path = Path::new("typhon.toml");
-        for t in &["3.13", "3.13t", "3.14", "3.14t", "3.13.2"] {
+        for t in &[
+            "3.13", "3.13t", "3.14", "3.14t", "3.15", "3.15t", "3.13.2", "3.15.2",
+        ] {
             cfg_with_target(t)
                 .validate(path)
                 .unwrap_or_else(|e| panic!("target {t} should be accepted, got {e}"));
@@ -771,6 +938,9 @@ skip-decoration-bases = [\"BaseModel\", \"Enum\"]
         assert_eq!(parse_python_target("3.13t"), Some((3, 13)));
         assert_eq!(parse_python_target("3.14rc1"), Some((3, 14)));
         assert_eq!(parse_python_target("3.13.2"), Some((3, 13)));
+        assert_eq!(parse_python_target("3.15"), Some((3, 15)));
+        assert_eq!(parse_python_target("3.15t"), Some((3, 15)));
+        assert_eq!(parse_python_target("3.15.2"), Some((3, 15)));
         assert_eq!(parse_python_target(""), None);
         assert_eq!(parse_python_target("3"), None);
         assert_eq!(parse_python_target("abc"), None);
@@ -977,5 +1147,246 @@ stub-check = \"warn\"
             "stub-check should be \"warn\", got {:?}",
             parsed.strictness.stub_check
         );
+    }
+
+    // ── [optimise] level tests ────────────────────────────────────────────
+
+    #[test]
+    fn optimise_level_defaults_to_zero() {
+        let cfg = TyphonConfig::default();
+        assert_eq!(cfg.optimise.level, 0);
+        // With no [optimise] section at all, the same default applies.
+        let parsed: TyphonConfig =
+            toml::from_str("[project]\nname = \"x\"\n").expect("parse without [optimise]");
+        assert_eq!(parsed.optimise.level, 0);
+    }
+
+    #[test]
+    fn optimise_level_parses_zero_and_one() {
+        for lvl in [0u8, 1] {
+            let src = format!("[project]\nname = \"x\"\n\n[optimise]\nlevel = {lvl}\n");
+            let parsed: TyphonConfig =
+                toml::from_str(&src).unwrap_or_else(|e| panic!("level {lvl} should parse: {e}"));
+            assert_eq!(parsed.optimise.level, lvl);
+            parsed
+                .validate(Path::new("typhon.toml"))
+                .unwrap_or_else(|e| panic!("level {lvl} should validate: {e}"));
+        }
+    }
+
+    #[test]
+    fn optimise_level_two_is_rejected_by_validate() {
+        // `2` fits in u8 so it parses; validate() must reject it.
+        let parsed: TyphonConfig =
+            toml::from_str("[project]\nname = \"x\"\n\n[optimise]\nlevel = 2\n")
+                .expect("level = 2 parses (u8) then fails validation");
+        let err = parsed
+            .validate(Path::new("typhon.toml"))
+            .expect_err("level = 2 should be rejected");
+        match err {
+            ConfigError::InvalidOptimiseLevel { value, .. } => assert_eq!(value, 2),
+            other => panic!("expected InvalidOptimiseLevel, got {other:?}"),
+        }
+        // Message names the offending file and the allowed values.
+        let msg = format!("{err}");
+        assert!(msg.contains("typhon.toml"), "got {msg}");
+        assert!(msg.contains("0, 1"), "got {msg}");
+    }
+
+    #[test]
+    fn optimise_level_non_integer_is_rejected_at_parse() {
+        // A string value can't deserialise into `u8` — a hard parse error.
+        let err = toml::from_str::<TyphonConfig>(
+            "[project]\nname = \"x\"\n\n[optimise]\nlevel = \"1\"\n",
+        )
+        .expect_err("string level should be rejected at parse time");
+        // Surfaced as a serde/toml parse error, not silently defaulted.
+        let _ = err;
+    }
+
+    #[test]
+    fn optimise_section_rejects_unknown_keys() {
+        let err = toml::from_str::<TyphonConfig>(
+            "[project]\nname = \"x\"\n\n[optimise]\nlevel = 1\nlvl = 2\n",
+        )
+        .expect_err("unknown key inside [optimise] should be rejected");
+        assert!(
+            err.to_string().contains("lvl") || err.to_string().contains("unknown"),
+            "got {err}"
+        );
+    }
+
+    // ── explicit-wins optimise resolution tests ───────────────────────────
+
+    #[test]
+    fn level_one_flips_the_four_optimise_defaults() {
+        let mut cfg: TyphonConfig =
+            toml::from_str("[project]\nname = \"x\"\n\n[optimise]\nlevel = 1\n").expect("parse");
+        // Absent from [strictness] → None before resolution.
+        assert_eq!(cfg.strictness.auto_memoise, None);
+        cfg.resolve_optimise(/* cli_force_level1 = */ false);
+        assert_eq!(cfg.strictness.auto_memoise, Some(true));
+        assert_eq!(cfg.strictness.auto_gather, Some(true));
+        assert_eq!(cfg.strictness.auto_parallel, Some(true));
+        assert_eq!(cfg.strictness.pgo_memoise, Some(true));
+    }
+
+    #[test]
+    fn level_zero_keeps_the_four_optimise_defaults_off() {
+        let mut cfg = TyphonConfig::default();
+        cfg.resolve_optimise(false);
+        assert_eq!(cfg.strictness.auto_memoise, Some(false));
+        assert_eq!(cfg.strictness.auto_gather, Some(false));
+        assert_eq!(cfg.strictness.auto_parallel, Some(false));
+        assert_eq!(cfg.strictness.pgo_memoise, Some(false));
+    }
+
+    #[test]
+    fn explicit_strictness_false_survives_level_one() {
+        // level = 1 but an explicit `auto-parallel = false` must win.
+        let mut cfg: TyphonConfig = toml::from_str(
+            "[project]\nname = \"x\"\n\n[optimise]\nlevel = 1\n\n[strictness]\nauto-parallel = false\n",
+        )
+        .expect("parse");
+        assert_eq!(cfg.strictness.auto_parallel, Some(false));
+        cfg.resolve_optimise(false);
+        // The explicit knob stays off; the other three still flip on.
+        assert_eq!(cfg.strictness.auto_parallel, Some(false));
+        assert_eq!(cfg.strictness.auto_memoise, Some(true));
+        assert_eq!(cfg.strictness.auto_gather, Some(true));
+        assert_eq!(cfg.strictness.pgo_memoise, Some(true));
+    }
+
+    #[test]
+    fn cli_optimise_override_forces_level_one() {
+        // Config says level 0, but `-O` (cli_force_level1 = true) flips the
+        // four defaults on — without overriding an explicit `= false`.
+        let mut cfg: TyphonConfig =
+            toml::from_str("[project]\nname = \"x\"\n\n[strictness]\nauto-gather = false\n")
+                .expect("parse");
+        cfg.resolve_optimise(/* cli_force_level1 = */ true);
+        assert_eq!(cfg.strictness.auto_memoise, Some(true));
+        assert_eq!(cfg.strictness.auto_parallel, Some(true));
+        assert_eq!(cfg.strictness.pgo_memoise, Some(true));
+        // Explicit false still wins over the CLI flag.
+        assert_eq!(cfg.strictness.auto_gather, Some(false));
+    }
+
+    #[test]
+    fn resolve_optimise_is_idempotent() {
+        let mut cfg = TyphonConfig::default();
+        cfg.resolve_optimise(true);
+        let snapshot = (
+            cfg.strictness.auto_memoise,
+            cfg.strictness.auto_gather,
+            cfg.strictness.auto_parallel,
+            cfg.strictness.pgo_memoise,
+        );
+        cfg.resolve_optimise(false); // second call must not un-flip resolved values
+        assert_eq!(
+            (
+                cfg.strictness.auto_memoise,
+                cfg.strictness.auto_gather,
+                cfg.strictness.auto_parallel,
+                cfg.strictness.pgo_memoise,
+            ),
+            snapshot
+        );
+    }
+
+    #[test]
+    fn optimise_knobs_absent_omitted_from_toml_round_trip() {
+        // A fresh (unresolved) config has None for the four knobs, so
+        // `to_toml_string` must omit them — keeping `tyc add`'s rewrite and
+        // the `tyc init` scaffold clean.
+        let cfg = TyphonConfig::default();
+        let out = cfg.to_toml_string().expect("serialise");
+        // Match the `key =` assignment form so the check isn't fooled by an
+        // unrelated key that merely contains the name as a substring (e.g.
+        // `auto-parallel-reductions`, which is a distinct always-serialised knob).
+        assert!(
+            !out.contains("auto-memoise ="),
+            "absent optimise knob should not be serialised, got:\n{out}"
+        );
+        assert!(!out.contains("auto-gather ="), "got:\n{out}");
+        assert!(!out.contains("auto-parallel ="), "got:\n{out}");
+        assert!(!out.contains("pgo-memoise ="), "got:\n{out}");
+        // It should still re-parse cleanly.
+        let _: TyphonConfig = toml::from_str(&out).expect("round-trip parse");
+    }
+
+    // ── new strictness knob tests ─────────────────────────────────────────
+
+    #[test]
+    fn new_strictness_knobs_have_expected_defaults() {
+        let cfg = TyphonConfig::default();
+        assert!(cfg.strictness.suggest_perf, "suggest-perf defaults true");
+        assert!(
+            cfg.strictness.suggest_parallel,
+            "suggest-parallel defaults true"
+        );
+        assert!(
+            !cfg.strictness.auto_parallel_reductions,
+            "auto-parallel-reductions defaults false"
+        );
+        assert_eq!(
+            cfg.strictness.parallel_backend, "threads",
+            "parallel-backend defaults to threads"
+        );
+    }
+
+    #[test]
+    fn new_strictness_knobs_round_trip_through_toml() {
+        let toml_src = "\
+[project]
+name = \"demo\"
+
+[strictness]
+suggest-perf = false
+suggest-parallel = false
+auto-parallel-reductions = true
+parallel-backend = \"interpreters\"
+";
+        let parsed: TyphonConfig = toml::from_str(toml_src).expect("parse");
+        assert!(!parsed.strictness.suggest_perf);
+        assert!(!parsed.strictness.suggest_parallel);
+        assert!(parsed.strictness.auto_parallel_reductions);
+        assert_eq!(parsed.strictness.parallel_backend, "interpreters");
+        parsed
+            .validate(Path::new("typhon.toml"))
+            .expect("interpreters backend should validate");
+    }
+
+    #[test]
+    fn validate_accepts_all_parallel_backends() {
+        let path = Path::new("typhon.toml");
+        for v in ALLOWED_PARALLEL_BACKENDS {
+            let mut cfg = cfg_with_target("3.13");
+            cfg.strictness.parallel_backend = (*v).into();
+            cfg.validate(path)
+                .unwrap_or_else(|e| panic!("parallel-backend {v:?} should be accepted, got {e}"));
+        }
+    }
+
+    #[test]
+    fn validate_rejects_unknown_parallel_backend() {
+        let path = Path::new("typhon.toml");
+        for v in &["processes", "async", "", "THREADS"] {
+            let mut cfg = cfg_with_target("3.13");
+            cfg.strictness.parallel_backend = (*v).into();
+            let err = cfg
+                .validate(path)
+                .expect_err(&format!("parallel-backend {v:?} should be rejected"));
+            match err {
+                ConfigError::InvalidParallelBackend { value, allowed, .. } => {
+                    assert_eq!(value, *v);
+                    assert!(
+                        allowed.contains("threads") && allowed.contains("interpreters"),
+                        "got {allowed}"
+                    );
+                }
+                other => panic!("expected InvalidParallelBackend for {v:?}, got {other:?}"),
+            }
+        }
     }
 }

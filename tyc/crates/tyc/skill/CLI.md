@@ -2,7 +2,7 @@
 
 The full `tyc` surface. For background and design rationale, see `docs/cli.md` and `docs/long-term-plan.md`.
 
-`tyc` is a single Rust binary built from `tyc/Cargo.toml`. Each subcommand reuses the same Salsa-backed pipeline (`tyc-syntax → tyc-resolve → tyc-types → tyc-analyse → tyc-desugar → tyc-emit → tyc-format`); third-party introspection rides on the side crate `tyc-venv`. The current release is **v1.0.0-alpha.2**.
+`tyc` is a single Rust binary built from `tyc/Cargo.toml`. Each subcommand reuses the same Salsa-backed pipeline (`tyc-syntax → tyc-resolve → tyc-types → tyc-analyse → tyc-desugar → tyc-emit → tyc-format`); third-party introspection rides on the side crate `tyc-venv`. The current release is **v1.0.0-alpha.4**.
 
 ```bash
 # One-time: build the compiler
@@ -53,6 +53,7 @@ Full pipeline: parse → check → analyse → desugar → emit → format. Writ
 | `--no-format` | Skip `ruff format` post-process |
 | `--check` | Dry-run — list every file that *would* be created/overwritten without touching disk. Full pipeline still runs, so type errors surface |
 | `--no-sync` (env: `TYC_NO_SYNC=1`) | Skip `uv sync` but still merge `pyproject.toml` |
+| `--optimise` / `-O` (alias `--optimize`) | Apply `[optimise] level = 1` for this invocation — flips the default of `auto-memoise`, `auto-gather`, `auto-parallel`, and `pgo-memoise` to on. Overrides a config `level = 0`, but an explicit `[strictness]` entry for any of those knobs still wins |
 | `--with-ty` (v0.12.0) | After emit, run Astral's `ty` over the emitted Python (typeshed-backed second-stage check); errors fail the build. Equivalent to `[checker] external = "ty"` for one invocation |
 
 When `[checker] external = "ty"` is set in `typhon.toml` (or `--with-ty` is passed), `tyc build` runs the `ty` pass automatically after a successful emit, re-attributing `ty`'s diagnostics to the originating `.ty` line via the `.py.map` sidecars. This is the only path that type-checks against **typeshed** (C-extension + stdlib APIs that venv introspection can't model). Requires `ty` on `PATH`. `[checker] external-args = [...]` forwards extra flags verbatim.

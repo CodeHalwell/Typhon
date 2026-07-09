@@ -433,7 +433,25 @@ notifs = _t_notifs.result()
 
 ### Free-threaded Python
 
-When `typhon.toml` sets `free-threaded = true`, the analyser emits `ThreadPoolExecutor`-based parallelism for pure-function comprehensions on large collections. The emitter inserts a runtime `sys._is_gil_enabled()` check and falls back to sequential execution if the GIL is present. Default-off until 3.14 is the default Python.
+When `typhon.toml` sets `[python] free-threaded = true`, Typhon targets a free-threaded CPython build (3.13t / 3.14t / 3.15t) and unlocks two opt-in build-time rewrites plus two advice lints. Default-off until 3.14 is the default Python.
+
+**Auto-parallel comprehensions** (`[strictness] auto-parallel = true`). A list / set / dict comprehension whose element is a *pure call* is rewritten to `typhon_runtime.parallel.map_pure(lambda x: <elt>, <source>)`. The eligible shapes are:
+
+- `[f(x) for x in xs]` — the baseline pure-call element;
+- `[f(x) for x in xs if COND]` — a **filter** whose `COND` is itself pure (loop target, literals, arithmetic / comparison / boolean operators, pure calls) runs sequentially in the map's source list, the pure element map runs in parallel;
+- `[f(x, k) for x in xs]` — **extra arguments** that are literals or `let`-bound loop invariants (a `mut`-bound name is never captured);
+- `[g(f(x)) for x in xs]` — **nested** pure calls.
+
+Every widening is semantics-preserving because the element, its captured arguments, and the filters are all side-effect-free. `[strictness] parallel-min-size` (default 64) suppresses the rewrite for statically-sized literal iterables below the threshold.
+
+**Auto-parallel integer reductions** (`[strictness] auto-parallel-reductions = true`, which also requires `auto-parallel`). A canonical accumulation loop `for x in ITER: total += EXPR` — with a **plain `int`** accumulator (`mut total: int`), a pure `EXPR`, and an invariant `ITER` — folds into `total += sum(typhon_runtime.parallel.map_pure(lambda x: EXPR, ITER))`. Integers only: integer addition is associative/commutative and Python ints are exact, so summing partial results in any order is identical. **Floats are never eligible** — reordering IEEE-754 addition changes the result. `ITER` must also be **provably bounded and effect-free to materialise** — a `list`/`tuple`/`set` literal, a bare name annotated `list[...]` / `tuple[...]` / `set[...]` / `frozenset[...]` in the loop's scope, or a direct builtin `range(...)` call (parallelising a `range` loop materialises it — an inherent cost of the map-based design) — because `map_pure` runs `list(ITER)` before evaluating any element; a call result, unannotated name, or generator never rewrites, since an unbounded iterator would hang where the sequential loop raises on its first element, and a stateful iterator's side effects would all run where the loop stopped early.
+
+**Execution backend** (`[strictness] parallel-backend`, default `"threads"`). `map_pure` runs on a `ThreadPoolExecutor` (order-preserving; escapes the GIL on a free-threaded build, serialises but stays correct on a stock GIL build). Setting `parallel-backend = "interpreters"` first tries a PEP 734 `concurrent.futures.InterpreterPoolExecutor` (Python 3.14+) and falls back **transparently** to the thread pool on `ImportError` / `AttributeError` (older runtimes) or when the mapped function can't be pickled across the interpreter boundary — probed with `pickle.dumps` before any pool is created, so an unshareable callable falls back whatever exception pickling raises, while exceptions raised *by* the mapped function still propagate normally. Order is preserved on every path. The lambdas the auto-parallel rewrites emit never pickle, so rewritten call sites always run on the thread pool under this backend today; the interpreters pool benefits hand-written `map_pure` calls passing top-level named functions.
+
+**Advice lints** (both gated by `[strictness] suggest-parallel`, default on, and both silent unless `free-threaded = true`):
+
+- [`tyc::parallel_opportunity`](diagnostics/parallel_opportunity.md) nudges a comprehension or integer accumulator loop that *would* be rewritten if the relevant knob were on — or a `float` accumulator loop that matches every reduction condition except the required `int` annotation (parallelisable only by reordering float addition, which changes results).
+- [`tyc::shared_mut_across_tasks`](diagnostics/shared_mut_across_tasks.md) flags a `go`-spawned same-module function that writes module-level mutable state (a `global` assignment or a write to a module-level `mut` binding), since under free-threaded Python the spawned task runs concurrently with the spawner.
 
 ### `go` spawn
 
@@ -487,11 +505,29 @@ loaded.use()        # OK — every non-diverging arm assigned `loaded`
 
 ## Lazy loading
 
-- `lazy import np = numpy` → defers module loading until first attribute access via a generated `__TyphonLazy_<alias>_` proxy class (thread-safe, double-checked locking).
-- `lazy from foo import a, b` is **rejected** at parse time: PEP 690 notes that `from`-imports eagerly touch attributes on the source module and therefore defeat deferral. Use `lazy import foo` and access `foo.a` / `foo.b`.
+- `lazy import np = numpy` → defers module loading until first attribute access. On a **3.13 / 3.14 target** this lowers to a call to the generated `typhon_runtime.lazy.lazy_import` helper (which wraps the stdlib `importlib.util.LazyLoader`). On a **3.15+ target** it lowers to native [PEP 810](https://peps.python.org/pep-0810/) syntax instead — see below.
+- `lazy from foo import a, b` is **rejected** at parse time: PEP 690 notes that `from`-imports eagerly touch attributes on the source module and therefore defeat deferral. Use `lazy import foo` and access `foo.a` / `foo.b`. (Note: PEP 810 permits a `lazy from … import` form upstream, but Typhon keeps the single `lazy import ALIAS = MODULE` surface for now — supporting the `from` form is a future surface decision.)
 - `lazy let` module-level bindings → cached getter with a sentinel + lock helper in `typhon_runtime` (not `functools.cached_property`, which is instance-scoped, race-prone, and writable after first evaluation).
 - `lazy let` instance-level bindings on effectively immutable classes → `functools.cached_property`.
 - `lazy[list[T]]` return types → generator functions instead of materialised lists.
+
+### Native lazy imports on Python 3.15 (PEP 810)
+
+Python 3.15 ships [PEP 810](https://peps.python.org/pep-0810/): a native `lazy import` statement with exactly the deferred-until-first-use semantics Typhon's helper emulates. When a project targets `3.15` / `3.15t`, `tyc build` lowers `lazy import` directly to that native form — no `typhon_runtime` helper, no runtime import:
+
+```python
+# Typhon source (any target)
+lazy import np = numpy
+
+# Emitted Python — 3.13 / 3.14 target
+from typhon_runtime.lazy import lazy_import as __typhon_lazy_import
+np = __typhon_lazy_import("numpy")
+
+# Emitted Python — 3.15+ target
+lazy import numpy as np
+```
+
+A project whose only runtime-touching feature was `lazy import` therefore ships **no** generated `typhon_runtime/` package on a 3.15+ target. The change is `tyc build`-only and only on 3.15+ — 3.13 / 3.14 output is byte-for-byte unchanged, and `tyc check` / `tyc run` are unaffected. (If `[checker] external = "ty"` is enabled, run it with a PEP 810-aware `ty`; an older `ty` build will reject the native `lazy import` syntax in the emitted Python.)
 
 ## Stubs and Python interop
 

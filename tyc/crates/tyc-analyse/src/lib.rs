@@ -69,12 +69,27 @@ pub mod pgo;
 pub use pgo::{load_profile_samples, pgo_memoise_targets, ProfileSample};
 
 pub mod parallel;
-pub use parallel::{rewrite_parallel_comprehensions, ParallelStats};
+pub use parallel::{
+    detect_parallel_comprehensions, rewrite_parallel_comprehensions, ParallelStats,
+};
+
+pub mod reductions;
+pub use reductions::{
+    detect_reduction_loops, rewrite_reduction_loops, ReductionHit, ReductionStats,
+};
+
+pub mod parallel_lints;
+pub use parallel_lints::{parallel_opportunity_diagnostics, shared_mut_across_tasks_diagnostics};
 
 pub mod extend_builtin;
 pub use extend_builtin::{
     extract_builtin_extensions, rewrite_builtin_extension_calls,
     rewrite_builtin_extension_calls_tracking, ExtensionExtractionStats, ExtensionRegistry,
+};
+
+pub mod perf;
+pub use perf::{
+    is_stdlib_top_level, lazy_import_opportunity_diagnostics, perf_diagnostics, PerfLintContext,
 };
 
 // ── Shared editor / CLI lint advisories ───────────────────────────────────────
@@ -92,15 +107,44 @@ pub struct LintOptions {
     /// `[strictness] suggest-gather` — when `true` (the default), surface
     /// `tyc::gather_opportunity` for runs of independent awaits.
     pub suggest_gather: bool,
+    /// `[strictness] suggest-perf` — when `true` (the default), surface the
+    /// `tyc::perf_*` / `tyc::lazy_import_opportunity` advice family.
+    pub suggest_perf: bool,
+    /// `[strictness] suggest-parallel` — when `true` (the default), surface
+    /// `tyc::parallel_opportunity` and `tyc::shared_mut_across_tasks`. Only
+    /// takes effect when [`LintOptions::free_threaded`] is also `true`.
+    pub suggest_parallel: bool,
+    /// `[python] free-threaded` — the free-threading advice lints
+    /// (`suggest-parallel`) only fire when this is `true` (the project
+    /// explicitly targets free-threaded Python). Defaults `false`, which keeps
+    /// the two lints silent — and the corpus quiet — by construction.
+    pub free_threaded: bool,
+    /// `[strictness] auto-parallel` (resolved) — silences the
+    /// `parallel_opportunity` comprehension arm when the rewrite is already on.
+    pub auto_parallel: bool,
+    /// `[strictness] auto-parallel-reductions` — silences the
+    /// `parallel_opportunity` int-reduction arm when the rewrite is already on.
+    pub auto_parallel_reductions: bool,
+    /// `[strictness] parallel-min-size` — matches the rewrite's threshold so
+    /// the advice fires on exactly the shapes that would be rewritten.
+    pub parallel_min_size: u64,
 }
 
 impl Default for LintOptions {
     fn default() -> Self {
-        // `allow-secret-comptime` defaults off (lint on); `suggest-gather`
-        // defaults on — same as `[strictness]`'s own defaults.
+        // `allow-secret-comptime` defaults off (lint on); `suggest-gather`,
+        // `suggest-perf`, and `suggest-parallel` default on — same as
+        // `[strictness]`'s own defaults. `free-threaded` defaults off, so the
+        // parallel advice lints stay silent unless a project opts in.
         Self {
             allow_secret_comptime: false,
             suggest_gather: true,
+            suggest_perf: true,
+            suggest_parallel: true,
+            free_threaded: false,
+            auto_parallel: false,
+            auto_parallel_reductions: false,
+            parallel_min_size: 64,
         }
     }
 }
@@ -135,11 +179,18 @@ pub fn gather_opportunity_diagnostics(module: &ModModule, path: &str, source: &s
 /// (purity and the import-vetting / `pub *` checks stay in the `check`
 /// command — they need resolve / comptime context the LSP composes
 /// separately).
+///
+/// `perf_ctx` carries the preprocess-derived facts the `tyc::perf_*`
+/// family (specifically `lazy_import_opportunity`) needs — which imports
+/// are already `lazy`, the module's `pub` names, and whether it has a
+/// `pub *`. Pass [`perf::PerfLintContext::default`] when they're
+/// unavailable (a standalone buffer); the perf family degrades gracefully.
 pub fn editor_lint_diagnostics(
     module: &ModModule,
     path: &str,
     source: &str,
     opts: LintOptions,
+    perf_ctx: &perf::PerfLintContext,
 ) -> Diagnostics {
     let mut diags = Diagnostics::new();
     diags.extend(analyse_empty_collection_bindings(module, path, source));
@@ -155,6 +206,31 @@ pub fn editor_lint_diagnostics(
     ));
     if opts.suggest_gather {
         diags.extend(gather_opportunity_diagnostics(module, path, source));
+    }
+    if opts.suggest_perf {
+        diags.extend(perf_diagnostics(module, path, source, perf_ctx));
+    }
+    // The free-threading advice lints (`parallel_opportunity`,
+    // `shared_mut_across_tasks`) only fire when the project targets
+    // free-threaded Python — the gate that keeps the corpus (which never sets
+    // it) quiet by construction. The pure-callee set is only computed inside
+    // this guard so free-threaded-off projects pay nothing for it.
+    if opts.suggest_parallel && opts.free_threaded {
+        diags.extend(shared_mut_across_tasks_diagnostics(module, path, source));
+        let pure: std::collections::HashSet<String> = analyse_purity(module, false)
+            .iter()
+            .filter(|f| f.violation.is_none())
+            .map(|f| f.name.clone())
+            .collect();
+        diags.extend(parallel_opportunity_diagnostics(
+            module,
+            path,
+            source,
+            &pure,
+            opts.parallel_min_size,
+            opts.auto_parallel,
+            opts.auto_parallel_reductions,
+        ));
     }
     diags
 }
@@ -4380,8 +4456,13 @@ def f(xs: list[int] = []) -> int:
 ";
         let prep = preprocess(src);
         let module = parse(src);
-        let diags =
-            editor_lint_diagnostics(&module, "x.ty", &prep.python_source, LintOptions::default());
+        let diags = editor_lint_diagnostics(
+            &module,
+            "x.ty",
+            &prep.python_source,
+            LintOptions::default(),
+            &PerfLintContext::default(),
+        );
         let codes = warning_codes(&diags);
         assert!(
             codes.iter().any(|c| c.contains("gather_opportunity")),
@@ -4411,13 +4492,66 @@ async def load() -> int:
             suggest_gather: false,
             ..LintOptions::default()
         };
-        let diags = editor_lint_diagnostics(&module, "x.ty", &prep.python_source, opts);
+        let diags = editor_lint_diagnostics(
+            &module,
+            "x.ty",
+            &prep.python_source,
+            opts,
+            &PerfLintContext::default(),
+        );
         let has_gather = warning_codes(&diags)
             .iter()
             .any(|c| c.contains("gather_opportunity"));
         assert!(
             !has_gather,
             "suggest_gather = false must silence the gather nudge"
+        );
+    }
+
+    #[test]
+    fn editor_lint_diagnostics_respects_suggest_perf_off() {
+        // A `sorted(...)[0]` (perf_sorted_first) and a module-level-only
+        // third-party import (lazy_import_opportunity) are both present; with
+        // `suggest_perf = false` neither surfaces.
+        let src = "\
+import numpy as np
+def first(xs: list[int]) -> int:
+    return sorted(xs)[0]
+def use_np() -> object:
+    return np.array([1])
+";
+        let prep = preprocess(src);
+        let module = parse(src);
+        let on = editor_lint_diagnostics(
+            &module,
+            "x.ty",
+            &prep.python_source,
+            LintOptions::default(),
+            &PerfLintContext::default(),
+        );
+        assert!(
+            warning_codes(&on).iter().any(|c| c.contains("perf_")),
+            "sanity: perf lints fire by default; got {:?}",
+            warning_codes(&on)
+        );
+        let opts = LintOptions {
+            suggest_perf: false,
+            ..LintOptions::default()
+        };
+        let off = editor_lint_diagnostics(
+            &module,
+            "x.ty",
+            &prep.python_source,
+            opts,
+            &PerfLintContext::default(),
+        );
+        let perf_hits: Vec<String> = warning_codes(&off)
+            .into_iter()
+            .filter(|c| c.contains("perf_") || c.contains("lazy_import_opportunity"))
+            .collect();
+        assert!(
+            perf_hits.is_empty(),
+            "suggest_perf = false must silence the whole perf family; got {perf_hits:?}"
         );
     }
 

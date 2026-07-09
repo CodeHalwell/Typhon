@@ -15,14 +15,22 @@ exhaustive-match = "error"
 methods-in-class-body = "warn"
 unintrospectable-dependency = "warn"
 suggest-gather = true
+suggest-perf = true
+suggest-parallel = true
 auto-memoise = false
 auto-gather = false
 auto-parallel = false
+auto-parallel-reductions = false
 parallel-min-size = 64
+parallel-backend = "threads"
 pgo-memoise = false
 pgo-min-calls = 100
 allow-secret-comptime = false
 ```
+
+<Aside type="tip">
+  `auto-memoise`, `auto-gather`, `auto-parallel`, and `pgo-memoise` all default to `false` here, but [`[optimise] level = 1`](/Typhon/configuration/overview/#optimise) flips all four defaults to `true` in one step. An explicit entry for any of them in this table always overrides the level-derived default.
+</Aside>
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
@@ -32,10 +40,14 @@ allow-secret-comptime = false
 | `methods-in-class-body` | `"error"` \| `"warn"` \| `"off"` | `"warn"` | Severity for [`tyc::method_in_class_body`](/Typhon/diagnostics/class-errors/) — Rule 4: methods live in `impl Name:`, not the class body. Default `"warn"` matches every other nudge diagnostic; promote to `"error"` once a codebase has finished migrating off in-body methods. `"off"` suppresses it entirely. |
 | `unintrospectable-dependency` | `"warn"` \| `"error"` \| `"off"` | `"warn"` | Severity when a declared dependency is imported but cannot be introspected (no reachable `.venv` / `python3`, not installed, or no introspectable signatures). `"warn"` surfaces it; `"error"` CI-gates; `"off"` restores the old silent skip. |
 | `suggest-gather` | bool | `true` | Emit the advice-level [`tyc::gather_opportunity`](/Typhon/diagnostics/) hint when 2+ adjacent independent awaited calls could be wrapped in a `gather:` block. Never rewrites, never blocks a build. |
+| `suggest-perf` | bool | `true` | Emit the advice-level `tyc::perf_*` micro-optimisation family (six lints) plus [`tyc::lazy_import_opportunity`](/Typhon/diagnostics/). Never rewrites, never blocks a build. |
+| `suggest-parallel` | bool | `true` | Emit the advice-level `tyc::parallel_opportunity` / `tyc::shared_mut_across_tasks` hints. Both additionally require `[python] free-threaded = true` to fire. Never rewrites, never blocks a build. |
 | `auto-memoise` | bool | `false` | Insert `@functools.cache` on every function the analyser infers as pure. **Off by default — caches extend lifetimes invisibly.** |
 | `auto-gather` | bool | `false` | Fold straight-line independent `await` runs into `asyncio.TaskGroup`, but only for `@gatherable`-decorated callees (same-module or imported from another project module). |
 | `auto-parallel` | bool | `false` | Rewrite pure list comprehensions over large iterables to a `ThreadPoolExecutor.map` (needs `free-threaded`). |
+| `auto-parallel-reductions` | bool | `false` | Parallelise `int`-only accumulator loops (`for x in xs: total += f(x)` with `mut total: int` and a pure `f`) the same way `auto-parallel` handles comprehensions. Requires `auto-parallel = true`. `float` accumulators are never rewritten — reordering IEEE-754 addition changes the result — and the iterable must be provably bounded and effect-free to materialise (a container literal, a container-annotated name, or a builtin `range(...)` call). |
 | `parallel-min-size` | int | `64` | Minimum iterable size for `auto-parallel` to fire. When the size can't be statically inferred, treated as zero. |
+| `parallel-backend` | `"threads"` \| `"interpreters"` | `"threads"` | Execution backend for `auto-parallel` / `auto-parallel-reductions` rewrites. `"interpreters"` tries a PEP 734 `InterpreterPoolExecutor` (3.14+) first, falling back transparently to the thread pool on an older runtime or an unshareable mapped callable. |
 | `pgo-memoise` | bool | `false` | Promote hot pure functions to `@functools.cache` based on `typhon-profile.json` from a prior `tyc profile` run. |
 | `pgo-min-calls` | int | `100` | Threshold for `pgo-memoise`. |
 | `allow-secret-comptime` | bool | `false` | When true, silences the `tyc::contains_secret_literal` warning that flags hardcoded secrets or environment variables mapped at build time. |
@@ -114,6 +126,26 @@ It is purely advisory: it **never rewrites** your code and **never blocks a buil
 suggest-gather = false
 ```
 
+## `suggest-perf`
+
+**On by default.** Controls the `tyc::perf_*` family — six advice-level (Hint) lints that flag common hot-loop anti-patterns: a linear `in` scan of a loop-invariant list (`perf_membership_in_loop`), `list.insert(0, …)` / `list.pop(0)` in a loop (`perf_list_shift_in_loop`), quadratic `str +=` accumulation (`perf_str_concat_in_loop`), re-sorting loop-invariant data every iteration (`perf_sort_in_loop`), `sorted(...)[0]` instead of `min(...)` (`perf_sorted_first`), and `x in d.keys()` instead of `x in d` (`perf_keys_membership`) — plus `tyc::lazy_import_opportunity`, which nudges a module-level import used only inside function bodies toward `lazy import`.
+
+Every lint in the family fires only on unambiguous local evidence (annotated receiver types, statically-provable loop-invariance). Like `suggest-gather`, it **never rewrites** and **never blocks a build**:
+
+```toml
+[strictness]
+suggest-perf = false
+```
+
+## `suggest-parallel`
+
+**On by default.** Controls two advice-level lints that only fire on a free-threaded target (`[python] free-threaded = true` — silent otherwise): `tyc::parallel_opportunity` (a comprehension or `int` accumulator loop that could be parallelised if `auto-parallel` / `auto-parallel-reductions` were on, or a `float` accumulator that's ineligible only because of its type) and `tyc::shared_mut_across_tasks` (a `go`-spawned same-module function that writes a `global` or module-level `mut` binding — a data race under real concurrency).
+
+```toml
+[strictness]
+suggest-parallel = false
+```
+
 ## `auto-memoise`
 
 **Off by default.** When on, every function the analyser infers as pure (all six conditions hold) gets `@functools.cache`. The runtime impact:
@@ -141,6 +173,25 @@ Default `false`. Explicit `gather:` blocks are unaffected by this setting.
 When `true`, pure list comprehensions whose element is a pure call are rewritten at build time to a `ThreadPoolExecutor.map`. Combine with `[python] free-threaded = true` to release the GIL across workers; on stock CPython the rewrite still runs but the GIL serialises.
 
 `parallel-min-size` is the minimum statically-detectable iterable length. Default `64`. When the iterable size cannot be inferred, the threshold is treated as zero — users opting in accept that contract.
+
+## `auto-parallel-reductions`
+
+**Off by default. Requires `auto-parallel = true`.** Extends the `auto-parallel` rewrite to integer accumulator loops: `for x in xs: total += f(x)` with a **plain `int`** accumulator (`mut total: int`) and a pure `f` lowers to `total += sum(map_pure(lambda x: f(x), xs))`. Integer addition is exact and associative/commutative, so summing partial results in any order gives an identical answer.
+
+The iterable must additionally be **provably bounded and effect-free to materialise**, because `map_pure` runs `list(ITER)` before evaluating a single element: a `list`/`tuple`/`set` literal, a bare name annotated `list[...]` / `tuple[...]` / `set[...]` / `frozenset[...]` in the loop's scope, or a direct builtin `range(...)` call. Anything else — an unannotated name, a function/method call result, a generator — is never rewritten: an unbounded iterator would hang where the sequential loop raises on its first element, and a stateful iterator's side effects would all run where the loop stopped early. Note that parallelising a `range` loop materialises the range — an inherent cost of the map-based design.
+
+<Aside type="caution">
+  `float` accumulators are **never** rewritten — reordering IEEE-754 floating-point addition changes the result, so the compiler refuses to silently reorder it. A `float` loop that's otherwise shaped for the rewrite surfaces `tyc::parallel_opportunity` instead, explaining why it was skipped.
+</Aside>
+
+## `parallel-backend`
+
+**Default `"threads"`.** The execution backend baked into the generated `typhon_runtime/parallel.py` for `auto-parallel` / `auto-parallel-reductions` rewrites:
+
+- `"threads"` — a `concurrent.futures.ThreadPoolExecutor` (order-preserving; escapes the GIL on a free-threaded build, serialises but stays correct on stock CPython).
+- `"interpreters"` — first tries a [PEP 734](https://peps.python.org/pep-0734/) `concurrent.futures.InterpreterPoolExecutor` (Python 3.14+), falling back **transparently** to the thread pool on `ImportError` / `AttributeError` (older runtimes) or when the mapped callable can't be pickled across the interpreter boundary — the generated helper probes `pickle.dumps(fn)` before creating a pool, so an unshareable callable (whose pickling raises `PicklingError` / `AttributeError`, not just `TypeError`) falls back cleanly while exceptions raised *by* the callable still propagate normally. Order is preserved on every fallback path. Note that the lambdas the auto-parallel rewrites emit never pickle, so rewritten call sites always run on the thread pool under this backend today; the interpreters pool benefits hand-written `map_pure` calls passing top-level named functions.
+
+Any other value is rejected at config load.
 
 ## `pgo-memoise`
 

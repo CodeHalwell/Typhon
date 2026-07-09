@@ -22,6 +22,9 @@ out = "build"
 target = "3.13"
 free-threaded = false
 
+[optimise]
+level = 0
+
 [emit]
 class-default = "dataclass"
 format = true
@@ -36,10 +39,14 @@ exhaustive-match = "error"
 methods-in-class-body = "warn"
 unintrospectable-dependency = "warn"
 suggest-gather = true
+suggest-perf = true
+suggest-parallel = true
 auto-memoise = false
 auto-gather = false
 auto-parallel = false
+auto-parallel-reductions = false
 parallel-min-size = 64
+parallel-backend = "threads"
 pgo-memoise = false
 pgo-min-calls = 100
 allow-secret-comptime = false
@@ -64,6 +71,7 @@ pytest = "8.2"
 |---------|---------|------|
 | `[project]` | Name, version, src/out dirs | [→](/Typhon/configuration/project/) |
 | `[python]` | Target version, free-threaded mode | [→](/Typhon/configuration/python/) |
+| `[optimise]` | Single-dial opt-in performance defaults | [↓](#optimise) |
 | `[emit]` | Class default, format toggle, framework-base skip list | [→](/Typhon/configuration/emit/) |
 | `[strictness]` | Every strictness knob | [→](/Typhon/configuration/strictness/) |
 | `[checker]` | External type-checker integration | [↓](#checker) |
@@ -79,6 +87,33 @@ One emit policy is no longer configurable and runs unconditionally:
 - **PEP 561 `.pyi` stubs** are emitted for every `.dty` file next to the project, so mypy / pyright / Pyrefly / `ty` can consume Typhon-authored libraries without an interop tax. The previously-documented `[emit] pyi-stubs` toggle has been removed.
 
 **Pydantic `model` classes** now use `[emit] model-extra` (default `"forbid"`) to control the `ConfigDict(extra=…)` value. See the [`[emit]` reference](/Typhon/configuration/emit/) for details.
+
+## `[optimise]`
+
+A single project-wide dial that flips the *default* of four other opt-in [`[strictness]`](/Typhon/configuration/strictness/) knobs — `auto-memoise`, `auto-gather`, `auto-parallel`, `pgo-memoise` — without touching each one individually.
+
+```toml
+[optimise]
+level = 0
+```
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `level` | `0` \| `1` | `0` | `0` leaves every optimisation knob at its own default. `1` flips the default of `auto-memoise` / `auto-gather` / `auto-parallel` / `pgo-memoise` to `true`. Any other integer is rejected at config load. |
+
+<Aside type="tip">
+  An explicit `[strictness]` entry always wins over the level-derived default, so a project can opt into `level = 1` and still keep one knob off:
+
+  ```toml
+  [optimise]
+  level = 1               # auto-memoise / auto-gather / pgo-memoise default on…
+
+  [strictness]
+  auto-parallel = false   # …but this explicit entry keeps auto-parallel off
+  ```
+</Aside>
+
+[`tyc build -O`](/Typhon/cli/build/) (or `--optimise` / `--optimize`) applies `level = 1` for a single invocation without editing `typhon.toml` — it overrides a config `level = 0` but, like the file-level `level` itself, never overrides an explicit `[strictness]` setting.
 
 ## `[checker]`
 

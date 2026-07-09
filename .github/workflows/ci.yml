@@ -29,6 +29,11 @@ jobs:
 
       - name: Cache cargo registry and build
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        # The cache is an optimization, never a correctness requirement: a
+        # cache-service outage must not fail CI (observed 2026-07-09 — the
+        # restore step died before any code step ran). Cold builds are
+        # slower but correct.
+        continue-on-error: true
         with:
           path: |
             ~/.cargo/registry
@@ -75,6 +80,8 @@ jobs:
 
       - name: Cache cargo registry and build
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        # See the test job: cache failures must not fail CI.
+        continue-on-error: true
         with:
           path: |
             ~/.cargo/registry
