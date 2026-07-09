@@ -1822,6 +1822,55 @@ fn corpus_examples_all_check_clean() {
 }
 
 #[test]
+fn perf_advice_surfaces_and_respects_suggest_perf() {
+    // End-to-end: a `sorted(xs)[0]` fires `tyc::perf_sorted_first`. The advice
+    // is surfaced by `tyc check` but is advice-only (never fails the build),
+    // and `[strictness] suggest-perf = false` silences the whole family —
+    // mirroring how `suggest-gather` gates `tyc::gather_opportunity`.
+    let body = "def first(xs: list[int]) -> int:\n    return sorted(xs)[0]\n";
+
+    // Default (suggest-perf on): advice present, check still succeeds.
+    let on = tempfile::tempdir().unwrap();
+    scaffold(on.path(), body);
+    let out = tyc().arg("check").arg(on.path()).output().unwrap();
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        out.status.success(),
+        "advice must not fail the check: {combined}"
+    );
+    assert!(
+        combined.contains("perf_sorted_first"),
+        "expected perf_sorted_first advice; got: {combined}"
+    );
+
+    // suggest-perf = false: the perf family is silenced.
+    let off = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(off.path().join("src")).unwrap();
+    std::fs::write(
+        off.path().join("typhon.toml"),
+        "[project]\nname = \"t\"\nversion = \"0.1.0\"\nsrc = \"src\"\nout = \"build\"\n\
+         [python]\ntarget = \"3.13\"\n[strictness]\nsuggest-perf = false\n",
+    )
+    .unwrap();
+    std::fs::write(off.path().join("src").join("main.ty"), body).unwrap();
+    let out2 = tyc().arg("check").arg(off.path()).output().unwrap();
+    let combined2 = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out2.stdout),
+        String::from_utf8_lossy(&out2.stderr)
+    );
+    assert!(out2.status.success(), "{combined2}");
+    assert!(
+        !combined2.contains("perf_sorted_first"),
+        "suggest-perf = false must silence perf advice; got: {combined2}"
+    );
+}
+
+#[test]
 fn bundled_httpx_stub_checks_without_venv() {
     // A project that declares (but hasn't installed) httpx still type-checks
     // against the compiler-bundled stub: construction is validated, the

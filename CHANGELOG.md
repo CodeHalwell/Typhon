@@ -23,6 +23,29 @@ canonical phase-by-phase status lives in `docs/roadmap.md`.
   (measured ~5–18× slower than the compiled path at steady state; VM
   wins startup) and added `docs/vm-performance-plan.md` (tiered VM
   performance plan).
+- feat(lints): new **performance-advice family** — advice-level, on by
+  default, gated by `[strictness] suggest-perf` and surfaced by `tyc check`
+  / `tyc build` and live in the editor (the LSP), exactly like
+  `tyc::gather_opportunity`. Six `tyc::perf_*` lints plus
+  `tyc::lazy_import_opportunity`: `perf_membership_in_loop` (a linear `in`
+  scan of a loop-invariant `list` in an `if`/`while` condition → build a
+  `set` once outside the loop), `perf_list_shift_in_loop`
+  (`list.insert(0, …)` / `list.pop(0)` in a loop → `collections.deque`),
+  `perf_str_concat_in_loop` (`s += …` on a `str` in a loop → collect a
+  `list[str]` and `"".join(...)`), `perf_sort_in_loop` (`sorted(x)` /
+  `x.sort()` of a loop-invariant `x` in a loop → sort once, or `heapq`),
+  `perf_sorted_first` (`sorted(...)[0]` / `[-1]` → `min` / `max`),
+  `perf_keys_membership` (`k in d.keys()` → `k in d`), and
+  `lazy_import_opportunity` (a module-level `import X` used only inside
+  function bodies → `lazy import`). Detectors live in the new
+  `tyc-analyse/src/perf.rs`; each fires only on unambiguous local AST
+  evidence (annotated receiver types, loop-invariance proofs) so the
+  example/stress corpus stays advice-noise-free. Advice only — the accepted
+  surface is unchanged. Each code ships a `docs/diagnostics/<code>.md` page
+  and a `tyc explain` entry.
+- refactor(lints): the Python 3.13 stdlib top-level module table now lives
+  once in `tyc-analyse` (`is_stdlib_top_level`); `tyc::stdlib_module_shadow`
+  delegates to it, so it and `tyc::lazy_import_opportunity` can't drift.
 
 ## 1.0.0-alpha.4 — 2026-07-08 — post-alpha.3 hardening: H5 soundness, secret-detection correctness & supply-chain hygiene
 

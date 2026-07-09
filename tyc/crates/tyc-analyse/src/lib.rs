@@ -77,6 +77,11 @@ pub use extend_builtin::{
     rewrite_builtin_extension_calls_tracking, ExtensionExtractionStats, ExtensionRegistry,
 };
 
+pub mod perf;
+pub use perf::{
+    is_stdlib_top_level, lazy_import_opportunity_diagnostics, perf_diagnostics, PerfLintContext,
+};
+
 // ── Shared editor / CLI lint advisories ───────────────────────────────────────
 
 /// Config knobs that gate two of the advisory lints. Mirrors the
@@ -92,15 +97,20 @@ pub struct LintOptions {
     /// `[strictness] suggest-gather` — when `true` (the default), surface
     /// `tyc::gather_opportunity` for runs of independent awaits.
     pub suggest_gather: bool,
+    /// `[strictness] suggest-perf` — when `true` (the default), surface the
+    /// `tyc::perf_*` / `tyc::lazy_import_opportunity` advice family.
+    pub suggest_perf: bool,
 }
 
 impl Default for LintOptions {
     fn default() -> Self {
         // `allow-secret-comptime` defaults off (lint on); `suggest-gather`
-        // defaults on — same as `[strictness]`'s own defaults.
+        // and `suggest-perf` default on — same as `[strictness]`'s own
+        // defaults.
         Self {
             allow_secret_comptime: false,
             suggest_gather: true,
+            suggest_perf: true,
         }
     }
 }
@@ -135,11 +145,18 @@ pub fn gather_opportunity_diagnostics(module: &ModModule, path: &str, source: &s
 /// (purity and the import-vetting / `pub *` checks stay in the `check`
 /// command — they need resolve / comptime context the LSP composes
 /// separately).
+///
+/// `perf_ctx` carries the preprocess-derived facts the `tyc::perf_*`
+/// family (specifically `lazy_import_opportunity`) needs — which imports
+/// are already `lazy`, the module's `pub` names, and whether it has a
+/// `pub *`. Pass [`perf::PerfLintContext::default`] when they're
+/// unavailable (a standalone buffer); the perf family degrades gracefully.
 pub fn editor_lint_diagnostics(
     module: &ModModule,
     path: &str,
     source: &str,
     opts: LintOptions,
+    perf_ctx: &perf::PerfLintContext,
 ) -> Diagnostics {
     let mut diags = Diagnostics::new();
     diags.extend(analyse_empty_collection_bindings(module, path, source));
@@ -155,6 +172,9 @@ pub fn editor_lint_diagnostics(
     ));
     if opts.suggest_gather {
         diags.extend(gather_opportunity_diagnostics(module, path, source));
+    }
+    if opts.suggest_perf {
+        diags.extend(perf_diagnostics(module, path, source, perf_ctx));
     }
     diags
 }
@@ -4380,8 +4400,13 @@ def f(xs: list[int] = []) -> int:
 ";
         let prep = preprocess(src);
         let module = parse(src);
-        let diags =
-            editor_lint_diagnostics(&module, "x.ty", &prep.python_source, LintOptions::default());
+        let diags = editor_lint_diagnostics(
+            &module,
+            "x.ty",
+            &prep.python_source,
+            LintOptions::default(),
+            &PerfLintContext::default(),
+        );
         let codes = warning_codes(&diags);
         assert!(
             codes.iter().any(|c| c.contains("gather_opportunity")),
@@ -4411,13 +4436,66 @@ async def load() -> int:
             suggest_gather: false,
             ..LintOptions::default()
         };
-        let diags = editor_lint_diagnostics(&module, "x.ty", &prep.python_source, opts);
+        let diags = editor_lint_diagnostics(
+            &module,
+            "x.ty",
+            &prep.python_source,
+            opts,
+            &PerfLintContext::default(),
+        );
         let has_gather = warning_codes(&diags)
             .iter()
             .any(|c| c.contains("gather_opportunity"));
         assert!(
             !has_gather,
             "suggest_gather = false must silence the gather nudge"
+        );
+    }
+
+    #[test]
+    fn editor_lint_diagnostics_respects_suggest_perf_off() {
+        // A `sorted(...)[0]` (perf_sorted_first) and a module-level-only
+        // third-party import (lazy_import_opportunity) are both present; with
+        // `suggest_perf = false` neither surfaces.
+        let src = "\
+import numpy as np
+def first(xs: list[int]) -> int:
+    return sorted(xs)[0]
+def use_np() -> object:
+    return np.array([1])
+";
+        let prep = preprocess(src);
+        let module = parse(src);
+        let on = editor_lint_diagnostics(
+            &module,
+            "x.ty",
+            &prep.python_source,
+            LintOptions::default(),
+            &PerfLintContext::default(),
+        );
+        assert!(
+            warning_codes(&on).iter().any(|c| c.contains("perf_")),
+            "sanity: perf lints fire by default; got {:?}",
+            warning_codes(&on)
+        );
+        let opts = LintOptions {
+            suggest_perf: false,
+            ..LintOptions::default()
+        };
+        let off = editor_lint_diagnostics(
+            &module,
+            "x.ty",
+            &prep.python_source,
+            opts,
+            &PerfLintContext::default(),
+        );
+        let perf_hits: Vec<String> = warning_codes(&off)
+            .into_iter()
+            .filter(|c| c.contains("perf_") || c.contains("lazy_import_opportunity"))
+            .collect();
+        assert!(
+            perf_hits.is_empty(),
+            "suggest_perf = false must silence the whole perf family; got {perf_hits:?}"
         );
     }
 

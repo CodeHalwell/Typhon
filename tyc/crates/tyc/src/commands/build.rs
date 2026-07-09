@@ -846,6 +846,32 @@ pub fn run(args: BuildArgs) -> Result<()> {
             }
         }
 
+        // Default-on performance-advice family (`tyc::perf_*` +
+        // `tyc::lazy_import_opportunity`). Same detectors the `check` command
+        // and the LSP run via `editor_lint_diagnostics`; advice-only, never
+        // blocks a build, silenced by `[strictness] suggest-perf = false`.
+        if config.strictness.suggest_perf {
+            let perf_ctx = tyc_analyse::PerfLintContext {
+                lazy_import_aliases: prep
+                    .lazy_imports
+                    .iter()
+                    .map(|li| li.alias.clone())
+                    .collect(),
+                pub_names: prep.pub_names.clone(),
+                has_pub_star: !prep.pub_star_lines.is_empty(),
+            };
+            for advice in tyc_analyse::perf_diagnostics(
+                &module,
+                &path.to_string_lossy(),
+                &prep.python_source,
+                &perf_ctx,
+            )
+            .warnings()
+            {
+                eprintln!("{:?}", miette::Report::new_boxed(Box::new(advice.clone())));
+            }
+        }
+
         // Lower `extend BUILTIN:` blocks (e.g. `extend str:`) into module-
         // level free functions and rewrite call sites whose receiver has a
         // matching type annotation.  Receivers without a static annotation

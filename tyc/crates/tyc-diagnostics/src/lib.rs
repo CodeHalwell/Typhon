@@ -1026,6 +1026,151 @@ pub enum TycError {
         span: SourceSpan,
     },
 
+    /// A `NAME2 in NAME` / `NAME2 not in NAME` membership test where
+    /// `NAME` is a `list`-annotated (or list-literal) binding runs a
+    /// linear O(n) scan, and it sits inside a loop that never mutates
+    /// `NAME` — so the same scan repeats every iteration. Building a
+    /// `set` once outside the loop turns each test into an O(1) lookup.
+    /// Advice-level: this never changes behaviour, so it never blocks a
+    /// build. Part of the `tyc::perf_*` family gated by
+    /// `[strictness] suggest-perf`.
+    #[error("linear membership scan of list `{name}` repeats on every loop iteration")]
+    #[diagnostic(
+        severity(Advice),
+        code(tyc::perf_membership_in_loop),
+        url("https://github.com/CodeHalwell/Typhon/blob/main/docs/diagnostics/perf_membership_in_loop.md"),
+        help("build a `set` from `{name}` once before the loop and test against it — set membership is O(1) versus the list's O(n) scan")
+    )]
+    PerfMembershipInLoop {
+        name: String,
+        #[source_code]
+        src: NamedSource<String>,
+        #[label("linear `in` scan, repeated each iteration")]
+        span: SourceSpan,
+    },
+
+    /// A `list.insert(0, …)` or `list.pop(0)` on a `list`-annotated
+    /// binding inside a loop shifts every element (O(n)) on each call.
+    /// A `collections.deque` gives O(1) `appendleft` / `popleft`.
+    /// Advice-level; part of the `tyc::perf_*` family gated by
+    /// `[strictness] suggest-perf`.
+    #[error("`{op}` shifts every list element (O(n)) on each loop iteration")]
+    #[diagnostic(
+        severity(Advice),
+        code(tyc::perf_list_shift_in_loop),
+        url("https://github.com/CodeHalwell/Typhon/blob/main/docs/diagnostics/perf_list_shift_in_loop.md"),
+        help("front insert/remove on a `list` is O(n); a `collections.deque` gives O(1) `appendleft` / `popleft`")
+    )]
+    PerfListShiftInLoop {
+        op: String,
+        #[source_code]
+        src: NamedSource<String>,
+        #[label("O(n) front shift, repeated each iteration")]
+        span: SourceSpan,
+    },
+
+    /// A `str`-annotated (or `mut NAME: str`) binding accumulated with
+    /// `NAME += …` inside a loop is quadratic — CPython copies the whole
+    /// string on every `+=`. Collecting the parts in a `list[str]` and
+    /// `"".join(...)`-ing once after the loop is linear. Advice-level;
+    /// part of the `tyc::perf_*` family gated by
+    /// `[strictness] suggest-perf`.
+    #[error("string `{name}` grown by `+=` in a loop is quadratic")]
+    #[diagnostic(
+        severity(Advice),
+        code(tyc::perf_str_concat_in_loop),
+        url("https://github.com/CodeHalwell/Typhon/blob/main/docs/diagnostics/perf_str_concat_in_loop.md"),
+        help("append each piece to a `list[str]` in the loop and `\"\".join(parts)` once after it — repeated `+=` copies the whole string each time")
+    )]
+    PerfStrConcatInLoop {
+        name: String,
+        #[source_code]
+        src: NamedSource<String>,
+        #[label("quadratic string build here")]
+        span: SourceSpan,
+    },
+
+    /// A `sorted(...)` / `NAME.sort(...)` call inside a loop whose
+    /// argument (or receiver) is provably loop-invariant re-sorts the
+    /// same data on every iteration. Sort once before the loop, or use
+    /// `heapq` for running extremes. Advice-level; part of the
+    /// `tyc::perf_*` family gated by `[strictness] suggest-perf`.
+    #[error("a loop-invariant collection is sorted on every iteration")]
+    #[diagnostic(
+        severity(Advice),
+        code(tyc::perf_sort_in_loop),
+        url("https://github.com/CodeHalwell/Typhon/blob/main/docs/diagnostics/perf_sort_in_loop.md"),
+        help("hoist the sort out of the loop (the input doesn't change inside it), or use `heapq` (`nlargest` / `nsmallest`) for running extremes")
+    )]
+    PerfSortInLoop {
+        #[source_code]
+        src: NamedSource<String>,
+        #[label("repeated sort of unchanging data")]
+        span: SourceSpan,
+    },
+
+    /// `sorted(...)[0]` / `sorted(...)[-1]` sorts the entire sequence
+    /// (O(n log n)) just to read one element. `min(...)` / `max(...)`
+    /// finds it in O(n). Advice-level; part of the `tyc::perf_*` family
+    /// gated by `[strictness] suggest-perf`.
+    #[error("`sorted(...){which}` sorts the whole sequence to take one element")]
+    #[diagnostic(
+        severity(Advice),
+        code(tyc::perf_sorted_first),
+        url(
+            "https://github.com/CodeHalwell/Typhon/blob/main/docs/diagnostics/perf_sorted_first.md"
+        ),
+        help("`{builtin}(...)` returns the same element in O(n) without the O(n log n) sort")
+    )]
+    PerfSortedFirst {
+        which: String,
+        builtin: String,
+        #[source_code]
+        src: NamedSource<String>,
+        #[label("O(n log n) sort to read one element")]
+        span: SourceSpan,
+    },
+
+    /// `EXPR in NAME.keys()` / `not in NAME.keys()` allocates a keys
+    /// view for a test that works directly on the dict. `EXPR in NAME`
+    /// is equivalent and skips the view. Advice-level (safe anywhere,
+    /// not just loops); part of the `tyc::perf_*` family gated by
+    /// `[strictness] suggest-perf`.
+    #[error("membership test against `.keys()` allocates a view")]
+    #[diagnostic(
+        severity(Advice),
+        code(tyc::perf_keys_membership),
+        url("https://github.com/CodeHalwell/Typhon/blob/main/docs/diagnostics/perf_keys_membership.md"),
+        help("drop `.keys()` — `key in d` tests the dict directly, without materialising a keys view")
+    )]
+    PerfKeysMembership {
+        #[source_code]
+        src: NamedSource<String>,
+        #[label("redundant `.keys()` view")]
+        span: SourceSpan,
+    },
+
+    /// A module-level `import MODULE` whose bound name is referenced
+    /// only inside function/method bodies (never at module scope, in an
+    /// annotation, a decorator, or a re-export). Declaring it
+    /// `lazy import` defers the import cost from process startup until
+    /// the first call that needs it. Advice-level; part of the
+    /// `tyc::perf_*` family gated by `[strictness] suggest-perf`.
+    #[error("`{module}` is imported at module scope but used only inside function bodies")]
+    #[diagnostic(
+        severity(Advice),
+        code(tyc::lazy_import_opportunity),
+        url("https://github.com/CodeHalwell/Typhon/blob/main/docs/diagnostics/lazy_import_opportunity.md"),
+        help("declare it `lazy import <alias> = {module}` to defer the import cost from startup (on Python 3.15 targets Typhon lowers this to a native PEP 810 lazy import)")
+    )]
+    LazyImportOpportunity {
+        module: String,
+        #[source_code]
+        src: NamedSource<String>,
+        #[label("only used inside function bodies")]
+        span: SourceSpan,
+    },
+
     /// A top-level `def main()` is defined but is never called from
     /// the module. Common newcomer mistake — the script's `main`
     /// function never runs, leaving the build apparently successful
@@ -2502,6 +2647,112 @@ impl TycError {
     ) -> Self {
         Self::GatherOpportunity {
             count,
+            src: NamedSource::new(path.into(), source.into()),
+            span: SourceSpan::new(SourceOffset::from(offset), length),
+        }
+    }
+
+    /// Construct a [`TycError::PerfMembershipInLoop`] advice diagnostic.
+    pub fn perf_membership_in_loop(
+        name: impl Into<String>,
+        path: impl Into<String>,
+        source: impl Into<String>,
+        offset: usize,
+        length: usize,
+    ) -> Self {
+        Self::PerfMembershipInLoop {
+            name: name.into(),
+            src: NamedSource::new(path.into(), source.into()),
+            span: SourceSpan::new(SourceOffset::from(offset), length),
+        }
+    }
+
+    /// Construct a [`TycError::PerfListShiftInLoop`] advice diagnostic.
+    /// `op` is the human-readable operation (e.g. `insert(0, …)`).
+    pub fn perf_list_shift_in_loop(
+        op: impl Into<String>,
+        path: impl Into<String>,
+        source: impl Into<String>,
+        offset: usize,
+        length: usize,
+    ) -> Self {
+        Self::PerfListShiftInLoop {
+            op: op.into(),
+            src: NamedSource::new(path.into(), source.into()),
+            span: SourceSpan::new(SourceOffset::from(offset), length),
+        }
+    }
+
+    /// Construct a [`TycError::PerfStrConcatInLoop`] advice diagnostic.
+    pub fn perf_str_concat_in_loop(
+        name: impl Into<String>,
+        path: impl Into<String>,
+        source: impl Into<String>,
+        offset: usize,
+        length: usize,
+    ) -> Self {
+        Self::PerfStrConcatInLoop {
+            name: name.into(),
+            src: NamedSource::new(path.into(), source.into()),
+            span: SourceSpan::new(SourceOffset::from(offset), length),
+        }
+    }
+
+    /// Construct a [`TycError::PerfSortInLoop`] advice diagnostic.
+    pub fn perf_sort_in_loop(
+        path: impl Into<String>,
+        source: impl Into<String>,
+        offset: usize,
+        length: usize,
+    ) -> Self {
+        Self::PerfSortInLoop {
+            src: NamedSource::new(path.into(), source.into()),
+            span: SourceSpan::new(SourceOffset::from(offset), length),
+        }
+    }
+
+    /// Construct a [`TycError::PerfSortedFirst`] advice diagnostic.
+    /// `which` is the subscript form (`[0]` / `[-1]`) and `builtin` the
+    /// suggested replacement (`min` / `max`).
+    pub fn perf_sorted_first(
+        which: impl Into<String>,
+        builtin: impl Into<String>,
+        path: impl Into<String>,
+        source: impl Into<String>,
+        offset: usize,
+        length: usize,
+    ) -> Self {
+        Self::PerfSortedFirst {
+            which: which.into(),
+            builtin: builtin.into(),
+            src: NamedSource::new(path.into(), source.into()),
+            span: SourceSpan::new(SourceOffset::from(offset), length),
+        }
+    }
+
+    /// Construct a [`TycError::PerfKeysMembership`] advice diagnostic.
+    pub fn perf_keys_membership(
+        path: impl Into<String>,
+        source: impl Into<String>,
+        offset: usize,
+        length: usize,
+    ) -> Self {
+        Self::PerfKeysMembership {
+            src: NamedSource::new(path.into(), source.into()),
+            span: SourceSpan::new(SourceOffset::from(offset), length),
+        }
+    }
+
+    /// Construct a [`TycError::LazyImportOpportunity`] advice diagnostic.
+    pub fn lazy_import_opportunity(
+        module: impl Into<String>,
+        path: impl Into<String>,
+        source: impl Into<String>,
+        offset: usize,
+        length: usize,
+    ) -> Self {
+        Self::LazyImportOpportunity {
+            module: module.into(),
             src: NamedSource::new(path.into(), source.into()),
             span: SourceSpan::new(SourceOffset::from(offset), length),
         }

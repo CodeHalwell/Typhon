@@ -79,6 +79,7 @@ fn catalog_codes() -> &'static [&'static str] {
         "invalid_config_value",
         "invalid_question_op",
         "io",
+        "lazy_import_opportunity",
         "lazy_usage",
         "main_not_called",
         "manual_init",
@@ -106,6 +107,12 @@ fn catalog_codes() -> &'static [&'static str] {
         "orphan_py_import",
         "parse",
         "pattern_shadows_outer",
+        "perf_keys_membership",
+        "perf_list_shift_in_loop",
+        "perf_membership_in_loop",
+        "perf_sort_in_loop",
+        "perf_sorted_first",
+        "perf_str_concat_in_loop",
         "pub",
         "pub_name_collision",
         "pub_star_outside_init",
@@ -202,6 +209,9 @@ fn catalog_entry(short_code: &str) -> Option<&'static str> {
             include_str!("../../../../../docs/diagnostics/invalid_question_op.md")
         }
         "io" => include_str!("../../../../../docs/diagnostics/io.md"),
+        "lazy_import_opportunity" => {
+            include_str!("../../../../../docs/diagnostics/lazy_import_opportunity.md")
+        }
         "lazy_usage" => include_str!("../../../../../docs/diagnostics/lazy_usage.md"),
         "main_not_called" => include_str!("../../../../../docs/diagnostics/main_not_called.md"),
         "manual_init" => include_str!("../../../../../docs/diagnostics/manual_init.md"),
@@ -260,6 +270,24 @@ fn catalog_entry(short_code: &str) -> Option<&'static str> {
         "parse" => include_str!("../../../../../docs/diagnostics/parse.md"),
         "pattern_shadows_outer" => {
             include_str!("../../../../../docs/diagnostics/pattern_shadows_outer.md")
+        }
+        "perf_keys_membership" => {
+            include_str!("../../../../../docs/diagnostics/perf_keys_membership.md")
+        }
+        "perf_list_shift_in_loop" => {
+            include_str!("../../../../../docs/diagnostics/perf_list_shift_in_loop.md")
+        }
+        "perf_membership_in_loop" => {
+            include_str!("../../../../../docs/diagnostics/perf_membership_in_loop.md")
+        }
+        "perf_sort_in_loop" => {
+            include_str!("../../../../../docs/diagnostics/perf_sort_in_loop.md")
+        }
+        "perf_sorted_first" => {
+            include_str!("../../../../../docs/diagnostics/perf_sorted_first.md")
+        }
+        "perf_str_concat_in_loop" => {
+            include_str!("../../../../../docs/diagnostics/perf_str_concat_in_loop.md")
         }
         "pub" => include_str!("../../../../../docs/diagnostics/pub.md"),
         "pub_name_collision" => {
