@@ -10,6 +10,22 @@ Realistic milestones for one person plus AI assistance. The headline target is a
 
 ## Current release
 
+**[v1.0.0-alpha.5](https://github.com/CodeHalwell/Typhon/releases/tag/v1.0.0-alpha.5) — 2026-07-09.**
+A performance-focused release on top of alpha.4. VM performance Tier 1
+(`tyc run`) — a two-representation `VmInt`, a per-class resolved-method
+cache with a direct dispatch path, and slot-resolved locals — compresses the
+VM's steady-state slowdown vs `tyc build` + CPython from ~5–18× to ~3–14×
+(startup-adjusted), with CPython's exact arbitrary-precision integer
+semantics preserved. A new `[optimise]` config profile + `tyc build -O` give
+a single dial over `auto-memoise` / `auto-gather` / `auto-parallel` /
+`pgo-memoise`. Seven new advice-only lints (the `tyc::perf_*` family +
+`lazy_import_opportunity`) flag hot-loop anti-patterns. A free-threading
+parallelisation wave widens `auto-parallel`, adds an integer
+accumulator-loop reduction (`auto-parallel-reductions`), two new advice
+lints, and a PEP 734 interpreters backend. Native PEP 810 lazy imports land
+on `[python] target = "3.15"` targets. No new syntax; every rewrite here is
+opt-in or advice-only, so no previously-*correct* program changes behaviour.
+
 **[v1.0.0-alpha.4](https://github.com/CodeHalwell/Typhon/releases/tag/v1.0.0-alpha.4) — 2026-07-08.**
 A focused hardening release on top of alpha.3. It closes the one HIGH finding
 the release-readiness review deferred — **H5**, scope-blind class unification: a
@@ -951,3 +967,35 @@ shipped in v0.1.6. Phase 4+ work (everything not on the headline path):
    See [`docs/vm-performance-plan.md`](vm-performance-plan.md) for the
    measured baseline, the Tier 1 measured-outcome table, the root-cause
    breakdown, and the full tiered plan.
+8. ✅ **`[optimise]` config profile + `tyc build -O`.** A single
+   project-wide `level` dial in `typhon.toml`: `level = 1` flips the
+   *default* of `auto-memoise`, `auto-gather`, `auto-parallel`, and
+   `pgo-memoise` to `true` (an explicit `[strictness]` entry for any
+   of the four always wins). `tyc build -O` / `--optimise` applies
+   `level = 1` for a single invocation without editing the config.
+9. ✅ **Performance-advice lint family.** Seven new advice-level
+   lints living in `tyc-analyse/src/perf.rs`, gated by
+   `[strictness] suggest-perf` (default on), surfaced by `tyc check`
+   / `tyc build` / the LSP: `perf_membership_in_loop`,
+   `perf_list_shift_in_loop`, `perf_str_concat_in_loop`,
+   `perf_sort_in_loop`, `perf_sorted_first`, `perf_keys_membership`,
+   and `lazy_import_opportunity`. Each fires only on unambiguous
+   local AST evidence, so the example/stress corpus stays
+   advice-noise-free.
+10. ✅ **Free-threading parallelisation wave.** For
+    `[python] free-threaded = true` projects: `auto-parallel`
+    widened to cover comprehension filters, multi-argument calls,
+    and nested pure calls; a new integer accumulator-loop reduction
+    (`auto-parallel-reductions`) that folds a provably-bounded
+    `for x in xs: total += EXPR` into a parallel `sum(map_pure(...))`
+    when `total` is a plain `mut ...: int`; two new advice lints
+    (`parallel_opportunity`, `shared_mut_across_tasks`); and a
+    `[strictness] parallel-backend = "interpreters"` option that
+    tries a PEP 734 `InterpreterPoolExecutor` before falling back to
+    the thread pool. See `tyc-analyse/src/parallel.rs`,
+    `reductions.rs`, and `parallel_lints.rs`.
+11. ✅ **Native PEP 810 lazy imports on Python 3.15 targets.**
+    `[python] target = "3.15"` / `"3.15t"` lowers `lazy import ALIAS
+    = MODULE` to CPython 3.15's native `lazy import MODULE as ALIAS`
+    statement instead of the `typhon_runtime` helper call — 3.13/3.14
+    output is byte-for-byte unchanged.

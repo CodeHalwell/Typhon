@@ -6,6 +6,18 @@ canonical phase-by-phase status lives in `docs/roadmap.md`.
 
 ## Unreleased
 
+## 1.0.0-alpha.5 — 2026-07-09 — VM performance Tier 1, `[optimise]` profile, perf-advice lints & free-threading wave
+
+A performance-focused release on top of alpha.4, landing the first tier of
+the VM performance plan alongside a project-wide `[optimise]` dial, a new
+`tyc::perf_*` advice-lint family, a free-threading parallelisation wave, and
+native PEP 810 lazy imports on 3.15 targets. **No new syntax, and no
+previously-*correct* program changes behaviour** — every rewrite here is
+opt-in (`[optimise]`, `auto-parallel`, `auto-parallel-reductions`,
+`parallel-backend`) or advice-only (the seven new lints), and the VM's
+representation change preserves CPython's exact arbitrary-precision integer
+semantics.
+
 - **VM performance: Tier 1 representation and dispatch tuning (`tyc run`).**
   `Value::Int` now wraps a `VmInt` two-representation integer — any value
   that fits `i64` is stored inline (`Small`), only overflowing to a
