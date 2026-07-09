@@ -184,9 +184,18 @@ pub fn shared_mut_across_tasks_diagnostics(
     diags
 }
 
-/// The names of module-level `mut` bindings (top-level `mut NAME[: T] = …`).
+/// The names of module-level `mut` bindings (`mut NAME[: T] = …`), including
+/// those declared inside module-level control-flow blocks (`if` / `elif` /
+/// `else`, `try` / `except` / `finally`, `for` / `while`, `with`, `match`).
+/// Function and class bodies are **not** descended into — a `mut` local there is
+/// frame state, not module state. Mirrors [`collect_globals`]'s scope rule.
 fn module_level_mut_names(body: &[Stmt]) -> HashSet<String> {
     let mut out = HashSet::new();
+    collect_module_mut_names(body, &mut out);
+    out
+}
+
+fn collect_module_mut_names(body: &[Stmt], out: &mut HashSet<String>) {
     for stmt in body {
         match stmt {
             Stmt::Assign(a) if a.mutability == Some(Mutability::Mut) => {
@@ -201,10 +210,41 @@ fn module_level_mut_names(body: &[Stmt]) -> HashSet<String> {
                     out.insert(n.id.to_string());
                 }
             }
+            // Module-level control flow still runs in module scope — descend.
+            Stmt::If(s) => {
+                collect_module_mut_names(&s.body, out);
+                for c in &s.elif_else_clauses {
+                    collect_module_mut_names(&c.body, out);
+                }
+            }
+            Stmt::While(s) => {
+                collect_module_mut_names(&s.body, out);
+                collect_module_mut_names(&s.orelse, out);
+            }
+            Stmt::For(s) => {
+                collect_module_mut_names(&s.body, out);
+                collect_module_mut_names(&s.orelse, out);
+            }
+            Stmt::With(s) => collect_module_mut_names(&s.body, out),
+            Stmt::Try(s) => {
+                collect_module_mut_names(&s.body, out);
+                collect_module_mut_names(&s.orelse, out);
+                collect_module_mut_names(&s.finalbody, out);
+                for h in &s.handlers {
+                    let ruff_python_ast::ExceptHandler::ExceptHandler(h) = h;
+                    collect_module_mut_names(&h.body, out);
+                }
+            }
+            Stmt::Match(s) => {
+                for case in &s.cases {
+                    collect_module_mut_names(&case.body, out);
+                }
+            }
+            // `def` / `class` open their own frame — a `mut` local there is not
+            // module state, so don't descend.
             _ => {}
         }
     }
-    out
 }
 
 /// A discovered `go`-spawn call site.
@@ -575,6 +615,54 @@ async def main(obj) -> None:
         assert_eq!(
             codes(&shared_mut_across_tasks_diagnostics(&m, "x.ty", src)).len(),
             0
+        );
+    }
+
+    #[test]
+    fn shared_mut_flags_module_mut_declared_inside_if() {
+        // Finding 5: a module-level `mut` declared inside a module-level `if`
+        // block is still module state. `module_level_mut_names` used to scan
+        // only top-level statements, so a go-spawned writer under-warned.
+        let src = "\
+if True:
+    mut hits: int = 0
+
+async def worker() -> None:
+    hits += 1
+
+async def main() -> None:
+    go worker()
+";
+        let m = parse(src);
+        let c = codes(&shared_mut_across_tasks_diagnostics(&m, "x.ty", src));
+        assert_eq!(
+            c.len(),
+            1,
+            "a module `mut` inside a top-level `if` is shared state"
+        );
+        assert!(c[0].contains("shared_mut_across_tasks"));
+    }
+
+    #[test]
+    fn shared_mut_silent_for_mut_inside_function_body() {
+        // The scope rule must stay one-sided: a `mut` local inside a *function*
+        // body is frame state, not module state, so writing a same-named name
+        // from a go-spawned callee is not a shared-state race.
+        let src = "\
+def setup() -> None:
+    mut hits: int = 0
+
+async def worker() -> None:
+    hits += 1
+
+async def main() -> None:
+    go worker()
+";
+        let m = parse(src);
+        assert_eq!(
+            codes(&shared_mut_across_tasks_diagnostics(&m, "x.ty", src)).len(),
+            0,
+            "a function-local `mut` is not module state"
         );
     }
 }

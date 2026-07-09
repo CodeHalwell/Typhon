@@ -81,7 +81,15 @@ canonical phase-by-phase status lives in `docs/roadmap.md`.
     sum(typhon_runtime.parallel.map_pure(lambda x: EXPR, ITER))`. Integers only
     — integer addition is associative/commutative and Python ints are exact, so
     parallel partial sums are identical; **floats are never rewritten**
-    (reordering IEEE-754 addition changes the result).
+    (reordering IEEE-754 addition changes the result). The accumulator's
+    `mut NAME: int` declaration is resolved **within the loop's own scope**
+    (the enclosing function, or module scope), never against a same-named
+    binding in another function — so an `int` accumulator in one function can
+    never make a same-named `float` accumulator elsewhere eligible. The
+    rewrite also suppresses itself when user code binds the name `sum`
+    anywhere visible to the loop (module scope or the enclosing function,
+    parameters included), since the emitted bare `sum(...)` call would
+    otherwise resolve to the user binding instead of the builtin.
   - **`tyc::parallel_opportunity`** — new advice lint (severity Advice, on by
     default, gated by `[strictness] suggest-parallel`). Fires only under
     `free-threaded = true` on a comprehension / integer accumulator loop that
@@ -96,8 +104,17 @@ canonical phase-by-phase status lives in `docs/roadmap.md`.
     bakes a `_BACKEND` constant into the generated `typhon_runtime/parallel.py`
     and makes `map_pure` try a PEP 734 `concurrent.futures.InterpreterPoolExecutor`
     (Python 3.14+), falling back **transparently** to the thread pool on
-    `ImportError` / `AttributeError` or a `TypeError` when submitting the mapped
-    lambda. Order is preserved on every path; the default `"threads"` backend is
+    `ImportError` / `AttributeError` (older runtimes) or when the mapped
+    function can't be pickled across the interpreter boundary: the helper
+    probes `pickle.dumps(fn)` *before* creating a pool, so an unshareable
+    callable — whose pickling raises `PicklingError` / `AttributeError`, not
+    just `TypeError` — falls back cleanly instead of crashing, while
+    exceptions raised *by* the mapped function inside a worker still
+    propagate exactly as the thread path propagates them. The lambdas the
+    auto-parallel rewrites emit never pickle, so rewritten call sites always
+    run on the thread pool under this backend today; the interpreters pool
+    benefits hand-written `map_pure` calls passing top-level named functions.
+    Order is preserved on every path; the default `"threads"` backend is
     behaviourally unchanged.
   - Wiring mirrors the `tyc::perf_*` family: diagnostics registration + doc
     pages (`docs/diagnostics/parallel_opportunity.md`,

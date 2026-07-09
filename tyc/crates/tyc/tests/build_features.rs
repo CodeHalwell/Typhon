@@ -947,9 +947,17 @@ fn parallel_backend_interpreters_bakes_backend_constant_and_fallback() {
     assert!(
         parallel_py.contains("from concurrent.futures import InterpreterPoolExecutor")
             && parallel_py.contains("except (ImportError, AttributeError)")
-            && parallel_py.contains("except TypeError")
+            && parallel_py.contains("except (TypeError, pickle.PicklingError)")
             && parallel_py.contains("with ThreadPoolExecutor(max_workers=max_workers) as pool"),
         "interpreters fallback chain missing:\n{parallel_py}"
+    );
+    // The pre-flight serialisation probe: an unpicklable callable (every
+    // lambda the rewrites emit) must be rejected *before* a pool is created,
+    // whatever exception pickling raises — PicklingError / AttributeError,
+    // not just the TypeError the pool-block catch covers.
+    assert!(
+        parallel_py.contains("pickle.dumps(fn)") && parallel_py.contains("except Exception:"),
+        "pre-flight pickle probe missing:\n{parallel_py}"
     );
 }
 
@@ -1030,6 +1038,76 @@ if __name__ == \"__main__\":
     build(tmp.path());
     let out = run_main(tmp.path()).expect("interpreters build should run (falls back to threads)");
     assert_eq!(out.trim(), "[1, 4, 9, 16, 25]", "unexpected output: {out}");
+}
+
+#[test]
+fn interpreters_backend_probe_rejects_lambda_before_pool_creation() {
+    // Regression for the P1 fallback hole: pickling a lambda raises
+    // `pickle.PicklingError` (module level) or `AttributeError` (closure) —
+    // NOT the `TypeError` the pool-block catch handles — so before the
+    // pre-flight probe, a 3.14+ runtime (InterpreterPoolExecutor importable)
+    // crashed instead of falling back to threads. Simulate that runtime on
+    // any Python by injecting a fake executor whose *construction* aborts:
+    // the probe must reject the lambda first, never touch the pool, and the
+    // thread fallback must produce the correct result.
+    let Some(py) = python() else {
+        return;
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    scaffold_parallel_full(
+        tmp.path(),
+        "interpreters",
+        "@pure\ndef sq(n: int) -> int:\n    return n * n\n\n\
+         xs: list[int] = [1, 2, 3]\nys: list[int] = [sq(x) for x in xs]\n",
+    );
+    build(tmp.path());
+    let driver = r#"
+import sys
+import concurrent.futures as cf
+
+class _MustNotConstruct:
+    def __init__(self, *args, **kwargs):
+        raise SystemExit("BUG: pool constructed for an unpicklable lambda")
+
+# Simulate Python 3.14+: make `from concurrent.futures import
+# InterpreterPoolExecutor` succeed, so only the pickle probe stands between
+# a lambda and the (fatal) pool construction.
+cf.InterpreterPoolExecutor = _MustNotConstruct
+
+sys.path.insert(0, sys.argv[1])
+from typhon_runtime.parallel import map_pure, _BACKEND
+
+assert _BACKEND == "interpreters", _BACKEND
+print(map_pure(lambda x: x * x, [1, 2, 3, 4, 5]))
+
+# The probe must only guard serialisation: an exception raised BY the mapped
+# function (here on the thread path a lambda falls back to) must propagate,
+# never be swallowed by the fallback machinery.
+try:
+    map_pure(lambda x: 1 // (x - x), [7])
+except ZeroDivisionError:
+    pass
+else:
+    raise SystemExit("BUG: worker exception was swallowed")
+"#;
+    let driver_path = tmp.path().join("probe_driver.py");
+    std::fs::write(&driver_path, driver).unwrap();
+    let out = Command::new(py)
+        .arg(&driver_path)
+        .arg(tmp.path().join("build"))
+        .output()
+        .expect("python should spawn");
+    assert!(
+        out.status.success(),
+        "probe driver crashed (fallback hole regressed):\nstdout={}\nstderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "[1, 4, 9, 16, 25]",
+        "thread fallback produced wrong output"
+    );
 }
 
 // ── REPL dedent terminator ──────────────────────────────────────────────────

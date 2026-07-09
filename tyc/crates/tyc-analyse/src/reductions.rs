@@ -82,27 +82,41 @@ pub fn rewrite_reduction_loops(
     min_size: u64,
 ) -> ReductionStats {
     let captures = collect_capturable_names(module);
-    let int_mut = collect_typed_mut_names(module, "int");
+    // Typed-`mut` accumulators are resolved **per scope**, not module-wide: the
+    // set here covers only the module scope, and the traversal recomputes a
+    // fresh set on entry to each `def` / `class` body. This is what stops a
+    // `mut total: int` in one function from making a same-named
+    // `mut total: float` accumulator in another look int-typed — which would let
+    // the rewrite reorder that function's float addition and change results, the
+    // one thing the reduction rewrite must never do.
+    let scope_mut = collect_scope_typed_mut(&module.body, "int");
+    // The rewrite emits a call to the bare name `sum`; if user code rebinds
+    // `sum` anywhere visible to the loop (module scope here; each function
+    // scope below), the emitted call would resolve to the user binding instead
+    // of `builtins.sum` — a behaviour change. Track shadowing per scope and
+    // suppress the rewrite conservatively.
+    let sum_shadowed = scope_binds_name(&module.body, "sum");
     let ctx = RewriteCtx::new(pure_callees, min_size, &captures);
     let mut stats = ReductionStats::default();
-    rewrite_stmts(&mut module.body, &ctx, &int_mut, &mut stats);
+    rewrite_stmts(&mut module.body, &ctx, &scope_mut, sum_shadowed, &mut stats);
     stats
 }
 
 fn rewrite_stmts(
     body: &mut [Stmt],
     ctx: &RewriteCtx<'_>,
-    int_mut: &HashSet<String>,
+    scope_mut: &HashSet<String>,
+    sum_shadowed: bool,
     stats: &mut ReductionStats,
 ) {
     for stmt in body.iter_mut() {
         // Recurse first so nested loops inside a matched loop's *sibling*
         // blocks are considered (a matched leaf loop has no nested statements
         // to recurse into anyway).
-        recurse_children(stmt, ctx, int_mut, stats);
+        recurse_children(stmt, ctx, scope_mut, sum_shadowed, stats);
         if let Stmt::For(f) = stmt {
-            if let Some(m) = match_reduction_loop(f, ctx, int_mut) {
-                if !under_min_size(&m.iter, ctx.min_size) {
+            if let Some(m) = match_reduction_loop(f, ctx, scope_mut) {
+                if !sum_shadowed && !under_min_size(&m.iter, ctx.min_size) {
                     *stmt = build_reduction_stmt(&m);
                     stats.rewrites += 1;
                 }
@@ -114,39 +128,57 @@ fn rewrite_stmts(
 fn recurse_children(
     stmt: &mut Stmt,
     ctx: &RewriteCtx<'_>,
-    int_mut: &HashSet<String>,
+    scope_mut: &HashSet<String>,
+    sum_shadowed: bool,
     stats: &mut ReductionStats,
 ) {
     match stmt {
-        Stmt::FunctionDef(f) => rewrite_stmts(&mut f.body, ctx, int_mut, stats),
-        Stmt::ClassDef(c) => rewrite_stmts(&mut c.body, ctx, int_mut, stats),
+        // A `def` / `class` opens a new scope: recompute the typed-`mut` set
+        // from that body so accumulators from the enclosing scope don't leak in
+        // (and this scope's don't leak out). `sum`-shadowing accumulates the
+        // other way: a binding in any *enclosing* scope stays visible inside,
+        // so OR the outer flag with this scope's own evidence (parameters
+        // included — a parameter named `sum` shadows the builtin too).
+        Stmt::FunctionDef(f) => {
+            let inner = collect_scope_typed_mut(&f.body, "int");
+            let shadowed = sum_shadowed
+                || params_bind_name(&f.parameters, "sum")
+                || scope_binds_name(&f.body, "sum");
+            rewrite_stmts(&mut f.body, ctx, &inner, shadowed, stats);
+        }
+        Stmt::ClassDef(c) => {
+            let inner = collect_scope_typed_mut(&c.body, "int");
+            let shadowed = sum_shadowed || scope_binds_name(&c.body, "sum");
+            rewrite_stmts(&mut c.body, ctx, &inner, shadowed, stats);
+        }
+        // Control-flow blocks share the enclosing scope: thread it unchanged.
         Stmt::If(s) => {
-            rewrite_stmts(&mut s.body, ctx, int_mut, stats);
+            rewrite_stmts(&mut s.body, ctx, scope_mut, sum_shadowed, stats);
             for clause in &mut s.elif_else_clauses {
-                rewrite_stmts(&mut clause.body, ctx, int_mut, stats);
+                rewrite_stmts(&mut clause.body, ctx, scope_mut, sum_shadowed, stats);
             }
         }
         Stmt::While(s) => {
-            rewrite_stmts(&mut s.body, ctx, int_mut, stats);
-            rewrite_stmts(&mut s.orelse, ctx, int_mut, stats);
+            rewrite_stmts(&mut s.body, ctx, scope_mut, sum_shadowed, stats);
+            rewrite_stmts(&mut s.orelse, ctx, scope_mut, sum_shadowed, stats);
         }
         Stmt::For(s) => {
-            rewrite_stmts(&mut s.body, ctx, int_mut, stats);
-            rewrite_stmts(&mut s.orelse, ctx, int_mut, stats);
+            rewrite_stmts(&mut s.body, ctx, scope_mut, sum_shadowed, stats);
+            rewrite_stmts(&mut s.orelse, ctx, scope_mut, sum_shadowed, stats);
         }
-        Stmt::With(s) => rewrite_stmts(&mut s.body, ctx, int_mut, stats),
+        Stmt::With(s) => rewrite_stmts(&mut s.body, ctx, scope_mut, sum_shadowed, stats),
         Stmt::Try(s) => {
-            rewrite_stmts(&mut s.body, ctx, int_mut, stats);
-            rewrite_stmts(&mut s.orelse, ctx, int_mut, stats);
-            rewrite_stmts(&mut s.finalbody, ctx, int_mut, stats);
+            rewrite_stmts(&mut s.body, ctx, scope_mut, sum_shadowed, stats);
+            rewrite_stmts(&mut s.orelse, ctx, scope_mut, sum_shadowed, stats);
+            rewrite_stmts(&mut s.finalbody, ctx, scope_mut, sum_shadowed, stats);
             for h in &mut s.handlers {
                 let ruff_python_ast::ExceptHandler::ExceptHandler(h) = h;
-                rewrite_stmts(&mut h.body, ctx, int_mut, stats);
+                rewrite_stmts(&mut h.body, ctx, scope_mut, sum_shadowed, stats);
             }
         }
         Stmt::Match(s) => {
             for case in &mut s.cases {
-                rewrite_stmts(&mut case.body, ctx, int_mut, stats);
+                rewrite_stmts(&mut case.body, ctx, scope_mut, sum_shadowed, stats);
             }
         }
         _ => {}
@@ -261,15 +293,25 @@ fn under_min_size(iter: &Expr, min_size: u64) -> bool {
     literal_iter_len(iter).is_some_and(|n| n < min_size)
 }
 
-/// Collect every name declared `mut NAME: <ann>` at any scope, where `<ann>`
-/// is the bare type name `ann` (`"int"` / `"float"`).
-pub(crate) fn collect_typed_mut_names(module: &ModModule, ann: &str) -> HashSet<String> {
+/// Collect every name declared `mut NAME: <ann>` **within a single
+/// function/module scope** — the given `body` plus the nested control-flow
+/// blocks that share that scope (`if` / `while` / `for` / `with` / `try` /
+/// `match`), but **not** nested `def` / `class` bodies, which open their own
+/// scope. `<ann>` is the bare type name (`"int"` / `"float"`).
+///
+/// Scoping this (rather than flattening every `mut NAME: <ann>` in the module
+/// into one set) is the fix for the cross-function contamination the reduction
+/// rewrite must avoid: an `int` accumulator in function A and a same-named
+/// `float` accumulator in function B are different bindings, and B's loop must
+/// stay sequential — reordering IEEE-754 addition changes the result. The
+/// caller recomputes a fresh set on entry to each `def` / `class`.
+fn collect_scope_typed_mut(body: &[Stmt], ann: &str) -> HashSet<String> {
     let mut out = HashSet::new();
-    collect_typed_mut_into(&module.body, ann, &mut out);
+    collect_scope_typed_mut_into(body, ann, &mut out);
     out
 }
 
-fn collect_typed_mut_into(body: &[Stmt], ann: &str, out: &mut HashSet<String>) {
+fn collect_scope_typed_mut_into(body: &[Stmt], ann: &str, out: &mut HashSet<String>) {
     for stmt in body {
         match stmt {
             Stmt::AnnAssign(a) if a.mutability == Some(Mutability::Mut) => {
@@ -281,37 +323,38 @@ fn collect_typed_mut_into(body: &[Stmt], ann: &str, out: &mut HashSet<String>) {
                     }
                 }
             }
-            Stmt::FunctionDef(f) => collect_typed_mut_into(&f.body, ann, out),
-            Stmt::ClassDef(c) => collect_typed_mut_into(&c.body, ann, out),
+            // Control-flow blocks share the enclosing scope — descend.
             Stmt::If(s) => {
-                collect_typed_mut_into(&s.body, ann, out);
+                collect_scope_typed_mut_into(&s.body, ann, out);
                 for clause in &s.elif_else_clauses {
-                    collect_typed_mut_into(&clause.body, ann, out);
+                    collect_scope_typed_mut_into(&clause.body, ann, out);
                 }
             }
             Stmt::While(s) => {
-                collect_typed_mut_into(&s.body, ann, out);
-                collect_typed_mut_into(&s.orelse, ann, out);
+                collect_scope_typed_mut_into(&s.body, ann, out);
+                collect_scope_typed_mut_into(&s.orelse, ann, out);
             }
             Stmt::For(s) => {
-                collect_typed_mut_into(&s.body, ann, out);
-                collect_typed_mut_into(&s.orelse, ann, out);
+                collect_scope_typed_mut_into(&s.body, ann, out);
+                collect_scope_typed_mut_into(&s.orelse, ann, out);
             }
-            Stmt::With(s) => collect_typed_mut_into(&s.body, ann, out),
+            Stmt::With(s) => collect_scope_typed_mut_into(&s.body, ann, out),
             Stmt::Try(s) => {
-                collect_typed_mut_into(&s.body, ann, out);
-                collect_typed_mut_into(&s.orelse, ann, out);
-                collect_typed_mut_into(&s.finalbody, ann, out);
+                collect_scope_typed_mut_into(&s.body, ann, out);
+                collect_scope_typed_mut_into(&s.orelse, ann, out);
+                collect_scope_typed_mut_into(&s.finalbody, ann, out);
                 for h in &s.handlers {
                     let ruff_python_ast::ExceptHandler::ExceptHandler(h) = h;
-                    collect_typed_mut_into(&h.body, ann, out);
+                    collect_scope_typed_mut_into(&h.body, ann, out);
                 }
             }
             Stmt::Match(s) => {
                 for case in &s.cases {
-                    collect_typed_mut_into(&case.body, ann, out);
+                    collect_scope_typed_mut_into(&case.body, ann, out);
                 }
             }
+            // `def` / `class` open their own scope — do NOT descend. The
+            // traversal recomputes a fresh set when it enters them.
             _ => {}
         }
     }
@@ -344,6 +387,192 @@ fn mentions_name_anywhere(expr: &Expr, name: &str) -> bool {
     v.found
 }
 
+/// True when any parameter of `parameters` (positional-only, positional,
+/// keyword-only, `*args`, `**kwargs`) is named `name`.
+fn params_bind_name(parameters: &ruff_python_ast::Parameters, name: &str) -> bool {
+    parameters
+        .posonlyargs
+        .iter()
+        .chain(parameters.args.iter())
+        .chain(parameters.kwonlyargs.iter())
+        .any(|p| p.parameter.name.as_str() == name)
+        || [parameters.vararg.as_deref(), parameters.kwarg.as_deref()]
+            .into_iter()
+            .flatten()
+            .any(|p| p.name.as_str() == name)
+}
+
+/// True when `name` is (or may be) **bound** within a single scope body — the
+/// given statements plus the control-flow blocks that share the scope, but not
+/// nested `def` / `class` bodies (which open their own scope; only their
+/// *names* bind here, though their decorators / parameter defaults / class
+/// arguments still evaluate — and can walrus-bind — in this scope).
+///
+/// Binding evidence: any `Name` in Store / Del context (assignments, `for` /
+/// `with` targets, walrus, tuple unpacking, `del`), `def NAME` / `class NAME`,
+/// import aliases (a `from m import *` conservatively counts as binding
+/// anything), `global NAME` / `nonlocal NAME` declarations, `except … as
+/// NAME`, and `match` pattern captures. Used to keep the reduction rewrite
+/// from emitting a bare `sum` call where user code rebinds `sum`; false
+/// positives merely skip an optimisation, so ambiguity resolves to `true`.
+fn scope_binds_name(body: &[Stmt], name: &str) -> bool {
+    use ruff_python_ast::visitor::source_order::{
+        walk_expr, walk_pattern, walk_stmt, SourceOrderVisitor,
+    };
+    use ruff_python_ast::Pattern;
+
+    struct V<'a> {
+        name: &'a str,
+        found: bool,
+    }
+    impl<'ast, 'a> SourceOrderVisitor<'ast> for V<'a> {
+        fn visit_stmt(&mut self, s: &'ast Stmt) {
+            if self.found {
+                return;
+            }
+            match s {
+                // A nested `def` binds its *name* in this scope; its body is a
+                // different scope. Decorators and parameter defaults evaluate
+                // here, so walk those for walrus bindings.
+                Stmt::FunctionDef(f) => {
+                    if f.name.as_str() == self.name {
+                        self.found = true;
+                        return;
+                    }
+                    for dec in &f.decorator_list {
+                        self.visit_expr(&dec.expression);
+                    }
+                    for p in f
+                        .parameters
+                        .posonlyargs
+                        .iter()
+                        .chain(f.parameters.args.iter())
+                        .chain(f.parameters.kwonlyargs.iter())
+                    {
+                        if let Some(default) = p.default.as_deref() {
+                            self.visit_expr(default);
+                        }
+                    }
+                }
+                // Same for a nested `class`: name binds here, body doesn't;
+                // decorators and base/keyword arguments evaluate here.
+                Stmt::ClassDef(c) => {
+                    if c.name.as_str() == self.name {
+                        self.found = true;
+                        return;
+                    }
+                    for dec in &c.decorator_list {
+                        self.visit_expr(&dec.expression);
+                    }
+                    if let Some(args) = c.arguments.as_deref() {
+                        for arg in &args.args {
+                            self.visit_expr(arg);
+                        }
+                        for kw in &args.keywords {
+                            self.visit_expr(&kw.value);
+                        }
+                    }
+                }
+                Stmt::Import(i) => {
+                    for alias in &i.names {
+                        let bound = match &alias.asname {
+                            Some(asname) => asname.as_str(),
+                            // `import a.b` binds `a`.
+                            None => alias.name.as_str().split('.').next().unwrap_or(""),
+                        };
+                        if bound == self.name {
+                            self.found = true;
+                            return;
+                        }
+                    }
+                }
+                Stmt::ImportFrom(i) => {
+                    for alias in &i.names {
+                        let bound = match &alias.asname {
+                            Some(asname) => asname.as_str(),
+                            None => alias.name.as_str(),
+                        };
+                        // `from m import *` may bind anything — conservative.
+                        if bound == self.name || bound == "*" {
+                            self.found = true;
+                            return;
+                        }
+                    }
+                }
+                // A `global` / `nonlocal` declaration makes assignments in
+                // this scope rebind the outer name — conservative evidence.
+                Stmt::Global(g) => {
+                    if g.names.iter().any(|n| n.as_str() == self.name) {
+                        self.found = true;
+                    }
+                }
+                Stmt::Nonlocal(nl) => {
+                    if nl.names.iter().any(|n| n.as_str() == self.name) {
+                        self.found = true;
+                    }
+                }
+                // `except E as NAME:` — the alias is an Identifier, not an
+                // `Expr::Name`, so check it here; the bodies walk normally.
+                Stmt::Try(t) => {
+                    for h in &t.handlers {
+                        let ruff_python_ast::ExceptHandler::ExceptHandler(h) = h;
+                        if let Some(alias) = &h.name {
+                            if alias.id.as_str() == self.name {
+                                self.found = true;
+                                return;
+                            }
+                        }
+                    }
+                    walk_stmt(self, s);
+                }
+                _ => walk_stmt(self, s),
+            }
+        }
+
+        fn visit_expr(&mut self, e: &'ast Expr) {
+            if self.found {
+                return;
+            }
+            // Store covers assignment / loop / `with` targets, tuple unpacks,
+            // and walrus targets; Del covers `del NAME` (rebinding evidence
+            // either way).
+            if let Expr::Name(n) = e {
+                if n.id.as_str() == self.name && !n.ctx.is_load() {
+                    self.found = true;
+                    return;
+                }
+            }
+            walk_expr(self, e);
+        }
+
+        fn visit_pattern(&mut self, p: &'ast Pattern) {
+            if self.found {
+                return;
+            }
+            let captured = match p {
+                Pattern::MatchAs(m) => m.name.as_ref(),
+                Pattern::MatchStar(m) => m.name.as_ref(),
+                Pattern::MatchMapping(m) => m.rest.as_ref(),
+                _ => None,
+            };
+            if captured.is_some_and(|id| id.as_str() == self.name) {
+                self.found = true;
+                return;
+            }
+            walk_pattern(self, p);
+        }
+    }
+
+    let mut v = V { name, found: false };
+    for stmt in body {
+        v.visit_stmt(stmt);
+        if v.found {
+            return true;
+        }
+    }
+    false
+}
+
 // ── detection (for the `tyc::parallel_opportunity` advice lint) ───────────────
 
 /// A reduction shape the `tyc::parallel_opportunity` advice reports.
@@ -370,11 +599,24 @@ pub fn detect_reduction_loops(
     min_size: u64,
 ) -> Vec<ReductionHit> {
     let captures = collect_capturable_names(module);
-    let int_mut = collect_typed_mut_names(module, "int");
-    let float_mut = collect_typed_mut_names(module, "float");
+    // Per-scope, like the rewrite (see `rewrite_reduction_loops`): recomputed on
+    // entry to each `def` / `class` so the advice keys on the accumulator's type
+    // in its own scope, never a same-named binding from another function.
+    let int_mut = collect_scope_typed_mut(&module.body, "int");
+    let float_mut = collect_scope_typed_mut(&module.body, "float");
+    // Mirror the rewrite's bare-`sum` shadowing suppression so the int hits
+    // report precisely the loops `rewrite_reduction_loops` would transform.
+    let sum_shadowed = scope_binds_name(&module.body, "sum");
     let ctx = RewriteCtx::new(pure_callees, min_size, &captures);
     let mut out = Vec::new();
-    detect_in_stmts(&module.body, &ctx, &int_mut, &float_mut, &mut out);
+    detect_in_stmts(
+        &module.body,
+        &ctx,
+        &int_mut,
+        &float_mut,
+        sum_shadowed,
+        &mut out,
+    );
     out
 }
 
@@ -383,23 +625,29 @@ fn detect_in_stmts(
     ctx: &RewriteCtx<'_>,
     int_mut: &HashSet<String>,
     float_mut: &HashSet<String>,
+    sum_shadowed: bool,
     out: &mut Vec<ReductionHit>,
 ) {
     for stmt in body {
-        detect_children(stmt, ctx, int_mut, float_mut, out);
+        detect_children(stmt, ctx, int_mut, float_mut, sum_shadowed, out);
         if let Stmt::For(f) = stmt {
-            // int accumulator → eligible for the rewrite.
-            if let Some(m) = match_reduction_loop(f, ctx, int_mut) {
-                if !under_min_size(&m.iter, ctx.min_size) {
-                    out.push(ReductionHit {
-                        acc: m.acc,
-                        range: m.range,
-                        is_float: false,
-                    });
-                    continue;
+            // int accumulator → eligible for the rewrite (unless a user
+            // binding of `sum` would capture the rewrite's emitted call).
+            if !sum_shadowed {
+                if let Some(m) = match_reduction_loop(f, ctx, int_mut) {
+                    if !under_min_size(&m.iter, ctx.min_size) {
+                        out.push(ReductionHit {
+                            acc: m.acc,
+                            range: m.range,
+                            is_float: false,
+                        });
+                        continue;
+                    }
                 }
             }
             // float accumulator → matches everything but the int annotation.
+            // (Independent of `sum` shadowing: this advice is about the float
+            // reordering barrier, not the emitted `sum(...)` call.)
             if let Some(m) = match_reduction_loop(f, ctx, float_mut) {
                 if !under_min_size(&m.iter, ctx.min_size) {
                     out.push(ReductionHit {
@@ -418,38 +666,54 @@ fn detect_children(
     ctx: &RewriteCtx<'_>,
     int_mut: &HashSet<String>,
     float_mut: &HashSet<String>,
+    sum_shadowed: bool,
     out: &mut Vec<ReductionHit>,
 ) {
     match stmt {
-        Stmt::FunctionDef(f) => detect_in_stmts(&f.body, ctx, int_mut, float_mut, out),
-        Stmt::ClassDef(c) => detect_in_stmts(&c.body, ctx, int_mut, float_mut, out),
+        // New scope: recompute both sets from that body (see `detect_children`'s
+        // sibling in the rewrite path, `recurse_children`); `sum` shadowing ORs
+        // downward exactly like the rewrite path.
+        Stmt::FunctionDef(f) => {
+            let int_inner = collect_scope_typed_mut(&f.body, "int");
+            let float_inner = collect_scope_typed_mut(&f.body, "float");
+            let shadowed = sum_shadowed
+                || params_bind_name(&f.parameters, "sum")
+                || scope_binds_name(&f.body, "sum");
+            detect_in_stmts(&f.body, ctx, &int_inner, &float_inner, shadowed, out);
+        }
+        Stmt::ClassDef(c) => {
+            let int_inner = collect_scope_typed_mut(&c.body, "int");
+            let float_inner = collect_scope_typed_mut(&c.body, "float");
+            let shadowed = sum_shadowed || scope_binds_name(&c.body, "sum");
+            detect_in_stmts(&c.body, ctx, &int_inner, &float_inner, shadowed, out);
+        }
         Stmt::If(s) => {
-            detect_in_stmts(&s.body, ctx, int_mut, float_mut, out);
+            detect_in_stmts(&s.body, ctx, int_mut, float_mut, sum_shadowed, out);
             for clause in &s.elif_else_clauses {
-                detect_in_stmts(&clause.body, ctx, int_mut, float_mut, out);
+                detect_in_stmts(&clause.body, ctx, int_mut, float_mut, sum_shadowed, out);
             }
         }
         Stmt::While(s) => {
-            detect_in_stmts(&s.body, ctx, int_mut, float_mut, out);
-            detect_in_stmts(&s.orelse, ctx, int_mut, float_mut, out);
+            detect_in_stmts(&s.body, ctx, int_mut, float_mut, sum_shadowed, out);
+            detect_in_stmts(&s.orelse, ctx, int_mut, float_mut, sum_shadowed, out);
         }
         Stmt::For(s) => {
-            detect_in_stmts(&s.body, ctx, int_mut, float_mut, out);
-            detect_in_stmts(&s.orelse, ctx, int_mut, float_mut, out);
+            detect_in_stmts(&s.body, ctx, int_mut, float_mut, sum_shadowed, out);
+            detect_in_stmts(&s.orelse, ctx, int_mut, float_mut, sum_shadowed, out);
         }
-        Stmt::With(s) => detect_in_stmts(&s.body, ctx, int_mut, float_mut, out),
+        Stmt::With(s) => detect_in_stmts(&s.body, ctx, int_mut, float_mut, sum_shadowed, out),
         Stmt::Try(s) => {
-            detect_in_stmts(&s.body, ctx, int_mut, float_mut, out);
-            detect_in_stmts(&s.orelse, ctx, int_mut, float_mut, out);
-            detect_in_stmts(&s.finalbody, ctx, int_mut, float_mut, out);
+            detect_in_stmts(&s.body, ctx, int_mut, float_mut, sum_shadowed, out);
+            detect_in_stmts(&s.orelse, ctx, int_mut, float_mut, sum_shadowed, out);
+            detect_in_stmts(&s.finalbody, ctx, int_mut, float_mut, sum_shadowed, out);
             for h in &s.handlers {
                 let ruff_python_ast::ExceptHandler::ExceptHandler(h) = h;
-                detect_in_stmts(&h.body, ctx, int_mut, float_mut, out);
+                detect_in_stmts(&h.body, ctx, int_mut, float_mut, sum_shadowed, out);
             }
         }
         Stmt::Match(s) => {
             for case in &s.cases {
-                detect_in_stmts(&case.body, ctx, int_mut, float_mut, out);
+                detect_in_stmts(&case.body, ctx, int_mut, float_mut, sum_shadowed, out);
             }
         }
         _ => {}
@@ -660,5 +924,174 @@ def run(xs: list[int], ys: list[float]) -> None:
         assert_eq!(hits.len(), 2, "both reductions detected");
         assert!(hits.iter().any(|h| !h.is_float && h.acc == "isum"));
         assert!(hits.iter().any(|h| h.is_float && h.acc == "fsum"));
+    }
+
+    #[test]
+    fn same_name_int_and_float_accumulators_do_not_cross_contaminate() {
+        // Regression: `collect_typed_mut_names` used to flatten every
+        // `mut NAME: <ann>` in the module into one set, so fn A's
+        // `mut total: int` made fn B's same-named `mut total: float` loop look
+        // int-typed and it was rewritten into `sum(map_pure(...))` — reordering
+        // float addition and changing results. A must still rewrite; B must not.
+        let src = "\
+def a(xs: list[int]) -> int:
+    mut total: int = 0
+    for x in xs:
+        total += x
+    return total
+
+def b(ys: list[float]) -> float:
+    mut total: float = 0.0
+    for y in ys:
+        total += y
+    return total
+";
+        let (out, stats) = rewrite(src, &[], 0);
+        assert_eq!(
+            stats.rewrites, 1,
+            "only A's int loop may rewrite; B's float loop must not:\n{out}"
+        );
+        // A's int accumulator was parallelised …
+        assert!(
+            out.contains("total += sum(typhon_runtime.parallel.map_pure(lambda x: x, xs))"),
+            "A's int reduction should be parallelised:\n{out}"
+        );
+        // … and B's float accumulator is left as a plain sequential loop.
+        assert!(
+            out.contains("for y in ys:"),
+            "B's float loop must be left untouched (no float reordering):\n{out}"
+        );
+    }
+
+    #[test]
+    fn same_name_untyped_accumulator_does_not_borrow_int_typing() {
+        // fn A declares `mut total: int`; fn B uses a same-named accumulator
+        // with NO annotation. B must not borrow A's int typing across scopes —
+        // only A rewrites.
+        let src = "\
+def a(xs: list[int]) -> int:
+    mut total: int = 0
+    for x in xs:
+        total += x
+    return total
+
+def b(xs: list[int]) -> int:
+    total = 0
+    for x in xs:
+        total += x
+    return total
+";
+        let (out, stats) = rewrite(src, &[], 0);
+        assert_eq!(
+            stats.rewrites, 1,
+            "only A rewrites; B's unannotated accumulator is ineligible:\n{out}"
+        );
+    }
+
+    #[test]
+    fn module_level_sum_binding_suppresses_rewrite() {
+        // The rewrite emits a bare `sum(...)` call; a module-level `def sum`
+        // would capture it and change behaviour, so the rewrite must not fire.
+        let src = "\
+def sum(xs: list[int]) -> int:
+    return 0
+
+def run(xs: list[int]) -> int:
+    mut total: int = 0
+    for x in xs:
+        total += x
+    return total
+";
+        let (out, stats) = rewrite(src, &[], 0);
+        assert_eq!(
+            stats.rewrites, 0,
+            "a module-level `sum` binding must suppress the rewrite:\n{out}"
+        );
+        assert!(
+            out.contains("for x in xs:"),
+            "the loop must be left untouched:\n{out}"
+        );
+    }
+
+    #[test]
+    fn local_sum_binding_suppresses_rewrite() {
+        // Same for a local binding of `sum` in the enclosing function.
+        let src = "\
+def run(xs: list[int]) -> int:
+    let sum: int = 3
+    mut total: int = 0
+    for x in xs:
+        total += x
+    return total + sum
+";
+        let (out, stats) = rewrite(src, &[], 0);
+        assert_eq!(
+            stats.rewrites, 0,
+            "a local `sum` binding must suppress the rewrite:\n{out}"
+        );
+    }
+
+    #[test]
+    fn parameter_named_sum_suppresses_rewrite() {
+        let src = "\
+def run(xs: list[int], sum: int) -> int:
+    mut total: int = 0
+    for x in xs:
+        total += x
+    return total + sum
+";
+        let (out, stats) = rewrite(src, &[], 0);
+        assert_eq!(
+            stats.rewrites, 0,
+            "a parameter named `sum` must suppress the rewrite:\n{out}"
+        );
+    }
+
+    #[test]
+    fn sum_used_but_never_bound_still_rewrites() {
+        // Merely *calling* the builtin `sum` (a Load, not a binding) must not
+        // over-suppress the rewrite.
+        let src = "\
+def run(xs: list[int], ys: list[int]) -> int:
+    let base: int = sum(ys)
+    mut total: int = 0
+    for x in xs:
+        total += x
+    return total + base
+";
+        let (out, stats) = rewrite(src, &[], 0);
+        assert_eq!(
+            stats.rewrites, 1,
+            "a Load-context use of `sum` must not suppress the rewrite:\n{out}"
+        );
+        assert!(
+            out.contains("total += sum(typhon_runtime.parallel.map_pure"),
+            "expected the reduction lowering:\n{out}"
+        );
+    }
+
+    #[test]
+    fn same_name_int_accumulators_in_separate_functions_both_rewrite() {
+        // The per-scope resolution must not over-reject: two *independent* `int`
+        // accumulators that happen to share a name each rewrite in their own
+        // function.
+        let src = "\
+def a(xs: list[int]) -> int:
+    mut total: int = 0
+    for x in xs:
+        total += x
+    return total
+
+def b(ys: list[int]) -> int:
+    mut total: int = 0
+    for y in ys:
+        total += y
+    return total
+";
+        let (out, stats) = rewrite(src, &[], 0);
+        assert_eq!(
+            stats.rewrites, 2,
+            "both same-named int accumulators should rewrite in their own scope:\n{out}"
+        );
     }
 }

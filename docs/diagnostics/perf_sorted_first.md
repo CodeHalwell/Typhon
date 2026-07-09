@@ -10,7 +10,7 @@ O(n) pass.
 
 ```ty
 def cheapest(items: list[Item]) -> Item:
-    return sorted(items, )[0]        # advice: sorts everything to take one element
+    return sorted(items)[0]        # advice: sorts everything to take one element
 ```
 
 (Only the *bare* form — `sorted(...)` with no `key=` / `reverse=` — fires, so

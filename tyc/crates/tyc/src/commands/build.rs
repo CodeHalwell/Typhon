@@ -3334,8 +3334,18 @@ def _remap(text, state):
 /// * `"interpreters"` first tries a PEP 734
 ///   `concurrent.futures.InterpreterPoolExecutor` (Python 3.14+) and falls
 ///   back **transparently** to the thread pool on `ImportError` /
-///   `AttributeError` (older runtimes) or a `TypeError` when submitting the
-///   mapped function (a lambda isn't shareable across sub-interpreters).
+///   `AttributeError` (older runtimes) or when the mapped function can't be
+///   pickled across the interpreter boundary. Pickling an unshareable
+///   callable raises `pickle.PicklingError` / `AttributeError` (a lambda or
+///   closure), not the `TypeError` an earlier revision caught — so the
+///   generated helper *probes* `pickle.dumps(fn)` up front and falls back on
+///   any serialisation failure, without ever wrapping the task execution in
+///   a broad `except` (an exception raised *by* `fn` in a worker still
+///   propagates exactly as the thread path propagates it). Because the
+///   auto-parallel rewrites always pass lambdas, rewritten call sites run on
+///   the thread pool even under this backend today; the interpreters pool
+///   benefits hand-written `map_pure` calls passing top-level named
+///   functions.
 ///
 /// Order is preserved on every path. The `_try_interpreters` helper and the
 /// backend switch are emitted for both settings, so the only difference
@@ -3386,7 +3396,11 @@ def map_pure(
     stock CPython build the GIL serialises them — correctness is preserved but
     no speedup is observed. With the ``\"interpreters\"`` backend a PEP 734
     ``InterpreterPoolExecutor`` (Python 3.14+) is tried first, falling back to
-    the thread pool transparently.
+    the thread pool transparently. Note: crossing the interpreter boundary
+    requires ``fn`` to pickle, and the lambdas Typhon's auto-parallel rewrites
+    emit never do — so rewritten call sites always run on the thread pool
+    today; the interpreters pool benefits hand-written ``map_pure`` calls that
+    pass a top-level named function.
     \"\"\"
     # Materialise once to size the work and to keep ``.map`` from blocking on a
     # slow generator while workers idle.
@@ -3413,18 +3427,39 @@ def _try_interpreters(
 
     Falls back (returns ``None``) when ``InterpreterPoolExecutor`` is
     unavailable (Python < 3.14) or when the mapped function can't cross the
-    interpreter boundary — a lambda isn't shareable, which surfaces as a
-    ``TypeError`` on submit. The caller then reruns on the thread pool; ``fn``
-    is pure, so the retry is free of observable effects and order is preserved.
+    interpreter boundary. Crossing requires ``fn`` to pickle, and pickling an
+    unshareable callable raises ``pickle.PicklingError`` or ``AttributeError``
+    (a lambda / closure / local def), sometimes ``TypeError`` — so ``fn`` is
+    probed with ``pickle.dumps`` *before* any pool is created, where a failure
+    can only mean \"can't serialise fn\". The caller then reruns on the thread
+    pool; ``fn`` is pure, so the retry is free of observable effects and order
+    is preserved. In particular the lambdas Typhon's auto-parallel rewrites
+    emit never pickle, so rewritten call sites always take the thread pool.
     \"\"\"
     try:
         from concurrent.futures import InterpreterPoolExecutor
     except (ImportError, AttributeError):
         return None
+    import pickle
+
+    # Pre-flight serialisation probe. Deliberately broad: any failure to
+    # pickle ``fn`` means it can't reach a sub-interpreter, whatever the
+    # exception type. This must stay a *probe* — never wrap the task
+    # execution below in a broad ``except``, or real exceptions raised by
+    # ``fn`` inside a worker would be swallowed instead of propagating the
+    # way the thread path propagates them.
+    try:
+        pickle.dumps(fn)
+    except Exception:
+        return None
     try:
         with InterpreterPoolExecutor(max_workers=max_workers) as pool:
             return list(pool.map(fn, items))
-    except TypeError:
+    except (TypeError, pickle.PicklingError):
+        # Submission-time serialisation failures only (e.g. an unpicklable
+        # *item*); ``fn`` is pure, so retrying on threads is observably
+        # identical — and a pure ``fn`` that itself raises one of these
+        # re-raises identically on the thread path.
         return None
 ";
 

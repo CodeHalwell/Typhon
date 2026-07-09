@@ -223,7 +223,7 @@ Integer addition is associative and commutative and Python ints are exact, so su
 parallel-backend = "threads"     # or "interpreters"
 ```
 
-`map_pure` runs on a `ThreadPoolExecutor` by default (order-preserving; escapes the GIL on a free-threaded build, serialises but stays correct on stock CPython). `parallel-backend = "interpreters"` first tries a [PEP 734](https://peps.python.org/pep-0734/) `InterpreterPoolExecutor` (Python 3.14+), falling back **transparently** to the thread pool on `ImportError` / `AttributeError` (older runtimes) or a `TypeError` when submitting the mapped function (a lambda isn't shareable across sub-interpreters). Order is preserved on every path.
+`map_pure` runs on a `ThreadPoolExecutor` by default (order-preserving; escapes the GIL on a free-threaded build, serialises but stays correct on stock CPython). `parallel-backend = "interpreters"` first tries a [PEP 734](https://peps.python.org/pep-0734/) `InterpreterPoolExecutor` (Python 3.14+), falling back **transparently** to the thread pool on `ImportError` / `AttributeError` (older runtimes) or when the mapped function can't be pickled across the interpreter boundary (probed with `pickle.dumps` before any pool is created — a lambda or closure never pickles, so the fallback fires whatever exception pickling raises, while exceptions raised *by* the mapped function still propagate normally). Order is preserved on every path. Since the auto-parallel rewrites emit lambdas, rewritten call sites always run on the thread pool under this backend today; the interpreters pool benefits hand-written `map_pure` calls passing top-level named functions.
 
 ### Parallelism advice lints
 

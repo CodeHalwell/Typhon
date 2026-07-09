@@ -43,7 +43,7 @@ use ruff_python_ast::{
     name::Name, Arguments, AtomicNodeIndex, Comprehension, ExceptHandler, Expr, ExprAttribute,
     ExprCall, ExprContext, ExprDictComp, ExprLambda, ExprListComp, ExprName, ExprSet, ExprSetComp,
     ExprStarred, ExprTuple, ModModule, Mutability, Parameter, ParameterWithDefault, Parameters,
-    Stmt,
+    Pattern, Stmt,
 };
 use ruff_text_size::{Ranged, TextRange};
 
@@ -809,11 +809,20 @@ fn scan_binding_evidence(
             }
         }
         Stmt::For(s) => {
+            // The loop target rebinds its name(s) every iteration — it is not a
+            // stable invariant, so record it as mutated.
+            collect_target_names(&s.target, mutated);
             for s in s.body.iter().chain(s.orelse.iter()) {
                 scan_binding_evidence(s, let_bound, mutated);
             }
         }
         Stmt::With(s) => {
+            // `with … as TARGET:` binds TARGET.
+            for item in &s.items {
+                if let Some(vars) = &item.optional_vars {
+                    collect_target_names(vars, mutated);
+                }
+            }
             for s in &s.body {
                 scan_binding_evidence(s, let_bound, mutated);
             }
@@ -829,6 +838,10 @@ fn scan_binding_evidence(
             }
             for h in &s.handlers {
                 let ExceptHandler::ExceptHandler(h) = h;
+                // `except E as NAME:` binds (and later unbinds) NAME.
+                if let Some(name) = &h.name {
+                    mutated.insert(name.id.to_string());
+                }
                 for s in &h.body {
                     scan_binding_evidence(s, let_bound, mutated);
                 }
@@ -836,12 +849,89 @@ fn scan_binding_evidence(
         }
         Stmt::Match(s) => {
             for case in &s.cases {
+                // `case PATTERN:` captures rebind names (`case Point(x, y)`,
+                // `case [*rest]`, `case {**rest}`, `case _ as n`, …).
+                collect_pattern_names(&case.pattern, mutated);
                 for s in &case.body {
                     scan_binding_evidence(s, let_bound, mutated);
                 }
             }
         }
         _ => {}
+    }
+}
+
+/// Insert every bare name bound by an assignment / `for` / `with` **target**
+/// expression — `x`, `a, b`, `[a, b]`, `*rest`, and nested combinations — into
+/// `out`. Attribute / subscript targets (`obj.x`, `xs[0]`) bind no bare name and
+/// contribute nothing.
+fn collect_target_names(target: &Expr, out: &mut HashSet<String>) {
+    match target {
+        Expr::Name(n) => {
+            out.insert(n.id.to_string());
+        }
+        Expr::Tuple(t) => {
+            for e in &t.elts {
+                collect_target_names(e, out);
+            }
+        }
+        Expr::List(l) => {
+            for e in &l.elts {
+                collect_target_names(e, out);
+            }
+        }
+        Expr::Starred(s) => collect_target_names(&s.value, out),
+        _ => {}
+    }
+}
+
+/// Insert every name a `match` pattern captures into `out`: a bare capture
+/// (`case NAME`), an `as` capture (`case … as NAME`), a sequence star
+/// (`case [*rest]`), a mapping rest (`case {**rest}`), and every capture reached
+/// through class / sequence / or sub-patterns. Mirrors the binding positions
+/// `tyc-resolve`'s `walk_pattern` declares.
+fn collect_pattern_names(pattern: &Pattern, out: &mut HashSet<String>) {
+    match pattern {
+        Pattern::MatchValue(_) | Pattern::MatchSingleton(_) => {}
+        Pattern::MatchSequence(p) => {
+            for sub in &p.patterns {
+                collect_pattern_names(sub, out);
+            }
+        }
+        Pattern::MatchMapping(p) => {
+            for sub in &p.patterns {
+                collect_pattern_names(sub, out);
+            }
+            if let Some(rest) = &p.rest {
+                out.insert(rest.id.to_string());
+            }
+        }
+        Pattern::MatchClass(p) => {
+            for sub in &p.arguments.patterns {
+                collect_pattern_names(sub, out);
+            }
+            for kw in &p.arguments.keywords {
+                collect_pattern_names(&kw.pattern, out);
+            }
+        }
+        Pattern::MatchStar(p) => {
+            if let Some(name) = &p.name {
+                out.insert(name.id.to_string());
+            }
+        }
+        Pattern::MatchAs(p) => {
+            if let Some(sub) = &p.pattern {
+                collect_pattern_names(sub, out);
+            }
+            if let Some(name) = &p.name {
+                out.insert(name.id.to_string());
+            }
+        }
+        Pattern::MatchOr(p) => {
+            for sub in &p.patterns {
+                collect_pattern_names(sub, out);
+            }
+        }
     }
 }
 
@@ -1006,6 +1096,99 @@ mod tests {
 
     fn pure_set(names: &[&str]) -> HashSet<String> {
         names.iter().map(|s| (*s).to_owned()).collect()
+    }
+
+    // ── Finding 4: binding positions that rebind a name must disqualify it ─────
+    // from the capturable ("let-bound and never mutated") invariant set.
+
+    #[test]
+    fn let_bound_then_for_target_is_not_capturable() {
+        let src = "\
+let k: int = 1
+for k in xs:
+    print(k)
+";
+        let caps = collect_capturable_names(&parse(src));
+        assert!(
+            !caps.contains("k"),
+            "a let binding rebound as a for-target is not an invariant: {caps:?}"
+        );
+    }
+
+    #[test]
+    fn let_bound_then_with_target_is_not_capturable() {
+        let src = "\
+let f: int = 1
+with ctx() as f:
+    print(f)
+";
+        let caps = collect_capturable_names(&parse(src));
+        assert!(
+            !caps.contains("f"),
+            "a let binding rebound as a with-as target is not an invariant: {caps:?}"
+        );
+    }
+
+    #[test]
+    fn let_bound_then_except_alias_is_not_capturable() {
+        let src = "\
+let e: int = 1
+try:
+    print(e)
+except ValueError as e:
+    print(e)
+";
+        let caps = collect_capturable_names(&parse(src));
+        assert!(
+            !caps.contains("e"),
+            "a let binding rebound as an except alias is not an invariant: {caps:?}"
+        );
+    }
+
+    #[test]
+    fn let_bound_then_match_capture_is_not_capturable() {
+        // Covers a sequence capture, a mapping value capture, and an `as`
+        // capture — every match-pattern binding position.
+        let src = "\
+let n: int = 1
+let m: int = 2
+let p: int = 3
+match v:
+    case [n]:
+        print(n)
+    case {\"k\": m}:
+        print(m)
+    case _ as p:
+        print(p)
+";
+        let caps = collect_capturable_names(&parse(src));
+        assert!(
+            !caps.contains("n"),
+            "match sequence capture must disqualify: {caps:?}"
+        );
+        assert!(
+            !caps.contains("m"),
+            "match mapping capture must disqualify: {caps:?}"
+        );
+        assert!(
+            !caps.contains("p"),
+            "match `as` capture must disqualify: {caps:?}"
+        );
+    }
+
+    #[test]
+    fn let_bound_invariant_never_rebound_stays_capturable() {
+        // The fix must not over-reject: a let binding that is never rebound by
+        // any construct remains a capturable invariant.
+        let src = "\
+let k: int = 1
+ys = [f(x, k) for x in xs]
+";
+        let caps = collect_capturable_names(&parse(src));
+        assert!(
+            caps.contains("k"),
+            "a never-rebound let binding must stay capturable: {caps:?}"
+        );
     }
 
     #[test]

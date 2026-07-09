@@ -187,7 +187,7 @@ When `true`, pure list comprehensions whose element is a pure call are rewritten
 **Default `"threads"`.** The execution backend baked into the generated `typhon_runtime/parallel.py` for `auto-parallel` / `auto-parallel-reductions` rewrites:
 
 - `"threads"` — a `concurrent.futures.ThreadPoolExecutor` (order-preserving; escapes the GIL on a free-threaded build, serialises but stays correct on stock CPython).
-- `"interpreters"` — first tries a [PEP 734](https://peps.python.org/pep-0734/) `concurrent.futures.InterpreterPoolExecutor` (Python 3.14+), falling back **transparently** to the thread pool on `ImportError` / `AttributeError` (older runtimes) or a `TypeError` when submitting the mapped callable (not shareable across sub-interpreters). Order is preserved on every fallback path.
+- `"interpreters"` — first tries a [PEP 734](https://peps.python.org/pep-0734/) `concurrent.futures.InterpreterPoolExecutor` (Python 3.14+), falling back **transparently** to the thread pool on `ImportError` / `AttributeError` (older runtimes) or when the mapped callable can't be pickled across the interpreter boundary — the generated helper probes `pickle.dumps(fn)` before creating a pool, so an unshareable callable (whose pickling raises `PicklingError` / `AttributeError`, not just `TypeError`) falls back cleanly while exceptions raised *by* the callable still propagate normally. Order is preserved on every fallback path. Note that the lambdas the auto-parallel rewrites emit never pickle, so rewritten call sites always run on the thread pool under this backend today; the interpreters pool benefits hand-written `map_pure` calls passing top-level named functions.
 
 Any other value is rejected at config load.
 
