@@ -422,15 +422,43 @@ on `Foo`."
 
 ## Performance
 
-Tree-walking is intentionally simple. Expect roughly CPython-3.13
-performance on arithmetic-heavy microbenchmarks (sometimes faster because
-there is no per-call bytecode dispatch overhead, sometimes slower because
-the AST nodes are not cache-friendly). On allocation-heavy code (lots of
-`list`/`dict` construction) the VM is competitive but uses single-threaded
-`Rc` — there is no parallelism today.
+The tree-walking VM optimizes for correctness/parity with CPython and for
+startup latency, not for steady-state compute throughput. On a
+hello-world program the VM starts and exits in ~21 ms against ~38 ms for
+`tyc build` + a CPython 3.13 process spawn — and the VM skips the build
+step entirely, so there's no `build/` directory or `typhon_runtime.py` to
+generate first. For short scripts, the REPL, and (eventually) LSP-driven
+expression evaluation, the VM wins.
 
-A bytecode VM and/or PyO3-backed FFI for unsupported modules are tracked
-in `docs/roadmap.md`.
+Steady-state compute is the opposite story: measured against `tyc build`
++ CPython 3.13 (release binary, median of 3 runs, outputs
+parity-checked), the VM is currently **~5–18× slower** once fixed
+startup cost is factored out. Recursive, call-heavy integer arithmetic is
+the worst case (~18×, e.g. a naive recursive `fib`); object-construction-
+and method-call-heavy code fares best of the workloads measured so far
+(~5×). Four architectural costs drive this:
+
+- Every `int` is a heap-allocated arbitrary-precision `BigInt` — even
+  `x + 1` allocates.
+- Every variable read is a string-hash `HashMap` lookup that walks a
+  parent scope chain, rather than resolving to a fixed slot.
+- Every call allocates a fresh `Env` (a `HashMap`), even for a two-line
+  leaf function.
+- Method resolution recurses through base classes on every call, with no
+  cache.
+
+None of this is inherent to the language — it's a property of today's
+tree-walking implementation, and a tiered plan to close the gap is
+underway. [`docs/vm-performance-plan.md`](vm-performance-plan.md) has the
+full measured baseline, the root-cause breakdown, and the tiers; Tier 1
+(small-int fast path, per-class method cache, direct method-call path,
+slot-resolved locals) is in progress on this branch.
+
+A bytecode VM — the point at which rough CPython parity on most code
+becomes realistic — is designed as Tier 2 of that plan but not yet
+started; see [`docs/vm-performance-plan.md`](vm-performance-plan.md).
+PyO3-backed FFI for unsupported modules is not currently planned; it's
+listed there as a non-goal for now.
 
 ## Diagnostics
 

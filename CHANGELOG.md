@@ -6,6 +6,11 @@ canonical phase-by-phase status lives in `docs/roadmap.md`.
 
 ## Unreleased
 
+- docs: corrected the stale VM performance claim in `docs/vm.md`
+  (measured ~5–18× slower than the compiled path at steady state; VM
+  wins startup) and added `docs/vm-performance-plan.md` (tiered VM
+  performance plan).
+
 ## 1.0.0-alpha.4 — 2026-07-08 — post-alpha.3 hardening: H5 soundness, secret-detection correctness & supply-chain hygiene
 
 A focused hardening release on top of alpha.3. It closes the **one HIGH
