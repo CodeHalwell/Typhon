@@ -96,6 +96,11 @@ Shipped:
 - ✅ `tyc repl`; `tyc debug` (with `--break` source mapping); `tyc run` (defaulting to the in-process `tyc-vm` tree-walking interpreter — no build/, no CPython spawn).
 - ✅ `tyc add` / `remove` / `sync` over `uv`.
 - ✅ Runtime `stubtest` probe via `tyc stubtest` (shells out to `python -m mypy.stubtest`).
+- ✅ VM performance Tier 1 — small-int fast path, per-class method cache, direct method-call dispatch, and slot-resolved locals compress `tyc run`'s slowdown vs `tyc build` + CPython from ~5–18× to ~3–14× (startup-adjusted). See [Performance Baseline](/Typhon/project/performance/) and `docs/vm-performance-plan.md`.
+- ✅ `[optimise]` config profile + `tyc build -O` — a single `level` dial that flips the default of `auto-memoise` / `auto-gather` / `auto-parallel` / `pgo-memoise` to `true`.
+- ✅ Performance-advice lint family — seven advice-level lints (`perf_membership_in_loop`, `perf_list_shift_in_loop`, `perf_str_concat_in_loop`, `perf_sort_in_loop`, `perf_sorted_first`, `perf_keys_membership`, `lazy_import_opportunity`), gated by `[strictness] suggest-perf`, default on.
+- ✅ Free-threading parallelisation wave — widened `auto-parallel` comprehension shapes (filters, multi-arg calls, nested pure calls), integer accumulator-loop reductions (`auto-parallel-reductions`), `parallel_opportunity` / `shared_mut_across_tasks` advice lints, and a `parallel-backend = "interpreters"` (PEP 734) option.
+- ✅ Native PEP 810 lazy imports on `[python] target = "3.15"` / `"3.15t"` — `lazy import` lowers to CPython's native statement instead of the `typhon_runtime` helper; 3.13/3.14 output unchanged.
 
 Deferred:
 

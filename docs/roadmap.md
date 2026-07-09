@@ -951,3 +951,35 @@ shipped in v0.1.6. Phase 4+ work (everything not on the headline path):
    See [`docs/vm-performance-plan.md`](vm-performance-plan.md) for the
    measured baseline, the Tier 1 measured-outcome table, the root-cause
    breakdown, and the full tiered plan.
+8. ✅ **`[optimise]` config profile + `tyc build -O`.** A single
+   project-wide `level` dial in `typhon.toml`: `level = 1` flips the
+   *default* of `auto-memoise`, `auto-gather`, `auto-parallel`, and
+   `pgo-memoise` to `true` (an explicit `[strictness]` entry for any
+   of the four always wins). `tyc build -O` / `--optimise` applies
+   `level = 1` for a single invocation without editing the config.
+9. ✅ **Performance-advice lint family.** Seven new advice-level
+   lints living in `tyc-analyse/src/perf.rs`, gated by
+   `[strictness] suggest-perf` (default on), surfaced by `tyc check`
+   / `tyc build` / the LSP: `perf_membership_in_loop`,
+   `perf_list_shift_in_loop`, `perf_str_concat_in_loop`,
+   `perf_sort_in_loop`, `perf_sorted_first`, `perf_keys_membership`,
+   and `lazy_import_opportunity`. Each fires only on unambiguous
+   local AST evidence, so the example/stress corpus stays
+   advice-noise-free.
+10. ✅ **Free-threading parallelisation wave.** For
+    `[python] free-threaded = true` projects: `auto-parallel`
+    widened to cover comprehension filters, multi-argument calls,
+    and nested pure calls; a new integer accumulator-loop reduction
+    (`auto-parallel-reductions`) that folds a provably-bounded
+    `for x in xs: total += EXPR` into a parallel `sum(map_pure(...))`
+    when `total` is a plain `mut ...: int`; two new advice lints
+    (`parallel_opportunity`, `shared_mut_across_tasks`); and a
+    `[strictness] parallel-backend = "interpreters"` option that
+    tries a PEP 734 `InterpreterPoolExecutor` before falling back to
+    the thread pool. See `tyc-analyse/src/parallel.rs`,
+    `reductions.rs`, and `parallel_lints.rs`.
+11. ✅ **Native PEP 810 lazy imports on Python 3.15 targets.**
+    `[python] target = "3.15"` / `"3.15t"` lowers `lazy import ALIAS
+    = MODULE` to CPython 3.15's native `lazy import MODULE as ALIAS`
+    statement instead of the `typhon_runtime` helper call — 3.13/3.14
+    output is byte-for-byte unchanged.
