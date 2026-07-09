@@ -444,15 +444,22 @@ and method-call-heavy code fares best of the workloads measured so far
   parent scope chain, rather than resolving to a fixed slot.
 - Every call allocates a fresh `Env` (a `HashMap`), even for a two-line
   leaf function.
-- Method resolution recurses through base classes on every call, with no
-  cache.
 
-None of this is inherent to the language — it's a property of today's
-tree-walking implementation, and a tiered plan to close the gap is
-underway. [`docs/vm-performance-plan.md`](vm-performance-plan.md) has the
-full measured baseline, the root-cause breakdown, and the tiers; Tier 1
-(small-int fast path, per-class method cache, direct method-call path,
-slot-resolved locals) is in progress on this branch.
+Integer arithmetic no longer allocates on the common path: `Value::Int`
+wraps a `VmInt` that keeps any `i64`-range value inline and only promotes
+to a heap `BigInt` on overflow (CPython's arbitrary-precision semantics are
+preserved exactly). Method resolution first probes the class's own
+(base-flattened) method table and memoises base-chain / negative lookups in
+a per-class cache, and `obj.method(args)` on a user instance is invoked
+directly without building an intermediate `BoundMethod`.
+
+The remaining cost centres — string-hash scope-chain variable lookups and a
+fresh `Env` per call — are a property of today's tree-walking
+implementation, not the language. [`docs/vm-performance-plan.md`](vm-performance-plan.md)
+has the full measured baseline, the root-cause breakdown, and the tiers;
+Tier 1a (small-int fast path, per-class method cache, direct method-call
+path) has landed, with slot-resolved locals and Tier 2 (bytecode VM) still
+ahead.
 
 A bytecode VM — the point at which rough CPython parity on most code
 becomes realistic — is designed as Tier 2 of that plan but not yet
@@ -477,7 +484,9 @@ use tyc_vm::{Interpreter, run_source};
 let code = run_source("print(1 + 2)\n", None)?;   // returns process exit code
 // or, for finer control:
 let mut interp = Interpreter::new();
-interp.root.set("custom", tyc_vm::Value::Int(42));
+// `Value::Int` wraps a `VmInt` (a small-int/`BigInt` two-representation
+// integer); build one with `.into()` from any primitive integer.
+interp.root.set("custom", tyc_vm::Value::Int(42.into()));
 // … run a parsed module …
 ```
 

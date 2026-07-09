@@ -9,7 +9,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use crate::error::{Unwind, VmException};
-use crate::value::{NativeFn, Value};
+use crate::value::{NativeFn, Value, VmInt};
 
 /// Minimal text-mode file shim sufficient for the most common scripting
 /// patterns: `open(path)`, `open(path, "r")`, `open(path, "w")`,
@@ -252,7 +252,7 @@ pub fn open_file(path: &str, mode: &str) -> Result<Value, Unwind> {
                     )))
                 }
             };
-            Ok(Value::Int(num_bigint::BigInt::from(written)))
+            Ok(Value::Int(VmInt::from(written)))
         });
         members.insert("write".into(), Value::Native(Rc::new(write_fn)));
     }

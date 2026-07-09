@@ -423,6 +423,102 @@ print(x + y)
         assert_eq!(run_capturing(src).unwrap(), 0);
     }
 
+    /// Small-int fast path: i64-boundary arithmetic and 2**100 must produce the
+    /// exact arbitrary-precision result (CPython parity), driven through the
+    /// full public run path. The program raises on any wrong value, so a clean
+    /// exit code is the assertion.
+    #[test]
+    fn small_int_fast_path_matches_cpython_semantics() {
+        let src = r#"
+def main() -> None:
+    # Crossing the i64 boundary must not wrap.
+    let big: int = 9223372036854775807 + 1
+    if big != 9223372036854775808:
+        raise ValueError("i64::MAX + 1 wrong")
+    let small_again: int = big - 1
+    if small_again != 9223372036854775807:
+        raise ValueError("demotion wrong")
+    if 2 ** 100 != 1267650600228229401496703205376:
+        raise ValueError("2**100 wrong")
+    # Floor-div / mod sign rules (divisor's sign for %).
+    if 7 // -3 != -3 or 7 % -3 != -2:
+        raise ValueError("floordiv/mod sign wrong")
+    if -7 // 3 != -3 or -7 % 3 != 2:
+        raise ValueError("neg floordiv/mod wrong")
+    # pow with negative exponent widens to float.
+    if 2 ** -1 != 0.5:
+        raise ValueError("negative pow wrong")
+
+main()
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    /// CPython collapses numerically-equal int / float / bool dict keys onto a
+    /// single slot (`hash(1) == hash(1.0) == hash(True)`). The `VmInt`-backed
+    /// `HashKey` must preserve that.
+    #[test]
+    fn numeric_dict_key_collapse_preserved() {
+        let src = r#"
+def main() -> None:
+    mut d: dict[int, int] = {}
+    d[1] = 1
+    d[1.0] = 2
+    d[True] = 3
+    if len(d) != 1:
+        raise ValueError("numeric keys did not collapse to one slot")
+    if d[1] != 3:
+        raise ValueError("collapse did not overwrite the shared slot")
+    # A distinct big int and a non-integral float stay separate keys.
+    d[10000000000000000000] = 7
+    d[1.5] = 8
+    if len(d) != 3:
+        raise ValueError("distinct numeric keys wrongly merged")
+
+main()
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    /// Task 3 direct method-call path must preserve every dispatch flavour:
+    /// plain method (fast path), method with args, `@staticmethod` and
+    /// `@classmethod` (which fall back to the general path).
+    #[test]
+    fn method_dispatch_flavours_preserved() {
+        let src = r#"
+class Counter:
+    n: int
+
+impl Counter:
+    def get(self) -> int:
+        return self.n
+    def plus(self, k: int) -> int:
+        return self.n + k
+    @staticmethod
+    def stat() -> int:
+        return 42
+    @classmethod
+    def twice(cls, v: int) -> int:
+        return v * 2
+
+def main() -> None:
+    let c: Counter = Counter(n=10)
+    if c.get() != 10:
+        raise ValueError("plain method broken")
+    if c.plus(5) != 15:
+        raise ValueError("method with arg broken")
+    if Counter.stat() != 42:
+        raise ValueError("staticmethod on class broken")
+    if c.stat() != 42:
+        raise ValueError("staticmethod via instance broken")
+    if Counter.twice(3) != 6:
+        raise ValueError("classmethod broken")
+
+main()
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
     #[test]
     fn bytes_percent_formatting_runs() {
         // Regression (PEP 461): the VM must implement `bytes % args` (it only

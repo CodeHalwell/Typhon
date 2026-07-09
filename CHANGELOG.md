@@ -6,6 +6,19 @@ canonical phase-by-phase status lives in `docs/roadmap.md`.
 
 ## Unreleased
 
+- perf(vm): Tier 1a of the VM performance plan. `Value::Int` now wraps a
+  `VmInt` two-representation integer — any value that fits `i64` is stored
+  inline (`Small`), only overflowing to a reference-counted `BigInt`
+  (`Big`) — so integer arithmetic on the common path no longer allocates,
+  while CPython's exact arbitrary-precision semantics (floor-div/mod sign
+  rules, `2 ** 100`, big-int↔float comparison, numeric int/float/bool
+  dict-key collapse) are preserved. Adds a per-class resolved-method cache
+  (negative results included) so repeated `find_method` misses don't
+  re-walk the base chain, and a direct `obj.method(args)` dispatch path for
+  user instances that skips the intermediate `BoundMethod` allocation.
+  Measured on the plan's corpus: while-accumulator loop ~1.6×, dict +
+  comprehension ~1.6×, `fib(27)` ~1.2× faster; VM↔CPython output parity
+  unchanged.
 - docs: corrected the stale VM performance claim in `docs/vm.md`
   (measured ~5–18× slower than the compiled path at steady state; VM
   wins startup) and added `docs/vm-performance-plan.md` (tiered VM

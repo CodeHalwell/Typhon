@@ -12,8 +12,7 @@ use std::rc::Rc;
 
 use indexmap::IndexMap;
 use num_bigint::BigInt;
-use num_integer::Integer;
-use num_traits::{Signed, ToPrimitive, Zero};
+use num_traits::Signed;
 use ruff_python_ast::{
     self as ast, BoolOp, CmpOp, ExceptHandler, Expr, FStringPart, InterpolatedStringElement,
     ModModule, Mutability, Number, Operator, Parameters, Pattern, Stmt, UnaryOp,
@@ -25,9 +24,16 @@ use crate::error::{
     vm_unsupported_use_compile, zero_division, zero_division_floor_mod, Unwind, VmException,
 };
 use crate::value::{
-    bigint_to_f64, Class, ClassField, DictMap, Function, HashKey, Instance, IterState, NativeFn,
-    Value,
+    Class, ClassField, DictMap, Function, HashKey, Instance, IterState, NativeFn, Value, VmInt,
 };
+
+/// A call's evaluated arguments: positional values plus `(name, value)`
+/// keyword pairs (with `*args` / `**kwargs` already flattened in).
+type CallArgs = (Vec<Value>, Vec<(String, Value)>);
+
+/// One class's resolved-method cache — method name → the resolved method, or a
+/// cached negative (`None`) result. Keyed per class in `Interpreter::method_cache`.
+type MethodTableCache = HashMap<String, Option<Rc<Function>>>;
 
 pub struct Interpreter {
     pub root: EnvRef,
@@ -85,6 +91,16 @@ pub struct Interpreter {
     /// that a consumer module can merge imported extensions into its own
     /// rewrite pass. (#202)
     pub builtin_ext_registries: HashMap<String, tyc_analyse::ExtensionRegistry>,
+    /// Resolved-method cache: `class pointer → (method name → resolved method)`,
+    /// caching negative (`None`) results too. A warm [`Interpreter::find_method`]
+    /// is then a single map probe with no base-chain walk. Cleared wholesale
+    /// whenever a class's method table is mutated (the impl-block merge) — that
+    /// happens at module-load time, never inside a hot call loop, so a full
+    /// clear is cheap and trivially correct: no stale entry can survive, in the
+    /// mutated class or any subclass that inherited from it. The `usize` key is
+    /// the class's stable `Rc` address (classes are never dropped, so it is a
+    /// permanent identity — the same assumption `HashKey::Instance` relies on).
+    pub method_cache: RefCell<HashMap<usize, MethodTableCache>>,
 }
 
 /// Upper bound on values an eagerly-evaluated generator may yield before the
@@ -163,6 +179,7 @@ impl Interpreter {
             active_exceptions: Vec::new(),
             unresolved_aliases: HashMap::new(),
             builtin_ext_registries: HashMap::new(),
+            method_cache: RefCell::new(HashMap::new()),
         };
         crate::builtins::install(&mut interp);
         interp
@@ -385,6 +402,10 @@ impl Interpreter {
                                 .borrow_mut()
                                 .insert(name.clone(), m.clone());
                         }
+                        // The merge changed `existing`'s method table (and thus
+                        // any subclass that inherits from it), so drop the whole
+                        // resolved-method cache — see `method_cache`.
+                        self.method_cache.borrow_mut().clear();
                         for (k, v) in new_class.class_attrs.borrow().iter() {
                             existing
                                 .class_attrs
@@ -1436,7 +1457,7 @@ impl Interpreter {
                 // from it.
                 let raw = if Self::is_enum_auto(&raw) {
                     last_value += 1;
-                    Value::Int(BigInt::from(last_value))
+                    Value::Int(VmInt::from(last_value))
                 } else {
                     if let Value::Int(i) = &raw {
                         if let Some(v) = i.to_i64() {
@@ -2126,7 +2147,73 @@ impl Interpreter {
                 )));
             }
         }
+        // Fast path for a method call on a user instance — `obj.method(args)`.
+        // The generic path evaluates `obj.method` into an intermediate
+        // `Value::BoundMethod` (heap-boxing the receiver) which `call_value`
+        // then unwraps; here we resolve and invoke the method directly, boxing
+        // nothing. Gated narrowly to *plain* instance methods — a same-named
+        // field (which shadows the method and may itself be callable), a
+        // `@property` (whose getter runs on read to yield the real callable),
+        // and `@staticmethod` / `@classmethod` / `async` methods all fall
+        // through to the general path, which preserves their exact semantics.
+        // The receiver is evaluated exactly once and reused on both branches,
+        // so no subexpression is ever double-evaluated.
+        if let Expr::Attribute(a) = c.func.as_ref() {
+            let recv = self.eval_expr(&a.value, env)?;
+            let attr = a.attr.as_str();
+            let inst = match &recv {
+                Value::Instance(inst) => Some(inst.clone()),
+                _ => None,
+            };
+            if let Some(inst) = inst {
+                // A field or `@property` of the same name takes precedence over
+                // a method (matching `get_attr`'s order) — leave those to the
+                // general path.
+                let shadowed = inst.fields.borrow().contains_key(attr)
+                    || inst.class.properties.borrow().contains(attr);
+                if !shadowed {
+                    if let Some(m) = self.find_method(&inst.class, attr) {
+                        let is_classmethod =
+                            m.is_classmethod || inst.class.classmethods.borrow().contains(attr);
+                        if !m.is_static && !is_classmethod && !m.is_async {
+                            let (args, kwargs) = self.eval_call_args(c, env)?;
+                            // Mirror `call_value`'s `BoundMethod` arm exactly:
+                            // push a `(owner, self)` frame so a zero-arg
+                            // `super()` in the body can climb the MRO when the
+                            // owning class is known, else just prepend `self`.
+                            return match self.method_owner(&inst.class, &m) {
+                                Some(owner) => {
+                                    self.call_method_with_frame(&m, owner, recv, args, &kwargs)
+                                }
+                                None => {
+                                    let mut full = Vec::with_capacity(args.len() + 1);
+                                    full.push(recv);
+                                    full.extend(args);
+                                    self.call_function(&m, full, &kwargs, None)
+                                }
+                            };
+                        }
+                    }
+                }
+            }
+            // General attribute-callee path, reusing the already-evaluated
+            // receiver so a `@property` getter (or any side-effecting receiver
+            // expression) runs exactly once. Identical to
+            // `eval_expr(Expr::Attribute)` followed by `call_value`.
+            let func = self.get_attr(&recv, attr)?;
+            let (args, kwargs) = self.eval_call_args(c, env)?;
+            return self.call_value(func, args, &kwargs);
+        }
+
         let func = self.eval_expr(&c.func, env)?;
+        let (args, kwargs) = self.eval_call_args(c, env)?;
+        self.call_value(func, args, &kwargs)
+    }
+
+    /// Evaluate a call's positional (with `*args` spread) and keyword (with
+    /// `**kwargs` spread) arguments in source order. Shared by the general call
+    /// path and the direct method-call fast path so both stay byte-identical.
+    fn eval_call_args(&mut self, c: &ast::ExprCall, env: &EnvRef) -> Result<CallArgs, Unwind> {
         let mut args = Vec::with_capacity(c.arguments.args.len());
         for arg in c.arguments.args.iter() {
             if let Expr::Starred(s) = arg {
@@ -2163,7 +2250,7 @@ impl Interpreter {
                 }
             }
         }
-        self.call_value(func, args, &kwargs)
+        Ok((args, kwargs))
     }
 
     /// Structural runtime check backing `EXPR as! TYPE` in the VM — mirrors
@@ -2893,11 +2980,44 @@ impl Interpreter {
     }
 
     pub fn find_method(&self, class: &Rc<Class>, name: &str) -> Option<Rc<Function>> {
+        // Fast path: the class's own table. `build_class` flattens inherited
+        // methods down into every subclass, so a normal method (own or
+        // inherited-at-build-time) resolves here in a single probe with no
+        // base-chain walk and no cache overhead — the hot case.
         if let Some(m) = class.methods.borrow().get(name) {
             return Some(m.clone());
         }
+        // Miss on the own table: either a genuine negative (a dunder probe like
+        // `__enter__` / `__add__` that most classes lack) or a method added to
+        // a *base* after this class was built. Both otherwise re-walk the whole
+        // base chain on every call, so memoise the resolution here — including
+        // the negative. Cleared wholesale on any impl-merge (see `method_cache`),
+        // which also covers a base gaining a method.
+        let cid = Rc::as_ptr(class) as usize;
+        if let Some(inner) = self.method_cache.borrow().get(&cid) {
+            if let Some(hit) = inner.get(name) {
+                return hit.clone();
+            }
+        }
+        let resolved = self.resolve_via_bases(class, name);
+        self.method_cache
+            .borrow_mut()
+            .entry(cid)
+            .or_default()
+            .insert(name.to_owned(), resolved.clone());
+        resolved
+    }
+
+    /// Resolve `name` through `class`'s base chain only (the own table has
+    /// already been probed by [`find_method`]). Each base's own table is
+    /// likewise base-flattened, so this recurses only for methods added to a
+    /// base after `class` was built.
+    fn resolve_via_bases(&self, class: &Rc<Class>, name: &str) -> Option<Rc<Function>> {
         for base in &class.bases {
-            if let Some(m) = self.find_method(base, name) {
+            if let Some(m) = base.methods.borrow().get(name) {
+                return Some(m.clone());
+            }
+            if let Some(m) = self.resolve_via_bases(base, name) {
                 return Some(m);
             }
         }
@@ -3194,42 +3314,46 @@ impl Interpreter {
         // (FINDINGS #19) so `2 ** 100`, `fib(99)`, and friends no longer
         // overflow — matching Python's arbitrary-precision semantics.
         match (l, op, r) {
-            (Int(a), Add, Int(b)) => return Ok(Int(a + b)),
-            (Int(a), Sub, Int(b)) => return Ok(Int(a - b)),
-            (Int(a), Mult, Int(b)) => return Ok(Int(a * b)),
+            // Integer ops go through `VmInt`, which keeps values that fit `i64`
+            // inline (`Small`) and only promotes to a heap `BigInt` on overflow
+            // — so `i + 1` in a tight loop never allocates, while `2 ** 100`
+            // and `fib(99)` still compute the exact arbitrary-precision result.
+            (Int(a), Add, Int(b)) => return Ok(Int(a.add(b))),
+            (Int(a), Sub, Int(b)) => return Ok(Int(a.sub(b))),
+            (Int(a), Mult, Int(b)) => return Ok(Int(a.mul(b))),
             (Int(_), Div, Int(b)) if b.is_zero() => return Err(zero_division()),
-            (Int(a), Div, Int(b)) => return Ok(Float(bigint_to_f64(a) / bigint_to_f64(b))),
+            (Int(a), Div, Int(b)) => return Ok(Float(a.to_f64() / b.to_f64())),
             (Int(_), FloorDiv, Int(b)) if b.is_zero() => return Err(zero_division_floor_mod()),
             (Int(a), FloorDiv, Int(b)) => return Ok(Int(a.div_floor(b))),
             (Int(_), Mod, Int(b)) if b.is_zero() => return Err(zero_division_floor_mod()),
             (Int(a), Mod, Int(b)) => return Ok(Int(a.mod_floor(b))),
             (Int(a), Pow, Int(b)) => {
                 if b.is_negative() {
-                    return Ok(Float(bigint_to_f64(a).powf(bigint_to_f64(b))));
+                    return Ok(Float(a.to_f64().powf(b.to_f64())));
                 }
-                // BigInt::pow takes a `u32`; for ridiculous exponents
+                // `pow` takes a `u32` exponent; for ridiculous exponents
                 // (10**million) we'd happily eat all the RAM, so cap at
                 // u32::MAX which is already astronomically more than
                 // Python tolerates before timing out.
                 let exp = b.to_u32().ok_or_else(overflow)?;
                 return Ok(Int(a.pow(exp)));
             }
-            (Int(a), BitOr, Int(b)) => return Ok(Int(a | b)),
-            (Int(a), BitAnd, Int(b)) => return Ok(Int(a & b)),
-            (Int(a), BitXor, Int(b)) => return Ok(Int(a ^ b)),
+            (Int(a), BitOr, Int(b)) => return Ok(Int(a.bitor(b))),
+            (Int(a), BitAnd, Int(b)) => return Ok(Int(a.bitand(b))),
+            (Int(a), BitXor, Int(b)) => return Ok(Int(a.bitxor(b))),
             (Int(a), LShift, Int(b)) => {
                 if b.is_negative() {
                     return Err(value_error("negative shift count"));
                 }
                 let shift = b.to_usize().ok_or_else(overflow)?;
-                return Ok(Int(a << shift));
+                return Ok(Int(a.shl(shift)));
             }
             (Int(a), RShift, Int(b)) => {
                 if b.is_negative() {
                     return Err(value_error("negative shift count"));
                 }
                 let shift = b.to_usize().unwrap_or(usize::MAX);
-                return Ok(Int(a >> shift));
+                return Ok(Int(a.shr(shift)));
             }
 
             (Float(a), Add, Float(b)) => return Ok(Float(a + b)),
@@ -3306,8 +3430,8 @@ impl Interpreter {
         }
         // Bool ↔ Int.
         if matches!((l, r), (Bool(_), Int(_) | Bool(_)) | (Int(_), Bool(_))) {
-            let a = l.to_bigint()?;
-            let b = r.to_bigint()?;
+            let a = VmInt::from(l.to_bigint()?);
+            let b = VmInt::from(r.to_bigint()?);
             return self.binop(&Int(a), op, &Int(b));
         }
 
@@ -3516,7 +3640,7 @@ impl Interpreter {
             UnaryOp::USub => match v {
                 Value::Int(i) => Ok(Value::Int(-i)),
                 Value::Float(x) => Ok(Value::Float(-*x)),
-                Value::Bool(b) => Ok(Value::Int(BigInt::from(-(*b as i64)))),
+                Value::Bool(b) => Ok(Value::Int(VmInt::from(-(*b as i64)))),
                 Value::Complex(re, im) => Ok(Value::Complex(-*re, -*im)),
                 _ => Err(type_error(format!(
                     "bad operand for unary -: '{}'",
@@ -3525,7 +3649,7 @@ impl Interpreter {
             },
             UnaryOp::UAdd => match v {
                 Value::Int(_) | Value::Float(_) | Value::Complex(_, _) => Ok(v.clone()),
-                Value::Bool(b) => Ok(Value::Int(BigInt::from(*b as i64))),
+                Value::Bool(b) => Ok(Value::Int(VmInt::from(*b as i64))),
                 _ => Err(type_error(format!(
                     "bad operand for unary +: '{}'",
                     v.type_name()
@@ -3533,7 +3657,7 @@ impl Interpreter {
             },
             UnaryOp::Invert => match v {
                 Value::Int(i) => Ok(Value::Int(!i)),
-                Value::Bool(b) => Ok(Value::Int(!BigInt::from(*b as i64))),
+                Value::Bool(b) => Ok(Value::Int(VmInt::from(!(*b as i64)))),
                 _ => Err(type_error(format!(
                     "bad operand for unary ~: '{}'",
                     v.type_name()
@@ -3594,7 +3718,7 @@ impl Interpreter {
                 let i = key.to_int()?;
                 let idx = normalize_index(i, len as usize)
                     .ok_or_else(|| index_error("range object index out of range"))?;
-                Ok(Value::Int(BigInt::from(start + idx as i64 * step)))
+                Ok(Value::Int(VmInt::from(start + idx as i64 * step)))
             }
             Value::Tuple(t) => {
                 let i = key.to_int()?;
@@ -3624,7 +3748,7 @@ impl Interpreter {
                 let i = key.to_int()?;
                 let idx = normalize_index(i, b.len())
                     .ok_or_else(|| index_error("bytes index out of range"))?;
-                Ok(Value::Int(BigInt::from(b[idx] as i64)))
+                Ok(Value::Int(VmInt::from(b[idx] as i64)))
             }
             Value::Instance(i) => {
                 // Missing-key hook (mechanism #2). The builtins agent's
@@ -4452,7 +4576,7 @@ impl Interpreter {
             Value::Bytes(b) => {
                 let items: Vec<Value> = b
                     .iter()
-                    .map(|byte| Value::Int(BigInt::from(*byte)))
+                    .map(|byte| Value::Int(VmInt::from(*byte)))
                     .collect();
                 IterState::List {
                     items: Rc::new(RefCell::new(items)),
@@ -4589,7 +4713,7 @@ impl Interpreter {
                     return if done {
                         Ok(None)
                     } else {
-                        let v = Value::Int(BigInt::from(*current));
+                        let v = Value::Int(VmInt::from(*current));
                         *current += *step;
                         Ok(Some(v))
                     };
@@ -4659,7 +4783,7 @@ impl Interpreter {
                         _ => unreachable!(),
                     };
                     Ok(Some(Value::Tuple(Rc::new(vec![
-                        Value::Int(BigInt::from(idx)),
+                        Value::Int(VmInt::from(idx)),
                         v,
                     ]))))
                 }
@@ -5362,10 +5486,14 @@ fn number_to_value(n: &Number) -> Value {
         // to `as_i64` for the common small-literal case.
         Number::Int(i) => {
             if let Some(small) = i.as_i64() {
-                Value::Int(BigInt::from(small))
+                // Common case: the literal fits `i64`, so build `Small` directly
+                // without ever constructing a `BigInt`.
+                Value::Int(VmInt::Small(small))
             } else {
                 let s = format!("{i}");
-                Value::Int(s.parse::<BigInt>().unwrap_or_else(|_| BigInt::from(0)))
+                Value::Int(VmInt::from(
+                    s.parse::<BigInt>().unwrap_or_else(|_| BigInt::from(0)),
+                ))
             }
         }
         Number::Float(x) => Value::Float(*x),
@@ -5992,7 +6120,7 @@ fn value_as_complex(v: &Value) -> Option<(f64, f64)> {
     match v {
         Value::Complex(re, im) => Some((*re, *im)),
         Value::Float(x) => Some((*x, 0.0)),
-        Value::Int(i) => Some((bigint_to_f64(i), 0.0)),
+        Value::Int(i) => Some((i.to_f64(), 0.0)),
         Value::Bool(b) => Some((*b as i64 as f64, 0.0)),
         _ => None,
     }
@@ -6900,9 +7028,9 @@ pub fn format_with_spec_pub(
     format_with_spec(value, default, spec)
 }
 
-/// Separator-group every third digit of a non-negative `BigInt`. Caller
+/// Separator-group every third digit of a non-negative integer. Caller
 /// is responsible for prepending the sign — the body is sign-free.
-fn format_bigint_with_separator(i: &BigInt, sep: char) -> String {
+fn format_bigint_with_separator(i: &VmInt, sep: char) -> String {
     let s = i.to_str_radix(10);
     let mut out = String::with_capacity(s.len() + s.len() / 3);
     for (k, c) in s.chars().rev().enumerate() {
@@ -6995,11 +7123,88 @@ result = fib(99)
         assert_eq!(v.py_str(), "218922995834555169026");
     }
 
+    /// The flattened method cache must not survive a runtime impl-block merge:
+    /// after a `class __typhon_impl_Foo` is merged into `Foo` (the shape the
+    /// preprocessor produces for `impl Foo:`), a method resolved and cached
+    /// before the merge must be re-resolved to the merged/overriding version.
+    /// Driven end-to-end through the public run path (`run_module`).
+    #[test]
+    fn method_cache_invalidated_after_runtime_impl_merge() {
+        let src = r#"
+class Foo:
+    pass
+
+class __typhon_impl_Foo(object):
+    def val(self):
+        return 1
+
+f = Foo()
+first = f.val()
+
+class __typhon_impl_Foo(object):
+    def val(self):
+        return 2
+
+second = f.val()
+"#;
+        let (interp, res) = parse_and_run(src);
+        res.unwrap();
+        // First call cached `val` → 1; the second impl merge cleared the cache
+        // so the overriding `val` → 2 is observed.
+        assert_eq!(interp.root.get("first").unwrap().py_str(), "1");
+        assert_eq!(interp.root.get("second").unwrap().py_str(), "2");
+    }
+
+    /// Task 3 fast path: `obj.method(args)` on a user instance is invoked
+    /// directly (no intermediate `BoundMethod`), with `self` and args bound
+    /// correctly. A same-named callable *field* must still shadow the method.
+    #[test]
+    fn direct_method_call_binds_self_and_args() {
+        let src = r#"
+class Point:
+    x = 0
+    y = 0
+
+class __typhon_impl_Point(object):
+    def sum2(self, k):
+        return self.x + self.y + k
+
+p = Point()
+p.x = 3
+p.y = 4
+result = p.sum2(5)
+"#;
+        let (interp, res) = parse_and_run(src);
+        res.unwrap();
+        assert_eq!(interp.root.get("result").unwrap().py_str(), "12");
+    }
+
+    #[test]
+    fn field_shadows_method_on_call() {
+        // A callable instance field of the same name as a method takes
+        // precedence (matches `get_attr` order); the fast path must fall back.
+        let src = r#"
+class Box:
+    pass
+
+class __typhon_impl_Box(object):
+    def act(self):
+        return 1
+
+b = Box()
+b.act = lambda: 99
+result = b.act()
+"#;
+        let (interp, res) = parse_and_run(src);
+        res.unwrap();
+        assert_eq!(interp.root.get("result").unwrap().py_str(), "99");
+    }
+
     /// FINDINGS #20 — zero-pad, alternate-form, and width+precision for
     /// f-string format specs must match Python.
     #[test]
     fn fstring_zero_pad_and_alternate_form() {
-        let v = Value::Int(BigInt::from(42));
+        let v = Value::Int(VmInt::from(42));
         assert_eq!(format_with_spec(&v, "42", "04d").unwrap(), "0042");
         assert_eq!(format_with_spec(&v, "42", "06").unwrap(), "000042");
         assert_eq!(format_with_spec(&v, "42", "#x").unwrap(), "0x2a");
@@ -7025,7 +7230,7 @@ result = fib(99)
         // Combined: alternate-form hex with zero-pad and width.
         assert_eq!(format_with_spec(&v, "42", "#06x").unwrap(), "0x002a");
         // Negative numbers respect sign position with zero-pad.
-        let n = Value::Int(BigInt::from(-7));
+        let n = Value::Int(VmInt::from(-7));
         assert_eq!(format_with_spec(&n, "-7", "04d").unwrap(), "-007");
         // Default formatting still works.
         assert_eq!(format_with_spec(&v, "42", "5").unwrap(), "   42");
@@ -7297,9 +7502,9 @@ e = (1+2j) - (3+1j)
     /// Mechanism #3 — complex equality across int/float when imag == 0.
     #[test]
     fn complex_equality() {
-        assert!(Value::Complex(3.0, 0.0).py_eq(&Value::Int(BigInt::from(3))));
+        assert!(Value::Complex(3.0, 0.0).py_eq(&Value::Int(VmInt::from(3))));
         assert!(Value::Complex(3.0, 0.0).py_eq(&Value::Float(3.0)));
-        assert!(!Value::Complex(3.0, 1.0).py_eq(&Value::Int(BigInt::from(3))));
+        assert!(!Value::Complex(3.0, 1.0).py_eq(&Value::Int(VmInt::from(3))));
         assert!(Value::Complex(1.0, 2.0).py_eq(&Value::Complex(1.0, 2.0)));
     }
 
@@ -7319,7 +7524,7 @@ e = (1+2j) - (3+1j)
 
         let values = Value::DictView {
             kind: DictViewKind::Values,
-            items: vec![Value::Int(BigInt::from(1)), Value::Int(BigInt::from(2))],
+            items: vec![Value::Int(VmInt::from(1)), Value::Int(VmInt::from(2))],
         };
         assert_eq!(values.py_str(), "dict_values([1, 2])");
 
@@ -7328,11 +7533,11 @@ e = (1+2j) - (3+1j)
             items: vec![
                 Value::Tuple(Rc::new(vec![
                     Value::Str(Rc::new("a".into())),
-                    Value::Int(BigInt::from(1)),
+                    Value::Int(VmInt::from(1)),
                 ])),
                 Value::Tuple(Rc::new(vec![
                     Value::Str(Rc::new("b".into())),
-                    Value::Int(BigInt::from(2)),
+                    Value::Int(VmInt::from(2)),
                 ])),
             ],
         };
