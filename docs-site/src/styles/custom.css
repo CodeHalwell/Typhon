@@ -314,7 +314,8 @@ starlight-tabs .tab > [role="tab"] {
   transition: color 150ms ease, border-color 150ms ease;
 }
 
-starlight-tabs .tab > [role="tab"]:not([aria-selected="true"]):hover {
+starlight-tabs .tab > [role="tab"]:not([aria-selected="true"]):hover,
+starlight-tabs .tab > [role="tab"]:not([aria-selected="true"]):focus-visible {
   color: var(--sl-color-white);
   border-color: var(--sl-color-gray-4);
 }
