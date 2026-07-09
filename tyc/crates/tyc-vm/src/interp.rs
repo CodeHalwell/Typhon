@@ -722,16 +722,21 @@ impl Interpreter {
                 .iter()
                 .any(|d| decorator_simple_name(&d.expression).as_deref() == Some(want))
         };
+        let body = Rc::new(f.body.clone());
+        // Compute the slot layout on the exact `Rc`'d body clone the VM will
+        // later walk (the analysis stamps node indices onto its `Name` nodes).
+        let slot_info = Rc::new(crate::slots::SlotInfo::analyze(&f.parameters, &body));
         Ok(Function {
             name: f.name.as_str().to_owned(),
             params: f.parameters.clone(),
-            body: Rc::new(f.body.clone()),
+            body,
             defaults,
             closure: env.clone(),
             is_async: f.is_async,
             is_static: has_deco("staticmethod"),
             is_classmethod: has_deco("classmethod"),
             source: self.current_source.clone(),
+            slot_info,
         })
     }
 
@@ -1523,7 +1528,7 @@ impl Interpreter {
             Expr::EllipsisLiteral(_) => Err(not_implemented("Ellipsis literal")),
             Expr::FString(f) => self.eval_fstring(f, env),
             Expr::Name(n) => env
-                .get(n.id.as_str())
+                .get_name_node(n)
                 .ok_or_else(|| name_error(format!("name '{}' is not defined", n.id.as_str()))),
             Expr::BinOp(b) => {
                 let left = self.eval_expr(&b.left, env)?;
@@ -1658,16 +1663,19 @@ impl Interpreter {
                     range: l.range,
                     value: Some(l.body.clone()),
                 });
+                let body = Rc::new(vec![body_stmt]);
+                let slot_info = Rc::new(crate::slots::SlotInfo::analyze(&params, &body));
                 let func = Function {
                     name: "<lambda>".into(),
                     params,
-                    body: Rc::new(vec![body_stmt]),
+                    body,
                     defaults: vec![],
                     closure: env.clone(),
                     is_async: false,
                     is_static: false,
                     is_classmethod: false,
                     source: self.current_source.clone(),
+                    slot_info,
                 };
                 Ok(Value::Function(Rc::new(func)))
             }
@@ -2679,7 +2687,13 @@ impl Interpreter {
         }
         // Wrap the body in a closure so every early `return` decrements the
         // counter on the way out — including a failure in `bind_args`.
-        let call_env = Env::new_child(&f.closure);
+        // Slot-eligible functions get an indexed frame (no per-call HashMap,
+        // no per-write String key); everything else keeps the classic path.
+        let call_env = if f.slot_info.eligible {
+            Env::new_frame(&f.closure, f.slot_info.clone())
+        } else {
+            Env::new_child(&f.closure)
+        };
         let is_generator = body_is_generator(&f.body);
         let result = (|| -> Result<Value, Unwind> {
             self.bind_args(f, args, kwargs, receiver, &call_env)?;
@@ -4303,7 +4317,7 @@ impl Interpreter {
     ) -> Result<(), Unwind> {
         match target {
             Expr::Name(n) => {
-                env.assign_or_create(n.id.as_str(), value);
+                env.store_name_node(n, value);
                 Ok(())
             }
             Expr::Tuple(t) => self.assign_unpack(&t.elts, value, env),

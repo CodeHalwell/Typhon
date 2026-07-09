@@ -925,6 +925,10 @@ pub struct Function {
     /// runs) attribute to the right file when a function defined in one
     /// module is called from another.
     pub source: Option<std::rc::Rc<crate::interp::SourceInfo>>,
+    /// Slot-resolved-locals layout + eligibility (VM performance Tier 1b),
+    /// computed once from `params` + `body` when the function value is built.
+    /// Ineligible functions use the classic per-call `Env` HashMap path.
+    pub slot_info: std::rc::Rc<crate::slots::SlotInfo>,
 }
 
 pub struct Class {
