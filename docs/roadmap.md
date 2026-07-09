@@ -10,6 +10,22 @@ Realistic milestones for one person plus AI assistance. The headline target is a
 
 ## Current release
 
+**[v1.0.0-alpha.5](https://github.com/CodeHalwell/Typhon/releases/tag/v1.0.0-alpha.5) — 2026-07-09.**
+A performance-focused release on top of alpha.4. VM performance Tier 1
+(`tyc run`) — a two-representation `VmInt`, a per-class resolved-method
+cache with a direct dispatch path, and slot-resolved locals — compresses the
+VM's steady-state slowdown vs `tyc build` + CPython from ~5–18× to ~3–14×
+(startup-adjusted), with CPython's exact arbitrary-precision integer
+semantics preserved. A new `[optimise]` config profile + `tyc build -O` give
+a single dial over `auto-memoise` / `auto-gather` / `auto-parallel` /
+`pgo-memoise`. Seven new advice-only lints (the `tyc::perf_*` family +
+`lazy_import_opportunity`) flag hot-loop anti-patterns. A free-threading
+parallelisation wave widens `auto-parallel`, adds an integer
+accumulator-loop reduction (`auto-parallel-reductions`), two new advice
+lints, and a PEP 734 interpreters backend. Native PEP 810 lazy imports land
+on `[python] target = "3.15"` targets. No new syntax; every rewrite here is
+opt-in or advice-only, so no previously-*correct* program changes behaviour.
+
 **[v1.0.0-alpha.4](https://github.com/CodeHalwell/Typhon/releases/tag/v1.0.0-alpha.4) — 2026-07-08.**
 A focused hardening release on top of alpha.3. It closes the one HIGH finding
 the release-readiness review deferred — **H5**, scope-blind class unification: a
