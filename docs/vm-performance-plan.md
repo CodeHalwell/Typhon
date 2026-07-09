@@ -1,11 +1,13 @@
 # VM performance plan
 
-`docs/vm.md`'s [Performance](vm.md#performance) section states the current
-numbers plainly: `tyc run`'s tree-walking VM is **5–18× slower** than
-`tyc build` + CPython 3.13 at steady-state compute, in exchange for
-winning on startup latency and skipping the build step entirely. This
-document is the engineering plan behind that gap: what was measured, why
-the VM is this slow today, and the tiered plan to close the distance.
+`docs/vm.md`'s [Performance](vm.md#performance) section states the
+numbers plainly: at the start of this plan, `tyc run`'s tree-walking VM
+measured **5–18× slower** than `tyc build` + CPython 3.13 at
+steady-state compute, in exchange for winning on startup latency and
+skipping the build step entirely. This document is the engineering plan
+behind that gap: what was measured, why the VM was that slow, and the
+tiered plan to close the distance. **Tier 1 has since landed** — see its
+measured-outcome table below; Tiers 2–3 remain the forward plan.
 
 ---
 
@@ -82,7 +84,7 @@ variable access, calls):
 
 ---
 
-## Tier 1 — representation & dispatch tuning (in progress on this branch)
+## Tier 1 — representation & dispatch tuning (landed)
 
 Tier 1 doesn't change the execution model — it's still a tree-walker. It
 replaces four hot-path data structures with cheaper ones, targeting the
@@ -115,9 +117,24 @@ four costs above:
   weight (an array of slots is cheaper to allocate and populate than a
   `HashMap`, though a per-call allocation still happens).
 
-**Expected outcome:** the measured 5–18× range compresses to roughly
-**2–4×**. This is a tuning pass over the existing tree-walker; Tier 2 is
-where the larger structural win lives.
+**Measured outcome** (same methodology as the baseline table — release
+binary, median of 3, parity-checked; compiled-side numbers re-measured
+the same day):
+
+| benchmark | VM before | VM after Tier 1 | VM speedup | startup-adjusted slowdown (was) |
+|---|---|---|---|---|
+| fib(27) recursive int | 569 ms | 400 ms | 1.42× | ~14× (was ~18×) |
+| 3M-iteration while accumulator | 2168 ms | 650 ms | **3.3×** | ~3× (was ~9×) |
+| 300k object constructions + method calls | 733 ms | 567 ms | 1.29× | ~3.5× (was ~5×) |
+| dict writes + list comprehension | 387 ms | 238 ms | 1.63× | ~5× (was ~8×) |
+
+The 5–18× range compressed to roughly **3–14× startup-adjusted (~2.7–6×
+end-to-end wall clock)**. Loop-shaped code — where slot-resolved locals
+and the small-int path compound — gained the most; recursive call-heavy
+code (`fib`) remains the outlier because per-call costs (a real Rust
+frame, argument binding, frame setup) dominate it, and those are
+precisely Tier 2's target. This was a tuning pass over the existing
+tree-walker; Tier 2 is where the larger structural win lives.
 
 ---
 

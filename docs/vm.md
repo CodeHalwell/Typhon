@@ -430,36 +430,36 @@ step entirely, so there's no `build/` directory or `typhon_runtime.py` to
 generate first. For short scripts, the REPL, and (eventually) LSP-driven
 expression evaluation, the VM wins.
 
-Steady-state compute is the opposite story: measured against `tyc build`
-+ CPython 3.13 (release binary, median of 3 runs, outputs
-parity-checked), the VM is currently **~5–18× slower** once fixed
-startup cost is factored out. Recursive, call-heavy integer arithmetic is
-the worst case (~18×, e.g. a naive recursive `fib`); object-construction-
-and method-call-heavy code fares best of the workloads measured so far
-(~5×). Four architectural costs drive this:
+Steady-state compute is the opposite story. Before the Tier 1 work the
+VM measured **~5–18× slower** than `tyc build` + CPython 3.13 once fixed
+startup cost was factored out (release binary, median of 3 runs, outputs
+parity-checked), driven by four architectural costs: every `int` was a
+heap-allocated arbitrary-precision `BigInt`, every variable read was a
+string-hash `HashMap` lookup walking a parent scope chain, every call
+allocated a fresh `Env` (a `HashMap`), and method resolution re-walked
+the base-class chain on every miss.
 
-- Every `int` is a heap-allocated arbitrary-precision `BigInt` — even
-  `x + 1` allocates.
-- Every variable read is a string-hash `HashMap` lookup that walks a
-  parent scope chain, rather than resolving to a fixed slot.
-- Every call allocates a fresh `Env` (a `HashMap`), even for a two-line
-  leaf function.
+Tier 1 (landed) attacks all four without changing the execution model:
 
-Integer arithmetic no longer allocates on the common path: `Value::Int`
-wraps a `VmInt` that keeps any `i64`-range value inline and only promotes
-to a heap `BigInt` on overflow (CPython's arbitrary-precision semantics are
-preserved exactly). Method resolution first probes the class's own
-(base-flattened) method table and memoises base-chain / negative lookups in
-a per-class cache, and `obj.method(args)` on a user instance is invoked
-directly without building an intermediate `BoundMethod`.
+- `Value::Int` wraps a `VmInt` that keeps any `i64`-range value inline
+  and only promotes to a heap `BigInt` on overflow — integer arithmetic
+  no longer allocates on the common path, and CPython's
+  arbitrary-precision semantics are preserved exactly.
+- Functions with no `global`/`nonlocal` and no captured closure
+  variables resolve locals to fixed slots computed once at definition
+  time; other functions keep the `HashMap` path unchanged.
+- Method resolution memoises base-chain / negative lookups in a
+  per-class cache, and `obj.method(args)` on a user instance dispatches
+  directly without building an intermediate `BoundMethod`.
 
-The remaining cost centres — string-hash scope-chain variable lookups and a
-fresh `Env` per call — are a property of today's tree-walking
-implementation, not the language. [`docs/vm-performance-plan.md`](vm-performance-plan.md)
-has the full measured baseline, the root-cause breakdown, and the tiers;
-Tier 1a (small-int fast path, per-class method cache, direct method-call
-path) has landed, with slot-resolved locals and Tier 2 (bytecode VM) still
-ahead.
+Measured after Tier 1 (same methodology): **~3–14× slower
+startup-adjusted, ~2.7–6× end-to-end wall clock**. Tight loops improved
+the most (a 3M-iteration accumulator went 2168ms → ~650ms, now ~3×
+adjusted); recursive, call-heavy code remains the worst case (~14×
+adjusted on a naive recursive `fib`) because each Typhon call still pays
+a real Rust frame plus argument binding — exactly the cost Tier 2 (a
+bytecode VM) targets. [`docs/vm-performance-plan.md`](vm-performance-plan.md)
+has the full measured tables, the root-cause breakdown, and the tiers.
 
 A bytecode VM — the point at which rough CPython parity on most code
 becomes realistic — is designed as Tier 2 of that plan but not yet

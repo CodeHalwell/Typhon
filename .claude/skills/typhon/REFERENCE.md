@@ -912,6 +912,8 @@ The exact emission uses a small thread-safe proxy class so concurrent first acce
 
 `lazy from numpy import array` is **rejected at parse time** (`tyc::lazy_usage`). Use `lazy import numpy` and dotted access.
 
+On a **3.15+ `[python] target`**, the lowering above is skipped entirely: `lazy import np = numpy` instead emits the native PEP 810 `lazy import numpy as np` statement — no proxy class, no `typhon_runtime` involvement. 3.13 / 3.14 targets keep the proxy-class emission shown above, byte-for-byte.
+
 ### 7.2 Module-level `lazy let`
 
 ```python

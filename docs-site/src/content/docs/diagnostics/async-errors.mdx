@@ -92,6 +92,64 @@ async def a() -> int: ...
 
 Externally-imported async callees are never rewritten — opting a project into `auto-gather` does not surprise callers that aren't ready to run concurrently.
 
+## `tyc::parallel_opportunity` (advice)
+
+Only fires when [`[python] free-threaded = true`](/Typhon/configuration/python/). A comprehension or integer accumulator loop that *could* be parallelised across a thread pool (or PEP 734 sub-interpreters), but the enabling knob is off — or a `float` accumulator loop that matches every reduction condition except the required `int` annotation:
+
+```python
+# [python] free-threaded = true, [strictness] auto-parallel not set
+ys: list[int] = [transform(x) for x in xs]     # 💡 tyc::parallel_opportunity
+```
+
+```python
+# [python] free-threaded = true
+mut total: float = 0.0
+for x in xs:
+    total += x        # 💡 tyc::parallel_opportunity — float reordering changes results
+```
+
+The lint never rewrites anything — it names the knob to flip, or (for the `float` case) explains why the shape is permanently ineligible.
+
+**Fix:** flip [`[strictness] auto-parallel`](/Typhon/configuration/strictness/#auto-parallel) (and `auto-parallel-reductions` for the loop-reduction case). For the `float` case, refactor to an `int` accumulation if the domain allows, or write the parallel reduction explicitly with `sum(typhon_runtime.parallel.map_pure(lambda x: EXPR, ITER))` so the reordering is a deliberate, visible choice.
+
+Knob: [`[strictness] suggest-parallel`](/Typhon/configuration/strictness/#suggest-parallel) (default `true`).
+
+## `tyc::shared_mut_across_tasks` (advice)
+
+Only fires when [`[python] free-threaded = true`](/Typhon/configuration/python/). Flags a `go`-spawned same-module function that writes module-level mutable state — a `global NAME` assignment, or a write to a module-level `mut` binding:
+
+```python
+# [python] free-threaded = true
+mut hits: int = 0
+
+async def record() -> None:
+    global hits
+    hits = hits + 1          # concurrent write to shared state
+
+async def serve() -> None:
+    go record()              # 💡 tyc::shared_mut_across_tasks
+```
+
+Under free-threaded Python a `go`-spawned task runs *concurrently* with the spawner (and every other task), so an unguarded write to shared state is a data race — lost updates, torn reads, or corrupt containers. With the GIL, most such writes were *accidentally* atomic; free-threading removes that safety net.
+
+The lint is conservative: it only fires for a **bare-name callee** that resolves to a same-module `def` and *directly* writes a `global` or module-level `mut` binding. A `go obj.method()` (attribute callee) or an indirect shared write is not flagged.
+
+**Fix:** guard the shared state (e.g. an `asyncio.Lock`), or have the task **return** its result and let the spawner (or a queue) accumulate it instead of writing a global:
+
+```python
+import asyncio
+
+freeze let LOCK = asyncio.Lock()
+mut hits: int = 0
+
+async def record() -> None:
+    global hits
+    async with LOCK:
+        hits = hits + 1
+```
+
+Knob: [`[strictness] suggest-parallel`](/Typhon/configuration/strictness/#suggest-parallel) (default `true`).
+
 ## `tyc::interface_isinstance`
 
 `isinstance(x, MyInterface)`:

@@ -56,6 +56,22 @@ First access to `np.array` triggers `import numpy`, which can take 150ms+. Subse
 
 For very latency-sensitive entry points, prefer eager `import` so the cost is paid once at startup rather than at the worst possible moment (the first request).
 
+## Automatic performance advice
+
+`tyc check` / `tyc build` catch several of the patterns on this page automatically, as advice-level (Hint) lints — they never rewrite code and never block a build, they just point at the fix:
+
+| Lint | Catches |
+|------|---------|
+| `tyc::perf_membership_in_loop` | A linear `in` scan of a loop-invariant `list` inside a loop condition — hoist a `set` instead. |
+| `tyc::perf_list_shift_in_loop` | `list.insert(0, …)` / `list.pop(0)` in a loop — O(n) front-shift each time; use `collections.deque`. |
+| `tyc::perf_str_concat_in_loop` | `str +=` accumulation in a loop — quadratic; collect into a `list[str]` and `"".join(...)`. |
+| `tyc::perf_sort_in_loop` | Re-sorting loop-invariant data every iteration — sort once outside the loop. |
+| `tyc::perf_sorted_first` | `sorted(...)[0]` / `[-1]` — use `min(...)` / `max(...)` instead of sorting everything. |
+| `tyc::perf_keys_membership` | `x in d.keys()` — drop `.keys()`, test the dict directly. |
+| `tyc::lazy_import_opportunity` | A module-level import used only inside function bodies — the exact shape described above; a candidate for `lazy import`. |
+
+All seven are gated by [`[strictness] suggest-perf`](/Typhon/configuration/strictness/#suggest-perf) (default `true`). Two more advice lints, `tyc::parallel_opportunity` and `tyc::shared_mut_across_tasks`, cover the [Free-threaded mode](#free-threaded-mode) patterns below and are gated by [`suggest-parallel`](/Typhon/configuration/strictness/#suggest-parallel) — both silent unless `[python] free-threaded = true`.
+
 ## `comptime let` is free
 
 Inlined as a literal. No runtime cost.
@@ -81,6 +97,7 @@ Lowers to nested function calls. No runtime cost beyond what the calls themselve
 When `[python] free-threaded = true`:
 
 - `go` on CPU-bound functions lowers to `ThreadPoolExecutor.submit` — actual parallelism.
+- Pure comprehensions (and, opt-in, `int` accumulator loops) can be rewritten to a parallel map via `[strictness] auto-parallel` / `auto-parallel-reductions` — see [Free-threaded parallelism](/Typhon/reference/async/#free-threaded-parallelism) for the full rewrite surface and the `parallel-backend` executor choice.
 - The single-threaded overhead of free-threaded CPython is ~5-10% vs the GIL build.
 - The fallback runtime check (`sys._is_gil_enabled()`) costs nothing on the parallel path.
 
