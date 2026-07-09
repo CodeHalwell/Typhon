@@ -80,7 +80,7 @@ pytest = "8.2"              # bare version → ==8.2
 
 | Key | Type | Description |
 |-----|------|-------------|
-| `target` | `"3.13"` \| `"3.13t"` \| `"3.14"` \| `"3.14t"` \| `"3.15"` \| `"3.15t"` | Target CPython version. **Typhon requires 3.13+**; older targets are rejected at config load with `unsupported [python] target` and an actionable error. The `t` suffix selects free-threaded emission paths (PEP 703); see `free-threaded` below. |
+| `target` | `"3.13"` \| `"3.13t"` \| `"3.14"` \| `"3.14t"` \| `"3.15"` \| `"3.15t"` | Target CPython version. **Typhon requires 3.13+**; older targets are rejected at config load with `unsupported [python] target` and an actionable error. The `t` suffix selects free-threaded emission paths (PEP 703); see `free-threaded` below. A `3.15`+ target additionally unlocks native [PEP 810](https://peps.python.org/pep-0810/) lazy-import lowering — `lazy import` emits the native `lazy import MODULE as ALIAS` statement instead of the `typhon_runtime` helper call (see the lazy-loading section of `language.md`). |
 | `free-threaded` | bool | Allow free-threaded emission paths. Default `false` until 3.14 is the default Python. Use a `t` suffix on `target` to attest at config time. |
 
 ### `[emit]`

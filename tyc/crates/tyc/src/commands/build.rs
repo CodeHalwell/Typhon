@@ -24,8 +24,8 @@ use tyc_emit::{emit_python_with_source_for_target, emit_stub};
 use tyc_format::format_source;
 use tyc_syntax::preprocess::{
     expand_gather_blocks, expand_go_calls, expand_inline_question_ops, expand_lazy_imports,
-    expand_multiline_guards, expand_pipes, expand_question_ops, expand_typed_let_unpack,
-    expand_with_chains, line_byte_starts, preprocess,
+    expand_lazy_lets, expand_multiline_guards, expand_pipes, expand_question_ops,
+    expand_typed_let_unpack, expand_with_chains, line_byte_starts, preprocess, LazyImport,
 };
 
 use crate::commands::util::{
@@ -187,6 +187,17 @@ pub fn run(args: BuildArgs) -> Result<()> {
     };
 
     let do_format = config.emit.format && !args.no_format;
+    // PEP 810 (Python 3.15) ships native `lazy import` syntax with exactly
+    // the deferred-until-first-use semantics Typhon's bespoke lowering
+    // emulates. On a 3.15+ target, lower `lazy import ALIAS = MODULE` to the
+    // native `lazy import MODULE as ALIAS` form instead of the runtime-helper
+    // call. For 3.13 / 3.14 targets this is `false` and the emitted Python is
+    // byte-identical to before (a hard regression requirement). The check
+    // uses the full `(major, minor)` tuple so a future major bump still gates
+    // correctly. `tyc check` / `tyc run` / the REPL are unaffected — only
+    // `tyc build`'s emitted `.py` changes, and only on 3.15+.
+    let native_lazy_imports = crate::config::parse_python_target(&config.python.target)
+        .is_some_and(|major_minor| major_minor >= (3, 15));
     let check_mode = args.check;
     // Counter for `would write …` lines so the final summary is honest.
     let mut would_write_count: usize = 0;
@@ -478,15 +489,27 @@ pub fn run(args: BuildArgs) -> Result<()> {
         // Typhon line-prefix keywords (`val`/`var`/`model`/`impl`/`extend`/
         // `interface`/`unsafe`/`comptime`/`lazy`) stripped by `preprocess`.
         //
-        // Note `expand_lazy_imports` runs first so that `lazy import` lines
-        // become a full inline proxy class before the other sugar passes see
-        // them.
+        // Note the lazy-import pass runs first so that `lazy import` lines are
+        // handled before the other sugar passes see them. On a pre-3.15 target
+        // `expand_lazy_imports` rewrites each `lazy import ALIAS = MODULE` into
+        // a runtime-helper call here; on a 3.15+ target we instead run
+        // `expand_lazy_lets` (which touches only `lazy let`), leaving the
+        // `lazy import` line for the main `preprocess` pass below to convert to
+        // `import MODULE as ALIAS` and record in `prep.lazy_imports`. The
+        // recorded aliases drive the post-emit rewrite to native PEP 810
+        // syntax further down. (This mirrors the VM / check paths, which
+        // already use `expand_lazy_lets` + the `import … as …` rewrite.)
+        let lazy_expanded = if native_lazy_imports {
+            expand_lazy_lets(&expand_typed_let_unpack(source))
+        } else {
+            expand_lazy_imports(&expand_typed_let_unpack(source))
+        };
         // The inline `?` pass runs before the end-of-line `?` pass so
         // `Ok(f(x)?)`-shaped sub-expressions get lifted into temps
         // first. O17 / FINDINGS #66 / R3.13 / E9.
         let expanded = expand_question_ops(&expand_inline_question_ops(&expand_pipes(
             &expand_with_chains(&expand_go_calls(&expand_gather_blocks(
-                &expand_multiline_guards(&expand_lazy_imports(&expand_typed_let_unpack(source))),
+                &expand_multiline_guards(&lazy_expanded),
             ))),
         )));
         let mut prep = preprocess(&expanded);
@@ -1073,6 +1096,21 @@ pub fn run(args: BuildArgs) -> Result<()> {
             if let Ok(result) = format_source(&python_src, &path_str) {
                 python_src = result.output;
             }
+        }
+
+        // PEP 810 native lazy-import lowering (3.15+ targets only). The
+        // emitter has printed each recorded `lazy import ALIAS = MODULE` as a
+        // plain `import MODULE as ALIAS`; prefix `lazy ` on the matching
+        // module-level line so the artifact carries the native syntax. This
+        // runs AFTER the formatter deliberately: the vendored ruff parser
+        // (and an installed `ruff` on `$PATH`) can't parse `lazy import`, so
+        // prefixing earlier would make `format_source` fail its parse step and
+        // silently drop all formatting. Prefixing here keeps the plain-Python
+        // buffer formattable and only stamps the keyword on at the very end.
+        // The rewrite prepends to existing lines (no line-count change), so
+        // the `.py.map` sidecar stays valid at line granularity.
+        if native_lazy_imports && !prep.lazy_imports.is_empty() {
+            python_src = prefix_native_lazy_imports(&python_src, &prep.lazy_imports);
         }
 
         let rel = path
@@ -2127,6 +2165,65 @@ fn parse_python_minor(target: &str) -> u8 {
     // Strip any trailing alphabetical suffix ("t" for free-threaded).
     let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
     digits.parse::<u8>().unwrap_or(0)
+}
+
+/// Rewrite the emitted Python so each recorded `lazy import ALIAS = MODULE`
+/// carries native PEP 810 syntax on a Python 3.15+ target.
+///
+/// On the 3.15+ build path the main preprocessor lowered every
+/// `lazy import ALIAS = MODULE` to a plain `import MODULE as ALIAS`
+/// statement and recorded the `(alias, module)` pair in
+/// `prep.lazy_imports`. This pass finds the matching emitted line and
+/// prepends the `lazy ` keyword, producing `lazy import MODULE as ALIAS`
+/// — the native deferred-import form CPython 3.15 understands directly.
+///
+/// Matching rules (deliberately conservative):
+///   * Only **module-level** lines (no leading indentation) are eligible —
+///     a `lazy import` is only recognised at column 0 upstream, so an
+///     indented `import numpy as np` inside a function is never a lazy one.
+///   * The line's code must equal exactly `import MODULE as ALIAS`. For the
+///     `alias == module` case the emitter prints `import numpy as numpy`
+///     (it never elides a redundant `as`); a bare `import MODULE` is also
+///     accepted there as a defensive fallback in case a formatter collapses
+///     the redundant alias.
+///   * Each recorded lazy import claims the **first** unclaimed matching
+///     line, and at most one line. A recorded import with no matching line
+///     is skipped, leaving that line untouched rather than corrupting the
+///     file.
+///
+/// Prepending never changes the line count, so the `.py.map` sidecar (built
+/// from the pre-format emit offsets) stays valid at line granularity.
+fn prefix_native_lazy_imports(src: &str, lazy_imports: &[LazyImport]) -> String {
+    let mut claimed = vec![false; lazy_imports.len()];
+    let mut out = String::with_capacity(src.len() + lazy_imports.len() * 5);
+    for line in src.split_inclusive('\n') {
+        let content = line.trim_end_matches(['\n', '\r']);
+        let trailing = &line[content.len()..];
+        let mut prefixed = false;
+        // Module level only: reject any line that starts with whitespace.
+        if !content.starts_with([' ', '\t']) {
+            for (i, li) in lazy_imports.iter().enumerate() {
+                if claimed[i] {
+                    continue;
+                }
+                let want_as = format!("import {} as {}", li.module, li.alias);
+                let matches = content == want_as
+                    || (li.alias == li.module && content == format!("import {}", li.module));
+                if matches {
+                    out.push_str("lazy ");
+                    out.push_str(content);
+                    out.push_str(trailing);
+                    claimed[i] = true;
+                    prefixed = true;
+                    break;
+                }
+            }
+        }
+        if !prefixed {
+            out.push_str(line);
+        }
+    }
+    out
 }
 
 /// Minimal JSON string escape for paths used in the `.py.map` body.  Only

@@ -505,11 +505,29 @@ loaded.use()        # OK — every non-diverging arm assigned `loaded`
 
 ## Lazy loading
 
-- `lazy import np = numpy` → defers module loading until first attribute access via a generated `__TyphonLazy_<alias>_` proxy class (thread-safe, double-checked locking).
-- `lazy from foo import a, b` is **rejected** at parse time: PEP 690 notes that `from`-imports eagerly touch attributes on the source module and therefore defeat deferral. Use `lazy import foo` and access `foo.a` / `foo.b`.
+- `lazy import np = numpy` → defers module loading until first attribute access. On a **3.13 / 3.14 target** this lowers to a call to the generated `typhon_runtime.lazy.lazy_import` helper (which wraps the stdlib `importlib.util.LazyLoader`). On a **3.15+ target** it lowers to native [PEP 810](https://peps.python.org/pep-0810/) syntax instead — see below.
+- `lazy from foo import a, b` is **rejected** at parse time: PEP 690 notes that `from`-imports eagerly touch attributes on the source module and therefore defeat deferral. Use `lazy import foo` and access `foo.a` / `foo.b`. (Note: PEP 810 permits a `lazy from … import` form upstream, but Typhon keeps the single `lazy import ALIAS = MODULE` surface for now — supporting the `from` form is a future surface decision.)
 - `lazy let` module-level bindings → cached getter with a sentinel + lock helper in `typhon_runtime` (not `functools.cached_property`, which is instance-scoped, race-prone, and writable after first evaluation).
 - `lazy let` instance-level bindings on effectively immutable classes → `functools.cached_property`.
 - `lazy[list[T]]` return types → generator functions instead of materialised lists.
+
+### Native lazy imports on Python 3.15 (PEP 810)
+
+Python 3.15 ships [PEP 810](https://peps.python.org/pep-0810/): a native `lazy import` statement with exactly the deferred-until-first-use semantics Typhon's helper emulates. When a project targets `3.15` / `3.15t`, `tyc build` lowers `lazy import` directly to that native form — no `typhon_runtime` helper, no runtime import:
+
+```python
+# Typhon source (any target)
+lazy import np = numpy
+
+# Emitted Python — 3.13 / 3.14 target
+from typhon_runtime.lazy import lazy_import as __typhon_lazy_import
+np = __typhon_lazy_import("numpy")
+
+# Emitted Python — 3.15+ target
+lazy import numpy as np
+```
+
+A project whose only runtime-touching feature was `lazy import` therefore ships **no** generated `typhon_runtime/` package on a 3.15+ target. The change is `tyc build`-only and only on 3.15+ — 3.13 / 3.14 output is byte-for-byte unchanged, and `tyc check` / `tyc run` are unaffected. (If `[checker] external = "ty"` is enabled, run it with a PEP 810-aware `ty`; an older `ty` build will reject the native `lazy import` syntax in the emitted Python.)
 
 ## Stubs and Python interop
 

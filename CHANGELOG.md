@@ -6,6 +6,21 @@ canonical phase-by-phase status lives in `docs/roadmap.md`.
 
 ## Unreleased
 
+- feat(build): **native PEP 810 lazy imports on Python 3.15 targets.** When a
+  project targets `3.15` / `3.15t`, `tyc build` lowers `lazy import ALIAS =
+  MODULE` to the native `lazy import MODULE as ALIAS` statement CPython 3.15
+  ships (PEP 810), instead of the `typhon_runtime.lazy.lazy_import` helper call.
+  The lowering reuses the same `import MODULE as ALIAS` rewrite the VM / check
+  paths already run (`expand_lazy_lets` + the main preprocessor), then stamps
+  the `lazy ` keyword onto the emitted line as a post-emit pass that runs *after*
+  the formatter (the vendored/`$PATH` ruff can't parse the native keyword yet).
+  A project whose only runtime-touching feature was `lazy import` no longer ships
+  a generated `typhon_runtime/` package on a 3.15+ target. **3.13 / 3.14 output
+  is byte-for-byte unchanged** (the helper-call lowering is retained below the
+  3.15 gate), and `tyc check` / `tyc run` / the REPL are unaffected. `lazy from
+  … import` stays rejected (Typhon keeps the single `lazy import` surface for
+  now). If `[checker] external = "ty"` is enabled on a 3.15 target, run it with a
+  PEP 810-aware `ty`.
 - feat(parallel): **free-threading parallelisation wave.** For projects that
   target free-threaded Python (`[python] free-threaded = true`):
   - **Widened `auto-parallel` comprehension shapes** (semantics-preserving).

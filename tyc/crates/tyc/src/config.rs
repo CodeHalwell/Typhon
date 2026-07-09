@@ -590,7 +590,14 @@ impl TyphonConfig {
 /// (`"3.13t"` … `"3.15t"`), and tolerates patch-level strings like
 /// `"3.15.2"` by ignoring everything past the second segment. Returns
 /// `None` for malformed input.
-fn parse_python_target(s: &str) -> Option<(u32, u32)> {
+///
+/// Exposed at `pub(crate)` so `tyc build` can gate PEP 810 native
+/// lazy-import lowering on a `(major, minor) >= (3, 15)` target without
+/// duplicating the suffix-tolerant parse. The `(major, minor)` tuple —
+/// rather than the minor-only [`parse_python_minor`] in `build.rs` — is
+/// the correct comparison basis: a hypothetical future `"4.0"` compares
+/// `>= (3, 15)` as a version, whereas its minor `0` would not.
+pub(crate) fn parse_python_target(s: &str) -> Option<(u32, u32)> {
     let mut parts = s.split('.');
     let major: u32 = parts.next()?.parse().ok()?;
     let minor_raw = parts.next()?;

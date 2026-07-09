@@ -72,6 +72,22 @@ fn scaffold_parallel(dir: &Path, src_content: &str) {
     std::fs::write(dir.join("src").join("main.ty"), src_content).unwrap();
 }
 
+/// Scaffold a project with an explicit `[python] target`, keeping
+/// `[emit] format = false` so the emitted Python is deterministic
+/// (no ruff line-shifting) for byte-level assertions.
+fn scaffold_target(dir: &Path, target: &str, src_content: &str) {
+    std::fs::create_dir_all(dir.join("src")).unwrap();
+    std::fs::write(
+        dir.join("typhon.toml"),
+        format!(
+            "[project]\nname = \"feat\"\nversion = \"0.1.0\"\nsrc = \"src\"\nout = \"build\"\n\
+             [python]\ntarget = \"{target}\"\n[emit]\nformat = false\n[strictness]\n[env]\n",
+        ),
+    )
+    .unwrap();
+    std::fs::write(dir.join("src").join("main.ty"), src_content).unwrap();
+}
+
 /// Run `tyc build` only when a usable Python interpreter is present.
 ///
 /// Tests that subsequently execute the emitted Python use this gate so a
@@ -1880,6 +1896,219 @@ fn build_emits_typhon_runtime_when_only_lazy_import_used() {
         tmp.path().join("build/typhon_runtime/lazy.py").exists(),
         "typhon_runtime/lazy.py must ship with the package",
     );
+}
+
+// ── PEP 810 native lazy imports (3.15+ targets) ───────────────────────────────
+
+#[test]
+fn build_lazy_import_lowers_to_native_pep810_on_3_15() {
+    // On a 3.15 target, `lazy import ALIAS = MODULE` lowers to the native
+    // deferred-import syntax `lazy import MODULE as ALIAS` — not the
+    // runtime-helper call (nor the historical `__TyphonLazy_` proxy class).
+    let tmp = tempfile::tempdir().unwrap();
+    scaffold_target(
+        tmp.path(),
+        "3.15",
+        "lazy import np = numpy\nlet arr: object = np.array([1])\n",
+    );
+    build(tmp.path());
+    let py = main_py(tmp.path());
+    assert!(
+        py.contains("lazy import numpy as np"),
+        "3.15 target must emit native `lazy import MODULE as ALIAS`; got:\n{py}"
+    );
+    assert!(
+        !py.contains("__TyphonLazy_"),
+        "native lowering must not emit the historical proxy class; got:\n{py}"
+    );
+    assert!(
+        !py.contains("__typhon_lazy_import"),
+        "native lowering must not emit the runtime-helper call; got:\n{py}"
+    );
+    assert!(
+        !py.contains("from typhon_runtime.lazy import"),
+        "native lowering must not inject the runtime-helper import; got:\n{py}"
+    );
+}
+
+#[test]
+fn build_lazy_import_stays_runtime_helper_on_3_13() {
+    // Regression pin: a 3.13 target is byte-for-byte unchanged by the PEP 810
+    // work — it keeps the runtime-helper lowering and never emits the native
+    // `lazy import MODULE as ALIAS` keyword form.
+    let tmp = tempfile::tempdir().unwrap();
+    scaffold_target(
+        tmp.path(),
+        "3.13",
+        "lazy import np = numpy\nlet arr: object = np.array([1])\n",
+    );
+    build(tmp.path());
+    let py = main_py(tmp.path());
+    assert!(
+        py.contains("from typhon_runtime.lazy import lazy_import as __typhon_lazy_import"),
+        "3.13 target must keep the runtime-helper import; got:\n{py}"
+    );
+    assert!(
+        py.contains("np = __typhon_lazy_import(\"numpy\")"),
+        "3.13 target must keep the runtime-helper call; got:\n{py}"
+    );
+    // The native keyword form must NOT appear. (The injected header
+    // `from typhon_runtime.lazy import …` contains the substring "lazy
+    // import", so match the whole native statement, anchored at column 0.)
+    assert!(
+        !py.lines().any(|l| l.starts_with("lazy import ")),
+        "3.13 target must not emit the native `lazy import` keyword form; got:\n{py}"
+    );
+}
+
+#[test]
+fn build_lazy_import_stays_runtime_helper_on_3_14() {
+    // Native lowering is gated on `>= (3, 15)`, so 3.14 stays on the
+    // runtime-helper path exactly like 3.13.
+    let tmp = tempfile::tempdir().unwrap();
+    scaffold_target(
+        tmp.path(),
+        "3.14",
+        "lazy import np = numpy\nlet arr: object = np.array([1])\n",
+    );
+    build(tmp.path());
+    let py = main_py(tmp.path());
+    assert!(
+        py.contains("np = __typhon_lazy_import(\"numpy\")"),
+        "3.14 target must keep the runtime-helper call; got:\n{py}"
+    );
+    assert!(
+        !py.lines().any(|l| l.starts_with("lazy import ")),
+        "3.14 target must not emit the native `lazy import` keyword form; got:\n{py}"
+    );
+}
+
+#[test]
+fn build_lazy_import_alias_equals_module_native_on_3_15() {
+    // The alias==module case: `lazy import numpy = numpy` lowers (via the
+    // main preprocessor) to `import numpy as numpy`, which the emitter prints
+    // verbatim (it never elides the redundant `as`). The native rewrite then
+    // prefixes it to `lazy import numpy as numpy`.
+    let tmp = tempfile::tempdir().unwrap();
+    scaffold_target(
+        tmp.path(),
+        "3.15",
+        "lazy import numpy = numpy\nlet arr: object = numpy.array([1])\n",
+    );
+    build(tmp.path());
+    let py = main_py(tmp.path());
+    assert!(
+        py.contains("lazy import numpy as numpy"),
+        "alias==module must emit `lazy import numpy as numpy`; got:\n{py}"
+    );
+    assert!(
+        !py.contains("__typhon_lazy_import"),
+        "alias==module native form must not emit the runtime helper; got:\n{py}"
+    );
+}
+
+#[test]
+fn build_lazy_import_dotted_module_native_on_3_15() {
+    // Dotted submodule targets round-trip through the native form.
+    let tmp = tempfile::tempdir().unwrap();
+    scaffold_target(
+        tmp.path(),
+        "3.15",
+        "lazy import nn = torch.nn\nlet layer: object = nn.Linear(1, 1)\n",
+    );
+    build(tmp.path());
+    let py = main_py(tmp.path());
+    assert!(
+        py.contains("lazy import torch.nn as nn"),
+        "dotted module must emit `lazy import torch.nn as nn`; got:\n{py}"
+    );
+}
+
+#[test]
+fn build_native_lazy_import_skips_typhon_runtime_on_3_15() {
+    // Payoff of native lowering: when `lazy import` is the ONLY runtime-needing
+    // feature, a 3.15 build no longer emits `typhon_runtime/` at all (there is
+    // no `from typhon_runtime.lazy import …` to satisfy). Contrast with
+    // `build_emits_typhon_runtime_when_only_lazy_import_used`, which pins the
+    // opposite for the 3.13 runtime-helper path.
+    let tmp = tempfile::tempdir().unwrap();
+    scaffold_target(
+        tmp.path(),
+        "3.15",
+        "lazy import np = numpy\nlet arr: object = np.array([1])\n",
+    );
+    build(tmp.path());
+    assert!(
+        tmp.path().join("build/main.py").exists(),
+        "main.py must be emitted",
+    );
+    assert!(
+        !tmp.path().join("build/typhon_runtime").exists(),
+        "native lazy imports must not force `typhon_runtime/` emission on 3.15",
+    );
+}
+
+#[test]
+fn build_native_lazy_import_sourcemap_round_trips_on_3_15() {
+    // The native rewrite only prepends `lazy ` to existing lines (no line-count
+    // change), so the `.py.map` sidecar stays valid: its `lines` table has one
+    // entry per emitted output line. (format=false keeps emit line count and
+    // map entries in lock-step, unlike the ruff pass which may add blank lines.)
+    let tmp = tempfile::tempdir().unwrap();
+    scaffold_target(
+        tmp.path(),
+        "3.15",
+        "lazy import np = numpy\nlet arr: object = np.array([1])\n",
+    );
+    build(tmp.path());
+    let map_path = tmp
+        .path()
+        .join("build")
+        .join(".sourcemaps")
+        .join("main.py.map");
+    assert!(
+        map_path.exists(),
+        "3.15 build must write the .py.map sidecar"
+    );
+    let body = std::fs::read_to_string(&map_path).unwrap();
+    assert!(
+        body.contains("\"version\":2"),
+        "map must be v2; got: {body}"
+    );
+    assert!(
+        body.contains("\"lines\":["),
+        "map must carry a lines table; got: {body}"
+    );
+
+    // Parse the `lines` array and assert one entry per emitted output line.
+    let arr = body
+        .split("\"lines\":[")
+        .nth(1)
+        .and_then(|s| s.split(']').next())
+        .expect("lines array present");
+    let map_entries = arr.split(',').filter(|s| !s.trim().is_empty()).count();
+    let py_lines = main_py(tmp.path()).lines().count();
+    assert_eq!(
+        map_entries, py_lines,
+        "source-map `lines` entries ({map_entries}) must match emitted line count ({py_lines})",
+    );
+}
+
+#[test]
+fn build_native_lazy_import_3_13_output_runs() {
+    // The 3.13 runtime-helper path still produces runnable Python. Use a
+    // stdlib module (`json`) so the lazy import resolves at first use without
+    // any third-party dependency, and execute the emitted script.
+    let tmp = tempfile::tempdir().unwrap();
+    scaffold_target(
+        tmp.path(),
+        "3.13",
+        "lazy import js = json\n\ndef main() -> None:\n    let payload: str = js.dumps({\"ok\": True})\n    print(payload)\n\nif __name__ == \"__main__\":\n    main()\n",
+    );
+    let Some(out) = build_and_run_main(tmp.path()) else {
+        return; // no Python interpreter — skip cleanly
+    };
+    assert_eq!(out.trim(), "{\"ok\": true}");
 }
 
 #[test]
