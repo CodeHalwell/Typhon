@@ -381,13 +381,29 @@ pub fn run(args: CheckArgs) -> Result<()> {
             // 100-LOC files this is a small win, but on larger trees
             // it adds up — each preprocess walks the full source and
             // each `parse_module` call rebuilds the ruff AST.
+            // Resolve the optimise-gated `auto-parallel` knob the same way
+            // `TyphonConfig::resolve_optimise` would (level 1 flips its default
+            // on) without mutating the loaded config, so the
+            // `parallel_opportunity` advice stays silent when the rewrite is
+            // already enabled.
+            let auto_parallel = config
+                .strictness
+                .auto_parallel
+                .unwrap_or(config.optimise.level >= 1);
             let analysis_diags = run_secondary_passes(
                 &path.to_string_lossy(),
                 &source,
                 has_project_config.then_some(&vetting_ctx),
-                config.strictness.allow_secret_comptime,
-                config.strictness.suggest_gather,
-                config.strictness.suggest_perf,
+                tyc_analyse::LintOptions {
+                    allow_secret_comptime: config.strictness.allow_secret_comptime,
+                    suggest_gather: config.strictness.suggest_gather,
+                    suggest_perf: config.strictness.suggest_perf,
+                    suggest_parallel: config.strictness.suggest_parallel,
+                    free_threaded: config.python.free_threaded,
+                    auto_parallel,
+                    auto_parallel_reductions: config.strictness.auto_parallel_reductions,
+                    parallel_min_size: config.strictness.parallel_min_size,
+                },
             );
             diags.extend(analysis_diags);
         }
@@ -886,14 +902,11 @@ pub(crate) fn check_stdlib_module_shadow(
 /// Passing `vetting_ctx = None` skips the unknown-module check — the
 /// standalone-file flow (no `typhon.toml` found) suppresses that
 /// diagnostic since the user isn't in a project context.
-#[allow(clippy::too_many_arguments)]
 fn run_secondary_passes(
     path: &str,
     source: &str,
     vetting_ctx: Option<&ImportVettingContext>,
-    allow_secret_comptime: bool,
-    suggest_gather: bool,
-    suggest_perf: bool,
+    lint_opts: tyc_analyse::LintOptions,
 ) -> Diagnostics {
     let mut diags = Diagnostics::new();
     let expanded = expand_for_check(source);
@@ -964,11 +977,7 @@ fn run_secondary_passes(
         &module,
         path,
         &prep.python_source,
-        tyc_analyse::LintOptions {
-            allow_secret_comptime,
-            suggest_gather,
-            suggest_perf,
-        },
+        lint_opts,
         &perf_ctx,
     ));
 

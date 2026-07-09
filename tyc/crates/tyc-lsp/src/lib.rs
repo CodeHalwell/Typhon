@@ -2010,7 +2010,26 @@ fn read_lint_options(root: &std::path::Path) -> tyc_analyse::LintOptions {
     let Ok(parsed) = toml::from_str::<toml::Value>(&text) else {
         return opts;
     };
+    // `[python] free-threaded` gates the parallel advice lints.
+    if let Some(b) = parsed
+        .get("python")
+        .and_then(|p| p.as_table())
+        .and_then(|t| t.get("free-threaded"))
+        .and_then(|v| v.as_bool())
+    {
+        opts.free_threaded = b;
+    }
+    // `[optimise] level = 1` flips the `auto-parallel` default on.
+    let optimise_level1 = parsed
+        .get("optimise")
+        .and_then(|o| o.as_table())
+        .and_then(|t| t.get("level"))
+        .and_then(|v| v.as_integer())
+        .is_some_and(|n| n >= 1);
     let Some(strictness) = parsed.get("strictness").and_then(|s| s.as_table()) else {
+        // No `[strictness]` table — `auto-parallel` still takes the
+        // optimise-level default so the advice matches the build.
+        opts.auto_parallel = optimise_level1;
         return opts;
     };
     if let Some(b) = strictness.get("suggest-gather").and_then(|v| v.as_bool()) {
@@ -2019,11 +2038,32 @@ fn read_lint_options(root: &std::path::Path) -> tyc_analyse::LintOptions {
     if let Some(b) = strictness.get("suggest-perf").and_then(|v| v.as_bool()) {
         opts.suggest_perf = b;
     }
+    if let Some(b) = strictness.get("suggest-parallel").and_then(|v| v.as_bool()) {
+        opts.suggest_parallel = b;
+    }
     if let Some(b) = strictness
         .get("allow-secret-comptime")
         .and_then(|v| v.as_bool())
     {
         opts.allow_secret_comptime = b;
+    }
+    // `auto-parallel` and `auto-parallel-reductions` silence the
+    // `parallel_opportunity` advice when the rewrite is already enabled.
+    opts.auto_parallel = strictness
+        .get("auto-parallel")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(optimise_level1);
+    if let Some(b) = strictness
+        .get("auto-parallel-reductions")
+        .and_then(|v| v.as_bool())
+    {
+        opts.auto_parallel_reductions = b;
+    }
+    if let Some(n) = strictness
+        .get("parallel-min-size")
+        .and_then(|v| v.as_integer())
+    {
+        opts.parallel_min_size = n.max(0) as u64;
     }
     opts
 }

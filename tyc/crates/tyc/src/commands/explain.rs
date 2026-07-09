@@ -105,6 +105,7 @@ fn catalog_codes() -> &'static [&'static str] {
         "nullable_use",
         "operator_type_mismatch",
         "orphan_py_import",
+        "parallel_opportunity",
         "parse",
         "pattern_shadows_outer",
         "perf_keys_membership",
@@ -121,6 +122,7 @@ fn catalog_codes() -> &'static [&'static str] {
         "resource_not_managed",
         "result_error_mismatch",
         "self_outside_impl",
+        "shared_mut_across_tasks",
         "stdlib_module_shadow",
         "stub_mismatch",
         "tuple_index_out_of_range",
@@ -267,6 +269,9 @@ fn catalog_entry(short_code: &str) -> Option<&'static str> {
             include_str!("../../../../../docs/diagnostics/operator_type_mismatch.md")
         }
         "orphan_py_import" => include_str!("../../../../../docs/diagnostics/orphan_py_import.md"),
+        "parallel_opportunity" => {
+            include_str!("../../../../../docs/diagnostics/parallel_opportunity.md")
+        }
         "parse" => include_str!("../../../../../docs/diagnostics/parse.md"),
         "pattern_shadows_outer" => {
             include_str!("../../../../../docs/diagnostics/pattern_shadows_outer.md")
@@ -309,6 +314,9 @@ fn catalog_entry(short_code: &str) -> Option<&'static str> {
             include_str!("../../../../../docs/diagnostics/result_error_mismatch.md")
         }
         "self_outside_impl" => include_str!("../../../../../docs/diagnostics/self_outside_impl.md"),
+        "shared_mut_across_tasks" => {
+            include_str!("../../../../../docs/diagnostics/shared_mut_across_tasks.md")
+        }
         "stdlib_module_shadow" => {
             include_str!("../../../../../docs/diagnostics/stdlib_module_shadow.md")
         }

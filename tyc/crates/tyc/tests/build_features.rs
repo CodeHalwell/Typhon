@@ -805,6 +805,217 @@ fn build_skips_rewrite_when_auto_parallel_off() {
     );
 }
 
+// ── auto-parallel widened shapes + reductions ───────────────────────────────
+
+/// Scaffold a project with `free-threaded = true`, `auto-parallel = true`,
+/// `auto-parallel-reductions = true`, and the given `parallel-backend`.
+fn scaffold_parallel_full(dir: &Path, backend: &str, src_content: &str) {
+    std::fs::create_dir_all(dir.join("src")).unwrap();
+    std::fs::write(
+        dir.join("typhon.toml"),
+        format!(
+            "[project]\nname = \"feat\"\nversion = \"0.1.0\"\nsrc = \"src\"\nout = \"build\"\n\
+             [python]\ntarget = \"3.13\"\nfree-threaded = true\n\
+             [emit]\nformat = false\n\
+             [strictness]\nauto-parallel = true\nauto-parallel-reductions = true\n\
+             parallel-backend = \"{backend}\"\n[env]\n"
+        ),
+    )
+    .unwrap();
+    std::fs::write(dir.join("src").join("main.ty"), src_content).unwrap();
+}
+
+#[test]
+fn build_rewrites_widened_comprehension_shapes() {
+    let tmp = tempfile::tempdir().unwrap();
+    scaffold_parallel(
+        tmp.path(),
+        "@pure\ndef sq(n: int) -> int:\n    return n * n\n\n\
+         def run(xs: list[int]) -> list[int]:\n    let k: int = 2\n    \
+         return [sq(x) for x in xs if x > 0]\n",
+    );
+    build(tmp.path());
+    let py = main_py(tmp.path());
+    assert!(
+        py.contains("typhon_runtime.parallel.map_pure"),
+        "filtered comprehension should be parallelised; got:\n{py}"
+    );
+    assert!(
+        py.contains("for x in xs if x > 0"),
+        "filter should run sequentially in the map source; got:\n{py}"
+    );
+}
+
+#[test]
+fn build_rewrites_int_reduction_under_auto_parallel_reductions() {
+    let tmp = tempfile::tempdir().unwrap();
+    scaffold_parallel_full(
+        tmp.path(),
+        "threads",
+        "def run(xs: list[int]) -> int:\n    mut total: int = 0\n    \
+         for x in xs:\n        total += x * x\n    return total\n",
+    );
+    build(tmp.path());
+    let py = main_py(tmp.path());
+    assert!(
+        py.contains("total += sum(typhon_runtime.parallel.map_pure"),
+        "int reduction should be folded into sum(map_pure(...)); got:\n{py}"
+    );
+}
+
+#[test]
+fn build_leaves_float_reduction_alone() {
+    let tmp = tempfile::tempdir().unwrap();
+    scaffold_parallel_full(
+        tmp.path(),
+        "threads",
+        "def run(xs: list[float]) -> float:\n    mut total: float = 0.0\n    \
+         for x in xs:\n        total += x\n    return total\n",
+    );
+    build(tmp.path());
+    let py = main_py(tmp.path());
+    assert!(
+        !py.contains("map_pure"),
+        "float reduction must NOT be parallelised; got:\n{py}"
+    );
+    // The original sequential loop is preserved.
+    assert!(
+        py.contains("total += x"),
+        "float loop should be untouched; got:\n{py}"
+    );
+}
+
+// ── interpreters backend ────────────────────────────────────────────────────
+
+#[test]
+fn parallel_backend_threads_bakes_backend_constant_and_fallback() {
+    let tmp = tempfile::tempdir().unwrap();
+    scaffold_parallel_full(
+        tmp.path(),
+        "threads",
+        "@pure\ndef sq(n: int) -> int:\n    return n * n\n\n\
+         xs: list[int] = [1, 2, 3]\nys: list[int] = [sq(x) for x in xs]\n",
+    );
+    build(tmp.path());
+    let parallel_py =
+        std::fs::read_to_string(tmp.path().join("build/typhon_runtime/parallel.py")).unwrap();
+    assert!(
+        parallel_py.contains("_BACKEND = \"threads\""),
+        "threads backend constant missing:\n{parallel_py}"
+    );
+    // The fallback chain is present for both settings; only the constant differs.
+    assert!(
+        parallel_py.contains("InterpreterPoolExecutor")
+            && parallel_py.contains("ThreadPoolExecutor")
+            && parallel_py.contains("_try_interpreters"),
+        "fallback chain missing:\n{parallel_py}"
+    );
+}
+
+#[test]
+fn parallel_backend_interpreters_bakes_backend_constant_and_fallback() {
+    let tmp = tempfile::tempdir().unwrap();
+    scaffold_parallel_full(
+        tmp.path(),
+        "interpreters",
+        "@pure\ndef sq(n: int) -> int:\n    return n * n\n\n\
+         xs: list[int] = [1, 2, 3]\nys: list[int] = [sq(x) for x in xs]\n",
+    );
+    build(tmp.path());
+    let parallel_py =
+        std::fs::read_to_string(tmp.path().join("build/typhon_runtime/parallel.py")).unwrap();
+    assert!(
+        parallel_py.contains("_BACKEND = \"interpreters\""),
+        "interpreters backend constant missing:\n{parallel_py}"
+    );
+    assert!(
+        parallel_py.contains("from concurrent.futures import InterpreterPoolExecutor")
+            && parallel_py.contains("except (ImportError, AttributeError)")
+            && parallel_py.contains("except TypeError")
+            && parallel_py.contains("with ThreadPoolExecutor(max_workers=max_workers) as pool"),
+        "interpreters fallback chain missing:\n{parallel_py}"
+    );
+}
+
+#[test]
+fn reduction_and_comprehension_rewrites_match_sequential_output() {
+    // Execution-equivalence: the parallel build and the sequential (knobs-off)
+    // build must produce identical stdout. On a GIL / 3.13 build the map_pure
+    // helper serialises the workers, so the point is correctness, not speed.
+    let Some(_py) = python() else {
+        return; // skip without an interpreter
+    };
+    let program = "\
+@pure
+def sq(n: int) -> int:
+    return n * n
+
+def main() -> None:
+    let xs: list[int] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+    let squared: list[int] = [sq(x) for x in xs if x % 2 == 0]
+    mut total: int = 0
+    for x in xs:
+        total += sq(x)
+    print(squared)
+    print(total)
+
+if __name__ == \"__main__\":
+    main()
+";
+    // Parallel build (auto-parallel + reductions + free-threaded).
+    let par = tempfile::tempdir().unwrap();
+    scaffold_parallel_full(par.path(), "threads", program);
+    build(par.path());
+    let par_out = run_main(par.path()).expect("parallel build should run");
+
+    // Sequential build (default scaffold: all parallel knobs off).
+    let seq = tempfile::tempdir().unwrap();
+    scaffold(seq.path(), program);
+    build(seq.path());
+    let seq_out = run_main(seq.path()).expect("sequential build should run");
+
+    assert_eq!(
+        par_out, seq_out,
+        "parallel and sequential builds must produce identical output"
+    );
+    // Sanity: the parallel build actually applied both rewrites.
+    let par_py = main_py(par.path());
+    assert!(
+        par_py.contains("map_pure"),
+        "comprehension rewrite missing:\n{par_py}"
+    );
+    assert!(
+        par_py.contains("total += sum(typhon_runtime.parallel.map_pure"),
+        "reduction rewrite missing:\n{par_py}"
+    );
+}
+
+#[test]
+fn interpreters_backend_falls_back_and_runs_on_gil_build() {
+    // With backend=interpreters on a 3.13 interpreter (no InterpreterPoolExecutor),
+    // map_pure must fall back to the thread pool and still produce correct output.
+    let Some(_py) = python() else {
+        return;
+    };
+    let program = "\
+@pure
+def sq(n: int) -> int:
+    return n * n
+
+def main() -> None:
+    let xs: list[int] = [1, 2, 3, 4, 5]
+    print([sq(x) for x in xs])
+
+if __name__ == \"__main__\":
+    main()
+";
+    let tmp = tempfile::tempdir().unwrap();
+    scaffold_parallel_full(tmp.path(), "interpreters", program);
+    build(tmp.path());
+    let out = run_main(tmp.path()).expect("interpreters build should run (falls back to threads)");
+    assert_eq!(out.trim(), "[1, 4, 9, 16, 25]", "unexpected output: {out}");
+}
+
 // ── REPL dedent terminator ──────────────────────────────────────────────────
 
 #[test]

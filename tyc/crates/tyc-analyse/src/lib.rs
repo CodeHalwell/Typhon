@@ -69,7 +69,17 @@ pub mod pgo;
 pub use pgo::{load_profile_samples, pgo_memoise_targets, ProfileSample};
 
 pub mod parallel;
-pub use parallel::{rewrite_parallel_comprehensions, ParallelStats};
+pub use parallel::{
+    detect_parallel_comprehensions, rewrite_parallel_comprehensions, ParallelStats,
+};
+
+pub mod reductions;
+pub use reductions::{
+    detect_reduction_loops, rewrite_reduction_loops, ReductionHit, ReductionStats,
+};
+
+pub mod parallel_lints;
+pub use parallel_lints::{parallel_opportunity_diagnostics, shared_mut_across_tasks_diagnostics};
 
 pub mod extend_builtin;
 pub use extend_builtin::{
@@ -100,17 +110,41 @@ pub struct LintOptions {
     /// `[strictness] suggest-perf` — when `true` (the default), surface the
     /// `tyc::perf_*` / `tyc::lazy_import_opportunity` advice family.
     pub suggest_perf: bool,
+    /// `[strictness] suggest-parallel` — when `true` (the default), surface
+    /// `tyc::parallel_opportunity` and `tyc::shared_mut_across_tasks`. Only
+    /// takes effect when [`LintOptions::free_threaded`] is also `true`.
+    pub suggest_parallel: bool,
+    /// `[python] free-threaded` — the free-threading advice lints
+    /// (`suggest-parallel`) only fire when this is `true` (the project
+    /// explicitly targets free-threaded Python). Defaults `false`, which keeps
+    /// the two lints silent — and the corpus quiet — by construction.
+    pub free_threaded: bool,
+    /// `[strictness] auto-parallel` (resolved) — silences the
+    /// `parallel_opportunity` comprehension arm when the rewrite is already on.
+    pub auto_parallel: bool,
+    /// `[strictness] auto-parallel-reductions` — silences the
+    /// `parallel_opportunity` int-reduction arm when the rewrite is already on.
+    pub auto_parallel_reductions: bool,
+    /// `[strictness] parallel-min-size` — matches the rewrite's threshold so
+    /// the advice fires on exactly the shapes that would be rewritten.
+    pub parallel_min_size: u64,
 }
 
 impl Default for LintOptions {
     fn default() -> Self {
-        // `allow-secret-comptime` defaults off (lint on); `suggest-gather`
-        // and `suggest-perf` default on — same as `[strictness]`'s own
-        // defaults.
+        // `allow-secret-comptime` defaults off (lint on); `suggest-gather`,
+        // `suggest-perf`, and `suggest-parallel` default on — same as
+        // `[strictness]`'s own defaults. `free-threaded` defaults off, so the
+        // parallel advice lints stay silent unless a project opts in.
         Self {
             allow_secret_comptime: false,
             suggest_gather: true,
             suggest_perf: true,
+            suggest_parallel: true,
+            free_threaded: false,
+            auto_parallel: false,
+            auto_parallel_reductions: false,
+            parallel_min_size: 64,
         }
     }
 }
@@ -175,6 +209,28 @@ pub fn editor_lint_diagnostics(
     }
     if opts.suggest_perf {
         diags.extend(perf_diagnostics(module, path, source, perf_ctx));
+    }
+    // The free-threading advice lints (`parallel_opportunity`,
+    // `shared_mut_across_tasks`) only fire when the project targets
+    // free-threaded Python — the gate that keeps the corpus (which never sets
+    // it) quiet by construction. The pure-callee set is only computed inside
+    // this guard so free-threaded-off projects pay nothing for it.
+    if opts.suggest_parallel && opts.free_threaded {
+        diags.extend(shared_mut_across_tasks_diagnostics(module, path, source));
+        let pure: std::collections::HashSet<String> = analyse_purity(module, false)
+            .iter()
+            .filter(|f| f.violation.is_none())
+            .map(|f| f.name.clone())
+            .collect();
+        diags.extend(parallel_opportunity_diagnostics(
+            module,
+            path,
+            source,
+            &pure,
+            opts.parallel_min_size,
+            opts.auto_parallel,
+            opts.auto_parallel_reductions,
+        ));
     }
     diags
 }

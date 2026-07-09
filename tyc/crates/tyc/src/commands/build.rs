@@ -12,9 +12,10 @@ use miette::{miette, Result};
 use tyc_analyse::{
     analyse_purity, collect_gatherable_async_fn_names, detect_missed_gathers,
     evaluate_comptime_with_functions, extract_builtin_extensions, load_profile_samples,
-    pgo_memoise_targets, purity_diagnostics, rewrite_auto_gather,
+    parallel_opportunity_diagnostics, pgo_memoise_targets, purity_diagnostics, rewrite_auto_gather,
     rewrite_builtin_extension_calls_tracking, rewrite_parallel_comprehensions,
-    substitute_comptime_literals, ProfileSample,
+    rewrite_reduction_loops, shared_mut_across_tasks_diagnostics, substitute_comptime_literals,
+    ProfileSample,
 };
 use tyc_db::{check_file_with_imports, extract_shapes_for_path, TycDatabase};
 use tyc_desugar::{desugar_module_with, DesugarOptions};
@@ -872,6 +873,44 @@ pub fn run(args: BuildArgs) -> Result<()> {
             }
         }
 
+        // Default-on free-threading advice: `tyc::parallel_opportunity`
+        // (a comprehension / accumulator loop that could be parallelised) and
+        // `tyc::shared_mut_across_tasks` (a `go`-spawned callee that writes
+        // shared mutable state). Both only fire when the project targets
+        // free-threaded Python — the gate that keeps the example / stress
+        // corpus quiet — and are silenced by `[strictness] suggest-parallel =
+        // false`. Run *before* the auto-parallel / reduction rewrites so the
+        // original comprehension / loop shapes are still present.
+        if config.strictness.suggest_parallel && config.python.free_threaded {
+            for advice in shared_mut_across_tasks_diagnostics(
+                &module,
+                &path.to_string_lossy(),
+                &prep.python_source,
+            )
+            .warnings()
+            {
+                eprintln!("{:?}", miette::Report::new_boxed(Box::new(advice.clone())));
+            }
+            let pure_names: std::collections::HashSet<String> = purity_findings
+                .iter()
+                .filter(|f| f.violation.is_none())
+                .map(|f| f.name.clone())
+                .collect();
+            for advice in parallel_opportunity_diagnostics(
+                &module,
+                &path.to_string_lossy(),
+                &prep.python_source,
+                &pure_names,
+                config.strictness.parallel_min_size,
+                config.strictness.auto_parallel.unwrap_or(false),
+                config.strictness.auto_parallel_reductions,
+            )
+            .warnings()
+            {
+                eprintln!("{:?}", miette::Report::new_boxed(Box::new(advice.clone())));
+            }
+        }
+
         // Lower `extend BUILTIN:` blocks (e.g. `extend str:`) into module-
         // level free functions and rewrite call sites whose receiver has a
         // matching type annotation.  Receivers without a static annotation
@@ -958,13 +997,28 @@ pub fn run(args: BuildArgs) -> Result<()> {
                 .filter(|f| f.violation.is_none())
                 .map(|f| f.name.clone())
                 .collect();
-            if !pure_names.is_empty() {
-                let stats = rewrite_parallel_comprehensions(
+            let stats = rewrite_parallel_comprehensions(
+                &mut module,
+                &pure_names,
+                config.strictness.parallel_min_size,
+            );
+            if stats.rewrites > 0 {
+                needs_runtime = true;
+            }
+            // Integer accumulator-loop reductions, gated additionally on
+            // `[strictness] auto-parallel-reductions`. Shares the pure-name
+            // set with the comprehension rewrite; `total += EXPR` over a pure
+            // body and a `mut total: int` accumulator becomes
+            // `total += sum(map_pure(lambda x: EXPR, ITER))`. Integers only —
+            // reordering float addition changes results, so floats are never
+            // rewritten (they surface as `tyc::parallel_opportunity` advice).
+            if config.strictness.auto_parallel_reductions {
+                let rstats = rewrite_reduction_loops(
                     &mut module,
                     &pure_names,
                     config.strictness.parallel_min_size,
                 );
-                if stats.rewrites > 0 {
+                if rstats.rewrites > 0 {
                     needs_runtime = true;
                 }
             }
@@ -1255,13 +1309,16 @@ pub fn run(args: BuildArgs) -> Result<()> {
     // separate PyPI package.
     if needs_runtime {
         let runtime_dir = out_dir.join("typhon_runtime");
+        // `parallel.py` is parameterised by the configured execution backend
+        // (`[strictness] parallel-backend`); the rest are static.
+        let parallel_py = typhon_runtime_parallel_py(&config.strictness.parallel_backend);
         let files = [
             ("__init__.py", TYPHON_RUNTIME_INIT_PY),
             ("tasks.py", TYPHON_RUNTIME_TASKS_PY),
             ("lazy.py", TYPHON_RUNTIME_LAZY_PY),
             ("stdlib.py", TYPHON_RUNTIME_STDLIB_PY),
             ("result.py", TYPHON_RUNTIME_RESULT_PY),
-            ("parallel.py", TYPHON_RUNTIME_PARALLEL_PY),
+            ("parallel.py", parallel_py.as_str()),
             ("freeze.py", TYPHON_RUNTIME_FREEZE_PY),
             ("cast.py", TYPHON_RUNTIME_CAST_PY),
             ("traceback.py", TYPHON_RUNTIME_TRACEBACK_PY),
@@ -3169,9 +3226,38 @@ def _remap(text, state):
     return _FRAME_RE.sub(repl, text)
 ";
 
-const TYPHON_RUNTIME_PARALLEL_PY: &str = "\
+/// Render `typhon_runtime/parallel.py`, baking the auto-parallel execution
+/// backend (`[strictness] parallel-backend`) in as the module-level
+/// `_BACKEND` constant.
+///
+/// * `"threads"` (the default) runs `map_pure` on a `ThreadPoolExecutor` —
+///   order-preserving, and on a free-threaded CPython build (3.13t/3.14t) it
+///   escapes the GIL for real parallelism; on the stock GIL build the workers
+///   serialise but the results are identical.
+/// * `"interpreters"` first tries a PEP 734
+///   `concurrent.futures.InterpreterPoolExecutor` (Python 3.14+) and falls
+///   back **transparently** to the thread pool on `ImportError` /
+///   `AttributeError` (older runtimes) or a `TypeError` when submitting the
+///   mapped function (a lambda isn't shareable across sub-interpreters).
+///
+/// Order is preserved on every path. The `_try_interpreters` helper and the
+/// backend switch are emitted for both settings, so the only difference
+/// between the two generated files is the `_BACKEND` value — the thread path
+/// is behaviourally identical to the historical single-backend runtime.
+fn typhon_runtime_parallel_py(backend: &str) -> String {
+    // Config load already validated the value; guard anyway so an unexpected
+    // string degrades to the safe thread pool rather than an unknown backend.
+    let backend = if backend == "interpreters" {
+        "interpreters"
+    } else {
+        "threads"
+    };
+    TYPHON_RUNTIME_PARALLEL_PY_TEMPLATE.replace("@BACKEND@", backend)
+}
+
+const TYPHON_RUNTIME_PARALLEL_PY_TEMPLATE: &str = "\
 # generated by tyc — do not edit
-\"\"\"Thread-pool helpers backing Typhon's auto-parallel rewrite.\"\"\"
+\"\"\"Parallel-map helpers backing Typhon's auto-parallel rewrite.\"\"\"
 from __future__ import annotations
 
 import os
@@ -3181,6 +3267,9 @@ from typing import Callable, Iterable, TypeVar
 _T = TypeVar(\"_T\")
 _R = TypeVar(\"_R\")
 
+# Execution backend, baked in at build time from `[strictness] parallel-backend`.
+_BACKEND = \"@BACKEND@\"
+
 
 def map_pure(
     fn: Callable[[_T], _R],
@@ -3188,26 +3277,58 @@ def map_pure(
     *,
     max_workers: int | None = None,
 ) -> list[_R]:
-    \"\"\"Apply ``fn`` to every element of ``iterable`` across a thread pool.
+    \"\"\"Apply ``fn`` to every element of ``iterable``, preserving input order.
 
-    The result list preserves input order. ``fn`` must be pure (the
-    Typhon analyser proves this before emitting calls into this
-    helper); calling with a side-effecting function defeats the
+    ``fn`` must be pure (the Typhon analyser proves this before emitting calls
+    into this helper); calling with a side-effecting function defeats the
     parallelism guarantees.
 
-    On a free-threaded CPython build (3.13t / 3.14t) workers run with
-    no GIL contention. On the stock CPython build the GIL serialises
-    the workers — correctness is preserved but no speedup is observed.
+    With the ``\"threads\"`` backend, or when the ``\"interpreters\"`` backend
+    can't be used, work runs on a ``ThreadPoolExecutor``. On a free-threaded
+    CPython build (3.13t / 3.14t) the workers run with no GIL contention; on the
+    stock CPython build the GIL serialises them — correctness is preserved but
+    no speedup is observed. With the ``\"interpreters\"`` backend a PEP 734
+    ``InterpreterPoolExecutor`` (Python 3.14+) is tried first, falling back to
+    the thread pool transparently.
     \"\"\"
-    # Materialise once to size the work and to keep ``ThreadPoolExecutor.map``
-    # from blocking on a slow generator while workers idle.
+    # Materialise once to size the work and to keep ``.map`` from blocking on a
+    # slow generator while workers idle.
     items = list(iterable)
     if not items:
         return []
     if max_workers is None:
         max_workers = min(32, (os.cpu_count() or 1) + 4)
+    if _BACKEND == \"interpreters\":
+        result = _try_interpreters(fn, items, max_workers)
+        if result is not None:
+            return result
+    # Thread-pool path: the default backend, and the interpreters fallback.
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
         return list(pool.map(fn, items))
+
+
+def _try_interpreters(
+    fn: Callable[[_T], _R],
+    items: list[_T],
+    max_workers: int,
+) -> list[_R] | None:
+    \"\"\"Attempt a PEP 734 sub-interpreter pool; return ``None`` to fall back.
+
+    Falls back (returns ``None``) when ``InterpreterPoolExecutor`` is
+    unavailable (Python < 3.14) or when the mapped function can't cross the
+    interpreter boundary — a lambda isn't shareable, which surfaces as a
+    ``TypeError`` on submit. The caller then reruns on the thread pool; ``fn``
+    is pure, so the retry is free of observable effects and order is preserved.
+    \"\"\"
+    try:
+        from concurrent.futures import InterpreterPoolExecutor
+    except (ImportError, AttributeError):
+        return None
+    try:
+        with InterpreterPoolExecutor(max_workers=max_workers) as pool:
+            return list(pool.map(fn, items))
+    except TypeError:
+        return None
 ";
 
 #[cfg(test)]

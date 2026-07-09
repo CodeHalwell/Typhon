@@ -6,6 +6,52 @@ canonical phase-by-phase status lives in `docs/roadmap.md`.
 
 ## Unreleased
 
+- feat(parallel): **free-threading parallelisation wave.** For projects that
+  target free-threaded Python (`[python] free-threaded = true`):
+  - **Widened `auto-parallel` comprehension shapes** (semantics-preserving).
+    The `[strictness] auto-parallel` rewrite now handles, in addition to the
+    baseline `[f(x) for x in xs]`: **filters** `[f(x) for x in xs if COND]`
+    (a pure `COND` runs sequentially in the map's source list, the pure
+    element map runs in parallel); **multi-argument calls**
+    `[f(x, k) for x in xs]` where the extra arguments are literals or
+    `let`-bound loop invariants (a `mut`-bound name is never captured); and
+    **nested pure calls** `[g(f(x)) for x in xs]`. Applies to list, set, and
+    dict comprehensions. Every widening is sound because the element, its
+    captured arguments, and the filters are all side-effect-free. (Cross-module
+    pure callees are **deferred** — see the type-system frontier.)
+  - **Integer accumulator-loop reductions** (`[strictness]
+    auto-parallel-reductions = true`, which also requires `auto-parallel`). A
+    `for x in ITER: total += EXPR` loop with a **`mut total: int`** accumulator,
+    a pure `EXPR`, and an invariant `ITER` folds into `total +=
+    sum(typhon_runtime.parallel.map_pure(lambda x: EXPR, ITER))`. Integers only
+    — integer addition is associative/commutative and Python ints are exact, so
+    parallel partial sums are identical; **floats are never rewritten**
+    (reordering IEEE-754 addition changes the result).
+  - **`tyc::parallel_opportunity`** — new advice lint (severity Advice, on by
+    default, gated by `[strictness] suggest-parallel`). Fires only under
+    `free-threaded = true` on a comprehension / integer accumulator loop that
+    *would* be rewritten if the relevant knob were on, or a `float` accumulator
+    loop that matches every reduction condition except the required `int`
+    annotation.
+  - **`tyc::shared_mut_across_tasks`** — new advice lint (same gating). Flags a
+    `go`-spawned same-module function that writes module-level mutable state (a
+    `global` assignment or a write to a module-level `mut` binding), which under
+    free-threaded Python races with the spawner.
+  - **Interpreters backend** — `[strictness] parallel-backend = "interpreters"`
+    bakes a `_BACKEND` constant into the generated `typhon_runtime/parallel.py`
+    and makes `map_pure` try a PEP 734 `concurrent.futures.InterpreterPoolExecutor`
+    (Python 3.14+), falling back **transparently** to the thread pool on
+    `ImportError` / `AttributeError` or a `TypeError` when submitting the mapped
+    lambda. Order is preserved on every path; the default `"threads"` backend is
+    behaviourally unchanged.
+  - Wiring mirrors the `tyc::perf_*` family: diagnostics registration + doc
+    pages (`docs/diagnostics/parallel_opportunity.md`,
+    `shared_mut_across_tasks.md`) + `tyc explain` entries + `LintOptions` fields
+    + `tyc check` / `tyc build` / LSP surfacing. The two lints are silent across
+    the example / stress corpus by construction (it never sets `free-threaded`).
+    New rewrites live in `tyc-analyse/src/parallel.rs` (widened) and
+    `tyc-analyse/src/reductions.rs` (new); the lints in
+    `tyc-analyse/src/parallel_lints.rs` (new).
 - perf(vm): Tier 1a of the VM performance plan. `Value::Int` now wraps a
   `VmInt` two-representation integer — any value that fits `i64` is stored
   inline (`Small`), only overflowing to a reference-counted `BigInt`

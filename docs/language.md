@@ -433,7 +433,25 @@ notifs = _t_notifs.result()
 
 ### Free-threaded Python
 
-When `typhon.toml` sets `free-threaded = true`, the analyser emits `ThreadPoolExecutor`-based parallelism for pure-function comprehensions on large collections. The emitter inserts a runtime `sys._is_gil_enabled()` check and falls back to sequential execution if the GIL is present. Default-off until 3.14 is the default Python.
+When `typhon.toml` sets `[python] free-threaded = true`, Typhon targets a free-threaded CPython build (3.13t / 3.14t / 3.15t) and unlocks two opt-in build-time rewrites plus two advice lints. Default-off until 3.14 is the default Python.
+
+**Auto-parallel comprehensions** (`[strictness] auto-parallel = true`). A list / set / dict comprehension whose element is a *pure call* is rewritten to `typhon_runtime.parallel.map_pure(lambda x: <elt>, <source>)`. The eligible shapes are:
+
+- `[f(x) for x in xs]` — the baseline pure-call element;
+- `[f(x) for x in xs if COND]` — a **filter** whose `COND` is itself pure (loop target, literals, arithmetic / comparison / boolean operators, pure calls) runs sequentially in the map's source list, the pure element map runs in parallel;
+- `[f(x, k) for x in xs]` — **extra arguments** that are literals or `let`-bound loop invariants (a `mut`-bound name is never captured);
+- `[g(f(x)) for x in xs]` — **nested** pure calls.
+
+Every widening is semantics-preserving because the element, its captured arguments, and the filters are all side-effect-free. `[strictness] parallel-min-size` (default 64) suppresses the rewrite for statically-sized literal iterables below the threshold.
+
+**Auto-parallel integer reductions** (`[strictness] auto-parallel-reductions = true`, which also requires `auto-parallel`). A canonical accumulation loop `for x in ITER: total += EXPR` — with a **plain `int`** accumulator (`mut total: int`), a pure `EXPR`, and an invariant `ITER` — folds into `total += sum(typhon_runtime.parallel.map_pure(lambda x: EXPR, ITER))`. Integers only: integer addition is associative/commutative and Python ints are exact, so summing partial results in any order is identical. **Floats are never eligible** — reordering IEEE-754 addition changes the result.
+
+**Execution backend** (`[strictness] parallel-backend`, default `"threads"`). `map_pure` runs on a `ThreadPoolExecutor` (order-preserving; escapes the GIL on a free-threaded build, serialises but stays correct on a stock GIL build). Setting `parallel-backend = "interpreters"` first tries a PEP 734 `concurrent.futures.InterpreterPoolExecutor` (Python 3.14+) and falls back **transparently** to the thread pool on `ImportError` / `AttributeError` (older runtimes) or a `TypeError` when submitting the mapped function (a lambda isn't shareable across sub-interpreters). Order is preserved on every path.
+
+**Advice lints** (both gated by `[strictness] suggest-parallel`, default on, and both silent unless `free-threaded = true`):
+
+- [`tyc::parallel_opportunity`](diagnostics/parallel_opportunity.md) nudges a comprehension or integer accumulator loop that *would* be rewritten if the relevant knob were on — or a `float` accumulator loop that matches every reduction condition except the required `int` annotation (parallelisable only by reordering float addition, which changes results).
+- [`tyc::shared_mut_across_tasks`](diagnostics/shared_mut_across_tasks.md) flags a `go`-spawned same-module function that writes module-level mutable state (a `global` assignment or a write to a module-level `mut` binding), since under free-threaded Python the spawned task runs concurrently with the spawner.
 
 ### `go` spawn
 

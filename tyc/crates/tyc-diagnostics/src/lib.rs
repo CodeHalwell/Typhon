@@ -1171,6 +1171,51 @@ pub enum TycError {
         span: SourceSpan,
     },
 
+    /// A comprehension or integer accumulator loop that qualifies for the
+    /// `auto-parallel` / `auto-parallel-reductions` rewrite, on a project that
+    /// targets free-threaded Python (`[python] free-threaded = true`), but the
+    /// relevant knob is off — or a `float` accumulator loop that matches every
+    /// reduction condition except the required `int` annotation (float addition
+    /// can only be parallelised by reordering, which changes the result).
+    /// Advice-level; never blocks a build. Gated by
+    /// `[strictness] suggest-parallel` and only fires when free-threaded.
+    #[error("this {shape} could run in parallel on the free-threaded target")]
+    #[diagnostic(
+        severity(Advice),
+        code(tyc::parallel_opportunity),
+        url("https://github.com/CodeHalwell/Typhon/blob/main/docs/diagnostics/parallel_opportunity.md"),
+        help("{hint}")
+    )]
+    ParallelOpportunity {
+        shape: String,
+        hint: String,
+        #[source_code]
+        src: NamedSource<String>,
+        #[label("parallelisable on a free-threaded build")]
+        span: SourceSpan,
+    },
+
+    /// A `go`-spawned same-module function writes module-level mutable state
+    /// (a `global` assignment, or an assignment / augmented-assignment to a
+    /// module-level `mut` binding). Under free-threaded Python the spawned
+    /// task runs concurrently with the spawner, so the unguarded write is a
+    /// data race. Advice-level; never blocks a build. Gated by
+    /// `[strictness] suggest-parallel` and only fires when free-threaded.
+    #[error("`go {callee}(...)` runs concurrently but `{callee}` writes shared mutable state")]
+    #[diagnostic(
+        severity(Advice),
+        code(tyc::shared_mut_across_tasks),
+        url("https://github.com/CodeHalwell/Typhon/blob/main/docs/diagnostics/shared_mut_across_tasks.md"),
+        help("under free-threaded Python this task runs concurrently with the spawner; guard the shared mutable state with a lock or queue, or restructure so the task returns its result instead of writing a global")
+    )]
+    SharedMutAcrossTasks {
+        callee: String,
+        #[source_code]
+        src: NamedSource<String>,
+        #[label("concurrent write to shared mutable state")]
+        span: SourceSpan,
+    },
+
     /// A top-level `def main()` is defined but is never called from
     /// the module. Common newcomer mistake — the script's `main`
     /// function never runs, leaving the build apparently successful
@@ -2753,6 +2798,41 @@ impl TycError {
     ) -> Self {
         Self::LazyImportOpportunity {
             module: module.into(),
+            src: NamedSource::new(path.into(), source.into()),
+            span: SourceSpan::new(SourceOffset::from(offset), length),
+        }
+    }
+
+    /// Construct a [`TycError::ParallelOpportunity`] advice diagnostic.
+    /// `shape` names the parallelisable form (e.g. `"comprehension"`,
+    /// `"int accumulator loop"`); `hint` is the actionable advice (which knob
+    /// to flip, or the float-reordering refactor note).
+    pub fn parallel_opportunity(
+        shape: impl Into<String>,
+        hint: impl Into<String>,
+        path: impl Into<String>,
+        source: impl Into<String>,
+        offset: usize,
+        length: usize,
+    ) -> Self {
+        Self::ParallelOpportunity {
+            shape: shape.into(),
+            hint: hint.into(),
+            src: NamedSource::new(path.into(), source.into()),
+            span: SourceSpan::new(SourceOffset::from(offset), length),
+        }
+    }
+
+    /// Construct a [`TycError::SharedMutAcrossTasks`] advice diagnostic.
+    pub fn shared_mut_across_tasks(
+        callee: impl Into<String>,
+        path: impl Into<String>,
+        source: impl Into<String>,
+        offset: usize,
+        length: usize,
+    ) -> Self {
+        Self::SharedMutAcrossTasks {
+            callee: callee.into(),
             src: NamedSource::new(path.into(), source.into()),
             span: SourceSpan::new(SourceOffset::from(offset), length),
         }
