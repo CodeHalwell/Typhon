@@ -29,13 +29,36 @@
 //!      `else` clause, and a body of *exactly one* statement.
 //!   2. **Accumulation.** That statement is `ACC += EXPR` or the equivalent
 //!      `ACC = ACC + EXPR`, where `ACC` is a plain name.
-//!   3. **Int accumulator.** `ACC` is declared `mut ACC: int` somewhere in the
-//!      module (the `int` annotation is required).
+//!   3. **Int accumulator.** `ACC` is declared `mut ACC: int` **in the loop's
+//!      own scope** (the enclosing function, or module scope for a top-level
+//!      loop). A same-named binding in a *different* function never counts —
+//!      resolving this module-wide would let an `int` accumulator in one
+//!      function make a same-named `float` accumulator elsewhere eligible.
 //!   4. **Pure element.** `EXPR` is a [`crate::parallel::is_pure_value_expr`]
 //!      over the loop target — the target, literals, `let`-bound loop
 //!      invariants, arithmetic / comparison / boolean operators, and calls to
 //!      pure functions — and it mentions the target at least once.
 //!   5. **Invariant iterable.** `ITER` does not reference the accumulator.
+//!   6. **Materialisable iterable.** `map_pure`'s generated helper runs
+//!      `items = list(iterable)` *before* evaluating a single element, so the
+//!      rewrite only preserves semantics when `ITER` is provably bounded and
+//!      effect-free to materialise: a `list` / `tuple` / `set` display, a bare
+//!      name annotated `list[...]` / `tuple[...]` / `set[...]` /
+//!      `frozenset[...]` in the loop's scope (the container already sits fully
+//!      in memory, and `map_pure` returns results in input order, so the first
+//!      raising element still propagates first), or a direct builtin
+//!      `range(...)` call — bounded, pure, deterministic; note that
+//!      parallelising a `range` loop materialises the range, an inherent cost
+//!      of the map-based design. Anything else — an unannotated name, a
+//!      function / method call result, an attribute, a generator — could be
+//!      unbounded (the sequential loop raises on the first element where the
+//!      rewrite would hang exhausting the iterator) or could run iterator
+//!      side effects the sequential loop never reached, and is never
+//!      rewritten.
+//!   7. **Builtins unshadowed.** The emitted code calls the bare name `sum`
+//!      (and treats `range(...)` as the builtin under condition 6), so a
+//!      user binding of `sum` — or `range`, for a range iterable — anywhere
+//!      visible to the loop suppresses the rewrite.
 //!
 //! Gated at the call site on `auto-parallel` **and** `auto-parallel-reductions`
 //! both being on. Honours `[strictness] parallel-min-size` for statically-sized
@@ -72,6 +95,56 @@ struct ReductionMatch {
     range: TextRange,
 }
 
+/// Per-scope eligibility environment for the reduction rewrite / detection:
+/// the typed-`mut` accumulator sets, the container-annotated names, and the
+/// builtin-shadowing flags, all resolved against a single function / module /
+/// class scope. Recomputed on entry to each `def` / `class`; threaded
+/// unchanged through control-flow blocks, which share their enclosing scope.
+struct ScopeEnv {
+    /// Names declared `mut NAME: int` in this scope (condition 3).
+    int_mut: HashSet<String>,
+    /// Names declared `mut NAME: float` in this scope (detection's
+    /// "eligible-but-for-the-float-annotation" advice arm).
+    float_mut: HashSet<String>,
+    /// Names provably bound to a fully-materialised builtin container in this
+    /// scope (condition 6): parameters and annotated assignments typed
+    /// `list[...]` / `tuple[...]` / `set[...]` / `frozenset[...]`.
+    containers: HashSet<String>,
+    /// True when `sum` is rebound in this or any enclosing scope — the
+    /// rewrite emits a bare `sum(...)` call, which must be the builtin.
+    sum_shadowed: bool,
+    /// True when `range` is rebound in this or any enclosing scope — a
+    /// `range(...)` iterable only proves boundedness when it's the builtin.
+    range_shadowed: bool,
+}
+
+impl ScopeEnv {
+    /// Build the environment for one scope: `body` is the scope's statement
+    /// list, `params` its parameters (functions only). The typed-`mut` and
+    /// container sets are deliberately *not* inherited from `outer` (a
+    /// same-named binding in another scope is a different binding — see
+    /// [`collect_scope_typed_mut`]); the shadowing flags *are* OR-inherited,
+    /// because an enclosing scope's binding stays visible inside.
+    fn for_scope(
+        body: &[Stmt],
+        params: Option<&ruff_python_ast::Parameters>,
+        outer: Option<&ScopeEnv>,
+    ) -> ScopeEnv {
+        let shadowed = |name: &str, outer_flag: bool| {
+            outer_flag
+                || params.is_some_and(|p| params_bind_name(p, name))
+                || scope_binds_name(body, name)
+        };
+        ScopeEnv {
+            int_mut: collect_scope_typed_mut(body, "int"),
+            float_mut: collect_scope_typed_mut(body, "float"),
+            containers: collect_scope_container_names(body, params),
+            sum_shadowed: shadowed("sum", outer.is_some_and(|o| o.sum_shadowed)),
+            range_shadowed: shadowed("range", outer.is_some_and(|o| o.range_shadowed)),
+        }
+    }
+}
+
 /// Rewrite eligible integer accumulator loops into `total += sum(map_pure(...))`.
 ///
 /// `pure_callees` and `min_size` mirror the comprehension rewrite's parameters
@@ -82,41 +155,27 @@ pub fn rewrite_reduction_loops(
     min_size: u64,
 ) -> ReductionStats {
     let captures = collect_capturable_names(module);
-    // Typed-`mut` accumulators are resolved **per scope**, not module-wide: the
-    // set here covers only the module scope, and the traversal recomputes a
-    // fresh set on entry to each `def` / `class` body. This is what stops a
-    // `mut total: int` in one function from making a same-named
-    // `mut total: float` accumulator in another look int-typed — which would let
-    // the rewrite reorder that function's float addition and change results, the
-    // one thing the reduction rewrite must never do.
-    let scope_mut = collect_scope_typed_mut(&module.body, "int");
-    // The rewrite emits a call to the bare name `sum`; if user code rebinds
-    // `sum` anywhere visible to the loop (module scope here; each function
-    // scope below), the emitted call would resolve to the user binding instead
-    // of `builtins.sum` — a behaviour change. Track shadowing per scope and
-    // suppress the rewrite conservatively.
-    let sum_shadowed = scope_binds_name(&module.body, "sum");
+    let env = ScopeEnv::for_scope(&module.body, None, None);
     let ctx = RewriteCtx::new(pure_callees, min_size, &captures);
     let mut stats = ReductionStats::default();
-    rewrite_stmts(&mut module.body, &ctx, &scope_mut, sum_shadowed, &mut stats);
+    rewrite_stmts(&mut module.body, &ctx, &env, &mut stats);
     stats
 }
 
 fn rewrite_stmts(
     body: &mut [Stmt],
     ctx: &RewriteCtx<'_>,
-    scope_mut: &HashSet<String>,
-    sum_shadowed: bool,
+    env: &ScopeEnv,
     stats: &mut ReductionStats,
 ) {
     for stmt in body.iter_mut() {
         // Recurse first so nested loops inside a matched loop's *sibling*
         // blocks are considered (a matched leaf loop has no nested statements
         // to recurse into anyway).
-        recurse_children(stmt, ctx, scope_mut, sum_shadowed, stats);
+        recurse_children(stmt, ctx, env, stats);
         if let Stmt::For(f) = stmt {
-            if let Some(m) = match_reduction_loop(f, ctx, scope_mut) {
-                if !sum_shadowed && !under_min_size(&m.iter, ctx.min_size) {
+            if let Some(m) = match_reduction_loop(f, ctx, &env.int_mut, env) {
+                if !env.sum_shadowed && !under_min_size(&m.iter, ctx.min_size) {
                     *stmt = build_reduction_stmt(&m);
                     stats.rewrites += 1;
                 }
@@ -128,57 +187,49 @@ fn rewrite_stmts(
 fn recurse_children(
     stmt: &mut Stmt,
     ctx: &RewriteCtx<'_>,
-    scope_mut: &HashSet<String>,
-    sum_shadowed: bool,
+    env: &ScopeEnv,
     stats: &mut ReductionStats,
 ) {
     match stmt {
-        // A `def` / `class` opens a new scope: recompute the typed-`mut` set
-        // from that body so accumulators from the enclosing scope don't leak in
-        // (and this scope's don't leak out). `sum`-shadowing accumulates the
-        // other way: a binding in any *enclosing* scope stays visible inside,
-        // so OR the outer flag with this scope's own evidence (parameters
-        // included — a parameter named `sum` shadows the builtin too).
+        // A `def` / `class` opens a new scope: rebuild the environment from
+        // that body (see `ScopeEnv::for_scope` for what is and isn't
+        // inherited).
         Stmt::FunctionDef(f) => {
-            let inner = collect_scope_typed_mut(&f.body, "int");
-            let shadowed = sum_shadowed
-                || params_bind_name(&f.parameters, "sum")
-                || scope_binds_name(&f.body, "sum");
-            rewrite_stmts(&mut f.body, ctx, &inner, shadowed, stats);
+            let inner = ScopeEnv::for_scope(&f.body, Some(&f.parameters), Some(env));
+            rewrite_stmts(&mut f.body, ctx, &inner, stats);
         }
         Stmt::ClassDef(c) => {
-            let inner = collect_scope_typed_mut(&c.body, "int");
-            let shadowed = sum_shadowed || scope_binds_name(&c.body, "sum");
-            rewrite_stmts(&mut c.body, ctx, &inner, shadowed, stats);
+            let inner = ScopeEnv::for_scope(&c.body, None, Some(env));
+            rewrite_stmts(&mut c.body, ctx, &inner, stats);
         }
         // Control-flow blocks share the enclosing scope: thread it unchanged.
         Stmt::If(s) => {
-            rewrite_stmts(&mut s.body, ctx, scope_mut, sum_shadowed, stats);
+            rewrite_stmts(&mut s.body, ctx, env, stats);
             for clause in &mut s.elif_else_clauses {
-                rewrite_stmts(&mut clause.body, ctx, scope_mut, sum_shadowed, stats);
+                rewrite_stmts(&mut clause.body, ctx, env, stats);
             }
         }
         Stmt::While(s) => {
-            rewrite_stmts(&mut s.body, ctx, scope_mut, sum_shadowed, stats);
-            rewrite_stmts(&mut s.orelse, ctx, scope_mut, sum_shadowed, stats);
+            rewrite_stmts(&mut s.body, ctx, env, stats);
+            rewrite_stmts(&mut s.orelse, ctx, env, stats);
         }
         Stmt::For(s) => {
-            rewrite_stmts(&mut s.body, ctx, scope_mut, sum_shadowed, stats);
-            rewrite_stmts(&mut s.orelse, ctx, scope_mut, sum_shadowed, stats);
+            rewrite_stmts(&mut s.body, ctx, env, stats);
+            rewrite_stmts(&mut s.orelse, ctx, env, stats);
         }
-        Stmt::With(s) => rewrite_stmts(&mut s.body, ctx, scope_mut, sum_shadowed, stats),
+        Stmt::With(s) => rewrite_stmts(&mut s.body, ctx, env, stats),
         Stmt::Try(s) => {
-            rewrite_stmts(&mut s.body, ctx, scope_mut, sum_shadowed, stats);
-            rewrite_stmts(&mut s.orelse, ctx, scope_mut, sum_shadowed, stats);
-            rewrite_stmts(&mut s.finalbody, ctx, scope_mut, sum_shadowed, stats);
+            rewrite_stmts(&mut s.body, ctx, env, stats);
+            rewrite_stmts(&mut s.orelse, ctx, env, stats);
+            rewrite_stmts(&mut s.finalbody, ctx, env, stats);
             for h in &mut s.handlers {
                 let ruff_python_ast::ExceptHandler::ExceptHandler(h) = h;
-                rewrite_stmts(&mut h.body, ctx, scope_mut, sum_shadowed, stats);
+                rewrite_stmts(&mut h.body, ctx, env, stats);
             }
         }
         Stmt::Match(s) => {
             for case in &mut s.cases {
-                rewrite_stmts(&mut case.body, ctx, scope_mut, sum_shadowed, stats);
+                rewrite_stmts(&mut case.body, ctx, env, stats);
             }
         }
         _ => {}
@@ -186,11 +237,14 @@ fn recurse_children(
 }
 
 /// Match a `for` loop against the reduction shape, checking eligibility
-/// against `int_mut` (the set of `mut NAME: int` names) and `ctx`.
+/// against `typed_mut` (the scope's `mut NAME: int` — or, for the advice
+/// lint's float arm, `mut NAME: float` — names), `env` (container-annotated
+/// names + builtin shadowing), and `ctx`.
 fn match_reduction_loop(
     f: &ruff_python_ast::StmtFor,
     ctx: &RewriteCtx<'_>,
     typed_mut: &HashSet<String>,
+    env: &ScopeEnv,
 ) -> Option<ReductionMatch> {
     if f.is_async || !f.orelse.is_empty() || f.body.len() != 1 {
         return None;
@@ -212,6 +266,14 @@ fn match_reduction_loop(
     }
     // The iterable must be loop-invariant with respect to the accumulator.
     if mentions_name_anywhere(&f.iter, &acc) {
+        return None;
+    }
+    // The iterable must be provably bounded and effect-free to materialise
+    // (condition 6 in the module docs): `map_pure` runs `list(ITER)` before
+    // evaluating a single element, so an unbounded iterator would hang where
+    // the sequential loop raises on its first element, and a stateful
+    // iterator's side effects would all run where the loop stopped early.
+    if !iter_is_materialisable(&f.iter, env) {
         return None;
     }
     Some(ReductionMatch {
@@ -291,6 +353,134 @@ fn build_reduction_stmt(m: &ReductionMatch) -> Stmt {
 /// True when a statically-sized literal iterable is shorter than `min_size`.
 fn under_min_size(iter: &Expr, min_size: u64) -> bool {
     literal_iter_len(iter).is_some_and(|n| n < min_size)
+}
+
+/// Condition 6 (see the module docs): `map_pure`'s generated helper
+/// materialises `items = list(iterable)` *before* evaluating any element, so
+/// the sequential loop and the rewrite only agree when `ITER` is bounded and
+/// effect-free to materialise. A sequential
+/// `for x in itertools.count(): total += 1 // x` raises `ZeroDivisionError`
+/// on its first element; the rewrite would hang exhausting the iterator — and
+/// a stateful iterator (a generator reading a file, say) would run side
+/// effects the sequential loop never reached. Accepted shapes:
+///
+/// * a `list` / `tuple` / `set` display — materialised by evaluating it;
+/// * a bare name annotated `list[...]` / `tuple[...]` / `set[...]` /
+///   `frozenset[...]` in this scope — the container already sits fully in
+///   memory, so `list()` over it adds no effects, and exception order is
+///   preserved (`map_pure` returns results in input order, so the first
+///   raising slot propagates first while later elements are pure to
+///   evaluate);
+/// * a direct builtin `range(...)` call — bounded, pure, deterministic; the
+///   canonical reduction shape. Parallelising a `range` loop materialises the
+///   range, an inherent cost of the map-based design.
+///
+/// Everything else — an unannotated name, a function / method call result, an
+/// attribute, a generator expression — is refused.
+fn iter_is_materialisable(iter: &Expr, env: &ScopeEnv) -> bool {
+    match iter {
+        Expr::List(_) | Expr::Tuple(_) | Expr::Set(_) => true,
+        Expr::Name(n) => env.containers.contains(n.id.as_str()),
+        Expr::Call(c) => {
+            !env.range_shadowed
+                && matches!(c.func.as_ref(), Expr::Name(f) if f.id.as_str() == "range")
+        }
+        _ => false,
+    }
+}
+
+/// True when `ann` names a materialised builtin container type — bare
+/// (`list`) or subscripted (`list[int]`, `tuple[float, ...]`,
+/// `dict`-excluded: iterating a dict is keys-only and fine, but keeping to
+/// the sequence/set containers keeps the proof obvious).
+fn is_container_annotation(ann: &Expr) -> bool {
+    let head = match ann {
+        Expr::Name(n) => n.id.as_str(),
+        Expr::Subscript(s) => match s.value.as_ref() {
+            Expr::Name(n) => n.id.as_str(),
+            _ => return false,
+        },
+        _ => return false,
+    };
+    matches!(head, "list" | "tuple" | "set" | "frozenset")
+}
+
+/// Collect the names provably bound to a fully-materialised builtin container
+/// in one scope: function parameters and annotated assignments
+/// (`NAME: list[...] = …`, any `let` / `mut` / module binding — the checker
+/// enforces the annotation either way). Same scope discipline as
+/// [`collect_scope_typed_mut`]: descends control-flow blocks, never nested
+/// `def` / `class` bodies. `*args: T` / `**kwargs: T` annotate the *element*
+/// type, not the aggregate, so variadic parameters never qualify.
+fn collect_scope_container_names(
+    body: &[Stmt],
+    params: Option<&ruff_python_ast::Parameters>,
+) -> HashSet<String> {
+    let mut out = HashSet::new();
+    if let Some(params) = params {
+        for p in params
+            .posonlyargs
+            .iter()
+            .chain(params.args.iter())
+            .chain(params.kwonlyargs.iter())
+        {
+            if p.parameter
+                .annotation
+                .as_deref()
+                .is_some_and(is_container_annotation)
+            {
+                out.insert(p.parameter.name.to_string());
+            }
+        }
+    }
+    collect_container_names_into(body, &mut out);
+    out
+}
+
+fn collect_container_names_into(body: &[Stmt], out: &mut HashSet<String>) {
+    for stmt in body {
+        match stmt {
+            Stmt::AnnAssign(a) => {
+                if let Expr::Name(target) = a.target.as_ref() {
+                    if is_container_annotation(&a.annotation) {
+                        out.insert(target.id.to_string());
+                    }
+                }
+            }
+            // Control-flow blocks share the enclosing scope — descend.
+            Stmt::If(s) => {
+                collect_container_names_into(&s.body, out);
+                for clause in &s.elif_else_clauses {
+                    collect_container_names_into(&clause.body, out);
+                }
+            }
+            Stmt::While(s) => {
+                collect_container_names_into(&s.body, out);
+                collect_container_names_into(&s.orelse, out);
+            }
+            Stmt::For(s) => {
+                collect_container_names_into(&s.body, out);
+                collect_container_names_into(&s.orelse, out);
+            }
+            Stmt::With(s) => collect_container_names_into(&s.body, out),
+            Stmt::Try(s) => {
+                collect_container_names_into(&s.body, out);
+                collect_container_names_into(&s.orelse, out);
+                collect_container_names_into(&s.finalbody, out);
+                for h in &s.handlers {
+                    let ruff_python_ast::ExceptHandler::ExceptHandler(h) = h;
+                    collect_container_names_into(&h.body, out);
+                }
+            }
+            Stmt::Match(s) => {
+                for case in &s.cases {
+                    collect_container_names_into(&case.body, out);
+                }
+            }
+            // `def` / `class` open their own scope — do NOT descend.
+            _ => {}
+        }
+    }
 }
 
 /// Collect every name declared `mut NAME: <ann>` **within a single
@@ -599,42 +789,31 @@ pub fn detect_reduction_loops(
     min_size: u64,
 ) -> Vec<ReductionHit> {
     let captures = collect_capturable_names(module);
-    // Per-scope, like the rewrite (see `rewrite_reduction_loops`): recomputed on
-    // entry to each `def` / `class` so the advice keys on the accumulator's type
-    // in its own scope, never a same-named binding from another function.
-    let int_mut = collect_scope_typed_mut(&module.body, "int");
-    let float_mut = collect_scope_typed_mut(&module.body, "float");
-    // Mirror the rewrite's bare-`sum` shadowing suppression so the int hits
-    // report precisely the loops `rewrite_reduction_loops` would transform.
-    let sum_shadowed = scope_binds_name(&module.body, "sum");
+    // Per-scope, like the rewrite (see `rewrite_reduction_loops` and
+    // `ScopeEnv::for_scope`): recomputed on entry to each `def` / `class` so
+    // the advice keys on the accumulator's type — and the iterable's
+    // container proof — in its own scope, never a same-named binding from
+    // another function.
+    let env = ScopeEnv::for_scope(&module.body, None, None);
     let ctx = RewriteCtx::new(pure_callees, min_size, &captures);
     let mut out = Vec::new();
-    detect_in_stmts(
-        &module.body,
-        &ctx,
-        &int_mut,
-        &float_mut,
-        sum_shadowed,
-        &mut out,
-    );
+    detect_in_stmts(&module.body, &ctx, &env, &mut out);
     out
 }
 
 fn detect_in_stmts(
     body: &[Stmt],
     ctx: &RewriteCtx<'_>,
-    int_mut: &HashSet<String>,
-    float_mut: &HashSet<String>,
-    sum_shadowed: bool,
+    env: &ScopeEnv,
     out: &mut Vec<ReductionHit>,
 ) {
     for stmt in body {
-        detect_children(stmt, ctx, int_mut, float_mut, sum_shadowed, out);
+        detect_children(stmt, ctx, env, out);
         if let Stmt::For(f) = stmt {
             // int accumulator → eligible for the rewrite (unless a user
             // binding of `sum` would capture the rewrite's emitted call).
-            if !sum_shadowed {
-                if let Some(m) = match_reduction_loop(f, ctx, int_mut) {
+            if !env.sum_shadowed {
+                if let Some(m) = match_reduction_loop(f, ctx, &env.int_mut, env) {
                     if !under_min_size(&m.iter, ctx.min_size) {
                         out.push(ReductionHit {
                             acc: m.acc,
@@ -646,9 +825,12 @@ fn detect_in_stmts(
                 }
             }
             // float accumulator → matches everything but the int annotation.
-            // (Independent of `sum` shadowing: this advice is about the float
-            // reordering barrier, not the emitted `sum(...)` call.)
-            if let Some(m) = match_reduction_loop(f, ctx, float_mut) {
+            // (Independent of `sum` shadowing — this advice is about the float
+            // reordering barrier, not the emitted `sum(...)` call — but it
+            // shares every structural condition, including the materialisable
+            // iterable: advice about a shape that could never be a parallel
+            // reduction is noise.)
+            if let Some(m) = match_reduction_loop(f, ctx, &env.float_mut, env) {
                 if !under_min_size(&m.iter, ctx.min_size) {
                     out.push(ReductionHit {
                         acc: m.acc,
@@ -661,59 +843,45 @@ fn detect_in_stmts(
     }
 }
 
-fn detect_children(
-    stmt: &Stmt,
-    ctx: &RewriteCtx<'_>,
-    int_mut: &HashSet<String>,
-    float_mut: &HashSet<String>,
-    sum_shadowed: bool,
-    out: &mut Vec<ReductionHit>,
-) {
+fn detect_children(stmt: &Stmt, ctx: &RewriteCtx<'_>, env: &ScopeEnv, out: &mut Vec<ReductionHit>) {
     match stmt {
-        // New scope: recompute both sets from that body (see `detect_children`'s
-        // sibling in the rewrite path, `recurse_children`); `sum` shadowing ORs
-        // downward exactly like the rewrite path.
+        // New scope: rebuild the environment from that body (see
+        // `recurse_children`, this walker's sibling in the rewrite path).
         Stmt::FunctionDef(f) => {
-            let int_inner = collect_scope_typed_mut(&f.body, "int");
-            let float_inner = collect_scope_typed_mut(&f.body, "float");
-            let shadowed = sum_shadowed
-                || params_bind_name(&f.parameters, "sum")
-                || scope_binds_name(&f.body, "sum");
-            detect_in_stmts(&f.body, ctx, &int_inner, &float_inner, shadowed, out);
+            let inner = ScopeEnv::for_scope(&f.body, Some(&f.parameters), Some(env));
+            detect_in_stmts(&f.body, ctx, &inner, out);
         }
         Stmt::ClassDef(c) => {
-            let int_inner = collect_scope_typed_mut(&c.body, "int");
-            let float_inner = collect_scope_typed_mut(&c.body, "float");
-            let shadowed = sum_shadowed || scope_binds_name(&c.body, "sum");
-            detect_in_stmts(&c.body, ctx, &int_inner, &float_inner, shadowed, out);
+            let inner = ScopeEnv::for_scope(&c.body, None, Some(env));
+            detect_in_stmts(&c.body, ctx, &inner, out);
         }
         Stmt::If(s) => {
-            detect_in_stmts(&s.body, ctx, int_mut, float_mut, sum_shadowed, out);
+            detect_in_stmts(&s.body, ctx, env, out);
             for clause in &s.elif_else_clauses {
-                detect_in_stmts(&clause.body, ctx, int_mut, float_mut, sum_shadowed, out);
+                detect_in_stmts(&clause.body, ctx, env, out);
             }
         }
         Stmt::While(s) => {
-            detect_in_stmts(&s.body, ctx, int_mut, float_mut, sum_shadowed, out);
-            detect_in_stmts(&s.orelse, ctx, int_mut, float_mut, sum_shadowed, out);
+            detect_in_stmts(&s.body, ctx, env, out);
+            detect_in_stmts(&s.orelse, ctx, env, out);
         }
         Stmt::For(s) => {
-            detect_in_stmts(&s.body, ctx, int_mut, float_mut, sum_shadowed, out);
-            detect_in_stmts(&s.orelse, ctx, int_mut, float_mut, sum_shadowed, out);
+            detect_in_stmts(&s.body, ctx, env, out);
+            detect_in_stmts(&s.orelse, ctx, env, out);
         }
-        Stmt::With(s) => detect_in_stmts(&s.body, ctx, int_mut, float_mut, sum_shadowed, out),
+        Stmt::With(s) => detect_in_stmts(&s.body, ctx, env, out),
         Stmt::Try(s) => {
-            detect_in_stmts(&s.body, ctx, int_mut, float_mut, sum_shadowed, out);
-            detect_in_stmts(&s.orelse, ctx, int_mut, float_mut, sum_shadowed, out);
-            detect_in_stmts(&s.finalbody, ctx, int_mut, float_mut, sum_shadowed, out);
+            detect_in_stmts(&s.body, ctx, env, out);
+            detect_in_stmts(&s.orelse, ctx, env, out);
+            detect_in_stmts(&s.finalbody, ctx, env, out);
             for h in &s.handlers {
                 let ruff_python_ast::ExceptHandler::ExceptHandler(h) = h;
-                detect_in_stmts(&h.body, ctx, int_mut, float_mut, sum_shadowed, out);
+                detect_in_stmts(&h.body, ctx, env, out);
             }
         }
         Stmt::Match(s) => {
             for case in &s.cases {
-                detect_in_stmts(&case.body, ctx, int_mut, float_mut, sum_shadowed, out);
+                detect_in_stmts(&case.body, ctx, env, out);
             }
         }
         _ => {}
@@ -1067,6 +1235,166 @@ def run(xs: list[int], ys: list[int]) -> int:
         assert!(
             out.contains("total += sum(typhon_runtime.parallel.map_pure"),
             "expected the reduction lowering:\n{out}"
+        );
+    }
+
+    // ── Finding 8: the iterable must be bounded & effect-free to materialise ──
+    // (`map_pure` runs `list(ITER)` before evaluating any element).
+
+    #[test]
+    fn leaves_call_result_iterable_alone() {
+        // `itertools.count()` is the canonical hazard: the sequential loop
+        // raises ZeroDivisionError on the first element (x == 0), while the
+        // rewrite would hang inside `list(itertools.count())` forever. Any
+        // call/method-call result is refused — boundedness is unprovable.
+        let src = "\
+import itertools
+
+def run() -> int:
+    mut total: int = 0
+    for x in itertools.count():
+        total += 1 // x
+    return total
+";
+        let (out, stats) = rewrite(src, &[], 0);
+        assert_eq!(
+            stats.rewrites, 0,
+            "a call-result iterable must never rewrite:\n{out}"
+        );
+        assert!(
+            out.contains("for x in itertools.count():"),
+            "the loop must be left untouched:\n{out}"
+        );
+
+        // Same for a bare-name call result.
+        let src = "\
+def run() -> int:
+    mut total: int = 0
+    for x in load():
+        total += x
+    return total
+";
+        let (_out, stats) = rewrite(src, &[], 0);
+        assert_eq!(
+            stats.rewrites, 0,
+            "bare-name call iterable must not rewrite"
+        );
+    }
+
+    #[test]
+    fn leaves_unannotated_name_iterable_alone() {
+        // `xs` has no container annotation in scope, so nothing proves it is
+        // bounded (it could be a generator handed back by `build()`).
+        let src = "\
+def run() -> int:
+    let xs = build()
+    mut total: int = 0
+    for x in xs:
+        total += x
+    return total
+";
+        let (out, stats) = rewrite(src, &[], 0);
+        assert_eq!(
+            stats.rewrites, 0,
+            "an unannotated name iterable must not rewrite:\n{out}"
+        );
+    }
+
+    #[test]
+    fn annotated_container_local_iterable_rewrites() {
+        // `let xs: list[int] = …` proves the container shape regardless of the
+        // initialiser: the checker enforces the annotation, and a list is
+        // fully materialised in memory.
+        let src = "\
+def run() -> int:
+    let xs: list[int] = build()
+    mut total: int = 0
+    for x in xs:
+        total += x
+    return total
+";
+        let (out, stats) = rewrite(src, &[], 0);
+        assert_eq!(
+            stats.rewrites, 1,
+            "a container-annotated local iterable should rewrite:\n{out}"
+        );
+    }
+
+    #[test]
+    fn range_iterable_rewrites() {
+        let src = "\
+def run() -> int:
+    mut total: int = 0
+    for x in range(1000):
+        total += x * x
+    return total
+";
+        let (out, stats) = rewrite(src, &[], 0);
+        assert_eq!(
+            stats.rewrites, 1,
+            "a builtin range(...) iterable should rewrite:\n{out}"
+        );
+        assert!(
+            out.contains(
+                "total += sum(typhon_runtime.parallel.map_pure(lambda x: x * x, range(1000)))"
+            ),
+            "unexpected lowering:\n{out}"
+        );
+    }
+
+    #[test]
+    fn list_literal_iterable_rewrites() {
+        let src = "\
+def run() -> int:
+    mut total: int = 0
+    for x in [1, 2, 3]:
+        total += x
+    return total
+";
+        let (_out, stats) = rewrite(src, &[], 0);
+        assert_eq!(stats.rewrites, 1, "a list display iterable should rewrite");
+    }
+
+    #[test]
+    fn shadowed_range_iterable_does_not_rewrite() {
+        // A user `def range` could return anything — an unbounded generator
+        // included — so `range(...)` only proves boundedness as the builtin.
+        let src = "\
+def range(n: int) -> int:
+    return n
+
+def run() -> int:
+    mut total: int = 0
+    for x in range(1000):
+        total += x
+    return total
+";
+        let (out, stats) = rewrite(src, &[], 0);
+        assert_eq!(
+            stats.rewrites, 0,
+            "a shadowed `range` must not count as a bounded iterable:\n{out}"
+        );
+    }
+
+    #[test]
+    fn detect_skips_unmaterialisable_iterable() {
+        // The advice arms mirror the rewrite's iterable restriction — both the
+        // int arm (would-rewrite advice) and the float arm (advice about a
+        // rewrite shape that must otherwise be structurally valid).
+        let src = "\
+def run() -> None:
+    mut isum: int = 0
+    for x in load():
+        isum += x
+    mut fsum: float = 0.0
+    for y in stream():
+        fsum += y
+";
+        let m = parse(src);
+        let hits = detect_reduction_loops(&m, &pure_set(&[]), 0);
+        assert!(
+            hits.is_empty(),
+            "call-result iterables must produce no reduction advice: {hits:?}"
         );
     }
 

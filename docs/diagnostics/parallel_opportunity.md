@@ -40,6 +40,16 @@ construction.
    rewrite. Enable **both** `[strictness] auto-parallel = true` and
    `auto-parallel-reductions = true`.
 
+   The advice mirrors the rewrite's full eligibility, including the iterable:
+   `xs` must be provably bounded and effect-free to materialise — a
+   `list`/`tuple`/`set` literal, a bare name annotated `list[...]` /
+   `tuple[...]` / `set[...]` / `frozenset[...]` in the loop's scope, or a
+   direct builtin `range(...)` call — because the rewrite's `map_pure` runs
+   `list(ITER)` before evaluating a single element (an unbounded or stateful
+   iterator would diverge from the sequential loop, so such loops neither
+   rewrite nor produce this advice). Parallelising a `range` loop materialises
+   the range — an inherent cost of the map-based design.
+
 3. **A float accumulator loop that is *not* eligible.**
 
    ```ty

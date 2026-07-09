@@ -214,7 +214,7 @@ A canonical accumulation loop with a **plain `int`** accumulator folds into a pa
   </TabItem>
 </Tabs>
 
-Integer addition is associative and commutative and Python ints are exact, so summing partial results in any order is identical to the sequential loop. **`float` accumulators are never eligible** — reordering IEEE-754 addition changes the result, so a `mut total: float` loop is left alone (and surfaces `tyc::parallel_opportunity` explaining why).
+Integer addition is associative and commutative and Python ints are exact, so summing partial results in any order is identical to the sequential loop. **`float` accumulators are never eligible** — reordering IEEE-754 addition changes the result, so a `mut total: float` loop is left alone (and surfaces `tyc::parallel_opportunity` explaining why). The iterable must also be **provably bounded and effect-free to materialise** — a `list`/`tuple`/`set` literal, a name annotated `list[...]` / `tuple[...]` / `set[...]` / `frozenset[...]` in the loop's scope, or a builtin `range(...)` call (parallelising a `range` loop materialises it — an inherent cost of the map-based design) — because `map_pure` runs `list(ITER)` before evaluating any element; a call result or unannotated name could be an unbounded or stateful iterator, where materialising diverges from the sequential loop, so those never rewrite.
 
 ### Execution backend
 

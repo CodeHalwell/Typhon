@@ -45,7 +45,7 @@ allow-secret-comptime = false
 | `auto-memoise` | bool | `false` | Insert `@functools.cache` on every function the analyser infers as pure. **Off by default — caches extend lifetimes invisibly.** |
 | `auto-gather` | bool | `false` | Fold straight-line independent `await` runs into `asyncio.TaskGroup`, but only for `@gatherable`-decorated callees (same-module or imported from another project module). |
 | `auto-parallel` | bool | `false` | Rewrite pure list comprehensions over large iterables to a `ThreadPoolExecutor.map` (needs `free-threaded`). |
-| `auto-parallel-reductions` | bool | `false` | Parallelise `int`-only accumulator loops (`for x in xs: total += f(x)` with `mut total: int` and a pure `f`) the same way `auto-parallel` handles comprehensions. Requires `auto-parallel = true`. `float` accumulators are never rewritten — reordering IEEE-754 addition changes the result. |
+| `auto-parallel-reductions` | bool | `false` | Parallelise `int`-only accumulator loops (`for x in xs: total += f(x)` with `mut total: int` and a pure `f`) the same way `auto-parallel` handles comprehensions. Requires `auto-parallel = true`. `float` accumulators are never rewritten — reordering IEEE-754 addition changes the result — and the iterable must be provably bounded and effect-free to materialise (a container literal, a container-annotated name, or a builtin `range(...)` call). |
 | `parallel-min-size` | int | `64` | Minimum iterable size for `auto-parallel` to fire. When the size can't be statically inferred, treated as zero. |
 | `parallel-backend` | `"threads"` \| `"interpreters"` | `"threads"` | Execution backend for `auto-parallel` / `auto-parallel-reductions` rewrites. `"interpreters"` tries a PEP 734 `InterpreterPoolExecutor` (3.14+) first, falling back transparently to the thread pool on an older runtime or an unshareable mapped callable. |
 | `pgo-memoise` | bool | `false` | Promote hot pure functions to `@functools.cache` based on `typhon-profile.json` from a prior `tyc profile` run. |
@@ -177,6 +177,8 @@ When `true`, pure list comprehensions whose element is a pure call are rewritten
 ## `auto-parallel-reductions`
 
 **Off by default. Requires `auto-parallel = true`.** Extends the `auto-parallel` rewrite to integer accumulator loops: `for x in xs: total += f(x)` with a **plain `int`** accumulator (`mut total: int`) and a pure `f` lowers to `total += sum(map_pure(lambda x: f(x), xs))`. Integer addition is exact and associative/commutative, so summing partial results in any order gives an identical answer.
+
+The iterable must additionally be **provably bounded and effect-free to materialise**, because `map_pure` runs `list(ITER)` before evaluating a single element: a `list`/`tuple`/`set` literal, a bare name annotated `list[...]` / `tuple[...]` / `set[...]` / `frozenset[...]` in the loop's scope, or a direct builtin `range(...)` call. Anything else — an unannotated name, a function/method call result, a generator — is never rewritten: an unbounded iterator would hang where the sequential loop raises on its first element, and a stateful iterator's side effects would all run where the loop stopped early. Note that parallelising a `range` loop materialises the range — an inherent cost of the map-based design.
 
 <Aside type="caution">
   `float` accumulators are **never** rewritten — reordering IEEE-754 floating-point addition changes the result, so the compiler refuses to silently reorder it. A `float` loop that's otherwise shaped for the rewrite surfaces `tyc::parallel_opportunity` instead, explaining why it was skipped.

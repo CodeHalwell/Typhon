@@ -89,7 +89,19 @@ canonical phase-by-phase status lives in `docs/roadmap.md`.
     rewrite also suppresses itself when user code binds the name `sum`
     anywhere visible to the loop (module scope or the enclosing function,
     parameters included), since the emitted bare `sum(...)` call would
-    otherwise resolve to the user binding instead of the builtin.
+    otherwise resolve to the user binding instead of the builtin. And because
+    `map_pure` materialises `list(ITER)` before evaluating a single element,
+    the iterable must be provably bounded and effect-free to materialise — a
+    `list`/`tuple`/`set` literal, a bare name annotated `list[...]` /
+    `tuple[...]` / `set[...]` / `frozenset[...]` in the loop's scope, or a
+    direct builtin `range(...)` call (parallelising a `range` loop
+    materialises the range, an inherent cost of the map-based design); call
+    results, unannotated names, and generators never rewrite, so an unbounded
+    iterator can't turn a first-element exception into a hang, and a stateful
+    iterator's side effects can't run past where the sequential loop stopped.
+    The `tyc::parallel_opportunity` advice mirrors every one of these
+    conditions, so it only ever names loops the rewrite would actually
+    transform.
   - **`tyc::parallel_opportunity`** — new advice lint (severity Advice, on by
     default, gated by `[strictness] suggest-parallel`). Fires only under
     `free-threaded = true` on a comprehension / integer accumulator loop that
