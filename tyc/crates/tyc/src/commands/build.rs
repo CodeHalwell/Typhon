@@ -1521,7 +1521,18 @@ fn secret_suffix(name: &str) -> Option<&'static str> {
     // Order matters: check the longest/most specific suffixes first so
     // `MY_PASSWORD` reports `PASSWORD` rather than the shorter `PASS`.
     let words = [
-        "PASSWORD", "SECRET", "TOKEN", "API_KEY", "APIKEY", "KEY", "PWD", "PASS",
+        "CREDENTIAL",
+        "PASSWORD",
+        "SECRET",
+        "BEARER",
+        "TOKEN",
+        "API_KEY",
+        "APIKEY",
+        "JWT",
+        "KEY",
+        "PAT",
+        "PWD",
+        "PASS",
     ];
     for candidate in words {
         // We match if the substring is bounded by:

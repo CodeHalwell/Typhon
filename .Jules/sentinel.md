@@ -7,3 +7,8 @@
 **Vulnerability:** Hardcoded secret detection was missing `APIKEY` due to partial overlap with `KEY` because `KEY` was evaluated before `APIKEY`.
 **Learning:** When scanning for secrets using keyword arrays, substrings (like `KEY`) must be placed after longer matches (like `APIKEY` or `API_KEY`) to prevent premature partial matches.
 **Prevention:** Always maintain hardcoded secret matching keywords in longest-first order.
+
+## 2024-05-27 - Expanding Hardcoded Secret Detection Keywords
+**Vulnerability:** The hardcoded secret detection (`tyc::contains_secret_literal`) was missing checks for modern API tokens like `JWT`, `BEARER`, `CREDENTIAL`, and `PAT`.
+**Learning:** Hardcoded credentials are a critical security risk and identifying them requires an up-to-date list of high-risk keywords used by developers. Also, matching logic based on substring bounding means we don't need to add permutations if the base word is caught, but we must ensure the base keywords are present and ordered longest-first.
+**Prevention:** Periodically update the keyword lists (`is_secret_name` and `secret_suffix`) to include emerging credential patterns, ensuring they are ordered longest-first and synchronized across all parts of the scanning pipeline.

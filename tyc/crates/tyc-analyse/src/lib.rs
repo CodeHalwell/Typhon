@@ -3542,7 +3542,18 @@ fn is_secret_name(name: &str) -> bool {
     // `API_KEY` overlapping `KEY` — both fire, but the help text
     // remains the same so the order is purely defensive.
     const WORDS: &[&str] = &[
-        "PASSWORD", "SECRET", "TOKEN", "API_KEY", "APIKEY", "KEY", "PWD", "PASS",
+        "CREDENTIAL",
+        "PASSWORD",
+        "SECRET",
+        "BEARER",
+        "TOKEN",
+        "API_KEY",
+        "APIKEY",
+        "JWT",
+        "KEY",
+        "PAT",
+        "PWD",
+        "PASS",
     ];
     let upper = name.to_ascii_uppercase();
     for word in WORDS {
