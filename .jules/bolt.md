@@ -23,3 +23,6 @@
 ## 2024-03-24 - Zero-Allocation AST Traversal
 **Learning:** Using `HashSet<&str>` instead of `HashSet<String>` by capturing the lifetime of `Expr` nodes avoids significant allocation overhead in hot paths like `collect_names_in_expr`.
 **Action:** When writing Rust traversal logic over the AST, borrow identifiers as `&str` instead of collecting owned `String` instances wherever possible to reduce heap allocations.
+## 2024-08-11 - Avoid HashSet<String> for AST Identifiers in tyc-desugar
+**Learning:** Checking for subset matching against multiple AST node identifiers utilizing `HashSet<String>` creates constant temporary heap allocations within module-level name resolution (`module_level_bound_names`).
+**Action:** Always borrow AST node string slices into `HashSet<&str>` directly where practical (e.g. for short-lived tracking sets during type-checking pattern loops) to mitigate massive redundant allocations across deep compilation traces.
