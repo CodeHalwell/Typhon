@@ -1521,7 +1521,7 @@ fn secret_suffix(name: &str) -> Option<&'static str> {
     // Order matters: check the longest/most specific suffixes first so
     // `MY_PASSWORD` reports `PASSWORD` rather than the shorter `PASS`.
     let words = [
-        "PASSWORD", "SECRET", "TOKEN", "API_KEY", "APIKEY", "KEY", "PWD", "PASS",
+        "PASSPHRASE", "CREDENTIAL", "PASSWORD", "SECRET", "BEARER", "TOKEN", "API_KEY", "APIKEY", "KEY", "AUTH", "JWT", "PAT", "PWD", "PASS",
     ];
     for candidate in words {
         // We match if the substring is bounded by:
@@ -4802,6 +4802,8 @@ let pet: Animal = Dog(name=\"Rex\")
         assert_eq!(secret_suffix("FOO_API_KEY_BAR"), Some("API_KEY"));
         assert_eq!(secret_suffix("KEY_APIKEY"), Some("APIKEY"));
         assert_eq!(secret_suffix("APIKEY"), Some("APIKEY"));
+        assert_eq!(secret_suffix("GITHUB_PAT"), Some("PAT"));
+        assert_eq!(secret_suffix("BEARER_TOKEN"), Some("BEARER"));
     }
 
     #[test]
@@ -4811,6 +4813,8 @@ let pet: Animal = Dog(name=\"Rex\")
         assert_eq!(secret_suffix("USER"), None);
         assert_eq!(secret_suffix("MONKEY"), None);
         assert_eq!(secret_suffix("PASSPORT"), None);
+        assert_eq!(secret_suffix("PATIENT"), None);
+        assert_eq!(secret_suffix("AUTHOR"), None);
     }
 
     #[test]

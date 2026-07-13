@@ -12,3 +12,7 @@
 **Vulnerability:** A hardcoded secrets check (`contains_secret_literal`) failed to detect `APIKEY` as a secret, despite catching `API_KEY` and similar variations.
 **Learning:** Case-boundary heuristics and substring matching logic may miss fully capitalized squashed acronyms like `APIKEY` if they are not explicitly registered as standalone keywords, leading to potential false negatives for common secret variable names.
 **Prevention:** When updating or adding to the `tyc::contains_secret_literal` diagnostic (e.g., in `is_secret_name` or `secret_suffix`), explicitly register all common permutations of high-risk security keywords (like `APIKEY` and `API_KEY`), as boundary heuristics cannot be fully relied upon to catch all variations.
+## $(date +%Y-%m-%d) - Expand hardcoded secret keywords
+**Vulnerability:** The hardcoded secret scanner in `contains_secret_literal` missed several common credentials types (e.g., JWTs, Personal Access Tokens, Bearer tokens, Passphrases).
+**Learning:** Security token identifiers evolve over time (e.g., `PAT` and `JWT` are increasingly common). Relying solely on `PASSWORD` or `API_KEY` leaves gaps that can be exploited by users hardcoding other token variants.
+**Prevention:** Regularly review and update the list of tracked security-sensitive variable suffixes/prefixes to reflect modern development practices (e.g., adding `JWT`, `PAT`, `BEARER`, `CREDENTIAL`). Ensure overlapping terms adhere to a strict longest-match-first order to prevent partial match failures.

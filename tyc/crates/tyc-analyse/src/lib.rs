@@ -3542,7 +3542,7 @@ fn is_secret_name(name: &str) -> bool {
     // `API_KEY` overlapping `KEY` — both fire, but the help text
     // remains the same so the order is purely defensive.
     const WORDS: &[&str] = &[
-        "PASSWORD", "SECRET", "TOKEN", "API_KEY", "APIKEY", "KEY", "PWD", "PASS",
+        "PASSPHRASE", "CREDENTIAL", "PASSWORD", "SECRET", "BEARER", "TOKEN", "API_KEY", "APIKEY", "KEY", "AUTH", "JWT", "PAT", "PWD", "PASS",
     ];
     let upper = name.to_ascii_uppercase();
     for word in WORDS {
@@ -4765,6 +4765,7 @@ def use_np() -> object:
             "FOO_API_KEY_BAR = \"sk-foo\"\n",
             "KEY_APIKEY = \"sk-foo\"\n",
             "myTokenValue = \"sk-foo\"\n",
+            "GITHUB_PAT = \"sk-foo\"\n",
             "APIKEY = \"123\"\n",
         ];
         for src in srcs {
@@ -4790,7 +4791,7 @@ def use_np() -> object:
     #[test]
     fn secret_literal_silent_on_unrelated_string_name() {
         // A regular `let username = "x"` must stay silent.
-        let src = "username = \"alice\"\nMONKEY = \"chimp\"\n";
+        let src = "username = \"alice\"\nMONKEY = \"chimp\"\nPATIENT = \"sick\"\n";
         let module = parse(src);
         let diags = analyse_secret_literal_bindings(&module, "x.ty", src, false);
         assert!(
