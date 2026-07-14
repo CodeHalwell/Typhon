@@ -242,6 +242,10 @@ textarea:focus-visible,
   .sl-link-card:focus-within {
     transform: none;
   }
+  .sl-markdown-content a:not(:where(.not-content *)),
+  starlight-tabs .tab > [role="tab"] {
+    transition: none;
+  }
 }
 
 /* Accessibility: Ensure links in markdown content do not rely on color alone (WCAG 1.4.1) */
@@ -252,7 +256,8 @@ textarea:focus-visible,
   text-decoration-thickness: 1px;
   transition: text-decoration-color 150ms ease;
 }
-.sl-markdown-content a:hover:not(:where(.not-content *)) {
+.sl-markdown-content a:hover:not(:where(.not-content *)),
+.sl-markdown-content a:focus-visible:not(:where(.not-content *)) {
   text-decoration-color: var(--sl-color-accent);
 }
 
@@ -314,7 +319,8 @@ starlight-tabs .tab > [role="tab"] {
   transition: color 150ms ease, border-color 150ms ease;
 }
 
-starlight-tabs .tab > [role="tab"]:not([aria-selected="true"]):hover {
+starlight-tabs .tab > [role="tab"]:not([aria-selected="true"]):hover,
+starlight-tabs .tab > [role="tab"]:not([aria-selected="true"]):focus-visible {
   color: var(--sl-color-white);
   border-color: var(--sl-color-gray-4);
 }
