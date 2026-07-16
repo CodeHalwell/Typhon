@@ -12,3 +12,8 @@
 **Vulnerability:** A hardcoded secrets check (`contains_secret_literal`) failed to detect `APIKEY` as a secret, despite catching `API_KEY` and similar variations.
 **Learning:** Case-boundary heuristics and substring matching logic may miss fully capitalized squashed acronyms like `APIKEY` if they are not explicitly registered as standalone keywords, leading to potential false negatives for common secret variable names.
 **Prevention:** When updating or adding to the `tyc::contains_secret_literal` diagnostic (e.g., in `is_secret_name` or `secret_suffix`), explicitly register all common permutations of high-risk security keywords (like `APIKEY` and `API_KEY`), as boundary heuristics cannot be fully relied upon to catch all variations.
+
+## $(date +%Y-%m-%d) - Expand hardcoded secret detection keywords
+**Vulnerability:** The secret detection lists in `tyc-analyse` and `tyc build` lacked common keywords like `CREDENTIALS`, `AUTH_TOKEN`, and `PRIVATE_KEY`, resulting in false negatives for hardcoded credentials.
+**Learning:** Security heuristics for detecting hardcoded secrets must be regularly updated to cover common and emerging naming conventions for sensitive data beyond standard 'KEY' or 'PASSWORD' terminology.
+**Prevention:** Keep heuristic arrays synced across all toolchain paths (analysis and build) and ensure comprehensive permutations (like `AUTH`, `AUTH_TOKEN`, `CREDENTIALS`, `PRIVATE_KEY`) are added, preserving longest-first matching order to avoid premature token-boundary false negatives.
