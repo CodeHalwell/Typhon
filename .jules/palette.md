@@ -52,3 +52,7 @@
 ## 2026-06-25 - [Modern thin scrollbars for technical documentation]
 **Learning:** Default OS scrollbars (especially on Windows/Linux) are bulky and visually clash with custom, modern documentation themes. They are particularly detrimental when dealing with horizontally scrollable technical content, like `.expressive-code pre` blocks, as thick default scrollbars can overlap or reduce the visibility of code content.
 **Action:** Added global `scrollbar-width: thin` and `::-webkit-scrollbar` styling in `custom.css` with a matching theme color. Included a specific fix for `.expressive-code pre::-webkit-scrollbar-corner` to prevent unsightly corner boxes on code blocks with both horizontal and vertical overflow.
+
+## 2024-07-18 - Improve Keyboard Accessibility on Hover Elements
+**Learning:** Keyboard users navigating the Typhon docs site were missing out on the visual cues provided by `:hover` states on markdown inline links and Starlight tabs. Also, while `prefers-reduced-motion` was handled for card transforms, it didn't explicitly disable transitions on these newly updated interactive elements.
+**Action:** When adding or modifying hover effects on interactive elements in Astro/Starlight, explicitly pair them with `:focus-visible` or `:focus-within` to maintain parity for keyboard navigation. Always remember to add `transition: none` within the `@media (prefers-reduced-motion: reduce)` block to respect accessibility settings.
