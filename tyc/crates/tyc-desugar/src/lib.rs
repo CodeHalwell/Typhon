@@ -917,8 +917,8 @@ const ABC_PRELUDE_NAMES: &[&str] = &[
 
 /// Names bound at module level (imports, defs, classes, assignments) —
 /// anything here doesn't need an injected import.
-fn module_level_bound_names(body: &[Stmt]) -> HashSet<String> {
-    let mut bound: HashSet<String> = HashSet::new();
+fn module_level_bound_names<'a>(body: &'a [Stmt]) -> HashSet<&'a str> {
+    let mut bound: HashSet<&'a str> = HashSet::new();
     for stmt in body {
         match stmt {
             Stmt::Import(i) => {
@@ -926,10 +926,8 @@ fn module_level_bound_names(body: &[Stmt]) -> HashSet<String> {
                     let n = a
                         .asname
                         .as_ref()
-                        .map(|n| n.as_str().to_owned())
-                        .unwrap_or_else(|| {
-                            a.name.as_str().split('.').next().unwrap_or("").to_owned()
-                        });
+                        .map(|n| n.as_str())
+                        .unwrap_or_else(|| a.name.as_str().split('.').next().unwrap_or(""));
                     bound.insert(n);
                 }
             }
@@ -938,32 +936,32 @@ fn module_level_bound_names(body: &[Stmt]) -> HashSet<String> {
                     let n = a
                         .asname
                         .as_ref()
-                        .map(|n| n.as_str().to_owned())
-                        .unwrap_or_else(|| a.name.as_str().to_owned());
+                        .map(|n| n.as_str())
+                        .unwrap_or_else(|| a.name.as_str());
                     bound.insert(n);
                 }
             }
             Stmt::FunctionDef(f) => {
-                bound.insert(f.name.as_str().to_owned());
+                bound.insert(f.name.as_str());
             }
             Stmt::ClassDef(c) => {
-                bound.insert(c.name.as_str().to_owned());
+                bound.insert(c.name.as_str());
             }
             Stmt::Assign(a) => {
                 for t in &a.targets {
                     if let Expr::Name(n) = t {
-                        bound.insert(n.id.as_str().to_owned());
+                        bound.insert(n.id.as_str());
                     }
                 }
             }
             Stmt::AnnAssign(a) => {
                 if let Expr::Name(n) = a.target.as_ref() {
-                    bound.insert(n.id.as_str().to_owned());
+                    bound.insert(n.id.as_str());
                 }
             }
             Stmt::TypeAlias(ta) => {
                 if let Expr::Name(n) = ta.name.as_ref() {
-                    bound.insert(n.id.as_str().to_owned());
+                    bound.insert(n.id.as_str());
                 }
             }
             _ => {}
