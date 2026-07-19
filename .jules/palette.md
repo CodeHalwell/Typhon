@@ -52,3 +52,6 @@
 ## 2026-06-25 - [Modern thin scrollbars for technical documentation]
 **Learning:** Default OS scrollbars (especially on Windows/Linux) are bulky and visually clash with custom, modern documentation themes. They are particularly detrimental when dealing with horizontally scrollable technical content, like `.expressive-code pre` blocks, as thick default scrollbars can overlap or reduce the visibility of code content.
 **Action:** Added global `scrollbar-width: thin` and `::-webkit-scrollbar` styling in `custom.css` with a matching theme color. Included a specific fix for `.expressive-code pre::-webkit-scrollbar-corner` to prevent unsightly corner boxes on code blocks with both horizontal and vertical overflow.
+## 2025-02-12 - Added focus-visible state to starlight tabs and markdown links
+**Learning:** When using Playwright to visually verify `:focus-within` or `:focus-visible` styles, explicitly trigger the focus state via `locator.evaluate('node => node.focus()')`. Avoid passing `'element.focus()'` directly to evaluate without defining the parameter context, as it causes ReferenceErrors.
+**Action:** Always use the `node => node.focus()` syntax when calling `evaluate()` on a Playwright locator to focus it during visual verification tests.
