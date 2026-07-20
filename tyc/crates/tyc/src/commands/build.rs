@@ -1518,25 +1518,10 @@ fn display_relative(path: &std::path::Path, project_root: &std::path::Path) -> S
 /// Used by the secret-comptime lint.
 fn secret_suffix(name: &str) -> Option<&'static str> {
     let upper = name.to_ascii_uppercase();
-    // Order matters: check the longest/most specific suffixes first so
-    // `MY_PASSWORD` reports `PASSWORD` rather than the shorter `PASS`.
-    let words = [
-        "API_PASSWORD",
-        "APIPASSWORD",
-        "API_SECRET",
-        "APISECRET",
-        "API_TOKEN",
-        "APITOKEN",
-        "PASSWORD",
-        "SECRET",
-        "TOKEN",
-        "API_KEY",
-        "APIKEY",
-        "KEY",
-        "PWD",
-        "PASS",
-    ];
-    for candidate in words {
+    // Keyword table shared with the `tyc::contains_secret_literal` lint —
+    // see `tyc_analyse::SECRET_NAME_KEYWORDS` for the longest-first
+    // ordering invariant both consumers rely on.
+    for &candidate in tyc_analyse::SECRET_NAME_KEYWORDS {
         // We match if the substring is bounded by:
         // - start/end of string
         // - underscore (`_`)

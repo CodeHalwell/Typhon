@@ -3531,6 +3531,33 @@ fn is_string_literal(expr: &Expr) -> bool {
     matches!(expr, Expr::StringLiteral(_))
 }
 
+/// Secret-shaped name keywords, longest / most-specific first.
+///
+/// The single source of truth shared by the `tyc::contains_secret_literal`
+/// lint in this crate ([`is_secret_name`]) and the `tyc build` secret-suffix
+/// scan (`secret_suffix` in the CLI crate), so the two heuristics cannot
+/// drift apart — exactly the class of bug fixed in v1.0.0-alpha.4, where an
+/// ordering discrepancy between the two copies made `KEY_APIKEY` report the
+/// less-specific suffix. Invariant: any keyword that contains another
+/// keyword as a substring (`APITOKEN` ⊃ `TOKEN`, `API_KEY` ⊃ `KEY`) must
+/// come first, so first-match reporting picks the most specific word.
+pub const SECRET_NAME_KEYWORDS: &[&str] = &[
+    "API_PASSWORD",
+    "APIPASSWORD",
+    "API_SECRET",
+    "APISECRET",
+    "API_TOKEN",
+    "APITOKEN",
+    "PASSWORD",
+    "SECRET",
+    "TOKEN",
+    "API_KEY",
+    "APIKEY",
+    "KEY",
+    "PWD",
+    "PASS",
+];
+
 /// True when `name` ends with one of the recognised secret-shaped
 /// suffixes. Match is case-insensitive on the suffix; the suffix may
 /// either form the whole name (e.g. `TOKEN`) or follow an underscore
@@ -3538,27 +3565,8 @@ fn is_string_literal(expr: &Expr) -> bool {
 /// names; passing a function or method name through is harmless because
 /// the caller already gated on `Stmt::Assign` / `Stmt::AnnAssign`.
 fn is_secret_name(name: &str) -> bool {
-    // Recognised secret words. Longest-first matters because of
-    // `API_KEY` overlapping `KEY` — both fire, but the help text
-    // remains the same so the order is purely defensive.
-    const WORDS: &[&str] = &[
-        "API_PASSWORD",
-        "APIPASSWORD",
-        "API_SECRET",
-        "APISECRET",
-        "API_TOKEN",
-        "APITOKEN",
-        "PASSWORD",
-        "SECRET",
-        "TOKEN",
-        "API_KEY",
-        "APIKEY",
-        "KEY",
-        "PWD",
-        "PASS",
-    ];
     let upper = name.to_ascii_uppercase();
-    for word in WORDS {
+    for word in SECRET_NAME_KEYWORDS {
         let mut start_idx = 0;
         while let Some(idx) = upper[start_idx..].find(word) {
             let actual_idx = start_idx + idx;
