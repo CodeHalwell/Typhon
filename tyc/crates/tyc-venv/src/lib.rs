@@ -1363,7 +1363,11 @@ pub fn allowed_top_level_from_project(project_root: &Path) -> HashSet<String> {
     let Ok(text) = std::fs::read_to_string(project_root.join("typhon.toml")) else {
         return out;
     };
-    let Ok(value) = text.parse::<toml::Value>() else {
+    // `toml::from_str` (the serde path) parses a whole document; with the
+    // toml 1.x crate, `str::parse::<toml::Value>()` parses a single TOML
+    // *value* instead and rejects a document, which silently emptied this
+    // allow-list.
+    let Ok(value) = toml::from_str::<toml::Value>(&text) else {
         return out;
     };
     let mut declared_normalised: HashSet<String> = HashSet::new();
