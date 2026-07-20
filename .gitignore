@@ -19,3 +19,7 @@ stress/round-*/build/
 # Generated stress-test project dirs (contain a heavy .venv)
 stress/**/third-party/proj/
 stress/round-2026-06-21/proj/
+
+# AI-agent scratch notes live only in lowercase .jules/ — the capitalised
+# twin breaks checkout on case-insensitive filesystems (macOS, Windows).
+.Jules/
