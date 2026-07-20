@@ -3542,7 +3542,20 @@ fn is_secret_name(name: &str) -> bool {
     // `API_KEY` overlapping `KEY` — both fire, but the help text
     // remains the same so the order is purely defensive.
     const WORDS: &[&str] = &[
-        "PASSWORD", "SECRET", "TOKEN", "API_KEY", "APIKEY", "KEY", "PWD", "PASS",
+        "ACCESSTOKEN",
+        "SESSIONTOKEN",
+        "PRIVATEKEY",
+        "AUTHTOKEN",
+        "SECRETKEY",
+        "APITOKEN",
+        "PASSWORD",
+        "SECRET",
+        "TOKEN",
+        "API_KEY",
+        "APIKEY",
+        "KEY",
+        "PWD",
+        "PASS",
     ];
     let upper = name.to_ascii_uppercase();
     for word in WORDS {
@@ -4766,6 +4779,12 @@ def use_np() -> object:
             "KEY_APIKEY = \"sk-foo\"\n",
             "myTokenValue = \"sk-foo\"\n",
             "APIKEY = \"123\"\n",
+            "APITOKEN = \"123\"\n",
+            "AUTHTOKEN = \"123\"\n",
+            "ACCESSTOKEN = \"123\"\n",
+            "PRIVATEKEY = \"123\"\n",
+            "SESSIONTOKEN = \"123\"\n",
+            "SECRETKEY = \"123\"\n",
         ];
         for src in srcs {
             let module = parse(src);
