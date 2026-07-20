@@ -38,7 +38,7 @@ The canonical sources are:
 - **`examples/apps/01..15-*/`** — 15 production-shaped multi-file projects (event-sourced banking, distributed KV, mini-compiler, search engine, GraphQL server, game ECS, trading engine, ML orchestrator, web crawler, task scheduler, real-time game server, static site generator, vector DB, API gateway, stream processor).
 - The full example corpus is **256 `.ty` files** (exercises + apps + `examples/testing/`); the v0.12.0 third-party-introspection work was verified against it with zero false positives.
 - **`tyc/vendor/README.md`** — Ruff fork rationale.
-- **`editors/vscode/README.md`** — reference VS Code extension (v0.2.1).
+- **`editors/vscode/README.md`** — reference VS Code extension (v0.2.3).
 - **`docs-site/`** — the published Astro + Starlight documentation site (`src/content/docs/*.mdx`); self-contained, not generated from `docs/`. Deployed to GitHub Pages.
 
 This skill ships sibling files for the long-tail detail:
@@ -1550,7 +1550,7 @@ Consumers:
 
 ## 19. Diagnostics catalog (top tier)
 
-The recurring diagnostic codes and what they actually mean. **See [DIAGNOSTICS.md](DIAGNOSTICS.md) for the exhaustive 83-code reference** — what follows is the daily-driver subset.
+The recurring diagnostic codes and what they actually mean. **See [DIAGNOSTICS.md](DIAGNOSTICS.md) for the exhaustive 87-code reference** — what follows is the daily-driver subset.
 
 | Code | Meaning | Fix |
 |---|---|---|

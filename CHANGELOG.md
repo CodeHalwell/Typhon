@@ -6,6 +6,37 @@ canonical phase-by-phase status lives in `docs/roadmap.md`.
 
 ## Unreleased
 
+- **Secret-name detection: six more high-risk keywords.** `API_TOKEN`,
+  `APITOKEN`, `API_SECRET`, `APISECRET`, `API_PASSWORD`, and `APIPASSWORD`
+  are explicitly registered in the `tyc::contains_secret_literal` keyword
+  table (`tyc-analyse`) and the `tyc build` secret-suffix scan — placed
+  ahead of their shorter substrings so alpha.4's longest-first matching is
+  preserved. Squashed acronyms like `APITOKEN = "…"` no longer evade the
+  case-boundary heuristics.
+- **toml 1.x compatibility: venv-introspection allow-list.** The
+  `[dependencies]` / `[dev-dependencies]` allow-list reader in `tyc-venv`
+  now parses `typhon.toml` through the serde document path
+  (`toml::from_str`). With the toml 1.x crate, `str::parse::<toml::Value>()`
+  parses a single TOML *value* rather than a document, which silently
+  emptied the allow-list — caught by the crate's regression test during the
+  0.8 → 1.1 dependency bump, before any release shipped with it.
+- **Release workflow: artifact download re-pinned to the v4 line** (matching
+  `upload-artifact@v4.6.2`) — a Dependabot bump had moved only the download
+  half to v8, leaving the release pipeline on an unverified cross-major
+  artifact pairing. Both halves should be bumped together, with a
+  pre-release dry-run tag, in a deliberate follow-up.
+- **Docs-site accessibility polish** (keyboard focus states,
+  reduced-motion support) and a desugar-path allocation reduction
+  (`module_level_bound_names` borrows instead of allocating owned strings).
+- **Repo hygiene:** the case-colliding `.Jules/` directory (which broke
+  fresh checkouts on case-insensitive filesystems — macOS and Windows) is
+  merged into `.jules/`; `docs/diagnostics/README.md` now indexes all 87
+  diagnostic pages (20 were missing, including the nine alpha.5 advice
+  lints); the bundled skill's `DIAGNOSTICS.md` gains the four v0.13.0
+  footgun lints it omitted (`mutable_default_param`, `is_literal_comparison`,
+  `incompatible_override`, `loop_closure_capture`) and its stale
+  "current release" strings are refreshed to alpha.5.
+
 ## 1.0.0-alpha.5 — 2026-07-09 — VM performance Tier 1, `[optimise]` profile, perf-advice lints & free-threading wave
 
 A performance-focused release on top of alpha.4, landing the first tier of

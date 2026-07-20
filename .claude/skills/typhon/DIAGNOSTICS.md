@@ -513,6 +513,18 @@ compared, so external / non-dataclass bases are unaffected.
 
 **Fix:** Make both classes `frozen`, or both non-`frozen`.
 
+### `tyc::incompatible_override` — warning (v0.13.0)
+
+A subclass method overrides a base-class method with an incompatible signature
+— a different parameter count, a parameter type *narrower* than the base's, or
+a return type not assignable to the base's. Code holding the base type can call
+the method with the base signature and dispatch into the override at runtime
+(the Liskov violation mypy / pyright flag). Widening a parameter or narrowing a
+return is fine and does not fire (fixed for LSP-valid overrides in v0.13.0).
+
+**Fix:** Match the base signature (parameters may widen, returns may narrow),
+or rename the method.
+
 ---
 
 ## 5. Call-site argument checking
@@ -740,6 +752,39 @@ rejected at check time. Stdlib / third-party context managers and
 
 **Fix:** Add the protocol methods to the class, or use a `@contextmanager`
 factory.
+
+### `tyc::mutable_default_param` — warning (v0.13.0)
+
+A function parameter's default value is a mutable literal or constructor call
+(`= []`, `= {}`, `= set()`, `= dict()`, or a comprehension). Python evaluates
+the default **once, at `def` time** — every call that omits the argument shares
+(and mutates) the same object. Class fields get the `default_factory` rewrite
+automatically; parameters warn instead, because rewriting them would change the
+signature visible to runtime introspection.
+
+**Fix:** Use `xs: list[int]? = None` and materialise inside the body
+(`if xs is None: ...`), or pass the argument explicitly.
+
+### `tyc::is_literal_comparison` — warning (v0.13.0)
+
+An `is` / `is not` comparison has a string, number, bytes, or f-string literal
+on either side (`s is "hello"`, `n is not 5`). `is` compares object *identity*,
+not value — whether two equal literals are the same object is an interpreter
+caching detail (small-int cache, string interning), so the result is arbitrary.
+CPython itself emits a `SyntaxWarning` for this shape.
+
+**Fix:** Use `==` / `!=` for value comparison; reserve `is` for `None` and
+sentinel objects.
+
+### `tyc::loop_closure_capture` — warning (v0.13.0)
+
+A closure (lambda or nested `def`) created inside a `for` loop references the
+loop variable. Python closures capture *variables*, not values — after the loop
+ends, every closure observes the final iteration's value
+(`[lambda: i for i in range(3)]` → all return `2`).
+
+**Fix:** Bind the current value per closure with a default
+(`lambda i=i: ...`), or build values eagerly instead of deferring.
 
 ---
 
