@@ -189,25 +189,25 @@ pub fn shared_mut_across_tasks_diagnostics(
 /// `else`, `try` / `except` / `finally`, `for` / `while`, `with`, `match`).
 /// Function and class bodies are **not** descended into — a `mut` local there is
 /// frame state, not module state. Mirrors [`collect_globals`]'s scope rule.
-fn module_level_mut_names(body: &[Stmt]) -> HashSet<String> {
+fn module_level_mut_names(body: &[Stmt]) -> HashSet<&str> {
     let mut out = HashSet::new();
     collect_module_mut_names(body, &mut out);
     out
 }
 
-fn collect_module_mut_names(body: &[Stmt], out: &mut HashSet<String>) {
+fn collect_module_mut_names<'a>(body: &'a [Stmt], out: &mut HashSet<&'a str>) {
     for stmt in body {
         match stmt {
             Stmt::Assign(a) if a.mutability == Some(Mutability::Mut) => {
                 for t in &a.targets {
                     if let Expr::Name(n) = t {
-                        out.insert(n.id.to_string());
+                        out.insert(n.id.as_str());
                     }
                 }
             }
             Stmt::AnnAssign(a) if a.mutability == Some(Mutability::Mut) => {
                 if let Expr::Name(n) = a.target.as_ref() {
-                    out.insert(n.id.to_string());
+                    out.insert(n.id.as_str());
                 }
             }
             // Module-level control flow still runs in module scope — descend.
@@ -306,8 +306,8 @@ fn is_spawn_call(call: &ExprCall) -> bool {
 /// True when the function body writes module-level mutable state: an
 /// assignment / augmented-assignment to a name declared `global` in the body,
 /// or to a module-level `mut` binding.
-fn fn_writes_shared_state(body: &[Stmt], module_muts: &HashSet<String>) -> bool {
-    let mut globals: HashSet<String> = HashSet::new();
+fn fn_writes_shared_state<'a>(body: &'a [Stmt], module_muts: &HashSet<&'a str>) -> bool {
+    let mut globals: HashSet<&'a str> = HashSet::new();
     collect_globals(body, &mut globals);
     body_writes(body, &globals, module_muts)
 }
@@ -315,12 +315,12 @@ fn fn_writes_shared_state(body: &[Stmt], module_muts: &HashSet<String>) -> bool 
 /// Collect every name declared `global` anywhere in the body (recursing into
 /// nested blocks, but not into nested `def` / `class`, which have their own
 /// global scope).
-fn collect_globals(body: &[Stmt], out: &mut HashSet<String>) {
+fn collect_globals<'a>(body: &'a [Stmt], out: &mut HashSet<&'a str>) {
     for stmt in body {
         match stmt {
             Stmt::Global(g) => {
                 for n in &g.names {
-                    out.insert(n.to_string());
+                    out.insert(n.as_str());
                 }
             }
             Stmt::If(s) => {
@@ -360,7 +360,7 @@ fn collect_globals(body: &[Stmt], out: &mut HashSet<String>) {
 /// True when any assignment / augmented-assignment in `body` targets a name in
 /// `globals` or `module_muts`. Recurses into nested blocks but not into nested
 /// `def` / `class` (their writes belong to a different frame).
-fn body_writes(body: &[Stmt], globals: &HashSet<String>, module_muts: &HashSet<String>) -> bool {
+fn body_writes(body: &[Stmt], globals: &HashSet<&str>, module_muts: &HashSet<&str>) -> bool {
     let hits = |name: &str| globals.contains(name) || module_muts.contains(name);
     for stmt in body {
         match stmt {
