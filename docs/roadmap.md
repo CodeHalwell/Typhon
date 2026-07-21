@@ -10,6 +10,22 @@ Realistic milestones for one person plus AI assistance. The headline target is a
 
 ## Current release
 
+**[v1.0.0-alpha.6](https://github.com/CodeHalwell/Typhon/releases/tag/v1.0.0-alpha.6) — 2026-07-21.**
+A maintenance release on top of alpha.5, driven by the
+[2026-07-20 release-readiness review](release-readiness-2026-07-20.md). The
+July dependency wave is carried safely across the `toml` 0.8 → 1.x major —
+including the fix for the one regression that bump introduced (the
+`tyc-venv` dependency allow-list reader silently returning empty, which
+would have no-opped third-party arg/type checking) — six squashed-acronym
+keywords join the now-shared `tyc::contains_secret_literal` table
+(`API_TOKEN`, `APITOKEN`, `API_SECRET`, `APISECRET`, `API_PASSWORD`,
+`APIPASSWORD`; warn-level only), the release pipeline's artifact download is
+re-pinned to the proven v4 line to match the v4 upload, and a round of
+docs-site accessibility, diagnostics-index, and repo-hygiene fixes lands
+(including the `.Jules`/`.jules` case-collision that broke fresh checkouts
+on macOS/Windows). No new syntax; no previously-*correct* program changes
+behaviour.
+
 **[v1.0.0-alpha.5](https://github.com/CodeHalwell/Typhon/releases/tag/v1.0.0-alpha.5) — 2026-07-09.**
 A performance-focused release on top of alpha.4. VM performance Tier 1
 (`tyc run`) — a two-representation `VmInt`, a per-class resolved-method

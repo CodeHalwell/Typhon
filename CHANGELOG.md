@@ -4,7 +4,17 @@ All notable changes to Typhon are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely; the
 canonical phase-by-phase status lives in `docs/roadmap.md`.
 
-## Unreleased
+## 1.0.0-alpha.6 — 2026-07-21 — maintenance: dependency wave, secret-lint keywords & release-pipeline hygiene
+
+A maintenance release on top of alpha.5, driven by the
+[2026-07-20 release-readiness review](docs/release-readiness-2026-07-20.md):
+it carries the July Dependabot wave safely across the `toml` 0.8 → 1.x
+major (fixing the one regression that bump introduced before it could
+ship), widens the secret-name lint's keyword table, and lands a round of
+release-pipeline, docs, and repo hygiene. **No new syntax, and no
+previously-*correct* program changes behaviour** — the only
+diagnostic-surface change is warn-level (`tyc::contains_secret_literal`
+fires on six more secret-shaped name patterns).
 
 - **Secret-name detection: six more high-risk keywords.** `API_TOKEN`,
   `APITOKEN`, `API_SECRET`, `APISECRET`, `API_PASSWORD`, and `APIPASSWORD`
@@ -12,7 +22,10 @@ canonical phase-by-phase status lives in `docs/roadmap.md`.
   table (`tyc-analyse`) and the `tyc build` secret-suffix scan — placed
   ahead of their shorter substrings so alpha.4's longest-first matching is
   preserved. Squashed acronyms like `APITOKEN = "…"` no longer evade the
-  case-boundary heuristics.
+  case-boundary heuristics. The two consumers now share a single
+  `tyc_analyse::SECRET_NAME_KEYWORDS` table (doc-commented with the
+  longest-first invariant), closing off the copy drift that has bitten
+  twice before.
 - **toml 1.x compatibility: venv-introspection allow-list.** The
   `[dependencies]` / `[dev-dependencies]` allow-list reader in `tyc-venv`
   now parses `typhon.toml` through the serde document path
@@ -20,6 +33,11 @@ canonical phase-by-phase status lives in `docs/roadmap.md`.
   parses a single TOML *value* rather than a document, which silently
   emptied the allow-list — caught by the crate's regression test during the
   0.8 → 1.1 dependency bump, before any release shipped with it.
+- **Dependency refresh.** `toml` 0.8.23 → 1.1.3 (major), `bitflags`
+  2.11.1 → 2.13.0, `memchr` 2.8.2 → 2.8.3, `bstr` 1.12.1 → 1.13.0; the
+  SHA-pinned GitHub Actions move to their current majors (`checkout` /
+  `setup-node` v7, `upload-pages-artifact` / `deploy-pages` v5) — every
+  bumped pin verified against its upstream tag during the review.
 - **Release workflow: artifact download re-pinned to the v4 line** (matching
   `upload-artifact@v4.6.2`) — a Dependabot bump had moved only the download
   half to v8, leaving the release pipeline on an unverified cross-major
