@@ -4,9 +4,14 @@ This directory holds the design and reference docs for **Typhon**, a statically-
 
 ## Start here
 
-- **[Long-term plan](long-term-plan.md)** — the harmonised implementation plan. Single canonical source for goals, architecture, language design, roadmap, and risks. Read this first.
-- **[Zero to Hero](zero-to-hero/README.md)** — a ten-lesson path from install to a capstone program. Start here if you want a fast, end-to-end tour before diving into the focused guides.
-- **[Programming guides](guides/README.md)** — progressive walk through the language, from hello-world to advanced features. Start here if you want to *write* Typhon code, not just understand its design.
+**Want to *learn the language*?** Start with the teaching material, not the design docs:
+
+- **[Zero to Hero](zero-to-hero/README.md)** — a ten-lesson path from install to a capstone program. The fastest end-to-end tour.
+- **[Programming guides](guides/README.md)** — a progressive, feature-by-feature walk through the language, with the emitted Python shown side-by-side.
+- **[The eight rules](language.md#the-eight-rules-every-typhon-program-follows)** — the short list of what makes Typhon stricter than Python. If you read nothing else, read this.
+- **[Cheat sheet](cheatsheet.md)** — the 30-second syntax refresher (also `tyc cheatsheet`).
+
+**Want to understand the *design*?** Read the **[long-term plan](long-term-plan.md)** — the single canonical source for goals, architecture, language design, roadmap, and risks.
 
 ## Focused references
 
@@ -29,4 +34,4 @@ The sub-docs below are extracted from the long-term plan for easier navigation. 
 
 ## Status
 
-**Phases 0–3 are substantially complete.** See [roadmap.md](roadmap.md) for the full feature list and the project [README](../README.md) for build instructions.
+**Current release: [v1.0.0-alpha.6](https://github.com/CodeHalwell/Typhon/releases/tag/v1.0.0-alpha.6).** Typhon reached its first *feature-complete* alpha in [v1.0.0-alpha](https://github.com/CodeHalwell/Typhon/releases/tag/v1.0.0-alpha); the production path (`tyc build` → CPython 3.13+) is stable, and the language is additive on *correct* programs across the whole v0.3.0 → v1.0.0-alpha line. As an alpha, the surface syntax is not yet frozen. See [roadmap.md](roadmap.md) for the per-feature status, [../CHANGELOG.md](../CHANGELOG.md) for the release-by-release history, and the project [README](../README.md) for build instructions.
