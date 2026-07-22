@@ -27,3 +27,8 @@
 **Vulnerability:** Hardcoded secret detection was missing `APIKEY` due to partial overlap with `KEY` because `KEY` was evaluated before `APIKEY`.
 **Learning:** When scanning for secrets using keyword arrays, substrings (like `KEY`) must be placed after longer matches (like `APIKEY` or `API_KEY`) to prevent premature partial matches.
 **Prevention:** Always maintain hardcoded secret matching keywords in longest-first order.
+
+## $(date +%Y-%m-%d) - Fix secret scanning heuristic false negative on TitleCase boundaries
+**Vulnerability:** The hardcoded secret scanning logic (`contains_secret_literal`) failed to identify secrets in TitleCase situations (e.g. `dbPASSWORDString`), where the secret ended with an uppercase letter and was immediately followed by another uppercase letter that formed the start of a TitleCase word.
+**Learning:** The previous boundary logic incorrectly assumed that if the next character was uppercase, the last character of the secret MUST be lowercase for it to be a boundary (`!name[actual_end - 1].is_upper()`). However, secret keywords themselves are fully uppercase, meaning the last character is always uppercase. For a word like `dbPASSWORDString`, `PASSWORD` ends in an uppercase `D`, and `String` starts with an uppercase `S`, followed by a lowercase `t`. We must specifically handle this by checking if the character *after* the next character is lowercase.
+**Prevention:** When modifying token or string matching heuristics for secret detection (`is_secret_name` and `secret_suffix`), ensure boundary logic correctly handles TitleCase and camelCase junctions by robustly checking the capitalization of surrounding characters (e.g. `is_upper() && next.is_upper() && next_next.is_lower()`).
