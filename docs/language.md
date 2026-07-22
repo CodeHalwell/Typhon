@@ -13,7 +13,7 @@ internalise only this section, you can already read and write most Typhon:
 1. **Every parameter and return type is annotated.** There is no implicit-`Any` fallback; a sync function that returns nothing still needs `-> None`.
 2. **Local bindings declare `let` or `mut`.** `let` is immutable, `mut` is rebindable. Module-level assignments default to `let`; inside a function the keyword is mandatory.
 3. **`T` cannot hold `None`.** Use `T?` (sugar for `T | None`) when a value is optional, and narrow it (`is None`, `guard`, early return, `match`) before use.
-4. **Methods live in `impl` blocks, not in `class`.** Write `impl Foo:` with explicit `self`; the constructor is generated, so a hand-written `__init__` is rejected.
+4. **Methods live in `impl` blocks, not in `class`.** Write `impl Foo:` with explicit `self`. For an ordinary `class` / `model`, the constructor is generated and a hand-written `__init__` is rejected; the raw-class escape hatches (`class!` and `plain class`) deliberately keep your own `__init__`.
 5. **`Any` only enters through `unsafe:` or `.dty` stubs.** Re-assert a concrete type at the boundary; for a one-off value, `EXPR as! TYPE` is the sound one-liner.
 6. **`match` on a sealed union must be exhaustive.** Add a variant and every `match` site errors until you handle it — no silent fall-through.
 7. **Errors flow as `Result[T, E]`, not exceptions.** `Ok`/`Err` and the `?` operator make failure visible in signatures; bridge to exceptions only at library boundaries.
