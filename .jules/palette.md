@@ -60,3 +60,6 @@
 ## 2024-05-16 - Equitable Focus States and Reduced Motion
 **Learning:** We need to pair existing `:hover` states with `:focus-visible` to ensure equitable visual feedback for keyboard users on interactive elements (like markdown links and starlight tabs). Additionally, when respecting `@media (prefers-reduced-motion: reduce)`, we must explicitly disable all associated CSS transitions using `transition: none;` on the affected elements.
 **Action:** Pair `:hover` with `:focus-visible` on interactive elements, and explicitly disable transitions under `@media (prefers-reduced-motion: reduce)` rules for any components with CSS transitions.
+## 2026-06-27 - [Tactile click feedback for interactive cards]
+**Learning:** Adding a subtle, tactile click feedback to interactive card components makes the UI feel more grounded and responsive. When cards only have hover/focus states, clicking them feels floaty and unresponsive.
+**Action:** Added an `:active` pseudo-class to `.card` and `.sl-link-card` elements in `custom.css` that resets their vertical translation to `transform: translateY(0)` and reduces the spread of their `box-shadow`, successfully simulating a physical button press.

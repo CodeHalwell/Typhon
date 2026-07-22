@@ -90,6 +90,13 @@
   box-shadow: 0 4px 12px color-mix(in srgb, var(--sl-color-accent) 20%, transparent);
 }
 
+/* UX: Provide tactile click feedback on interactive cards */
+.card:active,
+.sl-link-card:active {
+  transform: translateY(0);
+  box-shadow: 0 2px 4px color-mix(in srgb, var(--sl-color-accent) 15%, transparent);
+}
+
 .card h3 {
   font-size: 1rem;
   margin-top: 0;
