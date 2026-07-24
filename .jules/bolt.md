@@ -26,3 +26,6 @@
 ## 2024-11-25 - Zero-Allocation `module_level_bound_names`
 **Learning:** `module_level_bound_names` in `tyc-desugar` originally created a new `HashSet<String>` by cloning string identifiers inside AST nodes. As this is used to verify `collections.abc` types inside hot paths, the repeated allocation of strings negatively impacted compilation times.
 **Action:** By bounding the lifetime of the `HashSet<&str>` to the incoming `&[Stmt]` reference, we can avoid String allocations entirely when building the `bound_names` set and rely on dereferencing pointers for fast lookups.
+## 2024-07-24 - HashSet memory allocation optimization during AST traversal
+**Learning:** During static analysis, traversing ASTs with recursive walkers and capturing node identifiers frequently as owned Strings (using `HashSet<String>`) creates unnecessary heap allocations and can significantly bottleneck performance.
+**Action:** When performing static analysis and building collections of strings (like lists of mutated variables or variable scopes) across AST nodes, always prefer tying the collection's lifetime to the AST slice itself (e.g. `HashSet<&'a str>`) and borrowing with `n.id.as_str()` over cloning or heap-allocating `.to_string()`.
