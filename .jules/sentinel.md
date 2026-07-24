@@ -27,3 +27,7 @@
 **Vulnerability:** Hardcoded secret detection was missing `APIKEY` due to partial overlap with `KEY` because `KEY` was evaluated before `APIKEY`.
 **Learning:** When scanning for secrets using keyword arrays, substrings (like `KEY`) must be placed after longer matches (like `APIKEY` or `API_KEY`) to prevent premature partial matches.
 **Prevention:** Always maintain hardcoded secret matching keywords in longest-first order.
+## $(date +%Y-%m-%d) - Improve camelCase boundary detection for secret keywords
+**Vulnerability:** A hardcoded secrets check (`contains_secret_literal`) failed to detect uppercase secrets embedded within camelCase or TitleCase names, like `dbPASSWORDString`. The boundary heuristic required an explicit delimiter (like `_`) or a direct end-of-string.
+**Learning:** Checking for end-of-word boundaries in camelCase/PascalCase structures requires looking ahead to verify if an uppercase letter is followed by a lowercase letter (e.g. the "S" in `String` following the "D" in `PASSWORD`). Simple lower-to-upper boundary checks (`myTokenValue`) handle the start of the secret keyword, but complex upper-to-upper-then-lower transitions are needed to correctly capture the end boundary.
+**Prevention:** When modifying token or string matching heuristics (e.g., `is_secret_name` and `secret_suffix`), ensure boundary logic correctly handles TitleCase and camelCase junctions (such as `dbPASSWORDString`) by verifying the capitalization of surrounding characters to prevent false negatives.

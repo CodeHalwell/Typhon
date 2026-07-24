@@ -1546,7 +1546,10 @@ fn secret_suffix(name: &str) -> Option<&'static str> {
             let end_ok = actual_end == upper.len()
                 || upper.as_bytes()[actual_end] == b'_'
                 || (name.as_bytes()[actual_end].is_ascii_uppercase()
-                    && !name.as_bytes()[actual_end - 1].is_ascii_uppercase());
+                    && !name.as_bytes()[actual_end - 1].is_ascii_uppercase())
+                || (name.as_bytes()[actual_end].is_ascii_uppercase()
+                    && actual_end + 1 < name.len()
+                    && name.as_bytes()[actual_end + 1].is_ascii_lowercase());
 
             if start_ok && end_ok {
                 return Some(candidate);
@@ -4803,6 +4806,7 @@ let pet: Animal = Dog(name=\"Rex\")
         assert_eq!(secret_suffix("APITOKEN"), Some("APITOKEN"));
         assert_eq!(secret_suffix("APISECRET"), Some("APISECRET"));
         assert_eq!(secret_suffix("API_TOKEN"), Some("API_TOKEN"));
+        assert_eq!(secret_suffix("dbPASSWORDString"), Some("PASSWORD"));
     }
 
     #[test]
