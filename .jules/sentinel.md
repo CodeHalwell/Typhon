@@ -27,3 +27,8 @@
 **Vulnerability:** Hardcoded secret detection was missing `APIKEY` due to partial overlap with `KEY` because `KEY` was evaluated before `APIKEY`.
 **Learning:** When scanning for secrets using keyword arrays, substrings (like `KEY`) must be placed after longer matches (like `APIKEY` or `API_KEY`) to prevent premature partial matches.
 **Prevention:** Always maintain hardcoded secret matching keywords in longest-first order.
+
+## $(date +%Y-%m-%d) - Improve secret detection bounding logic for numbers and casing
+**Vulnerability:** The secret detection logic (`secret_suffix` and `is_secret_name`) previously missed secrets embedded between digits (like `123PASSWORD` or `myPASSWORD123`), leading to false negatives in security scanning.
+**Learning:** Hardcoded secret checks rely heavily on accurate word boundary detection. Missing specific cases like digit-to-letter transitions (or vice versa) can create gaps that allow sensitive keys to be committed silently.
+**Prevention:** When modifying token or string matching heuristics (e.g., `is_secret_name` and `secret_suffix`), ensure boundary logic correctly handles TitleCase/camelCase junctions (such as `dbPASSWORDString`) and numeric boundaries (such as `myPASSWORD123` or `123PASSWORD`) by verifying the capitalization and digit status of surrounding characters to prevent false negatives.
