@@ -49,6 +49,7 @@ code uses 3.13+ syntax.
 | `decorators_misc.ty` | `@memo`, `@pure`, `functools.cache`, frozen-class equality and hashing, per-instance `default_factory` |
 | `interfaces_extend.ty` | structural interface conformance, `impl` distributed over a sealed union, `extend str:` / `extend list:` |
 | `vm_asbang_cast.ty` | `as!` in value, comprehension and union positions, and its runtime `TypeError` on a wrong shape |
+| `inline_question_op.ty` | `?` away from statement-tail — nested in a call argument, mid-expression, in a condition, twice in one expression |
 
 ## Adding a case
 

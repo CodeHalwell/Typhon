@@ -65,10 +65,12 @@ pub fn run_source(
     // = MODULE` to a plain `import MODULE as ALIAS`, which is the right
     // shape for an in-process VM (no point deferring an import that's
     // about to be evaluated eagerly anyway).
-    let expanded = preprocess::expand_question_ops(&preprocess::expand_pipes(
-        &preprocess::expand_with_chains(&preprocess::expand_go_calls(
-            &preprocess::expand_gather_blocks(&preprocess::expand_multiline_guards(
-                &preprocess::expand_typed_let_unpack(&preprocess::expand_lazy_lets(source)),
+    let expanded = preprocess::expand_question_ops(&preprocess::expand_inline_question_ops(
+        &preprocess::expand_pipes(&preprocess::expand_with_chains(
+            &preprocess::expand_go_calls(&preprocess::expand_gather_blocks(
+                &preprocess::expand_multiline_guards(&preprocess::expand_typed_let_unpack(
+                    &preprocess::expand_lazy_lets(source),
+                )),
             )),
         )),
     ));
@@ -307,10 +309,12 @@ fn merge_sibling_extensions(
     registry: &mut tyc_analyse::ExtensionRegistry,
     cross_fns: &mut std::collections::HashMap<String, String>,
 ) {
-    let expanded = preprocess::expand_question_ops(&preprocess::expand_pipes(
-        &preprocess::expand_with_chains(&preprocess::expand_go_calls(
-            &preprocess::expand_gather_blocks(&preprocess::expand_multiline_guards(
-                &preprocess::expand_typed_let_unpack(&preprocess::expand_lazy_lets(source)),
+    let expanded = preprocess::expand_question_ops(&preprocess::expand_inline_question_ops(
+        &preprocess::expand_pipes(&preprocess::expand_with_chains(
+            &preprocess::expand_go_calls(&preprocess::expand_gather_blocks(
+                &preprocess::expand_multiline_guards(&preprocess::expand_typed_let_unpack(
+                    &preprocess::expand_lazy_lets(source),
+                )),
             )),
         )),
     ));

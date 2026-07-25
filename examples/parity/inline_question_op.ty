@@ -1,0 +1,57 @@
+# Inline `?` — the propagation operator away from statement-tail position.
+#
+# `?` is not limited to `let x: int = f()?`. It composes anywhere an expression
+# can appear: nested inside a call argument, mid-expression, and in a statement
+# condition. Each of these lowers to the same `isinstance(_t, Err): return _t`
+# ladder, hoisted above the statement that contains it.
+#
+#     return Ok(p(a)?)            nested in a call argument
+#     let x: int = p(a)? + 1      mid-expression
+#     if p(a)? > 0:               statement condition
+#     Ok(max(p(a)?, p(b)?))       two in one expression
+#
+# The VM reached parity here late: until the `expand_inline_question_ops` pass
+# was added to its preprocessing pipeline it handled only the statement-tail
+# form, so every shape below was a parse error under `tyc run` while
+# `tyc check` and `tyc build` accepted them.
+
+
+def parse_int(raw: str) -> Result[int, str]:
+    if not raw.isdigit():
+        return Err(f"bad {raw}")
+    return Ok(int(raw))
+
+
+def add_both(a: str, b: str) -> Result[int, str]:
+    return Ok(parse_int(a)? + parse_int(b)?)
+
+
+def nested_in_call(a: str) -> Result[int, str]:
+    return Ok(parse_int(a)?)
+
+
+def mid_expression(a: str) -> Result[int, str]:
+    let x: int = parse_int(a)? + 1
+    return Ok(x)
+
+
+def in_condition(a: str) -> Result[str, str]:
+    if parse_int(a)? > 10:
+        return Ok("big")
+    return Ok("small")
+
+
+def two_in_one_call(a: str, b: str) -> Result[int, str]:
+    return Ok(max(parse_int(a)?, parse_int(b)?))
+
+
+def main() -> None:
+    print(add_both("1", "2"))
+    print(nested_in_call("7"))
+    print(mid_expression("7"))
+    print(in_condition("5"), in_condition("50"))
+    print(two_in_one_call("3", "9"))
+    print(add_both("x", "2"), nested_in_call("q"))
+
+
+main()
