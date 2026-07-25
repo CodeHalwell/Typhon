@@ -80,7 +80,7 @@
   border: 1px solid var(--sl-color-gray-5);
   border-radius: 0.75rem;
   padding: 1rem 1.1rem;
-  transition: border-color 120ms ease, transform 120ms ease;
+  transition: border-color 120ms ease, transform 120ms ease, box-shadow 120ms ease;
 }
 
 .card:hover,
@@ -221,6 +221,14 @@ textarea:focus-visible,
 }
 
 /* Starlight specific focus fixes */
+.sl-link-card {
+  transition: border-color 120ms ease, transform 120ms ease, box-shadow 120ms ease, background-color 120ms ease;
+}
+
+.sl-link-card .icon {
+  transition: color 120ms ease;
+}
+
 .sl-link-card:hover,
 .sl-link-card:focus-within {
   background: var(--sl-color-gray-7, var(--sl-color-gray-6));
