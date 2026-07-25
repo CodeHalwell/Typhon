@@ -26,3 +26,6 @@
 ## 2024-11-25 - Zero-Allocation `module_level_bound_names`
 **Learning:** `module_level_bound_names` in `tyc-desugar` originally created a new `HashSet<String>` by cloning string identifiers inside AST nodes. As this is used to verify `collections.abc` types inside hot paths, the repeated allocation of strings negatively impacted compilation times.
 **Action:** By bounding the lifetime of the `HashSet<&str>` to the incoming `&[Stmt]` reference, we can avoid String allocations entirely when building the `bound_names` set and rely on dereferencing pointers for fast lookups.
+## $(date +%Y-%m-%d) - Zero-Copy AST Traversal Gotchas
+**Learning:** Replacing `.to_string()` with `.as_str()` during local AST traversal significantly reduces heap allocations. However, modifying caches or state trackers (like `HashMap<String, bool>`) that outlive the iteration block to use `&str` instead of `String` causes fatal Rust borrow checker `E0597` errors, as the borrowed AST field's lifetime doesn't match the cache's requirement.
+**Action:** Always constrain `&str` borrowings to the immediate, local iteration scope. Leave long-lived data structures tracking the "verdict" as owned `String` types if the reference drops early.

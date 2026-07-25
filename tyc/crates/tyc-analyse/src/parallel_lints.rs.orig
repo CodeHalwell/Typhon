@@ -189,9 +189,6 @@ pub fn shared_mut_across_tasks_diagnostics(
 /// `else`, `try` / `except` / `finally`, `for` / `while`, `with`, `match`).
 /// Function and class bodies are **not** descended into — a `mut` local there is
 /// frame state, not module state. Mirrors [`collect_globals`]'s scope rule.
-// PERFORMANCE (Bolt): Using `HashSet<&str>` instead of `HashSet<String>`
-// avoids continuous heap allocations (`.to_string()`) during AST traversal,
-// significantly improving the performance of the linter in hot paths.
 fn module_level_mut_names(body: &[Stmt]) -> HashSet<&str> {
     let mut out = HashSet::new();
     collect_module_mut_names(body, &mut out);
