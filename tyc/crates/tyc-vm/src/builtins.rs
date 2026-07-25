@@ -5592,29 +5592,6 @@ pub fn method_for(_value: &Value, _attr: &str) -> Option<()> {
     None
 }
 
-/// Peel a trailing keyword-argument sentinel (built by `call_with_kwargs`)
-/// off a method's positional args, returning the remaining positional args
-/// and the keyword map. Methods that don't care about kwargs simply ignore
-/// the returned map.
-fn split_kwargs_map(args: &[Value]) -> (&[Value], HashMap<String, Value>) {
-    if let Some(Value::Tuple(t)) = args.last() {
-        if t.len() == 2 {
-            if let (Value::Str(tag), Value::Dict(d)) = (&t[0], &t[1]) {
-                if tag.as_str() == "__typhon_kwargs__" {
-                    let mut map = HashMap::new();
-                    for (k, v) in d.borrow().iter() {
-                        if let HashKey::Str(s) = k {
-                            map.insert((**s).clone(), v.clone());
-                        }
-                    }
-                    return (&args[..args.len() - 1], map);
-                }
-            }
-        }
-    }
-    (args, HashMap::new())
-}
-
 pub fn dispatch_method(
     interp: &mut Interpreter,
     name: &str,
@@ -5624,10 +5601,12 @@ pub fn dispatch_method(
         .first()
         .cloned()
         .ok_or_else(|| type_error("method called without receiver"))?;
-    let (rest, kwargs) = split_kwargs_map(&args[1..]);
+    // Methods that accept keywords peel the trailing sentinel themselves via
+    // `split_kwargs`; there is no dispatcher-level kwargs map.
+    let rest = &args[1..];
     match (&receiver, name) {
         // ── str methods ────────────────────────────────────────────────────
-        (Value::Str(s), m) => str_method(interp, s, m, rest, &kwargs),
+        (Value::Str(s), m) => str_method(interp, s, m, rest),
         // ── bytes methods ──────────────────────────────────────────────────
         (Value::Bytes(b), m) => bytes_method(b, m, rest),
         // ── bytearray methods ──────────────────────────────────────────────
@@ -5766,7 +5745,6 @@ fn str_method(
     s: &Rc<String>,
     name: &str,
     args: &[Value],
-    _kwargs: &HashMap<String, Value>,
 ) -> Result<Value, Unwind> {
     Ok(match name {
         "upper" => Value::Str(Rc::new(s.to_uppercase())),
