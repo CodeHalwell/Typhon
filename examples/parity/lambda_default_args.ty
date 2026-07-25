@@ -1,0 +1,25 @@
+# Lambda parameter defaults — `lambda i=i: i`, the loop-capture snapshot form
+# that `tyc explain loop_closure_capture` prescribes, alongside a `def`
+# default for comparison.
+
+
+from typing import Callable
+
+
+def make_closures() -> list[Callable[[], int]]:
+    mut fns: list[Callable[[], int]] = []
+    for i in [0, 1, 2]:
+        fns.append(lambda i=i: i)
+    return fns
+
+
+def with_def_default(i: int = 7) -> int:
+    return i * 2
+
+
+def main() -> None:
+    print([f() for f in make_closures()])
+    print(with_def_default())
+
+
+main()

@@ -697,24 +697,20 @@ pub fn run(args: BuildArgs) -> Result<()> {
         // build output to a repository leaks the secret.
         //
         // Suppression knob: a `[strictness] allow-secret-comptime = true`
-        // toggle in `typhon.toml` should silence this warning.
-        // It is checked using `!config.strictness.allow_secret_comptime` below.
-        if !config.strictness.allow_secret_comptime {
-            for name in comptime_values.keys() {
-                if secret_suffix(name).is_none() {
-                    continue;
-                }
-                // Only fire when the RHS actually pulls from `env(...)` — a
-                // hard-coded `comptime let API_KEY = "test"` isn't reading a
-                // secret, just labelling a literal. Pull the actual env-var
-                // key out of the source so the help text points at the right
-                // identifier (the binding name and the env key often differ:
-                // `comptime let API_KEY = env("MY_SERVICE_API_KEY")`).
-                if let Some(env_key) = find_env_key_for_comptime_binding(source, name) {
-                    let warn = TycError::contains_secret_literal(name.clone(), env_key);
-                    eprintln!("{:?}", miette::Report::new_boxed(Box::new(warn)));
-                }
-            }
+        // toggle in `typhon.toml` silences this warning.
+        //
+        // The detection lives in `tyc_analyse::comptime_secret_literal_diagnostics`
+        // so `tyc check` (the documented CI primary gate) reports exactly the
+        // same warnings — before v1.0.0-alpha.7 this scan lived here only, so a
+        // pipeline following the documented advice never saw it.
+        for warn in tyc_analyse::comptime_secret_literal_diagnostics(
+            &comptime_values,
+            source,
+            config.strictness.allow_secret_comptime,
+        )
+        .warnings()
+        {
+            eprintln!("{:?}", miette::Report::new_boxed(Box::new(warn.clone())));
         }
 
         if comptime_diags.has_errors() {
@@ -1512,51 +1508,6 @@ fn display_relative(path: &std::path::Path, project_root: &std::path::Path) -> S
         .unwrap_or_else(|_| path.to_string_lossy().into_owned())
 }
 
-/// Return `Some(suffix)` if `name` looks like a credential identifier.
-/// The match is case-insensitive and ensures the token is bounded by the
-/// start/end of the string or underscores.
-/// Used by the secret-comptime lint.
-fn secret_suffix(name: &str) -> Option<&'static str> {
-    let upper = name.to_ascii_uppercase();
-    // Keyword table shared with the `tyc::contains_secret_literal` lint —
-    // see `tyc_analyse::SECRET_NAME_KEYWORDS` for the longest-first
-    // ordering invariant both consumers rely on.
-    for &candidate in tyc_analyse::SECRET_NAME_KEYWORDS {
-        // We match if the substring is bounded by:
-        // - start/end of string
-        // - underscore (`_`)
-        // - or if it's preceded/followed by a casing change (for camelCase)
-        // e.g. "myTokenValue" -> "my" + "Token" + "Value" -> preceded by 'y' (lowercase),
-        // followed by 'V' (uppercase).
-        // Ensure "PASSPORT" does not match "PASS" by checking that the matched prefix/suffix
-        // boundaries are actually word boundaries (i.e. we don't have uppercase letters directly next to uppercase letters in original, etc).
-        // The simplest check for camelCase/PascalCase is:
-        // start_ok: actual_idx == 0 OR previous char is `_` OR (previous char is lowercase AND current char is uppercase).
-        // end_ok: actual_end == len OR next char is `_` OR (next char is uppercase AND last char of match was NOT uppercase).
-        let mut start_idx = 0;
-        while let Some(idx) = upper[start_idx..].find(candidate) {
-            let actual_idx = start_idx + idx;
-
-            let start_ok = actual_idx == 0
-                || upper.as_bytes()[actual_idx - 1] == b'_'
-                || (name.as_bytes()[actual_idx].is_ascii_uppercase()
-                    && name.as_bytes()[actual_idx - 1].is_ascii_lowercase());
-
-            let actual_end = actual_idx + candidate.len();
-            let end_ok = actual_end == upper.len()
-                || upper.as_bytes()[actual_end] == b'_'
-                || (name.as_bytes()[actual_end].is_ascii_uppercase()
-                    && !name.as_bytes()[actual_end - 1].is_ascii_uppercase());
-
-            if start_ok && end_ok {
-                return Some(candidate);
-            }
-            start_idx = actual_idx + 1;
-        }
-    }
-    None
-}
-
 /// Scan `source` for `from .NAME import …` lines and return
 /// `(NAME, snippet)` pairs. Single-dot relative imports only — this
 /// lint targets sibling-file imports, not parent-package `from ..pkg
@@ -1664,51 +1615,6 @@ pub(crate) fn scan_overdeep_relative_imports(
         line_start += line_len;
     }
     out
-}
-
-/// Find the env-var key in a `comptime let NAME ... = env("KEY"...)`
-/// declaration by scanning `source` for the binding's line. Returns the
-/// first quoted string immediately following `env(` on a line that mentions
-/// `NAME`. Returns `None` when the binding's RHS doesn't use `env(...)` —
-/// e.g. `comptime let X = 42`, where the secret lint shouldn't fire.
-fn find_env_key_for_comptime_binding(source: &str, binding_name: &str) -> Option<String> {
-    let needle = "comptime ";
-    for line in source.lines() {
-        let trimmed = line.trim_start();
-        if !trimmed.starts_with(needle) {
-            continue;
-        }
-        // Match either `comptime let NAME` or `comptime mut NAME` or
-        // bare `comptime NAME` (legacy). Cheaply check the binding name
-        // appears before the `=`.
-        let lhs = trimmed.split('=').next().unwrap_or("");
-        let lhs_has_name = lhs.split_whitespace().any(|tok| {
-            tok.trim_end_matches(':')
-                .trim_end_matches(',')
-                .eq(binding_name)
-        });
-        if !lhs_has_name {
-            continue;
-        }
-        // Locate the first `env(` after the `=` and lift the first quoted
-        // string out of its argument list.
-        let after_eq = match trimmed.split_once('=') {
-            Some((_, r)) => r,
-            None => continue,
-        };
-        let env_idx = after_eq.find("env(")?;
-        let after_open = &after_eq[env_idx + "env(".len()..];
-        // Strip optional whitespace and grab the leading `"..."` or `'...'`.
-        let after_ws = after_open.trim_start();
-        let quote = after_ws.chars().next()?;
-        if quote != '"' && quote != '\'' {
-            return None;
-        }
-        let rest = &after_ws[1..];
-        let end = rest.find(quote)?;
-        return Some(rest[..end].to_owned());
-    }
-    None
 }
 
 /// Byte offset of the start of the 0-based `line_idx` line in `source`.
@@ -4790,6 +4696,10 @@ let pet: Animal = Dog(name=\"Rex\")
 
     #[test]
     fn secret_suffix_matches_credential_names() {
+        // The detection primitive lives in `tyc-analyse` so `tyc check` and
+        // `tyc build` share one implementation; these assertions pin the
+        // longest-first ordering the CLI scan depends on.
+        use tyc_analyse::secret_suffix;
         assert_eq!(secret_suffix("API_KEY"), Some("API_KEY"));
         assert_eq!(secret_suffix("MyToken"), Some("TOKEN"));
         assert_eq!(secret_suffix("myTokenValue"), Some("TOKEN"));
@@ -4807,6 +4717,7 @@ let pet: Animal = Dog(name=\"Rex\")
 
     #[test]
     fn secret_suffix_ignores_unrelated_names() {
+        use tyc_analyse::secret_suffix;
         assert_eq!(secret_suffix("PORT"), None);
         assert_eq!(secret_suffix("MAX_RETRIES"), None);
         assert_eq!(secret_suffix("USER"), None);

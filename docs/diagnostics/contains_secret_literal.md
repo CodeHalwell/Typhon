@@ -14,6 +14,15 @@ comptime let API_KEY: str = env("MY_API_KEY")  # warning: secret inlined
 
 After build the emitted Python becomes literally `API_KEY = "sk-…"`.
 
+Both `tyc check` and `tyc build` report it, so the documented CI primary gate
+(`tyc check src/`) catches it. (Before v1.0.0-alpha.7 the scan lived only in
+the build command, so a pipeline gating on `tyc check` alone never saw it.)
+
+The same code also covers a second, unrelated shape: a plain `let` / module
+binding whose name is secret-shaped and whose RHS is a bare string literal
+(`API_KEY = "sk-live-…"`) — a hard-coded credential in the source tree rather
+than one inlined at build time.
+
 ## Why
 
 `comptime` exists for build-time constants (feature flags, banner strings,

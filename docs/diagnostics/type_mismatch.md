@@ -26,6 +26,35 @@ a hint. Permitting an `str` where `int` was promised would silently propagate
 a wrong-typed value across the program and surface as a runtime `TypeError`
 far from the source of the problem.
 
+## Reading a fixed-arity tuple at a non-constant index
+
+`tuple[int, str]` holds a different type in each slot, so the type a read
+produces depends on *which* slot is read. With a literal index the compiler
+resolves the slot exactly; with a variable index it cannot, so the read is
+typed as the **union of every slot type**:
+
+```ty
+def main() -> None:
+    let t: tuple[int, str] = (1, "abc")
+    mut i: int = 1
+    let a: int = t[i]  # error: expected `int`, found `int | str`
+    let b: str = t[i]  # error: expected `str`, found `int | str`
+    print(a, b)
+```
+
+Both fail, which is the point — they are the same expression, so they cannot
+both be right. The `int | str` in the message means *the index is not
+statically known*, not that the tuple changed shape. Three ways out:
+
+1. index with a literal when you know the slot — `let v: int = t[0]`;
+2. annotate the union and narrow before use —
+   `let v: int | str = t[i]` then `if isinstance(v, int): …`;
+3. use a homogeneous `tuple[int, ...]` (or a `list[int]`) when every slot
+   holds the same type — an element read on those is `int` at any index.
+
+A homogeneous fixed-arity tuple (`tuple[int, int]`) collapses to its single
+element type, so nothing widens there.
+
 ## Fix
 
 Convert the expression to the expected type, or update the surrounding

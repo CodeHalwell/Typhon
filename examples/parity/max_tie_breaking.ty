@@ -1,0 +1,29 @@
+# `min()` / `max()` tie-breaking — both keep the FIRST extremal element.
+#
+# CPython replaces the running best only on a *strict* improvement, so neither
+# `min` nor `max` moves on a tie. Exercised over records with a user `__lt__`
+# keyed on one field, where two distinct values compare neither `<` nor `==`.
+
+
+class Rec:
+    name: str
+    score: int
+
+
+impl Rec:
+    def __lt__(self, other: Rec) -> bool:
+        return self.score < other.score
+
+    def __repr__(self) -> str:
+        return self.name
+
+
+def main() -> None:
+    let mixed: list[Rec] = [Rec(name="c", score=2), Rec(name="a", score=1), Rec(name="b", score=2)]
+    print("max:", max(mixed), "min:", min(mixed))
+
+    let tied: list[Rec] = [Rec(name="p", score=1), Rec(name="q", score=1)]
+    print("max-tie:", max(tied), "min-tie:", min(tied))
+
+
+main()

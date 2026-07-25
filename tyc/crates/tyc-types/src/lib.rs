@@ -12478,21 +12478,47 @@ fn stmt_always_exits(stmt: &Stmt) -> bool {
         // A `try/except` always exits when:
         //   (a) the `finally` body is non-empty and always exits (finally runs
         //       on every path), OR
-        //   (b) the `try` body always exits AND every exception handler always
-        //       exits AND the `else` clause (if present) always exits.
+        //   (b) the non-raising path always exits AND every exception handler
+        //       always exits.
         // Case (b) is the common `try: return Ok(x) except E: return Err(e)`
         // pattern that must not be flagged as a missing-return false positive.
+        // See [`try_normal_path_exits`] for why the `else:` clause — not the
+        // `try` body — owns the non-raising path when it is present.
         Stmt::Try(t) => {
             let finally_exits = !t.finalbody.is_empty() && body_always_exits(&t.finalbody);
-            let try_and_handlers_exit = body_always_exits(&t.body)
+            let try_and_handlers_exit = try_normal_path_exits(t, body_always_exits)
                 && t.handlers.iter().all(|h| {
                     let ruff_python_ast::ExceptHandler::ExceptHandler(h) = h;
                     body_always_exits(&h.body)
-                })
-                && (t.orelse.is_empty() || body_always_exits(&t.orelse));
+                });
             finally_exits || try_and_handlers_exit
         }
         _ => false,
+    }
+}
+
+/// Decide whether the *non-raising* path through a `try` statement always
+/// exits, given a body-level "always exits" predicate.
+///
+/// CPython runs the `else:` clause exactly when the `try` body completed
+/// without raising, and guarantees that precisely one of the `except`
+/// handlers or the `else:` runs. So when an `else:` is present it — not the
+/// `try` body — is what the fall-through path runs last: reachability after
+/// the whole statement requires the `else:` to fall through. A `try` body
+/// that always exits on its own never reaches the `else:` at all, which is
+/// still an exit; hence the disjunction. Without an `else:` the `try` body
+/// is the whole non-raising path.
+///
+/// Shared by all four reachability walkers (structural / checker-aware ×
+/// any-terminal / non-suppressible-terminal) so they cannot drift.
+fn try_normal_path_exits(
+    t: &ruff_python_ast::StmtTry,
+    mut exits: impl FnMut(&[Stmt]) -> bool,
+) -> bool {
+    if t.orelse.is_empty() {
+        exits(&t.body)
+    } else {
+        exits(&t.body) || exits(&t.orelse)
     }
 }
 
@@ -12575,12 +12601,11 @@ fn stmt_always_exits_aware(c: &Checker, stmt: &Stmt) -> bool {
         Stmt::With(w) => body_exits_non_suppressible_aware(c, &w.body),
         Stmt::Try(t) => {
             let finally_exits = !t.finalbody.is_empty() && body_always_exits_aware(c, &t.finalbody);
-            let try_and_handlers_exit = body_always_exits_aware(c, &t.body)
+            let try_and_handlers_exit = try_normal_path_exits(t, |b| body_always_exits_aware(c, b))
                 && t.handlers.iter().all(|h| {
                     let ruff_python_ast::ExceptHandler::ExceptHandler(h) = h;
                     body_always_exits_aware(c, &h.body)
-                })
-                && (t.orelse.is_empty() || body_always_exits_aware(c, &t.orelse));
+                });
             finally_exits || try_and_handlers_exit
         }
         _ => false,
@@ -12663,12 +12688,11 @@ fn stmt_exits_non_suppressible(stmt: &Stmt) -> bool {
         Stmt::Try(t) => {
             let finally_exits =
                 !t.finalbody.is_empty() && body_exits_non_suppressible(&t.finalbody);
-            let try_and_handlers_exit = body_exits_non_suppressible(&t.body)
+            let try_and_handlers_exit = try_normal_path_exits(t, body_exits_non_suppressible)
                 && t.handlers.iter().all(|h| {
                     let ruff_python_ast::ExceptHandler::ExceptHandler(h) = h;
                     body_exits_non_suppressible(&h.body)
-                })
-                && (t.orelse.is_empty() || body_exits_non_suppressible(&t.orelse));
+                });
             finally_exits || try_and_handlers_exit
         }
         _ => false,
@@ -12709,12 +12733,12 @@ fn stmt_exits_non_suppressible_aware(c: &Checker, stmt: &Stmt) -> bool {
         Stmt::Try(t) => {
             let finally_exits =
                 !t.finalbody.is_empty() && body_exits_non_suppressible_aware(c, &t.finalbody);
-            let try_and_handlers_exit = body_exits_non_suppressible_aware(c, &t.body)
-                && t.handlers.iter().all(|h| {
-                    let ruff_python_ast::ExceptHandler::ExceptHandler(h) = h;
-                    body_exits_non_suppressible_aware(c, &h.body)
-                })
-                && (t.orelse.is_empty() || body_exits_non_suppressible_aware(c, &t.orelse));
+            let try_and_handlers_exit =
+                try_normal_path_exits(t, |b| body_exits_non_suppressible_aware(c, b))
+                    && t.handlers.iter().all(|h| {
+                        let ruff_python_ast::ExceptHandler::ExceptHandler(h) = h;
+                        body_exits_non_suppressible_aware(c, &h.body)
+                    });
             finally_exits || try_and_handlers_exit
         }
         _ => false,
@@ -12765,6 +12789,8 @@ fn match_arms_exit_non_suppressible_aware(c: &Checker, m: &ruff_python_ast::Stmt
 /// - Aliased union subjects (e.g. `type IntTree = int | list[IntTree]`)
 ///   where every variant of the unwrapped union is covered by an unguarded
 ///   arm that is a class-wildcard for that variant.
+/// - Mapping subjects covered by an *empty* mapping pattern (`case {}:` /
+///   `case {**rest}:`) — see [`is_irrefutable_mapping_pattern`].
 fn match_cases_cover_subject(c: &Checker, m: &ruff_python_ast::StmtMatch) -> bool {
     if m.cases.iter().any(|case| {
         case.guard.is_none()
@@ -12779,7 +12805,68 @@ fn match_cases_cover_subject(c: &Checker, m: &ruff_python_ast::StmtMatch) -> boo
         return false;
     };
     let unwrapped = c.unwrap_alias(&subject_type);
+    // An empty mapping pattern places no constraint on the subject beyond
+    // "it is a mapping", so over a mapping-typed subject it is the exact
+    // equivalent of `case _:`.
+    if is_mapping_type(&unwrapped)
+        && m.cases
+            .iter()
+            .any(|case| case.guard.is_none() && is_irrefutable_mapping_pattern(&case.pattern))
+    {
+        return true;
+    }
     cases_cover_type(c, &m.cases, &unwrapped)
+}
+
+/// True when `pattern` is an *irrefutable* mapping pattern — one that
+/// constrains the subject no further than "it is a mapping".
+///
+/// CPython matches a mapping pattern when the subject is a
+/// `collections.abc.Mapping` **and** every listed key is present. A pattern
+/// with no keys therefore matches *every* mapping: `case {}:` is the
+/// mapping-typed equivalent of `case _:`, **not** a test for an empty dict
+/// (verified against CPython 3.13 — `match {'z': 0}: case {'kind': k}: …`
+/// does not match, `case {}: …` does). A double-star capture carries no key
+/// requirement either, so `case {**rest}:` is equally irrefutable. A pattern
+/// with at least one key (`case {"kind": k}:`) stays refutable.
+fn is_irrefutable_mapping_pattern(pattern: &Pattern) -> bool {
+    match pattern {
+        Pattern::MatchMapping(mp) => mp.keys.is_empty(),
+        // `case {} as d:` binds the whole subject; the wrapped pattern
+        // decides irrefutability.
+        Pattern::MatchAs(a) => a
+            .pattern
+            .as_deref()
+            .is_some_and(is_irrefutable_mapping_pattern),
+        // An or-pattern matches when *any* alternative does.
+        Pattern::MatchOr(o) => o.patterns.iter().any(is_irrefutable_mapping_pattern),
+        _ => false,
+    }
+}
+
+/// True when `ty` is a mapping type — the domain over which an empty
+/// mapping pattern (see [`is_irrefutable_mapping_pattern`]) is irrefutable.
+/// Deliberately a closed list of known mapping heads: anything else stays
+/// refutable, so the recognition can only ever accept more *valid*
+/// programs, never suppress a genuine fall-through.
+fn is_mapping_type(ty: &Type) -> bool {
+    let name = match ty {
+        Type::Generic(name, _) => name.as_str(),
+        Type::Class(name) => name.as_str(),
+        _ => return false,
+    };
+    matches!(
+        name.rsplit('.').next().unwrap_or(name),
+        "dict"
+            | "Dict"
+            | "Mapping"
+            | "MutableMapping"
+            | "OrderedDict"
+            | "defaultdict"
+            | "DefaultDict"
+            | "Counter"
+            | "ChainMap"
+    )
 }
 
 fn match_subject_type(c: &Checker, m: &ruff_python_ast::StmtMatch) -> Option<Type> {
@@ -16489,6 +16576,41 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
                                 return Type::Unknown;
                             }
                         }
+                    }
+                    // Non-constant index into a fixed-arity tuple
+                    // (`t[i]` where `i` is a variable). The slot is not
+                    // statically known, so the read denotes the UNION of
+                    // every slot type — `tuple[int, str]` indexed with a
+                    // variable is `int | str`, not `Unknown`. Degrading
+                    // to `Unknown` was a soundness hole: `let a: int =
+                    // t[i]` AND `let b: str = t[i]` were both accepted
+                    // for the same expression, and the emitted Python
+                    // then crashed. (The v1.0.0-alpha.2 sweep typed slice
+                    // reads / subscript assigns / unpack targets but
+                    // missed this read position.)
+                    //
+                    // Guarded so the union only replaces `Unknown` where
+                    // it is strictly more informative:
+                    //   * slice syntax (`t[a:b]`) yields a container, not
+                    //     an element — leave it to `subscript_slice_type`;
+                    //   * a dynamic *element* type (`Any` / `Unknown` /
+                    //     TypeVar in any slot) would poison the union into
+                    //     something no annotation could satisfy, so such a
+                    //     tuple keeps the whole read permissive.
+                    // The index's own type is deliberately NOT gated on:
+                    // whatever it infers as, it is not a compile-time
+                    // constant, so the read still denotes every slot. That
+                    // covers the common `for j in range(n): t[j]` shape,
+                    // where the loop variable currently types as `Unknown`.
+                    // A homogeneous tuple collapses through `union_of` to
+                    // its single element type, so nothing widens there.
+                    // Variadic `tuple[T, ...]` never reaches here — it is
+                    // `Generic("tuple_variadic", [T])` and is handled by
+                    // `subscript_element_type` below.
+                    if !matches!(s.slice.as_ref(), Expr::Slice(_))
+                        && !elts.iter().any(is_dynamic_type)
+                    {
+                        return Type::union_of(elts.clone());
                     }
                 }
             }
@@ -21022,6 +21144,186 @@ def maybe_int(x: int) -> int:
                 .iter()
                 .any(|e| matches!(e, TycError::MissingReturn { .. })),
             "expected MissingReturn variant, got {:?}",
+            d.errors()
+        );
+    }
+
+    // ── try/except/else reachability ─────────────────────────────────
+    // CPython guarantees exactly one of the `except` handlers or the
+    // `else:` clause runs, so a `try` whose handlers and `else` all
+    // return cannot fall through. The reachability walkers used to
+    // additionally demand that the *try body* exit, which the `else:`
+    // form never does — a false-positive `tyc::missing_return`.
+    // (Ported from examples/errors/13-false-positives/try_else_missing_return.ty)
+
+    fn has_missing_return(d: &Diagnostics) -> bool {
+        d.errors()
+            .iter()
+            .any(|e| matches!(e, TycError::MissingReturn { .. }))
+    }
+
+    #[test]
+    fn try_except_else_all_returning_is_not_missing_return() {
+        let src = "\
+def attempt(n: int) -> str:
+    try:
+        let v: int = 10 // n
+    except ZeroDivisionError:
+        return \"divide by zero\"
+    else:
+        return f\"ok {v}\"
+";
+        let d = check(src);
+        assert!(
+            !has_missing_return(&d),
+            "try/except/else where every arm returns must not fire missing_return: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn try_except_else_finally_all_returning_is_not_missing_return() {
+        let src = "\
+def attempt(n: int) -> str:
+    try:
+        let v: int = 10 // n
+    except ZeroDivisionError:
+        return \"divide by zero\"
+    else:
+        return f\"ok {v}\"
+    finally:
+        print(\"done\")
+";
+        let d = check(src);
+        assert!(
+            !has_missing_return(&d),
+            "try/except/else/finally where every arm returns must not fire missing_return: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn try_except_else_with_non_returning_handler_still_fires() {
+        // Negative: the `except` handler falls through, so the function can
+        // reach the end of its body without returning.
+        let src = "\
+def attempt(n: int) -> str:
+    try:
+        let v: int = 10 // n
+    except ZeroDivisionError:
+        print(\"boom\")
+    else:
+        return f\"ok {v}\"
+";
+        let d = check(src);
+        assert!(
+            has_missing_return(&d),
+            "try/except/else with a falling-through handler must still fire missing_return: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn try_except_else_with_non_returning_else_still_fires() {
+        // Negative: the `else:` clause owns the non-raising path, and it
+        // falls through — so does the function.
+        let src = "\
+def attempt(n: int) -> str:
+    try:
+        let v: int = 10 // n
+    except ZeroDivisionError:
+        return \"divide by zero\"
+    else:
+        print(v)
+";
+        let d = check(src);
+        assert!(
+            has_missing_return(&d),
+            "try/except/else with a falling-through else must still fire missing_return: {:?}",
+            d.errors()
+        );
+    }
+
+    // ── empty mapping patterns are irrefutable ───────────────────────
+    // `case {}:` places no constraint on the subject, so over a mapping
+    // subject it matches everything — the mapping equivalent of `case _:`.
+    // (Ported from examples/errors/13-false-positives/empty_mapping_pattern.ty)
+
+    #[test]
+    fn empty_mapping_pattern_is_irrefutable() {
+        let src = "\
+def describe(d: dict[str, int]) -> str:
+    match d:
+        case {\"kind\": k, \"n\": n}:
+            return f\"both {k} {n}\"
+        case {\"kind\": k}:
+            return f\"kind {k}\"
+        case {}:
+            return \"other\"
+";
+        let d = check(src);
+        assert!(
+            !has_missing_return(&d),
+            "a match ending in `case {{}}:` over a dict subject must not fire missing_return: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn double_star_only_mapping_pattern_is_irrefutable() {
+        // `case {**rest}:` carries no key requirement either.
+        let src = "\
+def describe(d: dict[str, int]) -> str:
+    match d:
+        case {\"kind\": k}:
+            return f\"kind {k}\"
+        case {**rest}:
+            return f\"rest {len(rest)}\"
+";
+        let d = check(src);
+        assert!(
+            !has_missing_return(&d),
+            "a match ending in `case {{**rest}}:` must not fire missing_return: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn non_empty_mapping_pattern_stays_refutable() {
+        // Negative: a keyed mapping pattern only matches mappings that
+        // actually carry the key, so the match can fall through.
+        let src = "\
+def describe(d: dict[str, int]) -> str:
+    match d:
+        case {\"kind\": k, \"n\": n}:
+            return f\"both {k} {n}\"
+        case {\"kind\": k}:
+            return f\"kind {k}\"
+";
+        let d = check(src);
+        assert!(
+            has_missing_return(&d),
+            "a match whose last arm is a non-empty mapping pattern must fire missing_return: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn empty_mapping_pattern_over_non_mapping_subject_stays_refutable() {
+        // Negative: `case {}:` only matches `collections.abc.Mapping`
+        // instances, so it does not make a match over an `int` exhaustive.
+        let src = "\
+def describe(n: int) -> str:
+    match n:
+        case 0:
+            return \"zero\"
+        case {}:
+            return \"mapping\"
+";
+        let d = check(src);
+        assert!(
+            has_missing_return(&d),
+            "`case {{}}:` over a non-mapping subject must still fire missing_return: {:?}",
             d.errors()
         );
     }
@@ -30454,6 +30756,243 @@ def main() -> None:
         assert!(
             !d.has_errors(),
             "tuple subscript must remain precise; got: {:?}",
+            d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    // ── fixed-arity tuple read at a NON-CONSTANT index ──────────────
+    // The slot is not statically known, so `t[i]` denotes the union of
+    // every slot type. Previously it degraded to `Unknown`, which made
+    // `let a: int = t[i]` AND `let b: str = t[i]` both type-check for
+    // the same expression while the emitted Python crashed.
+
+    /// Helper: source that reads `tuple[int, str]` at a variable index
+    /// and binds the result to `ann`.
+    fn tuple_var_index_src(ann: &str) -> String {
+        format!(
+            "\
+def main() -> None:
+    let t: tuple[int, str] = (1, \"x\")
+    mut i: int = 1
+    let v: {ann} = t[i]
+    print(v)
+"
+        )
+    }
+
+    /// FAIL: reading a `tuple[int, str]` at a variable index yields
+    /// `int | str`, which is not assignable to `int`.
+    #[test]
+    fn tuple_variable_index_rejects_first_slot_annotation() {
+        let d = check(&tuple_var_index_src("int"));
+        let msgs: Vec<String> = d.errors().iter().map(|e| e.to_string()).collect();
+        assert!(
+            msgs.iter()
+                .any(|m| m.contains("expected `int`") && m.contains("found `int | str`")),
+            "variable-index tuple read must be `int | str`; got: {msgs:?}"
+        );
+    }
+
+    /// FAIL: the mirror image — the same expression is not `str` either.
+    /// (Before the fix BOTH of these were accepted, which is what made
+    /// the degradation to `Unknown` a soundness hole rather than merely
+    /// imprecise.)
+    #[test]
+    fn tuple_variable_index_rejects_second_slot_annotation() {
+        let d = check(&tuple_var_index_src("str"));
+        let msgs: Vec<String> = d.errors().iter().map(|e| e.to_string()).collect();
+        assert!(
+            msgs.iter()
+                .any(|m| m.contains("expected `str`") && m.contains("found `int | str`")),
+            "variable-index tuple read must be `int | str`; got: {msgs:?}"
+        );
+    }
+
+    /// PASS: annotating the binding as the union is the honest form.
+    #[test]
+    fn tuple_variable_index_union_annotation_ok() {
+        let d = check(&tuple_var_index_src("int | str"));
+        assert!(
+            !d.has_errors(),
+            "union annotation must be accepted; got: {:?}",
+            d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    /// PASS: `object` is a supertype of every slot, so it is accepted.
+    #[test]
+    fn tuple_variable_index_object_annotation_ok() {
+        let d = check(&tuple_var_index_src("object"));
+        assert!(
+            !d.has_errors(),
+            "object annotation must be accepted; got: {:?}",
+            d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    /// PASS: the union is narrowable, so `isinstance` recovers the
+    /// per-slot type exactly as it does for any other union.
+    #[test]
+    fn tuple_variable_index_union_narrows_with_isinstance() {
+        let src = "\
+def main() -> None:
+    let t: tuple[int, str] = (1, \"x\")
+    mut i: int = 1
+    let v: int | str = t[i]
+    if isinstance(v, int):
+        print(v + 1)
+    else:
+        print(v + \"!\")
+";
+        let d = check(src);
+        assert!(
+            !d.has_errors(),
+            "isinstance narrowing over the union must pass; got: {:?}",
+            d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    /// FAIL: the union applies wherever the read is typed, not just in a
+    /// `let` initialiser — call-argument and `return` positions too.
+    #[test]
+    fn tuple_variable_index_union_applies_in_call_and_return() {
+        let src = "\
+def show(x: int) -> None:
+    print(x)
+
+def pick(t: tuple[int, str], i: int) -> int:
+    return t[i]
+
+def main() -> None:
+    let t: tuple[int, str] = (1, \"x\")
+    mut i: int = 1
+    show(t[i])
+    print(pick(t, i))
+";
+        let d = check(src);
+        let msgs: Vec<String> = d.errors().iter().map(|e| e.to_string()).collect();
+        let hits = msgs
+            .iter()
+            .filter(|m| m.contains("found `int | str`"))
+            .count();
+        assert_eq!(
+            hits, 2,
+            "both the `return` and the call-argument read must be typed as the union; got: {msgs:?}"
+        );
+    }
+
+    /// PASS: a CONSTANT index is still resolved precisely — the union
+    /// must not swallow the exact per-slot typing. `t[1]` is `str`, so
+    /// binding it to `int` still reports the precise `found `str``.
+    #[test]
+    fn tuple_constant_index_still_precise_after_union_fix() {
+        let src = "\
+def main() -> None:
+    let t: tuple[int, str] = (1, \"x\")
+    let v: int = t[1]
+    print(v)
+";
+        let d = check(src);
+        let msgs: Vec<String> = d.errors().iter().map(|e| e.to_string()).collect();
+        assert!(
+            msgs.iter()
+                .any(|m| m.contains("expected `int`") && m.contains("found `str`")),
+            "constant index must stay precise (`str`, not the union); got: {msgs:?}"
+        );
+    }
+
+    /// PASS: an out-of-range CONSTANT index still reports
+    /// `tyc::tuple_index_out_of_range` rather than degrading to the
+    /// union.
+    #[test]
+    fn tuple_constant_index_out_of_range_still_fires() {
+        let src = "\
+def main() -> None:
+    let t: tuple[int, str] = (1, \"x\")
+    let v: int = t[5]
+    print(v)
+";
+        let d = check(src);
+        let msgs: Vec<String> = d.errors().iter().map(|e| e.to_string()).collect();
+        assert!(
+            msgs.iter().any(|m| m.contains("out of range")),
+            "out-of-range constant index must still fire; got: {msgs:?}"
+        );
+    }
+
+    /// PASS: a homogeneous VARIADIC tuple keeps typing as its single
+    /// element type — `tuple[float, ...]` at a variable index is
+    /// `float`, never a union.
+    #[test]
+    fn variadic_tuple_variable_index_stays_element_type() {
+        let src = "\
+def main() -> None:
+    let t: tuple[float, ...] = (1.0, 2.0)
+    mut i: int = 0
+    let v: float = t[i]
+    print(v)
+";
+        let d = check(src);
+        assert!(
+            !d.has_errors(),
+            "variadic tuple element read must stay `float`; got: {:?}",
+            d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    /// FAIL: …and a variadic tuple read is still *checked* against its
+    /// element type (it did not become permissive).
+    #[test]
+    fn variadic_tuple_variable_index_still_checked() {
+        let src = "\
+def main() -> None:
+    let t: tuple[float, ...] = (1.0, 2.0)
+    mut i: int = 0
+    let v: str = t[i]
+    print(v)
+";
+        let d = check(src);
+        let msgs: Vec<String> = d.errors().iter().map(|e| e.to_string()).collect();
+        assert!(
+            msgs.iter()
+                .any(|m| m.contains("expected `str`") && m.contains("found `float`")),
+            "variadic tuple read must still be checked as `float`; got: {msgs:?}"
+        );
+    }
+
+    /// PASS: a fixed-arity tuple whose slots are all the same type
+    /// collapses through `union_of` to that single type — no widening.
+    #[test]
+    fn homogeneous_fixed_tuple_variable_index_collapses() {
+        let src = "\
+def main() -> None:
+    let t: tuple[int, int] = (1, 2)
+    mut i: int = 0
+    let v: int = t[i]
+    print(v)
+";
+        let d = check(src);
+        assert!(
+            !d.has_errors(),
+            "homogeneous fixed tuple must collapse to `int`; got: {:?}",
+            d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    /// PASS: a SLICE of a fixed-arity tuple is unaffected — it yields a
+    /// container, not an element, and stays permissive.
+    #[test]
+    fn fixed_tuple_slice_read_unaffected() {
+        let src = "\
+def main() -> None:
+    let t: tuple[int, str] = (1, \"x\")
+    let s: tuple[int, str] = t[0:2]
+    print(s)
+";
+        let d = check(src);
+        assert!(
+            !d.has_errors(),
+            "tuple slice read must stay permissive; got: {:?}",
             d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
         );
     }

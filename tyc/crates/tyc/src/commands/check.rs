@@ -944,12 +944,24 @@ fn run_secondary_passes(
 
     // Pass `comptime_functions` so `comptime def` calls dispatch
     // correctly in check the same way they do in build (FINDINGS #48).
-    let (_, comptime_diags) = evaluate_comptime_with_functions(
+    let (comptime_values, comptime_diags) = evaluate_comptime_with_functions(
         &module,
         &prep.comptime_bindings,
         &prep.comptime_functions,
     );
     diags.extend(comptime_diags);
+
+    // C4: `tyc::contains_secret_literal` for `comptime let SECRET = env(...)`
+    // used to be emitted only from `tyc build`, so the documented CI primary
+    // gate (`tyc check src/`) never saw it and a resolved credential could be
+    // baked into a build artifact unflagged. Both paths now route through the
+    // same `tyc-analyse` helper. Warn-level in both, and honouring
+    // `[strictness] allow-secret-comptime` in both.
+    diags.extend(tyc_analyse::comptime_secret_literal_diagnostics(
+        &comptime_values,
+        source,
+        lint_opts.allow_secret_comptime,
+    ));
 
     let purity_findings = analyse_purity(&module, false);
     let purity_diags = purity_diagnostics(&purity_findings, path, source);

@@ -1473,14 +1473,13 @@ fn reduce_minmax(
         ))
     })?;
     for v in iter {
-        // Route through `value_cmp` (not the dunder-blind `Value::py_cmp`) so a
-        // user-defined `__lt__` on instances is honoured — matching `list.sort`
-        // and CPython. `py_cmp` returns `None` for instances, which collapsed to
-        // `Equal` here and made `min`/`max` return the first element.
-        let cmp = interp.value_cmp(&v, &best)?;
-        if (want_min && cmp == std::cmp::Ordering::Less)
-            || (!want_min && cmp == std::cmp::Ordering::Greater)
-        {
+        // Replace only on a *strict* improvement, via the `__lt__` / `__gt__`
+        // protocol CPython uses — so both `min` and `max` keep the FIRST
+        // extremal element and never replace on a tie. `value_cmp` cannot be
+        // used here: it reports `Greater` for two instances that are neither
+        // `<` nor `==`, which is what a tie looks like under a user `__lt__`
+        // keyed on one field, and made `max` return the LAST maximal element.
+        if interp.minmax_improves(&v, &best, want_min)? {
             best = v;
         }
     }
@@ -1599,11 +1598,23 @@ fn defaultdict_class(interp: &mut Interpreter) -> Result<Value, Unwind> {
     )
 }
 
-/// Source for the native `datetime` module: `date`, `datetime`, `timedelta`.
+/// Source for the native `datetime` module: `date`, `datetime`, `timedelta`,
+/// `timezone`.
 /// Date math uses a proleptic-Gregorian ordinal (`_ordinal`) so `date - date`
 /// and `datetime + timedelta(days=…)` are exact. Arithmetic flows through the
 /// `__add__` / `__sub__` dunders the foundation dispatches on instances.
+///
+/// `timezone` models CPython's FIXED-OFFSET tzinfo only — which is all
+/// `datetime.timezone` ever is — so `timezone.utc` and `timezone(timedelta(
+/// hours=…))` are exact, and `datetime.now(tz)` (current UTC instant shifted
+/// by the fixed offset) is exact for any of them. A naive `datetime.now()`
+/// returns the UTC wall clock rather than the host's local time: the VM has
+/// no timezone database, and every alternative (guessing, or raising) is worse
+/// than a documented UTC reading. Programs whose output depends on the local
+/// zone are not drop-in under `tyc run` and should use `tyc run --compile`.
 const DATETIME_SRC: &str = r#"
+import time
+
 def _is_leap(y):
     return y % 4 == 0 and (y % 100 != 0 or y % 400 == 0)
 
@@ -1664,6 +1675,48 @@ class timedelta:
     def __repr__(self):
         return "datetime.timedelta(days=" + str(self.days) + ")"
 
+def _offset_suffix(total):
+    if total < 0:
+        sign = "-"
+        total = -total
+    else:
+        sign = "+"
+    return sign + _pad2(total // 3600) + ":" + _pad2((total % 3600) // 60)
+
+class timezone:
+    def __init__(self, offset, name=None):
+        self.offset = offset
+        self.name = name
+    def utcoffset(self, dt):
+        return self.offset
+    def tzname(self, dt):
+        if self.name is None:
+            total = self.offset.total_seconds()
+            if total == 0:
+                return "UTC"
+            return "UTC" + _offset_suffix(total)
+        return self.name
+    def __eq__(self, other):
+        return self.offset.total_seconds() == other.offset.total_seconds()
+    def __repr__(self):
+        if self.offset.total_seconds() == 0 and self.name == "UTC":
+            return "datetime.timezone.utc"
+        return "datetime.timezone(" + repr(self.offset) + ")"
+    def __str__(self):
+        return self.tzname(None)
+
+timezone.utc = timezone(timedelta(0), "UTC")
+
+# Epoch (1970-01-01) as a proleptic-Gregorian ordinal, so `time.time()` can be
+# converted with the same `_from_ordinal` the rest of the shim uses.
+_EPOCH_ORDINAL = 719163
+
+def _now_parts(offset_seconds):
+    t = int(time.time()) + offset_seconds
+    ymd = _from_ordinal(_EPOCH_ORDINAL + t // 86400)
+    rem = t % 86400
+    return (ymd[0], ymd[1], ymd[2], rem // 3600, (rem % 3600) // 60, rem % 60)
+
 class date:
     def __init__(self, year, month, day):
         self.year = year
@@ -1684,7 +1737,7 @@ class date:
         return self.isoformat()
 
 class datetime:
-    def __init__(self, year, month, day, hour=0, minute=0, second=0, microsecond=0):
+    def __init__(self, year, month, day, hour=0, minute=0, second=0, microsecond=0, tzinfo=None):
         self.year = year
         self.month = month
         self.day = day
@@ -1692,13 +1745,33 @@ class datetime:
         self.minute = minute
         self.second = second
         self.microsecond = microsecond
+        self.tzinfo = tzinfo
+    @staticmethod
+    def now(tz=None):
+        if tz is None:
+            off = 0
+        else:
+            off = tz.utcoffset(None).total_seconds()
+        p = _now_parts(off)
+        return datetime(p[0], p[1], p[2], p[3], p[4], p[5], 0, tz)
     def date(self):
         return date(self.year, self.month, self.day)
+    def utcoffset(self):
+        if self.tzinfo is None:
+            return None
+        return self.tzinfo.utcoffset(self)
+    def tzname(self):
+        if self.tzinfo is None:
+            return None
+        return self.tzinfo.tzname(self)
     def _ordinal(self):
         return _to_ordinal(self.year, self.month, self.day)
     def isoformat(self):
-        return (str(self.year) + "-" + _pad2(self.month) + "-" + _pad2(self.day)
+        base = (str(self.year) + "-" + _pad2(self.month) + "-" + _pad2(self.day)
                 + "T" + _pad2(self.hour) + ":" + _pad2(self.minute) + ":" + _pad2(self.second))
+        if self.tzinfo is None:
+            return base
+        return base + _offset_suffix(self.tzinfo.utcoffset(self).total_seconds())
     def __add__(self, other):
         total_secs = self.hour * 3600 + self.minute * 60 + self.second + other.seconds
         extra_days = total_secs // 86400
@@ -1717,7 +1790,7 @@ class datetime:
 
 fn make_datetime_module(interp: &mut Interpreter) -> Result<Value, Unwind> {
     let members = compile_helpers(interp, DATETIME_SRC)?;
-    let wanted = ["date", "datetime", "timedelta"];
+    let wanted = ["date", "datetime", "timedelta", "timezone"];
     let entries: Vec<(&str, Value)> = wanted
         .iter()
         .filter_map(|&n| {
@@ -5838,6 +5911,21 @@ fn str_method(
         "isalpha" => Value::Bool(!s.is_empty() && s.chars().all(|c| c.is_alphabetic())),
         "isalnum" => Value::Bool(!s.is_empty() && s.chars().all(|c| c.is_alphanumeric())),
         "isspace" => Value::Bool(!s.is_empty() && s.chars().all(|c| c.is_whitespace())),
+        // Unlike `isdigit` / `isalpha` / …, CPython defines BOTH of these as
+        // True for the empty string: `"".isascii()` and `"".isprintable()`
+        // are True (an empty string trivially satisfies "every character
+        // is …"), where `"".isdigit()` is False.
+        "isascii" => Value::Bool(s.is_ascii()),
+        // CPython: printable is everything except the "Other" (Cc, Cf, Cs,
+        // Co, Cn) and "Separator" (Zs, Zl, Zp) categories — with ASCII space
+        // (U+0020) explicitly printable. `char::is_control` covers Cc; the
+        // remaining unprintables the VM can identify without a full Unicode
+        // category table are the non-ASCII whitespace/separator characters
+        // (every Zs/Zl/Zp other than U+0020 is `char::is_whitespace`).
+        "isprintable" => Value::Bool(
+            s.chars()
+                .all(|c| c == ' ' || (!c.is_control() && !c.is_whitespace())),
+        ),
         // CPython: true iff there is at least one cased character and no
         // character of the opposite case (uncased chars like ',', ' ', digits
         // do not satisfy the predicate on their own).
@@ -6019,11 +6107,79 @@ fn str_method(
     })
 }
 
+/// Resolve one `str.format` replacement-field reference: `""` (auto-numbered),
+/// `"0"` / `"1"` (explicit index), or `"name"` (keyword). Shared by the outer
+/// field and by the nested fields a format spec may contain, so both advance
+/// the same auto-numbering counter in CPython's order.
+fn resolve_format_field(
+    field_ref: &str,
+    pos_args: &[Value],
+    kwargs: &[(String, Value)],
+    auto_idx: &mut usize,
+) -> Result<Value, Unwind> {
+    if field_ref.is_empty() {
+        let v = pos_args.get(*auto_idx).ok_or_else(|| {
+            index_error(format!(
+                "Replacement index {} out of range for positional args",
+                *auto_idx
+            ))
+        })?;
+        *auto_idx += 1;
+        return Ok(v.clone());
+    }
+    if let Ok(idx) = field_ref.parse::<usize>() {
+        return pos_args.get(idx).cloned().ok_or_else(|| {
+            index_error(format!(
+                "Replacement index {idx} out of range for positional args"
+            ))
+        });
+    }
+    kwargs
+        .iter()
+        .find(|(k, _)| k == field_ref)
+        .map(|(_, v)| v.clone())
+        .ok_or_else(|| key_error(format!("'{}'", field_ref)))
+}
+
+/// Substitute the replacement fields a format spec may itself contain —
+/// `"{:.{}}"`, `"{:>{w}}"`, `"{:{fill}{align}{n}}"` — before the spec is
+/// parsed. CPython allows exactly one level of nesting here and resolves them
+/// AFTER the outer field's own auto-numbering, which is why `auto_idx` is
+/// threaded through rather than restarted.
+fn expand_nested_spec(
+    interp: &mut Interpreter,
+    spec: &str,
+    pos_args: &[Value],
+    kwargs: &[(String, Value)],
+    auto_idx: &mut usize,
+) -> Result<String, Unwind> {
+    let chars: Vec<char> = spec.chars().collect();
+    let mut out = String::with_capacity(spec.len());
+    let mut i = 0usize;
+    while i < chars.len() {
+        if chars[i] != '{' {
+            out.push(chars[i]);
+            i += 1;
+            continue;
+        }
+        let start = i + 1;
+        let Some(end) = (start..chars.len()).find(|&j| chars[j] == '}') else {
+            return Err(value_error("unmatched '{' in format spec"));
+        };
+        let field_ref: String = chars[start..end].iter().collect();
+        let v = resolve_format_field(&field_ref, pos_args, kwargs, auto_idx)?;
+        out.push_str(&interp.str_of(&v)?);
+        i = end + 1;
+    }
+    Ok(out)
+}
+
 /// Implementation of `str.format(...)`. Supports:
 /// - `{}` auto-numbered positional fields
 /// - `{0}`, `{1}` explicit positional fields
 /// - `{name}` named fields
 /// - `{0:.2f}`, `{name:05d}` format-spec fields
+/// - `{:.{}}`, `{:>{w}}` specs containing their own replacement fields
 /// - `{{` and `}}` as literal braces
 fn str_format(
     interp: &mut Interpreter,
@@ -6071,34 +6227,19 @@ fn str_format(
                     (field.as_str(), "")
                 };
 
-                // Resolve the value
-                let value = if field_ref.is_empty() {
-                    // `{}` auto-numbering
-                    let v = pos_args.get(auto_idx).ok_or_else(|| {
-                        index_error(format!(
-                            "Replacement index {} out of range for positional args",
-                            auto_idx
-                        ))
-                    })?;
-                    auto_idx += 1;
-                    v.clone()
-                } else if let Ok(idx) = field_ref.parse::<usize>() {
-                    // `{0}`, `{1}` etc.
-                    pos_args
-                        .get(idx)
-                        .ok_or_else(|| {
-                            index_error(format!(
-                                "Replacement index {idx} out of range for positional args"
-                            ))
-                        })?
-                        .clone()
+                // Resolve the value (`{}` auto-numbered, `{0}` indexed, or
+                // `{name}` from kwargs).
+                let value = resolve_format_field(field_ref, pos_args, kwargs, &mut auto_idx)?;
+
+                // The spec may itself contain replacement fields
+                // (`"{:.{}}"`, `"{:>{w}}"`); substitute them before parsing,
+                // after the outer field's own auto-numbering.
+                let expanded;
+                let spec: &str = if spec.contains('{') {
+                    expanded = expand_nested_spec(interp, spec, pos_args, kwargs, &mut auto_idx)?;
+                    &expanded
                 } else {
-                    // `{name}` — look up in kwargs
-                    kwargs
-                        .iter()
-                        .find(|(k, _)| k == field_ref)
-                        .map(|(_, v)| v.clone())
-                        .ok_or_else(|| key_error(format!("'{}'", field_ref)))?
+                    spec
                 };
 
                 // A user `__format__(self, spec)` controls its own
@@ -6226,6 +6367,29 @@ fn bytes_method(b: &Rc<Vec<u8>>, name: &str, args: &[Value]) -> Result<Value, Un
                 Some(i) => Value::Int(VmInt::from(i as i64)),
                 None if name == "find" => Value::Int(VmInt::from(-1)),
                 None => return Err(value_error("subsection not found")),
+            }
+        }
+        // `b"aabb".count(b"a")` → 2. CPython counts NON-OVERLAPPING
+        // occurrences (`b"aaa".count(b"aa")` is 1), and an empty subsequence
+        // matches at every position including both ends (`len + 1`). An `int`
+        // argument counts occurrences of that byte, via `bytes_arg`.
+        "count" => {
+            let needle = bytes_arg(single(args, "count")?)?;
+            if needle.is_empty() {
+                Value::Int(VmInt::from(b.len() as i64 + 1))
+            } else {
+                let mut n: i64 = 0;
+                let mut at = 0usize;
+                while at + needle.len() <= b.len() {
+                    match find_subslice(&b[at..], &needle) {
+                        Some(i) => {
+                            n += 1;
+                            at += i + needle.len();
+                        }
+                        None => break,
+                    }
+                }
+                Value::Int(VmInt::from(n))
             }
         }
         "replace" => {
@@ -7505,11 +7669,10 @@ pub fn call_with_kwargs(
                     Some(f) => interp.call_value(f.clone(), vec![v.clone()], &[])?,
                     None => v.clone(),
                 };
-                // `value_cmp` honours a user `__lt__` on the (keyed) operands.
-                let cmp = interp.value_cmp(&vk, &best_key)?;
-                if (want_min && cmp == std::cmp::Ordering::Less)
-                    || (!want_min && cmp == std::cmp::Ordering::Greater)
-                {
+                // Strict improvement only, honouring a user `__lt__` /
+                // `__gt__` on the (keyed) operands — CPython keeps the first
+                // extremal element on a tie for both `min` and `max`.
+                if interp.minmax_improves(&vk, &best_key, want_min)? {
                     best = v;
                     best_key = vk;
                 }

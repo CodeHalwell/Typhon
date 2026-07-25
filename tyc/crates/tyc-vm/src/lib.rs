@@ -2588,4 +2588,297 @@ main()
 "#;
         assert_eq!(run_capturing(src).unwrap(), 0);
     }
+
+    /// CPython's `max` keeps the FIRST maximal element and `min` the first
+    /// minimal — neither replaces the running best on a tie. The VM used a
+    /// three-way `value_cmp` that reports `Greater` for two instances that
+    /// are neither `<` nor `==` (exactly a tie under a user `__lt__` keyed on
+    /// one field), so `max` returned the LAST maximal element. Covers the
+    /// bare form, the `key=` form (which has its own reduction loop), and
+    /// plain scalars.
+    #[test]
+    fn minmax_keep_first_extremal_element_on_a_tie() {
+        let src = r#"
+class Rec:
+    name: str
+    score: int
+
+impl Rec:
+    def __lt__(self, other: Rec) -> bool:
+        return self.score < other.score
+
+def main() -> None:
+    let tied: list[Rec] = [Rec(name="p", score=1), Rec(name="q", score=1)]
+    if max(tied).name != "p":
+        raise ValueError("max must keep the FIRST maximal element")
+    if min(tied).name != "p":
+        raise ValueError("min must keep the FIRST minimal element")
+
+    # A real ordering still wins over position.
+    let mixed: list[Rec] = [Rec(name="c", score=2), Rec(name="a", score=1), Rec(name="b", score=2)]
+    if max(mixed).name != "c":
+        raise ValueError("max over a real ordering wrong")
+    if min(mixed).name != "a":
+        raise ValueError("min over a real ordering wrong")
+
+    # The `key=` path is a separate reduction loop with the same rule.
+    if max(tied, key=lambda r: r.score).name != "p":
+        raise ValueError("max(key=) must keep the first maximal element")
+    if max(mixed, key=lambda r: r.score).name != "c":
+        raise ValueError("max(key=) over a real ordering wrong")
+    if min(mixed, key=lambda r: r.score).name != "a":
+        raise ValueError("min(key=) over a real ordering wrong")
+
+    # Scalars are unaffected.
+    if max([3, 1, 3, 2]) != 3 or min([3, 1, 1, 2]) != 1:
+        raise ValueError("scalar min/max wrong")
+    if max(2, 5) != 5 or min(2, 5) != 2:
+        raise ValueError("variadic min/max wrong")
+
+main()
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    /// `str.isascii()` / `str.isprintable()` were missing entirely
+    /// (`AttributeError`). Note the empty-string cases: CPython returns True
+    /// for both, unlike its `isdigit` / `isalpha` / `isspace` neighbours.
+    #[test]
+    fn str_isascii_and_isprintable_match_cpython() {
+        let src = r#"
+def main() -> None:
+    if not "abc".isascii():
+        raise ValueError("'abc'.isascii() must be True")
+    if "café".isascii():
+        raise ValueError("non-ASCII isascii() must be False")
+    # Empty string: True for isascii/isprintable, False for isdigit.
+    if not "".isascii():
+        raise ValueError("''.isascii() must be True")
+    if not "".isprintable():
+        raise ValueError("''.isprintable() must be True")
+    if "".isdigit():
+        raise ValueError("''.isdigit() must be False (unchanged)")
+
+    if not "abc 123!".isprintable():
+        raise ValueError("printable ASCII incl. space must be True")
+    if "a\nb".isprintable():
+        raise ValueError("newline is not printable")
+    if "a\tb".isprintable():
+        raise ValueError("tab is not printable")
+    # Non-ASCII letters ARE printable; a non-breaking space is not.
+    if not "café".isprintable():
+        raise ValueError("accented letters are printable")
+    if "a b".isprintable():
+        raise ValueError("NBSP is a separator, not printable")
+
+main()
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    /// `bytes.count()` was listed in the attribute table but never
+    /// implemented (`bytes has no method 'count'`). CPython counts
+    /// NON-overlapping occurrences, and an empty needle matches `len + 1`
+    /// times.
+    #[test]
+    fn bytes_count_matches_cpython() {
+        let src = r#"
+def main() -> None:
+    if b"aabb".count(b"a") != 2:
+        raise ValueError("simple count wrong")
+    if b"aabb".count(b"ab") != 1:
+        raise ValueError("multi-byte needle count wrong")
+    if b"aaa".count(b"aa") != 1:
+        raise ValueError("count must be non-overlapping")
+    if b"aabb".count(b"z") != 0:
+        raise ValueError("absent needle must count 0")
+    if b"abc".count(b"") != 4:
+        raise ValueError("empty needle counts len + 1")
+    if b"".count(b"a") != 0:
+        raise ValueError("empty haystack must count 0")
+    # An int argument counts that byte value (b'a' == 97).
+    if b"aabb".count(97) != 2:
+        raise ValueError("int needle count wrong")
+    # The already-working neighbours must not regress.
+    if b"aabb".find(b"b") != 2:
+        raise ValueError("bytes.find regressed")
+
+main()
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    /// `datetime.timezone` was absent from the VM's `datetime` shim, so
+    /// `datetime.now(timezone.utc)` — what every UTC-aware timestamp needs —
+    /// raised `AttributeError`. Fixed-offset tzinfo is all
+    /// `datetime.timezone` ever models, so this is exact.
+    #[test]
+    fn datetime_timezone_utc_is_usable() {
+        let src = r#"
+from datetime import datetime, timedelta, timezone
+
+def main() -> None:
+    if timezone.utc.utcoffset(None).total_seconds() != 0:
+        raise ValueError("timezone.utc offset must be 0")
+    if timezone.utc.tzname(None) != "UTC":
+        raise ValueError("timezone.utc tzname must be UTC")
+
+    # The headline use: an aware "now". Only the shape is deterministic.
+    let now = datetime.now(timezone.utc)
+    if now.year <= 2000:
+        raise ValueError("datetime.now(timezone.utc) year wrong")
+    if now.tzinfo != timezone.utc:
+        raise ValueError("datetime.now(tz) must carry its tzinfo")
+    if now.utcoffset().total_seconds() != 0:
+        raise ValueError("aware now must report a zero UTC offset")
+
+    # A naive `now()` still works and carries no tzinfo.
+    if datetime.now().tzinfo is not None:
+        raise ValueError("naive now() must have tzinfo None")
+
+    # `isoformat` gains the offset suffix once aware.
+    let fixed = datetime(2020, 1, 2, 3, 4, 5, 0, timezone.utc)
+    if fixed.isoformat() != "2020-01-02T03:04:05+00:00":
+        raise ValueError("aware isoformat wrong: " + fixed.isoformat())
+    if datetime(2020, 1, 2, 3, 4, 5).isoformat() != "2020-01-02T03:04:05":
+        raise ValueError("naive isoformat regressed")
+
+    # Non-UTC fixed offsets are modelled too.
+    let plus5 = timezone(timedelta(hours=5))
+    if plus5.utcoffset(None).total_seconds() != 18000:
+        raise ValueError("fixed +5 offset wrong")
+    if datetime(2020, 1, 2, 3, 4, 5, 0, plus5).isoformat() != "2020-01-02T03:04:05+05:00":
+        raise ValueError("fixed-offset isoformat wrong")
+    let minus330 = timezone(timedelta(hours=-3, minutes=-30))
+    if datetime(2020, 1, 2, 3, 4, 5, 0, minus330).isoformat() != "2020-01-02T03:04:05-03:30":
+        raise ValueError("negative fixed-offset isoformat wrong")
+
+main()
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    /// A lambda never evaluated its parameter defaults, so `lambda i=i: i`
+    /// raised "missing required argument". That form is the fix
+    /// `tyc explain loop_closure_capture` prescribes, so the VM was
+    /// rejecting the code the compiler recommends.
+    #[test]
+    fn lambda_parameter_defaults_bind() {
+        let src = r#"
+from typing import Callable
+
+def main() -> None:
+    # The canonical loop-capture fix.
+    mut fns: list[Callable[[], int]] = []
+    for i in [0, 1, 2]:
+        fns.append(lambda i=i: i)
+    if [f() for f in fns] != [0, 1, 2]:
+        raise ValueError("lambda default did not snapshot the loop variable")
+
+    # Defaults are evaluated once, at lambda-creation time.
+    mut seed: int = 10
+    let snap = lambda x=seed: x
+    seed = 99
+    if snap() != 10:
+        raise ValueError("lambda default must be evaluated at creation time")
+
+    # A default is still overridable by an explicit argument, and mixes with
+    # required parameters.
+    let add = lambda a, b=5: a + b
+    if add(1) != 6 or add(1, 2) != 3:
+        raise ValueError("lambda default/override wrong")
+    if (lambda a=1, b=2: a * 10 + b)(7) != 72:
+        raise ValueError("multiple lambda defaults wrong")
+    # Keyword arguments still reach a defaulted parameter.
+    if add(1, b=9) != 10:
+        raise ValueError("lambda default by keyword wrong")
+
+main()
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    /// For a STRING operand, `.N` in a format spec is a MAXIMUM LENGTH, not a
+    /// decimal precision (`f"{'hello':.1}"` is `'h'`). The VM applied
+    /// precision only to numerics and passed strings through whole. Must hold
+    /// in f-strings, `str.format`, and `format()` — and must not disturb the
+    /// specs that already agreed.
+    #[test]
+    fn string_precision_spec_truncates() {
+        let src = r#"
+def main() -> None:
+    let s: str = "hello"
+    if f"{s:.1}" != "h":
+        raise ValueError("f-string precision 1 wrong")
+    if f"{s:.3}" != "hel":
+        raise ValueError("f-string precision 3 wrong")
+    # A precision longer than the string is a no-op.
+    if f"{s:.9}" != "hello":
+        raise ValueError("over-long precision must not pad")
+    # Precision composes with width and alignment.
+    if f"{s:>8.2}" != "      he":
+        raise ValueError("width + precision wrong")
+    if f"{s:*<6.3}" != "hel***":
+        raise ValueError("fill/align + precision wrong")
+    if "{:.2}".format(s) != "he":
+        raise ValueError("str.format precision wrong")
+    if format(s, ".4") != "hell":
+        raise ValueError("format() precision wrong")
+    # Nested {precision} substitution.
+    if "{:.{}}".format(s, 2) != "he":
+        raise ValueError("nested precision wrong")
+    # `!r` converts first, so the QUOTED rendering is what gets truncated.
+    if f"{s!r:.3}" != "'he":
+        raise ValueError("!r + precision must truncate the repr")
+
+    # No-precision string specs must be unchanged.
+    if f"{s:>8}" != "   hello" or f"{s:<8}" != "hello   " or f"{s:^9}" != "  hello  ":
+        raise ValueError("string width/align regressed")
+    # Numeric precision is unchanged.
+    if f"{3.14159:.2f}" != "3.14" or f"{42:5d}" != "   42":
+        raise ValueError("numeric format specs regressed")
+
+main()
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    /// `freeze let` lowers a nested dict to `types.MappingProxyType`, which
+    /// CPython renders two ways: `__repr__` is `mappingproxy({…})` but
+    /// `__str__` delegates to the underlying dict, so `print(m)` shows `{…}`.
+    /// The VM used the repr form for both.
+    #[test]
+    fn frozen_mapping_str_uses_the_dict_form() {
+        let src = r#"
+freeze let CONFIG = {"port": 8080, "hosts": ["a", "b"], "nested": {"k": [1, 2]}}
+
+def main() -> None:
+    let nested = CONFIG["nested"]
+    if str(nested) != "{'k': (1, 2)}":
+        raise ValueError("str(mappingproxy) must use the dict form: " + str(nested))
+    if repr(nested) != "mappingproxy({'k': (1, 2)})":
+        raise ValueError("repr(mappingproxy) must keep the wrapper: " + repr(nested))
+    # An f-string / `format` goes through `str`, like `print`.
+    if f"{nested}" != "{'k': (1, 2)}":
+        raise ValueError("f-string must use the dict form")
+    # A proxy NESTED in another container still shows the wrapper, because
+    # container reprs render their elements with `repr`.
+    if str([nested]) != "[mappingproxy({'k': (1, 2)})]":
+        raise ValueError("nested proxy must keep the wrapper: " + str([nested]))
+    # An ordinary dict is unaffected.
+    if str({"a": 1}) != "{'a': 1}" or repr({"a": 1}) != "{'a': 1}":
+        raise ValueError("plain dict rendering regressed")
+    # Immutability is untouched by the rendering change.
+    mut raised: bool = False
+    try:
+        nested["k"] = [9]
+    except TypeError:
+        raised = True
+    if not raised:
+        raise ValueError("frozen mapping must still reject item assignment")
+
+main()
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
 }

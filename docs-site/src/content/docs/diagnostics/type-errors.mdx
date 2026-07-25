@@ -41,6 +41,29 @@ let x: int = "hello"    # ❌
 
 **Fix:** change the value, the annotation, or convert explicitly (`int("...")`).
 
+### Fixed-arity tuple read at a non-constant index
+
+Each slot of a `tuple[int, str]` holds a different type, so which type a read
+produces depends on *which* slot is read. A literal index resolves the slot
+exactly; a variable index cannot, so the read is typed as the union of every
+slot type.
+
+```python
+let t: tuple[int, str] = (1, "abc")
+mut i: int = 1
+let a: int = t[i]       # ❌ expected `int`, found `int | str`
+let b: str = t[i]       # ❌ expected `str`, found `int | str`
+```
+
+Both are rejected — they are the same expression, so they cannot both be
+right. `int | str` in the message means *the index is not statically known*.
+
+**Fix:** index with a literal (`t[0]`), or annotate the union and narrow it
+(`let v: int | str = t[i]` then `if isinstance(v, int): …`), or switch to a
+homogeneous `tuple[int, ...]` / `list[int]` when every slot holds the same
+type. A homogeneous fixed-arity tuple (`tuple[int, int]`) collapses to its
+single element type, so nothing widens there.
+
 ## `tyc::arg_count`
 
 A call site has too few or too many arguments. Fires on free functions, methods, and class constructors.

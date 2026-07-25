@@ -1,0 +1,15 @@
+# Format specs over a string operand. For a string, `.N` is a MAXIMUM LENGTH
+# rather than a decimal precision (`f"{'hello':.1}"` is `'h'`), in f-strings,
+# `str.format`, and `format()`, and composed with width and alignment.
+
+
+def main() -> None:
+    let s: str = "hello"
+    print(f"{s:.1}")
+    print(f"{s:.3}")
+    print(f"{s:>8.2}")
+    print("{:.2}".format(s))
+    print(format(s, ".4"))
+
+
+main()

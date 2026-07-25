@@ -237,16 +237,22 @@ pub enum TycError {
         span: SourceSpan,
     },
 
-    /// `let NAME: T` (or `mut NAME: T`) was written without an
-    /// initialiser. Typhon requires every binding to have a value at
-    /// declaration — the Rust-style "declare-then-assign-later" shape
-    /// produces a confusing `tyc::immutable_assign` on the next
-    /// assignment, so this dedicated diagnostic fires earlier.
-    #[error("`{keyword} {name}: {annotation}` is missing an initialiser")]
+    /// A declare-only `let NAME: T` / `mut NAME: T` that is never assigned
+    /// on any path **and** never read — a dead binding.
+    ///
+    /// Declare-then-assign became a supported form in v0.7.0 (definite-
+    /// assignment analysis), so a declaration followed by an assignment is
+    /// correct, a read on an unassigned path is `tyc::use_of_uninitialised`,
+    /// and a second assignment is `tyc::immutable_assign`. The one shape
+    /// nothing covered was "never assigned, never read": it lowers to an
+    /// inert bare annotation in the emitted Python and runs fine, so this is
+    /// a **warning** — flagging dead code, not rejecting a working program.
+    #[error("`{keyword} {name}: {annotation}` is never assigned and never read")]
     #[diagnostic(
+        severity(Warning),
         code(tyc::missing_initialiser),
         url("https://github.com/CodeHalwell/Typhon/blob/main/docs/diagnostics/missing_initialiser.md"),
-        help("Typhon bindings must be initialised at the point of declaration. Write `{keyword} {name}: {annotation} = <expr>` instead.")
+        help("Give it a value (`{keyword} {name}: {annotation} = <expr>`), assign it before it is read, or delete the declaration — as written it emits a bare `{name}: {annotation}` annotation that does nothing at runtime.")
     )]
     MissingInitialiser {
         keyword: String,
@@ -254,7 +260,7 @@ pub enum TycError {
         annotation: String,
         #[source_code]
         src: NamedSource<String>,
-        #[label("missing `= <expr>` here")]
+        #[label("declared here, never assigned")]
         span: SourceSpan,
     },
 
@@ -3599,10 +3605,64 @@ fn type_mismatch_help(expected: &str, actual: &str) -> String {
     if let Some(hint) = dict_literal_to_model_hint(expected, actual) {
         return hint;
     }
+    if let Some(hint) = union_member_hint(expected, actual) {
+        return hint;
+    }
     format!(
         "change the value so it produces `{expected}`, or widen the annotation to \
          `{expected} | {actual}` if both are intended"
     )
+}
+
+/// When the *found* type is a union that already contains the expected
+/// type as one of its members, the default "widen the annotation to
+/// `{expected} | {actual}`" hint renders nonsense (`int | int | str`)
+/// and, worse, misses the point: the value genuinely could be any
+/// member, so the fix is to widen to the union and *narrow* before use.
+///
+/// This is the shape produced by reading a fixed-arity tuple at a
+/// non-constant index — `t[i]` on a `tuple[int, str]` is `int | str`,
+/// because the slot is not statically known — so the hint names that
+/// origin and the literal-index escape hatch alongside the general
+/// advice.
+///
+/// Returns `None` unless `actual` is a top-level union (`A | B`) with
+/// `expected` among its members, so every other mismatch shape falls
+/// through to the default phrasing.
+fn union_member_hint(expected: &str, actual: &str) -> Option<String> {
+    if !actual.contains('|') {
+        return None;
+    }
+    // Split on top-level `|` only — a `|` nested inside `[...]`
+    // (e.g. `list[int | str]`) belongs to a parameter, not to this
+    // union.
+    let mut depth = 0usize;
+    let mut members: Vec<&str> = Vec::new();
+    let mut start = 0usize;
+    for (i, ch) in actual.char_indices() {
+        match ch {
+            '[' | '(' => depth += 1,
+            ']' | ')' => depth = depth.saturating_sub(1),
+            '|' if depth == 0 => {
+                members.push(actual[start..i].trim());
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    members.push(actual[start..].trim());
+    if members.len() < 2 || !members.contains(&expected) {
+        return None;
+    }
+    Some(format!(
+        "`{actual}` is a union — the value is not statically known to be \
+         `{expected}`, so it cannot be used as one. Widen the annotation to \
+         `{actual}` and narrow it (with `isinstance(…)`, a `match`, or a \
+         `guard`) before using it as `{expected}`. (If the union came from a \
+         tuple read such as `t[i]`, the index is what is unknown — indexing \
+         with a literal, e.g. `t[0]`, selects a single slot and yields that \
+         slot's type.)"
+    ))
 }
 
 /// When a dict literal flows into a `model` / `class` / `class!` binding,
@@ -4821,6 +4881,65 @@ mod tests {
     }
 
     #[test]
+    fn type_mismatch_union_member_suggests_narrowing() {
+        // Reading a fixed-arity tuple at a non-constant index produces
+        // `int | str`. The default "widen to `{expected} | {actual}`"
+        // hint would render the nonsense `int | int | str`; the union
+        // hint must instead point at narrowing and name the literal-index
+        // escape hatch.
+        let e = TycError::type_mismatch("int", "int | str", "a.ty", "let v: int = t[i]", 13, 4);
+        let TycError::TypeMismatch { suggestion, .. } = &e else {
+            panic!("expected TypeMismatch variant");
+        };
+        assert!(
+            !suggestion.contains("int | int | str"),
+            "must not suggest a duplicated union widening: {suggestion}"
+        );
+        assert!(
+            suggestion.contains("not statically known"),
+            "hint must explain the value could be any member: {suggestion}"
+        );
+        assert!(
+            suggestion.contains("t[0]"),
+            "hint must name the literal-index escape hatch: {suggestion}"
+        );
+    }
+
+    #[test]
+    fn type_mismatch_non_union_keeps_default_hint() {
+        // A plain scalar mismatch must be untouched by the union hint.
+        let e = TycError::type_mismatch("int", "str", "a.ty", "let v: int = s", 13, 1);
+        let TycError::TypeMismatch { suggestion, .. } = &e else {
+            panic!("expected TypeMismatch variant");
+        };
+        assert!(
+            suggestion.contains("widen the annotation to `int | str`"),
+            "scalar mismatch must keep the default hint: {suggestion}"
+        );
+    }
+
+    #[test]
+    fn type_mismatch_nested_pipe_is_not_a_top_level_union() {
+        // The `|` here belongs to the list's element parameter, not to a
+        // top-level union, so the union hint must not fire.
+        let e = TycError::type_mismatch(
+            "list[int]",
+            "list[int | str]",
+            "a.ty",
+            "let v: list[int] = xs",
+            19,
+            2,
+        );
+        let TycError::TypeMismatch { suggestion, .. } = &e else {
+            panic!("expected TypeMismatch variant");
+        };
+        assert!(
+            !suggestion.contains("not statically known"),
+            "nested `|` must not be read as a top-level union: {suggestion}"
+        );
+    }
+
+    #[test]
     fn type_mismatch_dict_variance_suggests_mapping() {
         let e = TycError::type_mismatch(
             "dict[str, Animal]",
@@ -5412,6 +5531,30 @@ mod tests {
         let e = TycError::typevar_bound_violation("T", "int", "C", "f.ty", "src", 0, 1);
         let code = e.code().unwrap().to_string();
         assert_eq!(code, "tyc::typevar_bound");
+    }
+
+    #[test]
+    fn missing_initialiser_is_declared_warning_severity() {
+        // C3: the dead-binding lint must render with `⚠` and be counted as a
+        // warning — a `severity(Warning)` omission is exactly how two other
+        // diagnostics ended up rendering with the error glyph. A
+        // never-assigned-never-read binding runs correctly today, so an error
+        // here would narrow the accepted surface on a *correct* program.
+        use miette::Diagnostic;
+        let e = TycError::missing_initialiser(
+            "let",
+            "port",
+            "int",
+            "a.ty",
+            "def f() -> None:\n    let port: int\n",
+            25,
+            4,
+        );
+        assert_eq!(e.severity(), Some(miette::Severity::Warning));
+        assert_eq!(
+            e.code().map(|c| c.to_string()).unwrap_or_default(),
+            "tyc::missing_initialiser"
+        );
     }
 
     #[test]

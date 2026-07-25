@@ -50,6 +50,11 @@ code uses 3.13+ syntax.
 | `interfaces_extend.ty` | structural interface conformance, `impl` distributed over a sealed union, `extend str:` / `extend list:` |
 | `vm_asbang_cast.ty` | `as!` in value, comprehension and union positions, and its runtime `TypeError` on a wrong shape |
 | `inline_question_op.ty` | `?` away from statement-tail — nested in a call argument, mid-expression, in a condition, twice in one expression |
+| `max_tie_breaking.ty` | `min()` / `max()` keeping the FIRST extremal element on a tie, over records with a user `__lt__` |
+| `missing_vm_builtins.ty` | `str.isascii` / `isprintable` (incl. the empty string), `bytes.count`, `datetime.now(timezone.utc)` |
+| `lambda_default_args.ty` | lambda parameter defaults — the `lambda i=i: i` loop-capture snapshot `tyc explain loop_closure_capture` prescribes |
+| `string_precision_spec.ty` | `.N` as a MAXIMUM LENGTH for a string operand, in f-strings / `str.format` / `format()`, composed with width and align |
+| `frozen_dict_str.ty` | `freeze let` mapping renderings — `str` gives the dict form, `repr` keeps the `mappingproxy(…)` wrapper |
 
 ## Adding a case
 

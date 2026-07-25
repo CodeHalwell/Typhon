@@ -1,0 +1,34 @@
+# EXPECT-WARN: tyc::missing_initialiser
+#
+# A declare-only `let NAME: T` is legal (v0.7.0) — the first subsequent
+# assignment IS the initialiser. But a declaration that is never assigned on
+# any path *and* never read is dead: it lowers to a bare `port: int`
+# annotation in the emitted Python, which does nothing at runtime.
+#
+# This completes the v0.7.0 definite-assignment story; the other three shapes
+# were already covered:
+#
+#   let x: int  then  x = 1    → accepted (the assignment is the initialiser)
+#   read on an unassigned path → tyc::use_of_uninitialised
+#   a second assignment        → tyc::immutable_assign
+#
+# It is a *warning*, not an error, because the program as written runs
+# correctly — the lint flags dead code rather than rejecting working code.
+#
+# Fix: give it a value at the declaration, assign it before it is read, or —
+# as here, where nothing ever uses it — delete the declaration:
+#
+#     def start() -> str:
+#         return "started"
+
+
+def start() -> str:
+    let port: int
+    return "started"
+
+
+def main() -> None:
+    print(start())
+
+
+main()

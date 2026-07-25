@@ -1,0 +1,17 @@
+# Isolated stdlib members that each sit next to an already-implemented
+# neighbour in the VM's native shims: `str.isascii` / `str.isprintable` (both
+# True for the empty string, unlike their `isdigit` neighbour), `bytes.count`
+# beside `bytes.find`, and `datetime.timezone.utc` — what every UTC-aware
+# timestamp needs — beside `datetime.now()`.
+
+
+from datetime import datetime, timezone
+
+
+def main() -> None:
+    print("abc".isascii(), "abc".isprintable())
+    print(b"aabb".count(b"a"), b"aabb".find(b"b"))
+    print(datetime.now(timezone.utc).year > 2000)
+
+
+main()

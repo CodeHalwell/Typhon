@@ -1665,11 +1665,26 @@ impl Interpreter {
                 });
                 let body = Rc::new(vec![body_stmt]);
                 let slot_info = Rc::new(crate::slots::SlotInfo::analyze(&params, &body));
+                // Evaluate parameter defaults at lambda-creation time, in
+                // source order — exactly what `build_function` does for a
+                // `def`, and what `call_function` later indexes into. Without
+                // this, `lambda i=i: i` bound no default and raised "missing
+                // required argument". That form is not exotic: it is the fix
+                // `tyc explain loop_closure_capture` prescribes, so the VM was
+                // rejecting the code the compiler recommends.
+                let mut defaults = Vec::new();
+                for p in params.iter_non_variadic_params() {
+                    let v = match p.default() {
+                        Some(d) => Some(self.eval_expr(d, env)?),
+                        None => None,
+                    };
+                    defaults.push(v);
+                }
                 let func = Function {
                     name: "<lambda>".into(),
                     params,
                     body,
-                    defaults: vec![],
+                    defaults,
                     closure: env.clone(),
                     is_async: false,
                     is_static: false,
@@ -1960,6 +1975,39 @@ impl Interpreter {
             return Ok(Ordering::Greater);
         }
         Ok(a.py_cmp(b).unwrap_or(Ordering::Equal))
+    }
+
+    /// Whether `candidate` *strictly* improves on the running `best` for
+    /// `min` (`candidate < best`) / `max` (`candidate > best`) — the exact
+    /// predicate CPython's `min` / `max` use, and the reason both keep the
+    /// FIRST extremal element and never replace on a tie.
+    ///
+    /// Deliberately not `value_cmp`: that collapses instances to a total
+    /// order by reporting `Greater` whenever two are neither `<` nor `==`,
+    /// which is precisely the shape of a tie under a user `__lt__` keyed on
+    /// one field (`p.score == q.score` but `p != q`). `max` then replaced on
+    /// every such tie and returned the LAST maximal element. Routing the
+    /// instance case through `cmp_op` uses the same `__lt__` / `__gt__`
+    /// protocol (with reflected fallback) CPython does. Non-instances keep
+    /// `py_cmp`, treating an incomparable pair as "no improvement" rather
+    /// than raising — matching the previous behaviour exactly.
+    pub fn minmax_improves(
+        &mut self,
+        candidate: &Value,
+        best: &Value,
+        want_min: bool,
+    ) -> Result<bool, Unwind> {
+        use std::cmp::Ordering;
+        if matches!(candidate, Value::Instance(_)) || matches!(best, Value::Instance(_)) {
+            let op = if want_min { CmpOp::Lt } else { CmpOp::Gt };
+            return self.cmp_op(op, candidate, best);
+        }
+        let want = if want_min {
+            Ordering::Less
+        } else {
+            Ordering::Greater
+        };
+        Ok(candidate.py_cmp(best) == Some(want))
     }
 
     fn cmp_op(&mut self, op: CmpOp, l: &Value, r: &Value) -> Result<bool, Unwind> {
@@ -3120,6 +3168,16 @@ impl Interpreter {
         if let Some(s) = self.enum_member_repr(v) {
             return Ok(s);
         }
+        // `freeze let` lowers a nested dict to `types.MappingProxyType`, and
+        // CPython gives that type TWO renderings: `__repr__` is
+        // `mappingproxy({…})` but `__str__` delegates to the underlying dict,
+        // so `print(m)` shows `{…}`. Render the bare dict body here and keep
+        // the `mappingproxy(…)` wrapper for `repr` only. A proxy NESTED inside
+        // another container still shows the wrapper, because container reprs
+        // render their elements with `repr` (CPython does the same).
+        if let Value::Dict(d) = v {
+            return self.dict_body_repr(d, 0);
+        }
         if Self::is_container(v) {
             return self.repr_of(v);
         }
@@ -3146,6 +3204,36 @@ impl Interpreter {
             v,
             Value::List(_) | Value::Tuple(_) | Value::Dict(_) | Value::Set(_)
         )
+    }
+
+    /// The bare `{k: v, …}` rendering of a dict, with the synthetic
+    /// `__typhon_frozen__` sentinel filtered out and every key / value taken
+    /// through `repr` (matching CPython's `dict.__repr__`). Shared by
+    /// `repr_of_depth` — which wraps it in `mappingproxy(…)` for a frozen
+    /// mapping — and by `str_of`, which never wraps (CPython's
+    /// `mappingproxy.__str__` delegates to the underlying dict).
+    fn dict_body_repr(&mut self, d: &crate::value::RcDict, depth: usize) -> Result<String, Unwind> {
+        // Snapshot (key, value) pairs before recursing so the `RefCell`
+        // borrow isn't held across calls that may touch the same dict.
+        let pairs: Vec<(HashKey, Value)> = d
+            .borrow()
+            .iter()
+            .filter(
+                |(k, _)| !matches!(k, HashKey::Str(name) if name.as_str() == "__typhon_frozen__"),
+            )
+            .map(|(k, val)| (k.clone(), val.clone()))
+            .collect();
+        let mut s = String::from("{");
+        for (i, (k, val)) in pairs.iter().enumerate() {
+            if i > 0 {
+                s.push_str(", ");
+            }
+            s.push_str(&self.repr_hashkey(k, depth + 1)?);
+            s.push_str(": ");
+            s.push_str(&self.repr_of_depth(val, depth + 1)?);
+        }
+        s.push('}');
+        Ok(s)
     }
 
     /// `repr(v)` with a recursion-depth guard. Containers render each element
@@ -3202,36 +3290,12 @@ impl Interpreter {
             Value::Dict(d) => {
                 let frozen_key = HashKey::Str(Rc::new("__typhon_frozen__".to_owned()));
                 let is_frozen = matches!(d.borrow().get(&frozen_key), Some(Value::Bool(true)));
-                // Snapshot (key, value) pairs, filtering the synthetic
-                // `__typhon_frozen__` sentinel, before recursing.
-                let pairs: Vec<(HashKey, Value)> = d
-                    .borrow()
-                    .iter()
-                    .filter(|(k, _)| {
-                        !matches!(k, HashKey::Str(name) if name.as_str() == "__typhon_frozen__")
-                    })
-                    .map(|(k, val)| (k.clone(), val.clone()))
-                    .collect();
-                let mut s = String::new();
-                if is_frozen {
-                    s.push_str("mappingproxy({");
+                let body = self.dict_body_repr(d, depth)?;
+                Ok(if is_frozen {
+                    format!("mappingproxy({body})")
                 } else {
-                    s.push('{');
-                }
-                for (i, (k, val)) in pairs.iter().enumerate() {
-                    if i > 0 {
-                        s.push_str(", ");
-                    }
-                    s.push_str(&self.repr_hashkey(k, depth + 1)?);
-                    s.push_str(": ");
-                    s.push_str(&self.repr_of_depth(val, depth + 1)?);
-                }
-                if is_frozen {
-                    s.push_str("})");
-                } else {
-                    s.push('}');
-                }
-                Ok(s)
+                    body
+                })
             }
             Value::Set(set) => {
                 let frozen_key = HashKey::Str(Rc::new("__typhon_frozen__".to_owned()));
@@ -5556,10 +5620,12 @@ fn builtin_has_attr(value: &Value, attr: &str) -> bool {
                 | "index"
                 | "isalnum"
                 | "isalpha"
+                | "isascii"
                 | "isdecimal"
                 | "isdigit"
                 | "islower"
                 | "isnumeric"
+                | "isprintable"
                 | "isspace"
                 | "istitle"
                 | "isupper"
@@ -6990,6 +7056,22 @@ fn format_with_spec(value: &Value, default: &str, spec: &str) -> Result<String, 
         }
         Value::Bool(b) => {
             buf = (*b as i64).to_string();
+        }
+        // For a STRING operand `.N` is a MAXIMUM LENGTH, not a decimal
+        // precision — `f"{'hello':.1}"` is `'h'` (CPython truncates via
+        // `str.__format__`). Counted in characters, not bytes, so it is
+        // correct on non-ASCII text. Only `str` gets this: `object.__format__`
+        // rejects a non-empty spec outright in CPython, so applying it to the
+        // catch-all `default` rendering would invent behaviour.
+        Value::Str(_) => {
+            // Truncate the already-rendered `default`, not the value's own
+            // characters: an explicit `!r` / `!s` conversion has already
+            // replaced the operand with its rendering, and CPython formats
+            // *that* (`f"{'hello'!r:.3}"` is `"'he"`).
+            buf = match precision {
+                Some(p) => default.chars().take(p).collect(),
+                None => default.to_owned(),
+            };
         }
         _ => buf = default.to_owned(),
     }

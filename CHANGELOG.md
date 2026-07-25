@@ -12,7 +12,7 @@ only compiler-behaviour changes are one bundled-skill file that was being
 silently dropped, two warn-level diagnostics that rendered with the error
 glyph, and `tyc explain --list` labelling its two non-diagnostic entries.
 
-- **New `examples/errors/` corpus — 70 deliberately-broken programs.**
+- **New `examples/errors/` corpus — 71 deliberately-broken programs.**
   Twelve themed directories covering 56 of the 87 emittable `tyc::` codes:
   one file per rule (bindings, annotations, classes, sealed unions, `Result`,
   async, interfaces/generics, `newtype`/`freeze`/`pub`, boundary escapes, and
@@ -38,25 +38,110 @@ glyph, and `tyc explain --list` labelling its two non-diagnostic entries.
   `examples/parity/divergent/` under the inverse assertion, so fixing one fails
   the test as a prompt to promote the file. Harness:
   `tyc/crates/tyc/tests/parity_corpus.rs`.
-- **Findings recorded, not silently fixed** (each needs a decision, and two are
-  narrowings): the VM parses `?` only in statement-tail position, so the
-  documented inline form (`return Ok(p(a)?)`, `let x = p(a)? + 1`,
-  `if p(a)? > 0:`) is a hard parse error under `tyc run` while `tyc check` and
-  `tyc build` accept it; `max()` returns the last rather than the first maximal
-  element on a tie; `lambda x=x:` is unimplemented in the VM — which is the fix
-  `tyc explain loop_closure_capture` itself prescribes; the string precision
-  spec `f"{s:.1}"` is ignored; frozen mappings print as `mappingproxy(...)`
-  rather than CPython's `__str__` form; `str.isascii` / `str.isprintable` /
-  `bytes.count` / `datetime.timezone` are missing from the VM shims; a variable
-  index into a fixed-arity tuple type-checks against *any* element type (both
-  `let a: int = t[i]` and `let b: str = t[i]` are accepted, so the read
-  degrades to `Unknown` instead of the union); and two type-checker false
-  positives — a `try`/`except`/`else` whose `else` returns draws
-  `tyc::missing_return`, as does an exhaustive `match` ending in the
-  irrefutable `case {}:`. The two false positives are checked in under
-  `examples/errors/13-false-positives/`, the rest under
-  `examples/errors/12-known-gaps/` and `examples/parity/divergent/`. Full
-  analysis in `docs/review-2026-07-25.md`.
+- **Every finding the review recorded has now been fixed.** The review
+  (`docs/review-2026-07-25.md`) originally landed as a set of documented gaps
+  with reproductions checked in under `examples/errors/12-known-gaps/`,
+  `examples/errors/13-false-positives/` and `examples/parity/divergent/`, each
+  asserted by a harness to *keep* misbehaving so that fixing it would fail the
+  test as a prompt to reclassify the file. That is what happened for most of them:
+  `13-false-positives/` is deleted outright, `parity/divergent/` is emptied and
+  kept only as a home (with a README) for the next divergence, and
+  `12-known-gaps/` retains just the two findings still open — the silent
+  missing `await` and `implicit_any` not covering function signatures, both of
+  which need an explicit narrowing decision. The individual fixes are itemised
+  in the entries below.
+- **Six VM ↔ CPython divergences fixed** (`tyc-vm` only; the compiled path is
+  byte-for-byte unchanged, so this is additive on *correct* programs — each
+  fix moves `tyc run` onto the behaviour `tyc build` + CPython already had):
+  - **`max()` kept the LAST maximal element on a tie.** `min` / `max` reduced
+    through `value_cmp`, which collapses instances to a total order by
+    reporting `Greater` whenever two are neither `<` nor `==` — exactly a tie
+    under a user `__lt__` keyed on one field. The reduction now tests a
+    *strict* improvement via the same `__lt__` / `__gt__` protocol (with
+    reflected fallback) CPython uses, so both `min` and `max` keep the FIRST
+    extremal element. Silent wrong output on "highest score wins" logic.
+  - **`str.isascii()` / `str.isprintable()` / `bytes.count()` added.** Each sat
+    next to an implemented neighbour and raised `AttributeError`. Both string
+    predicates are True for the empty string (unlike their `isdigit`
+    neighbour); `bytes.count` counts non-overlapping occurrences.
+  - **`datetime.timezone` added to the VM's `datetime` shim,** along with the
+    `datetime.now()` it needs, so `datetime.now(timezone.utc)` — what every
+    UTC-aware timestamp needs — works. Fixed-offset tzinfo is all
+    `datetime.timezone` ever models, so `timezone.utc`, an arbitrary
+    `timezone(timedelta(hours=…))`, `utcoffset` / `tzname`, and the aware
+    `isoformat` offset suffix are exact. A *naive* `datetime.now()` returns the
+    UTC wall clock rather than host-local time (the VM has no timezone
+    database); programs whose output depends on the local zone need
+    `tyc run --compile`.
+  - **Lambda parameter defaults never bound.** `lambda i=i: i` raised
+    "missing required argument" because the lambda path built its `Function`
+    with an empty `defaults` vector. This is the form
+    `tyc explain loop_closure_capture` prescribes, so the VM was rejecting the
+    code the compiler recommends. Defaults are now evaluated at
+    lambda-creation time, in source order, exactly as for a `def`.
+  - **The string precision spec `f"{s:.1}"` was ignored.** For a *string*
+    operand `.N` is a MAXIMUM LENGTH, not a decimal precision, and CPython
+    truncates. Now honoured in f-strings, `str.format`, and `format()`, in
+    characters (not bytes), and applied to the post-conversion rendering so
+    `f"{s!r:.3}"` truncates the quoted form. Fixing this exposed a second
+    `str.format` gap: a spec containing its own replacement fields
+    (`"{:.{}}"`, `"{:>{w}}"`) was passed through unsubstituted; nested fields
+    are now expanded, after the outer field's auto-numbering, as CPython does.
+  - **A frozen mapping printed as `mappingproxy({…})`.** `freeze let` lowers
+    nested dicts to `types.MappingProxyType`, which CPython renders two ways:
+    `__repr__` keeps the wrapper but `__str__` delegates to the underlying
+    dict, so `print(m)` shows `{…}`. `str` / `print` / f-strings now use the
+    dict form and `repr` keeps the wrapper; a proxy nested inside another
+    container still shows the wrapper (container reprs render elements with
+    `repr`). Immutability enforcement is untouched on both paths.
+
+  Each fix carries a `tyc-vm` unit test, and the five reproductions moved from
+  `examples/parity/divergent/` up into `examples/parity/`, where the harness
+  now asserts their stdout is byte-identical under both paths.
+- **Type-checker soundness: a fixed-arity tuple read at a non-constant index is
+  typed as the union of its slots.** Given `t: tuple[int, str]` and a variable
+  `i`, both `let a: int = t[i]` and `let b: str = t[i]` used to be accepted —
+  the same expression satisfying two incompatible annotations — because the
+  subscript arm of `infer_expr_ctx` resolved a fixed-arity tuple only when the
+  index was a literal and fell through to `Unknown` otherwise. The emitted
+  Python then crashed (`TypeError: can only concatenate str (not "int") to
+  str`). `t[i]` now types as `int | str` — what a non-constant index actually
+  denotes — everywhere the read is typed: `let` initialiser, call argument,
+  `return`, comprehension. A *constant* index stays precise (`t[1]` is `str`;
+  an out-of-range constant still fires `tyc::tuple_index_out_of_range`), a
+  homogeneous `tuple[int, int]` collapses back to `int`, variadic
+  `tuple[T, ...]` is untouched, and a tuple *slice* (`t[a:b]`) stays permissive.
+  The `tyc::type_mismatch` help text gained a union case, so the diagnostic now
+  explains that the index — not the tuple — is what is unknown, and points at
+  both the literal-index and narrow-the-union fixes instead of rendering the
+  nonsense "widen to `int | int | str`". This is a **narrowing**: it rejects
+  programs `tyc check` used to accept, but only ones reading a tuple slot at a
+  type it does not hold, which crashed at runtime — the same bar
+  v1.0.0-alpha.2's three conservative diagnostics were held to. Verified
+  false-positive-free across all 259 `examples/` and ~1083 `stress/` programs
+  (baseline vs after: identical, save the reproduction itself). Was finding
+  **S1** in `docs/review-2026-07-25.md`; the reproduction moved from
+  `examples/errors/12-known-gaps/` to
+  `examples/errors/02-types-and-annotations/tuple_variable_index.ty`.
+- **Two type-checker false positives fixed** (both strictly widening — they
+  accept more *valid* programs and reject nothing that used to check):
+  - **`try`/`except`/`else` reachability.** CPython runs the `else:` clause
+    exactly when the `try` body completed without raising, and guarantees
+    precisely one of the `except` handlers or the `else:` runs. The four
+    reachability walkers in `tyc-types` additionally demanded that the *try
+    body* exit — which the `else:` form never does — so a function returning
+    on every path drew `tyc::missing_return` whenever an `else:` was present
+    (`try`/`except` and `try`/`except`/`finally` were already accepted). The
+    `else:` clause now owns the non-raising path, via a single shared
+    `try_normal_path_exits` helper so the four walkers cannot drift.
+  - **`case {}:` is irrefutable.** An empty mapping pattern places no
+    constraint on the subject beyond "it is a mapping", so it matches *every*
+    mapping — the mapping-typed equivalent of `case _:`, not a test for an
+    empty dict. `match_cases_cover_subject` now recognises an unguarded empty
+    mapping pattern (`case {}:` and the equally key-free `case {**rest}:`)
+    over a mapping-typed subject as a catch-all. A mapping pattern with at
+    least one key, and an empty mapping pattern over a non-mapping subject,
+    both stay refutable.
 - **Both example corpora are now regression-enforced.** Each error example
   declares its diagnostics in an `# EXPECT-ERROR:` / `# EXPECT-WARN:` header,
   asserted exactly (no more, no fewer) by the new
@@ -80,6 +165,37 @@ glyph, and `tyc explain --list` labelling its two non-diagnostic entries.
   and reported as warnings but drew miette's `×` glyph instead of `⚠`,
   because their declarations omitted `severity(Warning)`. Cosmetic, but it made
   a warning look like a build failure.
+- **`tyc::contains_secret_literal` now fires under `tyc check`.** The
+  `comptime let SECRET = env(...)` scan lived in `tyc/src/commands/build.rs`,
+  so it only ever appeared during `tyc build` — and both `docs/cli.md` and the
+  bundled skill recommend `tyc check src/` as the CI primary gate, meaning a
+  pipeline following the documented advice never saw it and a resolved API key
+  baked into a build artifact shipped unflagged. The detection moved into
+  `tyc_analyse::comptime_secret_literal_diagnostics`, which both commands now
+  call, so the two paths cannot report differently (the keyword table was
+  centralised into `tyc_analyse::SECRET_NAME_KEYWORDS` in alpha.6 for the same
+  reason; `secret_suffix` and the `env(...)` key extractor follow it). Still
+  warn-level on both paths, still silenced by `[strictness]
+  allow-secret-comptime` on both, and the longest-first keyword matching is
+  unchanged. Warnings are now emitted in sorted binding order rather than
+  `HashMap` order, so repeated runs report identically.
+- **`tyc::missing_initialiser` is live again, as a warn-level dead-binding
+  lint.** The variant and constructor existed in `tyc-diagnostics` and the code
+  was listed by `tyc explain --list`, but nothing in the compiler called
+  `TycError::missing_initialiser` — it had been orphaned since v0.7.0 made
+  declare-then-assign a supported form. It now fires on the one declare-only
+  shape nothing covered: a `let` / `mut NAME: T` that is never assigned on any
+  path **and** never read. (A declaration followed by an assignment is accepted
+  — the assignment is the initialiser; a read on an unassigned path is
+  `tyc::use_of_uninitialised`; a second assignment is
+  `tyc::immutable_assign`.) **Warn-level by design:** such a binding lowers to
+  an inert bare annotation and runs correctly, so per the "additive on
+  *correct* programs" rule an error would be a narrowing we are not entitled
+  to. Detection reuses the resolver's existing definite-assignment bookkeeping
+  — any declaration span not claimed by a first assignment, whose name is
+  referenced nowhere in the module. Matching on the name across the whole
+  module is deliberately conservative: it can only under-report. Zero hits
+  across `examples/` and `stress/`.
 - **`tyc explain --list` no longer advertises two codes that don't exist.**
   `freeze` and `pub` are language-reference topics with pages under
   `docs/diagnostics/`, not emittable diagnostics; they were printed as
@@ -92,8 +208,10 @@ glyph, and `tyc explain --list` labelling its two non-diagnostic entries.
   `DIAGNOSTICS.md`; function-level and `interface`-level HKT parameters
   (`def f[F[_]]`, `interface F[G[_]]:`) were documented as parsing and are hard
   parse errors, `class` headers being the only accepted position;
-  `tyc::missing_initialiser` is unreachable dead code and its page described
-  pre-v0.7.0 behaviour that v0.7.0's definite-assignment analysis replaced;
+  `tyc::missing_initialiser`'s page described pre-v0.7.0 behaviour that
+  v0.7.0's definite-assignment analysis replaced (the code was dead; it is
+  wired up as a warn-level dead-binding lint above, and the page, the skill's
+  `DIAGNOSTICS.md`, and the skill's diagnostics table now describe that);
   `tyc::implicit_any` was documented with a function-signature example, the one
   position it does *not* cover; the deprecated `typing` aliases are described
   as warn-level but are effectively unusable, since `Dict[K, V]` never unifies

@@ -1,0 +1,16 @@
+# `freeze let` renderings. Nested dicts lower to `types.MappingProxyType`,
+# which CPython renders two ways: `__repr__` is `mappingproxy({...})` while
+# `__str__` delegates to the underlying dict, so `print` shows `{...}`.
+
+
+freeze let CONFIG = {"port": 8080, "hosts": ["a", "b"], "nested": {"k": [1, 2]}}
+
+
+def main() -> None:
+    print(CONFIG["port"])
+    print(CONFIG["hosts"])
+    print(CONFIG["nested"])
+    print(repr(CONFIG["nested"]))
+
+
+main()

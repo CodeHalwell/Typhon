@@ -172,6 +172,10 @@ fn vm_output_matches_cpython() {
 
 /// The confirmed-divergence tripwire. These files are checked in *because*
 /// they misbehave; when one starts agreeing, promote it out of `divergent/`.
+///
+/// An **empty** `divergent/` is the goal state, not a failure: it means every
+/// known divergence has been fixed and promoted. The directory is kept (with
+/// its README) so the next confirmed divergence has an obvious home.
 #[test]
 fn documented_divergences_still_diverge() {
     let Some(python) = cpython() else {
@@ -181,7 +185,10 @@ fn documented_divergences_still_diverge() {
 
     let dir = parity_dir().join("divergent");
     let files = ty_files(&dir);
-    assert!(!files.is_empty(), "divergent corpus is empty");
+    if files.is_empty() {
+        // Nothing left to watch — every documented divergence has been fixed.
+        return;
+    }
 
     let mut agreed = Vec::new();
     for path in &files {

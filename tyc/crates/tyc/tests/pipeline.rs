@@ -599,6 +599,128 @@ fn async_without_await_emits_warning() {
 }
 
 #[test]
+fn check_reports_comptime_secret_literal() {
+    // C4: `tyc::contains_secret_literal` used to be emitted only from
+    // `tyc build`, so a CI pipeline following the documented advice
+    // (`tyc check src/` as the primary gate) never saw it and a resolved
+    // API key could ship inlined in a build artifact unflagged. Both
+    // commands now share `tyc_analyse::comptime_secret_literal_diagnostics`.
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join("secret.ty"),
+        "comptime let API_KEY: str = env(\"API_KEY\", \"dev-placeholder\")\n\n\
+         def main() -> None:\n    print(len(API_KEY))\n\n\nmain()\n",
+    )
+    .unwrap();
+    let out = tyc().arg("check").arg(tmp.path()).output().unwrap();
+    assert!(
+        out.status.success(),
+        "the secret lint is warn-level; check must still succeed"
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stderr),
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(
+        combined.contains("tyc::contains_secret_literal"),
+        "expected tyc::contains_secret_literal under `tyc check`, got: {combined}"
+    );
+    assert!(
+        combined.contains("API_KEY"),
+        "warning should name the binding, got: {combined}"
+    );
+}
+
+#[test]
+fn check_respects_allow_secret_comptime_knob() {
+    // `[strictness] allow-secret-comptime = true` must silence the lint on the
+    // check path exactly as it does on the build path.
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+    std::fs::write(
+        tmp.path().join("typhon.toml"),
+        "[project]\nname = \"t\"\nversion = \"0.1.0\"\nsrc = \"src\"\nout = \"build\"\n\
+         [python]\ntarget = \"3.13\"\n[strictness]\nallow-secret-comptime = true\n",
+    )
+    .unwrap();
+    std::fs::write(
+        tmp.path().join("src").join("main.ty"),
+        "comptime let API_KEY: str = env(\"API_KEY\", \"dev-placeholder\")\n\n\
+         def main() -> None:\n    print(len(API_KEY))\n\n\nmain()\n",
+    )
+    .unwrap();
+    let out = tyc()
+        .arg("check")
+        .arg(tmp.path().join("src"))
+        .output()
+        .unwrap();
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stderr),
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(
+        !combined.contains("tyc::contains_secret_literal"),
+        "allow-secret-comptime must silence the lint under check, got: {combined}"
+    );
+}
+
+#[test]
+fn check_reports_dead_declare_only_binding() {
+    // C3: a declare-only `let NAME: T` that is never assigned on any path and
+    // never read is dead code. Warn-level — the program runs correctly.
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join("dead.ty"),
+        "def start() -> str:\n    let port: int\n    return \"ok\"\n\n\
+         def main() -> None:\n    print(start())\n\n\nmain()\n",
+    )
+    .unwrap();
+    let out = tyc().arg("check").arg(tmp.path()).output().unwrap();
+    assert!(
+        out.status.success(),
+        "the dead-binding lint is warn-level; check must still succeed"
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stderr),
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(
+        combined.contains("tyc::missing_initialiser"),
+        "expected tyc::missing_initialiser, got: {combined}"
+    );
+    assert!(
+        combined.contains('⚠'),
+        "must render with the warning glyph, got: {combined}"
+    );
+}
+
+#[test]
+fn check_does_not_report_declare_only_binding_that_is_used() {
+    // The supported declare-then-assign form must stay silent.
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join("live.ty"),
+        "def pick(cond: bool) -> int:\n    let result: int\n    if cond:\n        result = 1\n    \
+         else:\n        result = 2\n    return result\n\n\
+         def main() -> None:\n    print(pick(True))\n\n\nmain()\n",
+    )
+    .unwrap();
+    let out = tyc().arg("check").arg(tmp.path()).output().unwrap();
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stderr),
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(
+        !combined.contains("tyc::missing_initialiser"),
+        "declare-then-assign must not warn, got: {combined}"
+    );
+}
+
+#[test]
 fn async_with_await_does_not_warn() {
     // Negative case: an `async def` that actually `await`s something must
     // not produce the warning. Use `asyncio.sleep(0)` so we have an

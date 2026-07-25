@@ -137,7 +137,7 @@ with its own `typhon.toml`, `src/` tree, and run recipe.
 ### Programs that are meant to fail
 
 Everything above shows Typhon working. [`errors/`](errors/) shows it saying
-**no** — 73 deliberately broken programs, each with a header comment naming the
+**no** — 71 deliberately broken programs, each with a header comment naming the
 diagnostics it produces, explaining the rule behind them, and showing the fix.
 They cover 56 of the 87 `tyc::` codes, from single-rule demos through
 realistic multi-error files, plus a
@@ -161,8 +161,8 @@ Both directions are asserted by `tyc/crates/tyc/tests/parity_corpus.rs`.
 | Path | Topic | Highlights |
 |---|---|---|
 | `testing/` | pytest | `Result`-aware assertions, parametrised tests |
-| `errors/` | diagnostics | 73 programs that fail on purpose, one per rule |
-| `parity/` | VM parity | 12 programs asserted identical under both execution paths, 6 documented divergences |
+| `errors/` | diagnostics | 71 programs that fail on purpose, one per rule |
+| `parity/` | VM parity | 18 programs asserted identical under both execution paths |
 
 ## Conventions used in this suite
 

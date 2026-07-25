@@ -14,7 +14,7 @@
 //! expressions remain stable; we use them directly.
 
 use ruff_python_ast::{self as ast, Expr, ModModule, Stmt};
-use ruff_text_size::TextRange;
+use ruff_text_size::{Ranged, TextRange};
 use tyc_diagnostics::{Diagnostics, TycError};
 
 /// Mutability of a binding.
@@ -783,6 +783,52 @@ pub struct SymbolAtOffset<'a> {
     pub is_definition: bool,
 }
 
+/// Record a declare-only `let NAME: T` / `mut NAME: T` as "not yet
+/// initialised", capturing the surface details the end-of-resolve
+/// dead-binding pass needs.
+///
+/// Called from both AnnAssign sites (the pre-collect sub-pass and the walk
+/// pass), which visit the same declaration; the span set dedupes and the
+/// details map keeps the first entry, so the double visit is harmless.
+fn record_uninit_let(r: &mut Resolver, a: &ast::StmtAnnAssign, n: &ast::ExprName) {
+    let name_span = (
+        n.range.start().to_usize(),
+        n.range.start().to_usize() + n.id.as_str().len(),
+    );
+    r.uninit_let_spans.insert(name_span);
+    let keyword = match a.mutability {
+        Some(ast::Mutability::Mut) => "mut",
+        _ => "let",
+    };
+    let ann_range = a.annotation.range();
+    let annotation = r
+        .source
+        .get(ann_range.start().to_usize()..ann_range.end().to_usize())
+        .unwrap_or("")
+        .trim()
+        .to_owned();
+    r.uninit_let_decls
+        .entry(name_span)
+        .or_insert_with(|| UninitLetDecl {
+            keyword,
+            name: n.id.as_str().to_owned(),
+            annotation,
+        });
+}
+
+/// Surface details of one declare-only `let NAME: T` / `mut NAME: T`.
+/// Captured at declaration time so the end-of-resolve dead-binding pass can
+/// render `tyc::missing_initialiser` without re-walking the AST.
+#[derive(Debug, Clone)]
+struct UninitLetDecl {
+    /// `"let"` or `"mut"` — whichever keyword the user wrote.
+    keyword: &'static str,
+    name: String,
+    /// The annotation as written (`int`, `dict[str, int]`, `Cfg?`, …),
+    /// sliced verbatim out of the preprocessed source.
+    annotation: String,
+}
+
 /// Internal helper for building a [`ResolvedModule`] while walking the AST.
 struct Resolver<'a> {
     path: String,
@@ -845,6 +891,13 @@ struct Resolver<'a> {
     /// minimal form here unblocks the heterogeneous-error /
     /// `_load_or_default(...)` workaround R2-7 / R3-8 documented.
     uninit_let_spans: std::collections::HashSet<(usize, usize)>,
+    /// Surface details (`let`/`mut`, name, annotation text) for every span
+    /// recorded in [`Self::uninit_let_spans`], keyed by the same span.
+    /// Entries are *never* removed — the set above is the live "still
+    /// unassigned" state, this map is the lookup table the end-of-resolve
+    /// dead-binding pass ([`Resolver::report_unassigned_declare_only_lets`])
+    /// uses to render `tyc::missing_initialiser` for the spans that survive.
+    uninit_let_decls: std::collections::HashMap<(usize, usize), UninitLetDecl>,
     /// `(scope, name)` pairs where a `mut NAME = ...` / `let NAME = ...`
     /// statement has been seen against an existing Parameter binding.
     /// Subsequent bareword assignments to the same name in the same
@@ -884,6 +937,7 @@ impl<'a> Resolver<'a> {
             preprocessed_line_starts: std::cell::OnceCell::new(),
             in_pattern: 0,
             uninit_let_spans: std::collections::HashSet::new(),
+            uninit_let_decls: std::collections::HashMap::new(),
             params_with_explicit_rebind: std::collections::HashSet::new(),
             loop_body_depth: 0,
             loop_origin_spans: std::collections::HashSet::new(),
@@ -1294,6 +1348,66 @@ impl<'a> Resolver<'a> {
         ));
     }
 
+    /// `tyc::missing_initialiser` — the dead-binding half of the v0.7.0
+    /// definite-assignment story.
+    ///
+    /// After the walk, [`Self::uninit_let_spans`] holds exactly the
+    /// declare-only `let NAME: T` / `mut NAME: T` declarations that no
+    /// assignment ever landed on (the first assignment removes the span in
+    /// [`Self::declare_full`] — it *is* the initialiser). Of those, the ones
+    /// whose name is also never read anywhere in the module are dead: they
+    /// lower to a bare `NAME: T` annotation that does nothing at runtime.
+    ///
+    /// The other three shapes are already covered and are deliberately left
+    /// alone here:
+    ///
+    /// - declared then assigned → accepted (the assignment is the initialiser);
+    /// - read on a path that never assigned → `tyc::use_of_uninitialised`;
+    /// - assigned a second time → `tyc::immutable_assign`.
+    ///
+    /// **Warn-level by design.** A never-assigned-never-read binding runs
+    /// correctly today, so per the project's "additive on *correct* programs"
+    /// rule an error here would be a narrowing we are not entitled to. It is
+    /// pushed onto the warnings channel and the diagnostic itself carries
+    /// `severity(Warning)`, so it renders with `⚠` and is counted as a warning.
+    ///
+    /// The "never read" test deliberately matches on the *name* across the
+    /// whole module rather than resolving each reference back to this exact
+    /// binding: any mention of the name at all silences the lint. That is the
+    /// conservative direction — it can only ever under-report.
+    fn report_unassigned_declare_only_lets(&mut self) {
+        if self.uninit_let_spans.is_empty() {
+            return;
+        }
+        let read_names: std::collections::HashSet<String> = self
+            .references
+            .iter()
+            .map(|reference| reference.name.clone())
+            .collect();
+        // Sorted so the diagnostic order follows source order rather than
+        // `HashSet` iteration order.
+        let mut spans: Vec<(usize, usize)> = self.uninit_let_spans.iter().copied().collect();
+        spans.sort_unstable();
+        // Materialise before the emit loop: the diagnostics push needs
+        // `&mut self` while `uninit_let_decls` is still borrowed.
+        let dead: Vec<((usize, usize), UninitLetDecl)> = spans
+            .into_iter()
+            .filter_map(|span| self.uninit_let_decls.get(&span).map(|d| (span, d.clone())))
+            .filter(|(_, decl)| !read_names.contains(&decl.name))
+            .collect();
+        for (span, decl) in dead {
+            self.diagnostics.push_warning(TycError::missing_initialiser(
+                decl.keyword,
+                &decl.name,
+                &decl.annotation,
+                &self.path,
+                self.source,
+                span.0,
+                span.1.saturating_sub(span.0).max(1),
+            ));
+        }
+    }
+
     /// Translate a preprocessed-source byte offset to a 0-based line
     /// index, computing (and caching) the line-start table on first
     /// use. Lazily computed because most resolves don't need it.
@@ -1365,6 +1479,9 @@ pub fn resolve_module_with(
     r.report_unknown_names();
     r.report_unused_imports();
     r.report_main_not_called();
+    // Must run after the walk: `uninit_let_spans` is only settled once every
+    // assignment has had its chance to claim a declare-only `let`/`mut`.
+    r.report_unassigned_declare_only_lets();
 
     // Collect class-kind metadata for the type checker. `plain class`
     // names are scraped by name from the original Typhon source (robust
@@ -1637,11 +1754,7 @@ fn collect_top_level(r: &mut Resolver, scope: ScopeId, body: &[Stmt]) {
                 // simpler "declare as mut" relaxation.)
                 if a.value.is_none() && a.mutability.is_some() {
                     if let Expr::Name(n) = a.target.as_ref() {
-                        let name_span = (
-                            n.range.start().to_usize(),
-                            n.range.start().to_usize() + n.id.as_str().len(),
-                        );
-                        r.uninit_let_spans.insert(name_span);
+                        record_uninit_let(r, a, n);
                     }
                 }
                 declare_target(r, scope, &a.target, default_val, a.mutability);
@@ -2110,11 +2223,7 @@ fn walk_stmt(r: &mut Resolver, scope: ScopeId, stmt: &Stmt) {
             let missing_init = a.value.is_none() && a.mutability.is_some();
             if let Expr::Name(n) = a.target.as_ref() {
                 if missing_init {
-                    let name_span = (
-                        n.range.start().to_usize(),
-                        n.range.start().to_usize() + n.id.as_str().len(),
-                    );
-                    r.uninit_let_spans.insert(name_span);
+                    record_uninit_let(r, a, n);
                 }
                 let default_val = r.scopes[scope].kind == ScopeKind::Module;
                 declare_target(r, scope, &a.target, default_val, a.mutability);
@@ -3944,6 +4053,135 @@ def foo():
             !d.has_errors(),
             "if/else assignments to declare-only let must check clean; got {:?}",
             d.errors()
+        );
+    }
+
+    // ── C3: `tyc::missing_initialiser` dead-binding lint ───────────────────
+
+    /// Every `tyc::missing_initialiser` in `d`, as `(keyword, name)` pairs.
+    fn dead_bindings(d: &Diagnostics) -> Vec<(String, String)> {
+        d.warnings()
+            .iter()
+            .filter_map(|e| match e {
+                TycError::MissingInitialiser { keyword, name, .. } => {
+                    Some((keyword.clone(), name.clone()))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn declare_only_let_never_assigned_never_read_warns() {
+        // C3: the one declare-only shape v0.7.0's definite-assignment work
+        // left uncovered — never assigned on any path AND never read.
+        let (_m, d) = resolve("def f() -> str:\n    let port: int\n    return \"ok\"\n");
+        assert_eq!(
+            dead_bindings(&d),
+            vec![("let".to_owned(), "port".to_owned())],
+            "declare-only `let` that is never assigned and never read must warn; got {:?}",
+            d.warnings()
+        );
+    }
+
+    #[test]
+    fn declare_only_dead_binding_is_a_warning_not_an_error() {
+        // The program runs correctly (a bare annotation is inert), so per the
+        // "additive on *correct* programs" rule this must never fail a build.
+        let (_m, d) = resolve("def f() -> str:\n    let port: int\n    return \"ok\"\n");
+        assert!(
+            !d.has_errors(),
+            "dead-binding lint must be warn-level; got errors {:?}",
+            d.errors()
+        );
+        // It must land on the *warnings* channel, not just carry a warning
+        // severity attribute — the CLI counts from the channel.
+        // (`severity(Warning)` on the declaration is asserted in
+        // `tyc-diagnostics`, which has miette in scope.)
+        assert!(
+            d.warnings()
+                .iter()
+                .any(|e| matches!(e, TycError::MissingInitialiser { .. })),
+            "dead-binding lint must be pushed as a warning; got {:?}",
+            d.warnings()
+        );
+    }
+
+    #[test]
+    fn declare_only_mut_never_assigned_never_read_warns() {
+        // Same rule for `mut NAME: T` — the keyword is echoed back in the
+        // message so the suggested fix reads naturally.
+        let (_m, d) = resolve("def f() -> str:\n    mut port: int\n    return \"ok\"\n");
+        assert_eq!(
+            dead_bindings(&d),
+            vec![("mut".to_owned(), "port".to_owned())],
+            "declare-only `mut` that is never assigned and never read must warn; got {:?}",
+            d.warnings()
+        );
+    }
+
+    #[test]
+    fn declare_only_let_that_is_assigned_does_not_warn() {
+        // The first assignment IS the initialiser (v0.7.0) — not dead.
+        let (_m, d) = resolve("def f() -> int:\n    let x: int\n    x = 5\n    return x\n");
+        assert!(
+            dead_bindings(&d).is_empty(),
+            "an assigned declare-only `let` must not warn; got {:?}",
+            d.warnings()
+        );
+    }
+
+    #[test]
+    fn declare_only_let_assigned_in_a_nested_arm_does_not_warn() {
+        // The assignment lives inside an `if` body, which the pre-collect
+        // sub-pass never descends into — only the walk pass clears the span.
+        let src = "def pick(cond: bool) -> int:\n\
+                   \x20   let result: int\n\
+                   \x20   if cond:\n\
+                   \x20       result = 1\n\
+                   \x20   else:\n\
+                   \x20       result = 2\n\
+                   \x20   return result\n";
+        let (_m, d) = resolve(src);
+        assert!(
+            dead_bindings(&d).is_empty(),
+            "sibling-arm assignments must clear the dead-binding lint; got {:?}",
+            d.warnings()
+        );
+    }
+
+    #[test]
+    fn declare_only_let_that_is_read_does_not_warn() {
+        // Reading it without assigning is a *different* bug, owned by
+        // `tyc::use_of_uninitialised`. This lint must stay out of the way so
+        // the two never double-report on the same declaration.
+        let (_m, d) = resolve("def f() -> int:\n    let x: int\n    return x\n");
+        assert!(
+            dead_bindings(&d).is_empty(),
+            "a read declare-only `let` belongs to use_of_uninitialised; got {:?}",
+            d.warnings()
+        );
+    }
+
+    #[test]
+    fn class_field_declaration_does_not_warn_as_dead_binding() {
+        // Class fields are bare annotations with no `let`/`mut` keyword, so
+        // they never enter the declare-only set at all.
+        let (_m, d) = resolve("class User:\n    id: int\n    name: str\n");
+        assert!(
+            dead_bindings(&d).is_empty(),
+            "class fields must not fire missing_initialiser; got {:?}",
+            d.warnings()
+        );
+    }
+
+    #[test]
+    fn initialised_let_does_not_warn_as_dead_binding() {
+        let (_m, d) = resolve("def f() -> None:\n    let x: int = 1\n    print(x)\n");
+        assert!(
+            dead_bindings(&d).is_empty(),
+            "an initialised `let` must not warn; got {:?}",
+            d.warnings()
         );
     }
 

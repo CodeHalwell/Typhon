@@ -33,9 +33,10 @@ The header format is three directives:
 # REQUIRES: build                            # rare: needs `tyc build`, not `tyc check`
 ```
 
-`REQUIRES: build` exists because a couple of diagnostics only fire during
-emission — see [`10-footguns-and-lints/contains_secret_literal.ty`](10-footguns-and-lints/contains_secret_literal.ty),
-which is worth reading if your CI gate is `tyc check` alone.
+`REQUIRES: build` exists for diagnostics that can only fire during emission.
+No file currently needs it — `tyc::contains_secret_literal` was the last
+holdout, and as of v1.0.0-alpha.7 it fires under plain `tyc check` too, so
+the documented CI gate (`tyc check src/`) sees every code in this corpus.
 
 Codes are matched as a *set*, not a count: a file expecting
 `tyc::implicit_any` passes whether the code fires once or three times.
@@ -62,7 +63,6 @@ Codes are matched as a *set*, not a count: a file expecting
 | [`10-footguns-and-lints/`](10-footguns-and-lints/) | Python's classic traps — mutable defaults, `is` on literals, loop closures, unmanaged resources, inlined secrets |
 | [`11-multi-error-programs/`](11-multi-error-programs/) | Realistic files with many errors at once, including which errors *mask* others |
 | [`12-known-gaps/`](12-known-gaps/) | The inverse: programs that compile clean and fail at runtime. See that directory's README |
-| [`13-false-positives/`](13-false-positives/) | The other inverse: valid programs the checker wrongly rejects. See that directory's README |
 
 ## Start here
 
@@ -75,10 +75,14 @@ If you are new to Typhon, three files carry most of the signal:
 3. [`12-known-gaps/missing_await_in_async_caller.ty`](12-known-gaps/missing_await_in_async_caller.ty)
    — the checker is strict, not omniscient; here is one place it is silent.
 
-`12-known-gaps/` and `13-false-positives/` are the two honest directories: the
-first is code the compiler wrongly *accepts*, the second is code it wrongly
-*rejects*. Both are asserted to keep misbehaving, so fixing either one fails
-the test — which is the prompt to delete or reclassify the file.
+`12-known-gaps/` is the honest directory: code the compiler wrongly *accepts*
+and that fails at runtime anyway. Its entries are asserted to keep
+misbehaving, so fixing one fails the test — which is the prompt to delete or
+reclassify the file. (A `13-false-positives/` directory recording the mirror
+case — valid programs the checker wrongly *rejected* — lived here until its
+last two entries, a `try`/`except`/`else` reachability hole and `case {}:`
+being treated as refutable, were fixed; both shapes are now regression tests
+in `tyc-types`.)
 
 ## Adding a new one
 

@@ -3558,13 +3558,22 @@ pub const SECRET_NAME_KEYWORDS: &[&str] = &[
     "PASS",
 ];
 
-/// True when `name` ends with one of the recognised secret-shaped
-/// suffixes. Match is case-insensitive on the suffix; the suffix may
-/// either form the whole name (e.g. `TOKEN`) or follow an underscore
-/// (e.g. `MY_TOKEN`). The expected callers feed module-level binding
-/// names; passing a function or method name through is harmless because
-/// the caller already gated on `Stmt::Assign` / `Stmt::AnnAssign`.
-fn is_secret_name(name: &str) -> bool {
+/// Return `Some(keyword)` when `name` contains one of the recognised
+/// secret-shaped keywords as a whole word. Match is case-insensitive; the
+/// keyword may form the whole name (e.g. `TOKEN`), sit between underscores
+/// (`MY_TOKEN_VALUE`), or be delimited by a camelCase boundary
+/// (`myTokenValue`) — so `MONKEY` does not match `KEY` and `PASSPORT` does
+/// not match `PASS`. [`SECRET_NAME_KEYWORDS`] is ordered longest-first, so
+/// the returned keyword is always the most specific match.
+///
+/// This is the single detection primitive behind **both** halves of
+/// `tyc::contains_secret_literal`: the inline-string-literal lint in this
+/// crate ([`analyse_secret_literal_bindings`]) and the `comptime let`
+/// env-inlining scan ([`comptime_secret_literal_diagnostics`], used by
+/// `tyc check` and `tyc build` alike). Keeping one implementation is what
+/// stops the two heuristics drifting — the class of bug fixed twice before
+/// (v1.0.0-alpha.4, v1.0.0-alpha.6).
+pub fn secret_suffix(name: &str) -> Option<&'static str> {
     let upper = name.to_ascii_uppercase();
     for word in SECRET_NAME_KEYWORDS {
         let mut start_idx = 0;
@@ -3583,12 +3592,117 @@ fn is_secret_name(name: &str) -> bool {
                 || (name.as_bytes()[actual_end].is_ascii_uppercase()
                     && !name.as_bytes()[actual_end - 1].is_ascii_uppercase());
             if start_ok && end_ok {
-                return true;
+                return Some(word);
             }
             start_idx = actual_idx + 1;
         }
     }
-    false
+    None
+}
+
+/// True when `name` looks like a credential identifier. Thin wrapper over
+/// [`secret_suffix`]; the expected callers feed binding names.
+fn is_secret_name(name: &str) -> bool {
+    secret_suffix(name).is_some()
+}
+
+/// `tyc::contains_secret_literal` warnings for every `comptime let` binding
+/// whose name is secret-shaped **and** whose RHS reads `env(...)`. The
+/// build-time value is substituted into the emitted `.py` as a raw string
+/// literal, so the artifact carries the resolved credential.
+///
+/// `comptime_values` is the map [`evaluate_comptime_with_functions`]
+/// produces; `original_source` must be the *original* Typhon source (not the
+/// preprocessed Python view) because the `env("KEY")` argument is recovered
+/// lexically from the `comptime let …` line.
+///
+/// Shared verbatim by `tyc check` and `tyc build` so the security-relevant
+/// warning cannot be visible on only one of the two gates — the `tyc check`
+/// path is the documented CI primary gate, and prior to v1.0.0-alpha.7 this
+/// lint fired only under `tyc build`. Returns an empty bundle when
+/// `allow_secret_comptime` (`[strictness] allow-secret-comptime`) is set.
+///
+/// Every diagnostic is pushed as a **warning**: this must never fail a build
+/// that previously succeeded.
+pub fn comptime_secret_literal_diagnostics(
+    comptime_values: &HashMap<String, ComptimeValue>,
+    original_source: &str,
+    allow_secret_comptime: bool,
+) -> Diagnostics {
+    let mut diags = Diagnostics::new();
+    if allow_secret_comptime {
+        return diags;
+    }
+    // `comptime_values` is a `HashMap`, whose iteration order is
+    // nondeterministic — sort so repeated runs report in a stable order.
+    let mut names: Vec<&String> = comptime_values.keys().collect();
+    names.sort();
+    for name in names {
+        if secret_suffix(name).is_none() {
+            continue;
+        }
+        // Only fire when the RHS actually pulls from `env(...)` — a
+        // hard-coded `comptime let API_KEY = "test"` isn't reading a secret,
+        // just labelling a literal. Pull the actual env-var key out of the
+        // source so the help text points at the right identifier (the binding
+        // name and the env key often differ:
+        // `comptime let API_KEY = env("MY_SERVICE_API_KEY")`).
+        if let Some(env_key) = find_env_key_for_comptime_binding(original_source, name) {
+            diags.push_warning(TycError::contains_secret_literal(name.clone(), env_key));
+        }
+    }
+    diags
+}
+
+/// Extract the env-var key from a `comptime let NAME … = env("KEY", …)`
+/// declaration in `source` (the original Typhon text). Returns `None` when
+/// the binding isn't found or its RHS doesn't call `env(...)` with a leading
+/// string literal — which is exactly the "not actually reading a secret"
+/// case [`comptime_secret_literal_diagnostics`] wants to stay quiet about.
+fn find_env_key_for_comptime_binding(source: &str, binding_name: &str) -> Option<String> {
+    let needle = "comptime ";
+    for line in source.lines() {
+        let trimmed = line.trim_start();
+        // `pub comptime let X = …` is a legal stacking (v0.15.4), so accept a
+        // leading `pub ` before the `comptime` keyword.
+        let trimmed = trimmed
+            .strip_prefix("pub ")
+            .map(str::trim_start)
+            .unwrap_or(trimmed);
+        if !trimmed.starts_with(needle) {
+            continue;
+        }
+        // Match either `comptime let NAME` or `comptime mut NAME` or
+        // bare `comptime NAME` (legacy). Cheaply check the binding name
+        // appears before the `=`.
+        let lhs = trimmed.split('=').next().unwrap_or("");
+        let lhs_has_name = lhs.split_whitespace().any(|tok| {
+            tok.trim_end_matches(':')
+                .trim_end_matches(',')
+                .eq(binding_name)
+        });
+        if !lhs_has_name {
+            continue;
+        }
+        // Locate the first `env(` after the `=` and lift the first quoted
+        // string out of its argument list.
+        let after_eq = match trimmed.split_once('=') {
+            Some((_, r)) => r,
+            None => continue,
+        };
+        let env_idx = after_eq.find("env(")?;
+        let after_open = &after_eq[env_idx + "env(".len()..];
+        // Strip optional whitespace and grab the leading `"..."` or `'...'`.
+        let after_ws = after_open.trim_start();
+        let quote = after_ws.chars().next()?;
+        if quote != '"' && quote != '\'' {
+            return None;
+        }
+        let rest = &after_ws[1..];
+        let end = rest.find(quote)?;
+        return Some(rest[..end].to_owned());
+    }
+    None
 }
 
 /// Walk every `let` / `mut` / `AnnAssign` binding statement in `module`
@@ -4836,6 +4950,141 @@ def use_np() -> object:
             diags.warnings().len(),
             1,
             "annotated let TOKEN must warn; got {:?}",
+            diags.warnings()
+        );
+    }
+
+    // ── C4: comptime secret scan, shared by `tyc check` and `tyc build` ────
+
+    /// Evaluate `src`'s comptime bindings the way both commands do, then run
+    /// the shared secret scan over the result.
+    fn comptime_secret_warnings(src: &str, allow: bool) -> Vec<String> {
+        let prep = preprocess(src);
+        let module = tyc_syntax::parse_module(&prep.python_source)
+            .expect("parse failed")
+            .into_syntax();
+        let (values, _) = evaluate_comptime_with_functions(
+            &module,
+            &prep.comptime_bindings,
+            &prep.comptime_functions,
+        );
+        comptime_secret_literal_diagnostics(&values, src, allow)
+            .warnings()
+            .iter()
+            .map(|w| w.to_string())
+            .collect()
+    }
+
+    #[test]
+    fn comptime_secret_scan_fires_on_env_backed_credential() {
+        // The exact shape `tyc build` used to be the only reporter of. It is
+        // now emitted from a shared helper so `tyc check` — the documented CI
+        // primary gate — sees it too.
+        let warnings = comptime_secret_warnings(
+            "comptime let API_KEY: str = env(\"API_KEY\", \"dev\")\n",
+            false,
+        );
+        assert_eq!(warnings.len(), 1, "expected one warning; got {warnings:?}");
+        assert!(
+            warnings[0].contains("API_KEY"),
+            "warning should name the binding; got {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn comptime_secret_scan_reports_in_sorted_binding_order() {
+        // `comptime_values` is a HashMap; the scan sorts so repeat runs of the
+        // same build emit the same order.
+        let warnings = comptime_secret_warnings(
+            "comptime let DB_PASSWORD: str = env(\"DB_PASSWORD\", \"hunter2\")\n\
+             comptime let API_KEY: str = env(\"API_KEY\", \"dev\")\n",
+            false,
+        );
+        assert_eq!(warnings.len(), 2, "got {warnings:?}");
+        assert!(warnings[0].contains("API_KEY"), "got {warnings:?}");
+        assert!(warnings[1].contains("DB_PASSWORD"), "got {warnings:?}");
+    }
+
+    #[test]
+    fn comptime_secret_scan_honours_allow_secret_comptime() {
+        // `[strictness] allow-secret-comptime = true` must silence the lint on
+        // BOTH paths, not just the build one.
+        let warnings = comptime_secret_warnings(
+            "comptime let API_KEY: str = env(\"API_KEY\", \"dev\")\n",
+            true,
+        );
+        assert!(
+            warnings.is_empty(),
+            "knob must silence it; got {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn comptime_secret_scan_silent_without_env_lookup() {
+        // A hard-coded `comptime let API_KEY = "test"` isn't reading a secret,
+        // just labelling a literal.
+        let warnings = comptime_secret_warnings("comptime let API_KEY: str = \"test\"\n", false);
+        assert!(
+            warnings.is_empty(),
+            "non-env RHS must not warn; got {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn comptime_secret_scan_silent_on_unrelated_binding_name() {
+        let warnings = comptime_secret_warnings(
+            "comptime let PORT: int = int(env(\"PORT\", \"80\"))\n",
+            false,
+        );
+        assert!(
+            warnings.is_empty(),
+            "non-secret name must not warn; got {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn comptime_secret_scan_reads_the_env_key_not_the_binding_name() {
+        // The help text points at the env var to read at runtime, which is
+        // often spelled differently from the binding.
+        let warnings = comptime_secret_warnings(
+            "comptime let API_KEY: str = env(\"MY_SERVICE_API_KEY\", \"dev\")\n",
+            false,
+        );
+        assert_eq!(warnings.len(), 1, "got {warnings:?}");
+        let rendered = format!(
+            "{:?}",
+            comptime_secret_literal_diagnostics(
+                &{
+                    let mut m = HashMap::new();
+                    m.insert("API_KEY".to_owned(), ComptimeValue::Str("x".into()));
+                    m
+                },
+                "comptime let API_KEY: str = env(\"MY_SERVICE_API_KEY\", \"dev\")\n",
+                false,
+            )
+            .warnings()
+        );
+        assert!(
+            rendered.contains("MY_SERVICE_API_KEY"),
+            "env key should be carried through; got {rendered}"
+        );
+    }
+
+    #[test]
+    fn comptime_secret_scan_handles_pub_comptime_let() {
+        // `pub` stacks with `comptime` (v0.15.4); the lexical env-key scan
+        // must see through the leading modifier.
+        let mut values = HashMap::new();
+        values.insert("API_KEY".to_owned(), ComptimeValue::Str("x".into()));
+        let diags = comptime_secret_literal_diagnostics(
+            &values,
+            "pub comptime let API_KEY: str = env(\"API_KEY\", \"dev\")\n",
+            false,
+        );
+        assert_eq!(
+            diags.warnings().len(),
+            1,
+            "`pub comptime let` must still be scanned; got {:?}",
             diags.warnings()
         );
     }

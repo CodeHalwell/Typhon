@@ -1,0 +1,38 @@
+# EXPECT-ERROR: tyc::type_mismatch
+#
+# A fixed-arity `tuple[int, str]` carries a distinct type per slot, so which
+# type a read produces depends on *which slot* is read. With a constant index
+# the compiler resolves the slot exactly (`t[0]` is `int`, `t[1]` is `str`), but
+# with a **variable** index the slot is not statically known — so `t[i]` denotes
+# the union of every slot type, `int | str`, which is not assignable to `int`.
+#
+# Both of these are rejected, which is the point: they are the same expression,
+# so they cannot both be right.
+#
+#     let a: int = t[i]     # tyc::type_mismatch — expected `int`, found `int | str`
+#     let b: str = t[i]     # tyc::type_mismatch — expected `str`, found `int | str`
+#
+# Fix, in order of preference:
+#
+#   1. Index with a literal when you know the slot:  `let v: int = t[0]`
+#   2. Annotate the union and narrow it before use:
+#          let v: int | str = t[i]
+#          if isinstance(v, int):
+#              print(v + 1)
+#   3. Use a homogeneous `tuple[int, ...]` (or a `list[int]`) when every slot
+#      holds the same type and the length genuinely varies — an element read on
+#      those is `int` at any index.
+#
+# This read used to degrade to `Unknown`: the program type-checked clean and the
+# emitted Python then crashed with
+#   TypeError: can only concatenate str (not "int") to str
+
+
+def main() -> None:
+    let t: tuple[int, str] = (1, "abc")
+    mut i: int = 1
+    let v: int = t[i]
+    print(v + 1)
+
+
+main()

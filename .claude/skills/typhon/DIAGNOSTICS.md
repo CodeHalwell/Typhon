@@ -30,13 +30,21 @@ count = count + 1     # error: cannot assign to immutable binding
 
 **Fix:** Change the declaration to `mut`.
 
-### `tyc::missing_initialiser` — **currently unreachable**
+### `tyc::missing_initialiser` — warning
 
-Historic code, kept for `tyc explain` compatibility. No pass emits it today: since v0.7.0 the declare-only `let NAME: T` form is fully supported, and a declare-only binding that is *never* assigned and never read is accepted silently (it lowers to an inert bare `name: T` annotation). The two codes that actually police the form are `tyc::use_of_uninitialised` (read on a path that didn't assign) and `tyc::immutable_assign` (a *second* assignment — the first is the initialiser).
+A declare-only `let NAME: T` / `mut NAME: T` that is **never assigned on any path and never read** — a dead binding. It lowers to an inert bare `name: T` annotation in the emitted Python, so the program runs correctly; the lint flags dead code, which is why it is **warn-level** and never fails a build.
+
+It completes the v0.7.0 definite-assignment story. The other three declare-only shapes are covered elsewhere: a declaration followed by an assignment is accepted (the first assignment IS the initialiser), a read on a path that didn't assign is `tyc::use_of_uninitialised`, and a *second* assignment is `tyc::immutable_assign`.
+
+The "never read" test matches the name across the whole module, so any mention at all silences it — deliberately conservative, so it can only under-report.
 
 ```ty
-let x: int            # accepted; no diagnostic
+def start() -> str:
+    let port: int     # warning: never assigned and never read
+    return "started"
 ```
+
+**Fix:** Initialise it (`let port: int = 8080`), assign it before it is read, or delete the declaration.
 
 ### `tyc::use_of_uninitialised` — error (v0.7.0)
 
@@ -153,6 +161,8 @@ let result: int = double("3")   # error: expected `int`, found `str`
 ```
 
 **(v0.12.0) Third-party argument types.** This is also the code you'll see when a wrong-*typed* argument is passed to a fully-typed third-party function **or constructor** — venv signature introspection (`tyc-venv`) now recovers parameter/return *annotations* (scalars, `Optional[X]` / `X | None`, parametric containers, fixed-arity tuples), so a dependency exposing `def fetch(url: str, …)` called as `fetch(12345)`, or constructing a `Client(host: str, port: int)` with `port="oops"`, is rejected at check time, not just on arity. Anything not confidently modelled degrades to a permissive `Unknown`, so the check only adds true positives. The dependency must ship **inline** annotations for this path — a stub-only library like `requests` (typed via typeshed's `types-requests`, not in its own source) degrades to `Unknown` here and is instead caught by the `ty`/typeshed pass (`[checker] external = "ty"`) or a `.dty` stub. A declared dependency that can't be introspected at all surfaces the separate `unintrospectable-dependency` warning (`[strictness] unintrospectable-dependency`, default `"warn"`) rather than silently skipping these checks.
+
+**Fixed-arity tuple read at a non-constant index.** Each slot of a `tuple[int, str]` holds a different type, so which type a read yields depends on *which* slot is read. A literal index resolves the slot exactly (`t[0]` is `int`); a **variable** index cannot, so the read is typed as the union of every slot — `t[i]` is `int | str`. Both `let a: int = t[i]` and `let b: str = t[i]` are therefore rejected (they are the same expression, so they cannot both be right); the union in the message means *the index* is unknown, not that the tuple changed shape. The help text switches to a narrowing hint in this case rather than the nonsense "widen to `int | int | str`". Fix by indexing with a literal, annotating the union and narrowing it (`let v: int | str = t[i]` then `isinstance`), or using a homogeneous `tuple[int, ...]` / `list[int]`. A homogeneous fixed-arity tuple (`tuple[int, int]`) collapses to its single element type, an out-of-range *constant* index still fires `tyc::tuple_index_out_of_range`, and a tuple slice (`t[a:b]`) is unaffected.
 
 **Fix:** Convert at the boundary, or correct the annotation.
 
@@ -1133,7 +1143,7 @@ Standard values for severity keys are `"off"`, `"warn"`, `"error"`. The `suggest
 
 **Errors** (block the build by default): `arg_count`, `attribute_not_found`, `comptime`, `cyclic_type_alias`, `div_by_zero_literal`, `duplicate_class`, `duplicate_method`, `extend_builtin`, `field_default_ordering`, `frozen_assign`, `generator_return_type`, `generic`, `immutable_assign`, `impl_unknown_class`, `implicit_any`, `impure_pure_fn`, `interface_isinstance`, `interface_not_conforming`, `invalid_config_value`, `invalid_question_op`, `io`, `lazy_usage`, `manual_init`, `method_in_class_body` (default warn but commonly bumped), `missing_annotation`, `missing_argument`, `missing_await`, `missing_binding_kind`, `missing_field_init`, `missing_return`, `newtype_violation`, `no_block_shadow`, `non_exhaustive_match`, `not_callable`, `nullable_use`, `operator_type_mismatch`, `parse`, `pattern_shadows_outer`, `pub_name_collision`, `result_error_mismatch`, `self_outside_impl`, `stub_mismatch`, `tuple_index_out_of_range`, `type_mismatch`, `typevar_bound`, `typevar_import_rejected`, `typing_alias_deprecated`, `unknown_kwarg`, `unknown_module`, `unknown_name`, `unsafe_value_leak`, `unused_import`, `use_of_uninitialised`.
 
-**Warnings**: `async_without_await`, `class_attr_shadows_slot`, `blocking_in_async`, `contains_secret_literal`, `orphan_py_import`, `python_semantic_drift`, `resource_not_managed`, `stdlib_module_shadow`.
+**Warnings**: `async_without_await`, `class_attr_shadows_slot`, `blocking_in_async`, `contains_secret_literal`, `missing_initialiser`, `orphan_py_import`, `python_semantic_drift`, `resource_not_managed`, `stdlib_module_shadow`.
 
 **Advice**: `auto_gather_missed`, `gather_opportunity`, `lazy_import_opportunity`, `main_not_called`, `parallel_opportunity`, `perf_keys_membership`, `perf_list_shift_in_loop`, `perf_membership_in_loop`, `perf_sort_in_loop`, `perf_sorted_first`, `perf_str_concat_in_loop`, `pub_star_outside_init`, `shared_mut_across_tasks`.
 
