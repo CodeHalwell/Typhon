@@ -1,0 +1,18 @@
+# DIVERGENT: `bytearray` does not exist in the VM.
+#
+#   CPython: bytearray(b'abcd') 4 b'abcd' abcd
+#   VM:      NameError: name 'bytearray' is not defined
+#
+# `bytes` is a first-class VM value with a broad method surface, and
+# `bytearray` is its mutable sibling — the one you reach for when building a
+# buffer incrementally. It is simply absent from the builtin table, so any
+# program that touches one runs compiled and dies under `tyc run`.
+
+
+def main() -> None:
+    mut ba: bytearray = bytearray(b"abc")
+    ba.append(100)
+    print(ba, len(ba), bytes(ba), ba.decode("utf-8"))
+
+
+main()

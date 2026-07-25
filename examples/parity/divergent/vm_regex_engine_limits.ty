@@ -1,0 +1,40 @@
+# DIVERGENT: the VM's regex engine rejects patterns CPython's `re` accepts.
+#
+#   CPython: ['a'] / ['b'] / ['aa']
+#   VM:      ValueError: invalid regex: look-around, including look-ahead and
+#            look-behind, is not supported
+#            ValueError: invalid regex: backreferences are not supported
+#
+# This one is ARCHITECTURAL, not an oversight. The VM's `re` shim is backed by
+# the Rust `regex` crate, which guarantees linear-time matching by refusing the
+# two constructs that require backtracking:
+#
+#   look-ahead / look-behind   (?=…) (?!…) (?<=…) (?<!…)
+#   backreferences             (a)\1
+#
+# CPython's `re` is a backtracking engine and supports both. So a program using
+# either compiles and runs correctly via `tyc build`, and dies at the point of
+# first use under `tyc run`.
+#
+# Closing this means either adopting a backtracking crate (`fancy-regex`) for
+# the shim — a dependency decision that has to clear the repo's `cargo deny`
+# policy, and which gives up the linear-time guarantee — or accepting the
+# limitation and documenting it. Recorded here so the choice is explicit rather
+# than discovered by a user mid-debugging.
+#
+# Everything else probed in the `re` surface agrees across both paths:
+# `search` / `match` / `fullmatch` / `findall` / `finditer` / `sub` / `split` /
+# `compile`, group and named-group access, `.groups()` / `.groupdict()`,
+# character classes, quantifiers, anchors, and alternation.
+
+
+import re
+
+
+def main() -> None:
+    print(re.findall(r"a(?=b)", "ab ac"))
+    print(re.findall(r"(?<=a)b", "ab cb"))
+    print(re.findall(r"(a)\1", "aa ab"))
+
+
+main()

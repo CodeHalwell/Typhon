@@ -1,0 +1,41 @@
+# DIVERGENT: `model` classes behave differently under the VM in two ways.
+#
+# 1. A field with a DEFAULT is rejected by the constructor:
+#
+#      CPython: 1 5
+#      VM:      TypeError: U() got unexpected keyword argument(s): age
+#
+#    `model U: id: int; age: int? = None` emits a `pydantic.BaseModel`
+#    subclass where `age` is an ordinary optional field. The VM's pydantic
+#    shim builds its constructor from the non-defaulted fields only, so
+#    passing the defaulted one is rejected — and a `model` with defaults is
+#    the common shape at a validation boundary, which is what `model` is for.
+#
+# 2. `str()` and `repr()` both leak the synthesised `model_config`, and `str()`
+#    uses the dataclass rendering rather than pydantic's:
+#
+#      CPython: str → `id=1 name='a'`      repr → `U(id=1, name='a')`
+#      VM:      str → `U(id=1, name='a', model_config={})`   (same for repr)
+#
+#    `model_config = ConfigDict(extra="forbid")` is injected by the desugar
+#    pass, so it is a compiler artefact — it should never be visible in user
+#    output. Pydantic renders `str` as space-separated `field=value` pairs and
+#    `repr` as `Class(field=value, …)`; the VM uses its dataclass repr for both.
+
+
+model U:
+    id: int
+    name: str
+    age: int? = None
+
+
+def main() -> None:
+    let plain: U = U(id=1, name="a")
+    print(plain)
+    print(repr(plain))
+
+    let with_default: U = U(id=2, name="b", age=45)
+    print(with_default.id, with_default.age)
+
+
+main()

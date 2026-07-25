@@ -1,11 +1,22 @@
 # Confirmed VM ↔ CPython divergences
 
-**This directory is currently empty, which is the goal state.** Every
-divergence found so far has been fixed and its program promoted up a level
-into `examples/parity/`, where it is now asserted to produce byte-identical
-output under both execution paths.
+Programs here run correctly through `tyc build` + CPython and misbehave under
+`tyc run`. They are checked in *because* they misbehave: the harness asserts
+they **keep** differing, so fixing one fails the test — which is the prompt to
+promote the file up a level into `examples/parity/`.
 
-It is kept so the next confirmed divergence has an obvious home.
+The six divergences the 2026-07-25 review found were all fixed and promoted.
+The three below came from a second probe round and are still open:
+
+| File | Divergence |
+|---|---|
+| `vm_regex_engine_limits.ty` | the VM's `re` is backed by the Rust `regex` crate, which refuses look-around and backreferences by design; CPython's backtracking engine accepts both |
+| `vm_model_construction.ty` | a `model` field with a default is rejected by the VM's constructor, and `str`/`repr` leak the compiler-synthesised `model_config` |
+| `vm_bytearray_missing.ty` | `bytearray` is absent from the VM's builtin table |
+
+The regex one is architectural rather than an oversight — closing it means
+adopting a backtracking engine and giving up the linear-time guarantee, which
+is a dependency-policy decision, not a bug fix.
 
 ## When to put a file here
 
