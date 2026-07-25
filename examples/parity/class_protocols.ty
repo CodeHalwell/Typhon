@@ -1,0 +1,72 @@
+class Vec:
+    x: float
+    y: float
+
+
+impl Vec:
+    def __add__(self, other: Vec) -> Vec:
+        return Vec(x=self.x + other.x, y=self.y + other.y)
+    def __mul__(self, k: float) -> Vec:
+        return Vec(x=self.x * k, y=self.y * k)
+    def __rmul__(self, k: float) -> Vec:
+        return Vec(x=self.x * k, y=self.y * k)
+    def __neg__(self) -> Vec:
+        return Vec(x=-self.x, y=-self.y)
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, Vec):
+            return self.x == other.x and self.y == other.y
+        return False
+    def __lt__(self, other: Vec) -> bool:
+        return self.norm2() < other.norm2()
+    def __len__(self) -> int:
+        return 2
+    def __getitem__(self, i: int) -> float:
+        return self.x if i == 0 else self.y
+    def __contains__(self, v: float) -> bool:
+        return v == self.x or v == self.y
+    def __str__(self) -> str:
+        return f"<{self.x},{self.y}>"
+    def __hash__(self) -> int:
+        return hash((self.x, self.y))
+    def norm2(self) -> float:
+        return self.x * self.x + self.y * self.y
+
+
+class Base:
+    name: str
+
+
+impl Base:
+    def describe(self) -> str:
+        return f"Base({self.name})"
+    @property
+    def shouted(self) -> str:
+        return self.name.upper()
+    @classmethod
+    def make(cls, n: str) -> Base:
+        return Base(name=n)
+    @staticmethod
+    def kind() -> str:
+        return "base"
+
+
+class Mid(Base):
+    tag: int
+
+
+impl Mid:
+    def describe(self) -> str:
+        return f"Mid({self.name},{self.tag})"
+
+
+def main() -> None:
+    let a: Vec = Vec(x=1.0, y=2.0)
+    let b: Vec = Vec(x=3.0, y=4.0)
+    print(str(a + b), str(a * 2.0), str(2.0 * a), str(-a))
+    print(a == Vec(x=1.0, y=2.0), a == b, a < b, len(a), a[0], a[1], 2.0 in a)
+    print(sorted([b, a], key=lambda v: v.norm2())[0].x)
+    print(len({a, Vec(x=1.0, y=2.0)}))
+    let m: Mid = Mid(name="m", tag=7)
+    print(m.describe(), m.shouted, Base.make("z").describe(), Base.kind())
+    print(isinstance(m, Base), m.name, m.tag)
+main()

@@ -1,0 +1,33 @@
+# KNOWN-GAP: no diagnostic — crashes at runtime with
+#   TypeError: can only concatenate str (not "int") to str
+#
+# Indexing a fixed-arity `tuple[int, str]` with a **variable** index type-checks
+# against *any* element type. Both of these are accepted:
+#
+#     let a: int = t[i]     # ✅ accepted
+#     let b: str = t[i]     # ✅ accepted — same expression, contradictory types
+#
+# so `t[i]` is degrading to `Unknown` rather than to the union `int | str` that
+# a non-constant index actually denotes.
+#
+# A *constant* index is checked correctly — `let v: int = t[1]` is a clean
+# `tyc::type_mismatch` — and homogeneous containers are fine (`let v: int =
+# xs[i]` on a `list[str]` is caught). It is specifically the fixed-arity-tuple
+# variable-index read that falls through.
+#
+# v1.0.0-alpha.2 typed "slice reads, subscript assignments, `for` / `let`
+# tuple-unpack targets" that previously degraded to `Unknown`; this read
+# position was missed by that sweep.
+#
+# Fix in this file: index with a constant, or annotate the binding as the union
+# (`let v: int | str = t[i]`) and narrow it.
+
+
+def main() -> None:
+    let t: tuple[int, str] = (1, "abc")
+    mut i: int = 1
+    let v: int = t[i]
+    print(v + 1)
+
+
+main()

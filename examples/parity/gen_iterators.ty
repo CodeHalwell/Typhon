@@ -1,0 +1,48 @@
+from typing import Iterator
+import itertools
+
+
+def countdown(n: int) -> Iterator[int]:
+    mut i: int = n
+    while i > 0:
+        yield i
+        i = i - 1
+
+
+def chained() -> Iterator[int]:
+    yield from countdown(3)
+    yield from [10, 20]
+
+
+class Fib:
+    a: int
+    b: int
+    limit: int
+
+
+impl Fib:
+    def __iter__(self) -> Iterator[int]:
+        return self
+    def __next__(self) -> int:
+        if self.a > self.limit:
+            raise StopIteration
+        let cur: int = self.a
+        let nxt: int = self.a + self.b
+        self.a = self.b
+        self.b = nxt
+        return cur
+
+
+def main() -> None:
+    print(list(countdown(4)))
+    print(list(chained()))
+    print([x for x in Fib(a=0, b=1, limit=50)])
+    print(list(itertools.islice(itertools.count(5), 4)))
+    print(list(itertools.accumulate([1, 2, 3, 4])))
+    print(list(itertools.chain([1], [2, 3])))
+    print([list(g) for k, g in itertools.groupby([1, 1, 2, 3, 3])])
+    print(list(itertools.combinations([1, 2, 3], 2)))
+    print(list(itertools.permutations([1, 2], 2)))
+    print(list(itertools.takewhile(lambda x: x < 3, [1, 2, 3, 1])))
+    print(list(itertools.product([1, 2], "ab")))
+main()

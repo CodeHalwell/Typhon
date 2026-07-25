@@ -1,0 +1,21 @@
+def main() -> None:
+    let grid: list[list[int]] = [[1, 2], [3, 4], [5, 6]]
+    print([x for row in grid for x in row])
+    print([[x * 2 for x in row] for row in grid])
+    print([x for row in grid for x in row if x % 2 == 0])
+    let pairs: list[tuple[str, int]] = [("a", 1), ("b", 2)]
+    print({k: v for k, v in pairs})
+    print([f"{k}{v}" for k, v in pairs])
+    print({v for k, v in pairs})
+    let d: dict[str, int] = {"a": 1, "b": 2, "c": 3}
+    print({k: v for k, v in d.items() if v > 1})
+    print({v: k for k, v in d.items()})
+    print([x + y for x in [1, 2] for y in [10, 20]])
+    print([(x, y) for x in range(3) for y in range(x)])
+    print(sum(x * x for x in range(5)))
+    print(sorted({x % 3 for x in range(10)}))
+    print(list(range(10, 0, -3)), list(range(0)))
+    print([x if x > 1 else -x for x in [0, 1, 2]])
+    let nested: list[int] = [y for x in [[1], [2, 3]] for y in x]
+    print(nested)
+main()

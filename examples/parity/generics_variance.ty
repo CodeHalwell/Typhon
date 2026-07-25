@@ -1,0 +1,68 @@
+from typing import Callable, Iterable, Sequence
+
+
+class Box[T]:
+    value: T
+
+
+impl[T] Box[T]:
+    def get(self) -> T:
+        return self.value
+    def map[U](self, f: Callable[[T], U]) -> Box[U]:
+        return Box(value=f(self.value))
+
+
+class Pair[A, B]:
+    left: A
+    right: B
+
+
+impl[A, B] Pair[A, B]:
+    def swap(self) -> Pair[B, A]:
+        return Pair(left=self.right, right=self.left)
+
+
+def first[T](xs: list[T]) -> T?:
+    if len(xs) == 0:
+        return None
+    return xs[0]
+
+
+def total(xs: Sequence[int]) -> int:
+    mut s: int = 0
+    for x in xs:
+        s = s + x
+    return s
+
+
+def join_all(xs: Iterable[str]) -> str:
+    return "|".join(xs)
+
+
+class Animal:
+    name: str
+
+
+class Dog(Animal):
+    breed: str
+
+
+def names(xs: Sequence[Animal]) -> list[str]:
+    return [a.name for a in xs]
+
+type Vec[T] = list[T]
+
+
+def main() -> None:
+    let b: Box[int] = Box(value=21)
+    print(b.get(), b.map(lambda v: v * 2).get(), b.map(lambda v: str(v)).get())
+    let p: Pair[int, str] = Pair(left=1, right="x")
+    print(p.swap().left, p.swap().right)
+    print(first([1, 2]), first([]))
+    print(total([1, 2, 3]), total((4, 5)))
+    print(join_all(["a", "b"]))
+    let dogs: list[Dog] = [Dog(name="Rex", breed="H")]
+    print(names(dogs))
+    let v: Vec[int] = [1, 2, 3]
+    print(v)
+main()

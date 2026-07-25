@@ -1,0 +1,51 @@
+import functools
+
+
+@memo
+def fib(n: int) -> int:
+    if n < 2:
+        return n
+    return fib(n - 1) + fib(n - 2)
+
+
+@pure
+def square(n: int) -> int:
+    return n * n
+
+
+@functools.cache
+def slow(n: int) -> int:
+    return n * 3
+
+
+class Temp:
+    celsius: float
+
+
+impl Temp:
+    @property
+    def fahrenheit(self) -> float:
+        return self.celsius * 9.0 / 5.0 + 32.0
+
+
+class Point frozen:
+    x: int
+    y: int
+
+
+class Tagged:
+    name: str
+    tags: list[str] = []
+
+
+def main() -> None:
+    print(fib(30), square(7), slow(4))
+    print(Temp(celsius=100.0).fahrenheit)
+    let p: Point = Point(x=1, y=2)
+    print(p, p == Point(x=1, y=2), hash(p) == hash(Point(x=1, y=2)))
+    let a: Tagged = Tagged(name="a")
+    let b: Tagged = Tagged(name="b")
+    a.tags.append("x")
+    print(a.tags, b.tags)
+    print(functools.reduce(lambda x, y: x + y, [1, 2, 3, 4], 0))
+main()

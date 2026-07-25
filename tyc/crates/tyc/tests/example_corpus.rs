@@ -39,7 +39,8 @@ fn combined(out: &std::process::Output) -> String {
 }
 
 /// Single-file exercises: `examples/NN-topic/name.ty`, excluding the multi-file
-/// `47-mini-app` and the `errors/` corpus.
+/// `47-mini-app` and the `errors/` and `parity/` corpora, which have their own
+/// harnesses (`error_examples.rs`, `parity_corpus.rs`).
 fn single_file_exercises() -> Vec<PathBuf> {
     let examples = repo_root().join("examples");
     let mut files = Vec::new();
@@ -49,7 +50,7 @@ fn single_file_exercises() -> Vec<PathBuf> {
             continue;
         }
         let name = dir.file_name().unwrap().to_string_lossy().to_string();
-        if name == "errors" || name == "apps" || name == "47-mini-app" {
+        if matches!(name.as_str(), "errors" | "parity" | "apps" | "47-mini-app") {
             continue;
         }
         for entry in std::fs::read_dir(&dir).unwrap() {

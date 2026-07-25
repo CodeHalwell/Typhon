@@ -4,7 +4,7 @@ All notable changes to Typhon are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely; the
 canonical phase-by-phase status lives in `docs/roadmap.md`.
 
-## Unreleased — error-example corpus, corpus regression harnesses & docs/skill accuracy pass
+## Unreleased — error + parity example corpora, regression harnesses & docs/skill accuracy pass
 
 A documentation- and test-infrastructure release from a full review of the
 v1.0.0-alpha.6 tree against the shipped compiler. **No language change** — the
@@ -24,6 +24,39 @@ glyph, and `tyc explain --list` labelling its two non-diagnostic entries.
   clean today and still fail at runtime. Every file explains the rule and the
   fix in a header comment; the broken code is the exhibit, the prose is the
   point.
+- **New `examples/parity/` corpus + differential harness — 11 compiler bugs
+  found.** `docs/vm.md` states the VM "must stay a drop-in for `tyc build &&
+  python`", which makes a VM-vs-CPython output diff a mechanical bug detector.
+  A battery of 26 diverse probe programs (numeric edge cases, string/bytes
+  methods, container ops, exception hierarchies, generators, dunder protocols,
+  pattern matching, closures, PEP 695 generics, `Result` plumbing, `as!`,
+  decorators, enums/models/`freeze let`, interfaces/`extend`, operator
+  precedence, format specs, recursion, comprehensions, async, and deliberate
+  soundness attacks) was pushed through `tyc check`, `tyc run`, and `tyc build`
+  + CPython 3.13. The 12 clean ones are checked in as `examples/parity/` under
+  a byte-identical-stdout assertion; the six confirmed divergences live in
+  `examples/parity/divergent/` under the inverse assertion, so fixing one fails
+  the test as a prompt to promote the file. Harness:
+  `tyc/crates/tyc/tests/parity_corpus.rs`.
+- **Findings recorded, not silently fixed** (each needs a decision, and two are
+  narrowings): the VM parses `?` only in statement-tail position, so the
+  documented inline form (`return Ok(p(a)?)`, `let x = p(a)? + 1`,
+  `if p(a)? > 0:`) is a hard parse error under `tyc run` while `tyc check` and
+  `tyc build` accept it; `max()` returns the last rather than the first maximal
+  element on a tie; `lambda x=x:` is unimplemented in the VM — which is the fix
+  `tyc explain loop_closure_capture` itself prescribes; the string precision
+  spec `f"{s:.1}"` is ignored; frozen mappings print as `mappingproxy(...)`
+  rather than CPython's `__str__` form; `str.isascii` / `str.isprintable` /
+  `bytes.count` / `datetime.timezone` are missing from the VM shims; a variable
+  index into a fixed-arity tuple type-checks against *any* element type (both
+  `let a: int = t[i]` and `let b: str = t[i]` are accepted, so the read
+  degrades to `Unknown` instead of the union); and two type-checker false
+  positives — a `try`/`except`/`else` whose `else` returns draws
+  `tyc::missing_return`, as does an exhaustive `match` ending in the
+  irrefutable `case {}:`. The two false positives are checked in under
+  `examples/errors/13-false-positives/`, the rest under
+  `examples/errors/12-known-gaps/` and `examples/parity/divergent/`. Full
+  analysis in `docs/review-2026-07-25.md`.
 - **Both example corpora are now regression-enforced.** Each error example
   declares its diagnostics in an `# EXPECT-ERROR:` / `# EXPECT-WARN:` header,
   asserted exactly (no more, no fewer) by the new

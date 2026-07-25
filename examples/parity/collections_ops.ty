@@ -1,0 +1,31 @@
+def main() -> None:
+    let xs: list[int] = [5, 3, 9, 1, 7]
+    print(xs[::2], xs[::-1], xs[1:4], xs[-2:], xs[:-2], xs[10:20])
+    print(sorted(xs), sorted(xs, reverse=True))
+    let words: list[str] = ["bb", "a", "ccc", "dd"]
+    print(sorted(words, key=len), sorted(words, key=len, reverse=True))
+    print(min(xs), max(xs), sum(xs), len(xs))
+    mut ys: list[int] = list(xs)
+    ys.sort()
+    ys.insert(0, 0)
+    ys.remove(9)
+    print(ys, ys.pop(), ys.pop(0), ys.index(3), ys.count(1))
+    ys.extend([2, 2])
+    ys.reverse()
+    print(ys)
+    let d: dict[str, int] = {"b": 2, "a": 1, "c": 3}
+    print(list(d.keys()), list(d.values()), list(d.items()))
+    print(sorted(d.items(), key=lambda kv: kv[1]))
+    print(d.get("z"), d.get("z", 0), "a" in d, len(d))
+    mut d2: dict[str, int] = dict(d)
+    d2.update({"d": 4})
+    print(d2.pop("a"), sorted(d2.keys()))
+    let s1: set[int] = {1, 2, 3}
+    let s2: set[int] = {3, 4}
+    print(sorted(s1 | s2), sorted(s1 & s2), sorted(s1 - s2), sorted(s1 ^ s2))
+    print(s1.issubset({1, 2, 3, 4}), s1.isdisjoint({9}))
+    let t: tuple[int, str, float] = (1, "a", 2.0)
+    print(t, t[0], t[-1], len(t), t + (3,))
+    print(list(zip([1, 2, 3], "abc")), list(enumerate("ab", start=1)))
+    print(list(reversed([1, 2, 3])), any([False, True]), all([True, True]))
+main()

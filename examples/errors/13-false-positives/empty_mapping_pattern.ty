@@ -1,0 +1,34 @@
+# FALSE-POSITIVE: this match is exhaustive; `case {}:` matches every mapping.
+# EXPECT-ERROR: tyc::missing_return
+#
+# In Python's structural pattern matching an **empty mapping pattern** `{}`
+# places no constraints on the subject, so it matches *any* mapping — it is the
+# mapping equivalent of `case _:`, not a test for an empty dict. Verified
+# against CPython 3.13:
+#
+#     match {'z': 0}:
+#         case {'kind': k}: ...   # no match
+#         case {}: ...            # matches
+#
+# The checker treats `case {}:` as refutable, so it does not count the `match`
+# as exhaustive and reports `tyc::missing_return`. `case _:` in the same
+# position is accepted.
+#
+# Workaround until fixed: use `case _:` instead.
+
+
+def describe(d: dict[str, int]) -> str:
+    match d:
+        case {"kind": k, "n": n}:
+            return f"both {k} {n}"
+        case {"kind": k}:
+            return f"kind {k}"
+        case {}:
+            return "other"
+
+
+def main() -> None:
+    print(describe({"kind": 1, "n": 2}), describe({"kind": 3}), describe({"z": 0}))
+
+
+main()

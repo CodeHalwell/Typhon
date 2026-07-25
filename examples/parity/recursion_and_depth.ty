@@ -1,0 +1,48 @@
+def fact(n: int) -> int:
+    if n <= 1:
+        return 1
+    return n * fact(n - 1)
+
+
+def is_even(n: int) -> bool:
+    if n == 0:
+        return True
+    return is_odd(n - 1)
+
+
+def is_odd(n: int) -> bool:
+    if n == 0:
+        return False
+    return is_even(n - 1)
+
+
+class Node:
+    value: int
+    nxt: Node?
+
+
+def build(n: int) -> Node?:
+    mut head: Node? = None
+    mut i: int = 0
+    while i < n:
+        head = Node(value=i, nxt=head)
+        i = i + 1
+    return head
+
+
+def total(node: Node?) -> int:
+    mut sum: int = 0
+    mut cur: Node? = node
+    while cur is not None:
+        sum = sum + cur.value
+        cur = cur.nxt
+    return sum
+
+
+def main() -> None:
+    print(fact(20))
+    print(fact(30))
+    print(is_even(100), is_odd(101))
+    print(total(build(500)))
+    print(len(str(fact(100))))
+main()

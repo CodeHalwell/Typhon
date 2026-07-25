@@ -1,0 +1,20 @@
+import json
+
+
+def main() -> None:
+    let raw: str = '{"n": 1, "m": 2}'
+    let d: dict[str, int] = json.loads(raw) as! dict[str, int]
+    print(sorted(d.items()))
+    let n: int = d["n"] as! int
+    print(n + 1)
+    print([v as! int for v in d.values()])
+    let maybe: int? = json.loads('null') as! int | None
+    print(maybe)
+    let f: float = json.loads('3') as! float
+    print(f)
+    try:
+        let bad: dict[str, int] = json.loads('{"a": "x"}') as! dict[str, int]
+        print("NO RAISE", bad)
+    except TypeError as e:
+        print("raised TypeError")
+main()

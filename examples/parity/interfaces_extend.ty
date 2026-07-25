@@ -1,0 +1,60 @@
+interface Shaped:
+    def area(self) -> float: ...
+    def label(self) -> str: ...
+
+
+class Sq:
+    side: float
+
+
+class Ci:
+    r: float
+
+
+impl Sq:
+    def area(self) -> float:
+        return self.side * self.side
+    def label(self) -> str:
+        return "square"
+
+
+impl Ci:
+    def area(self) -> float:
+        return 3.14159 * self.r * self.r
+    def label(self) -> str:
+        return "circle"
+
+type Fig = Sq | Ci
+
+
+impl Fig:
+    def describe(self) -> str:
+        match self:
+            case Sq(s): return f"sq {s}"
+            case Ci(r): return f"ci {r}"
+
+
+extend str:
+    def slug(self) -> str:
+        return self.lower().replace(" ", "-")
+
+
+extend list:
+    def second(self) -> int:
+        return self[1]
+
+
+def render(s: Shaped) -> str:
+    return f"{s.label()}={s.area():.2f}"
+
+
+def main() -> None:
+    print(render(Sq(side=2.0)), render(Ci(r=1.0)))
+    print(Sq(side=3.0).describe(), Ci(r=2.0).describe())
+    let title: str = "Hello Big World"
+    print(title.slug())
+    let xs: list[int] = [10, 20, 30]
+    print(xs.second())
+    let figs: list[Fig] = [Sq(side=1.0), Ci(r=1.0)]
+    print([f.describe() for f in figs])
+main()

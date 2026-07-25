@@ -137,7 +137,7 @@ with its own `typhon.toml`, `src/` tree, and run recipe.
 ### Programs that are meant to fail
 
 Everything above shows Typhon working. [`errors/`](errors/) shows it saying
-**no** — 70 deliberately broken programs, each with a header comment naming the
+**no** — 73 deliberately broken programs, each with a header comment naming the
 diagnostics it produces, explaining the rule behind them, and showing the fix.
 They cover 56 of the 87 `tyc::` codes, from single-rule demos through
 realistic multi-error files, plus a
@@ -148,12 +148,21 @@ Each file's declared diagnostics are asserted on every `cargo test --workspace`
 by `tyc/crates/tyc/tests/error_examples.rs`, so a diagnostic that stops firing
 or changes severity breaks the build. See [`errors/README.md`](errors/README.md).
 
+### VM ↔ CPython parity
+
+[`parity/`](parity/) holds output-deterministic programs that must behave
+**identically** under `tyc run` (the in-process VM) and `tyc build` + CPython —
+the drop-in guarantee `docs/vm.md` makes. `parity/divergent/` holds the
+confirmed exceptions, each documenting both outputs and which one is correct.
+Both directions are asserted by `tyc/crates/tyc/tests/parity_corpus.rs`.
+
 ### Bonus
 
 | Path | Topic | Highlights |
 |---|---|---|
 | `testing/` | pytest | `Result`-aware assertions, parametrised tests |
-| `errors/` | diagnostics | 70 programs that fail on purpose, one per rule |
+| `errors/` | diagnostics | 73 programs that fail on purpose, one per rule |
+| `parity/` | VM parity | 12 programs asserted identical under both execution paths, 6 documented divergences |
 
 ## Conventions used in this suite
 

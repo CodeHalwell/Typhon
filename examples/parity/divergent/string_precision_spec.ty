@@ -1,0 +1,26 @@
+# DIVERGENT: the string precision spec `{s:.N}` truncates under CPython and is
+# ignored by the VM.
+#
+#   CPython: h
+#   VM:      hi
+#
+# For a string operand, `.N` in a format spec is a **maximum length**, not a
+# decimal precision — `f"{'hi':.1}"` is `'h'`. The VM applies precision only to
+# numeric operands and passes strings through whole.
+#
+# Every other spec in this file agrees across both paths (fill, align, sign,
+# width, grouping, `#`, base conversions, `%`, `=`, `!r`, and nested
+# `{width}` / `{precision}` substitution), so this is a narrow gap rather than
+# a broken formatter.
+
+
+def main() -> None:
+    let s: str = "hello"
+    print(f"{s:.1}")
+    print(f"{s:.3}")
+    print(f"{s:>8.2}")
+    print("{:.2}".format(s))
+    print(format(s, ".4"))
+
+
+main()

@@ -1,0 +1,40 @@
+# DIVERGENT: a lambda with a default argument runs under CPython and raises
+# under the VM.
+#
+#   CPython: [0, 1, 2]
+#   VM:      TypeError: <lambda>() missing required argument: 'i'
+#
+# **This is the fix `tyc` itself recommends.** `tyc::loop_closure_capture`
+# fires on `lambda: i` inside a loop, and `tyc explain loop_closure_capture`
+# prescribes exactly the form below:
+#
+#     for i in range(3):
+#         fns.append(lambda i=i: i)
+#
+# So following the diagnostic's advice produces a program that builds and runs
+# correctly but crashes under `tyc run`.
+#
+# Default arguments on a `def` work fine in the VM — it is specifically the
+# lambda parameter-default path that is unimplemented.
+
+
+from typing import Callable
+
+
+def make_closures() -> list[Callable[[], int]]:
+    mut fns: list[Callable[[], int]] = []
+    for i in [0, 1, 2]:
+        fns.append(lambda i=i: i)
+    return fns
+
+
+def with_def_default(i: int = 7) -> int:
+    return i * 2
+
+
+def main() -> None:
+    print([f() for f in make_closures()])
+    print(with_def_default())
+
+
+main()

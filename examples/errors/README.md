@@ -62,6 +62,7 @@ Codes are matched as a *set*, not a count: a file expecting
 | [`10-footguns-and-lints/`](10-footguns-and-lints/) | Python's classic traps — mutable defaults, `is` on literals, loop closures, unmanaged resources, inlined secrets |
 | [`11-multi-error-programs/`](11-multi-error-programs/) | Realistic files with many errors at once, including which errors *mask* others |
 | [`12-known-gaps/`](12-known-gaps/) | The inverse: programs that compile clean and fail at runtime. See that directory's README |
+| [`13-false-positives/`](13-false-positives/) | The other inverse: valid programs the checker wrongly rejects. See that directory's README |
 
 ## Start here
 
@@ -73,6 +74,11 @@ If you are new to Typhon, three files carry most of the signal:
    — why a single misplaced `?` can hide every other error in a file.
 3. [`12-known-gaps/missing_await_in_async_caller.ty`](12-known-gaps/missing_await_in_async_caller.ty)
    — the checker is strict, not omniscient; here is one place it is silent.
+
+`12-known-gaps/` and `13-false-positives/` are the two honest directories: the
+first is code the compiler wrongly *accepts*, the second is code it wrongly
+*rejects*. Both are asserted to keep misbehaving, so fixing either one fails
+the test — which is the prompt to delete or reclassify the file.
 
 ## Adding a new one
 
