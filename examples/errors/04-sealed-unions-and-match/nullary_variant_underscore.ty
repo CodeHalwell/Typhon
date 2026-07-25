@@ -1,0 +1,34 @@
+# EXPECT-ERROR: tyc::arg_count
+# EXPECT-ERROR: tyc::missing_return
+#
+# Pitfall: `case Nil(_):` looks like "match a Nil, ignore its contents", but
+# `_` is a *positional capture* and `Nil` has no positional fields — so the
+# pattern can never match. The arm is dead, which is why `missing_return`
+# follows: the union is no longer covered.
+#
+# Fix: `case Nil():` — two empty parens.
+
+
+class Cons frozen:
+    head: int
+    tail: int
+
+
+class Nil frozen:
+    pass
+
+
+type IntList = Cons | Nil
+
+
+def head_or_zero(xs: IntList) -> int:
+    match xs:
+        case Cons(h, _): return h
+        case Nil(_): return 0
+
+
+def main() -> None:
+    print(head_or_zero(Nil()))
+
+
+main()

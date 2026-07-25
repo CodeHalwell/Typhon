@@ -1,0 +1,20 @@
+# EXPECT-WARN: tyc::unused_import
+#
+# An import nothing references. Warn-level since v0.8.0 (it was an error
+# before), because a half-finished edit shouldn't block a local build. Set
+# `[strictness] unused-import = "error"` to gate CI on it. The LSP ships a
+# "Remove unused import" code action.
+#
+# Fix: delete the imports, or use them.
+
+
+import json
+import os
+from pathlib import Path
+
+
+def main() -> None:
+    print("nothing imported is actually used")
+
+
+main()

@@ -1,0 +1,28 @@
+# EXPECT-ERROR: tyc::raise_non_exception
+#
+# `raise` needs a `BaseException`. Raising an int, or a plain dataclass that
+# does not subclass `Exception`, is a `TypeError` at runtime — caught at check
+# time since v1.0.0-alpha.2.
+#
+# Fix: `class! ValidationError(Exception): field: str` and raise that, or
+# return `Err(...)` instead, which is the idiomatic Typhon shape for an
+# expected failure.
+
+
+class ValidationError frozen:
+    field: str
+
+
+def validate(age: int) -> int:
+    if age < 0:
+        raise ValidationError(field="age")
+    if age > 200:
+        raise 42
+    return age
+
+
+def main() -> None:
+    print(validate(30))
+
+
+main()

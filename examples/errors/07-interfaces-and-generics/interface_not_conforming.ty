@@ -1,0 +1,39 @@
+# EXPECT-ERROR: tyc::interface_not_conforming
+#
+# Conformance is structural but not loose: the method must exist *and* its
+# signature must line up. `Button.width` returns `str` where the interface
+# promises `float`.
+#
+# Note that `int` *would* be accepted here — `int` widens to `float`, so a
+# narrower return type still satisfies the contract. It is `str` that has no
+# path to `float`.
+#
+# Fix: return an actual `float`.
+
+
+interface Widget:
+    def draw(self) -> None: ...
+    def width(self) -> float: ...
+
+
+class Button:
+    label: str
+
+
+impl Button:
+    def draw(self) -> None:
+        print(self.label)
+
+    def width(self) -> str:
+        return str(len(self.label))
+
+
+def render(w: Widget) -> None:
+    w.draw()
+
+
+def main() -> None:
+    render(Button(label="ok"))
+
+
+main()

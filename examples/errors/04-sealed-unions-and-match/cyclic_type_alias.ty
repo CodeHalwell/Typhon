@@ -1,0 +1,17 @@
+# EXPECT-ERROR: tyc::cyclic_type_alias
+#
+# Two transparent aliases that only refer to each other never bottom out in a
+# concrete type, so resolving either one loops forever.
+#
+# Fix: anchor at least one of them to a real type.
+
+
+type Alpha = Beta
+type Beta = Alpha
+
+
+def main() -> None:
+    print("unreachable")
+
+
+main()

@@ -1,0 +1,30 @@
+# EXPECT-ERROR: tyc::parse
+#
+# `|>` is preprocessed line-by-line, so a chain that wraps onto the next
+# physical line needs the whole expression bracketed to keep it as one logical
+# line.
+#
+# Fix: wrap the chain in parens —
+#
+#     let shouted: str = (name
+#         |> strip()
+#         |> upper())
+
+
+def strip_ws(s: str) -> str:
+    return s.strip()
+
+
+def upper(s: str) -> str:
+    return s.upper()
+
+
+def main() -> None:
+    let name: str = "  ada  "
+    let shouted: str = name
+        |> strip_ws()
+        |> upper()
+    print(shouted)
+
+
+main()

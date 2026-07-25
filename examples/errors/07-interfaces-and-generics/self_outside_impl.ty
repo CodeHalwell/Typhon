@@ -1,0 +1,23 @@
+# EXPECT-ERROR: tyc::self_outside_impl
+#
+# `self` is only bound inside a method of an `impl` / `extend` block. In a free
+# function it resolves to nothing.
+#
+# Fix: move the function into `impl User:`, or take the value as an ordinary
+# parameter — `def display(user: User) -> str:`.
+
+
+class User:
+    id: int
+    name: str
+
+
+def display() -> str:
+    return f"{self.name} (#{self.id})"
+
+
+def main() -> None:
+    print(display())
+
+
+main()

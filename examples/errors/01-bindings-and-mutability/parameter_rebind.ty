@@ -1,0 +1,19 @@
+# EXPECT-ERROR: tyc::immutable_assign
+#
+# Parameters follow the same rule as locals (v0.8.0): they are `let` bindings
+# unless you say otherwise, so reassigning one is an error.
+#
+# Fix: copy into a `mut` local — `mut cleaned: str = raw` — and normalise that.
+
+
+def normalise(raw: str) -> str:
+    raw = raw.strip()
+    raw = raw.lower()
+    return raw
+
+
+def main() -> None:
+    print(normalise("  Hello  "))
+
+
+main()

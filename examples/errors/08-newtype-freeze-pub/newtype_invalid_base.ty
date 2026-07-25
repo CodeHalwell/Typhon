@@ -1,0 +1,17 @@
+# EXPECT-ERROR: tyc::newtype_invalid_base
+#
+# `newtype` wraps a *type*, and lowers to `typing.NewType("Name", Base)`. A
+# string literal is a value, not a type.
+#
+# Fix: `newtype Mode = str`, or — if you wanted the closed set of literals —
+# a string-literal union: `type Mode = "fast" | "slow"`.
+
+
+newtype Mode = "fast"
+
+
+def main() -> None:
+    print("unreachable")
+
+
+main()

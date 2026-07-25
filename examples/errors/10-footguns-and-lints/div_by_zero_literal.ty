@@ -1,0 +1,17 @@
+# EXPECT-ERROR: tyc::div_by_zero_literal
+#
+# A literal zero divisor always raises `ZeroDivisionError`. Pure constant fold,
+# no flow analysis — it covers `/`, `//` and `%`, including `-0.0` and a
+# unary-negated zero.
+#
+# Fix: fix the divisor, or guard the call site.
+
+
+def main() -> None:
+    let total: int = 10
+    print(total / 0)
+    print(total // 0)
+    print(total % 0)
+
+
+main()

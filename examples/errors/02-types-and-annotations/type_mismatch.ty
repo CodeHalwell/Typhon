@@ -1,0 +1,27 @@
+# EXPECT-ERROR: tyc::type_mismatch
+#
+# Three separate mismatches: a `str` where an `int` is expected, a `float`
+# narrowed into an `int` slot (widening int -> float is allowed; the reverse
+# is not), and a `list[str]` assigned to a `list[int]`.
+#
+# Fix: convert explicitly — `int(raw)`, `round(ratio)`, `[int(s) for s in tags]`.
+
+
+def double(n: int) -> int:
+    return n * 2
+
+
+def main() -> None:
+    let raw: str = "21"
+    print(double(raw))
+
+    let ratio: float = 2.5
+    let rounded: int = ratio
+    print(rounded)
+
+    let tags: list[str] = ["1", "2"]
+    let numbers: list[int] = tags
+    print(numbers)
+
+
+main()

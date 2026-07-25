@@ -23,6 +23,13 @@ see exactly what each Typhon construct lowers to without running
 > needs that same runtime on its `sys.path` — copy the example into a
 > `tyc init` playground and rebuild for the cleanest way to actually
 > execute it.
+>
+> "Stdlib-only" means *no dependency the example imports by name*. Two
+> foundations examples still need `pydantic` installed to **run**,
+> because `model X:` lowers to a `pydantic.BaseModel` subclass:
+> `06-classes-and-models` and `17-file-io-json`. Both type-check and
+> build fine without it. Everything else in 01–10, 15, 20, 21, 23, 24,
+> and 48–68 runs against a bare CPython 3.13.
 
 ```bash
 # pick any example, e.g. 01-hello-world
@@ -127,11 +134,26 @@ mini-compiler, search engine, distributed KV, real-time game server,
 static site generator, vector DB, API gateway, stream processor) — each
 with its own `typhon.toml`, `src/` tree, and run recipe.
 
+### Programs that are meant to fail
+
+Everything above shows Typhon working. [`errors/`](errors/) shows it saying
+**no** — 70 deliberately broken programs, each with a header comment naming the
+diagnostics it produces, explaining the rule behind them, and showing the fix.
+They cover 56 of the 87 `tyc::` codes, from single-rule demos through
+realistic multi-error files, plus a
+[`12-known-gaps/`](errors/12-known-gaps/) directory recording programs that
+compile clean today and still fail at runtime.
+
+Each file's declared diagnostics are asserted on every `cargo test --workspace`
+by `tyc/crates/tyc/tests/error_examples.rs`, so a diagnostic that stops firing
+or changes severity breaks the build. See [`errors/README.md`](errors/README.md).
+
 ### Bonus
 
 | Path | Topic | Highlights |
 |---|---|---|
 | `testing/` | pytest | `Result`-aware assertions, parametrised tests |
+| `errors/` | diagnostics | 70 programs that fail on purpose, one per rule |
 
 ## Conventions used in this suite
 

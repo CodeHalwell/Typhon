@@ -2,7 +2,7 @@
 
 Extracted from `/home/user/Typhon/examples/`. Each pattern is a near-verbatim snippet from a real, type-checked example. When in doubt about how to write something idiomatically, find the closest pattern here and copy from it.
 
-The repo ships 29 curated stdlib-only exercises (`examples/NN-*/`, sparsely numbered 01–68) plus 15 production-shaped multi-file apps (`examples/apps/01..15-*/`) — 256 `.ty` files in total. Every `.ty` file ships with a paired `.py` showing the lowering.
+The repo ships 32 curated single-file exercises (`examples/NN-*/`, sparsely numbered 01–68) plus 15 production-shaped multi-file apps (`examples/apps/01..15-*/`) — 259 `.ty` files in total. The single-file exercises (and `examples/testing/`) each ship a paired `.py` showing the lowering; the apps are built on demand.
 
 ---
 

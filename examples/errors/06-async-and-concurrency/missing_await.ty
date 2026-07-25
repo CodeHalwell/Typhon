@@ -1,0 +1,27 @@
+# EXPECT-ERROR: tyc::missing_await
+#
+# Calling an `async def` without `await` hands you a coroutine object, not the
+# value — and in CPython, a never-awaited coroutine is a `RuntimeWarning` and a
+# silently-skipped side effect. Typhon makes it a hard error.
+#
+# Fix: `let user: str = await fetch_user(1)` and make `report` async too.
+
+
+import asyncio
+
+
+async def fetch_user(uid: int) -> str:
+    await asyncio.sleep(0)
+    return f"user-{uid}"
+
+
+def report() -> str:
+    let user: str = fetch_user(1)
+    return user
+
+
+def main() -> None:
+    print(report())
+
+
+main()

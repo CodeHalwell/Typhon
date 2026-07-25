@@ -1,0 +1,27 @@
+# EXPECT-WARN: tyc::blocking_in_async
+#
+# `time.sleep` blocks the whole event loop, not just this coroutine — every
+# other task stalls for the full duration. The lint covers the usual suspects:
+# `time.sleep`, `requests.*`, `urllib.request.urlopen`, `subprocess.*`, `input`,
+# `socket.recv`. Severity is `[strictness] blocking-in-async`; it is suppressed
+# inside `unsafe:`.
+#
+# Fix: `await asyncio.sleep(0.1)`, or `await asyncio.to_thread(blocking_call)`
+# for a genuinely synchronous library.
+
+
+import asyncio
+import time
+
+
+async def poll() -> str:
+    time.sleep(0.1)
+    await asyncio.sleep(0)
+    return "done"
+
+
+async def main() -> None:
+    print(await poll())
+
+
+asyncio.run(main())

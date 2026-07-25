@@ -1,0 +1,31 @@
+# EXPECT-ERROR: tyc::pattern_shadows_outer
+#
+# A `case` capture is a *rebinding* that outlives the `match` in Python, so
+# capturing a name that already exists as an outer `let` silently clobbers it.
+#
+# Fix: rename the capture — `case Wrap(inner):`.
+
+
+class Wrap frozen:
+    value: int
+
+
+class Empty frozen:
+    pass
+
+
+type Box = Wrap | Empty
+
+
+def unwrap(b: Box) -> int:
+    let value: int = 99
+    match b:
+        case Wrap(value): return value
+        case Empty(): return 0
+
+
+def main() -> None:
+    print(unwrap(Wrap(value=1)))
+
+
+main()

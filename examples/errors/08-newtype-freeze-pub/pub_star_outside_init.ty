@@ -1,0 +1,18 @@
+# EXPECT-WARN: tyc::pub_star_outside_init
+#
+# `pub *` aggregates a package's sibling modules into its namespace, so it only
+# means anything in an `__init__.ty`. Anywhere else it is a silent no-op —
+# which is worse than an error, because the module looks like it re-exports
+# something and doesn't.
+#
+# Fix: move the marker to the package's `__init__.ty`, or delete it.
+
+pub *
+pub let VERSION: str = "1.0"
+
+
+def main() -> None:
+    print(VERSION)
+
+
+main()

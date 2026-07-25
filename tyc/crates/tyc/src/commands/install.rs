@@ -95,7 +95,29 @@ const SKILL_FILES: &[(&str, &str)] = &[
     skill_file!("references/18-iterators-generators.ty"),
     skill_file!("references/19-context-managers.ty"),
     skill_file!("references/20-boundary-casts.ty"),
+    skill_file!("references/21-rescue-boundaries.ty"),
 ];
+
+/// Number of `references/*.ty` programs in [`SKILL_FILES`]. Derived rather than
+/// hard-coded so the summary line can't drift from the manifest again.
+const SKILL_REFERENCE_PROGRAMS: usize = count_reference_programs();
+
+const fn count_reference_programs() -> usize {
+    let mut n = 0;
+    let mut i = 0;
+    while i < SKILL_FILES.len() {
+        let rel = SKILL_FILES[i].0.as_bytes();
+        if rel.len() > 3
+            && rel[rel.len() - 3] == b'.'
+            && rel[rel.len() - 2] == b't'
+            && rel[rel.len() - 1] == b'y'
+        {
+            n += 1;
+        }
+        i += 1;
+    }
+    n
+}
 
 /// Where the skill lands inside a project.
 const SKILL_SUBDIR: &str = ".claude/skills/typhon";
@@ -154,7 +176,7 @@ fn run_skill(args: SkillArgs) -> Result<()> {
         skill_root.display()
     );
     println!("  SKILL.md + 7 reference docs");
-    println!("  references/ (index + 20 example programs)");
+    println!("  references/ (index + {SKILL_REFERENCE_PROGRAMS} example programs)");
     println!();
     println!("Claude Code will discover it automatically as the `typhon` skill.");
 
@@ -192,6 +214,48 @@ mod tests {
         for (rel, _) in SKILL_FILES {
             assert!(root.join(rel).is_file(), "missing {rel}");
         }
+    }
+
+    /// The manifest is hand-maintained, so a new file added to
+    /// `tyc/crates/tyc/skill/` is silently dropped from the installed skill
+    /// unless someone remembers the one-line addition. This catches that:
+    /// every file in the source tree (bar the directory's own maintainer
+    /// `README.md`, which is deliberately not embedded) must be in
+    /// [`SKILL_FILES`].
+    #[test]
+    fn manifest_covers_every_file_in_the_skill_source_tree() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("skill");
+        let listed: std::collections::HashSet<&str> =
+            SKILL_FILES.iter().map(|(rel, _)| *rel).collect();
+
+        let mut missing = Vec::new();
+        let mut stack = vec![root.clone()];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                let rel = path
+                    .strip_prefix(&root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .to_string();
+                if rel == "README.md" {
+                    continue; // maintainer note for the directory, not part of the skill
+                }
+                if !listed.contains(rel.as_str()) {
+                    missing.push(rel);
+                }
+            }
+        }
+        missing.sort();
+        assert!(
+            missing.is_empty(),
+            "these files exist under tyc/crates/tyc/skill/ but are not in SKILL_FILES, \
+             so `tyc install skill` would silently omit them: {missing:?}"
+        );
     }
 
     #[test]

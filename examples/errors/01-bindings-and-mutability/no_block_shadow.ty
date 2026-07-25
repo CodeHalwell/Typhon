@@ -1,0 +1,22 @@
+# EXPECT-ERROR: tyc::no_block_shadow
+#
+# Python has no block scope: the `let label` inside the `if` would land in the
+# same function scope as the outer one, silently clobbering it. Typhon rejects
+# the shadow instead of letting the two names collide.
+#
+# Fix: rename the inner binding, or make the outer one `mut` and assign to it.
+
+
+def describe(n: int) -> str:
+    let label: str = "small"
+    if n > 100:
+        let label: str = "large"
+        return label
+    return label
+
+
+def main() -> None:
+    print(describe(5))
+
+
+main()

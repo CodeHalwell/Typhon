@@ -1,0 +1,66 @@
+# EXPECT-ERROR: tyc::implicit_any
+# EXPECT-ERROR: tyc::missing_annotation
+# EXPECT-ERROR: tyc::missing_binding_kind
+# EXPECT-ERROR: tyc::nullable_use
+# EXPECT-WARN: tyc::empty_collection_no_annotation
+# EXPECT-WARN: tyc::mutable_default_param
+#
+# What perfectly ordinary Python looks like to `tyc`. Nothing here is *wrong*
+# Python — this is the shape of a file someone pastes in before reading a
+# single page of the docs, and it is the fastest way to see which habits the
+# language actually asks you to change.
+#
+# Walking the diagnostics in order:
+#
+#   1. `tally` has an unannotated parameter and no return type (Rule 1).
+#   2. `counts` is a bare local assignment with no `let` / `mut` (Rule 2).
+#   3. `seen: dict` has no element types, so every read from it is `Any`.
+#   4. `into: list[str] = []` shares one list across every call that omits it.
+#   5. `.get(...)` is `V?`, and `bump` uses it as though it were `V` (Rule 3).
+#   6. `counts = {}` is an empty literal with nothing to infer an element type
+#      from, so it also draws `empty_collection_no_annotation`.
+#
+# Corrected version:
+#
+#     def tally(words: list[str]) -> dict[str, int]:
+#         mut counts: dict[str, int] = {}
+#         for w in words:
+#             counts[w] = counts.get(w, 0) + 1
+#         return counts
+#
+#     def remember(word: str, into: list[str]? = None) -> list[str]:
+#         mut target: list[str] = into if into is not None else []
+#         target.append(word)
+#         return target
+#
+#     def top(counts: dict[str, int], key: str) -> int:
+#         let hits: int? = counts.get(key)
+#         return hits if hits is not None else 0
+
+SEEN: dict = {}
+
+
+def tally(words):
+    counts = {}
+    for w in words:
+        counts[w] = counts.get(w, 0) + 1
+    return counts
+
+
+def remember(word: str, into: list[str] = []) -> list[str]:
+    into.append(word)
+    return into
+
+
+def bump(counts: dict[str, int], key: str) -> int:
+    let hits: int? = counts.get(key)
+    return hits + 1
+
+
+def main() -> None:
+    print(tally(["a", "a", "b"]))
+    print(remember("x"))
+    print(bump({"a": 2}, "a"))
+
+
+main()

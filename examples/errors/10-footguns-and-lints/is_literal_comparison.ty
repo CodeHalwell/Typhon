@@ -1,0 +1,22 @@
+# EXPECT-WARN: tyc::is_literal_comparison
+#
+# `is` compares identity, not value. It appears to work for small ints and
+# short strings because CPython interns them — and then fails for 257, or for
+# a string built at runtime. `SyntaxWarning` in modern CPython; a lint here.
+#
+# Fix: use `==`.
+
+
+def is_admin(role: str, level: int) -> bool:
+    if role is "admin":
+        return True
+    if level is 1000:
+        return True
+    return False
+
+
+def main() -> None:
+    print(is_admin("admin", 1))
+
+
+main()

@@ -1,0 +1,25 @@
+# EXPECT-ERROR: tyc::not_a_context_manager
+#
+# `with` needs `__enter__` / `__exit__` (or `__aenter__` / `__aexit__` for
+# `async with`). A plain dataclass has neither, so the emitted Python raises
+# `AttributeError` the moment the block is entered. Added as a conservative
+# diagnostic in v1.0.0-alpha.2 — it only fires where the output already crashed.
+#
+# Fix: add the protocol methods in an `impl` block, or build the resource with
+# a `@contextmanager` factory.
+
+
+class Transaction:
+    id: int
+
+
+def run() -> None:
+    with Transaction(id=1) as tx:
+        print(tx.id)
+
+
+def main() -> None:
+    run()
+
+
+main()

@@ -1,0 +1,23 @@
+# EXPECT-ERROR: tyc::frozen_inheritance_conflict
+#
+# CPython refuses to mix frozen and non-frozen dataclasses in one hierarchy:
+# `TypeError: cannot inherit frozen dataclass from a non-frozen one`, raised at
+# import. Added as a conservative diagnostic in v1.0.0-alpha.2 — it only fires
+# where the emitted Python already crashed.
+#
+# Fix: make both frozen, or neither.
+
+
+class Animal:
+    name: str
+
+
+class Dog frozen(Animal):
+    breed: str
+
+
+def main() -> None:
+    print(Dog(name="Rex", breed="Husky"))
+
+
+main()

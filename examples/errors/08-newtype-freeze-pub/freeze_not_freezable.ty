@@ -1,0 +1,23 @@
+# EXPECT-ERROR: tyc::freeze_not_freezable
+#
+# `freeze let` deep-freezes its value at import: `list -> tuple`,
+# `dict -> MappingProxyType`, `set -> frozenset`. A non-`frozen` user class has
+# no immutable equivalent, so `deep_freeze` would raise `TypeError` on the very
+# first import. Validated at check time since v0.9.0.
+#
+# Fix: declare the class `frozen` (`class Counter frozen:`) — frozen
+# dataclasses pass through `deep_freeze` untouched.
+
+
+class Counter:
+    value: int
+
+
+freeze let ORIGIN = Counter(value=0)
+
+
+def main() -> None:
+    print(ORIGIN)
+
+
+main()

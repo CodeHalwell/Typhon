@@ -1,0 +1,86 @@
+# EXPECT-ERROR: tyc::frozen_assign
+# EXPECT-ERROR: tyc::immutable_assign
+# EXPECT-ERROR: tyc::manual_init
+# EXPECT-ERROR: tyc::missing_return
+# EXPECT-ERROR: tyc::newtype_violation
+# EXPECT-ERROR: tyc::non_exhaustive_match
+# EXPECT-ERROR: tyc::type_mismatch
+#
+# A plausible-looking order service with several independent mistakes — the
+# shape of a real review comment rather than a single-rule demo. Ten
+# diagnostics across seven codes, each a different subsystem of the language
+# disagreeing with the code:
+#
+#   1. `class Money frozen:` declares `__init__` — `tyc::manual_init`. The
+#      constructor is generated from the field list; writing it by hand both
+#      duplicates it and fights the `frozen=True` lowering (which is why the
+#      three `self.x = ...` lines also draw `tyc::frozen_assign`).
+#   2. `total.amount = ...` in `place_order` writes a field on a frozen class.
+#      Build a new `Money` instead.
+#   3. `place_order(1001, ...)` passes a bare `int` where `OrderId` is
+#      required — `tyc::newtype_violation`. Wrap it: `OrderId(1001)`.
+#   4. `let status` is reassigned — `tyc::immutable_assign`. Use `mut`.
+#   5. The `match` in `describe` never handles `Cancelled` —
+#      `tyc::non_exhaustive_match` — which in turn means `describe` can fall
+#      off the end without returning (`tyc::missing_return`).
+#   6. `describe` returns `Result[str, str]` but its `case` arms return bare
+#      `str` — `tyc::type_mismatch`. Wrap them in `Ok(...)`.
+
+
+newtype OrderId = int
+
+
+class Money frozen:
+    amount: int
+    currency: str
+
+    def __init__(self, amount: int, currency: str) -> None:
+        self.amount = amount
+        self.currency = currency
+
+
+class Placed frozen:
+    order_id: OrderId
+
+
+class Shipped frozen:
+    order_id: OrderId
+    carrier: str
+
+
+class Cancelled frozen:
+    order_id: OrderId
+    reason: str
+
+
+type OrderState = Placed | Shipped | Cancelled
+
+
+def price_of(sku: str) -> Result[Money, str]:
+    if sku == "":
+        return Err("empty sku")
+    return Ok(Money(amount=1250, currency="GBP"))
+
+
+def place_order(oid: OrderId, sku: str) -> Result[OrderState, str]:
+    let total: Money = price_of(sku)?
+    total.amount = total.amount + 99
+    return Ok(Placed(order_id=oid))
+
+
+def describe(state: OrderState, sku: str) -> Result[str, str]:
+    let status: str = "unknown"
+    let total: Money = price_of(sku)?
+    status = "priced"
+    match state:
+        case Placed(oid): return f"{status}: order {oid} placed for {total.amount}"
+        case Shipped(oid, carrier): return f"order {oid} shipped via {carrier}"
+
+
+def main() -> None:
+    match place_order(1001, "widget"):
+        case Ok(state): print(describe(state, "widget"))
+        case Err(e): print(f"failed: {e}")
+
+
+main()

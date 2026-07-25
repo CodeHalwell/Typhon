@@ -1,0 +1,21 @@
+# EXPECT-ERROR: tyc::attribute_not_found
+#
+# Reading a field or method the class does not declare. Fires on in-project
+# class instances, whose shape the checker knows completely; venv-introspected
+# third-party classes carry a `partial` marker and stay lenient so a missing
+# stub member never false-positives.
+#
+# Fix: fix the typo (`name`), or declare the field.
+
+
+class User:
+    id: int
+    name: str
+
+
+def main() -> None:
+    let u: User = User(id=1, name="Ada")
+    print(u.nmae)
+
+
+main()

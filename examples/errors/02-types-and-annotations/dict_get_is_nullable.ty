@@ -1,0 +1,20 @@
+# EXPECT-ERROR: tyc::nullable_use
+#
+# `dict.get(k)` is typed `V?`, not `V` — the single most common way this rule
+# bites, because Python programmers read `.get` as "the safe lookup" and then
+# use the result unconditionally.
+#
+# Fix: narrow it, supply a default (`scores.get(name, 0)`), or use `scores[name]`
+# when a missing key really should raise.
+
+
+def report(scores: dict[str, int], name: str) -> str:
+    let score: int? = scores.get(name)
+    return f"{name}: {score + 1}"
+
+
+def main() -> None:
+    print(report({"ada": 10}, "grace"))
+
+
+main()

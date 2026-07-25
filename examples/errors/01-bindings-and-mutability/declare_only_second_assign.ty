@@ -1,0 +1,26 @@
+# EXPECT-ERROR: tyc::immutable_assign
+#
+# `let NAME: T` with no initialiser is legal (v0.7.0) — the *first* subsequent
+# assignment IS the initialiser. The second one is an ordinary immutability
+# violation. This trips people who read declare-only `let` as "declare a
+# variable" rather than "declare a constant I'll fill in once".
+#
+# Fix: `mut mode: str` if it genuinely needs to change; otherwise collapse the
+# two branches into a single assignment.
+
+
+def resolve(verbose: bool, quiet: bool) -> str:
+    let mode: str
+    mode = "normal"
+    if verbose:
+        mode = "verbose"
+    if quiet:
+        mode = "quiet"
+    return mode
+
+
+def main() -> None:
+    print(resolve(True, False))
+
+
+main()

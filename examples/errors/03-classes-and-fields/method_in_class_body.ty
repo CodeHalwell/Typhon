@@ -1,0 +1,23 @@
+# EXPECT-WARN: tyc::method_in_class_body
+#
+# Rule 4 again: methods live in an `impl` block, not in the class body. This is
+# a warning by default (`[strictness] methods-in-class-body`, settable to
+# "error" to gate CI) because the code still lowers correctly — it just splits
+# data from behaviour the way Typhon wants.
+#
+# Fix: move `display` into `impl User:`.
+
+
+class User:
+    id: int
+    name: str
+
+    def display(self) -> str:
+        return f"{self.name} (#{self.id})"
+
+
+def main() -> None:
+    print(User(id=1, name="Ada").display())
+
+
+main()

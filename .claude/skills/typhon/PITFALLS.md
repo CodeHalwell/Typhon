@@ -159,7 +159,7 @@ def first[T](xs: list[T]) -> T?:
     return xs[0]
 ```
 
-Typhon does not accept the `TypeVar` import path (`tyc::typevar_import_rejected`). Same for deprecated capitalised typing aliases: `from typing import List/Dict/Tuple/Set/FrozenSet/Type` → `tyc::typing_alias_deprecated`. Use lowercase built-ins.
+Typhon does not accept the `TypeVar` import path (`tyc::typevar_import_rejected`, an **error**). The deprecated capitalised typing aliases (`from typing import List/Dict/Tuple/Set/FrozenSet/Type`) are **warned** about — `tyc::typing_alias_deprecated` on the import, `tyc::typing_alias_in_annotation` on each use — but they do not actually work: the checker never unifies `Dict[K, V]` with `dict[K, V]`, so a literal or call site against one fails with a confusing `tyc::type_mismatch` ("expected `Dict[str, int]`, found `dict[?, ?]`"). Use lowercase built-ins.
 
 ---
 

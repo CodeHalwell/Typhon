@@ -30,15 +30,13 @@ count = count + 1     # error: cannot assign to immutable binding
 
 **Fix:** Change the declaration to `mut`.
 
-### `tyc::missing_initialiser` — error
+### `tyc::missing_initialiser` — **currently unreachable**
 
-`let NAME: T` (or `mut NAME: T`) written without `= <expr>` AND the binding is never assigned anywhere. The `let NAME: T` declare-then-assign form is allowed (v0.7.0) provided the definite-assignment pass accepts the control flow.
+Historic code, kept for `tyc explain` compatibility. No pass emits it today: since v0.7.0 the declare-only `let NAME: T` form is fully supported, and a declare-only binding that is *never* assigned and never read is accepted silently (it lowers to an inert bare `name: T` annotation). The two codes that actually police the form are `tyc::use_of_uninitialised` (read on a path that didn't assign) and `tyc::immutable_assign` (a *second* assignment — the first is the initialiser).
 
 ```ty
-let x: int            # error: missing initialiser (never assigned)
+let x: int            # accepted; no diagnostic
 ```
-
-**Fix:** `let x: int = 1`, or add an assignment that the definite-assignment pass accepts.
 
 ### `tyc::use_of_uninitialised` — error (v0.7.0)
 
@@ -112,10 +110,17 @@ def trace(f, *args, **kwargs):    # error since v0.9.0
 
 Bare collection annotation (`list`, `dict`, `tuple`, `set`, `frozenset`) without element-type parameters. `no-implicit-any = true` is the default; the flag is parsed for forward compat but today the check is always on.
 
+**Fires on annotated-assignment positions only** — locals, module bindings, and class-body fields:
+
 ```ty
-def keys(d: dict) -> list:   # error
-    return list(d.keys())
+let xs: list = [1, 2, 3]     # error
+CACHE: dict = {}             # error
+
+class Bag:
+    items: list              # error
 ```
+
+**Known gap:** function *parameter* and *return* annotations are **not** covered — `def keys(d: dict) -> list:` is accepted with no diagnostic today. Write the parameters anyway; closing the gap would narrow the accepted surface, so it is tracked rather than applied silently.
 
 **Fix:** Spell parameters: `dict[str, int] -> list[str]`.
 
@@ -443,7 +448,7 @@ class Worker:
 Field assignment on a `frozen` class outside the constructor.
 
 ```ty
-frozen class Identity: name: str
+class Identity frozen: name: str
 let id: Identity = Identity(name="Alice")
 id.name = "Bob"        # error
 ```
@@ -896,7 +901,10 @@ applied with the wrong arity, or bound to two different constructors in one call
 Landed in v1.0.0-alpha with HKT unification.
 
 ```ty
-interface Functor[F[_]]:
+class Functor[F[_]]:
+    pass
+
+impl[F] Functor[F]:
     def map[A, B](self, fa: F[A], f: Callable[[A], B]) -> F[B]: ...
 
 # error: `F` expects 1 type argument, applied with 2
@@ -905,8 +913,10 @@ interface Functor[F[_]]:
 
 **Fix:** Apply the constructor variable with the arity its kind declares
 (`F[_]` takes exactly one argument), and keep a single call's `F` bound to one
-concrete constructor. Function-level HKT params (`def f[F[_]]`) are not yet
-supported — see `TYPE_SYSTEM_FRONTIER.md`.
+concrete constructor. `F[_]` is only accepted on a **`class` header** —
+function-level (`def f[F[_]]`) and `interface`-level (`interface F[G[_]]:`)
+constructor parameters are both a `tyc::parse` error today; see
+`TYPE_SYSTEM_FRONTIER.md`.
 
 ---
 
@@ -1121,7 +1131,7 @@ Standard values for severity keys are `"off"`, `"warn"`, `"error"`. The `suggest
 
 ## Severity-only summary
 
-**Errors** (block the build by default): `arg_count`, `attribute_not_found`, `comptime`, `cyclic_type_alias`, `div_by_zero_literal`, `duplicate_class`, `duplicate_method`, `extend_builtin`, `field_default_ordering`, `frozen_assign`, `generator_return_type`, `generic`, `immutable_assign`, `impl_unknown_class`, `implicit_any`, `impure_pure_fn`, `interface_isinstance`, `interface_not_conforming`, `invalid_config_value`, `invalid_question_op`, `io`, `lazy_usage`, `manual_init`, `method_in_class_body` (default warn but commonly bumped), `missing_annotation`, `missing_argument`, `missing_await`, `missing_binding_kind`, `missing_field_init`, `missing_initialiser`, `missing_return`, `newtype_violation`, `no_block_shadow`, `non_exhaustive_match`, `not_callable`, `nullable_use`, `operator_type_mismatch`, `parse`, `pattern_shadows_outer`, `pub_name_collision`, `result_error_mismatch`, `self_outside_impl`, `stub_mismatch`, `tuple_index_out_of_range`, `type_mismatch`, `typevar_bound`, `typevar_import_rejected`, `typing_alias_deprecated`, `unknown_kwarg`, `unknown_module`, `unknown_name`, `unsafe_value_leak`, `unused_import`, `use_of_uninitialised`.
+**Errors** (block the build by default): `arg_count`, `attribute_not_found`, `comptime`, `cyclic_type_alias`, `div_by_zero_literal`, `duplicate_class`, `duplicate_method`, `extend_builtin`, `field_default_ordering`, `frozen_assign`, `generator_return_type`, `generic`, `immutable_assign`, `impl_unknown_class`, `implicit_any`, `impure_pure_fn`, `interface_isinstance`, `interface_not_conforming`, `invalid_config_value`, `invalid_question_op`, `io`, `lazy_usage`, `manual_init`, `method_in_class_body` (default warn but commonly bumped), `missing_annotation`, `missing_argument`, `missing_await`, `missing_binding_kind`, `missing_field_init`, `missing_return`, `newtype_violation`, `no_block_shadow`, `non_exhaustive_match`, `not_callable`, `nullable_use`, `operator_type_mismatch`, `parse`, `pattern_shadows_outer`, `pub_name_collision`, `result_error_mismatch`, `self_outside_impl`, `stub_mismatch`, `tuple_index_out_of_range`, `type_mismatch`, `typevar_bound`, `typevar_import_rejected`, `typing_alias_deprecated`, `unknown_kwarg`, `unknown_module`, `unknown_name`, `unsafe_value_leak`, `unused_import`, `use_of_uninitialised`.
 
 **Warnings**: `async_without_await`, `class_attr_shadows_slot`, `blocking_in_async`, `contains_secret_literal`, `orphan_py_import`, `python_semantic_drift`, `resource_not_managed`, `stdlib_module_shadow`.
 

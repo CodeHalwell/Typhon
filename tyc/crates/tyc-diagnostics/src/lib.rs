@@ -182,6 +182,7 @@ pub enum TycError {
     /// of the language.
     #[error("`from typing import {name}` is deprecated in Typhon")]
     #[diagnostic(
+        severity(Warning),
         code(tyc::typing_alias_deprecated),
         url("https://github.com/CodeHalwell/Typhon/blob/main/docs/diagnostics/typing_alias_deprecated.md"),
         help("Use the built-in lowercase `{lower}` instead — `{lower}[T]` works directly without importing anything.")
@@ -889,6 +890,7 @@ pub enum TycError {
         "method `{method}` defined inside `class {class}:` body — methods live in `impl {class}:`"
     )]
     #[diagnostic(
+        severity(Warning),
         code(tyc::method_in_class_body),
         url("https://github.com/CodeHalwell/Typhon/blob/main/docs/diagnostics/method_in_class_body.md"),
         help("move the method into an `impl {class}:` block at the same scope (multiple `impl` blocks for one class are merged at desugar)")

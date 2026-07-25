@@ -148,13 +148,15 @@ freeze let CFG = Counter(value=0)    # ✅ check-time validated
 
 ## Quoted annotations as forward references (v0.13.0)
 
-Quoted annotations now resolve as **forward references** — the reflexive Python idiom for naming a type that isn't defined yet — rather than as string-literal singleton types. This covers `next: "Node"`, `-> "Tree[T]"`, and `"list[Node]"`, including a trailing `?` (`"Node"?`).
+Quoted annotations now resolve as **forward references** — the reflexive Python idiom for naming a type that isn't defined yet — rather than as string-literal singleton types. This covers `next: "Node"`, `-> "Tree[T]"`, and `"list[Node]"`.
 
 ```python
 class Node:
     value: int
-    next: "Node"?    # ✅ forward reference — resolves to Node | None
+    next: "Node | None"    # ✅ forward reference — resolves to Node | None
 ```
+
+The `T?` sugar does **not** compose with a quoted annotation: `next: "Node"?` is a `tyc::parse` error, because the `?` rewrite only fires after an identifier or a `]`, never after a closing quote. Write the union out inside the quotes (`"Node | None"`), or drop the quotes entirely — a class can already refer to itself unquoted, so `next: Node?` is the idiomatic form here.
 
 Before v0.13.0 a quoted annotation became a string-literal singleton type, so the example above produced a baffling [`tyc::type_mismatch`](/Typhon/diagnostics/type-errors/#tyctype_mismatch) when a real `Node` was assigned to it.
 

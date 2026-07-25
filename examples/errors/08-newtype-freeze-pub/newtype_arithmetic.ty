@@ -1,0 +1,24 @@
+# EXPECT-ERROR: tyc::operator_type_mismatch
+#
+# Same-newtype arithmetic preserves the newtype (v0.7.0): `LogIndex + LogIndex`
+# and `LogIndex + 1` are both `LogIndex`. Two *different* newtypes over the
+# same base are not interchangeable, though — that is exactly what the newtype
+# was declared to prevent.
+#
+# Fix: convert deliberately at the boundary — `LogIndex(int(idx) + int(term))`
+# — so the intent is visible.
+
+
+newtype LogIndex = int
+newtype Term = int
+
+
+def combine(idx: LogIndex, term: Term) -> LogIndex:
+    return idx + term
+
+
+def main() -> None:
+    print(combine(LogIndex(1), Term(2)))
+
+
+main()

@@ -1,0 +1,24 @@
+# EXPECT-ERROR: tyc::manual_init
+#
+# Rule 4: `class` bodies declare fields, not behaviour. The constructor is
+# generated from the field list, so writing `__init__` yourself both duplicates
+# it and defeats the `@dataclass(slots=True)` lowering.
+#
+# Fix: delete `__init__` and let `User(id=..., name=...)` be generated. If the
+# base class owns its own constructor, reach for `class!` instead.
+
+
+class User:
+    id: int
+    name: str
+
+    def __init__(self, id: int, name: str) -> None:
+        self.id = id
+        self.name = name
+
+
+def main() -> None:
+    print(User(id=1, name="Ada"))
+
+
+main()

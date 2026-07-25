@@ -1,0 +1,19 @@
+# EXPECT-ERROR: tyc::field_default_ordering
+#
+# `@dataclass` rejects a non-defaulted field after a defaulted one — the
+# synthesised `__init__` would raise `TypeError` at *import* time, before any
+# of your code runs. Typhon catches it at check time instead.
+#
+# Fix: move every non-defaulted field above the defaulted ones.
+
+
+class Server:
+    port: int = 8080
+    host: str
+
+
+def main() -> None:
+    print(Server(host="localhost"))
+
+
+main()

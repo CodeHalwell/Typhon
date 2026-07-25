@@ -1,0 +1,20 @@
+# EXPECT-ERROR: tyc::parse
+#
+# The `frozen` marker belongs to `class` only. `model` lowers to a
+# `pydantic.BaseModel` subclass, whose immutability is configured through
+# `model_config`, not through Typhon's dataclass `frozen` flag.
+#
+# Fix: use `class Payload frozen:` if you want a frozen value type, or plain
+# `model Payload:` if you want boundary validation.
+
+
+model Payload frozen:
+    event: str
+    count: int
+
+
+def main() -> None:
+    print(Payload(event="ping", count=1))
+
+
+main()

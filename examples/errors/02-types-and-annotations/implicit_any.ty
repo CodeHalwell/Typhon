@@ -1,0 +1,26 @@
+# EXPECT-ERROR: tyc::implicit_any
+#
+# A bare container annotation carries no element type, so every value read out
+# of it would degrade to `Any` — exactly the hole Typhon exists to close. The
+# check covers annotated-assignment positions: module bindings, locals, and
+# class-body fields.
+#
+# Fix: `dict[str, int]`, `list[str]`, `set[int]`.
+#
+# NOTE: bare collections in *signature* positions (`def f(d: dict) -> list:`)
+# are a known gap and are silently accepted today — see
+# docs/diagnostics/implicit_any.md. Spell them out anyway.
+
+CACHE: dict = {}
+
+
+class Bag:
+    items: list
+
+
+def main() -> None:
+    let seen: set = set()
+    print(CACHE, Bag(items=[]), seen)
+
+
+main()

@@ -1,0 +1,25 @@
+# EXPECT-WARN: tyc::resource_not_managed
+#
+# A bare `open(...)` (or `socket.socket`, `sqlite3.connect`, `tempfile.*`)
+# leaks the handle if anything below it raises. CPython's refcounting usually
+# closes it eventually, which is exactly why the bug survives review and then
+# bites under PyPy or on a long-running server.
+#
+# Severity is `[strictness] require-with`. `@contextmanager` factory bodies are
+# exempt, since yielding the resource is the whole job.
+#
+# Fix: `with open(path) as f: return f.read()`.
+
+
+def read_all(path: str) -> str:
+    let f = open(path)
+    let body: str = f.read()
+    f.close()
+    return body
+
+
+def main() -> None:
+    print(read_all("/etc/hostname"))
+
+
+main()

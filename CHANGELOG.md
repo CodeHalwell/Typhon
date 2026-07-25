@@ -4,6 +4,72 @@ All notable changes to Typhon are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely; the
 canonical phase-by-phase status lives in `docs/roadmap.md`.
 
+## Unreleased — error-example corpus, corpus regression harnesses & docs/skill accuracy pass
+
+A documentation- and test-infrastructure release from a full review of the
+v1.0.0-alpha.6 tree against the shipped compiler. **No language change** — the
+only compiler-behaviour changes are one bundled-skill file that was being
+silently dropped, two warn-level diagnostics that rendered with the error
+glyph, and `tyc explain --list` labelling its two non-diagnostic entries.
+
+- **New `examples/errors/` corpus — 70 deliberately-broken programs.**
+  Twelve themed directories covering 56 of the 87 emittable `tyc::` codes:
+  one file per rule (bindings, annotations, classes, sealed unions, `Result`,
+  async, interfaces/generics, `newtype`/`freeze`/`pub`, boundary escapes, and
+  the classic Python footguns), plus
+  [`11-multi-error-programs/`](examples/errors/11-multi-error-programs/) —
+  realistic files carrying up to ten diagnostics at once, including one
+  documenting which errors *mask* others — and
+  [`12-known-gaps/`](examples/errors/12-known-gaps/), programs that compile
+  clean today and still fail at runtime. Every file explains the rule and the
+  fix in a header comment; the broken code is the exhibit, the prose is the
+  point.
+- **Both example corpora are now regression-enforced.** Each error example
+  declares its diagnostics in an `# EXPECT-ERROR:` / `# EXPECT-WARN:` header,
+  asserted exactly (no more, no fewer) by the new
+  `tyc/crates/tyc/tests/error_examples.rs`; known gaps are asserted to produce
+  *nothing*, so closing one fails the build as a prompt to reclassify the file.
+  A second new harness, `tests/example_corpus.rs`, extends the existing
+  single-file sweep to the 16 multi-file projects under `examples/apps/` and
+  `examples/47-mini-app/` (previously unchecked by CI), requires them to be
+  free of diagnostics at *any* severity, and asserts every checked-in `.py`
+  companion still matches a fresh `tyc build` — the promise
+  `examples/README.md` makes about them.
+- **`tyc install skill` was dropping a file.**
+  `references/21-rescue-boundaries.ty` existed in the vendored skill tree and
+  in the skill's own index, but was missing from the `SKILL_FILES` manifest, so
+  every installed copy shipped 20 reference programs instead of 21. Added,
+  along with a test asserting the manifest covers the whole source tree, and
+  the summary line's program count is now derived from the manifest rather
+  than hard-coded.
+- **Two warn-level diagnostics rendered as errors.**
+  `tyc::method_in_class_body` and `tyc::typing_alias_deprecated` were counted
+  and reported as warnings but drew miette's `×` glyph instead of `⚠`,
+  because their declarations omitted `severity(Warning)`. Cosmetic, but it made
+  a warning look like a build failure.
+- **`tyc explain --list` no longer advertises two codes that don't exist.**
+  `freeze` and `pub` are language-reference topics with pages under
+  `docs/diagnostics/`, not emittable diagnostics; they were printed as
+  `tyc::freeze` / `tyc::pub` alongside the 87 real codes. They are now labelled
+  as topics.
+- **Documentation corrections**, each verified against the compiler:
+  `pub frozen class` (six places) does not parse — the marker follows the class
+  name, `pub class X frozen:`; the prefix form `frozen class X:` was used as
+  live example code in `docs/diagnostics/frozen_assign.md` and the skill's
+  `DIAGNOSTICS.md`; function-level and `interface`-level HKT parameters
+  (`def f[F[_]]`, `interface F[G[_]]:`) were documented as parsing and are hard
+  parse errors, `class` headers being the only accepted position;
+  `tyc::missing_initialiser` is unreachable dead code and its page described
+  pre-v0.7.0 behaviour that v0.7.0's definite-assignment analysis replaced;
+  `tyc::implicit_any` was documented with a function-signature example, the one
+  position it does *not* cover; the deprecated `typing` aliases are described
+  as warn-level but are effectively unusable, since `Dict[K, V]` never unifies
+  with `dict[K, V]` and every use then draws a `tyc::type_mismatch`; the
+  docs-site claimed a trailing `?` composes with a quoted annotation
+  (`next: "Node"?`) when it is a parse error; and the skill's corpus counts
+  (256 `.ty` files, 29 stdlib-only exercises, a `.py` companion for every file)
+  were stale in all three respects.
+
 ## 1.0.0-alpha.6 — 2026-07-21 — maintenance: dependency wave, secret-lint keywords & release-pipeline hygiene
 
 A maintenance release on top of alpha.5, driven by the

@@ -1,0 +1,26 @@
+# EXPECT-ERROR: tyc::invalid_question_op
+#
+# `?` propagates an `Err` by returning it from the enclosing function, so that
+# function must itself return a compatible `Result`. Here `describe` returns
+# `str`, and there is nowhere for the `Err` to go.
+#
+# Fix: change the signature to `-> Result[str, str]`, or `match` on the Result
+# explicitly and handle the `Err` arm.
+
+
+def parse_port(raw: str) -> Result[int, str]:
+    if not raw.isdigit():
+        return Err(f"not a number: {raw}")
+    return Ok(int(raw))
+
+
+def describe(raw: str) -> str:
+    let port: int = parse_port(raw)?
+    return f"port {port}"
+
+
+def main() -> None:
+    print(describe("8080"))
+
+
+main()

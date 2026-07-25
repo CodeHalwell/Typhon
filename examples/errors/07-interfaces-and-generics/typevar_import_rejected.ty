@@ -1,0 +1,27 @@
+# EXPECT-ERROR: tyc::type_mismatch
+# EXPECT-ERROR: tyc::typevar_import_rejected
+#
+# Typhon is PEP 695 only. The legacy `TypeVar` object model puts the type
+# parameter in module scope, where nothing ties it to the function that uses
+# it; PEP 695 scopes it to the declaration.
+#
+# The rejected import leaves `T` unresolved, so the call site also fails with
+# a `tyc::type_mismatch` against the opaque `T`.
+#
+# Fix: `def first[T](xs: list[T]) -> T?:` — no import needed.
+
+
+from typing import TypeVar
+
+T = TypeVar("T")
+
+
+def first(xs: list[T]) -> T:
+    return xs[0]
+
+
+def main() -> None:
+    print(first([1, 2, 3]))
+
+
+main()

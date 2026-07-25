@@ -1,0 +1,26 @@
+# EXPECT-ERROR: tyc::type_mismatch
+#
+# `as!` is sound in a way TypeScript's `as` is not: the checker types the whole
+# expression as the target type, and the emitted code verifies the value's
+# shape *recursively* at runtime via `typhon_runtime.cast.checked_cast`.
+#
+# But it is still a cast to *that* type — the annotation on the binding has to
+# agree with it. Here the cast produces `dict[str, int]` and the binding
+# declares `dict[str, str]`, which no runtime check can reconcile.
+#
+# Fix: make the two agree — `let data: dict[str, int] = ... as! dict[str, int]`.
+
+
+import json
+
+
+def load(payload: str) -> dict[str, str]:
+    let data: dict[str, str] = json.loads(payload) as! dict[str, int]
+    return data
+
+
+def main() -> None:
+    print(load('{"n": 1}'))
+
+
+main()

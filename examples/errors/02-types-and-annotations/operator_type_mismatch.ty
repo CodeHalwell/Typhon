@@ -1,0 +1,14 @@
+# EXPECT-ERROR: tyc::operator_type_mismatch
+#
+# `str + int` is a `TypeError` in Python and a check-time error here — Typhon
+# will not silently coerce either side.
+#
+# Fix: `"total: " + str(count)`, or an f-string: `f"total: {count}"`.
+
+
+def main() -> None:
+    let count: int = 3
+    print("total: " + count)
+
+
+main()

@@ -1,0 +1,24 @@
+# EXPECT-ERROR: tyc::nullable_use
+#
+# Rule 3: `T` cannot hold `None`. `find_user` returns `str?` (= `str | None`),
+# so it cannot flow into a `str` parameter until it has been narrowed.
+#
+# Fix: `if found is not None: greet(found)`, or `guard f = found else: return`.
+
+
+def find_user(uid: int) -> str?:
+    if uid == 1:
+        return "Ada"
+    return None
+
+
+def greet(name: str) -> None:
+    print(f"hello {name}")
+
+
+def main() -> None:
+    let found: str? = find_user(2)
+    greet(found)
+
+
+main()

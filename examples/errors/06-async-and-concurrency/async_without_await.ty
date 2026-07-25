@@ -1,0 +1,23 @@
+# EXPECT-WARN: tyc::async_without_await
+#
+# An `async def` with no `await` inside pays the coroutine overhead and forces
+# every caller to be async, for nothing. Warning rather than error because
+# it is occasionally deliberate — and since v0.15.0 the check understands async
+# contracts, so implementing an async `interface` method or overriding an async
+# base method is exempt.
+#
+# Fix: drop the `async`, or await something.
+
+
+import asyncio
+
+
+async def compute(a: int, b: int) -> int:
+    return a + b
+
+
+async def main() -> None:
+    print(await compute(1, 2))
+
+
+asyncio.run(main())

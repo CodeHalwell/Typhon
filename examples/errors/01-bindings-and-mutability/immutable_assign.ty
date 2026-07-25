@@ -1,0 +1,23 @@
+# EXPECT-ERROR: tyc::immutable_assign
+#
+# `let` locks the *binding*, not just the value. Rebinding it is an error even
+# when the new value has the same type.
+#
+# Fix: declare `mut total: int = 0` — reach for `mut` only when you genuinely
+# rebind, which is exactly what this loop does.
+
+
+def sum_to(n: int) -> int:
+    let total: int = 0
+    mut i: int = 0
+    while i < n:
+        total = total + i
+        i = i + 1
+    return total
+
+
+def main() -> None:
+    print(sum_to(5))
+
+
+main()

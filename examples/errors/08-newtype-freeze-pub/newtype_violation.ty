@@ -1,0 +1,25 @@
+# EXPECT-ERROR: tyc::newtype_violation
+#
+# `newtype` gives you a nominal alias: the relationship is deliberately
+# asymmetric. A `UserId` flows freely into an `int` slot, but a bare `int` —
+# or, worse, a `PostId` — does not flow into a `UserId` slot. That asymmetry is
+# the whole point: it stops you passing a post id where a user id belongs.
+#
+# Fix: wrap explicitly — `fetch_user(UserId(42))`.
+
+
+newtype UserId = int
+newtype PostId = int
+
+
+def fetch_user(uid: UserId) -> str:
+    return f"user-{uid}"
+
+
+def main() -> None:
+    print(fetch_user(42))
+    let pid: PostId = PostId(7)
+    print(fetch_user(pid))
+
+
+main()

@@ -1,0 +1,32 @@
+# EXPECT-ERROR: tyc::unsafe_value_leak
+#
+# `unsafe:` is a *lexical region*, not a per-value annotation. Values born
+# inside it carry a hidden `Unsafe[T]` marker that cannot cross out into a
+# concrete-typed context without a re-assertion — otherwise the block would be
+# a hole straight through the type system.
+#
+# Fix: re-assert inside the block before returning:
+#
+#     unsafe:
+#         let raw = mystery.fetch()
+#         let checked: int = int(raw)
+#     return checked
+#
+# For a single one-off boundary value, prefer `as!` — one line, no block, and
+# runtime-checked (so it is sound, unlike a bare re-assertion).
+
+
+import json
+
+
+def parse_count(payload: str) -> int:
+    unsafe:
+        let raw = json.loads(payload)
+    return raw
+
+
+def main() -> None:
+    print(parse_count('{"n": 1}'))
+
+
+main()

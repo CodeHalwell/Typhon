@@ -1,0 +1,23 @@
+# EXPECT-WARN: tyc::mutable_default_param
+#
+# Python's oldest footgun: the default is evaluated once, at function
+# *definition* time, so every call that omits the argument shares one list.
+# Append to it and the "default" grows for the rest of the process.
+#
+# Fix: default to `None` and build inside —
+#
+#     def collect(item: str, into: list[str]? = None) -> list[str]:
+#         let target: list[str] = into if into is not None else []
+
+
+def collect(item: str, into: list[str] = []) -> list[str]:
+    into.append(item)
+    return into
+
+
+def main() -> None:
+    print(collect("a"))
+    print(collect("b"))
+
+
+main()

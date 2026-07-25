@@ -1,0 +1,25 @@
+# EXPECT-ERROR: tyc::invalid_question_op
+#
+# `?` cannot appear inside a comprehension: its lowering is an early `return`
+# from the enclosing function, and there is no way to hoist that out of the
+# comprehension's own scope.
+#
+# Fix: write an explicit loop and propagate inside it, or collect the Results
+# and fold them.
+
+
+def parse_one(raw: str) -> Result[int, str]:
+    if not raw.isdigit():
+        return Err(f"not a number: {raw}")
+    return Ok(int(raw))
+
+
+def parse_all(raws: list[str]) -> Result[list[int], str]:
+    return Ok([parse_one(r)? for r in raws])
+
+
+def main() -> None:
+    print(parse_all(["1", "2"]))
+
+
+main()

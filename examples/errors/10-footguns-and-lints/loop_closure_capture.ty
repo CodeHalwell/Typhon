@@ -1,0 +1,26 @@
+# EXPECT-WARN: tyc::loop_closure_capture
+#
+# The lambdas close over the *variable* `n`, not its value at each iteration,
+# so after the loop every one of them sees the final value. Calling them all
+# returns the same number.
+#
+# Fix: bind per-iteration with a default argument — `lambda n=n: n * 2` — or
+# build the list with a comprehension over the values.
+
+
+from typing import Callable
+
+
+def build() -> list[Callable[[], int]]:
+    mut fns: list[Callable[[], int]] = []
+    for n in [1, 2, 3]:
+        fns.append(lambda: n * 2)
+    return fns
+
+
+def main() -> None:
+    for f in build():
+        print(f())
+
+
+main()

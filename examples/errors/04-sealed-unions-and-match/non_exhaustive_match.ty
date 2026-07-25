@@ -1,0 +1,42 @@
+# EXPECT-ERROR: tyc::missing_return
+# EXPECT-ERROR: tyc::non_exhaustive_match
+#
+# Rule 6: a `match` over a sealed union must cover every variant. This is the
+# payoff of declaring the union — add `Triangle` to the alias and every match
+# that forgot it fails the build instead of falling through at runtime.
+#
+# The uncovered variant also means `area` can fall off the end without
+# returning, so `tyc::missing_return` rides along — one root cause, two codes.
+#
+# Fix: add `case Triangle(base, height): return 0.5 * base * height`. Use
+# `case _:` only when a catch-all is genuinely the intent.
+
+
+class Circle frozen:
+    radius: float
+
+
+class Rectangle frozen:
+    width: float
+    height: float
+
+
+class Triangle frozen:
+    base: float
+    height: float
+
+
+type Shape = Circle | Rectangle | Triangle
+
+
+def area(s: Shape) -> float:
+    match s:
+        case Circle(radius): return 3.14159 * radius * radius
+        case Rectangle(w, h): return w * h
+
+
+def main() -> None:
+    print(area(Circle(radius=1.0)))
+
+
+main()

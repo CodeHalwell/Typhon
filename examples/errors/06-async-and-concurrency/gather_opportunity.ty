@@ -1,0 +1,42 @@
+# EXPECT-WARN: tyc::gather_opportunity
+#
+# Not a bug — advice. Two adjacent awaits with no data dependency between them
+# run strictly one after the other, so the wall-clock cost is the sum rather
+# than the max. On by default (`[strictness] suggest-gather`); it never
+# rewrites, because turning sequential code concurrent is a behaviour change
+# the author opts into.
+#
+# Unlike `auto_gather_missed`, this one is callee-agnostic — it fires for
+# awaited *method* calls on imported clients too, the shape `auto-gather`
+# never touches.
+#
+# Fix:
+#     gather:
+#         user = fetch_user(uid)
+#         posts = fetch_posts(uid)
+
+
+import asyncio
+
+
+async def fetch_user(uid: int) -> str:
+    await asyncio.sleep(0)
+    return f"user-{uid}"
+
+
+async def fetch_posts(uid: int) -> int:
+    await asyncio.sleep(0)
+    return uid * 2
+
+
+async def load(uid: int) -> str:
+    let user: str = await fetch_user(uid)
+    let posts: int = await fetch_posts(uid)
+    return f"{user} has {posts} posts"
+
+
+async def main() -> None:
+    print(await load(1))
+
+
+asyncio.run(main())

@@ -1,0 +1,28 @@
+# EXPECT-ERROR: tyc::missing_annotation
+#
+# Rule 1: every parameter and every return type carries an explicit
+# annotation. There is no inference fallback and no implicit `Any`. A function
+# that returns nothing still spells `-> None`.
+#
+# Three separate violations here: an unannotated parameter, a missing return
+# type, and a procedure that omits `-> None`.
+
+
+def add(a: int, b):
+    return a + b
+
+
+def double(n: int):
+    return n * 2
+
+
+def shout(msg: str):
+    print(msg.upper())
+
+
+def main() -> None:
+    print(add(1, 2), double(3))
+    shout("hi")
+
+
+main()

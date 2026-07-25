@@ -1,0 +1,30 @@
+# EXPECT-ERROR: tyc::parse
+#
+# Higher-kinded type parameters (`F[_]`) are accepted on a **class header**
+# only. The function-level form below is a hard parse error, and so is the
+# `interface` form — see docs/guides/08-generics-and-interfaces.md and
+# TYPE_SYSTEM_FRONTIER.md.
+#
+# Fix: declare the constructor variable on a class and hang the methods off an
+# `impl` block:
+#
+#     class Functor[F[_]]:
+#         pass
+#
+#     impl[F] Functor[F]:
+#         def map_through[A, B](self, fa: F[A], f: Callable[[A], B]) -> F[B]:
+#             return f(fa)
+
+
+from typing import Callable
+
+
+def map_through[F[_], A, B](fa: F[A], f: Callable[[A], B]) -> F[B]:
+    return f(fa)
+
+
+def main() -> None:
+    print("unreachable")
+
+
+main()

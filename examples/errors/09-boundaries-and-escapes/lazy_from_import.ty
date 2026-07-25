@@ -1,0 +1,18 @@
+# EXPECT-ERROR: tyc::lazy_usage
+#
+# `lazy from X import Y` defeats its own purpose: binding `Y` requires touching
+# an attribute on `X`, which imports `X` eagerly. PEP 690 hit the same wall.
+# Typhon rejects the form at parse time rather than shipping a deferral that
+# doesn't defer.
+#
+# Fix: `lazy import np = numpy` and reach through the alias — `np.array(...)`.
+
+
+lazy from numpy import array
+
+
+def main() -> None:
+    print(array([1, 2, 3]))
+
+
+main()

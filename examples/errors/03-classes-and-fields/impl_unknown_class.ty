@@ -1,0 +1,24 @@
+# EXPECT-ERROR: tyc::impl_unknown_class
+#
+# An `impl` block has to attach to a class the project actually declares. A
+# typo here means the methods go nowhere — they would vanish at desugar rather
+# than land on anything.
+#
+# Fix: correct the name to `Counter`, or use `extend` for a class that lives in
+# another module.
+
+
+class Counter:
+    value: int
+
+
+impl Countr:
+    def bump(self) -> int:
+        return self.value + 1
+
+
+def main() -> None:
+    print(Counter(value=1))
+
+
+main()

@@ -1,0 +1,35 @@
+# EXPECT-ERROR: tyc::interface_isinstance
+#
+# `interface` lowers to `typing.Protocol`, and Python's `@runtime_checkable`
+# only checks that the *names* exist — it never checks signatures. An
+# `isinstance` against an interface would therefore accept objects that don't
+# actually satisfy the contract, which is precisely the bug the interface was
+# meant to prevent.
+#
+# Fix: narrow statically (a sealed union gives you exhaustive `match`), or
+# write an explicit predicate that checks what you actually need.
+
+
+interface Drawable:
+    def draw(self) -> None: ...
+
+
+class Button:
+    label: str
+
+
+impl Button:
+    def draw(self) -> None:
+        print(self.label)
+
+
+def render(x: object) -> None:
+    if isinstance(x, Drawable):
+        print("drawable")
+
+
+def main() -> None:
+    render(Button(label="ok"))
+
+
+main()

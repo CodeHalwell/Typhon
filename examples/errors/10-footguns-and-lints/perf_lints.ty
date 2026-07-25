@@ -1,0 +1,26 @@
+# EXPECT-WARN: tyc::perf_membership_in_loop
+# EXPECT-WARN: tyc::perf_str_concat_in_loop
+#
+# Advice-only, from the `tyc::perf_*` family added in v1.0.0-alpha.5 and gated
+# by `[strictness] suggest-perf`. Neither is wrong — both are quadratic.
+#
+#   * `x in some_list` inside a loop is O(n) per probe, so the loop is O(n*m).
+#     Hoist the list into a `set` once and probe that.
+#   * `s += part` in a loop reallocates the whole string every iteration.
+#     Collect the parts and `"".join(...)` at the end.
+
+
+def summarise(words: list[str], stop_words: list[str]) -> str:
+    mut out: str = ""
+    for w in words:
+        if w in stop_words:
+            continue
+        out += w + " "
+    return out
+
+
+def main() -> None:
+    print(summarise(["a", "the", "cat"], ["the"]))
+
+
+main()

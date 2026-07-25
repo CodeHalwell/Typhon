@@ -215,17 +215,32 @@ let xs: int? = first([])             # ✅ T inferred as int from the binding
 
 ## Higher-kinded type parameters (parser scaffold)
 
-A type parameter can declare itself as a *type constructor* (a generic that takes a type argument) via the `[_]` marker:
+A **class** type parameter can declare itself as a *type constructor* (a generic that takes a type argument) via the `[_]` marker:
 
 ```python
+from typing import Callable
+
 class Functor[F[_]]:
     pass
 
-def map_through[F[_], A, B](fa: F[A], f: Callable[[A], B]) -> F[B]:
-    ...
+impl[F] Functor[F]:
+    def map_through[A, B](self, fa: F[A], f: Callable[[A], B]) -> F[B]:
+        return f(fa)
 ```
 
-The parser accepts `F[_]` as a 1-arg type-constructor parameter and the resolver tracks the kind structure. **Full unification of higher-kinded types is not yet enforced** — the surface compiles, but the checker won't catch every kind mismatch. Use HKT signatures conservatively until the frontier work lands.
+The parser accepts `F[_]` as a 1-arg type-constructor parameter on a **`class` header**, and since v1.0.0-alpha the checker unifies `F` against a concrete head (`F[A]` against `list[int]` binds `F = list, A = int`), reporting `tyc::kind_mismatch` on a wrong arity or a conflicting binding.
+
+**Function-level and `interface`-level HKT parameters do not parse yet.** Both of these are a hard `tyc::parse` error today:
+
+```python
+def map_through[F[_], A, B](fa: F[A], f: Callable[[A], B]) -> F[B]:   # ❌ tyc::parse
+    ...
+
+interface Functor[F[_]]:                                              # ❌ tyc::parse
+    def map[A, B](self, fa: F[A], f: Callable[[A], B]) -> F[B]: ...
+```
+
+Declare the constructor variable on a `class` and hang the methods off an `impl[F]` block, as above. The remaining tail is tracked in [`TYPE_SYSTEM_FRONTIER.md`](../../TYPE_SYSTEM_FRONTIER.md).
 
 ## Generics emit as type-erased Python
 

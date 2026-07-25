@@ -1,0 +1,21 @@
+# EXPECT-ERROR: tyc::frozen_assign
+#
+# `class X frozen:` (note: the marker goes *after* the class name — `frozen
+# class X:` does not parse) lowers to `@dataclass(slots=True, frozen=True)`.
+# Every field is set once at construction and never again.
+#
+# Fix: build a new value — `Point(x=p.x + 1.0, y=p.y)`.
+
+
+class Point frozen:
+    x: float
+    y: float
+
+
+def main() -> None:
+    let p: Point = Point(x=1.0, y=2.0)
+    p.x = 5.0
+    print(p)
+
+
+main()

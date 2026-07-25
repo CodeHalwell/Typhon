@@ -1,0 +1,22 @@
+# EXPECT-ERROR: tyc::extend_builtin
+#
+# `extend BUILTIN:` extracts each method to a module-level free function and
+# rewrites call sites whose receiver is statically annotated as that built-in.
+# There is no monkey-patching, so there is nothing to attach a *parametric*
+# target to — the rewrite keys on the built-in head alone.
+#
+# Fix: drop the brackets. `extend list:` is the supported form; annotate the
+# receiver (`let xs: list[int] = ...`) and the call site resolves.
+
+
+extend list[int]:
+    def total(self) -> int:
+        return sum(self)
+
+
+def main() -> None:
+    let xs: list[int] = [1, 2, 3]
+    print(xs.total())
+
+
+main()

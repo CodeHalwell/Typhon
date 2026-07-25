@@ -1,0 +1,15 @@
+# EXPECT-ERROR: tyc::tuple_index_out_of_range
+#
+# A fixed-arity `tuple[...]` has a statically known length, so a constant index
+# past the end is a compile-time error rather than a runtime `IndexError`.
+#
+# Fix: index within range, or declare a homogeneous `tuple[float, ...]` if the
+# length genuinely varies.
+
+
+def main() -> None:
+    let point: tuple[float, float] = (1.0, 2.0)
+    print(point[2])
+
+
+main()

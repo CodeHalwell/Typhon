@@ -1,0 +1,35 @@
+# EXPECT-ERROR: tyc::arg_count
+# EXPECT-ERROR: tyc::missing_return
+#
+# A class pattern's positional slots line up 1:1 with the variant's declared
+# fields. `Rectangle` has two, so a three-slot pattern can never match.
+#
+# The dead arm leaves `Rectangle` uncovered, so `tyc::missing_return` follows.
+#
+# Fix: `case Rectangle(w, h):`, or use keyword patterns (`case Rectangle(width=w):`)
+# when you only care about some fields.
+
+
+class Circle frozen:
+    radius: float
+
+
+class Rectangle frozen:
+    width: float
+    height: float
+
+
+type Shape = Circle | Rectangle
+
+
+def area(s: Shape) -> float:
+    match s:
+        case Circle(radius): return 3.14159 * radius * radius
+        case Rectangle(w, h, depth): return w * h
+
+
+def main() -> None:
+    print(area(Circle(radius=1.0)))
+
+
+main()

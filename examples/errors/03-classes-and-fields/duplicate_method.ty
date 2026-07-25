@@ -1,0 +1,28 @@
+# EXPECT-ERROR: tyc::duplicate_method
+#
+# `impl` blocks merge at desugar, including across files. Two definitions of
+# the same method would silently collapse to whichever landed last — so the
+# collision is an error rather than a coin flip.
+#
+# Fix: rename one, delete one, or merge the bodies.
+
+
+class Counter:
+    value: int
+
+
+impl Counter:
+    def bump(self) -> int:
+        return self.value + 1
+
+
+impl Counter:
+    def bump(self) -> int:
+        return self.value + 10
+
+
+def main() -> None:
+    print(Counter(value=1).bump())
+
+
+main()

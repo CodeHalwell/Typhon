@@ -1,0 +1,21 @@
+# EXPECT-ERROR: tyc::parse
+#
+# `pub` stacks with every other modifier — `pub let`, `pub mut`,
+# `pub freeze let`, `pub class X frozen:`, `pub model`, `pub newtype`,
+# `pub comptime let` — with exactly one exception: `pub lazy let` does not
+# parse. The `lazy let` lowering runs in a separate text pass that would
+# silently drop the laziness behind a leading `pub `, so it is rejected rather
+# than half-working.
+#
+# Fix: drop the `pub` — a module-level `lazy let` is importable by name
+# regardless — or use `pub comptime let` when a build-time constant fits.
+
+
+pub lazy let SETTINGS: dict[str, int] = {"retries": 3}
+
+
+def main() -> None:
+    print(SETTINGS)
+
+
+main()

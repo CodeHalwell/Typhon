@@ -1770,10 +1770,16 @@ fn corpus_examples_all_check_clean() {
         for entry in entries.flatten() {
             let path = entry.path();
             if path.is_dir() {
+                // `testing/` is a two-file project (its test module imports the
+                // module under test), so its files don't check standalone.
+                // `errors/` is the deliberately-broken corpus — every file in it
+                // is *supposed* to fail; it has its own harness in
+                // `error_examples.rs`, which asserts the exact codes each one
+                // produces.
                 if path
                     .file_name()
                     .and_then(|f| f.to_str())
-                    .is_some_and(|n| n == "testing")
+                    .is_some_and(|n| n == "testing" || n == "errors")
                 {
                     continue;
                 }

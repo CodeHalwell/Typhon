@@ -1,0 +1,35 @@
+# EXPECT-ERROR: tyc::type_mismatch
+# EXPECT-WARN: tyc::typing_alias_deprecated
+# EXPECT-WARN: tyc::typing_alias_in_annotation
+#
+# The capitalised `typing` aliases were deprecated by PEP 585 in Python 3.9.
+# The two `typing_alias_*` codes are *warnings* — but note what else happens:
+# the checker treats `Dict[str, int]` as an opaque foreign class rather than
+# unifying it with `dict[str, int]`, so every literal and every call site fails
+# with a `tyc::type_mismatch` reading "expected `Dict[str, int]`, found
+# `dict[?, ?]`". The build stops on that, not on the deprecation warnings. In
+# practice the aliases are unusable, not merely discouraged.
+#
+# Fix: lowercase built-ins and Typhon sugar — `list[str]`, `dict[str, int]`,
+# `int?` instead of `Optional[int]`.
+
+
+from typing import Dict, List, Optional
+
+
+def tally(items: List[str]) -> Dict[str, int]:
+    mut counts: Dict[str, int] = {}
+    for item in items:
+        counts[item] = counts.get(item, 0) + 1
+    return counts
+
+
+def lookup(counts: Dict[str, int], key: str) -> Optional[int]:
+    return counts.get(key)
+
+
+def main() -> None:
+    print(tally(["a", "a", "b"]))
+
+
+main()

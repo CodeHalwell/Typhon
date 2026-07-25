@@ -1,0 +1,30 @@
+# EXPECT-ERROR: tyc::result_error_mismatch
+#
+# `?` re-returns the callee's `Err` unchanged, so the error types must line up.
+# `parse_port` fails with `str`, `handle` promises to fail with `AppError` —
+# the propagated `Err(str)` would escape as the wrong type.
+#
+# Fix: convert at the boundary — `parse_port(raw).map_err(AppError.from_str)?`
+# — or `match` and rebuild the error.
+
+
+class AppError frozen:
+    message: str
+
+
+def parse_port(raw: str) -> Result[int, str]:
+    if not raw.isdigit():
+        return Err(f"not a number: {raw}")
+    return Ok(int(raw))
+
+
+def handle(raw: str) -> Result[int, AppError]:
+    let port: int = parse_port(raw)?
+    return Ok(port)
+
+
+def main() -> None:
+    print(handle("8080"))
+
+
+main()

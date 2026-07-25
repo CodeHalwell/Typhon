@@ -255,7 +255,7 @@ What `class!` changes versus a plain `class`:
 
 `plain class X:` is the small-step escape hatch for "I want a plain Python
 class — no decorator, no synthesised constructor, no slots." It is the
-symmetric form of `frozen class X:` and reads at a glance: anyone scanning
+counterpart to `class X frozen:` and reads at a glance: anyone scanning
 the file sees that this type follows Python's stock semantics, not
 Typhon's dataclass-by-default rule.
 

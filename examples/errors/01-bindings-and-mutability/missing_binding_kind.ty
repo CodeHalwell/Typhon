@@ -1,0 +1,17 @@
+# EXPECT-ERROR: tyc::missing_binding_kind
+#
+# Rule 2: a *local* assignment must declare whether the binding is immutable
+# (`let`) or rebindable (`mut`). Module-level bindings default to `let`, which
+# is why `GREETING` below is fine and `name` is not.
+#
+# Fix: `let name: str = "world"`.
+
+GREETING: str = "hello"
+
+
+def main() -> None:
+    name = "world"
+    print(f"{GREETING}, {name}")
+
+
+main()

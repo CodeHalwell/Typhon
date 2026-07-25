@@ -23,7 +23,14 @@ pub struct ExplainArgs {
 pub fn run(args: ExplainArgs) -> Result<()> {
     if args.list {
         for code in catalog_codes() {
-            println!("tyc::{code}");
+            if TOPIC_ENTRIES.contains(code) {
+                // A language-reference topic, not an emittable diagnostic —
+                // print it bare so `tyc::freeze` isn't mistaken for a code
+                // that can appear in build output.
+                println!("{code}  (topic, not a diagnostic code)");
+            } else {
+                println!("tyc::{code}");
+            }
         }
         return Ok(());
     }
@@ -41,8 +48,16 @@ pub fn run(args: ExplainArgs) -> Result<()> {
     }
 }
 
-/// Every short diagnostic code the explainer knows about, in
-/// alphabetical order. Backs `tyc explain --list` (FINDINGS O25).
+/// Entries in [`catalog_codes`] that are **language-reference topics**, not
+/// diagnostic codes the compiler can ever emit. They are explainable because
+/// their `docs/diagnostics/` page is the canonical reference for the feature,
+/// but `tyc explain --list` labels them so nobody goes looking for a
+/// `tyc::freeze` in their build output.
+const TOPIC_ENTRIES: &[&str] = &["freeze", "pub"];
+
+/// Every short code the explainer knows about, in alphabetical order. Backs
+/// `tyc explain --list` (FINDINGS O25). All but [`TOPIC_ENTRIES`] are
+/// emittable `tyc::` diagnostic codes.
 /// Keep this list in sync with the match in [`catalog_entry`] — the
 /// `catalog_listing_matches_entries` test asserts that every listed
 /// code resolves to a non-empty entry.
@@ -373,6 +388,24 @@ mod tests {
             assert!(
                 !entry.trim().is_empty(),
                 "catalog entry for `{code}` should not be empty",
+            );
+        }
+    }
+
+    /// Every entry marked as a topic must actually be in the catalog, and
+    /// every non-topic entry must be a code the diagnostics crate can emit.
+    /// Without this, a new `tyc::` code added to `catalog_codes` but never
+    /// wired into an emitter — or a topic page listed as a code — goes unnoticed.
+    #[test]
+    fn topic_entries_are_in_the_catalog() {
+        for topic in TOPIC_ENTRIES {
+            assert!(
+                catalog_codes().contains(topic),
+                "`{topic}` is marked a topic but isn't in catalog_codes()",
+            );
+            assert!(
+                catalog_entry(topic).is_some(),
+                "topic `{topic}` has no catalog entry",
             );
         }
     }

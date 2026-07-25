@@ -1,0 +1,21 @@
+# EXPECT-ERROR: tyc::missing_return
+#
+# A non-`None` return type means every path must return. The `elif` ladder here
+# leaves the "zero" case falling off the end, where Python would silently hand
+# back `None` and the `str` annotation would be a lie.
+#
+# Fix: add an `else: return "zero"`.
+
+
+def sign(n: int) -> str:
+    if n > 0:
+        return "positive"
+    elif n < 0:
+        return "negative"
+
+
+def main() -> None:
+    print(sign(0))
+
+
+main()

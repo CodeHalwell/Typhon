@@ -1,0 +1,22 @@
+# EXPECT-ERROR: tyc::generic
+#
+# `func[T](args)` — explicit type application on a *function* — is not Typhon
+# syntax. In Python it evaluates as a subscript of the function object and
+# fails at runtime with `'function' object is not subscriptable`; since v0.9.0
+# it is caught at check time instead.
+#
+# Fix: let inference do the work. Annotate the binding (`let head: int? = ...`)
+# and `T` is inferred backwards from the expected type.
+
+
+def first[T](xs: list[T]) -> T?:
+    if len(xs) == 0:
+        return None
+    return xs[0]
+
+
+def main() -> None:
+    print(first[int]([1, 2, 3]))
+
+
+main()
