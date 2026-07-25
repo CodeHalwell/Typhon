@@ -99,6 +99,63 @@ glyph, and `tyc explain --list` labelling its two non-diagnostic entries.
   Each fix carries a `tyc-vm` unit test, and the five reproductions moved from
   `examples/parity/divergent/` up into `examples/parity/`, where the harness
   now asserts their stdout is byte-identical under both paths.
+- **Two more VM ↔ CPython divergences fixed, from a second probe round**
+  (`tyc-vm` only; the compiled path is byte-for-byte unchanged, so this too is
+  additive on *correct* programs):
+  - **`bytearray` did not exist in the VM.** `bytes` was a first-class value
+    with a broad method surface but its mutable sibling was simply absent from
+    the builtin table, so any program that built a buffer incrementally ran
+    compiled and died under `tyc run` with `NameError: name 'bytearray' is not
+    defined`. A new `Value::ByteArray(Rc<RefCell<Vec<u8>>>)` now backs the
+    whole surface: construction from every shape CPython accepts
+    (`bytearray()`, `bytearray(n)` zero-fill, `bytearray(b"…")`,
+    `bytearray([104, 105])`, `bytearray(bytearray(…))`), `len`, indexing (which
+    yields `int`), slicing and iteration, the in-place mutators (`append` /
+    `extend` / `insert` / `pop` / `remove` / `clear` / `reverse` / `copy` and
+    `ba[i] = n`), every read-only method `bytes` has — returning a `bytearray`
+    again where CPython does — `+` / `+=` / `*` / `*=` with the result type
+    taken from the left operand, `in`, cross-type `==` and ordering against
+    `bytes`, `is` identity, `isinstance`, `bytes(ba)` / `bytearray(bytes)`
+    round-tripping, and CPython's `bytearray(b'abcd')` repr. Because the
+    payload sits behind one `RefCell`, an in-place operation is visible through
+    every alias, as in CPython. `bytes` gained the ordering and membership
+    operators in the same pass (`b"a" < b"b"`, `b"el" in b"hello"`), which were
+    missing for it too. A `bytearray` inside a `freeze let` raises `TypeError`,
+    matching the generated `deep_freeze`, which has no immutable equivalent for
+    it either.
+  - **`model` classes: a defaulted field was rejected, and `str` / `repr`
+    leaked the synthesised `model_config`.** `model X:` lowers to a
+    `pydantic.BaseModel` subclass, which carries no `@dataclass` decorator —
+    the VM read that as "not field-shaped" and routed every annotated assign
+    *with a default* into class attributes, so `U(id=2, name="b", age=45)`
+    against `age: int? = None` failed with "got unexpected keyword
+    argument(s)". A `model` with defaults is the common shape at a validation
+    boundary, i.e. the thing `model` exists for. Separately,
+    `model_config = ConfigDict(extra="forbid")` — injected by the desugar pass,
+    so a compiler artefact — was snapshotted onto every instance and surfaced
+    in both renderings, and `str()` used the dataclass `Class(...)` form where
+    pydantic renders space-separated `field=value` pairs. All three are fixed:
+    a `BaseModel`-derived class is field-shaped, `model_config` stays a
+    class-level attribute (still readable as `Cls.model_config`) and never
+    reaches an instance, and `str` / `repr` match pydantic. Two adjacent gaps
+    in the same shim surfaced while verifying the rest of the pydantic surface
+    and are fixed too: `model_dump_json()` emitted `json.dumps` spacing where
+    pydantic emits compact JSON (`{"id":1}`, not `{"id": 1}`), and
+    `ConfigDict(**kwargs)` discarded its keywords, so `Cls.model_config` read
+    `{}` instead of `{'extra': 'forbid'}`. `model_dump()` and `model_validate()`
+    were unaffected by the leak.
+
+  Both reproductions moved from `examples/parity/divergent/` into
+  `examples/parity/` (as `bytearray_ops.ty` and `model_construction.ty`),
+  broadened to cover the full surface each fix touches, and carry `tyc-vm` unit
+  tests — including the mutation-through-an-alias case, which a
+  copy-on-write implementation would otherwise pass. `examples/parity/divergent/`
+  now holds only `vm_regex_engine_limits.ty`, which is architectural (the Rust
+  `regex` crate refuses look-around and backreferences by design) rather than a
+  bug. The parity harness skips a file whose *compiled* half needs a
+  third-party package that isn't installed, so `model_construction.ty` (which
+  needs `pydantic`, shimmed natively by the VM) doesn't report a false
+  divergence on a bare interpreter.
 - **Type-checker soundness: a fixed-arity tuple read at a non-constant index is
   typed as the union of its slots.** Given `t: tuple[int, str]` and a variable
   `i`, both `let a: int = t[i]` and `let b: str = t[i]` used to be accepted —
@@ -200,8 +257,10 @@ glyph, and `tyc explain --list` labelling its two non-diagnostic entries.
   explicit escape. Was finding **C2** in `docs/review-2026-07-25.md`; the
   reproduction moved from `examples/errors/12-known-gaps/` to
   `examples/errors/02-types-and-annotations/bare_collection_in_signature.ty`.
-- **Two type-checker false positives fixed** (both strictly widening — they
-  accept more *valid* programs and reject nothing that used to check):
+- **Three type-checker false positives fixed** (all strictly widening — they
+  accept more *valid* programs and reject nothing that used to check). Two of
+  the three are the same bug in different clothes: a compound statement's
+  `else:` arm was ignored by the return-reachability analysis.
   - **`try`/`except`/`else` reachability.** CPython runs the `else:` clause
     exactly when the `try` body completed without raising, and guarantees
     precisely one of the `except` handlers or the `else:` runs. The four
@@ -211,6 +270,20 @@ glyph, and `tyc explain --list` labelling its two non-diagnostic entries.
     (`try`/`except` and `try`/`except`/`finally` were already accepted). The
     `else:` clause now owns the non-raising path, via a single shared
     `try_normal_path_exits` helper so the four walkers cannot drift.
+  - **`for`/`else` and `while`/`else` reachability.** A loop's `else:` clause
+    runs exactly when the loop finished *without* hitting a `break`, so a loop
+    with no `break` targeting it always runs its `else:` — and a function
+    whose only `return` lives there returns on every path. The same four
+    walkers credited only the loop body, never the `else:` arm, so
+    `for x in xs: … else: return "not found"` drew `tyc::missing_return`. A
+    new shared `loop_normal_path_exits` helper (the loop twin of
+    `try_normal_path_exits`, again called from all four walkers) makes the
+    statement diverge when the `else:` diverges **and** the body contains no
+    `break` targeting this loop; the `break` search deliberately does not
+    descend into a nested `for` / `while`, whose `break` belongs to the inner
+    loop. A loop with no `else:` still never diverges by this route — the
+    iterable may be empty — and a `break` anywhere in the body still makes the
+    fall-through reachable regardless of what the `else:` does.
   - **`case {}:` is irrefutable.** An empty mapping pattern places no
     constraint on the subject beyond "it is a mapping", so it matches *every*
     mapping — the mapping-typed equivalent of `case _:`, not a test for an

@@ -1,0 +1,101 @@
+# Loop `else:` — the clause that runs only when the loop was NOT broken out of.
+#
+# CPython runs a `for` / `while` `else:` clause exactly when the loop finished
+# its iteration naturally. A `break` skips it; an empty iterable (or a `while`
+# test that is false on entry) still runs it, because the loop completed.
+#
+#     for x in xs: ... else: ...      runs the else unless a `break` fired
+#     while c: ... else: ...          same, and runs on the first false test
+#
+# Two things drift here. The VM has to model "completed without break" as a
+# separate flag from "the body finished" — a `break` in a nested loop must not
+# clear the OUTER loop's flag. And the type checker's return-reachability
+# analysis has to credit the `else:` arm: a `break`-free loop always runs it,
+# so a loop whose `else:` returns cannot fall through. Until the round-2
+# differential gap-hunt fixed it, every `for`/`else` and `while`/`else` below
+# that returns from its `else:` was a false-positive `tyc::missing_return`.
+
+
+def find(xs: list[int], target: int) -> str:
+    for x in xs:
+        if x == target:
+            return f"found {x}"
+    else:
+        return "not found"
+
+
+def countdown(start: int) -> str:
+    mut i: int = start
+    while i > 0:
+        i = i - 1
+    else:
+        return f"done at {i}"
+
+
+def has_zero(xs: list[int]) -> str:
+    for x in xs:
+        if x == 0:
+            break
+    else:
+        return "no zero"
+    return "found zero"
+
+
+def scan_rows(rows: list[list[int]]) -> str:
+    # The `break` targets the INNER loop, so the outer loop always completes
+    # and always runs its `else:`.
+    mut seen: int = 0
+    for row in rows:
+        for cell in row:
+            if cell < 0:
+                break
+            seen = seen + 1
+    else:
+        return f"scanned {seen}"
+
+
+def first_break_wins(xs: list[int]) -> str:
+    mut trace: list[int] = []
+    for x in xs:
+        trace.append(x)
+        if x > 2:
+            break
+    else:
+        return f"complete {trace}"
+    return f"broke {trace}"
+
+
+def main() -> None:
+    # for/else — the completed path and the returned-from-body path.
+    print(find([1, 2, 3], 2))
+    print(find([1, 2, 3], 9))
+    print(find([], 9))
+
+    # while/else — the loop-ran path and the never-entered path.
+    print(countdown(3))
+    print(countdown(0))
+
+    # break skips the else; no break runs it. Empty iterable runs it too.
+    print(has_zero([1, 2, 3]))
+    print(has_zero([1, 0, 3]))
+    print(has_zero([]))
+
+    # A break in a nested loop leaves the outer loop's else intact.
+    print(scan_rows([[1, 2], [3, -1, 4], [5]]))
+    print(scan_rows([]))
+
+    # Same loop, both outcomes, with the partial trace each takes.
+    print(first_break_wins([1, 2]))
+    print(first_break_wins([1, 2, 3, 4]))
+
+    # `else` on a loop nested inside another statement still lowers correctly.
+    for n in [0, 1]:
+        for m in [n, n + 1]:
+            if m == 2:
+                break
+        else:
+            print(f"row {n} had no 2")
+
+
+if __name__ == "__main__":
+    main()

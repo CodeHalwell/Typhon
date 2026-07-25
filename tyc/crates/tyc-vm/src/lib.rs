@@ -1454,8 +1454,191 @@ def main() -> None:
     let d: dict[str, object] = u.model_dump()
     if d["name"] != "Ada":
         raise ValueError("model_dump wrong")
-    if u.model_dump_json() != "{\"id\": 1, \"name\": \"Ada\", \"active\": true}":
+    if u.model_dump_json() != "{\"id\":1,\"name\":\"Ada\",\"active\":true}":
         raise ValueError("model_dump_json wrong: " + u.model_dump_json())
+main()
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    /// A `model` field carrying a DEFAULT is an ordinary optional pydantic
+    /// field, so the constructor must accept it. `model X:` lowers to a
+    /// `pydantic.BaseModel` subclass, which carries no `@dataclass`
+    /// decorator — the VM read that as "not field-shaped" and pushed every
+    /// defaulted annotated assign into `class_attrs`, so passing one was
+    /// rejected as an unexpected keyword.
+    #[test]
+    fn model_constructor_accepts_defaulted_fields() {
+        let src = r#"
+model U:
+    id: int
+    name: str
+    active: bool = True
+    age: int? = None
+
+def main() -> None:
+    let explicit: U = U(id=2, name="b", age=45, active=False)
+    if explicit.age != 45 or explicit.active:
+        raise ValueError("explicit defaulted field wrong")
+    let omitted: U = U(id=1, name="a")
+    if omitted.age is not None or not omitted.active:
+        raise ValueError("omitted default not applied")
+main()
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    /// pydantic's `__str__` is NOT its `__repr__`: `str` is the
+    /// space-separated `field=value` list with no class name, `repr` the
+    /// `Class(field=value, …)` constructor form. Neither may leak the
+    /// `model_config = ConfigDict(extra="forbid")` the desugar pass injects,
+    /// which is a compiler artefact — the VM used its dataclass repr for
+    /// both and snapshotted the artefact onto every instance.
+    #[test]
+    fn model_str_and_repr_match_pydantic_and_hide_model_config() {
+        let src = r#"
+model U:
+    id: int
+    name: str
+
+def main() -> None:
+    let u: U = U(id=1, name="a")
+    if str(u) != "id=1 name='a'":
+        raise ValueError("model str wrong: " + str(u))
+    if repr(u) != "U(id=1, name='a')":
+        raise ValueError("model repr wrong: " + repr(u))
+    let d: dict[str, object] = u.model_dump()
+    if len(d) != 2:
+        raise ValueError("model_dump leaked model_config: " + str(d))
+    if u.model_dump_json() != "{\"id\":1,\"name\":\"a\"}":
+        raise ValueError("model_dump_json wrong: " + u.model_dump_json())
+    # `model_config` stays readable on the CLASS, as it is in pydantic.
+    if U.model_config["extra"] != "forbid":
+        raise ValueError("class-level model_config lost")
+main()
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    /// `bytearray` construction from every accepted argument shape, plus the
+    /// readers shared with `bytes` (which hand back a `bytearray` again),
+    /// indexing, slicing, iteration, the operators, and cross-type equality
+    /// and ordering against `bytes`.
+    #[test]
+    fn bytearray_construction_and_readers() {
+        let src = r#"
+def main() -> None:
+    if repr(bytearray(b"abcd")) != "bytearray(b'abcd')":
+        raise ValueError("repr wrong: " + repr(bytearray(b"abcd")))
+    if bytearray() != bytearray(b"") or len(bytearray(3)) != 3:
+        raise ValueError("empty / zero-fill construction wrong")
+    if bytearray([104, 105]) != bytearray(b"hi"):
+        raise ValueError("iterable-of-ints construction wrong")
+    if bytes(bytearray(b"zz")) != b"zz" or bytearray(b"zz") != b"zz":
+        raise ValueError("round-trip / cross-type equality wrong")
+    let ba: bytearray = bytearray(b"hello")
+    if ba[0] != 104 or ba[-1] != 111:
+        raise ValueError("indexing must yield ints")
+    if ba[1:3] != bytearray(b"el") or list(ba)[0] != 104:
+        raise ValueError("slicing / iteration wrong")
+    if ba.upper() != bytearray(b"HELLO") or ba.decode("utf-8") != "hello":
+        raise ValueError("readers wrong")
+    if ba.find(b"ll") != 2 or ba.count(b"l") != 2 or not ba.startswith(b"he"):
+        raise ValueError("search readers wrong")
+    if ba.replace(b"l", b"L") != bytearray(b"heLLo"):
+        raise ValueError("replace wrong")
+    if bytearray(b"a,b").split(b",") != [bytearray(b"a"), bytearray(b"b")]:
+        raise ValueError("split must yield bytearrays")
+    # `+` takes its result type from the LEFT operand.
+    if bytearray(b"a") + b"b" != bytearray(b"ab") or bytearray(b"a") * 2 != bytearray(b"aa"):
+        raise ValueError("operators wrong")
+    if not (bytearray(b"a") < b"b") or not (b"a" < bytearray(b"b")):
+        raise ValueError("cross-type ordering wrong")
+    if b"el" not in bytearray(b"hello") or 101 not in bytearray(b"hello"):
+        raise ValueError("membership wrong")
+    if not isinstance(bytearray(b"a"), bytearray) or bool(bytearray()):
+        raise ValueError("isinstance / truthiness wrong")
+main()
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    /// The point of a `bytearray` over `bytes`: it has reference identity, so
+    /// every in-place operation must be visible through an alias. A
+    /// copy-on-write implementation would pass every test above and still be
+    /// wrong here.
+    #[test]
+    fn bytearray_mutates_through_an_alias() {
+        let src = r#"
+def main() -> None:
+    mut ba: bytearray = bytearray(b"abc")
+    let alias: bytearray = ba
+    if ba is not alias:
+        raise ValueError("binding an alias must preserve identity")
+    ba.append(100)
+    if alias != bytearray(b"abcd"):
+        raise ValueError("append not seen through alias: " + repr(alias))
+    ba.extend(b"ef")
+    ba.extend([103])
+    if alias != bytearray(b"abcdefg"):
+        raise ValueError("extend not seen through alias: " + repr(alias))
+    ba.insert(0, 122)
+    if alias != bytearray(b"zabcdefg"):
+        raise ValueError("insert not seen through alias: " + repr(alias))
+    if ba.pop() != 103 or ba.pop(0) != 122 or alias != bytearray(b"abcdef"):
+        raise ValueError("pop not seen through alias: " + repr(alias))
+    ba.remove(98)
+    if alias != bytearray(b"acdef"):
+        raise ValueError("remove not seen through alias: " + repr(alias))
+    ba.reverse()
+    if alias != bytearray(b"fedca"):
+        raise ValueError("reverse not seen through alias: " + repr(alias))
+    ba[0] = 65
+    if alias != bytearray(b"Aedca"):
+        raise ValueError("subscript store not seen through alias: " + repr(alias))
+    # `+=` and `*=` mutate in place rather than rebinding.
+    ba += b"!"
+    if alias != bytearray(b"Aedca!"):
+        raise ValueError("+= not seen through alias: " + repr(alias))
+    # `copy()` is independent — clearing it must leave the original alone.
+    let cp: bytearray = ba.copy()
+    cp.clear()
+    if len(cp) != 0 or len(alias) != 6:
+        raise ValueError("copy must be independent")
+    ba.clear()
+    if len(alias) != 0:
+        raise ValueError("clear not seen through alias")
+main()
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    /// Error shapes CPython raises, which the VM must match rather than
+    /// silently doing something different.
+    #[test]
+    fn bytearray_error_cases_match_cpython() {
+        let src = r#"
+def main() -> None:
+    try:
+        bytearray(b"ab").append(300)
+        raise AssertionError("out-of-range append must raise")
+    except ValueError:
+        pass
+    try:
+        let _ = bytearray().pop()
+        raise AssertionError("pop from empty must raise")
+    except IndexError:
+        pass
+    try:
+        bytearray(b"ab").remove(120)
+        raise AssertionError("removing an absent byte must raise")
+    except ValueError:
+        pass
+    try:
+        let _ = bytearray(b"ab").nope()
+        raise AssertionError("an unknown method must raise AttributeError")
+    except AttributeError:
+        pass
 main()
 "#;
         assert_eq!(run_capturing(src).unwrap(), 0);

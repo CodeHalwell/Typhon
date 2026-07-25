@@ -24,7 +24,8 @@ use crate::error::{
     vm_unsupported_use_compile, zero_division, zero_division_floor_mod, Unwind, VmException,
 };
 use crate::value::{
-    Class, ClassField, DictMap, Function, HashKey, Instance, IterState, NativeFn, Value, VmInt,
+    class_is_pydantic_model, Class, ClassField, DictMap, Function, HashKey, Instance, IterState,
+    NativeFn, Value, VmInt,
 };
 
 /// A call's evaluated arguments: positional values plus `(name, value)`
@@ -294,6 +295,34 @@ impl Interpreter {
                         // bare name this rebinds to the same `Rc`, so aliases are
                         // preserved.
                         self.assign_target(&a.target, Value::List(target), env, None)?;
+                        return Ok(());
+                    }
+                }
+                // `bytearray` is mutable too, so `ba += b"x"` / `ba *= 2` must
+                // mutate the existing buffer rather than rebinding — otherwise
+                // an alias (`other = ba; ba += b"x"`) would silently stop
+                // tracking, which is the whole reason to use a `bytearray`.
+                // `+=` accepts any bytes-like RHS, matching `bytearray.extend`.
+                if let Value::ByteArray(target) = &current {
+                    let target = target.clone();
+                    let mutated = match a.op {
+                        Operator::Add => match byte_slice_of(&rhs) {
+                            Some(extra) => {
+                                target.borrow_mut().extend_from_slice(&extra);
+                                true
+                            }
+                            None => false,
+                        },
+                        Operator::Mult => {
+                            let n = rhs.to_int().unwrap_or(0).max(0) as usize;
+                            let repeated = target.borrow().repeat(n);
+                            *target.borrow_mut() = repeated;
+                            true
+                        }
+                        _ => false,
+                    };
+                    if mutated {
+                        self.assign_target(&a.target, Value::ByteArray(target), env, None)?;
                         return Ok(());
                     }
                 }
@@ -784,6 +813,13 @@ impl Interpreter {
             .decorator_list
             .iter()
             .any(|d| rightmost_name(&d.expression).as_deref() == Some("dataclass"));
+        // A `model X:` lowers to a `pydantic.BaseModel` subclass, which
+        // carries no `@dataclass` decorator — but its annotated assigns ARE
+        // instance fields, defaults and all (`age: int | None = None` is an
+        // ordinary optional pydantic field, not a class constant). Without
+        // this the defaulted fields fell into `class_attrs` and the
+        // synthesised constructor rejected them as unexpected keywords.
+        let is_pydantic_model = bases.iter().any(|b| class_is_pydantic_model(b));
         let is_classvar = |ann: &Expr| -> bool {
             let head = match ann {
                 Expr::Subscript(s) => s.value.as_ref(),
@@ -862,7 +898,7 @@ impl Interpreter {
                         // dataclass (`plain class`) an annotated assign with a
                         // default is also a class attribute, not an instance
                         // slot. Everything else is a dataclass field.
-                        if classvar || (!is_dataclass && default.is_some()) {
+                        if classvar || (!is_dataclass && !is_pydantic_model && default.is_some()) {
                             if let Some(v) = default {
                                 class_attrs.insert(n.id.as_str().to_owned(), v);
                             }
@@ -2099,6 +2135,32 @@ impl Interpreter {
                 let needle = item.py_str();
                 Ok(s.contains(&needle))
             }
+            // `b"b" in b"abc"` is a subsequence test; `98 in b"abc"` tests for
+            // a single byte. Both work across `bytes` and `bytearray`.
+            Value::Bytes(_) | Value::ByteArray(_) => {
+                let Some(hay) = byte_slice_of(container) else {
+                    unreachable!("guarded by the match arm")
+                };
+                match item {
+                    Value::Int(_) | Value::Bool(_) => {
+                        let n = item.to_int()?;
+                        match u8::try_from(n) {
+                            Ok(b) => Ok(hay.contains(&b)),
+                            Err(_) => Err(value_error("byte must be in range(0, 256)")),
+                        }
+                    }
+                    _ => {
+                        let needle = byte_slice_of(item).ok_or_else(|| {
+                            type_error(format!(
+                                "a bytes-like object is required, not '{}'",
+                                item.type_name()
+                            ))
+                        })?;
+                        Ok(needle.is_empty()
+                            || hay.windows(needle.len()).any(|w| w == needle.as_slice()))
+                    }
+                }
+            }
             Value::Dict(d) => {
                 let key = item.to_hash_key()?;
                 Ok(d.borrow().contains_key(&key))
@@ -2335,6 +2397,7 @@ impl Interpreter {
                 "bool" => matches!(value, Value::Bool(_)),
                 "str" => matches!(value, Value::Str(_)),
                 "bytes" => matches!(value, Value::Bytes(_)),
+                "bytearray" => matches!(value, Value::ByteArray(_)),
                 // User class / unknown — resolve the name and use isinstance;
                 // be permissive when it can't be resolved in the VM env.
                 _ => match self.eval_expr(tp, env) {
@@ -2952,11 +3015,19 @@ impl Interpreter {
         // descriptor that binds through the class at lookup time (this is
         // how cross-module `extend` patches dispatch) — snapshotting it
         // into the instance would freeze an unbound copy.
+        let is_model = class_is_pydantic_model(class);
         for (k, v) in class.class_attrs.borrow().iter() {
             if is_enum_sentinel(k)
                 || k.starts_with("__typhon_setter__")
                 || k == "__typhon_exc_bases__"
                 || matches!(v, Value::Function(_))
+                // `model_config = ConfigDict(extra="forbid")` is injected into
+                // every `model X:` by the desugar pass, so it is a compiler
+                // artefact. Real pydantic keeps it a class-level attribute
+                // that never shows up in `str()` / `repr()` / `model_dump()`;
+                // snapshotting it onto the instance leaked it into all three.
+                // It stays readable as `Cls.model_config` via `class_attrs`.
+                || (is_model && k == "model_config")
             {
                 continue;
             }
@@ -3597,6 +3668,37 @@ impl Interpreter {
             return Ok(Bytes(Rc::new(a.repeat(n))));
         }
 
+        // `bytearray` mixes with `bytes` under `+`, and the LEFT operand's
+        // type decides the result: `bytearray + bytes` is a `bytearray`,
+        // `bytes + bytearray` is `bytes` (CPython).
+        if let (ByteArray(a), Add, Bytes(b)) = (l, op, r) {
+            let mut out = a.borrow().clone();
+            out.extend_from_slice(b);
+            return Ok(ByteArray(Rc::new(RefCell::new(out))));
+        }
+        if let (ByteArray(a), Add, ByteArray(b)) = (l, op, r) {
+            // Snapshot the left buffer first so `ba + ba` doesn't try to hold
+            // two borrows of the same `RefCell`.
+            let mut out = a.borrow().clone();
+            out.extend_from_slice(&b.borrow().clone());
+            return Ok(ByteArray(Rc::new(RefCell::new(out))));
+        }
+        if let (Bytes(a), Add, ByteArray(b)) = (l, op, r) {
+            let b = b.borrow();
+            let mut out = Vec::with_capacity(a.len() + b.len());
+            out.extend_from_slice(a);
+            out.extend_from_slice(&b);
+            return Ok(Bytes(Rc::new(out)));
+        }
+        if let (ByteArray(a), Mult, Int(n)) = (l, op, r) {
+            let n = n.to_usize().unwrap_or(0);
+            return Ok(ByteArray(Rc::new(RefCell::new(a.borrow().repeat(n)))));
+        }
+        if let (Int(n), Mult, ByteArray(a)) = (l, op, r) {
+            let n = n.to_usize().unwrap_or(0);
+            return Ok(ByteArray(Rc::new(RefCell::new(a.borrow().repeat(n)))));
+        }
+
         // Lists / tuples.
         if let (List(a), Add, List(b)) = (l, op, r) {
             let mut out = a.borrow().clone();
@@ -3828,6 +3930,14 @@ impl Interpreter {
                     .ok_or_else(|| index_error("bytes index out of range"))?;
                 Ok(Value::Int(VmInt::from(b[idx] as i64)))
             }
+            // Indexing a `bytearray` yields an `int`, same as `bytes`.
+            Value::ByteArray(b) => {
+                let b = b.borrow();
+                let i = key.to_int()?;
+                let idx = normalize_index(i, b.len())
+                    .ok_or_else(|| index_error("bytearray index out of range"))?;
+                Ok(Value::Int(VmInt::from(b[idx] as i64)))
+            }
             Value::Instance(i) => {
                 // Missing-key hook (mechanism #2). The builtins agent's
                 // `defaultdict` is an `Instance` whose class defines
@@ -3909,6 +4019,7 @@ impl Interpreter {
             Value::Tuple(t) => t.len(),
             Value::Str(s) => s.chars().count(),
             Value::Bytes(b) => b.len(),
+            Value::ByteArray(b) => b.borrow().len(),
             _ => {
                 return Err(type_error(format!(
                     "'{}' object is not sliceable",
@@ -3969,6 +4080,16 @@ impl Interpreter {
                     .filter_map(|i| b.get(i).copied())
                     .collect();
                 Ok(Value::Bytes(Rc::new(out)))
+            }
+            // Slicing a `bytearray` produces a fresh, independent
+            // `bytearray` (CPython copies — the slice never aliases).
+            Value::ByteArray(b) => {
+                let b = b.borrow();
+                let out: Vec<u8> = indices
+                    .into_iter()
+                    .filter_map(|i| b.get(i).copied())
+                    .collect();
+                Ok(Value::ByteArray(Rc::new(RefCell::new(out))))
             }
             _ => unreachable!(),
         }
@@ -4284,7 +4405,8 @@ impl Interpreter {
             | Value::Int(_)
             | Value::Float(_)
             | Value::Bool(_)
-            | Value::Bytes(_) => {
+            | Value::Bytes(_)
+            | Value::ByteArray(_) => {
                 // H5b — accessing an unknown (non-method, non-dunder)
                 // attribute on a built-in value must raise `AttributeError`
                 // rather than returning a bogus bound-method object.
@@ -4518,6 +4640,18 @@ impl Interpreter {
                 l[idx] = value;
                 Ok(())
             }
+            // `ba[i] = n` stores a single byte, range-checked like CPython.
+            Value::ByteArray(b) => {
+                let i = key.to_int()?;
+                let n = value.to_int()?;
+                let byte =
+                    u8::try_from(n).map_err(|_| value_error("byte must be in range(0, 256)"))?;
+                let mut b = b.borrow_mut();
+                let idx = normalize_index(i, b.len())
+                    .ok_or_else(|| index_error("bytearray index out of range"))?;
+                b[idx] = byte;
+                Ok(())
+            }
             Value::Dict(d) => {
                 if crate::builtins::dict_is_frozen(d) {
                     return Err(type_error(
@@ -4653,6 +4787,17 @@ impl Interpreter {
             // (`list(b"\x01\x02")` → `[1, 2]`).
             Value::Bytes(b) => {
                 let items: Vec<Value> = b
+                    .iter()
+                    .map(|byte| Value::Int(VmInt::from(*byte)))
+                    .collect();
+                IterState::List {
+                    items: Rc::new(RefCell::new(items)),
+                    index: 0,
+                }
+            }
+            Value::ByteArray(b) => {
+                let items: Vec<Value> = b
+                    .borrow()
                     .iter()
                     .map(|byte| Value::Int(VmInt::from(*byte)))
                     .collect();
@@ -5453,6 +5598,7 @@ impl Interpreter {
                     | ("float", Value::Float(_))
                     | ("bool", Value::Bool(_))
                     | ("bytes", Value::Bytes(_))
+                    | ("bytearray", Value::ByteArray(_))
                     | ("list", Value::List(_))
                     | ("tuple", Value::Tuple(_))
                     | ("dict", Value::Dict(_))
@@ -5596,6 +5742,39 @@ fn is_enum_sentinel(name: &str) -> bool {
     matches!(name, "__typhon_enum_base__" | "__typhon_enum_members__")
 }
 
+/// The byte payload of a bytes-like value, copied out. `None` for anything
+/// that isn't `bytes` / `bytearray`, so callers can fall through to their
+/// normal type-error path.
+fn byte_slice_of(v: &Value) -> Option<Vec<u8>> {
+    match v {
+        Value::Bytes(b) => Some((**b).clone()),
+        Value::ByteArray(b) => Some(b.borrow().clone()),
+        _ => None,
+    }
+}
+
+/// The read-only method names `bytes` and `bytearray` share — kept in one
+/// place so the two `builtin_has_attr` arms below can't drift apart from each
+/// other, or from `byte_seq_method` in `builtins.rs`.
+const BYTES_READ_METHODS: &[&str] = &[
+    "decode",
+    "hex",
+    "lower",
+    "upper",
+    "split",
+    "rsplit",
+    "strip",
+    "lstrip",
+    "rstrip",
+    "startswith",
+    "endswith",
+    "find",
+    "index",
+    "count",
+    "replace",
+    "join",
+];
+
 /// Whether a built-in value actually has the named attribute/method. Mirrors
 /// the method tables in `builtins.rs` (which this crate may not edit). Any
 /// dunder name passes through so internal probing paths keep working; only
@@ -5653,24 +5832,24 @@ fn builtin_has_attr(value: &Value, attr: &str) -> bool {
                 | "upper"
                 | "zfill"
         ),
-        Value::Bytes(_) => matches!(
+        Value::Bytes(_) => matches!(attr, a if BYTES_READ_METHODS.contains(&a)),
+        // `bytearray` has every `bytes` reader plus the in-place mutators.
+        // This gate is consulted BEFORE method dispatch — a name missing here
+        // raises `AttributeError` no matter what `bytearray_method` knows.
+        Value::ByteArray(_) => matches!(
             attr,
-            "decode"
-                | "hex"
-                | "lower"
-                | "upper"
-                | "split"
-                | "rsplit"
-                | "strip"
-                | "lstrip"
-                | "rstrip"
-                | "startswith"
-                | "endswith"
-                | "find"
-                | "index"
-                | "count"
-                | "replace"
-                | "join"
+            a if BYTES_READ_METHODS.contains(&a)
+                || matches!(
+                    a,
+                    "append"
+                        | "extend"
+                        | "insert"
+                        | "pop"
+                        | "remove"
+                        | "clear"
+                        | "reverse"
+                        | "copy"
+                )
         ),
         Value::List(_) => matches!(
             attr,
@@ -6059,6 +6238,10 @@ fn values_identical(a: &Value, b: &Value) -> bool {
         (Bool(x), Bool(y)) => x == y,
         (Int(x), Int(y)) => x == y,
         (Str(x), Str(y)) => Rc::ptr_eq(x, y) || x == y,
+        (Bytes(x), Bytes(y)) => Rc::ptr_eq(x, y),
+        // A `bytearray` is a mutable object with reference identity, so
+        // `ba is alias` must hold for two names bound to the same buffer.
+        (ByteArray(x), ByteArray(y)) => Rc::ptr_eq(x, y),
         (List(x), List(y)) => Rc::ptr_eq(x, y),
         (Tuple(x), Tuple(y)) => Rc::ptr_eq(x, y),
         (Dict(x), Dict(y)) => Rc::ptr_eq(x, y),

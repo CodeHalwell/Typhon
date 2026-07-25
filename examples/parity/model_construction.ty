@@ -1,0 +1,59 @@
+# `model X:` — the pydantic-backed boundary type.
+#
+# Covers the two things that used to diverge between `tyc run` and the compiled
+# path, and now don't:
+#
+#   * a field carrying a DEFAULT is accepted by the constructor. `model U:
+#     age: int? = None` lowers to an ordinary optional pydantic field; the VM's
+#     shim previously built its constructor from the non-defaulted fields only
+#     and rejected `U(id=2, name="b", age=45)` outright — which is the common
+#     shape at a validation boundary, i.e. what `model` is for.
+#
+#   * `str` and `repr` render the way pydantic does, and neither leaks the
+#     compiler-synthesised `model_config`. `model_config = ConfigDict(
+#     extra="forbid")` is injected by the desugar pass, so it is an artefact
+#     that must never reach user-visible output. Pydantic renders `str` as
+#     space-separated `field=value` pairs and `repr` as `Class(field=value,
+#     …)`; the VM used its dataclass repr for both and included the artefact.
+#
+# Note this is the one parity example whose *compiled* half needs a third-party
+# package installed: `model` lowers to a `pydantic.BaseModel` subclass, while
+# the VM shims pydantic natively. The harness detects the resulting
+# `ModuleNotFoundError` and skips the file rather than reporting a false
+# divergence, so the suite still runs on a bare interpreter.
+
+
+model U:
+    id: int
+    name: str
+    active: bool = True
+    age: int? = None
+
+
+model Empty:
+    pass
+
+
+def main() -> None:
+    let plain: U = U(id=1, name="a")
+    print(plain)
+    print(repr(plain))
+    print(plain.model_dump())
+    print(plain.model_dump_json())
+
+    let with_default: U = U(id=2, name="b", age=45, active=False)
+    print(with_default, with_default.id, with_default.name, with_default.active, with_default.age)
+    print(with_default.model_dump())
+
+    let data: dict[str, object] = {"id": 3, "name": "c"}
+    let validated: U = U.model_validate(data)
+    print(validated, validated.active, validated.age)
+
+    let empty: Empty = Empty()
+    print(str(empty), repr(empty), empty.model_dump())
+
+    # `model_config` stays readable on the class, as it is in pydantic.
+    print(U.model_config)
+
+
+main()

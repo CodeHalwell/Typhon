@@ -823,6 +823,12 @@ pub enum Value {
     Complex(f64, f64),
     Str(RcStr),
     Bytes(Rc<Vec<u8>>),
+    /// A `bytearray` — `bytes`'s mutable sibling. The payload sits behind a
+    /// `RefCell` so an in-place mutation (`append` / `extend` / `ba[0] = n`)
+    /// is visible through every alias of the same object, exactly as in
+    /// CPython. `bytearray` is unhashable there, and `to_hash_key` keeps
+    /// that here by falling through to the "unhashable type" arm.
+    ByteArray(Rc<RefCell<Vec<u8>>>),
     List(RcList),
     Tuple(Rc<Vec<Value>>),
     Dict(RcDict),
@@ -1046,6 +1052,7 @@ impl fmt::Debug for Value {
             Value::Complex(re, im) => write!(f, "{}", format_complex(*re, *im)),
             Value::Str(s) => write!(f, "{:?}", s.as_str()),
             Value::Bytes(b) => write!(f, "{}", python_repr_bytes(b)),
+            Value::ByteArray(b) => write!(f, "bytearray({})", python_repr_bytes(&b.borrow())),
             Value::List(l) => write!(f, "{:?}", l.borrow()),
             Value::Tuple(t) => write!(f, "{:?}", &t[..]),
             Value::Dict(d) => {
@@ -1132,6 +1139,7 @@ impl Value {
             Value::Complex(..) => "complex",
             Value::Str(_) => "str",
             Value::Bytes(_) => "bytes",
+            Value::ByteArray(_) => "bytearray",
             Value::List(_) => "list",
             Value::Tuple(_) => "tuple",
             Value::Dict(_) => "dict",
@@ -1167,6 +1175,7 @@ impl Value {
             Value::Complex(re, im) => *re != 0.0 || *im != 0.0,
             Value::Str(s) => !s.is_empty(),
             Value::Bytes(b) => !b.is_empty(),
+            Value::ByteArray(b) => !b.borrow().is_empty(),
             Value::List(l) => !l.borrow().is_empty(),
             Value::Tuple(t) => !t.is_empty(),
             // Truthiness ignores the synthetic `__typhon_frozen__`
@@ -1316,6 +1325,10 @@ impl Value {
             }
             (Str(a), Str(b)) => a == b,
             (Bytes(a), Bytes(b)) => a == b,
+            // `bytes` and `bytearray` compare by content across the two
+            // types (`b"ab" == bytearray(b"ab")` is `True` in CPython).
+            (ByteArray(a), ByteArray(b)) => Rc::ptr_eq(a, b) || *a.borrow() == *b.borrow(),
+            (Bytes(a), ByteArray(b)) | (ByteArray(b), Bytes(a)) => ***a == *b.borrow(),
             (List(a), List(b)) => {
                 // Identity short-circuit: the same list object is equal to
                 // itself without recursing into its (possibly self-cyclic)
@@ -1419,6 +1432,15 @@ impl Value {
             (Bool(a), Int(b)) => VmInt::from(*a as i64).partial_cmp(b),
             (Int(a), Bool(b)) => a.partial_cmp(&VmInt::from(*b as i64)),
             (Str(a), Str(b)) => a.partial_cmp(b),
+            // `bytes` / `bytearray` order lexicographically by byte value,
+            // and the two types are mutually comparable (CPython).
+            (Bytes(a), Bytes(b)) => a.as_slice().partial_cmp(b.as_slice()),
+            (ByteArray(a), ByteArray(b)) => {
+                let (a, b) = (a.borrow(), b.borrow());
+                a.as_slice().partial_cmp(b.as_slice())
+            }
+            (Bytes(a), ByteArray(b)) => a.as_slice().partial_cmp(b.borrow().as_slice()),
+            (ByteArray(a), Bytes(b)) => a.borrow().as_slice().partial_cmp(b.as_slice()),
             (Tuple(a), Tuple(b)) => {
                 for (x, y) in a.iter().zip(b.iter()) {
                     match x.py_cmp(y)? {
@@ -1516,6 +1538,9 @@ impl Value {
             Value::Complex(re, im) => format_complex(*re, *im),
             Value::Str(s) => (**s).clone(),
             Value::Bytes(b) => python_repr_bytes(b),
+            // CPython renders both `str(ba)` and `repr(ba)` as
+            // `bytearray(b'...')`.
+            Value::ByteArray(b) => format!("bytearray({})", python_repr_bytes(&b.borrow())),
             Value::List(l) => {
                 let l = l.borrow();
                 let mut s = String::from("[");
@@ -1622,6 +1647,12 @@ impl Value {
             // instance: the message/args, not `ClassName('msg')`.
             Value::Instance(i) => match exception_instance_args(i) {
                 Some(args) => exception_instance_str(i, &args),
+                // A `model X:` lowers to a `pydantic.BaseModel` subclass,
+                // and pydantic's `__str__` is NOT its `__repr__`: it is the
+                // space-separated `field=value` pair list with no class name
+                // (`id=1 name='a'`). The dataclass rendering below would
+                // print the `U(...)` constructor form for both.
+                None if class_is_pydantic_model(&i.class) => pydantic_instance_str(i),
                 None => instance_repr(i),
             },
             // Match the dataclass-default `repr` shape that
@@ -1841,6 +1872,19 @@ pub fn bigint_eq_f64(a: &BigInt, b: f64) -> bool {
 /// Whether `class` is an enum class — its own `class_attrs` carry the
 /// `__typhon_enum_base__` sentinel, or one of its bases does (the user's
 /// `Color(Enum)` inherits the flag from the synthetic `Enum` base).
+/// Whether `class` derives (directly or transitively) from `pydantic`'s
+/// `BaseModel` — i.e. it is the lowering of a Typhon `model X:`. The VM
+/// models `BaseModel` as a marker `Value::Class` with that exact name, so
+/// walking the base chain for the name is the whole test.
+///
+/// Drives two pydantic-specific behaviours the dataclass defaults get
+/// wrong: the `str()` rendering (space-separated `field=value` pairs, not
+/// the `Class(...)` constructor form) and the exclusion of the
+/// compiler-synthesised `model_config` from every user-visible surface.
+pub fn class_is_pydantic_model(class: &Class) -> bool {
+    class.name == "BaseModel" || class.bases.iter().any(|b| class_is_pydantic_model(b))
+}
+
 fn class_is_enum(class: &Class) -> bool {
     class
         .class_attrs
@@ -1906,6 +1950,26 @@ fn instance_repr(inst: &Instance) -> String {
         return format!("{}({})", inst.class.name, parts.join(", "));
     }
     instance_repr_inner(inst)
+}
+
+/// pydantic's `__str__`: `field=value` pairs (values rendered with `repr`)
+/// joined by a single space, with no surrounding class name or parens. Only
+/// declared model fields appear — never the compiler-synthesised
+/// `model_config`, which pydantic keeps off both `str()` and `repr()`.
+fn pydantic_instance_str(inst: &Instance) -> String {
+    let fields = inst.fields.borrow();
+    let parts: Vec<String> = inst
+        .class
+        .fields
+        .iter()
+        .filter(|cf| cf.name != "model_config")
+        .filter_map(|cf| {
+            fields
+                .get(&cf.name)
+                .map(|v| format!("{}={}", cf.name, v.py_repr()))
+        })
+        .collect();
+    parts.join(" ")
 }
 
 fn instance_repr_inner(inst: &Instance) -> String {

@@ -55,6 +55,9 @@ code uses 3.13+ syntax.
 | `lambda_default_args.ty` | lambda parameter defaults — the `lambda i=i: i` loop-capture snapshot `tyc explain loop_closure_capture` prescribes |
 | `string_precision_spec.ty` | `.N` as a MAXIMUM LENGTH for a string operand, in f-strings / `str.format` / `format()`, composed with width and align |
 | `frozen_dict_str.ty` | `freeze let` mapping renderings — `str` gives the dict form, `repr` keeps the `mappingproxy(…)` wrapper |
+| `loop_else.ty` | `for`/`else` and `while`/`else` — the completed, broken-out-of and empty-iterable paths, and a `break` in a nested loop leaving the outer `else:` intact |
+| `bytearray_ops.ty` | `bytearray` construction, indexing/slicing, the in-place mutators seen through an alias, the readers shared with `bytes`, `+` / `*` / `+=`, and cross-type comparison and membership |
+| `model_construction.ty` | `model X:` — defaulted-field construction, pydantic's `str` vs `repr` renderings, and `model_validate` / `model_dump` / `model_dump_json` keeping the synthesised `model_config` out of user-visible output (needs `pydantic` for the compiled half) |
 
 ## Adding a case
 
@@ -63,3 +66,9 @@ no dict-iteration-order assumptions beyond insertion order), drop it in, and
 run `cargo test --workspace parity`. If the two paths disagree you have found a
 bug: either fix it, or move the file into `divergent/` with a `# DIVERGENT:`
 header recording both outputs and what the correct behaviour is.
+
+Prefer stdlib-only programs. If a case genuinely needs a third-party package on
+the *compiled* side — `model X:` lowers to a `pydantic.BaseModel` subclass,
+which the VM shims natively — the harness notices the resulting
+`ModuleNotFoundError` and skips the file, so the suite still runs on a bare
+interpreter. Say so in the file's header comment.

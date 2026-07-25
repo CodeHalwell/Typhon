@@ -245,6 +245,12 @@ pub fn open_file(path: &str, mode: &str) -> Result<Value, Unwind> {
                     buf.borrow_mut().extend_from_slice(&b);
                     b.len()
                 }
+                // A `bytearray` is a valid buffer for a binary-mode write.
+                Value::ByteArray(b) => {
+                    let b = b.borrow();
+                    buf.borrow_mut().extend_from_slice(&b);
+                    b.len()
+                }
                 other => {
                     return Err(crate::error::type_error(format!(
                         "write() expects str or bytes; got {}",

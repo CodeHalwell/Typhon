@@ -1,0 +1,69 @@
+# `bytearray` — `bytes`'s mutable sibling. Covers construction from every
+# accepted argument shape, indexing (which yields `int`) and slicing (which
+# yields a fresh `bytearray`), the in-place mutators, the read-only methods
+# shared with `bytes` (whose buffer-producing results stay `bytearray`), the
+# operators, and the cross-type comparison and membership tests.
+#
+# The mutation block is the load-bearing part: a `bytearray` has reference
+# identity, so every in-place operation must be visible through an alias.
+
+
+def main() -> None:
+    # Construction: empty, zero-fill, from bytes, from an iterable of ints.
+    print(bytearray(), bytearray(3), bytearray(b"hi"), bytearray([104, 105]))
+    # Round-tripping between the two types always copies.
+    print(bytearray(bytearray(b"xy")), bytes(bytearray(b"zz")), bytearray(b"ab") == b"ab")
+
+    # len / index / slice / iterate.
+    mut ba: bytearray = bytearray(b"hello")
+    print(len(ba), ba[0], ba[-1], ba[1:3], ba[::-1], list(ba))
+
+    # Mutation is visible through an alias — the whole point of a bytearray.
+    let alias: bytearray = ba
+    ba.append(33)
+    print(alias, ba is alias)
+    ba.extend(b"!!")
+    ba.extend([63])
+    print(alias)
+    ba.insert(0, 62)
+    print(alias, ba.pop(), ba.pop(0), alias)
+    ba.remove(101)
+    print(alias)
+    ba.reverse()
+    print(alias)
+    ba[0] = 65
+    print(alias)
+
+    # `copy()` is independent; clearing it leaves the original alone.
+    let cp: bytearray = ba.copy()
+    cp.clear()
+    print(cp, len(cp), alias)
+
+    # Read-only methods shared with `bytes`; the ones that produce a buffer
+    # produce a `bytearray` again.
+    let r: bytearray = bytearray(b"a,B,c")
+    print(r.upper(), r.lower(), r.split(b","), r.replace(b",", b"-"))
+    print(r.find(b"B"), r.count(b","), r.startswith(b"a"), r.endswith(b"c"))
+    print(bytearray(b"  pad  ").strip(), r.decode("utf-8"), r.hex())
+    print(bytearray(b"-").join([b"x", b"y"]))
+
+    # `+` takes its result type from the LEFT operand; `*` repeats.
+    print(bytearray(b"a") + b"b", b"a" + bytearray(b"b"), bytearray(b"ab") * 2, 2 * bytearray(b"c"))
+
+    # Augmented assignment mutates in place rather than rebinding.
+    mut acc: bytearray = bytearray(b"q")
+    let acc_alias: bytearray = acc
+    acc += b"r"
+    print(acc, acc_alias)
+    acc *= 2
+    print(acc, acc_alias)
+
+    # Ordering and membership work within and across the two types.
+    print(bytearray(b"a") < bytearray(b"b"), bytearray(b"a") < b"b", b"a" < bytearray(b"b"))
+    print(b"el" in bytearray(b"hello"), 101 in bytearray(b"hello"), b"zz" in bytearray(b"hello"))
+
+    print(type(bytearray(b"a")).__name__, isinstance(bytearray(b"a"), bytearray))
+    print(bool(bytearray()), bool(bytearray(b"a")))
+
+
+main()

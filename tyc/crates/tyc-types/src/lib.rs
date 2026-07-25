@@ -12613,6 +12613,11 @@ fn stmt_always_exits(stmt: &Stmt) -> bool {
                 });
             finally_exits || try_and_handlers_exit
         }
+        // A `for` / `while` with a `break`-free body always runs its `else:`
+        // clause, so the statement exits whenever that clause does. See
+        // [`loop_normal_path_exits`].
+        Stmt::For(f) => loop_normal_path_exits(&f.body, &f.orelse, body_always_exits),
+        Stmt::While(w) => loop_normal_path_exits(&w.body, &w.orelse, body_always_exits),
         _ => false,
     }
 }
@@ -12640,6 +12645,39 @@ fn try_normal_path_exits(
     } else {
         exits(&t.body) || exits(&t.orelse)
     }
+}
+
+/// Decide whether a `for` / `while` statement always exits through its
+/// `else:` clause, given a body-level "always exits" predicate.
+///
+/// CPython runs a loop's `else:` clause exactly when the loop finished
+/// *without* a `break`. So a loop whose body contains no `break` targeting
+/// it always runs its `else:`, and the whole statement exits whenever that
+/// `else:` exits. Conversely a `break` anywhere in the body means control
+/// can reach the statement's fall-through, so the statement does not exit
+/// no matter what the `else:` does.
+///
+/// A loop with no `else:` never exits by this route: the iterable may be
+/// empty (or the `while` test false on entry), so the body may never run.
+/// `while True:` with no `break` is handled separately — that loop never
+/// completes, so its `else:` is unreachable rather than guaranteed.
+///
+/// `break` detection uses [`body_can_break`], which deliberately does not
+/// descend into nested `for` / `while` bodies — a `break` there targets the
+/// inner loop, not this one. It also skips a nested loop's own `else:`
+/// clause, where a `break` *would* target this loop; that residual
+/// approximation predates this helper (the `while True:` rule shares it) and
+/// is left as-is because closing it could only ever *reject* a program that
+/// checks today.
+///
+/// Shared by all four reachability walkers (structural / checker-aware ×
+/// any-terminal / non-suppressible-terminal) so they cannot drift.
+fn loop_normal_path_exits(
+    body: &[Stmt],
+    orelse: &[Stmt],
+    mut exits: impl FnMut(&[Stmt]) -> bool,
+) -> bool {
+    !orelse.is_empty() && !body_can_break(body) && exits(orelse)
 }
 
 /// Structural-only check: do every arm's body end in an unconditional
@@ -12710,7 +12748,18 @@ fn stmt_always_exits_aware(c: &Checker, stmt: &Stmt) -> bool {
         // to honour this so `while True: match x: case A: return ...;
         // case B: continue` doesn't surface `missing_return` for the
         // function (B23 stress finding).
-        Stmt::While(w) => is_constant_true(&w.test) && !body_can_break(&w.body),
+        // …and, independently, a `while` with a `break`-free body always runs
+        // its `else:` clause, so the statement exits whenever that clause
+        // does (see [`loop_normal_path_exits`]).
+        Stmt::While(w) => {
+            (is_constant_true(&w.test) && !body_can_break(&w.body))
+                || loop_normal_path_exits(&w.body, &w.orelse, |b| body_always_exits_aware(c, b))
+        }
+        // Same rule for `for` / `async for`: no `break` in the body means the
+        // `else:` clause always runs.
+        Stmt::For(f) => {
+            loop_normal_path_exits(&f.body, &f.orelse, |b| body_always_exits_aware(c, b))
+        }
         // A `with` / `async with` block exits the enclosing function
         // only when every terminal in its body is *non-suppressible*
         // — `return` / `break` / `continue`. Bare `raise` is
@@ -12815,6 +12864,12 @@ fn stmt_exits_non_suppressible(stmt: &Stmt) -> bool {
                 });
             finally_exits || try_and_handlers_exit
         }
+        // A `break`-free loop body means the `else:` clause always runs, so
+        // the statement inherits the clause's terminal — and the predicate
+        // applied to the clause is the non-suppressible one, so an `else:`
+        // whose only terminal is `raise` still doesn't count here.
+        Stmt::For(f) => loop_normal_path_exits(&f.body, &f.orelse, body_exits_non_suppressible),
+        Stmt::While(w) => loop_normal_path_exits(&w.body, &w.orelse, body_exits_non_suppressible),
         _ => false,
     }
 }
@@ -12861,6 +12916,14 @@ fn stmt_exits_non_suppressible_aware(c: &Checker, stmt: &Stmt) -> bool {
                     });
             finally_exits || try_and_handlers_exit
         }
+        // Mirror of the structural walker: a `break`-free loop body means the
+        // `else:` clause always runs (see [`loop_normal_path_exits`]).
+        Stmt::For(f) => loop_normal_path_exits(&f.body, &f.orelse, |b| {
+            body_exits_non_suppressible_aware(c, b)
+        }),
+        Stmt::While(w) => loop_normal_path_exits(&w.body, &w.orelse, |b| {
+            body_exits_non_suppressible_aware(c, b)
+        }),
         _ => false,
     }
 }
@@ -21619,6 +21682,226 @@ def attempt(n: int) -> str:
         assert!(
             has_missing_return(&d),
             "try/except/else with a falling-through else must still fire missing_return: {:?}",
+            d.errors()
+        );
+    }
+
+    // ── for/else and while/else reachability ─────────────────────────
+    // A loop's `else:` clause runs exactly when the loop completed without
+    // hitting a `break`. So a loop with no `break` targeting it ALWAYS runs
+    // its `else:`, and the statement diverges whenever that `else:` does.
+    // The reachability walkers used to ignore the `else:` arm entirely — a
+    // false-positive `tyc::missing_return` (round-2 differential gap-hunt).
+
+    #[test]
+    fn for_else_returning_is_not_missing_return() {
+        let src = "\
+def find(xs: list[int], target: int) -> str:
+    for x in xs:
+        if x == target:
+            return f\"found {x}\"
+    else:
+        return \"not found\"
+";
+        let d = check(src);
+        assert!(
+            !has_missing_return(&d),
+            "for/else where the else returns must not fire missing_return: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn while_else_returning_is_not_missing_return() {
+        let src = "\
+def countdown(start: int) -> str:
+    mut i: int = start
+    while i > 0:
+        i = i - 1
+    else:
+        return \"done\"
+";
+        let d = check(src);
+        assert!(
+            !has_missing_return(&d),
+            "while/else where the else returns must not fire missing_return: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn for_else_with_raising_body_is_not_missing_return() {
+        let src = "\
+def only_empty(xs: list[int]) -> str:
+    for x in xs:
+        raise ValueError(f\"unexpected {x}\")
+    else:
+        return \"empty\"
+";
+        let d = check(src);
+        assert!(
+            !has_missing_return(&d),
+            "for/else whose body raises and whose else returns must not fire missing_return: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn for_else_with_break_and_trailing_return_is_not_missing_return() {
+        let src = "\
+def has_zero(xs: list[int]) -> str:
+    for x in xs:
+        if x == 0:
+            break
+    else:
+        return \"no zero\"
+    return \"found zero\"
+";
+        let d = check(src);
+        assert!(
+            !has_missing_return(&d),
+            "for/else with a break and a trailing return must not fire missing_return: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn for_else_with_break_in_nested_loop_only_is_not_missing_return() {
+        // The `break` belongs to the INNER loop, so it can never carry
+        // control past the OUTER loop's `else:` — the outer statement still
+        // diverges. This is the case the `break` search is easiest to get
+        // wrong (descending into nested loops would suppress the fix).
+        let src = "\
+def scan(rows: list[list[int]]) -> str:
+    for row in rows:
+        for cell in row:
+            if cell == 0:
+                break
+    else:
+        return \"done\"
+";
+        let d = check(src);
+        assert!(
+            !has_missing_return(&d),
+            "a break inside a nested loop must not count as a break for the outer loop: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn for_else_inside_with_block_is_not_missing_return() {
+        // Exercises the non-suppressible walkers: a `with` body ending in a
+        // `break`-free for/else whose `else:` returns is a definite exit
+        // (`return` cannot be swallowed by `__exit__`).
+        let src = "\
+import contextlib
+
+def scan(xs: list[int]) -> str:
+    with contextlib.suppress(ValueError):
+        for x in xs:
+            print(x)
+        else:
+            return \"done\"
+";
+        let d = check(src);
+        assert!(
+            !has_missing_return(&d),
+            "a with-block ending in a returning for/else must not fire missing_return: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn for_else_that_does_not_return_still_fires() {
+        // Negative: the `else:` falls through, so the function does too.
+        let src = "\
+def scan(xs: list[int]) -> str:
+    for x in xs:
+        print(x)
+    else:
+        print(\"done\")
+";
+        let d = check(src);
+        assert!(
+            has_missing_return(&d),
+            "for/else whose else falls through must still fire missing_return: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn for_else_with_break_and_no_trailing_return_still_fires() {
+        // Negative: the `break` skips the `else:` and lands on the
+        // statement's fall-through, which reaches the end of the function.
+        let src = "\
+def has_zero(xs: list[int]) -> str:
+    for x in xs:
+        if x == 0:
+            break
+    else:
+        return \"no zero\"
+";
+        let d = check(src);
+        assert!(
+            has_missing_return(&d),
+            "for/else with a break and no trailing return must still fire missing_return: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn for_else_with_outer_break_beside_nested_loop_still_fires() {
+        // Negative mirror of the nested-break test: this `break` DOES target
+        // the outer loop, so the fall-through is reachable.
+        let src = "\
+def scan(rows: list[list[int]]) -> str:
+    for row in rows:
+        for cell in row:
+            print(cell)
+        if len(row) == 0:
+            break
+    else:
+        return \"done\"
+";
+        let d = check(src);
+        assert!(
+            has_missing_return(&d),
+            "a break targeting the outer loop must still fire missing_return: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn for_without_else_still_fires() {
+        // Negative: no `else:` clause at all — the iterable may be empty, so
+        // the body may never run and the fall-through is always reachable.
+        let src = "\
+def scan(xs: list[int]) -> str:
+    for x in xs:
+        return f\"first {x}\"
+";
+        let d = check(src);
+        assert!(
+            has_missing_return(&d),
+            "a for loop with no else clause must still fire missing_return: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn while_without_else_still_fires() {
+        // Negative: same reasoning for `while` — the test may be false on
+        // entry, so the body may never run.
+        let src = "\
+def countdown(start: int) -> str:
+    mut i: int = start
+    while i > 0:
+        return \"positive\"
+";
+        let d = check(src);
+        assert!(
+            has_missing_return(&d),
+            "a while loop with no else clause must still fire missing_return: {:?}",
             d.errors()
         );
     }

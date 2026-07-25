@@ -5,18 +5,18 @@ Programs here run correctly through `tyc build` + CPython and misbehave under
 they **keep** differing, so fixing one fails the test — which is the prompt to
 promote the file up a level into `examples/parity/`.
 
-The six divergences the 2026-07-25 review found were all fixed and promoted.
-The three below came from a second probe round and are still open:
+The six divergences the 2026-07-25 review found were all fixed and promoted,
+as were two of the three from a second probe round (`bytearray` and `model`
+construction/rendering, now `../bytearray_ops.ty` and
+`../model_construction.ty`). One remains open:
 
 | File | Divergence |
 |---|---|
 | `vm_regex_engine_limits.ty` | the VM's `re` is backed by the Rust `regex` crate, which refuses look-around and backreferences by design; CPython's backtracking engine accepts both |
-| `vm_model_construction.ty` | a `model` field with a default is rejected by the VM's constructor, and `str`/`repr` leak the compiler-synthesised `model_config` |
-| `vm_bytearray_missing.ty` | `bytearray` is absent from the VM's builtin table |
 
-The regex one is architectural rather than an oversight — closing it means
-adopting a backtracking engine and giving up the linear-time guarantee, which
-is a dependency-policy decision, not a bug fix.
+It is architectural rather than an oversight — closing it means adopting a
+backtracking engine and giving up the linear-time guarantee, which is a
+dependency-policy decision, not a bug fix.
 
 ## When to put a file here
 

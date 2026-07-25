@@ -596,30 +596,25 @@ pub fn install(interp: &mut Interpreter) {
     });
 
     native!("bytes", |i, args| {
-        match args.into_iter().next() {
-            None => Ok(Value::Bytes(Rc::new(Vec::new()))),
-            Some(Value::Bytes(b)) => Ok(Value::Bytes(b)),
-            // bytes(int) -> that many zero bytes.
-            Some(Value::Int(n)) => {
-                let n = n.to_usize().ok_or_else(|| value_error("negative count"))?;
-                Ok(Value::Bytes(Rc::new(vec![0u8; n])))
-            }
-            // bytes(str) requires an encoding in Python; not supported here.
-            Some(Value::Str(_)) => Err(type_error("string argument without an encoding")),
-            // bytes(iterable_of_ints).
-            Some(v) => {
-                let it = i.make_iter(v)?;
-                let mut out: Vec<u8> = Vec::new();
-                while let Some(x) = i.iter_next(&it)? {
-                    let n = x.to_int()?;
-                    if !(0..=255).contains(&n) {
-                        return Err(value_error("bytes must be in range(0, 256)"));
-                    }
-                    out.push(n as u8);
-                }
-                Ok(Value::Bytes(Rc::new(out)))
-            }
-        }
+        Ok(Value::Bytes(Rc::new(byte_buffer_from_arg(
+            i,
+            args.into_iter().next(),
+            // CPython's wording differs between the two constructors:
+            // `bytes([300])` says "bytes must be in range(0, 256)",
+            // `bytearray([300])` says "byte must be in range(0, 256)".
+            "bytes",
+        )?)))
+    });
+
+    // `bytearray()` — `bytes`'s mutable sibling. Accepts the same argument
+    // shapes (`bytearray()`, `bytearray(n)` zero-fill, `bytearray(b"...")`,
+    // `bytearray(bytearray(...))`, `bytearray([104, 105])`), always producing
+    // a fresh, independently-mutable buffer (CPython copies too — the source
+    // buffer is never aliased).
+    native!("bytearray", |i, args| {
+        Ok(Value::ByteArray(Rc::new(RefCell::new(
+            byte_buffer_from_arg(i, args.into_iter().next(), "byte")?,
+        ))))
     });
 
     native!("set", |i, args| {
@@ -1116,6 +1111,7 @@ pub fn install(interp: &mut Interpreter) {
             Value::Set(s) => Rc::as_ptr(s) as usize,
             Value::Str(s) => Rc::as_ptr(s) as usize,
             Value::Bytes(b) => Rc::as_ptr(b) as usize,
+            Value::ByteArray(b) => Rc::as_ptr(b) as usize,
             Value::Class(c) => Rc::as_ptr(c) as usize,
             Value::Instance(i) => Rc::as_ptr(i) as usize,
             Value::Module(m) => Rc::as_ptr(m) as usize,
@@ -1358,6 +1354,7 @@ fn value_len(v: &Value) -> Result<usize, Unwind> {
     Ok(match v {
         Value::Str(s) => s.chars().count(),
         Value::Bytes(b) => b.len(),
+        Value::ByteArray(b) => b.borrow().len(),
         Value::List(l) => l.borrow().len(),
         Value::Tuple(t) => t.len(),
         Value::Dict(d) => d
@@ -1409,6 +1406,7 @@ pub(crate) fn is_instance_of(val: &Value, cls: &Value) -> bool {
         ("bool", Value::Bool(_)) => true,
         ("str", Value::Str(_)) => true,
         ("bytes", Value::Bytes(_)) => true,
+        ("bytearray", Value::ByteArray(_)) => true,
         ("list", Value::List(_)) => true,
         ("tuple", Value::Tuple(_)) => true,
         ("dict", Value::Dict(_)) => true,
@@ -4760,14 +4758,19 @@ fn deep_freeze_value(v: Value) -> Result<Value, Unwind> {
         // value; freezing it is a no-op here. Revisit if `freeze let v = d.keys()`
         // ever needs view-specific semantics.
         Value::DictView { .. } => Ok(v),
-        Value::Iter(_) | Value::BoundMethod { .. } => Err(crate::error::Unwind::Exception(
-            crate::error::VmException::new(
+        // `bytearray` is mutable and has no in-place immutable equivalent, so
+        // the generated `typhon_runtime.freeze.deep_freeze` rejects it (it is
+        // absent from `_FROZEN_PRIMITIVES` and matches none of the
+        // list/dict/set branches). Reject it here too so `freeze let` behaves
+        // the same under `tyc run` and `tyc build` + CPython.
+        Value::ByteArray(_) | Value::Iter(_) | Value::BoundMethod { .. } => Err(
+            crate::error::Unwind::Exception(crate::error::VmException::new(
                 "TypeError",
                 "deep_freeze cannot freeze this value; types without an immutable \
-                 equivalent (open handles, generators, non-frozen dataclasses, ...) \
-                 must not appear in a `freeze let` value",
-            ),
-        )),
+                     equivalent (open handles, generators, non-frozen dataclasses, ...) \
+                     must not appear in a `freeze let` value",
+            )),
+        ),
     }
 }
 
@@ -4788,9 +4791,23 @@ fn make_pydantic_module() -> Value {
         classmethods: std::cell::RefCell::new(std::collections::HashSet::new()),
         is_exception: false,
     }));
-    let config_dict = nf("ConfigDict", |_i, _args| {
-        // Accept any kwargs and ignore — purely a config-record stub.
-        Ok(Value::Dict(Rc::new(RefCell::new(IndexMap::new()))))
+    let config_dict = nf("ConfigDict", |_i, args| {
+        // `ConfigDict` is a `TypedDict` in pydantic — calling it just builds
+        // the dict of the keywords passed. Returning an EMPTY dict made
+        // `Cls.model_config` read `{}` under `tyc run` where the compiled
+        // path reads `{'extra': 'forbid'}`. The VM doesn't act on the config
+        // (it enforces no `extra="forbid"` validation), but the value itself
+        // must still read back correctly.
+        // `split_kwargs` (not `split_kwargs_map`, which reads a different
+        // marker — see the note at `str_method`) peels the sentinel the
+        // `"ConfigDict"` arm of `call_with_kwargs` appends. It preserves
+        // call-site order, which is what CPython's kwargs dict does too.
+        let (_, kwargs) = split_kwargs(&args);
+        let mut map: IndexMap<HashKey, Value> = IndexMap::new();
+        for (name, v) in kwargs {
+            map.insert(HashKey::Str(Rc::new(name)), v);
+        }
+        Ok(Value::Dict(Rc::new(RefCell::new(map))))
     });
     make_module(
         "pydantic",
@@ -5539,6 +5556,7 @@ fn make_pathlib_module(interp: &mut Interpreter) -> Result<Value, Unwind> {
             Value::Native(Rc::new(NativeFn::new("write_bytes", move |_i, args| {
                 let data = match single(&args, "write_bytes")? {
                     Value::Bytes(b) => b.as_ref().clone(),
+                    Value::ByteArray(b) => b.borrow().clone(),
                     other => {
                         return Err(type_error(format!(
                             "write_bytes() expects bytes, not {}",
@@ -5612,6 +5630,8 @@ pub fn dispatch_method(
         (Value::Str(s), m) => str_method(interp, s, m, rest, &kwargs),
         // ── bytes methods ──────────────────────────────────────────────────
         (Value::Bytes(b), m) => bytes_method(b, m, rest),
+        // ── bytearray methods ──────────────────────────────────────────────
+        (Value::ByteArray(b), m) => bytearray_method(b, m, rest, interp),
         // ── list methods ───────────────────────────────────────────────────
         (Value::List(l), m) => list_method(interp, l, m, rest),
         // ── dict methods ───────────────────────────────────────────────────
@@ -6278,6 +6298,26 @@ fn str_format(
 }
 
 fn bytes_method(b: &Rc<Vec<u8>>, name: &str, args: &[Value]) -> Result<Value, Unwind> {
+    byte_seq_method(b, name, args, false)
+}
+
+/// The read-only method surface shared by `bytes` and `bytearray`. CPython
+/// gives `bytearray` the same readers as `bytes`, but every one that
+/// *produces* a buffer produces a `bytearray` again (`bytearray(b"a").upper()`
+/// is a `bytearray`, `.split()` a list of `bytearray`) — hence `mutable`,
+/// which picks the wrapper for each produced buffer.
+///
+/// Mutating methods (`append` / `extend` / … ) are `bytearray`-only and live
+/// in `bytearray_method`, which delegates here for everything else.
+fn byte_seq_method(b: &[u8], name: &str, args: &[Value], mutable: bool) -> Result<Value, Unwind> {
+    let wrap = |v: Vec<u8>| -> Value {
+        if mutable {
+            Value::ByteArray(Rc::new(RefCell::new(v)))
+        } else {
+            Value::Bytes(Rc::new(v))
+        }
+    };
+    let type_name = if mutable { "bytearray" } else { "bytes" };
     Ok(match name {
         // `.decode()` / `.decode("utf-8")` -> str. Only UTF-8/ASCII handled;
         // other encodings fall back to a lossy UTF-8 decode.
@@ -6303,8 +6343,8 @@ fn bytes_method(b: &Rc<Vec<u8>>, name: &str, args: &[Value]) -> Result<Value, Un
             }
             Value::Str(Rc::new(out))
         }
-        "upper" => Value::Bytes(Rc::new(b.iter().map(|c| c.to_ascii_uppercase()).collect())),
-        "lower" => Value::Bytes(Rc::new(b.iter().map(|c| c.to_ascii_lowercase()).collect())),
+        "upper" => wrap(b.iter().map(|c| c.to_ascii_uppercase()).collect()),
+        "lower" => wrap(b.iter().map(|c| c.to_ascii_lowercase()).collect()),
         // `.split(sep=None)` — on whitespace when no separator, else on the
         // separator bytes. Returns a list of bytes.
         "split" | "rsplit" => {
@@ -6325,10 +6365,7 @@ fn bytes_method(b: &Rc<Vec<u8>>, name: &str, args: &[Value]) -> Result<Value, Un
                 }
             };
             Value::List(Rc::new(RefCell::new(
-                parts
-                    .into_iter()
-                    .map(|p| Value::Bytes(Rc::new(p)))
-                    .collect(),
+                parts.into_iter().map(&wrap).collect(),
             )))
         }
         "strip" | "lstrip" | "rstrip" => {
@@ -6351,7 +6388,7 @@ fn bytes_method(b: &Rc<Vec<u8>>, name: &str, args: &[Value]) -> Result<Value, Un
                     end -= 1;
                 }
             }
-            Value::Bytes(Rc::new(b[start..end].to_vec()))
+            wrap(b[start..end].to_vec())
         }
         "startswith" => {
             let pre = bytes_arg(single(args, "startswith")?)?;
@@ -6414,7 +6451,7 @@ fn bytes_method(b: &Rc<Vec<u8>>, name: &str, args: &[Value]) -> Result<Value, Un
                 }
                 None => usize::MAX,
             };
-            Value::Bytes(Rc::new(replace_bytes(b, &from, &to, max)))
+            wrap(replace_bytes(b, &from, &to, max))
         }
         "join" => {
             // b",".join([b"a", b"b"]) -> b"a,b"
@@ -6428,10 +6465,133 @@ fn bytes_method(b: &Rc<Vec<u8>>, name: &str, args: &[Value]) -> Result<Value, Un
                     out.extend_from_slice(&bytes_arg(part)?);
                 }
             }
-            Value::Bytes(Rc::new(out))
+            wrap(out)
         }
-        _ => return Err(attribute_error(format!("bytes has no method '{}'", name))),
+        _ => {
+            return Err(attribute_error(format!(
+                "'{}' object has no attribute '{}'",
+                type_name, name
+            )))
+        }
     })
+}
+
+/// `bytearray`'s method surface: the in-place mutators (which have no `bytes`
+/// counterpart) plus everything `bytes` can do, delegated to
+/// `byte_seq_method` with `mutable = true` so buffer-producing readers hand
+/// back a `bytearray` as CPython does.
+///
+/// Every mutator writes through the shared `RefCell`, so a mutation is
+/// visible through every alias of the same object — that aliasing behaviour
+/// is the entire point of reaching for a `bytearray` over `bytes`.
+fn bytearray_method(
+    buf: &Rc<RefCell<Vec<u8>>>,
+    name: &str,
+    args: &[Value],
+    interp: &mut crate::interp::Interpreter,
+) -> Result<Value, Unwind> {
+    // A single byte argument, range-checked the way CPython does.
+    let byte_arg = |v: &Value| -> Result<u8, Unwind> {
+        let n = v.to_int()?;
+        u8::try_from(n).map_err(|_| value_error("byte must be in range(0, 256)"))
+    };
+    match name {
+        "append" => {
+            let v = byte_arg(single(args, "append")?)?;
+            buf.borrow_mut().push(v);
+            Ok(Value::None)
+        }
+        // `extend` takes any iterable of ints (and, as a special case of
+        // that, another bytes-like object).
+        "extend" => {
+            let arg = single(args, "extend")?.clone();
+            let extra: Vec<u8> = match &arg {
+                Value::Bytes(b) => (**b).clone(),
+                // Self-extension (`ba.extend(ba)`) must snapshot before the
+                // mutable borrow below, hence the eager clone.
+                Value::ByteArray(b) => b.borrow().clone(),
+                Value::Str(_) => {
+                    return Err(type_error("expected iterable of integers; got: 'str'"))
+                }
+                other => {
+                    let it = interp.make_iter(other.clone())?;
+                    let mut out = Vec::new();
+                    while let Some(x) = interp.iter_next(&it)? {
+                        out.push(byte_arg(&x)?);
+                    }
+                    out
+                }
+            };
+            buf.borrow_mut().extend_from_slice(&extra);
+            Ok(Value::None)
+        }
+        // `insert(index, byte)` clamps the index into range at both ends,
+        // exactly like `list.insert`.
+        "insert" => {
+            let idx = args
+                .first()
+                .ok_or_else(|| type_error("insert() requires an index"))?
+                .to_int()?;
+            let v = byte_arg(
+                args.get(1)
+                    .ok_or_else(|| type_error("insert() requires a value"))?,
+            )?;
+            let mut b = buf.borrow_mut();
+            let len = b.len() as i64;
+            let at = if idx < 0 {
+                (len + idx).max(0) as usize
+            } else {
+                (idx as usize).min(b.len())
+            };
+            b.insert(at, v);
+            Ok(Value::None)
+        }
+        // `pop()` removes and returns the last byte; `pop(i)` an arbitrary
+        // one (negative indices count from the end).
+        "pop" => {
+            let mut b = buf.borrow_mut();
+            if b.is_empty() {
+                return Err(index_error("pop from empty bytearray"));
+            }
+            let len = b.len();
+            let idx = match args.first() {
+                None => len - 1,
+                Some(v) => normalize_index(v.to_int()?, len)
+                    .ok_or_else(|| index_error("pop index out of range"))?,
+            };
+            Ok(Value::Int(VmInt::from(b.remove(idx) as i64)))
+        }
+        // `remove(byte)` drops the FIRST occurrence only.
+        "remove" => {
+            let v = byte_arg(single(args, "remove")?)?;
+            let mut b = buf.borrow_mut();
+            match b.iter().position(|&c| c == v) {
+                Some(i) => {
+                    b.remove(i);
+                    Ok(Value::None)
+                }
+                None => Err(value_error("value not found in bytearray")),
+            }
+        }
+        "clear" => {
+            buf.borrow_mut().clear();
+            Ok(Value::None)
+        }
+        "reverse" => {
+            buf.borrow_mut().reverse();
+            Ok(Value::None)
+        }
+        // `copy()` is an independent buffer — mutating it must not touch the
+        // original.
+        "copy" => Ok(Value::ByteArray(Rc::new(RefCell::new(
+            buf.borrow().clone(),
+        )))),
+        // Everything else is a read-only method shared with `bytes`.
+        _ => {
+            let b = buf.borrow();
+            byte_seq_method(&b, name, args, true)
+        }
+    }
 }
 
 /// Parse a Python complex-literal string like `"1+2j"`, `"3j"`, `"-1"`,
@@ -6488,9 +6648,46 @@ fn is_attribute_error(u: &Unwind) -> bool {
     matches!(u, Unwind::Exception(e) if e.kind == "AttributeError")
 }
 
+/// Shared argument handling for the `bytes(...)` and `bytearray(...)`
+/// constructors — the two accept exactly the same shapes in CPython and
+/// differ only in the value they wrap the resulting buffer in. Always
+/// returns an owned copy, so `bytearray(existing)` never aliases its source.
+fn byte_buffer_from_arg(
+    i: &mut crate::interp::Interpreter,
+    arg: Option<Value>,
+    who: &str,
+) -> Result<Vec<u8>, Unwind> {
+    match arg {
+        None => Ok(Vec::new()),
+        Some(Value::Bytes(b)) => Ok((*b).clone()),
+        Some(Value::ByteArray(b)) => Ok(b.borrow().clone()),
+        // `bytes(int)` / `bytearray(int)` -> that many zero bytes.
+        Some(Value::Int(n)) => {
+            let n = n.to_usize().ok_or_else(|| value_error("negative count"))?;
+            Ok(vec![0u8; n])
+        }
+        // A `str` needs an explicit encoding in Python; not supported here.
+        Some(Value::Str(_)) => Err(type_error("string argument without an encoding")),
+        // An iterable of ints.
+        Some(v) => {
+            let it = i.make_iter(v)?;
+            let mut out: Vec<u8> = Vec::new();
+            while let Some(x) = i.iter_next(&it)? {
+                let n = x.to_int()?;
+                if !(0..=255).contains(&n) {
+                    return Err(value_error(format!("{} must be in range(0, 256)", who)));
+                }
+                out.push(n as u8);
+            }
+            Ok(out)
+        }
+    }
+}
+
 fn bytes_arg(v: &Value) -> Result<Vec<u8>, Unwind> {
     match v {
         Value::Bytes(b) => Ok((**b).clone()),
+        Value::ByteArray(b) => Ok(b.borrow().clone()),
         Value::Int(i) => {
             let n = i.to_u32().and_then(|n| u8::try_from(n).ok());
             n.map(|b| vec![b])
@@ -7218,11 +7415,26 @@ fn json_dumps_indent(v: &Value, indent: usize, level: usize, sort: bool) -> Stri
 }
 
 /// Public wrapper so `interp.rs` (`model_dump_json`) can reuse the serializer.
+///
+/// pydantic's `model_dump_json()` emits **compact** JSON — no space after
+/// `,` or `:` — unlike `json.dumps`, whose defaults are `", "` / `": "`.
+/// Emitting the `json.dumps` spacing here made every `model_dump_json()`
+/// result diverge from the compiled path.
 pub fn json_dumps_pub(v: &Value) -> String {
-    json_dumps(v, false)
+    json_dumps_with(v, false, COMPACT_SEPARATORS)
 }
 
+/// `(item_separator, key_separator)`. CPython's `json.dumps` defaults.
+const JSON_SEPARATORS: (&str, &str) = (", ", ": ");
+/// What pydantic's `model_dump_json()` uses.
+const COMPACT_SEPARATORS: (&str, &str) = (",", ":");
+
 fn json_dumps(v: &Value, sort: bool) -> String {
+    json_dumps_with(v, sort, JSON_SEPARATORS)
+}
+
+fn json_dumps_with(v: &Value, sort: bool, seps: (&str, &str)) -> String {
+    let (item_sep, key_sep) = seps;
     match v {
         Value::None => "null".into(),
         Value::Bool(b) => if *b { "true" } else { "false" }.into(),
@@ -7230,12 +7442,16 @@ fn json_dumps(v: &Value, sort: bool) -> String {
         Value::Float(x) => json_float(*x),
         Value::Str(s) => json_string(s),
         Value::List(l) => {
-            let items: Vec<String> = l.borrow().iter().map(|x| json_dumps(x, sort)).collect();
-            format!("[{}]", items.join(", "))
+            let items: Vec<String> = l
+                .borrow()
+                .iter()
+                .map(|x| json_dumps_with(x, sort, seps))
+                .collect();
+            format!("[{}]", items.join(item_sep))
         }
         Value::Tuple(t) => {
-            let items: Vec<String> = t.iter().map(|x| json_dumps(x, sort)).collect();
-            format!("[{}]", items.join(", "))
+            let items: Vec<String> = t.iter().map(|x| json_dumps_with(x, sort, seps)).collect();
+            format!("[{}]", items.join(item_sep))
         }
         Value::Dict(d) => {
             // Filter the `__typhon_frozen__` sentinel a `freeze let`
@@ -7246,13 +7462,21 @@ fn json_dumps(v: &Value, sort: bool) -> String {
                 .borrow()
                 .iter()
                 .filter(|(k, _)| !matches!(k, HashKey::Str(s) if s.as_str() == "__typhon_frozen__"))
-                .map(|(k, v)| (json_dumps_key(&k.clone().into_value()), json_dumps(v, sort)))
+                .map(|(k, v)| {
+                    (
+                        json_dumps_key(&k.clone().into_value()),
+                        json_dumps_with(v, sort, seps),
+                    )
+                })
                 .collect();
             if sort {
                 pairs.sort_by(|a, b| a.0.cmp(&b.0));
             }
-            let items: Vec<String> = pairs.iter().map(|(k, v)| format!("{}: {}", k, v)).collect();
-            format!("{{{}}}", items.join(", "))
+            let items: Vec<String> = pairs
+                .iter()
+                .map(|(k, v)| format!("{}{}{}", k, key_sep, v))
+                .collect();
+            format!("{{{}}}", items.join(item_sep))
         }
         other => json_string(&other.py_repr()),
     }
@@ -7825,7 +8049,17 @@ pub fn call_with_kwargs(
         // Native ctors / shims that intentionally accept any kwargs and
         // discard them. Used by stdlib stubs that exist purely so user
         // code that calls them at import time doesn't crash.
-        "ConfigDict" | "dataclass" => (n.func)(interp, args),
+        // `ConfigDict(**kwargs)` is a `TypedDict` constructor — it builds the
+        // dict of the keywords it was handed, so forward them as the sentinel
+        // trailing arg the shim unpacks. (`dataclass` genuinely discards its
+        // kwargs: the VM models the decorator's effect structurally, not via
+        // its options.)
+        "ConfigDict" => {
+            let mut args = args;
+            args.push(make_kwargs_sentinel(kwargs));
+            (n.func)(interp, args)
+        }
+        "dataclass" => (n.func)(interp, args),
         // Text-IO helpers accept an `encoding=` (and `errors=`) kwarg the VM
         // doesn't model (it is always UTF-8). Drop the kwargs and run.
         "write_text" | "read_text" | "open" => (n.func)(interp, args),
