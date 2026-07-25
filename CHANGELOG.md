@@ -46,10 +46,11 @@ glyph, and `tyc explain --list` labelling its two non-diagnostic entries.
   test as a prompt to reclassify the file. That is what happened for most of them:
   `13-false-positives/` is deleted outright, `parity/divergent/` is emptied and
   kept only as a home (with a README) for the next divergence, and
-  `12-known-gaps/` retains just the two findings still open — the silent
-  missing `await` and `implicit_any` not covering function signatures, both of
-  which need an explicit narrowing decision. The individual fixes are itemised
-  in the entries below.
+  `12-known-gaps/` is emptied too — both of the findings that needed an
+  explicit narrowing decision (the silent missing `await`, and `implicit_any`
+  not covering function signatures) had that decision taken and applied, so the
+  directory is kept only as a home (with its README) for the next gap. The
+  individual fixes are itemised in the entries below.
 - **Six VM ↔ CPython divergences fixed** (`tyc-vm` only; the compiled path is
   byte-for-byte unchanged, so this is additive on *correct* programs — each
   fix moves `tyc run` onto the behaviour `tyc build` + CPython already had):
@@ -123,6 +124,82 @@ glyph, and `tyc explain --list` labelling its two non-diagnostic entries.
   **S1** in `docs/review-2026-07-25.md`; the reproduction moved from
   `examples/errors/12-known-gaps/` to
   `examples/errors/02-types-and-annotations/tuple_variable_index.ty`.
+- **Type-checker soundness: a forgotten `await` inside another `async def` is
+  no longer silent.** `tyc::missing_await` fired only when the *caller* was
+  synchronous — so the likelier mistake, one `async def` calling another and
+  dropping the `await`, produced no diagnostic at all. No `tyc::type_mismatch`
+  fired either: the checker types an async call by its declared return type
+  regardless of whether it was awaited, so the coroutine object flowed into a
+  concretely-typed slot unchallenged, and the emitted Python died with
+  `TypeError: object of type 'coroutine' has no len()` plus
+  `RuntimeWarning: coroutine 'fetch_a' was never awaited`.
+  `tyc::async_without_await` had been covering for the gap by accident — it
+  warns when the caller has *no* `await` at all — which is why it survived.
+  The diagnostic now also fires inside an `async def` caller, under a
+  deliberately narrow rule: **only when the un-awaited call flows into a slot
+  annotated with the coroutine's own return type** — the annotation of a
+  `let` / annotated assignment, or the enclosing function's declared return
+  type at `return f()`. That shape can never be a deliberate deferral, so
+  every intentional pattern stays legal: `let task = f()` … `await task` (no
+  annotation), `go f() -> handle`, `gather:` bindings (lowered to
+  `_tg.create_task(f())`), a coroutine passed as an *argument* to
+  `asyncio.create_task(...)` / `asyncio.gather(...)` / `asyncio.run(...)`,
+  `@gatherable` callees folded by `auto-gather`, and a widening
+  `let x: object = f()` (the rule requires type *equality* with the return
+  type, not assignability — a coroutine really is an `object`). The
+  diagnostic's help text is now per-shape, so the async-caller case no longer
+  advises "make the caller `async`" at a caller that already is; it points at
+  `await` and at the two ways to defer on purpose. This is a **narrowing**:
+  it rejects programs `tyc check` used to accept, but only ones that already
+  crashed at runtime — the same bar v1.0.0-alpha.2's three conservative
+  diagnostics were held to. Verified false-positive-free across all 259
+  `examples/` and ~1083 `stress/` programs (baseline vs after over 1,431
+  `.ty` / `.dty` files: identical save the reproduction and
+  `examples/errors/11-multi-error-programs/async_pipeline.ty`, whose header
+  already documented this exact gap as item 5 and now expects the code). Was
+  finding **C1** in `docs/review-2026-07-25.md`; the reproduction moved from
+  `examples/errors/12-known-gaps/` to
+  `examples/errors/06-async-and-concurrency/missing_await_in_async_caller.ty`.
+- **`tyc::implicit_any` now covers function signatures — a deliberate
+  narrowing that rejects previously-accepted programs which ran correctly.**
+  The check fired on annotated-assignment positions only (locals, module
+  bindings, class fields), so `let xs: list = []` errored while
+  `def keys(d: dict) -> list:` was accepted in silence. It now fires on every
+  *present* signature annotation whose head is a bare `list` / `dict` /
+  `tuple` / `set` / `frozenset` — positional, keyword-only, `*args`,
+  `**kwargs`, and the return annotation, on `def`, `async def`, and methods in
+  `impl` / `extend` blocks. The diagnostic's label names the offending slot
+  (``parameter `d` ``, `return type`), so a multi-slot signature reports one
+  diagnostic per bare head, and the `help:` gains a signature-specific line.
+  Not covered, deliberately: parameterised forms; non-container and dotted
+  heads (`collections.OrderedDict`); `__typhon_*` compiler-synthesised helpers
+  (already exempt from Rule 1); lambdas, which Python gives no annotation
+  slots; and third-party signatures recovered by venv introspection or a
+  bundled stub, which are shapes rather than source the checker walks — a
+  dependency's bare `dict` is never blamed on the user's file. It *does* fire
+  inside an `unsafe:` region and inside a `.dty`, matching how
+  `tyc::missing_annotation` and the annotated-assignment half of this same
+  code already behave (`unsafe:` relaxes *inferred* `Any`, not *declared*
+  `Any`).
+
+  **Read this as the exception it is.** Every other narrowing in the
+  v0.3.0 → v1.0.0-alpha line has only ever rejected programs that already
+  crashed at runtime, or relied on an unsound narrowing. This one rejects
+  programs that **type-checked and ran correctly** — `def keys(d: dict)` is
+  perfectly good Python and does exactly what it says. It was applied anyway,
+  as an explicit decision rather than a bug fix, because Rule 1's guarantee is
+  hollow while its single highest-leverage `Any` entry point goes unchecked: a
+  bare `dict` in a signature widens every call site *and* the entire function
+  body, which is precisely the hole Rule 1 exists to close, and it was the
+  worked example both the diagnostic's doc page and the bundled skill used to
+  illustrate the rule. Supporting evidence for the low cost: a per-file
+  `tyc check` over all 1,431 `.ty` files in `examples/` + `stress/`, run
+  before and against the shipped fix, differs on **exactly one file** — the
+  reproduction written for the finding. Anything that does trip it is a
+  one-line fix (spell the element types) with `object` available as the
+  explicit escape. Was finding **C2** in `docs/review-2026-07-25.md`; the
+  reproduction moved from `examples/errors/12-known-gaps/` to
+  `examples/errors/02-types-and-annotations/bare_collection_in_signature.ty`.
 - **Two type-checker false positives fixed** (both strictly widening — they
   accept more *valid* programs and reject nothing that used to check):
   - **`try`/`except`/`else` reachability.** CPython runs the `else:` clause

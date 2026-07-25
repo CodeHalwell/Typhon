@@ -7,7 +7,7 @@ sidebar:
 
 import { Aside } from '@astrojs/starlight/components';
 
-Typhon's collection types are Python's, with one stricter rule: **element types are mandatory**. A function parameter or return type annotated as bare `list` (without `[T]`) is rejected by `tyc::missing_annotation`; on a `let` / `mut` binding, an empty literal like `let xs = []` infers `list[Any]` and silently flows into whatever consumes it — annotate as `list[T]` to keep the type system honest.
+Typhon's collection types are Python's, with one stricter rule: **element types are mandatory**. A bare `list` (without `[T]`) is rejected by `tyc::implicit_any` wherever it is written — `let` / `mut` bindings, module bindings, class fields, **and** function parameter and return annotations; on a binding, an empty literal like `let xs = []` infers `list[Any]` and silently flows into whatever consumes it — annotate as `list[T]` to keep the type system honest.
 
 ## `list[T]`
 
@@ -289,9 +289,12 @@ Before v0.9.0 these protocols were treated as invariant on their type parameters
 ```python
 let xs: list = [1, 2, 3]      # ❌ implicit Any element
 let d: dict = {"a": 1}        # ❌ implicit Any keys and values
+
+def keys(d: dict) -> list:    # ❌ twice — parameter and return
+    return list(d.keys())
 ```
 
-Fix: spell the type parameters.
+Fix: spell the type parameters. The signature form is the one worth catching first — a bare `dict` there widens every call site *and* the whole function body to `Any`.
 
 ### Treating `dict.get` as non-nullable
 

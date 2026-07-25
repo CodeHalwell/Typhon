@@ -794,6 +794,59 @@ fn is_dynamic_type(t: &Type) -> bool {
     matches!(t, Type::Any | Type::Unknown | Type::TypeVar(_))
 }
 
+/// Help line attached to `tyc::missing_await` when a **sync** caller (or
+/// module scope) calls an `async def` without awaiting it.
+const MISSING_AWAIT_HINT_SYNC_CALLER: &str = "wrap the call in `await` (and make the caller `async`), or call `asyncio.run(...)` if you are at the top level";
+
+/// Help line attached to `tyc::missing_await` when an **async** caller
+/// binds an un-awaited `async def` call into a slot annotated with the
+/// coroutine's own return type (review 2026-07-25, finding C1). The
+/// caller is already `async`, so "make the caller `async`" would be
+/// nonsense advice here; instead point at the two legitimate shapes the
+/// rule deliberately keeps legal.
+const MISSING_AWAIT_HINT_ASYNC_CALLER: &str = "add `await` before the call — an un-awaited `async def` call evaluates to a coroutine, not to its return type; to start it now and await it later, bind it without the return-type annotation (`let task = f()` … `await task`) or hand it to `asyncio.create_task(...)` / `go f(...)`";
+
+/// Return `true` when an un-awaited call to an `async def` is flowing
+/// into a slot annotated with that coroutine's **own return type** — the
+/// one shape that is unambiguously a forgotten `await` even inside
+/// another `async def` (review 2026-07-25, finding C1).
+///
+/// `expected` is the bidirectional-inference hint, so it is `Some(T)`
+/// exactly where the surrounding syntax committed to a type: the
+/// annotation of `let d: T = f()` / `d: T = f()`, and the declared
+/// return type at `return f()`. It is `None` (or `Unknown`) for every
+/// deliberate-deferral shape the language supports —
+///
+/// * `let task = fetch()` … `await task` (no annotation),
+/// * `go fetch() -> handle` / `typhon_runtime.tasks.spawn(fetch())`,
+/// * `gather:` bindings (lowered to `_tg.create_task(fetch())`),
+/// * `asyncio.create_task(fetch())` / `asyncio.gather(fetch(), …)`
+///   (a coroutine passed as an *argument* — the parameter type is not
+///   the coroutine's return type),
+///
+/// — so none of them can trip it.
+///
+/// Both sides must be concrete: a dynamic annotation or an
+/// unresolvable return type degrades to "no evidence", never to a
+/// diagnostic. Equality (not assignability) is required, so widening
+/// slots like `let x: object = fetch()` — legal Python, a coroutine
+/// *is* an object — stay quiet.
+fn unawaited_async_call_into_return_slot(func_type: &Type, expected: Option<&Type>) -> bool {
+    let Some(exp) = expected else {
+        return false;
+    };
+    if is_dynamic_type(exp) {
+        return false;
+    }
+    let Type::Function { ret, .. } = func_type else {
+        return false;
+    };
+    if is_dynamic_type(ret) {
+        return false;
+    }
+    types_equivalent(exp, ret)
+}
+
 /// Return `true` when this call targets one of the well-known
 /// asyncio entry-points that accept coroutines as direct arguments.
 /// Used by the `missing_await` check (FINDINGS #49) to suppress
@@ -4675,13 +4728,14 @@ impl<'a> Checker<'a> {
         ));
     }
 
-    fn missing_await(&mut self, callee: &str, span: (usize, usize)) {
+    fn missing_await(&mut self, callee: &str, hint: &str, span: (usize, usize)) {
         if self.unsafe_depth > 0 {
             return;
         }
         let length = span.1.saturating_sub(span.0).max(1);
         self.diagnostics.push_error(TycError::missing_await(
             callee,
+            hint,
             &self.path,
             self.source,
             span.0,
@@ -10059,6 +10113,7 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                 let length = span.1.saturating_sub(span.0).max(1);
                 c.diagnostics.push_error(TycError::implicit_any(
                     bare,
+                    None,
                     c.path.clone(),
                     c.source,
                     span.0,
@@ -11215,11 +11270,44 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
     }
 }
 
+/// Emit `tyc::implicit_any` when `annotation` is a bare `list` / `dict` /
+/// `tuple` / `set` / `frozenset` sitting in a function signature slot
+/// (C2). `position` names the slot for the label — `parameter `d``,
+/// ``*args``, `return type`.
+///
+/// Annotated-assignment positions have their own emitting site in the
+/// `Stmt::AnnAssign` arm of `check_stmt`; this covers the signature half
+/// of Rule 1, where a bare collection is at its most damaging (it widens
+/// every call site *and* the whole body to `Any`).
+fn check_bare_collection_in_signature(c: &mut Checker, annotation: &Expr, position: &str) {
+    let Some(bare) = bare_collection_name(annotation) else {
+        return;
+    };
+    let span = (
+        annotation.range().start().to_usize(),
+        annotation.range().end().to_usize(),
+    );
+    let length = span.1.saturating_sub(span.0).max(1);
+    c.diagnostics.push_error(TycError::implicit_any(
+        bare,
+        Some(position),
+        c.path.clone(),
+        c.source,
+        span.0,
+        length,
+    ));
+}
+
 /// Enforce Rule 1: every parameter and return type must be annotated.
 /// The first positional named `self` or `cls` is exempted (the desugarer
 /// inserts unannotated receivers for `impl` methods, and explicit
 /// `self`/`cls` is idiomatic Python). `*args` / `**kwargs` are likewise
 /// not required to carry annotations.
+///
+/// An annotation that *is* present but bare (`d: dict`, `-> list`) is
+/// checked here too — it satisfies the letter of Rule 1 while smuggling
+/// an implicit `Any` element type through, so it fires
+/// `tyc::implicit_any` (C2).
 fn enforce_annotation_rule(
     c: &mut Checker,
     function: &str,
@@ -11241,37 +11329,49 @@ fn enforce_annotation_rule(
         }
     }
     for pwd in params_iter {
-        if pwd.parameter.annotation.is_none() {
-            let pname = pwd.parameter.name.as_str();
-            let span = (
-                pwd.parameter.range.start().to_usize(),
-                pwd.parameter.range.start().to_usize() + pname.len(),
-            );
-            c.diagnostics.push_error(TycError::missing_annotation(
-                function.to_owned(),
-                format!("parameter `{}`", pname),
-                c.path.clone(),
-                c.source,
-                span.0,
-                pname.len().max(1),
-            ));
+        let pname = pwd.parameter.name.as_str();
+        match pwd.parameter.annotation.as_deref() {
+            None => {
+                let span = (
+                    pwd.parameter.range.start().to_usize(),
+                    pwd.parameter.range.start().to_usize() + pname.len(),
+                );
+                c.diagnostics.push_error(TycError::missing_annotation(
+                    function.to_owned(),
+                    format!("parameter `{}`", pname),
+                    c.path.clone(),
+                    c.source,
+                    span.0,
+                    pname.len().max(1),
+                ));
+            }
+            Some(annotation) => {
+                let position = format!("parameter `{}`", pname);
+                check_bare_collection_in_signature(c, annotation, &position);
+            }
         }
     }
     for pwd in parameters.kwonlyargs.iter() {
-        if pwd.parameter.annotation.is_none() {
-            let pname = pwd.parameter.name.as_str();
-            let span = (
-                pwd.parameter.range.start().to_usize(),
-                pwd.parameter.range.start().to_usize() + pname.len(),
-            );
-            c.diagnostics.push_error(TycError::missing_annotation(
-                function.to_owned(),
-                format!("parameter `{}`", pname),
-                c.path.clone(),
-                c.source,
-                span.0,
-                pname.len().max(1),
-            ));
+        let pname = pwd.parameter.name.as_str();
+        match pwd.parameter.annotation.as_deref() {
+            None => {
+                let span = (
+                    pwd.parameter.range.start().to_usize(),
+                    pwd.parameter.range.start().to_usize() + pname.len(),
+                );
+                c.diagnostics.push_error(TycError::missing_annotation(
+                    function.to_owned(),
+                    format!("parameter `{}`", pname),
+                    c.path.clone(),
+                    c.source,
+                    span.0,
+                    pname.len().max(1),
+                ));
+            }
+            Some(annotation) => {
+                let position = format!("parameter `{}`", pname);
+                check_bare_collection_in_signature(c, annotation, &position);
+            }
         }
     }
 
@@ -11281,32 +11381,52 @@ fn enforce_annotation_rule(
     // — the canonical answer is `*args: object` / `**kwargs: object`
     // when the function is truly variadic.
     if let Some(vararg) = parameters.vararg.as_ref() {
-        if vararg.annotation.is_none() {
-            let pname = vararg.name.as_str();
-            let span_start = vararg.range.start().to_usize();
-            c.diagnostics.push_error(TycError::missing_annotation(
-                function.to_owned(),
-                format!("`*{}`", pname),
-                c.path.clone(),
-                c.source,
-                span_start,
-                pname.len().max(1),
-            ));
+        let pname = vararg.name.as_str();
+        match vararg.annotation.as_deref() {
+            None => {
+                let span_start = vararg.range.start().to_usize();
+                c.diagnostics.push_error(TycError::missing_annotation(
+                    function.to_owned(),
+                    format!("`*{}`", pname),
+                    c.path.clone(),
+                    c.source,
+                    span_start,
+                    pname.len().max(1),
+                ));
+            }
+            Some(annotation) => {
+                // `*args: T` annotates each *element*, so a bare `T` here
+                // is an implicit `Any` exactly as it is elsewhere — there
+                // is no legitimately-unparameterised variadic form in
+                // Typhon (`*args: object` is the canonical answer).
+                let position = format!("`*{}`", pname);
+                check_bare_collection_in_signature(c, annotation, &position);
+            }
         }
     }
     if let Some(kwarg) = parameters.kwarg.as_ref() {
-        if kwarg.annotation.is_none() {
-            let pname = kwarg.name.as_str();
-            let span_start = kwarg.range.start().to_usize();
-            c.diagnostics.push_error(TycError::missing_annotation(
-                function.to_owned(),
-                format!("`**{}`", pname),
-                c.path.clone(),
-                c.source,
-                span_start,
-                pname.len().max(1),
-            ));
+        let pname = kwarg.name.as_str();
+        match kwarg.annotation.as_deref() {
+            None => {
+                let span_start = kwarg.range.start().to_usize();
+                c.diagnostics.push_error(TycError::missing_annotation(
+                    function.to_owned(),
+                    format!("`**{}`", pname),
+                    c.path.clone(),
+                    c.source,
+                    span_start,
+                    pname.len().max(1),
+                ));
+            }
+            Some(annotation) => {
+                let position = format!("`**{}`", pname);
+                check_bare_collection_in_signature(c, annotation, &position);
+            }
         }
+    }
+
+    if let Some(returns_expr) = returns {
+        check_bare_collection_in_signature(c, returns_expr, "return type");
     }
 
     if returns.is_none() {
@@ -15372,11 +15492,33 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
             // async function silently read `.value` off the coroutine at
             // runtime. Either way `inside_await` exempts the `await expr?`
             // form. (FINDINGS: async-`?` missing-await.)
+            //
+            // Review 2026-07-25, finding C1: the two gates above between
+            // them left the *likeliest* forgotten `await` completely
+            // silent — one `async def` calling another and dropping the
+            // `await`. `async_without_await` only covered for it by
+            // accident (when the caller had no other `await` at all).
+            // The `else if` arm below closes that, deliberately narrowly:
+            // it fires only when the un-awaited coroutine flows into a
+            // slot annotated with the callee's *own return type*, which
+            // is never what a deliberate deferral looks like. See
+            // `unawaited_async_call_into_return_slot` for the full
+            // carve-out list (`let task = f()` … `await task`, `go`,
+            // `gather:`, `asyncio.create_task` / `gather` arguments).
             if (c.in_sync_function || c.in_question_temp_rhs) && c.inside_await == 0 {
                 if let Expr::Name(n) = call.func.as_ref() {
                     if c.async_functions.contains(n.id.as_str()) {
                         let span = (n.range.start().to_usize(), n.range.end().to_usize());
-                        c.missing_await(n.id.as_str(), span);
+                        c.missing_await(n.id.as_str(), MISSING_AWAIT_HINT_SYNC_CALLER, span);
+                    }
+                }
+            } else if c.inside_await == 0 {
+                if let Expr::Name(n) = call.func.as_ref() {
+                    if c.async_functions.contains(n.id.as_str())
+                        && unawaited_async_call_into_return_slot(&func_type, expected)
+                    {
+                        let span = (n.range.start().to_usize(), n.range.end().to_usize());
+                        c.missing_await(n.id.as_str(), MISSING_AWAIT_HINT_ASYNC_CALLER, span);
                     }
                 }
             }
@@ -21040,6 +21182,243 @@ def make() -> Config:
         );
     }
 
+    // ── C2: implicit_any covers function signature positions ──────────
+    //
+    // The signature position is the higher-leverage half of Rule 1: a
+    // bare `dict` there widens every call site AND the whole body to
+    // `Any`. Deliberate narrowing (2026-07-25 review, finding C2) — it
+    // rejects programs that ran correctly.
+
+    /// Collect every `ImplicitAny` diagnostic's `(kind, position)` pair.
+    fn implicit_any_positions(d: &Diagnostics) -> Vec<(String, String)> {
+        d.errors()
+            .iter()
+            .filter_map(|e| match e {
+                TycError::ImplicitAny { kind, position, .. } => {
+                    Some((kind.clone(), position.clone()))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn c2_bare_dict_parameter_errors() {
+        let src = "def keys_of(d: dict) -> list[str]:\n    return []\n";
+        let found = implicit_any_positions(&check(src));
+        assert!(
+            found
+                .iter()
+                .any(|(k, p)| k == "dict" && p.starts_with("parameter `d`")),
+            "expected ImplicitAny on parameter `d`; got {found:?}"
+        );
+    }
+
+    #[test]
+    fn c2_bare_list_return_errors() {
+        let src = "def keys_of(d: dict[str, int]) -> list:\n    return []\n";
+        let found = implicit_any_positions(&check(src));
+        assert!(
+            found
+                .iter()
+                .any(|(k, p)| k == "list" && p.starts_with("return type")),
+            "expected ImplicitAny on the return type; got {found:?}"
+        );
+    }
+
+    #[test]
+    fn c2_parameter_and_return_both_fire() {
+        // The reproduction from examples/errors — both halves reported.
+        let src = "def keys_of(d: dict) -> list:\n    return []\n";
+        let found = implicit_any_positions(&check(src));
+        assert_eq!(
+            found.len(),
+            2,
+            "expected exactly one diagnostic per bare slot; got {found:?}"
+        );
+    }
+
+    #[test]
+    fn c2_every_collection_head_fires_in_a_signature() {
+        for head in ["list", "dict", "tuple", "set", "frozenset"] {
+            let src = format!("def f(x: {head}) -> None:\n    return None\n");
+            let found = implicit_any_positions(&check(&src));
+            assert!(
+                found.iter().any(|(k, _)| k == head),
+                "bare `{head}` parameter must fire implicit_any; got {found:?}"
+            );
+            let src = format!("def g() -> {head}:\n    raise ValueError(\"x\")\n");
+            let found = implicit_any_positions(&check(&src));
+            assert!(
+                found.iter().any(|(k, _)| k == head),
+                "bare `{head}` return must fire implicit_any; got {found:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn c2_keyword_only_and_variadic_params_fire() {
+        // `*args: T` / `**kwargs: V` annotate the *element* type, so a
+        // bare head there is an implicit `Any` like anywhere else —
+        // Typhon has no legitimately-unparameterised variadic form
+        // (`*args: object` is the canonical answer). Keyword-only
+        // parameters route through their own loop and must fire too.
+        let src = "\
+def f(a: int, *args: tuple, key: dict, **kwargs: list) -> None:
+    return None
+";
+        let found = implicit_any_positions(&check(src));
+        assert!(
+            found
+                .iter()
+                .any(|(k, p)| k == "tuple" && p.contains("*args")),
+            "bare `*args: tuple` must fire; got {found:?}"
+        );
+        assert!(
+            found
+                .iter()
+                .any(|(k, p)| k == "dict" && p.starts_with("parameter `key`")),
+            "bare keyword-only `key: dict` must fire; got {found:?}"
+        );
+        assert!(
+            found
+                .iter()
+                .any(|(k, p)| k == "list" && p.contains("**kwargs")),
+            "bare `**kwargs: list` must fire; got {found:?}"
+        );
+    }
+
+    #[test]
+    fn c2_impl_method_signature_fires() {
+        // Methods declared in an `impl` block route through the same
+        // `check_function` path after the desugarer inserts `self`; the
+        // receiver skip must not swallow the first real parameter.
+        let src = "\
+class Bag:
+    label: str
+
+impl Bag:
+    def keys_of(self, d: dict) -> list:
+        return []
+";
+        let found = implicit_any_positions(&check(src));
+        assert!(
+            found
+                .iter()
+                .any(|(k, p)| k == "dict" && p.starts_with("parameter `d`")),
+            "bare `dict` parameter in an impl method must fire; got {found:?}"
+        );
+        assert!(
+            found
+                .iter()
+                .any(|(k, p)| k == "list" && p.starts_with("return type")),
+            "bare `list` return in an impl method must fire; got {found:?}"
+        );
+    }
+
+    #[test]
+    fn c2_async_def_signature_fires() {
+        let src = "async def load(d: dict) -> list:\n    return []\n";
+        let found = implicit_any_positions(&check(src));
+        assert_eq!(
+            found.len(),
+            2,
+            "`async def` signatures must be covered too; got {found:?}"
+        );
+    }
+
+    // ── C2: positions that must stay silent ───────────────────────────
+
+    #[test]
+    fn c2_parameterised_signature_is_clean() {
+        let src = "\
+def keys_of(d: dict[str, int], *rest: tuple[int, ...], **kw: list[str]) -> list[str]:
+    return []
+";
+        let found = implicit_any_positions(&check(src));
+        assert!(
+            found.is_empty(),
+            "fully parameterised signatures must stay clean; got {found:?}"
+        );
+    }
+
+    #[test]
+    fn c2_non_collection_annotations_stay_clean() {
+        // Only the five container heads are implicated. Scalars, user
+        // classes, and dotted/foreign names must not fire — a foreign
+        // `mod.dict` is not the builtin.
+        let src = "\
+import collections
+
+class Bag:
+    label: str
+
+def f(a: int, b: str, c: Bag, d: collections.OrderedDict) -> Bag:
+    return c
+";
+        let found = implicit_any_positions(&check(src));
+        assert!(
+            found.is_empty(),
+            "non-collection annotations must stay clean; got {found:?}"
+        );
+    }
+
+    #[test]
+    fn c2_lambda_carries_no_annotations() {
+        // Python lambdas cannot carry parameter or return annotations at
+        // all, so there is no signature slot to check — the form must
+        // simply not crash or false-fire.
+        let src = "\
+def main() -> None:
+    let f: Callable[[int], int] = lambda x: x + 1
+    print(f(1))
+";
+        let found = implicit_any_positions(&check(src));
+        assert!(
+            found.is_empty(),
+            "lambdas have no annotatable slots; got {found:?}"
+        );
+    }
+
+    #[test]
+    fn c2_synthesised_typhon_helpers_are_exempt() {
+        // Desugar-emitted `__typhon_*` bridges are already exempt from
+        // Rule 1 (the `!name.starts_with("__typhon_")` gate around
+        // `enforce_annotation_rule`); the signature check must inherit
+        // that exemption rather than blaming the user for compiler
+        // output.
+        let src = "def __typhon_bridge__(d: dict) -> list:\n    return []\n";
+        let found = implicit_any_positions(&check(src));
+        assert!(
+            found.is_empty(),
+            "compiler-synthesised helpers must stay exempt; got {found:?}"
+        );
+    }
+
+    #[test]
+    fn c2_fires_inside_unsafe_like_every_other_rule_1_check() {
+        // `unsafe:` is NOT a carve-out for Rule 1 diagnostics: both
+        // `tyc::missing_annotation` and the annotated-assignment half of
+        // `tyc::implicit_any` already fire inside an `unsafe:` region
+        // (verified against the shipped binary). The signature half is
+        // deliberately consistent with them. `unsafe:` relaxes *inferred*
+        // `Any`, not *declared* `Any`; the escape hatch for a genuinely
+        // untyped signature is `object`, or a `.dty` stub.
+        let src = "\
+def main() -> None:
+    unsafe:
+        def inner(d: dict) -> list:
+            return []
+        print(inner({}))
+";
+        let found = implicit_any_positions(&check(src));
+        assert_eq!(
+            found.len(),
+            2,
+            "Rule 1 signature checks are not suppressed by `unsafe:`; got {found:?}"
+        );
+    }
+
     // ── FINDINGS #68: generic ctor inference from sealed-union target ──
 
     #[test]
@@ -25264,6 +25643,199 @@ let s: str = id(3)
         assert!(
             !d.has_errors(),
             "regression: await on async def f() -> int must still be int; got {:?}",
+            d.errors()
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // Review 2026-07-25, finding C1 — a forgotten `await` inside another
+    // `async def`. The rule fires only when the un-awaited coroutine
+    // flows into a slot annotated with the callee's own return type; the
+    // deliberate-deferral shapes below must all stay legal.
+    // ---------------------------------------------------------------
+
+    fn has_missing_await(d: &Diagnostics) -> bool {
+        d.errors()
+            .iter()
+            .any(|e| matches!(e, TycError::MissingAwait { .. }))
+    }
+
+    /// `check`, but with the two concurrency sugar expansions that run
+    /// *ahead* of `preprocess` in the real pipeline (`tyc_db::
+    /// preprocessed_full`). `gather:` and `go` are rewritten there, not
+    /// inside `preprocess`, so a test that feeds either form through the
+    /// bare `check` helper hits a parse error instead of the lowering.
+    fn check_concurrency_sugar(src: &str) -> Diagnostics {
+        use tyc_syntax::preprocess::{expand_gather_blocks, expand_go_calls};
+        check(&expand_go_calls(&expand_gather_blocks(src)))
+    }
+
+    #[test]
+    fn missing_await_fires_in_async_caller_on_return_typed_binding() {
+        // C1, the hole itself: `run` awaits something else (so
+        // `async_without_await` stays quiet) and binds an un-awaited
+        // `fetch_a()` into a `dict[str, int]` slot — the callee's own
+        // return type. Runtime: "object of type 'coroutine' has no len()".
+        let d = check(
+            "import asyncio\n\
+             async def fetch_a() -> dict[str, int]:\n\
+             \x20   await asyncio.sleep(0)\n\
+             \x20   return {\"a\": 1}\n\
+             async def fetch_b() -> int:\n\
+             \x20   await asyncio.sleep(0)\n\
+             \x20   return 2\n\
+             async def run() -> int:\n\
+             \x20   let b: int = await fetch_b()\n\
+             \x20   let d: dict[str, int] = fetch_a()\n\
+             \x20   return len(d) + b\n",
+        );
+        assert!(
+            has_missing_await(&d),
+            "un-awaited async call into a return-typed slot must fire missing_await; got {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn missing_await_fires_in_async_caller_on_return_statement() {
+        // Same rule in return position — the declared return type is the
+        // annotation the coroutine is flowing into.
+        let d = check(
+            "async def fetch_a() -> int:\n\
+             \x20   return 1\n\
+             async def run() -> int:\n\
+             \x20   return fetch_a()\n",
+        );
+        assert!(
+            has_missing_await(&d),
+            "un-awaited async call in `return` position must fire missing_await; got {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn bind_now_await_later_stays_legal() {
+        // The deliberate-deferral pattern the rule is narrowed around:
+        // the binding carries no return-type annotation, so there is no
+        // evidence the author meant the value rather than the coroutine.
+        let d = check(
+            "async def fetch_a() -> dict[str, int]:\n\
+             \x20   return {\"a\": 1}\n\
+             async def run() -> int:\n\
+             \x20   let task = fetch_a()\n\
+             \x20   let data: dict[str, int] = await task\n\
+             \x20   return len(data)\n",
+        );
+        assert!(
+            !has_missing_await(&d),
+            "bind-now-await-later must stay legal; got {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn coroutine_passed_as_argument_stays_legal() {
+        // A coroutine handed to `asyncio.create_task` / `asyncio.gather`
+        // is correct: the parameter type is not the coroutine's return
+        // type, and `call_targets_coro_acceptor` bumps `inside_await`
+        // over the argument walk anyway.
+        let d = check(
+            "import asyncio\n\
+             async def fetch_b() -> int:\n\
+             \x20   return 2\n\
+             async def run() -> int:\n\
+             \x20   let t: asyncio.Task[int] = asyncio.create_task(fetch_b())\n\
+             \x20   let rs = await asyncio.gather(fetch_b(), fetch_b())\n\
+             \x20   let n: int = await t\n\
+             \x20   return n + len(rs)\n",
+        );
+        assert!(
+            !has_missing_await(&d),
+            "a coroutine passed as an argument must stay legal; got {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn gather_block_bindings_stay_legal() {
+        // `gather:` lowers to `_t_a = _tg.create_task(fetch_a())` — the
+        // bindings are awaited implicitly by the TaskGroup lowering, and
+        // the un-awaited call sits in an argument slot with no
+        // return-type annotation on it.
+        let d = check_concurrency_sugar(
+            "import asyncio\n\
+             async def fetch_a() -> dict[str, int]:\n\
+             \x20   return {\"a\": 1}\n\
+             async def fetch_b() -> int:\n\
+             \x20   return 2\n\
+             async def run() -> int:\n\
+             \x20   gather:\n\
+             \x20       a = fetch_a()\n\
+             \x20       b = fetch_b()\n\
+             \x20   return len(a) + b\n",
+        );
+        assert!(
+            !has_missing_await(&d),
+            "`gather:` bindings must stay legal; got {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn go_task_handle_stays_legal() {
+        // `go f(x) -> task` lowers to
+        // `task = typhon_runtime.tasks.spawn(f(x))`; the handle is
+        // awaited later.
+        let d = check_concurrency_sugar(
+            "async def fetch_b() -> int:\n\
+             \x20   return 2\n\
+             async def run() -> int:\n\
+             \x20   go fetch_b() -> handle\n\
+             \x20   let r: int = await handle\n\
+             \x20   return r\n",
+        );
+        assert!(
+            !has_missing_await(&d),
+            "`go … -> task` handles must stay legal; got {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn widening_slot_does_not_fire_missing_await() {
+        // `let x: object = fetch()` is legal Python — a coroutine *is* an
+        // object — so the rule requires type *equality*, not
+        // assignability, and stays quiet here.
+        let d = check(
+            "async def fetch_a() -> dict[str, int]:\n\
+             \x20   return {\"a\": 1}\n\
+             async def run() -> int:\n\
+             \x20   let anything: object = fetch_a()\n\
+             \x20   let d: dict[str, int] = await fetch_a()\n\
+             \x20   return len(d) + len(str(anything))\n",
+        );
+        assert!(
+            !has_missing_await(&d),
+            "a widening `object` slot must not fire missing_await; got {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn awaited_call_in_async_caller_stays_clean() {
+        // The corrected form of the C1 reproduction must be silent.
+        let d = check(
+            "import asyncio\n\
+             async def fetch_a() -> dict[str, int]:\n\
+             \x20   await asyncio.sleep(0)\n\
+             \x20   return {\"a\": 1}\n\
+             async def run() -> int:\n\
+             \x20   let d: dict[str, int] = await fetch_a()\n\
+             \x20   return len(d)\n",
+        );
+        assert!(
+            !d.has_errors(),
+            "the awaited form must stay clean; got {:?}",
             d.errors()
         );
     }

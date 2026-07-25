@@ -1,0 +1,23 @@
+# EXPECT-ERROR: tyc::implicit_any
+#
+# The signature half of `tyc::implicit_any`. A bare `dict` / `list` in a
+# *parameter* or *return* annotation satisfies the letter of Rule 1 — an
+# annotation is present — while smuggling an implicit `Any` element type
+# through the widest door in the language: it widens every call site *and*
+# every use in the body. `implicit_any.ty` in this directory covers the
+# annotated-assignment half (module bindings, locals, class fields).
+#
+# Both slots below fire, one diagnostic each.
+#
+# Fix in this file: `def keys_of(d: dict[str, int]) -> list[str]:`.
+
+
+def keys_of(d: dict) -> list:
+    return list(d.keys())
+
+
+def main() -> None:
+    print(keys_of({"a": 1}))
+
+
+main()

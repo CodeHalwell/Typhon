@@ -29,6 +29,7 @@ Static checks:
 
 - A function declared `async` with no `await` is `tyc::async_without_await` (warning).
 - A sync function calling an `async def` without `await` is `tyc::missing_await` (hard error).
+- Since v1.0.0-alpha.7, so is an `async` function calling another and dropping the `await` — but only when the un-awaited call flows into a slot annotated with the callee's *own return type* (`let d: dict[str, int] = fetch()`, or `return fetch()` from a matching `-> dict[str, int]`). Binding a coroutine to await later stays legal, since that shape never annotates the binding with the return type. See [Async errors](/Typhon/diagnostics/async-errors/).
 
 ## `gather:`
 
@@ -277,7 +278,11 @@ async def main() -> None:
     let body: str = fetch("...")    # ❌ coroutine, not str
 ```
 
-`tyc::missing_await`. Add `await`.
+`tyc::missing_await`. Add `await`. (This async-caller shape was silent before
+v1.0.0-alpha.7 — the page documented a diagnostic that only fired for *sync*
+callers.) To start a coroutine now and await it later, drop the return-type
+annotation (`let task = fetch("...")` … `await task`) or use
+`go` / `asyncio.create_task(...)`.
 
 ### `async` with no `await`
 

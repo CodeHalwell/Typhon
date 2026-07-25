@@ -1091,6 +1091,8 @@ def load_config(text: str) -> Result[Config, ConfigError]:
 ### Explicit `async`, not inferred
 
 - A sync function calling an `async` one without `await` is a **hard error** (`tyc::missing_await`).
+- **An `async` function calling another and dropping the `await` is also a hard error (v1.0.0-alpha.7)** — but only in the one shape that can never be a deliberate deferral: when the un-awaited call flows into a slot annotated with the coroutine's *own return type*. That means the annotation of a `let` / annotated assignment (`let d: dict[str, int] = fetch_a()`) or the enclosing function's declared return type at `return fetch_a()`. Type *equality* is required, not assignability, so a widening `let x: object = fetch_a()` stays legal (a coroutine really is an `object`). Before alpha.7 this case was completely silent; `tyc::async_without_await` only covered for it by accident, when the caller had no other `await`. The check keys on module-level `async def` names in the file being checked — async *methods* and imported async functions aren't covered.
+  - **Deliberate deferral stays legal** and is the documented way to bind now / await later: `let task = fetch_a()` (no annotation) … `await task`; `go fetch_a() -> handle` … `await handle`; `gather:` bindings; and a coroutine passed as an *argument* to `asyncio.create_task(...)` / `asyncio.gather(...)` / `asyncio.run(...)`.
 - An `async` function with no `await` is a **warning** (`tyc::async_without_await`).
 - Direct call to known-blocking stdlib (`time.sleep`, `requests.*`, `subprocess.run`, …) inside `async def` → **`tyc::blocking_in_async`** (warn).
 - `loop.run_until_complete(coro())` does NOT fire `tyc::missing_await` (v0.6.0).
@@ -1573,7 +1575,7 @@ The recurring diagnostic codes and what they actually mean. **See [DIAGNOSTICS.m
 | `tyc::no_block_shadow` | Inner `let`/`mut` would shadow an outer binding | Rename inner binding (no block scope in Python) |
 | `tyc::pattern_shadows_outer` | `case Wrap(value):` against outer `let value` | Rename the capture (`case Wrap(inner):`) |
 | `tyc::nullable_use` | Passing `T?` where `T` required | Narrow with `is None` / `guard` / early-return |
-| `tyc::missing_await` | Sync context calling `async def` | Add `await` and make caller `async` |
+| `tyc::missing_await` | Sync context calling `async def`; or (v1.0.0-alpha.7) an `async` caller binding an un-awaited async call into a slot annotated with the callee's own return type | Add `await` (and make a sync caller `async`). To defer on purpose, bind without the return-type annotation, or use `go` / `asyncio.create_task(...)` |
 | `tyc::async_without_await` (warn) | `async def` with no `await` inside | Drop `async` or await something |
 | `tyc::blocking_in_async` (warn) | Direct call to known-blocking stdlib inside `async def` | `asyncio.to_thread(...)` or async-native client. Suppressed inside `unsafe:` |
 | `tyc::manual_init` | `class` defines `__init__` | Remove it — constructor is generated |

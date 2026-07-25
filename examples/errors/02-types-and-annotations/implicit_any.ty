@@ -7,9 +7,8 @@
 #
 # Fix: `dict[str, int]`, `list[str]`, `set[int]`.
 #
-# NOTE: bare collections in *signature* positions (`def f(d: dict) -> list:`)
-# are a known gap and are silently accepted today — see
-# docs/diagnostics/implicit_any.md. Spell them out anyway.
+# Function parameter and return annotations are covered too — see
+# `bare_collection_in_signature.ty` in this directory.
 
 CACHE: dict = {}
 

@@ -273,14 +273,22 @@ pub enum TycError {
     #[diagnostic(
         code(tyc::implicit_any),
         url("https://github.com/CodeHalwell/Typhon/blob/main/docs/diagnostics/implicit_any.md"),
-        help("Spell out the element type so readers can see what the collection holds: `{kind}[<element-type>]`. For dicts use `dict[K, V]`; for tuples use `tuple[A, B, ...]` or `tuple[T, ...]` for a homogeneous tuple.")
+        help("{advice}")
     )]
     ImplicitAny {
         kind: String,
+        /// Rendered `help:` text. Built by the constructor so a signature
+        /// position can add the "widens every call site" nudge on top of
+        /// the shared "spell out the element type" advice.
+        advice: String,
         #[source_code]
         src: NamedSource<String>,
-        #[label("missing `[<element type>]`")]
+        /// Rendered label. Names the offending position (`parameter `d``,
+        /// `return type`) when the annotation sits in a function
+        /// signature; plain otherwise.
+        #[label("{position}")]
         span: SourceSpan,
+        position: String,
     },
 
     /// A second `let`/`mut` binding tries to shadow an outer binding
@@ -586,20 +594,31 @@ pub enum TycError {
         span: SourceSpan,
     },
 
-    /// A sync function called an `async def` without awaiting it. The
-    /// expression's value is a coroutine, not the function's declared
-    /// return type — and Python's runtime emits "coroutine was never
-    /// awaited" warnings for these. FINDINGS #49.
+    /// An `async def` was called without `await` in a position where the
+    /// coroutine object cannot be what the program meant. Two shapes fire
+    /// it:
+    ///
+    /// * a **sync** caller (or module scope) calling an `async def` at all
+    ///   — the expression's value is a coroutine, not the declared return
+    ///   type, and Python's runtime emits "coroutine was never awaited"
+    ///   (FINDINGS #49); and
+    /// * an **async** caller binding the un-awaited call into a slot
+    ///   annotated with the coroutine's own return type (review
+    ///   2026-07-25, finding C1) — deliberately deferring a coroutine
+    ///   stays legal, because that shape never annotates the binding with
+    ///   the return type.
+    ///
+    /// `hint` carries the per-site help so each shape gets advice that
+    /// actually applies to it.
     #[error("missing `await` on async call to `{callee}`")]
     #[diagnostic(
         code(tyc::missing_await),
         url("https://github.com/CodeHalwell/Typhon/blob/main/docs/diagnostics/missing_await.md"),
-        help(
-            "wrap the call in `await` (and make the caller `async`), or call `asyncio.run(...)` if you are at the top level"
-        )
+        help("{hint}")
     )]
     MissingAwait {
         callee: String,
+        hint: String,
         #[source_code]
         src: NamedSource<String>,
         #[label("this call returns a coroutine — `await` it")]
@@ -2065,17 +2084,39 @@ impl TycError {
     }
 
     /// Construct a [`TycError::ImplicitAny`] diagnostic.
+    ///
+    /// `position` names the offending slot when the bare annotation sits in
+    /// a function signature — `Some("parameter `d`")` / `Some("return
+    /// type")`. Pass `None` for an annotated binding (local, module-level,
+    /// or class field), which keeps the original label and help text.
     pub fn implicit_any(
         kind: impl Into<String>,
+        position: Option<&str>,
         path: impl Into<String>,
         source: impl Into<String>,
         offset: usize,
         length: usize,
     ) -> Self {
+        let kind = kind.into();
+        let advice = format!(
+            "Spell out the element type so readers can see what the collection holds: `{kind}[<element-type>]`. For dicts use `dict[K, V]`; for tuples use `tuple[A, B, ...]` or `tuple[T, ...]` for a homogeneous tuple.{}",
+            match position {
+                Some(_) => format!(
+                    " A bare `{kind}` in a signature is the widest `Any` entry point there is — it widens every call site *and* the whole function body."
+                ),
+                None => String::new(),
+            }
+        );
+        let position = match position {
+            Some(p) => format!("{p} — missing `[<element type>]`"),
+            None => "missing `[<element type>]`".to_owned(),
+        };
         Self::ImplicitAny {
-            kind: kind.into(),
+            kind,
+            advice,
             src: NamedSource::new(path.into(), source.into()),
             span: SourceSpan::new(SourceOffset::from(offset), length),
+            position,
         }
     }
 
@@ -2353,8 +2394,12 @@ impl TycError {
     }
 
     /// Construct a [`TycError::MissingAwait`] diagnostic.
+    ///
+    /// `hint` is the rendered help line; it differs between the
+    /// sync-caller and async-caller shapes (see [`TycError::MissingAwait`]).
     pub fn missing_await(
         callee: impl Into<String>,
+        hint: impl Into<String>,
         path: impl Into<String>,
         source: impl Into<String>,
         offset: usize,
@@ -2362,6 +2407,7 @@ impl TycError {
     ) -> Self {
         Self::MissingAwait {
             callee: callee.into(),
+            hint: hint.into(),
             src: NamedSource::new(path.into(), source.into()),
             span: SourceSpan::new(SourceOffset::from(offset), length),
         }

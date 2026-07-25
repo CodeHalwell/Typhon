@@ -118,7 +118,7 @@ def trace(f, *args, **kwargs):    # error since v0.9.0
 
 Bare collection annotation (`list`, `dict`, `tuple`, `set`, `frozenset`) without element-type parameters. `no-implicit-any = true` is the default; the flag is parsed for forward compat but today the check is always on.
 
-**Fires on annotated-assignment positions only** — locals, module bindings, and class-body fields:
+**Fires on annotated-assignment positions** — locals, module bindings, and class-body fields:
 
 ```ty
 let xs: list = [1, 2, 3]     # error
@@ -128,9 +128,20 @@ class Bag:
     items: list              # error
 ```
 
-**Known gap:** function *parameter* and *return* annotations are **not** covered — `def keys(d: dict) -> list:` is accepted with no diagnostic today. Write the parameters anyway; closing the gap would narrow the accepted surface, so it is tracked rather than applied silently.
+**…and on function signature positions** — every parameter (positional, keyword-only, `*args`, `**kwargs`) and the return annotation, on `def`, `async def`, and methods in `impl` / `extend` blocks:
 
-**Fix:** Spell parameters: `dict[str, int] -> list[str]`.
+```ty
+def keys(d: dict) -> list:   # two errors: parameter `d`, and the return type
+    return list(d.keys())
+```
+
+The signature position is the higher-leverage one — a bare `dict` there widens every call site *and* the whole function body to `Any`. The label names the offending slot (``parameter `d` ``, `return type`), so a multi-slot signature reports one diagnostic per bare head.
+
+**Does not fire on:** parameterised forms (`dict[str, int]`, `tuple[T, ...]`); non-container or dotted heads (`collections.OrderedDict`); compiler-synthesised `__typhon_*` helpers; lambdas (Python gives them no annotation slots); and third-party signatures recovered by venv introspection or a bundled stub (those are shapes, never source the checker walks — a dependency's bare `dict` is never blamed on your file). It **does** fire inside `unsafe:` and inside a `.dty`, deliberately and consistently with `tyc::missing_annotation` — `unsafe:` relaxes *inferred* `Any`, not *declared* `Any`.
+
+**Fix:** Spell parameters: `def keys(d: dict[str, int]) -> list[str]:`.
+
+Signature coverage landed after the 2026-07-25 review (finding C2) as a **deliberate narrowing** — it rejects programs that previously type-checked and ran correctly. Measured corpus impact when it landed: zero files beyond its own reproduction.
 
 ### `tyc::empty_collection_no_annotation` — warning (v0.8.0)
 
@@ -277,7 +288,9 @@ Contract exemption (v0.15.0): an awaitless `async def` is **not** warned when it
 
 ### `tyc::missing_await` — error
 
-A sync function calls an `async def` without awaiting it. The result is a coroutine, not the declared return value. `loop.run_until_complete(coro())` and `asyncio.run(coro())` are whitelisted (v0.6.0).
+An `async def` is called without `await` in a position where the coroutine object cannot be what was meant. The result is a coroutine, not the declared return value. Two shapes fire it.
+
+**1 — a sync caller** (or module scope) calling an `async def` at all. `loop.run_until_complete(coro())` and `asyncio.run(coro())` are whitelisted (v0.6.0).
 
 ```ty
 async def fetch() -> int: return 42
@@ -285,7 +298,31 @@ def main() -> int:
     return fetch()       # error
 ```
 
-**Fix:** `await` it inside an async caller, or `asyncio.run(...)` at the top level.
+**2 — an async caller binding into a return-typed slot** (v1.0.0-alpha.7). Before that release, one `async def` calling another and dropping the `await` was completely silent — `tyc::async_without_await` only covered for it by accident, when the caller happened to have no other `await`.
+
+```ty
+async def run() -> int:
+    let b: int = await fetch_b()
+    let d: dict[str, int] = fetch_a()   # error — runtime: 'coroutine' has no len()
+    return len(d) + b
+```
+
+The async-caller rule is **deliberately narrow**: it fires only when the un-awaited call flows into a slot annotated with the coroutine's *own return type* — the annotation of a `let` / annotated assignment, or the enclosing function's declared return type at `return f()`. Type *equality* is required, not assignability. Deliberate deferral therefore stays legal, and none of these fire:
+
+```ty
+let task = fetch_a()                      # no annotation …
+let data: dict[str, int] = await task     # … awaited later
+go fetch_a() -> handle                    # `go` spawns; handle awaited later
+gather:                                   # TaskGroup lowering
+    a = fetch_a()
+let t = asyncio.create_task(fetch_a())    # coroutine as an *argument*
+let rs = await asyncio.gather(fetch_a(), fetch_b())
+let anything: object = fetch_a()          # widening slot — a coroutine *is* an object
+```
+
+Limits: the check keys on module-level `async def` names declared in the file being checked. An un-awaited call to an `async` *method*, or to an async function imported from another module, is not covered.
+
+**Fix:** `await` it. From a sync caller, make the caller `async` or use `asyncio.run(...)` at the top level. To defer on purpose, drop the return-type annotation from the binding, or hand the coroutine to `asyncio.create_task(...)` / `asyncio.gather(...)` / `go f(...)`.
 
 ### `tyc::blocking_in_async` — warning (controlled by `[strictness] blocking-in-async`; v0.3.0)
 

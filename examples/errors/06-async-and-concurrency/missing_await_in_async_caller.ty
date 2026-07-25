@@ -1,0 +1,51 @@
+# EXPECT-ERROR: tyc::missing_await
+#
+# The sibling `missing_await.ty` covers a *sync* caller. This file covers the
+# likelier mistake: one `async def` calling another and forgetting the
+# `await`. `run` awaits `fetch_b`, so `tyc::async_without_await` — which used
+# to cover for this by accident — stays quiet, and before v1.0.0-alpha.7
+# `tyc check` reported absolutely nothing here. The emitted Python died with
+#
+#   TypeError: object of type 'coroutine' has no len()
+#   RuntimeWarning: coroutine 'fetch_a' was never awaited
+#
+# The rule is deliberately narrow, because binding a coroutine now and
+# awaiting it later is a legitimate, intentional pattern:
+#
+#     let task = fetch_a()      # bind now …
+#     let data = await task     # … await later
+#
+#     go fetch_a() -> handle    # `go` spawns; the handle is awaited later
+#     let r = await handle
+#
+# So inside an `async def` caller, `tyc::missing_await` fires only when the
+# un-awaited call flows into a slot annotated with the coroutine's *own
+# return type* — `let d: dict[str, int] = fetch_a()` below, and the
+# `return fetch_a()` shape. That never describes a deliberate deferral: a
+# deferred coroutine is bound without an annotation, or handed to
+# `asyncio.create_task(...)` / `asyncio.gather(...)` / `go`, never annotated
+# with the value it will eventually produce.
+#
+# Fix in this file: `let d: dict[str, int] = await fetch_a()`.
+
+
+import asyncio
+
+
+async def fetch_a() -> dict[str, int]:
+    await asyncio.sleep(0)
+    return {"a": 1}
+
+
+async def fetch_b() -> int:
+    await asyncio.sleep(0)
+    return 2
+
+
+async def run() -> int:
+    let b: int = await fetch_b()
+    let d: dict[str, int] = fetch_a()
+    return len(d) + b
+
+
+print(asyncio.run(run()))

@@ -478,6 +478,14 @@ error[tyc::missing_await]: cannot use a coroutine where `str` is required
 
 **Fix:** `let body: str = await fetch("...")` and make `main` `async`. Or at the top level, `asyncio.run(fetch(...))` — that path is whitelisted (v0.6.0).
 
+Since **v1.0.0-alpha.7** the same code fires when the caller is *already* `async` and the un-awaited call flows into a slot annotated with the callee's own return type (`let body: str = fetch("...")` inside an `async def`, and `return fetch("...")` from a `-> str` async function). Binding a coroutine to await later is still legal — that shape just never annotates the binding with the return type:
+
+```python
+let task = fetch("...")          # ✅ no annotation
+let body: str = await task
+go fetch("...") -> handle        # ✅ spawn now, await later
+```
+
 ---
 
 ## 24. Blocking I/O inside `async def`

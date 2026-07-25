@@ -72,13 +72,19 @@ If you are new to Typhon, three files carry most of the signal:
    — ordinary Python, and every habit it asks you to change.
 2. [`11-multi-error-programs/error_masking.ty`](11-multi-error-programs/error_masking.ty)
    — why a single misplaced `?` can hide every other error in a file.
-3. [`12-known-gaps/missing_await_in_async_caller.ty`](12-known-gaps/missing_await_in_async_caller.ty)
-   — the checker is strict, not omniscient; here is one place it is silent.
+3. [`06-async-and-concurrency/missing_await_in_async_caller.ty`](06-async-and-concurrency/missing_await_in_async_caller.ty)
+   — a forgotten `await` inside another `async def`, and why the rule that
+   catches it is narrower than "never leave a coroutine un-awaited".
 
 `12-known-gaps/` is the honest directory: code the compiler wrongly *accepts*
 and that fails at runtime anyway. Its entries are asserted to keep
 misbehaving, so fixing one fails the test — which is the prompt to delete or
-reclassify the file. (A `13-false-positives/` directory recording the mirror
+reclassify the file. It is **currently empty**: every gap it recorded has been
+closed, the last two being the silent missing `await` and `tyc::implicit_any`
+not covering function signatures (their reproductions now live in
+`06-async-and-concurrency/` and `02-types-and-annotations/`). The directory
+and its README are kept as the home for the next one. (A
+`13-false-positives/` directory recording the mirror
 case — valid programs the checker wrongly *rejected* — lived here until its
 last two entries, a `try`/`except`/`else` reachability hole and `case {}:`
 being treated as refutable, were fixed; both shapes are now regression tests

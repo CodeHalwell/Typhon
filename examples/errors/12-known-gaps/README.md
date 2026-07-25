@@ -1,5 +1,10 @@
 # Known gaps — programs that *should* fail to compile and don't
 
+**This directory is currently empty.** Every gap it recorded has been closed;
+the reproductions moved into the matching `NN-*/` directories with real
+`# EXPECT-ERROR:` headers. It is kept, with this README, as the home for the
+next one. The format below is what to follow when adding it.
+
 Every `.ty` file in this directory is broken: each one type-checks cleanly
 today and then fails at runtime. They are checked in deliberately, as
 executable documentation of where the type checker is currently silent.

@@ -1,3 +1,4 @@
+# EXPECT-ERROR: tyc::missing_await
 # EXPECT-ERROR: tyc::nullable_use
 # EXPECT-ERROR: tyc::type_mismatch
 # EXPECT-WARN: tyc::async_without_await
@@ -16,9 +17,11 @@
 #      this coroutine. Use `await asyncio.sleep(...)`.
 #   4. `summarise` is `async` but never awaits — `tyc::async_without_await`.
 #   5. `run` calls `fetch_batch(...)` without `await`. In CPython this binds a
-#      coroutine object and skips the work — but note that NO diagnostic fires
-#      for it, because `tyc::missing_await` only covers a *sync* caller. See
-#      ../12-known-gaps/missing_await_in_async_caller.ty.
+#      coroutine object and skips the work — `tyc::missing_await`. The caller
+#      is itself `async`, and the coroutine flows into a slot annotated with
+#      the callee's own return type (`dict[str, int]`), which is the shape
+#      that can never be a deliberate deferral. See
+#      ../06-async-and-concurrency/missing_await_in_async_caller.ty.
 #   6. `.get(...)` returns `int?`; `run` adds to it directly —
 #      `tyc::nullable_use`.
 #   7. `run` is annotated `-> int` but returns a `str` — `tyc::type_mismatch`.

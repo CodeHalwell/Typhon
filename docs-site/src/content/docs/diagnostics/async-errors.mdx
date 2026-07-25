@@ -26,6 +26,49 @@ def main() -> None:
     asyncio.run(main_async())
 ```
 
+### Inside another `async def` (v1.0.0-alpha.7)
+
+The likelier mistake is forgetting `await` in code that is *already* async — and
+until v1.0.0-alpha.7 that was completely silent (`tyc::async_without_await`
+only covered for it by accident, when the caller had no other `await`):
+
+```python
+async def run() -> int:
+    let b: int = await fetch_b()
+    let d: dict[str, int] = fetch_a()   # ❌ coroutine, not dict
+    return len(d) + b                   # TypeError at runtime
+```
+
+The rule here is **deliberately narrow**. It fires only when the un-awaited
+call flows into a slot annotated with the coroutine's *own return type* — the
+annotation on a `let` / annotated assignment, or the enclosing function's
+declared return type at `return f()`. Type *equality* is required, not
+assignability, so a widening `let x: object = fetch_a()` stays quiet (a
+coroutine really is an `object`).
+
+That means binding a coroutine now and awaiting it later — an intentional,
+supported pattern — keeps working, because it never annotates the binding with
+the value it will eventually produce:
+
+```python
+let task = fetch_a()                      # ✅ no annotation …
+let data: dict[str, int] = await task     #    … awaited later
+
+go fetch_a() -> handle                    # ✅ `go` spawns
+let r: dict[str, int] = await handle
+
+gather:                                   # ✅ TaskGroup lowering
+    a = fetch_a()
+    b = fetch_b()
+
+let t = asyncio.create_task(fetch_a())    # ✅ coroutine as an *argument*
+let rs = await asyncio.gather(fetch_a(), fetch_b())
+```
+
+The check keys on module-level `async def` names declared in the file being
+checked; an un-awaited call to an `async` *method*, or to an async function
+imported from another module, is not covered.
+
 ## `tyc::async_without_await` (warning)
 
 An `async def` contains no `await`:
