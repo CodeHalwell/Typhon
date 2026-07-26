@@ -26,3 +26,7 @@
 ## 2024-11-25 - Zero-Allocation `module_level_bound_names`
 **Learning:** `module_level_bound_names` in `tyc-desugar` originally created a new `HashSet<String>` by cloning string identifiers inside AST nodes. As this is used to verify `collections.abc` types inside hot paths, the repeated allocation of strings negatively impacted compilation times.
 **Action:** By bounding the lifetime of the `HashSet<&str>` to the incoming `&[Stmt]` reference, we can avoid String allocations entirely when building the `bound_names` set and rely on dereferencing pointers for fast lookups.
+
+## 2024-05-18 - Replacing HashSet<String> with HashSet<&str>
+**Learning:** In the Typhon codebase, many AST traversal functions in `tyc-analyse` and `tyc-desugar` temporarily track identifiers (e.g., globals, local mut bindings) using `HashSet<String>`. By refactoring these to use `HashSet<&str>` and extracting strings directly using `.as_str()` from the `ruff_python_ast` node types, we eliminate unnecessary heap allocations during these hot paths.
+**Action:** When implementing syntax tree traversals, always borrow the underlying strings (`&str`) unless an owned `String` is strictly required to escape a scope, especially in recurring tracking collections.
