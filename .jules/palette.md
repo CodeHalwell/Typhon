@@ -60,3 +60,6 @@
 ## 2024-05-16 - Equitable Focus States and Reduced Motion
 **Learning:** We need to pair existing `:hover` states with `:focus-visible` to ensure equitable visual feedback for keyboard users on interactive elements (like markdown links and starlight tabs). Additionally, when respecting `@media (prefers-reduced-motion: reduce)`, we must explicitly disable all associated CSS transitions using `transition: none;` on the affected elements.
 **Action:** Pair `:hover` with `:focus-visible` on interactive elements, and explicitly disable transitions under `@media (prefers-reduced-motion: reduce)` rules for any components with CSS transitions.
+## 2024-07-26 - Add missing transitions to Starlight cards
+**Learning:** In Astro/Starlight, interactive components like `.card` and `.sl-link-card` may rely heavily on hover styles (like `box-shadow` or `transform`) but omit the base `transition` property, causing abrupt visual snapping when a user interacts with them.
+**Action:** When adding or modifying custom hover/focus states on components—especially third-party Astro/Starlight components like `.sl-link-card`—always ensure the base class has corresponding `transition` properties defined in `custom.css` to prevent abrupt animations.
