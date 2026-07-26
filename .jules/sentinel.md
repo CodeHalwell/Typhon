@@ -27,3 +27,7 @@
 **Vulnerability:** Hardcoded secret detection was missing `APIKEY` due to partial overlap with `KEY` because `KEY` was evaluated before `APIKEY`.
 **Learning:** When scanning for secrets using keyword arrays, substrings (like `KEY`) must be placed after longer matches (like `APIKEY` or `API_KEY`) to prevent premature partial matches.
 **Prevention:** Always maintain hardcoded secret matching keywords in longest-first order.
+## $(date +%Y-%m-%d) - Python AST parsing requires valid identifiers in tests
+**Vulnerability:** When writing inline unit tests for static analyzers that parse source code (e.g., `tyc-analyse`), invalid identifiers (like `123PASSWORD`) cause AST parsing to panic with syntax errors (`invalid decimal literal`), preventing the tests from running and validating the security heuristic.
+**Learning:** Static analysis tools depend on the underlying language grammar (e.g., Python identifiers cannot start with a digit). A security boundary check designed to catch substrings adjacent to digits must be tested using valid syntax.
+**Prevention:** When writing inline tests in `tyc-analyse` that parse Python code snippets (e.g., testing `secret_literal` assignments), ensure the variable names are valid Python identifiers. Variables starting with digits (e.g., `123PASSWORD = "secret"`) will trigger an AST `ParseError`; use valid prefixes like `foo123PASSWORD = "secret"` instead.
