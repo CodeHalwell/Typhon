@@ -1539,14 +1539,19 @@ fn secret_suffix(name: &str) -> Option<&'static str> {
 
             let start_ok = actual_idx == 0
                 || upper.as_bytes()[actual_idx - 1] == b'_'
+                || name.as_bytes()[actual_idx - 1].is_ascii_digit()
                 || (name.as_bytes()[actual_idx].is_ascii_uppercase()
                     && name.as_bytes()[actual_idx - 1].is_ascii_lowercase());
 
             let actual_end = actual_idx + candidate.len();
             let end_ok = actual_end == upper.len()
                 || upper.as_bytes()[actual_end] == b'_'
+                || name.as_bytes()[actual_end].is_ascii_digit()
                 || (name.as_bytes()[actual_end].is_ascii_uppercase()
-                    && !name.as_bytes()[actual_end - 1].is_ascii_uppercase());
+                    && !name.as_bytes()[actual_end - 1].is_ascii_uppercase())
+                || (name.as_bytes()[actual_end].is_ascii_uppercase()
+                    && actual_end + 1 < name.len()
+                    && name.as_bytes()[actual_end + 1].is_ascii_lowercase());
 
             if start_ok && end_ok {
                 return Some(candidate);
@@ -4794,6 +4799,10 @@ let pet: Animal = Dog(name=\"Rex\")
         assert_eq!(secret_suffix("MyToken"), Some("TOKEN"));
         assert_eq!(secret_suffix("myTokenValue"), Some("TOKEN"));
         assert_eq!(secret_suffix("DB_PASSWORD"), Some("PASSWORD"));
+        assert_eq!(secret_suffix("dbPASSWORDString"), Some("PASSWORD"));
+        assert_eq!(secret_suffix("myPASSWORD123"), Some("PASSWORD"));
+        assert_eq!(secret_suffix("foo123PASSWORD"), Some("PASSWORD"));
+        assert_eq!(secret_suffix("PASSWORD123"), Some("PASSWORD"));
         assert_eq!(secret_suffix("client_secret"), Some("SECRET"));
         assert_eq!(secret_suffix("PWD"), Some("PWD"));
         assert_eq!(secret_suffix("API_KEY_FOO"), Some("API_KEY"));

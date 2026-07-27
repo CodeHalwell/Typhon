@@ -3575,13 +3575,18 @@ fn is_secret_name(name: &str) -> bool {
             // so `MONKEY` doesn't match `KEY` and `PASSPORT` doesn't match `PASS`.
             let start_ok = actual_idx == 0
                 || upper.as_bytes()[actual_idx - 1] == b'_'
+                || name.as_bytes()[actual_idx - 1].is_ascii_digit()
                 || (name.as_bytes()[actual_idx].is_ascii_uppercase()
                     && name.as_bytes()[actual_idx - 1].is_ascii_lowercase());
             let actual_end = actual_idx + word.len();
             let end_ok = actual_end == upper.len()
                 || upper.as_bytes()[actual_end] == b'_'
+                || name.as_bytes()[actual_end].is_ascii_digit()
                 || (name.as_bytes()[actual_end].is_ascii_uppercase()
-                    && !name.as_bytes()[actual_end - 1].is_ascii_uppercase());
+                    && !name.as_bytes()[actual_end - 1].is_ascii_uppercase())
+                || (name.as_bytes()[actual_end].is_ascii_uppercase()
+                    && actual_end + 1 < name.len()
+                    && name.as_bytes()[actual_end + 1].is_ascii_lowercase());
             if start_ok && end_ok {
                 return true;
             }
@@ -4786,6 +4791,10 @@ def use_np() -> object:
             "FOO_API_KEY_BAR = \"sk-foo\"\n",
             "KEY_APIKEY = \"sk-foo\"\n",
             "myTokenValue = \"sk-foo\"\n",
+            "dbPASSWORDString = \"sk-foo\"\n",
+            "myPASSWORD123 = \"sk-foo\"\n",
+            "foo123PASSWORD = \"sk-foo\"\n",
+            "PASSWORD123 = \"sk-foo\"\n",
             "APIKEY = \"123\"\n",
             "APITOKEN = \"abc\"\n",
             "APISECRET = \"abc\"\n",

@@ -27,3 +27,7 @@
 **Vulnerability:** Hardcoded secret detection was missing `APIKEY` due to partial overlap with `KEY` because `KEY` was evaluated before `APIKEY`.
 **Learning:** When scanning for secrets using keyword arrays, substrings (like `KEY`) must be placed after longer matches (like `APIKEY` or `API_KEY`) to prevent premature partial matches.
 **Prevention:** Always maintain hardcoded secret matching keywords in longest-first order.
+## 2024-10-27 - [Fix Secret Scanning Boundary Checks]
+**Vulnerability:** The hardcoded secret scanning logic (`is_secret_name` and `secret_suffix`) failed to detect secrets adjacent to numbers (e.g., `PASSWORD123`, `foo123PASSWORD`) or TitleCase word junctions (e.g., `dbPASSWORDString`).
+**Learning:** The boundary logic assumed valid separators were strictly underscores, start/end of strings, or lowercase-to-uppercase casing transitions. It didn't account for digits acting as separators or the transition at the end of an uppercase block back to a lowercase word (which signifies the start of the next camelCase/TitleCase word, like `S` in `String`).
+**Prevention:** When writing custom tokenization or substring boundary heuristics, explicitly test for alphanumeric transitions and ensure lookahead/lookbehind correctly models all valid case junction permutations, including digits.
