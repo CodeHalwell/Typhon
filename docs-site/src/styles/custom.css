@@ -221,12 +221,20 @@ textarea:focus-visible,
 }
 
 /* Starlight specific focus fixes */
+.sl-link-card {
+  transition: background 120ms ease, border-color 120ms ease, transform 120ms ease, box-shadow 120ms ease;
+}
+
 .sl-link-card:hover,
 .sl-link-card:focus-within {
   background: var(--sl-color-gray-7, var(--sl-color-gray-6));
   border-color: var(--sl-color-accent);
   transform: translateY(-2px);
   box-shadow: 0 4px 12px color-mix(in srgb, var(--sl-color-accent) 20%, transparent);
+}
+
+.sl-link-card .icon {
+  transition: color 120ms ease;
 }
 
 .sl-link-card:hover .icon,
