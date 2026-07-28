@@ -2021,7 +2021,18 @@ impl Interpreter {
             }
             return Ok(Ordering::Greater);
         }
-        Ok(a.py_cmp(b).unwrap_or(Ordering::Equal))
+        // An incomparable pair used to fall back to `Equal`, which is the
+        // worst possible answer: `sorted()` / `min()` / `max()` treat every
+        // element as tied and return the input *unsorted*, silently, with no
+        // error. CPython raises here, so raise here — the VM must not be the
+        // surface that quietly produces a wrong ordering.
+        a.py_cmp(b).ok_or_else(|| {
+            type_error(format!(
+                "'<' not supported between instances of '{}' and '{}'",
+                a.type_name(),
+                b.type_name()
+            ))
+        })
     }
 
     fn cmp_op(&mut self, op: CmpOp, l: &Value, r: &Value) -> Result<bool, Unwind> {

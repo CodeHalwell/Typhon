@@ -1122,6 +1122,34 @@ impl fmt::Debug for Value {
 
 // ── Conversion / introspection helpers ────────────────────────────────────
 
+/// Exact `float` → `BigInt` conversion with CPython's error behaviour.
+///
+/// Rust's `as` cast saturates (`1e30 as i64` is `i64::MAX`) and maps NaN to
+/// zero, so every out-of-range float silently became a wrong integer — in an
+/// interpreter whose defining property is that its integers are arbitrary
+/// precision. `BigInt::from_f64` truncates toward zero exactly like
+/// `int(x)` and returns `None` only for the values CPython refuses.
+fn float_to_bigint(x: f64) -> Result<BigInt, Unwind> {
+    if x.is_nan() {
+        return Err(Unwind::Exception(crate::error::VmException::new(
+            "ValueError",
+            "cannot convert float NaN to integer",
+        )));
+    }
+    if x.is_infinite() {
+        return Err(Unwind::Exception(crate::error::VmException::new(
+            "OverflowError",
+            "cannot convert float infinity to integer",
+        )));
+    }
+    BigInt::from_f64(x.trunc()).ok_or_else(|| {
+        Unwind::Exception(crate::error::VmException::new(
+            "ValueError",
+            format!("cannot convert float {x} to integer"),
+        ))
+    })
+}
+
 impl Value {
     pub fn type_name(&self) -> &'static str {
         match self {
@@ -1419,6 +1447,11 @@ impl Value {
             (Bool(a), Int(b)) => VmInt::from(*a as i64).partial_cmp(b),
             (Int(a), Bool(b)) => a.partial_cmp(&VmInt::from(*b as i64)),
             (Str(a), Str(b)) => a.partial_cmp(b),
+            // `bytes` is ordered in CPython (lexicographic over the byte
+            // values). Without this arm every bytes pair was "incomparable",
+            // which the `Equal` fallback in `value_cmp` then turned into
+            // "equal" — so `sorted([b"b", b"a"])` returned the list untouched.
+            (Bytes(a), Bytes(b)) => a.partial_cmp(b),
             (Tuple(a), Tuple(b)) => {
                 for (x, y) in a.iter().zip(b.iter()) {
                     match x.py_cmp(y)? {
@@ -1457,7 +1490,14 @@ impl Value {
                 ))
             }),
             Value::Bool(b) => Ok(*b as i64),
-            Value::Float(x) => Ok(*x as i64),
+            // Same saturation hazard as `to_bigint`: reject rather than
+            // silently clamp to `i64::MAX`.
+            Value::Float(x) => float_to_bigint(*x)?.to_i64().ok_or_else(|| {
+                Unwind::Exception(crate::error::VmException::new(
+                    "OverflowError",
+                    "Python int too large to convert to C int",
+                ))
+            }),
             Value::Str(s) => s
                 .trim()
                 .parse::<i64>()
@@ -1475,7 +1515,13 @@ impl Value {
         match self {
             Value::Int(i) => Ok(i.to_bigint()),
             Value::Bool(b) => Ok(BigInt::from(*b as i64)),
-            Value::Float(x) => Ok(BigInt::from(*x as i64)),
+            // `f64 as i64` in Rust *saturates* at `i64::MIN`/`i64::MAX` and
+            // maps NaN to 0, so `int(1e30)` silently produced
+            // 9223372036854775807 and `int(float("inf"))` produced the same
+            // instead of raising. The VM's whole point is arbitrary precision,
+            // and CPython raises `OverflowError` / `ValueError` here — so
+            // convert exactly and reject what has no integer value.
+            Value::Float(x) => float_to_bigint(*x),
             Value::Str(s) => s
                 .trim()
                 .parse::<BigInt>()

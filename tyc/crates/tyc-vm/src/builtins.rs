@@ -778,12 +778,22 @@ pub fn install(interp: &mut Interpreter) {
     native!("max", |i, args| reduce_minmax(i, args, false));
 
     native!("sum", |i, args| {
-        let it = i.make_iter(
-            args.into_iter()
-                .next()
-                .ok_or_else(|| type_error("sum() requires an iterable"))?,
-        )?;
-        let mut acc = Value::Int(VmInt::from(0));
+        let mut args = args.into_iter();
+        let iterable = args
+            .next()
+            .ok_or_else(|| type_error("sum() requires an iterable"))?;
+        // `sum(xs, start)` — the second positional argument was dropped on
+        // the floor, so the call returned a total short by exactly `start`
+        // with no error. (The keyword form `sum(xs, start=n)` is handled on
+        // the kwargs path.)
+        let mut acc = match args.next() {
+            Some(start) => start,
+            None => Value::Int(VmInt::from(0)),
+        };
+        if args.next().is_some() {
+            return Err(type_error("sum() takes at most 2 arguments"));
+        }
+        let it = i.make_iter(iterable)?;
         while let Some(v) = i.iter_next(&it)? {
             acc = i.binop(&acc, ruff_python_ast::Operator::Add, &v)?;
         }
@@ -1390,6 +1400,51 @@ fn value_len(v: &Value) -> Result<usize, Unwind> {
     })
 }
 
+/// Resolve the optional `start` / `end` positional arguments that CPython's
+/// search methods (`find`, `rfind`, `index`, `rindex`, `count`, `startswith`,
+/// `endswith`) accept after the needle, into a clamped `[start, end)` range
+/// over a sequence of `len` items.
+///
+/// These arguments were being dropped entirely: `single()` reads `args[0]`
+/// and ignores the rest, so `s.find(x, i)` searched from the beginning every
+/// time. That is not merely a wrong number — the canonical "scan for every
+/// occurrence" loop, `while (i := s.find(x, i + 1)) != -1:`, never advances,
+/// so it never terminates.
+///
+/// Python's rules: a negative index counts from the end, out-of-range values
+/// clamp rather than raise, and an inverted range is empty.
+fn search_range(args: &[Value], len: usize) -> Result<(usize, usize), Unwind> {
+    let resolve = |v: &Value, default: usize| -> Result<usize, Unwind> {
+        if matches!(v, Value::None) {
+            return Ok(default);
+        }
+        let i = v.to_int()?;
+        Ok(if i < 0 {
+            (len as i64 + i).max(0) as usize
+        } else {
+            (i as usize).min(len)
+        })
+    };
+    let start = match args.get(1) {
+        Some(v) => resolve(v, 0)?,
+        None => 0,
+    };
+    let end = match args.get(2) {
+        Some(v) => resolve(v, len)?,
+        None => len,
+    };
+    Ok((start, end.max(start)))
+}
+
+/// Byte offsets of the character range `[start, end)` within `s`, for
+/// re-slicing a string by CPython character indices.
+fn char_range_bytes(s: &str, start: usize, end: usize) -> (usize, usize) {
+    let mut it = s.char_indices().map(|(i, _)| i);
+    let bs = it.clone().nth(start).unwrap_or(s.len());
+    let be = it.nth(end).unwrap_or(s.len());
+    (bs, be)
+}
+
 pub(crate) fn is_instance_of(val: &Value, cls: &Value) -> bool {
     let want_name = match cls {
         Value::Native(n) => Some(n.name.to_owned()),
@@ -1404,7 +1459,15 @@ pub(crate) fn is_instance_of(val: &Value, cls: &Value) -> bool {
         return false;
     };
     match (name.as_str(), val) {
+        // Every value is an `object` — the root of Python's type hierarchy.
+        // Without this arm `isinstance(x, object)` was uniformly `False`,
+        // which silently inverts any control flow written around it.
+        ("object", _) => true,
         ("int", Value::Int(_)) => true,
+        // `bool` is a subclass of `int` in CPython, so `isinstance(True, int)`
+        // is `True` there. The VM answered `False`, taking the opposite branch
+        // from the compiled program on the same source.
+        ("int", Value::Bool(_)) => true,
         ("float", Value::Float(_)) => true,
         ("bool", Value::Bool(_)) => true,
         ("str", Value::Str(_)) => true,
@@ -2112,29 +2175,34 @@ fn make_math_module() -> Value {
                     Ok(Value::Float(single(&args, "sqrt")?.to_float()?.sqrt()))
                 }),
             ),
+            // `floor` / `ceil` / `trunc` all return a Python `int`, which is
+            // arbitrary-precision. Going through `as i64` saturated at
+            // `i64::MAX` for any |x| >= 2^63, so `math.floor(1e30)` silently
+            // produced 9223372036854775807 — a wrong answer with no error, in
+            // the one place the VM's bignum support is supposed to matter.
             (
                 "floor",
                 nf("floor", |_i, args| {
-                    Ok(Value::Int(VmInt::from(
-                        single(&args, "floor")?.to_float()?.floor() as i64,
-                    )))
+                    Value::Float(single(&args, "floor")?.to_float()?.floor())
+                        .to_bigint()
+                        .map(|b| Value::Int(VmInt::from(b)))
                 }),
             ),
             (
                 "ceil",
                 nf("ceil", |_i, args| {
-                    Ok(Value::Int(VmInt::from(
-                        single(&args, "ceil")?.to_float()?.ceil() as i64,
-                    )))
+                    Value::Float(single(&args, "ceil")?.to_float()?.ceil())
+                        .to_bigint()
+                        .map(|b| Value::Int(VmInt::from(b)))
                 }),
             ),
             (
                 "trunc",
                 nf("trunc", |_i, args| {
                     // Returns an int, consistent with CPython math.trunc.
-                    Ok(Value::Int(VmInt::from(
-                        single(&args, "trunc")?.to_float()?.trunc() as i64,
-                    )))
+                    Value::Float(single(&args, "trunc")?.to_float()?.trunc())
+                        .to_bigint()
+                        .map(|b| Value::Int(VmInt::from(b)))
                 }),
             ),
             (
@@ -5805,33 +5873,50 @@ fn str_method(
             };
             Value::Str(Rc::new(replaced))
         }
-        "startswith" => Value::Bool(s.starts_with(&single(args, "startswith")?.py_str())),
-        "endswith" => Value::Bool(s.ends_with(&single(args, "endswith")?.py_str())),
-        "find" => {
-            let needle = single(args, "find")?.py_str();
+        // Each of these takes optional `start` / `end` character offsets after
+        // the needle. They were ignored; see `search_range`.
+        "startswith" | "endswith" => {
+            let needle = single(args, name)?.py_str();
+            let (cs, ce) = search_range(args, s.chars().count())?;
+            let (bs, be) = char_range_bytes(s, cs, ce);
+            let window = &s[bs..be];
+            Value::Bool(if name == "startswith" {
+                window.starts_with(&needle)
+            } else {
+                window.ends_with(&needle)
+            })
+        }
+        "find" | "rfind" | "index" | "rindex" => {
+            let needle = single(args, name)?.py_str();
+            let (cs, ce) = search_range(args, s.chars().count())?;
+            let (bs, be) = char_range_bytes(s, cs, ce);
+            let window = &s[bs..be];
+            let hit = if name == "find" || name == "index" {
+                window.find(&needle)
+            } else {
+                window.rfind(&needle)
+            };
             // CPython indices are character offsets, but Rust's `str::find`
             // returns a byte offset. Convert so `s[s.find(x):]` matches
-            // CPython on non-ASCII text (the byte index is a char boundary).
-            Value::Int(VmInt::from(
-                s.find(&needle)
-                    .map(|i| s[..i].chars().count() as i64)
-                    .unwrap_or(-1),
-            ))
-        }
-        "rfind" => {
-            let needle = single(args, "rfind")?.py_str();
-            Value::Int(VmInt::from(
-                s.rfind(&needle)
-                    .map(|i| s[..i].chars().count() as i64)
-                    .unwrap_or(-1),
-            ))
+            // CPython on non-ASCII text (the byte index is a char boundary),
+            // and re-base onto the window's start.
+            match hit {
+                Some(i) => Value::Int(VmInt::from((cs + window[..i].chars().count()) as i64)),
+                None if name == "index" || name == "rindex" => {
+                    return Err(value_error("substring not found"))
+                }
+                None => Value::Int(VmInt::from(-1)),
+            }
         }
         "count" => {
             let needle = single(args, "count")?.py_str();
+            let (cs, ce) = search_range(args, s.chars().count())?;
+            let (bs, be) = char_range_bytes(s, cs, ce);
+            let window = &s[bs..be];
             if needle.is_empty() {
-                Value::Int(VmInt::from(s.chars().count() as i64 + 1))
+                Value::Int(VmInt::from(window.chars().count() as i64 + 1))
             } else {
-                Value::Int(VmInt::from(s.matches(&needle).count() as i64))
+                Value::Int(VmInt::from(window.matches(&needle).count() as i64))
             }
         }
         "isdigit" => Value::Bool(!s.is_empty() && s.chars().all(|c| c.is_ascii_digit())),
@@ -5862,21 +5947,6 @@ fn str_method(
                 })
                 .collect(),
         )),
-        "index" => {
-            let needle = single(args, "index")?.py_str();
-            // Char offset, not byte offset (see `find`).
-            match s.find(&needle) {
-                Some(i) => Value::Int(VmInt::from(s[..i].chars().count() as i64)),
-                None => return Err(value_error("substring not found")),
-            }
-        }
-        "rindex" => {
-            let needle = single(args, "rindex")?.py_str();
-            match s.rfind(&needle) {
-                Some(i) => Value::Int(VmInt::from(s[..i].chars().count() as i64)),
-                None => return Err(value_error("substring not found")),
-            }
-        }
         "isnumeric" | "isdecimal" => {
             Value::Bool(!s.is_empty() && s.chars().all(|c| c.is_numeric()))
         }
@@ -7777,11 +7847,21 @@ pub fn call_with_kwargs(
                     return Err(type_error(format!("sum() got unexpected keyword: '{}'", k)));
                 }
             }
-            let it = interp.make_iter(
-                args.into_iter()
-                    .next()
-                    .ok_or_else(|| type_error("sum() requires an iterable"))?,
-            )?;
+            let mut args = args.into_iter();
+            let iterable = args
+                .next()
+                .ok_or_else(|| type_error("sum() requires an iterable"))?;
+            // `sum(xs, start)` — CPython accepts `start` positionally as well
+            // as by keyword. Only the keyword form was read, so the positional
+            // one was silently discarded and the call returned a total short
+            // by exactly `start`, with no error.
+            if let Some(start) = args.next() {
+                acc = start;
+            }
+            if args.next().is_some() {
+                return Err(type_error("sum() takes at most 2 arguments"));
+            }
+            let it = interp.make_iter(iterable)?;
             while let Some(v) = interp.iter_next(&it)? {
                 acc = interp.binop(&acc, ruff_python_ast::Operator::Add, &v)?;
             }
