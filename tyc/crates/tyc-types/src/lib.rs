@@ -9114,7 +9114,20 @@ fn effective_class_shape(
         seen.push(name.to_owned());
         let direct = class_shapes.get(name)?;
         let mut merged = InterfaceShape::default();
-        for base in &direct.bases {
+        // Bases are visited **right-to-left**, which is what makes the
+        // accumulated `field_order` match `@dataclass`'s reverse-MRO
+        // collection (and therefore match what `tyc-desugar` now emits and
+        // what CPython actually constructs). Left-to-right — the previous
+        // behaviour — put `class C(A, B)`'s fields in the order
+        // `a…, b…, own`, while `dataclasses.fields()` reports `b…, a…, own`,
+        // so the checker validated positional arguments against a signature
+        // the runtime did not have.
+        //
+        // Right-to-left recursion coincides with `mro::field_collection_order`
+        // on every hierarchy CPython accepts; the shared helper is not called
+        // here only because this walk is over `InterfaceShape` bases, which
+        // include names resolved across module boundaries.
+        for base in direct.bases.iter().rev() {
             if let Some(base_shape) = build(base, class_shapes, depth + 1, seen) {
                 for fname in &base_shape.field_order {
                     if !merged.fields.contains_key(fname) {
@@ -9152,10 +9165,16 @@ fn effective_class_shape(
                 merged.field_defaults.remove(fname);
             }
         }
-        // Methods / bases on the merged shape stay empty — the only
-        // callers of this helper read fields / field_order /
-        // field_defaults. Keeping methods empty avoids a misleading
-        // member surface if a downstream consumer reads it.
+        // Methods on the merged shape stay empty — the callers of this
+        // helper read fields / field_order / field_defaults, and an empty
+        // method map avoids presenting a misleading member surface.
+        //
+        // `bases`, however, must be carried through. The constructor-shape
+        // check reads it to recognise a Pydantic `model` (whose `__init__`
+        // is keyword-only), and dropping it made every model look like a
+        // plain dataclass again — silently undoing that check for exactly
+        // the classes it exists for.
+        merged.bases = direct.bases.clone();
         seen.pop();
         Some(merged)
     }
@@ -9373,6 +9392,36 @@ fn class_constructor_arity_for(shape: &InterfaceShape, class_name: Option<&str>)
         Some(name) => Type::Class(name.to_owned()),
         None => Type::Unknown,
     };
+    // A `model X:` emits `class X(BaseModel):`, and Pydantic's
+    // `BaseModel.__init__` is `(self, **data)` — **keyword-only**. Modelling
+    // its fields as positional meant `ApiUser(1, "alice")` type-checked clean
+    // and then raised `TypeError: BaseModel.__init__() takes 1 positional
+    // argument but 3 were given` the moment it ran. Re-file the fields as
+    // keyword-only so the arity check matches the constructor that actually
+    // exists.
+    //
+    // This narrows the accepted surface, but only for programs that were
+    // already guaranteed to raise at runtime — the alpha.2 carve-out.
+    if shape.bases.iter().any(|b| b == "BaseModel") {
+        return ArityInfo {
+            param_names: Vec::new(),
+            min_positional: 0,
+            required_positional: Vec::new(),
+            max_positional: Some(0),
+            kwonly_names: shape.field_order.clone(),
+            kwonly_required: shape
+                .field_order
+                .iter()
+                .filter(|name| !shape.field_defaults.contains(*name))
+                .cloned()
+                .collect(),
+            has_kwarg: false,
+            vararg_type: None,
+            param_types: Vec::new(),
+            kwonly_types: param_types,
+            return_type,
+        };
+    }
     ArityInfo {
         param_names: shape.field_order.clone(),
         min_positional,
@@ -16019,7 +16068,15 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
                             || (!c.is_plain_class(&name)
                                 && !c.is_raw_class(&name)
                                 && c.class_hierarchy_fully_known(&name));
-                        if !info.param_names.is_empty() || shape_is_authoritative {
+                        // `kwonly_names` matters as much as `param_names`
+                        // here: a `model` class files every field as
+                        // keyword-only (Pydantic's `__init__` is `**data`), so
+                        // reading only `param_names` would skip the check for
+                        // exactly the classes that need it.
+                        if !info.param_names.is_empty()
+                            || !info.kwonly_names.is_empty()
+                            || shape_is_authoritative
+                        {
                             match check_arity_with_info(&info, pos_args, kw_args) {
                                 ArityCheck::Ok => {}
                                 ArityCheck::UnknownKwarg { .. } => {
@@ -18459,6 +18516,113 @@ impl[T] Box[T]:
                 .any(|e| matches!(e, TycError::TypeMismatch { .. })),
             "valid attribute writes must stay green; got {:?}",
             d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn multiple_inheritance_field_order_follows_reverse_mro() {
+        // `@dataclass` builds `__dataclass_fields__` from the reverse MRO, so
+        // for `class C(A, B)` the constructor is `C(b1, a1, a2, c1)` — not the
+        // left-to-right `C(a1, a2, b1, c1)` the emitted body used to read.
+        // Positional construction in the *wrong* (old) order must now be
+        // rejected, or a green build silently writes each argument into the
+        // wrong field.
+        let wrong = check(
+            r#"
+class A:
+    a1: int
+    a2: str
+
+class B:
+    b1: float
+
+class C(A, B):
+    c1: bool
+
+def go() -> None:
+    let bad: C = C(1, "x", 2.0, True)
+    print(bad)
+"#,
+        );
+        assert!(
+            wrong
+                .errors()
+                .iter()
+                .any(|e| matches!(e, TycError::TypeMismatch { .. })),
+            "declaration-order positional construction must be rejected"
+        );
+
+        let right = check(
+            r#"
+class A:
+    a1: int
+    a2: str
+
+class B:
+    b1: float
+
+class C(A, B):
+    c1: bool
+
+def go() -> None:
+    let good: C = C(2.0, 1, "x", True)
+    print(good)
+"#,
+        );
+        assert!(
+            !right
+                .errors()
+                .iter()
+                .any(|e| matches!(e, TycError::TypeMismatch { .. })),
+            "reverse-MRO positional construction must be accepted; got {:?}",
+            right
+                .errors()
+                .iter()
+                .map(|e| e.to_string())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn model_constructors_are_keyword_only() {
+        // `model X:` emits `class X(BaseModel):`, and Pydantic's
+        // `BaseModel.__init__` is `(self, **data)`. Positional construction
+        // type-checked clean and then raised TypeError on the first run.
+        let positional = check(
+            r#"
+model ApiUser:
+    id: int
+    name: str
+
+def go() -> None:
+    let u: ApiUser = ApiUser(1, "alice")
+    print(u)
+"#,
+        );
+        assert!(
+            !positional.errors().is_empty(),
+            "positional construction of a `model` must be rejected"
+        );
+
+        let keyword = check(
+            r#"
+model ApiUser:
+    id: int
+    name: str
+
+def go() -> None:
+    let u: ApiUser = ApiUser(id=1, name="alice")
+    print(u)
+"#,
+        );
+        assert!(
+            keyword.errors().is_empty(),
+            "keyword construction of a `model` must stay green; got {:?}",
+            keyword
+                .errors()
+                .iter()
+                .map(|e| e.to_string())
+                .collect::<Vec<_>>()
         );
     }
 

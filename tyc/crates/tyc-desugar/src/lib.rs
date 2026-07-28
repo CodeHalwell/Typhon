@@ -3953,9 +3953,15 @@ fn make_extend_patch_stmts(target: &str, methods: &[Stmt]) -> Vec<Stmt> {
 /// Recurses into nested function/class bodies so a class defined inside a
 /// function still benefits from this transformation.
 fn inherit_parent_fields(body: Vec<Stmt>) -> Vec<Stmt> {
-    // First pass: collect each class's own field annotations, indexed by name.
+    // First pass: collect each class's own field annotations, indexed by name,
+    // plus its direct bases so the MRO can be reconstructed.
     let mut field_map: HashMap<String, Vec<Stmt>> = HashMap::new();
-    fn collect_fields(stmts: &[Stmt], field_map: &mut HashMap<String, Vec<Stmt>>) {
+    let mut parents: HashMap<String, Vec<String>> = HashMap::new();
+    fn collect_fields(
+        stmts: &[Stmt],
+        field_map: &mut HashMap<String, Vec<Stmt>>,
+        parents: &mut HashMap<String, Vec<String>>,
+    ) {
         for stmt in stmts {
             if let Stmt::ClassDef(c) = stmt {
                 let mut fields: Vec<Stmt> = Vec::new();
@@ -3967,15 +3973,29 @@ fn inherit_parent_fields(body: Vec<Stmt>) -> Vec<Stmt> {
                     }
                 }
                 field_map.insert(c.name.as_str().to_owned(), fields);
-                collect_fields(&c.body, field_map);
+                parents.insert(
+                    c.name.as_str().to_owned(),
+                    c.bases()
+                        .iter()
+                        .filter_map(|b| match b {
+                            Expr::Name(n) => Some(n.id.as_str().to_owned()),
+                            _ => None,
+                        })
+                        .collect(),
+                );
+                collect_fields(&c.body, field_map, parents);
             } else if let Stmt::FunctionDef(f) = stmt {
-                collect_fields(&f.body, field_map);
+                collect_fields(&f.body, field_map, parents);
             }
         }
     }
-    collect_fields(&body, &mut field_map);
+    collect_fields(&body, &mut field_map, &mut parents);
 
-    fn rewrite(stmts: Vec<Stmt>, field_map: &HashMap<String, Vec<Stmt>>) -> Vec<Stmt> {
+    fn rewrite(
+        stmts: Vec<Stmt>,
+        field_map: &HashMap<String, Vec<Stmt>>,
+        parents: &HashMap<String, Vec<String>>,
+    ) -> Vec<Stmt> {
         stmts
             .into_iter()
             .map(|stmt| match stmt {
@@ -3983,44 +4003,76 @@ fn inherit_parent_fields(body: Vec<Stmt>) -> Vec<Stmt> {
                     // Recurse so a class defined inside another class
                     // body is also rewritten.
                     let inner = std::mem::take(&mut c.body);
-                    c.body = rewrite(inner, field_map);
+                    c.body = rewrite(inner, field_map, parents);
 
-                    // Names already declared as fields on `c` — never
-                    // shadow a child field with the parent's annotation.
-                    let mut own_field_names: std::collections::HashSet<String> =
-                        std::collections::HashSet::new();
+                    // The class's own field annotations, keyed by name, so a
+                    // re-declared parent field can be re-sited (see below).
+                    let mut own_fields: HashMap<String, Stmt> = HashMap::new();
                     for s in &c.body {
                         if let Stmt::AnnAssign(a) = s {
                             if let Expr::Name(n) = a.target.as_ref() {
-                                own_field_names.insert(n.id.as_str().to_owned());
+                                own_fields.insert(n.id.as_str().to_owned(), s.clone());
                             }
                         }
                     }
 
-                    // Walk every direct base name; prepend the
-                    // matching parent's fields (skip any name the
-                    // child already declares). Bases are walked in
-                    // declaration order so the resulting body reads
-                    // [base_a fields, base_b fields, own fields,
-                    // methods].
+                    // Inherited field order must be **reverse MRO**, because
+                    // that is how `@dataclass` builds `__dataclass_fields__`:
+                    // it walks `cls.__mro__[-1:0:-1]` updating a dict, then
+                    // adds the class's own annotations.
+                    //
+                    // Walking direct bases left-to-right instead — which is
+                    // what this did — silently scrambles the positional
+                    // constructor for multiple inheritance. For
+                    // `class C(A, B)` with `A(a1: int, a2: str)` and
+                    // `B(b1: float)`, the emitted body read `a1, a2, b1, c1`
+                    // while `dataclasses.fields()` reported `b1, a1, a2, c1`,
+                    // so `C(1, "x", 2.0, True)` wrote the int into `b1`, the
+                    // str into `a1` and the float into `a2` — wrong-field
+                    // writes, or a TypeError at import, from a green build.
+                    //
+                    // A re-declared parent field keeps the *parent's*
+                    // position (a dict `update` on an existing key does not
+                    // move it) while taking the *child's* annotation, so it is
+                    // emitted here and removed from the child's own block.
+                    let ancestors =
+                        tyc_syntax::mro::field_collection_order(c.name.as_str(), parents);
+
                     let mut inherited: Vec<Stmt> = Vec::new();
-                    for base in c.bases() {
-                        if let Expr::Name(n) = base {
-                            if let Some(parent_fields) = field_map.get(n.id.as_str()) {
-                                for pf in parent_fields {
-                                    if let Stmt::AnnAssign(a) = pf {
-                                        if let Expr::Name(nf) = a.target.as_ref() {
-                                            if own_field_names.contains(nf.id.as_str()) {
-                                                continue;
-                                            }
-                                            own_field_names.insert(nf.id.as_str().to_owned());
-                                            inherited.push(pf.clone());
-                                        }
-                                    }
-                                }
+                    let mut placed: std::collections::HashSet<String> =
+                        std::collections::HashSet::new();
+                    for ancestor in &ancestors {
+                        let Some(parent_fields) = field_map.get(ancestor) else {
+                            continue;
+                        };
+                        for pf in parent_fields {
+                            let Stmt::AnnAssign(a) = pf else { continue };
+                            let Expr::Name(nf) = a.target.as_ref() else {
+                                continue;
+                            };
+                            let fname = nf.id.as_str();
+                            if !placed.insert(fname.to_owned()) {
+                                continue;
                             }
+                            // A child re-declaration overrides the type but
+                            // not the position.
+                            inherited
+                                .push(own_fields.get(fname).cloned().unwrap_or_else(|| pf.clone()));
                         }
                     }
+                    // Drop the child's own copies of re-declared fields; they
+                    // have been re-sited into `inherited` at the parent's
+                    // position.
+                    if !inherited.is_empty() {
+                        c.body.retain(|s| match s {
+                            Stmt::AnnAssign(a) => match a.target.as_ref() {
+                                Expr::Name(n) => !placed.contains(n.id.as_str()),
+                                _ => true,
+                            },
+                            _ => true,
+                        });
+                    }
+
                     if !inherited.is_empty() {
                         // FINDINGS #22: a `class!` subclass gets a synthesised
                         // `__init__` during `desugar_stmts`, *before* these
@@ -4057,14 +4109,14 @@ fn inherit_parent_fields(body: Vec<Stmt>) -> Vec<Stmt> {
                 }
                 Stmt::FunctionDef(mut f) => {
                     let inner = std::mem::take(&mut f.body);
-                    f.body = rewrite(inner, field_map);
+                    f.body = rewrite(inner, field_map, parents);
                     Stmt::FunctionDef(f)
                 }
                 other => other,
             })
             .collect()
     }
-    rewrite(body, &field_map)
+    rewrite(body, &field_map, &parents)
 }
 
 /// Rewrite a `class!`'s synthesised `__init__` so it also accepts and
