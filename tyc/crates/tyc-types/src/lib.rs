@@ -6870,6 +6870,111 @@ fn collect_names_in_expr(expr: &Expr) -> std::collections::HashSet<&str> {
     v.names
 }
 
+/// True when `ty` still mentions an unbound type parameter anywhere.
+///
+/// Used as a bail-out: a field whose type is still generic has no single
+/// concrete answer at this site, so checking it would be guessing.
+fn mentions_type_param(ty: &Type) -> bool {
+    match ty {
+        Type::TypeVar(_) | Type::TypeConstructor(..) => true,
+        Type::Union(xs) => xs.iter().any(mentions_type_param),
+        Type::Generic(_, args) => args.iter().any(mentions_type_param),
+        Type::Function { params, ret, .. } => {
+            params.iter().any(mentions_type_param) || mentions_type_param(ret)
+        }
+        _ => false,
+    }
+}
+
+/// Type-check `receiver.field = value`.
+///
+/// Instance-attribute assignment was never checked, which left a hole at the
+/// centre of the language: `self.field = v` is the *mandated* idiom — methods
+/// live in `impl` blocks and write through `self` — so the single most common
+/// assignment form in idiomatic Typhon accepted any type at all. A `str` into
+/// an `int` field passed `tyc check`, emitted, and corrupted the field.
+///
+/// Every gate below exists because attribute assignment is also the position
+/// where the checker knows *least*, and a false positive here would reject
+/// working code at the same central idiom. In order:
+///
+/// * `unsafe:` regions are exempt, like every other check.
+/// * A `partial` shape (venv-introspected, or a bundled stub) lists only the
+///   members introspection happened to see; an absent field there means
+///   "unknown", not "wrong".
+/// * An absent field is not an error: `plain class` / `class!` may carry a
+///   hand-written `__init__` that creates attributes this table never saw.
+///   Reads are covered separately by `tyc::attribute_not_found`.
+/// * Anything still mentioning a type parameter — on either side — is skipped:
+///   inside `impl[T] Box[T]:` the field type is literally `T`, and the
+///   assigned value's type is whatever the caller will pin it to.
+/// * `Unknown` on either side is the checker admitting it does not know.
+///
+/// What survives all of that is the case where a concrete field type and a
+/// concrete value type are both known and genuinely incompatible.
+fn check_attr_assign_type(c: &mut Checker, target: &Expr, value_type: &Type) {
+    if c.unsafe_depth > 0 {
+        return;
+    }
+    let Expr::Attribute(attr) = target else {
+        return;
+    };
+    if matches!(value_type, Type::Unknown) {
+        return;
+    }
+    let recv = infer_expr_readonly(c, &attr.value);
+    // A nullable receiver is already reported as `tyc::nullable_use`; peel the
+    // `| None` so the field check still applies to the underlying class rather
+    // than double-reporting or silently skipping.
+    let (class_name, targs) = match recv.strip_none() {
+        Type::Class(name) => (name, Vec::new()),
+        Type::Generic(name, args) => (name, args),
+        _ => return,
+    };
+    let Some(shape) = c.class_shapes.get(&class_name).cloned() else {
+        return;
+    };
+    if shape.partial {
+        return;
+    }
+    let Some(field_ty) = shape.fields.get(attr.attr.as_str()).cloned() else {
+        return;
+    };
+    // Substitute the receiver's type arguments into the field type, so a
+    // `Box[int]`'s `value: T` field is checked as `int`. When the receiver is
+    // bare (`Type::Class`) or the arity does not line up, the bindings map
+    // stays empty and the `mentions_type_param` gate below drops the check.
+    let mut bindings = std::collections::HashMap::new();
+    if let Some(tparams) = c.class_type_params.get(&class_name) {
+        if tparams.len() == targs.len() {
+            for (p, a) in tparams.iter().zip(targs.iter()) {
+                bindings.insert(p.clone(), a.clone());
+            }
+        }
+    }
+    let field_ty = substitute_typevars(&field_ty, &bindings);
+    if matches!(field_ty, Type::Unknown)
+        || mentions_type_param(&field_ty)
+        || mentions_type_param(value_type)
+    {
+        return;
+    }
+    if c.is_assignable(&field_ty, value_type) {
+        return;
+    }
+    let span_start = attr.attr.range.start().to_usize();
+    let span_end = attr.attr.range.end().to_usize();
+    let length = span_end.saturating_sub(span_start).max(1);
+    c.diagnostics.push_error(TycError::type_mismatch(
+        field_ty.display(),
+        value_type.display(),
+        c.path.clone(),
+        c.source,
+        span_start,
+        length,
+    ));
+}
+
 fn check_attr_assign_not_frozen(c: &mut Checker, target: &Expr) {
     if c.frozen_classes.is_empty() || c.unsafe_depth > 0 {
         return;
@@ -10303,6 +10408,7 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
             }
             for target in &a.targets {
                 check_attr_assign_not_frozen(c, target);
+                check_attr_assign_type(c, target, &value_type);
                 audit_record_field_set(c, target);
                 if let Expr::Name(n) = target {
                     let span = (
@@ -18291,6 +18397,71 @@ mod tests {
     /// `ClassKind::Raw`). Required for any test exercising plain-/raw-class
     /// awareness in the checker (manual_init / class_attr_shadows_slot /
     /// attribute_not_found suppression).
+    #[test]
+    fn attribute_assignment_is_type_checked() {
+        // `self.field = v` is the mandated idiom — methods live in `impl`
+        // blocks and write through `self` — and it was never type-checked.
+        let d = check(
+            r#"
+class Counter:
+    total: int
+
+impl Counter:
+    def broken(self) -> None:
+        self.total = "nope"
+"#,
+        );
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::TypeMismatch { .. })),
+            "wrong-typed attribute write must be rejected; got {:?}",
+            d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn attribute_assignment_keeps_valid_writes_green() {
+        // The gates that keep this from false-positiving at the language's
+        // most common assignment position: primitive widening, a subclass
+        // into a base-typed field, `None` into `T?`, and a field whose type
+        // is still a free type parameter inside `impl[T]`.
+        let d = check(
+            r#"
+class Animal:
+    name: str
+
+class Dog(Animal):
+    breed: str
+
+class Holder:
+    ratio: float
+    pet: Animal
+    tag: str?
+
+impl Holder:
+    def go(self) -> None:
+        self.ratio = 3
+        self.pet = Dog(name="Rex", breed="Husky")
+        self.tag = None
+
+class Box[T]:
+    value: T
+
+impl[T] Box[T]:
+    def put(self, v: T) -> None:
+        self.value = v
+"#,
+        );
+        assert!(
+            !d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::TypeMismatch { .. })),
+            "valid attribute writes must stay green; got {:?}",
+            d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
     fn check_class_kinds(src: &str) -> Diagnostics {
         use tyc_resolve::{resolve_module_with, ResolveOptions};
         let prep = preprocess(src);
