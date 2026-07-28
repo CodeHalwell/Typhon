@@ -3335,6 +3335,20 @@ impl<'a> Checker<'a> {
                 }
             }
         }
+        // Union → Union. Neither single-sided arm below handles this shape:
+        // the expected-Union arm asks whether the *whole* actual union fits
+        // one expected variant, and the actual-Union arm asks whether every
+        // actual variant fits the whole expected union but is only reached
+        // when `expected` is not itself a union. So `Dog?` → `Animal?` (and
+        // `Circle?` → a sealed `Shape?`, `Button?` → `Drawable?`, `UserId?`
+        // → `int?`) were rejected. The correct rule is member-wise: every
+        // actual variant must be assignable to at least one expected
+        // variant. Strictly a relaxation — it can only accept more.
+        if let (Type::Union(exp_variants), Type::Union(act_variants)) = (expected, actual) {
+            return act_variants
+                .iter()
+                .all(|a| exp_variants.iter().any(|e| self.is_assignable(e, a)));
+        }
         // For Union expected types (e.g. `Shape | None`), `assignable` recurses
         // using only the base rules. Re-check each variant here so sealed-union
         // knowledge is available in the recursive call.

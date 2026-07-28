@@ -22,7 +22,7 @@
 //! [`INTROSPECT_SCRIPT`]) so the LSP has nothing to install at the
 //! Python side.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
@@ -97,6 +97,23 @@ pub struct IntrospectionCache {
     /// failure so we don't re-launch Python for the same broken
     /// module-name within one session.
     cache: HashMap<String, Option<Arc<Vec<MemberInfo>>>>,
+    /// Top-level import names this cache is permitted to introspect: the
+    /// project's declared dependencies (exactly the set `tyc check` uses)
+    /// plus the Python stdlib.
+    ///
+    /// Introspection *imports* the named module in a subprocess, running its
+    /// import-time code. Without this gate, opening a `.ty` file that merely
+    /// names a module was enough to execute it — so a repository could ship
+    /// an `evil.py` beside a `.ty` that imports it and get code execution
+    /// from the act of opening the folder in an editor. The CLI has always
+    /// had this gate; this copy did not.
+    allowed_top_level: HashSet<String>,
+    /// Working directory for the introspection subprocess. Deliberately
+    /// **not** the project root: with the project root as cwd, Python's
+    /// `sys.path[0]` is the project itself, so an attacker-controlled
+    /// `<root>/json.py` shadows the stdlib module of the same name and runs
+    /// instead of it. An empty scratch directory has nothing to shadow with.
+    cwd: PathBuf,
     /// Per-module failure reason (kept only for cache entries whose
     /// value is `None`). Lets the LSP surface "torch.nn import
     /// failed in <python>" diagnostics instead of silently showing
@@ -109,18 +126,17 @@ impl IntrospectionCache {
     /// and return a fresh cache. `project_root` is the directory
     /// containing `typhon.toml`.
     pub fn for_project_root(project_root: &Path) -> Self {
-        let venv_python = project_root.join(".venv").join("bin").join("python");
         let venv_stamp = stat_pyvenv_cfg(project_root);
-        let python_bin = if venv_python.is_file() {
-            Some(venv_python)
-        } else {
-            which_python3()
-        };
         Self {
-            python_bin,
+            // Shared with the CLI: honours `TYC_NO_INTROSPECT` and probes the
+            // Windows venv layout. This used to be a second, weaker copy that
+            // did neither.
+            python_bin: tyc_venv::discover_python(project_root),
             venv_stamp,
             cache: HashMap::new(),
             failures: HashMap::new(),
+            allowed_top_level: introspection_allow_list(project_root),
+            cwd: scratch_cwd(),
         }
     }
 
@@ -161,13 +177,19 @@ impl IntrospectionCache {
             self.failures.clear();
             self.venv_stamp = current_stamp;
             // Also re-discover the venv: a new `uv sync` may have
-            // materialised one where there wasn't before.
-            let venv_python = project_root.join(".venv").join("bin").join("python");
-            self.python_bin = if venv_python.is_file() {
-                Some(venv_python)
-            } else {
-                which_python3()
-            };
+            // materialised one where there wasn't before. A `uv sync` also
+            // means new packages, so refresh the allow-list with it.
+            self.python_bin = tyc_venv::discover_python(project_root);
+            self.allowed_top_level = introspection_allow_list(project_root);
+        }
+        // Allow-list gate. Refuse to import anything the project has not
+        // declared as a dependency and that is not stdlib — importing it is
+        // arbitrary code execution, and a completion request is not consent
+        // to run a stranger's module. Recorded as a plain miss (no failure
+        // hint) so the editor shows no completions rather than an error.
+        let top = module.split('.').next().unwrap_or(module);
+        if !may_introspect(&self.allowed_top_level, top) {
+            return None;
         }
         // Cache check — `None` value short-circuits repeated failures,
         // `Some` returns the result.
@@ -180,7 +202,7 @@ impl IntrospectionCache {
             self.cache.insert(module.to_owned(), None);
             return None;
         };
-        let (result, failure) = introspect_via_python(&python, module);
+        let (result, failure) = introspect_via_python(&python, &self.cwd, module);
         let result_arc = result.map(Arc::new);
         if result_arc.is_none() {
             if let Some(reason) = failure {
@@ -203,18 +225,40 @@ fn stat_pyvenv_cfg(project_root: &Path) -> Option<SystemTime> {
     std::fs::metadata(&cfg).ok().and_then(|m| m.modified().ok())
 }
 
-/// Find a `python3` on the user's PATH using a small portable lookup.
-/// Returns the first matching entry; `None` when the PATH has nothing
-/// callable named `python3`.
-fn which_python3() -> Option<PathBuf> {
-    let path_var = std::env::var_os("PATH")?;
-    for dir in std::env::split_paths(&path_var) {
-        let candidate = dir.join("python3");
-        if candidate.is_file() {
-            return Some(candidate);
-        }
+/// The project's declared dependencies — the same allow-list `tyc check`
+/// computes from `[dependencies]` + `[dev-dependencies]`, expanded through
+/// installed `.dist-info` metadata so packages whose import root differs from
+/// their PyPI name (`beautifulsoup4` → `bs4`) are covered.
+fn introspection_allow_list(project_root: &Path) -> HashSet<String> {
+    tyc_venv::allowed_top_level_from_project(project_root)
+}
+
+/// True when the editor may introspect `top`.
+///
+/// Two arms, and the split is the trust boundary. **Stdlib** is always
+/// allowed: `os.` / `json.` completions are the common case, no project
+/// declares those as dependencies, and importing them is not a trust decision
+/// — it is code that ships with the interpreter the user already chose to run.
+/// **Declared dependencies** are allowed because declaring a package in
+/// `typhon.toml` is the act of consent. Everything else — including a module
+/// that merely happens to sit next to the file being edited — is refused.
+fn may_introspect(allowed: &HashSet<String>, top: &str) -> bool {
+    tyc_analyse::perf::is_stdlib_top_level(top) || allowed.contains(top)
+}
+
+/// A directory to run the introspection subprocess in that contains nothing
+/// importable. Python prepends the script's directory (for `python -`, the
+/// current directory) to `sys.path`, so running in the project root lets any
+/// `.py` file there shadow the module being introspected. The system temp
+/// directory is not ideal either but is not attacker-chosen per project;
+/// falling back to the root directory keeps the call infallible.
+fn scratch_cwd() -> PathBuf {
+    let dir = std::env::temp_dir().join("tyc-lsp-introspect");
+    if std::fs::create_dir_all(&dir).is_ok() {
+        dir
+    } else {
+        std::env::temp_dir()
     }
-    None
 }
 
 /// Embedded Python helper. Reads the module name from `sys.argv[1]`,
@@ -368,6 +412,7 @@ main()
 /// re-block on the next keystroke.
 fn introspect_via_python(
     python: &Path,
+    cwd: &Path,
     module: &str,
 ) -> (Option<Vec<MemberInfo>>, Option<IntrospectionFailure>) {
     // We feed the script over stdin rather than `-c "<code>"` to avoid
@@ -379,6 +424,10 @@ fn introspect_via_python(
     let mut child = match Command::new(python)
         .arg("-")
         .arg(module)
+        // Run outside the project tree. With the project root as cwd,
+        // Python puts it on `sys.path`, so a file named after a stdlib
+        // module (`<root>/json.py`) is imported in place of the real one.
+        .current_dir(cwd)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
@@ -524,11 +573,69 @@ mod tests {
         let root = tmp.path();
         std::fs::write(root.join("typhon.toml"), "").unwrap();
         let mut cache = IntrospectionCache::for_project_root(root);
-        let _first = cache.members(root, "definitely_not_a_real_module_xyz");
-        let _second = cache.members(root, "definitely_not_a_real_module_xyz");
+        // Use a stdlib name: an undeclared, non-stdlib module is now refused
+        // by the allow-list before it ever reaches the cache, so it would
+        // never produce an entry to assert on.
+        let _first = cache.members(root, "os");
+        let _second = cache.members(root, "os");
         // Either both succeed or both fail; either way the cache size
         // must be exactly 1 after two lookups of the same name.
         assert_eq!(cache.cache.len(), 1);
+    }
+
+    #[test]
+    fn undeclared_module_is_never_introspected() {
+        // The security property: naming a module in a `.ty` file must not be
+        // enough to make the editor import it. Only stdlib and the project's
+        // declared dependencies are importable.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(
+            root.join("typhon.toml"),
+            "[project]\nname = \"p\"\n\n[dependencies]\nrich = \"*\"\n",
+        )
+        .unwrap();
+        let mut cache = IntrospectionCache::for_project_root(root);
+
+        // Not declared, not stdlib → refused, and nothing is cached (so no
+        // subprocess was spawned and none will be on a repeat lookup).
+        assert!(cache.members(root, "evil_local_module").is_none());
+        assert!(cache.cache.is_empty());
+
+        // A submodule of an undeclared package is refused on its top level.
+        assert!(cache.members(root, "evil_local_module.sub").is_none());
+        assert!(cache.cache.is_empty());
+
+        // Declared and stdlib names pass the gate (whether the subsequent
+        // import succeeds depends on the machine, so only the gate is
+        // asserted — a cache entry means we got past it).
+        assert!(may_introspect(&cache.allowed_top_level, "rich"));
+        assert!(may_introspect(&cache.allowed_top_level, "os"));
+        assert!(!may_introspect(
+            &cache.allowed_top_level,
+            "evil_local_module"
+        ));
+    }
+
+    #[test]
+    fn tyc_no_introspect_disables_the_editor_path_too() {
+        // `SECURITY.md` documents `TYC_NO_INTROSPECT` as disabling dependency
+        // introspection. It used to disable only the CLI's — the editor kept
+        // executing dependency import-time code past the kill-switch.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(root.join("typhon.toml"), "").unwrap();
+
+        // SAFETY: single-threaded test body; the var is removed before return.
+        unsafe { std::env::set_var("TYC_NO_INTROSPECT", "1") };
+        let cache = IntrospectionCache::for_project_root(root);
+        let disabled = cache.python_bin().is_none();
+        unsafe { std::env::remove_var("TYC_NO_INTROSPECT") };
+
+        assert!(
+            disabled,
+            "TYC_NO_INTROSPECT must leave the LSP with no interpreter to shell to"
+        );
     }
 
     /// Integration test: only runs when `python3` is on PATH. Verifies
@@ -536,10 +643,10 @@ mod tests {
     /// `getcwd` with a reasonable kind.
     #[test]
     fn introspects_os_module_when_python_available() {
-        let Some(python) = which_python3() else {
+        let Some(python) = tyc_venv::which_python3_for_test() else {
             return;
         };
-        let (members, failure) = introspect_via_python(&python, "os");
+        let (members, failure) = introspect_via_python(&python, &scratch_cwd(), "os");
         let members = match members {
             Some(m) => m,
             None => return,
@@ -557,11 +664,14 @@ mod tests {
         // Sanity check: failed introspection captures a reason instead
         // of silently returning a bare `None`, so the LSP can offer
         // the user a useful "did you mean to install …?" hint.
-        let Some(python) = which_python3() else {
+        let Some(python) = tyc_venv::which_python3_for_test() else {
             return;
         };
-        let (members, failure) =
-            introspect_via_python(&python, "definitely_not_a_real_module_xyz_typhon");
+        let (members, failure) = introspect_via_python(
+            &python,
+            &scratch_cwd(),
+            "definitely_not_a_real_module_xyz_typhon",
+        );
         assert!(members.is_none());
         assert!(matches!(
             failure,

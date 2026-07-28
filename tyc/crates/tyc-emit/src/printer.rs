@@ -855,6 +855,21 @@ impl Emitter {
 
     // ── expressions ────────────────────────────────────────────────────────
 
+    /// Emit `expr` as an operand of a construct whose own precedence is
+    /// `parent_prec`, parenthesising it when it does not bind strictly
+    /// tighter. This is the shared guard for the operand positions that
+    /// `expr_precedence` alone cannot express, because the parent is not a
+    /// `BinOp`.
+    fn emit_operand_above(&mut self, expr: &Expr, parent_prec: u8) {
+        if operand_precedence(expr) <= parent_prec {
+            self.write("(");
+            self.emit_expr(expr);
+            self.write(")");
+        } else {
+            self.emit_expr(expr);
+        }
+    }
+
     pub fn emit_expr(&mut self, node: &Expr) {
         match node {
             Expr::BoolOp(b) => {
@@ -966,10 +981,19 @@ impl Emitter {
             }
 
             // `IfExp` is now `Expr::If`.
+            //
+            // Python's grammar is
+            //   conditional_expression ::= or_test ["if" or_test "else" expression]
+            // so the body and the test must bind tighter than a conditional
+            // (they are `or_test`s), while the `else` arm is a full
+            // `expression` and needs no guard — that is what makes chained
+            // ternaries and a trailing lambda emit correctly. Without the
+            // guard, `(a if p else b) if q else c` re-emits as
+            // `a if p else b if q else c`, which regroups to the right.
             Expr::If(i) => {
-                self.emit_expr(&i.body);
+                self.emit_operand_above(&i.body, IF_EXP_PRECEDENCE);
                 self.write(" if ");
-                self.emit_expr(&i.test);
+                self.emit_operand_above(&i.test, IF_EXP_PRECEDENCE);
                 self.write(" else ");
                 self.emit_expr(&i.orelse);
             }
@@ -1072,7 +1096,15 @@ impl Emitter {
             }
 
             Expr::Compare(c) => {
-                self.emit_expr(&c.left);
+                // Every operand of a comparison must bind tighter than the
+                // comparison itself. Without this guard `(a if p else b) == c`
+                // re-emits as `a if p else b == c`, which Python parses as
+                // `a if p else (b == c)` — a different program that still
+                // compiles, and `(x := 1) == 1` re-emits as unparseable
+                // Python. Chained comparisons arrive as a single `Compare`
+                // node, so a nested `Compare` operand can only have come from
+                // explicit parens in the source and must keep them.
+                self.emit_operand_above(&c.left, COMPARE_PRECEDENCE);
                 for (op, right) in c.ops.iter().zip(c.comparators.iter()) {
                     let op_str = match op {
                         CmpOp::Eq => " == ",
@@ -1087,7 +1119,7 @@ impl Emitter {
                         CmpOp::NotIn => " not in ",
                     };
                     self.write(op_str);
-                    self.emit_expr(right);
+                    self.emit_operand_above(right, COMPARE_PRECEDENCE);
                 }
             }
 
@@ -1824,6 +1856,23 @@ fn bin_op_precedence(op: &Operator) -> u8 {
 /// `not` has very low precedence in Python (between `and` and comparisons),
 /// so it is distinguished from the arithmetic unary operators which sit
 /// just below `**`.
+/// Precedence of a conditional expression (`x if c else y`).
+const IF_EXP_PRECEDENCE: u8 = 2;
+/// Precedence of a comparison chain (`a < b <= c`).
+const COMPARE_PRECEDENCE: u8 = 6;
+
+/// `expr_precedence` extended with the forms that cannot appear as a `BinOp`
+/// child without already being a syntax error, but *can* appear as an operand
+/// of a comparison or a conditional — and which therefore still need parens
+/// there. A bare `x := 1` or `yield v` in a comparison operand is a hard
+/// SyntaxError, not merely a regrouping.
+fn operand_precedence(expr: &Expr) -> u8 {
+    match expr {
+        Expr::Named(_) | Expr::Yield(_) | Expr::YieldFrom(_) => 0,
+        _ => expr_precedence(expr),
+    }
+}
+
 fn expr_precedence(expr: &Expr) -> u8 {
     match expr {
         Expr::Lambda(_) => 1,

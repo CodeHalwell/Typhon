@@ -47,11 +47,23 @@ To inspect an untrusted project without executing any of its dependencies:
 - **`TYC_NO_INTROSPECT=1`** disables venv dependency introspection entirely, in
   both the CLI and the language server. Third-party calls fall back to being
   type-checked leniently, but no project package is imported.
+  (Before v1.0.0-alpha.7 the language server had its own introspection path
+  that did not read this variable, so the kill-switch only covered the CLI. The
+  editor now shares the CLI's interpreter discovery, so the guarantee holds on
+  both surfaces.)
 - **`--no-sync` / `TYC_NO_SYNC=1`** on `tyc build` skips `uv sync`, so no
   dependency is installed.
 
 Set both when working with code you don't trust, and avoid attaching the
 language server until you do.
+
+Independently of those switches, introspection is limited to an allow-list:
+the Python standard library plus the packages the project declares in
+`[dependencies]` / `[dev-dependencies]`. A module that is merely *named* by a
+`.ty` file — including one sitting next to it in the repository — is never
+imported. The introspection subprocess also runs in an empty scratch
+directory rather than the project root, so a file named after a stdlib module
+cannot shadow it on `sys.path`.
 
 ## Supported versions
 

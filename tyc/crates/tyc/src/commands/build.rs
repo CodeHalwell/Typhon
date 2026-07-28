@@ -1093,9 +1093,44 @@ pub fn run(args: BuildArgs) -> Result<()> {
         // will replace this when the ruff vendor fork lands in Phase 3.
         if do_format {
             let path_str = path.to_string_lossy().into_owned();
-            if let Ok(result) = format_source(&python_src, &path_str) {
-                python_src = result.output;
-            }
+            // Do NOT swallow the error. `format_source` fails when its own
+            // parse step rejects the buffer, which means the emitter produced
+            // something that is not valid Python — exactly the condition the
+            // build must not exit 0 on.
+            let result = format_source(&python_src, &path_str).map_err(|e| {
+                miette!(
+                    "internal error: formatting the Python emitted from '{}' failed: {e}\n\
+                     This is a compiler bug — the emitted output is not valid Python. \
+                     Please report it at https://github.com/CodeHalwell/Typhon/issues",
+                    path.display()
+                )
+            })?;
+            python_src = result.output;
+        }
+
+        // Post-emit parse gate.
+        //
+        // "Every `.ty` file emits valid `.py`" is the project's central
+        // promise, and until now nothing checked it: a printer bug (missing
+        // parens, a botched string escape, a preprocessor rewrite inside a
+        // string literal) produced unparseable Python and the build still
+        // exited 0. Re-parse the bytes we are about to write with the same
+        // vendored parser the front end uses, and fail loudly if they do not
+        // round-trip.
+        //
+        // This runs *before* the PEP 810 native-lazy-import rewrite below,
+        // deliberately: that pass stamps `lazy import …` onto the buffer, and
+        // no parser — vendored or upstream — accepts that syntax on a
+        // pre-3.15 grammar. The rewrite only ever prefixes an existing,
+        // already-validated `import` line, so gating ahead of it loses no
+        // coverage.
+        if let Err(err) = tyc_syntax::parse_module(&python_src) {
+            return Err(miette!(
+                "internal error: the Python emitted from '{}' does not parse: {err}\n\
+                 This is a compiler bug — `tyc` must never write invalid Python. \
+                 Please report it at https://github.com/CodeHalwell/Typhon/issues",
+                path.display()
+            ));
         }
 
         // PEP 810 native lazy-import lowering (3.15+ targets only). The

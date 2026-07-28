@@ -298,7 +298,13 @@ pub fn which_python3_for_test() -> Option<PathBuf> {
 /// The venv interpreter lives at `.venv/bin/python` on Unix and
 /// `.venv\Scripts\python.exe` on Windows; both are probed so third-party
 /// introspection and editor completion work on every shipped platform.
-fn discover_python(project_root: &Path) -> Option<PathBuf> {
+///
+/// This is the **only** supported way to obtain an interpreter for
+/// introspection. It is public so `tyc-lsp` shares it rather than keeping a
+/// second discovery path — a duplicate that, before this was hoisted, did not
+/// honour `TYC_NO_INTROSPECT` and so executed dependency import-time code past
+/// a kill-switch `SECURITY.md` documents as disabling exactly that.
+pub fn discover_python(project_root: &Path) -> Option<PathBuf> {
     // Opt-out kill-switch: introspection imports the project's declared
     // dependencies in a subprocess to recover their type signatures, which
     // executes those packages' import-time code. On an untrusted project a
