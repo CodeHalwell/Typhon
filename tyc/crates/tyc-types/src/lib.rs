@@ -377,19 +377,7 @@ pub fn assignable(expected: &Type, actual: &Type) -> bool {
             // declared covariant in `generic_param_variance`. The
             // element type still has to be assignable, so the
             // direction stays correct.
-            const READ_VIEW_HEADS: &[&str] = &[
-                "Sequence",
-                "Iterable",
-                "Iterator",
-                "Collection",
-                "Container",
-                "Reversible",
-            ];
-            if READ_VIEW_HEADS.contains(&an.as_str())
-                && aa.len() == 1
-                && matches!(bn.as_str(), "list" | "tuple" | "set" | "frozenset")
-                && !bb.is_empty()
-            {
+            if read_view_head_accepts(an.as_str(), bn.as_str()) && aa.len() == 1 && !bb.is_empty() {
                 return assignable(&aa[0], &bb[0]);
             }
             // Mapping[K, V] is invariant in K (keys participate in
@@ -2517,6 +2505,40 @@ impl TypeEnv {
 }
 
 /// Per-module check state.
+/// Which concrete container heads actually satisfy each read-only ABC.
+///
+/// A single flat list of ABC names, matched against a single flat list of
+/// containers, over-approximated the `collections.abc` lattice in two ways
+/// that produce a clean check and a `TypeError` at runtime, in both CPython
+/// and the VM:
+///
+/// * `set` / `frozenset` are unordered, so they are **not** `Sequence[T]`
+///   (no `__getitem__`) and **not** `Reversible[T]` (no `__reversed__`).
+/// * No built-in container is an `Iterator[T]`. `list` / `tuple` / `set` are
+///   *iterables* — `iter(xs)` produces the iterator. Passing a `list` where an
+///   `Iterator` is expected fails on the first `next()`.
+///
+/// Anything not listed here is simply not covered by this rule, which is the
+/// conservative direction: the assignment falls through to the ordinary
+/// nominal check rather than being waved through.
+const READ_VIEW_LATTICE: &[(&str, &[&str])] = &[
+    ("Sequence", &["list", "tuple"]),
+    ("Reversible", &["list", "tuple"]),
+    ("Iterable", &["list", "tuple", "set", "frozenset"]),
+    ("Collection", &["list", "tuple", "set", "frozenset"]),
+    ("Container", &["list", "tuple", "set", "frozenset"]),
+    // `Iterator` intentionally has no built-in members.
+    ("Iterator", &[]),
+];
+
+/// True when `container` satisfies the read-only ABC `abc`.
+fn read_view_head_accepts(abc: &str, container: &str) -> bool {
+    READ_VIEW_LATTICE
+        .iter()
+        .find(|(name, _)| *name == abc)
+        .is_some_and(|(_, members)| members.contains(&container))
+}
+
 /// Recursion bound for `infer_expr_ctx`.
 ///
 /// Deliberately generous — the review's own guidance was that a budget of
@@ -3519,19 +3541,10 @@ impl<'a> Checker<'a> {
         // primitive widening; route through is_assignable here so the
         // class hierarchy is consulted.
         if let (Type::Generic(an, aa), Type::Generic(bn, bb)) = (expected, actual) {
-            const READ_VIEW_HEADS: &[&str] = &[
-                "Sequence",
-                "Iterable",
-                "Iterator",
-                "Collection",
-                "Container",
-                "Reversible",
-            ];
-            if READ_VIEW_HEADS.contains(&an.as_str())
-                && aa.len() == 1
-                && matches!(bn.as_str(), "list" | "tuple" | "set" | "frozenset")
-                && !bb.is_empty()
-            {
+            // Same per-head lattice as the free `assignable`; a second flat
+            // list here is exactly the drift that let `set` pass as a
+            // `Sequence`.
+            if read_view_head_accepts(an.as_str(), bn.as_str()) && aa.len() == 1 && !bb.is_empty() {
                 return self.is_assignable(&aa[0], &bb[0]);
             }
             // Sealed-union-aware counterpart to the Mapping rule in
@@ -11522,7 +11535,17 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
             }
             // Exhaustiveness check: sealed unions and enums (both are
             // closed sets).
-            if let Type::Class(ref union_name) = subject_type {
+            // A *parametric* sealed union (`type U[T] = A | B | C`) infers as
+            // `Type::Generic("U", [..])`, not `Type::Class`, so gating on
+            // `Class` alone skipped exhaustiveness checking for every one of
+            // them — including the repo's own flagship linked-list example.
+            // The head name is what identifies the union either way.
+            let union_head = match &subject_type {
+                Type::Class(name) => Some(name.clone()),
+                Type::Generic(name, _) => Some(name.clone()),
+                _ => None,
+            };
+            if let Some(ref union_name) = union_head {
                 let subject_span = (
                     m.subject.range().start().to_usize(),
                     m.subject.range().end().to_usize(),
@@ -18900,6 +18923,82 @@ def go() -> None:
             "got {:?}",
             d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn parametric_sealed_union_match_is_checked_for_exhaustiveness() {
+        // A parametric union infers as `Type::Generic`, not `Type::Class`, so
+        // gating on `Class` alone skipped the check for every one of them.
+        let missing = check(
+            r#"
+class Some[T]:
+    value: T
+
+class Nothing frozen:
+    pass
+
+type Maybe[T] = Some[T] | Nothing
+
+def describe(m: Maybe[int]) -> str:
+    match m:
+        case Some(v): return f"some {v}"
+"#,
+        );
+        assert!(
+            missing
+                .errors()
+                .iter()
+                .any(|e| matches!(e, TycError::NonExhaustiveMatch { .. })),
+            "an uncovered variant of a parametric union must be reported"
+        );
+
+        let complete = check(
+            r#"
+class Some[T]:
+    value: T
+
+class Nothing frozen:
+    pass
+
+type Maybe[T] = Some[T] | Nothing
+
+def describe(m: Maybe[int]) -> str:
+    match m:
+        case Some(v): return f"some {v}"
+        case Nothing(): return "nothing"
+"#,
+        );
+        assert!(
+            !complete
+                .errors()
+                .iter()
+                .any(|e| matches!(e, TycError::NonExhaustiveMatch { .. })),
+            "a complete match must stay green; got {:?}",
+            complete
+                .errors()
+                .iter()
+                .map(|e| e.to_string())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn read_view_lattice_matches_collections_abc() {
+        // The flat table let `set` pass as a `Sequence` (no `__getitem__`) and
+        // any container pass as an `Iterator` (no `__next__`) — a clean check
+        // and a TypeError at runtime on both execution paths.
+        assert!(read_view_head_accepts("Sequence", "list"));
+        assert!(read_view_head_accepts("Sequence", "tuple"));
+        assert!(!read_view_head_accepts("Sequence", "set"));
+        assert!(!read_view_head_accepts("Sequence", "frozenset"));
+        assert!(!read_view_head_accepts("Reversible", "set"));
+        // Every built-in container is iterable…
+        assert!(read_view_head_accepts("Iterable", "set"));
+        assert!(read_view_head_accepts("Collection", "frozenset"));
+        // …and none of them *is* an iterator.
+        for c in ["list", "tuple", "set", "frozenset"] {
+            assert!(!read_view_head_accepts("Iterator", c), "Iterator vs {c}");
+        }
     }
 
     fn check_class_kinds(src: &str) -> Diagnostics {

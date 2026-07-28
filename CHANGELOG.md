@@ -18,7 +18,14 @@ Compatibility, using the review's own taxonomy:
 - **Narrowings on already-crashing code** (the alpha.2 carve-out, each one only
   rejects a program that was guaranteed to fail at runtime): positional
   construction of a `model`; positional construction against the wrong
-  multiple-inheritance field order; wrong-typed attribute assignment.
+  multiple-inheritance field order; wrong-typed attribute assignment; `set` /
+  `frozenset` passed as a `Sequence` / `Reversible`, and any container passed
+  as an `Iterator`.
+- **One narrowing on code that may run correctly today**: a `match` over a
+  *parametric* sealed union (`type U[T] = A | B`) is now checked for
+  exhaustiveness — it was skipped entirely, so such a match has never been
+  checked. `case _:` and `[strictness] exhaustive-match` are the escapes. No
+  file in the example or stress corpus is affected.
 - **Miscompilation fixes** (only change programs that were already producing
   the wrong answer): `?` in an `elif` / `while` condition; string-literal
   corruption in four passes; emitter precedence.
@@ -54,6 +61,13 @@ Compatibility, using the review's own taxonomy:
 - **Recursive type aliases terminate.** `type A = list[B]` / `type B = list[A]`
   aborted the process with SIGABRT on a five-line file.
 - **`from module import *` no longer errors** on every star-imported name.
+- **A function with a defaulted tail satisfies a narrower `Callable`.**
+  `def scale(x: int, factor: int = 2)` was rejected where
+  `Callable[[int], int]` was expected.
+- **`List[int]` no longer also raises a hard mismatch** on top of the
+  deprecation warning that already tells the user what to write.
+- **`match` over a parametric sealed union is checked** for exhaustiveness.
+- **The read-only-ABC lattice matches `collections.abc`.**
 
 ### Preprocessor / emitter
 
@@ -64,6 +78,11 @@ Compatibility, using the review's own taxonomy:
   rewrite, the `with`-chain re-indent, indent-only block collection, and
   `tyc fmt`'s whitespace pass.
 - **Emitter parenthesises comparison and conditional operands.**
+- **A quote run at the tail of a triple-quoted string is escaped** — one
+  trailing quote emitted unparseable Python, two silently deleted themselves.
+- **An f-string interpolating a brace-opening expression** no longer collapses
+  into the literal-brace escape `{{`.
+- **`class!` keeps `ClassVar` out of the constructor** and keeps its value.
 - **`Literal["?"]` is no longer rewritten** to `Literal[" | None"]`.
 - **User-defined `pure` / `memo` / `gatherable` decorators survive.**
 
@@ -93,6 +112,9 @@ Compatibility, using the review's own taxonomy:
   unbreaking `uv sync` for the three free-threaded targets.
 - **`map_pure` has the documented GIL and minimum-size guards.**
 - `tyc::contains_secret_literal` recognises `PASSPHRASE`.
+- comptime `int(float)` raises on out-of-range / NaN / infinity instead of
+  folding a saturated constant into the artifact.
+- A deeply-nested generated expression no longer overflows the stack.
 - Symlink cycles under `src/` no longer hang the file collector.
 
 ### Known open
