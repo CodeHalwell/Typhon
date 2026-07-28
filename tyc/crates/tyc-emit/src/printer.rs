@@ -870,6 +870,32 @@ impl Emitter {
         }
     }
 
+    /// Open an f-string interpolation, keeping a brace-opening expression
+    /// distinguishable from an escaped literal brace.
+    ///
+    /// `f"{ {'k': 1}['k'] }"` interpolates a dict-literal subscript. Emitting
+    /// the opener and the expression back to back produces `{{`, which CPython
+    /// reads as the *escape* for a literal `{` — so the expression was never
+    /// evaluated and the f-string rendered braces as text (or failed to parse
+    /// on the closing side). A single space is enough to separate them and is
+    /// invisible in the result.
+    fn open_interpolation(&mut self, expr: &Expr) {
+        self.write("{");
+        if expr_starts_with_brace(expr) {
+            self.write(" ");
+        }
+    }
+
+    /// Close an interpolation, mirroring [`Self::open_interpolation`]: a
+    /// trailing `}` from the expression would otherwise pair with the closing
+    /// brace into `}}`, the literal-brace escape.
+    fn close_interpolation(&mut self, expr: &Expr) {
+        if expr_ends_with_brace(expr) {
+            self.write(" ");
+        }
+        self.write("}");
+    }
+
     pub fn emit_expr(&mut self, node: &Expr) {
         match node {
             Expr::BoolOp(b) => {
@@ -1179,7 +1205,7 @@ impl Emitter {
                                         ));
                                     }
                                     InterpolatedStringElement::Interpolation(interp) => {
-                                        self.write("{");
+                                        self.open_interpolation(&interp.expression);
                                         // PEP 501 debug f-string: `f"{x=}"` carries
                                         // the verbatim `x=` text on `debug_text`,
                                         // including the surrounding whitespace
@@ -1215,14 +1241,16 @@ impl Emitter {
                                                     InterpolatedStringElement::Interpolation(
                                                         nested,
                                                     ) => {
-                                                        self.write("{");
+                                                        self.open_interpolation(&nested.expression);
                                                         self.emit_expr(&nested.expression);
-                                                        self.write("}");
+                                                        self.close_interpolation(
+                                                            &nested.expression,
+                                                        );
                                                     }
                                                 }
                                             }
                                         }
-                                        self.write("}");
+                                        self.close_interpolation(&interp.expression);
                                     }
                                 }
                             }
@@ -1246,9 +1274,9 @@ impl Emitter {
                                 self.write(&escape_python_string(&lit.value));
                             }
                             InterpolatedStringElement::Interpolation(interp) => {
-                                self.write("{");
+                                self.open_interpolation(&interp.expression);
                                 self.emit_expr(&interp.expression);
-                                self.write("}");
+                                self.close_interpolation(&interp.expression);
                             }
                         }
                     }
@@ -1967,6 +1995,38 @@ fn escape_python_string_with_quote(s: &str, quote: char) -> String {
     out
 }
 
+/// True when the emitted text of `expr` begins with `{` — a dict or set
+/// display, which is the only expression form that can.
+fn expr_starts_with_brace(expr: &Expr) -> bool {
+    match expr {
+        Expr::Dict(_) | Expr::Set(_) | Expr::DictComp(_) | Expr::SetComp(_) => true,
+        // The brace belongs to the left-most leaf: `{1: 2}[k]`, `{1}.pop()`,
+        // `{1, 2} | s`, `{1: 2}["k"] if c else d`.
+        Expr::Subscript(x) => expr_starts_with_brace(&x.value),
+        Expr::Attribute(x) => expr_starts_with_brace(&x.value),
+        Expr::Call(x) => expr_starts_with_brace(&x.func),
+        Expr::BinOp(x) => expr_starts_with_brace(&x.left),
+        Expr::Compare(x) => expr_starts_with_brace(&x.left),
+        Expr::BoolOp(x) => x.values.first().is_some_and(expr_starts_with_brace),
+        Expr::If(x) => expr_starts_with_brace(&x.body),
+        _ => false,
+    }
+}
+
+/// True when the emitted text of `expr` ends with `}`.
+fn expr_ends_with_brace(expr: &Expr) -> bool {
+    match expr {
+        Expr::Dict(_) | Expr::Set(_) | Expr::DictComp(_) | Expr::SetComp(_) => true,
+        Expr::BinOp(x) => expr_ends_with_brace(&x.right),
+        Expr::BoolOp(x) => x.values.last().is_some_and(expr_ends_with_brace),
+        Expr::Compare(x) => x.comparators.last().is_some_and(expr_ends_with_brace),
+        Expr::If(x) => expr_ends_with_brace(&x.orelse),
+        Expr::UnaryOp(x) => expr_ends_with_brace(&x.operand),
+        Expr::Starred(x) => expr_ends_with_brace(&x.value),
+        _ => false,
+    }
+}
+
 /// Escape content for a triple-quoted string literal using `quote` as the
 /// delimiter character (either `'` or `"`).  Only two things need escaping:
 /// backslashes, and a run of three or more consecutive delimiter characters
@@ -1976,16 +2036,23 @@ fn escape_triple_quoted_string(s: &str, quote: char) -> String {
     let mut out = String::with_capacity(s.len());
     // Track how many consecutive unescaped quote chars we have just emitted.
     let mut run = 0usize;
-    for ch in s.chars() {
+    let mut chars = s.chars().peekable();
+    while let Some(ch) = chars.next() {
         if ch == '\\' {
             out.push_str("\\\\");
             run = 0;
         } else if ch == quote {
             run += 1;
-            if run == 3 {
-                // Third consecutive quote would close the literal — escape it
-                // so the run in the output stays at 1 (the escaped char itself
-                // is still a quote but breaks the "three unescaped" sequence).
+            // A quote that is the LAST character of the content is just as
+            // dangerous as a run of three inside it: the closing delimiter
+            // butts straight up against it. Content ending in one quote
+            // emitted `"""…""""`, which is `"""…"""` plus a stray quote — a
+            // hard SyntaxError. Content ending in two emitted `"""…"""""`,
+            // which Python reads as `"""…"""` implicitly concatenated with
+            // the empty string `""`, so the two trailing quotes vanished
+            // *silently* and the constant differed from the source.
+            let at_tail = chars.peek().is_none();
+            if run == 3 || at_tail {
                 out.push('\\');
                 run = 1;
             }
@@ -2190,6 +2257,49 @@ fn pick_fstring_outer_quote(fs: &ast::ExprFString) -> char {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn triple_quoted_tail_quote_run_is_escaped() {
+        // A quote at the very end of the content butts against the closing
+        // delimiter. One trailing quote emitted `"""…""""` — a hard
+        // SyntaxError. Two emitted `"""…"""""`, which Python reads as the
+        // literal implicitly concatenated with the empty string `""`, so the
+        // trailing quotes vanished *silently* and the constant differed from
+        // the source.
+        assert_eq!(escape_triple_quoted_string("x\"", '"'), "x\\\"");
+        assert_eq!(escape_triple_quoted_string("y\"\"", '"'), "y\"\\\"");
+        // A run of three inside the content is still escaped as before.
+        assert_eq!(escape_triple_quoted_string("a\"\"\"b", '"'), "a\"\"\\\"b");
+        // No trailing quote, no change.
+        assert_eq!(escape_triple_quoted_string("plain", '"'), "plain");
+        // The other delimiter is handled symmetrically.
+        assert_eq!(escape_triple_quoted_string("x'", '\''), "x\\'");
+        assert_eq!(escape_triple_quoted_string("x\"", '\''), "x\"");
+    }
+
+    #[test]
+    fn fstring_interpolation_of_a_brace_expression_is_separated() {
+        // `f"{ {'k': 1}['k'] }"` — the opener and a dict display back to back
+        // produce `{{`, which CPython reads as the escape for a literal brace,
+        // so the expression was never evaluated.
+        let out = round_trip("x = f\"{ {'k': 1}['k'] }\"\n");
+        assert!(
+            out.contains("f\"{ {"),
+            "the interpolation opener must be separated from the dict display; got:\n{out}"
+        );
+        assert!(
+            !out.contains("f\"{{"),
+            "must not emit the literal-brace escape; got:\n{out}"
+        );
+        // The closing side needs no space here — the expression ends in `]`.
+        // It does when the expression itself ends in a brace, which would
+        // otherwise pair with the closing one into the `}}` escape.
+        let ends_with_brace = round_trip("y = f\"{ {1, 2} }\"\n");
+        assert!(
+            ends_with_brace.contains("{ {1, 2} }"),
+            "a set display must be separated on both sides; got:\n{ends_with_brace}"
+        );
+    }
     use crate::emit;
     use crate::printer::escape_triple_quoted_string;
     use tyc_syntax::parse_module;

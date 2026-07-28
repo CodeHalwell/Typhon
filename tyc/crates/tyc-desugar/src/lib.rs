@@ -3219,6 +3219,20 @@ fn raw_class_init_insert_pos(body: &[Stmt]) -> usize {
     idx
 }
 
+/// True when `ann` is `ClassVar[...]`, in any spelling the language accepts —
+/// bare, `typing.ClassVar`, or an aliased module (`t.ClassVar`).
+fn is_classvar_annotation(ann: &Expr) -> bool {
+    let head = match ann {
+        Expr::Subscript(s) => s.value.as_ref(),
+        other => other,
+    };
+    match head {
+        Expr::Name(n) => n.id.as_str() == "ClassVar",
+        Expr::Attribute(a) => a.attr.as_str() == "ClassVar",
+        _ => false,
+    }
+}
+
 /// Strip the default value from each top-level `AnnAssign` whose target
 /// is a plain `Name`. Used after `synthesise_raw_class_init` has folded
 /// those defaults into the generated `__init__` signature — keeping them
@@ -3233,6 +3247,13 @@ fn raw_class_init_insert_pos(body: &[Stmt]) -> usize {
 fn strip_field_defaults(body: &mut [Stmt]) {
     for stmt in body.iter_mut() {
         if let Stmt::AnnAssign(a) = stmt {
+            // A `ClassVar[T] = default` is a class attribute and its default
+            // is the attribute's *value*, not a constructor default. Stripping
+            // it deleted the attribute outright, so `Cls.NAME` raised
+            // AttributeError on a program that checked clean.
+            if is_classvar_annotation(&a.annotation) {
+                continue;
+            }
             if matches!(a.target.as_ref(), Expr::Name(_)) {
                 a.value = None;
             }
@@ -3269,6 +3290,16 @@ fn synthesise_raw_class_init(body: &[Stmt]) -> Stmt {
                 ..
             }) = s
             {
+                // `ClassVar[T]` is a *class* attribute, never a constructor
+                // parameter. Treating it as one produced
+                // `def __init__(self, name, REGISTRY: ClassVar[str] = "widgets")`
+                // and — because the synthesiser also strips class-level
+                // defaults from the body — deleted the class attribute
+                // outright, so `Widget.REGISTRY` raised AttributeError on a
+                // clean check.
+                if is_classvar_annotation(annotation) {
+                    return None;
+                }
                 if let Expr::Name(n) = target.as_ref() {
                     return Some((&n.id, (**annotation).clone(), value.as_deref().cloned()));
                 }

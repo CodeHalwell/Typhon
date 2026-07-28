@@ -1107,7 +1107,27 @@ fn eval_call(call: &ExprCall, ctx: &mut EvalContext<'_>) -> Result<ComptimeValue
                     .map(ComptimeValue::Int)
                     .map_err(|_| format!("cannot parse '{}' as int", s)),
                 ComptimeValue::Int(n) => Ok(ComptimeValue::Int(n)),
-                ComptimeValue::Float(f) => Ok(ComptimeValue::Int(f as i64)),
+                // Rust's `as i64` *saturates* at `i64::MIN`/`i64::MAX` and maps
+                // NaN to 0, so `int(1e30)` silently folded the constant
+                // 9223372036854775807 into the build and `int(float("inf"))`
+                // did the same instead of raising. A comptime value is inlined
+                // as a literal, so a wrong one is baked into the artifact with
+                // nothing downstream able to notice.
+                ComptimeValue::Float(f) => {
+                    if f.is_nan() {
+                        return Err("cannot convert float NaN to integer".into());
+                    }
+                    if f.is_infinite() {
+                        return Err("cannot convert float infinity to integer".into());
+                    }
+                    let truncated = f.trunc();
+                    if truncated < i64::MIN as f64 || truncated > i64::MAX as f64 {
+                        return Err(format!(
+                            "int({f}) is out of range for a comptime integer constant"
+                        ));
+                    }
+                    Ok(ComptimeValue::Int(truncated as i64))
+                }
                 ComptimeValue::Bool(b) => Ok(ComptimeValue::Int(if b { 1 } else { 0 })),
                 ComptimeValue::List(_)
                 | ComptimeValue::Tuple(_)

@@ -2471,6 +2471,14 @@ impl TypeEnv {
 }
 
 /// Per-module check state.
+/// Recursion bound for `infer_expr_ctx`.
+///
+/// Deliberately generous — the review's own guidance was that a budget of
+/// 2,000 is too tight, because a 3,000-term expression builds and runs
+/// correctly today. This must only ever catch input that would otherwise
+/// crash the process.
+const INFER_EXPR_MAX_DEPTH: u32 = 20_000;
+
 /// Recursion bound for [`Checker::is_assignable`].
 ///
 /// Sized so that no real program reaches it: the deepest nesting in the
@@ -2498,6 +2506,8 @@ struct Checker<'a> {
     /// a depth parameter would touch every one of the ~200 recursive call
     /// sites and each of them would have to remember to pass it on.
     is_assignable_depth: std::cell::Cell<u32>,
+    /// Current nesting depth of `infer_expr_ctx`; see [`INFER_EXPR_MAX_DEPTH`].
+    infer_depth: std::cell::Cell<u32>,
     /// The `(expected, actual)` pairs currently on the [`Checker::is_assignable`]
     /// recursion stack.
     ///
@@ -2974,6 +2984,7 @@ impl<'a> Checker<'a> {
             source,
             resolved,
             is_assignable_depth: std::cell::Cell::new(0),
+            infer_depth: std::cell::Cell::new(0),
             is_assignable_path: std::cell::RefCell::new(Vec::new()),
             classes: Vec::new(),
             function_signatures: HashMap::new(),
@@ -14909,6 +14920,26 @@ fn container_expectation(
 ///   type so `let xs: list[int] = []` produces `list[int]` rather than
 ///   `list[?]`.
 fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type {
+    // Depth guard. Inference recurses structurally with no bound, so a large
+    // machine-generated expression — a long `a + b + c + …` chain, a deeply
+    // nested literal — overflowed the native stack and aborted the compiler
+    // with no diagnostic, no file name, and no line number. `Unknown` on
+    // exhaustion is the permissive answer: it cannot turn a correct program
+    // into an error, only stop the checker from reasoning past the bound.
+    //
+    // The ceiling is set far above any hand-written expression (the corpus
+    // peaks in the low hundreds) so only genuinely generated input reaches it.
+    let depth = c.infer_depth.get();
+    if depth >= INFER_EXPR_MAX_DEPTH {
+        return Type::Unknown;
+    }
+    c.infer_depth.set(depth + 1);
+    let result = infer_expr_ctx_inner(c, expr, expected);
+    c.infer_depth.set(depth);
+    result
+}
+
+fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type {
     match expr {
         Expr::BooleanLiteral(_) => Type::Bool,
         Expr::NumberLiteral(n) => match &n.value {
