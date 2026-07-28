@@ -55,6 +55,16 @@ pub enum Type {
         params: Vec<Type>,
         ret: Box<Type>,
         variadic: bool,
+        /// How many of `params` the caller must actually supply.
+        ///
+        /// `None` means "all of them" — the common case, and what every
+        /// builtin signature and every `Callable[[…], R]` annotation means.
+        /// `Some(n)` records that the trailing `params.len() - n` parameters
+        /// carry defaults, which is what makes a function with a defaulted
+        /// tail satisfy a narrower `Callable`: `def scale(x: int, factor: int = 2)`
+        /// *is* a `Callable[[int], int]`, and rejecting it was a false
+        /// positive at one of the most common higher-order-function shapes.
+        min_params: Option<usize>,
     },
     /// `Container[Args...]` — e.g. `list[int]`, `dict[str, int]`.
     Generic(String, Vec<Type>),
@@ -448,11 +458,13 @@ pub fn assignable(expected: &Type, actual: &Type) -> bool {
                 params: ep,
                 ret: er,
                 variadic: ev,
+                min_params: _,
             },
             Type::Function {
                 params: ap,
                 ret: ar,
                 variadic: _av,
+                min_params: a_min,
             },
         ) => {
             if *ev && ep.is_empty() {
@@ -466,6 +478,18 @@ pub fn assignable(expected: &Type, actual: &Type) -> bool {
                     return ep.iter().zip(ap).all(|(e, a)| assignable(a, e)) && assignable(er, ar);
                 }
                 return false;
+            }
+            // A function whose trailing parameters carry defaults declares
+            // more parameters than it requires, so it satisfies a *narrower*
+            // `Callable`: `def scale(x: int, factor: int = 2)` is a
+            // `Callable[[int], int]`. Comparing declared arity alone rejected
+            // that — a false positive at one of the most common higher-order
+            // shapes there is. Only the supplied prefix is checked; the
+            // defaulted tail is never passed.
+            if let Some(required) = a_min {
+                if *required <= ep.len() && ep.len() <= ap.len() {
+                    return ep.iter().zip(ap).all(|(e, a)| assignable(a, e)) && assignable(er, ar);
+                }
             }
             if ep.len() != ap.len() {
                 return false;
@@ -1557,6 +1581,21 @@ pub fn type_from_annotation_with_params(
                 Expr::Attribute(a) => a.attr.as_str().to_owned(),
                 _ => return Type::Unknown,
             };
+            // The deprecated capitalised aliases are the *same types* as their
+            // lowercase builtins. `tyc::typing_alias_deprecated` already tells
+            // the user to stop writing them; leaving the head un-normalised on
+            // top of that produced a second, hard error reading
+            // "expected `List[int]`, found `list[int]`" — nonsensical on its
+            // face, and it blocks the build rather than nudging.
+            let head = match head.as_str() {
+                "List" => "list".to_owned(),
+                "Dict" => "dict".to_owned(),
+                "Set" => "set".to_owned(),
+                "FrozenSet" => "frozenset".to_owned(),
+                "Tuple" => "tuple".to_owned(),
+                "Type" => "type".to_owned(),
+                _ => head,
+            };
             // Optional[T] → T | None
             if head == "Optional" {
                 return Type::optional(type_from_annotation_with_params(
@@ -1639,6 +1678,7 @@ pub fn type_from_annotation_with_params(
                                     params,
                                     ret: Box::new(ret),
                                     variadic: false,
+                                    min_params: None,
                                 };
                             }
                             // `Callable[..., R]` — any args (including
@@ -1653,6 +1693,7 @@ pub fn type_from_annotation_with_params(
                                     params: vec![],
                                     ret: Box::new(ret),
                                     variadic: true,
+                                    min_params: None,
                                 };
                             }
                             _ => {}
@@ -2070,6 +2111,7 @@ fn substitute_typevars(ty: &Type, bindings: &std::collections::HashMap<String, T
             params,
             ret,
             variadic,
+            min_params,
         } => Type::Function {
             params: params
                 .iter()
@@ -2077,6 +2119,10 @@ fn substitute_typevars(ty: &Type, bindings: &std::collections::HashMap<String, T
                 .collect(),
             ret: Box::new(substitute_typevars(ret, bindings)),
             variadic: *variadic,
+            // Carry the required-arity through: dropping it here silently
+            // reverts a substituted signature to "every parameter required",
+            // which is exactly the false positive this field exists to fix.
+            min_params: *min_params,
         },
         other => other.clone(),
     }
@@ -3204,11 +3250,13 @@ impl<'a> Checker<'a> {
                 params: ep,
                 ret: er,
                 variadic: ev,
+                min_params: _,
             },
             Type::Function {
                 params: ap,
                 ret: ar,
-                variadic: _av,
+                variadic: av,
+                min_params: a_min,
             },
         ) = (expected, actual)
         {
@@ -3216,6 +3264,22 @@ impl<'a> Checker<'a> {
             // function with an assignable (covariant) return type.
             if *ev && ep.is_empty() {
                 return self.is_assignable(er, ar);
+            }
+            // Mirrors the arity rules in the free `assignable`: a variadic
+            // actual absorbs a wider call shape, and a defaulted tail lets a
+            // function satisfy a narrower `Callable`. This copy is the one
+            // that actually decides local function-to-`Callable` assignment,
+            // so leaving it on declared-arity-only kept the false positive
+            // alive after the other copy was fixed.
+            if *av && ap.len() <= ep.len() {
+                return ep.iter().zip(ap).all(|(e, a)| self.is_assignable(a, e))
+                    && self.is_assignable(er, ar);
+            }
+            if let Some(required) = a_min {
+                if *required <= ep.len() && ep.len() <= ap.len() {
+                    return ep.iter().zip(ap).all(|(e, a)| self.is_assignable(a, e))
+                        && self.is_assignable(er, ar);
+                }
             }
             if ep.len() != ap.len() {
                 return false;
@@ -3243,6 +3307,7 @@ impl<'a> Checker<'a> {
                     params: sig.param_types.clone(),
                     ret: Box::new(sig.return_type.clone()),
                     variadic: false,
+                    min_params: None,
                 };
                 if self.is_assignable(expected, &call_ty) {
                     return true;
@@ -3668,6 +3733,7 @@ impl<'a> Checker<'a> {
                 params,
                 ret,
                 variadic,
+                min_params,
             } => Type::Function {
                 params: params
                     .iter()
@@ -3675,6 +3741,10 @@ impl<'a> Checker<'a> {
                     .collect(),
                 ret: Box::new(self.canonicalize_module_aliases(ret)),
                 variadic: *variadic,
+                // Carried through, like every other structure-preserving
+                // rebuild: dropping it reverts the signature to
+                // "every parameter required".
+                min_params: *min_params,
             },
             other => other.clone(),
         }
@@ -7038,6 +7108,7 @@ fn seed_typhon_builtins(c: &mut Checker) {
         params: vec![Type::Str],
         ret: Box::new(Type::Str),
         variadic: true,
+        min_params: None,
     };
     c.env.declare(TypeBinding {
         name: "env".into(),
@@ -9479,6 +9550,16 @@ fn function_signature(
         Some(r) => type_from_annotation_with_params(r, classes, type_params),
         None => Type::Unknown,
     };
+    // How many of those parameters the caller must actually supply: the
+    // positional ones without a default. A defaulted tail is what lets
+    // `def scale(x: int, factor: int = 2)` satisfy `Callable[[int], int]`;
+    // comparing declared arity alone rejected it.
+    let required = parameters
+        .posonlyargs
+        .iter()
+        .chain(parameters.args.iter())
+        .take_while(|pwd| pwd.default.is_none())
+        .count();
     Type::Function {
         params,
         ret: Box::new(ret),
@@ -9486,6 +9567,7 @@ fn function_signature(
         // the call-site arity check accept any number of positional
         // arguments beyond the declared params (FINDINGS #44c).
         variadic: parameters.vararg.is_some(),
+        min_params: Some(required),
     }
 }
 
@@ -9684,6 +9766,7 @@ fn infer_expr_readonly(c: &Checker, e: &Expr) -> Type {
                                 params: vec![Type::Unknown; sig.arity],
                                 ret: Box::new(sig.return_type.clone()),
                                 variadic: false,
+                                min_params: None,
                             }
                         }
                     } else {
@@ -10122,6 +10205,10 @@ fn seed_env_from_scope(c: &mut Checker, scope: ScopeId) {
                         params,
                         ret: Box::new(info.return_type.clone()),
                         variadic: info.max_positional.is_none(),
+                        // Real required-arity, so a function whose trailing
+                        // parameters carry defaults can satisfy a narrower
+                        // `Callable[[…], R]`.
+                        min_params: Some(info.required_positional.iter().filter(|r| **r).count()),
                     }
                 } else if let Some(info) = &b.import_info {
                     // `import pkg.sub` binds the TOP name `pkg` (Python
@@ -10674,10 +10761,24 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
             let variadic = all_params().any(|pwd| pwd.default.is_some())
                 || f.parameters.vararg.is_some()
                 || f.parameters.kwarg.is_some();
+            // How many parameters the caller must actually supply. This
+            // binding *overrides* the one `seed_env_from_scope` installed from
+            // `function_signature`, so it has to carry the required-arity too
+            // — otherwise the field is silently `None` by the time any call
+            // site reads it, and a function with a defaulted tail is rejected
+            // where a narrower `Callable` is expected.
+            let required = f
+                .parameters
+                .posonlyargs
+                .iter()
+                .chain(f.parameters.args.iter())
+                .take_while(|pwd| pwd.default.is_none())
+                .count();
             let fn_type = Type::Function {
                 params,
                 ret: Box::new(ret),
                 variadic,
+                min_params: Some(required),
             };
             c.env.declare(TypeBinding {
                 name: f.name.as_str().to_owned(),
@@ -14294,6 +14395,7 @@ fn builtin_generic_method(recv: &Type, attr: &str) -> Option<Type> {
                 params: vec![k.clone()],
                 ret: Box::new(ret),
                 variadic: true,
+                min_params: None,
             })
         }
         // Result / Ok / Err combinators — emitted on the runtime classes
@@ -14319,11 +14421,13 @@ fn builtin_generic_method(recv: &Type, attr: &str) -> Option<Type> {
             params: vec![Type::Unknown],
             ret: Box::new(Type::Generic("Ok".into(), vec![Type::Unknown])),
             variadic: false,
+            min_params: None,
         }),
         ("Ok", "map_err", [t]) => Some(Type::Function {
             params: vec![Type::Unknown],
             ret: Box::new(Type::Generic("Ok".into(), vec![t.clone()])),
             variadic: false,
+            min_params: None,
         }),
         ("Ok", "and_then", [_t]) => Some(Type::Function {
             params: vec![Type::Unknown],
@@ -14332,26 +14436,31 @@ fn builtin_generic_method(recv: &Type, attr: &str) -> Option<Type> {
                 vec![Type::Unknown, Type::Unknown],
             )),
             variadic: false,
+            min_params: None,
         }),
         ("Ok", "or_else", [t]) => Some(Type::Function {
             params: vec![Type::Unknown],
             ret: Box::new(Type::Generic("Ok".into(), vec![t.clone()])),
             variadic: false,
+            min_params: None,
         }),
         ("Err", "map", [e]) => Some(Type::Function {
             params: vec![Type::Unknown],
             ret: Box::new(Type::Generic("Err".into(), vec![e.clone()])),
             variadic: false,
+            min_params: None,
         }),
         ("Err", "map_err", [_e]) => Some(Type::Function {
             params: vec![Type::Unknown],
             ret: Box::new(Type::Generic("Err".into(), vec![Type::Unknown])),
             variadic: false,
+            min_params: None,
         }),
         ("Err", "and_then", [e]) => Some(Type::Function {
             params: vec![Type::Unknown],
             ret: Box::new(Type::Generic("Err".into(), vec![e.clone()])),
             variadic: false,
+            min_params: None,
         }),
         ("Err", "or_else", [_e]) => Some(Type::Function {
             params: vec![Type::Unknown],
@@ -14360,6 +14469,7 @@ fn builtin_generic_method(recv: &Type, attr: &str) -> Option<Type> {
                 vec![Type::Unknown, Type::Unknown],
             )),
             variadic: false,
+            min_params: None,
         }),
         ("Result", "map", [_t, e]) => Some(Type::Function {
             params: vec![Type::Unknown],
@@ -14368,6 +14478,7 @@ fn builtin_generic_method(recv: &Type, attr: &str) -> Option<Type> {
                 vec![Type::Unknown, e.clone()],
             )),
             variadic: false,
+            min_params: None,
         }),
         ("Result", "map_err", [t, _e]) => Some(Type::Function {
             params: vec![Type::Unknown],
@@ -14376,6 +14487,7 @@ fn builtin_generic_method(recv: &Type, attr: &str) -> Option<Type> {
                 vec![t.clone(), Type::Unknown],
             )),
             variadic: false,
+            min_params: None,
         }),
         ("Result", "and_then", _) | ("Result", "or_else", _) => Some(Type::Function {
             params: vec![Type::Unknown],
@@ -14384,6 +14496,7 @@ fn builtin_generic_method(recv: &Type, attr: &str) -> Option<Type> {
                 vec![Type::Unknown, Type::Unknown],
             )),
             variadic: false,
+            min_params: None,
         }),
         // Unwrap family (R-API). The receiver's static type narrows the
         // return as far as possible:
@@ -14397,33 +14510,39 @@ fn builtin_generic_method(recv: &Type, attr: &str) -> Option<Type> {
             params: vec![],
             ret: Box::new(t.clone()),
             variadic: false,
+            min_params: None,
         }),
         ("Ok", "expect", [t]) | ("Result", "expect", [t, _]) => Some(Type::Function {
             params: vec![Type::Str],
             ret: Box::new(t.clone()),
             variadic: false,
+            min_params: None,
         }),
         ("Ok", "unwrap_or", [t]) | ("Result", "unwrap_or", [t, _]) => Some(Type::Function {
             params: vec![t.clone()],
             ret: Box::new(t.clone()),
             variadic: false,
+            min_params: None,
         }),
         ("Ok", "unwrap_or_else", [t]) | ("Result", "unwrap_or_else", [t, _]) => {
             Some(Type::Function {
                 params: vec![Type::Unknown],
                 ret: Box::new(t.clone()),
                 variadic: false,
+                min_params: None,
             })
         }
         ("Ok", "ok", [t]) | ("Result", "ok", [t, _]) => Some(Type::Function {
             params: vec![],
             ret: Box::new(Type::optional(t.clone())),
             variadic: false,
+            min_params: None,
         }),
         ("Ok", "err", [_t]) => Some(Type::Function {
             params: vec![],
             ret: Box::new(Type::None),
             variadic: false,
+            min_params: None,
         }),
         // `unwrap()` takes no arguments even on a statically-known Err
         // (it always raises); `expect` takes exactly the message.
@@ -14431,31 +14550,37 @@ fn builtin_generic_method(recv: &Type, attr: &str) -> Option<Type> {
             params: vec![],
             ret: Box::new(Type::Unknown),
             variadic: false,
+            min_params: None,
         }),
         ("Err", "expect", [_e]) => Some(Type::Function {
             params: vec![Type::Str],
             ret: Box::new(Type::Unknown),
             variadic: false,
+            min_params: None,
         }),
         ("Err", "unwrap_or", [_e]) | ("Err", "unwrap_or_else", [_e]) => Some(Type::Function {
             params: vec![Type::Unknown],
             ret: Box::new(Type::Unknown),
             variadic: false,
+            min_params: None,
         }),
         ("Err", "ok", [_e]) => Some(Type::Function {
             params: vec![],
             ret: Box::new(Type::None),
             variadic: false,
+            min_params: None,
         }),
         ("Err", "err", [e]) => Some(Type::Function {
             params: vec![],
             ret: Box::new(e.clone()),
             variadic: false,
+            min_params: None,
         }),
         ("Result", "err", [_t, e]) => Some(Type::Function {
             params: vec![],
             ret: Box::new(Type::optional(e.clone())),
             variadic: false,
+            min_params: None,
         }),
         ("Ok", "is_ok", _)
         | ("Ok", "is_err", _)
@@ -14466,6 +14591,7 @@ fn builtin_generic_method(recv: &Type, attr: &str) -> Option<Type> {
             params: vec![],
             ret: Box::new(Type::Bool),
             variadic: false,
+            min_params: None,
         }),
         // Mapping views — preserve the element type (with `?`) so iterating
         // `d.values()` over a `dict[K, V?]` yields `V?`, not `V`. Returning
@@ -14475,11 +14601,13 @@ fn builtin_generic_method(recv: &Type, attr: &str) -> Option<Type> {
             params: vec![],
             ret: Box::new(Type::Generic("KeysView".into(), vec![k.clone()])),
             variadic: false,
+            min_params: None,
         }),
         ("dict", "values", [_k, v]) => Some(Type::Function {
             params: vec![],
             ret: Box::new(Type::Generic("ValuesView".into(), vec![v.clone()])),
             variadic: false,
+            min_params: None,
         }),
         ("dict", "items", [k, v]) => Some(Type::Function {
             params: vec![],
@@ -14488,6 +14616,7 @@ fn builtin_generic_method(recv: &Type, attr: &str) -> Option<Type> {
                 vec![Type::Generic("tuple".into(), vec![k.clone(), v.clone()])],
             )),
             variadic: false,
+            min_params: None,
         }),
         _ => None,
     }
@@ -15062,6 +15191,7 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
                 params: vec![Type::Unknown; n],
                 ret: Box::new(Type::Unknown),
                 variadic,
+                min_params: None,
             }
         }
         Expr::Name(n) => {
@@ -15592,6 +15722,7 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
                     params,
                     ret,
                     variadic,
+                    min_params: _,
                 } => {
                     // Argument count check honours defaults, keyword args,
                     // `*args`, and `**kwargs` by looking up the function's
@@ -16406,6 +16537,7 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
                             params,
                             ret: Box::new(ret),
                             variadic,
+                            min_params: None,
                         };
                     }
                 }
@@ -16462,6 +16594,7 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
                             params,
                             ret: Box::new(ret),
                             variadic: false,
+                            min_params: None,
                         };
                     }
                     if let Some(field_type) = c.find_field(class_name.as_str(), attr_name) {
@@ -16557,6 +16690,7 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
                             params,
                             ret: Box::new(ret),
                             variadic: false,
+                            min_params: None,
                         };
                     }
                     if let Some(field_type) = c.find_field(class_name.as_str(), attr_name) {
@@ -16624,6 +16758,7 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
                                 params: vec![Type::Unknown; arity],
                                 ret: Box::new(ret),
                                 variadic: false,
+                                min_params: None,
                             };
                         }
                         if let Some(field_type) = c.find_field(bound_name.as_str(), attr_name) {
@@ -18654,6 +18789,116 @@ def go() -> None:
                 .iter()
                 .map(|e| e.to_string())
                 .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn defaulted_tail_satisfies_a_narrower_callable() {
+        let expected = Type::Function {
+            params: vec![Type::Int],
+            ret: Box::new(Type::Int),
+            variadic: false,
+            min_params: None,
+        };
+        let actual = Type::Function {
+            params: vec![Type::Int, Type::Int],
+            ret: Box::new(Type::Int),
+            variadic: false,
+            min_params: Some(1),
+        };
+        assert!(
+            assignable(&expected, &actual),
+            "a function with a defaulted tail is a narrower Callable"
+        );
+        let two_required = Type::Function {
+            params: vec![Type::Int, Type::Int],
+            ret: Box::new(Type::Int),
+            variadic: false,
+            min_params: Some(2),
+        };
+        assert!(
+            !assignable(&expected, &two_required),
+            "a function that genuinely needs two arguments is not a 1-arg Callable"
+        );
+    }
+
+    #[test]
+    fn defaulted_function_passes_as_a_narrower_callable_end_to_end() {
+        let d = check(
+            r#"
+from typing import Callable
+
+def apply(f: Callable[[int], int], x: int) -> int:
+    return f(x)
+
+def scale(x: int, factor: int = 2) -> int:
+    return x * factor
+
+def go() -> None:
+    print(apply(scale, 3))
+"#,
+        );
+        assert!(
+            !d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::TypeMismatch { .. })),
+            "got {:?}",
+            d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn a_genuinely_wider_function_is_still_rejected_as_a_callable() {
+        // The relaxation must not become "any arity fits": a function that
+        // really needs two arguments is not a `Callable[[int], int]`.
+        let d = check(
+            r#"
+from typing import Callable
+
+def apply(f: Callable[[int], int], x: int) -> int:
+    return f(x)
+
+def needs_two(a: int, b: int) -> int:
+    return a + b
+
+def go() -> None:
+    print(apply(needs_two, 3))
+"#,
+        );
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::TypeMismatch { .. })),
+            "a 2-argument function must not satisfy a 1-argument Callable"
+        );
+    }
+
+    #[test]
+    fn deprecated_typing_aliases_do_not_also_mismatch() {
+        // `List[int]` already earns `tyc::typing_alias_deprecated`. Leaving
+        // the head un-normalised produced a second, *hard* error reading
+        // "expected `List[int]`, found `list[int]`" — nonsensical, and it
+        // blocks the build rather than nudging.
+        let d = check(
+            r#"
+from typing import List
+
+def sum_all(xs: List[int]) -> int:
+    mut t: int = 0
+    for x in xs:
+        t = t + x
+    return t
+
+def go() -> None:
+    print(sum_all([1, 2, 3]))
+"#,
+        );
+        assert!(
+            !d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::TypeMismatch { .. })),
+            "got {:?}",
+            d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
         );
     }
 
