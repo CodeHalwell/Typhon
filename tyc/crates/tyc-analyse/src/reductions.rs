@@ -168,20 +168,59 @@ fn rewrite_stmts(
     env: &ScopeEnv,
     stats: &mut ReductionStats,
 ) {
-    for stmt in body.iter_mut() {
+    for idx in 0..body.len() {
         // Recurse first so nested loops inside a matched loop's *sibling*
         // blocks are considered (a matched leaf loop has no nested statements
         // to recurse into anyway).
-        recurse_children(stmt, ctx, env, stats);
-        if let Stmt::For(f) = stmt {
-            if let Some(m) = match_reduction_loop(f, ctx, &env.int_mut, env) {
-                if !env.sum_shadowed && !under_min_size(&m.iter, ctx.min_size) {
-                    *stmt = build_reduction_stmt(&m);
-                    stats.rewrites += 1;
+        recurse_children(&mut body[idx], ctx, env, stats);
+        let Stmt::For(f) = &body[idx] else { continue };
+        let Some(m) = match_reduction_loop(f, ctx, &env.int_mut, env) else {
+            continue;
+        };
+        if env.sum_shadowed || under_min_size(&m.iter, ctx.min_size) {
+            continue;
+        }
+        // The rewrite *deletes* the `for` statement, and with it the loop
+        // variable's binding. Python leaves the loop variable in scope after
+        // the loop, so any later read of it — `print("last x was", x)` — became
+        // a `NameError` on emitted code that type-checked clean, or, when the
+        // name happened to be pre-declared, silently kept its pre-loop value
+        // instead of the last element. Only rewrite when the target is dead
+        // after the loop.
+        if name_read_in(&body[idx + 1..], &m.target) {
+            continue;
+        }
+        body[idx] = build_reduction_stmt(&m);
+        stats.rewrites += 1;
+    }
+}
+
+/// True when `name` is read anywhere in `stmts` (at any nesting depth).
+///
+/// Deliberately conservative: it does not model re-binding, so a later
+/// `for name in …` that would shadow the stale value still counts as a read
+/// and suppresses the rewrite. Missing a parallelisation opportunity costs
+/// speed; taking one that changes the program's meaning costs correctness.
+fn name_read_in(stmts: &[Stmt], name: &str) -> bool {
+    struct V<'a> {
+        name: &'a str,
+        found: bool,
+    }
+    impl ruff_python_ast::visitor::Visitor<'_> for V<'_> {
+        fn visit_expr(&mut self, e: &Expr) {
+            if let Expr::Name(n) = e {
+                if n.id.as_str() == self.name {
+                    self.found = true;
                 }
             }
+            ruff_python_ast::visitor::walk_expr(self, e);
         }
     }
+    let mut v = V { name, found: false };
+    for s in stmts {
+        ruff_python_ast::visitor::walk_stmt(&mut v, s);
+    }
+    v.found
 }
 
 fn recurse_children(

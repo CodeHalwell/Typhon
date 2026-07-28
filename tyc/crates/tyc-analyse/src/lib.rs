@@ -3298,7 +3298,108 @@ fn walk_expr_purity(expr: &Expr, ctx: &mut PurityCtx) {
             walk_expr_purity(&s.value, ctx);
             walk_expr_purity(&s.slice, ctx);
         }
-        _ => {}
+        // The arms below all used to fall into `_ => {}`, which meant the
+        // purity check simply did not look inside them — so `@pure` accepted a
+        // function whose only impurity was a `random()` call in a
+        // comprehension, an f-string, a lambda body, or a dict/set literal.
+        // With `@memo` (or `auto-memoise`) that put `@functools.cache` on a
+        // *nondeterministic* function, which is a wrong answer that gets more
+        // wrong the longer the process runs.
+        //
+        // R5: no `_ => {}` in an analysis visitor. Every remaining arm is
+        // enumerated so adding a node type to the AST forces a decision here
+        // instead of silently widening what `@pure` accepts.
+        Expr::Set(x) => {
+            for e in &x.elts {
+                walk_expr_purity(e, ctx);
+            }
+        }
+        Expr::ListComp(x) => {
+            walk_expr_purity(&x.elt, ctx);
+            walk_comprehension_clauses(&x.generators, ctx);
+        }
+        Expr::SetComp(x) => {
+            walk_expr_purity(&x.elt, ctx);
+            walk_comprehension_clauses(&x.generators, ctx);
+        }
+        Expr::Generator(x) => {
+            walk_expr_purity(&x.elt, ctx);
+            walk_comprehension_clauses(&x.generators, ctx);
+        }
+        Expr::DictComp(x) => {
+            // The vendored fork models the key as optional (it is absent for
+            // a `**spread` entry in the equivalent display form).
+            if let Some(k) = x.key.as_deref() {
+                walk_expr_purity(k, ctx);
+            }
+            walk_expr_purity(&x.value, ctx);
+            walk_comprehension_clauses(&x.generators, ctx);
+        }
+        Expr::Dict(x) => {
+            for item in &x.items {
+                if let Some(k) = &item.key {
+                    walk_expr_purity(k, ctx);
+                }
+                walk_expr_purity(&item.value, ctx);
+            }
+        }
+        Expr::Lambda(x) => walk_expr_purity(&x.body, ctx),
+        Expr::FString(x) => {
+            for part in x.value.iter() {
+                if let ruff_python_ast::FStringPart::FString(f) = part {
+                    for elem in f.elements.iter() {
+                        if let ruff_python_ast::InterpolatedStringElement::Interpolation(i) = elem {
+                            walk_expr_purity(&i.expression, ctx);
+                            if let Some(spec) = &i.format_spec {
+                                for se in &spec.elements {
+                                    if let
+                                        ruff_python_ast::InterpolatedStringElement::Interpolation(n)
+                                        = se
+                                    {
+                                        walk_expr_purity(&n.expression, ctx);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Expr::Starred(x) => walk_expr_purity(&x.value, ctx),
+        // `Await` / `Yield` / `YieldFrom` are rejected outright by the first
+        // arm of this match — they are never walked into.
+        Expr::Named(x) => {
+            walk_expr_purity(&x.target, ctx);
+            walk_expr_purity(&x.value, ctx);
+        }
+        Expr::Slice(x) => {
+            for part in [&x.lower, &x.upper, &x.step].into_iter().flatten() {
+                walk_expr_purity(part, ctx);
+            }
+        }
+        // Leaves: literals and bare names carry nothing to inspect.
+        Expr::Name(_)
+        | Expr::NumberLiteral(_)
+        | Expr::StringLiteral(_)
+        | Expr::BytesLiteral(_)
+        | Expr::BooleanLiteral(_)
+        | Expr::NoneLiteral(_)
+        | Expr::EllipsisLiteral(_)
+        | Expr::IpyEscapeCommand(_) => {}
+        // `t"..."` template strings are not part of the accepted surface;
+        // treat like an f-string so a future lowering can't slip past.
+        Expr::TString(_) => {}
+    }
+}
+
+/// Walk the iterables and conditions of a comprehension's `for … in … if …`
+/// clauses. The element expression is walked by the caller.
+fn walk_comprehension_clauses(generators: &[ruff_python_ast::Comprehension], ctx: &mut PurityCtx) {
+    for g in generators {
+        walk_expr_purity(&g.iter, ctx);
+        for cond in &g.ifs {
+            walk_expr_purity(cond, ctx);
+        }
     }
 }
 
