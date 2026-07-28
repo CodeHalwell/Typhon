@@ -158,6 +158,39 @@ A new `shipped_docs` test extracts every snippet from the cheatsheet and runs
 it through the real front end, and scans the docs and bundled skill for the
 prefix-`frozen` spelling. This is the gate that was missing (R9).
 
+### `tyc migrate`
+
+The migrator produced `.ty` files that do not parse for most real modules. On a
+sample of 16 CPython stdlib modules it now produces parseable Typhon for
+**16 of 16**; the review measured 3 of 10.
+
+- **`let` was injected into continuation lines** of a multi-line signature or
+  call, so `name: str,` — a *parameter* — became `let name: str,`. The
+  migrator now tracks bracket depth and leaves continuations alone (annotation
+  rewrites such as `Optional[T]` → `T?` still apply there).
+- **The closing `) -> T:` of a multi-line `def` header popped the function
+  scope** the header had just opened, so none of that function's locals got
+  their `let` / `mut` keyword.
+- **Synthesised fields were over-indented** for a class with a docstring: the
+  injection anchor is the docstring's last line, and the indent was derived
+  from the anchor rather than recorded with the fields.
+- **`impl X:` blocks were emitted with empty bodies** when a class's only
+  method stayed in place, which lowers to a class with no suite.
+- **The class-body/method partition was blind to docstrings**, so an indented
+  line starting with `@` inside a class docstring was hauled out as a
+  decorator, and a method whose signature spans lines had its closing `):`
+  left behind.
+
+### Parser
+
+- **A soft keyword is a valid binding name.** `let match = re.match(...)`,
+  `let type = ...` and `let case = ...` failed to parse: the statement-start
+  lookahead after `let` / `mut` accepted only `TokenKind::Name`, so `let` fell
+  through as an identifier. These are valid Python identifiers and Typhon is a
+  superset. (Found while fixing the migrator — it is what made CPython's
+  `dataclasses` migrate to an unparseable file.)
+- **`gather:` accepts a trailing comment.**
+
 ### Known open
 
 - The `.py.map` line table records preprocessed-buffer lines rather than `.ty`

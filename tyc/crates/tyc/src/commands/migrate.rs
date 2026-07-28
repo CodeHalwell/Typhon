@@ -135,9 +135,18 @@ pub fn migrate_source(source: &str) -> String {
     let mut scope_stack: Vec<Scope> = Vec::new();
 
     let mut out = String::with_capacity(source.len());
+    // Residual bracket depth carried across lines. A line that *starts* inside
+    // an open bracket is a continuation, not a statement — `name: str,` on the
+    // second line of a multi-line `def` signature is a parameter, and
+    // `[name] * count,` inside a multi-line call is an argument. Both matched
+    // the assignment shapes below and had `let` prepended, producing a `.ty`
+    // file that does not parse.
+    let mut bracket_depth: i32 = 0;
     for (line_index, line) in source.split_inclusive('\n').enumerate() {
         let raw = line.trim_end_matches(['\n', '\r']);
         let terminator = &line[raw.len()..];
+        let starts_inside_brackets = bracket_depth > 0;
+        bracket_depth = (bracket_depth + bracket_delta(raw)).max(0);
 
         // FINDINGS #33: drop lines belonging to a stripped trivial `__init__`.
         // Skipping the whole line (including its trailing newline) keeps
@@ -152,7 +161,14 @@ pub fn migrate_source(source: &str) -> String {
 
         // Pop scopes we've exited (any non-blank, non-comment line at
         // indent ≤ the scope's header indent leaves that scope).
-        let is_structural = !trimmed.is_empty() && !trimmed.starts_with('#');
+        // A continuation line's indentation is layout inside a bracket, not
+        // block structure, so it must not close a scope. The `) -> T:` line
+        // that ends a multi-line `def` header sits at the *header's* indent
+        // and was popping the function scope the header had just opened —
+        // after which the body's locals were no longer seen as function
+        // locals and never got their `let` / `mut` keyword.
+        let is_structural =
+            !trimmed.is_empty() && !trimmed.starts_with('#') && !starts_inside_brackets;
         if is_structural {
             while let Some(top) = scope_stack.last() {
                 if indent <= top.indent {
@@ -183,6 +199,7 @@ pub fn migrate_source(source: &str) -> String {
                 &frozen_decorator_lines,
                 in_class_body,
                 already_declared_here,
+                starts_inside_brackets,
             )
         };
 
@@ -231,8 +248,10 @@ pub fn migrate_source(source: &str) -> String {
         // so the rewritten output reads like a normal dataclass-style
         // body. Indent matches the class header (header indent + 4),
         // covering both top-level and nested class declarations.
-        if let Some(fields) = injected_fields.get(&line_index) {
-            let body_indent = " ".repeat(indent + 4);
+        if let Some((field_indent, fields)) = injected_fields.get(&line_index) {
+            // The recorded class-body indent, not one derived from whatever
+            // line the anchor happened to land on.
+            let body_indent = " ".repeat(*field_indent);
             for (name, ty) in fields {
                 out.push_str(&body_indent);
                 out.push_str(name);
@@ -328,6 +347,64 @@ fn simplify_field_default_factories(source: &str) -> String {
     out
 }
 
+/// Indices of the lines that *begin* inside a triple-quoted string.
+///
+/// Passes that decide structure from indentation and leading text need this,
+/// because a docstring's contents look exactly like structure: an indented
+/// line inside a class docstring that starts with `@` reads as a decorator.
+fn lines_starting_inside_string(lines: &[&str]) -> Vec<bool> {
+    const DQ3: &str = "\"\"\"";
+    const SQ3: &str = "'''";
+    let mut out = Vec::with_capacity(lines.len());
+    let mut delim: Option<&'static str> = None;
+    for line in lines {
+        out.push(delim.is_some());
+        let bytes = line.as_bytes();
+        let mut i = 0usize;
+        while i < bytes.len() {
+            match delim {
+                Some(d) => {
+                    if line[i..].starts_with(d) {
+                        delim = None;
+                        i += 3;
+                        continue;
+                    }
+                }
+                None => {
+                    if bytes[i] == b'#' {
+                        break;
+                    }
+                    if line[i..].starts_with(DQ3) {
+                        delim = Some(DQ3);
+                        i += 3;
+                        continue;
+                    }
+                    if line[i..].starts_with(SQ3) {
+                        delim = Some(SQ3);
+                        i += 3;
+                        continue;
+                    }
+                    // A single-quoted literal cannot span lines; skip over it
+                    // so a triple delimiter inside one is not mistaken for a
+                    // real one.
+                    if bytes[i] == b'"' || bytes[i] == b'\'' {
+                        let q = bytes[i];
+                        i += 1;
+                        while i < bytes.len() && bytes[i] != q {
+                            if bytes[i] == b'\\' {
+                                i += 1;
+                            }
+                            i += 1;
+                        }
+                    }
+                }
+            }
+            i += 1;
+        }
+    }
+    out
+}
+
 /// Relocate method definitions out of top-level `class` bodies into an
 /// `impl ClassName:` block emitted right after the class — Typhon's Rule
 /// 4 (`tyc::method_in_class_body` is a warning on exactly the output the
@@ -337,13 +414,19 @@ fn simplify_field_default_factories(source: &str) -> String {
 /// is meaningful). Only top-level classes are transformed.
 fn move_methods_to_impl(source: &str) -> String {
     let lines: Vec<&str> = source.split_inclusive('\n').collect();
+    // A class docstring containing an indented line that starts with `@` was
+    // read as a decorator and hauled out of the class body into the `impl`
+    // block, corrupting both the docstring and the method list. CPython's own
+    // `typing.py` migrates through here and hit exactly that.
+    let in_string = lines_starting_inside_string(&lines);
     let mut out = String::with_capacity(source.len());
     let mut i = 0usize;
     while i < lines.len() {
         let raw = lines[i].trim_end_matches(['\n', '\r']);
         let trimmed = raw.trim_start();
         let indent = raw.len() - trimmed.len();
-        let is_class_header = indent == 0
+        let is_class_header = !in_string[i]
+            && indent == 0
             && (trimmed.starts_with("class ") || trimmed.starts_with("class! "))
             && trimmed.ends_with(':');
         if !is_class_header {
@@ -370,7 +453,9 @@ fn move_methods_to_impl(source: &str) -> String {
         while end < lines.len() {
             let r = lines[end].trim_end_matches(['\n', '\r']);
             let t = r.trim_start();
-            if !t.is_empty() && r.len() - t.len() == 0 {
+            // A string-content line never ends the block, whatever its
+            // apparent indentation.
+            if !in_string[end] && !t.is_empty() && r.len() - t.len() == 0 {
                 break;
             }
             end += 1;
@@ -394,7 +479,7 @@ fn move_methods_to_impl(source: &str) -> String {
                     }
                     k += 1;
                 }
-                let next_is_method = k < end && {
+                let next_is_method = k < end && !in_string[k] && {
                     let rk = lines[k].trim_end_matches(['\n', '\r']);
                     let tk = rk.trim_start();
                     rk.len() - tk.len() == 4
@@ -412,17 +497,32 @@ fn move_methods_to_impl(source: &str) -> String {
                 j = k;
                 continue;
             }
-            if ind == 4
+            if !in_string[j]
+                && ind == 4
                 && (t.starts_with("def ") || t.starts_with("async def ") || t.starts_with('@'))
             {
                 // Item extent: this line plus everything indented deeper
                 // (decorators chain through subsequent indent-4 def lines).
                 let start_item = j;
+                // Residual bracket depth from the item's header. A method
+                // whose signature spans lines closes with `):` at the *same*
+                // indent as its `def`, so an indent-only extent scan stopped
+                // before it and left the `):` behind in the class body while
+                // the rest moved into the `impl` block — an unparseable file
+                // from the migrator's own output. `ast.py` does this.
+                let mut header_depth = bracket_delta(lines[j]).max(0);
                 j += 1;
                 while j < end {
                     let r2 = lines[j].trim_end_matches(['\n', '\r']);
                     let t2 = r2.trim_start();
                     let ind2 = r2.len() - t2.len();
+                    if header_depth > 0 {
+                        // Still inside the signature: this line belongs to the
+                        // item whatever its indentation looks like.
+                        header_depth = (header_depth + bracket_delta(lines[j])).max(0);
+                        j += 1;
+                        continue;
+                    }
                     if t2.is_empty() {
                         // Blank inside an item only if deeper content follows.
                         let mut k = j + 1;
@@ -487,7 +587,20 @@ fn move_methods_to_impl(source: &str) -> String {
                 }
             }
         }
-        if methods.is_empty() {
+        // Trim before deciding, not after. `methods` can hold nothing but the
+        // blank lines the look-ahead attributed to a method that then stayed
+        // in the class body (a `class!`'s hand-written `__init__`), and an
+        // `impl X:` with an empty body lowers to a class with no suite —
+        // "Expected an indented block after `class` definition" on a file the
+        // migrator itself produced.
+        let mut methods_trimmed: Vec<&str> = methods.clone();
+        while methods_trimmed.first().is_some_and(|l| l.trim().is_empty()) {
+            methods_trimmed.remove(0);
+        }
+        while methods_trimmed.last().is_some_and(|l| l.trim().is_empty()) {
+            methods_trimmed.pop();
+        }
+        if methods_trimmed.is_empty() {
             for l in &lines[i..end] {
                 out.push_str(l);
             }
@@ -516,13 +629,6 @@ fn move_methods_to_impl(source: &str) -> String {
         match &type_params {
             Some(tp) => out.push_str(&format!("impl{tp} {class_name}{tp}:\n")),
             None => out.push_str(&format!("impl {class_name}:\n")),
-        }
-        let mut methods_trimmed: Vec<&str> = methods.clone();
-        while methods_trimmed.first().is_some_and(|l| l.trim().is_empty()) {
-            methods_trimmed.remove(0);
-        }
-        while methods_trimmed.last().is_some_and(|l| l.trim().is_empty()) {
-            methods_trimmed.pop();
         }
         let mut prev_blank = false;
         for l in &methods_trimmed {
@@ -616,6 +722,39 @@ fn prune_stale_migration_imports(source: &str) -> String {
     out
 }
 
+/// Net bracket delta of `line`, ignoring brackets inside string literals and
+/// after a `#` comment. Used to tell a statement from the continuation of a
+/// multi-line signature or call.
+fn bracket_delta(line: &str) -> i32 {
+    let bytes = line.as_bytes();
+    let mut depth = 0i32;
+    let mut quote: Option<u8> = None;
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        match quote {
+            Some(q) => {
+                if b == b'\\' {
+                    i += 2;
+                    continue;
+                }
+                if b == q {
+                    quote = None;
+                }
+            }
+            None => match b {
+                b'"' | b'\'' => quote = Some(b),
+                b'#' => break,
+                b'(' | b'[' | b'{' => depth += 1,
+                b')' | b']' | b'}' => depth -= 1,
+                _ => {}
+            },
+        }
+        i += 1;
+    }
+    depth
+}
+
 /// Walk every line and apply rewrite rules in order.  Returns the
 /// transformed line (without its terminator).
 #[allow(clippy::too_many_arguments)]
@@ -628,6 +767,13 @@ fn rewrite_line(
     frozen_decorator_lines: &HashSet<usize>,
     in_class_body: bool,
     already_declared_here: Option<(bool, &HashSet<String>)>,
+    // True when this line begins inside an open bracket, i.e. it is the
+    // continuation of a multi-line signature or call. Annotation rewrites
+    // (`Optional[T]` → `T?`) still apply — those are safe anywhere — but a
+    // `let` / `mut` keyword must not be injected: `name: str,` on the second
+    // line of a `def` header is a *parameter*, and prefixing it produced a
+    // `.ty` file that does not parse.
+    is_continuation: bool,
 ) -> String {
     // Quick exit for comments — leave them untouched.
     let trimmed = line.trim_start();
@@ -737,7 +883,9 @@ fn rewrite_line(
     }
 
     // Module-level annotated assignment: prepend let/mut.
-    if indent.is_empty() {
+    if is_continuation {
+        // No binding-keyword injection on a continuation line.
+    } else if indent.is_empty() {
         if let Some(name) = leading_ann_assign_name(&body) {
             // Only rewrite when the user has not already added the keyword.
             if !body.starts_with("let ") && !body.starts_with("mut ") {
@@ -1036,17 +1184,25 @@ fn rewrite_generic_class_base(line: &str) -> Option<String> {
 /// Anything more exotic stays on the `class!` path so the user keeps
 /// their custom constructor — strip-and-synthesise would silently drop
 /// real logic. False-negatives are preferred over false-positives.
+/// `(trivial-init class header lines, lines to drop, injection sites)`.
+///
+/// An injection site is keyed by the line to emit *after*, and carries the
+/// indent the fields must be written at alongside them. The indent has to
+/// travel with the fields because the anchor is not always the class header:
+/// when the class opens with a docstring the anchor is the docstring's last
+/// line, so deriving the indent from the anchor line over-indented every
+/// synthesised field by one level and produced an unparseable class body.
 type TrivialInitClasses = (
     HashSet<usize>,
     HashSet<usize>,
-    HashMap<usize, Vec<(String, String)>>,
+    HashMap<usize, (usize, Vec<(String, String)>)>,
 );
 
 fn collect_trivial_init_classes(source: &str) -> TrivialInitClasses {
     let lines: Vec<&str> = source.lines().collect();
     let mut trivial: HashSet<usize> = HashSet::new();
     let mut skip: HashSet<usize> = HashSet::new();
-    let mut inject: HashMap<usize, Vec<(String, String)>> = HashMap::new();
+    let mut inject: HashMap<usize, (usize, Vec<(String, String)>)> = HashMap::new();
 
     for (idx, raw) in lines.iter().enumerate() {
         let trimmed = raw.trim_start();
@@ -1309,7 +1465,7 @@ fn collect_trivial_init_classes(source: &str) -> TrivialInitClasses {
         // at `body_indent` and anchor the injection after its last line
         // so `__doc__` is preserved.
         let anchor = leading_docstring_end(&lines, idx, body_indent).unwrap_or(idx);
-        inject.insert(anchor, typed_params);
+        inject.insert(anchor, (body_indent, typed_params));
     }
 
     (trivial, skip, inject)
@@ -2404,6 +2560,42 @@ fn walk(dir: &std::path::Path, out: &mut Vec<PathBuf>) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn multi_line_signature_parameters_do_not_get_a_binding_keyword() {
+        // `name: str,` on the second line of a `def` header is a *parameter*.
+        // Prefixing it with `let` produced a `.ty` file that does not parse,
+        // which is what broke migration of most real modules.
+        let out = migrate_source(
+            "def build(\n    name: str,\n    count: int = 1,\n) -> str:\n    result = name * count\n    return result\n",
+        );
+        assert!(!out.contains("let name: str,"), "got:\n{out}");
+        assert!(!out.contains("let count: int = 1,"), "got:\n{out}");
+        // The function body's local still gets one — the closing `) -> str:`
+        // line must not have popped the function scope.
+        assert!(out.contains("let result = name * count"), "got:\n{out}");
+    }
+
+    #[test]
+    fn synthesised_fields_are_indented_under_a_class_with_a_docstring() {
+        // The injection anchor is the docstring's last line, so deriving the
+        // indent from the anchor over-indented every field by one level.
+        let out = migrate_source(
+            "class Point:\n    \"\"\"A point.\"\"\"\n\n    def __init__(self, x: int, y: int) -> None:\n        self.x = x\n        self.y = y\n",
+        );
+        assert!(out.contains("\n    x: int\n"), "got:\n{out}");
+        assert!(out.contains("\n    y: int\n"), "got:\n{out}");
+        assert!(!out.contains("        x: int"), "over-indented:\n{out}");
+    }
+
+    #[test]
+    fn a_class_whose_methods_all_stay_gets_no_empty_impl_block() {
+        // `impl X:` with an empty body lowers to a class with no suite.
+        let out = migrate_source(
+            "class! Act(Base):\n\n    def __init__(self, a: int) -> None:\n        super().__init__()\n",
+        );
+        assert!(!out.contains("impl Act:"), "empty impl emitted:\n{out}");
+    }
     use super::*;
 
     #[test]
