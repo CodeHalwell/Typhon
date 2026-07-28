@@ -1208,6 +1208,7 @@ pub fn install(interp: &mut Interpreter) {
             properties: std::cell::RefCell::new(std::collections::HashSet::new()),
             classmethods: std::cell::RefCell::new(std::collections::HashSet::new()),
             is_exception: false,
+            is_protocol: false,
         })),
     );
     // Common typing names that show up as zero-effort bases.
@@ -1223,6 +1224,7 @@ pub fn install(interp: &mut Interpreter) {
                 properties: std::cell::RefCell::new(std::collections::HashSet::new()),
                 classmethods: std::cell::RefCell::new(std::collections::HashSet::new()),
                 is_exception: false,
+                is_protocol: false,
             })),
         );
     }
@@ -3747,6 +3749,7 @@ fn make_re_module() -> Value {
             properties: std::cell::RefCell::new(std::collections::HashSet::new()),
             classmethods: std::cell::RefCell::new(std::collections::HashSet::new()),
             is_exception: false,
+            is_protocol: false,
         });
         Value::Instance(Rc::new(crate::value::Instance {
             class: cls,
@@ -3871,6 +3874,7 @@ fn make_re_module() -> Value {
             properties: std::cell::RefCell::new(std::collections::HashSet::new()),
             classmethods: std::cell::RefCell::new(std::collections::HashSet::new()),
             is_exception: false,
+            is_protocol: false,
         });
         Value::Instance(Rc::new(crate::value::Instance {
             class: cls,
@@ -4787,6 +4791,7 @@ fn make_pydantic_module() -> Value {
         properties: std::cell::RefCell::new(std::collections::HashSet::new()),
         classmethods: std::cell::RefCell::new(std::collections::HashSet::new()),
         is_exception: false,
+        is_protocol: false,
     }));
     let config_dict = nf("ConfigDict", |_i, _args| {
         // Accept any kwargs and ignore — purely a config-record stub.
@@ -7966,6 +7971,7 @@ pub fn make_builtin_type(name: &str) -> Value {
                     properties: std::cell::RefCell::new(std::collections::HashSet::new()),
                     classmethods: std::cell::RefCell::new(std::collections::HashSet::new()),
                     is_exception: false,
+                    is_protocol: false,
                 })
             })
             .clone();

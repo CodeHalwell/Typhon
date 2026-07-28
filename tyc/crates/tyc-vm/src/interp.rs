@@ -835,6 +835,22 @@ impl Interpreter {
             })
             .unwrap_or(false);
         let has_generated_fields = is_dataclass || is_pydantic_model;
+        // `interface X:` lowers to `class X(Protocol):`. `typing.Protocol` is
+        // an identity native in the VM, not a class, so it never survives into
+        // `bases` — read it off the base expression instead.
+        let is_protocol = c
+            .arguments
+            .as_ref()
+            .map(|args| {
+                args.args.iter().any(|b| {
+                    let head = match b {
+                        Expr::Subscript(s) => s.value.as_ref(),
+                        other => other,
+                    };
+                    rightmost_name(head).as_deref() == Some("Protocol")
+                })
+            })
+            .unwrap_or(false);
         let is_classvar = |ann: &Expr| -> bool {
             let head = match ann {
                 Expr::Subscript(s) => s.value.as_ref(),
@@ -1031,6 +1047,7 @@ impl Interpreter {
             properties: RefCell::new(properties),
             classmethods: RefCell::new(classmethods),
             is_exception,
+            is_protocol,
         });
 
         // Enum subclass: convert simple class-level assignments (`RED = 1`)
@@ -1431,6 +1448,7 @@ impl Interpreter {
                 properties: RefCell::new(std::collections::HashSet::new()),
                 classmethods: RefCell::new(std::collections::HashSet::new()),
                 is_exception: false,
+                is_protocol: false,
             });
             members.insert(base_name.to_owned(), Value::Class(cls));
         }
@@ -2398,6 +2416,42 @@ impl Interpreter {
     /// shape it can't model (a TypeVar, an unresolvable name, an unknown
     /// parameterised origin) is accepted, so the cast only ever rejects a value
     /// it can prove wrong.
+    /// Match `value` against an `as!` target that has already been resolved to
+    /// a runtime value, mirroring `typhon_runtime/cast.py::_matches`.
+    ///
+    /// Two targets need more than `isinstance`:
+    ///
+    /// * An `interface` lowers to a `Protocol` subclass. Nominal
+    ///   `isinstance` can never succeed against one — the value's class chain
+    ///   does not contain the protocol — so `EXPR as! SomeInterface` always
+    ///   raised `TypeError` inside the guard, making a structurally valid cast
+    ///   to an interface impossible. Interfaces are structural by definition,
+    ///   so check for the members instead.
+    ///
+    /// * A `newtype` lowers to `typing.NewType`, which the VM models as an
+    ///   identity callable. That is not a class, so `isinstance` rejected
+    ///   *everything* — `as! SomeNewtype` could never succeed here either,
+    ///   while the compiled path (before it was fixed) accepted everything
+    ///   unchecked. The VM cannot recover the declared base from the identity
+    ///   shim, so it accepts, which is the documented rule for this matcher:
+    ///   only ever reject a value it can prove wrong.
+    fn value_matches_resolved_target(&mut self, value: &Value, target: &Value) -> bool {
+        if let Value::Native(n) = target {
+            if n.name == "NewTypeAlias" {
+                return true;
+            }
+        }
+        if let Value::Class(cls) = target {
+            if class_is_protocol(cls) {
+                let names: Vec<String> = cls.methods.borrow().keys().cloned().collect();
+                return names
+                    .iter()
+                    .all(|m| self.get_attr(value, m.as_str()).is_ok());
+            }
+        }
+        crate::builtins::is_instance_of(value, target)
+    }
+
     fn value_matches_cast_type(&mut self, value: &Value, tp: &Expr, env: &EnvRef) -> bool {
         match tp {
             Expr::NoneLiteral(_) => matches!(value, Value::None),
@@ -2420,12 +2474,12 @@ impl Interpreter {
                 // User class / unknown — resolve the name and use isinstance;
                 // be permissive when it can't be resolved in the VM env.
                 _ => match self.eval_expr(tp, env) {
-                    Ok(cls) => crate::builtins::is_instance_of(value, &cls),
+                    Ok(cls) => self.value_matches_resolved_target(value, &cls),
                     Err(_) => true,
                 },
             },
             Expr::Attribute(_) => match self.eval_expr(tp, env) {
-                Ok(cls) => crate::builtins::is_instance_of(value, &cls),
+                Ok(cls) => self.value_matches_resolved_target(value, &cls),
                 Err(_) => true,
             },
             Expr::BinOp(b) if matches!(b.op, Operator::BitOr) => {
@@ -7242,6 +7296,12 @@ fn package_of_module(name: &str, is_package_init: bool) -> Vec<String> {
         segs.pop();
     }
     segs
+}
+
+/// True when `cls` is (or inherits) the `Protocol` marker the VM installs for
+/// `interface` declarations.
+fn class_is_protocol(cls: &Rc<crate::value::Class>) -> bool {
+    cls.is_protocol || cls.name == "Protocol" || cls.bases.iter().any(class_is_protocol)
 }
 
 #[cfg(test)]

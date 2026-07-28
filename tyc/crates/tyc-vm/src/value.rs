@@ -955,6 +955,16 @@ pub struct Class {
     /// getting the dataclass "takes N arguments" treatment, so that the
     /// ubiquitous `raise FooError("message")` idiom works under the VM.
     pub is_exception: bool,
+    /// `true` when the class was declared with a `Protocol` base — i.e. it is
+    /// the lowering of a Typhon `interface`.
+    ///
+    /// Recorded from the base *expression* rather than the resolved base,
+    /// because `typing.Protocol` resolves to an identity native in the VM, not
+    /// a class, so it never appears in `bases`. Without this the `as!` cast
+    /// could not tell an interface target from an ordinary class and fell back
+    /// to a nominal `isinstance`, which can never succeed against a protocol —
+    /// making `EXPR as! SomeInterface` impossible under `tyc run`.
+    pub is_protocol: bool,
 }
 
 #[derive(Clone)]
@@ -2302,6 +2312,7 @@ mod tests {
             properties: RefCell::new(std::collections::HashSet::new()),
             classmethods: RefCell::new(std::collections::HashSet::new()),
             is_exception: false,
+            is_protocol: false,
         })
     }
 

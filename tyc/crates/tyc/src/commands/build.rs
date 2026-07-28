@@ -3184,6 +3184,22 @@ def _matches(value: Any, tp: Any) -> bool:
             return isinstance(value, (int, float)) and not isinstance(value, complex)
         if tp is complex:
             return isinstance(value, (int, float, complex))
+        # `newtype Foo = int` lowers to `typing.NewType`, which is a callable,
+        # not a type — `isinstance(tp, type)` is False, so this fell straight
+        # through to `return True` and the cast was completely unchecked on
+        # the compiled path while the VM rejected it. Unwrap to the base type
+        # and check that.
+        supertype = getattr(tp, \"__supertype__\", None)
+        if supertype is not None:
+            return _matches(value, supertype)
+        # An `interface` lowers to a `Protocol` subclass, and `isinstance`
+        # against a Protocol that is not `@runtime_checkable` *raises*
+        # TypeError — so `EXPR as! SomeInterface` could never succeed, it only
+        # ever blew up inside the guard. Check structurally instead, which is
+        # what an interface means anyway: does the value carry the members?
+        protocol_attrs = getattr(tp, \"__protocol_attrs__\", None)
+        if protocol_attrs is not None:
+            return all(hasattr(value, attr) for attr in protocol_attrs)
         if isinstance(tp, type):
             return isinstance(value, tp)
         # An unrecognised descriptor (e.g. a TypeVar) — be permissive so the
