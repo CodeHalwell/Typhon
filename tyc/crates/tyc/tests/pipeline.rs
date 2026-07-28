@@ -1470,23 +1470,15 @@ def parse(s: str) -> Result[int, str]:
     // test in this file used to assert — is satisfied by a table of all 1s,
     // so it only ever caught an *absent* map, never a wrong one.
     //
-    // Two real invariants are checked instead:
+    // Three real invariants are checked instead.
     //
-    //  1. The table is monotonically non-decreasing. Emission walks the
-    //     module in source order, so a later output line can never originate
-    //     above an earlier one. This rejects a shuffled or garbage table.
-    // KNOWN DEFECT, which is why only monotonicity is asserted. The values in
-    // this table are line numbers in the *preprocessed buffer*, not in the
-    // `.ty` file — `tyc-emit` records `(out_line -> preprocessed_line)` and
-    // nothing composes that with a `preprocessed_line -> ty_line` map, because
-    // none of the nine text passes in front of `preprocess` produces one. For
-    // this three-line program the table runs up to 7, and the four lines of
-    // the `?` expansion map to 3, 4, 5, 6 rather than all to the single source
-    // line they came from. Every consumer (`tyc trace`, `tyc debug --break`,
-    // `tyc ty` re-attribution, `[emit] traceback-remap`) is therefore off for
-    // any file using `?`, `gather:`, a `with`-chain, `rescue`, pipes, or typed
-    // unpack. Tracked as Cluster B in docs/codebase-review-2026-07-28.md.
-    // Monotonicity is asserted now so the eventual fix cannot regress it.
+    // 1. The table is monotonically non-decreasing. Emission walks the module
+    //    in source order, so for *this* program a later output line can never
+    //    originate above an earlier one, and a shuffled or garbage table is
+    //    rejected. Note this is a property of the fixture, not of source maps
+    //    in general: a `with`-chain copies its `else` body into each binding's
+    //    guard, so those output lines legitimately point back "early". Do not
+    //    generalise this assertion to a fixture using one.
     for w in lines.windows(2) {
         assert!(
             w[1] >= w[0],
@@ -1496,12 +1488,33 @@ def parse(s: str) -> Result[int, str]:
         );
     }
 
-    // NOT asserted, because it does not hold today: that the lines of the `?`
-    // expansion all map back to the single `.ty` line they came from. They map
-    // to 3, 4, 5, 6 — four consecutive lines of the *preprocessed buffer*.
-    // See the note above; this is the invariant the Cluster B fix must
-    // establish, and the monotonicity check above is what guards the table in
-    // the meantime.
+    // 2. Every value is a real line of the *`.ty` file* — the three-line
+    //    program above. Until v1.0.0-alpha.7 the table recorded lines of the
+    //    *preprocessed buffer* instead: `tyc-emit` produced
+    //    `(out_line -> preprocessed_line)` and nothing composed it with a
+    //    `preprocessed_line -> ty_line` map, because none of the text passes
+    //    in front of `preprocess` produced one. This table ran to 7 on a
+    //    3-line file, so `tyc trace`, `tyc debug --break`, `tyc ty`
+    //    re-attribution and `[emit] traceback-remap` all pointed past EOF for
+    //    any file using `?`, `gather:`, a `with`-chain, `rescue`, pipes or
+    //    typed unpack — which is most idiomatic Typhon. This assertion is what
+    //    stops that regressing.
+    let ty_line_count = 3;
+    for &line in &lines {
+        assert!(
+            line >= 1 && line <= ty_line_count,
+            "source map points at .ty line {line}, but the file has only {ty_line_count} lines \
+             — the table is recording preprocessed-buffer lines again"
+        );
+    }
+
+    // 3. The lines of the `?` expansion all map back to the *single* `.ty`
+    //    line they came from (line 2, `let n = int(s)?`). Before the fix they
+    //    mapped to 3, 4, 5, 6 — four consecutive preprocessed-buffer lines.
+    assert!(
+        lines.iter().filter(|&&l| l == 2).count() >= 2,
+        "the `?` expansion should collapse onto .ty line 2; got {lines:?}"
+    );
 
     // The `?` expansion injects at least three Python lines containing
     // `__typhon_q_` (assignment, isinstance guard, return/unwrap).  Reading

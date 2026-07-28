@@ -10830,7 +10830,11 @@ fn reset_globals_after_call(c: &mut Checker) {
 /// test-implied narrowing (`if reload() is not None:`) survives the reset.
 fn eval_stmt_expr(c: &mut Checker, e: &Expr) -> Type {
     let t = infer_expr(c, e);
-    if expr_contains_call(e) {
+    // Short-circuit on the empty set *before* walking the expression. Most
+    // modules declare no `global` at all, and `expr_contains_call` is a full
+    // subtree walk that would otherwise run once per statement in the program
+    // only to find there is nothing it could invalidate.
+    if !c.globals_rebound_by_call.is_empty() && expr_contains_call(e) {
         reset_globals_after_call(c);
     }
     t
@@ -10865,7 +10869,7 @@ fn widen_loop_carried_narrowings(c: &mut Checker, body: &[Stmt]) {
     // The sequential reset at the call's own statement fires only once control
     // *reaches* the call — which is after the top-of-body read on iteration 2.
     // The back-edge therefore needs its own reset.
-    if body_contains_call(body) {
+    if !c.globals_rebound_by_call.is_empty() && body_contains_call(body) {
         reset_globals_after_call(c);
     }
 }
@@ -10913,7 +10917,7 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                 // `global NAME` in the callee, staling a caller narrowing on
                 // that global. Reset for subsequent statements (mirrors the
                 // `Stmt::Assign` / `Stmt::Expr` resets). Locals are immune.
-                if expr_contains_call(value) {
+                if !c.globals_rebound_by_call.is_empty() && expr_contains_call(value) {
                     reset_globals_after_call(c);
                 }
                 if bare_final {
@@ -11035,7 +11039,7 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
             // assignment applies its own target narrowing below, so that fresh
             // narrowing survives — mirroring the bare-call `Stmt::Expr` reset.
             // Locals are immune (a call can't rebind a caller's local).
-            if expr_contains_call(&a.value) {
+            if !c.globals_rebound_by_call.is_empty() && expr_contains_call(&a.value) {
                 reset_globals_after_call(c);
             }
             for target in &a.targets {
@@ -11654,7 +11658,9 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
             // reachable afterwards, so this only matters for the statements
             // the checker keeps walking past a `return` — but the arm is here
             // so the reset never drifts out of the statement list again.
-            if ret.value.as_deref().is_some_and(expr_contains_call) {
+            if !c.globals_rebound_by_call.is_empty()
+                && ret.value.as_deref().is_some_and(expr_contains_call)
+            {
                 reset_globals_after_call(c);
             }
         }
@@ -11778,7 +11784,7 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
             // so any narrowing the caller established on a global is now stale.
             // Reset it. (Locals are immune — a call can't rebind a caller's
             // local.) See `reset_global_narrowings`.
-            if expr_contains_call(&e.value) {
+            if !c.globals_rebound_by_call.is_empty() && expr_contains_call(&e.value) {
                 reset_globals_after_call(c);
             }
             // A bare method-call statement (`self.reset()`, `conn.close()`) may
@@ -12073,10 +12079,8 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
         }
         Stmt::Delete(d) => {
             // `del cache[key()]` evaluates the subscript, calls included.
-            for tgt in &d.targets {
-                if expr_contains_call(tgt) {
-                    reset_globals_after_call(c);
-                }
+            if !c.globals_rebound_by_call.is_empty() && d.targets.iter().any(expr_contains_call) {
+                reset_globals_after_call(c);
             }
         }
         _ => {}

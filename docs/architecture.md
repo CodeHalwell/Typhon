@@ -110,6 +110,17 @@ Express each analysis as a Salsa query: `parse(file)`, `resolve(module)`, `infer
 
 Pipeline: Typhon AST → desugar to plain Python AST → `tyc-emit` hand-written printer → `ruff format` post-process (when `[emit] format = true`). Emitted files carry a generated-header comment.
 
-Source maps mapping `.py` lines back to `.ty` are written as a sidecar `.py.map` file. The printer records a `line_offsets` table as it prints each statement; the v2 format stores the resulting `(out_line → ty_line)` mapping. `tyc trace` uses it to rewrite Python tracebacks back to Typhon source, and the LSP uses it for cross-file go-to-definition across the `.ty`/`.py` boundary.
+Source maps mapping `.py` lines back to `.ty` are written as a sidecar `.py.map` file. The v2 format stores an `(out_line → ty_line)` table, built by composing **two** maps:
+
+1. `tyc-emit`'s printer records a `line_offsets` table as it prints each statement, giving `out_line → preprocessed_line`.
+2. Each line-count-changing preprocessor pass returns its own `preprocessed_line → input_line` table from a `*_mapped` variant (`expand_pipes_mapped`, `expand_gather_blocks_mapped`, …); `tyc build` folds them with `compose_line_maps` to get `preprocessed_line → ty_line`.
+
+Both halves are required. Before v1.0.0-alpha.7 only the first existed and its values were written out directly, so the table named lines of the preprocessed buffer — which for any file using `?`, `gather:`, a `with`-chain, `rescue`, pipes or typed unpack is a different, longer file than the one the user wrote, frequently past its EOF.
+
+The plain entry points (`expand_pipes(s) -> String`) are thin wrappers over the mapped variants, so a consumer that does not need provenance — the VM, `tyc check`, the REPL — is unaffected.
+
+The composed table is **not** monotonic in general: a `with`-chain copies its `else` body into each binding's guard, so those output lines point back to a line above their neighbours. Do not assume monotonicity when consuming it.
+
+`tyc trace` uses the map to rewrite Python tracebacks back to Typhon source, `tyc debug --break` to place breakpoints, and the LSP for cross-file go-to-definition across the `.ty`/`.py` boundary.
 
 There is deliberately **no Typhon-specific runtime package** the user must install. The handful of helpers needed (`Result`/`Ok`/`Err`, `lazy_import`, `str_to_slug`-style extension shims) are emitted inline into each project as a generated `typhon_runtime/` module the build owns.

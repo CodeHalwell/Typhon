@@ -23,10 +23,14 @@ use tyc_diagnostics::{Diagnostics, TycError};
 use tyc_emit::{emit_python_with_source_for_target, emit_stub};
 use tyc_format::format_source;
 use tyc_syntax::preprocess::{
-    expand_compound_question_headers, expand_gather_blocks, expand_go_calls,
-    expand_inline_question_ops, expand_lazy_imports, expand_lazy_lets, expand_multiline_guards,
-    expand_pipes, expand_question_ops, expand_typed_let_unpack, expand_with_chains,
-    line_byte_starts, preprocess, LazyImport,
+    compose_line_maps, expand_compound_question_headers, expand_compound_question_headers_mapped,
+    expand_gather_blocks, expand_gather_blocks_mapped, expand_go_calls, expand_go_calls_mapped,
+    expand_inline_question_ops, expand_inline_question_ops_mapped, expand_lazy_imports,
+    expand_lazy_imports_mapped, expand_lazy_lets_mapped, expand_multiline_guards,
+    expand_multiline_guards_mapped, expand_pipes, expand_pipes_mapped, expand_question_ops,
+    expand_question_ops_mapped, expand_typed_let_unpack, expand_typed_let_unpack_mapped,
+    expand_with_chains, expand_with_chains_mapped, line_byte_starts, preprocess, preprocess_mapped,
+    LazyImport,
 };
 
 use crate::commands::util::{
@@ -502,22 +506,36 @@ pub fn run(args: BuildArgs) -> Result<()> {
         // recorded aliases drive the post-emit rewrite to native PEP 810
         // syntax further down. (This mirrors the VM / check paths, which
         // already use `expand_lazy_lets` + the `import … as …` rewrite.)
-        let lazy_expanded = if native_lazy_imports {
-            expand_lazy_lets(&expand_typed_let_unpack(source))
+        //
+        // Each pass is run through its `*_mapped` sibling and the resulting
+        // `output line -> input line` tables are folded together, so we come
+        // out of the chain holding a `preprocessed line -> .ty line` table.
+        // Without it the `.py.map` sidecar written below would record line
+        // numbers from the preprocessed buffer while claiming they are `.ty`
+        // lines — wrong for every file using `?`, `gather:`, a `with`-chain,
+        // `rescue`, pipes, or a typed unpack.
+        let mut stage = expand_typed_let_unpack_mapped(source);
+        if native_lazy_imports {
+            chain_step(&mut stage, expand_lazy_lets_mapped);
         } else {
-            expand_lazy_imports(&expand_typed_let_unpack(source))
-        };
+            chain_step(&mut stage, expand_lazy_imports_mapped);
+        }
+        chain_step(&mut stage, expand_multiline_guards_mapped);
+        chain_step(&mut stage, expand_gather_blocks_mapped);
+        chain_step(&mut stage, expand_go_calls_mapped);
+        chain_step(&mut stage, expand_with_chains_mapped);
+        chain_step(&mut stage, expand_pipes_mapped);
+        chain_step(&mut stage, expand_compound_question_headers_mapped);
         // The inline `?` pass runs before the end-of-line `?` pass so
         // `Ok(f(x)?)`-shaped sub-expressions get lifted into temps
         // first. O17 / FINDINGS #66 / R3.13 / E9.
-        let expanded = expand_question_ops(&expand_inline_question_ops(
-            &expand_compound_question_headers(&expand_pipes(&expand_with_chains(
-                &expand_go_calls(&expand_gather_blocks(&expand_multiline_guards(
-                    &lazy_expanded,
-                ))),
-            ))),
-        ));
-        let mut prep = preprocess(&expanded);
+        chain_step(&mut stage, expand_inline_question_ops_mapped);
+        chain_step(&mut stage, expand_question_ops_mapped);
+        let (expanded, expanded_to_ty) = stage;
+        let (mut prep, prep_to_expanded) = preprocess_mapped(&expanded);
+        // The one table the `.py.map` writer needs: preprocessed line → `.ty`
+        // line, both 0-based.
+        let preprocessed_to_ty = compose_line_maps(&prep_to_expanded, &expanded_to_ty);
 
         // `pub *` wildcard re-export aggregation.
         //
@@ -1198,7 +1216,12 @@ pub fn run(args: BuildArgs) -> Result<()> {
                 .display()
                 .to_string(),
         );
-        let map_body = build_source_map_v2(&source_rel, &prep.python_source, &line_offsets);
+        let map_body = build_source_map_v2(
+            &source_rel,
+            &prep.python_source,
+            &line_offsets,
+            &preprocessed_to_ty,
+        );
         if check_mode {
             println!("would write {}", display_relative(&map_path, &project_root));
             would_write_count += 1;
@@ -2307,13 +2330,36 @@ fn escape_json_path(s: &str) -> String {
     out
 }
 
+/// Run one `&str -> (String, line map)` stage of the sugar-expansion chain,
+/// folding its table into the one accumulated so far.
+///
+/// `stage` is `(text, text line -> .ty line)`. After the call it describes the
+/// pass's output, still keyed back to the original `.ty` file.
+fn chain_step(stage: &mut (String, Vec<usize>), pass: fn(&str) -> (String, Vec<usize>)) {
+    let (text, step_map) = pass(&stage.0);
+    stage.1 = compose_line_maps(&step_map, &stage.1);
+    stage.0 = text;
+}
+
 /// Build a v2 `.py.map` JSON body with a full `lines` table.
 ///
 /// `line_offsets[i]` is the byte offset in `preprocessed` that was "active"
 /// when output line `i` (0-indexed) was emitted.  Each offset is converted to
-/// a 1-indexed line number and the array is serialised inline.  Synthesised
-/// lines (offset 0) correctly land on line 1, matching the identity fallback.
-fn build_source_map_v2(source_rel: &str, preprocessed: &str, line_offsets: &[usize]) -> String {
+/// a 0-indexed line number *of the preprocessed buffer*, and then — this is
+/// the step that makes the sidecar mean what it claims — through
+/// `preprocessed_to_ty` to the 0-based `.ty` line it actually came from,
+/// emitted 1-indexed.  Synthesised lines (offset 0) land on the file's first
+/// line, matching the identity fallback.
+///
+/// Passing an empty `preprocessed_to_ty` selects the identity mapping, which
+/// is only correct for a buffer no pass changed the line count of; real builds
+/// always pass the folded chain table.
+fn build_source_map_v2(
+    source_rel: &str,
+    preprocessed: &str,
+    line_offsets: &[usize],
+    preprocessed_to_ty: &[usize],
+) -> String {
     // ⚡ Bolt optimization: Precompute newline offsets to avoid O(N^2) behavior.
     // Instead of rescanning the string for every offset, we find all newlines
     // once O(N) and binary search them for each offset O(log N).
@@ -2329,7 +2375,15 @@ fn build_source_map_v2(source_rel: &str, preprocessed: &str, line_offsets: &[usi
         .map(|&offset| {
             let clamped = offset.min(preprocessed.len());
             let count = newline_offsets.partition_point(|&nl_offset| nl_offset < clamped);
-            count as u32 + 1
+            let ty_line = if preprocessed_to_ty.is_empty() {
+                count
+            } else {
+                // Clamp rather than drop: a token offset past the last mapped
+                // line can only come from trailing synthesised text, which
+                // belongs to the last real source line.
+                preprocessed_to_ty[count.min(preprocessed_to_ty.len() - 1)]
+            };
+            ty_line as u32 + 1
         })
         .collect();
 
@@ -4625,7 +4679,7 @@ async def load(uid: int) -> int:
         // Three output lines, all from preprocessed line 2 (offset 6 in "line1\nline2\n")
         let preprocessed = "line1\nline2\n";
         let offsets = vec![0usize, 6, 6];
-        let json = build_source_map_v2("main.ty", preprocessed, &offsets);
+        let json = build_source_map_v2("main.ty", preprocessed, &offsets, &[]);
         assert!(
             json.contains("\"version\":2"),
             "version must be 2; got: {json}"
@@ -4641,6 +4695,14 @@ async def load(uid: int) -> int:
         assert!(
             json.contains("\"lines\":[1,2,2]"),
             "lines array wrong; got: {json}"
+        );
+
+        // With a provenance table the same offsets resolve through it: here
+        // preprocessed lines 1 and 2 both came from `.ty` line 1.
+        let json = build_source_map_v2("main.ty", preprocessed, &offsets, &[0, 0]);
+        assert!(
+            json.contains("\"lines\":[1,1,1]"),
+            "lines array must be remapped through the .ty table; got: {json}"
         );
     }
 

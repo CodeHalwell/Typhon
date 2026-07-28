@@ -297,13 +297,60 @@ sample of 16 CPython stdlib modules it now produces parseable Typhon for
   `dataclasses` migrate to an unparseable file.)
 - **`gather:` accepts a trailing comment.**
 
+### Source maps
+
+- **`.py.map` records `.ty` lines, not preprocessed-buffer lines.** `tyc-emit`
+  produced an `(out_line → preprocessed_line)` table and nothing composed it
+  with a `preprocessed_line → ty_line` map, because none of the text passes
+  ahead of `preprocess` produced one. A three-line file yielded a table running
+  to 7, and the four lines of a `?` expansion mapped to four consecutive buffer
+  lines rather than the one source line they came from — so `tyc trace`,
+  `tyc debug --break`, `tyc ty` re-attribution and `[emit] traceback-remap`
+  were all wrong for any file using `?`, `gather:`, a `with`-chain, `rescue`,
+  pipes or typed unpack, which is most idiomatic Typhon.
+
+  Every line-count-changing pass now has a `*_mapped` sibling returning its own
+  table, and `tyc build` folds them into one composed map. Existing entry
+  points keep their signatures — each is a thin wrapper over its mapped
+  variant — so the VM, `tyc check` and the REPL were untouched. Where it was
+  cheap, provenance is *per statement* rather than collapsed onto a block
+  header: each `gather:` binding, each `with`-chain binding plus its success
+  and `else` bodies, and each copy of a method distributed across a sealed
+  union's variants map back to the one line the user wrote.
+
+  The map format is unchanged (v2, `line_strategy: "table"`).
+
+  Note the table is no longer monotonic in general, and correctly so: a
+  `with`-chain copies its `else` body into each binding's guard, so those lines
+  legitimately point back "early".
+
 ### Known open
 
-- The `.py.map` line table records preprocessed-buffer lines rather than `.ty`
-  lines, so `tyc trace`, `tyc debug --break`, `tyc ty` re-attribution and
-  `[emit] traceback-remap` are wrong for any file using `?`, `gather:`, a
-  `with`-chain, `rescue`, pipes or typed unpack. Closing it needs a line map
-  threaded through the nine text passes ahead of `preprocess`.
+- **The source map is captured before `ruff format` runs.** With
+  `[emit] format = true`, a line ruff reflows shifts the whole table relative
+  to the written `.py`. Orthogonal to the mapping fix above, which addresses
+  the `.ty` half of the composition.
+- **Emit-side granularity is statement-level.** `line_offsets` records the
+  offset active when a line was printed, so a sub-statement line — a `case`
+  clause header, say — inherits the preceding statement's offset and can name a
+  nearby rather than exact `.ty` line.
+- **`tyc::` diagnostics still report preprocessed-buffer lines** in the known
+  `impl Alias:` distribution case. The tables needed to fix it now exist but
+  are not yet wired into the diagnostic path.
+
+### Performance
+
+- **The perf-gate baseline is re-recorded at 23 ms (was 14 ms).** The
+  correctness work in this entry adds real per-module analysis: instance-attribute
+  type checking on every assignment, reverse-MRO field ordering, the read-view
+  lattice, the coinductive assignability cycle guard, the post-emit parse gate,
+  `except*` control-flow validation, the invariant re-check on generic calls,
+  and the source-map line tables. Measured attribution on the gate corpus:
+  `except*` validation ~1 ms, the post-emit parse gate ~2 ms, the source-map
+  tables ~1 ms, the narrowing invalidation ~0 ms (it short-circuits on the
+  common module that declares no `global`), and the remainder spread across the
+  type checker. Nothing quadratic was introduced — every addition is linear in
+  file size.
 
 ## 1.0.0-alpha.6 — 2026-07-21 — maintenance: dependency wave, secret-lint keywords & release-pipeline hygiene
 
