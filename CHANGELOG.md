@@ -4,6 +4,105 @@ All notable changes to Typhon are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely; the
 canonical phase-by-phase status lives in `docs/roadmap.md`.
 
+## Unreleased — codebase-review remediation (2026-07-28)
+
+Fixes driven by the [2026-07-28 full-codebase review](docs/codebase-review-2026-07-28.md).
+All ten of the review's 1.0 blockers are addressed here, plus the Tier-0 gates
+that make them verifiable and a batch of Tier-2/3 items.
+
+Compatibility, using the review's own taxonomy:
+
+- **Pure relaxations** (always safe): `Dog?` → `Animal?` assignability;
+  `from module import *`; `as!` to an `interface`; recursive type aliases no
+  longer abort.
+- **Narrowings on already-crashing code** (the alpha.2 carve-out, each one only
+  rejects a program that was guaranteed to fail at runtime): positional
+  construction of a `model`; positional construction against the wrong
+  multiple-inheritance field order; wrong-typed attribute assignment.
+- **Miscompilation fixes** (only change programs that were already producing
+  the wrong answer): `?` in an `elif` / `while` condition; string-literal
+  corruption in four passes; emitter precedence.
+
+### Gates
+
+- **Post-emit parse gate.** `tyc build` re-parses the Python it is about to
+  write and fails if it does not parse, and no longer discards
+  `format_source`'s `Err`. "Every `.ty` emits valid `.py`" was the central
+  promise with nothing checking it.
+- **CI runs the Python-executing tests.** 14 tests build a project and run the
+  emitted Python; all skipped when no interpreter was present, and the test job
+  never installed one. CI now installs Python 3.13 and sets
+  `TYC_REQUIRE_PYTHON=1`, which turns the skip into a failure.
+- **Source-map tests assert something.** Every assertion was `ty_line >= 1`,
+  which a table of all 1s satisfies. Replaced with a monotonicity check — which
+  immediately surfaced that the `.py.map` values are preprocessed-buffer lines,
+  not `.ty` lines (documented at the assertion site; **not yet fixed**).
+- **Perf gate measures the compiler.** Venv introspection and `ruff format`
+  were ~84% of the timed region (median 89 ms → 14 ms once excluded), so the
+  nominal 20% threshold tolerated a far larger regression in the code under
+  test. Re-baselined, with a 5 ms absolute floor so CI jitter cannot trip it.
+
+### Type checker
+
+- **Instance-attribute assignment is type-checked.** `self.field = v` — the
+  mandated idiom — was never checked at all, so any wrong-typed value silently
+  corrupted a declared field.
+- **`Dog?` is assignable to `Animal?`.** `is_assignable` had no Union/Union arm.
+- **Constructor field order follows reverse MRO**, matching `@dataclass`, so
+  the checker, the emitter and CPython finally agree for multiple inheritance.
+- **`model` constructors are keyword-only**, matching Pydantic's `__init__`.
+- **Recursive type aliases terminate.** `type A = list[B]` / `type B = list[A]`
+  aborted the process with SIGABRT on a five-line file.
+- **`from module import *` no longer errors** on every star-imported name.
+
+### Preprocessor / emitter
+
+- **`?` in an `elif` or `while` condition no longer corrupts control flow.**
+  The lifted guard reattached the `elif` to the generated `if`, and froze a
+  `while` condition at its first value.
+- **Four passes stop rewriting string-literal contents**: the `enum` body
+  rewrite, the `with`-chain re-indent, indent-only block collection, and
+  `tyc fmt`'s whitespace pass.
+- **Emitter parenthesises comparison and conditional operands.**
+- **`Literal["?"]` is no longer rewritten** to `Literal[" | None"]`.
+- **User-defined `pure` / `memo` / `gatherable` decorators survive.**
+
+### VM
+
+- Relative imports resolve against the importing module's package (example apps
+  running under `tyc run`: 0/16 → 6/16).
+- `model` defaulted fields reach the constructor; `Ok(value=…)` / `Err(error=…)`
+  accept their keyword form.
+- Inline `?` is expanded (the VM's chain omitted the pass entirely).
+- `float` → `int` conversions are exact rather than saturating at `i64::MAX`;
+  `sum(xs, start)` honours a positional start; incomparable values raise
+  instead of comparing equal; `bytes` are ordered; `isinstance(True, int)` and
+  `isinstance(x, object)` are `True`; string search methods honour
+  `start` / `end`.
+- `from module import *` binds the module's public surface.
+
+### Tooling / security
+
+- **`tyc lsp` no longer executes arbitrary modules.** It kept its own venv
+  discovery that ignored `TYC_NO_INTROSPECT`, had no dependency allow-list, and
+  ran in the project root. `SECURITY.md` corrected.
+- **`tyc lsp` honours the `[strictness]` severity knobs**, through the same
+  rules the CLI uses (hoisted into `tyc-diagnostics`).
+- **`unused-import = "off"` works.** It was validated and then ignored.
+- **`[python] target = "3.13t"` produces a valid PEP 440 `requires-python`**,
+  unbreaking `uv sync` for the three free-threaded targets.
+- **`map_pure` has the documented GIL and minimum-size guards.**
+- `tyc::contains_secret_literal` recognises `PASSPHRASE`.
+- Symlink cycles under `src/` no longer hang the file collector.
+
+### Known open
+
+- The `.py.map` line table records preprocessed-buffer lines rather than `.ty`
+  lines, so `tyc trace`, `tyc debug --break`, `tyc ty` re-attribution and
+  `[emit] traceback-remap` are wrong for any file using `?`, `gather:`, a
+  `with`-chain, `rescue`, pipes or typed unpack. Closing it needs a line map
+  threaded through the nine text passes ahead of `preprocess`.
+
 ## 1.0.0-alpha.6 — 2026-07-21 — maintenance: dependency wave, secret-lint keywords & release-pipeline hygiene
 
 A maintenance release on top of alpha.5, driven by the

@@ -3622,6 +3622,13 @@ fn is_string_literal(expr: &Expr) -> bool {
 /// keyword as a substring (`APITOKEN` ⊃ `TOKEN`, `API_KEY` ⊃ `KEY`) must
 /// come first, so first-match reporting picks the most specific word.
 pub const SECRET_NAME_KEYWORDS: &[&str] = &[
+    // Longest-first: `APIKEY` must be tried before the bare `KEY` so a name
+    // like `KEY_APIKEY` reports the more specific suffix. `PASSPHRASE` must
+    // precede `PASS` for the same reason — and it needs its own entry at all
+    // because the word-boundary rule that (correctly) stops `PASSPORT` from
+    // matching `PASS` also stopped `PASSPHRASE`, so the single most obvious
+    // secret-shaped name after `PASSWORD` went unflagged.
+    "PASSPHRASE",
     "API_PASSWORD",
     "APIPASSWORD",
     "API_SECRET",

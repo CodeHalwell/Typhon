@@ -1391,7 +1391,10 @@ pub fn run(args: BuildArgs) -> Result<()> {
         let runtime_dir = out_dir.join("typhon_runtime");
         // `parallel.py` is parameterised by the configured execution backend
         // (`[strictness] parallel-backend`); the rest are static.
-        let parallel_py = typhon_runtime_parallel_py(&config.strictness.parallel_backend);
+        let parallel_py = typhon_runtime_parallel_py(
+            &config.strictness.parallel_backend,
+            config.strictness.parallel_min_size,
+        );
         let files = [
             ("__init__.py", TYPHON_RUNTIME_INIT_PY),
             ("tasks.py", TYPHON_RUNTIME_TASKS_PY),
@@ -3409,7 +3412,7 @@ def _remap(text, state):
 /// backend switch are emitted for both settings, so the only difference
 /// between the two generated files is the `_BACKEND` value — the thread path
 /// is behaviourally identical to the historical single-backend runtime.
-fn typhon_runtime_parallel_py(backend: &str) -> String {
+fn typhon_runtime_parallel_py(backend: &str, min_size: u64) -> String {
     // Config load already validated the value; guard anyway so an unexpected
     // string degrades to the safe thread pool rather than an unknown backend.
     let backend = if backend == "interpreters" {
@@ -3417,7 +3420,9 @@ fn typhon_runtime_parallel_py(backend: &str) -> String {
     } else {
         "threads"
     };
-    TYPHON_RUNTIME_PARALLEL_PY_TEMPLATE.replace("@BACKEND@", backend)
+    TYPHON_RUNTIME_PARALLEL_PY_TEMPLATE
+        .replace("@BACKEND@", backend)
+        .replace("@MIN_SIZE@", &min_size.to_string())
 }
 
 const TYPHON_RUNTIME_PARALLEL_PY_TEMPLATE: &str = "\
@@ -3426,6 +3431,7 @@ const TYPHON_RUNTIME_PARALLEL_PY_TEMPLATE: &str = "\
 from __future__ import annotations
 
 import os
+import sys
 from concurrent.futures import ThreadPoolExecutor
 from typing import Callable, Iterable, TypeVar
 
@@ -3434,6 +3440,8 @@ _R = TypeVar(\"_R\")
 
 # Execution backend, baked in at build time from `[strictness] parallel-backend`.
 _BACKEND = \"@BACKEND@\"
+# Minimum item count worth a thread pool, from `[strictness] parallel-min-size`.
+_MIN_SIZE = @MIN_SIZE@
 
 
 def map_pure(
@@ -3471,7 +3479,25 @@ def map_pure(
         result = _try_interpreters(fn, items, max_workers)
         if result is not None:
             return result
-    # Thread-pool path: the default backend, and the interpreters fallback.
+    # Below this point the only backend left is threads, so the two guards the
+    # docs have always promised finally apply.
+    #
+    # They sit *after* `_try_interpreters` deliberately: a sub-interpreter pool
+    # gives real parallelism even on a GIL build, so gating it on
+    # `_is_gil_enabled()` would disable the one backend that works there.
+    #
+    # 1. On a GIL build the workers cannot run Python concurrently, so the pool
+    #    is pure overhead. The documented `sys._is_gil_enabled()` sequential
+    #    fallback did not exist: every rewritten comprehension paid thread
+    #    setup for zero parallelism, which measured as a ~60x pessimisation on
+    #    stock CPython.
+    # 2. Even on a free-threaded build, a handful of items is not worth a pool.
+    #    `[strictness] parallel-min-size` gates the *rewrite* at compile time,
+    #    but the length is only known here — a comprehension over a runtime
+    #    list of 3 took 424x longer through the pool than sequentially.
+    gil_enabled = getattr(sys, \"_is_gil_enabled\", None)
+    if (gil_enabled is None or gil_enabled()) or len(items) < _MIN_SIZE:
+        return [fn(item) for item in items]
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
         return list(pool.map(fn, items))
 

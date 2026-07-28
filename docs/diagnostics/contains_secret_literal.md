@@ -1,7 +1,7 @@
 # tyc::contains_secret_literal
 
 Warns when a `comptime let` binding's name matches a secret-suffix heuristic
-(`*KEY`, `*TOKEN`, `*PASSWORD`, `*SECRET`, `*PASS`, `*PWD`). `comptime`
+(`*KEY`, `*TOKEN`, `*PASSWORD`, `*PASSPHRASE`, `*SECRET`, `*PASS`, `*PWD`). `comptime`
 bindings are evaluated at build time, so the emitted Python contains the
 resolved env-var value as a string literal — anyone with the build output
 can read the secret.
