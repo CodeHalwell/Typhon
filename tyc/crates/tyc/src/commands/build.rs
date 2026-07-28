@@ -23,9 +23,10 @@ use tyc_diagnostics::{Diagnostics, TycError};
 use tyc_emit::{emit_python_with_source_for_target, emit_stub};
 use tyc_format::format_source;
 use tyc_syntax::preprocess::{
-    expand_gather_blocks, expand_go_calls, expand_inline_question_ops, expand_lazy_imports,
-    expand_lazy_lets, expand_multiline_guards, expand_pipes, expand_question_ops,
-    expand_typed_let_unpack, expand_with_chains, line_byte_starts, preprocess, LazyImport,
+    expand_compound_question_headers, expand_gather_blocks, expand_go_calls,
+    expand_inline_question_ops, expand_lazy_imports, expand_lazy_lets, expand_multiline_guards,
+    expand_pipes, expand_question_ops, expand_typed_let_unpack, expand_with_chains,
+    line_byte_starts, preprocess, LazyImport,
 };
 
 use crate::commands::util::{
@@ -452,11 +453,13 @@ pub fn run(args: BuildArgs) -> Result<()> {
         if stem == "__init__" {
             continue;
         }
-        let expanded = expand_question_ops(&expand_inline_question_ops(&expand_pipes(
-            &expand_with_chains(&expand_go_calls(&expand_gather_blocks(
-                &expand_multiline_guards(&expand_lazy_imports(&expand_typed_let_unpack(source))),
+        let expanded = expand_question_ops(&expand_inline_question_ops(
+            &expand_compound_question_headers(&expand_pipes(&expand_with_chains(
+                &expand_go_calls(&expand_gather_blocks(&expand_multiline_guards(
+                    &expand_lazy_imports(&expand_typed_let_unpack(source)),
+                ))),
             ))),
-        )));
+        ));
         let prep = preprocess(&expanded);
         if prep.pub_names.is_empty() {
             continue;
@@ -507,11 +510,13 @@ pub fn run(args: BuildArgs) -> Result<()> {
         // The inline `?` pass runs before the end-of-line `?` pass so
         // `Ok(f(x)?)`-shaped sub-expressions get lifted into temps
         // first. O17 / FINDINGS #66 / R3.13 / E9.
-        let expanded = expand_question_ops(&expand_inline_question_ops(&expand_pipes(
-            &expand_with_chains(&expand_go_calls(&expand_gather_blocks(
-                &expand_multiline_guards(&lazy_expanded),
+        let expanded = expand_question_ops(&expand_inline_question_ops(
+            &expand_compound_question_headers(&expand_pipes(&expand_with_chains(
+                &expand_go_calls(&expand_gather_blocks(&expand_multiline_guards(
+                    &lazy_expanded,
+                ))),
             ))),
-        )));
+        ));
         let mut prep = preprocess(&expanded);
 
         // `pub *` wildcard re-export aggregation.
@@ -1325,11 +1330,13 @@ pub fn run(args: BuildArgs) -> Result<()> {
         // .dty files use the same syntax as .ty but typically contain only
         // declarations.  Run the preprocessor so `val`/`var`/`model` stripping
         // works, then desugar to plain Python so the printer can emit it.
-        let expanded = expand_question_ops(&expand_inline_question_ops(&expand_pipes(
-            &expand_with_chains(&expand_go_calls(&expand_gather_blocks(
-                &expand_multiline_guards(&expand_lazy_imports(&expand_typed_let_unpack(&source))),
+        let expanded = expand_question_ops(&expand_inline_question_ops(
+            &expand_compound_question_headers(&expand_pipes(&expand_with_chains(
+                &expand_go_calls(&expand_gather_blocks(&expand_multiline_guards(
+                    &expand_lazy_imports(&expand_typed_let_unpack(&source)),
+                ))),
             ))),
-        )));
+        ));
         let prep = preprocess(&expanded);
         let module = tyc_syntax::parse_module(&prep.python_source)
             .map(|p| p.into_syntax())
@@ -1901,11 +1908,13 @@ pub(crate) fn detect_pub_star_diagnostics(
     let mut advice: Vec<tyc_diagnostics::TycError> = Vec::new();
 
     for (path, source) in sources {
-        let expanded = expand_question_ops(&expand_inline_question_ops(&expand_pipes(
-            &expand_with_chains(&expand_go_calls(&expand_gather_blocks(
-                &expand_multiline_guards(&expand_lazy_imports(&expand_typed_let_unpack(source))),
+        let expanded = expand_question_ops(&expand_inline_question_ops(
+            &expand_compound_question_headers(&expand_pipes(&expand_with_chains(
+                &expand_go_calls(&expand_gather_blocks(&expand_multiline_guards(
+                    &expand_lazy_imports(&expand_typed_let_unpack(source)),
+                ))),
             ))),
-        )));
+        ));
         let prep = preprocess(&expanded);
         if prep.pub_star_lines.is_empty() {
             continue;

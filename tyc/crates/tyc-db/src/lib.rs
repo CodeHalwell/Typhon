@@ -17,10 +17,11 @@ use tyc_resolve::{resolve_module_with, LazyImportRemap, ResolveOptions, Resolved
 use tyc_syntax::{
     parse_module,
     preprocess::{
-        expand_gather_blocks, expand_go_calls, expand_inline_question_ops, expand_lazy_lets,
-        expand_multiline_guards, expand_pipes, expand_question_ops, expand_typed_let_unpack,
-        expand_with_chains, line_byte_starts, preprocess, validate_extend_usage,
-        validate_lazy_usage, validate_question_ops, PreprocessResult,
+        expand_compound_question_headers, expand_gather_blocks, expand_go_calls,
+        expand_inline_question_ops, expand_lazy_lets, expand_multiline_guards, expand_pipes,
+        expand_question_ops, expand_typed_let_unpack, expand_with_chains, line_byte_starts,
+        preprocess, validate_extend_usage, validate_lazy_usage, validate_question_ops,
+        PreprocessResult,
     },
 };
 use tyc_types::{
@@ -103,11 +104,13 @@ unsafe impl salsa::Update for ArcPreprocessResult {
 #[salsa::tracked]
 pub fn preprocessed_full(db: &dyn salsa::Database, file: SourceFile) -> ArcPreprocessResult {
     let text = file.text(db);
-    let expanded = expand_question_ops(&expand_inline_question_ops(&expand_pipes(
-        &expand_with_chains(&expand_go_calls(&expand_gather_blocks(
-            &expand_multiline_guards(&expand_lazy_lets(&expand_typed_let_unpack(text))),
-        ))),
-    )));
+    let expanded = expand_question_ops(&expand_inline_question_ops(
+        &expand_compound_question_headers(&expand_pipes(&expand_with_chains(&expand_go_calls(
+            &expand_gather_blocks(&expand_multiline_guards(&expand_lazy_lets(
+                &expand_typed_let_unpack(text),
+            ))),
+        )))),
+    ));
     ArcPreprocessResult(Arc::new(preprocess(&expanded)))
 }
 
@@ -479,11 +482,13 @@ pub fn check_source_file(db: &mut TycDatabase, source_file: SourceFile) -> Diagn
 /// stops there. Returns an empty [`ModuleShapes`] on any parse error
 /// — the real diagnostic surfaces when the file is checked for real.
 pub fn extract_shapes_for_path(_path: &str, text: &str) -> ModuleShapes {
-    let expanded = expand_question_ops(&expand_inline_question_ops(&expand_pipes(
-        &expand_with_chains(&expand_go_calls(&expand_gather_blocks(
-            &expand_multiline_guards(&expand_lazy_lets(&expand_typed_let_unpack(text))),
-        ))),
-    )));
+    let expanded = expand_question_ops(&expand_inline_question_ops(
+        &expand_compound_question_headers(&expand_pipes(&expand_with_chains(&expand_go_calls(
+            &expand_gather_blocks(&expand_multiline_guards(&expand_lazy_lets(
+                &expand_typed_let_unpack(text),
+            ))),
+        )))),
+    ));
     let prep = preprocess(&expanded);
     let module = match parse_module(&prep.python_source) {
         Ok(p) => p.into_syntax(),
@@ -1140,11 +1145,13 @@ fn check_impl(path: &str, text: &str) -> Diagnostics {
     // Apply Typhon sugar expansion in order before preprocessing so the
     // Python parser sees valid Python.  `tyc fmt` skips these expansions to
     // preserve Typhon syntax in the formatter's round trip.
-    let expanded = expand_question_ops(&expand_inline_question_ops(&expand_pipes(
-        &expand_with_chains(&expand_go_calls(&expand_gather_blocks(
-            &expand_multiline_guards(&expand_lazy_lets(&expand_typed_let_unpack(text))),
-        ))),
-    )));
+    let expanded = expand_question_ops(&expand_inline_question_ops(
+        &expand_compound_question_headers(&expand_pipes(&expand_with_chains(&expand_go_calls(
+            &expand_gather_blocks(&expand_multiline_guards(&expand_lazy_lets(
+                &expand_typed_let_unpack(text),
+            ))),
+        )))),
+    ));
     let prep = preprocess(&expanded);
 
     let module = match parse_module(&prep.python_source) {

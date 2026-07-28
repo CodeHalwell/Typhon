@@ -1181,10 +1181,17 @@ impl Interpreter {
         // top-level entry, so the imported module sees identical surface
         // syntax handling.
         use tyc_syntax::preprocess;
-        let expanded = preprocess::expand_question_ops(&preprocess::expand_pipes(
-            &preprocess::expand_with_chains(&preprocess::expand_go_calls(
-                &preprocess::expand_gather_blocks(&preprocess::expand_multiline_guards(
-                    &preprocess::expand_typed_let_unpack(&preprocess::expand_lazy_lets(&source)),
+        let expanded = preprocess::expand_question_ops(&preprocess::expand_inline_question_ops(
+            // Shared with the CLI: the VM omitted both of these, so an
+            // inline `?` (`f(g()?)`, `elif h()? > 1:`) failed to parse under
+            // `tyc run` on a program `tyc build` compiles and runs.
+            &preprocess::expand_compound_question_headers(&preprocess::expand_pipes(
+                &preprocess::expand_with_chains(&preprocess::expand_go_calls(
+                    &preprocess::expand_gather_blocks(&preprocess::expand_multiline_guards(
+                        &preprocess::expand_typed_let_unpack(&preprocess::expand_lazy_lets(
+                            &source,
+                        )),
+                    )),
                 )),
             )),
         ));

@@ -5932,6 +5932,155 @@ fn expand_question_ops_inner(source: &str) -> String {
     }
 }
 
+/// Restructure `elif COND:` / `while COND:` headers whose condition contains a
+/// propagating `?`, so the guard that `?` lowers to can be hoisted to a place
+/// where it is actually reachable.
+///
+/// This must run **before** [`expand_inline_question_ops`], which lifts the
+/// `?` guard onto the lines *preceding* the one it rewrites. That is correct
+/// for a statement, and wrong for a compound header:
+///
+/// For `elif`, the lifted `if isinstance(_, Err): return _` is emitted between
+/// the previous `if` body and the `elif`, so the `elif` silently reattaches to
+/// the *generated* `if` instead of the user's. The original `if` branch stops
+/// guarding it, the fallible expression is evaluated even when the first
+/// branch was taken, and the `else` arm then runs on top of it. A clean
+/// `tyc check` and an exit-0 `tyc build` produced a program that took the
+/// wrong branch: an `if a == "": out = "empty-a"` / `elif parse(b)? > 10`
+/// chain returned `"small-b"` for `a == ""`.
+///
+/// For `while`, the guard lands *before* the loop, so the fallible expression
+/// is evaluated exactly once and the loop condition is frozen at its first
+/// value — a wrong result, or an infinite loop.
+///
+/// The rewrites are the standard ones:
+///
+/// ```text
+///   elif COND:          →   else:
+///       BODY                    if COND:          ← `?` now hoists inside
+///   else:                           BODY              the else arm
+///       REST                    else:
+///                                   REST
+///
+///   while COND:         →   while True:
+///       BODY                    if not (COND):    ← `?` hoists above this
+///           …                       break
+///                               BODY
+/// ```
+///
+/// Both are semantics-preserving on programs that were *correctly* compiled
+/// before (a condition with no `?` is left completely untouched), and they
+/// only change the output of programs that were miscompiled.
+pub fn expand_compound_question_headers(source: &str) -> String {
+    // Fixpoint: rewriting an outer `elif` can expose a nested one.
+    let mut current = source.to_owned();
+    for _ in 0..64 {
+        match rewrite_first_compound_question_header(&current) {
+            Some(next) => current = next,
+            None => break,
+        }
+    }
+    current
+}
+
+/// Indices of the lines that *begin* inside a triple-quoted string, and so
+/// must never be re-indented — their leading whitespace is string content, not
+/// layout. This is the same hazard that makes a naive block re-indent corrupt
+/// docstrings.
+fn lines_starting_inside_string(lines: &[&str]) -> Vec<bool> {
+    let mut in_string: Option<StringMode> = None;
+    let mut out = Vec::with_capacity(lines.len());
+    for line in lines {
+        out.push(in_string.is_some());
+        let _ = scan_line_code_end(line, &mut in_string);
+    }
+    out
+}
+
+fn indent_width(line: &str) -> usize {
+    line.len() - line.trim_start().len()
+}
+
+fn rewrite_first_compound_question_header(source: &str) -> Option<String> {
+    let lines: Vec<&str> = source.split('\n').collect();
+    let inside_string = lines_starting_inside_string(&lines);
+
+    for (i, line) in lines.iter().enumerate() {
+        if inside_string[i] {
+            continue;
+        }
+        let trimmed = line.trim_start();
+        let is_elif = trimmed.starts_with("elif ");
+        let is_while = trimmed.starts_with("while ");
+        if !is_elif && !is_while {
+            continue;
+        }
+        // Only a *propagating* `?` matters; `T?` nullable sugar is not one.
+        if find_first_inline_propagation_q(line).is_none() {
+            continue;
+        }
+        let indent = indent_width(line);
+        let pad = " ".repeat(indent);
+        let keyword_len = if is_elif {
+            "elif ".len()
+        } else {
+            "while ".len()
+        };
+        let after_keyword = &trimmed[keyword_len..];
+        // The header ends at its trailing `:`; anything after it is a comment.
+        let colon = after_keyword.rfind(':')?;
+        let cond = after_keyword[..colon].trim_end();
+        let trailing = after_keyword[colon + 1..].trim_end();
+
+        // The block this header owns: everything more-indented, plus (for an
+        // `elif`) the sibling `elif` / `else` clauses that follow it, which
+        // must move inside the new `else` with it.
+        let mut end = i + 1;
+        while end < lines.len() {
+            let l = lines[end];
+            if inside_string[end] || l.trim().is_empty() {
+                end += 1;
+                continue;
+            }
+            let w = indent_width(l);
+            if w > indent {
+                end += 1;
+                continue;
+            }
+            let t = l.trim_start();
+            if is_elif && w == indent && (t.starts_with("elif ") || t.starts_with("else")) {
+                end += 1;
+                continue;
+            }
+            break;
+        }
+
+        let mut out: Vec<String> = lines[..i].iter().map(|s| (*s).to_owned()).collect();
+        if is_elif {
+            out.push(format!("{pad}else:"));
+            out.push(format!("{pad}    if {cond}:{trailing}"));
+        } else {
+            out.push(format!("{pad}while True:"));
+            out.push(format!("{pad}    if not ({cond}):{trailing}"));
+            out.push(format!("{pad}        break"));
+        }
+        for (j, l) in lines[i + 1..end].iter().enumerate() {
+            let idx = i + 1 + j;
+            // A line whose leading whitespace is string content keeps it.
+            if inside_string[idx] || l.trim().is_empty() {
+                out.push((*l).to_owned());
+            } else if is_elif {
+                out.push(format!("    {l}"));
+            } else {
+                out.push((*l).to_owned());
+            }
+        }
+        out.extend(lines[end..].iter().map(|s| (*s).to_owned()));
+        return Some(out.join("\n"));
+    }
+    None
+}
+
 /// Lift inline `?` propagation operators (`)?` appearing inside a larger
 /// expression on the same line) into temp bindings that
 /// [`expand_question_ops`] can then process as ordinary top-of-statement
@@ -8818,6 +8967,79 @@ fn find_assignment_eq(s: &str) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn elif_with_propagating_question_becomes_a_nested_if() {
+        // The lifted `?` guard used to be emitted between the previous `if`
+        // body and the `elif`, so the `elif` reattached to the *generated*
+        // `if isinstance(_, Err)` instead of the user's `if`. The first
+        // branch stopped guarding it and the chain silently took the wrong
+        // arm.
+        let src = "\
+if a == \"\":
+    out = \"empty-a\"
+elif parse(b)? > 10:
+    out = \"big-b\"
+else:
+    out = \"small-b\"
+";
+        let out = expand_compound_question_headers(src);
+        assert!(
+            out.contains("else:") && out.contains("    if parse(b)? > 10:"),
+            "the elif must become an else + nested if; got:\n{out}"
+        );
+        assert!(
+            !out.lines().any(|l| l.trim_start().starts_with("elif ")),
+            "no elif may survive; got:\n{out}"
+        );
+        // The trailing `else` arm must have moved inside the new `else`.
+        assert!(
+            out.contains("        out = \"small-b\""),
+            "the else arm must be re-indented into the new else; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn while_with_propagating_question_re_evaluates_each_iteration() {
+        // The guard used to land *before* the loop, so the fallible
+        // expression ran once and the condition was frozen — a wrong result
+        // or an infinite loop.
+        let src = "\
+while next_val()? < 4:
+    steps = steps + 1
+";
+        let out = expand_compound_question_headers(src);
+        assert!(out.contains("while True:"), "got:\n{out}");
+        assert!(out.contains("    if not (next_val()? < 4):"), "got:\n{out}");
+        assert!(out.contains("        break"), "got:\n{out}");
+    }
+
+    #[test]
+    fn compound_headers_without_a_question_are_untouched() {
+        // Only miscompiled programs may change. A condition with no
+        // propagating `?` — including nullable-type sugar — must come
+        // through byte-identical.
+        for src in [
+            "if a:\n    x = 1\nelif b > 2:\n    x = 2\nelse:\n    x = 3\n",
+            "while n < 10:\n    n = n + 1\n",
+            "elif isinstance(v, str):\n    pass\n",
+        ] {
+            assert_eq!(expand_compound_question_headers(src), src, "changed: {src}");
+        }
+    }
+
+    #[test]
+    fn question_inside_a_docstring_does_not_trigger_a_rewrite() {
+        // The scan must not treat text inside a triple-quoted string as code.
+        let src = "\
+def f() -> None:
+    \"\"\"
+    while g()? < 3:
+    \"\"\"
+    pass
+";
+        assert_eq!(expand_compound_question_headers(src), src);
+    }
     use super::*;
 
     #[test]
