@@ -59,6 +59,18 @@ pub struct Interpreter {
     /// name (e.g. "repo" or "sub.util"). Lets the same module be imported
     /// from multiple files without re-evaluating its body.
     pub module_cache: HashMap<String, Value>,
+    /// Dotted package of the module currently executing, as segments —
+    /// `["app", "domain"]` while running `src/app/domain/orders.ty`, and
+    /// empty at the source root. Saved and restored around a sibling
+    /// module's body exactly like `current_source`.
+    ///
+    /// This is what makes a relative import inside a sub-package resolve.
+    /// Every `from .sibling import X` used to be resolved against
+    /// `source_root` regardless of where the importing file lived, so
+    /// `src/app/domain/orders.ty` looked for `src/sibling.ty` — which is why
+    /// `tyc run` failed on every multi-package example app while
+    /// `tyc build` + CPython succeeded.
+    pub current_package: Vec<String>,
     /// Stack of value buffers for generator functions. The VM has no way to
     /// suspend a tree-walk mid-frame, so a `yield`-bearing function is run
     /// eagerly to completion with each yielded value pushed onto the top
@@ -172,6 +184,7 @@ impl Interpreter {
             max_stack_depth: 1000,
             script_argv: Vec::new(),
             source_root: None,
+            current_package: Vec::new(),
             module_cache: HashMap::new(),
             gen_buffers: Vec::new(),
             loading_modules: std::collections::HashSet::new(),
@@ -453,20 +466,20 @@ impl Interpreter {
                     .map(|i| i.as_str().to_owned())
                     .unwrap_or_default();
                 // Relative imports (`from .repo import X`) carry a `level`
-                // > 0. The dot-count tells us how many package levels up
-                // to start from. The VM treats the configured source_root
-                // as the package root, so any positive level resolves the
-                // import relative to it. This is enough for the common
-                // pattern of `from .sibling import x` between files
-                // sharing a `src/` directory.
+                // > 0: one dot means "this package", each extra dot strips
+                // one more segment off it. Resolving against the importing
+                // module's own package — rather than always against
+                // `source_root` — is what lets a relative import work below
+                // the top level of a project.
                 let module = if im.level > 0 {
+                    let base = self.relative_import_base(im.level);
                     if module_name.is_empty() {
                         // `from . import sibling` — load each name as a
                         // sibling module instead of going through an
                         // umbrella package object.
                         for alias in &im.names {
                             let attr = alias.name.as_str();
-                            let val = self.import_module(attr)?;
+                            let val = self.import_module(&join_module(&base, attr))?;
                             let bind = alias
                                 .asname
                                 .as_ref()
@@ -476,7 +489,7 @@ impl Interpreter {
                         }
                         return Ok(());
                     }
-                    self.import_module(&module_name)?
+                    self.import_module(&join_module(&base, &module_name))?
                 } else {
                     self.import_module(&module_name)?
                 };
@@ -784,6 +797,28 @@ impl Interpreter {
             .decorator_list
             .iter()
             .any(|d| rightmost_name(&d.expression).as_deref() == Some("dataclass"));
+        // A `model` class emits `class Foo(BaseModel):` — no `@dataclass`
+        // decorator, because Pydantic generates the constructor itself. Its
+        // annotated assigns are still *fields*, and every one of them
+        // ordinarily carries a default. Reading `is_dataclass` alone
+        // classified each defaulted field as a class attribute, so the VM
+        // built a constructor that had never heard of it: `Foo(port=8080)`
+        // and `Foo.model_validate({...})` raised TypeError under `tyc run`
+        // while the same program worked under `tyc build` + CPython.
+        //
+        // `BaseModel` never resolves to a `Value::Class` in the VM (it is a
+        // shim), so it is absent from `bases` by the time this runs — match
+        // it on the base expression instead.
+        let is_pydantic_model = c
+            .arguments
+            .as_ref()
+            .map(|args| {
+                args.args
+                    .iter()
+                    .any(|b| rightmost_name(b).as_deref() == Some("BaseModel"))
+            })
+            .unwrap_or(false);
+        let has_generated_fields = is_dataclass || is_pydantic_model;
         let is_classvar = |ann: &Expr| -> bool {
             let head = match ann {
                 Expr::Subscript(s) => s.value.as_ref(),
@@ -862,7 +897,7 @@ impl Interpreter {
                         // dataclass (`plain class`) an annotated assign with a
                         // default is also a class attribute, not an instance
                         // slot. Everything else is a dataclass field.
-                        if classvar || (!is_dataclass && default.is_some()) {
+                        if classvar || (!has_generated_fields && default.is_some()) {
                             if let Some(v) = default {
                                 class_attrs.insert(n.id.as_str().to_owned(), v);
                             }
@@ -1045,6 +1080,21 @@ impl Interpreter {
 
     // ── Imports ────────────────────────────────────────────────────────────
 
+    /// The dotted package a relative import of `level` dots resolves
+    /// against, given where the importing module lives.
+    ///
+    /// `level == 1` is the importing module's own package; each further dot
+    /// strips one segment. Walking past the source root clamps to the root
+    /// rather than erroring — CPython raises here, but the VM has no
+    /// `__package__` to report and a clamp degrades to the pre-fix
+    /// behaviour (resolve at the root) instead of failing a program that
+    /// `tyc build` accepts.
+    fn relative_import_base(&self, level: u32) -> Vec<String> {
+        let strip = level.saturating_sub(1) as usize;
+        let keep = self.current_package.len().saturating_sub(strip);
+        self.current_package[..keep].to_vec()
+    }
+
     fn import_module(&mut self, name: &str) -> Result<Value, Unwind> {
         // Cache hit: same name imported earlier in the same VM run.
         if let Some(cached) = self.module_cache.get(name).cloned() {
@@ -1206,7 +1256,19 @@ impl Interpreter {
             path.to_string_lossy().into_owned(),
             &prep.python_source,
         )));
+        // Enter the loaded module's package so its own relative imports
+        // resolve from where it lives, not from where the import chain
+        // started. A package's `__init__.ty` *is* the package, so it keeps
+        // every segment; a plain module drops its own trailing name.
+        // Which file matched decides the module's own package: the
+        // `__init__.ty` form *is* the package `name` refers to.
+        let is_package_init = path.file_name().and_then(|f| f.to_str()) == Some("__init__.ty");
+        let saved_package = std::mem::replace(
+            &mut self.current_package,
+            package_of_module(name, is_package_init),
+        );
         let body_result = self.exec_block(&module.body, &module_env);
+        self.current_package = saved_package;
         self.current_source = saved_source;
         body_result?;
         // Correct any forward-declared `type` alias before the module's
@@ -7087,6 +7149,31 @@ fn insert_float_thousands(raw: &str, sep: char) -> String {
     }
     let grouped: String = grouped.chars().rev().collect();
     format!("{sign}{grouped}{rest}")
+}
+
+/// Join a package path and a module name into a dotted absolute module name.
+/// An empty package yields the bare name, so a relative import at the source
+/// root resolves exactly as it did before packages were tracked.
+fn join_module(package: &[String], name: &str) -> String {
+    if package.is_empty() {
+        name.to_owned()
+    } else {
+        format!("{}.{}", package.join("."), name)
+    }
+}
+
+/// The package segments a module body should execute under.
+///
+/// `is_package_init` distinguishes `pkg/__init__.ty` (whose package is
+/// `pkg` itself) from `pkg/mod.ty` (whose package is `pkg`, i.e. its own
+/// name dropped). Getting this wrong makes `from . import x` inside an
+/// `__init__.ty` look one level too high.
+fn package_of_module(name: &str, is_package_init: bool) -> Vec<String> {
+    let mut segs: Vec<String> = name.split('.').map(|s| s.to_owned()).collect();
+    if !is_package_init {
+        segs.pop();
+    }
+    segs
 }
 
 #[cfg(test)]

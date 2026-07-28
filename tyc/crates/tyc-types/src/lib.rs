@@ -2471,10 +2471,48 @@ impl TypeEnv {
 }
 
 /// Per-module check state.
+/// Recursion bound for [`Checker::is_assignable`].
+///
+/// Sized so that no real program reaches it: the deepest nesting in the
+/// example and stress corpora is well under 30, and the alpha.3 O(2^depth)
+/// work already exercised depth-28 aliases without trouble. It exists purely
+/// to stop a *non-terminating* unfold (mutually-recursive parametric aliases)
+/// from taking the process down, so it is set far above the working range
+/// rather than tuned close to it.
+const IS_ASSIGNABLE_MAX_DEPTH: u32 = 256;
+
 struct Checker<'a> {
     path: String,
     source: &'a str,
     resolved: &'a ResolvedModule,
+    /// Current nesting depth of [`Checker::is_assignable`].
+    ///
+    /// Mutually-recursive parametric type aliases (`type A[T] = B[T] | int`
+    /// alongside `type B[T] = A[T] | str`) unfold forever: each expansion
+    /// produces a structurally larger type, so no memoisation on the type
+    /// pair terminates. Without a bound the recursion overflows the native
+    /// stack and the process dies with SIGABRT on a five-line file. The
+    /// counter bounds it; see [`IS_ASSIGNABLE_MAX_DEPTH`].
+    ///
+    /// A `Cell` because every assignability method takes `&self` — threading
+    /// a depth parameter would touch every one of the ~200 recursive call
+    /// sites and each of them would have to remember to pass it on.
+    is_assignable_depth: std::cell::Cell<u32>,
+    /// The `(expected, actual)` pairs currently on the [`Checker::is_assignable`]
+    /// recursion stack.
+    ///
+    /// The depth counter alone does not terminate the recursive-alias case:
+    /// each level branches over union variants and generic arguments, so a
+    /// depth bound of *n* still admits exponentially many calls below it.
+    /// Detecting that a pair is already being decided further up the stack is
+    /// what actually closes the cycle, and answering `true` for it is the
+    /// standard coinductive reading — "assignable unless we can find a
+    /// counterexample", which is what makes `type Json = str | list[Json]`
+    /// work at all.
+    ///
+    /// A `Vec` rather than a `HashSet` because `Type` is not `Hash`, and
+    /// because a stack this shallow scans faster than it hashes.
+    is_assignable_path: std::cell::RefCell<Vec<(Type, Type)>>,
     classes: Vec<String>,
     /// For each declared function name, its inferred signature type.
     function_signatures: HashMap<String, Type>,
@@ -2935,6 +2973,8 @@ impl<'a> Checker<'a> {
             path,
             source,
             resolved,
+            is_assignable_depth: std::cell::Cell::new(0),
+            is_assignable_path: std::cell::RefCell::new(Vec::new()),
             classes: Vec::new(),
             function_signatures: HashMap::new(),
             function_arity_info: HashMap::new(),
@@ -3043,6 +3083,43 @@ impl<'a> Checker<'a> {
     ///    be assignable to `expected` so nominal and structural rules apply to
     ///    each arm.
     fn is_assignable(&self, expected: &Type, actual: &Type) -> bool {
+        // Depth guard. See `is_assignable_depth`. On exhaustion return
+        // `true` — deliberately, and it is the only safe answer: a budget is
+        // an admission that we don't know, and the project's compatibility
+        // rule is that a check must never reject a program it cannot prove
+        // wrong. Answering `false` here would turn "the checker ran out of
+        // budget" into a user-visible `tyc::type_mismatch` on correct code.
+        let depth = self.is_assignable_depth.get();
+        if depth >= IS_ASSIGNABLE_MAX_DEPTH {
+            return true;
+        }
+        // Cycle check: this exact question is already being decided further
+        // up the stack, so the answer depends on itself. Assume `true` and
+        // let the surrounding conjunction find a real counterexample if one
+        // exists. Without this, a pair of aliases that reference each other
+        // through a type constructor (`type A = list[B]`, `type B = list[A]`)
+        // recurses forever — the per-file `tyc::cyclic_type_alias` pass
+        // deliberately treats such a reference as guarded, because
+        // `type Json = str | list[Json]` must remain legal.
+        if self
+            .is_assignable_path
+            .borrow()
+            .iter()
+            .any(|(e, a)| e == expected && a == actual)
+        {
+            return true;
+        }
+        self.is_assignable_depth.set(depth + 1);
+        self.is_assignable_path
+            .borrow_mut()
+            .push((expected.clone(), actual.clone()));
+        let result = self.is_assignable_inner(expected, actual);
+        self.is_assignable_path.borrow_mut().pop();
+        self.is_assignable_depth.set(depth);
+        result
+    }
+
+    fn is_assignable_inner(&self, expected: &Type, actual: &Type) -> bool {
         if assignable(expected, actual) {
             return true;
         }

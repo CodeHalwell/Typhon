@@ -7820,6 +7820,26 @@ pub fn call_with_kwargs(
             args.push(make_kwargs_sentinel(kwargs));
             (n.func)(interp, args)
         }
+        // `Ok` / `Err` are natives in the VM but frozen *dataclasses* in the
+        // emitted `typhon_runtime`, where the field names are part of the
+        // public API: `Ok(value=v)` and `Err(error=e)` are ordinary calls
+        // under CPython. Accept the same keyword forms so a program does not
+        // run under `tyc build` and fail under `tyc run`.
+        "Ok" | "Err" => {
+            let field = if n.name == "Ok" { "value" } else { "error" };
+            let mut args = args;
+            for (k, v) in kwargs {
+                if k == field && args.is_empty() {
+                    args.push(v.clone());
+                } else {
+                    return Err(type_error(format!(
+                        "{}() got an unexpected keyword argument '{k}'",
+                        n.name
+                    )));
+                }
+            }
+            (n.func)(interp, args)
+        }
         // Bound builtin methods (the "method" native) never reach here — they
         // are intercepted in `call_value`, which forwards kwargs via the
         // tuple sentinel (`make_kwargs_sentinel` / `split_kwargs`).

@@ -1,6 +1,6 @@
 //! Shared helpers used by multiple `tyc` subcommands.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use miette::{miette, Result};
@@ -183,6 +183,39 @@ pub fn collect_py_files(root: &Path) -> Result<Vec<PathBuf>> {
 /// directories: `__pycache__/`, `tests/`, `.venv/`, and any hidden
 /// `.X` directory. Files are still matched by extension.
 fn collect_with_ext_filtered(root: &Path, ext: &str, acc: &mut Vec<PathBuf>) -> Result<()> {
+    let mut visited = HashSet::new();
+    collect_with_ext_impl(root, ext, acc, &mut visited, true)
+}
+
+fn collect_with_ext(root: &Path, ext: &str, acc: &mut Vec<PathBuf>) -> Result<()> {
+    let mut visited = HashSet::new();
+    collect_with_ext_impl(root, ext, acc, &mut visited, false)
+}
+
+/// Shared source-tree walk behind [`collect_with_ext`] and
+/// [`collect_with_ext_filtered`]; `filtered` selects whether conventional
+/// non-source directories are skipped.
+///
+/// `visited` holds the canonicalised path of every directory already
+/// descended on this walk. Without it, a symlink pointing back up into the
+/// tree is followed as if it were a real directory — `Path::is_dir()` calls
+/// `stat`, not `lstat`, so it reports `true` for a link to a directory. The
+/// only thing that stopped the walk at all was the kernel's 40-link
+/// `ELOOP` ceiling, which bounds the depth but not the branching: one
+/// back-link re-enumerated a three-file project under 41 distinct paths
+/// (every diagnostic reported 41 times, every file checked 41 times), and two
+/// made the walk effectively non-terminating.
+///
+/// Canonicalising also deduplicates a *legitimate* symlinked source
+/// directory, so a linked shared-source tree is checked exactly once instead
+/// of once per link.
+fn collect_with_ext_impl(
+    root: &Path,
+    ext: &str,
+    acc: &mut Vec<PathBuf>,
+    visited: &mut HashSet<PathBuf>,
+    filtered: bool,
+) -> Result<()> {
     if root.is_file() {
         if root.extension().map(|e| e == ext).unwrap_or(false) {
             acc.push(root.to_path_buf());
@@ -190,6 +223,15 @@ fn collect_with_ext_filtered(root: &Path, ext: &str, acc: &mut Vec<PathBuf>) -> 
         return Ok(());
     }
     if root.is_dir() {
+        // Identity is the canonical path, not the path we arrived by: two
+        // different link paths to one directory must count as one visit. A
+        // directory that cannot be canonicalised (permissions, a race) is
+        // keyed by its literal path — worse deduplication, never a hang,
+        // because the cycle case always canonicalises.
+        let key = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+        if !visited.insert(key) {
+            return Ok(());
+        }
         let entries = std::fs::read_dir(root)
             .map_err(|e| miette!("cannot read directory {}: {}", root.display(), e))?;
         let mut paths: Vec<PathBuf> = entries
@@ -198,7 +240,7 @@ fn collect_with_ext_filtered(root: &Path, ext: &str, acc: &mut Vec<PathBuf>) -> 
             .map_err(|e| miette!("cannot read directory entry in {}: {}", root.display(), e))?;
         paths.sort();
         for path in paths {
-            if path.is_dir() {
+            if filtered && path.is_dir() {
                 if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
                     if name == "__pycache__"
                         || name == "tests"
@@ -209,29 +251,7 @@ fn collect_with_ext_filtered(root: &Path, ext: &str, acc: &mut Vec<PathBuf>) -> 
                     }
                 }
             }
-            collect_with_ext_filtered(&path, ext, acc)?;
-        }
-    }
-    Ok(())
-}
-
-fn collect_with_ext(root: &Path, ext: &str, acc: &mut Vec<PathBuf>) -> Result<()> {
-    if root.is_file() {
-        if root.extension().map(|e| e == ext).unwrap_or(false) {
-            acc.push(root.to_path_buf());
-        }
-        return Ok(());
-    }
-    if root.is_dir() {
-        let entries = std::fs::read_dir(root)
-            .map_err(|e| miette!("cannot read directory {}: {}", root.display(), e))?;
-        let mut paths: Vec<PathBuf> = entries
-            .map(|res| res.map(|e| e.path()))
-            .collect::<std::io::Result<Vec<_>>>()
-            .map_err(|e| miette!("cannot read directory entry in {}: {}", root.display(), e))?;
-        paths.sort();
-        for path in paths {
-            collect_with_ext(&path, ext, acc)?;
+            collect_with_ext_impl(&path, ext, acc, visited, filtered)?;
         }
     }
     Ok(())
