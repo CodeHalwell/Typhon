@@ -2445,10 +2445,22 @@ impl TypeEnv {
     /// cannot invalidate their narrowing. This closes the *global* slice of the
     /// narrowing-across-call soundness gap (the `match`-over-a-global case in
     /// particular silently broke the sealed-union exhaustiveness guarantee).
-    fn reset_global_narrowings(&mut self) {
+    ///
+    /// `rebound` is the set of names some function in this module actually
+    /// declares `global` (see [`collect_call_rebound_globals`]); only those are
+    /// widened. Before v1.0.0-alpha.7 *every* global was widened on *every*
+    /// intervening call, which was both needlessly lossy — a global no callee
+    /// can reach lost its narrowing to an unrelated `len(xs)` — and, because
+    /// the reset ran from only three statement arms, still unsound everywhere
+    /// else. Restricting the set is what makes it affordable to run the reset
+    /// from *every* statement arm that evaluates a call (F41).
+    fn reset_global_narrowings(&mut self, rebound: &std::collections::HashSet<String>) {
+        if rebound.is_empty() {
+            return;
+        }
         if let Some(globals) = self.scopes.first_mut() {
-            for b in globals.values_mut() {
-                if b.narrowed != b.declared {
+            for (name, b) in globals.iter_mut() {
+                if rebound.contains(name) && b.narrowed != b.declared {
                     b.narrowed = b.declared.clone();
                 }
             }
@@ -2592,6 +2604,12 @@ struct Checker<'a> {
     /// because a stack this shallow scans faster than it hashes.
     is_assignable_path: std::cell::RefCell<Vec<(Type, Type)>>,
     classes: Vec<String>,
+    /// Module-global names some function in this module declares `global` —
+    /// the exact set an intervening call can rebind under a narrowing's feet.
+    /// See [`collect_call_rebound_globals`]; empty for the overwhelming
+    /// majority of modules, which is what makes the per-statement invalidation
+    /// in [`eval_stmt_expr`] free.
+    globals_rebound_by_call: std::collections::HashSet<String>,
     /// For each declared function name, its inferred signature type.
     function_signatures: HashMap<String, Type>,
     /// Per-function arity metadata that doesn't fit in `Type::Function`
@@ -3055,6 +3073,7 @@ impl<'a> Checker<'a> {
             infer_depth: std::cell::Cell::new(0),
             is_assignable_path: std::cell::RefCell::new(Vec::new()),
             classes: Vec::new(),
+            globals_rebound_by_call: std::collections::HashSet::new(),
             function_signatures: HashMap::new(),
             function_arity_info: HashMap::new(),
             function_kwarg_types: HashMap::new(),
@@ -4750,6 +4769,36 @@ impl<'a> Checker<'a> {
     }
 
     fn nullable_use(&mut self, name: &str, expected: &Type, span: (usize, usize)) {
+        self.nullable_use_at(name, expected, span, /*warn_only=*/ false);
+    }
+
+    /// Same diagnostic, emitted at warn level.
+    ///
+    /// Used for an *attribute-rooted* receiver (`self.conn.execute()`,
+    /// `cfg.db.host`). Before v1.0.0-alpha.7 the check ran only when the
+    /// receiver was a bare `Expr::Name` — not by design, but because
+    /// [`Checker::nullable_use`] wanted a name for the message, so an
+    /// `if let Expr::Name` gate sat inside the `is_nullable()` branch and
+    /// silently swallowed every other receiver shape (F42). Dereferencing a
+    /// nullable *field* is the single most common non-nullability bug in real
+    /// code, and it was invisible.
+    ///
+    /// Warn, not error, because unlike the narrowing-invalidation fixes this
+    /// one newly rejects programs that *ran correctly* — code whose nullable
+    /// field happens to always be populated at the deref. Promote it with
+    /// `[strictness] nullable-use = "error"`; it becomes an error by default
+    /// in a later release.
+    fn nullable_attr_use(&mut self, path: &str, expected: &Type, span: (usize, usize)) {
+        self.nullable_use_at(path, expected, span, /*warn_only=*/ true);
+    }
+
+    fn nullable_use_at(
+        &mut self,
+        name: &str,
+        expected: &Type,
+        span: (usize, usize),
+        warn_only: bool,
+    ) {
         if self.unsafe_depth > 0 {
             return;
         }
@@ -4769,14 +4818,12 @@ impl<'a> Checker<'a> {
             },
             other => other.display(),
         };
-        self.diagnostics.push_error(TycError::nullable_use(
-            name,
-            display,
-            &self.path,
-            self.source,
-            span.0,
-            length,
-        ));
+        let diag = TycError::nullable_use(name, display, &self.path, self.source, span.0, length);
+        if warn_only {
+            self.diagnostics.push_warning(diag);
+        } else {
+            self.diagnostics.push_error(diag);
+        }
     }
 
     fn wrong_args(&mut self, name: &str, expected: usize, actual: usize, span: (usize, usize)) {
@@ -5831,6 +5878,7 @@ pub fn check_module_with_imports(
 
     // First pass: collect class names + function signatures so forward
     // references work.
+    collect_call_rebound_globals(&module.body, &mut c.globals_rebound_by_call);
     collect_classes_and_functions(&mut c, &module.body);
     check_override_compatibility(&mut c, &module.body);
     populate_frozen_classes(&mut c, &module.body, &frozen_starts);
@@ -10271,10 +10319,47 @@ fn seed_env_from_scope(c: &mut Checker, scope: ScopeId) {
 /// not collected, and the pre-loop narrowing of `x` survives for the paths that
 /// do reach the back-edge. Conservative: over-skipping only ever *keeps* a
 /// narrowing (a sound false negative), never introduces a false positive.
-fn collect_reassigned_names(stmts: &[Stmt], acc: &mut std::collections::HashSet<String>) {
-    fn add_target(t: &Expr, acc: &mut std::collections::HashSet<String>) {
-        if let Expr::Name(n) = t {
-            acc.insert(n.id.as_str().to_owned());
+///
+/// The two channels a loop body can carry a new value through.
+#[derive(Default)]
+struct LoopReassigned {
+    /// Bare names rebound in the body — widened with `widen_to_declared`.
+    names: std::collections::HashSet<String>,
+    /// Attribute paths (`self.buffer`, `a.b.c`) assigned in the body — cleared
+    /// with `clear_attr_narrowing`, which also drops sub-paths.
+    attrs: std::collections::HashSet<String>,
+}
+
+fn collect_reassigned_names(stmts: &[Stmt], acc: &mut LoopReassigned) {
+    fn add_target(t: &Expr, acc: &mut LoopReassigned) {
+        match t {
+            Expr::Name(n) => {
+                acc.names.insert(n.id.as_str().to_owned());
+            }
+            // `(prev, cur) = (cur, None)` / `[a, b] = ...` / `first, *rest =
+            // ...` rebind every element, so each one carries a new value into
+            // the next iteration exactly as a bare name does.
+            Expr::Tuple(t) => {
+                for e in &t.elts {
+                    add_target(e, acc);
+                }
+            }
+            Expr::List(l) => {
+                for e in &l.elts {
+                    add_target(e, acc);
+                }
+            }
+            Expr::Starred(s) => add_target(&s.value, acc),
+            // `self.buffer = None` at the bottom of a drain loop stales any
+            // `if self.buffer is not None:` narrowing established before the
+            // loop. Attribute narrowings live in a separate map that
+            // `widen_to_declared` cannot reach, so they are collected apart
+            // and cleared by path.
+            _ => {
+                if let Some(path) = attr_path_of(t) {
+                    acc.attrs.insert(path);
+                }
+            }
         }
     }
     for s in stmts {
@@ -10333,6 +10418,38 @@ fn collect_reassigned_names(stmts: &[Stmt], acc: &mut std::collections::HashSet<
             Stmt::Break(_) | Stmt::Return(_) | Stmt::Raise(_) | Stmt::Continue(_) => return,
             _ => {}
         }
+    }
+}
+
+/// Report a possibly-`None` receiver in `<recv>.attr` / `<recv>.method()`.
+///
+/// Two shapes, deliberately different severities:
+///
+/// * a bare name (`x.foo` where `x: T?`) — error, exactly as before;
+/// * a dotted path (`self.conn.execute()`, `cfg.db.host`) — warning, because
+///   this shape was never checked at all before v1.0.0-alpha.7 and turning it
+///   straight into an error would reject programs that ran correctly. See
+///   [`Checker::nullable_attr_use`].
+///
+/// Anything else — a call result, a subscript, a comprehension — is left
+/// alone: `attr_path_of` returns `None` for it, and there is no stable place
+/// to name in the message. Those receivers were not checked before either, so
+/// staying quiet is no regression.
+fn check_nullable_receiver(c: &mut Checker, recv_expr: &Expr, recv_ty: &Type) {
+    if let Expr::Name(n) = recv_expr {
+        let span = (
+            n.range.start().to_usize(),
+            n.range.start().to_usize() + n.id.as_str().len(),
+        );
+        c.nullable_use(n.id.as_str(), recv_ty, span);
+        return;
+    }
+    if let Some(path) = attr_path_of(recv_expr) {
+        let span = (
+            recv_expr.range().start().to_usize(),
+            recv_expr.range().end().to_usize(),
+        );
+        c.nullable_attr_use(&path, recv_ty, span);
     }
 }
 
@@ -10398,6 +10515,230 @@ fn comprehensions_contain_call(generators: &[ruff_python_ast::Comprehension]) ->
         .any(|g| expr_contains_call(&g.iter) || g.ifs.iter().any(expr_contains_call))
 }
 
+/// Whether any expression these statements evaluate contains a call.
+///
+/// Used by the loop-body widening: a call anywhere in the body can rebind a
+/// module global through `global NAME` in the callee, and the sequential reset
+/// at the call's own statement fires *after* the top-of-body read on iteration
+/// 2. Recurses into nested bodies; a nested `def`/`class` body is skipped
+/// because declaring it does not run it.
+fn body_contains_call(stmts: &[Stmt]) -> bool {
+    stmts.iter().any(stmt_contains_call)
+}
+
+fn stmt_contains_call(s: &Stmt) -> bool {
+    match s {
+        Stmt::Expr(e) => expr_contains_call(&e.value),
+        Stmt::Assign(a) => expr_contains_call(&a.value) || a.targets.iter().any(expr_contains_call),
+        Stmt::AugAssign(a) => expr_contains_call(&a.value) || expr_contains_call(&a.target),
+        Stmt::AnnAssign(a) => {
+            a.value.as_deref().is_some_and(expr_contains_call) || expr_contains_call(&a.target)
+        }
+        Stmt::Return(r) => r.value.as_deref().is_some_and(expr_contains_call),
+        Stmt::Delete(d) => d.targets.iter().any(expr_contains_call),
+        Stmt::Raise(r) => {
+            r.exc.as_deref().is_some_and(expr_contains_call)
+                || r.cause.as_deref().is_some_and(expr_contains_call)
+        }
+        Stmt::Assert(a) => {
+            expr_contains_call(&a.test) || a.msg.as_deref().is_some_and(expr_contains_call)
+        }
+        Stmt::If(i) => {
+            expr_contains_call(&i.test)
+                || body_contains_call(&i.body)
+                || i.elif_else_clauses.iter().any(|cl| {
+                    cl.test.as_ref().is_some_and(expr_contains_call) || body_contains_call(&cl.body)
+                })
+        }
+        Stmt::While(w) => {
+            expr_contains_call(&w.test)
+                || body_contains_call(&w.body)
+                || body_contains_call(&w.orelse)
+        }
+        Stmt::For(f) => {
+            expr_contains_call(&f.iter)
+                || body_contains_call(&f.body)
+                || body_contains_call(&f.orelse)
+        }
+        Stmt::With(w) => {
+            w.items
+                .iter()
+                .any(|it| expr_contains_call(&it.context_expr))
+                || body_contains_call(&w.body)
+        }
+        Stmt::Try(t) => {
+            body_contains_call(&t.body)
+                || t.handlers.iter().any(|h| {
+                    let ruff_python_ast::ExceptHandler::ExceptHandler(h) = h;
+                    h.type_.as_deref().is_some_and(expr_contains_call)
+                        || body_contains_call(&h.body)
+                })
+                || body_contains_call(&t.orelse)
+                || body_contains_call(&t.finalbody)
+        }
+        Stmt::Match(m) => {
+            expr_contains_call(&m.subject)
+                || m.cases.iter().any(|case| {
+                    case.guard.as_deref().is_some_and(expr_contains_call)
+                        || body_contains_call(&case.body)
+                })
+        }
+        Stmt::TypeAlias(t) => expr_contains_call(&t.value),
+        // A decorator runs at *definition* time, which for a nested `def`
+        // inside a loop body is once per iteration.
+        Stmt::FunctionDef(f) => f
+            .decorator_list
+            .iter()
+            .any(|d| expr_contains_call(&d.expression)),
+        Stmt::ClassDef(cd) => cd
+            .decorator_list
+            .iter()
+            .any(|d| expr_contains_call(&d.expression)),
+        // No expression to evaluate.
+        Stmt::Import(_)
+        | Stmt::ImportFrom(_)
+        | Stmt::Global(_)
+        | Stmt::Nonlocal(_)
+        | Stmt::Pass(_)
+        | Stmt::Break(_)
+        | Stmt::Continue(_)
+        | Stmt::IpyEscapeCommand(_) => false,
+    }
+}
+
+/// Every module-global name that some function in this module declares
+/// `global`, i.e. the exact set a call can rebind under the caller's feet.
+///
+/// Python globals are per-module, so a callee in *another* module cannot
+/// rebind one of ours no matter what it does with `global` — collecting from
+/// this module's own AST is not an approximation, it is the whole channel.
+/// (The residual hole is a foreign module doing `import us; us.g = None`
+/// through the module object; that is not a `global` rebinding and is not
+/// modelled here, as it is not modelled anywhere else in the checker either.)
+///
+/// A bare `global NAME` with no assignment under it is counted too. Writing
+/// one without then assigning is vanishingly rare, and over-counting only
+/// costs a narrowing — it never invents a diagnostic on a name no callee
+/// touches.
+fn collect_call_rebound_globals(stmts: &[Stmt], acc: &mut std::collections::HashSet<String>) {
+    for s in stmts {
+        match s {
+            Stmt::Global(g) => {
+                for name in &g.names {
+                    acc.insert(name.as_str().to_owned());
+                }
+            }
+            Stmt::FunctionDef(f) => collect_call_rebound_globals(&f.body, acc),
+            Stmt::ClassDef(cd) => collect_call_rebound_globals(&cd.body, acc),
+            Stmt::If(i) => {
+                collect_call_rebound_globals(&i.body, acc);
+                for clause in &i.elif_else_clauses {
+                    collect_call_rebound_globals(&clause.body, acc);
+                }
+            }
+            Stmt::For(f) => {
+                collect_call_rebound_globals(&f.body, acc);
+                collect_call_rebound_globals(&f.orelse, acc);
+            }
+            Stmt::While(w) => {
+                collect_call_rebound_globals(&w.body, acc);
+                collect_call_rebound_globals(&w.orelse, acc);
+            }
+            Stmt::With(w) => collect_call_rebound_globals(&w.body, acc),
+            Stmt::Try(t) => {
+                collect_call_rebound_globals(&t.body, acc);
+                for h in &t.handlers {
+                    let ruff_python_ast::ExceptHandler::ExceptHandler(h) = h;
+                    collect_call_rebound_globals(&h.body, acc);
+                }
+                collect_call_rebound_globals(&t.orelse, acc);
+                collect_call_rebound_globals(&t.finalbody, acc);
+            }
+            Stmt::Match(m) => {
+                for case in &m.cases {
+                    collect_call_rebound_globals(&case.body, acc);
+                }
+            }
+            // Cannot contain a nested statement, so cannot contain a `global`.
+            Stmt::Return(_)
+            | Stmt::Delete(_)
+            | Stmt::TypeAlias(_)
+            | Stmt::Assign(_)
+            | Stmt::AugAssign(_)
+            | Stmt::AnnAssign(_)
+            | Stmt::Raise(_)
+            | Stmt::Assert(_)
+            | Stmt::Import(_)
+            | Stmt::ImportFrom(_)
+            | Stmt::Nonlocal(_)
+            | Stmt::Expr(_)
+            | Stmt::Pass(_)
+            | Stmt::Break(_)
+            | Stmt::Continue(_)
+            | Stmt::IpyEscapeCommand(_) => {}
+        }
+    }
+}
+
+/// Widen the module-global narrowings an intervening call could have staled.
+///
+/// Cheap no-op for the overwhelmingly common module that declares no `global`
+/// at all, which is what makes it affordable to call from *every* statement
+/// arm that evaluates a call rather than from the three that used to (F41).
+fn reset_globals_after_call(c: &mut Checker) {
+    c.env.reset_global_narrowings(&c.globals_rebound_by_call);
+}
+
+/// Evaluate an expression appearing in statement position, invalidating global
+/// narrowing when it contains a call.
+///
+/// The single choke point F41 asked for: every statement arm that evaluates an
+/// expression goes through here, so the arm list can no longer drift out of
+/// sync with the reset. Callers that then apply their own narrowings (`if` /
+/// `while` tests) must call this *before* `apply_narrowings`, so a fresh
+/// test-implied narrowing (`if reload() is not None:`) survives the reset.
+fn eval_stmt_expr(c: &mut Checker, e: &Expr) -> Type {
+    let t = infer_expr(c, e);
+    if expr_contains_call(e) {
+        reset_globals_after_call(c);
+    }
+    t
+}
+
+/// Widen every narrowing a loop body could carry a *stale* value through into
+/// its second and later iterations, before that body is checked.
+///
+/// Four channels, all the same defect one AST shape apart (F43):
+///
+/// 1. bare names rebound in the body — `x = None`;
+/// 2. tuple / list / starred unpack targets — `(prev, cur) = (cur, None)`;
+/// 3. attribute paths — `self.buffer = None` at the bottom of a drain loop;
+/// 4. a module global a call in the body rebinds through `global NAME`.
+///
+/// Skipped entirely when every path through the body leaves the loop: there is
+/// then no back-edge, the body runs at most once, and widening would be a
+/// false positive. A `continue` does not leave the loop, so a body ending in
+/// one is still widened.
+fn widen_loop_carried_narrowings(c: &mut Checker, body: &[Stmt]) {
+    if body_always_leaves_loop(body) {
+        return;
+    }
+    let mut reassigned = LoopReassigned::default();
+    collect_reassigned_names(body, &mut reassigned);
+    for name in &reassigned.names {
+        c.env.widen_to_declared(name);
+    }
+    for path in &reassigned.attrs {
+        c.env.clear_attr_narrowing(path);
+    }
+    // The sequential reset at the call's own statement fires only once control
+    // *reaches* the call — which is after the top-of-body read on iteration 2.
+    // The back-edge therefore needs its own reset.
+    if body_contains_call(body) {
+        reset_globals_after_call(c);
+    }
+}
+
 fn check_stmt(c: &mut Checker, stmt: &Stmt) {
     match stmt {
         Stmt::AnnAssign(a) => {
@@ -10442,7 +10783,7 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                 // that global. Reset for subsequent statements (mirrors the
                 // `Stmt::Assign` / `Stmt::Expr` resets). Locals are immune.
                 if expr_contains_call(value) {
-                    c.env.reset_global_narrowings();
+                    reset_globals_after_call(c);
                 }
                 if bare_final {
                     ann_type = value_type.clone();
@@ -10564,7 +10905,7 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
             // narrowing survives — mirroring the bare-call `Stmt::Expr` reset.
             // Locals are immune (a call can't rebind a caller's local).
             if expr_contains_call(&a.value) {
-                c.env.reset_global_narrowings();
+                reset_globals_after_call(c);
             }
             for target in &a.targets {
                 check_attr_assign_not_frozen(c, target);
@@ -11178,10 +11519,19 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                     }
                 }
             }
+            // `return finish()` runs the callee. Nothing in this block is
+            // reachable afterwards, so this only matters for the statements
+            // the checker keeps walking past a `return` — but the arm is here
+            // so the reset never drifts out of the statement list again.
+            if ret.value.as_deref().is_some_and(expr_contains_call) {
+                reset_globals_after_call(c);
+            }
         }
         Stmt::If(i) => check_if(c, i),
         Stmt::While(w) => {
-            let _ = infer_expr(c, &w.test);
+            // See `check_if`: reset before the test's own narrowings are
+            // collected and applied, so `while poll() is not None:` keeps its.
+            let _ = eval_stmt_expr(c, &w.test);
             declare_walrus_targets(c, &w.test);
             // Flow narrowing inside the loop body: the test is known to
             // hold on every iteration that *enters* the body, so the
@@ -11216,13 +11566,7 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
             // pass — widening there would be a false positive (`while f: y = x;
             // x = None; break`). A `continue` does NOT leave the loop, so a body
             // ending in one is still widened (`body_always_leaves_loop`).
-            if !body_always_leaves_loop(&w.body) {
-                let mut loop_reassigned = std::collections::HashSet::new();
-                collect_reassigned_names(&w.body, &mut loop_reassigned);
-                for name in &loop_reassigned {
-                    c.env.widen_to_declared(name);
-                }
-            }
+            widen_loop_carried_narrowings(c, &w.body);
             apply_narrowings(c, &narrowings);
             for s in &w.body {
                 check_stmt(c, s);
@@ -11255,7 +11599,9 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
             }
         }
         Stmt::For(f) => {
-            let iter_ty = infer_expr(c, &f.iter);
+            // `for row in reload():` runs the callee before the first
+            // iteration, so a global it rebinds is stale from here on.
+            let iter_ty = eval_stmt_expr(c, &f.iter);
             // H5/M6: `for x in <non-iterable>` over a statically-known
             // scalar (`int`, `float`, `bool`, `None`) is a runtime
             // `TypeError`. str/bytes/list/dict/set/tuple and anything
@@ -11289,13 +11635,7 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
             // when the body always leaves the loop (`break`/`return`/`raise` on
             // every path) — there is then no back-edge, so no stale carry to
             // widen. A `continue` still reaches the back-edge, so it is widened.
-            if !body_always_leaves_loop(&f.body) {
-                let mut loop_reassigned = std::collections::HashSet::new();
-                collect_reassigned_names(&f.body, &mut loop_reassigned);
-                for name in &loop_reassigned {
-                    c.env.widen_to_declared(name);
-                }
-            }
+            widen_loop_carried_narrowings(c, &f.body);
             for s in &f.body {
                 check_stmt(c, s);
             }
@@ -11308,7 +11648,7 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
             // Reset it. (Locals are immune — a call can't rebind a caller's
             // local.) See `reset_global_narrowings`.
             if expr_contains_call(&e.value) {
-                c.env.reset_global_narrowings();
+                reset_globals_after_call(c);
             }
             // A bare method-call statement (`self.reset()`, `conn.close()`) may
             // mutate a field of its receiver, so a prior attribute narrowing
@@ -11327,7 +11667,9 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
         }
         Stmt::AugAssign(a) => {
             let l = infer_expr(c, &a.target);
-            let r = infer_expr(c, &a.value);
+            // `total += fetch()` runs the callee, staling any narrowing on a
+            // global it rebinds.
+            let r = eval_stmt_expr(c, &a.value);
             check_attr_assign_not_frozen(c, &a.target);
             // Operator-compatibility check, mirroring `Expr::BinOp`. Restricted
             // to scalar targets (int/float/bool/str/bytes) where `x op= y` has
@@ -11379,7 +11721,8 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
         }
         Stmt::With(w) => {
             for item in &w.items {
-                let ctx_ty = infer_expr(c, &item.context_expr);
+                // `with open_conn():` runs the callee before the body.
+                let ctx_ty = eval_stmt_expr(c, &item.context_expr);
                 // Reject a `with`/`async with` subject that is a fully-local
                 // class definitely missing the context-manager protocol
                 // (`__enter__`/`__exit__`, or `__aenter__`/`__aexit__` for
@@ -11570,13 +11913,18 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
         // for completeness but the narrowing is the important
         // side-effect.
         Stmt::Assert(a) => {
-            let _ = infer_expr(c, &a.test);
+            // Reset before the assert's own narrowings are applied, so
+            // `assert reconnect() is not None` keeps what it establishes.
+            let _ = eval_stmt_expr(c, &a.test);
+            if let Some(msg) = &a.msg {
+                let _ = eval_stmt_expr(c, msg);
+            }
             let pos = collect_narrowings(c, &a.test, /*negate=*/ false);
             apply_narrowings(c, &pos);
         }
         Stmt::Raise(r) => {
             if let Some(exc) = &r.exc {
-                let exc_type = infer_expr(c, exc);
+                let exc_type = eval_stmt_expr(c, exc);
                 if let Some(display) = raise_non_exception_display(c, &exc_type) {
                     let span = (exc.range().start().to_usize(), exc.range().end().to_usize());
                     c.diagnostics.push_error(TycError::raise_non_exception(
@@ -11589,7 +11937,15 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                 }
             }
             if let Some(cause) = &r.cause {
-                let _ = infer_expr(c, cause);
+                let _ = eval_stmt_expr(c, cause);
+            }
+        }
+        Stmt::Delete(d) => {
+            // `del cache[key()]` evaluates the subscript, calls included.
+            for tgt in &d.targets {
+                if expr_contains_call(tgt) {
+                    reset_globals_after_call(c);
+                }
             }
         }
         _ => {}
@@ -12702,7 +13058,11 @@ fn check_if(c: &mut Checker, i: &ruff_python_ast::StmtIf) {
     // never emits one) but is handled safely below.
     let is_unsafe = c.is_unsafe_marker(i.range);
 
-    let _ = infer_expr(c, &i.test);
+    // `eval_stmt_expr`, not `infer_expr`: `if refresh_cache():` runs the
+    // callee, which may `global cache; cache = None`. The reset must land
+    // *before* `collect_narrowings`/`apply_narrowings` below so a narrowing the
+    // test itself implies (`if reload() is not None:`) survives it.
+    let _ = eval_stmt_expr(c, &i.test);
     declare_walrus_targets(c, &i.test);
 
     // Apply narrowing for the true branch.
@@ -15730,13 +16090,7 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
             if let Expr::Attribute(attr) = call.func.as_ref() {
                 let recv = infer_expr(c, &attr.value);
                 if recv.is_nullable() {
-                    if let Expr::Name(n) = attr.value.as_ref() {
-                        let span = (
-                            n.range.start().to_usize(),
-                            n.range.start().to_usize() + n.id.as_str().len(),
-                        );
-                        c.nullable_use(n.id.as_str(), &recv, span);
-                    }
+                    check_nullable_receiver(c, &attr.value, &recv);
                 }
             }
 
@@ -16416,13 +16770,7 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
             }
             let recv = infer_expr(c, &a.value);
             if recv.is_nullable() {
-                if let Expr::Name(n) = a.value.as_ref() {
-                    let span = (
-                        n.range.start().to_usize(),
-                        n.range.start().to_usize() + n.id.as_str().len(),
-                    );
-                    c.nullable_use(n.id.as_str(), &recv, span);
-                }
+                check_nullable_receiver(c, &a.value, &recv);
             }
             let attr_name = a.attr.as_str();
             // B35: `_t.error` / `_t.value` on an isinstance-narrowed
@@ -18643,6 +18991,302 @@ mod tests {
     /// `ClassKind::Raw`). Required for any test exercising plain-/raw-class
     /// awareness in the checker (manual_init / class_attr_shadows_slot /
     /// attribute_not_found suppression).
+    /// F41: the reset used to be wired into three statement arms by hand, so
+    /// every other statement that can run a call kept a stale narrowing. Each
+    /// case here is a `tyc check`-clean program that crashed at runtime.
+    #[test]
+    fn a_call_in_any_statement_position_invalidates_a_global_narrowing() {
+        // One shape per previously-uncovered arm. `cache` is narrowed to
+        // non-`None` by the guard, then `clear()` nulls it out from under the
+        // narrowing, then `cache.upper()` reads it.
+        let arms: &[(&str, &str)] = &[
+            ("if", "    if clear():\n        pass\n"),
+            ("while", "    while clear():\n        break\n"),
+            ("for", "    for _c in reload():\n        break\n"),
+            ("assert", "    assert clear()\n"),
+            ("aug-assign", "    mut n: int = 0\n    n += bump()\n"),
+            ("with", "    with hold():\n        pass\n"),
+        ];
+        for (label, middle) in arms {
+            let src = format!(
+                r#"
+mut cache: str? = "seed"
+
+def clear() -> bool:
+    global cache
+    cache = None
+    return True
+
+def bump() -> int:
+    global cache
+    cache = None
+    return 1
+
+def reload() -> list[int]:
+    global cache
+    cache = None
+    return [1]
+
+def hold() -> object:
+    global cache
+    cache = None
+    return open("/dev/null")
+
+def go() -> None:
+    if cache is None:
+        return
+{middle}    let _s: str = cache.upper()
+"#
+            );
+            let d = check(&src);
+            assert!(
+                d.errors()
+                    .iter()
+                    .any(|e| matches!(e, TycError::NullableUse { .. })),
+                "a call in {label} position must invalidate the `cache` narrowing; got {:?}",
+                d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    /// The other half of F41: restricting the reset to globals some function
+    /// actually declares `global` is what keeps the now-per-statement
+    /// invalidation from costing narrowings nothing can invalidate.
+    #[test]
+    fn a_call_does_not_invalidate_a_global_no_callee_rebinds() {
+        // `helper` never says `global cache`, so `cache` cannot change under
+        // the guard and the narrowing must survive the intervening call.
+        let d = check(
+            r#"
+mut cache: str? = "seed"
+
+def helper() -> bool:
+    return True
+
+def go() -> None:
+    if cache is None:
+        return
+    if helper():
+        pass
+    let _s: str = cache.upper()
+"#,
+        );
+        assert!(
+            !d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::NullableUse { .. })),
+            "no function rebinds `cache`, so the narrowing must survive; got {:?}",
+            d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    /// A narrowing the test *itself* establishes has to survive the reset the
+    /// same test triggers — the reset must land before `apply_narrowings`.
+    #[test]
+    fn a_test_implied_narrowing_survives_its_own_call_reset() {
+        let d = check(
+            r#"
+mut cache: str? = "seed"
+
+def bump() -> int:
+    global cache
+    cache = "fresh"
+    return 1
+
+def go() -> None:
+    if bump() > 0 and cache is not None:
+        let _s: str = cache.upper()
+"#,
+        );
+        assert!(
+            !d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::NullableUse { .. })),
+            "the `if` test's own narrowing must outlive the reset it triggers; got {:?}",
+            d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    /// F43(a): an attribute narrowed before a loop, nulled at the bottom of
+    /// the body, is stale when iteration 2 reads it at the top.
+    #[test]
+    fn a_loop_body_widens_an_attribute_it_reassigns() {
+        let d = check(
+            r#"
+class Drain:
+    buffer: str?
+
+impl Drain:
+    def run(self) -> None:
+        if self.buffer is None:
+            return
+        while True:
+            let _s: str = self.buffer.upper()
+            self.buffer = None
+"#,
+        );
+        assert!(
+            d.warnings()
+                .iter()
+                .chain(d.errors().iter())
+                .any(|e| matches!(e, TycError::NullableUse { .. })),
+            "`self.buffer = None` at the bottom stales the top-of-body read; got {:?}",
+            d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    /// F43(b): a tuple-unpack target carries a new value into iteration 2 just
+    /// as a bare name does, but `add_target` used to drop every non-`Name`.
+    #[test]
+    fn a_loop_body_widens_a_tuple_unpack_target() {
+        let d = check(
+            r#"
+def go(items: list[str]) -> None:
+    mut cur: str? = "seed"
+    mut prev: str? = None
+    if cur is None:
+        return
+    for _it in items:
+        let _s: str = cur.upper()
+        (prev, cur) = (cur, None)
+"#,
+        );
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::NullableUse { .. })),
+            "`(prev, cur) = (cur, None)` stales `cur` for iteration 2; got {:?}",
+            d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    /// F43(c): a call in the body rebinds a global, but the sequential reset
+    /// fires only once control *reaches* it — after the top-of-body read.
+    #[test]
+    fn a_loop_body_widens_a_global_an_in_body_call_rebinds() {
+        let d = check(
+            r#"
+mut cache: str? = "seed"
+
+def clear() -> None:
+    global cache
+    cache = None
+
+def go(items: list[str]) -> None:
+    if cache is None:
+        return
+    for _it in items:
+        let _s: str = cache.upper()
+        clear()
+"#,
+        );
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::NullableUse { .. })),
+            "the in-body `clear()` stales `cache` for iteration 2; got {:?}",
+            d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    /// The `body_always_leaves_loop` gate has to keep holding: a body that
+    /// cannot reach the back-edge runs at most once, so widening it would be
+    /// a false positive.
+    #[test]
+    fn a_single_pass_loop_body_keeps_its_narrowing() {
+        let d = check(
+            r#"
+class Drain:
+    buffer: str?
+
+impl Drain:
+    def run(self) -> None:
+        if self.buffer is None:
+            return
+        while True:
+            let _s: str = self.buffer.upper()
+            self.buffer = None
+            break
+"#,
+        );
+        assert!(
+            !d.errors()
+                .iter()
+                .chain(d.warnings().iter())
+                .any(|e| matches!(e, TycError::NullableUse { .. })),
+            "a body that always leaves the loop has no back-edge to stale; got {:?}",
+            d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    /// F42: an attribute-rooted receiver was never checked at all — the
+    /// diagnostic was gated on the receiver being a bare `Expr::Name`.
+    #[test]
+    fn a_nullable_attribute_receiver_is_reported() {
+        let d = check(
+            r#"
+class Db:
+    host: str
+
+class Cfg:
+    db: Db?
+
+impl Cfg:
+    def show(self) -> str:
+        return self.db.host
+"#,
+        );
+        assert!(
+            d.warnings()
+                .iter()
+                .any(|e| matches!(e, TycError::NullableUse { .. })),
+            "`self.db.host` on a `Db?` field must be reported; got warnings {:?} errors {:?}",
+            d.warnings()
+                .iter()
+                .map(|e| e.to_string())
+                .collect::<Vec<_>>(),
+            d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+        assert!(
+            !d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::NullableUse { .. })),
+            "…at warn level for one release, not error — it rejects correct programs"
+        );
+    }
+
+    /// …and a guarded one stays silent, so the new check does not fight the
+    /// attribute narrowing that already exists.
+    #[test]
+    fn a_guarded_nullable_attribute_receiver_is_silent() {
+        let d = check(
+            r#"
+class Db:
+    host: str
+
+class Cfg:
+    db: Db?
+
+impl Cfg:
+    def show(self) -> str:
+        if self.db is None:
+            return ""
+        return self.db.host
+"#,
+        );
+        assert!(
+            !d.warnings()
+                .iter()
+                .chain(d.errors().iter())
+                .any(|e| matches!(e, TycError::NullableUse { .. })),
+            "`if self.db is None: return` narrows the path; got {:?}",
+            d.warnings()
+                .iter()
+                .map(|e| e.to_string())
+                .collect::<Vec<_>>()
+        );
+    }
+
     #[test]
     fn attribute_assignment_is_type_checked() {
         // `self.field = v` is the mandated idiom — methods live in `impl`

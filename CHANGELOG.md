@@ -21,11 +21,19 @@ Compatibility, using the review's own taxonomy:
   multiple-inheritance field order; wrong-typed attribute assignment; `set` /
   `frozenset` passed as a `Sequence` / `Reversible`, and any container passed
   as an `Iterator`.
-- **One narrowing on code that may run correctly today**: a `match` over a
-  *parametric* sealed union (`type U[T] = A | B`) is now checked for
-  exhaustiveness — it was skipped entirely, so such a match has never been
-  checked. `case _:` and `[strictness] exhaustive-match` are the escapes. No
-  file in the example or stress corpus is affected.
+- **Narrowings on code that may run correctly today**, each with an escape and
+  each verified against the full example + stress corpus:
+  - a `match` over a *parametric* sealed union (`type U[T] = A | B`) is now
+    checked for exhaustiveness — it was skipped entirely, so such a match has
+    never been checked. `case _:` and `[strictness] exhaustive-match` are the
+    escapes;
+  - dereferencing a nullable *field* (`self.conn.execute()`) is reported. This
+    lands at **warn** level for one release because, unlike the narrowing
+    fixes below, it can flag a field that happens always to be populated;
+    promote it with `[strictness] nullable-use = "error"`;
+  - `let` immutability is enforced inside loop bodies and through
+    `global` / `nonlocal`. Both were unenforced, so this rejects programs that
+    ran — but only ones already violating Rule 2 as documented.
 - **Miscompilation fixes** (only change programs that were already producing
   the wrong answer): `?` in an `elif` / `while` condition; string-literal
   corruption in four passes; emitter precedence.
@@ -68,6 +76,48 @@ Compatibility, using the review's own taxonomy:
   deprecation warning that already tells the user what to write.
 - **`match` over a parametric sealed union is checked** for exhaustiveness.
 - **The read-only-ABC lattice matches `collections.abc`.**
+- **A call in *any* statement position invalidates a global narrowing.** The
+  invalidation was wired into three statement arms by hand — assign, annotated
+  assign, and a bare call — so `if refresh():`, `while poll():`,
+  `for row in reload():`, `assert reconnect()`, `total += bump()` and
+  `with hold():` all kept a narrowing the callee had just invalidated. Every
+  statement that evaluates an expression now routes through one helper, so the
+  arm list cannot drift out of sync with the reset again. Paired with a
+  precision fix in the other direction: only globals some function in the
+  module actually declares `global` are widened, where previously *every*
+  global lost its narrowing to *any* intervening call — so the common case
+  (a module with no `global` anywhere) now keeps narrowings it used to lose.
+- **A loop body widens every channel it can carry a stale value through.** The
+  iteration-2 fix covered bare-name assignment targets only, so
+  `self.buffer = None` at the bottom of a drain loop, `(prev, cur) = (cur, None)`
+  in a swap, and an in-body call that clears a global cache all left the
+  top-of-body read checked against the pre-loop narrowing. The
+  "body always leaves the loop" gate is unchanged, so single-pass bodies keep
+  their narrowing.
+- **A nullable *field* receiver is reported.** The check was gated on the
+  receiver being a bare name — not by design, but because the diagnostic wanted
+  a name for its message — so `self.conn.execute()`, `cfg.db.host` and
+  `resp.body.decode()` on a `T?` member had no check at all: not
+  `tyc::nullable_use`, not `tyc::attribute_not_found`. Warn level for one
+  release (see the compatibility note above).
+
+### Resolver
+
+- **`let` is single-assignment inside loop bodies.** A carve-out that lets a
+  later *sibling* loop reuse a scratch name was keyed on the declaration span
+  alone, so it could not distinguish that from a loop body reassigning its own
+  `let` — and swallowed both. Rule 2 was therefore unenforced across the single
+  most common code shape in the language. Loop bodies now carry an identity and
+  the carve-out fires only when the declaring body has already exited; the
+  sibling-loop pattern it exists for is unaffected.
+- **`global` / `nonlocal` no longer defeats `let`.** `global CONFIG;
+  CONFIG = "b"` used a scope-*local* lookup, found nothing, and declared a
+  brand-new mutable binding in the function scope — so the module-level
+  `let CONFIG` was never consulted and `tyc::immutable_assign` could never
+  fire. The write now resolves to the binding the keyword actually names
+  (module scope for `global`, nearest enclosing function scope for
+  `nonlocal`), which also stops a phantom local from entering the binding graph
+  that LSP go-to-definition and the unused-import pass read.
 
 ### Preprocessor / emitter
 

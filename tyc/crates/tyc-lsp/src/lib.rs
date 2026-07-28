@@ -10,7 +10,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use miette::{Diagnostic as MietteDiagnostic, LabeledSpan};
-use salsa::Setter;
 use tokio::sync::Mutex;
 use tower_lsp_server::ls_types::{
     CodeAction, CodeActionKind, CodeActionOrCommand, CodeActionParams,
@@ -27,7 +26,7 @@ use tower_lsp_server::ls_types::{
 use tower_lsp_server::{jsonrpc, Client, LanguageServer, LspService, Server};
 use tyc_db::{
     check_source_file, check_source_file_with_imports, module_shapes_query, preprocessed_full,
-    preprocessed_text, resolved_module_arc, ModuleShapes, SourceFile, TycDatabase,
+    preprocessed_text, resolved_module_arc, set_source_text, ModuleShapes, SourceFile, TycDatabase,
 };
 use tyc_diagnostics::TycError;
 use tyc_resolve::{
@@ -68,10 +67,15 @@ pub struct Backend {
     /// Per-document Salsa handles, keyed by URI string.
     ///
     /// The [`SourceFile`] handle is the Salsa input for this document; on
-    /// `did_change` it is updated via `set_text` so Salsa propagates
-    /// invalidations incrementally rather than creating a fresh entity.
+    /// `did_change` it is updated via `tyc_db::set_source_text` so Salsa
+    /// propagates invalidations incrementally rather than creating a fresh
+    /// entity — and so byte-identical text doesn't invalidate anything at all.
     /// Raw text is stored inside the Salsa input itself and read back via
     /// `source_file.text(db)` when needed, avoiding dual-state synchronisation.
+    ///
+    /// This map is also the authoritative text for *every* open file, not
+    /// just the one being checked: the cross-module shape builder reads
+    /// sibling modules through these handles rather than from disk.
     documents: Arc<Mutex<HashMap<String, SourceFile>>>,
     /// Resolved-module cache for cross-file import resolution.
     ///
@@ -124,8 +128,11 @@ pub struct Backend {
     ///
     /// Entries are refreshed lazily inside `check_and_publish`: every
     /// `.ty` / `.dty` file under the project's src tree is registered
-    /// (or its text re-uploaded via `set_text`) before the cross-
-    /// module shape map is assembled.
+    /// before the cross-module shape map is assembled. A file the client
+    /// has open reuses that document's [`SourceFile`] handle verbatim
+    /// (one input per file); the rest have their on-disk text pushed
+    /// through `tyc_db::set_source_text`, which writes only on a real
+    /// change.
     project_files: Arc<Mutex<HashMap<std::path::PathBuf, HashMap<String, SourceFile>>>>,
     /// Last document version we've already kicked off a venv-
     /// introspection prewarm for, keyed by URI. Used to debounce
@@ -199,13 +206,16 @@ impl Backend {
 
         // Upsert the SourceFile in the Salsa database.
         //
-        // On `did_open` we create a fresh entity; on `did_change` we call
-        // `set_text` on the existing handle so Salsa can propagate the
-        // invalidation incrementally: queries that depend on this file's text
-        // are re-evaluated on the next access, but queries for *other* files
-        // stay cached.  We hold the db lock only for this short operation so
-        // hover/completion requests can still acquire it while the heavy
-        // `check_source_file` runs on the blocking thread.
+        // On `did_open` we create a fresh entity; on `did_change` we push the
+        // new text through `set_source_text` on the existing handle so Salsa
+        // can propagate the invalidation incrementally: queries that depend on
+        // this file's text are re-evaluated on the next access, but queries for
+        // *other* files stay cached. `set_source_text` compares before it
+        // writes — raw `set_text` does not (F56) — so a `did_change` that
+        // delivers byte-identical text (a formatter round-trip, an editor
+        // re-sync) leaves the whole cache warm. We hold the db lock only for
+        // this short operation so hover/completion requests can still acquire
+        // it while the heavy `check_source_file` runs on the blocking thread.
         let source_file: SourceFile = {
             let existing = {
                 let docs = self.documents.lock().await;
@@ -213,7 +223,7 @@ impl Backend {
             };
             let mut db_guard = self.db.lock().await;
             if let Some(sf) = existing {
-                sf.set_text(&mut *db_guard).to(text.clone());
+                set_source_text(&mut db_guard, sf, text.clone());
                 sf
             } else {
                 SourceFile::new(&*db_guard, uri_str.clone(), text.clone())
@@ -222,10 +232,23 @@ impl Backend {
 
         // Cache the Salsa handle; raw text is stored inside Salsa itself and
         // retrieved via `source_file.text(db)` when needed.
-        {
+        //
+        // The same pass snapshots every open document's handle keyed by
+        // filesystem path, so the cross-module shape builder below can read
+        // sibling modules from their live buffers instead of from disk (F57).
+        // `SourceFile` is `Copy`, so this is a cheap handle snapshot — the
+        // text stays in Salsa and is only read under the db lock inside the
+        // blocking closure. Taking it here (rather than inside the closure)
+        // keeps the `documents` lock off the blocking thread entirely.
+        let open_docs: HashMap<std::path::PathBuf, SourceFile> = {
             let mut docs = self.documents.lock().await;
             docs.insert(uri_str.clone(), source_file);
-        }
+            docs.iter()
+                .filter_map(|(doc_uri, sf)| {
+                    uri_str_to_path(doc_uri).map(|p| (path_lookup_key(&p), *sf))
+                })
+                .collect()
+        };
 
         // Resolve the project root once on the async side so the
         // blocking closure (which holds the salsa db lock) only needs
@@ -262,12 +285,14 @@ impl Backend {
             // blocking closure so the salsa-cached
             // `module_shapes_query` does the heavy lifting: only the
             // file whose text actually changed re-runs the parse.
-            // `set_text` on a salsa input is a no-op when the new
-            // value matches, so re-uploading every file's on-disk
-            // text per check doesn't churn the cache. The currently-
-            // edited document uses its in-flight buffer text, not
-            // the on-disk content, so cross-module diagnostics
-            // update within one keystroke.
+            // Salsa's own `set_text` is NOT value-comparing, so the
+            // builder routes every write through
+            // `tyc_db::set_source_text`, which compares first — that
+            // is what keeps re-uploading unchanged on-disk text from
+            // churning the cache. Every document the client has open
+            // is served from its live buffer input (`open_docs`), so
+            // cross-module diagnostics react to unsaved edits in any
+            // module within one keystroke, not just the edited one.
             let project_shapes = if let Some((_root, src_dir)) = workspace.as_ref() {
                 let src_root_name = src_dir
                     .file_name()
@@ -282,6 +307,7 @@ impl Backend {
                     &src_root_name,
                     &uri_str_for_check,
                     &text_for_check,
+                    &open_docs,
                 );
                 // Seed compiler-bundled stubs (httpx, requests, …) so the
                 // editor surfaces their shapes live, matching `tyc check` /
@@ -1728,8 +1754,13 @@ fn map_preprocessed_offset_to_original(
 /// Convert an `lsp_types::Uri` into a local filesystem path.  Only `file:`
 /// URIs are supported — anything else (e.g. `untitled:`) returns `None`.
 fn uri_to_path(uri: &Uri) -> Option<std::path::PathBuf> {
-    let s = uri.as_str();
-    let stripped = s.strip_prefix("file://")?;
+    uri_str_to_path(uri.as_str())
+}
+
+/// [`uri_to_path`] for an already-stringified URI. The `documents` map is
+/// keyed by URI string, so the open-document lookup needs this form.
+fn uri_str_to_path(uri: &str) -> Option<std::path::PathBuf> {
+    let stripped = uri.strip_prefix("file://")?;
     // Strip the host component (always empty for local files but the LSP
     // URI may emit it as "//"). Anything past the first `/` is the path.
     let path = if let Some(rest) = stripped.strip_prefix('/') {
@@ -1738,6 +1769,13 @@ fn uri_to_path(uri: &Uri) -> Option<std::path::PathBuf> {
         stripped.to_owned()
     };
     Some(std::path::PathBuf::from(percent_decode(&path)))
+}
+
+/// Normalise a path for use as a lookup key: canonicalise when the file
+/// exists (so symlinks and `..` segments compare equal), fall back to the
+/// path as given when it doesn't (unsaved / network FS).
+fn path_lookup_key(path: &std::path::Path) -> std::path::PathBuf {
+    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
 }
 
 /// Convert a local filesystem path back into an `lsp_types::Uri`.
@@ -1801,17 +1839,25 @@ fn from_hex(b: u8) -> Option<u8> {
 ///
 /// Walks every `.ty` / `.dty` file under `src_dir`, ensures each one
 /// is registered as a [`SourceFile`] input in the Salsa database, and
-/// then queries [`module_shapes_query`] for each. Salsa's input
-/// equality check means re-uploading on-disk text that hasn't changed
-/// is a no-op; the per-file `module_shapes_query` cache then returns
-/// immediately. Net result: a keystroke in `main.ty` only triggers
-/// shape extraction for `main.ty`, not every sibling.
+/// then queries [`module_shapes_query`] for each. Inputs are updated
+/// through [`set_source_text`], which writes only when the text really
+/// changed, so the per-file `module_shapes_query` cache survives; net
+/// result: a keystroke in `main.ty` only triggers shape extraction for
+/// `main.ty`, not every sibling.
 ///
-/// `current_uri` + `current_text` carry the in-flight editor buffer
-/// for the document currently being checked. That text is uploaded
-/// via `set_text` (or used to create a fresh `SourceFile`) so
-/// cross-module diagnostics react to unsaved changes within one
-/// keystroke.
+/// `open_docs` maps a normalised filesystem path (see [`path_lookup_key`])
+/// to the live, buffer-backed [`SourceFile`] the backend holds for every
+/// document the client has opened. Those handles are the source of truth:
+/// a project file that is open in the editor is served straight from its
+/// document input, never re-read from disk. Before this, only the
+/// *currently-checked* document used its buffer and every other open
+/// document was overwritten with stale on-disk bytes — so adding a member
+/// in module A lit module B up red until A was saved (F57). Disk is the
+/// fallback for project files the client has not opened.
+///
+/// `current_uri` + `current_text` still carry the in-flight buffer of the
+/// document being checked, as a belt-and-braces path for a file that is
+/// being checked without a `documents` entry (the synthetic-open form).
 ///
 /// `project_files` is the per-project handle table that survives
 /// across calls — without it we'd create a new `SourceFile` on every
@@ -1827,6 +1873,7 @@ fn build_project_shapes_salsa(
     src_root_name: &str,
     current_uri: &str,
     current_text: &str,
+    open_docs: &HashMap<std::path::PathBuf, SourceFile>,
 ) -> std::collections::HashMap<String, ModuleShapes> {
     let project_root = src_dir
         .parent()
@@ -1842,51 +1889,74 @@ fn build_project_shapes_salsa(
     // `.dty` stubs first, so `.ty` insertions skip them on
     // collisions — authored stubs are the source of truth.
     let dty_files = collect_files_with_ext(src_dir, "dty");
-    for file in &dty_files {
-        let dotted = path_to_dotted(file, src_root_name);
-        if shapes.contains_key(&dotted) {
-            continue;
-        }
-        // Prefer the editor buffer for the currently-edited file,
-        // disk for everything else. Skip files we can't read.
-        let text = if uri_matches_path(current_uri, file) {
-            current_text.to_owned()
-        } else {
-            match std::fs::read_to_string(file) {
-                Ok(t) => t,
-                Err(_) => continue,
-            }
-        };
-        let source_file = upsert_source_file(db, entries, &dotted, file, text);
-        shapes.insert(dotted, (*module_shapes_query(db, source_file).0).clone());
-    }
-
     let ty_files = collect_files_with_ext(src_dir, "ty");
-    for file in &ty_files {
+    for file in dty_files.iter().chain(ty_files.iter()) {
         let dotted = path_to_dotted(file, src_root_name);
         if shapes.contains_key(&dotted) {
             continue;
         }
-        let text = if uri_matches_path(current_uri, file) {
-            current_text.to_owned()
-        } else {
-            match std::fs::read_to_string(file) {
-                Ok(t) => t,
-                Err(_) => continue,
-            }
+        let Some(source_file) = shape_input_for(
+            db,
+            entries,
+            open_docs,
+            &dotted,
+            file,
+            current_uri,
+            current_text,
+        ) else {
+            continue;
         };
-        let source_file = upsert_source_file(db, entries, &dotted, file, text);
         shapes.insert(dotted, (*module_shapes_query(db, source_file).0).clone());
     }
 
     shapes
 }
 
+/// Resolve the Salsa input that `module_shapes_query` should read for one
+/// project file.
+///
+/// Precedence, highest first:
+///
+/// 1. The live document input, when the client has this file open. Its text
+///    is already the editor buffer, so nothing is written and no filesystem
+///    read happens. The handle is also recorded in `entries`, so a file has
+///    exactly one input whether or not it happens to be open.
+/// 2. `current_text`, when this file is the document being checked but has no
+///    `documents` entry yet (synthetic open).
+/// 3. The on-disk contents.
+///
+/// Returns `None` for a file that is not open and cannot be read.
+fn shape_input_for(
+    db: &mut TycDatabase,
+    entries: &mut HashMap<String, SourceFile>,
+    open_docs: &HashMap<std::path::PathBuf, SourceFile>,
+    dotted: &str,
+    file: &std::path::Path,
+    current_uri: &str,
+    current_text: &str,
+) -> Option<SourceFile> {
+    if let Some(&sf) = open_docs.get(&path_lookup_key(file)) {
+        entries.insert(dotted.to_owned(), sf);
+        return Some(sf);
+    }
+    let text = if uri_matches_path(current_uri, file) {
+        current_text.to_owned()
+    } else {
+        std::fs::read_to_string(file).ok()?
+    };
+    Some(upsert_source_file(db, entries, dotted, file, text))
+}
+
 /// Locate or create the Salsa `SourceFile` handle for a project
 /// module. If we already have a handle, push the new text through
-/// `set_text` (a no-op when content matches); otherwise allocate one
-/// via `SourceFile::new`. Either way, returns a handle that
-/// `module_shapes_query` can consume.
+/// [`set_source_text`], which writes only when the content actually
+/// differs; otherwise allocate one via `SourceFile::new`. Either way,
+/// returns a handle that `module_shapes_query` can consume.
+///
+/// The value comparison is load-bearing: salsa's raw `set_text` stamps the
+/// field as written at the current revision without looking at the value, so
+/// the unconditional re-upload this function used to perform invalidated
+/// `module_shapes_query` for every project file on every keystroke (F56).
 fn upsert_source_file(
     db: &mut TycDatabase,
     entries: &mut HashMap<String, SourceFile>,
@@ -1895,7 +1965,7 @@ fn upsert_source_file(
     text: String,
 ) -> SourceFile {
     if let Some(&sf) = entries.get(dotted) {
-        sf.set_text(db).to(text);
+        set_source_text(db, sf, text);
         sf
     } else {
         let sf = SourceFile::new(db, path.to_string_lossy().into_owned(), text);
@@ -6498,6 +6568,146 @@ def f() -> None:
         assert!(
             Arc::ptr_eq(&first, &second),
             "unchanged file should return the same Arc from the Salsa cache"
+        );
+    }
+
+    // ── Cross-module shape registry (F56 / F57) ──────────────────────────────
+
+    /// Lay down a two-module project on disk and return `(tmpdir, src_dir)`.
+    fn two_module_project() -> (tempfile::TempDir, std::path::PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("thing.ty"), "pub class Thing:\n    a: int\n").unwrap();
+        std::fs::write(
+            src.join("main.ty"),
+            "from thing import Thing\n\ndef main() -> None:\n    let t: Thing = Thing(a=1)\n    print(t.a)\n",
+        )
+        .unwrap();
+        (tmp, src)
+    }
+
+    /// F57 — a sibling module that the client has open must be read from its
+    /// live buffer, not from the (stale) bytes on disk. Before the fix, only
+    /// the document currently being checked used its buffer; every other open
+    /// document was overwritten with disk text, so an unsaved edit in module A
+    /// produced phantom errors in module B.
+    #[test]
+    fn project_shapes_read_open_documents_not_disk() {
+        let (_tmp, src) = two_module_project();
+        let thing_path = src.join("thing.ty");
+
+        let mut db = TycDatabase::new();
+        let project_files: Arc<Mutex<HashMap<std::path::PathBuf, HashMap<String, SourceFile>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+
+        // Control: nothing open → disk text, one field.
+        let shapes = build_project_shapes_salsa(
+            &mut db,
+            &project_files,
+            &src,
+            "src",
+            "",
+            "",
+            &HashMap::new(),
+        );
+        let disk = &shapes["thing"].class_shapes["Thing"];
+        assert!(disk.fields.contains_key("a"));
+        assert!(
+            !disk.fields.contains_key("b"),
+            "disk copy of thing.ty has no `b` field"
+        );
+
+        // Now open `thing.ty` in the editor and add a field WITHOUT saving.
+        let buffer = "pub class Thing:\n    a: int\n    b: int\n";
+        let doc = SourceFile::new(
+            &db,
+            format!("file://{}", thing_path.display()),
+            buffer.to_owned(),
+        );
+        let mut open_docs = HashMap::new();
+        open_docs.insert(path_lookup_key(&thing_path), doc);
+
+        let shapes =
+            build_project_shapes_salsa(&mut db, &project_files, &src, "src", "", "", &open_docs);
+        let live = &shapes["thing"].class_shapes["Thing"];
+        assert!(
+            live.fields.contains_key("b"),
+            "the unsaved buffer's new field must reach the registry; got {:?}",
+            live.field_order
+        );
+    }
+
+    /// F56 — re-running the registry build with nothing changed must not
+    /// invalidate `module_shapes_query`. Salsa's raw `set_text` is not
+    /// value-comparing, so the unguarded re-upload this used to perform
+    /// re-parsed every project file on every keystroke.
+    #[test]
+    fn project_shapes_rebuild_reuses_the_salsa_memo() {
+        let (_tmp, src) = two_module_project();
+        let mut db = TycDatabase::new();
+        let project_files: Arc<Mutex<HashMap<std::path::PathBuf, HashMap<String, SourceFile>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+
+        let _ = build_project_shapes_salsa(
+            &mut db,
+            &project_files,
+            &src,
+            "src",
+            "",
+            "",
+            &HashMap::new(),
+        );
+        // Grab the handle the first pass registered, and the memo it produced.
+        let handle = {
+            let per_project = project_files.blocking_lock();
+            per_project
+                .values()
+                .next()
+                .expect("one project root registered")["thing"]
+        };
+        let before = module_shapes_query(&db, handle);
+
+        // Second pass, identical on-disk text.
+        let _ = build_project_shapes_salsa(
+            &mut db,
+            &project_files,
+            &src,
+            "src",
+            "",
+            "",
+            &HashMap::new(),
+        );
+        let after = module_shapes_query(&db, handle);
+        assert!(
+            Arc::ptr_eq(&before.0, &after.0),
+            "an unchanged sibling module must stay a Salsa cache hit across \
+             registry rebuilds"
+        );
+
+        // A genuine on-disk edit must still invalidate.
+        std::fs::write(
+            src.join("thing.ty"),
+            "pub class Thing:\n    a: int\n    b: int\n",
+        )
+        .unwrap();
+        let _ = build_project_shapes_salsa(
+            &mut db,
+            &project_files,
+            &src,
+            "src",
+            "",
+            "",
+            &HashMap::new(),
+        );
+        let edited = module_shapes_query(&db, handle);
+        assert!(
+            !Arc::ptr_eq(&before.0, &edited.0),
+            "a real edit must invalidate the memo"
+        );
+        assert!(
+            edited.class_shapes["Thing"].fields.contains_key("b"),
+            "the re-run must observe the edited file"
         );
     }
 }

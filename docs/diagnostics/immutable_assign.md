@@ -30,4 +30,46 @@ def main() -> None:
     count = count + 1  # ok
 ```
 
+## Inside a loop body
+
+A `let` declared inside a `for` / `while` body is freshly bound on every
+iteration, so a *later sibling loop* may reuse the same scratch name:
+
+```ty
+for a in xs:
+    let t: int = a      # ok
+for b in ys:
+    let t: int = b      # ok — a different loop, a fresh binding
+```
+
+Reassigning that binding from inside the loop that declared it — or from a loop
+nested within it — is still `tyc::immutable_assign`:
+
+```ty
+for a in xs:
+    let t: int = a
+    t = 99              # error: cannot assign to immutable binding 't'
+```
+
+This was not enforced before **v1.0.0-alpha.7**: the sibling-loop carve-out was
+keyed on the declaration alone and could not tell the two cases apart.
+
+## Through `global` / `nonlocal`
+
+`global NAME` and `nonlocal NAME` name a binding in an outer scope. Assigning
+through them is an assignment to *that* binding, so `let` applies:
+
+```ty
+let CONFIG: str = "a"
+
+def go() -> None:
+    global CONFIG
+    CONFIG = "b"        # error: cannot assign to immutable binding 'CONFIG'
+```
+
+Declare it `mut` at module level if it is meant to be rebound. Before
+**v1.0.0-alpha.7** this fired no diagnostic — the write silently created a
+separate function-local binding instead, so the module constant was left alone
+at check time and clobbered at run time.
+
 See https://github.com/CodeHalwell/Typhon/blob/main/docs/diagnostics/immutable_assign.md

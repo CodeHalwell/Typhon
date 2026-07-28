@@ -28,6 +28,15 @@ pub enum Mutability {
     Mut,
 }
 
+/// Which enclosing scope a `global X` / `nonlocal X` declaration names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OuterScopeKind {
+    /// `global X` — the module scope, always scope 0.
+    Global,
+    /// `nonlocal X` — the nearest enclosing *function* scope that binds `X`.
+    Nonlocal,
+}
+
 /// What kind of entity a binding introduces.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BindingKind {
@@ -805,7 +814,14 @@ struct Resolver<'a> {
     /// the same scope — the user has already told us *where* the binding
     /// lives, so insisting on a `let`/`mut` keyword is noise.
     /// FINDINGS #61.
-    global_nonlocal_names: std::collections::HashMap<ScopeId, std::collections::HashSet<String>>,
+    ///
+    /// Valued by *which* keyword was used, because the two name different
+    /// bindings: `global` always means the module scope, `nonlocal` means the
+    /// nearest enclosing function scope. `declare_target` needs the
+    /// distinction to redirect the write to the binding it actually names
+    /// instead of declaring a phantom local (F65).
+    global_nonlocal_names:
+        std::collections::HashMap<ScopeId, std::collections::HashMap<String, OuterScopeKind>>,
     /// Sorted byte offsets pointing at the first non-whitespace character
     /// of each `class!` declaration line in [`Self::source`]. Consulted
     /// when declaring a class binding to decide whether to tag it
@@ -856,8 +872,22 @@ struct Resolver<'a> {
     /// name is not a block shadow (mirrors the sibling `if`-arm and
     /// `case`-arm carve-outs).
     loop_body_depth: usize,
-    /// Declaration spans of bindings created inside a loop body.
-    loop_origin_spans: std::collections::HashSet<(usize, usize)>,
+    /// Declaration spans of bindings created inside a loop body, valued by
+    /// the identity of the loop body that created them.
+    ///
+    /// The identity is what makes the carve-out below discriminating. Keyed on
+    /// the span alone, it could not tell "a *later sibling* loop is reusing
+    /// this scratch name" — which it exists to permit — from "the *same* loop
+    /// body is reassigning its own `let`", which is `tyc::immutable_assign`.
+    /// It swallowed both, so Rule 2 was unenforced inside every `for` and
+    /// `while` in the language (F25).
+    loop_origin_spans: std::collections::HashMap<(usize, usize), usize>,
+    /// Identities of the loop bodies currently being walked, outermost first.
+    /// `loop_body_depth` is its length; both are kept because the depth is
+    /// read in several places where the stack is not needed.
+    loop_body_stack: Vec<usize>,
+    /// Source of fresh loop-body identities.
+    next_loop_body_id: usize,
 }
 
 impl<'a> Resolver<'a> {
@@ -886,7 +916,9 @@ impl<'a> Resolver<'a> {
             uninit_let_spans: std::collections::HashSet::new(),
             params_with_explicit_rebind: std::collections::HashSet::new(),
             loop_body_depth: 0,
-            loop_origin_spans: std::collections::HashSet::new(),
+            loop_origin_spans: std::collections::HashMap::new(),
+            loop_body_stack: Vec::new(),
+            next_loop_body_id: 0,
         }
     }
 
@@ -921,6 +953,74 @@ impl<'a> Resolver<'a> {
     /// Has a binding called `name` already been declared in `scope`?
     fn lookup_local(&self, scope: ScopeId, name: &str) -> Option<&Binding> {
         self.scopes[scope].lookup_local(name)
+    }
+
+    fn enter_loop_body(&mut self) {
+        self.next_loop_body_id += 1;
+        self.loop_body_stack.push(self.next_loop_body_id);
+        self.loop_body_depth += 1;
+    }
+
+    fn exit_loop_body(&mut self) {
+        self.loop_body_stack.pop();
+        self.loop_body_depth = self.loop_body_depth.saturating_sub(1);
+    }
+
+    /// Tag a value binding with the loop body that created it, if any.
+    fn mark_loop_origin(&mut self, span: (usize, usize)) {
+        if let Some(id) = self.loop_body_stack.last().copied() {
+            self.loop_origin_spans.insert(span, id);
+        }
+    }
+
+    /// True when `span` was declared inside a loop body that has since
+    /// exited — i.e. a *later sibling* loop is now reusing the name.
+    ///
+    /// False when the declaring loop body is still on the stack, which covers
+    /// both the same-body reassignment (`for …: let t = 1; t = 99`) and an
+    /// inner loop writing to an outer body's `let`. Those are genuine Rule 2
+    /// violations and must fall through to the `immutable_assign` path.
+    fn binding_came_from_an_exited_loop(&self, span: (usize, usize)) -> bool {
+        self.loop_origin_spans
+            .get(&span)
+            .is_some_and(|id| !self.loop_body_stack.contains(id))
+    }
+
+    /// The binding a `global NAME` / `nonlocal NAME` inside `scope` actually
+    /// names, as `(declaration span, mutability)`.
+    ///
+    /// `global` means the module scope and nothing else, even when an
+    /// intervening function also binds the name. `nonlocal` means the nearest
+    /// *enclosing function* scope that binds it — never the module scope,
+    /// which is what CPython rejects at compile time. Returns `None` when no
+    /// such binding exists yet (a `global` naming a module global that is only
+    /// created by this very assignment is legal Python, and the caller then
+    /// falls through to declaring it).
+    fn lookup_outer_binding(
+        &self,
+        scope: ScopeId,
+        name: &str,
+        kind: OuterScopeKind,
+    ) -> Option<((usize, usize), Mutability)> {
+        match kind {
+            OuterScopeKind::Global => {
+                let b = self.scopes[0].lookup_local(name)?;
+                Some((b.span, b.mutability))
+            }
+            OuterScopeKind::Nonlocal => {
+                let mut cur = self.scopes[scope].parent;
+                while let Some(id) = cur {
+                    let s = &self.scopes[id];
+                    if s.kind == ScopeKind::Function {
+                        if let Some(b) = s.lookup_local(name) {
+                            return Some((b.span, b.mutability));
+                        }
+                    }
+                    cur = s.parent;
+                }
+                None
+            }
+        }
     }
 
     fn declare(
@@ -1050,8 +1150,8 @@ impl<'a> Resolver<'a> {
             // appears after the loop has exited is a genuine shadow of a
             // still-live binding and must not be silently replaced.
             if existing.kind == BindingKind::Value
-                && self.loop_origin_spans.contains(&existing.span)
                 && self.loop_body_depth > 0
+                && self.binding_came_from_an_exited_loop(existing.span)
             {
                 let old_span = existing.span;
                 if let Some(b) = self.scopes[scope]
@@ -1064,9 +1164,7 @@ impl<'a> Resolver<'a> {
                     b.kind = kind;
                 }
                 self.loop_origin_spans.remove(&old_span);
-                if self.loop_body_depth > 0 {
-                    self.loop_origin_spans.insert(span);
-                }
+                self.mark_loop_origin(span);
                 return;
             }
             if existing.mutability == Mutability::Let || mutability == Mutability::Let {
@@ -1113,8 +1211,8 @@ impl<'a> Resolver<'a> {
             return;
         }
 
-        if self.loop_body_depth > 0 && kind == BindingKind::Value {
-            self.loop_origin_spans.insert(span);
+        if kind == BindingKind::Value {
+            self.mark_loop_origin(span);
         }
         self.scopes[scope].bindings.push(Binding {
             name: name.to_owned(),
@@ -1616,13 +1714,13 @@ fn collect_top_level(r: &mut Resolver, scope: ScopeId, body: &[Stmt]) {
             Stmt::Global(g) => {
                 let entry = r.global_nonlocal_names.entry(scope).or_default();
                 for ident in &g.names {
-                    entry.insert(ident.id.as_str().to_owned());
+                    entry.insert(ident.id.as_str().to_owned(), OuterScopeKind::Global);
                 }
             }
             Stmt::Nonlocal(n) => {
                 let entry = r.global_nonlocal_names.entry(scope).or_default();
                 for ident in &n.names {
-                    entry.insert(ident.id.as_str().to_owned());
+                    entry.insert(ident.id.as_str().to_owned(), OuterScopeKind::Nonlocal);
                 }
             }
             _ => {}
@@ -1774,10 +1872,12 @@ fn declare_target(
                 n.range.start().to_usize(),
                 n.range.start().to_usize() + n.id.as_str().len(),
             );
-            let declared_global_or_nonlocal = r
+            let outer_scope_kind = r
                 .global_nonlocal_names
                 .get(&scope)
-                .is_some_and(|set| set.contains(n.id.as_str()));
+                .and_then(|m| m.get(n.id.as_str()))
+                .copied();
+            let declared_global_or_nonlocal = outer_scope_kind.is_some();
             if ast_mutability.is_none()
                 && existing_mut.is_none()
                 && r.scopes[scope].kind == ScopeKind::Function
@@ -1816,7 +1916,8 @@ fn declare_target(
                     // has exited (`loop_body_depth == 0`), re-declaring the
                     // name is a real block-shadow and is flagged as usual.
                     if existing.kind == BindingKind::Value
-                        && !(r.loop_origin_spans.contains(&existing.span) && r.loop_body_depth > 0)
+                        && !(r.loop_body_depth > 0
+                            && r.binding_came_from_an_exited_loop(existing.span))
                     {
                         let decl_span = existing.span;
                         if decl_span != span && r.seen_immutable_redecl.insert((decl_span, span)) {
@@ -1877,6 +1978,44 @@ fn declare_target(
                     if existing.kind == BindingKind::Parameter {
                         r.params_with_explicit_rebind
                             .insert((scope, n.id.as_str().to_owned()));
+                    }
+                }
+            }
+            // F65: `global CONFIG` / `nonlocal CONFIG` names a binding in an
+            // *outer* scope, but the lookup above is deliberately
+            // scope-*local*, so it found nothing and the fallback below would
+            // declare a brand-new `Mut` binding right here. Two consequences:
+            // the module-level `let CONFIG` is never consulted, so
+            // `tyc::immutable_assign` can never fire — a two-keyword escape
+            // hatch out of Rule 2 — and the resolver's binding graph gains a
+            // phantom local that LSP go-to-definition and the unused-import
+            // pass then read. Resolve through the scope chain instead.
+            if existing_mut.is_none() {
+                if let Some(kind) = outer_scope_kind {
+                    if let Some((decl_span, outer_mut)) =
+                        r.lookup_outer_binding(scope, n.id.as_str(), kind)
+                    {
+                        // Mirrors `declare_full`: the first assignment to an
+                        // uninitialised `let NAME: T` *is* the initialiser.
+                        if r.uninit_let_spans.remove(&decl_span) {
+                            return;
+                        }
+                        if outer_mut == Mutability::Let
+                            && r.seen_immutable_redecl.insert((decl_span, span))
+                        {
+                            r.diagnostics.push_error(TycError::immutable_assign(
+                                n.id.as_str(),
+                                &r.path,
+                                r.source,
+                                decl_span.0,
+                                decl_span.1.saturating_sub(decl_span.0).max(1),
+                                span.0,
+                                span.1.saturating_sub(span.0).max(1),
+                            ));
+                        }
+                        // Either way the write lands on the outer binding, so
+                        // do not push a local one.
+                        return;
                     }
                 }
             }
@@ -2210,13 +2349,13 @@ fn walk_stmt(r: &mut Resolver, scope: ScopeId, stmt: &Stmt) {
             // `if` / `elif` arms are. Bindings declared while
             // `loop_body_depth > 0` are marked loop-origin; the shadow
             // check skips collisions against loop-origin predecessors.
-            r.loop_body_depth += 1;
+            r.enter_loop_body();
             for s in &w.body {
                 walk_stmt(r, scope, s);
             }
             // The `else` clause runs once, after the loop — its bindings
             // are NOT per-iteration, so they don't get the carve-out.
-            r.loop_body_depth -= 1;
+            r.exit_loop_body();
             for s in &w.orelse {
                 walk_stmt(r, scope, s);
             }
@@ -2229,12 +2368,12 @@ fn walk_stmt(r: &mut Resolver, scope: ScopeId, stmt: &Stmt) {
             // `for (a, *rest) in pairs:`) declare every name they bind.
             declare_loop_target(r, scope, f.target.as_ref());
             // Same sequential-loop carve-out as `while` above.
-            r.loop_body_depth += 1;
+            r.enter_loop_body();
             for s in &f.body {
                 walk_stmt(r, scope, s);
             }
             // `else` runs once after the loop — no per-iteration carve-out.
-            r.loop_body_depth -= 1;
+            r.exit_loop_body();
             for s in &f.orelse {
                 walk_stmt(r, scope, s);
             }
@@ -2316,13 +2455,13 @@ fn walk_stmt(r: &mut Resolver, scope: ScopeId, stmt: &Stmt) {
         Stmt::Global(g) => {
             let entry = r.global_nonlocal_names.entry(scope).or_default();
             for ident in &g.names {
-                entry.insert(ident.id.as_str().to_owned());
+                entry.insert(ident.id.as_str().to_owned(), OuterScopeKind::Global);
             }
         }
         Stmt::Nonlocal(n) => {
             let entry = r.global_nonlocal_names.entry(scope).or_default();
             for ident in &n.names {
-                entry.insert(ident.id.as_str().to_owned());
+                entry.insert(ident.id.as_str().to_owned(), OuterScopeKind::Nonlocal);
             }
         }
         Stmt::Assert(a) => {
@@ -3235,6 +3374,107 @@ mod tests {
             .unwrap()
             .into_syntax();
         resolve_module_with("<test>".to_owned(), &prep.python_source, &module, options)
+    }
+
+    fn has_immutable_assign(d: &Diagnostics) -> bool {
+        d.errors()
+            .iter()
+            .any(|e| matches!(e, TycError::ImmutableAssign { .. }))
+    }
+
+    /// F25: the sequential-loop carve-out keyed on the declaration span
+    /// alone, so it could not tell a sibling loop reusing a scratch name from
+    /// a loop body reassigning its own `let`. It swallowed both, and Rule 2
+    /// went unenforced inside every `for` and `while` in the language.
+    #[test]
+    fn a_let_reassigned_in_the_loop_that_declared_it_is_rejected() {
+        let (_, d) = resolve("for i in [1, 2]:\n    let t: int = i\n    t = 99\n");
+        assert!(
+            has_immutable_assign(&d),
+            "reassigning a loop-local `let` inside its own loop is `tyc::immutable_assign`; got {:?}",
+            d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    /// …and the sibling-loop scratch-name pattern the carve-out exists for
+    /// keeps working.
+    #[test]
+    fn a_later_sibling_loop_may_reuse_a_scratch_name() {
+        let (_, d) = resolve(
+            "for i in [1, 2]:\n    let t: int = i\n    let _a: int = t\nfor j in [3, 4]:\n    let t: int = j\n    let _b: int = t\n",
+        );
+        assert!(
+            !has_immutable_assign(&d),
+            "a later sibling loop starts a fresh binding; got {:?}",
+            d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    /// An *inner* loop writing to the outer body's `let` is the same
+    /// violation one nesting level down — the declaring body is still live.
+    #[test]
+    fn an_inner_loop_may_not_reassign_the_outer_bodys_let() {
+        let (_, d) =
+            resolve("for i in [1, 2]:\n    let t: int = i\n    for j in [3, 4]:\n        t = j\n");
+        assert!(
+            has_immutable_assign(&d),
+            "the declaring loop body is still on the stack; got {:?}",
+            d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    /// F65: `global` was a two-keyword escape hatch out of `let`
+    /// immutability — the scope-local lookup found nothing, so the write
+    /// declared a fresh `Mut` binding in the function scope and the module
+    /// `let` was never consulted.
+    #[test]
+    fn global_cannot_reassign_a_module_let() {
+        let (_, d) = resolve(
+            "let CONFIG: str = \"a\"\n\ndef go() -> None:\n    global CONFIG\n    CONFIG = \"b\"\n",
+        );
+        assert!(
+            has_immutable_assign(&d),
+            "`global CONFIG; CONFIG = …` must hit the module `let`; got {:?}",
+            d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    /// The working idiom — a module-level `mut` — is unaffected.
+    #[test]
+    fn global_may_reassign_a_module_mut() {
+        let (_, d) = resolve(
+            "mut counter: int = 0\n\ndef bump() -> None:\n    global counter\n    counter = 1\n",
+        );
+        assert!(
+            !has_immutable_assign(&d),
+            "`mut` at module level is the documented rebindable form; got {:?}",
+            d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    /// `nonlocal` against an enclosing function's `let` is the same hole.
+    #[test]
+    fn nonlocal_cannot_reassign_an_enclosing_let() {
+        let (_, d) = resolve(
+            "def outer() -> None:\n    let total: int = 0\n\n    def inner() -> None:\n        nonlocal total\n        total = 1\n\n    inner()\n",
+        );
+        assert!(
+            has_immutable_assign(&d),
+            "`nonlocal total; total = 1` must hit the enclosing `let`; got {:?}",
+            d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    /// A `global` naming a module global this assignment itself creates is
+    /// legal Python and must stay silent.
+    #[test]
+    fn global_declaring_a_fresh_module_name_is_accepted() {
+        let (_, d) = resolve("def go() -> None:\n    global fresh\n    fresh = 1\n");
+        assert!(
+            !has_immutable_assign(&d),
+            "there is no outer binding to violate; got {:?}",
+            d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
     }
 
     #[test]

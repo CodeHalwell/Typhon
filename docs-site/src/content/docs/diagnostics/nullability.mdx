@@ -55,11 +55,27 @@ See [Flow Narrowing](/Typhon/types/narrowing/) for every form the checker recogn
 
 **Note on `assert`:** disabling assertions with `python -O` removes the runtime guard, so safety-critical narrowing should still go through `guard` or `if x is None: return`. `assert` is best as a "this can't happen" checkpoint inside functions that already validated their inputs.
 
+### Nullable receivers on a dotted path
+
+Dereferencing a nullable *field* — `self.conn.execute()`, `cfg.db.host`, `resp.body.decode()` — is reported too. Before **v1.0.0-alpha.7** it was not checked at all: the diagnostic was gated on the receiver being a bare name, so the single most common non-nullability bug in real code was invisible.
+
+Because that check has never run, it lands at **warn** level for one release rather than error — it can flag a field that happens always to be populated at the dereference. Promote it once your code is clean:
+
+```toml
+[strictness]
+nullable-use = "error"
+```
+
+It becomes an error by default in a later release. The bare-name form has always been, and remains, an error.
+
 ## What does *not* narrow
 
-- **Fields and attribute paths** — `if u.email is not None: u.email.upper()` does not narrow `u.email`. Copy to a local first.
-- **Indexed access** — `if xs[0] is not None:` does not narrow `xs[0]`.
-- **Cross-mutation** — explicit `u.refresh()` in between invalidates the narrowing on `u`'s fields.
+- **Indexed access** — `if xs[0] is not None:` does not narrow `xs[0]`. Copy to a local first.
+- **Cross-mutation** — an assignment to the path or any prefix of it, or an explicit `u.refresh()` in between, invalidates the narrowing on `u`'s fields.
+- **Across a call, for module globals** — a call can rebind a module global through `global NAME` in the callee, so any narrowing on such a global is dropped at the call. Locals are unaffected: nothing can rebind a caller's local.
+- **Around a loop back-edge** — a narrowing established before the loop does not survive into iteration 2 if the body reassigns the name, the attribute path, or (through a call) the global.
+
+Attribute paths *are* narrowed — see [Flow Narrowing](/Typhon/types/narrowing/).
 
 See [Flow Narrowing](/Typhon/types/narrowing/) for the rules and limits.
 
