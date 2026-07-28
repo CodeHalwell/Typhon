@@ -124,6 +124,31 @@ Compatibility, using the review's own taxonomy:
 - **Build artifacts are written atomically**, so an interrupted build cannot
   leave a persistent 0-byte `build/main.py` that CPython runs with exit 0.
 
+### Docs that ship inside the binary
+
+`docs/cheatsheet.md` is `include_str!`'d into `tyc cheatsheet`, so everything in
+it is something the tool actively teaches — and three of those things were
+wrong, with nothing checking any of it.
+
+- **The `## Concurrency` block did not parse**: it spelled `gather:` bindings
+  with `let` and `go`, neither of which the grammar accepts there. Corrected,
+  and the module-level `lazy import` moved out of it into its own section.
+- **`lazy import pandas` emitted an *eager* import.** Only the
+  `lazy import ALIAS = MODULE` form was recognised, so the PEP 810 spellings
+  (`lazy import M`, `lazy import M as A`) had the `lazy` marker silently
+  dropped — including the exact line the cheatsheet taught. Both now defer.
+- **Prefix `frozen class X:` was taught on five pages**, including the one
+  `tyc explain frozen_assign` prints, where it was the only example. The
+  modifier is postfix (`class X frozen:`); the prefix form is a parse error.
+- **`gather:` now accepts a trailing comment.** `gather:  # run concurrently`
+  was a hard `tyc::parse` error because the header was matched by exact string
+  equality — found by the new guard below while checking the corrected
+  cheatsheet.
+
+A new `shipped_docs` test extracts every snippet from the cheatsheet and runs
+it through the real front end, and scans the docs and bundled skill for the
+prefix-`frozen` spelling. This is the gate that was missing (R9).
+
 ### Known open
 
 - The `.py.map` line table records preprocessed-buffer lines rather than `.ty`

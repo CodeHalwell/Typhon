@@ -133,7 +133,7 @@ If no `pub` exists in a module, no `__all__` is emitted — the module behaves l
 - `pub let`, `pub mut`
 - `pub freeze let` (v0.6.0)
 - `pub def`, `pub async def`
-- `pub class`, `pub frozen class`, `pub class!`, `pub plain class`
+- `pub class`, `pub class X frozen`, `pub class!`, `pub plain class`
 - `pub model`
 - `pub interface`
 - `pub newtype`

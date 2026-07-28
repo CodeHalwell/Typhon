@@ -85,7 +85,7 @@ synthesised list.
 `tyc fmt` preserves the `pub` prefix on every line where it was
 written. The postprocessor restores `pub` last so it ends up at the
 front of any other modifier (`pub let`, `pub mut`, `pub model`,
-`pub frozen class`, …) on the same line.
+`pub class X frozen`, …) on the same line.
 
 ## Package-level re-export — `pub *` in `__init__.ty`
 

@@ -7,7 +7,7 @@ construction time and then cannot change.
 ## Example
 
 ```ty
-frozen class Identity:
+class Identity frozen:
     name: str
 
 def main() -> None:

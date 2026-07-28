@@ -571,7 +571,7 @@ API_VERSION: str = "v1"
 `pub` stacks with all other modifiers:
 
 ```python
-pub frozen class Point:     # public + frozen dataclass
+pub class Point frozen:     # public + frozen dataclass
     x: float
     y: float
 

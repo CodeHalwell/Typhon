@@ -1554,7 +1554,35 @@ fn parse_lazy_import(tail: &str) -> Option<(String, String)> {
     // Strip a trailing `# comment` so that `lazy import np = numpy  # noqa`
     // is handled correctly rather than failing the identifier check.
     let code = tail.split('#').next().unwrap_or("").trim();
-    let eq = code.find('=')?;
+    let Some(eq) = code.find('=') else {
+        // PEP 810 spelling with no alias: `lazy import pandas`, and
+        // `lazy import pandas as pd`. Both are unambiguous — the alias is the
+        // one given, or the module's last segment, exactly as a plain
+        // `import` binds it.
+        //
+        // Without this, neither form matched, the `lazy ` prefix was dropped,
+        // and an ordinary *eager* `import` was emitted: the deferral silently
+        // did not happen. `tyc cheatsheet` teaches `lazy import pandas`
+        // verbatim, so the documented example was the failing case.
+        let module_and_alias = code.trim();
+        if let Some((module, alias)) = module_and_alias.split_once(" as ") {
+            let module = module.trim().to_owned();
+            let alias = alias.trim().to_owned();
+            if !is_dotted_python_ident(&module) || !is_python_ident(&alias) {
+                return None;
+            }
+            return Some((alias, module));
+        }
+        if !is_dotted_python_ident(module_and_alias) {
+            return None;
+        }
+        // `import a.b.c` binds the root name `a`; a lazy proxy has to bind
+        // the same name, so only a single-segment module can take this form.
+        if module_and_alias.contains('.') {
+            return None;
+        }
+        return Some((module_and_alias.to_owned(), module_and_alias.to_owned()));
+    };
     let alias = code[..eq].trim().to_owned();
     let module = code[eq + 1..].trim().to_owned();
     if !is_python_ident(&alias) || !is_dotted_python_ident(&module) {
@@ -7645,9 +7673,47 @@ enum GatherStrategy {
     BestEffort,
 }
 
+/// Return `s` with any trailing `# comment` removed, ignoring a `#` that
+/// appears inside a quoted string.
+fn strip_trailing_comment_outside_strings(s: &str) -> &str {
+    let bytes = s.as_bytes();
+    let mut quote: Option<u8> = None;
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        match quote {
+            Some(q) => {
+                if b == b'\\' {
+                    i += 2;
+                    continue;
+                }
+                if b == q {
+                    quote = None;
+                }
+            }
+            None => {
+                if b == b'"' || b == b'\'' {
+                    quote = Some(b);
+                } else if b == b'#' {
+                    return &s[..i];
+                }
+            }
+        }
+        i += 1;
+    }
+    s
+}
+
 /// Parse a `gather:` or `gather(strategy="..."):` header line, returning the
 /// chosen strategy when the syntax is well-formed.
 fn parse_gather_header(body: &str) -> Option<GatherStrategy> {
+    // Strip a trailing `# comment`. Every other block header in the language
+    // tolerates one, and Python does; `gather:  # run concurrently` was a hard
+    // `tyc::parse` error purely because this matched the header by exact
+    // string equality. The `#` is only a comment start when it is outside a
+    // string, and the only string a gather header can contain is the
+    // `strategy="…"` literal, so the scan stops at an open quote.
+    let body = strip_trailing_comment_outside_strings(body);
     let trimmed = body.trim_end();
     if trimmed == "gather:" {
         return Some(GatherStrategy::TaskGroup);

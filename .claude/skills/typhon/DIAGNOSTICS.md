@@ -443,7 +443,7 @@ class Worker:
 Field assignment on a `frozen` class outside the constructor.
 
 ```ty
-frozen class Identity: name: str
+class Identity frozen: name: str
 let id: Identity = Identity(name="Alice")
 id.name = "Bob"        # error
 ```
