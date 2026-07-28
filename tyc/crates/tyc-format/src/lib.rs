@@ -437,19 +437,50 @@ fn normalise_whitespace_with_map(source: &str) -> (String, Vec<usize>) {
     // don't realistically straddle newlines in idiomatic Python.
     let mut paren_depth_carry: i32 = 0;
     for raw_line in source.lines() {
-        // Triple-quoted block: keep raw, but still strip trailing spaces and
-        // expand the leading tabs so indentation matches the file style.
+        // Is this line *string content* — i.e. inside a triple-quoted literal
+        // that opened on an earlier line?
+        //
+        // If so it gets no normalisation whatsoever. This used to "keep raw,
+        // but still strip trailing spaces and expand the leading tabs so
+        // indentation matches the file style", which is not formatting at
+        // all: it edits the *value* of the literal. A `"""` block containing
+        // a tab-indented sample or a line with meaningful trailing spaces came
+        // out of `tyc fmt` with different contents — in the user's own source
+        // file, in place — and out of `tyc build` with a different constant
+        // than the VM had.
+        let starts_inside_triple = in_triple.is_some();
         let (line_owned, exited_triple) = if let Some(q) = in_triple {
             let exited = line_closes_triple_quote(raw_line, q);
-            let l = raw_line.trim_end().to_owned();
-            (l, exited)
+            (raw_line.to_owned(), exited)
         } else {
-            let trimmed = raw_line.trim_end();
+            // The line that *opens* a triple quote carries string content
+            // after the delimiter, so its trailing whitespace is data too.
+            let opens_triple = detect_triple_quote_open(raw_line).is_some();
+            let trimmed = if opens_triple {
+                raw_line
+            } else {
+                raw_line.trim_end()
+            };
             let (rewritten, new_depth) =
                 apply_simple_style_rules_with_paren_depth(trimmed, paren_depth_carry);
             paren_depth_carry = new_depth.max(0);
             (rewritten, false)
         };
+
+        if starts_inside_triple {
+            // Verbatim, and short-circuit every rule below: blank-line
+            // collapsing would eat blank lines out of a docstring, and the
+            // tab expansion at the tail would rewrite its indentation.
+            line_map.push(out_line);
+            result.push_str(&line_owned);
+            result.push('\n');
+            out_line += 1;
+            consecutive_blank = 0;
+            if exited_triple {
+                in_triple = None;
+            }
+            continue;
+        }
 
         if in_triple.is_none() && !exited_triple {
             in_triple = detect_triple_quote_open(&line_owned);
@@ -1281,6 +1312,28 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn triple_quoted_string_contents_are_never_reformatted() {
+        // The whitespace pass used to "keep raw, but still strip trailing
+        // spaces and expand the leading tabs" inside a triple-quoted block.
+        // That is not formatting — it edits the value of the literal, in the
+        // user's own source file, in place under `tyc fmt`.
+        let src = "BANNER = \"\"\"\n\tTabbed line\ntrailing spaces here   \n\n\n\nafter three blanks\n\"\"\"\n";
+        let (out, _) = normalise_whitespace_with_map(src);
+        assert!(
+            out.contains("\n\tTabbed line\n"),
+            "a tab inside a string must survive; got {out:?}"
+        );
+        assert!(
+            out.contains("trailing spaces here   \n"),
+            "trailing spaces inside a string must survive; got {out:?}"
+        );
+        assert!(
+            out.contains("\n\n\n\nafter three blanks"),
+            "blank lines inside a string must not be collapsed; got {out:?}"
+        );
+    }
     use super::*;
 
     #[test]

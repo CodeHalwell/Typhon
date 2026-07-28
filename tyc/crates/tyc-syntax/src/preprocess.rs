@@ -358,6 +358,27 @@ pub fn preprocess_opts(source: &str, opts: PreprocessOptions) -> PreprocessResul
                     python_source.push_str(line);
                     continue;
                 }
+                // Every path out of this block `continue`s, skipping the
+                // string-state update the bottom of the loop performs. That
+                // meant a triple-quote opened *inside* an enum body — an enum
+                // docstring is the obvious case — never registered, so every
+                // following line of the string was treated as code and each
+                // bare word in it was rewritten to `WORD = enum.auto()`.
+                // A docstring listing the members silently became
+                // `RED = enum.auto()` *inside the string*. Track the state
+                // here so the block sees, and leaves alone, string content.
+                let opened_in_string = in_string.is_some();
+                if opened_in_string || indent_len > header_indent {
+                    // Advance the string state on the paths that `continue`.
+                    // The dedent path below falls through instead, and the
+                    // bottom of the loop advances it there — doing it twice
+                    // would desynchronise the scanner from the source.
+                    let _ = scan_line_code_end(line, &mut in_string);
+                }
+                if opened_in_string {
+                    python_source.push_str(line);
+                    continue;
+                }
                 if indent_len > header_indent {
                     // Member line. Bare `MEMBER` → `MEMBER = enum.auto()`;
                     // `MEMBER = value` and any non-member statement (e.g. a
@@ -1899,8 +1920,21 @@ fn expand_impl_sealed_unions(source: &str) -> (String, Vec<usize>) {
             let mut body_end = idx + 1;
             let mut last_body_line: Option<usize> = None;
             let mut probe = idx + 1;
+            // String state carried across the probe. A line that *begins*
+            // inside a triple-quoted string has string content, not
+            // indentation, at its left edge — reading it as a dedent ends the
+            // block early and the rest of the real body then surfaces as a
+            // bogus `tyc::parse` "unexpected indentation" on a valid program.
+            let mut probe_string = in_string;
             while probe < lines.len() {
                 let candidate = lines[probe].trim_end_matches(['\n', '\r']);
+                let started_in_string = probe_string.is_some();
+                let _ = scan_line_code_end(candidate, &mut probe_string);
+                if started_in_string {
+                    last_body_line = Some(probe);
+                    probe += 1;
+                    continue;
+                }
                 if candidate.chars().all(|c| c.is_whitespace()) {
                     probe += 1;
                     continue;
@@ -7071,6 +7105,18 @@ fn collect_chain(
     while idx < lines.len() {
         let line = lines[idx];
         let raw = line.trim_end_matches(['\n', '\r']);
+        // A line that *begins* inside a triple-quoted string is string
+        // content: its leading whitespace is data, not layout, so the indent
+        // test below must not run on it. Without this guard a `"""` block in
+        // the body whose text starts at column 0 read as a dedent, ended the
+        // block early, and the rest of the real body surfaced as a bogus
+        // `tyc::parse` "unexpected indentation" — a valid program rejected.
+        if in_string.is_some() {
+            let _ = scan_line_code_end(raw, &mut in_string);
+            body.push(line.to_string());
+            idx += 1;
+            continue;
+        }
         if raw.trim().is_empty() {
             // Pass blank lines through verbatim.
             let _ = scan_line_code_end(raw, &mut in_string);
@@ -7480,8 +7526,19 @@ fn render_chain(chain: &WithChain, chain_indent: &str, counter: &mut usize) -> S
 
     // Success body: strip the unit-indent the `with` header imposed on each
     // line so the statements become siblings of the unwraps.
-    for line in &chain.body {
-        if line.trim().is_empty() {
+    //
+    // A line that *begins* inside a triple-quoted string is exempt: its
+    // leading whitespace is string content, and stripping it silently
+    // changed the value of the literal. A `"""` block in a `with`-chain body
+    // came out of the build with four spaces removed from every line —
+    // consistently, on both the compiled and VM paths, so nothing caught it.
+    let body_refs: Vec<&str> = chain.body.iter().map(|s| s.as_str()).collect();
+    let body_in_string = lines_starting_inside_string(&body_refs);
+    for (i, line) in chain.body.iter().enumerate() {
+        // String content and blank lines are both emitted verbatim, for
+        // different reasons: for a string line the leading whitespace is
+        // data, for a blank line there is none to strip.
+        if body_in_string[i] || line.trim().is_empty() {
             out.push_str(line);
         } else if let Some(stripped) = line.strip_prefix(inner_indent.as_str()) {
             out.push_str(chain_indent);
@@ -8967,6 +9024,82 @@ fn find_assignment_eq(s: &str) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn enum_body_rewrite_stops_at_a_docstring() {
+        // Every path out of the enum-body block `continue`s, skipping the
+        // string-state update at the bottom of the loop — so a triple quote
+        // opened inside an enum body never registered and each bare word in
+        // the docstring was rewritten to `WORD = enum.auto()` *inside the
+        // string*.
+        let src = "\
+enum Color:
+    \"\"\"
+    Members:
+    RED
+    GREEN
+    \"\"\"
+    RED
+    GREEN
+";
+        let out = preprocess(src).python_source;
+        // The docstring's own `RED` / `GREEN` lines survive untouched…
+        assert!(
+            out.contains("    Members:\n    RED\n    GREEN\n"),
+            "docstring content was rewritten; got:\n{out}"
+        );
+        // …while the real members are still expanded, exactly twice.
+        assert_eq!(
+            out.matches("= enum.auto()").count(),
+            2,
+            "expected exactly the two real members to expand; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn with_chain_body_preserves_string_indentation() {
+        // The body re-indent stripped the chain's unit indent from every
+        // line, including lines that are string *content*, silently changing
+        // the value of the literal on both the compiled and VM paths.
+        let src = "\
+def run() -> Result[str, str]:
+    with x = a()?:
+        let note: str = \"\"\"
+    indented sample
+        deeper sample
+\"\"\"
+        return Ok(note)
+";
+        let out = expand_with_chains(src);
+        assert!(
+            out.contains("\n    indented sample\n        deeper sample\n"),
+            "string content must keep its own indentation; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn with_chain_body_survives_a_column_zero_string_line() {
+        // Indent-only block collection read a `\"\"\"` at column 0 *inside* a
+        // string as a dedent, ended the block early, and the remaining real
+        // body surfaced as a bogus `tyc::parse` error on a valid program.
+        let src = "\
+def run() -> Result[str, str]:
+    with x = a()?:
+        let note: str = \"\"\"
+text
+\"\"\"
+        return Ok(note)
+";
+        let out = expand_with_chains(src);
+        assert!(
+            out.contains("return Ok(note)"),
+            "the body after the string must stay in the chain; got:\n{out}"
+        );
+        assert!(
+            !out.contains("with x = a()?:"),
+            "the chain must have been expanded; got:\n{out}"
+        );
+    }
 
     #[test]
     fn elif_with_propagating_question_becomes_a_nested_if() {
