@@ -18,7 +18,26 @@ fn tyc() -> Command {
 }
 
 /// Locate a Python 3.12+ interpreter on `PATH`; returns `None` to skip.
+///
+/// **`TYC_REQUIRE_PYTHON=1` turns the skip into a panic.** Every test that
+/// executes emitted Python was silently no-opping wherever `python3` was
+/// absent — including in CI, whose test job never installed Python — so the
+/// entire "does the output actually run" tier of the suite was green without
+/// ever running. A skip that nothing can observe is indistinguishable from a
+/// pass, so CI sets this variable and a missing interpreter fails the job.
 fn python() -> Option<String> {
+    let found = python_inner();
+    if found.is_none() && std::env::var_os("TYC_REQUIRE_PYTHON").is_some() {
+        panic!(
+            "TYC_REQUIRE_PYTHON is set but no Python 3.12+ interpreter was found on PATH. \
+             These tests execute the emitted Python; skipping them would report a pass \
+             for a tier of the suite that never ran."
+        );
+    }
+    found
+}
+
+fn python_inner() -> Option<String> {
     for candidate in ["python3.13", "python3.12", "python3"] {
         let out = Command::new(candidate).arg("--version").output();
         if let Ok(out) = out {

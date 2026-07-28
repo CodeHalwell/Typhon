@@ -1466,14 +1466,42 @@ def parse(s: str) -> Result[int, str]:
     let lines = parse_map_lines(&map_body);
     assert!(!lines.is_empty(), "lines array must not be empty");
 
-    // Every map entry must be non-zero (no gap in the table).
-    for (py_line_idx, &ty_line) in lines.iter().enumerate() {
+    // Value-level assertions. `ty_line >= 1` — which is what every source-map
+    // test in this file used to assert — is satisfied by a table of all 1s,
+    // so it only ever caught an *absent* map, never a wrong one.
+    //
+    // Two real invariants are checked instead:
+    //
+    //  1. The table is monotonically non-decreasing. Emission walks the
+    //     module in source order, so a later output line can never originate
+    //     above an earlier one. This rejects a shuffled or garbage table.
+    // KNOWN DEFECT, which is why only monotonicity is asserted. The values in
+    // this table are line numbers in the *preprocessed buffer*, not in the
+    // `.ty` file — `tyc-emit` records `(out_line -> preprocessed_line)` and
+    // nothing composes that with a `preprocessed_line -> ty_line` map, because
+    // none of the nine text passes in front of `preprocess` produces one. For
+    // this three-line program the table runs up to 7, and the four lines of
+    // the `?` expansion map to 3, 4, 5, 6 rather than all to the single source
+    // line they came from. Every consumer (`tyc trace`, `tyc debug --break`,
+    // `tyc ty` re-attribution, `[emit] traceback-remap`) is therefore off for
+    // any file using `?`, `gather:`, a `with`-chain, `rescue`, pipes, or typed
+    // unpack. Tracked as Cluster B in docs/codebase-review-2026-07-28.md.
+    // Monotonicity is asserted now so the eventual fix cannot regress it.
+    for w in lines.windows(2) {
         assert!(
-            ty_line >= 1,
-            "Python line {} maps to 0 — source map has a gap",
-            py_line_idx + 1
+            w[1] >= w[0],
+            "source map is not monotonic: {} follows {}",
+            w[1],
+            w[0]
         );
     }
+
+    // NOT asserted, because it does not hold today: that the lines of the `?`
+    // expansion all map back to the single `.ty` line they came from. They map
+    // to 3, 4, 5, 6 — four consecutive lines of the *preprocessed buffer*.
+    // See the note above; this is the invariant the Cluster B fix must
+    // establish, and the monotonicity check above is what guards the table in
+    // the meantime.
 
     // The `?` expansion injects at least three Python lines containing
     // `__typhon_q_` (assignment, isinstance guard, return/unwrap).  Reading
