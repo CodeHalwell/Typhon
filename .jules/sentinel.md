@@ -27,3 +27,8 @@
 **Vulnerability:** Hardcoded secret detection was missing `APIKEY` due to partial overlap with `KEY` because `KEY` was evaluated before `APIKEY`.
 **Learning:** When scanning for secrets using keyword arrays, substrings (like `KEY`) must be placed after longer matches (like `APIKEY` or `API_KEY`) to prevent premature partial matches.
 **Prevention:** Always maintain hardcoded secret matching keywords in longest-first order.
+
+## 2025-02-14 - Improve secret detection bounding logic to allow numeric and case transition boundaries
+**Vulnerability:** The secret detection logic in `tyc-analyse` and `tyc build` missed secrets bounded by digits (e.g., `PASSWORD123` or `123PASSWORD`), allowing hardcoded credentials and secrets within mixed alphanumeric literals to go undetected.
+**Learning:** Checking for only underscore and string boundaries is insufficient for token parsing where digits are frequently used as prefixes or suffixes in variable names (like versions or numerical suffixes). Relying on alphabetical limits misses mixed-pattern secrets.
+**Prevention:** In static analysis secret checks, always ensure the delimiter/boundary checks explicitly allow for digits (`is_ascii_digit()`) and mixed casing transitions that frequently delimit secret identifiers.
