@@ -4476,6 +4476,16 @@ impl Interpreter {
                     }
                 }
                 "kind" => Ok(Value::Str(kind.clone())),
+                // PEP 654 group members. `.exceptions` is always a tuple in
+                // CPython even when `args[1]` was passed as a list.
+                "exceptions" if crate::value::is_exception_group_kind(kind.as_str()) => {
+                    Ok(Value::Tuple(Rc::new(
+                        crate::value::exception_group_subs(value).unwrap_or_default(),
+                    )))
+                }
+                "message" if crate::value::is_exception_group_kind(kind.as_str()) => {
+                    Ok(Value::Str(message.clone()))
+                }
                 // `__cause__` / `__context__` are not tracked yet; expose None
                 // so the common introspection (`e.__cause__ is None`) works.
                 "__cause__" | "__context__" => Ok(Value::None),
@@ -5129,6 +5139,13 @@ impl Interpreter {
     // ── try/except ─────────────────────────────────────────────────────────
 
     fn exec_try(&mut self, t: &ast::StmtTry, env: &EnvRef) -> Result<(), Unwind> {
+        // `try` / `try*` share one AST node, discriminated by `is_star`.
+        // Their handler semantics have nothing in common, so they get
+        // separate executors (F7: ignoring `is_star` bound the *bare*
+        // exception where CPython binds an `ExceptionGroup`).
+        if t.is_star {
+            return self.exec_try_star(t, env);
+        }
         let body_res = self.exec_block(&t.body, env);
         let mut handled_exc: Option<Value> = None;
         let body_res = match body_res {
@@ -5197,6 +5214,250 @@ impl Interpreter {
         body_res
     }
 
+    /// `try ... except* E:` — PEP 654 exception-group handling.
+    ///
+    /// CPython semantics, replicated here (each rule verified against
+    /// CPython 3.13):
+    ///
+    /// 1. A raised exception that is not already a group is wrapped in an
+    ///    implicit `ExceptionGroup('', (exc,))` for matching purposes.
+    /// 2. Handlers are tried **in order and all of them run** (unlike plain
+    ///    `except`, which stops at the first match). Each handler receives an
+    ///    exception group containing only its matching members, splitting
+    ///    recursively through nested groups and preserving their nesting.
+    /// 3. Whatever is left unmatched after every handler is re-raised.
+    /// 4. If the original exception was *not* a group and nothing matched, the
+    ///    original bare exception propagates — not a wrapper.
+    /// 5. Exceptions raised by handler bodies are collected and combined with
+    ///    the unhandled remainder: exactly one survivor propagates as itself,
+    ///    two or more are wrapped in a fresh `ExceptionGroup('', [...])`.
+    /// 6. `except* ExceptionGroup` / `except* BaseExceptionGroup` is a runtime
+    ///    `TypeError`.
+    ///
+    /// Not modelled: `__context__` / `__cause__` chaining between the
+    /// collected exceptions, and CPython's nested "Exception Group Traceback"
+    /// rendering for an uncaught group.
+    fn exec_try_star(&mut self, t: &ast::StmtTry, env: &EnvRef) -> Result<(), Unwind> {
+        let body_res = self.exec_block(&t.body, env);
+        let exc = match body_res {
+            Ok(()) => {
+                let orelse_res = self.exec_block(&t.orelse, env);
+                self.exec_block(&t.finalbody, env)?;
+                return orelse_res;
+            }
+            Err(Unwind::Exception(exc)) => exc,
+            Err(other) => {
+                self.exec_block(&t.finalbody, env)?;
+                return Err(other);
+            }
+        };
+
+        // Rule 1 — `remaining` holds whatever is still unhandled. It starts as
+        // the raised group, or — when a *bare* exception was raised — as that
+        // bare exception, which each handler tests directly and, on a match,
+        // wraps in the implicit `ExceptionGroup('', (exc,))`. Keeping the bare
+        // form here (rather than pre-wrapping) is what makes rule 4 work and
+        // what gives the wrapper CPython's tuple-shaped `args[1]`; a *derived*
+        // group from a split gets a list, as `BaseExceptionGroup.derive` does.
+        let raised_value = match &exc.value {
+            Some(v @ (Value::Instance(_) | Value::Exception { .. })) => v.clone(),
+            _ => Value::Exception {
+                kind: Rc::new(exc.kind.clone()),
+                message: Rc::new(exc.message.clone()),
+                args: Rc::new(exc_fallback_args(&exc.message)),
+            },
+        };
+        let was_group = crate::value::exception_group_subs(&raised_value).is_some();
+        let mut remaining: Option<Value> = Some(raised_value);
+
+        let mut any_matched = false;
+        let mut escaped: Vec<Value> = Vec::new();
+
+        for handler in &t.handlers {
+            let ExceptHandler::ExceptHandler(h) = handler;
+            let Some(type_expr) = h.type_.as_deref() else {
+                // The parser rejects a bare `except*:` before we get here;
+                // treat it defensively as matching nothing.
+                continue;
+            };
+            if let Some(banned) = self.except_star_names_group_type(type_expr) {
+                self.exec_block(&t.finalbody, env)?;
+                return Err(type_error(format!(
+                    "catching {banned} with except* is not allowed. Use except instead."
+                )));
+            }
+            let Some(current) = remaining.take() else {
+                break;
+            };
+            let (matched, rest) = if crate::value::exception_group_subs(&current).is_some() {
+                self.split_exception_group(&current, type_expr, env)?
+            } else if self.exception_value_matches(type_expr, &current, env)? {
+                let kind = if crate::value::is_base_only_exception(&current) {
+                    "BaseExceptionGroup"
+                } else {
+                    "ExceptionGroup"
+                };
+                (
+                    Some(crate::value::make_exception_group(
+                        kind,
+                        "",
+                        vec![current.clone()],
+                        true,
+                    )),
+                    None,
+                )
+            } else {
+                (None, Some(current))
+            };
+            remaining = rest;
+            let Some(matched) = matched else {
+                continue;
+            };
+            any_matched = true;
+            if let Some(name) = &h.name {
+                env.set(name.as_str(), matched.clone());
+            }
+            let Unwind::Exception(active) = self.value_to_exception(matched.clone()) else {
+                unreachable!("value_to_exception always yields Unwind::Exception")
+            };
+            self.active_exceptions.push(active);
+            let result = self.exec_block(&h.body, env);
+            self.active_exceptions.pop();
+            if let Some(name) = &h.name {
+                env.delete(name.as_str());
+            }
+            match result {
+                Ok(()) => {}
+                Err(Unwind::Exception(e)) => {
+                    // Rule 5 — collect, keep running later handlers.
+                    escaped.push(e.value.clone().unwrap_or_else(|| Value::Exception {
+                        kind: Rc::new(e.kind.clone()),
+                        message: Rc::new(e.message.clone()),
+                        args: Rc::new(exc_fallback_args(&e.message)),
+                    }));
+                }
+                // `return` / `break` / `continue` out of an `except*` body is
+                // a CPython *compile* error, reported at check time as
+                // `tyc::return_in_except_star`. Should a program reach here
+                // anyway, propagating is the least surprising behaviour.
+                Err(other) => {
+                    self.exec_block(&t.finalbody, env)?;
+                    return Err(other);
+                }
+            }
+        }
+
+        self.exec_block(&t.finalbody, env)?;
+
+        // Rule 4 — an unmatched bare exception propagates unwrapped, with its
+        // original frames (so the traceback is unchanged).
+        if !any_matched && !was_group && escaped.is_empty() {
+            return Err(Unwind::Exception(exc));
+        }
+
+        // Rule 5 — combine handler failures with the unhandled remainder.
+        let mut pending = escaped;
+        if let Some(rest) = remaining {
+            pending.push(rest);
+        }
+        match pending.len() {
+            0 => Ok(()),
+            1 => Err(self.value_to_exception(pending.remove(0))),
+            _ => {
+                let kind = if pending.iter().any(crate::value::is_base_only_exception) {
+                    "BaseExceptionGroup"
+                } else {
+                    "ExceptionGroup"
+                };
+                Err(self.value_to_exception(crate::value::make_exception_group(
+                    kind, "", pending, false,
+                )))
+            }
+        }
+    }
+
+    /// `except* ExceptionGroup` / `except* BaseExceptionGroup` is rejected by
+    /// CPython at runtime (`TypeError`), because splitting a group by a group
+    /// type is meaningless. Returns the offending name when `type_expr` — or
+    /// any member of a tuple of types — is one of them.
+    fn except_star_names_group_type(&self, type_expr: &Expr) -> Option<String> {
+        fn walk(e: &Expr) -> Option<String> {
+            match e {
+                Expr::Tuple(t) => t.elts.iter().find_map(walk),
+                Expr::Name(n) if crate::value::is_exception_group_kind(n.id.as_str()) => {
+                    Some(n.id.as_str().to_owned())
+                }
+                _ => None,
+            }
+        }
+        walk(type_expr)
+    }
+
+    /// Split `group` by `type_expr` into `(matched, rest)`, both exception
+    /// groups derived from `group` (same kind and message) or `None` when the
+    /// side is empty. Recurses through nested groups, preserving their
+    /// nesting — CPython's `BaseExceptionGroup.split` behaviour.
+    fn split_exception_group(
+        &mut self,
+        group: &Value,
+        type_expr: &Expr,
+        env: &EnvRef,
+    ) -> Result<(Option<Value>, Option<Value>), Unwind> {
+        // CPython tests the group itself first: `except* Exception` against an
+        // `ExceptionGroup` matches the *whole* group rather than recursing.
+        if self.exception_value_matches(type_expr, group, env)? {
+            return Ok((Some(group.clone()), None));
+        }
+        let (kind, message) = match group {
+            Value::Exception { kind, message, .. } => {
+                (kind.as_str().to_owned(), (**message).clone())
+            }
+            _ => return Ok((None, Some(group.clone()))),
+        };
+        let subs = crate::value::exception_group_subs(group).unwrap_or_default();
+        let mut matched: Vec<Value> = Vec::new();
+        let mut rest: Vec<Value> = Vec::new();
+        for sub in subs {
+            if crate::value::exception_group_subs(&sub).is_some() {
+                let (m, r) = self.split_exception_group(&sub, type_expr, env)?;
+                if let Some(m) = m {
+                    matched.push(m);
+                }
+                if let Some(r) = r {
+                    rest.push(r);
+                }
+            } else if self.exception_value_matches(type_expr, &sub, env)? {
+                matched.push(sub);
+            } else {
+                rest.push(sub);
+            }
+        }
+        let build = |items: Vec<Value>| {
+            if items.is_empty() {
+                None
+            } else {
+                Some(crate::value::make_exception_group(
+                    &kind, &message, items, false,
+                ))
+            }
+        };
+        Ok((build(matched), build(rest)))
+    }
+
+    /// `exception_matches` for a raw exception *value* rather than an
+    /// in-flight [`VmException`] — the leaf test used by group splitting.
+    fn exception_value_matches(
+        &mut self,
+        type_expr: &Expr,
+        value: &Value,
+        env: &EnvRef,
+    ) -> Result<bool, Unwind> {
+        let Unwind::Exception(exc) = self.value_to_exception(value.clone()) else {
+            return Ok(false);
+        };
+        self.exception_matches(type_expr, &exc, env)
+    }
+
     fn exception_matches(
         &mut self,
         type_expr: &Expr,
@@ -5245,7 +5506,7 @@ impl Interpreter {
         Ok(false)
     }
 
-    fn value_to_exception(&self, v: Value) -> Unwind {
+    pub(crate) fn value_to_exception(&self, v: Value) -> Unwind {
         match v {
             Value::Exception {
                 ref kind,
@@ -5254,7 +5515,17 @@ impl Interpreter {
             } => {
                 // Keep the full value (carrying `args`) attached so the
                 // handler can bind it and `e.args` survives.
-                let (k, m) = ((**kind).clone(), (**message).clone());
+                let k = (**kind).clone();
+                // An exception group's traceback summary line is its `str()`
+                // — `ExceptionGroup: g (2 sub-exceptions)` — not the bare
+                // group message. (The VM prints that one line; it does not
+                // reproduce CPython's nested "Exception Group Traceback"
+                // rendering of each member.)
+                let m = if crate::value::is_exception_group_kind(&k) {
+                    v.py_str()
+                } else {
+                    (**message).clone()
+                };
                 Unwind::Exception(VmException::new(k, m).with_value(v))
             }
             Value::Instance(i) => {
@@ -6698,13 +6969,22 @@ pub fn builtin_exc_is_a(kind: &str, target: &str) -> bool {
         // CPython (where they derive from BaseException, not Exception).
         return !matches!(
             kind,
-            "BaseException" | "KeyboardInterrupt" | "SystemExit" | "GeneratorExit"
+            "BaseException"
+                | "KeyboardInterrupt"
+                | "SystemExit"
+                | "GeneratorExit"
+                // PEP 654: `BaseExceptionGroup` derives from `BaseException`
+                // only — `except Exception` must not catch it. Its
+                // `ExceptionGroup` sibling *does* derive from `Exception` and
+                // is deliberately absent from this list.
+                | "BaseExceptionGroup"
         );
     }
     // Direct parent in the standard hierarchy (subset covering the common
     // intermediate bases programs actually catch).
     fn parent(name: &str) -> Option<&'static str> {
         Some(match name {
+            "ExceptionGroup" => "BaseExceptionGroup",
             "ZeroDivisionError" | "OverflowError" | "FloatingPointError" => "ArithmeticError",
             "IndexError" | "KeyError" => "LookupError",
             "ModuleNotFoundError" => "ImportError",

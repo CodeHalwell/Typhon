@@ -811,6 +811,77 @@ impl std::hash::Hash for HashKey {
     }
 }
 
+// ── ExceptionGroup ────────────────────────────────────────────────────────
+//
+// PEP 654 exception groups are modelled with the *existing*
+// `Value::Exception` shape rather than a new `Value` variant, because CPython
+// itself stores a group's payload in its `args`: `ExceptionGroup("g", [e])`
+// has `args == ("g", [e])` and exposes `.exceptions` as `tuple(args[1])`.
+// Reusing `Value::Exception` therefore gives `e.args`, `repr(e)`, class-name
+// lookup (`type(e).__name__`) and dict/set hashing for free, and keeps the
+// blast radius of the feature to the handful of helpers below.
+//
+// What is modelled: construction (`ExceptionGroup` / `BaseExceptionGroup`,
+// including CPython's auto-downcast of a `BaseExceptionGroup` whose members
+// are all ordinary `Exception`s), `.exceptions` / `.message`, `str()` /
+// `repr()`, `except*` splitting/binding/re-raise, and the `asyncio.TaskGroup`
+// failure path. What is NOT modelled: `.split()` / `.subgroup()` / `.derive()`
+// as user-callable methods, `__notes__`, and CPython's nested
+// "Exception Group Traceback" rendering for an uncaught group (the VM prints
+// the single summary line).
+
+/// Whether `kind` names one of the two builtin exception-group types.
+pub fn is_exception_group_kind(kind: &str) -> bool {
+    matches!(kind, "ExceptionGroup" | "BaseExceptionGroup")
+}
+
+/// The sub-exceptions of an exception-group value, or `None` when `v` is not
+/// a group. Reads `args[1]`, which is a tuple for the implicit wrapper
+/// `except*` builds around a non-group exception and a list for an explicitly
+/// constructed or derived group — matching CPython's own `args` in both cases.
+pub fn exception_group_subs(v: &Value) -> Option<Vec<Value>> {
+    match v {
+        Value::Exception { kind, args, .. } if is_exception_group_kind(kind.as_str()) => {
+            match args.get(1) {
+                Some(Value::List(l)) => Some(l.borrow().clone()),
+                Some(Value::Tuple(t)) => Some((**t).clone()),
+                _ => Some(Vec::new()),
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Build an exception-group value. `as_tuple` selects the `args[1]` shape:
+/// `true` for the implicit wrapper `except*` puts around a bare exception
+/// (CPython: `ExceptionGroup('', (ValueError('v'),))`), `false` for an
+/// explicitly constructed or split-derived group (`ExceptionGroup('g', [...])`).
+pub fn make_exception_group(kind: &str, message: &str, subs: Vec<Value>, as_tuple: bool) -> Value {
+    let subs_value = if as_tuple {
+        Value::Tuple(Rc::new(subs))
+    } else {
+        Value::List(Rc::new(RefCell::new(subs)))
+    };
+    Value::Exception {
+        kind: Rc::new(kind.to_owned()),
+        message: Rc::new(message.to_owned()),
+        args: Rc::new(vec![Value::Str(Rc::new(message.to_owned())), subs_value]),
+    }
+}
+
+/// Whether `v` is an exception that derives from `BaseException` but *not*
+/// `Exception` — the set `ExceptionGroup` refuses to hold, and which forces
+/// `BaseExceptionGroup` to stay a `BaseExceptionGroup`.
+pub fn is_base_only_exception(v: &Value) -> bool {
+    match v {
+        Value::Exception { kind, .. } => matches!(
+            kind.as_str(),
+            "BaseException" | "KeyboardInterrupt" | "SystemExit" | "GeneratorExit"
+        ),
+        _ => false,
+    }
+}
+
 #[derive(Clone)]
 pub enum Value {
     None,
@@ -1695,6 +1766,13 @@ impl Value {
                 message,
                 args,
             } => match args.len() {
+                // `str(ExceptionGroup("g", [e]))` is `"g (1 sub-exception)"`,
+                // not the generic multi-arg tuple form below.
+                _ if is_exception_group_kind(kind.as_str()) => {
+                    let n = exception_group_subs(self).map(|s| s.len()).unwrap_or(0);
+                    let plural = if n == 1 { "" } else { "s" };
+                    format!("{message} ({n} sub-exception{plural})")
+                }
                 // `str(ValueError("a", "b"))` is the tuple `('a', 'b')`.
                 n if n >= 2 => {
                     let parts: Vec<String> = args.iter().map(|a| a.py_repr()).collect();

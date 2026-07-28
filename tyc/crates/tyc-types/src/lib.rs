@@ -10421,6 +10421,137 @@ fn collect_reassigned_names(stmts: &[Stmt], acc: &mut LoopReassigned) {
     }
 }
 
+/// Whether `ty` mentions a type parameter anywhere under an **invariant**
+/// generic slot — the positions where union-widening a TypeVar is unsound.
+///
+/// `list[T]` and `dict[K, V]` qualify; `Sequence[T]`, `tuple[T1, T2]` and a
+/// bare `T` do not. A user-declared generic is consulted through
+/// `user_generic_param_variance`, so a class inferred covariant is exempt for
+/// the same reason `Sequence` is.
+fn formal_has_invariant_typevar(c: &Checker, ty: &Type) -> bool {
+    match ty {
+        Type::Generic(head, args) => args.iter().enumerate().any(|(i, a)| {
+            let variance = if generic_param_variance(head, i) == Variance::Invariant {
+                c.user_generic_param_variance(head, i)
+            } else {
+                generic_param_variance(head, i)
+            };
+            (variance == Variance::Invariant && mentions_type_param(a))
+                || formal_has_invariant_typevar(c, a)
+        }),
+        Type::Union(arms) => arms.iter().any(|a| formal_has_invariant_typevar(c, a)),
+        Type::Function { params, ret, .. } => {
+            params.iter().any(|p| formal_has_invariant_typevar(c, p))
+                || formal_has_invariant_typevar(c, ret)
+        }
+        _ => false,
+    }
+}
+
+/// Drop union arms that another arm already subsumes, keeping the general one.
+///
+/// This is what makes the invariant re-check below usable. `bind_typevars`
+/// widens a conflicting second binding into a union, which is right for the
+/// documented scalar case (`pair(1, "two")` → `T = int | str`) — but calling
+/// `def f[T](xs: list[T], item: T)` as `f(animals, dog)` also produces
+/// `T = Animal | Dog`, and re-checking `list[Animal]` against
+/// `list[Animal | Dog]` under invariance would reject a perfectly good call.
+/// Collapsing by subsumption first turns that binding back into `Animal`.
+fn collapse_union_by_subsumption(c: &Checker, ty: &Type) -> Type {
+    let Type::Union(arms) = ty else {
+        return ty.clone();
+    };
+    let kept: Vec<Type> = arms
+        .iter()
+        .filter(|a| {
+            // Drop `a` when some *other* arm subsumes it. `None` is never
+            // dropped — `int | None` must stay nullable.
+            if matches!(a, Type::None) {
+                return true;
+            }
+            !arms
+                .iter()
+                .any(|b| b != *a && !matches!(b, Type::None) && c.is_assignable(b, a))
+        })
+        .cloned()
+        .collect();
+    if kept.is_empty() {
+        ty.clone()
+    } else {
+        Type::union_of(kept)
+    }
+}
+
+/// F45: re-check each argument against its formal *after* inference has pinned
+/// the type parameters, for the formals where that matters.
+///
+/// The forward pass at the argument loop checks against the **declared,
+/// un-substituted** formal — `list[T]` — and `is_assignable` treats a free
+/// `TypeVar` leaf as permissive, so *any* `list[X]` is accepted. Nothing then
+/// re-validated the actuals once `T` was pinned, and a conflicting second
+/// binding was union-*widened* rather than reported. Together that let
+/// `def add_all[T](dst: list[T], src: list[T])` accept a `list[int]` and a
+/// `list[str]` in the same call, and the callee then writes `str` into a list
+/// the caller still believes is `list[int]` — the invariance that direct
+/// assignment enforces correctly, bypassed by routing through a generic.
+///
+/// Deliberately narrow, so it cannot false-positive on anything the corpus
+/// already compiles: only invariant positions are re-checked, the substituted
+/// formal must be fully concrete, `Unknown` / `Any` actuals are skipped, an
+/// argument that already drew a diagnostic on the forward pass is not
+/// re-reported, and HKT signatures are excluded by the caller.
+fn check_invariant_arg_positions(
+    c: &mut Checker,
+    params: &[Type],
+    actuals: &[Type],
+    ret: &Type,
+    expected: Option<&Type>,
+    pos_args: &[Expr],
+    positional_cutoff: usize,
+) {
+    if c.unsafe_depth > 0 {
+        return;
+    }
+    let invariant_formals: Vec<usize> = (0..params.len().min(actuals.len()))
+        .filter(|&i| i < positional_cutoff && i < pos_args.len())
+        .filter(|&i| formal_has_invariant_typevar(c, &params[i]))
+        .collect();
+    if invariant_formals.is_empty() {
+        return;
+    }
+    let bindings = compute_bidirectional_bindings(params, actuals, ret, expected);
+    if bindings.is_empty() {
+        return;
+    }
+    let collapsed: HashMap<String, Type> = bindings
+        .iter()
+        .map(|(k, v)| (k.clone(), collapse_union_by_subsumption(c, v)))
+        .collect();
+    for i in invariant_formals {
+        let actual = &actuals[i];
+        if matches!(actual, Type::Unknown | Type::Any) {
+            continue;
+        }
+        // The forward pass already reported this argument; one diagnostic per
+        // span is enough, and the un-substituted formal is the clearer one.
+        if !c.is_assignable(&params[i], actual) {
+            continue;
+        }
+        let substituted = substitute_typevars(&params[i], &collapsed);
+        if contains_free_typevar(&substituted) {
+            continue;
+        }
+        if c.is_assignable(&substituted, actual) {
+            continue;
+        }
+        let span = (
+            pos_args[i].range().start().to_usize(),
+            pos_args[i].range().end().to_usize(),
+        );
+        c.mismatch(&substituted, actual, span);
+    }
+}
+
 /// Report a possibly-`None` receiver in `<recv>.attr` / `<recv>.method()`.
 ///
 /// Two shapes, deliberately different severities:
@@ -16451,6 +16582,20 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
                     // is exactly `bind_typevars_and_substitute_bidirectional`.
                     let ctor_vars = c.collect_ctor_vars(&params, &ret);
                     let result = if ctor_vars.is_empty() {
+                        // F45: the forward per-argument pass above checked
+                        // against the *un-substituted* formal, where a free
+                        // TypeVar leaf makes `is_assignable` permissive.
+                        // Re-validate the invariant positions now that
+                        // inference has pinned the parameters.
+                        check_invariant_arg_positions(
+                            c,
+                            &params,
+                            &actuals,
+                            &ret,
+                            expected,
+                            pos_args,
+                            positional_cutoff,
+                        );
                         bind_typevars_and_substitute_bidirectional(
                             &params, &actuals, &ret, expected,
                         )
@@ -18991,6 +19136,111 @@ mod tests {
     /// `ClassKind::Raw`). Required for any test exercising plain-/raw-class
     /// awareness in the checker (manual_init / class_attr_shadows_slot /
     /// attribute_not_found suppression).
+    /// F45: the forward argument pass checks against the declared formal
+    /// `list[T]`, where a free TypeVar leaf makes `is_assignable` permissive,
+    /// so any `list[X]` was accepted; a conflicting second binding was then
+    /// union-*widened* rather than reported. The callee writes elements of the
+    /// widened union into a container the caller still believes is `list[int]`.
+    #[test]
+    fn a_generic_call_may_not_bind_one_typevar_to_two_invariant_containers() {
+        let d = check(
+            r#"
+def add_all[T](dst: list[T], src: list[T]) -> None:
+    for item in src:
+        dst.append(item)
+
+def go() -> None:
+    let ints: list[int] = [1, 2]
+    let strs: list[str] = ["a"]
+    add_all(ints, strs)
+"#,
+        );
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::TypeMismatch { .. })),
+            "`list` is invariant — a `list[str]` cannot bind the same `T` as a `list[int]`; got {:?}",
+            d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    /// The matching call with both containers the same type stays green.
+    #[test]
+    fn a_generic_call_over_matching_containers_is_accepted() {
+        let d = check(
+            r#"
+def add_all[T](dst: list[T], src: list[T]) -> None:
+    for item in src:
+        dst.append(item)
+
+def go() -> None:
+    let a: list[int] = [1, 2]
+    let b: list[int] = [3]
+    add_all(a, b)
+"#,
+        );
+        assert!(
+            d.errors().is_empty(),
+            "matching containers must stay clean; got {:?}",
+            d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    /// Without collapsing the inferred union by subsumption first, this is the
+    /// false positive the re-check would produce: `T` binds `Animal` from the
+    /// list and `Dog` from the item, widening to `Animal | Dog`, and
+    /// `list[Animal]` re-checked against `list[Animal | Dog]` under invariance
+    /// fails — on a call that is correct.
+    #[test]
+    fn a_generic_call_binding_a_subclass_alongside_its_base_is_accepted() {
+        let d = check(
+            r#"
+class Animal:
+    name: str
+
+class Dog(Animal):
+    breed: str
+
+def push[T](xs: list[T], item: T) -> None:
+    xs.append(item)
+
+def go() -> None:
+    let pets: list[Animal] = []
+    let rex: Dog = Dog(name="Rex", breed="Husky")
+    push(pets, rex)
+"#,
+        );
+        assert!(
+            d.errors().is_empty(),
+            "`Dog` is an `Animal`; the inferred union collapses; got {:?}",
+            d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    /// A covariant formal is untouched — the documented scalar union-widening
+    /// (`pair(1, "two")` → `T = int | str`) must keep working.
+    #[test]
+    fn a_generic_call_over_a_covariant_formal_still_union_widens() {
+        let d = check(
+            r#"
+def first_of[T](xs: Sequence[T], ys: Sequence[T]) -> None:
+    pass
+
+def go() -> None:
+    let a: list[int] = [1]
+    let b: list[str] = ["x"]
+    first_of(a, b)
+"#,
+        );
+        assert!(
+            !d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::TypeMismatch { .. })),
+            "`Sequence` is covariant — widening `T` there is sound; got {:?}",
+            d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
     /// F41: the reset used to be wired into three statement arms by hand, so
     /// every other statement that can run a call kept a stale narrowing. Each
     /// case here is a `tyc check`-clean program that crashed at runtime.

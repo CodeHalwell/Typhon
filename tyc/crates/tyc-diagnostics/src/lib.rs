@@ -1892,6 +1892,31 @@ pub enum TycError {
         #[label("not a context manager")]
         span: SourceSpan,
     },
+
+    /// `return` / `break` / `continue` inside an `except*` handler body.
+    /// CPython rejects this at *compile* time
+    /// (`SyntaxError: 'break', 'continue' and 'return' cannot appear in an
+    /// except* block`), because an `except*` handler may run more than once
+    /// — one pass per matching subgroup — so there is no coherent meaning
+    /// for a jump out of it. Without this diagnostic, `tyc check` and
+    /// `tyc build` both report success and the emitted `.py` fails to even
+    /// import. Only fires on statements CPython would reject: a jump bound
+    /// to a loop declared *inside* the handler is legal and never flagged,
+    /// and nothing inside a nested `def` / `class` is inspected.
+    #[error("`{keyword}` cannot appear in an `except*` block")]
+    #[diagnostic(
+        severity(Error),
+        code(tyc::return_in_except_star),
+        url("https://github.com/CodeHalwell/Typhon/blob/main/docs/diagnostics/return_in_except_star.md"),
+        help("CPython rejects this at compile time — an `except*` handler can run once per matching subgroup, so a jump out of it has no defined meaning. Set a flag in the handler and act on it after the `try` statement, or use a plain `except` if the code does not need exception-group splitting.")
+    )]
+    ReturnInExceptStar {
+        keyword: String,
+        #[source_code]
+        src: NamedSource<String>,
+        #[label("not allowed inside an `except*` handler")]
+        span: SourceSpan,
+    },
 }
 
 impl TycError {
@@ -3388,6 +3413,22 @@ impl TycError {
             desc: desc.to_owned(),
             method: method.into(),
             with_kw: with_kw.to_owned(),
+            src: NamedSource::new(path.into(), source.into()),
+            span: SourceSpan::new(SourceOffset::from(offset), length.max(1)),
+        }
+    }
+
+    /// Construct a [`TycError::ReturnInExceptStar`] error. `keyword` is the
+    /// offending statement keyword — `return`, `break`, or `continue`.
+    pub fn return_in_except_star(
+        keyword: impl Into<String>,
+        path: impl Into<String>,
+        source: impl Into<String>,
+        offset: usize,
+        length: usize,
+    ) -> Self {
+        Self::ReturnInExceptStar {
+            keyword: keyword.into(),
             src: NamedSource::new(path.into(), source.into()),
             span: SourceSpan::new(SourceOffset::from(offset), length.max(1)),
         }

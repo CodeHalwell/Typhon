@@ -1310,6 +1310,54 @@ pub fn install(interp: &mut Interpreter) {
         root.set(name, Value::Native(Rc::new(ctor)));
     }
 
+    // PEP 654 exception groups. Two-argument constructors
+    // (`ExceptionGroup(message, [sub, ...])`) whose value keeps CPython's own
+    // layout — `args == (message, subs)` — see `value::make_exception_group`.
+    // `BaseExceptionGroup` auto-downcasts to `ExceptionGroup` when every
+    // member is an ordinary `Exception`, exactly as CPython's `__new__` does.
+    for name in ["ExceptionGroup", "BaseExceptionGroup"] {
+        let n = name.to_owned();
+        let ctor = NativeFn::new(Box::leak(n.clone().into_boxed_str()), move |_i, args| {
+            let message = args.first().map(|v| v.py_str()).unwrap_or_default();
+            let subs: Vec<Value> = match args.get(1) {
+                Some(Value::List(l)) => l.borrow().clone(),
+                Some(Value::Tuple(t)) => (**t).clone(),
+                Some(other) => {
+                    return Err(type_error(format!(
+                        "second argument (exceptions) must be a sequence, not {}",
+                        other.type_name()
+                    )))
+                }
+                None => {
+                    return Err(type_error(format!(
+                        "{n}() missing required argument 'exceptions'"
+                    )))
+                }
+            };
+            if subs.is_empty() {
+                return Err(Unwind::Exception(crate::error::VmException::new(
+                    "ValueError",
+                    "second argument (exceptions) must be a non-empty sequence",
+                )));
+            }
+            let has_base_only = subs.iter().any(crate::value::is_base_only_exception);
+            if n == "ExceptionGroup" && has_base_only {
+                return Err(type_error(
+                    "Cannot nest BaseExceptions in an ExceptionGroup".to_owned(),
+                ));
+            }
+            let kind = if has_base_only {
+                "BaseExceptionGroup"
+            } else {
+                "ExceptionGroup"
+            };
+            Ok(crate::value::make_exception_group(
+                kind, &message, subs, false,
+            ))
+        });
+        root.set(name, Value::Native(Rc::new(ctor)));
+    }
+
     // `freeze let X = expr` lowers to `X = __typhon_freeze__(expr)`. The
     // compile path resolves this via `from typhon_runtime.freeze import
     // deep_freeze as __typhon_freeze__`. The VM implements deep_freeze
@@ -4083,6 +4131,51 @@ fn make_re_module() -> Value {
 /// A completed-task wrapper: `TaskGroup.create_task` / `spawn` force the
 /// coroutine immediately (sequential semantics) and hand back this module
 /// so `.result()` / `await task` recover the value.
+/// The exception *value* carried by an unwind, materialising a
+/// `Value::Exception` summary when the raise site didn't attach one.
+fn exception_unwind_value(e: &crate::error::VmException) -> Value {
+    e.value.clone().unwrap_or_else(|| Value::Exception {
+        kind: Rc::new(e.kind.clone()),
+        message: Rc::new(e.message.clone()),
+        args: Rc::new(if e.message.is_empty() {
+            Vec::new()
+        } else {
+            vec![Value::Str(Rc::new(e.message.clone()))]
+        }),
+    })
+}
+
+/// A task whose coroutine raised. `TaskGroup.__aexit__` re-raises the whole
+/// batch as an `ExceptionGroup` before the `gather:` lowering ever reads a
+/// `.result()`, so this only matters for hand-written TaskGroup use — where
+/// CPython's `Task.result()` likewise re-raises the task's exception.
+fn make_failed_task_value(exc: Value) -> Value {
+    let for_result = exc.clone();
+    make_module(
+        "Task",
+        vec![
+            (
+                "result",
+                Value::Native(Rc::new(NativeFn::new("result", move |i, _args| {
+                    Err(i.value_to_exception(for_result.clone()))
+                }))),
+            ),
+            ("done", nf("done", |_i, _args| Ok(Value::Bool(true)))),
+            ("cancel", nf("cancel", |_i, _args| Ok(Value::Bool(false)))),
+            (
+                "cancelled",
+                nf("cancelled", |_i, _args| Ok(Value::Bool(false))),
+            ),
+            (
+                "exception",
+                Value::Native(Rc::new(NativeFn::new("exception", move |_i, _args| {
+                    Ok(exc.clone())
+                }))),
+            ),
+        ],
+    )
+}
+
 fn make_task_value(result: Value) -> Value {
     let result_for_member = result.clone();
     make_module(
@@ -4115,6 +4208,26 @@ fn make_asyncio_module() -> Value {
     let task_group = nf("TaskGroup", |_i, _args| {
         let tg = make_module("asyncio.TaskGroup", vec![]);
         let tg_for_enter = tg.clone();
+        // F5 — a child task that fails must NOT propagate its bare exception
+        // out of `create_task`. CPython's TaskGroup collects child failures
+        // and re-raises them from `__aexit__` wrapped in
+        // `ExceptionGroup('unhandled errors in a TaskGroup', [...])`, so a
+        // surrounding `except ValueError:` does not match and only an
+        // `except* ValueError:` does. Before this, the VM raised the bare
+        // exception straight out of `create_task`, so the identical `.ty`
+        // source caught the error under `tyc run` and died with an uncaught
+        // ExceptionGroup under `tyc build && python` — opposite outcomes from
+        // a clean check.
+        //
+        // Divergence that remains (inherent to the VM's sequential execution,
+        // documented in docs/vm.md): CPython *cancels* the sibling tasks when
+        // one fails, so a task that had not started contributes nothing to the
+        // group. The VM runs every `create_task` body to completion at its
+        // force point, so every failure is collected. The single-failure case
+        // — overwhelmingly the common one for `gather:` — is identical.
+        let failures: Rc<RefCell<Vec<Value>>> = Rc::new(RefCell::new(Vec::new()));
+        let failures_for_create = failures.clone();
+        let failures_for_exit = failures.clone();
         if let Value::Module(m) = &tg {
             let mut members = m.members.borrow_mut();
             members.insert(
@@ -4125,19 +4238,51 @@ fn make_asyncio_module() -> Value {
             );
             members.insert(
                 "__aexit__".to_owned(),
-                Value::Native(Rc::new(NativeFn::new("__aexit__", |_i, _args| {
-                    Ok(Value::Bool(false))
+                Value::Native(Rc::new(NativeFn::new("__aexit__", move |_i, args| {
+                    let mut pending = failures_for_exit.borrow_mut();
+                    // CPython wraps a body-raised exception into the same
+                    // group (verified against 3.13), so fold it in here.
+                    if let Some(body_exc) = args.get(1) {
+                        if !matches!(body_exc, Value::None) {
+                            pending.push(body_exc.clone());
+                        }
+                    }
+                    if pending.is_empty() {
+                        return Ok(Value::Bool(false));
+                    }
+                    let subs: Vec<Value> = pending.drain(..).collect();
+                    let kind = if subs.iter().any(crate::value::is_base_only_exception) {
+                        "BaseExceptionGroup"
+                    } else {
+                        "ExceptionGroup"
+                    };
+                    let group = crate::value::make_exception_group(
+                        kind,
+                        "unhandled errors in a TaskGroup",
+                        subs,
+                        false,
+                    );
+                    Err(Unwind::Exception(
+                        crate::error::VmException::new(kind, group.py_str()).with_value(group),
+                    ))
                 }))),
             );
             members.insert(
                 "create_task".to_owned(),
-                Value::Native(Rc::new(NativeFn::new("create_task", |i, args| {
+                Value::Native(Rc::new(NativeFn::new("create_task", move |i, args| {
                     let coro = args
                         .into_iter()
                         .next()
                         .ok_or_else(|| type_error("create_task() requires a coroutine"))?;
-                    let result = i.force_awaitable(coro)?;
-                    Ok(make_task_value(result))
+                    match i.force_awaitable(coro) {
+                        Ok(result) => Ok(make_task_value(result)),
+                        Err(Unwind::Exception(e)) => {
+                            let value = exception_unwind_value(&e);
+                            failures_for_create.borrow_mut().push(value.clone());
+                            Ok(make_failed_task_value(value))
+                        }
+                        Err(other) => Err(other),
+                    }
                 }))),
             );
         }

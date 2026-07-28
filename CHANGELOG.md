@@ -138,6 +138,25 @@ Compatibility, using the review's own taxonomy:
 
 ### VM
 
+- **`ExceptionGroup` and `except*` are modelled.** The VM ignored
+  `StmtTry.is_star` entirely, so `except* ValueError as e` bound the bare
+  `ValueError` where CPython binds a group, and a failing `gather:` task raised
+  its bare exception out of `create_task` — catchable by a plain
+  `except ValueError:` under `tyc run` and fatal under `tyc build && python`,
+  from the same clean `tyc check`. PEP 654 is now implemented: the
+  `ExceptionGroup` / `BaseExceptionGroup` constructors with CPython's
+  auto-downcast, `.exceptions` / `.message` / `str()` / `repr()`, and `except*`
+  splitting — every matching handler runs once with its own recursively-split
+  subgroup, the unmatched remainder is re-raised, an unmatched bare exception
+  propagates unwrapped, handler-raised exceptions are collected and combined,
+  and `except* ExceptionGroup` is the same runtime `TypeError`. `TaskGroup`
+  accumulates child failures and raises
+  `ExceptionGroup('unhandled errors in a TaskGroup', [...])` from `__aexit__`.
+  Not modelled, and documented as such in `docs/vm.md`: `.split()` /
+  `.subgroup()` / `.derive()` as user-callable methods, `__context__` chaining
+  between collected exceptions, and CPython's nested exception-group traceback
+  rendering. Sequential execution also means the VM cannot cancel siblings, so
+  a multi-failure `gather:` may report more members than CPython would.
 - Relative imports resolve against the importing module's package (example apps
   running under `tyc run`: 0/16 → 6/16).
 - `model` defaulted fields reach the constructor; `Ok(value=…)` / `Err(error=…)`
@@ -149,6 +168,43 @@ Compatibility, using the review's own taxonomy:
   `isinstance(x, object)` are `True`; string search methods honour
   `start` / `end`.
 - `from module import *` binds the module's public surface.
+
+### New diagnostics
+
+- **`tyc::return_in_except_star`** — `return` / `break` / `continue` inside an
+  `except*` handler. CPython rejects all three at *compile* time, so Typhon
+  previously reported a clean `tyc check`, a successful `tyc build`, and wrote a
+  `build/main.py` that could not be imported. The rule is replicated exactly: a
+  jump bound to a loop declared inside the handler is legal (a jump in that
+  loop's `else:` clause is not), nested `def` / `class` bodies are exempt, and
+  the `try` body / `else:` / `finally:` are not part of the block. It also
+  catches the desugared form of `?` inside an `except*` handler. A narrowing on
+  already-crashing code — every program it rejects emitted Python CPython
+  refused to compile.
+
+### Language server
+
+- **The single-file check no longer diverges from `tyc check`.** `tyc-db`
+  carried two check pipelines meant to be interchangeable that had silently
+  drifted: the Salsa-tracked one — used by `tyc repl` and by the LSP for any
+  file outside a discovered workspace — skipped the comptime-literal
+  substitution the project pipeline applies, so a correct program using
+  `comptime let T: type = int` drew two unactionable squiggles in the editor and
+  was refused by `tyc repl` while `tyc check` accepted it. There is now one
+  pipeline body both entry points call, with the cross-module shape registry as
+  the only differing parameter, so they cannot drift again. Pure relaxation.
+- **The editor type-checks unsaved buffers, not stale bytes on disk.** The
+  cross-module shape registry read every project file from the filesystem,
+  actively overwriting the live buffer-backed inputs the server already held for
+  every other open document — so adding a field in module A lit module B up red
+  until A was saved.
+- **Salsa incrementality restored.** `Setter::to` stamps the input as written
+  before it inspects the new value, so re-uploading every project file's text on
+  each check invalidated the whole project on every keystroke — typing latency
+  was O(total project source). Writes go through one guarded `set_source_text`
+  that compares first, and the three doc comments asserting the false
+  "no-op when the value matches" premise, which is what hid the bug, are
+  corrected.
 
 ### Tooling / security
 

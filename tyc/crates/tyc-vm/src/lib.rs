@@ -2594,4 +2594,301 @@ main()
 "#;
         assert_eq!(run_capturing(src).unwrap(), 0);
     }
+
+    // ── PEP 654 exception groups / `except*` ──────────────────────────────
+    //
+    // Every expected value below was produced by running the equivalent
+    // Python under CPython 3.13 first; the VM is asserted against it.
+
+    /// A bare (non-group) exception caught by `except*` binds an implicit
+    /// `ExceptionGroup('', (exc,))` wrapper, not the exception itself — the
+    /// F7 divergence. CPython 3.13:
+    ///   type(e).__name__ == 'ExceptionGroup'
+    ///   repr(e)          == "ExceptionGroup('', (ValueError('v'),))"
+    ///   e.exceptions     == (ValueError('v'),)
+    ///   e.message        == ''
+    #[test]
+    fn except_star_wraps_a_bare_exception_in_a_group() {
+        let src = r#"
+def main() -> None:
+    mut seen: int = 0
+    try:
+        raise ValueError("v")
+    except* ValueError as e:
+        seen = 1
+        if type(e).__name__ != "ExceptionGroup":
+            raise AssertionError("handler must bind an ExceptionGroup")
+        if repr(e) != "ExceptionGroup('', (ValueError('v'),))":
+            raise AssertionError("wrapper repr wrong: " + repr(e))
+        if len(e.exceptions) != 1 or str(e.exceptions[0]) != "v":
+            raise AssertionError("wrapper members wrong")
+        if e.message != "":
+            raise AssertionError("wrapper message wrong")
+    if seen != 1:
+        raise AssertionError("handler did not run")
+
+main()
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    /// Every matching handler runs — once each — and receives only its own
+    /// members, keeping the group's message. CPython 3.13 prints
+    /// `hV g (ValueError('v'), ValueError('v2'))` then `hT g (TypeError('t'),)`.
+    #[test]
+    fn except_star_runs_each_matching_handler_once_with_its_own_subgroup() {
+        let src = r#"
+def main() -> None:
+    mut v_runs: int = 0
+    mut t_runs: int = 0
+    mut v_count: int = 0
+    try:
+        raise ExceptionGroup("g", [ValueError("v"), TypeError("t"), ValueError("v2")])
+    except* ValueError as e:
+        v_runs = v_runs + 1
+        v_count = len(e.exceptions)
+        if e.message != "g":
+            raise AssertionError("subgroup lost the group message")
+    except* TypeError as e2:
+        t_runs = t_runs + 1
+        if len(e2.exceptions) != 1:
+            raise AssertionError("TypeError subgroup wrong")
+    if v_runs != 1 or t_runs != 1:
+        raise AssertionError("each handler must run exactly once")
+    if v_count != 2:
+        raise AssertionError("ValueError subgroup should hold both members")
+
+main()
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    /// The unmatched remainder is re-raised as a group derived from the
+    /// original (same message), and a plain `except Exception` catches it
+    /// (`ExceptionGroup` derives from `Exception`).
+    #[test]
+    fn except_star_reraises_the_unhandled_remainder() {
+        let src = r#"
+def main() -> None:
+    mut caught: str = ""
+    try:
+        try:
+            raise ExceptionGroup("g", [ValueError("v"), KeyError("k")])
+        except* ValueError as e:
+            if len(e.exceptions) != 1:
+                raise AssertionError("wrong matched subgroup")
+    except Exception as outer:
+        caught = repr(outer)
+    if caught != "ExceptionGroup('g', [KeyError('k')])":
+        raise AssertionError("remainder wrong: " + caught)
+
+main()
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    /// A bare exception that no `except*` handler matches propagates as
+    /// itself — CPython does not leave the implicit wrapper behind.
+    #[test]
+    fn unmatched_bare_exception_propagates_unwrapped() {
+        let src = r#"
+def main() -> None:
+    mut name: str = ""
+    try:
+        try:
+            raise ValueError("v")
+        except* TypeError as e:
+            raise AssertionError("must not match")
+    except ValueError as outer:
+        name = type(outer).__name__ + ":" + str(outer)
+    if name != "ValueError:v":
+        raise AssertionError("bare exception was rewrapped: " + name)
+
+main()
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    /// Splitting recurses through nested groups and preserves their nesting.
+    /// CPython 3.13: the `except* TypeError` handler sees
+    /// `ExceptionGroup('outer', [ExceptionGroup('inner', [TypeError('t')])])`.
+    #[test]
+    fn except_star_split_preserves_nesting() {
+        let src = r#"
+def main() -> None:
+    mut got: str = ""
+    try:
+        raise ExceptionGroup("outer", [ValueError("v"), ExceptionGroup("inner", [TypeError("t")])])
+    except* TypeError as e:
+        got = repr(e)
+    except* ValueError as e2:
+        if repr(e2) != "ExceptionGroup('outer', [ValueError('v')])":
+            raise AssertionError("ValueError side wrong: " + repr(e2))
+    if got != "ExceptionGroup('outer', [ExceptionGroup('inner', [TypeError('t')])])":
+        raise AssertionError("nesting not preserved: " + got)
+
+main()
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    /// Group construction, `str`, `repr`, `.args`, `.exceptions`, `.message`,
+    /// and CPython's `BaseExceptionGroup` -> `ExceptionGroup` auto-downcast.
+    #[test]
+    fn exception_group_value_protocol_matches_cpython() {
+        let src = r#"
+def main() -> None:
+    let one = ExceptionGroup("g", [ValueError("v")])
+    if str(one) != "g (1 sub-exception)":
+        raise AssertionError("str wrong: " + str(one))
+    if repr(one) != "ExceptionGroup('g', [ValueError('v')])":
+        raise AssertionError("repr wrong: " + repr(one))
+    if one.message != "g":
+        raise AssertionError("message wrong")
+    if len(one.args) != 2 or one.args[0] != "g":
+        raise AssertionError("args wrong")
+    let two = ExceptionGroup("g", [ValueError("v"), TypeError("t")])
+    if str(two) != "g (2 sub-exceptions)":
+        raise AssertionError("plural str wrong: " + str(two))
+    # BaseExceptionGroup downcasts when every member is an Exception.
+    let down = BaseExceptionGroup("g", [ValueError("v")])
+    if type(down).__name__ != "ExceptionGroup":
+        raise AssertionError("BaseExceptionGroup did not downcast")
+
+main()
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    /// `except* ExceptionGroup` is a runtime `TypeError` in CPython, with
+    /// this exact message.
+    #[test]
+    fn catching_a_group_type_with_except_star_is_a_type_error() {
+        let src = r#"
+def main() -> None:
+    mut msg: str = ""
+    try:
+        try:
+            raise ExceptionGroup("g", [ValueError("v")])
+        except* ExceptionGroup as e:
+            raise AssertionError("must not run")
+    except TypeError as te:
+        msg = str(te)
+    if msg != "catching ExceptionGroup with except* is not allowed. Use except instead.":
+        raise AssertionError("wrong message: " + msg)
+
+main()
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    /// F5 — a failing `gather:` task surfaces as
+    /// `ExceptionGroup('unhandled errors in a TaskGroup', [...])`, exactly as
+    /// `asyncio.TaskGroup` does under CPython. Before this, the VM raised the
+    /// bare `ValueError` out of `create_task`, so a plain `except ValueError`
+    /// caught it under `tyc run` and the compiled build died uncaught.
+    #[test]
+    fn gather_task_failure_surfaces_as_an_exception_group() {
+        let src = r#"
+import asyncio
+
+@gatherable
+async def fine() -> int:
+    return 1
+
+@gatherable
+async def boom() -> int:
+    raise ValueError("bad")
+
+async def run() -> None:
+    mut caught: str = ""
+    try:
+        gather:
+            a = fine()
+            b = boom()
+    except* ValueError as e:
+        caught = type(e).__name__ + "|" + e.message + "|" + str(len(e.exceptions))
+    if caught != "ExceptionGroup|unhandled errors in a TaskGroup|1":
+        raise AssertionError("gather failure shape wrong: " + caught)
+
+def main() -> None:
+    asyncio.run(run())
+
+main()
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    /// The companion half of F5: a *plain* `except ValueError` around a
+    /// `gather:` must NOT catch the failure — the group does not match it —
+    /// which is exactly what the compiled CPython build does.
+    #[test]
+    fn plain_except_does_not_catch_a_gather_failure() {
+        let src = r#"
+import asyncio
+
+@gatherable
+async def boom() -> int:
+    raise ValueError("bad")
+
+@gatherable
+async def fine() -> int:
+    return 1
+
+async def run() -> None:
+    mut wrong: int = 0
+    mut group: str = ""
+    try:
+        try:
+            gather:
+                a = fine()
+                b = boom()
+        except ValueError as v:
+            wrong = 1
+    except Exception as outer:
+        group = type(outer).__name__
+    if wrong != 0:
+        raise AssertionError("plain except must not catch a TaskGroup failure")
+    if group != "ExceptionGroup":
+        raise AssertionError("expected an ExceptionGroup, got " + group)
+
+def main() -> None:
+    asyncio.run(run())
+
+main()
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    /// `else:` and `finally:` still work on a `try*`, and neither is part of
+    /// the `except*` block.
+    #[test]
+    fn except_star_honours_else_and_finally() {
+        let src = r#"
+def main() -> None:
+    mut trace: str = ""
+    try:
+        trace = trace + "b"
+    except* ValueError as e:
+        trace = trace + "h"
+    else:
+        trace = trace + "e"
+    finally:
+        trace = trace + "f"
+    if trace != "bef":
+        raise AssertionError("else/finally order wrong: " + trace)
+    mut trace2: str = ""
+    try:
+        raise ValueError("v")
+    except* ValueError as e2:
+        trace2 = trace2 + "h"
+    finally:
+        trace2 = trace2 + "f"
+    if trace2 != "hf":
+        raise AssertionError("finally after handler wrong: " + trace2)
+
+main()
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
 }

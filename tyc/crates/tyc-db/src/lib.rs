@@ -774,6 +774,19 @@ fn check_pipeline(
     // `resolve_module_with` here.
     diags.extend(resolved_arc.diagnostics().clone());
 
+    // `except*` control-flow validation. This is an *error*, not a lint: a
+    // `return` / `break` / `continue` in an `except*` handler makes CPython
+    // refuse to compile the emitted file, so it has to run on the pipeline
+    // every surface shares — `tyc build` reaches this function, but not the
+    // `editor_lint_diagnostics` hook where the rest of the pure-AST checks
+    // live. Without it here, `tyc check` reported the error and `tyc build`
+    // cheerfully wrote a `build/main.py` that could not be imported.
+    diags.extend(tyc_analyse::analyse_except_star_control_flow(
+        &module,
+        &path,
+        &prep.python_source,
+    ));
+
     // `None` here is exactly what the pre-F55 single-file path did: with no
     // registry there is nothing to seed, so the checker runs its
     // in-module-only pass (`check_module_with`).

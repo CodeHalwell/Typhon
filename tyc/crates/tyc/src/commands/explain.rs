@@ -121,6 +121,7 @@ fn catalog_codes() -> &'static [&'static str] {
         "raise_non_exception",
         "resource_not_managed",
         "result_error_mismatch",
+        "return_in_except_star",
         "self_outside_impl",
         "shared_mut_across_tasks",
         "stdlib_module_shadow",
@@ -312,6 +313,9 @@ fn catalog_entry(short_code: &str) -> Option<&'static str> {
         }
         "result_error_mismatch" => {
             include_str!("../../../../../docs/diagnostics/result_error_mismatch.md")
+        }
+        "return_in_except_star" => {
+            include_str!("../../../../../docs/diagnostics/return_in_except_star.md")
         }
         "self_outside_impl" => include_str!("../../../../../docs/diagnostics/self_outside_impl.md"),
         "shared_mut_across_tasks" => {

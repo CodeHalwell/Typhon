@@ -241,6 +241,24 @@ message:
   exit — after its side effects, unlike a real cancellation.
   `@asynccontextmanager` factories share the eager-generator limitation
   below.
+- **`ExceptionGroup` / `except*`.** Modelled since v1.0.0-alpha.7. A
+  failing task inside a `gather:` block or a `TaskGroup` surfaces as
+  `ExceptionGroup('unhandled errors in a TaskGroup', [...])` raised from
+  `__aexit__`, exactly as under CPython — so it must be handled with
+  `except*`, not a plain `except ValueError:`. Before that release the VM
+  ignored `is_star` entirely and raised the bare exception out of
+  `create_task`, which a plain `except` caught under `tyc run` and did not
+  under `tyc build && python`, from the same clean `tyc check`. `except*`
+  now splits the group, runs every matching handler once with its own
+  recursively-split subgroup, re-raises the unmatched remainder, and raises
+  the same `TypeError` CPython does for `except* ExceptionGroup`.
+  Three residual divergences: `.split()` / `.subgroup()` / `.derive()` are
+  not exposed as user-callable methods, `__context__` is not chained
+  between exceptions collected from handler bodies, and an uncaught group
+  prints the summary line (`ExceptionGroup: g (2 sub-exceptions)`) rather
+  than CPython's nested `+-+---- 1 ----` traceback tree. Inherent to
+  sequential execution: the VM cannot cancel sibling tasks, so a
+  multi-failure `gather:` may report more members than CPython would.
 - **Lazy / unbounded generators.** Finite `yield` / `yield from` work
   since v0.10.0 via eager materialisation, but the worst case
   (`while True: yield`) hits the `GENERATOR_CAP = 1_000_000` ceiling and
