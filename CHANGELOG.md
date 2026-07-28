@@ -107,6 +107,15 @@ Compatibility, using the review's own taxonomy:
   ran in the project root. `SECURITY.md` corrected.
 - **`tyc lsp` honours the `[strictness]` severity knobs**, through the same
   rules the CLI uses (hoisted into `tyc-diagnostics`).
+- **"Remove unused import" can no longer delete the wrong line.** The
+  diagnostic's line indexes the preprocessed buffer while the edit lands in the
+  editor buffer; the quick-fix now verifies that the line it is about to delete
+  actually imports the name the diagnostic gives, and offers no edit rather
+  than a wrong one.
+- **A workspace path containing a space no longer disables the language
+  server's project mode** (cross-module checking, venv introspection and
+  `[strictness]` were all silently skipped, because the path was used
+  percent-encoded).
 - **`unused-import = "off"` works.** It was validated and then ignored.
 - **`[python] target = "3.13t"` produces a valid PEP 440 `requires-python`**,
   unbreaking `uv sync` for the three free-threaded targets.

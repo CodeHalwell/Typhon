@@ -230,7 +230,15 @@ impl Backend {
         // Resolve the project root once on the async side so the
         // blocking closure (which holds the salsa db lock) only needs
         // the cheap filesystem walk + cached queries below.
-        let path_for_root = std::path::PathBuf::from(uri.path().as_str());
+        // `uri.path()` is still percent-encoded, so a workspace whose path
+        // contains a space (or any character an editor escapes) produced a
+        // path with a literal `%20` in it, `find_workspace_layout` found no
+        // `typhon.toml`, and the server silently fell back to single-file
+        // mode: no cross-module checking, no venv introspection, no
+        // `[strictness]`. `uri_to_path` is the decoding conversion the rest of
+        // this file already uses.
+        let path_for_root =
+            uri_to_path(&uri).unwrap_or_else(|| std::path::PathBuf::from(uri.path().as_str()));
         let workspace = find_workspace_layout(&path_for_root);
         let project_files_arc = Arc::clone(&self.project_files);
 
@@ -3155,13 +3163,25 @@ pub fn compute_code_actions(
         if !diagnostic_code_matches(diag, "tyc::unused_import") {
             continue;
         }
-        let line = diag.range.start.line;
-        let line_text = nth_line_content(text, line);
-        if !is_safe_single_import_line(line_text) {
-            // Bail rather than emit an unsafe edit. The diagnostic still
-            // surfaces in the editor; the user fixes by hand for now.
+        // The diagnostic's line is an offset into the *preprocessed* buffer,
+        // and this edit is applied to the editor buffer — so any line-count
+        // change above the import (an injected prelude import, a `gather:`
+        // block, a `with`-chain) makes them disagree, and the quick-fix
+        // cheerfully deleted a completely different line. Silently removing a
+        // *used* import is about the worst thing a "safe" quick-fix can do.
+        //
+        // The diagnostic names the offending import, so require the line being
+        // deleted to actually import that name. If it does not, look for the
+        // one line in the file that does; if that is ambiguous or absent, emit
+        // no action at all. The diagnostic still shows — the user just fixes it
+        // by hand — which is the right failure direction for a destructive
+        // edit.
+        let Some(name) = unused_import_name(diag) else {
             continue;
-        }
+        };
+        let Some(line) = resolve_unused_import_line(text, diag.range.start.line, &name) else {
+            continue;
+        };
         let line_range = whole_line_range(text, line);
         let edit = TextEdit {
             range: line_range,
@@ -3185,6 +3205,72 @@ pub fn compute_code_actions(
         }));
     }
     actions
+}
+
+/// The imported name a `tyc::unused_import` diagnostic refers to.
+///
+/// The message is `imported name '<name>' is never used`.
+fn unused_import_name(diag: &Diagnostic) -> Option<String> {
+    let msg = &diag.message;
+    // Accept a backtick-quoted name too, so a future rewording of the
+    // diagnostic cannot silently disable the quick-fix.
+    let quote = msg.chars().find(|c| *c == '\'' || *c == '`')?;
+    let start = msg.find(quote)? + quote.len_utf8();
+    let end = msg[start..].find(quote)? + start;
+    let name = &msg[start..end];
+    if name.is_empty() {
+        None
+    } else {
+        Some(name.to_owned())
+    }
+}
+
+/// The line in `text` that a "Remove unused import" edit may delete.
+///
+/// Prefers `hinted` (the diagnostic's own line) when it really is a safe
+/// single import binding `name`. Otherwise falls back to the unique line in
+/// the file that is — and returns `None` when there is no such line or more
+/// than one, so no edit is offered rather than a wrong one.
+fn resolve_unused_import_line(text: &str, hinted: u32, name: &str) -> Option<u32> {
+    let binds = |line: &str| is_safe_single_import_line(line) && import_line_binds(line, name);
+    if binds(nth_line_content(text, hinted)) {
+        return Some(hinted);
+    }
+    let mut found: Option<u32> = None;
+    for (i, line) in text.lines().enumerate() {
+        if binds(line) {
+            if found.is_some() {
+                return None; // ambiguous
+            }
+            found = Some(i as u32);
+        }
+    }
+    found
+}
+
+/// True when `line` is an import statement that binds `name`.
+///
+/// Handles `import m`, `import m as n`, `import a.b` (binds `a`),
+/// `from m import x` and `from m import x as y`.
+fn import_line_binds(line: &str, name: &str) -> bool {
+    let core = line.split_once('#').map(|(b, _)| b).unwrap_or(line).trim();
+    let bound = if let Some(rest) = core.strip_prefix("from ") {
+        match rest.split_once(" import ") {
+            Some((_, after)) => after,
+            None => return false,
+        }
+    } else if let Some(rest) = core.strip_prefix("import ") {
+        rest
+    } else {
+        return false;
+    };
+    let bound = bound.trim();
+    match bound.split_once(" as ") {
+        // An `as` clause binds the alias.
+        Some((_, alias)) => alias.trim() == name,
+        // `import a.b.c` binds the root segment; `from m import x` binds `x`.
+        None => bound.split('.').next().unwrap_or(bound).trim() == name,
+    }
 }
 
 /// Extract the text content of `text`'s line `line` (0-indexed),
@@ -6063,7 +6149,11 @@ def f() -> None:
             code: Some(NumberOrString::String("tyc::unused_import".to_string())),
             code_description: None,
             source: Some("tyc".into()),
-            message: "unused import `os`".to_string(),
+            // The real `tyc::unused_import` text. The fixture used to say
+            // "unused import `os`", which no diagnostic ever produced — so the
+            // code-action tests were exercising a message shape that does not
+            // exist.
+            message: "imported name 'os' is never used".to_string(),
             related_information: None,
             tags: None,
             data: None,
@@ -6137,6 +6227,54 @@ def f() -> None:
         let diag = unused_import_diag(0, 7, 2);
         let actions = compute_code_actions(&u, text, &[diag]);
         assert_eq!(actions.len(), 1, "simple import + comment should fix");
+    }
+
+    #[test]
+    fn quick_fix_never_deletes_a_line_that_is_not_the_named_import() {
+        // The diagnostic's line indexes the *preprocessed* buffer while the
+        // edit lands in the editor buffer, so any line-count change above the
+        // import makes them disagree — and the quick-fix used to delete
+        // whatever happened to be at that index. Silently removing a *used*
+        // import is the worst thing a "safe" quick-fix can do.
+        let text = "import os\nimport json\n\ndef main() -> None:\n    print(os.name)\n";
+
+        // Diagnostic points at line 0 (`import os`) but names `json`: the
+        // hint is stale, so the edit must target the real `import json` line.
+        assert_eq!(resolve_unused_import_line(text, 0, "json"), Some(1));
+        // A correct hint is used as-is.
+        assert_eq!(resolve_unused_import_line(text, 1, "json"), Some(1));
+        // A name that is not imported anywhere yields no edit at all.
+        assert_eq!(resolve_unused_import_line(text, 0, "sys"), None);
+        // Ambiguity yields no edit rather than a guess.
+        let dupes = "import json\nimport json\n";
+        assert_eq!(resolve_unused_import_line(dupes, 5, "json"), None);
+    }
+
+    #[test]
+    fn import_line_binding_names() {
+        assert!(import_line_binds("import os", "os"));
+        assert!(import_line_binds("import os as o", "o"));
+        assert!(!import_line_binds("import os as o", "os"));
+        // `import a.b.c` binds the root name.
+        assert!(import_line_binds("import a.b.c", "a"));
+        assert!(!import_line_binds("import a.b.c", "c"));
+        assert!(import_line_binds("from typing import Callable", "Callable"));
+        assert!(import_line_binds("from typing import Callable as C", "C"));
+        assert!(!import_line_binds("print(os)", "os"));
+    }
+
+    #[test]
+    fn unused_import_name_is_read_from_the_message() {
+        let diag = Diagnostic {
+            message: "imported name 'json' is never used".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(unused_import_name(&diag).as_deref(), Some("json"));
+        let other = Diagnostic {
+            message: "something else entirely".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(unused_import_name(&other), None);
     }
 
     #[test]
