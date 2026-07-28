@@ -815,6 +815,16 @@ fn is_enum_qualified_base(base: &Expr) -> bool {
 /// annotation position. Unquoted `T?` is handled by the preprocessor;
 /// string literals escape it, and the raw `?` is a SyntaxError when the
 /// runtime later evaluates the forward reference.
+/// The rightmost identifier of a subscript head, so `Literal[...]`,
+/// `typing.Literal[...]` and `t.Literal[...]` are all recognised.
+fn subscript_head_name(value: &Expr) -> Option<String> {
+    match value {
+        Expr::Name(n) => Some(n.id.as_str().to_owned()),
+        Expr::Attribute(a) => Some(a.attr.as_str().to_owned()),
+        _ => None,
+    }
+}
+
 fn normalise_quoted_annotation_nullability(body: &mut [Stmt]) {
     fn fix_expr(e: &mut Expr) {
         match e {
@@ -828,7 +838,24 @@ fn normalise_quoted_annotation_nullability(body: &mut [Stmt]) {
             }
             Expr::Subscript(s) => {
                 fix_expr(&mut s.value);
-                fix_expr(&mut s.slice);
+                // `Literal[...]` arguments are *values*, not type expressions:
+                // `Literal["?"]` means the one-character string `"?"`, and
+                // rewriting it to `Literal[" | None"]` silently changed the
+                // constant. Same for `Annotated[T, meta]` past the first
+                // argument, whose metadata is arbitrary and often a string.
+                match subscript_head_name(&s.value).as_deref() {
+                    Some("Literal") => {}
+                    Some("Annotated") => {
+                        if let Expr::Tuple(t) = s.slice.as_mut() {
+                            if let Some(first) = t.elts.first_mut() {
+                                fix_expr(first);
+                            }
+                        } else {
+                            fix_expr(&mut s.slice);
+                        }
+                    }
+                    _ => fix_expr(&mut s.slice),
+                }
             }
             Expr::BinOp(b) => {
                 fix_expr(&mut b.left);
@@ -1797,12 +1824,15 @@ fn desugar_mod_module_with(m: &ModModule, options: &DesugarOptions) -> ModModule
 /// emitted Python and raise `NameError` at import time.
 fn inject_memoise_decorators(body: Vec<Stmt>, memoise: &[String]) -> (Vec<Stmt>, bool) {
     let mut added = false;
+    // Names this module binds for itself — a user or third-party `pure` /
+    // `memo` / `gatherable` is not Typhon's marker and must survive.
+    let shadowed = user_bound_marker_names(&body);
     let new_body: Vec<Stmt> = body
         .into_iter()
         .map(|stmt| match stmt {
             Stmt::FunctionDef(mut f) => {
-                f.decorator_list = strip_purity_decorators(f.decorator_list);
-                f.body = strip_purity_decorators_in_body(f.body);
+                f.decorator_list = strip_purity_decorators_with(f.decorator_list, &shadowed);
+                f.body = strip_purity_decorators_in_body_with(f.body, &shadowed);
                 if memoise.iter().any(|n| n == f.name.as_str())
                     && !has_cache_decorator(&f.decorator_list)
                 {
@@ -1813,7 +1843,7 @@ fn inject_memoise_decorators(body: Vec<Stmt>, memoise: &[String]) -> (Vec<Stmt>,
                 Stmt::FunctionDef(f)
             }
             Stmt::ClassDef(mut c) => {
-                c.body = strip_purity_decorators_in_body(c.body);
+                c.body = strip_purity_decorators_in_body_with(c.body, &shadowed);
                 Stmt::ClassDef(c)
             }
             other => other,
@@ -1826,16 +1856,19 @@ fn inject_memoise_decorators(body: Vec<Stmt>, memoise: &[String]) -> (Vec<Stmt>,
 /// inside `body` (and any nested function/class bodies). Used to clean up
 /// Typhon-only decorators that the top-level pass doesn't see directly —
 /// class methods and nested functions.
-fn strip_purity_decorators_in_body(body: Vec<Stmt>) -> Vec<Stmt> {
+fn strip_purity_decorators_in_body_with(
+    body: Vec<Stmt>,
+    shadowed: &std::collections::HashSet<String>,
+) -> Vec<Stmt> {
     body.into_iter()
         .map(|stmt| match stmt {
             Stmt::FunctionDef(mut f) => {
-                f.decorator_list = strip_purity_decorators(f.decorator_list);
-                f.body = strip_purity_decorators_in_body(f.body);
+                f.decorator_list = strip_purity_decorators_with(f.decorator_list, shadowed);
+                f.body = strip_purity_decorators_in_body_with(f.body, shadowed);
                 Stmt::FunctionDef(f)
             }
             Stmt::ClassDef(mut c) => {
-                c.body = strip_purity_decorators_in_body(c.body);
+                c.body = strip_purity_decorators_in_body_with(c.body, shadowed);
                 Stmt::ClassDef(c)
             }
             other => other,
@@ -1843,23 +1876,88 @@ fn strip_purity_decorators_in_body(body: Vec<Stmt>) -> Vec<Stmt> {
         .collect()
 }
 
+/// Names among `pure` / `memo` / `gatherable` that this module *defines or
+/// imports for itself*.
+///
+/// The three markers are recognised purely by their text, so a user (or a
+/// library) that legitimately owns one of those names had their decorator
+/// silently deleted — and `@memo` was worse than deleted, it was silently
+/// *replaced* by `@functools.cache`, so a third-party `memo` decorator's
+/// behaviour was substituted with a different one. Evidence that the name is
+/// bound in this module is enough to know it is not Typhon's marker.
+fn user_bound_marker_names(body: &[Stmt]) -> std::collections::HashSet<String> {
+    const MARKERS: [&str; 3] = ["pure", "memo", "gatherable"];
+    let mut out = std::collections::HashSet::new();
+    let mut note = |name: &str| {
+        if MARKERS.contains(&name) {
+            out.insert(name.to_owned());
+        }
+    };
+    for stmt in body {
+        match stmt {
+            Stmt::Import(i) => {
+                for a in &i.names {
+                    note(
+                        a.asname
+                            .as_ref()
+                            .map(|n| n.as_str())
+                            .unwrap_or_else(|| a.name.as_str()),
+                    );
+                }
+            }
+            Stmt::ImportFrom(i) => {
+                for a in &i.names {
+                    note(
+                        a.asname
+                            .as_ref()
+                            .map(|n| n.as_str())
+                            .unwrap_or_else(|| a.name.as_str()),
+                    );
+                }
+            }
+            Stmt::FunctionDef(f) => note(f.name.as_str()),
+            Stmt::ClassDef(c) => note(c.name.as_str()),
+            Stmt::Assign(a) => {
+                for t in &a.targets {
+                    if let Expr::Name(n) = t {
+                        note(n.id.as_str());
+                    }
+                }
+            }
+            Stmt::AnnAssign(a) => {
+                if let Expr::Name(n) = a.target.as_ref() {
+                    note(n.id.as_str());
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
 /// Drop `@pure`, `@pure(...)`, and `@memo` decorators from a function — they
 /// are Typhon-only metadata, not actual Python runtime decorators.
-fn strip_purity_decorators(decorators: Vec<Decorator>) -> Vec<Decorator> {
+fn strip_purity_decorators_with(
+    decorators: Vec<Decorator>,
+    shadowed: &std::collections::HashSet<String>,
+) -> Vec<Decorator> {
     decorators
         .into_iter()
-        .filter(|d| !is_purity_marker(&d.expression))
+        .filter(|d| !is_purity_marker_with(&d.expression, shadowed))
         .collect()
 }
 
-fn is_purity_marker(d: &Expr) -> bool {
+fn is_purity_marker_with(d: &Expr, shadowed: &std::collections::HashSet<String>) -> bool {
     match d {
         // `gatherable` lives alongside `pure` / `memo` as a Typhon-internal
         // attestation: the user marks `async def fetch_user(...)` with it
         // to opt the function in as an auto-gather candidate, but the name
         // has no Python runtime form so the emitter must drop it.
-        Expr::Name(n) => matches!(n.id.as_str(), "pure" | "memo" | "gatherable"),
-        Expr::Call(c) => is_purity_marker(&c.func),
+        Expr::Name(n) => {
+            matches!(n.id.as_str(), "pure" | "memo" | "gatherable")
+                && !shadowed.contains(n.id.as_str())
+        }
+        Expr::Call(c) => is_purity_marker_with(&c.func, shadowed),
         _ => false,
     }
 }

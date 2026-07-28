@@ -2829,6 +2829,7 @@ struct ModuleScope {
 impl ModuleScope {
     fn collect(body: &[Stmt], auto_memoise: bool) -> Self {
         let mut s = Self::default();
+        let shadowed_markers = user_bound_marker_names(body);
         for stmt in body {
             match stmt {
                 Stmt::Assign(a) => {
@@ -2847,7 +2848,8 @@ impl ModuleScope {
                     s.class_names.push(c.name.as_str().to_owned());
                 }
                 Stmt::FunctionDef(f) => {
-                    let (declared, _) = decorator_intent(&f.decorator_list, auto_memoise);
+                    let (declared, _) =
+                        decorator_intent(&f.decorator_list, auto_memoise, &shadowed_markers);
                     s.user_functions
                         .insert(f.name.as_str().to_owned(), declared);
                 }
@@ -2873,9 +2875,11 @@ fn analyse_stmts(
     // `@functools.cache` on the wrong function. Restrict the analyser to
     // top-level scope until we thread span-based identifiers through to
     // the desugarer.
+    let shadowed_markers = user_bound_marker_names(body);
     for stmt in body {
         if let Stmt::FunctionDef(f) = stmt {
-            let (declared, memo) = decorator_intent(&f.decorator_list, auto_memoise);
+            let (declared, memo) =
+                decorator_intent(&f.decorator_list, auto_memoise, &shadowed_markers);
             // Run the purity check whenever the user opted in OR the
             // project asked for automatic caching. Auto-memoise never
             // produces an error (see `purity_diagnostics`); it just
@@ -2909,10 +2913,23 @@ fn analyse_stmts(
 ///     `@pure(memo=True)`, or `auto_memoise`. The desugarer only injects
 ///     `@functools.cache` when the function ALSO passes the purity check;
 ///     `auto_memoise` is therefore a silent best-effort, never a hard error.
-fn decorator_intent(decorators: &[Decorator], auto_memoise: bool) -> (bool, bool) {
+fn decorator_intent(
+    decorators: &[Decorator],
+    auto_memoise: bool,
+    shadowed: &std::collections::HashSet<String>,
+) -> (bool, bool) {
     let mut declared = false;
     let mut memoise = auto_memoise;
     for d in decorators {
+        // A `pure` / `memo` this module defines or imports for itself is the
+        // user's decorator, not Typhon's marker. Reading it as the marker made
+        // `@functools.cache` get injected on top of an unrelated third-party
+        // decorator.
+        if let Some(name) = decorator_head_name(&d.expression) {
+            if shadowed.contains(&name) {
+                continue;
+            }
+        }
         match &d.expression {
             Expr::Name(n) if n.id.as_str() == "pure" => {
                 declared = true;
@@ -2944,6 +2961,69 @@ fn decorator_intent(decorators: &[Decorator], auto_memoise: bool) -> (bool, bool
         }
     }
     (declared, memoise)
+}
+
+/// The bare name a decorator expression applies, for `@name` and `@name(...)`.
+fn decorator_head_name(expr: &Expr) -> Option<String> {
+    match expr {
+        Expr::Name(n) => Some(n.id.as_str().to_owned()),
+        Expr::Call(c) => decorator_head_name(&c.func),
+        _ => None,
+    }
+}
+
+/// Names among `pure` / `memo` / `gatherable` that this module defines or
+/// imports for itself. Mirrors `tyc_desugar::user_bound_marker_names`; the two
+/// must agree or the analyser and the emitter disagree about which decorators
+/// are Typhon's.
+pub fn user_bound_marker_names(body: &[Stmt]) -> std::collections::HashSet<String> {
+    const MARKERS: [&str; 3] = ["pure", "memo", "gatherable"];
+    let mut out = std::collections::HashSet::new();
+    let mut note = |name: &str| {
+        if MARKERS.contains(&name) {
+            out.insert(name.to_owned());
+        }
+    };
+    for stmt in body {
+        match stmt {
+            Stmt::Import(i) => {
+                for a in &i.names {
+                    note(
+                        a.asname
+                            .as_ref()
+                            .map(|n| n.as_str())
+                            .unwrap_or_else(|| a.name.as_str()),
+                    );
+                }
+            }
+            Stmt::ImportFrom(i) => {
+                for a in &i.names {
+                    note(
+                        a.asname
+                            .as_ref()
+                            .map(|n| n.as_str())
+                            .unwrap_or_else(|| a.name.as_str()),
+                    );
+                }
+            }
+            Stmt::FunctionDef(f) => note(f.name.as_str()),
+            Stmt::ClassDef(c) => note(c.name.as_str()),
+            Stmt::Assign(a) => {
+                for t in &a.targets {
+                    if let Expr::Name(n) = t {
+                        note(n.id.as_str());
+                    }
+                }
+            }
+            Stmt::AnnAssign(a) => {
+                if let Expr::Name(n) = a.target.as_ref() {
+                    note(n.id.as_str());
+                }
+            }
+            _ => {}
+        }
+    }
+    out
 }
 
 fn check_purity(
