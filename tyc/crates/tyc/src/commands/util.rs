@@ -5,7 +5,9 @@ use std::path::{Path, PathBuf};
 
 use miette::{miette, Result};
 use tyc_db::ModuleShapes;
-use tyc_diagnostics::{Diagnostics, TycError};
+use tyc_diagnostics::Diagnostics;
+#[cfg(test)]
+use tyc_diagnostics::TycError;
 use tyc_syntax::preprocess::preprocess;
 
 use crate::config::TyphonConfig;
@@ -35,76 +37,22 @@ use crate::config::TyphonConfig;
 /// All other warnings are passed through unchanged. The function consumes the
 /// input `Diagnostics` to avoid cloning individual diagnostics.
 pub fn apply_strictness(diags: Diagnostics, config: &TyphonConfig) -> Diagnostics {
-    let promote_unused_import = config.strictness.unused_import == "error";
-    let methods_in_class_body = config.strictness.methods_in_class_body.as_str();
-    let require_with = config.strictness.require_with.as_str();
-    let require_with_default = require_with == "warn" || require_with.is_empty();
-    let blocking_in_async = config.strictness.blocking_in_async.as_str();
-    let blocking_in_async_default = blocking_in_async == "warn" || blocking_in_async.is_empty();
-    let stub_check = config.strictness.stub_check.as_str();
-    // Default is "error" — stub drift is promoted to error by default.
-    // Only skip reclassification when the setting is explicitly "warn" or empty.
-    let stub_check_default = stub_check == "warn" || stub_check.is_empty();
-    // `exhaustive-match` defaults to "error". `NonExhaustiveMatch` is emitted
-    // by the checker as an error, so honouring "warn"/"off" means reclassifying
-    // it out of the errors bucket below.
-    let exhaustive_match = config.strictness.exhaustive_match.as_str();
-    let exhaustive_match_default = exhaustive_match == "error" || exhaustive_match.is_empty();
-    if !promote_unused_import
-        && (methods_in_class_body == "warn" || methods_in_class_body.is_empty())
-        && require_with_default
-        && blocking_in_async_default
-        && stub_check_default
-        && exhaustive_match_default
-    {
-        return diags;
+    // The rules themselves live in `tyc-diagnostics` so `tyc lsp` applies the
+    // identical ones — the editor used to ignore every knob here, and squiggled
+    // diagnostics a project had turned off in its `typhon.toml`.
+    tyc_diagnostics::apply_severity_overrides(diags, &severity_overrides(config))
+}
+
+/// Project the `[strictness]` severity knobs out of a loaded config.
+pub fn severity_overrides(config: &TyphonConfig) -> tyc_diagnostics::SeverityOverrides {
+    tyc_diagnostics::SeverityOverrides {
+        unused_import: config.strictness.unused_import.clone(),
+        methods_in_class_body: config.strictness.methods_in_class_body.clone(),
+        require_with: config.strictness.require_with.clone(),
+        blocking_in_async: config.strictness.blocking_in_async.clone(),
+        stub_check: config.strictness.stub_check.clone(),
+        exhaustive_match: config.strictness.exhaustive_match.clone(),
     }
-    let (errors, warnings) = diags.into_parts();
-    let mut new_diags = Diagnostics::new();
-    for err in errors {
-        if matches!(err, TycError::NonExhaustiveMatch { .. }) && !exhaustive_match_default {
-            match exhaustive_match {
-                "off" => {}                            // drop entirely
-                "warn" => new_diags.push_warning(err), // demote to warning
-                _ => new_diags.push_error(err),        // any other value stays an error
-            }
-        } else {
-            new_diags.push_error(err);
-        }
-    }
-    for warn in warnings {
-        if promote_unused_import && matches!(warn, TycError::UnusedImport { .. }) {
-            new_diags.push_error(warn);
-        } else if matches!(warn, TycError::MethodInClassBody { .. }) {
-            match methods_in_class_body {
-                "off" => {} // drop the diagnostic entirely
-                "error" => new_diags.push_error(warn),
-                _ => new_diags.push_warning(warn),
-            }
-        } else if matches!(warn, TycError::ResourceNotManaged { .. }) {
-            match require_with {
-                "off" => {} // drop the diagnostic entirely
-                "error" => new_diags.push_error(warn),
-                _ => new_diags.push_warning(warn),
-            }
-        } else if matches!(warn, TycError::BlockingInAsync { .. }) {
-            match blocking_in_async {
-                "off" => {} // drop the diagnostic entirely
-                "error" => new_diags.push_error(warn),
-                _ => new_diags.push_warning(warn),
-            }
-        } else if matches!(warn, TycError::StubMismatch { .. }) {
-            match stub_check {
-                "off" => {} // drop the diagnostic entirely
-                "warn" => new_diags.push_warning(warn),
-                // "error" (default) and any other value → promote to error
-                _ => new_diags.push_error(warn),
-            }
-        } else {
-            new_diags.push_warning(warn);
-        }
-    }
-    new_diags
 }
 
 /// Map a project-relative source file path to its dotted Python

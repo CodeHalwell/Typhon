@@ -345,6 +345,19 @@ impl Backend {
                 // above so we don't need to thread them again here.)
                 check_source_file_with_imports(&mut *db, source_file, &project_shapes)
             };
+            // Apply the project's `[strictness]` severity knobs, through the
+            // same `tyc-diagnostics` rules the CLI uses. Without this the
+            // editor ignored every knob: a project that set
+            // `exhaustive-match = "off"` or `unused-import = "off"` in its
+            // `typhon.toml` still got the squiggle on every keystroke, so the
+            // editor and CI disagreed about what counted as an error.
+            if let Some((root, _)) = workspace.as_ref() {
+                diags = tyc_diagnostics::apply_severity_overrides(
+                    diags,
+                    &read_severity_overrides(root),
+                );
+            }
+
             // Retrieve the preprocessed source for diagnostic position
             // mapping.  After `check_source_file` runs the full pipeline the
             // Salsa `preprocessed_text` query is populated; hover/definition
@@ -2002,6 +2015,41 @@ fn parse_src_dir(toml_path: &std::path::Path) -> Option<String> {
 /// `typhon.toml` behaviour (gather on, perf on, secret-literal lint on) — so
 /// an editor buffer in a project without an explicit `[strictness]` table
 /// still gets the on-by-default advice, exactly like `tyc check`.
+/// Read the `[strictness]` *severity* knobs from the project's `typhon.toml`.
+///
+/// Distinct from [`read_lint_options`], which reads the advice-lint *gates*.
+/// The severity knobs decide whether a diagnostic is an error, a warning, or
+/// suppressed; they were not read at all here, so `tyc lsp` and `tyc check`
+/// disagreed about the severity of six diagnostics.
+///
+/// Unreadable or malformed config falls back to defaults, matching the CLI.
+fn read_severity_overrides(root: &std::path::Path) -> tyc_diagnostics::SeverityOverrides {
+    let mut out = tyc_diagnostics::SeverityOverrides::default();
+    let Ok(text) = std::fs::read_to_string(root.join("typhon.toml")) else {
+        return out;
+    };
+    let Ok(parsed) = toml::from_str::<toml::Value>(&text) else {
+        return out;
+    };
+    let Some(strictness) = parsed.get("strictness").and_then(|s| s.as_table()) else {
+        return out;
+    };
+    let read = |key: &str| -> String {
+        strictness
+            .get(key)
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_owned()
+    };
+    out.unused_import = read("unused-import");
+    out.methods_in_class_body = read("methods-in-class-body");
+    out.require_with = read("require-with");
+    out.blocking_in_async = read("blocking-in-async");
+    out.stub_check = read("stub-check");
+    out.exhaustive_match = read("exhaustive-match");
+    out
+}
+
 fn read_lint_options(root: &std::path::Path) -> tyc_analyse::LintOptions {
     let mut opts = tyc_analyse::LintOptions::default();
     let Ok(text) = std::fs::read_to_string(root.join("typhon.toml")) else {

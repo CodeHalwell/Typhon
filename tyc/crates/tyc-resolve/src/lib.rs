@@ -1138,7 +1138,15 @@ impl<'a> Resolver<'a> {
         let builtins = builtin_names();
         for r in &self.references {
             // Walk the scope chain.
+            //
+            // A `from module import *` on the chain suppresses the
+            // diagnostic entirely: it binds an unknown set of names, so the
+            // resolver cannot say the reference is undefined. Without this,
+            // `from .helpers import *` — a documented, supported form — made
+            // every star-imported name a hard `tyc::unknown_name` and blocked
+            // the build.
             let mut found = false;
+            let mut wildcard_in_scope = false;
             let mut current = Some(r.scope);
             while let Some(id) = current {
                 let scope = &self.scopes[id];
@@ -1146,9 +1154,16 @@ impl<'a> Resolver<'a> {
                     found = true;
                     break;
                 }
+                if scope
+                    .bindings
+                    .iter()
+                    .any(|b| b.name == "*" && b.kind == BindingKind::Import)
+                {
+                    wildcard_in_scope = true;
+                }
                 current = scope.parent;
             }
-            if !found && !builtins.contains(&r.name.as_str()) {
+            if !found && !wildcard_in_scope && !builtins.contains(&r.name.as_str()) {
                 let length = r.span.1.saturating_sub(r.span.0).max(1);
                 // `self` is special: it's only legal inside an `impl`
                 // method body, so an unresolved reference deserves a

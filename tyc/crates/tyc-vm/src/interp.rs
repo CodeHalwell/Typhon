@@ -495,6 +495,22 @@ impl Interpreter {
                 };
                 for alias in &im.names {
                     let attr = alias.name.as_str();
+                    // `from module import *` — bind the module's public
+                    // surface rather than looking up a member literally named
+                    // `*`. Without this the VM raised
+                    // `AttributeError: module has no attribute '*'` on a
+                    // documented, supported form that `tyc build` + CPython
+                    // handles fine.
+                    //
+                    // "Public" follows Python: the module's `__all__` when it
+                    // declares one (which `pub` synthesises), otherwise every
+                    // name not starting with `_`.
+                    if attr == "*" {
+                        for (name, value) in self.module_public_members(&module) {
+                            env.set(&name, value);
+                        }
+                        continue;
+                    }
                     let val = self.get_attr(&module, attr)?;
                     let bind = alias
                         .asname
@@ -1093,6 +1109,40 @@ impl Interpreter {
         let strip = level.saturating_sub(1) as usize;
         let keep = self.current_package.len().saturating_sub(strip);
         self.current_package[..keep].to_vec()
+    }
+
+    /// The names `from module import *` binds: the module's `__all__` when it
+    /// declares one, otherwise every member whose name does not start with
+    /// `_`. Mirrors CPython.
+    fn module_public_members(&mut self, module: &Value) -> Vec<(String, Value)> {
+        let Value::Module(m) = module else {
+            return Vec::new();
+        };
+        let members = m.members.borrow();
+        let declared: Option<Vec<String>> = members.get("__all__").and_then(|v| match v {
+            Value::List(items) => Some(
+                items
+                    .borrow()
+                    .iter()
+                    .filter_map(|i| match i {
+                        Value::Str(s) => Some((**s).clone()),
+                        _ => None,
+                    })
+                    .collect(),
+            ),
+            _ => None,
+        });
+        match declared {
+            Some(names) => names
+                .into_iter()
+                .filter_map(|n| members.get(&n).map(|v| (n, v.clone())))
+                .collect(),
+            None => members
+                .iter()
+                .filter(|(k, _)| !k.starts_with('_'))
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
+        }
     }
 
     fn import_module(&mut self, name: &str) -> Result<Value, Unwind> {

@@ -5572,3 +5572,106 @@ mod tests {
         }
     }
 }
+
+// ── severity overrides ────────────────────────────────────────────────────────
+
+/// The `[strictness]` severity knobs, as plain strings.
+///
+/// This exists so the reclassification rules live in exactly one place. They
+/// used to live in the `tyc` binary crate, keyed off `TyphonConfig` — which
+/// the language server cannot reach, so `tyc lsp` ignored every severity knob
+/// and squiggled diagnostics a project had explicitly turned off in its
+/// `typhon.toml`. Editor and CI disagreeing about what is an error erodes
+/// trust in the whole diagnostic surface, so the rules are stated once, here,
+/// in a crate both surfaces already depend on.
+///
+/// An empty string means "not configured" and takes the diagnostic's default.
+#[derive(Debug, Clone, Default)]
+pub struct SeverityOverrides {
+    /// `"warn"` (default) | `"error"` | `"off"`.
+    pub unused_import: String,
+    /// `"warn"` (default) | `"error"` | `"off"`.
+    pub methods_in_class_body: String,
+    /// `"warn"` (default) | `"error"` | `"off"`.
+    pub require_with: String,
+    /// `"warn"` (default) | `"error"` | `"off"`.
+    pub blocking_in_async: String,
+    /// `"error"` (default) | `"warn"` | `"off"`.
+    pub stub_check: String,
+    /// `"error"` (default) | `"warn"` | `"off"`.
+    pub exhaustive_match: String,
+}
+
+impl SeverityOverrides {
+    /// True when no knob asks for a change of classification, so the caller
+    /// can hand back the input untouched.
+    ///
+    /// Note this is *not* "every knob is at its documented default": it is
+    /// "every knob agrees with the severity the diagnostic was emitted at".
+    /// `stub-check` defaults to `"error"` while `StubMismatch` is emitted as
+    /// a warning, so the default is a promotion and therefore real work;
+    /// `exhaustive-match` defaults to `"error"` and `NonExhaustiveMatch` is
+    /// already an error, so that one genuinely is a no-op.
+    pub fn is_noop(&self) -> bool {
+        let stays_warning = |s: &str| s.is_empty() || s == "warn";
+        stays_warning(&self.unused_import)
+            && stays_warning(&self.methods_in_class_body)
+            && stays_warning(&self.require_with)
+            && stays_warning(&self.blocking_in_async)
+            && (self.stub_check == "warn")
+            && (self.exhaustive_match.is_empty() || self.exhaustive_match == "error")
+    }
+}
+
+/// Reclassify `diags` according to `overrides`.
+///
+/// `"off"` drops the diagnostic entirely, `"warn"` demotes it, `"error"`
+/// promotes it. Diagnostics with no configured knob pass through unchanged.
+pub fn apply_severity_overrides(diags: Diagnostics, overrides: &SeverityOverrides) -> Diagnostics {
+    if overrides.is_noop() {
+        return diags;
+    }
+    let (errors, warnings) = diags.into_parts();
+    let mut out = Diagnostics::new();
+
+    // `NonExhaustiveMatch` is emitted as an error, so honouring "warn"/"off"
+    // means reclassifying it out of the errors bucket.
+    for err in errors {
+        if matches!(err, TycError::NonExhaustiveMatch { .. }) {
+            match overrides.exhaustive_match.as_str() {
+                "off" => {}
+                "warn" => out.push_warning(err),
+                _ => out.push_error(err),
+            }
+        } else {
+            out.push_error(err);
+        }
+    }
+
+    for warn in warnings {
+        // (matcher, knob, promote-by-default)
+        let knob = if matches!(warn, TycError::UnusedImport { .. }) {
+            Some((overrides.unused_import.as_str(), false))
+        } else if matches!(warn, TycError::MethodInClassBody { .. }) {
+            Some((overrides.methods_in_class_body.as_str(), false))
+        } else if matches!(warn, TycError::ResourceNotManaged { .. }) {
+            Some((overrides.require_with.as_str(), false))
+        } else if matches!(warn, TycError::BlockingInAsync { .. }) {
+            Some((overrides.blocking_in_async.as_str(), false))
+        } else if matches!(warn, TycError::StubMismatch { .. }) {
+            // Stub drift is promoted to an error unless explicitly relaxed.
+            Some((overrides.stub_check.as_str(), true))
+        } else {
+            None
+        };
+        match knob {
+            Some(("off", _)) => {}
+            Some(("error", _)) => out.push_error(warn),
+            Some(("warn", _)) => out.push_warning(warn),
+            // Unset / unrecognised: keep the diagnostic's own default.
+            Some((_, true)) => out.push_error(warn),
+            Some((_, false)) | None => out.push_warning(warn),
+        }
+    }
+    out
+}
