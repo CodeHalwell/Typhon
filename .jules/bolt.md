@@ -26,3 +26,6 @@
 ## 2024-11-25 - Zero-Allocation `module_level_bound_names`
 **Learning:** `module_level_bound_names` in `tyc-desugar` originally created a new `HashSet<String>` by cloning string identifiers inside AST nodes. As this is used to verify `collections.abc` types inside hot paths, the repeated allocation of strings negatively impacted compilation times.
 **Action:** By bounding the lifetime of the `HashSet<&str>` to the incoming `&[Stmt]` reference, we can avoid String allocations entirely when building the `bound_names` set and rely on dereferencing pointers for fast lookups.
+## 2024-11-26 - Zero-Allocation `module_level_mut_names` in `tyc-analyse`
+**Learning:** `module_level_mut_names` and `fn_writes_shared_state` in `tyc-analyse/src/parallel_lints.rs` originally created `HashSet<String>` by explicitly cloning or converting string identifiers to owned string inside AST nodes in `tyc-analyse`. Since this is called frequently, allocating hundreds of strings in hot paths like traversing the AST node to collect `mut` names could bottleneck analysis.
+**Action:** By bounding the lifetime of the `HashSet<&str>` to the incoming `&[Stmt]` reference, we can avoid String allocations entirely when building the `module_muts` and `globals` sets, instead relying on direct string slice references which speeds up execution.
