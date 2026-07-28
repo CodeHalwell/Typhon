@@ -1167,7 +1167,7 @@ pub fn run(args: BuildArgs) -> Result<()> {
                     .map_err(|e| miette!("cannot create '{}': {e}", parent.display()))?;
             }
 
-            std::fs::write(&out_file, &python_src)
+            tyc_format::atomic_write(&out_file, python_src.as_bytes())
                 .map_err(|e| miette!("cannot write '{}': {e}", out_file.display()))?;
         }
 
@@ -1208,7 +1208,7 @@ pub fn run(args: BuildArgs) -> Result<()> {
                 std::fs::create_dir_all(parent)
                     .map_err(|e| miette!("cannot create '{}': {e}", parent.display()))?;
             }
-            std::fs::write(&map_path, map_body)
+            tyc_format::atomic_write(&map_path, map_body.as_bytes())
                 .map_err(|e| miette!("cannot write '{}': {e}", map_path.display()))?;
         }
 
@@ -1240,6 +1240,26 @@ pub fn run(args: BuildArgs) -> Result<()> {
             .strip_prefix(&src_dir)
             .map_err(|_| miette!("'{}' is outside the source directory", path.display()))?;
         let dest = out_dir.join(rel);
+        // A hand-written `src/X.py` lands on exactly the path the compiled
+        // `src/X.ty` was just emitted to, so the copy silently replaced it:
+        // the shipped program was not the program `tyc check` validated, and
+        // the build still exited 0. The compiled output must win — a `.ty` is
+        // the source of truth for its own module name — and the collision is
+        // worth saying out loud, because a stale `.py` beside a `.ty` is
+        // usually a leftover the author forgot to delete.
+        //
+        // Warn rather than fail: a *draft* `.ty` beside a working `.py` builds
+        // today, and breaking that outright would reject a working project.
+        if path.with_extension("ty").is_file() {
+            let ty_rel = rel.with_extension("ty");
+            eprintln!(
+                "warning: '{}' shadows the Python compiled from '{}'. \
+                 Keeping the compiled output; delete the .py file to silence this.",
+                display_relative(path, &project_root),
+                display_relative(&src_dir.join(&ty_rel), &project_root),
+            );
+            continue;
+        }
         if check_mode {
             println!("would write {}", display_relative(&dest, &project_root));
             would_write_count += 1;
@@ -1374,7 +1394,7 @@ pub fn run(args: BuildArgs) -> Result<()> {
                 std::fs::create_dir_all(parent)
                     .map_err(|e| miette!("cannot create '{}': {e}", parent.display()))?;
             }
-            std::fs::write(&out_file, &stub_text)
+            tyc_format::atomic_write(&out_file, stub_text.as_bytes())
                 .map_err(|e| miette!("cannot write '{}': {e}", out_file.display()))?;
         }
         stubs_emitted += 1;
@@ -1419,7 +1439,7 @@ pub fn run(args: BuildArgs) -> Result<()> {
                 .map_err(|e| miette!("cannot create '{}': {e}", runtime_dir.display()))?;
             for (name, body) in files {
                 let path = runtime_dir.join(name);
-                std::fs::write(&path, body)
+                tyc_format::atomic_write(&path, body.as_bytes())
                     .map_err(|e| miette!("cannot write '{}': {e}", path.display()))?;
             }
             println!("wrote typhon_runtime/ → '{}'", runtime_dir.display());

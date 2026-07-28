@@ -748,8 +748,15 @@ fn apply_simple_style_rules_with_paren_depth(
                 //   `==` (comparison) — never split, keep tight if user
                 //       wrote `==`, add spaces only when user already
                 //       spaced one side. Leave alone here.
-                //   `:=` (walrus) — handled by the `:` branch swallowing
-                //       the `=` chain; we never see a leading `:`.
+                //   `:=` (walrus) — the `:` branch emits the colon without
+                //       consuming the `=`, so a bare `:` DOES arrive here as
+                //       `prev`. It is listed among the glued operators below.
+                //       (The comment used to claim we never see one, and the
+                //       `:` was missing from that list, so an unparenthesised
+                //       `if n := len(xs):` was rewritten to `if n : = len(xs):`
+                //       — `tyc fmt` destroying a working program in place.
+                //       A *parenthesised* walrus was safe only by accident,
+                //       via the kwarg rule below.)
                 //   `+=` / `-=` / `*=` / `/=` / etc. — augmented assign
                 //       must stay glued to its operator. Detected by
                 //       looking at the previously-emitted char.
@@ -762,7 +769,8 @@ fn apply_simple_style_rules_with_paren_depth(
                 let is_double_eq = matches!(next, Some('='));
                 let is_augmented = matches!(
                     prev,
-                    Some('+')
+                    Some(':')
+                        | Some('+')
                         | Some('-')
                         | Some('*')
                         | Some('/')
@@ -1260,7 +1268,13 @@ pub fn format_file(path: &Path) -> Result<bool, TycError> {
 /// directory, flush it, then `rename` it over the target. Because the temp file
 /// lives on the same filesystem as the target, the rename is atomic, so readers
 /// see either the old or the new content — never a half-written file.
-fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+///
+/// Public so `tyc build` writes its artifacts the same way. A plain
+/// `std::fs::write` truncates first, so an interrupted build left a persistent
+/// **0-byte** `build/main.py` — which CPython runs successfully, with exit 0
+/// and no output. A subsequent build overwrites it, so the failure looks like
+/// "the program silently does nothing" rather than "the build was interrupted".
+pub fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
 
     // Resolve symlinks so we rename over the *real* file. A bare `fs::write`
@@ -1280,7 +1294,7 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     // Unique-enough within a run: fmt processes each path at most once, and the
     // pid disambiguates concurrent `tyc fmt` invocations. (No randomness/clock
     // is available in this crate's environment.)
-    let tmp = dir.join(format!(".{}.tycfmt-{}.tmp", file_name, std::process::id()));
+    let tmp = dir.join(format!(".{}.tyc-{}.tmp", file_name, std::process::id()));
 
     // Scope the handle so it is closed before the rename. `sync_all` (not
     // `flush`, which is a no-op on a bufferless `std::fs::File`) forces the
@@ -1312,6 +1326,41 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn unparenthesised_walrus_survives_formatting() {
+        // `tyc fmt` rewrote `if n := len(xs):` to `if n : = len(xs):`,
+        // destroying a working program in place. The `:` was missing from the
+        // glued-operator set the `=` branch checks, and the comment there
+        // claimed a bare `:` could never arrive — it does. A *parenthesised*
+        // walrus was safe only by accident, through the kwarg rule.
+        for src in [
+            "if n := len(xs):\n    print(n)\n",
+            "while j := step():\n    print(j)\n",
+            "y = (m := 3) + 1\n",
+        ] {
+            let (out, _) = normalise_whitespace_with_map(src);
+            assert!(
+                out.contains(":="),
+                "the walrus must survive formatting; got {out:?}"
+            );
+            assert!(
+                !out.contains(": ="),
+                "the walrus must not be split; got {out:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn annotation_and_assignment_spacing_still_applies() {
+        // The walrus fix must not disable ordinary `:` / `=` spacing.
+        let (out, _) = normalise_whitespace_with_map(
+            "def f(a:int,b:str=\"x\")->int:\n    z:int=a\n    return z\n",
+        );
+        assert!(out.contains("a: int"), "got {out:?}");
+        assert!(out.contains("z: int = a"), "got {out:?}");
+        assert!(out.contains(") -> int:"), "got {out:?}");
+    }
 
     #[test]
     fn triple_quoted_string_contents_are_never_reformatted() {

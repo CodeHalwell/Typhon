@@ -116,6 +116,13 @@ Compatibility, using the review's own taxonomy:
   folding a saturated constant into the artifact.
 - A deeply-nested generated expression no longer overflows the stack.
 - Symlink cycles under `src/` no longer hang the file collector.
+- **`tyc fmt` no longer splits an unparenthesised walrus** (`if n := len(xs):`
+  became `if n : = len(xs):`, destroying a working program in place).
+- **A hand-written `src/X.py` no longer overwrites the Python compiled from
+  `src/X.ty`** — the compiled output wins and the collision is warned about, so
+  the shipped program is the one `tyc check` validated.
+- **Build artifacts are written atomically**, so an interrupted build cannot
+  leave a persistent 0-byte `build/main.py` that CPython runs with exit 0.
 
 ### Known open
 
