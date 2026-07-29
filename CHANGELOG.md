@@ -56,6 +56,52 @@ rather than a silent one.
 
 ### Gates
 
+- **VM ↔ CPython differential gate** (`scripts/vm-differential.sh`, CI job
+  `differential`). The VM is contractually a drop-in for `tyc build` + CPython,
+  and nothing verified it. Every unit in `examples/` and `stress/` — 1130 of
+  them, covering all 1342 `.ty` files — is now built and run under
+  `python3.13`, run again through the VM, and its stdout and exit code
+  compared. Known divergences are pinned in
+  `scripts/differential-baseline.txt`; the gate fails both on a *new*
+  divergence and on a baseline entry that has stopped diverging, so the file
+  can only shrink. Full run ~75 s, network-free.
+
+  **The first run records 126 divergences.** The review estimated ~37. They
+  break down as 58 VM runtime errors, 32 missing stdlib shims, 9 unsupported
+  features — and **27 cases where both sides exit 0 and the VM simply prints
+  something different**, which is the class nothing else in the toolchain can
+  catch. Among them: `raise X from Y` loses `__cause__`; `@cached_property`
+  recomputes on every access; `functools.wraps` does not copy `__name__`;
+  `re.findall` with groups returns whole matches instead of tuples; a
+  module-level `lazy let` evaluates eagerly, reordering side effects;
+  `model_dump_json()` uses the wrong separators and `model` instances leak a
+  `model_config` field into their repr. Four of the sixteen `examples/apps/`
+  projects diverge.
+
+  Two coverage limits are reported explicitly rather than folded into the pass
+  count: 94 units "agree" only because both paths die on an uninstalled
+  third-party import (counted as `vacuous`, never as passes — closing that
+  needs a provisioned venv), and `stderr` is captured but not diffed, because
+  VM tracebacks legitimately point at `.ty` where CPython points at `.py`.
+  Documented in `docs/differential-testing.md`.
+- **Opt-in knob codegen matrix** (`scripts/knob-matrix.sh`, `tests/knobs/`, CI
+  job `knob-matrix`). `examples/` and `stress/` run entirely on default
+  configuration, so every opt-in codegen path shipped with no end-to-end
+  coverage at all. Twelve fixtures now cover `auto-memoise`, `auto-gather`,
+  `auto-parallel`, `auto-parallel-reductions`, `parallel-backend =
+  "interpreters"`, `pgo-memoise`, `[optimise] level = 1`,
+  `[emit] traceback-remap`, `[emit] model-extra`,
+  `[emit] skip-decoration-bases`, `[python] free-threaded`, and the PEP 810
+  lazy-import lowering. Each builds with the knob **on and off** and asserts
+  the rewrite fired, is absent from the control build, and leaves observable
+  behaviour byte-identical — so the assertions are provably knob-sensitive
+  rather than vacuously true.
+
+  Building it surfaced a real bug: **`tyc profile` writes profile keys as
+  `__main__.<fn>` while `pgo-memoise` looks them up as `main.<fn>`**, so a
+  profile a user actually generates never promotes anything in the entry
+  module. The fixture pins the codegen path with a hand-written profile; the
+  round-trip itself is still broken and is not yet fixed.
 - **Post-emit parse gate.** `tyc build` re-parses the Python it is about to
   write and fails if it does not parse, and no longer discards
   `format_source`'s `Err`. "Every `.ty` emits valid `.py`" was the central

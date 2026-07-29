@@ -1,0 +1,18 @@
+# `[emit] model-extra` is baked into every `model` class as
+# ConfigDict(extra=...). "allow" keeps unexpected keys, "ignore" drops them, so
+# unlike the optimisation knobs this one is DELIBERATELY observable — the
+# fixture therefore has no control-stdout equality expectation to satisfy
+# beyond what the driver derives from the marker sets.
+model Payload:
+    id: int
+    name: str
+
+
+def main() -> None:
+    let raw: dict[str, str] = {"id": "7", "name": "amy", "extra": "kept"}
+    let p: Payload = Payload.model_validate(raw)
+    print(p.id, p.name)
+
+
+if __name__ == "__main__":
+    main()

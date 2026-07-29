@@ -1,0 +1,1 @@
+@dataclasses.dataclass(slots=True)\nclass Button(WidgetBase):

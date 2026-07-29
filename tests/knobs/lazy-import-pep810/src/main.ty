@@ -1,0 +1,15 @@
+# `[python] target = "3.15"` lowers `lazy import` to CPython's native PEP 810
+# statement instead of the typhon_runtime proxy — so a project whose only
+# runtime-touching feature is a lazy import ships no generated runtime at all.
+# The emitted file is 3.15 syntax and cannot be executed by python3.13, so this
+# fixture is build-only (meta.conf: run=none); the control build pins the
+# 3.13 lowering it replaces.
+lazy import js = json
+
+
+def main() -> None:
+    print(js.dumps({"a": 1}))
+
+
+if __name__ == "__main__":
+    main()

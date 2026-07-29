@@ -27,6 +27,7 @@ The sub-docs below are extracted from the long-term plan for easier navigation. 
 | [install.md](install.md) | Installing the `tyc` binary (macOS / Linux / Windows) |
 | [vm.md](vm.md) | The in-process tree-walking VM behind `tyc run` |
 | [ty-integration.md](ty-integration.md) | The `tyc ty` / `[checker] external = "ty"` typeshed checker |
+| [differential-testing.md](differential-testing.md) | The VM ↔ CPython differential gate and the opt-in knob codegen matrix |
 | [diagnostics/](diagnostics/README.md) | One page per `tyc::` diagnostic code |
 | [roadmap.md](roadmap.md) | Phased delivery plan |
 | [risks.md](risks.md) | Risks and mitigations |

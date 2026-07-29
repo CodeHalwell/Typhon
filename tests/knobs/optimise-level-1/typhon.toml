@@ -1,0 +1,17 @@
+[project]
+name = "knob-optimise-level-1"
+version = "0.1.0"
+src = "src"
+out = "build"
+
+[python]
+target = "3.13"
+
+[emit]
+format = false
+
+[optimise]
+level = 1
+
+[strictness]
+suggest-gather = false

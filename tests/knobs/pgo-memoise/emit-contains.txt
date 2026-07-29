@@ -1,0 +1,1 @@
+@functools.cache\ndef hot(n: int) -> int:

@@ -217,6 +217,17 @@ imports in the entry point resolve correctly.
   VM mode (the descriptor-based proxy class the build path emits has
   nothing to bind against in a tree-walking VM) (v0.9.0).
 
+## Verifying the drop-in contract
+
+The VM is contractually a drop-in for `tyc build` + CPython: any difference in
+stdout or exit code between the two is a bug, not a documented limitation.
+`scripts/vm-differential.sh` is the CI gate that holds that contract — it builds
+and executes every unit in `examples/` and `stress/` both ways and diffs the
+results. Divergences that exist today are pinned in
+`scripts/differential-baseline.txt`, which the gate forces to only ever shrink.
+See [differential-testing.md](differential-testing.md); every entry in that
+baseline is a VM bug awaiting a fix.
+
 ## What the VM does not support yet
 
 Surface as `NotImplementedError` at runtime, with the feature name in the

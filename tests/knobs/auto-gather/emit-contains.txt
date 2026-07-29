@@ -1,0 +1,3 @@
+asyncio.TaskGroup()
+create_task(fetch_a())
+create_task(fetch_b())

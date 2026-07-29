@@ -1,0 +1,20 @@
+# `[python] target = "3.13t"` + `free-threaded = true` is one of the three `t`
+# targets that had no end-to-end coverage. The emitted Python must still run on
+# a stock GIL build of 3.13 — a free-threaded *target* changes which rewrites
+# are eligible, not which interpreter can execute the result.
+@pure
+def cube(x: int) -> int:
+    return x * x * x
+
+
+def main() -> None:
+    let xs: list[int] = [1, 2, 3, 4, 5]
+    print([cube(x) for x in xs])
+    mut total: int = 0
+    for x in xs:
+        total += cube(x)
+    print(total)
+
+
+if __name__ == "__main__":
+    main()

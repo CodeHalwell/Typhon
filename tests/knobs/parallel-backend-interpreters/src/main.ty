@@ -1,0 +1,17 @@
+# `[strictness] parallel-backend = "interpreters"` bakes a PEP 734
+# InterpreterPoolExecutor attempt into the generated typhon_runtime/parallel.py,
+# with a transparent fallback to the thread pool. The rewrite site is identical
+# to the "threads" backend, so only the generated runtime differs — and the
+# observable output must not.
+@pure
+def scale(x: int) -> int:
+    return x * 7
+
+
+def main() -> None:
+    let xs: list[int] = [1, 2, 3, 4, 5, 6]
+    print([scale(x) for x in xs])
+
+
+if __name__ == "__main__":
+    main()

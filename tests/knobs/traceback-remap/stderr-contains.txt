@@ -1,0 +1,2 @@
+src/main.ty", line 6, in boom
+IndexError: list index out of range
