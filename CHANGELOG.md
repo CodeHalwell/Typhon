@@ -190,6 +190,59 @@ rather than a silent one.
   `nonlocal`), which also stops a phantom local from entering the binding graph
   that LSP go-to-definition and the unused-import pass read.
 
+### Preprocessor internals
+
+- **One shared lexical mask.** `preprocess.rs` is a line-oriented rewriter in
+  which nearly every pass must answer the same three questions before it may
+  touch anything: is this byte inside a string literal or a comment, how deep
+  are the brackets, and does a new logical line start here. Each pass answered
+  them with its own hand-rolled scanner, and the copies drifted. Every drift
+  surfaced the same way — a rewrite firing inside a string literal, silently
+  mutating a program constant. That corruption happens *upstream of the AST*,
+  so it survives `tyc check`, `tyc build` and the new VM↔CPython gate alike:
+  all three consume the already-corrupted text.
+
+  A new `tyc-syntax::lexmask` module holds one scanner exposing
+  `in_string` / `in_comment` / `bracket_depth` / logical-line-start at byte and
+  line granularity, computed once per buffer. The enum-body rewrite, the
+  `with`-chain collector and renderer, the sealed-union `impl` probe,
+  `rename_whole_word` and the `gather:` dependency scan consult it, and the
+  three near-duplicate line scanners plus seven fragment scanners are now thin
+  wrappers over it — roughly 35 call sites on one state machine.
+
+  Verified as a pure refactor the strong way: emitted `build/` trees
+  (`main.py`, `typhon_runtime/`, `.sourcemaps/`) hashed per file across the
+  whole 1342-file corpus and all 16 multi-file example projects, against a
+  control binary differing only in these two files, are **byte-identical**.
+
+  Converting the scanners exposed four latent bugs that the drift had been
+  hiding:
+
+- **`gather:` no longer serialises a block because a binding's name appears
+  inside a string.** The dependency probe was a raw byte substring scan, so
+  `posts = fetch_posts("user")` was judged to depend on an earlier `user`
+  binding and the whole block fell back to sequential `await`s — the user asked
+  for concurrency and silently got none. Under `strategy="best-effort"` it was
+  worse than a missed optimisation: it discarded the requested strategy and
+  re-armed the failure mode that strategy exists to avoid. A reference inside an
+  f-string replacement field still counts as a real dependency, so nothing is
+  newly parallelised that shouldn't be.
+- **`with`-chain: string content can no longer be read as an `else` header, or
+  renamed.** A line of string content reading `    else foo:` at the chain
+  indent was consumed as a real `else err:` header, splitting the literal; and
+  `else`-body lines beginning inside a triple-quoted string had the user's error
+  binding renamed *inside* the literal.
+- **`enum` body: a bare word on a bracket-continuation line is no longer
+  rewritten as a member.** `RED = pick(\n    GREEN\n)` inside an `enum` body
+  turned the argument into `GREEN = enum.auto()`.
+
+  Roughly fourteen fragment scanners in the `?`-validation and pipe families are
+  deliberately left unconverted — none is named by the review item, several are
+  diagnostic validators where a semantic change would alter user-facing messages
+  rather than emitted code, and converting them here would have traded the
+  byte-identity guarantee for scope. Each is a `let mut in_str: Option<u8>`
+  fragment and easy to find.
+
 ### Preprocessor / emitter
 
 - **`?` in an `elif` or `while` condition no longer corrupts control flow.**
