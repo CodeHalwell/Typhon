@@ -124,6 +124,15 @@ struct Frame {
     /// Nesting of `{` *within* an open replacement field (dict displays,
     /// nested format specs), so the first inner `}` doesn't close the field.
     field_braces: u32,
+    /// `true` once past the field's top-level `:` — the format-spec portion,
+    /// where a quote is a literal spec character (the fill char in
+    /// `f"{v:'>8}"`), not a string opener, and a bracket is spec text, not
+    /// structure. Only a nested `{…}` field inside the spec is code again.
+    in_spec: bool,
+    /// Bracket depth at field entry. The spec-introducing `:` is only the
+    /// one at this depth with no `{` nesting, so the slice colon in
+    /// `f"{a[1:2]}"` does not start a spec.
+    field_entry_depth: i32,
 }
 
 /// Length in bytes of the UTF-8 character starting at `bytes[i]`.
@@ -197,6 +206,8 @@ where
             is_fstring: false,
             in_field: false,
             field_braces: 0,
+            in_spec: false,
+            field_entry_depth: 0,
         });
     }
 
@@ -242,6 +253,8 @@ where
                     if let Some(last) = stack.last_mut() {
                         last.in_field = true;
                         last.field_braces = 0;
+                        last.in_spec = false;
+                        last.field_entry_depth = *depth;
                     }
                     i += 1;
                     continue;
@@ -256,11 +269,27 @@ where
             }
 
             // ── Inside an f-string replacement field: bytes are code ─────
+            // …except in the format-spec portion (after the field's
+            // top-level `:`), where everything but a nested `{…}` field is
+            // literal spec text: `f"{v:'>8}"` pads with a quote and
+            // `f"{v:(>8}"` with a paren — neither opens a string or a
+            // bracket. Pushing a frame for such a quote opened a *phantom*
+            // string that masked the rest of the line (and, triple-shaped,
+            // the following lines), silently dropping later rewrites.
+            if top.in_spec && top.field_braces == 0 && b != b'{' && b != b'}' {
+                let n = char_len_at(bytes, i);
+                for k in 0..n {
+                    emit(i + k, ByteKind::FStringExpr, *depth);
+                }
+                i += n;
+                continue;
+            }
             match b {
                 b'}' if top.field_braces == 0 => {
                     emit(i, ByteKind::StringText, *depth);
                     if let Some(last) = stack.last_mut() {
                         last.in_field = false;
+                        last.in_spec = false;
                     }
                     i += 1;
                     continue;
@@ -283,6 +312,17 @@ where
                     i += 1;
                     continue;
                 }
+                b':' if top.field_braces == 0 && *depth == top.field_entry_depth => {
+                    // The field's top-level `:` starts the format spec. A
+                    // colon nested in brackets (`f"{a[1:2]}"`) or braces
+                    // (`f"{ {'k': 1} }"`) is expression code, not a spec.
+                    emit(i, ByteKind::FStringExpr, *depth);
+                    if let Some(last) = stack.last_mut() {
+                        last.in_spec = true;
+                    }
+                    i += 1;
+                    continue;
+                }
                 b'"' | b'\'' => {
                     let triple = i + 2 < bytes.len() && bytes[i + 1] == b && bytes[i + 2] == b;
                     emit(i, ByteKind::StringText, *depth);
@@ -295,6 +335,8 @@ where
                         is_fstring: has_fstring_prefix(bytes, i),
                         in_field: false,
                         field_braces: 0,
+                        in_spec: false,
+                        field_entry_depth: 0,
                     });
                     i += if triple { 3 } else { 1 };
                     continue;
@@ -356,6 +398,8 @@ where
                 is_fstring: has_fstring_prefix(bytes, i),
                 in_field: false,
                 field_braces: 0,
+                in_spec: false,
+                field_entry_depth: 0,
             });
             i += if triple { 3 } else { 1 };
             continue;
@@ -659,6 +703,82 @@ mod tests {
         let mask = LexMask::new(src);
         let e = src.find("err").unwrap();
         assert!(!mask.is_code(e));
+    }
+
+    #[test]
+    fn quote_fill_char_in_format_spec_is_not_a_string_opener() {
+        // `f"{v:'>8}"` pads with a literal `'` (valid CPython). Treating it
+        // as a string opener pushed a phantom frame that masked the rest of
+        // the line, so later rewrites (`?`, `as!`) on the same line were
+        // silently skipped and the emitted Python failed to parse.
+        let src = "let s: str = f\"{v:'>8}\" + name()\n";
+        let mask = LexMask::new(src);
+        let plus = src.find('+').unwrap();
+        assert!(
+            mask.is_structural_code(plus),
+            "code after the f-string must not be masked"
+        );
+        let name = src.find("name").unwrap();
+        assert!(mask.is_structural_code(name));
+        // The spec text itself is inside a literal, not structural code.
+        let fill = src.find("'>").unwrap();
+        assert!(!mask.is_structural_code(fill));
+    }
+
+    #[test]
+    fn triple_quote_shaped_format_spec_does_not_open_a_phantom_string() {
+        // `f"{v:'''}"` — three quote fill/spec chars must not open a
+        // phantom triple-quoted string that swallows the rest of the line
+        // (and the f-string's own terminator with it).
+        let src = "x = f\"{v:'''}\" + tail\ny = 1\n";
+        let mask = LexMask::new(src);
+        let plus = src.find('+').unwrap();
+        assert!(
+            mask.is_structural_code(plus),
+            "code after the f-string must not be masked"
+        );
+        assert!(!mask.line_starts_in_string(1));
+        assert!(mask.is_structural_code(src.find("y = 1").unwrap()));
+    }
+
+    #[test]
+    fn bracket_fill_char_in_format_spec_does_not_desync_depth() {
+        // `(` as the fill char is spec text, not an opening bracket;
+        // counting it would leave a bracket open across the line boundary
+        // and stop the next line from reading as a logical line start.
+        let src = "x = f\"{v:(>8}\"\ny = 1\n";
+        let mask = LexMask::new(src);
+        assert_eq!(mask.line_entry_depth(1), 0);
+        assert!(mask.is_logical_line_start(1));
+    }
+
+    #[test]
+    fn spec_rule_does_not_bleed_into_the_expression_portion() {
+        // A quote in the *expression* portion still opens a real string,
+        // and a slice colon inside brackets does not start the spec.
+        let src = "x = f\"{d['a:b'][1:2]:>8}\" + tail\n";
+        let mask = LexMask::new(src);
+        let key = src.find("a:b").unwrap();
+        assert!(!mask.is_code(key), "the subscript key is string text");
+        let spec = src.find(">8").unwrap();
+        assert!(!mask.is_structural_code(spec));
+        let plus = src.find('+').unwrap();
+        assert!(mask.is_structural_code(plus));
+    }
+
+    #[test]
+    fn nested_field_inside_a_format_spec_is_still_code() {
+        // `f"{v:{d['k']}>8}"` — the nested `{…}` inside the spec is a real
+        // replacement field: its quotes open strings and its expression is
+        // code, while the surrounding spec text stays inert.
+        let src = "x = f\"{v:{d['k']}>8}\" + tail\n";
+        let mask = LexMask::new(src);
+        let d = src.find("d[").unwrap();
+        assert!(mask.is_code(d));
+        let k = src.find('k').unwrap();
+        assert!(!mask.is_code(k), "the nested key is string text");
+        let plus = src.find('+').unwrap();
+        assert!(mask.is_structural_code(plus));
     }
 
     #[test]

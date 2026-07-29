@@ -36,11 +36,35 @@ pub fn c3_linearise(name: &str, parents: &HashMap<String, Vec<String>>) -> Optio
         name: &str,
         parents: &HashMap<String, Vec<String>>,
         stack: &mut Vec<String>,
+        memo: &mut HashMap<String, Option<Vec<String>>>,
     ) -> Option<Vec<String>> {
+        // A class's linearisation is a function of the (immutable) parents
+        // map alone, so a completed result — `Some` or `None` — is reused
+        // wherever the class reappears. Without this a chain of diamonds
+        // recomputes each shared base once per path through it and the walk
+        // is exponential; CPython is immune for the same reason (it caches
+        // per-class `__mro__`).
+        if let Some(cached) = memo.get(name) {
+            return cached.clone();
+        }
         // A cycle is not expressible in valid Python; bail rather than hang.
+        // The in-progress re-entry itself is not memoised — the enclosing
+        // frames record the `None` as they unwind (a class on a cycle, or
+        // above one, has no linearisation on any path).
         if stack.iter().any(|s| s == name) {
             return None;
         }
+        let result = compute(name, parents, stack, memo);
+        memo.insert(name.to_owned(), result.clone());
+        result
+    }
+
+    fn compute(
+        name: &str,
+        parents: &HashMap<String, Vec<String>>,
+        stack: &mut Vec<String>,
+        memo: &mut HashMap<String, Option<Vec<String>>>,
+    ) -> Option<Vec<String>> {
         let Some(bases) = parents.get(name) else {
             return Some(vec![name.to_owned()]);
         };
@@ -50,7 +74,7 @@ pub fn c3_linearise(name: &str, parents: &HashMap<String, Vec<String>>) -> Optio
         stack.push(name.to_owned());
         let mut sequences: Vec<Vec<String>> = Vec::with_capacity(bases.len() + 1);
         for b in bases {
-            match go(b, parents, stack) {
+            match go(b, parents, stack, memo) {
                 Some(seq) => sequences.push(seq),
                 None => {
                     stack.pop();
@@ -87,7 +111,7 @@ pub fn c3_linearise(name: &str, parents: &HashMap<String, Vec<String>>) -> Optio
             }
         }
     }
-    go(name, parents, &mut Vec::new())
+    go(name, parents, &mut Vec::new(), &mut HashMap::new())
 }
 
 /// The ancestors of `name` in the order `@dataclass` collects fields from
@@ -169,5 +193,38 @@ mod tests {
     fn cycle_declines_instead_of_hanging() {
         let g = graph(&[("A", &["B"]), ("B", &["A"])]);
         assert!(c3_linearise("A", &g).is_none());
+    }
+
+    #[test]
+    fn deep_diamond_chain_linearises_without_exponential_blowup() {
+        // D_k(A_k, B_k) with A_k and B_k both deriving D_{k-1}: without the
+        // per-class memo the recursion revisits D_{k-1} once per path — 2^n
+        // calls — and this test effectively hangs at n = 40 (~10^12 calls).
+        // CPython accepts and linearises the same hierarchy instantly.
+        let n = 40usize;
+        let mut pairs: Vec<(String, Vec<String>)> = vec![("D0".to_owned(), Vec::new())];
+        for k in 1..=n {
+            pairs.push((format!("D{k}"), vec![format!("A{k}"), format!("B{k}")]));
+            pairs.push((format!("A{k}"), vec![format!("D{}", k - 1)]));
+            pairs.push((format!("B{k}"), vec![format!("D{}", k - 1)]));
+        }
+        let g: HashMap<String, Vec<String>> = pairs.into_iter().collect();
+        let mro = c3_linearise(&format!("D{n}"), &g).expect("hierarchy is consistent");
+        // MRO is D_n, A_n, B_n, D_{n-1}, A_{n-1}, B_{n-1}, …, D0.
+        assert_eq!(mro.len(), 3 * n + 1);
+        assert_eq!(mro[0], format!("D{n}"));
+        assert_eq!(mro[1], format!("A{n}"));
+        assert_eq!(mro[2], format!("B{n}"));
+        assert_eq!(mro[3], format!("D{}", n - 1));
+        assert_eq!(*mro.last().unwrap(), "D0");
+        // And a cycle reachable from a diamond still declines (the memo must
+        // not turn the in-progress cycle probe into a cached success).
+        let g2 = graph(&[
+            ("Top", &["L", "R"]),
+            ("L", &["Loop"]),
+            ("R", &["Loop"]),
+            ("Loop", &["Top"]),
+        ]);
+        assert!(c3_linearise("Top", &g2).is_none());
     }
 }

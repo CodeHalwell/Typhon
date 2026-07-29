@@ -6056,14 +6056,21 @@ fn rewrite_first_compound_question_header(source: &str) -> Option<(String, Vec<u
         if mask.line_starts_in_string(i) {
             continue;
         }
-        let trimmed = line.trim_start();
+        // Probe only the *code* portion of the line: a `)?` or a `:` inside
+        // a trailing `#` comment is prose, not code. Reading the full line
+        // made `while n < limit:  # done (or not)? recheck: yes` — a valid
+        // header with no propagating `?` at all — trigger the rewrite and
+        // split at the comment's colon, corrupting a correct program.
+        let code_len = mask.line_code_end(i).min(line.len());
+        let code = &line[..code_len];
+        let trimmed = code.trim_start();
         let is_elif = trimmed.starts_with("elif ");
         let is_while = trimmed.starts_with("while ");
         if !is_elif && !is_while {
             continue;
         }
         // Only a *propagating* `?` matters; `T?` nullable sugar is not one.
-        if find_first_inline_propagation_q(line).is_none() {
+        if find_first_inline_propagation_q(code).is_none() {
             continue;
         }
         let indent = indent_width(line);
@@ -6074,10 +6081,13 @@ fn rewrite_first_compound_question_header(source: &str) -> Option<(String, Vec<u
             "while ".len()
         };
         let after_keyword = &trimmed[keyword_len..];
-        // The header ends at its trailing `:`; anything after it is a comment.
+        // The header ends at the last `:` of its code portion; the trailing
+        // comment (which may itself contain a colon) is carried over
+        // verbatim after the rebuilt header.
         let colon = after_keyword.rfind(':')?;
         let cond = after_keyword[..colon].trim_end();
-        let trailing = after_keyword[colon + 1..].trim_end();
+        let tail = format!("{}{}", &after_keyword[colon + 1..], &line[code_len..]);
+        let trailing = tail.trim_end();
 
         // The block this header owns: everything more-indented, plus (for an
         // `elif`) the sibling `elif` / `else` clauses that follow it, which
@@ -9070,6 +9080,45 @@ while next_val()? < 4:
         assert!(out.contains("while True:"), "got:\n{out}");
         assert!(out.contains("    if not (next_val()? < 4):"), "got:\n{out}");
         assert!(out.contains("        break"), "got:\n{out}");
+    }
+
+    #[test]
+    fn question_and_colon_inside_a_comment_do_not_trigger_a_header_rewrite() {
+        // A `)?` and a `:` inside the trailing comment are prose, not code:
+        // these headers carry no propagating `?` and must come through
+        // byte-identical. The comment-blind probe rewrote the `while` into
+        // `if not (n < limit:  # done (or not)? recheck): yes` — a hard
+        // parse error on a previously-correct program — and silently broke
+        // `while … else:` semantics (the loop only exited via the inserted
+        // `break`, so the `else` arm never ran).
+        for src in [
+            "while n < limit:  # done (or not)? recheck: yes\n    n = n + 1\n",
+            "if a:\n    x = 1\nelif b > 2:  # bigger (or not)? verdict: yes\n    x = 2\n",
+            "while n < 3:  # done? note: check\n    n = n + 1\nelse:\n    done = True\n",
+        ] {
+            assert_eq!(expand_compound_question_headers(src), src, "changed: {src}");
+        }
+    }
+
+    #[test]
+    fn header_comment_with_a_colon_is_carried_over_verbatim() {
+        // A *real* propagating `?` in the condition must split the header at
+        // its code colon, not at a colon inside the trailing comment.
+        let src = "while parse(b)? > 10:  # note: retry\n    n = n + 1\n";
+        let out = expand_compound_question_headers(src);
+        assert!(out.contains("while True:"), "got:\n{out}");
+        assert!(
+            out.contains("    if not (parse(b)? > 10):  # note: retry"),
+            "the comment must survive after the rebuilt header; got:\n{out}"
+        );
+        assert!(out.contains("        break"), "got:\n{out}");
+
+        let src = "if a:\n    x = 1\nelif parse(b)? > 10:  # note: retry\n    x = 2\n";
+        let out = expand_compound_question_headers(src);
+        assert!(
+            out.contains("    if parse(b)? > 10:  # note: retry"),
+            "the elif comment must survive after the rebuilt header; got:\n{out}"
+        );
     }
 
     #[test]

@@ -1255,15 +1255,22 @@ impl Emitter {
                                         ));
                                     }
                                     InterpolatedStringElement::Interpolation(interp) => {
-                                        self.open_interpolation(&interp.expression);
                                         // PEP 501 debug f-string: `f"{x=}"` carries
                                         // the verbatim `x=` text on `debug_text`,
                                         // including the surrounding whitespace
                                         // (`f"{x = }"`). Emit it as-is so the
                                         // `=` marker survives the round-trip.
+                                        // Verbatim text can never begin or end
+                                        // with a bare brace (that would have been
+                                        // the `{{` / `}}` escape in the source),
+                                        // so the brace-separation spaces must not
+                                        // fire — the debug output reproduces them
+                                        // verbatim at runtime.
                                         if let Some(dt) = &interp.debug_text {
+                                            self.write("{");
                                             self.write(dt.as_str());
                                         } else {
+                                            self.open_interpolation(&interp.expression);
                                             self.emit_expr(&interp.expression);
                                         }
                                         // Emit `!r` / `!s` / `!a` conversion flags
@@ -1271,7 +1278,8 @@ impl Emitter {
                                         // AST but carried on the `conversion`
                                         // field. Losing them silently changes
                                         // runtime output of `f"{x!r}"` etc.
-                                        if let Some(c) = interp.conversion.to_char() {
+                                        let conversion = interp.conversion.to_char();
+                                        if let Some(c) = conversion {
                                             self.write("!");
                                             self.write_char(c);
                                         }
@@ -1300,7 +1308,23 @@ impl Emitter {
                                                 }
                                             }
                                         }
-                                        self.close_interpolation(&interp.expression);
+                                        // The close separator only exists to keep
+                                        // the *expression's* trailing `}` from
+                                        // pairing with the closing brace into the
+                                        // `}}` escape. Debug text, a conversion,
+                                        // or a format spec already separates them
+                                        // — and a space added after those lands
+                                        // *inside* the conversion/spec (a
+                                        // SyntaxError after `!r`; format code
+                                        // `\x20` in a spec).
+                                        if interp.debug_text.is_some()
+                                            || conversion.is_some()
+                                            || interp.format_spec.is_some()
+                                        {
+                                            self.write("}");
+                                        } else {
+                                            self.close_interpolation(&interp.expression);
+                                        }
                                     }
                                 }
                             }
@@ -2366,6 +2390,103 @@ mod tests {
     fn round_trip(src: &str) -> String {
         let parsed = parse_module(src).expect("parse failed");
         emit(parsed.syntax())
+    }
+
+    /// Locate a Python 3.12+ interpreter on `PATH`; returns `None` to skip.
+    /// A bare `python3` is only accepted after a version probe (it may be
+    /// 3.11, which predates the PEP 701 f-string grammar these tests need).
+    /// `TYC_REQUIRE_PYTHON=1` turns the skip into a panic, matching the
+    /// `tyc` crate's execution-tier tests.
+    fn python() -> Option<String> {
+        for candidate in ["python3.13", "python3.12", "python3"] {
+            if let Ok(out) = std::process::Command::new(candidate)
+                .arg("--version")
+                .output()
+            {
+                if out.status.success() {
+                    let v = String::from_utf8_lossy(&out.stdout);
+                    if let Some(rest) = v.trim().strip_prefix("Python 3.") {
+                        if let Some(minor) = rest.split('.').next() {
+                            if let Ok(m) = minor.parse::<u32>() {
+                                if m >= 12 {
+                                    return Some(candidate.to_owned());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if std::env::var_os("TYC_REQUIRE_PYTHON").is_some() {
+            panic!("TYC_REQUIRE_PYTHON is set but no Python 3.12+ interpreter was found on PATH");
+        }
+        None
+    }
+
+    /// Run `code` under `py`, asserting a clean exit; returns stdout.
+    fn run_python(py: &str, code: &str) -> String {
+        let out = std::process::Command::new(py)
+            .arg("-c")
+            .arg(code)
+            .output()
+            .expect("failed to spawn python");
+        assert!(
+            out.status.success(),
+            "python rejected the code:\n{code}\nstderr:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+
+    #[test]
+    fn fstring_conversion_spec_and_debug_text_stay_flush_with_the_braces() {
+        // The brace-separation space must attach to the *expression*, never
+        // to a conversion / format spec / debug text: a space after `:spec`
+        // becomes format code `\x20` (ValueError at runtime), a space after
+        // `!r` is a SyntaxError, and synthetic spaces around debug text are
+        // reproduced verbatim in the program's output. Each emitted program
+        // is executed under a PEP 701-capable CPython (3.12+; `python3`
+        // alone may be 3.11 here) and must print exactly what the source
+        // prints.
+        let cases: [(&str, &str); 3] = [
+            // Expression ends with `}`, followed by a format spec.
+            (
+                "x = 7\nflag = True\nprint(f\"{x if flag else {} :>5}\")\n",
+                "    7\n",
+            ),
+            // PEP 501 debug text: the user's own separating space, nothing
+            // more, on both sides.
+            ("print(f\"{ {1, 2}=}\")\n", " {1, 2}={1, 2}\n"),
+            // Expression ends with `}`, followed by a conversion.
+            ("print(f\"{ {1, 2} !r}\")\n", "{1, 2}\n"),
+        ];
+        let spec_out = round_trip(cases[0].0);
+        assert!(
+            spec_out.contains("{}:>5}"),
+            "the spec must stay flush against the closing brace; got:\n{spec_out}"
+        );
+        let debug_out = round_trip(cases[1].0);
+        assert!(
+            debug_out.contains("f\"{ {1, 2}=}\""),
+            "debug text must be emitted verbatim with no synthetic spaces; got:\n{debug_out}"
+        );
+        let conv_out = round_trip(cases[2].0);
+        assert!(
+            conv_out.contains("{1, 2}!r}"),
+            "the conversion must stay flush on both sides; got:\n{conv_out}"
+        );
+        let Some(py) = python() else {
+            eprintln!("skipping execution tier: no Python 3.12+ on PATH");
+            return;
+        };
+        for (src, expected) in cases {
+            let emitted = round_trip(src);
+            assert_eq!(
+                run_python(&py, &emitted),
+                expected,
+                "emitted Python diverged from the source program:\n{emitted}"
+            );
+        }
     }
 
     #[test]

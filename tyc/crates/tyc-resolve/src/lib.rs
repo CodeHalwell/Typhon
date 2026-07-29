@@ -3503,8 +3503,9 @@ mod tests {
     /// the uninit marker on the first visit and flag the second.
     #[test]
     fn global_first_write_to_an_uninitialised_let_is_the_initialiser() {
-        let (_, d) =
-            resolve("let CONFIG: str\n\ndef go() -> None:\n    global CONFIG\n    CONFIG = \"b\"\n");
+        let (_, d) = resolve(
+            "let CONFIG: str\n\ndef go() -> None:\n    global CONFIG\n    CONFIG = \"b\"\n",
+        );
         assert!(
             !has_immutable_assign(&d),
             "the initialising write is not a reassignment; got {:?}",
