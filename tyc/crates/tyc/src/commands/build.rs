@@ -1105,11 +1105,14 @@ pub fn run(args: BuildArgs) -> Result<()> {
         // The AST's TextRange offsets land in `prep.python_source`, not
         // the user's `.ty` text, so the printer needs the preprocessed
         // buffer. O27 / FINDINGS #111.
-        let (mut python_src, line_offsets) = emit_python_with_source_for_target(
+        let (mut python_src, emitted_line_offsets) = emit_python_with_source_for_target(
             &desugar_output.module,
             target_minor,
             Some(&prep.python_source),
         );
+        // `line_offsets` must stay keyed to the buffer we actually write.
+        // The formatting step below can reflow lines, so it re-keys this.
+        let mut line_offsets = emitted_line_offsets;
 
         // Optionally normalise whitespace in the emitted Python (tabs → spaces,
         // trailing whitespace, final newline).  Full ruff-style reformatting
@@ -1128,6 +1131,22 @@ pub fn run(args: BuildArgs) -> Result<()> {
                     path.display()
                 )
             })?;
+            // Re-key the source-map offsets onto the formatted text.
+            //
+            // `format_source` runs two line-count-changing passes: the
+            // in-process whitespace normaliser (which collapses runs of
+            // 3+ blank lines and inserts PEP 8 blank lines before
+            // top-level `def`/`class`) and, when `ruff` is on `$PATH`,
+            // `ruff format` — which additionally wraps long calls and
+            // signatures across several lines and joins short ones. Both
+            // shift every subsequent entry of the emitter's table
+            // relative to the file on disk, so `tyc trace`,
+            // `tyc debug --break` and `[emit] traceback-remap` reported
+            // lines that drifted further out the deeper into the file
+            // the frame was. Diffing the two buffers recovers the
+            // correspondence without the formatter having to report it.
+            line_offsets =
+                remap_line_offsets_through_format(&line_offsets, &python_src, &result.output);
             python_src = result.output;
         }
 
@@ -2339,6 +2358,305 @@ fn chain_step(stage: &mut (String, Vec<usize>), pass: fn(&str) -> (String, Vec<u
     let (text, step_map) = pass(&stage.0);
     stage.1 = compose_line_maps(&step_map, &stage.1);
     stage.0 = text;
+}
+
+/// Recursion budget for [`align_range`].
+///
+/// Each level consumes at least one anchor line from both buffers, so the
+/// depth is bounded by the file length anyway; the cap only exists so a
+/// pathological input degrades to the proportional fill instead of
+/// recursing thousands of frames deep on the CLI's worker stack.
+const ALIGN_MAX_DEPTH: usize = 32;
+
+/// Align the lines of a formatted buffer back onto the buffer it was
+/// formatted from.
+///
+/// `tyc-emit` records one source offset per line of the Python it prints,
+/// but with `[emit] format = true` that buffer is then handed to the
+/// whitespace normaliser and (when `ruff` is on `$PATH`) to `ruff format`,
+/// either of which can insert, delete, join or wrap lines. The offsets
+/// therefore describe a file that is *not* the one written to disk, and
+/// every entry after the first reflow is shifted — the further into the
+/// file, the worse. Consumers (`tyc trace`, `tyc debug --break`,
+/// `[emit] traceback-remap`, `ty` re-attribution) all index the sidecar by
+/// the line number CPython reports for the file on disk, so the table has
+/// to be keyed to the formatted text.
+///
+/// The returned vector has one entry per line of `after`, holding the
+/// 0-based index of the `before` line it came from. Composing it with the
+/// emitter's table re-keys the whole map onto the formatted buffer.
+///
+/// The alignment is a patience diff: exact common prefix / suffix first
+/// (the overwhelmingly common case — most files come back byte-identical,
+/// which this resolves in one linear scan), then lines that occur exactly
+/// once in both remaining ranges are taken as anchors via a longest
+/// increasing subsequence, and the gaps between anchors recurse. A gap
+/// with no anchors is distributed proportionally, which is exactly right
+/// for the shape that motivates this: one long statement wrapped across
+/// several output lines has a one-line `before` gap, so every wrapped
+/// line lands on it.
+fn align_formatted_lines(before: &[&str], after: &[&str]) -> Vec<usize> {
+    let mut out = vec![0usize; after.len()];
+    if before.is_empty() || after.is_empty() {
+        return out;
+    }
+    align_range(before, after, 0, before.len(), 0, after.len(), 0, &mut out);
+    out
+}
+
+/// Align `after[a0..a1)` onto `before[b0..b1)`, writing into `out`.
+#[allow(clippy::too_many_arguments)]
+fn align_range(
+    before: &[&str],
+    after: &[&str],
+    mut b0: usize,
+    mut b1: usize,
+    mut a0: usize,
+    mut a1: usize,
+    depth: usize,
+    out: &mut [usize],
+) {
+    while b0 < b1 && a0 < a1 && before[b0] == after[a0] {
+        out[a0] = b0;
+        b0 += 1;
+        a0 += 1;
+    }
+    while b1 > b0 && a1 > a0 && before[b1 - 1] == after[a1 - 1] {
+        b1 -= 1;
+        a1 -= 1;
+        out[a1] = b1;
+    }
+    if a0 >= a1 {
+        // Nothing left on the formatted side: any surviving `before`
+        // lines were deleted by the formatter and simply have no entry.
+        return;
+    }
+    if b0 >= b1 {
+        // Pure insertion (a blank line the formatter added, say).
+        // Attribute it to the nearest surviving neighbour, preferring the
+        // line above so an inserted blank before a `def` keeps naming the
+        // statement it follows rather than jumping ahead.
+        let anchor = if b0 > 0 { b0 - 1 } else { 0 };
+        for slot in out.iter_mut().take(a1).skip(a0) {
+            *slot = anchor;
+        }
+        return;
+    }
+    if depth < ALIGN_MAX_DEPTH {
+        let anchors = patience_anchors(before, after, b0, b1, a0, a1);
+        if !anchors.is_empty() {
+            let mut prev_b = b0;
+            let mut prev_a = a0;
+            for (bi, ai) in anchors {
+                align_range(before, after, prev_b, bi, prev_a, ai, depth + 1, out);
+                out[ai] = bi;
+                prev_b = bi + 1;
+                prev_a = ai + 1;
+            }
+            align_range(before, after, prev_b, b1, prev_a, a1, depth + 1, out);
+            return;
+        }
+    }
+    if align_gap_by_content(before, after, b0, b1, a0, a1, out) {
+        return;
+    }
+    let bn = b1 - b0;
+    let an = a1 - a0;
+    for (k, slot) in out.iter_mut().take(a1).skip(a0).enumerate() {
+        *slot = b0 + (k * bn / an).min(bn - 1);
+    }
+}
+
+/// Bytes the formatter may insert or delete without that counting as a
+/// divergence: the brackets it adds when wrapping an expression across
+/// lines, the ones it drops when a redundant pair becomes unnecessary,
+/// and the "magic trailing comma" it appends to a wrapped argument list.
+fn is_formatter_punctuation(b: u8) -> bool {
+    matches!(b, b'(' | b')' | b',')
+}
+
+/// Align an anchor-less gap by walking both sides' non-whitespace bytes
+/// in lockstep.
+///
+/// Two adjacent statements that a formatter both wraps produce one gap
+/// with no line-level anchor in it, and splitting such a gap
+/// proportionally lands lines on the wrong statement. Reflowing does not
+/// reorder or rewrite code, though — it only moves whitespace and adds or
+/// removes the punctuation above — so the two byte streams still match
+/// almost exactly. Each formatted line takes the `before` line that owns
+/// the first byte it matched; a line that matched nothing (a blank, or a
+/// bracket the walk skipped as an insertion) inherits its predecessor,
+/// which is what a wrapped continuation line wants.
+///
+/// Returns `false`, leaving `out` untouched, on any divergence reflowing
+/// cannot explain (a quote-style or numeric-literal normalisation, say).
+/// The caller then falls back to the proportional split rather than
+/// trusting a walk that has lost sync.
+#[allow(clippy::too_many_arguments)]
+fn align_gap_by_content(
+    before: &[&str],
+    after: &[&str],
+    b0: usize,
+    b1: usize,
+    a0: usize,
+    a1: usize,
+    out: &mut [usize],
+) -> bool {
+    fn stream(lines: &[&str], lo: usize, hi: usize) -> Vec<(u8, usize)> {
+        let mut v = Vec::new();
+        for (i, line) in lines.iter().enumerate().take(hi).skip(lo) {
+            v.extend(
+                line.bytes()
+                    .filter(|b| !b.is_ascii_whitespace())
+                    .map(|b| (b, i)),
+            );
+        }
+        v
+    }
+    let bs = stream(before, b0, b1);
+    let as_ = stream(after, a0, a1);
+    if bs.is_empty() || as_.is_empty() {
+        return false;
+    }
+
+    let mut first: Vec<Option<usize>> = vec![None; a1 - a0];
+    let mut i = 0usize;
+    let mut j = 0usize;
+    while i < as_.len() {
+        let (ac, aline) = as_[i];
+        if j < bs.len() && bs[j].0 == ac {
+            first[aline - a0].get_or_insert(bs[j].1);
+            i += 1;
+            j += 1;
+            continue;
+        }
+        if j >= bs.len() {
+            // A tail the formatter added — the closing bracket of a
+            // wrapped call on a line of its own. It belongs to the last
+            // statement of the gap.
+            first[aline - a0].get_or_insert(b1 - 1);
+            i += 1;
+            continue;
+        }
+        if is_formatter_punctuation(ac) {
+            i += 1;
+            continue;
+        }
+        if is_formatter_punctuation(bs[j].0) {
+            j += 1;
+            continue;
+        }
+        return false;
+    }
+
+    let mut last = b0;
+    for (k, slot) in out.iter_mut().take(a1).skip(a0).enumerate() {
+        if let Some(b) = first[k] {
+            last = b;
+        }
+        *slot = last;
+    }
+    true
+}
+
+/// Anchor pairs for a patience diff over `before[b0..b1)` / `after[a0..a1)`.
+///
+/// A candidate is a line that appears exactly once in each range and is
+/// equal on both sides; the returned pairs are the longest increasing
+/// subsequence of those candidates, so they are strictly increasing in
+/// both indices and can be used to split the ranges. Blank lines are
+/// never unique in a real file, so they self-exclude — which is what we
+/// want, since matching them carries no information.
+fn patience_anchors(
+    before: &[&str],
+    after: &[&str],
+    b0: usize,
+    b1: usize,
+    a0: usize,
+    a1: usize,
+) -> Vec<(usize, usize)> {
+    // `(count, first index)` per distinct line, for each side.
+    let mut b_seen: HashMap<&str, (u32, usize)> = HashMap::new();
+    for (i, line) in before.iter().enumerate().take(b1).skip(b0) {
+        b_seen
+            .entry(line)
+            .and_modify(|e| e.0 += 1)
+            .or_insert((1, i));
+    }
+    let mut a_seen: HashMap<&str, (u32, usize)> = HashMap::new();
+    for (i, line) in after.iter().enumerate().take(a1).skip(a0) {
+        a_seen
+            .entry(line)
+            .and_modify(|e| e.0 += 1)
+            .or_insert((1, i));
+    }
+
+    // Candidates ordered by `before` index; each carries its `after` index.
+    let mut candidates: Vec<(usize, usize)> = b_seen
+        .iter()
+        .filter(|(_, &(count, _))| count == 1)
+        .filter_map(|(line, &(_, bi))| match a_seen.get(line) {
+            Some(&(1, ai)) => Some((bi, ai)),
+            _ => None,
+        })
+        .collect();
+    if candidates.is_empty() {
+        return Vec::new();
+    }
+    candidates.sort_unstable();
+
+    // Longest increasing subsequence over the `after` indices (patience
+    // sorting): `tails[k]` is the candidate index ending the best length-
+    // `k+1` chain found so far, `prev` threads the chain backwards.
+    let mut tails: Vec<usize> = Vec::new();
+    let mut tail_values: Vec<usize> = Vec::new();
+    let mut prev: Vec<Option<usize>> = vec![None; candidates.len()];
+    for (idx, &(_, ai)) in candidates.iter().enumerate() {
+        let pos = tail_values.partition_point(|&v| v < ai);
+        prev[idx] = if pos > 0 { Some(tails[pos - 1]) } else { None };
+        if pos == tails.len() {
+            tails.push(idx);
+            tail_values.push(ai);
+        } else {
+            tails[pos] = idx;
+            tail_values[pos] = ai;
+        }
+    }
+
+    let mut chain = Vec::with_capacity(tails.len());
+    let mut cursor = tails.last().copied();
+    while let Some(idx) = cursor {
+        chain.push(candidates[idx]);
+        cursor = prev[idx];
+    }
+    chain.reverse();
+    chain
+}
+
+/// Re-key `line_offsets` (one entry per line of the *emitted* Python) onto
+/// the formatted buffer that is actually written to disk.
+///
+/// Returns one entry per line of `formatted`. See
+/// [`align_formatted_lines`] for why this is needed.
+fn remap_line_offsets_through_format(
+    line_offsets: &[usize],
+    unformatted: &str,
+    formatted: &str,
+) -> Vec<usize> {
+    if unformatted == formatted {
+        return line_offsets.to_vec();
+    }
+    let before: Vec<&str> = unformatted.lines().collect();
+    let after: Vec<&str> = formatted.lines().collect();
+    let alignment = align_formatted_lines(&before, &after);
+    // `line_offsets` has one entry per emitted line; a formatted line that
+    // aligns past its end can only come from trailing synthesised text, so
+    // clamp to the last known offset rather than dropping the entry.
+    let fallback = line_offsets.last().copied().unwrap_or(0);
+    alignment
+        .iter()
+        .map(|&i| line_offsets.get(i).copied().unwrap_or(fallback))
+        .collect()
 }
 
 /// Build a v2 `.py.map` JSON body with a full `lines` table.

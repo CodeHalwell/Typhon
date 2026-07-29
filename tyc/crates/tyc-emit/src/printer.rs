@@ -128,18 +128,33 @@ impl Emitter {
 
     fn write(&mut self, s: &str) {
         self.output.push_str(s);
+        // A newline can reach the output from *inside* a token, not just
+        // from `writeln` / `newline`: a triple-quoted docstring, or any
+        // string literal the printer re-emits verbatim, carries real
+        // newlines. Each one still ends an output line, so it needs its
+        // own `line_offsets` entry — otherwise the table is shorter than
+        // the file it describes and every entry after the literal names
+        // a line one-too-early, permanently, for the rest of the module.
+        for _ in s.bytes().filter(|&b| b == b'\n') {
+            self.line_offsets.push(self.current_input_offset);
+        }
     }
 
     fn write_char(&mut self, c: char) {
         self.output.push(c);
+        if c == '\n' {
+            self.line_offsets.push(self.current_input_offset);
+        }
     }
 
     fn write_hex_escape(&mut self, byte: u8) {
+        // Always emits `\xNN` (an escape *sequence*, two literal
+        // characters) — never a raw newline — so no offset bookkeeping.
         push_hex_escape(&mut self.output, byte);
     }
 
     fn writeln(&mut self, s: &str) {
-        self.output.push_str(s);
+        self.write(s);
         self.line_offsets.push(self.current_input_offset);
         self.output.push('\n');
     }
@@ -147,6 +162,27 @@ impl Emitter {
     fn newline(&mut self) {
         self.line_offsets.push(self.current_input_offset);
         self.output.push('\n');
+    }
+
+    /// Make `range` the source provenance of every output line printed
+    /// from here until the next call.
+    ///
+    /// `emit_stmt` calls this once per statement, which is only
+    /// *statement*-level granularity: a compound statement prints several
+    /// header lines of its own (a `case` clause, an `elif`, an `except`, a
+    /// decorator) and each of those used to inherit the offset of whatever
+    /// was printed before it — typically the last line of the preceding
+    /// body, so a `case Square(s):` header resolved to the `return` above
+    /// it. The sub-statement clauses carry their own `TextRange`, so they
+    /// call this too and name the line the user actually wrote.
+    ///
+    /// Synthesised nodes (produced by the desugar pass) carry a
+    /// zero-length `TextRange`; those are ignored so they inherit the last
+    /// known real offset rather than resetting to the top of the file.
+    fn set_input_offset(&mut self, range: ruff_text_size::TextRange) {
+        if u32::from(range.start()) != u32::from(range.end()) {
+            self.current_input_offset = u32::from(range.start()) as usize;
+        }
     }
 
     /// Append newlines until `self.output` ends in *at least* `count`
@@ -316,9 +352,7 @@ impl Emitter {
         // zero-length TextRange::default(); we skip those so they inherit
         // the last real offset rather than resetting to 0.
         let range = node.range();
-        if u32::from(range.start()) != u32::from(range.end()) {
-            self.current_input_offset = u32::from(range.start()) as usize;
-        }
+        self.set_input_offset(range);
         // PEP 8: surround top-level class/def with two blank lines.  We
         // enforce this on either side of the block by checking both the
         // current statement and the previous top-level one.  Two blank
@@ -340,10 +374,19 @@ impl Emitter {
                     self.newline();
                 }
                 for decorator in &f.decorator_list {
+                    // Each decorator is its own source line. Ruff's
+                    // `StmtFunctionDef.range` starts at the first `@`, so
+                    // without this the whole decorator stack *and* the
+                    // `def` line all resolved to the first decorator.
+                    self.set_input_offset(decorator.range);
                     self.fill("@");
                     self.emit_expr(&decorator.expression);
                     self.newline();
                 }
+                // The identifier sits on the `def` line, so its range
+                // recovers the header's own provenance after the
+                // decorators above moved the cursor.
+                self.set_input_offset(f.name.range());
                 if f.is_async {
                     self.fill("async def ");
                 } else {
@@ -381,10 +424,13 @@ impl Emitter {
                     self.newline();
                 }
                 for decorator in &c.decorator_list {
+                    // See the `FunctionDef` arm: a decorator owns its line.
+                    self.set_input_offset(decorator.range);
                     self.fill("@");
                     self.emit_expr(&decorator.expression);
                     self.newline();
                 }
+                self.set_input_offset(c.name.range());
                 self.fill("class ");
                 self.write(c.name.as_str());
                 let lowering = self.lower_pep695();
@@ -599,6 +645,10 @@ impl Emitter {
                 self.emit_body(&i.body);
                 self.leave_block();
                 for clause in &i.elif_else_clauses {
+                    // An `elif` / `else` header is a source line of its
+                    // own; without this it inherited the offset of the
+                    // last statement of the preceding branch's body.
+                    self.set_input_offset(clause.range);
                     match &clause.test {
                         Some(test) => {
                             self.fill("elif ");
@@ -1633,6 +1683,10 @@ impl Emitter {
 
     fn emit_except_handler(&mut self, handler: &ExceptHandler, star: bool) {
         let ExceptHandler::ExceptHandler(h) = handler;
+        // The handler header is its own source line; inheriting the
+        // offset left behind by the `try` body pointed it at the last
+        // statement of that body.
+        self.set_input_offset(h.range);
         if star {
             self.fill("except*");
         } else {
@@ -1653,6 +1707,11 @@ impl Emitter {
     }
 
     fn emit_match_case(&mut self, case: &MatchCase) {
+        // A `case` clause header is a source line of its own. Without
+        // this it inherited the offset of the previous arm's last
+        // statement, so `case Square(s):` resolved to the `return` above
+        // it — the canonical symptom of statement-level granularity.
+        self.set_input_offset(case.range);
         self.fill("case ");
         self.emit_pattern(&case.pattern);
         if let Some(guard) = &case.guard {

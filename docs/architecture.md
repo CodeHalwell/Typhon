@@ -110,14 +110,20 @@ Express each analysis as a Salsa query: `parse(file)`, `resolve(module)`, `infer
 
 Pipeline: Typhon AST → desugar to plain Python AST → `tyc-emit` hand-written printer → `ruff format` post-process (when `[emit] format = true`). Emitted files carry a generated-header comment.
 
-Source maps mapping `.py` lines back to `.ty` are written as a sidecar `.py.map` file. The v2 format stores an `(out_line → ty_line)` table, built by composing **two** maps:
+Source maps mapping `.py` lines back to `.ty` are written as a sidecar `.py.map` file. The v2 format stores an `(out_line → ty_line)` table, built by composing **three** maps:
 
-1. `tyc-emit`'s printer records a `line_offsets` table as it prints each statement, giving `out_line → preprocessed_line`.
-2. Each line-count-changing preprocessor pass returns its own `preprocessed_line → input_line` table from a `*_mapped` variant (`expand_pipes_mapped`, `expand_gather_blocks_mapped`, …); `tyc build` folds them with `compose_line_maps` to get `preprocessed_line → ty_line`.
+1. `tyc-emit`'s printer records a `line_offsets` table as it prints, giving `out_line → preprocessed_line`.
+2. When `[emit] format = true`, the emitted buffer is reflowed before it is written, so `tyc build` diffs the pre- and post-format text (`align_formatted_lines` in `commands/build.rs`) to get `formatted_line → emitted_line` and re-keys (1) through it.
+3. Each line-count-changing preprocessor pass returns its own `preprocessed_line → input_line` table from a `*_mapped` variant (`expand_pipes_mapped`, `expand_gather_blocks_mapped`, …); `tyc build` folds them with `compose_line_maps` to get `preprocessed_line → ty_line`.
 
-Both halves are required. Before v1.0.0-alpha.7 only the first existed and its values were written out directly, so the table named lines of the preprocessed buffer — which for any file using `?`, `gather:`, a `with`-chain, `rescue`, pipes or typed unpack is a different, longer file than the one the user wrote, frequently past its EOF.
+All three are required, and each was missing at some point:
 
-The plain entry points (`expand_pipes(s) -> String`) are thin wrappers over the mapped variants, so a consumer that does not need provenance — the VM, `tyc check`, the REPL — is unaffected.
+- Before v1.0.0-alpha.7 only (1) existed and its values were written out directly, so the table named lines of the preprocessed buffer — which for any file using `?`, `gather:`, a `with`-chain, `rescue`, pipes or typed unpack is a different, longer file than the one the user wrote, frequently past its EOF.
+- (2) closes the other end of the same gap. The offsets are recorded *as the printer prints*, so they cannot be recorded against the formatted text directly; both the in-process whitespace normaliser (which collapses runs of 3+ blank lines and inserts PEP 8 blank lines before top-level `def`/`class`) and `ruff format` (which wraps long calls and signatures, and joins short ones) then shift every subsequent entry relative to the file on disk. The alignment is a patience diff: exact common prefix/suffix, then lines unique-and-equal in both remaining ranges as anchors via a longest increasing subsequence, recursing into the gaps. A gap with no anchors is distributed proportionally, which is exactly right for the motivating shape — one statement wrapped across several output lines has a one-line `before` gap, so every wrapped line lands on it.
+
+`tyc-emit`'s half is **sub-statement** granular. `emit_stmt` sets the active offset from the statement's `TextRange`, but a compound statement prints header lines of its own that would otherwise inherit whatever was printed before them (a `case Square(s):` clause resolving to the `return` above it). Each such clause sets its own offset from its own range: `match` cases, `elif`/`else` clauses, `except` handlers, every decorator in a stack, and the `def`/`class` header itself — Ruff's `StmtFunctionDef.range` starts at the first `@`, so the header recovers its line from the name's range. Synthesised nodes carry a zero-length range and are skipped, so they inherit the last real offset rather than resetting to the top of the file.
+
+The plain preprocessor entry points (`expand_pipes(s) -> String`) are thin wrappers over the mapped variants, so a consumer that does not need provenance — the VM, `tyc check`, the REPL — is unaffected.
 
 The composed table is **not** monotonic in general: a `with`-chain copies its `else` body into each binding's guard, so those output lines point back to a line above their neighbours. Do not assume monotonicity when consuming it.
 

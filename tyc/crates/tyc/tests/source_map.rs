@@ -21,19 +21,79 @@ fn tyc() -> Command {
 
 /// Write a minimal `typhon.toml` + `src/main.ty` under `dir`.
 ///
-/// `format = false` keeps `ruff format` out of the picture: the emitter's
-/// `(out_line -> source offset)` table is recorded before formatting, so a
-/// reflow would shift the emitted lines out from under the map for reasons
-/// that have nothing to do with what these tests measure.
+/// `format = false` isolates the emitter's own `(out_line -> source
+/// offset)` table. The formatting stage is covered separately by
+/// [`scaffold_formatted`].
 fn scaffold(dir: &Path, src_content: &str) {
+    scaffold_with_format(dir, src_content, false);
+}
+
+/// Like [`scaffold`] but with `[emit] format = true` — the default whenever
+/// `ruff` is on `$PATH`, and the configuration the shipped artifacts are
+/// built with.
+fn scaffold_formatted(dir: &Path, src_content: &str) {
+    scaffold_with_format(dir, src_content, true);
+}
+
+fn scaffold_with_format(dir: &Path, src_content: &str, format: bool) {
     std::fs::create_dir_all(dir.join("src")).unwrap();
+    let format = if format { "true" } else { "false" };
     std::fs::write(
         dir.join("typhon.toml"),
-        "[project]\nname = \"test\"\nversion = \"0.1.0\"\nsrc = \"src\"\nout = \"build\"\n\
-         [python]\ntarget = \"3.13\"\n[emit]\nformat = false\n[strictness]\n[env]\n",
+        format!(
+            "[project]\nname = \"test\"\nversion = \"0.1.0\"\nsrc = \"src\"\nout = \"build\"\n\
+             [python]\ntarget = \"3.13\"\n[emit]\nformat = {format}\n[strictness]\n[env]\n"
+        ),
     )
     .unwrap();
     std::fs::write(dir.join("src").join("main.ty"), src_content).unwrap();
+}
+
+/// Whether a `ruff` binary is on `$PATH`.
+///
+/// The formatting tests below assert facts that hold with or without it,
+/// but only `ruff format` actually *reflows* — wraps a long signature,
+/// joins a short call — so the assertions that pin the reflow behaviour
+/// are gated on its presence rather than silently weakening.
+fn ruff_available() -> bool {
+    Command::new("ruff")
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// Locate a Python 3.12+ interpreter, mirroring `tests/build_features.rs`.
+/// `TYC_REQUIRE_PYTHON` turns the skip into a panic so CI cannot report a
+/// pass for a test tier that never ran.
+fn python() -> Option<String> {
+    for candidate in ["python3.13", "python3.12", "python3"] {
+        let Ok(out) = Command::new(candidate).arg("--version").output() else {
+            continue;
+        };
+        if !out.status.success() {
+            continue;
+        }
+        let v = String::from_utf8_lossy(&out.stdout);
+        if let Some(minor) = v
+            .trim()
+            .strip_prefix("Python 3.")
+            .and_then(|rest| rest.split('.').next())
+            .and_then(|m| m.parse::<u32>().ok())
+        {
+            if minor >= 12 {
+                return Some(candidate.to_owned());
+            }
+        }
+    }
+    if std::env::var_os("TYC_REQUIRE_PYTHON").is_some() {
+        panic!(
+            "TYC_REQUIRE_PYTHON is set but no Python 3.12+ interpreter was found on PATH. \
+             This test executes the emitted Python; skipping it would report a pass for a \
+             tier of the suite that never ran."
+        );
+    }
+    None
 }
 
 /// Build `dir` and return `(emitted Python lines, map `lines` table)`.
@@ -300,5 +360,339 @@ def load(payload: dict[str, str]) -> Result[int, str]:
         mapped_lines_for(&py, &map, "double(double(n))"),
         vec![ty_line_of(SRC, "|> double() |> double()")],
         "a lowered pipe chain must map to the line it was written on"
+    );
+}
+
+// ── sub-statement granularity ────────────────────────────────────────────────
+
+#[test]
+fn match_case_headers_map_to_their_own_ty_line() {
+    // The emitter recorded the source offset that was "active" when a line
+    // was printed, and only `emit_stmt` ever set one — so a `case` clause
+    // header inherited the offset of the *preceding arm's last statement*.
+    // `case Square(side):` resolved to the `return` above it.
+    const SRC: &str = "\
+class Circle frozen:
+    radius: float
+
+class Square frozen:
+    side: float
+
+type Shape = Circle | Square
+
+def area(s: Shape) -> float:
+    match s:
+        case Circle(r):
+            return 3.14 * r * r
+        case Square(side):
+            return side * side
+";
+    let tmp = tempfile::tempdir().unwrap();
+    scaffold(tmp.path(), SRC);
+    let (py, map) = build_and_load(tmp.path());
+
+    assert_in_range(&map, SRC);
+    assert_eq!(
+        mapped_lines_for(&py, &map, "case Circle(r):"),
+        vec![ty_line_of(SRC, "case Circle(r):")],
+        "the first `case` header must name its own line, not `match s:`"
+    );
+    assert_eq!(
+        mapped_lines_for(&py, &map, "case Square(side):"),
+        vec![ty_line_of(SRC, "case Square(side):")],
+        "the second `case` header must name its own line, not the `return` above it"
+    );
+    // The arm bodies must not have moved.
+    assert_eq!(
+        mapped_lines_for(&py, &map, "return 3.14 * r * r"),
+        vec![ty_line_of(SRC, "return 3.14 * r * r")]
+    );
+    assert_eq!(
+        mapped_lines_for(&py, &map, "return side * side"),
+        vec![ty_line_of(SRC, "return side * side")]
+    );
+}
+
+#[test]
+fn clause_headers_and_decorators_map_to_their_own_ty_line() {
+    // Same defect, the rest of the compound-statement surface: `elif` /
+    // `else` clause headers, `except` handlers, and each decorator in a
+    // stack. Ruff's `StmtFunctionDef.range` starts at the first `@`, so
+    // without a per-decorator offset the whole stack *and* the `def` line
+    // collapsed onto the first decorator.
+    const SRC: &str = "\
+import functools
+
+@functools.cache
+@functools.wraps(int)
+def classify(n: int) -> str:
+    if n < 0:
+        return \"neg\"
+    elif n == 0:
+        return \"zero\"
+    else:
+        return \"pos\"
+
+def guarded(raw: str) -> int:
+    try:
+        return int(raw)
+    except ValueError:
+        return -1
+    except TypeError:
+        return -2
+";
+    let tmp = tempfile::tempdir().unwrap();
+    scaffold(tmp.path(), SRC);
+    let (py, map) = build_and_load(tmp.path());
+
+    assert_in_range(&map, SRC);
+
+    for needle in [
+        "@functools.cache",
+        "@functools.wraps(int)",
+        "elif n == 0:",
+        "except ValueError:",
+        "except TypeError:",
+    ] {
+        assert_eq!(
+            mapped_lines_for(&py, &map, needle),
+            vec![ty_line_of(SRC, needle)],
+            "`{needle}` must map to the line it was written on"
+        );
+    }
+
+    // The `def` header follows its decorator stack rather than collapsing
+    // onto the first `@`.
+    assert_eq!(
+        mapped_lines_for(&py, &map, "def classify(n: int)"),
+        vec![ty_line_of(SRC, "def classify(n: int)")],
+        "the `def` line must map to itself, not to the first decorator"
+    );
+    // The `else:` of the if-chain names its own line. It shares the token
+    // with nothing else in this file, so match on the exact indented form.
+    let else_lines: Vec<usize> = py
+        .iter()
+        .enumerate()
+        .filter(|(_, l)| l.trim_end() == "    else:")
+        .map(|(i, _)| map[i])
+        .collect();
+    assert_eq!(
+        else_lines,
+        vec![ty_line_of(SRC, "    else:")],
+        "the `else:` header must name its own line, not the `return` above it"
+    );
+}
+
+// ── the formatting stage ─────────────────────────────────────────────────────
+
+/// A program whose emitted Python `ruff format` demonstrably reflows: the
+/// signature is too long for one line and so is the `total` expression.
+/// Everything after the first reflow used to be shifted in the sidecar.
+const REFLOW_SRC: &str = "\
+def widget(alpha: int, beta: int, gamma: int, delta: int, epsilon: int, zeta: int) -> int:
+    return alpha + beta + gamma + delta + epsilon + zeta
+
+def compute() -> int:
+    let total: int = widget(1111111, 2222222, 3333333, 4444444, 5555555, 6666666) + widget(7, 8, 9, 10, 11, 12)
+    return total
+
+def boom() -> int:
+    raise ValueError(\"kaboom\")
+
+def main() -> None:
+    print(compute())
+    print(boom())
+
+if __name__ == \"__main__\":
+    main()
+";
+
+#[test]
+fn map_is_keyed_to_the_formatted_file_not_the_emitted_one() {
+    // With `[emit] format = true` the sidecar was built from the offsets the
+    // printer recorded *before* `ruff format` ran. A single wrapped call
+    // therefore shifted every later entry relative to the file on disk —
+    // and the table came out shorter than the file it described.
+    let tmp = tempfile::tempdir().unwrap();
+    scaffold_formatted(tmp.path(), REFLOW_SRC);
+    let (py, map) = build_and_load(tmp.path());
+
+    assert_eq!(
+        map.len(),
+        py.len(),
+        "the table must carry one entry per line of the file actually written"
+    );
+    assert_in_range(&map, REFLOW_SRC);
+
+    if ruff_available() {
+        assert!(
+            py.iter().any(|l| l.trim_end() == "def widget("),
+            "this test is only meaningful when ruff reflows the signature; got:\n{}",
+            py.join("\n")
+        );
+    }
+
+    // Statements *after* the reflow are where the drift showed up.
+    assert_eq!(
+        mapped_lines_for(&py, &map, "raise ValueError(\"kaboom\")"),
+        vec![ty_line_of(REFLOW_SRC, "raise ValueError(\"kaboom\")")],
+        "a statement after a reflow must still name its own line"
+    );
+    assert_eq!(
+        mapped_lines_for(&py, &map, "print(boom())"),
+        vec![ty_line_of(REFLOW_SRC, "print(boom())")],
+    );
+    assert_eq!(
+        mapped_lines_for(&py, &map, "def boom()"),
+        vec![ty_line_of(REFLOW_SRC, "def boom()")],
+    );
+
+    // Every line ruff wrapped a single statement across must point back at
+    // that one statement.
+    let wrapped = mapped_lines_for(&py, &map, "7, 8, 9, 10, 11, 12");
+    let total_line = ty_line_of(REFLOW_SRC, "let total: int =");
+    assert!(
+        !wrapped.is_empty() && wrapped.iter().all(|&v| v == total_line),
+        "a wrapped continuation must map to .ty line {total_line}; got {wrapped:?}"
+    );
+}
+
+#[test]
+fn tyc_trace_reports_the_raising_ty_line_for_a_formatted_build() {
+    // The end-to-end contract. A table that looks right but whose
+    // `tyc trace` output is wrong is not a fix, so drive a real CPython
+    // traceback through the real `tyc trace`.
+    let Some(py_bin) = python() else {
+        eprintln!("skipping: no Python 3.12+ interpreter on PATH");
+        return;
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    scaffold_formatted(tmp.path(), REFLOW_SRC);
+    let status = tyc()
+        .arg("build")
+        .arg("--no-sync")
+        .arg(tmp.path())
+        .status()
+        .unwrap();
+    assert!(status.success(), "build should succeed");
+
+    let run = Command::new(&py_bin)
+        .arg(tmp.path().join("build").join("main.py"))
+        .output()
+        .unwrap();
+    assert!(
+        !run.status.success(),
+        "the program is expected to die with ValueError"
+    );
+    let traceback = String::from_utf8_lossy(&run.stderr).into_owned();
+    let tb_path = tmp.path().join("traceback.txt");
+    std::fs::write(&tb_path, &traceback).unwrap();
+
+    let traced = tyc()
+        .arg("trace")
+        .arg(&tb_path)
+        .current_dir(tmp.path())
+        .output()
+        .unwrap();
+    assert!(traced.status.success(), "tyc trace should succeed");
+    let remapped = String::from_utf8_lossy(&traced.stdout).into_owned();
+
+    // Every frame must land on the `.ty` line that actually produced it.
+    for needle in [
+        "raise ValueError(\"kaboom\")",
+        "print(boom())",
+        "    main()",
+    ] {
+        let expected = ty_line_of(REFLOW_SRC, needle);
+        assert!(
+            remapped.contains(&format!("main.ty\", line {expected},")),
+            "tyc trace must place a frame at .ty line {expected} (the line holding \
+             `{}`); got:\n{remapped}",
+            needle.trim()
+        );
+    }
+    assert!(
+        !remapped.contains("build/main.py"),
+        "every frame should have been remapped to .ty; got:\n{remapped}"
+    );
+}
+
+#[test]
+fn formatted_build_keeps_match_case_granularity() {
+    // Task 1 and Task 2 have to compose: the emitter's per-clause offsets
+    // survive the format-stage re-keying.
+    const SRC: &str = "\
+class Circle frozen:
+    radius: float
+
+class Square frozen:
+    side: float
+
+type Shape = Circle | Square
+
+def scale(a: float, b: float, c: float, d: float, e: float, f: float) -> float:
+    return a * b * c * d * e * f
+
+def area(s: Shape, z: float) -> float:
+    match s:
+        case Circle(r):
+            return scale(3.14159265358979, r, r, z, z, z) * scale(z, z, z, r, r, r) * z * z * z
+        case Square(side):
+            return side / z
+
+def main() -> None:
+    print(area(Square(side=3.0), 0.0))
+
+if __name__ == \"__main__\":
+    main()
+";
+    let tmp = tempfile::tempdir().unwrap();
+    scaffold_formatted(tmp.path(), SRC);
+    let (py, map) = build_and_load(tmp.path());
+
+    assert_eq!(map.len(), py.len());
+    assert_in_range(&map, SRC);
+    if ruff_available() {
+        // The first arm must be wrapped, so the `case` header below it sits
+        // past a reflow — otherwise this test would only exercise Task 2.
+        assert!(
+            py.iter().any(|l| l.trim_end() == "            return ("),
+            "expected ruff to wrap the first arm; got:\n{}",
+            py.join("\n")
+        );
+    }
+    assert_eq!(
+        mapped_lines_for(&py, &map, "case Square(side):"),
+        vec![ty_line_of(SRC, "case Square(side):")],
+        "the `case` header must survive the formatting re-key"
+    );
+    assert_eq!(
+        mapped_lines_for(&py, &map, "return side / z"),
+        vec![ty_line_of(SRC, "return side / z")],
+    );
+
+    // And end to end: the division raises, and the frame must name the
+    // `return side / z` line — not the `case` header above it.
+    let Some(py_bin) = python() else {
+        eprintln!("skipping the execution half: no Python 3.12+ interpreter on PATH");
+        return;
+    };
+    let run = Command::new(&py_bin)
+        .arg(tmp.path().join("build").join("main.py"))
+        .output()
+        .unwrap();
+    let tb_path = tmp.path().join("traceback.txt");
+    std::fs::write(&tb_path, run.stderr).unwrap();
+    let traced = tyc()
+        .arg("trace")
+        .arg(&tb_path)
+        .current_dir(tmp.path())
+        .output()
+        .unwrap();
+    let remapped = String::from_utf8_lossy(&traced.stdout).into_owned();
+    let expected = ty_line_of(SRC, "return side / z");
+    assert!(
+        remapped.contains(&format!("main.ty\", line {expected},")),
+        "the raising frame must land on .ty line {expected}; got:\n{remapped}"
     );
 }
