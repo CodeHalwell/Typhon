@@ -27,3 +27,7 @@
 **Vulnerability:** Hardcoded secret detection was missing `APIKEY` due to partial overlap with `KEY` because `KEY` was evaluated before `APIKEY`.
 **Learning:** When scanning for secrets using keyword arrays, substrings (like `KEY`) must be placed after longer matches (like `APIKEY` or `API_KEY`) to prevent premature partial matches.
 **Prevention:** Always maintain hardcoded secret matching keywords in longest-first order.
+## $(date +%Y-%m-%d) - Improve secret detection bounding logic
+**Vulnerability:** The secret detection logic in `tyc-analyse` and `tyc build` only matched variable names bounded by underscores or casing changes, missing secrets embedded with digits like `myPASSWORD123` or camelCase transitions where the trailing character is an uppercase initialism (e.g. `dbPASSWORDString`).
+**Learning:** Proper string bounding for sensitive identifier detection must account for digit adjacencies and specific sub-patterns in camelCase/TitleCase boundaries. Relying solely on `_` or previous casing is insufficient and causes false negatives.
+**Prevention:** Extend boundary conditions in heuristic scans to explicitly check `.is_ascii_digit()` on adjacent boundaries, and safely handle edge cases like the end of the substring transitioning into another TitleCase word (e.g. `PASSWORDString`). Ensure these heuristics are synchronized across all modules using them (e.g., `is_secret_name` and `secret_suffix`).
