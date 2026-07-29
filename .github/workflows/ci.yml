@@ -235,9 +235,16 @@ jobs:
       # half; without it that fixture reports "REDUCED to build-only" rather
       # than silently skipping. Installing it here keeps CI at full coverage
       # while `scripts/knob-matrix.sh` itself stays network-free for local runs.
+      # No `continue-on-error`: a failed install must fail the job here, with
+      # the install as the visible cause. Without pydantic the harness drops
+      # the model-extra fixture to build-only and still counts it a PASS, so
+      # the job could go green having never exercised the runtime behaviour it
+      # was added to gate — the same silent-skip class as the ruff and
+      # python3.13 gates. `TYC_REQUIRE_PYTHON=1` below is the second line of
+      # defence: it makes *any* reduced-coverage fixture fatal, whatever the
+      # cause. (PR #360 review, Codex P2.)
       - name: Install pydantic (model-extra fixture runtime)
         run: python3.13 -m pip install --quiet pydantic
-        continue-on-error: true
 
       - name: Knob codegen matrix
         run: scripts/knob-matrix.sh

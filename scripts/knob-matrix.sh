@@ -275,6 +275,17 @@ echo "knob matrix: $PASS passed, $FAIL failed (of ${#NAMES[@]})"
 if [ "${#REDUCED_NAMES[@]}" -gt 0 ]; then
     echo "  REDUCED to build-only (a runtime dependency was missing, so the"
     echo "  execution half of these fixtures did NOT run): ${REDUCED_NAMES[*]}"
+    # Locally this is a warning: not everyone has every fixture's runtime
+    # dependency installed, and the build half still gates the codegen. In CI
+    # it is fatal. A reduced fixture is still counted a PASS, so without this
+    # the job could report green having never executed the behaviour it
+    # exists to gate — the silent-skip failure mode TYC_REQUIRE_PYTHON was
+    # introduced to close for the interpreter itself. Fatal on ANY cause of
+    # reduction, not just a failed install. (PR #360 review, Codex P2.)
+    if [ -n "${TYC_REQUIRE_PYTHON:-}" ]; then
+        echo "  TYC_REQUIRE_PYTHON is set: reduced coverage is a failure." >&2
+        exit 1
+    fi
 fi
 if [ "$FAIL" -gt 0 ]; then
     printf '  failed: %s\n' "${FAILED_NAMES[*]}"

@@ -425,14 +425,50 @@ impl ScratchDir {
                 nanos,
                 attempt
             ));
-            // `create_dir`, NOT `create_dir_all`: it fails with
-            // `AlreadyExists` on a pre-existing path, so we never adopt a
-            // directory we did not create ourselves.
-            if std::fs::create_dir(&path).is_ok() {
+            // Two properties matter here, and both are load-bearing for the
+            // code-execution vector this directory exists to close.
+            //
+            // 1. `create_dir`, NOT `create_dir_all`: it fails with
+            //    `AlreadyExists` on a pre-existing path, so we never adopt a
+            //    directory we did not create ourselves.
+            // 2. The 0700 mode is passed to `mkdir(2)` itself rather than
+            //    applied afterwards with `set_permissions`. A create-then-
+            //    chmod sequence leaves a window in which the directory
+            //    carries umask-derived permissions — group- or world-writable
+            //    under a permissive umask (002 / 000) — and a local attacker
+            //    watching the shared temp dir can drop a `json.py` into it
+            //    that the introspection subprocess then imports as code.
+            //    `mkdir` masks the requested mode with the umask, and 0700
+            //    has no group/other bits for the umask to add back, so the
+            //    result can never be more permissive than intended.
+            //    (PR #360 review, Codex P2.)
+            let created = {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::DirBuilderExt;
+                    std::fs::DirBuilder::new().mode(0o700).create(&path).is_ok()
+                }
+                #[cfg(not(unix))]
+                {
+                    std::fs::create_dir(&path).is_ok()
+                }
+            };
+            if created {
+                // Fail closed rather than trust the mode we asked for: if the
+                // directory is not private, refuse it (and clean it up) so a
+                // caller never runs a subprocess in a world-writable cwd. The
+                // old code discarded the chmod result entirely, so a failure
+                // silently left a permissive directory in service.
                 #[cfg(unix)]
                 {
                     use std::os::unix::fs::PermissionsExt;
-                    let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700));
+                    let private = std::fs::metadata(&path)
+                        .map(|m| m.permissions().mode() & 0o077 == 0)
+                        .unwrap_or(false);
+                    if !private {
+                        let _ = std::fs::remove_dir_all(&path);
+                        return None;
+                    }
                 }
                 return Some(Self { path });
             }
@@ -2453,6 +2489,14 @@ class App:
             use std::os::unix::fs::PermissionsExt;
             let mode = std::fs::metadata(a.path()).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode, 0o700, "scratch dir must be private to the user");
+            // The *atomicity* of that mode — 0700 passed to `mkdir(2)` rather
+            // than chmod'd on afterwards — cannot be observed from inside this
+            // process: the window it closes sits between two syscalls. What
+            // this assertion does guard is the fail-closed check that backs
+            // it: a regression to a bare `create_dir` would, under a
+            // permissive umask, produce a non-private directory that
+            // `ScratchDir::new` now refuses outright, so `expect` above fails
+            // rather than handing back a world-writable cwd.
         }
         // Dropping removes the directory (and anything a subprocess left in it).
         std::fs::write(a.path().join("leftover.txt"), "x").unwrap();

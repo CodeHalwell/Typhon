@@ -49,9 +49,28 @@ type ResolvedCache = Arc<Mutex<HashMap<String, (String, Arc<ResolvedModule>)>>>;
 /// `typhon.toml` mtime they were read from (see the field doc on
 /// [`Backend::lint_options_cache`]). Aliased to keep the field type under
 /// clippy's `type_complexity` threshold, matching [`ResolvedCache`].
-type LintOptionsCache = Arc<
-    Mutex<HashMap<std::path::PathBuf, (Option<std::time::SystemTime>, tyc_analyse::LintOptions)>>,
->;
+/// Cache key for a project's `typhon.toml`: a hash of its bytes.
+///
+/// The caches below existed to avoid re-parsing the config on every keystroke,
+/// and were keyed on mtime alone. On a filesystem with coarse timestamp
+/// resolution two saves inside one tick share an mtime, so an editor that does
+/// not send the optional watched-file notification would keep serving the
+/// stale `off`/`warn`/`error` settings until the next write or a restart —
+/// the editor and CI disagreeing about severity, which is the exact defect
+/// these knobs were wired up to fix. Hashing the bytes removes the window
+/// entirely; the read is a page-cached ~1 KB file, negligible beside the
+/// type-check it gates, and the parse (the actual cost) is still skipped on a
+/// hit. `None` means "unreadable" and always misses. (PR #360 review, Codex P2.)
+fn config_fingerprint(root: &std::path::Path) -> Option<u64> {
+    use std::hash::{Hash, Hasher};
+    let bytes = std::fs::read(root.join("typhon.toml")).ok()?;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    Some(hasher.finish())
+}
+
+type LintOptionsCache =
+    Arc<Mutex<HashMap<std::path::PathBuf, (Option<u64>, tyc_analyse::LintOptions)>>>;
 
 /// Per-project-root cache of the `[strictness]` *severity* knobs, tagged with
 /// the `typhon.toml` mtime they were read from — the severity twin of
@@ -60,17 +79,8 @@ type LintOptionsCache = Arc<
 /// was exactly what the mtime-keyed lint-options cache was introduced to
 /// avoid (PR #192 review). `SeverityOverrides` holds `String`s, so entries are
 /// cloned rather than copied.
-type SeverityOverridesCache = Arc<
-    Mutex<
-        HashMap<
-            std::path::PathBuf,
-            (
-                Option<std::time::SystemTime>,
-                tyc_diagnostics::SeverityOverrides,
-            ),
-        >,
-    >,
->;
+type SeverityOverridesCache =
+    Arc<Mutex<HashMap<std::path::PathBuf, (Option<u64>, tyc_diagnostics::SeverityOverrides)>>>;
 
 /// The Typhon LSP backend. Holds a single shared salsa database and the
 /// `Client` handle used to send notifications back to the editor.
@@ -416,20 +426,22 @@ impl Backend {
             // on a real `typhon.toml` change, I/O outside the lock. A racing
             // double-miss just reads twice and stores the same value.
             if let Some((root, _)) = workspace.as_ref() {
-                let mtime = std::fs::metadata(root.join("typhon.toml"))
-                    .and_then(|m| m.modified())
-                    .ok();
+                let stamp = config_fingerprint(root);
                 let cached = severity_overrides_cache_arc
                     .blocking_lock()
                     .get(root)
                     .cloned();
                 let overrides = match cached {
-                    Some((cached_mtime, overrides)) if cached_mtime == mtime => overrides,
+                    Some((cached_stamp, overrides))
+                        if cached_stamp.is_some() && cached_stamp == stamp =>
+                    {
+                        overrides
+                    }
                     _ => {
                         let overrides = read_severity_overrides(root);
                         severity_overrides_cache_arc
                             .blocking_lock()
-                            .insert(root.clone(), (mtime, overrides.clone()));
+                            .insert(root.clone(), (stamp, overrides.clone()));
                         overrides
                     }
                 };
@@ -467,20 +479,18 @@ impl Backend {
                         // `std::fs` I/O would block concurrent checks; a racing
                         // double-miss just reads twice and stores the same
                         // value. (PR #192 review.)
-                        let mtime = std::fs::metadata(root.join("typhon.toml"))
-                            .and_then(|m| m.modified())
-                            .ok();
-                        if let Some((cached_mtime, opts)) =
+                        let stamp = config_fingerprint(root);
+                        if let Some((cached_stamp, opts)) =
                             lint_options_cache_arc.blocking_lock().get(root).copied()
                         {
-                            if cached_mtime == mtime {
+                            if cached_stamp.is_some() && cached_stamp == stamp {
                                 return opts;
                             }
                         }
                         let opts = read_lint_options(root);
                         lint_options_cache_arc
                             .blocking_lock()
-                            .insert(root.clone(), (mtime, opts));
+                            .insert(root.clone(), (stamp, opts));
                         opts
                     })
                     .unwrap_or_default();
@@ -4283,6 +4293,53 @@ mod tests {
         assert_eq!(overrides.blocking_in_async, "off");
         assert_eq!(overrides.stub_check, "warn");
         assert_eq!(overrides.exhaustive_match, "warn");
+    }
+
+    /// The config caches key on a content hash, not the mtime they used to
+    /// use: two saves inside one filesystem timestamp tick share an mtime, and
+    /// an editor that sends no watched-file notification would then serve the
+    /// stale severities until the next write or a restart.
+    #[test]
+    fn config_fingerprint_changes_when_content_changes_within_one_mtime_tick() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = tmp.path().join("typhon.toml");
+        let base = "[project]\nname = \"x\"\nsrc = \"src\"\n[strictness]\n";
+
+        std::fs::write(&cfg, format!("{base}unused-import = \"off\"\n")).unwrap();
+        let before = config_fingerprint(tmp.path());
+        let mtime_before = std::fs::metadata(&cfg).unwrap().modified().unwrap();
+
+        // Rewrite with different content, then force the mtime back to what it
+        // was — the coarse-timestamp collision, made deterministic.
+        std::fs::write(&cfg, format!("{base}unused-import = \"error\"\n")).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&cfg)
+            .unwrap()
+            .set_modified(mtime_before)
+            .unwrap();
+        assert_eq!(
+            std::fs::metadata(&cfg).unwrap().modified().unwrap(),
+            mtime_before,
+            "the collision must actually be reproduced for this test to mean anything"
+        );
+
+        let after = config_fingerprint(tmp.path());
+        assert!(before.is_some() && after.is_some());
+        assert_ne!(
+            before, after,
+            "an mtime-keyed cache would miss this edit and keep the stale severities"
+        );
+
+        // And the parsed result really did change, so the miss matters.
+        assert_eq!(read_severity_overrides(tmp.path()).unused_import, "error");
+    }
+
+    /// An unreadable config always misses rather than pinning a stale entry.
+    #[test]
+    fn config_fingerprint_is_none_when_the_config_is_unreadable() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert_eq!(config_fingerprint(tmp.path()), None);
     }
 
     // ── End-to-end LSP harness ──────────────────────────────────────────────

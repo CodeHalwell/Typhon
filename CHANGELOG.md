@@ -400,6 +400,30 @@ rather than a silent one.
   "no-op when the value matches" premise, which is what hid the bug, are
   corrected.
 
+### Review follow-ups (PR #360)
+
+- **The introspection scratch directory is created private, atomically.** It
+  was created with `create_dir` and chmod'd to `0700` afterwards, so under a
+  permissive umask it briefly carried group- or world-writable permissions —
+  a window in which a local user could drop a `json.py` for the introspection
+  subprocess to import — and the chmod's result was discarded, so a failure
+  silently left a permissive directory in service. The mode now goes to
+  `mkdir(2)` itself (umask can only remove bits, and `0700` has none to
+  remove), and the directory is verified private before use or else refused
+  and removed.
+- **A missing runtime dependency can no longer make the knob matrix green.**
+  Without pydantic the harness drops the `model-extra` fixture to build-only
+  and still counts it a pass, and CI installed pydantic with
+  `continue-on-error`. The install now fails the job, and
+  `TYC_REQUIRE_PYTHON=1` makes *any* reduced-coverage fixture fatal whatever
+  the cause — the same silent-skip class the python and ruff gates close.
+- **The editor's config caches key on content, not mtime.** Two `typhon.toml`
+  saves inside one filesystem timestamp tick share an mtime, so an editor that
+  sends no watched-file notification kept serving stale `off`/`warn`/`error`
+  settings until the next write or a restart — editor and CI disagreeing about
+  severity, which is what wiring the knobs up was meant to stop. Both the
+  severity cache and its pre-existing lint-options twin now hash the file.
+
 ### Tooling / security
 
 - **`tyc lsp` no longer executes arbitrary modules.** It kept its own venv
