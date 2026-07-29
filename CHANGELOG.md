@@ -337,6 +337,20 @@ rather than a silent one.
   between collected exceptions, and CPython's nested exception-group traceback
   rendering. Sequential execution also means the VM cannot cancel siblings, so
   a multi-failure `gather:` may report more members than CPython would.
+- **Five `except*` / string-search divergences found by the pre-PR review are
+  fixed**, each verified against a CPython 3.13 probe battery first: a naked
+  `raise` inside an `except*` handler reconstitutes the original group
+  (CPython's `_PyExc_PrepReraiseStar` merging) instead of propagating
+  `''`-wrapped fragments; `await` on a failed `TaskGroup` task re-raises the
+  task's exception instead of silently yielding `None` and running the rest of
+  the body; `KeyboardInterrupt` / `SystemExit` escape `TaskGroup.__aexit__`
+  bare (CPython's `_is_base_error` precedence) rather than grouped; group
+  splits and constructors apply `BaseExceptionGroup.__new__`'s downcast rule
+  per derived side — fixing `isinstance(e, Exception)` inside `except*` over a
+  mixed group — and reject a `BaseExceptionGroup` nested in an
+  `ExceptionGroup`; and the `str` search family no longer clamps a start
+  beyond the string's length, so empty-needle searches past the end answer
+  `-1` / `False` / `0` exactly as CPython.
 - Relative imports resolve against the importing module's package (example apps
   running under `tyc run`: 0/15 → 6/15 of the `examples/apps/` projects).
 - `model` defaulted fields reach the constructor; `Ok(value=…)` / `Err(error=…)`

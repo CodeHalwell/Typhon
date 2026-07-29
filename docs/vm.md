@@ -263,13 +263,23 @@ message:
   now splits the group, runs every matching handler once with its own
   recursively-split subgroup, re-raises the unmatched remainder, and raises
   the same `TypeError` CPython does for `except* ExceptionGroup`.
+  A naked `raise` inside an `except*` handler reconstitutes the original
+  group (CPython's `_PyExc_PrepReraiseStar` re-raise merging); `await` on a
+  failed task re-raises the task's exception; `KeyboardInterrupt` /
+  `SystemExit` escape `TaskGroup.__aexit__` bare rather than grouped; and
+  split sides re-derive through `BaseExceptionGroup.__new__`'s downcast
+  rule, so `isinstance(e, Exception)` holds inside an `except*` handler
+  over a mixed group exactly as under CPython.
+
   Three residual divergences: `.split()` / `.subgroup()` / `.derive()` are
   not exposed as user-callable methods, `__context__` is not chained
   between exceptions collected from handler bodies, and an uncaught group
   prints the summary line (`ExceptionGroup: g (2 sub-exceptions)`) rather
   than CPython's nested `+-+---- 1 ----` traceback tree. Inherent to
   sequential execution: the VM cannot cancel sibling tasks, so a
-  multi-failure `gather:` may report more members than CPython would.
+  multi-failure `gather:` may report more members than CPython would — and
+  the body of a `TaskGroup` sees a failed task's exception at the `await`
+  rather than the `CancelledError` a real cancellation would deliver.
 - **Lazy / unbounded generators.** Finite `yield` / `yield from` work
   since v0.10.0 via eager materialisation, but the worst case
   (`while True: yield`) hits the `GENERATOR_CAP = 1_000_000` ceiling and

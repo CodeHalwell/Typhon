@@ -882,6 +882,93 @@ pub fn is_base_only_exception(v: &Value) -> bool {
     }
 }
 
+/// Whether a prospective exception-group member derives from `Exception`
+/// (as opposed to being `BaseException`-only). A nested `BaseExceptionGroup`
+/// is *not* an `Exception` — only its downcast `ExceptionGroup` sibling is —
+/// which is what keeps a mixed group's base-only side base-only through
+/// splits and re-wraps.
+pub fn is_ordinary_exception_member(v: &Value) -> bool {
+    match v {
+        Value::Exception { kind, .. } => {
+            kind.as_str() != "BaseExceptionGroup" && !is_base_only_exception(v)
+        }
+        _ => true,
+    }
+}
+
+/// The exception-group class CPython's `BaseExceptionGroup.__new__` would
+/// choose for `members`: `ExceptionGroup` when every member is an ordinary
+/// `Exception`, `BaseExceptionGroup` otherwise. Splits, handler-failure
+/// re-wraps, and the `TaskGroup` failure path all funnel through `__new__`
+/// in CPython, so every VM site that builds a group derives its kind here
+/// (verified against 3.13: `BaseExceptionGroup("g", [ValueError("v"),
+/// KeyboardInterrupt()])` split by `except* ValueError` binds an
+/// `ExceptionGroup('g', [ValueError('v')])` on the matched side).
+pub fn exception_group_kind_for(members: &[Value]) -> &'static str {
+    if members.iter().all(is_ordinary_exception_member) {
+        "ExceptionGroup"
+    } else {
+        "BaseExceptionGroup"
+    }
+}
+
+/// Object identity (`is`) for exception values. Clones of one raised
+/// exception share their `Rc`s, so pointer equality on the payload is the
+/// VM's notion of "the same exception object" — the test PEP 654 reraise
+/// merging and `TaskGroup.__aexit__` deduplication rely on.
+pub fn exception_values_identical(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Exception { args: a, .. }, Value::Exception { args: b, .. }) => Rc::ptr_eq(a, b),
+        (Value::Instance(a), Value::Instance(b)) => Rc::ptr_eq(a, b),
+        _ => false,
+    }
+}
+
+/// Append every leaf (non-group) exception reachable through `v` to `out`,
+/// descending nested groups — the flattening CPython's
+/// `BaseExceptionGroup` machinery calls the group's "leaf exceptions".
+pub fn collect_exception_leaves(v: &Value, out: &mut Vec<Value>) {
+    match exception_group_subs(v) {
+        Some(subs) => {
+            for sub in subs {
+                collect_exception_leaves(&sub, out);
+            }
+        }
+        None => out.push(v.clone()),
+    }
+}
+
+/// Rebuild the subgroup of `orig` containing exactly the leaves that are
+/// identity-members of `keep`, preserving nesting and each level's message
+/// and recomputing each level's kind through the constructor's downcast
+/// rule — CPython's `exception_group_projection`, which
+/// `_PyExc_PrepReraiseStar` uses to reconstitute naked-`raise`d subgroups
+/// and the unhandled remainder into the original group's shape. Returns
+/// `None` when nothing is kept at this level.
+pub fn project_exception_group(orig: &Value, keep: &[Value]) -> Option<Value> {
+    match exception_group_subs(orig) {
+        Some(subs) => {
+            let members: Vec<Value> = subs
+                .iter()
+                .filter_map(|sub| project_exception_group(sub, keep))
+                .collect();
+            if members.is_empty() {
+                return None;
+            }
+            let message = match orig {
+                Value::Exception { message, .. } => (**message).clone(),
+                _ => String::new(),
+            };
+            let kind = exception_group_kind_for(&members);
+            Some(make_exception_group(kind, &message, members, false))
+        }
+        None => keep
+            .iter()
+            .any(|k| exception_values_identical(k, orig))
+            .then(|| orig.clone()),
+    }
+}
+
 #[derive(Clone)]
 pub enum Value {
     None,

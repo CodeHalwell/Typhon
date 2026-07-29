@@ -1340,17 +1340,16 @@ pub fn install(interp: &mut Interpreter) {
                     "second argument (exceptions) must be a non-empty sequence",
                 )));
             }
-            let has_base_only = subs.iter().any(crate::value::is_base_only_exception);
-            if n == "ExceptionGroup" && has_base_only {
+            // The member test is "derives from Exception", which a nested
+            // `BaseExceptionGroup` fails — CPython rejects
+            // `ExceptionGroup("o", [BaseExceptionGroup("i", [KeyboardInterrupt()])])`
+            // with the same TypeError it gives a bare KeyboardInterrupt.
+            let kind = crate::value::exception_group_kind_for(&subs);
+            if n == "ExceptionGroup" && kind == "BaseExceptionGroup" {
                 return Err(type_error(
                     "Cannot nest BaseExceptions in an ExceptionGroup".to_owned(),
                 ));
             }
-            let kind = if has_base_only {
-                "BaseExceptionGroup"
-            } else {
-                "ExceptionGroup"
-            };
             Ok(crate::value::make_exception_group(
                 kind, &message, subs, false,
             ))
@@ -1461,29 +1460,36 @@ fn value_len(v: &Value) -> Result<usize, Unwind> {
 /// occurrence" loop, `while (i := s.find(x, i + 1)) != -1:`, never advances,
 /// so it never terminates.
 ///
-/// Python's rules: a negative index counts from the end, out-of-range values
-/// clamp rather than raise, and an inverted range is empty.
-fn search_range(args: &[Value], len: usize) -> Result<(usize, usize), Unwind> {
-    let resolve = |v: &Value, default: usize| -> Result<usize, Unwind> {
-        if matches!(v, Value::None) {
-            return Ok(default);
+/// Python's rules (CPython's `ADJUST_INDICES`): a negative index counts from
+/// the end and clamps at 0; `end` clamps down to `len`; but a positive
+/// `start` is *not* clamped, so `start > end` marks the range as no-match
+/// territory — observable with an empty needle, where CPython answers
+/// `"abc".find("", 4) == -1`, `"abc".startswith("", 5) is False`,
+/// `"abc".count("", 2, 1) == 0` rather than treating the range as empty at
+/// `len` (all verified against 3.13). `None` signals that no-match state;
+/// callers map it to `-1` / `ValueError` / `False` / `0`.
+fn search_range(args: &[Value], len: usize) -> Result<Option<(usize, usize)>, Unwind> {
+    let len = len as i64;
+    let resolve = |v: Option<&Value>, default: i64| -> Result<i64, Unwind> {
+        match v {
+            None | Some(Value::None) => Ok(default),
+            Some(v) => v.to_int(),
         }
-        let i = v.to_int()?;
-        Ok(if i < 0 {
-            (len as i64 + i).max(0) as usize
-        } else {
-            (i as usize).min(len)
-        })
     };
-    let start = match args.get(1) {
-        Some(v) => resolve(v, 0)?,
-        None => 0,
-    };
-    let end = match args.get(2) {
-        Some(v) => resolve(v, len)?,
-        None => len,
-    };
-    Ok((start, end.max(start)))
+    let mut start = resolve(args.get(1), 0)?;
+    if start < 0 {
+        start = (start + len).max(0);
+    }
+    let mut end = resolve(args.get(2), len)?;
+    if end > len {
+        end = len;
+    } else if end < 0 {
+        end = (end + len).max(0);
+    }
+    if start > end {
+        return Ok(None);
+    }
+    Ok(Some((start as usize, end as usize)))
 }
 
 /// Byte offsets of the character range `[start, end)` within `s`, for
@@ -4145,6 +4151,28 @@ fn exception_unwind_value(e: &crate::error::VmException) -> Value {
     })
 }
 
+/// CPython `TaskGroup._is_base_error`: exactly `KeyboardInterrupt` and
+/// `SystemExit` (instances, so subclasses count). Deliberately narrower than
+/// [`crate::value::is_base_only_exception`] — a bare `BaseException` or a
+/// `GeneratorExit` is *not* a base error to a TaskGroup and gets wrapped in
+/// the group like any other failure (verified against 3.13).
+fn is_taskgroup_base_error(v: &Value) -> bool {
+    match v {
+        Value::Exception { kind, .. } => {
+            let k = kind.as_str();
+            k == "KeyboardInterrupt"
+                || k == "SystemExit"
+                || crate::interp::builtin_exc_is_a(k, "KeyboardInterrupt")
+                || crate::interp::builtin_exc_is_a(k, "SystemExit")
+        }
+        Value::Instance(inst) => {
+            crate::interp::class_has_builtin_exc_base(&inst.class, "KeyboardInterrupt")
+                || crate::interp::class_has_builtin_exc_base(&inst.class, "SystemExit")
+        }
+        _ => false,
+    }
+}
+
 /// A task whose coroutine raised. `TaskGroup.__aexit__` re-raises the whole
 /// batch as an `ExceptionGroup` before the `gather:` lowering ever reads a
 /// `.result()`, so this only matters for hand-written TaskGroup use — where
@@ -4154,6 +4182,10 @@ fn make_failed_task_value(exc: Value) -> Value {
     make_module(
         "Task",
         vec![
+            // `await task` consults this sentinel (see `force_awaitable`)
+            // and re-raises, exactly like `result()` below — CPython's
+            // `await` on a completed-with-exception task re-raises it.
+            ("__typhon_task_error__", exc.clone()),
             (
                 "result",
                 Value::Native(Rc::new(NativeFn::new("result", move |i, _args| {
@@ -4238,12 +4270,22 @@ fn make_asyncio_module() -> Value {
             );
             members.insert(
                 "__aexit__".to_owned(),
-                Value::Native(Rc::new(NativeFn::new("__aexit__", move |_i, args| {
+                Value::Native(Rc::new(NativeFn::new("__aexit__", move |i, args| {
                     let mut pending = failures_for_exit.borrow_mut();
                     // CPython wraps a body-raised exception into the same
-                    // group (verified against 3.13), so fold it in here.
+                    // group (verified against 3.13), so fold it in here —
+                    // unless it is a task failure the group already
+                    // collected, re-raised into the body by `await t` on the
+                    // failed task. CPython's body is cancelled at that await
+                    // and the group holds the error exactly once (3.13:
+                    // `ExceptionGroup('unhandled errors in a TaskGroup',
+                    // [ValueError('boom')])`, one member).
                     if let Some(body_exc) = args.get(1) {
-                        if !matches!(body_exc, Value::None) {
+                        if !matches!(body_exc, Value::None)
+                            && !pending
+                                .iter()
+                                .any(|p| crate::value::exception_values_identical(p, body_exc))
+                        {
                             pending.push(body_exc.clone());
                         }
                     }
@@ -4251,11 +4293,18 @@ fn make_asyncio_module() -> Value {
                         return Ok(Value::Bool(false));
                     }
                     let subs: Vec<Value> = pending.drain(..).collect();
-                    let kind = if subs.iter().any(crate::value::is_base_only_exception) {
-                        "BaseExceptionGroup"
-                    } else {
-                        "ExceptionGroup"
-                    };
+                    drop(pending);
+                    // CPython's TaskGroup singles out KeyboardInterrupt /
+                    // SystemExit (`_is_base_error`) as `_base_error` — the
+                    // first one observed is re-raised BARE, never wrapped in
+                    // the group, and every other collected failure is
+                    // dropped (verified against 3.13 for body- and
+                    // child-raised cases). A bare `BaseException` is *not* a
+                    // base error there and stays in the group.
+                    if let Some(base) = subs.iter().find(|v| is_taskgroup_base_error(v)) {
+                        return Err(i.value_to_exception(base.clone()));
+                    }
+                    let kind = crate::value::exception_group_kind_for(&subs);
                     let group = crate::value::make_exception_group(
                         kind,
                         "unhandled errors in a TaskGroup",
@@ -6032,7 +6081,9 @@ fn str_method(
         // the needle. They were ignored; see `search_range`.
         "startswith" | "endswith" => {
             let needle = single(args, name)?.py_str();
-            let (cs, ce) = search_range(args, s.chars().count())?;
+            let Some((cs, ce)) = search_range(args, s.chars().count())? else {
+                return Ok(Value::Bool(false));
+            };
             let (bs, be) = char_range_bytes(s, cs, ce);
             let window = &s[bs..be];
             Value::Bool(if name == "startswith" {
@@ -6043,20 +6094,26 @@ fn str_method(
         }
         "find" | "rfind" | "index" | "rindex" => {
             let needle = single(args, name)?.py_str();
-            let (cs, ce) = search_range(args, s.chars().count())?;
-            let (bs, be) = char_range_bytes(s, cs, ce);
-            let window = &s[bs..be];
-            let hit = if name == "find" || name == "index" {
-                window.find(&needle)
-            } else {
-                window.rfind(&needle)
+            let hit = match search_range(args, s.chars().count())? {
+                None => None,
+                Some((cs, ce)) => {
+                    let (bs, be) = char_range_bytes(s, cs, ce);
+                    let window = &s[bs..be];
+                    let hit = if name == "find" || name == "index" {
+                        window.find(&needle)
+                    } else {
+                        window.rfind(&needle)
+                    };
+                    // CPython indices are character offsets, but Rust's
+                    // `str::find` returns a byte offset. Convert so
+                    // `s[s.find(x):]` matches CPython on non-ASCII text (the
+                    // byte index is a char boundary), and re-base onto the
+                    // window's start.
+                    hit.map(|i| cs + window[..i].chars().count())
+                }
             };
-            // CPython indices are character offsets, but Rust's `str::find`
-            // returns a byte offset. Convert so `s[s.find(x):]` matches
-            // CPython on non-ASCII text (the byte index is a char boundary),
-            // and re-base onto the window's start.
             match hit {
-                Some(i) => Value::Int(VmInt::from((cs + window[..i].chars().count()) as i64)),
+                Some(i) => Value::Int(VmInt::from(i as i64)),
                 None if name == "index" || name == "rindex" => {
                     return Err(value_error("substring not found"))
                 }
@@ -6065,7 +6122,9 @@ fn str_method(
         }
         "count" => {
             let needle = single(args, "count")?.py_str();
-            let (cs, ce) = search_range(args, s.chars().count())?;
+            let Some((cs, ce)) = search_range(args, s.chars().count())? else {
+                return Ok(Value::Int(VmInt::from(0)));
+            };
             let (bs, be) = char_range_bytes(s, cs, ce);
             let window = &s[bs..be];
             if needle.is_empty() {

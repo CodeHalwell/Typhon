@@ -31,6 +31,13 @@ pub struct VmException {
     /// User-thrown exception object, if any (e.g. from `raise ValueError("…")`).
     pub value: Option<Value>,
     pub frames: Vec<Frame>,
+    /// Set on the active exception an `except*` handler pushes before running
+    /// its body. A naked `raise` clones the active exception, so this marker
+    /// (plus value identity) is how `exec_try_star` recognises a PEP 654
+    /// *re-raise* — which CPython merges back into the original group — as
+    /// opposed to an explicit `raise e` of the bound subgroup, which produces
+    /// a fresh exception and is treated as newly raised (verified on 3.13).
+    pub star_handler_reraise: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -51,6 +58,7 @@ impl VmException {
             message: message.into(),
             value: None,
             frames: Vec::new(),
+            star_handler_reraise: false,
         }
     }
     pub fn with_value(mut self, v: Value) -> Self {

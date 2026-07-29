@@ -3244,8 +3244,21 @@ impl Interpreter {
                 self.call_function(&thunk.function, args, &thunk.kwargs, thunk.receiver.clone())
             }
             Value::Module(m) if m.name == "Task" => {
-                let r = m.members.borrow().get("__typhon_task_result__").cloned();
-                Ok(r.unwrap_or(Value::None))
+                let (result, error) = {
+                    let members = m.members.borrow();
+                    (
+                        members.get("__typhon_task_result__").cloned(),
+                        members.get("__typhon_task_error__").cloned(),
+                    )
+                };
+                // `await` on a failed task re-raises the task's exception —
+                // CPython terminates the awaiting body there (a TaskGroup
+                // body would be cancelled); yielding `None` and running on
+                // is the silent-wrong-output class of divergence.
+                if let Some(err) = error {
+                    return Err(self.value_to_exception(err));
+                }
+                Ok(result.unwrap_or(Value::None))
             }
             other => Ok(other),
         }
@@ -5229,8 +5242,18 @@ impl Interpreter {
     /// 4. If the original exception was *not* a group and nothing matched, the
     ///    original bare exception propagates — not a wrapper.
     /// 5. Exceptions raised by handler bodies are collected and combined with
-    ///    the unhandled remainder: exactly one survivor propagates as itself,
-    ///    two or more are wrapped in a fresh `ExceptionGroup('', [...])`.
+    ///    the unhandled remainder, distinguishing *re-raises* from new raises
+    ///    the way `_PyExc_PrepReraiseStar` does: a naked `raise` of the bound
+    ///    subgroup is merged back with the unhandled remainder into a
+    ///    projection of the original group (same nesting, same messages), so
+    ///    the canonical log-and-reraise handler propagates
+    ///    `ExceptionGroup('g', [ValueError('v'), TypeError('t')])`, not a
+    ///    `''`-wrapped pair of fragments. An explicit `raise e` of the bound
+    ///    subgroup is a *new* raise (CPython keys on the exception's
+    ///    metadata, which `raise e` refreshes). Newly raised exceptions come
+    ///    first, the reconstituted projection last; exactly one survivor
+    ///    propagates as itself, two or more are wrapped in a fresh
+    ///    `ExceptionGroup('', [...])` (downcast rule applied).
     /// 6. `except* ExceptionGroup` / `except* BaseExceptionGroup` is a runtime
     ///    `TypeError`.
     ///
@@ -5268,10 +5291,16 @@ impl Interpreter {
             },
         };
         let was_group = crate::value::exception_group_subs(&raised_value).is_some();
+        // Kept for the rule-5 projection: reraised subgroups and the
+        // unhandled remainder are merged back into this group's shape.
+        let orig_value = raised_value.clone();
         let mut remaining: Option<Value> = Some(raised_value);
 
         let mut any_matched = false;
-        let mut escaped: Vec<Value> = Vec::new();
+        // Rule 5's two buckets: genuinely new exceptions raised by handler
+        // bodies, and naked re-raises of the bound subgroup.
+        let mut raised: Vec<Value> = Vec::new();
+        let mut reraised: Vec<Value> = Vec::new();
 
         for handler in &t.handlers {
             let ExceptHandler::ExceptHandler(h) = handler;
@@ -5317,9 +5346,12 @@ impl Interpreter {
             if let Some(name) = &h.name {
                 env.set(name.as_str(), matched.clone());
             }
-            let Unwind::Exception(active) = self.value_to_exception(matched.clone()) else {
+            let Unwind::Exception(mut active) = self.value_to_exception(matched.clone()) else {
                 unreachable!("value_to_exception always yields Unwind::Exception")
             };
+            // Mark the pushed active exception so a naked `raise` (which
+            // clones it) is recognisable as a PEP 654 re-raise below.
+            active.star_handler_reraise = true;
             self.active_exceptions.push(active);
             let result = self.exec_block(&h.body, env);
             self.active_exceptions.pop();
@@ -5329,12 +5361,22 @@ impl Interpreter {
             match result {
                 Ok(()) => {}
                 Err(Unwind::Exception(e)) => {
-                    // Rule 5 — collect, keep running later handlers.
-                    escaped.push(e.value.clone().unwrap_or_else(|| Value::Exception {
+                    // Rule 5 — collect, keep running later handlers. A naked
+                    // `raise` of the bound subgroup (marker + identity) is a
+                    // re-raise CPython merges back into the original group;
+                    // anything else — `raise e` included — is a new raise.
+                    let value = e.value.clone().unwrap_or_else(|| Value::Exception {
                         kind: Rc::new(e.kind.clone()),
                         message: Rc::new(e.message.clone()),
                         args: Rc::new(exc_fallback_args(&e.message)),
-                    }));
+                    });
+                    if e.star_handler_reraise
+                        && crate::value::exception_values_identical(&value, &matched)
+                    {
+                        reraised.push(value);
+                    } else {
+                        raised.push(value);
+                    }
                 }
                 // `return` / `break` / `continue` out of an `except*` body is
                 // a CPython *compile* error, reported at check time as
@@ -5351,26 +5393,42 @@ impl Interpreter {
 
         // Rule 4 — an unmatched bare exception propagates unwrapped, with its
         // original frames (so the traceback is unchanged).
-        if !any_matched && !was_group && escaped.is_empty() {
+        if !any_matched && !was_group && raised.is_empty() && reraised.is_empty() {
             return Err(Unwind::Exception(exc));
         }
 
         // Rule 5 — combine handler failures with the unhandled remainder.
-        let mut pending = escaped;
-        if let Some(rest) = remaining {
-            pending.push(rest);
+        // New raises come first; the naked re-raises and the remainder are
+        // both derived from the original group, so they merge back into a
+        // single projection of it — appended last, as CPython does.
+        let mut finals = raised;
+        if was_group {
+            let mut keep: Vec<Value> = Vec::new();
+            for v in &reraised {
+                crate::value::collect_exception_leaves(v, &mut keep);
+            }
+            if let Some(rest) = &remaining {
+                crate::value::collect_exception_leaves(rest, &mut keep);
+            }
+            if let Some(projection) = crate::value::project_exception_group(&orig_value, &keep) {
+                finals.push(projection);
+            }
+        } else {
+            // A bare original: its naked re-raise propagates the implicit
+            // wrapper unchanged — CPython 3.13 gives
+            // `ExceptionGroup('', (ValueError('v'),))`, not the bare value.
+            finals.extend(reraised);
+            if let Some(rest) = remaining {
+                finals.push(rest);
+            }
         }
-        match pending.len() {
+        match finals.len() {
             0 => Ok(()),
-            1 => Err(self.value_to_exception(pending.remove(0))),
+            1 => Err(self.value_to_exception(finals.remove(0))),
             _ => {
-                let kind = if pending.iter().any(crate::value::is_base_only_exception) {
-                    "BaseExceptionGroup"
-                } else {
-                    "ExceptionGroup"
-                };
+                let kind = crate::value::exception_group_kind_for(&finals);
                 Err(self.value_to_exception(crate::value::make_exception_group(
-                    kind, "", pending, false,
+                    kind, "", finals, false,
                 )))
             }
         }
@@ -5408,10 +5466,8 @@ impl Interpreter {
         if self.exception_value_matches(type_expr, group, env)? {
             return Ok((Some(group.clone()), None));
         }
-        let (kind, message) = match group {
-            Value::Exception { kind, message, .. } => {
-                (kind.as_str().to_owned(), (**message).clone())
-            }
+        let message = match group {
+            Value::Exception { message, .. } => (**message).clone(),
             _ => return Ok((None, Some(group.clone()))),
         };
         let subs = crate::value::exception_group_subs(group).unwrap_or_default();
@@ -5436,8 +5492,14 @@ impl Interpreter {
             if items.is_empty() {
                 None
             } else {
+                // Each derived side goes through `BaseExceptionGroup.__new__`
+                // in CPython, so its kind is recomputed per side: splitting
+                // `BaseExceptionGroup("g", [ValueError("v"), KeyboardInterrupt()])`
+                // by `except* ValueError` binds an *ExceptionGroup* on the
+                // matched side (verified on 3.13), not the parent's kind.
+                let kind = crate::value::exception_group_kind_for(&items);
                 Some(crate::value::make_exception_group(
-                    &kind, &message, items, false,
+                    kind, &message, items, false,
                 ))
             }
         };
@@ -6876,7 +6938,7 @@ fn name_is_exception_base(name: &str) -> bool {
 /// subclass of it). Reads the `__typhon_exc_bases__` record stamped on each
 /// class by `build_class`, since builtin exception bases have no
 /// `Value::Class` to walk.
-fn class_has_builtin_exc_base(class: &Rc<Class>, target: &str) -> bool {
+pub(crate) fn class_has_builtin_exc_base(class: &Rc<Class>, target: &str) -> bool {
     if let Some(Value::Tuple(names)) = class.class_attrs.borrow().get("__typhon_exc_bases__") {
         for nm in names.iter() {
             if let Value::Str(s) = nm {

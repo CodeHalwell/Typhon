@@ -2891,4 +2891,283 @@ main()
 "#;
         assert_eq!(run_capturing(src).unwrap(), 0);
     }
+
+    /// A naked `raise` inside an `except*` handler is a PEP 654 *re-raise*:
+    /// CPython merges the re-raised subgroup back with the unhandled
+    /// remainder, reconstituting the original group. `raise e` of the bound
+    /// subgroup is a *new* raise and keeps the `''`-wrapped shape. Every
+    /// expected repr below is CPython 3.13 output:
+    ///   naked:    ExceptionGroup('g', [ValueError('v'), TypeError('t')])
+    ///   raise e:  ExceptionGroup('', [ExceptionGroup('g', [ValueError('v')]),
+    ///                                 ExceptionGroup('g', [TypeError('t')])])
+    ///   mixed:    ExceptionGroup('', [OSError('new'),
+    ///                                 ExceptionGroup('g', [ValueError('v'), KeyError('k')])])
+    ///   handled+naked: ExceptionGroup('g', [ValueError('v')])
+    #[test]
+    fn except_star_naked_reraise_reconstitutes_the_original_group() {
+        let src = r#"
+def main() -> None:
+    mut got: str = ""
+    try:
+        try:
+            raise ExceptionGroup("g", [ValueError("v"), TypeError("t")])
+        except* ValueError:
+            raise
+    except BaseException as e:
+        got = repr(e)
+    if got != "ExceptionGroup('g', [ValueError('v'), TypeError('t')])":
+        raise AssertionError("naked reraise wrong: " + got)
+
+    mut explicit: str = ""
+    try:
+        try:
+            raise ExceptionGroup("g", [ValueError("v"), TypeError("t")])
+        except* ValueError as ex:
+            raise ex
+    except BaseException as e2:
+        explicit = repr(e2)
+    if explicit != "ExceptionGroup('', [ExceptionGroup('g', [ValueError('v')]), ExceptionGroup('g', [TypeError('t')])])":
+        raise AssertionError("explicit raise-e wrong: " + explicit)
+
+    mut mixed: str = ""
+    try:
+        try:
+            raise ExceptionGroup("g", [ValueError("v"), TypeError("t"), KeyError("k")])
+        except* ValueError:
+            raise
+        except* TypeError:
+            raise OSError("new")
+    except BaseException as e3:
+        mixed = repr(e3)
+    if mixed != "ExceptionGroup('', [OSError('new'), ExceptionGroup('g', [ValueError('v'), KeyError('k')])])":
+        raise AssertionError("mixed reraise/raise wrong: " + mixed)
+
+    mut partial: str = ""
+    try:
+        try:
+            raise ExceptionGroup("g", [ValueError("v"), TypeError("t")])
+        except* ValueError:
+            raise
+        except* TypeError:
+            pass
+    except BaseException as e4:
+        partial = repr(e4)
+    if partial != "ExceptionGroup('g', [ValueError('v')])":
+        raise AssertionError("handled+naked wrong: " + partial)
+
+main()
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    /// `await` on a TaskGroup task that failed must re-raise the task's
+    /// exception — not silently bind `None` and keep executing the body.
+    /// CPython 3.13 terminates the body at that await (via cancellation) and
+    /// `__aexit__` raises
+    /// `ExceptionGroup('unhandled errors in a TaskGroup', [ValueError('boom')])`
+    /// with the error exactly once; the statements after the await never run.
+    #[test]
+    fn await_on_failed_taskgroup_task_raises_instead_of_yielding_none() {
+        let src = r#"
+import asyncio
+
+async def bad() -> int:
+    raise ValueError("boom")
+    return 0
+
+async def body() -> None:
+    async with asyncio.TaskGroup() as tg:
+        let t = tg.create_task(bad())
+        let r: int = await t
+        raise AssertionError("body continued past an await on a failed task")
+
+def main() -> None:
+    mut caught: str = ""
+    try:
+        asyncio.run(body())
+    except Exception as e:
+        caught = repr(e)
+    if caught != "ExceptionGroup('unhandled errors in a TaskGroup', [ValueError('boom')])":
+        raise AssertionError("wrong group: " + caught)
+
+main()
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    /// CPython's `TaskGroup._is_base_error` singles out `KeyboardInterrupt`
+    /// and `SystemExit`: the first one observed is re-raised BARE from
+    /// `__aexit__` (other collected failures dropped), while every other
+    /// failure — a bare `BaseException` included — is wrapped in the group.
+    /// All four shapes verified against CPython 3.13.
+    #[test]
+    fn taskgroup_reraises_keyboard_interrupt_and_system_exit_bare() {
+        let src = r#"
+import asyncio
+
+async def ok() -> int:
+    return 1
+
+async def bad() -> int:
+    raise ValueError("boom")
+    return 0
+
+async def badki() -> int:
+    raise KeyboardInterrupt("k")
+    return 0
+
+async def body_ki() -> None:
+    async with asyncio.TaskGroup() as tg:
+        let t = tg.create_task(ok())
+        raise KeyboardInterrupt("body")
+
+async def child_ki() -> None:
+    async with asyncio.TaskGroup() as tg:
+        let t = tg.create_task(badki())
+
+async def body_exit() -> None:
+    async with asyncio.TaskGroup() as tg:
+        let t = tg.create_task(ok())
+        raise SystemExit(3)
+
+async def base_stays_grouped() -> None:
+    async with asyncio.TaskGroup() as tg:
+        let t = tg.create_task(ok())
+        raise BaseException("b")
+
+async def child_error_then_ki() -> None:
+    async with asyncio.TaskGroup() as tg:
+        let t1 = tg.create_task(bad())
+        let t2 = tg.create_task(badki())
+
+def main() -> None:
+    mut got: str = ""
+    try:
+        asyncio.run(body_ki())
+    except KeyboardInterrupt as e:
+        got = repr(e)
+    if got != "KeyboardInterrupt('body')":
+        raise AssertionError("body KI not re-raised bare: " + got)
+
+    mut child: str = ""
+    try:
+        asyncio.run(child_ki())
+    except KeyboardInterrupt as e2:
+        child = repr(e2)
+    if child != "KeyboardInterrupt('k')":
+        raise AssertionError("child KI not re-raised bare: " + child)
+
+    mut se: str = ""
+    try:
+        asyncio.run(body_exit())
+    except SystemExit as e3:
+        se = repr(e3)
+    if se != "SystemExit(3)":
+        raise AssertionError("SystemExit not re-raised bare: " + se)
+
+    mut base: str = ""
+    try:
+        asyncio.run(base_stays_grouped())
+    except BaseException as e4:
+        base = repr(e4)
+    if base != "BaseExceptionGroup('unhandled errors in a TaskGroup', [BaseException('b')])":
+        raise AssertionError("BaseException must stay in the group: " + base)
+
+    mut first: str = ""
+    try:
+        asyncio.run(child_error_then_ki())
+    except KeyboardInterrupt as e5:
+        first = repr(e5)
+    if first != "KeyboardInterrupt('k')":
+        raise AssertionError("KI must win over the group: " + first)
+
+main()
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    /// Splitting a mixed `BaseExceptionGroup` re-derives each side through
+    /// `BaseExceptionGroup.__new__`, so the matched side downcasts to
+    /// `ExceptionGroup` when its members are all ordinary `Exception`s —
+    /// making `isinstance(e, Exception)` true inside the handler. The
+    /// constructor enforces the same member rule: an `ExceptionGroup` cannot
+    /// hold a nested `BaseExceptionGroup`, and a `BaseExceptionGroup` with
+    /// one stays base. All verified against CPython 3.13.
+    #[test]
+    fn except_star_split_downcasts_matched_side_to_exception_group() {
+        let src = r#"
+def main() -> None:
+    mut matched: str = ""
+    mut rest: str = ""
+    try:
+        try:
+            raise BaseExceptionGroup("g", [ValueError("v"), KeyboardInterrupt("k")])
+        except* ValueError as e:
+            matched = type(e).__name__ + "|" + repr(e) + "|" + str(isinstance(e, Exception))
+    except BaseException as r:
+        rest = type(r).__name__ + "|" + repr(r)
+    if matched != "ExceptionGroup|ExceptionGroup('g', [ValueError('v')])|True":
+        raise AssertionError("matched side wrong: " + matched)
+    if rest != "BaseExceptionGroup|BaseExceptionGroup('g', [KeyboardInterrupt('k')])":
+        raise AssertionError("rest side wrong: " + rest)
+
+    let inner = BaseExceptionGroup("i", [KeyboardInterrupt("k")])
+    mut nested: str = ""
+    try:
+        let outer = ExceptionGroup("o", [inner])
+        nested = "constructed"
+    except TypeError as te:
+        nested = str(te)
+    if nested != "Cannot nest BaseExceptions in an ExceptionGroup":
+        raise AssertionError("nesting rule wrong: " + nested)
+    let outer2 = BaseExceptionGroup("o", [inner])
+    if type(outer2).__name__ != "BaseExceptionGroup":
+        raise AssertionError("group holding a BaseExceptionGroup must stay base")
+
+main()
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    /// CPython's `ADJUST_INDICES` never clamps a positive `start` down to
+    /// `len`, so a start beyond the string (or an inverted range) is
+    /// no-match territory even for an empty needle: `"abc".find("", 4)` is
+    /// `-1`, `"abc".startswith("", 5)` is `False`, `"abc".count("", 2, 1)`
+    /// is `0`, `"abc".index("", 4)` raises. All verified against 3.13.
+    #[test]
+    fn str_search_start_beyond_len_matches_cpython() {
+        let src = r#"
+def main() -> None:
+    let s: str = "abc"
+    if s.find("", 4) != -1 or s.find("", 3) != 3 or s.find("", 5) != -1:
+        raise AssertionError("find empty needle beyond len wrong")
+    if s.rfind("", 4) != -1 or s.rfind("", 3) != 3:
+        raise AssertionError("rfind empty needle beyond len wrong")
+    if s.startswith("", 5) or not s.startswith("", 3):
+        raise AssertionError("startswith empty needle beyond len wrong")
+    if s.endswith("", 4) or not s.endswith("", 3):
+        raise AssertionError("endswith empty needle beyond len wrong")
+    if s.count("", 4) != 0 or s.count("", 3) != 1 or s.count("", 0) != 4:
+        raise AssertionError("count empty needle beyond len wrong")
+    if s.find("", 2, 1) != -1 or s.count("", 2, 1) != 0:
+        raise AssertionError("inverted range must not match an empty needle")
+    if s.startswith("", 2, 1) or s.endswith("", 2, 1):
+        raise AssertionError("inverted range startswith/endswith wrong")
+    if s.find("", -10) != 0 or s.rfind("", -10) != 3:
+        raise AssertionError("negative start clamps to 0")
+    let e: str = ""
+    if e.find("", 0) != 0 or e.find("", 1) != -1 or e.startswith("", 1) or e.count("", 1) != 0:
+        raise AssertionError("empty string beyond-len searches wrong")
+    mut raised: str = ""
+    try:
+        let x: int = s.index("", 4)
+    except ValueError as ve:
+        raised = str(ve)
+    if raised != "substring not found":
+        raise AssertionError("index beyond len must raise: " + raised)
+
+main()
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
 }
