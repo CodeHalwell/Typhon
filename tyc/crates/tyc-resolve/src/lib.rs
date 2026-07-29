@@ -861,6 +861,13 @@ struct Resolver<'a> {
     /// minimal form here unblocks the heterogeneous-error /
     /// `_load_or_default(...)` workaround R2-7 / R3-8 documented.
     uninit_let_spans: std::collections::HashSet<(usize, usize)>,
+    /// `(declaration span, write span)` pairs where a `global` / `nonlocal`
+    /// redirected write consumed an uninitialised-`let` marker, i.e. *was*
+    /// the initialiser. The redirect path pushes no binding, so unlike
+    /// `declare_full` it has no natural idempotence across the two visits a
+    /// direct body child gets (pre-collect + walk); this set is what keeps
+    /// the second visit from flagging the initialiser as a reassignment.
+    outer_initialiser_spans: std::collections::HashSet<((usize, usize), (usize, usize))>,
     /// `(scope, name)` pairs where a `mut NAME = ...` / `let NAME = ...`
     /// statement has been seen against an existing Parameter binding.
     /// Subsequent bareword assignments to the same name in the same
@@ -914,6 +921,7 @@ impl<'a> Resolver<'a> {
             preprocessed_line_starts: std::cell::OnceCell::new(),
             in_pattern: 0,
             uninit_let_spans: std::collections::HashSet::new(),
+            outer_initialiser_spans: std::collections::HashSet::new(),
             params_with_explicit_rebind: std::collections::HashSet::new(),
             loop_body_depth: 0,
             loop_origin_spans: std::collections::HashMap::new(),
@@ -996,6 +1004,15 @@ impl<'a> Resolver<'a> {
     /// such binding exists yet (a `global` naming a module global that is only
     /// created by this very assignment is legal Python, and the caller then
     /// falls through to declaring it).
+    ///
+    /// Known limit: resolution happens at walk time, and the pre-collect pass
+    /// only declares *direct children* of the module body — so a module `let`
+    /// that lives only inside a nested block (an `if` arm, say) textually
+    /// *after* the consuming `def` is not yet in scope 0 when that function
+    /// body is walked, and the redirect misses. The consequence is a false
+    /// negative (the old phantom-local fallback silently accepts the write),
+    /// never a false positive. Recorded in the changelog; a complete fix
+    /// needs the pre-pass to harvest nested-block module-level declarations.
     fn lookup_outer_binding(
         &self,
         scope: ScopeId,
@@ -1997,7 +2014,22 @@ fn declare_target(
                     {
                         // Mirrors `declare_full`: the first assignment to an
                         // uninitialised `let NAME: T` *is* the initialiser.
+                        //
+                        // A direct child of a function body is visited TWICE —
+                        // once by the pre-collect sub-pass and once by the body
+                        // walk. `declare_full` is naturally idempotent (the
+                        // second visit finds the binding it pushed and no-ops
+                        // on the same span), but this redirect path pushes no
+                        // binding, so the first visit consuming the uninit
+                        // marker left the second visit to find it gone and
+                        // wrongly flag the *initialising* write as an
+                        // immutable-assign. Remember which write consumed the
+                        // marker so its re-visit stays silent.
                         if r.uninit_let_spans.remove(&decl_span) {
+                            r.outer_initialiser_spans.insert((decl_span, span));
+                            return;
+                        }
+                        if r.outer_initialiser_spans.contains(&(decl_span, span)) {
                             return;
                         }
                         if outer_mut == Mutability::Let
@@ -3461,6 +3493,41 @@ mod tests {
         assert!(
             has_immutable_assign(&d),
             "`nonlocal total; total = 1` must hit the enclosing `let`; got {:?}",
+            d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    /// The first write through `global` to a *declare-only* module `let` is
+    /// its initialiser (R3-8) and must stay silent. A direct body child is
+    /// visited twice (pre-collect + walk); the redirect path used to consume
+    /// the uninit marker on the first visit and flag the second.
+    #[test]
+    fn global_first_write_to_an_uninitialised_let_is_the_initialiser() {
+        let (_, d) =
+            resolve("let CONFIG: str\n\ndef go() -> None:\n    global CONFIG\n    CONFIG = \"b\"\n");
+        assert!(
+            !has_immutable_assign(&d),
+            "the initialising write is not a reassignment; got {:?}",
+            d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    /// …and a *second* write through the same `global` is flagged exactly
+    /// once — not once per resolver pass.
+    #[test]
+    fn global_second_write_to_an_uninitialised_let_is_flagged_once() {
+        let (_, d) = resolve(
+            "let CONFIG: str\n\ndef go() -> None:\n    global CONFIG\n    CONFIG = \"a\"\n    CONFIG = \"b\"\n",
+        );
+        let n = d
+            .errors()
+            .iter()
+            .filter(|e| matches!(e, TycError::ImmutableAssign { .. }))
+            .count();
+        assert_eq!(
+            n,
+            1,
+            "exactly the second write violates the `let`; got {:?}",
             d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
         );
     }

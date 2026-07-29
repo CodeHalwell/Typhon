@@ -5351,6 +5351,46 @@ mod tests {
         assert_eq!(d.warning_count(), 0);
     }
 
+    /// The `[strictness] nullable-use` knob the docs promise: it governs the
+    /// warn-emitted attribute-rooted form and leaves the error-emitted
+    /// bare-name form alone.
+    #[test]
+    fn nullable_use_knob_promotes_demotes_and_drops_the_warn_form_only() {
+        let field_form = || TycError::nullable_use("self.db", "Db", "t.ty", "x = 1", 0, 1);
+        let bare_form = || TycError::nullable_use("x", "str", "t.ty", "x = 1", 0, 1);
+        let build = || {
+            let mut d = Diagnostics::new();
+            d.push_warning(field_form());
+            d.push_error(bare_form());
+            d
+        };
+        let with = |value: &str| SeverityOverrides {
+            nullable_use: value.to_owned(),
+            ..SeverityOverrides::default()
+        };
+
+        let promoted = apply_severity_overrides(build(), &with("error"));
+        assert_eq!(
+            (promoted.error_count(), promoted.warning_count()),
+            (2, 0),
+            "\"error\" promotes the field form alongside the bare-name error"
+        );
+
+        let dropped = apply_severity_overrides(build(), &with("off"));
+        assert_eq!(
+            (dropped.error_count(), dropped.warning_count()),
+            (1, 0),
+            "\"off\" drops the field form; the bare-name error is not governed"
+        );
+
+        let default = apply_severity_overrides(build(), &with("warn"));
+        assert_eq!(
+            (default.error_count(), default.warning_count()),
+            (1, 1),
+            "\"warn\" (the default) leaves both forms at their emitted severity"
+        );
+    }
+
     #[test]
     fn push_warning_increments_warning_count_not_error_count() {
         let mut d = Diagnostics::new();
@@ -5633,6 +5673,10 @@ pub struct SeverityOverrides {
     pub unused_import: String,
     /// `"warn"` (default) | `"error"` | `"off"`.
     pub methods_in_class_body: String,
+    /// `"warn"` (default) | `"error"` | `"off"`. Governs only the
+    /// warn-emitted *attribute-rooted* form of `tyc::nullable_use`; the
+    /// error-emitted bare-name form is not reclassified by this knob.
+    pub nullable_use: String,
     /// `"warn"` (default) | `"error"` | `"off"`.
     pub require_with: String,
     /// `"warn"` (default) | `"error"` | `"off"`.
@@ -5657,6 +5701,7 @@ impl SeverityOverrides {
         let stays_warning = |s: &str| s.is_empty() || s == "warn";
         stays_warning(&self.unused_import)
             && stays_warning(&self.methods_in_class_body)
+            && stays_warning(&self.nullable_use)
             && stays_warning(&self.require_with)
             && stays_warning(&self.blocking_in_async)
             && (self.stub_check == "warn")
@@ -5695,6 +5740,10 @@ pub fn apply_severity_overrides(diags: Diagnostics, overrides: &SeverityOverride
             Some((overrides.unused_import.as_str(), false))
         } else if matches!(warn, TycError::MethodInClassBody { .. }) {
             Some((overrides.methods_in_class_body.as_str(), false))
+        } else if matches!(warn, TycError::NullableUse { .. }) {
+            // Only the warn-emitted (attribute-rooted) form reaches this
+            // loop; the bare-name form is emitted as an error and stays one.
+            Some((overrides.nullable_use.as_str(), false))
         } else if matches!(warn, TycError::ResourceNotManaged { .. }) {
             Some((overrides.require_with.as_str(), false))
         } else if matches!(warn, TycError::BlockingInAsync { .. }) {

@@ -150,6 +150,25 @@ async def record() -> None:
 
 Knob: [`[strictness] suggest-parallel`](/Typhon/configuration/strictness/#suggest-parallel) (default `true`).
 
+## `tyc::return_in_except_star`
+
+`return`, `break`, or `continue` inside an `except*` handler:
+
+```python
+try:
+    gather:
+        user  = fetch_user(id)
+        posts = fetch_posts(id)
+except* ValueError:
+    return None    # ❌ CPython rejects this at compile time
+```
+
+CPython refuses to compile all three — an `except*` handler can run once per matching subgroup, so a jump out of it has no defined meaning. Before this diagnostic existed, `tyc check` passed and `tyc build` emitted a `build/main.py` that could not be imported.
+
+**Fix:** set a flag in the handler and act on it after the `try`, or use plain `except` if the code does not need exception-group splitting. A jump bound to a loop declared *inside* the handler is legal and not flagged; nested `def` / `class` bodies are exempt.
+
+Related: a failing task inside `gather:` (which lowers to `asyncio.TaskGroup`) surfaces as `ExceptionGroup('unhandled errors in a TaskGroup', [...])` — catch it with `except*`, not a plain `except`. The VM models this identically; see the [async reference](/Typhon/reference/async/) and `docs/vm.md` for the residual divergences.
+
 ## `tyc::interface_isinstance`
 
 `isinstance(x, MyInterface)`:

@@ -9628,7 +9628,41 @@ fn function_signature(
         // the call-site arity check accept any number of positional
         // arguments beyond the declared params (FINDINGS #44c).
         variadic: parameters.vararg.is_some(),
-        min_params: Some(required),
+        min_params: min_params_for(parameters, required),
+    }
+}
+
+/// The `min_params` value a `def`'s signature may carry, or `None` to keep
+/// exact-arity matching.
+///
+/// `Some(required)` unlocks the defaulted-tail relaxation: a `Callable`
+/// expecting between `required` and `params.len()` positionals accepts the
+/// function. That reading is only sound when every parameter beyond the
+/// supplied prefix is genuinely omittable — and a *required keyword-only*
+/// parameter never is. `def tag(x: int, *, label: str)` can satisfy no
+/// positional `Callable` shape at all: a positional call can neither reach
+/// `label` nor omit it, so CPython raises `TypeError: missing 1 required
+/// keyword-only argument` on every call the `Callable` slot could make.
+/// Returning `None` here falls back to exact length matching, which rejects
+/// naturally because the kwonly params inflate `params.len()` past any
+/// satisfiable expected arity — exactly the pre-relaxation behaviour.
+/// (Setting `Some(required)` for such a function was the pre-PR review's
+/// soundness regression: the relaxation treated the required kwonly tail as
+/// omittable and accepted a check-clean program that crashed on both
+/// execution paths.) Defaulted kwonly params are harmless — a positional
+/// call never reaches them and never needs to.
+fn min_params_for(
+    parameters: &ruff_python_ast::Parameters,
+    required_positional: usize,
+) -> Option<usize> {
+    let has_required_kwonly = parameters
+        .kwonlyargs
+        .iter()
+        .any(|pwd| pwd.default.is_none());
+    if has_required_kwonly {
+        None
+    } else {
+        Some(required_positional)
     }
 }
 
@@ -10917,7 +10951,9 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                 // `global NAME` in the callee, staling a caller narrowing on
                 // that global. Reset for subsequent statements (mirrors the
                 // `Stmt::Assign` / `Stmt::Expr` resets). Locals are immune.
-                if !c.globals_rebound_by_call.is_empty() && expr_contains_call(value) {
+                if !c.globals_rebound_by_call.is_empty()
+                    && (expr_contains_call(value) || expr_contains_call(&a.target))
+                {
                     reset_globals_after_call(c);
                 }
                 if bare_final {
@@ -11039,7 +11075,10 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
             // assignment applies its own target narrowing below, so that fresh
             // narrowing survives — mirroring the bare-call `Stmt::Expr` reset.
             // Locals are immune (a call can't rebind a caller's local).
-            if !c.globals_rebound_by_call.is_empty() && expr_contains_call(&a.value) {
+            // Targets count too: `xs[clear()] = 5` runs the callee.
+            if !c.globals_rebound_by_call.is_empty()
+                && (expr_contains_call(&a.value) || a.targets.iter().any(expr_contains_call))
+            {
                 reset_globals_after_call(c);
             }
             for target in &a.targets {
@@ -11267,7 +11306,10 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                 params,
                 ret: Box::new(ret),
                 variadic,
-                min_params: Some(required),
+                // `None` when a required keyword-only parameter exists —
+                // see `min_params_for`; the relaxation must not treat that
+                // tail as omittable.
+                min_params: min_params_for(&f.parameters, required),
             };
             c.env.declare(TypeBinding {
                 name: f.name.as_str().to_owned(),
@@ -11803,7 +11845,8 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
             }
         }
         Stmt::AugAssign(a) => {
-            let l = infer_expr(c, &a.target);
+            // The target can run a call too: `xs[bump()] += 1`.
+            let l = eval_stmt_expr(c, &a.target);
             // `total += fetch()` runs the callee, staling any narrowing on a
             // global it rebinds.
             let r = eval_stmt_expr(c, &a.value);
@@ -19551,6 +19594,35 @@ def go(items: list[str]) -> None:
         );
     }
 
+    /// A call in an assignment *target* runs too: `xs[clear()] = 5` must
+    /// invalidate a global narrowing exactly as `x = clear()` does.
+    #[test]
+    fn a_call_in_an_assignment_target_invalidates_a_global_narrowing() {
+        let d = check(
+            r#"
+mut cache: str? = "seed"
+
+def clear() -> int:
+    global cache
+    cache = None
+    return 0
+
+def go(xs: list[int]) -> None:
+    if cache is None:
+        return
+    xs[clear()] = 5
+    let _s: str = cache.upper()
+"#,
+        );
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::NullableUse { .. })),
+            "the subscript target runs `clear()`; got {:?}",
+            d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
     /// The `body_always_leaves_loop` gate has to keep holding: a body that
     /// cannot reach the back-edge runs at most once, so widening it would be
     /// a false positive.
@@ -19899,6 +19971,64 @@ def go() -> None:
                 .iter()
                 .any(|e| matches!(e, TycError::TypeMismatch { .. })),
             "a 2-argument function must not satisfy a 1-argument Callable"
+        );
+    }
+
+    /// The pre-PR review's soundness regression: `min_params` was computed
+    /// from the positional prefix alone, so the defaulted-tail relaxation
+    /// treated a *required keyword-only* tail as omittable. `tag` can satisfy
+    /// no positional `Callable` at all — every call the slot could make
+    /// raises `TypeError: missing 1 required keyword-only argument`.
+    #[test]
+    fn a_required_kwonly_tail_does_not_satisfy_a_positional_callable() {
+        let d = check(
+            r#"
+from typing import Callable
+
+def apply(f: Callable[[int], int], x: int) -> int:
+    return f(x)
+
+def tag(x: int, *, label: str) -> int:
+    return x + len(label)
+
+def go() -> None:
+    print(apply(tag, 3))
+"#,
+        );
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::TypeMismatch { .. })),
+            "a required kwonly param can be neither reached nor omitted by a \
+             positional Callable; got {:?}",
+            d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    /// …while a *defaulted* keyword-only tail stays accepted at the positional
+    /// arity — a positional call never reaches it and never needs to.
+    #[test]
+    fn a_defaulted_kwonly_tail_still_satisfies_the_positional_callable() {
+        let d = check(
+            r#"
+from typing import Callable
+
+def apply(f: Callable[[int], int], x: int) -> int:
+    return f(x)
+
+def tag(x: int, *, label: str = "t") -> int:
+    return x + len(label)
+
+def go() -> None:
+    print(apply(tag, 3))
+"#,
+        );
+        assert!(
+            !d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::TypeMismatch { .. })),
+            "a defaulted kwonly tail is omittable; got {:?}",
+            d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
         );
     }
 

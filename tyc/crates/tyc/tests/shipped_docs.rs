@@ -197,6 +197,10 @@ fn docs_do_not_teach_the_prefix_frozen_modifier() {
     for rel in [
         "docs",
         ".claude/skills/typhon",
+        // The copy of the skill embedded in the crate — it ships with the
+        // binary, and the pre-PR review found the prefix spelling fixed in
+        // the `.claude` copy but still taught here.
+        "tyc/crates/tyc/skill",
         "docs-site/src/content/docs",
     ] {
         let dir = root.join(rel);

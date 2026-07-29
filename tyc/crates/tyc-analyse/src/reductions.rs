@@ -69,7 +69,10 @@
 //!      observe the difference is to catch the exception in the frame that
 //!      owns `ACC` — once it escapes the function, `ACC` dies with the frame —
 //!      so a loop lexically inside a `try` body in its own frame is never
-//!      rewritten. (Note that condition 4's purity requirement does *not*
+//!      rewritten — nor inside a `with` body, whose manager's `__exit__` can
+//!      suppress the exception in the same frame (`contextlib.suppress`); an
+//!      arbitrary manager cannot be proven non-suppressing, so every `with`
+//!      body counts as guarded. (Note that condition 4's purity requirement does *not*
 //!      imply non-raising: integer `//` and `%` and calls to `@pure` functions
 //!      all raise while being side-effect-free.) A nested `def` resets this:
 //!      it opens a new frame, which an enclosing `try` does not guard.
@@ -292,7 +295,12 @@ fn recurse_children(
             rewrite_stmts(&mut s.body, ctx, env, stats, in_try);
             rewrite_stmts(&mut s.orelse, ctx, env, stats, in_try);
         }
-        Stmt::With(s) => rewrite_stmts(&mut s.body, ctx, env, stats, in_try),
+        // A `with` body is guarded like a `try` body: the context manager's
+        // `__exit__` can suppress the exception in this same frame
+        // (`contextlib.suppress` exists to do exactly that), after which the
+        // accumulator's partial state is observable. We cannot prove an
+        // arbitrary manager non-suppressing, so every `with` body counts.
+        Stmt::With(s) => rewrite_stmts(&mut s.body, ctx, env, stats, /*in_try=*/ true),
         Stmt::Try(s) => {
             // Only the `try` body is guarded by this statement's handlers.
             // Python does not route a raise in the `else` clause, a handler
@@ -1033,6 +1041,30 @@ def run(xs: list[int]) -> int:
         assert_eq!(
             stats.rewrites, 0,
             "a `try` in the same frame can observe the accumulator; got:\n{out}"
+        );
+    }
+
+    /// A `with` body is guarded like a `try` body: `contextlib.suppress`
+    /// catches the raise in the same frame via `__exit__`, and execution then
+    /// reads the accumulator — exactly the observable-state difference
+    /// condition 8 exists to prevent. An arbitrary manager cannot be proven
+    /// non-suppressing, so every `with` body counts.
+    #[test]
+    fn does_not_rewrite_a_loop_inside_a_with_body() {
+        let src = "\
+import contextlib
+
+def run(xs: list[int]) -> int:
+    mut total: int = 0
+    with contextlib.suppress(ZeroDivisionError):
+        for x in xs:
+            total += 100 // x
+    return total
+";
+        let (out, stats) = rewrite(src, &[], 0);
+        assert_eq!(
+            stats.rewrites, 0,
+            "a suppressing `__exit__` observes the accumulator's partial state; got:\n{out}"
         );
     }
 

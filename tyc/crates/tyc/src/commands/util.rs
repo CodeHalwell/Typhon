@@ -48,6 +48,7 @@ pub fn severity_overrides(config: &TyphonConfig) -> tyc_diagnostics::SeverityOve
     tyc_diagnostics::SeverityOverrides {
         unused_import: config.strictness.unused_import.clone(),
         methods_in_class_body: config.strictness.methods_in_class_body.clone(),
+        nullable_use: config.strictness.nullable_use.clone(),
         require_with: config.strictness.require_with.clone(),
         blocking_in_async: config.strictness.blocking_in_async.clone(),
         stub_check: config.strictness.stub_check.clone(),

@@ -4,7 +4,7 @@ All notable changes to Typhon are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely; the
 canonical phase-by-phase status lives in `docs/roadmap.md`.
 
-## Unreleased — codebase-review remediation (2026-07-28)
+## Unreleased (will ship as v1.0.0-alpha.7) — codebase-review remediation (2026-07-28)
 
 Fixes driven by the [2026-07-28 full-codebase review](docs/codebase-review-2026-07-28.md).
 All ten of the review's 1.0 blockers are addressed here, plus the Tier-0 gates
@@ -17,10 +17,29 @@ Compatibility, using the review's own taxonomy:
   longer abort.
 - **Narrowings on already-crashing code** (the alpha.2 carve-out, each one only
   rejects a program that was guaranteed to fail at runtime): positional
-  construction of a `model`; positional construction against the wrong
-  multiple-inheritance field order; wrong-typed attribute assignment; `set` /
-  `frozenset` passed as a `Sequence` / `Reversible`, and any container passed
-  as an `Iterator`.
+  construction of a `model` (Pydantic's `__init__` is keyword-only, so the
+  call raises).
+- **Narrowings on code that relied on unsound typing** (the alpha.3/alpha.4
+  precedent: the program can run, but only because nothing yet exercised the
+  contract the annotation claims):
+  - wrong-typed attribute assignment — `c.total = "nope"` into an `int` field
+    *runs* under `@dataclass(slots=True)` (no runtime type check exists) and
+    corrupts the field for every later reader;
+  - positional construction against the wrong multiple-inheritance field
+    order — without slots it constructs successfully with silently-swapped
+    field values;
+  - `set` / `frozenset` passed as a `Sequence` / `Reversible`, and a container
+    passed as an `Iterator` — a callee that only iterates runs fine (`for`
+    calls `iter()` first); one that indexes, reverses, or calls `next()`
+    raises `TypeError`. The check enforces the declared contract, not the
+    subset a particular callee happens to exercise;
+  - a generic call binding one invariant type parameter to two different
+    containers (`add_all(ints, strs)` against `dst: list[T], src: list[T]`) —
+    runs until the callee's cross-writes are observed, corrupting the caller's
+    collection. `unsafe:` is the escape.
+  None of these has a severity knob; the escape is fixing the annotation (or
+  `unsafe:` where noted). No file in the 1342-file example + stress corpus is
+  affected by any of them.
 - **Narrowings on code that may run correctly today**, each with an escape and
   each verified against the full example + stress corpus:
   - a `match` over a *parametric* sealed union (`type U[T] = A | B`) is now
@@ -30,10 +49,15 @@ Compatibility, using the review's own taxonomy:
   - dereferencing a nullable *field* (`self.conn.execute()`) is reported. This
     lands at **warn** level for one release because, unlike the narrowing
     fixes below, it can flag a field that happens always to be populated;
-    promote it with `[strictness] nullable-use = "error"`;
+    promote it with `[strictness] nullable-use = "error"` (or silence it with
+    `"off"`);
   - `let` immutability is enforced inside loop bodies and through
     `global` / `nonlocal`. Both were unenforced, so this rejects programs that
-    ran — but only ones already violating Rule 2 as documented.
+    ran — but only ones already violating Rule 2 as documented. One known
+    limit: a module `let` declared only inside a nested block *textually
+    after* the consuming function is not yet visible to the redirect, so that
+    ordering still escapes enforcement (a false negative, never a false
+    positive).
 
 **Standing note on an alpha.2 narrowing that is *not* being reverted.** The
 subscript-assignment check added in v1.0.0-alpha.2 rejects an `object`-typed
@@ -75,8 +99,9 @@ rather than a silent one.
   `re.findall` with groups returns whole matches instead of tuples; a
   module-level `lazy let` evaluates eagerly, reordering side effects;
   `model_dump_json()` uses the wrong separators and `model` instances leak a
-  `model_config` field into their repr. Four of the sixteen `examples/apps/`
-  projects diverge.
+  `model_config` field into their repr. Four of the sixteen multi-file example
+  projects (fifteen under `examples/apps/` plus `examples/47-mini-app`)
+  diverge.
 
   Two coverage limits are reported explicitly rather than folded into the pass
   count: 94 units "agree" only because both paths die on an uninstalled
@@ -112,8 +137,10 @@ rather than a silent one.
   `TYC_REQUIRE_PYTHON=1`, which turns the skip into a failure.
 - **Source-map tests assert something.** Every assertion was `ty_line >= 1`,
   which a table of all 1s satisfies. Replaced with a monotonicity check — which
-  immediately surfaced that the `.py.map` values are preprocessed-buffer lines,
-  not `.ty` lines (documented at the assertion site; **not yet fixed**).
+  immediately surfaced that the `.py.map` values were preprocessed-buffer
+  lines, not `.ty` lines. That defect was then fixed on this branch (see the
+  Source maps section below), and the test now asserts the real invariant:
+  every value is a line of the `.ty` file itself.
 - **Perf gate measures the compiler.** Venv introspection and `ruff format`
   were ~84% of the timed region (median 89 ms → 14 ms once excluded), so the
   nominal 20% threshold tolerated a far larger regression in the code under
@@ -133,7 +160,36 @@ rather than a silent one.
 - **`from module import *` no longer errors** on every star-imported name.
 - **A function with a defaulted tail satisfies a narrower `Callable`.**
   `def scale(x: int, factor: int = 2)` was rejected where
-  `Callable[[int], int]` was expected.
+  `Callable[[int], int]` was expected. The relaxation is scoped to genuinely
+  omittable tails: a function with a *required keyword-only* parameter
+  (`def tag(x: int, *, label: str)`) satisfies no positional `Callable` shape
+  at all — every call the slot could make raises `TypeError` — and keeps
+  exact-arity matching. (The first cut of this fix missed that and was itself
+  a soundness regression, caught by the pre-PR review before shipping.)
+- **A call in an assignment *target* invalidates a global narrowing.**
+  `xs[clear()] = 5` runs the callee just as `x = clear()` does; the
+  per-statement reset now walks targets for `=`, `+=`, and annotated
+  assignment alongside the right-hand side.
+- **The auto-parallel reduction refuses a loop inside a `with` body.** A
+  context manager's `__exit__` can suppress the raise in the same frame
+  (`contextlib.suppress` exists to do exactly that), after which the
+  accumulator's partial state is observable — the same divergence the `try`
+  guard exists to prevent. An arbitrary manager cannot be proven
+  non-suppressing, so every `with` body counts as guarded.
+- **`[strictness] nullable-use` exists.** The compatibility note above and the
+  `nullable_use` doc page promise the promotion knob; the first cut of this
+  branch documented it without implementing it, so following the tool's own
+  guidance made `typhon.toml` fail validation. It is now a real knob
+  (`"warn"` default / `"error"` / `"off"`), governs only the warn-emitted
+  attribute-rooted form, and is documented in `docs/configuration.md` and the
+  site's strictness page.
+- **`global`-redirect initialisers are not reassignments.** The redirect that
+  routes `global NAME` writes to the module binding consumed the
+  uninitialised-`let` marker on the resolver's pre-collect pass, so the body
+  walk's second visit of the *same statement* flagged the initialising write
+  of a declare-only `let` as `tyc::immutable_assign`. The redirect now
+  remembers which write was the initialiser, mirroring `declare_full`'s
+  natural idempotence.
 - **`List[int]` no longer also raises a hard mismatch** on top of the
   deprecation warning that already tells the user what to write.
 - **`match` over a parametric sealed union is checked** for exhaustiveness.
@@ -282,7 +338,7 @@ rather than a silent one.
   rendering. Sequential execution also means the VM cannot cancel siblings, so
   a multi-failure `gather:` may report more members than CPython would.
 - Relative imports resolve against the importing module's package (example apps
-  running under `tyc run`: 0/16 → 6/16).
+  running under `tyc run`: 0/15 → 6/15 of the `examples/apps/` projects).
 - `model` defaulted fields reach the constructor; `Ok(value=…)` / `Err(error=…)`
   accept their keyword form.
 - Inline `?` is expanded (the VM's chain omitted the pass entirely).
