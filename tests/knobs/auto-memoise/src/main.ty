@@ -1,0 +1,17 @@
+# `[strictness] auto-memoise = true` puts @functools.cache on every function the
+# analyser proves pure. Naive `fib` is exponential without it, linear with it —
+# so the fixture also demonstrates the rewrite is observationally transparent.
+@pure
+def fib(n: int) -> int:
+    if n < 2:
+        return n
+    return fib(n - 1) + fib(n - 2)
+
+
+def main() -> None:
+    print(fib(24))
+    print(fib(0), fib(1), fib(2))
+
+
+if __name__ == "__main__":
+    main()

@@ -39,6 +39,16 @@ Two source-level changes ride on top of the upstream code:
    Mid-expression occurrences of `let` / `mut` continue to lex as
    identifiers, matching standard Python semantics.
 
+   The name that follows may be a **soft keyword** — `let match = ...`,
+   `let type = ...`, `let case = ...`. Those are valid identifiers in
+   Python, and Typhon is a superset, so the statement-start lookahead
+   accepts `TokenKind::is_soft_keyword()` alongside `Name` / `Lpar` /
+   `Lsqb`. Testing only for `Name` made `let` fall through and be parsed
+   as an ordinary identifier, surfacing "Simple statements must be
+   separated by newlines" on ordinary code — `match` is the conventional
+   name for a regex result, and it is what made `tyc migrate` emit an
+   unparseable `.ty` for CPython's own `dataclasses` module.
+
 Smoke tests at `vendor/ruff_python_parser/tests/typhon_mutability.rs` and
 `crates/tyc-syntax/src/ruff.rs::tests` cover the new shapes.
 

@@ -20,9 +20,9 @@ use tyc_emit::{compare_modules, StubTestKind};
 use tyc_resolve::check_unknown_modules;
 use tyc_resolve::{check_unknown_modules_with, ImportVettingContext};
 use tyc_syntax::preprocess::{
-    expand_gather_blocks, expand_go_calls, expand_inline_question_ops, expand_lazy_imports,
-    expand_multiline_guards, expand_pipes, expand_question_ops, expand_typed_let_unpack,
-    expand_with_chains, preprocess,
+    expand_compound_question_headers, expand_gather_blocks, expand_go_calls,
+    expand_inline_question_ops, expand_lazy_imports, expand_multiline_guards, expand_pipes,
+    expand_question_ops, expand_typed_let_unpack, expand_with_chains, preprocess,
 };
 
 use crate::commands::util::{apply_strictness, collect_dty_files, collect_ty_files};
@@ -1093,11 +1093,13 @@ fn ty_path_to_dotted(path: &std::path::Path, src_root: &str) -> String {
 /// downstream diagnostics. (Copilot review on PR #68, file
 /// check.rs:332.)
 fn expand_for_check(source: &str) -> String {
-    expand_question_ops(&expand_inline_question_ops(&expand_pipes(
-        &expand_with_chains(&expand_go_calls(&expand_gather_blocks(
-            &expand_multiline_guards(&expand_lazy_imports(&expand_typed_let_unpack(source))),
-        ))),
-    )))
+    expand_question_ops(&expand_inline_question_ops(
+        &expand_compound_question_headers(&expand_pipes(&expand_with_chains(&expand_go_calls(
+            &expand_gather_blocks(&expand_multiline_guards(&expand_lazy_imports(
+                &expand_typed_let_unpack(source),
+            ))),
+        )))),
+    ))
 }
 
 /// Run the full preprocess + parse pipeline on `source` and return the
@@ -1479,10 +1481,14 @@ def fetch(url: str) -> str:
         let tmp = tempfile::tempdir().unwrap();
         let src = tmp.path().join("src");
         std::fs::create_dir_all(&src).unwrap();
-        // Fake third-party package, importable via Python's CWD-based
-        // sys.path[0] entry. Lives at the project root so the
-        // subprocess Python spawned by `enrich_project_shapes_with_venv`
-        // finds it. The package name must match a [dependencies] key.
+        // Fake third-party package, made importable via PYTHONPATH (set
+        // below). It deliberately does NOT rely on Python's CWD-based
+        // sys.path[0] entry: the introspection subprocess runs in an empty
+        // private scratch directory precisely so files in the project root
+        // can never shadow real modules (see `tyc_venv::ScratchDir` and
+        // SECURITY.md). PYTHONPATH is honoured regardless of the subprocess
+        // cwd, so it is the faithful stand-in for an installed package.
+        // The package name must match a [dependencies] key.
         let pkg = tmp.path().join("fake_introspect_pkg");
         std::fs::create_dir_all(&pkg).unwrap();
         std::fs::write(
@@ -1508,10 +1514,6 @@ class Agent:
             "from fake_introspect_pkg import Agent\n\
              let a: Agent = Agent(name=\"x\", tools=[])\n",
         );
-        // The introspection helper sets its own subprocess CWD to
-        // `project_root`, so Python's `sys.path[0]` picks up
-        // `fake_introspect_pkg` without touching the process-global
-        // CWD that other parallel tests share.
         let project_root = tmp.path();
         let mut shape_map: std::collections::HashMap<String, tyc_db::ModuleShapes> =
             std::collections::HashMap::new();
@@ -1519,6 +1521,14 @@ class Agent:
             std::collections::HashSet::new();
         let allowed: std::collections::HashSet<String> =
             ["fake_introspect_pkg".to_owned()].into_iter().collect();
+        // Make the fake package importable by the introspection subprocess
+        // (which inherits this process's environment). Scoped tightly around
+        // the call and removed afterwards; the directory contains only
+        // `fake_introspect_pkg`, so a concurrently-running test that spawns
+        // Python cannot be affected by the extra entry.
+        // SAFETY: same pattern as the crate's other env-var tests; the var
+        // is removed before the test returns.
+        unsafe { std::env::set_var("PYTHONPATH", project_root) };
         tyc_venv::enrich_project_shapes_with_venv(
             std::slice::from_ref(&src),
             project_root,
@@ -1526,6 +1536,7 @@ class Agent:
             allowed,
             &mut shape_map,
         );
+        unsafe { std::env::remove_var("PYTHONPATH") };
         // The fake_introspect_pkg shape must now carry `Agent` with
         // field_order = ["name", "client", "tools"] and
         // field_defaults = {"tools"}.
@@ -1549,9 +1560,9 @@ class Agent:
         // `run()` returns Ok on warnings, so we test via the resolver helper
         // directly to confirm the warning fires in project context.
         let source = "import requests\n";
-        let expanded = expand_question_ops(&expand_inline_question_ops(&expand_pipes(
-            &expand_with_chains(source),
-        )));
+        let expanded = expand_question_ops(&expand_inline_question_ops(
+            &expand_compound_question_headers(&expand_pipes(&expand_with_chains(source))),
+        ));
         let module = tyc_syntax::parse_module(&expanded).unwrap().into_syntax();
         let diags = check_unknown_modules("t.ty", source, &module, &[], &[]);
         assert!(

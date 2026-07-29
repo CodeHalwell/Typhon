@@ -55,6 +55,16 @@ pub enum Type {
         params: Vec<Type>,
         ret: Box<Type>,
         variadic: bool,
+        /// How many of `params` the caller must actually supply.
+        ///
+        /// `None` means "all of them" — the common case, and what every
+        /// builtin signature and every `Callable[[…], R]` annotation means.
+        /// `Some(n)` records that the trailing `params.len() - n` parameters
+        /// carry defaults, which is what makes a function with a defaulted
+        /// tail satisfy a narrower `Callable`: `def scale(x: int, factor: int = 2)`
+        /// *is* a `Callable[[int], int]`, and rejecting it was a false
+        /// positive at one of the most common higher-order-function shapes.
+        min_params: Option<usize>,
     },
     /// `Container[Args...]` — e.g. `list[int]`, `dict[str, int]`.
     Generic(String, Vec<Type>),
@@ -367,19 +377,7 @@ pub fn assignable(expected: &Type, actual: &Type) -> bool {
             // declared covariant in `generic_param_variance`. The
             // element type still has to be assignable, so the
             // direction stays correct.
-            const READ_VIEW_HEADS: &[&str] = &[
-                "Sequence",
-                "Iterable",
-                "Iterator",
-                "Collection",
-                "Container",
-                "Reversible",
-            ];
-            if READ_VIEW_HEADS.contains(&an.as_str())
-                && aa.len() == 1
-                && matches!(bn.as_str(), "list" | "tuple" | "set" | "frozenset")
-                && !bb.is_empty()
-            {
+            if read_view_head_accepts(an.as_str(), bn.as_str()) && aa.len() == 1 && !bb.is_empty() {
                 return assignable(&aa[0], &bb[0]);
             }
             // Mapping[K, V] is invariant in K (keys participate in
@@ -448,11 +446,13 @@ pub fn assignable(expected: &Type, actual: &Type) -> bool {
                 params: ep,
                 ret: er,
                 variadic: ev,
+                min_params: _,
             },
             Type::Function {
                 params: ap,
                 ret: ar,
                 variadic: _av,
+                min_params: a_min,
             },
         ) => {
             if *ev && ep.is_empty() {
@@ -466,6 +466,18 @@ pub fn assignable(expected: &Type, actual: &Type) -> bool {
                     return ep.iter().zip(ap).all(|(e, a)| assignable(a, e)) && assignable(er, ar);
                 }
                 return false;
+            }
+            // A function whose trailing parameters carry defaults declares
+            // more parameters than it requires, so it satisfies a *narrower*
+            // `Callable`: `def scale(x: int, factor: int = 2)` is a
+            // `Callable[[int], int]`. Comparing declared arity alone rejected
+            // that — a false positive at one of the most common higher-order
+            // shapes there is. Only the supplied prefix is checked; the
+            // defaulted tail is never passed.
+            if let Some(required) = a_min {
+                if *required <= ep.len() && ep.len() <= ap.len() {
+                    return ep.iter().zip(ap).all(|(e, a)| assignable(a, e)) && assignable(er, ar);
+                }
             }
             if ep.len() != ap.len() {
                 return false;
@@ -1557,6 +1569,21 @@ pub fn type_from_annotation_with_params(
                 Expr::Attribute(a) => a.attr.as_str().to_owned(),
                 _ => return Type::Unknown,
             };
+            // The deprecated capitalised aliases are the *same types* as their
+            // lowercase builtins. `tyc::typing_alias_deprecated` already tells
+            // the user to stop writing them; leaving the head un-normalised on
+            // top of that produced a second, hard error reading
+            // "expected `List[int]`, found `list[int]`" — nonsensical on its
+            // face, and it blocks the build rather than nudging.
+            let head = match head.as_str() {
+                "List" => "list".to_owned(),
+                "Dict" => "dict".to_owned(),
+                "Set" => "set".to_owned(),
+                "FrozenSet" => "frozenset".to_owned(),
+                "Tuple" => "tuple".to_owned(),
+                "Type" => "type".to_owned(),
+                _ => head,
+            };
             // Optional[T] → T | None
             if head == "Optional" {
                 return Type::optional(type_from_annotation_with_params(
@@ -1639,6 +1666,7 @@ pub fn type_from_annotation_with_params(
                                     params,
                                     ret: Box::new(ret),
                                     variadic: false,
+                                    min_params: None,
                                 };
                             }
                             // `Callable[..., R]` — any args (including
@@ -1653,6 +1681,7 @@ pub fn type_from_annotation_with_params(
                                     params: vec![],
                                     ret: Box::new(ret),
                                     variadic: true,
+                                    min_params: None,
                                 };
                             }
                             _ => {}
@@ -2070,6 +2099,7 @@ fn substitute_typevars(ty: &Type, bindings: &std::collections::HashMap<String, T
             params,
             ret,
             variadic,
+            min_params,
         } => Type::Function {
             params: params
                 .iter()
@@ -2077,6 +2107,10 @@ fn substitute_typevars(ty: &Type, bindings: &std::collections::HashMap<String, T
                 .collect(),
             ret: Box::new(substitute_typevars(ret, bindings)),
             variadic: *variadic,
+            // Carry the required-arity through: dropping it here silently
+            // reverts a substituted signature to "every parameter required",
+            // which is exactly the false positive this field exists to fix.
+            min_params: *min_params,
         },
         other => other.clone(),
     }
@@ -2411,10 +2445,22 @@ impl TypeEnv {
     /// cannot invalidate their narrowing. This closes the *global* slice of the
     /// narrowing-across-call soundness gap (the `match`-over-a-global case in
     /// particular silently broke the sealed-union exhaustiveness guarantee).
-    fn reset_global_narrowings(&mut self) {
+    ///
+    /// `rebound` is the set of names some function in this module actually
+    /// declares `global` (see [`collect_call_rebound_globals`]); only those are
+    /// widened. Before v1.0.0-alpha.7 *every* global was widened on *every*
+    /// intervening call, which was both needlessly lossy — a global no callee
+    /// can reach lost its narrowing to an unrelated `len(xs)` — and, because
+    /// the reset ran from only three statement arms, still unsound everywhere
+    /// else. Restricting the set is what makes it affordable to run the reset
+    /// from *every* statement arm that evaluates a call (F41).
+    fn reset_global_narrowings(&mut self, rebound: &std::collections::HashSet<String>) {
+        if rebound.is_empty() {
+            return;
+        }
         if let Some(globals) = self.scopes.first_mut() {
-            for b in globals.values_mut() {
-                if b.narrowed != b.declared {
+            for (name, b) in globals.iter_mut() {
+                if rebound.contains(name) && b.narrowed != b.declared {
                     b.narrowed = b.declared.clone();
                 }
             }
@@ -2471,11 +2517,99 @@ impl TypeEnv {
 }
 
 /// Per-module check state.
+/// Which concrete container heads actually satisfy each read-only ABC.
+///
+/// A single flat list of ABC names, matched against a single flat list of
+/// containers, over-approximated the `collections.abc` lattice in two ways
+/// that produce a clean check and a `TypeError` at runtime, in both CPython
+/// and the VM:
+///
+/// * `set` / `frozenset` are unordered, so they are **not** `Sequence[T]`
+///   (no `__getitem__`) and **not** `Reversible[T]` (no `__reversed__`).
+/// * No built-in container is an `Iterator[T]`. `list` / `tuple` / `set` are
+///   *iterables* — `iter(xs)` produces the iterator. Passing a `list` where an
+///   `Iterator` is expected fails on the first `next()`.
+///
+/// Anything not listed here is simply not covered by this rule, which is the
+/// conservative direction: the assignment falls through to the ordinary
+/// nominal check rather than being waved through.
+const READ_VIEW_LATTICE: &[(&str, &[&str])] = &[
+    ("Sequence", &["list", "tuple"]),
+    ("Reversible", &["list", "tuple"]),
+    ("Iterable", &["list", "tuple", "set", "frozenset"]),
+    ("Collection", &["list", "tuple", "set", "frozenset"]),
+    ("Container", &["list", "tuple", "set", "frozenset"]),
+    // `Iterator` intentionally has no built-in members.
+    ("Iterator", &[]),
+];
+
+/// True when `container` satisfies the read-only ABC `abc`.
+fn read_view_head_accepts(abc: &str, container: &str) -> bool {
+    READ_VIEW_LATTICE
+        .iter()
+        .find(|(name, _)| *name == abc)
+        .is_some_and(|(_, members)| members.contains(&container))
+}
+
+/// Recursion bound for `infer_expr_ctx`.
+///
+/// Deliberately generous — the review's own guidance was that a budget of
+/// 2,000 is too tight, because a 3,000-term expression builds and runs
+/// correctly today. This must only ever catch input that would otherwise
+/// crash the process.
+const INFER_EXPR_MAX_DEPTH: u32 = 20_000;
+
+/// Recursion bound for [`Checker::is_assignable`].
+///
+/// Sized so that no real program reaches it: the deepest nesting in the
+/// example and stress corpora is well under 30, and the alpha.3 O(2^depth)
+/// work already exercised depth-28 aliases without trouble. It exists purely
+/// to stop a *non-terminating* unfold (mutually-recursive parametric aliases)
+/// from taking the process down, so it is set far above the working range
+/// rather than tuned close to it.
+const IS_ASSIGNABLE_MAX_DEPTH: u32 = 256;
+
 struct Checker<'a> {
     path: String,
     source: &'a str,
     resolved: &'a ResolvedModule,
+    /// Current nesting depth of [`Checker::is_assignable`].
+    ///
+    /// Mutually-recursive parametric type aliases (`type A[T] = B[T] | int`
+    /// alongside `type B[T] = A[T] | str`) unfold forever: each expansion
+    /// produces a structurally larger type, so no memoisation on the type
+    /// pair terminates. Without a bound the recursion overflows the native
+    /// stack and the process dies with SIGABRT on a five-line file. The
+    /// counter bounds it; see [`IS_ASSIGNABLE_MAX_DEPTH`].
+    ///
+    /// A `Cell` because every assignability method takes `&self` — threading
+    /// a depth parameter would touch every one of the ~200 recursive call
+    /// sites and each of them would have to remember to pass it on.
+    is_assignable_depth: std::cell::Cell<u32>,
+    /// Current nesting depth of `infer_expr_ctx`; see [`INFER_EXPR_MAX_DEPTH`].
+    infer_depth: std::cell::Cell<u32>,
+    /// The `(expected, actual)` pairs currently on the [`Checker::is_assignable`]
+    /// recursion stack.
+    ///
+    /// The depth counter alone does not terminate the recursive-alias case:
+    /// each level branches over union variants and generic arguments, so a
+    /// depth bound of *n* still admits exponentially many calls below it.
+    /// Detecting that a pair is already being decided further up the stack is
+    /// what actually closes the cycle, and answering `true` for it is the
+    /// standard coinductive reading — "assignable unless we can find a
+    /// counterexample", which is what makes `type Json = str | list[Json]`
+    /// work at all.
+    ///
+    /// A `Vec` rather than a `HashSet` because `Type` is not `Hash`, and
+    /// because a stack this shallow scans faster than it hashes.
+    is_assignable_path: std::cell::RefCell<Vec<(Type, Type)>>,
     classes: Vec<String>,
+    /// Module-global names some function in this module declares `global` —
+    /// the exact set an intervening call can rebind under a narrowing's feet.
+    /// See [`collect_call_rebound_globals`]; empty for the overwhelming
+    /// majority of modules, which is what makes the per-statement invalidation
+    /// in [`eval_stmt_expr`] free.
+    globals_rebound_by_call: std::collections::HashSet<String>,
     /// For each declared function name, its inferred signature type.
     function_signatures: HashMap<String, Type>,
     /// Per-function arity metadata that doesn't fit in `Type::Function`
@@ -2935,7 +3069,11 @@ impl<'a> Checker<'a> {
             path,
             source,
             resolved,
+            is_assignable_depth: std::cell::Cell::new(0),
+            infer_depth: std::cell::Cell::new(0),
+            is_assignable_path: std::cell::RefCell::new(Vec::new()),
             classes: Vec::new(),
+            globals_rebound_by_call: std::collections::HashSet::new(),
             function_signatures: HashMap::new(),
             function_arity_info: HashMap::new(),
             function_kwarg_types: HashMap::new(),
@@ -3043,6 +3181,43 @@ impl<'a> Checker<'a> {
     ///    be assignable to `expected` so nominal and structural rules apply to
     ///    each arm.
     fn is_assignable(&self, expected: &Type, actual: &Type) -> bool {
+        // Depth guard. See `is_assignable_depth`. On exhaustion return
+        // `true` — deliberately, and it is the only safe answer: a budget is
+        // an admission that we don't know, and the project's compatibility
+        // rule is that a check must never reject a program it cannot prove
+        // wrong. Answering `false` here would turn "the checker ran out of
+        // budget" into a user-visible `tyc::type_mismatch` on correct code.
+        let depth = self.is_assignable_depth.get();
+        if depth >= IS_ASSIGNABLE_MAX_DEPTH {
+            return true;
+        }
+        // Cycle check: this exact question is already being decided further
+        // up the stack, so the answer depends on itself. Assume `true` and
+        // let the surrounding conjunction find a real counterexample if one
+        // exists. Without this, a pair of aliases that reference each other
+        // through a type constructor (`type A = list[B]`, `type B = list[A]`)
+        // recurses forever — the per-file `tyc::cyclic_type_alias` pass
+        // deliberately treats such a reference as guarded, because
+        // `type Json = str | list[Json]` must remain legal.
+        if self
+            .is_assignable_path
+            .borrow()
+            .iter()
+            .any(|(e, a)| e == expected && a == actual)
+        {
+            return true;
+        }
+        self.is_assignable_depth.set(depth + 1);
+        self.is_assignable_path
+            .borrow_mut()
+            .push((expected.clone(), actual.clone()));
+        let result = self.is_assignable_inner(expected, actual);
+        self.is_assignable_path.borrow_mut().pop();
+        self.is_assignable_depth.set(depth);
+        result
+    }
+
+    fn is_assignable_inner(&self, expected: &Type, actual: &Type) -> bool {
         if assignable(expected, actual) {
             return true;
         }
@@ -3116,11 +3291,13 @@ impl<'a> Checker<'a> {
                 params: ep,
                 ret: er,
                 variadic: ev,
+                min_params: _,
             },
             Type::Function {
                 params: ap,
                 ret: ar,
-                variadic: _av,
+                variadic: av,
+                min_params: a_min,
             },
         ) = (expected, actual)
         {
@@ -3128,6 +3305,22 @@ impl<'a> Checker<'a> {
             // function with an assignable (covariant) return type.
             if *ev && ep.is_empty() {
                 return self.is_assignable(er, ar);
+            }
+            // Mirrors the arity rules in the free `assignable`: a variadic
+            // actual absorbs a wider call shape, and a defaulted tail lets a
+            // function satisfy a narrower `Callable`. This copy is the one
+            // that actually decides local function-to-`Callable` assignment,
+            // so leaving it on declared-arity-only kept the false positive
+            // alive after the other copy was fixed.
+            if *av && ap.len() <= ep.len() {
+                return ep.iter().zip(ap).all(|(e, a)| self.is_assignable(a, e))
+                    && self.is_assignable(er, ar);
+            }
+            if let Some(required) = a_min {
+                if *required <= ep.len() && ep.len() <= ap.len() {
+                    return ep.iter().zip(ap).all(|(e, a)| self.is_assignable(a, e))
+                        && self.is_assignable(er, ar);
+                }
             }
             if ep.len() != ap.len() {
                 return false;
@@ -3155,6 +3348,7 @@ impl<'a> Checker<'a> {
                     params: sig.param_types.clone(),
                     ret: Box::new(sig.return_type.clone()),
                     variadic: false,
+                    min_params: None,
                 };
                 if self.is_assignable(expected, &call_ty) {
                     return true;
@@ -3335,6 +3529,20 @@ impl<'a> Checker<'a> {
                 }
             }
         }
+        // Union → Union. Neither single-sided arm below handles this shape:
+        // the expected-Union arm asks whether the *whole* actual union fits
+        // one expected variant, and the actual-Union arm asks whether every
+        // actual variant fits the whole expected union but is only reached
+        // when `expected` is not itself a union. So `Dog?` → `Animal?` (and
+        // `Circle?` → a sealed `Shape?`, `Button?` → `Drawable?`, `UserId?`
+        // → `int?`) were rejected. The correct rule is member-wise: every
+        // actual variant must be assignable to at least one expected
+        // variant. Strictly a relaxation — it can only accept more.
+        if let (Type::Union(exp_variants), Type::Union(act_variants)) = (expected, actual) {
+            return act_variants
+                .iter()
+                .all(|a| exp_variants.iter().any(|e| self.is_assignable(e, a)));
+        }
         // For Union expected types (e.g. `Shape | None`), `assignable` recurses
         // using only the base rules. Re-check each variant here so sealed-union
         // knowledge is available in the recursive call.
@@ -3352,19 +3560,10 @@ impl<'a> Checker<'a> {
         // primitive widening; route through is_assignable here so the
         // class hierarchy is consulted.
         if let (Type::Generic(an, aa), Type::Generic(bn, bb)) = (expected, actual) {
-            const READ_VIEW_HEADS: &[&str] = &[
-                "Sequence",
-                "Iterable",
-                "Iterator",
-                "Collection",
-                "Container",
-                "Reversible",
-            ];
-            if READ_VIEW_HEADS.contains(&an.as_str())
-                && aa.len() == 1
-                && matches!(bn.as_str(), "list" | "tuple" | "set" | "frozenset")
-                && !bb.is_empty()
-            {
+            // Same per-head lattice as the free `assignable`; a second flat
+            // list here is exactly the drift that let `set` pass as a
+            // `Sequence`.
+            if read_view_head_accepts(an.as_str(), bn.as_str()) && aa.len() == 1 && !bb.is_empty() {
                 return self.is_assignable(&aa[0], &bb[0]);
             }
             // Sealed-union-aware counterpart to the Mapping rule in
@@ -3566,6 +3765,7 @@ impl<'a> Checker<'a> {
                 params,
                 ret,
                 variadic,
+                min_params,
             } => Type::Function {
                 params: params
                     .iter()
@@ -3573,6 +3773,10 @@ impl<'a> Checker<'a> {
                     .collect(),
                 ret: Box::new(self.canonicalize_module_aliases(ret)),
                 variadic: *variadic,
+                // Carried through, like every other structure-preserving
+                // rebuild: dropping it reverts the signature to
+                // "every parameter required".
+                min_params: *min_params,
             },
             other => other.clone(),
         }
@@ -4565,6 +4769,36 @@ impl<'a> Checker<'a> {
     }
 
     fn nullable_use(&mut self, name: &str, expected: &Type, span: (usize, usize)) {
+        self.nullable_use_at(name, expected, span, /*warn_only=*/ false);
+    }
+
+    /// Same diagnostic, emitted at warn level.
+    ///
+    /// Used for an *attribute-rooted* receiver (`self.conn.execute()`,
+    /// `cfg.db.host`). Before v1.0.0-alpha.7 the check ran only when the
+    /// receiver was a bare `Expr::Name` — not by design, but because
+    /// [`Checker::nullable_use`] wanted a name for the message, so an
+    /// `if let Expr::Name` gate sat inside the `is_nullable()` branch and
+    /// silently swallowed every other receiver shape (F42). Dereferencing a
+    /// nullable *field* is the single most common non-nullability bug in real
+    /// code, and it was invisible.
+    ///
+    /// Warn, not error, because unlike the narrowing-invalidation fixes this
+    /// one newly rejects programs that *ran correctly* — code whose nullable
+    /// field happens to always be populated at the deref. Promote it with
+    /// `[strictness] nullable-use = "error"`; it becomes an error by default
+    /// in a later release.
+    fn nullable_attr_use(&mut self, path: &str, expected: &Type, span: (usize, usize)) {
+        self.nullable_use_at(path, expected, span, /*warn_only=*/ true);
+    }
+
+    fn nullable_use_at(
+        &mut self,
+        name: &str,
+        expected: &Type,
+        span: (usize, usize),
+        warn_only: bool,
+    ) {
         if self.unsafe_depth > 0 {
             return;
         }
@@ -4584,14 +4818,12 @@ impl<'a> Checker<'a> {
             },
             other => other.display(),
         };
-        self.diagnostics.push_error(TycError::nullable_use(
-            name,
-            display,
-            &self.path,
-            self.source,
-            span.0,
-            length,
-        ));
+        let diag = TycError::nullable_use(name, display, &self.path, self.source, span.0, length);
+        if warn_only {
+            self.diagnostics.push_warning(diag);
+        } else {
+            self.diagnostics.push_error(diag);
+        }
     }
 
     fn wrong_args(&mut self, name: &str, expected: usize, actual: usize, span: (usize, usize)) {
@@ -5646,6 +5878,7 @@ pub fn check_module_with_imports(
 
     // First pass: collect class names + function signatures so forward
     // references work.
+    collect_call_rebound_globals(&module.body, &mut c.globals_rebound_by_call);
     collect_classes_and_functions(&mut c, &module.body);
     check_override_compatibility(&mut c, &module.body);
     populate_frozen_classes(&mut c, &module.body, &frozen_starts);
@@ -6779,6 +7012,111 @@ fn collect_names_in_expr(expr: &Expr) -> std::collections::HashSet<&str> {
     v.names
 }
 
+/// True when `ty` still mentions an unbound type parameter anywhere.
+///
+/// Used as a bail-out: a field whose type is still generic has no single
+/// concrete answer at this site, so checking it would be guessing.
+fn mentions_type_param(ty: &Type) -> bool {
+    match ty {
+        Type::TypeVar(_) | Type::TypeConstructor(..) => true,
+        Type::Union(xs) => xs.iter().any(mentions_type_param),
+        Type::Generic(_, args) => args.iter().any(mentions_type_param),
+        Type::Function { params, ret, .. } => {
+            params.iter().any(mentions_type_param) || mentions_type_param(ret)
+        }
+        _ => false,
+    }
+}
+
+/// Type-check `receiver.field = value`.
+///
+/// Instance-attribute assignment was never checked, which left a hole at the
+/// centre of the language: `self.field = v` is the *mandated* idiom — methods
+/// live in `impl` blocks and write through `self` — so the single most common
+/// assignment form in idiomatic Typhon accepted any type at all. A `str` into
+/// an `int` field passed `tyc check`, emitted, and corrupted the field.
+///
+/// Every gate below exists because attribute assignment is also the position
+/// where the checker knows *least*, and a false positive here would reject
+/// working code at the same central idiom. In order:
+///
+/// * `unsafe:` regions are exempt, like every other check.
+/// * A `partial` shape (venv-introspected, or a bundled stub) lists only the
+///   members introspection happened to see; an absent field there means
+///   "unknown", not "wrong".
+/// * An absent field is not an error: `plain class` / `class!` may carry a
+///   hand-written `__init__` that creates attributes this table never saw.
+///   Reads are covered separately by `tyc::attribute_not_found`.
+/// * Anything still mentioning a type parameter — on either side — is skipped:
+///   inside `impl[T] Box[T]:` the field type is literally `T`, and the
+///   assigned value's type is whatever the caller will pin it to.
+/// * `Unknown` on either side is the checker admitting it does not know.
+///
+/// What survives all of that is the case where a concrete field type and a
+/// concrete value type are both known and genuinely incompatible.
+fn check_attr_assign_type(c: &mut Checker, target: &Expr, value_type: &Type) {
+    if c.unsafe_depth > 0 {
+        return;
+    }
+    let Expr::Attribute(attr) = target else {
+        return;
+    };
+    if matches!(value_type, Type::Unknown) {
+        return;
+    }
+    let recv = infer_expr_readonly(c, &attr.value);
+    // A nullable receiver is already reported as `tyc::nullable_use`; peel the
+    // `| None` so the field check still applies to the underlying class rather
+    // than double-reporting or silently skipping.
+    let (class_name, targs) = match recv.strip_none() {
+        Type::Class(name) => (name, Vec::new()),
+        Type::Generic(name, args) => (name, args),
+        _ => return,
+    };
+    let Some(shape) = c.class_shapes.get(&class_name).cloned() else {
+        return;
+    };
+    if shape.partial {
+        return;
+    }
+    let Some(field_ty) = shape.fields.get(attr.attr.as_str()).cloned() else {
+        return;
+    };
+    // Substitute the receiver's type arguments into the field type, so a
+    // `Box[int]`'s `value: T` field is checked as `int`. When the receiver is
+    // bare (`Type::Class`) or the arity does not line up, the bindings map
+    // stays empty and the `mentions_type_param` gate below drops the check.
+    let mut bindings = std::collections::HashMap::new();
+    if let Some(tparams) = c.class_type_params.get(&class_name) {
+        if tparams.len() == targs.len() {
+            for (p, a) in tparams.iter().zip(targs.iter()) {
+                bindings.insert(p.clone(), a.clone());
+            }
+        }
+    }
+    let field_ty = substitute_typevars(&field_ty, &bindings);
+    if matches!(field_ty, Type::Unknown)
+        || mentions_type_param(&field_ty)
+        || mentions_type_param(value_type)
+    {
+        return;
+    }
+    if c.is_assignable(&field_ty, value_type) {
+        return;
+    }
+    let span_start = attr.attr.range.start().to_usize();
+    let span_end = attr.attr.range.end().to_usize();
+    let length = span_end.saturating_sub(span_start).max(1);
+    c.diagnostics.push_error(TycError::type_mismatch(
+        field_ty.display(),
+        value_type.display(),
+        c.path.clone(),
+        c.source,
+        span_start,
+        length,
+    ));
+}
+
 fn check_attr_assign_not_frozen(c: &mut Checker, target: &Expr) {
     if c.frozen_classes.is_empty() || c.unsafe_depth > 0 {
         return;
@@ -6831,6 +7169,7 @@ fn seed_typhon_builtins(c: &mut Checker) {
         params: vec![Type::Str],
         ret: Box::new(Type::Str),
         variadic: true,
+        min_params: None,
     };
     c.env.declare(TypeBinding {
         name: "env".into(),
@@ -8918,7 +9257,20 @@ fn effective_class_shape(
         seen.push(name.to_owned());
         let direct = class_shapes.get(name)?;
         let mut merged = InterfaceShape::default();
-        for base in &direct.bases {
+        // Bases are visited **right-to-left**, which is what makes the
+        // accumulated `field_order` match `@dataclass`'s reverse-MRO
+        // collection (and therefore match what `tyc-desugar` now emits and
+        // what CPython actually constructs). Left-to-right — the previous
+        // behaviour — put `class C(A, B)`'s fields in the order
+        // `a…, b…, own`, while `dataclasses.fields()` reports `b…, a…, own`,
+        // so the checker validated positional arguments against a signature
+        // the runtime did not have.
+        //
+        // Right-to-left recursion coincides with `mro::field_collection_order`
+        // on every hierarchy CPython accepts; the shared helper is not called
+        // here only because this walk is over `InterfaceShape` bases, which
+        // include names resolved across module boundaries.
+        for base in direct.bases.iter().rev() {
             if let Some(base_shape) = build(base, class_shapes, depth + 1, seen) {
                 for fname in &base_shape.field_order {
                     if !merged.fields.contains_key(fname) {
@@ -8956,10 +9308,16 @@ fn effective_class_shape(
                 merged.field_defaults.remove(fname);
             }
         }
-        // Methods / bases on the merged shape stay empty — the only
-        // callers of this helper read fields / field_order /
-        // field_defaults. Keeping methods empty avoids a misleading
-        // member surface if a downstream consumer reads it.
+        // Methods on the merged shape stay empty — the callers of this
+        // helper read fields / field_order / field_defaults, and an empty
+        // method map avoids presenting a misleading member surface.
+        //
+        // `bases`, however, must be carried through. The constructor-shape
+        // check reads it to recognise a Pydantic `model` (whose `__init__`
+        // is keyword-only), and dropping it made every model look like a
+        // plain dataclass again — silently undoing that check for exactly
+        // the classes it exists for.
+        merged.bases = direct.bases.clone();
         seen.pop();
         Some(merged)
     }
@@ -9177,6 +9535,36 @@ fn class_constructor_arity_for(shape: &InterfaceShape, class_name: Option<&str>)
         Some(name) => Type::Class(name.to_owned()),
         None => Type::Unknown,
     };
+    // A `model X:` emits `class X(BaseModel):`, and Pydantic's
+    // `BaseModel.__init__` is `(self, **data)` — **keyword-only**. Modelling
+    // its fields as positional meant `ApiUser(1, "alice")` type-checked clean
+    // and then raised `TypeError: BaseModel.__init__() takes 1 positional
+    // argument but 3 were given` the moment it ran. Re-file the fields as
+    // keyword-only so the arity check matches the constructor that actually
+    // exists.
+    //
+    // This narrows the accepted surface, but only for programs that were
+    // already guaranteed to raise at runtime — the alpha.2 carve-out.
+    if shape.bases.iter().any(|b| b == "BaseModel") {
+        return ArityInfo {
+            param_names: Vec::new(),
+            min_positional: 0,
+            required_positional: Vec::new(),
+            max_positional: Some(0),
+            kwonly_names: shape.field_order.clone(),
+            kwonly_required: shape
+                .field_order
+                .iter()
+                .filter(|name| !shape.field_defaults.contains(*name))
+                .cloned()
+                .collect(),
+            has_kwarg: false,
+            vararg_type: None,
+            param_types: Vec::new(),
+            kwonly_types: param_types,
+            return_type,
+        };
+    }
     ArityInfo {
         param_names: shape.field_order.clone(),
         min_positional,
@@ -9223,6 +9611,16 @@ fn function_signature(
         Some(r) => type_from_annotation_with_params(r, classes, type_params),
         None => Type::Unknown,
     };
+    // How many of those parameters the caller must actually supply: the
+    // positional ones without a default. A defaulted tail is what lets
+    // `def scale(x: int, factor: int = 2)` satisfy `Callable[[int], int]`;
+    // comparing declared arity alone rejected it.
+    let required = parameters
+        .posonlyargs
+        .iter()
+        .chain(parameters.args.iter())
+        .take_while(|pwd| pwd.default.is_none())
+        .count();
     Type::Function {
         params,
         ret: Box::new(ret),
@@ -9230,6 +9628,41 @@ fn function_signature(
         // the call-site arity check accept any number of positional
         // arguments beyond the declared params (FINDINGS #44c).
         variadic: parameters.vararg.is_some(),
+        min_params: min_params_for(parameters, required),
+    }
+}
+
+/// The `min_params` value a `def`'s signature may carry, or `None` to keep
+/// exact-arity matching.
+///
+/// `Some(required)` unlocks the defaulted-tail relaxation: a `Callable`
+/// expecting between `required` and `params.len()` positionals accepts the
+/// function. That reading is only sound when every parameter beyond the
+/// supplied prefix is genuinely omittable — and a *required keyword-only*
+/// parameter never is. `def tag(x: int, *, label: str)` can satisfy no
+/// positional `Callable` shape at all: a positional call can neither reach
+/// `label` nor omit it, so CPython raises `TypeError: missing 1 required
+/// keyword-only argument` on every call the `Callable` slot could make.
+/// Returning `None` here falls back to exact length matching, which rejects
+/// naturally because the kwonly params inflate `params.len()` past any
+/// satisfiable expected arity — exactly the pre-relaxation behaviour.
+/// (Setting `Some(required)` for such a function was the pre-PR review's
+/// soundness regression: the relaxation treated the required kwonly tail as
+/// omittable and accepted a check-clean program that crashed on both
+/// execution paths.) Defaulted kwonly params are harmless — a positional
+/// call never reaches them and never needs to.
+fn min_params_for(
+    parameters: &ruff_python_ast::Parameters,
+    required_positional: usize,
+) -> Option<usize> {
+    let has_required_kwonly = parameters
+        .kwonlyargs
+        .iter()
+        .any(|pwd| pwd.default.is_none());
+    if has_required_kwonly {
+        None
+    } else {
+        Some(required_positional)
     }
 }
 
@@ -9428,6 +9861,7 @@ fn infer_expr_readonly(c: &Checker, e: &Expr) -> Type {
                                 params: vec![Type::Unknown; sig.arity],
                                 ret: Box::new(sig.return_type.clone()),
                                 variadic: false,
+                                min_params: None,
                             }
                         }
                     } else {
@@ -9866,6 +10300,10 @@ fn seed_env_from_scope(c: &mut Checker, scope: ScopeId) {
                         params,
                         ret: Box::new(info.return_type.clone()),
                         variadic: info.max_positional.is_none(),
+                        // Real required-arity, so a function whose trailing
+                        // parameters carry defaults can satisfy a narrower
+                        // `Callable[[…], R]`.
+                        min_params: Some(info.required_positional.iter().filter(|r| **r).count()),
                     }
                 } else if let Some(info) = &b.import_info {
                     // `import pkg.sub` binds the TOP name `pkg` (Python
@@ -9915,10 +10353,47 @@ fn seed_env_from_scope(c: &mut Checker, scope: ScopeId) {
 /// not collected, and the pre-loop narrowing of `x` survives for the paths that
 /// do reach the back-edge. Conservative: over-skipping only ever *keeps* a
 /// narrowing (a sound false negative), never introduces a false positive.
-fn collect_reassigned_names(stmts: &[Stmt], acc: &mut std::collections::HashSet<String>) {
-    fn add_target(t: &Expr, acc: &mut std::collections::HashSet<String>) {
-        if let Expr::Name(n) = t {
-            acc.insert(n.id.as_str().to_owned());
+///
+/// The two channels a loop body can carry a new value through.
+#[derive(Default)]
+struct LoopReassigned {
+    /// Bare names rebound in the body — widened with `widen_to_declared`.
+    names: std::collections::HashSet<String>,
+    /// Attribute paths (`self.buffer`, `a.b.c`) assigned in the body — cleared
+    /// with `clear_attr_narrowing`, which also drops sub-paths.
+    attrs: std::collections::HashSet<String>,
+}
+
+fn collect_reassigned_names(stmts: &[Stmt], acc: &mut LoopReassigned) {
+    fn add_target(t: &Expr, acc: &mut LoopReassigned) {
+        match t {
+            Expr::Name(n) => {
+                acc.names.insert(n.id.as_str().to_owned());
+            }
+            // `(prev, cur) = (cur, None)` / `[a, b] = ...` / `first, *rest =
+            // ...` rebind every element, so each one carries a new value into
+            // the next iteration exactly as a bare name does.
+            Expr::Tuple(t) => {
+                for e in &t.elts {
+                    add_target(e, acc);
+                }
+            }
+            Expr::List(l) => {
+                for e in &l.elts {
+                    add_target(e, acc);
+                }
+            }
+            Expr::Starred(s) => add_target(&s.value, acc),
+            // `self.buffer = None` at the bottom of a drain loop stales any
+            // `if self.buffer is not None:` narrowing established before the
+            // loop. Attribute narrowings live in a separate map that
+            // `widen_to_declared` cannot reach, so they are collected apart
+            // and cleared by path.
+            _ => {
+                if let Some(path) = attr_path_of(t) {
+                    acc.attrs.insert(path);
+                }
+            }
         }
     }
     for s in stmts {
@@ -9977,6 +10452,169 @@ fn collect_reassigned_names(stmts: &[Stmt], acc: &mut std::collections::HashSet<
             Stmt::Break(_) | Stmt::Return(_) | Stmt::Raise(_) | Stmt::Continue(_) => return,
             _ => {}
         }
+    }
+}
+
+/// Whether `ty` mentions a type parameter anywhere under an **invariant**
+/// generic slot — the positions where union-widening a TypeVar is unsound.
+///
+/// `list[T]` and `dict[K, V]` qualify; `Sequence[T]`, `tuple[T1, T2]` and a
+/// bare `T` do not. A user-declared generic is consulted through
+/// `user_generic_param_variance`, so a class inferred covariant is exempt for
+/// the same reason `Sequence` is.
+fn formal_has_invariant_typevar(c: &Checker, ty: &Type) -> bool {
+    match ty {
+        Type::Generic(head, args) => args.iter().enumerate().any(|(i, a)| {
+            let variance = if generic_param_variance(head, i) == Variance::Invariant {
+                c.user_generic_param_variance(head, i)
+            } else {
+                generic_param_variance(head, i)
+            };
+            (variance == Variance::Invariant && mentions_type_param(a))
+                || formal_has_invariant_typevar(c, a)
+        }),
+        Type::Union(arms) => arms.iter().any(|a| formal_has_invariant_typevar(c, a)),
+        Type::Function { params, ret, .. } => {
+            params.iter().any(|p| formal_has_invariant_typevar(c, p))
+                || formal_has_invariant_typevar(c, ret)
+        }
+        _ => false,
+    }
+}
+
+/// Drop union arms that another arm already subsumes, keeping the general one.
+///
+/// This is what makes the invariant re-check below usable. `bind_typevars`
+/// widens a conflicting second binding into a union, which is right for the
+/// documented scalar case (`pair(1, "two")` → `T = int | str`) — but calling
+/// `def f[T](xs: list[T], item: T)` as `f(animals, dog)` also produces
+/// `T = Animal | Dog`, and re-checking `list[Animal]` against
+/// `list[Animal | Dog]` under invariance would reject a perfectly good call.
+/// Collapsing by subsumption first turns that binding back into `Animal`.
+fn collapse_union_by_subsumption(c: &Checker, ty: &Type) -> Type {
+    let Type::Union(arms) = ty else {
+        return ty.clone();
+    };
+    let kept: Vec<Type> = arms
+        .iter()
+        .filter(|a| {
+            // Drop `a` when some *other* arm subsumes it. `None` is never
+            // dropped — `int | None` must stay nullable.
+            if matches!(a, Type::None) {
+                return true;
+            }
+            !arms
+                .iter()
+                .any(|b| b != *a && !matches!(b, Type::None) && c.is_assignable(b, a))
+        })
+        .cloned()
+        .collect();
+    if kept.is_empty() {
+        ty.clone()
+    } else {
+        Type::union_of(kept)
+    }
+}
+
+/// F45: re-check each argument against its formal *after* inference has pinned
+/// the type parameters, for the formals where that matters.
+///
+/// The forward pass at the argument loop checks against the **declared,
+/// un-substituted** formal — `list[T]` — and `is_assignable` treats a free
+/// `TypeVar` leaf as permissive, so *any* `list[X]` is accepted. Nothing then
+/// re-validated the actuals once `T` was pinned, and a conflicting second
+/// binding was union-*widened* rather than reported. Together that let
+/// `def add_all[T](dst: list[T], src: list[T])` accept a `list[int]` and a
+/// `list[str]` in the same call, and the callee then writes `str` into a list
+/// the caller still believes is `list[int]` — the invariance that direct
+/// assignment enforces correctly, bypassed by routing through a generic.
+///
+/// Deliberately narrow, so it cannot false-positive on anything the corpus
+/// already compiles: only invariant positions are re-checked, the substituted
+/// formal must be fully concrete, `Unknown` / `Any` actuals are skipped, an
+/// argument that already drew a diagnostic on the forward pass is not
+/// re-reported, and HKT signatures are excluded by the caller.
+fn check_invariant_arg_positions(
+    c: &mut Checker,
+    params: &[Type],
+    actuals: &[Type],
+    ret: &Type,
+    expected: Option<&Type>,
+    pos_args: &[Expr],
+    positional_cutoff: usize,
+) {
+    if c.unsafe_depth > 0 {
+        return;
+    }
+    let invariant_formals: Vec<usize> = (0..params.len().min(actuals.len()))
+        .filter(|&i| i < positional_cutoff && i < pos_args.len())
+        .filter(|&i| formal_has_invariant_typevar(c, &params[i]))
+        .collect();
+    if invariant_formals.is_empty() {
+        return;
+    }
+    let bindings = compute_bidirectional_bindings(params, actuals, ret, expected);
+    if bindings.is_empty() {
+        return;
+    }
+    let collapsed: HashMap<String, Type> = bindings
+        .iter()
+        .map(|(k, v)| (k.clone(), collapse_union_by_subsumption(c, v)))
+        .collect();
+    for i in invariant_formals {
+        let actual = &actuals[i];
+        if matches!(actual, Type::Unknown | Type::Any) {
+            continue;
+        }
+        // The forward pass already reported this argument; one diagnostic per
+        // span is enough, and the un-substituted formal is the clearer one.
+        if !c.is_assignable(&params[i], actual) {
+            continue;
+        }
+        let substituted = substitute_typevars(&params[i], &collapsed);
+        if contains_free_typevar(&substituted) {
+            continue;
+        }
+        if c.is_assignable(&substituted, actual) {
+            continue;
+        }
+        let span = (
+            pos_args[i].range().start().to_usize(),
+            pos_args[i].range().end().to_usize(),
+        );
+        c.mismatch(&substituted, actual, span);
+    }
+}
+
+/// Report a possibly-`None` receiver in `<recv>.attr` / `<recv>.method()`.
+///
+/// Two shapes, deliberately different severities:
+///
+/// * a bare name (`x.foo` where `x: T?`) — error, exactly as before;
+/// * a dotted path (`self.conn.execute()`, `cfg.db.host`) — warning, because
+///   this shape was never checked at all before v1.0.0-alpha.7 and turning it
+///   straight into an error would reject programs that ran correctly. See
+///   [`Checker::nullable_attr_use`].
+///
+/// Anything else — a call result, a subscript, a comprehension — is left
+/// alone: `attr_path_of` returns `None` for it, and there is no stable place
+/// to name in the message. Those receivers were not checked before either, so
+/// staying quiet is no regression.
+fn check_nullable_receiver(c: &mut Checker, recv_expr: &Expr, recv_ty: &Type) {
+    if let Expr::Name(n) = recv_expr {
+        let span = (
+            n.range.start().to_usize(),
+            n.range.start().to_usize() + n.id.as_str().len(),
+        );
+        c.nullable_use(n.id.as_str(), recv_ty, span);
+        return;
+    }
+    if let Some(path) = attr_path_of(recv_expr) {
+        let span = (
+            recv_expr.range().start().to_usize(),
+            recv_expr.range().end().to_usize(),
+        );
+        c.nullable_attr_use(&path, recv_ty, span);
     }
 }
 
@@ -10042,6 +10680,234 @@ fn comprehensions_contain_call(generators: &[ruff_python_ast::Comprehension]) ->
         .any(|g| expr_contains_call(&g.iter) || g.ifs.iter().any(expr_contains_call))
 }
 
+/// Whether any expression these statements evaluate contains a call.
+///
+/// Used by the loop-body widening: a call anywhere in the body can rebind a
+/// module global through `global NAME` in the callee, and the sequential reset
+/// at the call's own statement fires *after* the top-of-body read on iteration
+/// 2. Recurses into nested bodies; a nested `def`/`class` body is skipped
+/// because declaring it does not run it.
+fn body_contains_call(stmts: &[Stmt]) -> bool {
+    stmts.iter().any(stmt_contains_call)
+}
+
+fn stmt_contains_call(s: &Stmt) -> bool {
+    match s {
+        Stmt::Expr(e) => expr_contains_call(&e.value),
+        Stmt::Assign(a) => expr_contains_call(&a.value) || a.targets.iter().any(expr_contains_call),
+        Stmt::AugAssign(a) => expr_contains_call(&a.value) || expr_contains_call(&a.target),
+        Stmt::AnnAssign(a) => {
+            a.value.as_deref().is_some_and(expr_contains_call) || expr_contains_call(&a.target)
+        }
+        Stmt::Return(r) => r.value.as_deref().is_some_and(expr_contains_call),
+        Stmt::Delete(d) => d.targets.iter().any(expr_contains_call),
+        Stmt::Raise(r) => {
+            r.exc.as_deref().is_some_and(expr_contains_call)
+                || r.cause.as_deref().is_some_and(expr_contains_call)
+        }
+        Stmt::Assert(a) => {
+            expr_contains_call(&a.test) || a.msg.as_deref().is_some_and(expr_contains_call)
+        }
+        Stmt::If(i) => {
+            expr_contains_call(&i.test)
+                || body_contains_call(&i.body)
+                || i.elif_else_clauses.iter().any(|cl| {
+                    cl.test.as_ref().is_some_and(expr_contains_call) || body_contains_call(&cl.body)
+                })
+        }
+        Stmt::While(w) => {
+            expr_contains_call(&w.test)
+                || body_contains_call(&w.body)
+                || body_contains_call(&w.orelse)
+        }
+        Stmt::For(f) => {
+            expr_contains_call(&f.iter)
+                || body_contains_call(&f.body)
+                || body_contains_call(&f.orelse)
+        }
+        Stmt::With(w) => {
+            w.items
+                .iter()
+                .any(|it| expr_contains_call(&it.context_expr))
+                || body_contains_call(&w.body)
+        }
+        Stmt::Try(t) => {
+            body_contains_call(&t.body)
+                || t.handlers.iter().any(|h| {
+                    let ruff_python_ast::ExceptHandler::ExceptHandler(h) = h;
+                    h.type_.as_deref().is_some_and(expr_contains_call)
+                        || body_contains_call(&h.body)
+                })
+                || body_contains_call(&t.orelse)
+                || body_contains_call(&t.finalbody)
+        }
+        Stmt::Match(m) => {
+            expr_contains_call(&m.subject)
+                || m.cases.iter().any(|case| {
+                    case.guard.as_deref().is_some_and(expr_contains_call)
+                        || body_contains_call(&case.body)
+                })
+        }
+        Stmt::TypeAlias(t) => expr_contains_call(&t.value),
+        // A decorator runs at *definition* time, which for a nested `def`
+        // inside a loop body is once per iteration.
+        Stmt::FunctionDef(f) => f
+            .decorator_list
+            .iter()
+            .any(|d| expr_contains_call(&d.expression)),
+        Stmt::ClassDef(cd) => cd
+            .decorator_list
+            .iter()
+            .any(|d| expr_contains_call(&d.expression)),
+        // No expression to evaluate.
+        Stmt::Import(_)
+        | Stmt::ImportFrom(_)
+        | Stmt::Global(_)
+        | Stmt::Nonlocal(_)
+        | Stmt::Pass(_)
+        | Stmt::Break(_)
+        | Stmt::Continue(_)
+        | Stmt::IpyEscapeCommand(_) => false,
+    }
+}
+
+/// Every module-global name that some function in this module declares
+/// `global`, i.e. the exact set a call can rebind under the caller's feet.
+///
+/// Python globals are per-module, so a callee in *another* module cannot
+/// rebind one of ours no matter what it does with `global` — collecting from
+/// this module's own AST is not an approximation, it is the whole channel.
+/// (The residual hole is a foreign module doing `import us; us.g = None`
+/// through the module object; that is not a `global` rebinding and is not
+/// modelled here, as it is not modelled anywhere else in the checker either.)
+///
+/// A bare `global NAME` with no assignment under it is counted too. Writing
+/// one without then assigning is vanishingly rare, and over-counting only
+/// costs a narrowing — it never invents a diagnostic on a name no callee
+/// touches.
+fn collect_call_rebound_globals(stmts: &[Stmt], acc: &mut std::collections::HashSet<String>) {
+    for s in stmts {
+        match s {
+            Stmt::Global(g) => {
+                for name in &g.names {
+                    acc.insert(name.as_str().to_owned());
+                }
+            }
+            Stmt::FunctionDef(f) => collect_call_rebound_globals(&f.body, acc),
+            Stmt::ClassDef(cd) => collect_call_rebound_globals(&cd.body, acc),
+            Stmt::If(i) => {
+                collect_call_rebound_globals(&i.body, acc);
+                for clause in &i.elif_else_clauses {
+                    collect_call_rebound_globals(&clause.body, acc);
+                }
+            }
+            Stmt::For(f) => {
+                collect_call_rebound_globals(&f.body, acc);
+                collect_call_rebound_globals(&f.orelse, acc);
+            }
+            Stmt::While(w) => {
+                collect_call_rebound_globals(&w.body, acc);
+                collect_call_rebound_globals(&w.orelse, acc);
+            }
+            Stmt::With(w) => collect_call_rebound_globals(&w.body, acc),
+            Stmt::Try(t) => {
+                collect_call_rebound_globals(&t.body, acc);
+                for h in &t.handlers {
+                    let ruff_python_ast::ExceptHandler::ExceptHandler(h) = h;
+                    collect_call_rebound_globals(&h.body, acc);
+                }
+                collect_call_rebound_globals(&t.orelse, acc);
+                collect_call_rebound_globals(&t.finalbody, acc);
+            }
+            Stmt::Match(m) => {
+                for case in &m.cases {
+                    collect_call_rebound_globals(&case.body, acc);
+                }
+            }
+            // Cannot contain a nested statement, so cannot contain a `global`.
+            Stmt::Return(_)
+            | Stmt::Delete(_)
+            | Stmt::TypeAlias(_)
+            | Stmt::Assign(_)
+            | Stmt::AugAssign(_)
+            | Stmt::AnnAssign(_)
+            | Stmt::Raise(_)
+            | Stmt::Assert(_)
+            | Stmt::Import(_)
+            | Stmt::ImportFrom(_)
+            | Stmt::Nonlocal(_)
+            | Stmt::Expr(_)
+            | Stmt::Pass(_)
+            | Stmt::Break(_)
+            | Stmt::Continue(_)
+            | Stmt::IpyEscapeCommand(_) => {}
+        }
+    }
+}
+
+/// Widen the module-global narrowings an intervening call could have staled.
+///
+/// Cheap no-op for the overwhelmingly common module that declares no `global`
+/// at all, which is what makes it affordable to call from *every* statement
+/// arm that evaluates a call rather than from the three that used to (F41).
+fn reset_globals_after_call(c: &mut Checker) {
+    c.env.reset_global_narrowings(&c.globals_rebound_by_call);
+}
+
+/// Evaluate an expression appearing in statement position, invalidating global
+/// narrowing when it contains a call.
+///
+/// The single choke point F41 asked for: every statement arm that evaluates an
+/// expression goes through here, so the arm list can no longer drift out of
+/// sync with the reset. Callers that then apply their own narrowings (`if` /
+/// `while` tests) must call this *before* `apply_narrowings`, so a fresh
+/// test-implied narrowing (`if reload() is not None:`) survives the reset.
+fn eval_stmt_expr(c: &mut Checker, e: &Expr) -> Type {
+    let t = infer_expr(c, e);
+    // Short-circuit on the empty set *before* walking the expression. Most
+    // modules declare no `global` at all, and `expr_contains_call` is a full
+    // subtree walk that would otherwise run once per statement in the program
+    // only to find there is nothing it could invalidate.
+    if !c.globals_rebound_by_call.is_empty() && expr_contains_call(e) {
+        reset_globals_after_call(c);
+    }
+    t
+}
+
+/// Widen every narrowing a loop body could carry a *stale* value through into
+/// its second and later iterations, before that body is checked.
+///
+/// Four channels, all the same defect one AST shape apart (F43):
+///
+/// 1. bare names rebound in the body — `x = None`;
+/// 2. tuple / list / starred unpack targets — `(prev, cur) = (cur, None)`;
+/// 3. attribute paths — `self.buffer = None` at the bottom of a drain loop;
+/// 4. a module global a call in the body rebinds through `global NAME`.
+///
+/// Skipped entirely when every path through the body leaves the loop: there is
+/// then no back-edge, the body runs at most once, and widening would be a
+/// false positive. A `continue` does not leave the loop, so a body ending in
+/// one is still widened.
+fn widen_loop_carried_narrowings(c: &mut Checker, body: &[Stmt]) {
+    if body_always_leaves_loop(body) {
+        return;
+    }
+    let mut reassigned = LoopReassigned::default();
+    collect_reassigned_names(body, &mut reassigned);
+    for name in &reassigned.names {
+        c.env.widen_to_declared(name);
+    }
+    for path in &reassigned.attrs {
+        c.env.clear_attr_narrowing(path);
+    }
+    // The sequential reset at the call's own statement fires only once control
+    // *reaches* the call — which is after the top-of-body read on iteration 2.
+    // The back-edge therefore needs its own reset.
+    if !c.globals_rebound_by_call.is_empty() && body_contains_call(body) {
+        reset_globals_after_call(c);
+    }
+}
+
 fn check_stmt(c: &mut Checker, stmt: &Stmt) {
     match stmt {
         Stmt::AnnAssign(a) => {
@@ -10085,8 +10951,10 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                 // `global NAME` in the callee, staling a caller narrowing on
                 // that global. Reset for subsequent statements (mirrors the
                 // `Stmt::Assign` / `Stmt::Expr` resets). Locals are immune.
-                if expr_contains_call(value) {
-                    c.env.reset_global_narrowings();
+                if !c.globals_rebound_by_call.is_empty()
+                    && (expr_contains_call(value) || expr_contains_call(&a.target))
+                {
+                    reset_globals_after_call(c);
                 }
                 if bare_final {
                     ann_type = value_type.clone();
@@ -10207,11 +11075,15 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
             // assignment applies its own target narrowing below, so that fresh
             // narrowing survives — mirroring the bare-call `Stmt::Expr` reset.
             // Locals are immune (a call can't rebind a caller's local).
-            if expr_contains_call(&a.value) {
-                c.env.reset_global_narrowings();
+            // Targets count too: `xs[clear()] = 5` runs the callee.
+            if !c.globals_rebound_by_call.is_empty()
+                && (expr_contains_call(&a.value) || a.targets.iter().any(expr_contains_call))
+            {
+                reset_globals_after_call(c);
             }
             for target in &a.targets {
                 check_attr_assign_not_frozen(c, target);
+                check_attr_assign_type(c, target, &value_type);
                 audit_record_field_set(c, target);
                 if let Expr::Name(n) = target {
                     let span = (
@@ -10417,10 +11289,27 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
             let variadic = all_params().any(|pwd| pwd.default.is_some())
                 || f.parameters.vararg.is_some()
                 || f.parameters.kwarg.is_some();
+            // How many parameters the caller must actually supply. This
+            // binding *overrides* the one `seed_env_from_scope` installed from
+            // `function_signature`, so it has to carry the required-arity too
+            // — otherwise the field is silently `None` by the time any call
+            // site reads it, and a function with a defaulted tail is rejected
+            // where a narrower `Callable` is expected.
+            let required = f
+                .parameters
+                .posonlyargs
+                .iter()
+                .chain(f.parameters.args.iter())
+                .take_while(|pwd| pwd.default.is_none())
+                .count();
             let fn_type = Type::Function {
                 params,
                 ret: Box::new(ret),
                 variadic,
+                // `None` when a required keyword-only parameter exists —
+                // see `min_params_for`; the relaxation must not treat that
+                // tail as omittable.
+                min_params: min_params_for(&f.parameters, required),
             };
             c.env.declare(TypeBinding {
                 name: f.name.as_str().to_owned(),
@@ -10807,10 +11696,21 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                     }
                 }
             }
+            // `return finish()` runs the callee. Nothing in this block is
+            // reachable afterwards, so this only matters for the statements
+            // the checker keeps walking past a `return` — but the arm is here
+            // so the reset never drifts out of the statement list again.
+            if !c.globals_rebound_by_call.is_empty()
+                && ret.value.as_deref().is_some_and(expr_contains_call)
+            {
+                reset_globals_after_call(c);
+            }
         }
         Stmt::If(i) => check_if(c, i),
         Stmt::While(w) => {
-            let _ = infer_expr(c, &w.test);
+            // See `check_if`: reset before the test's own narrowings are
+            // collected and applied, so `while poll() is not None:` keeps its.
+            let _ = eval_stmt_expr(c, &w.test);
             declare_walrus_targets(c, &w.test);
             // Flow narrowing inside the loop body: the test is known to
             // hold on every iteration that *enters* the body, so the
@@ -10845,13 +11745,7 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
             // pass — widening there would be a false positive (`while f: y = x;
             // x = None; break`). A `continue` does NOT leave the loop, so a body
             // ending in one is still widened (`body_always_leaves_loop`).
-            if !body_always_leaves_loop(&w.body) {
-                let mut loop_reassigned = std::collections::HashSet::new();
-                collect_reassigned_names(&w.body, &mut loop_reassigned);
-                for name in &loop_reassigned {
-                    c.env.widen_to_declared(name);
-                }
-            }
+            widen_loop_carried_narrowings(c, &w.body);
             apply_narrowings(c, &narrowings);
             for s in &w.body {
                 check_stmt(c, s);
@@ -10884,7 +11778,9 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
             }
         }
         Stmt::For(f) => {
-            let iter_ty = infer_expr(c, &f.iter);
+            // `for row in reload():` runs the callee before the first
+            // iteration, so a global it rebinds is stale from here on.
+            let iter_ty = eval_stmt_expr(c, &f.iter);
             // H5/M6: `for x in <non-iterable>` over a statically-known
             // scalar (`int`, `float`, `bool`, `None`) is a runtime
             // `TypeError`. str/bytes/list/dict/set/tuple and anything
@@ -10918,13 +11814,7 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
             // when the body always leaves the loop (`break`/`return`/`raise` on
             // every path) — there is then no back-edge, so no stale carry to
             // widen. A `continue` still reaches the back-edge, so it is widened.
-            if !body_always_leaves_loop(&f.body) {
-                let mut loop_reassigned = std::collections::HashSet::new();
-                collect_reassigned_names(&f.body, &mut loop_reassigned);
-                for name in &loop_reassigned {
-                    c.env.widen_to_declared(name);
-                }
-            }
+            widen_loop_carried_narrowings(c, &f.body);
             for s in &f.body {
                 check_stmt(c, s);
             }
@@ -10936,8 +11826,8 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
             // so any narrowing the caller established on a global is now stale.
             // Reset it. (Locals are immune — a call can't rebind a caller's
             // local.) See `reset_global_narrowings`.
-            if expr_contains_call(&e.value) {
-                c.env.reset_global_narrowings();
+            if !c.globals_rebound_by_call.is_empty() && expr_contains_call(&e.value) {
+                reset_globals_after_call(c);
             }
             // A bare method-call statement (`self.reset()`, `conn.close()`) may
             // mutate a field of its receiver, so a prior attribute narrowing
@@ -10955,8 +11845,11 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
             }
         }
         Stmt::AugAssign(a) => {
-            let l = infer_expr(c, &a.target);
-            let r = infer_expr(c, &a.value);
+            // The target can run a call too: `xs[bump()] += 1`.
+            let l = eval_stmt_expr(c, &a.target);
+            // `total += fetch()` runs the callee, staling any narrowing on a
+            // global it rebinds.
+            let r = eval_stmt_expr(c, &a.value);
             check_attr_assign_not_frozen(c, &a.target);
             // Operator-compatibility check, mirroring `Expr::BinOp`. Restricted
             // to scalar targets (int/float/bool/str/bytes) where `x op= y` has
@@ -11008,7 +11901,8 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
         }
         Stmt::With(w) => {
             for item in &w.items {
-                let ctx_ty = infer_expr(c, &item.context_expr);
+                // `with open_conn():` runs the callee before the body.
+                let ctx_ty = eval_stmt_expr(c, &item.context_expr);
                 // Reject a `with`/`async with` subject that is a fully-local
                 // class definitely missing the context-manager protocol
                 // (`__enter__`/`__exit__`, or `__aenter__`/`__aexit__` for
@@ -11164,7 +12058,17 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
             }
             // Exhaustiveness check: sealed unions and enums (both are
             // closed sets).
-            if let Type::Class(ref union_name) = subject_type {
+            // A *parametric* sealed union (`type U[T] = A | B | C`) infers as
+            // `Type::Generic("U", [..])`, not `Type::Class`, so gating on
+            // `Class` alone skipped exhaustiveness checking for every one of
+            // them — including the repo's own flagship linked-list example.
+            // The head name is what identifies the union either way.
+            let union_head = match &subject_type {
+                Type::Class(name) => Some(name.clone()),
+                Type::Generic(name, _) => Some(name.clone()),
+                _ => None,
+            };
+            if let Some(ref union_name) = union_head {
                 let subject_span = (
                     m.subject.range().start().to_usize(),
                     m.subject.range().end().to_usize(),
@@ -11189,13 +12093,18 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
         // for completeness but the narrowing is the important
         // side-effect.
         Stmt::Assert(a) => {
-            let _ = infer_expr(c, &a.test);
+            // Reset before the assert's own narrowings are applied, so
+            // `assert reconnect() is not None` keeps what it establishes.
+            let _ = eval_stmt_expr(c, &a.test);
+            if let Some(msg) = &a.msg {
+                let _ = eval_stmt_expr(c, msg);
+            }
             let pos = collect_narrowings(c, &a.test, /*negate=*/ false);
             apply_narrowings(c, &pos);
         }
         Stmt::Raise(r) => {
             if let Some(exc) = &r.exc {
-                let exc_type = infer_expr(c, exc);
+                let exc_type = eval_stmt_expr(c, exc);
                 if let Some(display) = raise_non_exception_display(c, &exc_type) {
                     let span = (exc.range().start().to_usize(), exc.range().end().to_usize());
                     c.diagnostics.push_error(TycError::raise_non_exception(
@@ -11208,7 +12117,13 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                 }
             }
             if let Some(cause) = &r.cause {
-                let _ = infer_expr(c, cause);
+                let _ = eval_stmt_expr(c, cause);
+            }
+        }
+        Stmt::Delete(d) => {
+            // `del cache[key()]` evaluates the subscript, calls included.
+            if !c.globals_rebound_by_call.is_empty() && d.targets.iter().any(expr_contains_call) {
+                reset_globals_after_call(c);
             }
         }
         _ => {}
@@ -12321,7 +13236,11 @@ fn check_if(c: &mut Checker, i: &ruff_python_ast::StmtIf) {
     // never emits one) but is handled safely below.
     let is_unsafe = c.is_unsafe_marker(i.range);
 
-    let _ = infer_expr(c, &i.test);
+    // `eval_stmt_expr`, not `infer_expr`: `if refresh_cache():` runs the
+    // callee, which may `global cache; cache = None`. The reset must land
+    // *before* `collect_narrowings`/`apply_narrowings` below so a narrowing the
+    // test itself implies (`if reload() is not None:`) survives it.
+    let _ = eval_stmt_expr(c, &i.test);
     declare_walrus_targets(c, &i.test);
 
     // Apply narrowing for the true branch.
@@ -14037,6 +14956,7 @@ fn builtin_generic_method(recv: &Type, attr: &str) -> Option<Type> {
                 params: vec![k.clone()],
                 ret: Box::new(ret),
                 variadic: true,
+                min_params: None,
             })
         }
         // Result / Ok / Err combinators — emitted on the runtime classes
@@ -14062,11 +14982,13 @@ fn builtin_generic_method(recv: &Type, attr: &str) -> Option<Type> {
             params: vec![Type::Unknown],
             ret: Box::new(Type::Generic("Ok".into(), vec![Type::Unknown])),
             variadic: false,
+            min_params: None,
         }),
         ("Ok", "map_err", [t]) => Some(Type::Function {
             params: vec![Type::Unknown],
             ret: Box::new(Type::Generic("Ok".into(), vec![t.clone()])),
             variadic: false,
+            min_params: None,
         }),
         ("Ok", "and_then", [_t]) => Some(Type::Function {
             params: vec![Type::Unknown],
@@ -14075,26 +14997,31 @@ fn builtin_generic_method(recv: &Type, attr: &str) -> Option<Type> {
                 vec![Type::Unknown, Type::Unknown],
             )),
             variadic: false,
+            min_params: None,
         }),
         ("Ok", "or_else", [t]) => Some(Type::Function {
             params: vec![Type::Unknown],
             ret: Box::new(Type::Generic("Ok".into(), vec![t.clone()])),
             variadic: false,
+            min_params: None,
         }),
         ("Err", "map", [e]) => Some(Type::Function {
             params: vec![Type::Unknown],
             ret: Box::new(Type::Generic("Err".into(), vec![e.clone()])),
             variadic: false,
+            min_params: None,
         }),
         ("Err", "map_err", [_e]) => Some(Type::Function {
             params: vec![Type::Unknown],
             ret: Box::new(Type::Generic("Err".into(), vec![Type::Unknown])),
             variadic: false,
+            min_params: None,
         }),
         ("Err", "and_then", [e]) => Some(Type::Function {
             params: vec![Type::Unknown],
             ret: Box::new(Type::Generic("Err".into(), vec![e.clone()])),
             variadic: false,
+            min_params: None,
         }),
         ("Err", "or_else", [_e]) => Some(Type::Function {
             params: vec![Type::Unknown],
@@ -14103,6 +15030,7 @@ fn builtin_generic_method(recv: &Type, attr: &str) -> Option<Type> {
                 vec![Type::Unknown, Type::Unknown],
             )),
             variadic: false,
+            min_params: None,
         }),
         ("Result", "map", [_t, e]) => Some(Type::Function {
             params: vec![Type::Unknown],
@@ -14111,6 +15039,7 @@ fn builtin_generic_method(recv: &Type, attr: &str) -> Option<Type> {
                 vec![Type::Unknown, e.clone()],
             )),
             variadic: false,
+            min_params: None,
         }),
         ("Result", "map_err", [t, _e]) => Some(Type::Function {
             params: vec![Type::Unknown],
@@ -14119,6 +15048,7 @@ fn builtin_generic_method(recv: &Type, attr: &str) -> Option<Type> {
                 vec![t.clone(), Type::Unknown],
             )),
             variadic: false,
+            min_params: None,
         }),
         ("Result", "and_then", _) | ("Result", "or_else", _) => Some(Type::Function {
             params: vec![Type::Unknown],
@@ -14127,6 +15057,7 @@ fn builtin_generic_method(recv: &Type, attr: &str) -> Option<Type> {
                 vec![Type::Unknown, Type::Unknown],
             )),
             variadic: false,
+            min_params: None,
         }),
         // Unwrap family (R-API). The receiver's static type narrows the
         // return as far as possible:
@@ -14140,33 +15071,39 @@ fn builtin_generic_method(recv: &Type, attr: &str) -> Option<Type> {
             params: vec![],
             ret: Box::new(t.clone()),
             variadic: false,
+            min_params: None,
         }),
         ("Ok", "expect", [t]) | ("Result", "expect", [t, _]) => Some(Type::Function {
             params: vec![Type::Str],
             ret: Box::new(t.clone()),
             variadic: false,
+            min_params: None,
         }),
         ("Ok", "unwrap_or", [t]) | ("Result", "unwrap_or", [t, _]) => Some(Type::Function {
             params: vec![t.clone()],
             ret: Box::new(t.clone()),
             variadic: false,
+            min_params: None,
         }),
         ("Ok", "unwrap_or_else", [t]) | ("Result", "unwrap_or_else", [t, _]) => {
             Some(Type::Function {
                 params: vec![Type::Unknown],
                 ret: Box::new(t.clone()),
                 variadic: false,
+                min_params: None,
             })
         }
         ("Ok", "ok", [t]) | ("Result", "ok", [t, _]) => Some(Type::Function {
             params: vec![],
             ret: Box::new(Type::optional(t.clone())),
             variadic: false,
+            min_params: None,
         }),
         ("Ok", "err", [_t]) => Some(Type::Function {
             params: vec![],
             ret: Box::new(Type::None),
             variadic: false,
+            min_params: None,
         }),
         // `unwrap()` takes no arguments even on a statically-known Err
         // (it always raises); `expect` takes exactly the message.
@@ -14174,31 +15111,37 @@ fn builtin_generic_method(recv: &Type, attr: &str) -> Option<Type> {
             params: vec![],
             ret: Box::new(Type::Unknown),
             variadic: false,
+            min_params: None,
         }),
         ("Err", "expect", [_e]) => Some(Type::Function {
             params: vec![Type::Str],
             ret: Box::new(Type::Unknown),
             variadic: false,
+            min_params: None,
         }),
         ("Err", "unwrap_or", [_e]) | ("Err", "unwrap_or_else", [_e]) => Some(Type::Function {
             params: vec![Type::Unknown],
             ret: Box::new(Type::Unknown),
             variadic: false,
+            min_params: None,
         }),
         ("Err", "ok", [_e]) => Some(Type::Function {
             params: vec![],
             ret: Box::new(Type::None),
             variadic: false,
+            min_params: None,
         }),
         ("Err", "err", [e]) => Some(Type::Function {
             params: vec![],
             ret: Box::new(e.clone()),
             variadic: false,
+            min_params: None,
         }),
         ("Result", "err", [_t, e]) => Some(Type::Function {
             params: vec![],
             ret: Box::new(Type::optional(e.clone())),
             variadic: false,
+            min_params: None,
         }),
         ("Ok", "is_ok", _)
         | ("Ok", "is_err", _)
@@ -14209,6 +15152,7 @@ fn builtin_generic_method(recv: &Type, attr: &str) -> Option<Type> {
             params: vec![],
             ret: Box::new(Type::Bool),
             variadic: false,
+            min_params: None,
         }),
         // Mapping views — preserve the element type (with `?`) so iterating
         // `d.values()` over a `dict[K, V?]` yields `V?`, not `V`. Returning
@@ -14218,11 +15162,13 @@ fn builtin_generic_method(recv: &Type, attr: &str) -> Option<Type> {
             params: vec![],
             ret: Box::new(Type::Generic("KeysView".into(), vec![k.clone()])),
             variadic: false,
+            min_params: None,
         }),
         ("dict", "values", [_k, v]) => Some(Type::Function {
             params: vec![],
             ret: Box::new(Type::Generic("ValuesView".into(), vec![v.clone()])),
             variadic: false,
+            min_params: None,
         }),
         ("dict", "items", [k, v]) => Some(Type::Function {
             params: vec![],
@@ -14231,6 +15177,7 @@ fn builtin_generic_method(recv: &Type, attr: &str) -> Option<Type> {
                 vec![Type::Generic("tuple".into(), vec![k.clone(), v.clone()])],
             )),
             variadic: false,
+            min_params: None,
         }),
         _ => None,
     }
@@ -14663,6 +15610,26 @@ fn container_expectation(
 ///   type so `let xs: list[int] = []` produces `list[int]` rather than
 ///   `list[?]`.
 fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type {
+    // Depth guard. Inference recurses structurally with no bound, so a large
+    // machine-generated expression — a long `a + b + c + …` chain, a deeply
+    // nested literal — overflowed the native stack and aborted the compiler
+    // with no diagnostic, no file name, and no line number. `Unknown` on
+    // exhaustion is the permissive answer: it cannot turn a correct program
+    // into an error, only stop the checker from reasoning past the bound.
+    //
+    // The ceiling is set far above any hand-written expression (the corpus
+    // peaks in the low hundreds) so only genuinely generated input reaches it.
+    let depth = c.infer_depth.get();
+    if depth >= INFER_EXPR_MAX_DEPTH {
+        return Type::Unknown;
+    }
+    c.infer_depth.set(depth + 1);
+    let result = infer_expr_ctx_inner(c, expr, expected);
+    c.infer_depth.set(depth);
+    result
+}
+
+fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type {
     match expr {
         Expr::BooleanLiteral(_) => Type::Bool,
         Expr::NumberLiteral(n) => match &n.value {
@@ -14785,6 +15752,7 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
                 params: vec![Type::Unknown; n],
                 ret: Box::new(Type::Unknown),
                 variadic,
+                min_params: None,
             }
         }
         Expr::Name(n) => {
@@ -15300,13 +16268,7 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
             if let Expr::Attribute(attr) = call.func.as_ref() {
                 let recv = infer_expr(c, &attr.value);
                 if recv.is_nullable() {
-                    if let Expr::Name(n) = attr.value.as_ref() {
-                        let span = (
-                            n.range.start().to_usize(),
-                            n.range.start().to_usize() + n.id.as_str().len(),
-                        );
-                        c.nullable_use(n.id.as_str(), &recv, span);
-                    }
+                    check_nullable_receiver(c, &attr.value, &recv);
                 }
             }
 
@@ -15315,6 +16277,7 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
                     params,
                     ret,
                     variadic,
+                    min_params: _,
                 } => {
                     // Argument count check honours defaults, keyword args,
                     // `*args`, and `**kwargs` by looking up the function's
@@ -15666,6 +16629,20 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
                     // is exactly `bind_typevars_and_substitute_bidirectional`.
                     let ctor_vars = c.collect_ctor_vars(&params, &ret);
                     let result = if ctor_vars.is_empty() {
+                        // F45: the forward per-argument pass above checked
+                        // against the *un-substituted* formal, where a free
+                        // TypeVar leaf makes `is_assignable` permissive.
+                        // Re-validate the invariant positions now that
+                        // inference has pinned the parameters.
+                        check_invariant_arg_positions(
+                            c,
+                            &params,
+                            &actuals,
+                            &ret,
+                            expected,
+                            pos_args,
+                            positional_cutoff,
+                        );
                         bind_typevars_and_substitute_bidirectional(
                             &params, &actuals, &ret, expected,
                         )
@@ -15822,7 +16799,15 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
                             || (!c.is_plain_class(&name)
                                 && !c.is_raw_class(&name)
                                 && c.class_hierarchy_fully_known(&name));
-                        if !info.param_names.is_empty() || shape_is_authoritative {
+                        // `kwonly_names` matters as much as `param_names`
+                        // here: a `model` class files every field as
+                        // keyword-only (Pydantic's `__init__` is `**data`), so
+                        // reading only `param_names` would skip the check for
+                        // exactly the classes that need it.
+                        if !info.param_names.is_empty()
+                            || !info.kwonly_names.is_empty()
+                            || shape_is_authoritative
+                        {
                             match check_arity_with_info(&info, pos_args, kw_args) {
                                 ArityCheck::Ok => {}
                                 ArityCheck::UnknownKwarg { .. } => {
@@ -15977,13 +16962,7 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
             }
             let recv = infer_expr(c, &a.value);
             if recv.is_nullable() {
-                if let Expr::Name(n) = a.value.as_ref() {
-                    let span = (
-                        n.range.start().to_usize(),
-                        n.range.start().to_usize() + n.id.as_str().len(),
-                    );
-                    c.nullable_use(n.id.as_str(), &recv, span);
-                }
+                check_nullable_receiver(c, &a.value, &recv);
             }
             let attr_name = a.attr.as_str();
             // B35: `_t.error` / `_t.value` on an isinstance-narrowed
@@ -16121,6 +17100,7 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
                             params,
                             ret: Box::new(ret),
                             variadic,
+                            min_params: None,
                         };
                     }
                 }
@@ -16177,6 +17157,7 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
                             params,
                             ret: Box::new(ret),
                             variadic: false,
+                            min_params: None,
                         };
                     }
                     if let Some(field_type) = c.find_field(class_name.as_str(), attr_name) {
@@ -16272,6 +17253,7 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
                             params,
                             ret: Box::new(ret),
                             variadic: false,
+                            min_params: None,
                         };
                     }
                     if let Some(field_type) = c.find_field(class_name.as_str(), attr_name) {
@@ -16339,6 +17321,7 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
                                 params: vec![Type::Unknown; arity],
                                 ret: Box::new(ret),
                                 variadic: false,
+                                min_params: None,
                             };
                         }
                         if let Some(field_type) = c.find_field(bound_name.as_str(), attr_name) {
@@ -16971,8 +17954,41 @@ fn assign_unpacking_target(c: &mut Checker, target: &Expr, elem_ty: &Type) {
                     let span = (n.range.start().to_usize(), n.range.end().to_usize());
                     c.mismatch(&declared, elem_ty, span);
                 }
+                // Re-narrow to the assigned value, exactly as the single-name
+                // `Stmt::Assign` path does. Without this the unpack checked
+                // the new value against the *declared* type and then left the
+                // old *narrowed* type in place, so
+                //
+                //     mut a: str? = "x"
+                //     if a is None: return
+                //     (a, b) = (None, 2)
+                //     a.upper()          # AttributeError, checked clean
+                //
+                // type-checked with `a` still narrowed to `str`. The loop
+                // back-edge widening covers the same shape one level up; this
+                // is the straight-line case, which nothing covered.
+                //
+                // `Unknown` — which is what an unpack from a non-tuple RHS
+                // yields per slot — falls back to the declared type rather
+                // than erasing it, so an opaque RHS widens rather than
+                // pretending to know the slot's type.
+                let narrowed_to = if matches!(elem_ty, Type::Unknown) {
+                    declared
+                } else {
+                    elem_ty.clone()
+                };
+                c.reassigned_names.insert(name.to_owned());
+                c.env.narrow(name, narrowed_to);
+                c.env.clear_attr_narrowing(name);
             } else {
                 bind_unpacking_target(c, target, elem_ty);
+            }
+        }
+        // `(self.x, y) = (None, 1)` rebinds the attribute, so any narrowing on
+        // that path — and on anything below it — is stale.
+        Expr::Attribute(_) => {
+            if let Some(path) = attr_path_of(target) {
+                c.env.clear_attr_narrowing(&path);
             }
         }
         Expr::Tuple(t) => {
@@ -18200,6 +19216,927 @@ mod tests {
     /// `ClassKind::Raw`). Required for any test exercising plain-/raw-class
     /// awareness in the checker (manual_init / class_attr_shadows_slot /
     /// attribute_not_found suppression).
+    /// The straight-line half of the tuple-unpack narrowing hole. The loop
+    /// back-edge case was closed with F43; this one — a plain sequential
+    /// unpack — was checked against the *declared* type while the stale
+    /// *narrowed* type stayed in the environment.
+    #[test]
+    fn a_tuple_unpack_reassignment_widens_the_target() {
+        let d = check(
+            r#"
+def go() -> None:
+    mut a: str? = "x"
+    mut b: int = 1
+    if a is None:
+        return
+    (a, b) = (None, 2)
+    let _s: str = a.upper()
+"#,
+        );
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::NullableUse { .. })),
+            "`(a, b) = (None, 2)` makes the earlier `a is None` guard stale; got {:?}",
+            d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    /// …and it re-narrows rather than merely widening, so an unpack that
+    /// assigns a definitely-non-`None` value leaves the target usable.
+    #[test]
+    fn a_tuple_unpack_renarrows_to_the_assigned_slot() {
+        let d = check(
+            r#"
+def go() -> None:
+    mut a: str? = None
+    mut b: int = 1
+    (a, b) = ("hello", 2)
+    let _s: str = a.upper()
+"#,
+        );
+        assert!(
+            !d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::NullableUse { .. })),
+            "the unpacked slot is `str`, so `a` is non-None after it; got {:?}",
+            d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    /// An opaque right-hand side yields `Unknown` per slot, which must widen
+    /// to the declared type rather than erase it.
+    #[test]
+    fn a_tuple_unpack_from_an_opaque_rhs_widens_to_declared() {
+        let d = check(
+            r#"
+def source() -> tuple[str?, int]:
+    return (None, 1)
+
+def go() -> None:
+    mut a: str? = "x"
+    mut b: int = 1
+    if a is None:
+        return
+    (a, b) = source()
+    let _s: str = a.upper()
+"#,
+        );
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::NullableUse { .. })),
+            "the slot is declared `str?`, so the guard is stale; got {:?}",
+            d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    /// F45: the forward argument pass checks against the declared formal
+    /// `list[T]`, where a free TypeVar leaf makes `is_assignable` permissive,
+    /// so any `list[X]` was accepted; a conflicting second binding was then
+    /// union-*widened* rather than reported. The callee writes elements of the
+    /// widened union into a container the caller still believes is `list[int]`.
+    #[test]
+    fn a_generic_call_may_not_bind_one_typevar_to_two_invariant_containers() {
+        let d = check(
+            r#"
+def add_all[T](dst: list[T], src: list[T]) -> None:
+    for item in src:
+        dst.append(item)
+
+def go() -> None:
+    let ints: list[int] = [1, 2]
+    let strs: list[str] = ["a"]
+    add_all(ints, strs)
+"#,
+        );
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::TypeMismatch { .. })),
+            "`list` is invariant — a `list[str]` cannot bind the same `T` as a `list[int]`; got {:?}",
+            d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    /// The matching call with both containers the same type stays green.
+    #[test]
+    fn a_generic_call_over_matching_containers_is_accepted() {
+        let d = check(
+            r#"
+def add_all[T](dst: list[T], src: list[T]) -> None:
+    for item in src:
+        dst.append(item)
+
+def go() -> None:
+    let a: list[int] = [1, 2]
+    let b: list[int] = [3]
+    add_all(a, b)
+"#,
+        );
+        assert!(
+            d.errors().is_empty(),
+            "matching containers must stay clean; got {:?}",
+            d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    /// Without collapsing the inferred union by subsumption first, this is the
+    /// false positive the re-check would produce: `T` binds `Animal` from the
+    /// list and `Dog` from the item, widening to `Animal | Dog`, and
+    /// `list[Animal]` re-checked against `list[Animal | Dog]` under invariance
+    /// fails — on a call that is correct.
+    #[test]
+    fn a_generic_call_binding_a_subclass_alongside_its_base_is_accepted() {
+        let d = check(
+            r#"
+class Animal:
+    name: str
+
+class Dog(Animal):
+    breed: str
+
+def push[T](xs: list[T], item: T) -> None:
+    xs.append(item)
+
+def go() -> None:
+    let pets: list[Animal] = []
+    let rex: Dog = Dog(name="Rex", breed="Husky")
+    push(pets, rex)
+"#,
+        );
+        assert!(
+            d.errors().is_empty(),
+            "`Dog` is an `Animal`; the inferred union collapses; got {:?}",
+            d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    /// A covariant formal is untouched — the documented scalar union-widening
+    /// (`pair(1, "two")` → `T = int | str`) must keep working.
+    #[test]
+    fn a_generic_call_over_a_covariant_formal_still_union_widens() {
+        let d = check(
+            r#"
+def first_of[T](xs: Sequence[T], ys: Sequence[T]) -> None:
+    pass
+
+def go() -> None:
+    let a: list[int] = [1]
+    let b: list[str] = ["x"]
+    first_of(a, b)
+"#,
+        );
+        assert!(
+            !d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::TypeMismatch { .. })),
+            "`Sequence` is covariant — widening `T` there is sound; got {:?}",
+            d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    /// F41: the reset used to be wired into three statement arms by hand, so
+    /// every other statement that can run a call kept a stale narrowing. Each
+    /// case here is a `tyc check`-clean program that crashed at runtime.
+    #[test]
+    fn a_call_in_any_statement_position_invalidates_a_global_narrowing() {
+        // One shape per previously-uncovered arm. `cache` is narrowed to
+        // non-`None` by the guard, then `clear()` nulls it out from under the
+        // narrowing, then `cache.upper()` reads it.
+        let arms: &[(&str, &str)] = &[
+            ("if", "    if clear():\n        pass\n"),
+            ("while", "    while clear():\n        break\n"),
+            ("for", "    for _c in reload():\n        break\n"),
+            ("assert", "    assert clear()\n"),
+            ("aug-assign", "    mut n: int = 0\n    n += bump()\n"),
+            ("with", "    with hold():\n        pass\n"),
+        ];
+        for (label, middle) in arms {
+            let src = format!(
+                r#"
+mut cache: str? = "seed"
+
+def clear() -> bool:
+    global cache
+    cache = None
+    return True
+
+def bump() -> int:
+    global cache
+    cache = None
+    return 1
+
+def reload() -> list[int]:
+    global cache
+    cache = None
+    return [1]
+
+def hold() -> object:
+    global cache
+    cache = None
+    return open("/dev/null")
+
+def go() -> None:
+    if cache is None:
+        return
+{middle}    let _s: str = cache.upper()
+"#
+            );
+            let d = check(&src);
+            assert!(
+                d.errors()
+                    .iter()
+                    .any(|e| matches!(e, TycError::NullableUse { .. })),
+                "a call in {label} position must invalidate the `cache` narrowing; got {:?}",
+                d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    /// The other half of F41: restricting the reset to globals some function
+    /// actually declares `global` is what keeps the now-per-statement
+    /// invalidation from costing narrowings nothing can invalidate.
+    #[test]
+    fn a_call_does_not_invalidate_a_global_no_callee_rebinds() {
+        // `helper` never says `global cache`, so `cache` cannot change under
+        // the guard and the narrowing must survive the intervening call.
+        let d = check(
+            r#"
+mut cache: str? = "seed"
+
+def helper() -> bool:
+    return True
+
+def go() -> None:
+    if cache is None:
+        return
+    if helper():
+        pass
+    let _s: str = cache.upper()
+"#,
+        );
+        assert!(
+            !d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::NullableUse { .. })),
+            "no function rebinds `cache`, so the narrowing must survive; got {:?}",
+            d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    /// A narrowing the test *itself* establishes has to survive the reset the
+    /// same test triggers — the reset must land before `apply_narrowings`.
+    #[test]
+    fn a_test_implied_narrowing_survives_its_own_call_reset() {
+        let d = check(
+            r#"
+mut cache: str? = "seed"
+
+def bump() -> int:
+    global cache
+    cache = "fresh"
+    return 1
+
+def go() -> None:
+    if bump() > 0 and cache is not None:
+        let _s: str = cache.upper()
+"#,
+        );
+        assert!(
+            !d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::NullableUse { .. })),
+            "the `if` test's own narrowing must outlive the reset it triggers; got {:?}",
+            d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    /// F43(a): an attribute narrowed before a loop, nulled at the bottom of
+    /// the body, is stale when iteration 2 reads it at the top.
+    #[test]
+    fn a_loop_body_widens_an_attribute_it_reassigns() {
+        let d = check(
+            r#"
+class Drain:
+    buffer: str?
+
+impl Drain:
+    def run(self) -> None:
+        if self.buffer is None:
+            return
+        while True:
+            let _s: str = self.buffer.upper()
+            self.buffer = None
+"#,
+        );
+        assert!(
+            d.warnings()
+                .iter()
+                .chain(d.errors().iter())
+                .any(|e| matches!(e, TycError::NullableUse { .. })),
+            "`self.buffer = None` at the bottom stales the top-of-body read; got {:?}",
+            d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    /// F43(b): a tuple-unpack target carries a new value into iteration 2 just
+    /// as a bare name does, but `add_target` used to drop every non-`Name`.
+    #[test]
+    fn a_loop_body_widens_a_tuple_unpack_target() {
+        let d = check(
+            r#"
+def go(items: list[str]) -> None:
+    mut cur: str? = "seed"
+    mut prev: str? = None
+    if cur is None:
+        return
+    for _it in items:
+        let _s: str = cur.upper()
+        (prev, cur) = (cur, None)
+"#,
+        );
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::NullableUse { .. })),
+            "`(prev, cur) = (cur, None)` stales `cur` for iteration 2; got {:?}",
+            d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    /// F43(c): a call in the body rebinds a global, but the sequential reset
+    /// fires only once control *reaches* it — after the top-of-body read.
+    #[test]
+    fn a_loop_body_widens_a_global_an_in_body_call_rebinds() {
+        let d = check(
+            r#"
+mut cache: str? = "seed"
+
+def clear() -> None:
+    global cache
+    cache = None
+
+def go(items: list[str]) -> None:
+    if cache is None:
+        return
+    for _it in items:
+        let _s: str = cache.upper()
+        clear()
+"#,
+        );
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::NullableUse { .. })),
+            "the in-body `clear()` stales `cache` for iteration 2; got {:?}",
+            d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    /// A call in an assignment *target* runs too: `xs[clear()] = 5` must
+    /// invalidate a global narrowing exactly as `x = clear()` does.
+    #[test]
+    fn a_call_in_an_assignment_target_invalidates_a_global_narrowing() {
+        let d = check(
+            r#"
+mut cache: str? = "seed"
+
+def clear() -> int:
+    global cache
+    cache = None
+    return 0
+
+def go(xs: list[int]) -> None:
+    if cache is None:
+        return
+    xs[clear()] = 5
+    let _s: str = cache.upper()
+"#,
+        );
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::NullableUse { .. })),
+            "the subscript target runs `clear()`; got {:?}",
+            d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    /// The `body_always_leaves_loop` gate has to keep holding: a body that
+    /// cannot reach the back-edge runs at most once, so widening it would be
+    /// a false positive.
+    #[test]
+    fn a_single_pass_loop_body_keeps_its_narrowing() {
+        let d = check(
+            r#"
+class Drain:
+    buffer: str?
+
+impl Drain:
+    def run(self) -> None:
+        if self.buffer is None:
+            return
+        while True:
+            let _s: str = self.buffer.upper()
+            self.buffer = None
+            break
+"#,
+        );
+        assert!(
+            !d.errors()
+                .iter()
+                .chain(d.warnings().iter())
+                .any(|e| matches!(e, TycError::NullableUse { .. })),
+            "a body that always leaves the loop has no back-edge to stale; got {:?}",
+            d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    /// F42: an attribute-rooted receiver was never checked at all — the
+    /// diagnostic was gated on the receiver being a bare `Expr::Name`.
+    #[test]
+    fn a_nullable_attribute_receiver_is_reported() {
+        let d = check(
+            r#"
+class Db:
+    host: str
+
+class Cfg:
+    db: Db?
+
+impl Cfg:
+    def show(self) -> str:
+        return self.db.host
+"#,
+        );
+        assert!(
+            d.warnings()
+                .iter()
+                .any(|e| matches!(e, TycError::NullableUse { .. })),
+            "`self.db.host` on a `Db?` field must be reported; got warnings {:?} errors {:?}",
+            d.warnings()
+                .iter()
+                .map(|e| e.to_string())
+                .collect::<Vec<_>>(),
+            d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+        assert!(
+            !d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::NullableUse { .. })),
+            "…at warn level for one release, not error — it rejects correct programs"
+        );
+    }
+
+    /// …and a guarded one stays silent, so the new check does not fight the
+    /// attribute narrowing that already exists.
+    #[test]
+    fn a_guarded_nullable_attribute_receiver_is_silent() {
+        let d = check(
+            r#"
+class Db:
+    host: str
+
+class Cfg:
+    db: Db?
+
+impl Cfg:
+    def show(self) -> str:
+        if self.db is None:
+            return ""
+        return self.db.host
+"#,
+        );
+        assert!(
+            !d.warnings()
+                .iter()
+                .chain(d.errors().iter())
+                .any(|e| matches!(e, TycError::NullableUse { .. })),
+            "`if self.db is None: return` narrows the path; got {:?}",
+            d.warnings()
+                .iter()
+                .map(|e| e.to_string())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn attribute_assignment_is_type_checked() {
+        // `self.field = v` is the mandated idiom — methods live in `impl`
+        // blocks and write through `self` — and it was never type-checked.
+        let d = check(
+            r#"
+class Counter:
+    total: int
+
+impl Counter:
+    def broken(self) -> None:
+        self.total = "nope"
+"#,
+        );
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::TypeMismatch { .. })),
+            "wrong-typed attribute write must be rejected; got {:?}",
+            d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn attribute_assignment_keeps_valid_writes_green() {
+        // The gates that keep this from false-positiving at the language's
+        // most common assignment position: primitive widening, a subclass
+        // into a base-typed field, `None` into `T?`, and a field whose type
+        // is still a free type parameter inside `impl[T]`.
+        let d = check(
+            r#"
+class Animal:
+    name: str
+
+class Dog(Animal):
+    breed: str
+
+class Holder:
+    ratio: float
+    pet: Animal
+    tag: str?
+
+impl Holder:
+    def go(self) -> None:
+        self.ratio = 3
+        self.pet = Dog(name="Rex", breed="Husky")
+        self.tag = None
+
+class Box[T]:
+    value: T
+
+impl[T] Box[T]:
+    def put(self, v: T) -> None:
+        self.value = v
+"#,
+        );
+        assert!(
+            !d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::TypeMismatch { .. })),
+            "valid attribute writes must stay green; got {:?}",
+            d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn multiple_inheritance_field_order_follows_reverse_mro() {
+        // `@dataclass` builds `__dataclass_fields__` from the reverse MRO, so
+        // for `class C(A, B)` the constructor is `C(b1, a1, a2, c1)` — not the
+        // left-to-right `C(a1, a2, b1, c1)` the emitted body used to read.
+        // Positional construction in the *wrong* (old) order must now be
+        // rejected, or a green build silently writes each argument into the
+        // wrong field.
+        let wrong = check(
+            r#"
+class A:
+    a1: int
+    a2: str
+
+class B:
+    b1: float
+
+class C(A, B):
+    c1: bool
+
+def go() -> None:
+    let bad: C = C(1, "x", 2.0, True)
+    print(bad)
+"#,
+        );
+        assert!(
+            wrong
+                .errors()
+                .iter()
+                .any(|e| matches!(e, TycError::TypeMismatch { .. })),
+            "declaration-order positional construction must be rejected"
+        );
+
+        let right = check(
+            r#"
+class A:
+    a1: int
+    a2: str
+
+class B:
+    b1: float
+
+class C(A, B):
+    c1: bool
+
+def go() -> None:
+    let good: C = C(2.0, 1, "x", True)
+    print(good)
+"#,
+        );
+        assert!(
+            !right
+                .errors()
+                .iter()
+                .any(|e| matches!(e, TycError::TypeMismatch { .. })),
+            "reverse-MRO positional construction must be accepted; got {:?}",
+            right
+                .errors()
+                .iter()
+                .map(|e| e.to_string())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn model_constructors_are_keyword_only() {
+        // `model X:` emits `class X(BaseModel):`, and Pydantic's
+        // `BaseModel.__init__` is `(self, **data)`. Positional construction
+        // type-checked clean and then raised TypeError on the first run.
+        let positional = check(
+            r#"
+model ApiUser:
+    id: int
+    name: str
+
+def go() -> None:
+    let u: ApiUser = ApiUser(1, "alice")
+    print(u)
+"#,
+        );
+        assert!(
+            !positional.errors().is_empty(),
+            "positional construction of a `model` must be rejected"
+        );
+
+        let keyword = check(
+            r#"
+model ApiUser:
+    id: int
+    name: str
+
+def go() -> None:
+    let u: ApiUser = ApiUser(id=1, name="alice")
+    print(u)
+"#,
+        );
+        assert!(
+            keyword.errors().is_empty(),
+            "keyword construction of a `model` must stay green; got {:?}",
+            keyword
+                .errors()
+                .iter()
+                .map(|e| e.to_string())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn defaulted_tail_satisfies_a_narrower_callable() {
+        let expected = Type::Function {
+            params: vec![Type::Int],
+            ret: Box::new(Type::Int),
+            variadic: false,
+            min_params: None,
+        };
+        let actual = Type::Function {
+            params: vec![Type::Int, Type::Int],
+            ret: Box::new(Type::Int),
+            variadic: false,
+            min_params: Some(1),
+        };
+        assert!(
+            assignable(&expected, &actual),
+            "a function with a defaulted tail is a narrower Callable"
+        );
+        let two_required = Type::Function {
+            params: vec![Type::Int, Type::Int],
+            ret: Box::new(Type::Int),
+            variadic: false,
+            min_params: Some(2),
+        };
+        assert!(
+            !assignable(&expected, &two_required),
+            "a function that genuinely needs two arguments is not a 1-arg Callable"
+        );
+    }
+
+    #[test]
+    fn defaulted_function_passes_as_a_narrower_callable_end_to_end() {
+        let d = check(
+            r#"
+from typing import Callable
+
+def apply(f: Callable[[int], int], x: int) -> int:
+    return f(x)
+
+def scale(x: int, factor: int = 2) -> int:
+    return x * factor
+
+def go() -> None:
+    print(apply(scale, 3))
+"#,
+        );
+        assert!(
+            !d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::TypeMismatch { .. })),
+            "got {:?}",
+            d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn a_genuinely_wider_function_is_still_rejected_as_a_callable() {
+        // The relaxation must not become "any arity fits": a function that
+        // really needs two arguments is not a `Callable[[int], int]`.
+        let d = check(
+            r#"
+from typing import Callable
+
+def apply(f: Callable[[int], int], x: int) -> int:
+    return f(x)
+
+def needs_two(a: int, b: int) -> int:
+    return a + b
+
+def go() -> None:
+    print(apply(needs_two, 3))
+"#,
+        );
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::TypeMismatch { .. })),
+            "a 2-argument function must not satisfy a 1-argument Callable"
+        );
+    }
+
+    /// The pre-PR review's soundness regression: `min_params` was computed
+    /// from the positional prefix alone, so the defaulted-tail relaxation
+    /// treated a *required keyword-only* tail as omittable. `tag` can satisfy
+    /// no positional `Callable` at all — every call the slot could make
+    /// raises `TypeError: missing 1 required keyword-only argument`.
+    #[test]
+    fn a_required_kwonly_tail_does_not_satisfy_a_positional_callable() {
+        let d = check(
+            r#"
+from typing import Callable
+
+def apply(f: Callable[[int], int], x: int) -> int:
+    return f(x)
+
+def tag(x: int, *, label: str) -> int:
+    return x + len(label)
+
+def go() -> None:
+    print(apply(tag, 3))
+"#,
+        );
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::TypeMismatch { .. })),
+            "a required kwonly param can be neither reached nor omitted by a \
+             positional Callable; got {:?}",
+            d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    /// …while a *defaulted* keyword-only tail stays accepted at the positional
+    /// arity — a positional call never reaches it and never needs to.
+    #[test]
+    fn a_defaulted_kwonly_tail_still_satisfies_the_positional_callable() {
+        let d = check(
+            r#"
+from typing import Callable
+
+def apply(f: Callable[[int], int], x: int) -> int:
+    return f(x)
+
+def tag(x: int, *, label: str = "t") -> int:
+    return x + len(label)
+
+def go() -> None:
+    print(apply(tag, 3))
+"#,
+        );
+        assert!(
+            !d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::TypeMismatch { .. })),
+            "a defaulted kwonly tail is omittable; got {:?}",
+            d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn deprecated_typing_aliases_do_not_also_mismatch() {
+        // `List[int]` already earns `tyc::typing_alias_deprecated`. Leaving
+        // the head un-normalised produced a second, *hard* error reading
+        // "expected `List[int]`, found `list[int]`" — nonsensical, and it
+        // blocks the build rather than nudging.
+        let d = check(
+            r#"
+from typing import List
+
+def sum_all(xs: List[int]) -> int:
+    mut t: int = 0
+    for x in xs:
+        t = t + x
+    return t
+
+def go() -> None:
+    print(sum_all([1, 2, 3]))
+"#,
+        );
+        assert!(
+            !d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::TypeMismatch { .. })),
+            "got {:?}",
+            d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn parametric_sealed_union_match_is_checked_for_exhaustiveness() {
+        // A parametric union infers as `Type::Generic`, not `Type::Class`, so
+        // gating on `Class` alone skipped the check for every one of them.
+        let missing = check(
+            r#"
+class Some[T]:
+    value: T
+
+class Nothing frozen:
+    pass
+
+type Maybe[T] = Some[T] | Nothing
+
+def describe(m: Maybe[int]) -> str:
+    match m:
+        case Some(v): return f"some {v}"
+"#,
+        );
+        assert!(
+            missing
+                .errors()
+                .iter()
+                .any(|e| matches!(e, TycError::NonExhaustiveMatch { .. })),
+            "an uncovered variant of a parametric union must be reported"
+        );
+
+        let complete = check(
+            r#"
+class Some[T]:
+    value: T
+
+class Nothing frozen:
+    pass
+
+type Maybe[T] = Some[T] | Nothing
+
+def describe(m: Maybe[int]) -> str:
+    match m:
+        case Some(v): return f"some {v}"
+        case Nothing(): return "nothing"
+"#,
+        );
+        assert!(
+            !complete
+                .errors()
+                .iter()
+                .any(|e| matches!(e, TycError::NonExhaustiveMatch { .. })),
+            "a complete match must stay green; got {:?}",
+            complete
+                .errors()
+                .iter()
+                .map(|e| e.to_string())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn read_view_lattice_matches_collections_abc() {
+        // The flat table let `set` pass as a `Sequence` (no `__getitem__`) and
+        // any container pass as an `Iterator` (no `__next__`) — a clean check
+        // and a TypeError at runtime on both execution paths.
+        assert!(read_view_head_accepts("Sequence", "list"));
+        assert!(read_view_head_accepts("Sequence", "tuple"));
+        assert!(!read_view_head_accepts("Sequence", "set"));
+        assert!(!read_view_head_accepts("Sequence", "frozenset"));
+        assert!(!read_view_head_accepts("Reversible", "set"));
+        // Every built-in container is iterable…
+        assert!(read_view_head_accepts("Iterable", "set"));
+        assert!(read_view_head_accepts("Collection", "frozenset"));
+        // …and none of them *is* an iterator.
+        for c in ["list", "tuple", "set", "frozenset"] {
+            assert!(!read_view_head_accepts("Iterator", c), "Iterator vs {c}");
+        }
+    }
+
     fn check_class_kinds(src: &str) -> Diagnostics {
         use tyc_resolve::{resolve_module_with, ResolveOptions};
         let prep = preprocess(src);

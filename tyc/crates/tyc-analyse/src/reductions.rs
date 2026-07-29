@@ -45,8 +45,9 @@
 //!      effect-free to materialise: a `list` / `tuple` / `set` display, a bare
 //!      name annotated `list[...]` / `tuple[...]` / `set[...]` /
 //!      `frozenset[...]` in the loop's scope (the container already sits fully
-//!      in memory, and `map_pure` returns results in input order, so the first
-//!      raising element still propagates first), or a direct builtin
+//!      in memory, and `map_pure` returns results in input order, so the *same*
+//!      exception propagates — though not with the same accumulator state
+//!      behind it; see condition 8), or a direct builtin
 //!      `range(...)` call — bounded, pure, deterministic; note that
 //!      parallelising a `range` loop materialises the range, an inherent cost
 //!      of the map-based design. Anything else — an unannotated name, a
@@ -59,6 +60,22 @@
 //!      (and treats `range(...)` as the builtin under condition 6), so a
 //!      user binding of `sum` — or `range`, for a range iterable — anywhere
 //!      visible to the loop suppresses the rewrite.
+//!   8. **Not guarded by a `try` in the same frame.** The rewrite does *not*
+//!      preserve the accumulator's state across a raise. Sequentially, `ACC`
+//!      is stored once per element, so a raise on element *k* leaves `ACC`
+//!      holding the sum of elements `0..k`; in the rewritten form the whole
+//!      `sum(map_pure(...))` must evaluate before the `+=` store happens, so
+//!      the same raise leaves `ACC` at its pre-loop value. The only way to
+//!      observe the difference is to catch the exception in the frame that
+//!      owns `ACC` — once it escapes the function, `ACC` dies with the frame —
+//!      so a loop lexically inside a `try` body in its own frame is never
+//!      rewritten — nor inside a `with` body, whose manager's `__exit__` can
+//!      suppress the exception in the same frame (`contextlib.suppress`); an
+//!      arbitrary manager cannot be proven non-suppressing, so every `with`
+//!      body counts as guarded. (Note that condition 4's purity requirement does *not*
+//!      imply non-raising: integer `//` and `%` and calls to `@pure` functions
+//!      all raise while being side-effect-free.) A nested `def` resets this:
+//!      it opens a new frame, which an enclosing `try` does not guard.
 //!
 //! Gated at the call site on `auto-parallel` **and** `auto-parallel-reductions`
 //! both being on. Honours `[strictness] parallel-min-size` for statically-sized
@@ -158,7 +175,13 @@ pub fn rewrite_reduction_loops(
     let env = ScopeEnv::for_scope(&module.body, None, None);
     let ctx = RewriteCtx::new(pure_callees, min_size, &captures);
     let mut stats = ReductionStats::default();
-    rewrite_stmts(&mut module.body, &ctx, &env, &mut stats);
+    rewrite_stmts(
+        &mut module.body,
+        &ctx,
+        &env,
+        &mut stats,
+        /*in_try=*/ false,
+    );
     stats
 }
 
@@ -167,21 +190,73 @@ fn rewrite_stmts(
     ctx: &RewriteCtx<'_>,
     env: &ScopeEnv,
     stats: &mut ReductionStats,
+    in_try: bool,
 ) {
-    for stmt in body.iter_mut() {
+    for idx in 0..body.len() {
         // Recurse first so nested loops inside a matched loop's *sibling*
         // blocks are considered (a matched leaf loop has no nested statements
         // to recurse into anyway).
-        recurse_children(stmt, ctx, env, stats);
-        if let Stmt::For(f) = stmt {
-            if let Some(m) = match_reduction_loop(f, ctx, &env.int_mut, env) {
-                if !env.sum_shadowed && !under_min_size(&m.iter, ctx.min_size) {
-                    *stmt = build_reduction_stmt(&m);
-                    stats.rewrites += 1;
+        recurse_children(&mut body[idx], ctx, env, stats, in_try);
+        let Stmt::For(f) = &body[idx] else { continue };
+        let Some(m) = match_reduction_loop(f, ctx, &env.int_mut, env) else {
+            continue;
+        };
+        if env.sum_shadowed || under_min_size(&m.iter, ctx.min_size) {
+            continue;
+        }
+        // Condition 8: never rewrite a loop guarded by a `try` in the same
+        // frame. The sequential loop stores into `ACC` once per element, so a
+        // raise on element k leaves `ACC` holding elements 0..k-1; the
+        // rewritten form must evaluate the whole `sum(map_pure(...))` before
+        // the `+=` store, so the same raise leaves `ACC` at its pre-loop
+        // value. Only a handler in this frame can read the accumulator to see
+        // the difference — once the exception escapes the function, `ACC` dies
+        // with the frame. Purity is not a proxy for non-raising: `//`, `%`, and
+        // calls to `@pure` functions all raise while being side-effect-free.
+        if in_try {
+            continue;
+        }
+        // The rewrite *deletes* the `for` statement, and with it the loop
+        // variable's binding. Python leaves the loop variable in scope after
+        // the loop, so any later read of it — `print("last x was", x)` — became
+        // a `NameError` on emitted code that type-checked clean, or, when the
+        // name happened to be pre-declared, silently kept its pre-loop value
+        // instead of the last element. Only rewrite when the target is dead
+        // after the loop.
+        if name_read_in(&body[idx + 1..], &m.target) {
+            continue;
+        }
+        body[idx] = build_reduction_stmt(&m);
+        stats.rewrites += 1;
+    }
+}
+
+/// True when `name` is read anywhere in `stmts` (at any nesting depth).
+///
+/// Deliberately conservative: it does not model re-binding, so a later
+/// `for name in …` that would shadow the stale value still counts as a read
+/// and suppresses the rewrite. Missing a parallelisation opportunity costs
+/// speed; taking one that changes the program's meaning costs correctness.
+fn name_read_in(stmts: &[Stmt], name: &str) -> bool {
+    struct V<'a> {
+        name: &'a str,
+        found: bool,
+    }
+    impl ruff_python_ast::visitor::Visitor<'_> for V<'_> {
+        fn visit_expr(&mut self, e: &Expr) {
+            if let Expr::Name(n) = e {
+                if n.id.as_str() == self.name {
+                    self.found = true;
                 }
             }
+            ruff_python_ast::visitor::walk_expr(self, e);
         }
     }
+    let mut v = V { name, found: false };
+    for s in stmts {
+        ruff_python_ast::visitor::walk_stmt(&mut v, s);
+    }
+    v.found
 }
 
 fn recurse_children(
@@ -189,47 +264,59 @@ fn recurse_children(
     ctx: &RewriteCtx<'_>,
     env: &ScopeEnv,
     stats: &mut ReductionStats,
+    in_try: bool,
 ) {
     match stmt {
         // A `def` / `class` opens a new scope: rebuild the environment from
         // that body (see `ScopeEnv::for_scope` for what is and isn't
-        // inherited).
+        // inherited). It also opens a new *frame*, so an enclosing `try` no
+        // longer guards it — a raise inside the nested body unwinds that
+        // frame and takes its accumulator with it.
         Stmt::FunctionDef(f) => {
             let inner = ScopeEnv::for_scope(&f.body, Some(&f.parameters), Some(env));
-            rewrite_stmts(&mut f.body, ctx, &inner, stats);
+            rewrite_stmts(&mut f.body, ctx, &inner, stats, /*in_try=*/ false);
         }
         Stmt::ClassDef(c) => {
             let inner = ScopeEnv::for_scope(&c.body, None, Some(env));
-            rewrite_stmts(&mut c.body, ctx, &inner, stats);
+            rewrite_stmts(&mut c.body, ctx, &inner, stats, /*in_try=*/ false);
         }
         // Control-flow blocks share the enclosing scope: thread it unchanged.
         Stmt::If(s) => {
-            rewrite_stmts(&mut s.body, ctx, env, stats);
+            rewrite_stmts(&mut s.body, ctx, env, stats, in_try);
             for clause in &mut s.elif_else_clauses {
-                rewrite_stmts(&mut clause.body, ctx, env, stats);
+                rewrite_stmts(&mut clause.body, ctx, env, stats, in_try);
             }
         }
         Stmt::While(s) => {
-            rewrite_stmts(&mut s.body, ctx, env, stats);
-            rewrite_stmts(&mut s.orelse, ctx, env, stats);
+            rewrite_stmts(&mut s.body, ctx, env, stats, in_try);
+            rewrite_stmts(&mut s.orelse, ctx, env, stats, in_try);
         }
         Stmt::For(s) => {
-            rewrite_stmts(&mut s.body, ctx, env, stats);
-            rewrite_stmts(&mut s.orelse, ctx, env, stats);
+            rewrite_stmts(&mut s.body, ctx, env, stats, in_try);
+            rewrite_stmts(&mut s.orelse, ctx, env, stats, in_try);
         }
-        Stmt::With(s) => rewrite_stmts(&mut s.body, ctx, env, stats),
+        // A `with` body is guarded like a `try` body: the context manager's
+        // `__exit__` can suppress the exception in this same frame
+        // (`contextlib.suppress` exists to do exactly that), after which the
+        // accumulator's partial state is observable. We cannot prove an
+        // arbitrary manager non-suppressing, so every `with` body counts.
+        Stmt::With(s) => rewrite_stmts(&mut s.body, ctx, env, stats, /*in_try=*/ true),
         Stmt::Try(s) => {
-            rewrite_stmts(&mut s.body, ctx, env, stats);
-            rewrite_stmts(&mut s.orelse, ctx, env, stats);
-            rewrite_stmts(&mut s.finalbody, ctx, env, stats);
+            // Only the `try` body is guarded by this statement's handlers.
+            // Python does not route a raise in the `else` clause, a handler
+            // body, or the `finally` block through the same handlers, so those
+            // inherit whatever guarded this `try` itself.
+            rewrite_stmts(&mut s.body, ctx, env, stats, /*in_try=*/ true);
+            rewrite_stmts(&mut s.orelse, ctx, env, stats, in_try);
+            rewrite_stmts(&mut s.finalbody, ctx, env, stats, in_try);
             for h in &mut s.handlers {
                 let ruff_python_ast::ExceptHandler::ExceptHandler(h) = h;
-                rewrite_stmts(&mut h.body, ctx, env, stats);
+                rewrite_stmts(&mut h.body, ctx, env, stats, in_try);
             }
         }
         Stmt::Match(s) => {
             for case in &mut s.cases {
-                rewrite_stmts(&mut case.body, ctx, env, stats);
+                rewrite_stmts(&mut case.body, ctx, env, stats, in_try);
             }
         }
         _ => {}
@@ -932,6 +1019,99 @@ def run(xs: list[int]) -> int:
         assert!(
             !out.contains("for x in xs:"),
             "for loop should be replaced:\n{out}"
+        );
+    }
+
+    /// Condition 8 (F53): the rewrite does not preserve partial accumulation
+    /// across a raise, and a handler in the same frame can read the
+    /// difference. `//` is pure but raises on a zero divisor.
+    #[test]
+    fn does_not_rewrite_a_loop_guarded_by_a_try_in_the_same_frame() {
+        let src = "\
+def run(xs: list[int]) -> int:
+    mut total: int = 0
+    try:
+        for x in xs:
+            total += 100 // x
+    except ZeroDivisionError:
+        return total
+    return total
+";
+        let (out, stats) = rewrite(src, &[], 0);
+        assert_eq!(
+            stats.rewrites, 0,
+            "a `try` in the same frame can observe the accumulator; got:\n{out}"
+        );
+    }
+
+    /// A `with` body is guarded like a `try` body: `contextlib.suppress`
+    /// catches the raise in the same frame via `__exit__`, and execution then
+    /// reads the accumulator — exactly the observable-state difference
+    /// condition 8 exists to prevent. An arbitrary manager cannot be proven
+    /// non-suppressing, so every `with` body counts.
+    #[test]
+    fn does_not_rewrite_a_loop_inside_a_with_body() {
+        let src = "\
+import contextlib
+
+def run(xs: list[int]) -> int:
+    mut total: int = 0
+    with contextlib.suppress(ZeroDivisionError):
+        for x in xs:
+            total += 100 // x
+    return total
+";
+        let (out, stats) = rewrite(src, &[], 0);
+        assert_eq!(
+            stats.rewrites, 0,
+            "a suppressing `__exit__` observes the accumulator's partial state; got:\n{out}"
+        );
+    }
+
+    /// The handler body, the `else` clause and the `finally` block are not
+    /// guarded by *this* `try`'s handlers, so a loop there still rewrites.
+    #[test]
+    fn rewrites_a_loop_in_an_else_clause_of_a_try() {
+        let src = "\
+def run(xs: list[int]) -> int:
+    mut total: int = 0
+    try:
+        pass
+    except ValueError:
+        pass
+    else:
+        for x in xs:
+            total += x * x
+    return total
+";
+        let (out, stats) = rewrite(src, &[], 0);
+        assert_eq!(
+            stats.rewrites, 1,
+            "the `else` clause is not covered by this `try`'s handlers; got:\n{out}"
+        );
+    }
+
+    /// A nested `def` opens a new frame, which the enclosing `try` does not
+    /// guard — the accumulator there dies with that frame.
+    #[test]
+    fn rewrites_a_loop_in_a_nested_def_inside_a_try() {
+        let src = "\
+def outer(xs: list[int]) -> int:
+    try:
+        def inner(ys: list[int]) -> int:
+            mut total: int = 0
+            for x in ys:
+                total += x * x
+            return total
+
+        return inner(xs)
+    except ValueError:
+        return 0
+";
+        let (out, stats) = rewrite(src, &[], 0);
+        assert_eq!(
+            stats.rewrites, 1,
+            "the nested `def` has its own frame; got:\n{out}"
         );
     }
 

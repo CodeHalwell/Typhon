@@ -449,6 +449,21 @@ notifs = _t_notifs.result()
 
 `gather:` lowers to `asyncio.TaskGroup` (3.11+) by default. `asyncio.gather(...)` propagates the first exception but lets siblings keep running, which is the wrong default for side-effectful work. Users who genuinely want partial-success semantics opt in via `gather(strategy="best-effort"):`, which lowers to `asyncio.gather(..., return_exceptions=True)`.
 
+**Handling failures.** Because the default lowering is a `TaskGroup`, a failing task does *not* surface as its own exception — `TaskGroup.__aexit__` raises `ExceptionGroup('unhandled errors in a TaskGroup', [...])`. Catch it with `except*`, not a plain `except`:
+
+```python
+try:
+    gather:
+        user  = fetch_user(id)
+        posts = fetch_posts(id)
+except* ValueError:
+    ...   # runs once per matching sub-exception
+```
+
+`return`, `break` and `continue` are not permitted inside an `except*` handler — CPython rejects all three at compile time, and Typhon reports `tyc::return_in_except_star`. Set a flag in the handler and act on it after the `try`.
+
+The tree-walking VM models this identically as of v1.0.0-alpha.7; see `docs/vm.md` for the three residual `ExceptionGroup` divergences.
+
 ### Free-threaded Python
 
 When `typhon.toml` sets `[python] free-threaded = true`, Typhon targets a free-threaded CPython build (3.13t / 3.14t / 3.15t) and unlocks two opt-in build-time rewrites plus two advice lints. Default-off until 3.14 is the default Python.

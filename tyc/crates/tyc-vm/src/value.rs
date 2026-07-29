@@ -811,6 +811,164 @@ impl std::hash::Hash for HashKey {
     }
 }
 
+// ── ExceptionGroup ────────────────────────────────────────────────────────
+//
+// PEP 654 exception groups are modelled with the *existing*
+// `Value::Exception` shape rather than a new `Value` variant, because CPython
+// itself stores a group's payload in its `args`: `ExceptionGroup("g", [e])`
+// has `args == ("g", [e])` and exposes `.exceptions` as `tuple(args[1])`.
+// Reusing `Value::Exception` therefore gives `e.args`, `repr(e)`, class-name
+// lookup (`type(e).__name__`) and dict/set hashing for free, and keeps the
+// blast radius of the feature to the handful of helpers below.
+//
+// What is modelled: construction (`ExceptionGroup` / `BaseExceptionGroup`,
+// including CPython's auto-downcast of a `BaseExceptionGroup` whose members
+// are all ordinary `Exception`s), `.exceptions` / `.message`, `str()` /
+// `repr()`, `except*` splitting/binding/re-raise, and the `asyncio.TaskGroup`
+// failure path. What is NOT modelled: `.split()` / `.subgroup()` / `.derive()`
+// as user-callable methods, `__notes__`, and CPython's nested
+// "Exception Group Traceback" rendering for an uncaught group (the VM prints
+// the single summary line).
+
+/// Whether `kind` names one of the two builtin exception-group types.
+pub fn is_exception_group_kind(kind: &str) -> bool {
+    matches!(kind, "ExceptionGroup" | "BaseExceptionGroup")
+}
+
+/// The sub-exceptions of an exception-group value, or `None` when `v` is not
+/// a group. Reads `args[1]`, which is a tuple for the implicit wrapper
+/// `except*` builds around a non-group exception and a list for an explicitly
+/// constructed or derived group — matching CPython's own `args` in both cases.
+pub fn exception_group_subs(v: &Value) -> Option<Vec<Value>> {
+    match v {
+        Value::Exception { kind, args, .. } if is_exception_group_kind(kind.as_str()) => {
+            match args.get(1) {
+                Some(Value::List(l)) => Some(l.borrow().clone()),
+                Some(Value::Tuple(t)) => Some((**t).clone()),
+                _ => Some(Vec::new()),
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Build an exception-group value. `as_tuple` selects the `args[1]` shape:
+/// `true` for the implicit wrapper `except*` puts around a bare exception
+/// (CPython: `ExceptionGroup('', (ValueError('v'),))`), `false` for an
+/// explicitly constructed or split-derived group (`ExceptionGroup('g', [...])`).
+pub fn make_exception_group(kind: &str, message: &str, subs: Vec<Value>, as_tuple: bool) -> Value {
+    let subs_value = if as_tuple {
+        Value::Tuple(Rc::new(subs))
+    } else {
+        Value::List(Rc::new(RefCell::new(subs)))
+    };
+    Value::Exception {
+        kind: Rc::new(kind.to_owned()),
+        message: Rc::new(message.to_owned()),
+        args: Rc::new(vec![Value::Str(Rc::new(message.to_owned())), subs_value]),
+    }
+}
+
+/// Whether `v` is an exception that derives from `BaseException` but *not*
+/// `Exception` — the set `ExceptionGroup` refuses to hold, and which forces
+/// `BaseExceptionGroup` to stay a `BaseExceptionGroup`.
+pub fn is_base_only_exception(v: &Value) -> bool {
+    match v {
+        Value::Exception { kind, .. } => matches!(
+            kind.as_str(),
+            "BaseException" | "KeyboardInterrupt" | "SystemExit" | "GeneratorExit"
+        ),
+        _ => false,
+    }
+}
+
+/// Whether a prospective exception-group member derives from `Exception`
+/// (as opposed to being `BaseException`-only). A nested `BaseExceptionGroup`
+/// is *not* an `Exception` — only its downcast `ExceptionGroup` sibling is —
+/// which is what keeps a mixed group's base-only side base-only through
+/// splits and re-wraps.
+pub fn is_ordinary_exception_member(v: &Value) -> bool {
+    match v {
+        Value::Exception { kind, .. } => {
+            kind.as_str() != "BaseExceptionGroup" && !is_base_only_exception(v)
+        }
+        _ => true,
+    }
+}
+
+/// The exception-group class CPython's `BaseExceptionGroup.__new__` would
+/// choose for `members`: `ExceptionGroup` when every member is an ordinary
+/// `Exception`, `BaseExceptionGroup` otherwise. Splits, handler-failure
+/// re-wraps, and the `TaskGroup` failure path all funnel through `__new__`
+/// in CPython, so every VM site that builds a group derives its kind here
+/// (verified against 3.13: `BaseExceptionGroup("g", [ValueError("v"),
+/// KeyboardInterrupt()])` split by `except* ValueError` binds an
+/// `ExceptionGroup('g', [ValueError('v')])` on the matched side).
+pub fn exception_group_kind_for(members: &[Value]) -> &'static str {
+    if members.iter().all(is_ordinary_exception_member) {
+        "ExceptionGroup"
+    } else {
+        "BaseExceptionGroup"
+    }
+}
+
+/// Object identity (`is`) for exception values. Clones of one raised
+/// exception share their `Rc`s, so pointer equality on the payload is the
+/// VM's notion of "the same exception object" — the test PEP 654 reraise
+/// merging and `TaskGroup.__aexit__` deduplication rely on.
+pub fn exception_values_identical(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Exception { args: a, .. }, Value::Exception { args: b, .. }) => Rc::ptr_eq(a, b),
+        (Value::Instance(a), Value::Instance(b)) => Rc::ptr_eq(a, b),
+        _ => false,
+    }
+}
+
+/// Append every leaf (non-group) exception reachable through `v` to `out`,
+/// descending nested groups — the flattening CPython's
+/// `BaseExceptionGroup` machinery calls the group's "leaf exceptions".
+pub fn collect_exception_leaves(v: &Value, out: &mut Vec<Value>) {
+    match exception_group_subs(v) {
+        Some(subs) => {
+            for sub in subs {
+                collect_exception_leaves(&sub, out);
+            }
+        }
+        None => out.push(v.clone()),
+    }
+}
+
+/// Rebuild the subgroup of `orig` containing exactly the leaves that are
+/// identity-members of `keep`, preserving nesting and each level's message
+/// and recomputing each level's kind through the constructor's downcast
+/// rule — CPython's `exception_group_projection`, which
+/// `_PyExc_PrepReraiseStar` uses to reconstitute naked-`raise`d subgroups
+/// and the unhandled remainder into the original group's shape. Returns
+/// `None` when nothing is kept at this level.
+pub fn project_exception_group(orig: &Value, keep: &[Value]) -> Option<Value> {
+    match exception_group_subs(orig) {
+        Some(subs) => {
+            let members: Vec<Value> = subs
+                .iter()
+                .filter_map(|sub| project_exception_group(sub, keep))
+                .collect();
+            if members.is_empty() {
+                return None;
+            }
+            let message = match orig {
+                Value::Exception { message, .. } => (**message).clone(),
+                _ => String::new(),
+            };
+            let kind = exception_group_kind_for(&members);
+            Some(make_exception_group(kind, &message, members, false))
+        }
+        None => keep
+            .iter()
+            .any(|k| exception_values_identical(k, orig))
+            .then(|| orig.clone()),
+    }
+}
+
 #[derive(Clone)]
 pub enum Value {
     None,
@@ -955,6 +1113,16 @@ pub struct Class {
     /// getting the dataclass "takes N arguments" treatment, so that the
     /// ubiquitous `raise FooError("message")` idiom works under the VM.
     pub is_exception: bool,
+    /// `true` when the class was declared with a `Protocol` base — i.e. it is
+    /// the lowering of a Typhon `interface`.
+    ///
+    /// Recorded from the base *expression* rather than the resolved base,
+    /// because `typing.Protocol` resolves to an identity native in the VM, not
+    /// a class, so it never appears in `bases`. Without this the `as!` cast
+    /// could not tell an interface target from an ordinary class and fell back
+    /// to a nominal `isinstance`, which can never succeed against a protocol —
+    /// making `EXPR as! SomeInterface` impossible under `tyc run`.
+    pub is_protocol: bool,
 }
 
 #[derive(Clone)]
@@ -1121,6 +1289,34 @@ impl fmt::Debug for Value {
 }
 
 // ── Conversion / introspection helpers ────────────────────────────────────
+
+/// Exact `float` → `BigInt` conversion with CPython's error behaviour.
+///
+/// Rust's `as` cast saturates (`1e30 as i64` is `i64::MAX`) and maps NaN to
+/// zero, so every out-of-range float silently became a wrong integer — in an
+/// interpreter whose defining property is that its integers are arbitrary
+/// precision. `BigInt::from_f64` truncates toward zero exactly like
+/// `int(x)` and returns `None` only for the values CPython refuses.
+fn float_to_bigint(x: f64) -> Result<BigInt, Unwind> {
+    if x.is_nan() {
+        return Err(Unwind::Exception(crate::error::VmException::new(
+            "ValueError",
+            "cannot convert float NaN to integer",
+        )));
+    }
+    if x.is_infinite() {
+        return Err(Unwind::Exception(crate::error::VmException::new(
+            "OverflowError",
+            "cannot convert float infinity to integer",
+        )));
+    }
+    BigInt::from_f64(x.trunc()).ok_or_else(|| {
+        Unwind::Exception(crate::error::VmException::new(
+            "ValueError",
+            format!("cannot convert float {x} to integer"),
+        ))
+    })
+}
 
 impl Value {
     pub fn type_name(&self) -> &'static str {
@@ -1419,6 +1615,11 @@ impl Value {
             (Bool(a), Int(b)) => VmInt::from(*a as i64).partial_cmp(b),
             (Int(a), Bool(b)) => a.partial_cmp(&VmInt::from(*b as i64)),
             (Str(a), Str(b)) => a.partial_cmp(b),
+            // `bytes` is ordered in CPython (lexicographic over the byte
+            // values). Without this arm every bytes pair was "incomparable",
+            // which the `Equal` fallback in `value_cmp` then turned into
+            // "equal" — so `sorted([b"b", b"a"])` returned the list untouched.
+            (Bytes(a), Bytes(b)) => a.partial_cmp(b),
             (Tuple(a), Tuple(b)) => {
                 for (x, y) in a.iter().zip(b.iter()) {
                     match x.py_cmp(y)? {
@@ -1457,7 +1658,14 @@ impl Value {
                 ))
             }),
             Value::Bool(b) => Ok(*b as i64),
-            Value::Float(x) => Ok(*x as i64),
+            // Same saturation hazard as `to_bigint`: reject rather than
+            // silently clamp to `i64::MAX`.
+            Value::Float(x) => float_to_bigint(*x)?.to_i64().ok_or_else(|| {
+                Unwind::Exception(crate::error::VmException::new(
+                    "OverflowError",
+                    "Python int too large to convert to C int",
+                ))
+            }),
             Value::Str(s) => s
                 .trim()
                 .parse::<i64>()
@@ -1475,7 +1683,13 @@ impl Value {
         match self {
             Value::Int(i) => Ok(i.to_bigint()),
             Value::Bool(b) => Ok(BigInt::from(*b as i64)),
-            Value::Float(x) => Ok(BigInt::from(*x as i64)),
+            // `f64 as i64` in Rust *saturates* at `i64::MIN`/`i64::MAX` and
+            // maps NaN to 0, so `int(1e30)` silently produced
+            // 9223372036854775807 and `int(float("inf"))` produced the same
+            // instead of raising. The VM's whole point is arbitrary precision,
+            // and CPython raises `OverflowError` / `ValueError` here — so
+            // convert exactly and reject what has no integer value.
+            Value::Float(x) => float_to_bigint(*x),
             Value::Str(s) => s
                 .trim()
                 .parse::<BigInt>()
@@ -1639,6 +1853,13 @@ impl Value {
                 message,
                 args,
             } => match args.len() {
+                // `str(ExceptionGroup("g", [e]))` is `"g (1 sub-exception)"`,
+                // not the generic multi-arg tuple form below.
+                _ if is_exception_group_kind(kind.as_str()) => {
+                    let n = exception_group_subs(self).map(|s| s.len()).unwrap_or(0);
+                    let plural = if n == 1 { "" } else { "s" };
+                    format!("{message} ({n} sub-exception{plural})")
+                }
                 // `str(ValueError("a", "b"))` is the tuple `('a', 'b')`.
                 n if n >= 2 => {
                     let parts: Vec<String> = args.iter().map(|a| a.py_repr()).collect();
@@ -2256,6 +2477,7 @@ mod tests {
             properties: RefCell::new(std::collections::HashSet::new()),
             classmethods: RefCell::new(std::collections::HashSet::new()),
             is_exception: false,
+            is_protocol: false,
         })
     }
 

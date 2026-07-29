@@ -1,0 +1,39 @@
+# `[optimise] level = 1` (also reachable as `tyc build -O`) flips the DEFAULT of
+# auto-memoise / auto-gather / auto-parallel / pgo-memoise to true. This fixture
+# proves the dial reaches at least the memoise and gather rewrites without any
+# [strictness] entry naming them.
+import asyncio
+
+
+@pure
+def fib(n: int) -> int:
+    if n < 2:
+        return n
+    return fib(n - 1) + fib(n - 2)
+
+
+@gatherable
+async def one() -> int:
+    await asyncio.sleep(0)
+    return 1
+
+
+@gatherable
+async def two() -> int:
+    await asyncio.sleep(0)
+    return 2
+
+
+async def load() -> int:
+    let a: int = await one()
+    let b: int = await two()
+    return a + b
+
+
+def main() -> None:
+    print(fib(20))
+    print(asyncio.run(load()))
+
+
+if __name__ == "__main__":
+    main()

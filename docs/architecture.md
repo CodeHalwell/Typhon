@@ -110,6 +110,29 @@ Express each analysis as a Salsa query: `parse(file)`, `resolve(module)`, `infer
 
 Pipeline: Typhon AST → desugar to plain Python AST → `tyc-emit` hand-written printer → `ruff format` post-process (when `[emit] format = true`). Emitted files carry a generated-header comment.
 
-Source maps mapping `.py` lines back to `.ty` are written as a sidecar `.py.map` file. The printer records a `line_offsets` table as it prints each statement; the v2 format stores the resulting `(out_line → ty_line)` mapping. `tyc trace` uses it to rewrite Python tracebacks back to Typhon source, and the LSP uses it for cross-file go-to-definition across the `.ty`/`.py` boundary.
+Source maps mapping `.py` lines back to `.ty` are written as a sidecar `.py.map` file. The v2 format stores an `(out_line → ty_line)` table, built by composing **three** maps:
+
+1. `tyc-emit`'s printer records a `line_offsets` table as it prints, giving `out_line → preprocessed_line`.
+2. When `[emit] format = true`, the emitted buffer is reflowed before it is written, so `tyc build` diffs the pre- and post-format text (`align_formatted_lines` in `commands/build.rs`) to get `formatted_line → emitted_line` and re-keys (1) through it.
+3. Each line-count-changing preprocessor pass returns its own `preprocessed_line → input_line` table from a `*_mapped` variant (`expand_pipes_mapped`, `expand_gather_blocks_mapped`, …); `tyc build` folds them with `compose_line_maps` to get `preprocessed_line → ty_line`.
+
+All three are required, and each was missing at some point:
+
+- Before v1.0.0-alpha.7 only (1) existed and its values were written out directly, so the table named lines of the preprocessed buffer — which for any file using `?`, `gather:`, a `with`-chain, `rescue`, pipes or typed unpack is a different, longer file than the one the user wrote, frequently past its EOF.
+- (2) closes the other end of the same gap. The offsets are recorded *as the printer prints*, so they cannot be recorded against the formatted text directly; both the in-process whitespace normaliser (which collapses runs of 3+ blank lines and inserts PEP 8 blank lines before top-level `def`/`class`) and `ruff format` (which wraps long calls and signatures, and joins short ones) then shift every subsequent entry relative to the file on disk. The alignment is a patience diff: exact common prefix/suffix, then lines unique-and-equal in both remaining ranges as anchors via a longest increasing subsequence, recursing into the gaps.
+
+  A gap with no anchors — two adjacent statements the formatter both wrapped — is resolved by walking the two sides' non-whitespace bytes in lockstep (`align_gap_by_content`). Reflowing never reorders or rewrites code, it only moves whitespace and adds or drops `(`, `)` and the magic trailing `,`, so the byte streams still match; each formatted line takes the `before` line owning the first byte it matched, and a line that matched nothing (a blank, or a bracket skipped as an insertion) inherits its predecessor — which is what a wrapped continuation wants. Any divergence reflowing cannot explain aborts the walk and falls back to a proportional split of the gap, so a formatter change can only degrade precision, never desynchronise the table.
+
+The invariant worth holding onto when touching any of this: **turning `[emit] format` on or off must not change what the map says a given Python statement means.** It is checkable over the whole example + stress corpus by building each file both ways and comparing the attribution of every emitted line that survives formatting verbatim.
+
+`tyc-emit`'s half is **sub-statement** granular. `emit_stmt` sets the active offset from the statement's `TextRange`, but a compound statement prints header lines of its own that would otherwise inherit whatever was printed before them (a `case Square(s):` clause resolving to the `return` above it). Each such clause sets its own offset from its own range: `match` cases, `elif`/`else` clauses, `except` handlers, every decorator in a stack, and the `def`/`class` header itself — Ruff's `StmtFunctionDef.range` starts at the first `@`, so the header recovers its line from the name's range. Synthesised nodes carry a zero-length range and are skipped, so they inherit the last real offset rather than resetting to the top of the file.
+
+The printer's table must also stay one-entry-per-*output line*, not per `writeln`. A newline can reach the output from inside a token — a triple-quoted docstring, or any literal re-emitted verbatim — and each one ends a line. Those are counted in `write` / `write_char`, so a module containing a multi-line string keeps the rest of its table aligned instead of running one line early from the literal onward.
+
+The plain preprocessor entry points (`expand_pipes(s) -> String`) are thin wrappers over the mapped variants, so a consumer that does not need provenance — the VM, `tyc check`, the REPL — is unaffected.
+
+The composed table is **not** monotonic in general: a `with`-chain copies its `else` body into each binding's guard, so those output lines point back to a line above their neighbours. Do not assume monotonicity when consuming it.
+
+`tyc trace` uses the map to rewrite Python tracebacks back to Typhon source, `tyc debug --break` to place breakpoints, and the LSP for cross-file go-to-definition across the `.ty`/`.py` boundary.
 
 There is deliberately **no Typhon-specific runtime package** the user must install. The handful of helpers needed (`Result`/`Ok`/`Err`, `lazy_import`, `str_to_slug`-style extension shims) are emitted inline into each project as a generated `typhon_runtime/` module the build owns.

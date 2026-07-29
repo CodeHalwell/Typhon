@@ -1,0 +1,23 @@
+# `[strictness] pgo-memoise = true` reads typhon-profile.json and promotes every
+# pure function whose recorded call count reaches `pgo-min-calls` to
+# @functools.cache. `hot` is above the threshold, `cold` is below it — so this
+# fixture also pins the negative half of the decision.
+@pure
+def hot(n: int) -> int:
+    return n * n + 1
+
+
+@pure
+def cold(n: int) -> int:
+    return n - 1
+
+
+def main() -> None:
+    mut acc: int = 0
+    for i in range(20):
+        acc += hot(i % 4)
+    print(acc, cold(9))
+
+
+if __name__ == "__main__":
+    main()

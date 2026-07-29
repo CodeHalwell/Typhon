@@ -39,6 +39,8 @@ TYC_BIN="${TYC_BIN:-$ROOT/tyc/target/release/tyc}"
 PERF_RUNS="${PERF_RUNS:-9}"
 PERF_WARMUP="${PERF_WARMUP:-2}"
 PERF_THRESHOLD="${PERF_THRESHOLD:-0.20}"
+# Absolute regression floor in milliseconds; see the comparison step.
+PERF_MIN_SLACK_MS="${PERF_MIN_SLACK_MS:-5}"
 PERF_BASELINE="${PERF_BASELINE:-$ROOT/perf-baseline.json}"
 
 # Fixed benchmark corpus: a real, self-contained Typhon project that exercises
@@ -51,7 +53,22 @@ CORPUS="$ROOT/$CORPUS_REL"
 
 # tyc build flags: --no-sync skips `uv sync` (no network); --check runs the
 # full pipeline as a dry run without writing files.
-BUILD_FLAGS=(build "$CORPUS" --no-sync --check)
+BUILD_FLAGS=(build "$CORPUS" --no-sync --check --no-format)
+
+# Keep the measurement on *compiler* work.
+#
+# The gate's job is to catch a regression in the Rust pipeline, and its 20%
+# threshold is meaningful only in proportion to how much of the measured time
+# the pipeline actually accounts for. Venv introspection spawns a Python
+# subprocess and imports the project's dependencies; that was 55-59% of the
+# measured wall-clock, so a 20% nominal threshold tolerated a ~45% regression
+# in the code under test, and every measurement inherited the variance of a
+# Python interpreter start. `ruff format` shells out for the same reason.
+#
+# Both are excluded here (`--no-format` above, `TYC_NO_INTROSPECT` below), so
+# the number means what the threshold claims. Re-baseline when changing either
+# (see perf-baseline.json "methodology").
+export TYC_NO_INTROSPECT=1
 
 MODE="check"
 case "${1:-}" in
@@ -166,15 +183,22 @@ BASELINE_MS="$(jq -r '.median_ms' "$PERF_BASELINE")"
 
 # Compute limit = baseline * (1 + threshold), the verdict, and a readable
 # report in python3 (no float math in bash).
-python3 - "$MEDIAN" "$BASELINE_MS" "$PERF_THRESHOLD" <<'PY'
+python3 - "$MEDIAN" "$BASELINE_MS" "$PERF_THRESHOLD" "$PERF_MIN_SLACK_MS" <<'PY'
 import sys
 median = float(sys.argv[1])
 baseline = float(sys.argv[2])
 threshold = float(sys.argv[3])
-limit = baseline * (1.0 + threshold)
+min_slack = float(sys.argv[4])
+# Absolute floor on top of the percentage. Now that the Python-subprocess time
+# is excluded the median is small (tens of ms), and at that scale a percentage
+# alone is dominated by process-start jitter on a shared CI runner — a 3 ms
+# hiccup would read as a 20% regression. Require the regression to clear both
+# the percentage and an absolute slack before failing.
+limit = max(baseline * (1.0 + threshold), baseline + min_slack)
 delta = (median - baseline) / baseline * 100.0 if baseline else 0.0
 print(f"perf-gate: baseline={baseline:.0f}ms  measured={median:.0f}ms  "
-      f"delta={delta:+.1f}%  limit={limit:.0f}ms (+{threshold*100:.0f}%)")
+      f"delta={delta:+.1f}%  limit={limit:.0f}ms "
+      f"(+{threshold*100:.0f}%, min slack {min_slack:.0f}ms)")
 if median > limit:
     print(f"perf-gate: FAIL — build pipeline regressed {delta:+.1f}% "
           f"(> +{threshold*100:.0f}% threshold).")

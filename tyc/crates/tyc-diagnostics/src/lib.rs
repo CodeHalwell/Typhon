@@ -1892,6 +1892,31 @@ pub enum TycError {
         #[label("not a context manager")]
         span: SourceSpan,
     },
+
+    /// `return` / `break` / `continue` inside an `except*` handler body.
+    /// CPython rejects this at *compile* time
+    /// (`SyntaxError: 'break', 'continue' and 'return' cannot appear in an
+    /// except* block`), because an `except*` handler may run more than once
+    /// — one pass per matching subgroup — so there is no coherent meaning
+    /// for a jump out of it. Without this diagnostic, `tyc check` and
+    /// `tyc build` both report success and the emitted `.py` fails to even
+    /// import. Only fires on statements CPython would reject: a jump bound
+    /// to a loop declared *inside* the handler is legal and never flagged,
+    /// and nothing inside a nested `def` / `class` is inspected.
+    #[error("`{keyword}` cannot appear in an `except*` block")]
+    #[diagnostic(
+        severity(Error),
+        code(tyc::return_in_except_star),
+        url("https://github.com/CodeHalwell/Typhon/blob/main/docs/diagnostics/return_in_except_star.md"),
+        help("CPython rejects this at compile time — an `except*` handler can run once per matching subgroup, so a jump out of it has no defined meaning. Set a flag in the handler and act on it after the `try` statement, or use a plain `except` if the code does not need exception-group splitting.")
+    )]
+    ReturnInExceptStar {
+        keyword: String,
+        #[source_code]
+        src: NamedSource<String>,
+        #[label("not allowed inside an `except*` handler")]
+        span: SourceSpan,
+    },
 }
 
 impl TycError {
@@ -3388,6 +3413,22 @@ impl TycError {
             desc: desc.to_owned(),
             method: method.into(),
             with_kw: with_kw.to_owned(),
+            src: NamedSource::new(path.into(), source.into()),
+            span: SourceSpan::new(SourceOffset::from(offset), length.max(1)),
+        }
+    }
+
+    /// Construct a [`TycError::ReturnInExceptStar`] error. `keyword` is the
+    /// offending statement keyword — `return`, `break`, or `continue`.
+    pub fn return_in_except_star(
+        keyword: impl Into<String>,
+        path: impl Into<String>,
+        source: impl Into<String>,
+        offset: usize,
+        length: usize,
+    ) -> Self {
+        Self::ReturnInExceptStar {
+            keyword: keyword.into(),
             src: NamedSource::new(path.into(), source.into()),
             span: SourceSpan::new(SourceOffset::from(offset), length.max(1)),
         }
@@ -5310,6 +5351,46 @@ mod tests {
         assert_eq!(d.warning_count(), 0);
     }
 
+    /// The `[strictness] nullable-use` knob the docs promise: it governs the
+    /// warn-emitted attribute-rooted form and leaves the error-emitted
+    /// bare-name form alone.
+    #[test]
+    fn nullable_use_knob_promotes_demotes_and_drops_the_warn_form_only() {
+        let field_form = || TycError::nullable_use("self.db", "Db", "t.ty", "x = 1", 0, 1);
+        let bare_form = || TycError::nullable_use("x", "str", "t.ty", "x = 1", 0, 1);
+        let build = || {
+            let mut d = Diagnostics::new();
+            d.push_warning(field_form());
+            d.push_error(bare_form());
+            d
+        };
+        let with = |value: &str| SeverityOverrides {
+            nullable_use: value.to_owned(),
+            ..SeverityOverrides::default()
+        };
+
+        let promoted = apply_severity_overrides(build(), &with("error"));
+        assert_eq!(
+            (promoted.error_count(), promoted.warning_count()),
+            (2, 0),
+            "\"error\" promotes the field form alongside the bare-name error"
+        );
+
+        let dropped = apply_severity_overrides(build(), &with("off"));
+        assert_eq!(
+            (dropped.error_count(), dropped.warning_count()),
+            (1, 0),
+            "\"off\" drops the field form; the bare-name error is not governed"
+        );
+
+        let default = apply_severity_overrides(build(), &with("warn"));
+        assert_eq!(
+            (default.error_count(), default.warning_count()),
+            (1, 1),
+            "\"warn\" (the default) leaves both forms at their emitted severity"
+        );
+    }
+
     #[test]
     fn push_warning_increments_warning_count_not_error_count() {
         let mut d = Diagnostics::new();
@@ -5571,4 +5652,116 @@ mod tests {
             assert_eq!(&code, expected_code, "code mismatch: got {code}");
         }
     }
+}
+
+// ── severity overrides ────────────────────────────────────────────────────────
+
+/// The `[strictness]` severity knobs, as plain strings.
+///
+/// This exists so the reclassification rules live in exactly one place. They
+/// used to live in the `tyc` binary crate, keyed off `TyphonConfig` — which
+/// the language server cannot reach, so `tyc lsp` ignored every severity knob
+/// and squiggled diagnostics a project had explicitly turned off in its
+/// `typhon.toml`. Editor and CI disagreeing about what is an error erodes
+/// trust in the whole diagnostic surface, so the rules are stated once, here,
+/// in a crate both surfaces already depend on.
+///
+/// An empty string means "not configured" and takes the diagnostic's default.
+#[derive(Debug, Clone, Default)]
+pub struct SeverityOverrides {
+    /// `"warn"` (default) | `"error"` | `"off"`.
+    pub unused_import: String,
+    /// `"warn"` (default) | `"error"` | `"off"`.
+    pub methods_in_class_body: String,
+    /// `"warn"` (default) | `"error"` | `"off"`. Governs only the
+    /// warn-emitted *attribute-rooted* form of `tyc::nullable_use`; the
+    /// error-emitted bare-name form is not reclassified by this knob.
+    pub nullable_use: String,
+    /// `"warn"` (default) | `"error"` | `"off"`.
+    pub require_with: String,
+    /// `"warn"` (default) | `"error"` | `"off"`.
+    pub blocking_in_async: String,
+    /// `"error"` (default) | `"warn"` | `"off"`.
+    pub stub_check: String,
+    /// `"error"` (default) | `"warn"` | `"off"`.
+    pub exhaustive_match: String,
+}
+
+impl SeverityOverrides {
+    /// True when no knob asks for a change of classification, so the caller
+    /// can hand back the input untouched.
+    ///
+    /// Note this is *not* "every knob is at its documented default": it is
+    /// "every knob agrees with the severity the diagnostic was emitted at".
+    /// `stub-check` defaults to `"error"` while `StubMismatch` is emitted as
+    /// a warning, so the default is a promotion and therefore real work;
+    /// `exhaustive-match` defaults to `"error"` and `NonExhaustiveMatch` is
+    /// already an error, so that one genuinely is a no-op.
+    pub fn is_noop(&self) -> bool {
+        let stays_warning = |s: &str| s.is_empty() || s == "warn";
+        stays_warning(&self.unused_import)
+            && stays_warning(&self.methods_in_class_body)
+            && stays_warning(&self.nullable_use)
+            && stays_warning(&self.require_with)
+            && stays_warning(&self.blocking_in_async)
+            && (self.stub_check == "warn")
+            && (self.exhaustive_match.is_empty() || self.exhaustive_match == "error")
+    }
+}
+
+/// Reclassify `diags` according to `overrides`.
+///
+/// `"off"` drops the diagnostic entirely, `"warn"` demotes it, `"error"`
+/// promotes it. Diagnostics with no configured knob pass through unchanged.
+pub fn apply_severity_overrides(diags: Diagnostics, overrides: &SeverityOverrides) -> Diagnostics {
+    if overrides.is_noop() {
+        return diags;
+    }
+    let (errors, warnings) = diags.into_parts();
+    let mut out = Diagnostics::new();
+
+    // `NonExhaustiveMatch` is emitted as an error, so honouring "warn"/"off"
+    // means reclassifying it out of the errors bucket.
+    for err in errors {
+        if matches!(err, TycError::NonExhaustiveMatch { .. }) {
+            match overrides.exhaustive_match.as_str() {
+                "off" => {}
+                "warn" => out.push_warning(err),
+                _ => out.push_error(err),
+            }
+        } else {
+            out.push_error(err);
+        }
+    }
+
+    for warn in warnings {
+        // (matcher, knob, promote-by-default)
+        let knob = if matches!(warn, TycError::UnusedImport { .. }) {
+            Some((overrides.unused_import.as_str(), false))
+        } else if matches!(warn, TycError::MethodInClassBody { .. }) {
+            Some((overrides.methods_in_class_body.as_str(), false))
+        } else if matches!(warn, TycError::NullableUse { .. }) {
+            // Only the warn-emitted (attribute-rooted) form reaches this
+            // loop; the bare-name form is emitted as an error and stays one.
+            Some((overrides.nullable_use.as_str(), false))
+        } else if matches!(warn, TycError::ResourceNotManaged { .. }) {
+            Some((overrides.require_with.as_str(), false))
+        } else if matches!(warn, TycError::BlockingInAsync { .. }) {
+            Some((overrides.blocking_in_async.as_str(), false))
+        } else if matches!(warn, TycError::StubMismatch { .. }) {
+            // Stub drift is promoted to an error unless explicitly relaxed.
+            Some((overrides.stub_check.as_str(), true))
+        } else {
+            None
+        };
+        match knob {
+            Some(("off", _)) => {}
+            Some(("error", _)) => out.push_error(warn),
+            Some(("warn", _)) => out.push_warning(warn),
+            // Unset / unrecognised: keep the diagnostic's own default.
+            Some((_, true)) => out.push_error(warn),
+            Some((_, false)) | None => out.push_warning(warn),
+        }
+    }
+    out
 }

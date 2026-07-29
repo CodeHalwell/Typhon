@@ -1466,14 +1466,55 @@ def parse(s: str) -> Result[int, str]:
     let lines = parse_map_lines(&map_body);
     assert!(!lines.is_empty(), "lines array must not be empty");
 
-    // Every map entry must be non-zero (no gap in the table).
-    for (py_line_idx, &ty_line) in lines.iter().enumerate() {
+    // Value-level assertions. `ty_line >= 1` — which is what every source-map
+    // test in this file used to assert — is satisfied by a table of all 1s,
+    // so it only ever caught an *absent* map, never a wrong one.
+    //
+    // Three real invariants are checked instead.
+    //
+    // 1. The table is monotonically non-decreasing. Emission walks the module
+    //    in source order, so for *this* program a later output line can never
+    //    originate above an earlier one, and a shuffled or garbage table is
+    //    rejected. Note this is a property of the fixture, not of source maps
+    //    in general: a `with`-chain copies its `else` body into each binding's
+    //    guard, so those output lines legitimately point back "early". Do not
+    //    generalise this assertion to a fixture using one.
+    for w in lines.windows(2) {
         assert!(
-            ty_line >= 1,
-            "Python line {} maps to 0 — source map has a gap",
-            py_line_idx + 1
+            w[1] >= w[0],
+            "source map is not monotonic: {} follows {}",
+            w[1],
+            w[0]
         );
     }
+
+    // 2. Every value is a real line of the *`.ty` file* — the three-line
+    //    program above. Until v1.0.0-alpha.7 the table recorded lines of the
+    //    *preprocessed buffer* instead: `tyc-emit` produced
+    //    `(out_line -> preprocessed_line)` and nothing composed it with a
+    //    `preprocessed_line -> ty_line` map, because none of the text passes
+    //    in front of `preprocess` produced one. This table ran to 7 on a
+    //    3-line file, so `tyc trace`, `tyc debug --break`, `tyc ty`
+    //    re-attribution and `[emit] traceback-remap` all pointed past EOF for
+    //    any file using `?`, `gather:`, a `with`-chain, `rescue`, pipes or
+    //    typed unpack — which is most idiomatic Typhon. This assertion is what
+    //    stops that regressing.
+    let ty_line_count = 3;
+    for &line in &lines {
+        assert!(
+            line >= 1 && line <= ty_line_count,
+            "source map points at .ty line {line}, but the file has only {ty_line_count} lines \
+             — the table is recording preprocessed-buffer lines again"
+        );
+    }
+
+    // 3. The lines of the `?` expansion all map back to the *single* `.ty`
+    //    line they came from (line 2, `let n = int(s)?`). Before the fix they
+    //    mapped to 3, 4, 5, 6 — four consecutive preprocessed-buffer lines.
+    assert!(
+        lines.iter().filter(|&&l| l == 2).count() >= 2,
+        "the `?` expansion should collapse onto .ty line 2; got {lines:?}"
+    );
 
     // The `?` expansion injects at least three Python lines containing
     // `__typhon_q_` (assignment, isinstance guard, return/unwrap).  Reading

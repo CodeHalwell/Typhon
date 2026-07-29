@@ -277,8 +277,18 @@ impl<'src> Parser<'src> {
         // as an identifier, surfacing the unhelpful "invalid assignment
         // target" diagnostic. FINDINGS #56 (cascade — destructuring `let`).
         let peek = self.peek();
+        // A *soft* keyword is a valid identifier everywhere Python allows one,
+        // and Typhon is a superset — so `let match = re.match(...)`,
+        // `let type = row["type"]` and `let case = 1` must bind, exactly as
+        // `match = ...` does in Python. Testing only for `TokenKind::Name`
+        // meant `let` fell through and was parsed as an ordinary identifier,
+        // surfacing "Simple statements must be separated by newlines" on
+        // perfectly ordinary code. `match` in particular is the conventional
+        // name for a regex result, and it is what made `tyc migrate` emit an
+        // unparseable `.ty` for CPython's own `dataclasses` module.
         let starts_binding = matches!(kind, TokenKind::Let | TokenKind::Mut)
-            && matches!(peek, TokenKind::Name | TokenKind::Lpar | TokenKind::Lsqb);
+            && (matches!(peek, TokenKind::Name | TokenKind::Lpar | TokenKind::Lsqb)
+                || peek.is_soft_keyword());
         if starts_binding {
             let mutability = match kind {
                 TokenKind::Let => ast::Mutability::Let,

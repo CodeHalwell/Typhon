@@ -8,7 +8,11 @@ description = "Typhon AST → Python AST lowering (Phase 2+)"
 [dependencies]
 ruff_python_ast = { workspace = true }
 ruff_text_size  = { workspace = true }
+# `tyc-syntax` is desugar's upstream neighbour in the pipeline, so this edge is
+# architecturally in-direction. It carries `mro::field_collection_order`, the
+# shared class-linearisation the type checker, the emitter and the VM must all
+# agree on — see crates/tyc-syntax/src/mro.rs.
+tyc-syntax      = { workspace = true }
 
 [dev-dependencies]
-tyc-syntax       = { workspace = true }
 tyc-emit         = { workspace = true }

@@ -13,6 +13,7 @@ no-implicit-any = true
 unused-import = "error"
 exhaustive-match = "error"
 methods-in-class-body = "warn"
+nullable-use = "warn"
 unintrospectable-dependency = "warn"
 suggest-gather = true
 suggest-perf = true
@@ -37,6 +38,7 @@ allow-secret-comptime = false
 | `no-implicit-any` | bool | `true` | Reserved — surfaces today as the [`tyc::missing_annotation`](/Typhon/diagnostics/type-errors/) diagnostic on un-annotated parameters and return types. The flag is parsed for forward compatibility; toggling it does not currently relax the check. |
 | `unused-import` | `"error"` \| `"warn"` \| `"off"` | `"error"` | Severity for unused imports. The LSP offers a "Remove unused import" quick-fix. |
 | `exhaustive-match` | `"error"` \| `"warn"` \| `"off"` | `"error"` | Severity for non-exhaustive `match` over sealed unions. |
+| `nullable-use` | `"error"` \| `"warn"` \| `"off"` | `"warn"` | Severity for the *attribute-rooted* form of [`tyc::nullable_use`](/Typhon/diagnostics/nullability/) — dereferencing a possibly-`None` field (`self.db.host` where `db: Db?`). Introduced at `"warn"` because the check never ran before v1.0.0-alpha.7; promote to `"error"` once your code is clean. The bare-name form is always an error and is not governed by this knob. |
 | `methods-in-class-body` | `"error"` \| `"warn"` \| `"off"` | `"warn"` | Severity for [`tyc::method_in_class_body`](/Typhon/diagnostics/class-errors/) — Rule 4: methods live in `impl Name:`, not the class body. Default `"warn"` matches every other nudge diagnostic; promote to `"error"` once a codebase has finished migrating off in-body methods. `"off"` suppresses it entirely. |
 | `unintrospectable-dependency` | `"warn"` \| `"error"` \| `"off"` | `"warn"` | Severity when a declared dependency is imported but cannot be introspected (no reachable `.venv` / `python3`, not installed, or no introspectable signatures). `"warn"` surfaces it; `"error"` CI-gates; `"off"` restores the old silent skip. |
 | `suggest-gather` | bool | `true` | Emit the advice-level [`tyc::gather_opportunity`](/Typhon/diagnostics/) hint when 2+ adjacent independent awaited calls could be wrapped in a `gather:` block. Never rewrites, never blocks a build. |

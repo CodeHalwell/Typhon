@@ -1,0 +1,18 @@
+[project]
+name = "knob-free-threaded-parallel"
+version = "0.1.0"
+src = "src"
+out = "build"
+
+[python]
+target = "3.13"
+free-threaded = false
+
+[emit]
+format = false
+
+[strictness]
+auto-parallel = false
+auto-parallel-reductions = false
+parallel-min-size = 2
+suggest-parallel = false

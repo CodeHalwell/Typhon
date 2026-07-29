@@ -168,11 +168,19 @@ Missing variants without a wildcard arm: `tyc::non_exhaustive_match`.
 
 ## Concurrency
 
-    gather:                   # asyncio.TaskGroup, run concurrently
-        let a: bytes = go fetch(url1)
-        let b: bytes = go fetch(url2)
+Both forms live inside an `async def`.
 
-    lazy import pandas        # deferred until first use
+    gather:                   # asyncio.TaskGroup, run concurrently
+        a = fetch(url1)       # no `let`/`mut` — `gather:` introduces the names
+        b = fetch(url2)       # no `go` — the block already runs them together
+
+    go send_welcome(user)     # fire-and-forget; the runtime holds a strong ref
+
+## Lazy loading
+
+Module level only, and the alias is required on 3.13 / 3.14 targets.
+
+    lazy import pd = pandas   # deferred until first use
 
 ## Comptime
 

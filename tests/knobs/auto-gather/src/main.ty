@@ -1,0 +1,31 @@
+# `[strictness] auto-gather = true` folds runs of adjacent independent awaits on
+# @gatherable callees into an asyncio.TaskGroup. `slow` sleeps; concurrently the
+# pair finishes in one tick, sequentially in two — but the *result* must be the
+# same either way, which is what the control build checks.
+import asyncio
+
+
+@gatherable
+async def fetch_a() -> int:
+    await asyncio.sleep(0.05)
+    return 1
+
+
+@gatherable
+async def fetch_b() -> int:
+    await asyncio.sleep(0.05)
+    return 2
+
+
+async def load() -> int:
+    let a: int = await fetch_a()
+    let b: int = await fetch_b()
+    return a + b
+
+
+def main() -> None:
+    print(asyncio.run(load()))
+
+
+if __name__ == "__main__":
+    main()

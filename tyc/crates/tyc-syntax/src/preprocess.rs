@@ -30,6 +30,7 @@
 //! Anything else is left untouched.
 
 use crate::lexer::TyphonKeyword;
+use crate::lexmask::{scan_line, ByteKind, LexMask, StringMode};
 
 /// One stripped keyword and the 0-based line index in the source where it
 /// appeared.
@@ -275,6 +276,26 @@ pub fn preprocess(source: &str) -> PreprocessResult {
 /// Like [`preprocess`] but with explicit options. Used by the formatter
 /// to suppress destructive expansions that don't round-trip.
 pub fn preprocess_opts(source: &str, opts: PreprocessOptions) -> PreprocessResult {
+    preprocess_opts_mapped(source, opts).0
+}
+
+/// [`preprocess`] plus an output-line → input-line table over
+/// `PreprocessResult::python_source` (both 0-based).
+///
+/// The main keyword-stripping loop is line-preserving, but the three
+/// pre-passes it runs first are not: `strip_pub_prefixes` blanks a `pub *`
+/// marker, and `expand_impl_sealed_unions` duplicates an `impl Alias:` block
+/// once per union variant. Callers that need `.ty`-accurate line numbers (the
+/// `.py.map` writer) must compose this table with the sugar chain's.
+pub fn preprocess_mapped(source: &str) -> (PreprocessResult, Vec<usize>) {
+    preprocess_opts_mapped(source, PreprocessOptions::default())
+}
+
+/// [`preprocess_opts`] plus the line table described on [`preprocess_mapped`].
+pub fn preprocess_opts_mapped(
+    source: &str,
+    opts: PreprocessOptions,
+) -> (PreprocessResult, Vec<usize>) {
     // Pre-pass: walk every line, strip a leading `pub ` modifier (at
     // module level — i.e. zero indentation), record the declared name,
     // and feed the rest of the pipeline a source string with `pub ` no
@@ -284,7 +305,7 @@ pub fn preprocess_opts(source: &str, opts: PreprocessOptions) -> PreprocessResul
     let mut pub_names: Vec<String> = Vec::new();
     let mut pub_lines: Vec<usize> = Vec::new();
     let mut pub_star_lines: Vec<usize> = Vec::new();
-    let source_owned =
+    let (source_owned, pre_map) =
         strip_pub_prefixes(source, &mut pub_names, &mut pub_lines, &mut pub_star_lines);
     // Pre-pass: rewrite higher-kinded-type markers (`Name[_]`) inside
     // PEP-695 class type-parameter lists down to plain TypeVars. The
@@ -292,7 +313,8 @@ pub fn preprocess_opts(source: &str, opts: PreprocessOptions) -> PreprocessResul
     // for the type-checker and would otherwise crash Ruff. Operates
     // line-by-line so any class header is normalised before the main
     // keyword-aware loop sees it. Finding #6.
-    let source_owned = strip_hkt_markers_in_class_headers(&source_owned);
+    let (source_owned, hkt_map) = strip_hkt_markers_in_class_headers(&source_owned);
+    let pre_map = compose_line_maps(&hkt_map, &pre_map);
     // Pre-pass: distribute `impl[<tp>] Alias[<args>]:` blocks targeting
     // a sealed-union type alias across each of its variants. The
     // existing desugar layer handles bare-name aliases (`type T = A | B`)
@@ -302,14 +324,23 @@ pub fn preprocess_opts(source: &str, opts: PreprocessOptions) -> PreprocessResul
     // missing case and emits one real `impl Variant:` block per
     // variant so the user's method bodies wire up at every call site.
     // Finding #7.
-    let (source_owned, impl_distributed_lines) = if opts.expand_impl_sealed_unions {
-        expand_impl_sealed_unions(&source_owned)
+    let (source_owned, impl_distributed_lines, pre_map) = if opts.expand_impl_sealed_unions {
+        let (text, distributed, impl_map) = expand_impl_sealed_unions(&source_owned);
+        let composed = compose_line_maps(&impl_map, &pre_map);
+        (text, distributed, composed)
     } else {
-        (source_owned, Vec::new())
+        (source_owned, Vec::new(), pre_map)
     };
     let source = source_owned.as_str();
+    // One lexical mask for the whole buffer, computed once. Every branch of
+    // the loop below used to advance a single hand-threaded `in_string` and
+    // each `continue` was a chance to forget — which is exactly how the enum
+    // body ended up rewriting inside docstrings. The per-line entry state now
+    // comes from the mask, so no branch can desynchronise it, and the block
+    // membership tests consult the same mask rather than re-deriving it.
+    let mask = LexMask::new(source);
 
-    let mut python_source = String::with_capacity(source.len());
+    let mut python_source = MappedOut::with_capacity(source.len());
     let mut stripped = Vec::new();
     let mut optionals = Vec::new();
     let mut comptime_bindings = Vec::new();
@@ -319,8 +350,6 @@ pub fn preprocess_opts(source: &str, opts: PreprocessOptions) -> PreprocessResul
     let mut raw_class_lines: Vec<usize> = Vec::new();
     let mut frozen_class_lines: Vec<usize> = Vec::new();
     let mut plain_class_lines: Vec<usize> = Vec::new();
-    // String state carried across lines (triple-quoted strings may span them).
-    let mut in_string: Option<StringMode> = None;
     // When a `freeze let` RHS spans multiple lines (e.g. a multi-line dict
     // literal), the opening `__typhon_freeze__(` is emitted on the first
     // line but the matching `)` has to land *after* the closing bracket of
@@ -339,6 +368,12 @@ pub fn preprocess_opts(source: &str, opts: PreprocessOptions) -> PreprocessResul
     let mut enum_header_indent: Option<usize> = None;
 
     for (line_index, line) in source.split_inclusive('\n').enumerate() {
+        python_source.mark(line_index);
+        // String state for the line being rewritten, straight from the shared
+        // mask. It is scoped to the iteration, so no branch can leave it
+        // stale for the next line; within the line `rewrite_optionals`
+        // advances it to tell a `?` in code from one in string content.
+        let mut in_string = mask.line_entry_string(line_index);
         // Keyword stripping only applies outside of string content.
         let line_after_keyword = if in_string.is_none() {
             let indent_len = line
@@ -358,13 +393,28 @@ pub fn preprocess_opts(source: &str, opts: PreprocessOptions) -> PreprocessResul
                     python_source.push_str(line);
                     continue;
                 }
+                // Membership used to be decided from indentation alone, with
+                // every path out of this block `continue`ing past the sole
+                // site that advanced the string state. A triple-quote opened
+                // *inside* an enum body — a docstring is the obvious case —
+                // never registered, so every following line of the string was
+                // read as code and each bare word in it was rewritten to
+                // `WORD = enum.auto()` inside the literal. The state now comes
+                // from the shared mask (the `in_string.is_none()` guard this
+                // block sits under is mask-derived), so it cannot go stale.
                 if indent_len > header_indent {
                     // Member line. Bare `MEMBER` → `MEMBER = enum.auto()`;
                     // `MEMBER = value` and any non-member statement (e.g. a
                     // docstring or `pass`) are left untouched.
                     let body = rest.trim_end_matches(['\n', '\r']);
                     let trailing = &rest[body.len()..];
-                    let is_bare_member = !body.contains('=')
+                    // A physical line that continues an open bracket (or a
+                    // backslash) is not a statement at all — its leading
+                    // whitespace is layout for something that started earlier,
+                    // so a bare word on it (`A = foo(\n    bar\n)`) is an
+                    // argument, not a member.
+                    let is_bare_member = mask.is_logical_line_start(line_index)
+                        && !body.contains('=')
                         && !body.contains(':')
                         && !body.contains('(')
                         && body
@@ -444,18 +494,16 @@ pub fn preprocess_opts(source: &str, opts: PreprocessOptions) -> PreprocessResul
             // earlier lines we forward the content verbatim.
             if freeze_let_depth > 0 {
                 let line_no_nl = line.trim_end_matches(['\n', '\r']);
-                let pre_string = in_string;
-                let net = bracket_delta_outside_strings(line_no_nl, &mut in_string);
-                freeze_let_depth += net;
+                // Both facts come from the shared mask: the line's net bracket
+                // delta outside strings/comments, and where its code portion
+                // ends. The `)` closing the `__typhon_freeze__(` call must land
+                // BEFORE any trailing comment, otherwise `#` swallows it and
+                // the call is left unclosed (a parse error).
+                freeze_let_depth += mask.line_bracket_delta(line_index);
                 if freeze_let_depth <= 0 {
                     freeze_let_depth = 0;
                     let trailing = &line[line_no_nl.len()..];
-                    // Close the `__typhon_freeze__(` call. The `)` must land
-                    // BEFORE any trailing comment, otherwise `#` swallows it
-                    // and the call is left unclosed (a parse error). Find the
-                    // comment boundary with this line's *entry* string-state.
-                    let mut scan_state = pre_string;
-                    let code_end = scan_line_code_end(line_no_nl, &mut scan_state);
+                    let code_end = mask.line_code_end(line_index);
                     let emitted = if code_end < line_no_nl.len() {
                         let code = line_no_nl[..code_end].trim_end();
                         let gap = &line_no_nl[code.len()..code_end];
@@ -953,7 +1001,9 @@ pub fn preprocess_opts(source: &str, opts: PreprocessOptions) -> PreprocessResul
             keyword: TyphonKeyword::PubStar,
         });
     }
-    PreprocessResult {
+    let (python_source, main_map) = python_source.finish();
+    let line_map = compose_line_maps(&main_map, &pre_map);
+    let result = PreprocessResult {
         python_source,
         stripped,
         optionals,
@@ -967,6 +1017,174 @@ pub fn preprocess_opts(source: &str, opts: PreprocessOptions) -> PreprocessResul
         pub_names,
         pub_star_lines,
         impl_distributed_lines,
+    };
+    (result, line_map)
+}
+
+// ── Source-line provenance for the text-expansion chain ───────────────────
+//
+// Every `&str -> String` pass in the sugar chain may add, remove, or merge
+// physical lines: `?` expands one line into four, `gather:` / `with`-chains /
+// multi-line `guard`s consume a block and emit a differently-shaped one, the
+// `?` and `as!` lowerings inject a runtime-alias import at the top of the
+// file, and the join pre-passes fold continuation lines together. Nothing
+// used to record any of that, so the only line numbers available downstream
+// were those of the *preprocessed* buffer — which is what the `.py.map`
+// sidecar was (incorrectly) writing as if they were `.ty` lines.
+//
+// Each line-count-changing pass therefore has a `*_mapped` sibling returning,
+// alongside the rewritten text, a table mapping every **output** line index
+// back to the **input** line index it derives from (both 0-based, under
+// `split_inclusive('\n')` line semantics). Folding a chain of those tables
+// with [`compose_line_maps`] yields one `preprocessed line -> .ty line`
+// table. The original single-return entry points stay as thin wrappers so
+// every existing caller (the VM, `tyc check`, the REPL, the LSP) keeps
+// compiling untouched.
+
+/// Number of lines in `s` under `split_inclusive('\n')` semantics: a trailing
+/// newline does *not* open a new line, and the empty string has zero lines.
+pub fn text_line_count(s: &str) -> usize {
+    s.split_inclusive('\n').count()
+}
+
+/// The line map of a stage that neither adds, removes, nor reorders lines.
+pub fn identity_line_map(n: usize) -> Vec<usize> {
+    (0..n).collect()
+}
+
+/// Fold two consecutive stage tables into one.
+///
+/// `outer[i]` is the stage-B input line that produced B's output line `i`;
+/// that input line *is* stage A's output line, which `inner` maps back to
+/// stage A's input. Out-of-range indices clamp to the last known line, so a
+/// composed table can never point past the original file.
+pub fn compose_line_maps(outer: &[usize], inner: &[usize]) -> Vec<usize> {
+    if inner.is_empty() {
+        return vec![0; outer.len()];
+    }
+    let last = inner.len() - 1;
+    outer.iter().map(|&mid| inner[mid.min(last)]).collect()
+}
+
+/// A single byte-range rewrite: `source[start..end]` is replaced by `repl`.
+///
+/// The `as!` and postfix-`rescue` lowerings both work this way — they find one
+/// operator, splice over the syntactic slot around it, and re-run to a
+/// fixpoint. Modelling the step as a splice (rather than an opaque new
+/// string) is what makes its line map exactly computable.
+struct Splice {
+    start: usize,
+    end: usize,
+    repl: String,
+}
+
+impl Splice {
+    fn apply(&self, source: &str) -> String {
+        let mut out = String::with_capacity(source.len() + self.repl.len());
+        out.push_str(&source[..self.start]);
+        out.push_str(&self.repl);
+        out.push_str(&source[self.end..]);
+        out
+    }
+
+    /// The output-line → input-line table for `self.apply(source)`.
+    ///
+    /// Lines before the splice are untouched. Every output line the
+    /// replacement occupies is attributed to the line the spliced region
+    /// *starts* on — that is the statement the user wrote, even when the
+    /// operand spanned several physical lines. Lines after the splice shift
+    /// back to their original indices.
+    fn line_map(&self, source: &str, out: &str) -> Vec<usize> {
+        let first = source[..self.start].matches('\n').count();
+        let last = source[..self.end].matches('\n').count();
+        let added = self.repl.matches('\n').count();
+        (0..text_line_count(out))
+            .map(|k| {
+                if k < first {
+                    k
+                } else if k <= first + added {
+                    first
+                } else {
+                    last + (k - first - added)
+                }
+            })
+            .collect()
+    }
+}
+
+/// Output buffer that records which input line each chunk of output came
+/// from.
+///
+/// A pass keeps pushing text exactly as it did before; the only addition at
+/// each call site is a [`MappedOut::mark`] where the pass starts emitting for
+/// a new input line. [`MappedOut::finish`] resolves the recorded marks into a
+/// per-output-line table.
+struct MappedOut {
+    text: String,
+    /// `(byte offset into `text`, input line index)`, in non-decreasing
+    /// offset order. Seeded with `(0, 0)` so output emitted before the first
+    /// `mark` (an injected header import, say) attributes to line 0.
+    marks: Vec<(usize, usize)>,
+}
+
+impl MappedOut {
+    fn with_capacity(cap: usize) -> Self {
+        Self {
+            text: String::with_capacity(cap),
+            marks: vec![(0, 0)],
+        }
+    }
+
+    /// Everything pushed from here until the next `mark` derives from input
+    /// line `src_line`.
+    fn mark(&mut self, src_line: usize) {
+        let at = self.text.len();
+        // Safe to unwrap: `marks` is seeded non-empty and never drained.
+        let last = self.marks.last_mut().expect("marks is never empty");
+        if last.0 == at {
+            last.1 = src_line;
+        } else {
+            self.marks.push((at, src_line));
+        }
+    }
+
+    fn push_str(&mut self, s: &str) {
+        self.text.push_str(s);
+    }
+
+    fn push(&mut self, c: char) {
+        self.text.push(c);
+    }
+
+    fn as_str(&self) -> &str {
+        &self.text
+    }
+
+    /// Append `chunk`, attributing its lines to `src_lines` entry-by-entry.
+    /// A short table repeats its final entry, so a render helper only has to
+    /// describe the lines whose provenance actually differs.
+    fn push_mapped(&mut self, chunk: &str, src_lines: &[usize]) {
+        let fallback = src_lines.last().copied().unwrap_or(0);
+        for (i, line) in chunk.split_inclusive('\n').enumerate() {
+            self.mark(src_lines.get(i).copied().unwrap_or(fallback));
+            self.text.push_str(line);
+        }
+    }
+
+    /// Resolve to `(text, output line -> input line)`.
+    fn finish(self) -> (String, Vec<usize>) {
+        let MappedOut { text, marks } = self;
+        let mut map = Vec::with_capacity(text_line_count(&text));
+        let mut cursor = 0usize;
+        let mut offset = 0usize;
+        for line in text.split_inclusive('\n') {
+            while cursor + 1 < marks.len() && marks[cursor + 1].0 <= offset {
+                cursor += 1;
+            }
+            map.push(marks[cursor].1);
+            offset += line.len();
+        }
+        (text, map)
     }
 }
 
@@ -1002,10 +1220,11 @@ fn strip_pub_prefixes(
     pub_names: &mut Vec<String>,
     pub_lines: &mut Vec<usize>,
     pub_star_lines: &mut Vec<usize>,
-) -> String {
-    let mut out = String::with_capacity(source.len());
+) -> (String, Vec<usize>) {
+    let mut out = MappedOut::with_capacity(source.len());
     let mut in_string: Option<StringMode> = None;
     for (line_index, line) in source.split_inclusive('\n').enumerate() {
+        out.mark(line_index);
         if in_string.is_some() {
             // Track string state without touching content.
             let _ = rewrite_optionals(line, &mut in_string);
@@ -1051,7 +1270,7 @@ fn strip_pub_prefixes(
         let _ = rewrite_optionals(line, &mut in_string);
         out.push_str(line);
     }
-    out
+    out.finish()
 }
 
 /// Recognise a `pub *` wildcard-re-export marker line. Accepts:
@@ -1382,111 +1601,25 @@ fn wrap_freeze_let_with_depth(tail: &str) -> Option<FreezeLetWrap> {
     })
 }
 
-/// Net bracket delta of `s`, ignoring brackets inside string literals.
-/// String literals use plain `'`/`"` quoting; backslash-escaped quotes
-/// are honoured. Triple-quoted strings span multiple lines — those are
-/// not handled here because the wider preprocess loop already tracks
-/// `in_string` separately.
+/// Net bracket delta of `s`, ignoring brackets inside string literals and
+/// after a `#` comment. For a fragment with no carried-over string state
+/// (a `freeze let` right-hand side, say).
+///
+/// Thin wrapper over the crate's single lexical scanner
+/// ([`crate::lexmask::scan_line`]).
 fn bracket_delta_simple(s: &str) -> i32 {
-    let bytes = s.as_bytes();
-    let mut depth: i32 = 0;
-    let mut in_str: Option<u8> = None;
-    let mut i = 0;
-    while i < bytes.len() {
-        let b = bytes[i];
-        if let Some(q) = in_str {
-            if b == b'\\' && i + 1 < bytes.len() {
-                i += 2;
-                continue;
-            }
-            if b == q {
-                in_str = None;
-            }
-            i += 1;
-            continue;
-        }
-        match b {
-            b'#' => break,
-            b'\'' | b'"' => in_str = Some(b),
-            b'(' | b'[' | b'{' => depth += 1,
-            b')' | b']' | b'}' => depth -= 1,
-            _ => {}
-        }
-        i += 1;
-    }
-    depth
+    scan_line(s, &mut None).bracket_delta
 }
 
-/// Net bracket delta of `line`, threading multi-line triple-string
-/// state through `in_string`. Mirrors `bracket_delta_simple` but defers
-/// to the wider preprocess loop's string tracker so brackets inside an
-/// active triple-quoted string don't count.
+/// Net bracket delta of `line`, threading multi-line triple-string state
+/// through `in_string` so brackets inside an active string (or after a `#`)
+/// don't count. This is what makes a multi-line
+/// `freeze let X = {"list": ["a#b"], …}` balance correctly.
+///
+/// Thin wrapper over the crate's single lexical scanner
+/// ([`crate::lexmask::scan_line`]).
 fn bracket_delta_outside_strings(line: &str, in_string: &mut Option<StringMode>) -> i32 {
-    fn mode_parts(mode: StringMode) -> (u8, bool) {
-        match mode {
-            StringMode::Single => (b'\'', false),
-            StringMode::Double => (b'"', false),
-            StringMode::TripleSingle => (b'\'', true),
-            StringMode::TripleDouble => (b'"', true),
-        }
-    }
-    fn open_mode(quote: u8, triple: bool) -> StringMode {
-        match (triple, quote == b'\'') {
-            (false, true) => StringMode::Single,
-            (false, false) => StringMode::Double,
-            (true, true) => StringMode::TripleSingle,
-            (true, false) => StringMode::TripleDouble,
-        }
-    }
-
-    let bytes = line.as_bytes();
-    let mut depth: i32 = 0;
-    let mut i = 0;
-    while i < bytes.len() {
-        // Inside a string (single-line, or a triple-quoted one carried over
-        // from a previous line via `in_string`) — skip its contents so a `#`
-        // or a bracket inside a string never affects the comment/depth scan.
-        // This is what makes `freeze let X = {"list": ["a#b"], ...}` over
-        // several lines balance correctly: the `#` is part of a string, not a
-        // comment, so the `]` after it is still counted.
-        if let Some(mode) = *in_string {
-            let (q, triple) = mode_parts(mode);
-            let b = bytes[i];
-            if b == b'\\' && i + 1 < bytes.len() {
-                i += 2;
-                continue;
-            }
-            if b == q {
-                if triple {
-                    if i + 2 < bytes.len() && bytes[i + 1] == q && bytes[i + 2] == q {
-                        *in_string = None;
-                        i += 3;
-                        continue;
-                    }
-                } else {
-                    *in_string = None;
-                }
-            }
-            i += 1;
-            continue;
-        }
-        let b = bytes[i];
-        match b {
-            // A `#` outside any string starts a comment to end-of-line.
-            b'#' => break,
-            b'"' | b'\'' => {
-                let triple = i + 2 < bytes.len() && bytes[i + 1] == b && bytes[i + 2] == b;
-                *in_string = Some(open_mode(b, triple));
-                i += if triple { 3 } else { 1 };
-                continue;
-            }
-            b'(' | b'[' | b'{' => depth += 1,
-            b')' | b']' | b'}' => depth -= 1,
-            _ => {}
-        }
-        i += 1;
-    }
-    depth
+    scan_line(line, in_string).bracket_delta
 }
 
 /// Parse the tail of a `newtype` line: `Name = Base`.
@@ -1533,7 +1666,35 @@ fn parse_lazy_import(tail: &str) -> Option<(String, String)> {
     // Strip a trailing `# comment` so that `lazy import np = numpy  # noqa`
     // is handled correctly rather than failing the identifier check.
     let code = tail.split('#').next().unwrap_or("").trim();
-    let eq = code.find('=')?;
+    let Some(eq) = code.find('=') else {
+        // PEP 810 spelling with no alias: `lazy import pandas`, and
+        // `lazy import pandas as pd`. Both are unambiguous — the alias is the
+        // one given, or the module's last segment, exactly as a plain
+        // `import` binds it.
+        //
+        // Without this, neither form matched, the `lazy ` prefix was dropped,
+        // and an ordinary *eager* `import` was emitted: the deferral silently
+        // did not happen. `tyc cheatsheet` teaches `lazy import pandas`
+        // verbatim, so the documented example was the failing case.
+        let module_and_alias = code.trim();
+        if let Some((module, alias)) = module_and_alias.split_once(" as ") {
+            let module = module.trim().to_owned();
+            let alias = alias.trim().to_owned();
+            if !is_dotted_python_ident(&module) || !is_python_ident(&alias) {
+                return None;
+            }
+            return Some((alias, module));
+        }
+        if !is_dotted_python_ident(module_and_alias) {
+            return None;
+        }
+        // `import a.b.c` binds the root name `a`; a lazy proxy has to bind
+        // the same name, so only a single-segment module can take this form.
+        if module_and_alias.contains('.') {
+            return None;
+        }
+        return Some((module_and_alias.to_owned(), module_and_alias.to_owned()));
+    };
     let alias = code[..eq].trim().to_owned();
     let module = code[eq + 1..].trim().to_owned();
     if !is_python_ident(&alias) || !is_dotted_python_ident(&module) {
@@ -1850,26 +2011,26 @@ fn append_ellipsis_to_bodiless_def(line: &str) -> Option<String> {
 /// them to avoid mis-remapping real blocks. ALL members of each
 /// distribution group are recorded (including the first) so a consumer
 /// can gate purely on membership.
-fn expand_impl_sealed_unions(source: &str) -> (String, Vec<usize>) {
+fn expand_impl_sealed_unions(source: &str) -> (String, Vec<usize>, Vec<usize>) {
     let aliases = collect_sealed_union_aliases_from_text(source);
     if aliases.is_empty() {
-        return (source.to_owned(), Vec::new());
+        let n = text_line_count(source);
+        return (source.to_owned(), Vec::new(), identity_line_map(n));
     }
     let lines: Vec<&str> = source.split_inclusive('\n').collect();
-    let mut out = String::with_capacity(source.len());
+    let mask = LexMask::new(source);
+    let mut out = MappedOut::with_capacity(source.len());
     let mut distributed_lines: Vec<usize> = Vec::new();
     // Track the 0-based line index at the *start* of `out` so we can
     // record the absolute output line of each synthesised header. Every
     // `\n` already pushed to `out` advances this counter.
     let mut out_line: usize = 0;
     let mut idx = 0;
-    let mut in_string: Option<StringMode> = None;
     while idx < lines.len() {
         let line = lines[idx];
-        let pre_string = in_string;
+        out.mark(idx);
         let raw = line.trim_end_matches(['\n', '\r']);
-        let _code_end = scan_line_code_end(raw, &mut in_string);
-        if pre_string.is_some() {
+        if mask.line_starts_in_string(idx) {
             out.push_str(line);
             out_line += line.matches('\n').count();
             idx += 1;
@@ -1899,8 +2060,19 @@ fn expand_impl_sealed_unions(source: &str) -> (String, Vec<usize>) {
             let mut body_end = idx + 1;
             let mut last_body_line: Option<usize> = None;
             let mut probe = idx + 1;
+            // A line that *begins* inside a triple-quoted string has string
+            // content, not indentation, at its left edge — reading it as a
+            // dedent ends the block early and the rest of the real body then
+            // surfaces as a bogus `tyc::parse` "unexpected indentation" on a
+            // valid program. The probe reads that fact off the shared mask
+            // rather than carrying a second copy of the scanner.
             while probe < lines.len() {
                 let candidate = lines[probe].trim_end_matches(['\n', '\r']);
+                if mask.line_starts_in_string(probe) {
+                    last_body_line = Some(probe);
+                    probe += 1;
+                    continue;
+                }
                 if candidate.chars().all(|c| c.is_whitespace()) {
                     probe += 1;
                     continue;
@@ -1916,6 +2088,11 @@ fn expand_impl_sealed_unions(source: &str) -> (String, Vec<usize>) {
             }
             body_end = last_body_line.map(|i| i + 1).unwrap_or(body_end);
             let body_slice: String = lines[idx + 1..body_end].concat();
+            // Provenance for the duplicated body: line `idx + 1 + k` of the
+            // input produced line `k` of every copy, so a diagnostic or
+            // traceback inside a distributed `impl` still points at the one
+            // method the user actually wrote.
+            let body_src: Vec<usize> = (idx + 1..body_end).collect();
             // Detect the line's terminator (LF / CRLF / none) so we can
             // emit identical separators between duplicated blocks.
             let term = &line[raw.len()..];
@@ -1932,9 +2109,10 @@ fn expand_impl_sealed_unions(source: &str) -> (String, Vec<usize>) {
                 // `out_line` is the index of the line currently at the end
                 // of `out`; the header we're about to push lands there.
                 distributed_lines.push(out_line);
+                out.mark(idx);
                 out.push_str(&header);
                 out_line += header.matches('\n').count();
-                out.push_str(&body_slice);
+                out.push_mapped(&body_slice, &body_src);
                 out_line += body_slice.matches('\n').count();
                 // Separate consecutive duplicated blocks by a blank line.
                 // `body_slice` from `split_inclusive('\n')` always ends in
@@ -1960,7 +2138,8 @@ fn expand_impl_sealed_unions(source: &str) -> (String, Vec<usize>) {
         out_line += line.matches('\n').count();
         idx += 1;
     }
-    (out, distributed_lines)
+    let (text, map) = out.finish();
+    (text, distributed_lines, map)
 }
 
 /// Collect sealed-union type aliases from a Typhon source string by
@@ -2056,39 +2235,21 @@ fn collect_sealed_union_aliases_from_text(
 }
 
 /// Split a string on top-level `|` characters, respecting brackets
-/// (`[]`, `()`, `{}`) and string literals. The operands are returned in
-/// source order and trimmed of leading/trailing whitespace.
+/// (`[]`, `()`, `{}`), string literals and comments. The operands are
+/// returned in source order and trimmed of leading/trailing whitespace.
+///
+/// Bracket depth and "is this byte code" both come from the shared
+/// [`LexMask`], so a `|` inside a string literal (`Literal["a|b"]`) or a
+/// trailing comment can never split a sealed-union alias.
 fn split_top_level_pipes(s: &str) -> Vec<&str> {
-    let bytes = s.as_bytes();
+    let mask = LexMask::new(s);
     let mut out = Vec::new();
-    let mut depth: i32 = 0;
     let mut start = 0usize;
-    let mut in_str: Option<u8> = None;
-    let mut i = 0;
-    while i < bytes.len() {
-        let b = bytes[i];
-        if let Some(q) = in_str {
-            if b == b'\\' && i + 1 < bytes.len() {
-                i += 2;
-                continue;
-            }
-            if b == q {
-                in_str = None;
-            }
-            i += 1;
-            continue;
+    for (i, c) in s.char_indices() {
+        if c == '|' && mask.is_structural_code(i) && mask.bracket_depth(i) == 0 {
+            out.push(s[start..i].trim());
+            start = i + 1;
         }
-        match b {
-            b'\'' | b'"' => in_str = Some(b),
-            b'(' | b'[' | b'{' => depth += 1,
-            b')' | b']' | b'}' => depth -= 1,
-            b'|' if depth == 0 => {
-                out.push(s[start..i].trim());
-                start = i + 1;
-            }
-            _ => {}
-        }
-        i += 1;
     }
     let last = s[start..].trim();
     if !last.is_empty() {
@@ -2193,10 +2354,11 @@ fn parse_impl_header_target(after_impl: &str) -> Option<ImplHeaderTarget> {
 ///
 /// Scope-limited to the bracket-list that follows the class name. Any
 /// `_` inside default values or bases is preserved verbatim.
-fn strip_hkt_markers_in_class_headers(source: &str) -> String {
-    let mut out = String::with_capacity(source.len());
+fn strip_hkt_markers_in_class_headers(source: &str) -> (String, Vec<usize>) {
+    let mut out = MappedOut::with_capacity(source.len());
     let mut in_string: Option<StringMode> = None;
-    for line in source.split_inclusive('\n') {
+    for (line_index, line) in source.split_inclusive('\n').enumerate() {
+        out.mark(line_index);
         let pre_string = in_string;
         let raw = line.trim_end_matches(['\n', '\r']);
         let _code_end = scan_line_code_end(raw, &mut in_string);
@@ -2280,7 +2442,7 @@ fn strip_hkt_markers_in_class_headers(source: &str) -> String {
         let term = &line[raw.len()..];
         out.push_str(term);
     }
-    out
+    out.finish()
 }
 
 /// Walk a comma-separated PEP-695 type-parameter list and drop any `[_]`
@@ -2619,17 +2781,6 @@ fn make_model_class_line(after_model: &str) -> Option<String> {
         format!("{}(BaseModel)", name)
     };
     Some(format!("{}{}", new_name, tail))
-}
-
-/// Active string-literal mode while scanning. `Single` and `Double` cannot
-/// span a newline (per Python's grammar) and are reset at end-of-line;
-/// triple-quoted forms persist across lines.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum StringMode {
-    Single,
-    Double,
-    TripleSingle,
-    TripleDouble,
 }
 
 /// Replace every `?` outside string literals and comments with ` | None`.
@@ -3987,6 +4138,11 @@ fn extract_return_type_text(def_line: &str) -> Option<String> {
 /// [`preprocess`]) can still recognise them and populate the lazy-import
 /// metadata used by the unused-import diagnostic.
 pub fn expand_lazy_lets(source: &str) -> String {
+    expand_lazy_imports_with(source, false).0
+}
+
+/// [`expand_lazy_lets`] plus an output-line → input-line table.
+pub fn expand_lazy_lets_mapped(source: &str) -> (String, Vec<usize>) {
     expand_lazy_imports_with(source, false)
 }
 
@@ -4041,98 +4197,48 @@ pub fn expand_lazy_lets(source: &str) -> String {
 /// is not a type expression is left untouched, so the stock parser surfaces a
 /// clean error rather than a mis-lowering.
 pub fn expand_checked_casts(source: &str) -> String {
+    expand_checked_casts_mapped(source).0
+}
+
+/// [`expand_checked_casts`] plus an output-line → input-line table.
+pub fn expand_checked_casts_mapped(source: &str) -> (String, Vec<usize>) {
     let mut current = source.to_owned();
+    let mut map = identity_line_map(text_line_count(source));
     let mut changed = false;
-    while let Some(next) = rewrite_one_checked_cast(&current) {
+    while let Some(splice) = rewrite_one_checked_cast(&current) {
+        let next = splice.apply(&current);
+        let step = splice.line_map(&current, &next);
+        map = compose_line_maps(&step, &map);
         current = next;
         changed = true;
     }
     if changed {
-        prepend_typhon_runtime_alias_import(
+        prepend_typhon_runtime_alias_import_mapped(
             current,
+            map,
             "from typhon_runtime.cast import checked_cast as __typhon_checked_cast__\n",
         )
     } else {
-        current
+        (current, map)
     }
 }
 
 /// Per-byte mask marking positions that are *not* structural code — inside a
-/// string literal or a trailing `#` comment. Handles single-, double-, and
-/// triple-quoted strings (spanning lines) and single-line `#` comments in one
-/// unified pass. A real newline is never masked, so the cast scanner can use it
-/// as a logical-line boundary, but the `#` and the comment text after it are.
+/// string literal (an f-string replacement field included: a statement-level
+/// rewrite must not reach inside a literal) or a trailing `#` comment. A real
+/// newline is never masked outside a string, so the cast scanner can use it as
+/// a logical-line boundary.
 ///
-/// Crucially this is a *single* scan rather than a string-mask followed by a
-/// comment-mask: a quote that lives inside a `#` comment (`# each field's
-/// shape`) must NOT open a phantom string. Computing the string mask first
-/// (comment-blind) would treat that apostrophe as a string opener and mask
-/// everything up to the next quote — swallowing a following `as!` and producing
-/// a spurious parse error.
+/// Derived from the shared [`LexMask`], which scans strings and comments in a
+/// *single* pass rather than string-first then comment-blind: a quote that
+/// lives inside a `#` comment (`# each field's shape`) must not open a phantom
+/// string, or it swallows a following `as!` and produces a spurious parse
+/// error (the v0.15.2 regression).
 fn compute_code_skip_mask(source: &str) -> Vec<bool> {
-    let bytes = source.as_bytes();
-    let mut skip = vec![false; bytes.len()];
-    // `None` outside any string/comment; `Some((quote, triple))` inside a
-    // string. Comments are tracked separately because a newline ends a comment
-    // but never a triple-quoted string.
-    let mut in_str: Option<(u8, bool)> = None;
-    let mut in_comment = false;
-    let mut i = 0;
-    while i < bytes.len() {
-        let b = bytes[i];
-        if let Some((q, triple)) = in_str {
-            skip[i] = true;
-            if b == b'\\' && i + 1 < bytes.len() {
-                skip[i + 1] = true;
-                i += 2;
-                continue;
-            }
-            if b == q {
-                if triple {
-                    if i + 2 < bytes.len() && bytes[i + 1] == q && bytes[i + 2] == q {
-                        skip[i + 1] = true;
-                        skip[i + 2] = true;
-                        in_str = None;
-                        i += 3;
-                        continue;
-                    }
-                } else {
-                    in_str = None;
-                }
-            }
-            i += 1;
-            continue;
-        }
-        if in_comment {
-            if b == b'\n' {
-                in_comment = false; // newline is structural — leave unmasked
-            } else {
-                skip[i] = true;
-            }
-            i += 1;
-            continue;
-        }
-        if b == b'#' {
-            in_comment = true;
-            skip[i] = true;
-            i += 1;
-            continue;
-        }
-        if b == b'"' || b == b'\'' {
-            if i + 2 < bytes.len() && bytes[i + 1] == b && bytes[i + 2] == b {
-                skip[i] = true;
-                skip[i + 1] = true;
-                skip[i + 2] = true;
-                in_str = Some((b, true));
-                i += 3;
-                continue;
-            }
-            in_str = Some((b, false));
-            skip[i] = true;
-        }
-        i += 1;
-    }
-    skip
+    let mask = LexMask::new(source);
+    (0..source.len())
+        .map(|i| !mask.is_structural_code(i))
+        .collect()
 }
 
 /// Find the left-most rewritable `as!` operator in `source` and return the
@@ -4140,7 +4246,7 @@ fn compute_code_skip_mask(source: &str) -> Vec<bool> {
 /// or `None` when no rewritable `as!` remains. An `as!` whose operands can't
 /// be resolved (e.g. the right side isn't a type expression) is skipped, not
 /// rewritten, so it falls through to the parser as a clean error.
-fn rewrite_one_checked_cast(source: &str) -> Option<String> {
+fn rewrite_one_checked_cast(source: &str) -> Option<Splice> {
     let bytes = source.as_bytes();
     let skip = compute_code_skip_mask(source);
     let mut i = 0;
@@ -4164,15 +4270,17 @@ fn rewrite_one_checked_cast(source: &str) -> Option<String> {
                     let expr_text = source[expr_start..i].trim();
                     let type_text = source[type_start..type_end].trim();
                     if !expr_text.is_empty() && !type_text.is_empty() {
-                        let mut out = String::with_capacity(source.len() + 24);
-                        out.push_str(&source[..expr_start]);
-                        out.push_str("__typhon_checked_cast__(");
-                        out.push_str(expr_text);
-                        out.push_str(", ");
-                        out.push_str(type_text);
-                        out.push(')');
-                        out.push_str(&source[type_end..]);
-                        return Some(out);
+                        let mut repl = String::with_capacity(expr_text.len() + 32);
+                        repl.push_str("__typhon_checked_cast__(");
+                        repl.push_str(expr_text);
+                        repl.push_str(", ");
+                        repl.push_str(type_text);
+                        repl.push(')');
+                        return Some(Splice {
+                            start: expr_start,
+                            end: type_end,
+                            repl,
+                        });
                     }
                 }
             }
@@ -4376,16 +4484,25 @@ fn match_balanced_bracket(bytes: &[u8], skip: &[bool], open: usize) -> Option<us
 /// not run the inline-`?` pass). A `rescue` whose right side isn't `NAME: EXPR`
 /// in statement-tail position is left untouched for the parser.
 pub fn expand_rescue(source: &str) -> String {
+    expand_rescue_mapped(source).0
+}
+
+/// [`expand_rescue`] plus an output-line → input-line table.
+pub fn expand_rescue_mapped(source: &str) -> (String, Vec<usize>) {
     let mut current = source.to_owned();
-    while let Some(next) = rewrite_one_rescue(&current) {
+    let mut map = identity_line_map(text_line_count(source));
+    while let Some(splice) = rewrite_one_rescue(&current) {
+        let next = splice.apply(&current);
+        let step = splice.line_map(&current, &next);
+        map = compose_line_maps(&step, &map);
         current = next;
     }
-    current
+    (current, map)
 }
 
 /// Find the left-most rewritable postfix `rescue` and lower that one
 /// occurrence, or return `None` when none remains.
-fn rewrite_one_rescue(source: &str) -> Option<String> {
+fn rewrite_one_rescue(source: &str) -> Option<Splice> {
     const KW: &[u8] = b"rescue";
     let bytes = source.as_bytes();
     let skip = compute_code_skip_mask(source);
@@ -4415,7 +4532,7 @@ fn try_rewrite_rescue_at(
     bytes: &[u8],
     skip: &[bool],
     kw_pos: usize,
-) -> Option<String> {
+) -> Option<Splice> {
     // Left operand: reuse the `as!` value-slot scanner (handles brackets,
     // strings, separators, and a leading `return`/`if`/`while`/… keyword).
     let expr_start = find_cast_expr_start(bytes, skip, kw_pos);
@@ -4474,17 +4591,19 @@ fn try_rewrite_rescue_at(
         return None;
     }
 
-    let mut out = String::with_capacity(source.len() + 32);
-    out.push_str(&source[..expr_start]);
-    out.push_str("try_result(lambda: ");
-    out.push_str(expr_text);
-    out.push_str(", lambda ");
-    out.push_str(name);
-    out.push_str(": ");
-    out.push_str(err_text);
-    out.push_str(")?");
-    out.push_str(&source[err_end..]);
-    Some(out)
+    let mut repl = String::with_capacity(expr_text.len() + err_text.len() + 40);
+    repl.push_str("try_result(lambda: ");
+    repl.push_str(expr_text);
+    repl.push_str(", lambda ");
+    repl.push_str(name);
+    repl.push_str(": ");
+    repl.push_str(err_text);
+    repl.push_str(")?");
+    Some(Splice {
+        start: expr_start,
+        end: err_end,
+        repl,
+    })
 }
 
 /// Locate where the error expression of a postfix `rescue` ends: the right
@@ -4583,23 +4702,31 @@ fn find_rescue_err_end(bytes: &[u8], start: usize) -> usize {
 /// `with`-chain and `gather:` expanders, this is a line-based transform that
 /// adds lines.
 pub fn expand_rescue_blocks(source: &str) -> String {
+    expand_rescue_blocks_mapped(source).0
+}
+
+/// [`expand_rescue_blocks`] plus an output-line → input-line table.
+pub fn expand_rescue_blocks_mapped(source: &str) -> (String, Vec<usize>) {
     let mut current = source.to_owned();
+    let mut map = identity_line_map(text_line_count(source));
     loop {
-        let next = expand_rescue_blocks_once(&current);
+        let (next, step) = expand_rescue_blocks_once(&current);
         if next == current {
-            return current;
+            return (current, map);
         }
+        map = compose_line_maps(&step, &map);
         current = next;
     }
 }
 
-fn expand_rescue_blocks_once(source: &str) -> String {
-    let mut out = String::with_capacity(source.len() + 64);
+fn expand_rescue_blocks_once(source: &str) -> (String, Vec<usize>) {
+    let mut out = MappedOut::with_capacity(source.len() + 64);
     let mut in_string: Option<StringMode> = None;
     let lines: Vec<&str> = source.split_inclusive('\n').collect();
     let mut i = 0;
     while i < lines.len() {
         let line = lines[i];
+        out.mark(i);
         let pre_string = in_string;
         let raw = line.trim_end_matches(['\n', '\r']);
         let code_end = scan_line_code_end(raw, &mut in_string);
@@ -4643,9 +4770,11 @@ fn expand_rescue_blocks_once(source: &str) -> String {
             if suite_end > i + 1 {
                 out.push_str(header_indent);
                 out.push_str("try:\n");
-                for s in &lines[i + 1..suite_end] {
+                for (k, s) in lines[i + 1..suite_end].iter().enumerate() {
+                    out.mark(i + 1 + k);
                     out.push_str(s);
                 }
+                out.mark(i);
                 out.push_str(header_indent);
                 out.push_str("except Exception as ");
                 out.push_str(&name);
@@ -4656,7 +4785,8 @@ fn expand_rescue_blocks_once(source: &str) -> String {
                 out.push_str(")\n");
                 // Re-emit any trailing blank lines that were scanned past the
                 // last suite statement so spacing is preserved.
-                for s in &lines[suite_end..j] {
+                for (k, s) in lines[suite_end..j].iter().enumerate() {
+                    out.mark(suite_end + k);
                     out.push_str(s);
                 }
                 // Recompute carried string state up to where we resume.
@@ -4673,7 +4803,7 @@ fn expand_rescue_blocks_once(source: &str) -> String {
         out.push_str(line);
         i += 1;
     }
-    out
+    out.finish()
 }
 
 /// Parse a `rescue NAME: ERR_EXPR:` block header from the comment-stripped,
@@ -4735,11 +4865,17 @@ fn parse_rescue_block_header(body: &str) -> Option<(String, String)> {
 /// keep the unpacking call on one line. The pass leaves multi-line
 /// shapes untouched so the parser surfaces a clean error.
 pub fn expand_typed_let_unpack(source: &str) -> String {
-    let mut out = String::with_capacity(source.len());
+    expand_typed_let_unpack_mapped(source).0
+}
+
+/// [`expand_typed_let_unpack`] plus an output-line → input-line table.
+pub fn expand_typed_let_unpack_mapped(source: &str) -> (String, Vec<usize>) {
+    let mut out = MappedOut::with_capacity(source.len());
     let mut counter: usize = 0;
     let mut in_string: Option<StringMode> = None;
 
-    for line in source.split_inclusive('\n') {
+    for (line_index, line) in source.split_inclusive('\n').enumerate() {
+        out.mark(line_index);
         let pre_string = in_string;
         let raw = line.trim_end_matches(['\n', '\r']);
         let _code_end = scan_line_code_end(raw, &mut in_string);
@@ -4793,7 +4929,7 @@ pub fn expand_typed_let_unpack(source: &str) -> String {
         }
     }
 
-    out
+    out.finish()
 }
 
 struct TypedLetUnpack {
@@ -5089,11 +5225,16 @@ fn find_top_level_colon(s: &str) -> Option<usize> {
 }
 
 pub fn expand_lazy_imports(source: &str) -> String {
+    expand_lazy_imports_with(source, true).0
+}
+
+/// [`expand_lazy_imports`] plus an output-line → input-line table.
+pub fn expand_lazy_imports_mapped(source: &str) -> (String, Vec<usize>) {
     expand_lazy_imports_with(source, true)
 }
 
-fn expand_lazy_imports_with(source: &str, rewrite_imports: bool) -> String {
-    let mut result = String::with_capacity(source.len() + 256);
+fn expand_lazy_imports_with(source: &str, rewrite_imports: bool) -> (String, Vec<usize>) {
+    let mut result = MappedOut::with_capacity(source.len() + 256);
     // Track triple-quoted string state so that a `lazy import` that appears
     // inside a docstring or multiline string is never mistakenly rewritten.
     let mut in_string: Option<StringMode> = None;
@@ -5245,11 +5386,15 @@ fn expand_lazy_imports_with(source: &str, rewrite_imports: bool) -> String {
         header.push_str("from functools import cached_property as _typhon_cached_property\n");
     }
 
+    // Exactly one `emitted_lines` entry is pushed per input line on every
+    // path through the loop above, so entry `i` is the (possibly multi-line)
+    // lowering of input line `i` — which is all the provenance table needs.
     if header.is_empty() {
-        for line in &emitted_lines {
+        for (i, line) in emitted_lines.iter().enumerate() {
+            result.mark(i);
             result.push_str(line);
         }
-        return result;
+        return result.finish();
     }
 
     // Find the insertion point: after any leading `from __future__ import …`
@@ -5300,15 +5445,20 @@ fn expand_lazy_imports_with(source: &str, rewrite_imports: bool) -> String {
         }
         break;
     }
-    for line in &emitted_lines[..insert_at] {
+    for (i, line) in emitted_lines[..insert_at].iter().enumerate() {
+        result.mark(i);
         result.push_str(line);
     }
+    // The injected runtime imports have no single originating line — they are
+    // a file-level artifact, so attribute them to the file's first line.
+    result.mark(0);
     result.push_str(&header);
-    for line in &emitted_lines[insert_at..] {
+    for (offset, line) in emitted_lines[insert_at..].iter().enumerate() {
+        result.mark(insert_at + offset);
         result.push_str(line);
     }
 
-    result
+    result.finish()
 }
 
 /// Parsed `lazy let NAME [: T] = expr` body.
@@ -5417,35 +5567,13 @@ fn find_top_level_assign_eq(s: &str) -> Option<usize> {
 }
 
 /// Strip a trailing `# comment` from a single line, respecting string
-/// literals.  Returns the comment-free prefix as an owned string.
+/// literals (including triple-quoted ones). Returns the comment-free prefix
+/// as an owned string.
+///
+/// Thin wrapper over the crate's single lexical scanner
+/// ([`crate::lexmask::scan_line`]).
 fn strip_trailing_comment(line: &str) -> String {
-    let mut in_string: Option<StringMode> = None;
-    let bytes = line.as_bytes();
-    let mut i = 0usize;
-    while i < bytes.len() {
-        let c = bytes[i] as char;
-        if let Some(mode) = in_string {
-            match mode {
-                StringMode::Single if c == '\'' => in_string = None,
-                StringMode::Double if c == '"' => in_string = None,
-                StringMode::Single | StringMode::Double if c == '\\' => {
-                    i += 2;
-                    continue;
-                }
-                _ => {}
-            }
-            i += 1;
-            continue;
-        }
-        match c {
-            '\'' => in_string = Some(StringMode::Single),
-            '"' => in_string = Some(StringMode::Double),
-            '#' => return line[..i].to_owned(),
-            _ => {}
-        }
-        i += 1;
-    }
-    line.to_owned()
+    strip_trailing_comment_outside_strings(line).to_owned()
 }
 
 /// Emit a `@cached_property`-decorated method for a class-body `lazy let`.
@@ -5499,128 +5627,16 @@ fn emit_lazy_proxy(out: &mut String, alias: &str, module: &str) {
     out.push_str(&format!("{alias} = __typhon_lazy_import(\"{module}\")\n"));
 }
 
-/// Expand the `?` error-propagation operator into equivalent Python guard code.
+/// Scan `line` for [`join_multiline_question_statements`], returning both
+/// the bracket-depth delta of the code (non-string, non-comment) portion of
+/// `line` and the byte index where a trailing comment begins (or
+/// `line.len()` if none).
 ///
-/// A line ending with `)?` in the code portion (before any comment) is treated
-/// as the propagation operator. It is expanded in-place into the
-/// three-statement guard form:
-///
-/// ```text
-/// # Input (Typhon)
-/// val x = f()?
-///
-/// # Output (valid Python, before further preprocessing)
-/// __typhon_q_0__ = f()
-/// if isinstance(__typhon_q_0__, Err):
-///     return __typhon_q_0__
-/// val x = __typhon_q_0__.value
-/// ```
-///
-/// If there is no assignment target (bare `f()?`), the final assignment is
-/// omitted and only the call + guard are emitted.
-///
-/// Lines inside triple-quoted strings and comment text are not expanded.
-/// Trailing comments (`f()? # note`) are stripped before the check so the
-/// comment does not interfere with operator detection.
-///
-/// This function is called **before** [`preprocess`] in the build and check
-/// pipelines. It is deliberately *not* called by `tyc fmt` so that the
-/// source formatter preserves the `?` syntax unchanged.
-///
-/// # Limitations
-///
-/// - Only handles `?` that directly follows `)`.  A `?` after `]` or an
-///   identifier is treated as nullable-type sugar (`T?`) by the regular
-///   preprocessor.
-/// - Nested `?` operators on a single line are not supported.  Break them
-///   across multiple `val` bindings instead.
-///
-/// Single-line scan helper: thread `in_string` across physical lines while
-/// returning both the bracket-depth delta of the code (non-string,
-/// non-comment) portion of `line` and the byte index where a trailing
-/// comment begins (or `line.len()` if none). Mirrors
-/// [`scan_line_code_end`]'s string handling so the two stay consistent, and
-/// adds the bracket count [`join_multiline_question_statements`] needs to
-/// find logical-line boundaries.
+/// Thin wrapper over the crate's single lexical scanner
+/// ([`crate::lexmask::scan_line`]).
 fn scan_line_delta_and_code_end(line: &str, in_string: &mut Option<StringMode>) -> (i32, usize) {
-    let mut depth: i32 = 0;
-    let mut code_end = line.len();
-    let mut chars = line.char_indices().peekable();
-
-    while let Some((i, c)) = chars.next() {
-        if let Some(mode) = *in_string {
-            match mode {
-                StringMode::Single | StringMode::Double => {
-                    if c == '\\' {
-                        chars.next();
-                        continue;
-                    }
-                    match mode {
-                        StringMode::Single if c == '\'' => *in_string = None,
-                        StringMode::Double if c == '"' => *in_string = None,
-                        _ => {}
-                    }
-                }
-                StringMode::TripleSingle | StringMode::TripleDouble => {
-                    // `\` escapes the next char inside a triple-quoted string
-                    // too, so an escaped quote (`\"`) doesn't end the region.
-                    if c == '\\' {
-                        chars.next();
-                        continue;
-                    }
-                    let (q, triple) = if matches!(mode, StringMode::TripleSingle) {
-                        ('\'', "'''")
-                    } else {
-                        ('"', "\"\"\"")
-                    };
-                    if c == q && line[i..].starts_with(triple) {
-                        chars.next();
-                        chars.next();
-                        *in_string = None;
-                    }
-                }
-            }
-            continue;
-        }
-
-        if c == '#' {
-            code_end = i;
-            break;
-        }
-
-        match c {
-            '"' | '\'' => {
-                let triple = (c == '"' && line[i..].starts_with("\"\"\""))
-                    || (c == '\'' && line[i..].starts_with("'''"));
-                if triple {
-                    chars.next();
-                    chars.next();
-                    *in_string = Some(if c == '"' {
-                        StringMode::TripleDouble
-                    } else {
-                        StringMode::TripleSingle
-                    });
-                } else {
-                    *in_string = Some(if c == '"' {
-                        StringMode::Double
-                    } else {
-                        StringMode::Single
-                    });
-                }
-            }
-            '(' | '[' | '{' => depth += 1,
-            ')' | ']' | '}' => depth -= 1,
-            _ => {}
-        }
-    }
-
-    // An unterminated single/double-quoted string is a Python syntax error;
-    // reset so subsequent lines aren't swallowed (matches scan_line_code_end).
-    if matches!(*in_string, Some(StringMode::Single | StringMode::Double)) {
-        *in_string = None;
-    }
-
-    (depth, code_end)
+    let scan = scan_line(line, in_string);
+    (scan.bracket_delta, scan.code_end)
 }
 
 /// Collapse a statement whose trailing `?` propagation operator sits on a
@@ -5645,8 +5661,8 @@ fn scan_line_delta_and_code_end(line: &str, in_string: &mut Option<StringMode>) 
 /// logical line — including ordinary multi-line calls — is re-emitted byte
 /// for byte. Logical lines that involve a multi-line (triple-quoted) string
 /// are left alone to avoid mangling string content.
-fn join_multiline_question_statements(source: &str) -> String {
-    let mut out = String::with_capacity(source.len() + 16);
+fn join_multiline_question_statements(source: &str) -> (String, Vec<usize>) {
+    let mut out = MappedOut::with_capacity(source.len() + 16);
     let mut in_string: Option<StringMode> = None;
     // Physical lines (with their newline) buffered for the current logical
     // line, plus the trimmed code portion of each.
@@ -5654,11 +5670,14 @@ fn join_multiline_question_statements(source: &str) -> String {
     let mut code_parts: Vec<String> = Vec::new();
     let mut depth: i32 = 0;
     let mut saw_string_continuation = false;
+    // Source line index of `buf[0]`.
+    let mut buf_start = 0usize;
 
-    let flush = |out: &mut String,
+    let flush = |out: &mut MappedOut,
                  buf: &mut Vec<String>,
                  code_parts: &mut Vec<String>,
-                 saw_string_continuation: bool| {
+                 saw_string_continuation: bool,
+                 buf_start: usize| {
         let joinable = buf.len() > 1
             && !saw_string_continuation
             && code_parts
@@ -5678,13 +5697,18 @@ fn join_multiline_question_statements(source: &str) -> String {
                 .collect::<Vec<_>>()
                 .join(" ");
             let newline_count = buf.iter().filter(|l| l.ends_with('\n')).count();
+            // The whole joined statement — plus the blank padding lines that
+            // keep the buffer's line count stable — belongs to the physical
+            // line the statement opened on.
+            out.mark(buf_start);
             out.push_str(indent);
             out.push_str(&joined_code);
             for _ in 0..newline_count {
                 out.push('\n');
             }
         } else {
-            for l in buf.iter() {
+            for (k, l) in buf.iter().enumerate() {
+                out.mark(buf_start + k);
                 out.push_str(l);
             }
         }
@@ -5692,7 +5716,7 @@ fn join_multiline_question_statements(source: &str) -> String {
         code_parts.clear();
     };
 
-    for line in source.split_inclusive('\n') {
+    for (line_index, line) in source.split_inclusive('\n').enumerate() {
         let raw = line.trim_end_matches(['\n', '\r']);
         let pre_string = in_string;
         let (delta, code_end) = scan_line_delta_and_code_end(raw, &mut in_string);
@@ -5704,21 +5728,31 @@ fn join_multiline_question_statements(source: &str) -> String {
         } else {
             raw[..code_end].trim()
         };
+        if buf.is_empty() {
+            buf_start = line_index;
+        }
         buf.push(line.to_owned());
         code_parts.push(code.to_owned());
         depth += delta;
         if depth <= 0 {
             depth = 0;
-            flush(&mut out, &mut buf, &mut code_parts, saw_string_continuation);
+            flush(
+                &mut out,
+                &mut buf,
+                &mut code_parts,
+                saw_string_continuation,
+                buf_start,
+            );
             saw_string_continuation = false;
         }
     }
     // An unterminated logical line (unbalanced brackets at EOF) is malformed
     // source; re-emit it verbatim and let the parser report the real error.
-    for l in &buf {
+    for (k, l) in buf.iter().enumerate() {
+        out.mark(buf_start + k);
         out.push_str(l);
     }
-    out
+    out.finish()
 }
 
 pub fn expand_question_ops(source: &str) -> String {
@@ -5747,20 +5781,33 @@ pub fn expand_question_ops(source: &str) -> String {
     // header has no left operand, so the postfix scanner skips it anyway), then
     // the postfix pass, so any generated `?` is in place before the cast lift
     // and the end-of-line `?` expansion below.
-    let deblocked = expand_rescue_blocks(source);
-    let rescued = expand_rescue(&deblocked);
-    let casted = expand_checked_casts(&rescued);
-    let joined = join_multiline_question_statements(&casted);
-    expand_question_ops_inner(&joined)
+    expand_question_ops_mapped(source).0
 }
 
-fn expand_question_ops_inner(source: &str) -> String {
-    let mut result = String::with_capacity(source.len() + 64);
+/// [`expand_question_ops`] plus an output-line → input-line table, folded
+/// across every sub-pass it runs (`rescue` blocks, postfix `rescue`, `as!`
+/// casts, the multi-line join, and the end-of-line `?` expansion).
+pub fn expand_question_ops_mapped(source: &str) -> (String, Vec<usize>) {
+    let (deblocked, m_blocks) = expand_rescue_blocks_mapped(source);
+    let (rescued, m_rescue) = expand_rescue_mapped(&deblocked);
+    let (casted, m_cast) = expand_checked_casts_mapped(&rescued);
+    let (joined, m_join) = join_multiline_question_statements(&casted);
+    let (out, m_inner) = expand_question_ops_inner(&joined);
+    let map = compose_line_maps(&m_rescue, &m_blocks);
+    let map = compose_line_maps(&m_cast, &map);
+    let map = compose_line_maps(&m_join, &map);
+    let map = compose_line_maps(&m_inner, &map);
+    (out, map)
+}
+
+fn expand_question_ops_inner(source: &str) -> (String, Vec<usize>) {
+    let mut result = MappedOut::with_capacity(source.len() + 64);
     let mut counter = 0usize;
     let mut in_string: Option<StringMode> = None;
     let mut needs_err_alias_import = false;
 
-    for line in source.split_inclusive('\n') {
+    for (line_index, line) in source.split_inclusive('\n').enumerate() {
+        result.mark(line_index);
         let raw = line.trim_end_matches(['\n', '\r']);
 
         // Record string state at the start of this line.
@@ -5925,11 +5972,187 @@ fn expand_question_ops_inner(source: &str) -> String {
         }
     }
 
+    let (text, map) = result.finish();
     if needs_err_alias_import {
-        prepend_typhon_err_alias_import(result)
+        prepend_typhon_err_alias_import_mapped(text, map)
     } else {
-        result
+        (text, map)
     }
+}
+
+/// Restructure `elif COND:` / `while COND:` headers whose condition contains a
+/// propagating `?`, so the guard that `?` lowers to can be hoisted to a place
+/// where it is actually reachable.
+///
+/// This must run **before** [`expand_inline_question_ops`], which lifts the
+/// `?` guard onto the lines *preceding* the one it rewrites. That is correct
+/// for a statement, and wrong for a compound header:
+///
+/// For `elif`, the lifted `if isinstance(_, Err): return _` is emitted between
+/// the previous `if` body and the `elif`, so the `elif` silently reattaches to
+/// the *generated* `if` instead of the user's. The original `if` branch stops
+/// guarding it, the fallible expression is evaluated even when the first
+/// branch was taken, and the `else` arm then runs on top of it. A clean
+/// `tyc check` and an exit-0 `tyc build` produced a program that took the
+/// wrong branch: an `if a == "": out = "empty-a"` / `elif parse(b)? > 10`
+/// chain returned `"small-b"` for `a == ""`.
+///
+/// For `while`, the guard lands *before* the loop, so the fallible expression
+/// is evaluated exactly once and the loop condition is frozen at its first
+/// value — a wrong result, or an infinite loop.
+///
+/// The rewrites are the standard ones:
+///
+/// ```text
+///   elif COND:          →   else:
+///       BODY                    if COND:          ← `?` now hoists inside
+///   else:                           BODY              the else arm
+///       REST                    else:
+///                                   REST
+///
+///   while COND:         →   while True:
+///       BODY                    if not (COND):    ← `?` hoists above this
+///           …                       break
+///                               BODY
+/// ```
+///
+/// Both are semantics-preserving on programs that were *correctly* compiled
+/// before (a condition with no `?` is left completely untouched), and they
+/// only change the output of programs that were miscompiled.
+pub fn expand_compound_question_headers(source: &str) -> String {
+    expand_compound_question_headers_mapped(source).0
+}
+
+/// [`expand_compound_question_headers`] plus an output-line → input-line
+/// table.
+pub fn expand_compound_question_headers_mapped(source: &str) -> (String, Vec<usize>) {
+    // Fixpoint: rewriting an outer `elif` can expose a nested one.
+    let mut current = source.to_owned();
+    let mut map = identity_line_map(text_line_count(source));
+    for _ in 0..64 {
+        match rewrite_first_compound_question_header(&current) {
+            Some((next, step_map)) => {
+                current = next;
+                map = compose_line_maps(&step_map, &map);
+            }
+            None => break,
+        }
+    }
+    (current, map)
+}
+
+fn indent_width(line: &str) -> usize {
+    line.len() - line.trim_start().len()
+}
+
+fn rewrite_first_compound_question_header(source: &str) -> Option<(String, Vec<usize>)> {
+    let lines: Vec<&str> = source.split('\n').collect();
+    // `split('\n')` and the mask's `split_inclusive('\n')` agree on every
+    // index that names a real line; a trailing empty element (when the buffer
+    // ends in a newline) reads as "not in a string", which is correct.
+    let mask = LexMask::new(source);
+
+    for (i, line) in lines.iter().enumerate() {
+        if mask.line_starts_in_string(i) {
+            continue;
+        }
+        // Probe only the *code* portion of the line: a `)?` or a `:` inside
+        // a trailing `#` comment is prose, not code. Reading the full line
+        // made `while n < limit:  # done (or not)? recheck: yes` — a valid
+        // header with no propagating `?` at all — trigger the rewrite and
+        // split at the comment's colon, corrupting a correct program.
+        let code_len = mask.line_code_end(i).min(line.len());
+        let code = &line[..code_len];
+        let trimmed = code.trim_start();
+        let is_elif = trimmed.starts_with("elif ");
+        let is_while = trimmed.starts_with("while ");
+        if !is_elif && !is_while {
+            continue;
+        }
+        // Only a *propagating* `?` matters; `T?` nullable sugar is not one.
+        if find_first_inline_propagation_q(code).is_none() {
+            continue;
+        }
+        let indent = indent_width(line);
+        let pad = " ".repeat(indent);
+        let keyword_len = if is_elif {
+            "elif ".len()
+        } else {
+            "while ".len()
+        };
+        let after_keyword = &trimmed[keyword_len..];
+        // The header ends at the last `:` of its code portion; the trailing
+        // comment (which may itself contain a colon) is carried over
+        // verbatim after the rebuilt header.
+        let colon = after_keyword.rfind(':')?;
+        let cond = after_keyword[..colon].trim_end();
+        let tail = format!("{}{}", &after_keyword[colon + 1..], &line[code_len..]);
+        let trailing = tail.trim_end();
+
+        // The block this header owns: everything more-indented, plus (for an
+        // `elif`) the sibling `elif` / `else` clauses that follow it, which
+        // must move inside the new `else` with it.
+        let mut end = i + 1;
+        while end < lines.len() {
+            let l = lines[end];
+            if mask.line_starts_in_string(end) || l.trim().is_empty() {
+                end += 1;
+                continue;
+            }
+            let w = indent_width(l);
+            if w > indent {
+                end += 1;
+                continue;
+            }
+            let t = l.trim_start();
+            if is_elif && w == indent && (t.starts_with("elif ") || t.starts_with("else")) {
+                end += 1;
+                continue;
+            }
+            break;
+        }
+
+        let mut out: Vec<String> = lines[..i].iter().map(|s| (*s).to_owned()).collect();
+        // Provenance runs in lock-step with `out`: the synthesised header
+        // lines belong to the `elif` / `while` the user wrote, and every
+        // moved body line keeps its own index.
+        let mut src: Vec<usize> = (0..i).collect();
+        if is_elif {
+            out.push(format!("{pad}else:"));
+            out.push(format!("{pad}    if {cond}:{trailing}"));
+            src.push(i);
+            src.push(i);
+        } else {
+            out.push(format!("{pad}while True:"));
+            out.push(format!("{pad}    if not ({cond}):{trailing}"));
+            out.push(format!("{pad}        break"));
+            src.push(i);
+            src.push(i);
+            src.push(i);
+        }
+        for (j, l) in lines[i + 1..end].iter().enumerate() {
+            let idx = i + 1 + j;
+            src.push(idx);
+            // A line whose leading whitespace is string content keeps it.
+            if mask.line_starts_in_string(idx) || l.trim().is_empty() {
+                out.push((*l).to_owned());
+            } else if is_elif {
+                out.push(format!("    {l}"));
+            } else {
+                out.push((*l).to_owned());
+            }
+        }
+        out.extend(lines[end..].iter().map(|s| (*s).to_owned()));
+        src.extend(end..lines.len());
+        let text = out.join("\n");
+        // `split('\n')` yields one more element than `split_inclusive` when
+        // the text ends in a newline (the trailing empty piece). Trim the
+        // table to `split_inclusive` line semantics, which is what every
+        // other stage's map uses.
+        src.truncate(text_line_count(&text));
+        return Some((text, src));
+    }
+    None
 }
 
 /// Lift inline `?` propagation operators (`)?` appearing inside a larger
@@ -5970,12 +6193,18 @@ fn expand_question_ops_inner(source: &str) -> String {
 ///   parenthesised receiver like `(a + b)()?` are skipped.
 /// - The `?` inside a string literal on the line is preserved verbatim.
 pub fn expand_inline_question_ops(source: &str) -> String {
-    let mut out = String::with_capacity(source.len() + 64);
+    expand_inline_question_ops_mapped(source).0
+}
+
+/// [`expand_inline_question_ops`] plus an output-line → input-line table.
+pub fn expand_inline_question_ops_mapped(source: &str) -> (String, Vec<usize>) {
+    let mut out = MappedOut::with_capacity(source.len() + 64);
     let mut counter = 0usize;
     let mut in_string: Option<StringMode> = None;
     let mut needs_err_alias_import = false;
 
-    for line in source.split_inclusive('\n') {
+    for (line_index, line) in source.split_inclusive('\n').enumerate() {
+        out.mark(line_index);
         let raw = line.trim_end_matches(['\n', '\r']);
         let pre_string = in_string;
         let code_end = scan_line_code_end(raw, &mut in_string);
@@ -6008,10 +6237,11 @@ pub fn expand_inline_question_ops(source: &str) -> String {
         }
     }
 
+    let (text, map) = out.finish();
     if needs_err_alias_import {
-        prepend_typhon_err_alias_import(out)
+        prepend_typhon_err_alias_import_mapped(text, map)
     } else {
-        out
+        (text, map)
     }
 }
 
@@ -6243,64 +6473,16 @@ fn find_callable_start(s: &str, open_pos: usize) -> usize {
 }
 
 /// Build a parallel byte-mask `mask[i] = true` iff `s.as_bytes()[i]` is
-/// inside a `"..."` / `'...'` string literal. Triple-quoted strings on a
-/// single line are treated as ordinary literals (they're rare on a
-/// single line and the only safety property we need is "don't match
-/// parens inside any string").
+/// inside a string literal (the quotes included). Derived from the shared
+/// [`LexMask`], so triple-quoted regions, escapes, and quotes inside a `#`
+/// comment are all handled by the one scanner. Bytes inside an f-string
+/// replacement field are *not* masked — they are a real expression, and the
+/// bracket-matching callers need to see their brackets.
 fn compute_in_string_mask(s: &str) -> Vec<bool> {
-    let bytes = s.as_bytes();
-    let mut mask = vec![false; bytes.len()];
-    // `None` outside any string; `Some((quote, triple))` inside one. A
-    // triple-quoted region (`"""` / `'''`) only ends on a matching
-    // triple; bare quotes inside it are ordinary content. Single-line
-    // strings continue to honour `\`-escapes; triple-quoted strings
-    // do too (Python allows `\` continuation inside them).
-    let mut in_str: Option<(u8, bool)> = None;
-    let mut i = 0;
-    while i < bytes.len() {
-        let b = bytes[i];
-        if let Some((q, triple)) = in_str {
-            mask[i] = true;
-            if b == b'\\' && i + 1 < bytes.len() {
-                mask[i + 1] = true;
-                i += 2;
-                continue;
-            }
-            if b == q {
-                if triple {
-                    if i + 2 < bytes.len() && bytes[i + 1] == q && bytes[i + 2] == q {
-                        mask[i + 1] = true;
-                        mask[i + 2] = true;
-                        in_str = None;
-                        i += 3;
-                        continue;
-                    }
-                } else {
-                    in_str = None;
-                }
-            }
-            i += 1;
-            continue;
-        }
-        if b == b'"' || b == b'\'' {
-            // Detect `"""` / `'''` triple openers and consume all three
-            // quotes at once so the in-string state for a triple region
-            // isn't toggled off by the second quote of the opener.
-            // Gemini review on PR #96.
-            if i + 2 < bytes.len() && bytes[i + 1] == b && bytes[i + 2] == b {
-                mask[i] = true;
-                mask[i + 1] = true;
-                mask[i + 2] = true;
-                in_str = Some((b, true));
-                i += 3;
-                continue;
-            }
-            in_str = Some((b, false));
-            mask[i] = true;
-        }
-        i += 1;
-    }
-    mask
+    let mask = LexMask::new(s);
+    (0..s.len())
+        .map(|i| matches!(mask.kind(i), ByteKind::StringText))
+        .collect()
 }
 
 /// Prepend `from typhon_runtime import Err as __typhon_Err__` to `source`
@@ -6308,8 +6490,28 @@ fn compute_in_string_mask(s: &str) -> Vec<bool> {
 /// and that doesn't demote a module docstring. Used by the `?` and
 /// `with`-chain lowerings when they introduced a `__typhon_Err__`
 /// reference. FINDINGS #104.
-fn prepend_typhon_err_alias_import(body: String) -> String {
-    prepend_typhon_runtime_alias_import(body, "from typhon_runtime import Err as __typhon_Err__\n")
+fn prepend_typhon_err_alias_import_mapped(body: String, map: Vec<usize>) -> (String, Vec<usize>) {
+    prepend_typhon_runtime_alias_import_mapped(
+        body,
+        map,
+        "from typhon_runtime import Err as __typhon_Err__\n",
+    )
+}
+
+/// Splice the runtime-alias import into `body` and keep `map` aligned.
+///
+/// The injected line has no originating `.ty` line of its own — it is a
+/// file-level artifact — so it inherits line 0.
+fn prepend_typhon_runtime_alias_import_mapped(
+    body: String,
+    mut map: Vec<usize>,
+    import_line: &str,
+) -> (String, Vec<usize>) {
+    let (out, inserted_at) = prepend_typhon_runtime_alias_import(body, import_line);
+    if let Some(at) = inserted_at {
+        map.insert(at.min(map.len()), 0);
+    }
+    (out, map)
 }
 
 /// Inject a `from typhon_runtime… import … as __typhon_…__` alias import
@@ -6318,9 +6520,15 @@ fn prepend_typhon_err_alias_import(body: String) -> String {
 /// present. Shared by the `?`-operator (`__typhon_Err__`) and `as!`
 /// (`__typhon_checked_cast__`) lowerings, both of which need a runtime alias
 /// in scope before the rest of the pipeline runs.
-fn prepend_typhon_runtime_alias_import(body: String, import_line: &str) -> String {
+///
+/// Returns the rewritten body and, when a line was actually injected, the
+/// 0-based **output** line index it landed on (`None` when the import was
+/// already present, so no line was added). Callers threading a source-line
+/// table use that index to keep the table aligned.
+fn prepend_typhon_runtime_alias_import(body: String, import_line: &str) -> (String, Option<usize>) {
     let mut out = String::with_capacity(body.len() + import_line.len());
     let mut inserted = false;
+    let mut injected_at: Option<usize> = None;
     let mut idx = 0usize;
     let mut in_docstring: Option<&'static str> = None;
     while idx < body.len() {
@@ -6384,6 +6592,7 @@ fn prepend_typhon_runtime_alias_import(body: String, import_line: &str) -> Strin
         // unless an identical line was already seen during the header
         // scan (in which case `inserted` is already `true`).
         if !inserted {
+            injected_at = Some(text_line_count(&out));
             out.push_str(import_line);
             inserted = true;
         }
@@ -6392,9 +6601,10 @@ fn prepend_typhon_runtime_alias_import(body: String, import_line: &str) -> Strin
     }
 
     if !inserted {
+        injected_at = Some(text_line_count(&out));
         out.push_str(import_line);
     }
-    out
+    (out, injected_at)
 }
 
 // ── multi-line `guard` expansion ───────────────────────────────────────────────
@@ -6441,7 +6651,12 @@ fn prepend_typhon_runtime_alias_import(body: String, import_line: &str) -> Strin
 ///   single-line form's drift. Downstream span fidelity is the same
 ///   as for single-line guards.
 pub fn expand_multiline_guards(source: &str) -> String {
-    let mut out = String::with_capacity(source.len());
+    expand_multiline_guards_mapped(source).0
+}
+
+/// [`expand_multiline_guards`] plus an output-line → input-line table.
+pub fn expand_multiline_guards_mapped(source: &str) -> (String, Vec<usize>) {
+    let mut out = MappedOut::with_capacity(source.len());
     let mut in_string: Option<StringMode> = None;
     let lines: Vec<&str> = source.split_inclusive('\n').collect();
     let mut i = 0;
@@ -6449,6 +6664,7 @@ pub fn expand_multiline_guards(source: &str) -> String {
 
     while i < lines.len() {
         let line = lines[i];
+        out.mark(i);
         let pre = in_string;
         let raw = line.trim_end_matches(['\n', '\r']);
         let _ = scan_line_code_end(raw, &mut in_string);
@@ -6598,9 +6814,14 @@ pub fn expand_multiline_guards(source: &str) -> String {
         out.push_str("if ");
         out.push_str(&tmp);
         out.push_str(" is None:\n");
-        for b in &body_lines {
+        // `body_lines[k]` is verbatim `lines[i + 1 + k]` — every collection
+        // path pushes one entry and advances `j` by one — so the guard body
+        // keeps its own line numbers instead of collapsing onto the header.
+        for (k, b) in body_lines.iter().enumerate() {
+            out.mark(i + 1 + k);
             out.push_str(b);
         }
+        out.mark(i);
         out.push_str(header_indent);
         out.push_str("let ");
         out.push_str(name);
@@ -6612,7 +6833,7 @@ pub fn expand_multiline_guards(source: &str) -> String {
         i = j;
     }
 
-    out
+    out.finish()
 }
 
 /// Split `NAME = EXPR` on the first `=` outside brackets, returning
@@ -6679,20 +6900,28 @@ fn split_guard_name_equals_expr(s: &str) -> Option<(&str, &str)> {
 ///   header. A bare `else:` (no binding name) defaults the error variable
 ///   name to `_err`.
 pub fn expand_with_chains(source: &str) -> String {
-    let mut out = String::with_capacity(source.len());
+    expand_with_chains_mapped(source).0
+}
+
+/// [`expand_with_chains`] plus an output-line → input-line table.
+pub fn expand_with_chains_mapped(source: &str) -> (String, Vec<usize>) {
+    let mut out = MappedOut::with_capacity(source.len());
     let mut counter: usize = 0;
-    let mut in_string: Option<StringMode> = None;
     let lines: Vec<&str> = source.split_inclusive('\n').collect();
+    // One mask for the buffer: the outer loop, the chain collector and the
+    // renderer all read the same "does this line begin inside a string"
+    // answer from it, instead of each carrying its own scanner (which is how
+    // the boundary test and the re-indent drifted apart in the first place).
+    let mask = LexMask::new(source);
     let mut i = 0;
 
     while i < lines.len() {
         let line = lines[i];
-        let pre_string = in_string;
+        out.mark(i);
         let raw = line.trim_end_matches(['\n', '\r']);
-        let _code_end = scan_line_code_end(raw, &mut in_string);
 
         // Lines that start inside a triple-quoted string are pure content.
-        if pre_string.is_some() {
+        if mask.line_starts_in_string(i) {
             out.push_str(line);
             i += 1;
             continue;
@@ -6705,22 +6934,11 @@ pub fn expand_with_chains(source: &str) -> String {
 
         if let Some(rest) = body.strip_prefix("with ") {
             if let Some((inline_bindings, first_term)) = parse_inline_with_bindings(rest) {
-                // Re-scan the binding line's string state so the continuation
-                // scanner picks up unfinished triple-quoted strings correctly.
-                let mut state_for_chain = pre_string;
-                let _ = scan_line_code_end(raw, &mut state_for_chain);
-
-                if let Some((chain, consumed, end_state)) = collect_chain(
-                    &lines,
-                    i,
-                    chain_indent,
-                    inline_bindings,
-                    first_term,
-                    state_for_chain,
-                ) {
-                    let rendered = render_chain(&chain, chain_indent, &mut counter);
-                    out.push_str(&rendered);
-                    in_string = end_state;
+                if let Some((chain, consumed)) =
+                    collect_chain(&lines, &mask, i, chain_indent, inline_bindings, first_term)
+                {
+                    let (rendered, rendered_src) = render_chain(&chain, chain_indent, &mut counter);
+                    out.push_mapped(&rendered, &rendered_src);
                     i += consumed;
                     continue;
                 }
@@ -6734,10 +6952,12 @@ pub fn expand_with_chains(source: &str) -> String {
     // `with`-chain lowering uses the shadow-resistant `__typhon_Err__`
     // alias for the isinstance check (FINDINGS #104). Inject the
     // aliasing import once if any rewrite was made.
-    if out.contains("__typhon_Err__") {
-        prepend_typhon_err_alias_import(out)
+    let needs_alias = out.as_str().contains("__typhon_Err__");
+    let (text, map) = out.finish();
+    if needs_alias {
+        prepend_typhon_err_alias_import_mapped(text, map)
     } else {
-        out
+        (text, map)
     }
 }
 
@@ -6748,6 +6968,9 @@ struct WithBinding {
     target: String,
     /// The Result-typed expression on the right (without the trailing `?`).
     expr: String,
+    /// 0-based source line the binding was written on. Filled in by
+    /// [`collect_chain`], which is the only place that knows line numbers.
+    src_line: usize,
 }
 
 #[derive(Debug)]
@@ -6756,12 +6979,25 @@ struct WithChain {
     /// Body lines that run after every binding has unwrapped to its `Ok` value.
     /// Each entry is a verbatim line including its trailing newline.
     body: Vec<String>,
+    /// Parallel to `body`: whether that physical line *begins* inside a
+    /// triple-quoted string, and so must be emitted byte-for-byte instead of
+    /// re-indented. Recorded by [`collect_chain`] from the shared
+    /// [`LexMask`] — the same fact the boundary test used, so the two cannot
+    /// disagree.
+    body_in_string: Vec<bool>,
+    /// 0-based source line index of `body[0]`; the rest follow consecutively.
+    body_start: usize,
+    /// 0-based source line index of `else_body[0]`, when there is one.
+    else_body_start: usize,
     /// The error-binding identifier supplied in `else <name>:`, or `None` for
     /// a default-propagating chain. A bare `else:` records `Some("_err")`.
     err_var: Option<String>,
     /// Body lines for the else branch, with the chain's base indentation
     /// removed (so each line starts at indent zero relative to the chain).
     else_body: Vec<String>,
+    /// Parallel to `else_body`, same meaning as `body_in_string`. Used to
+    /// keep [`rename_whole_word`] off lines that are string content.
+    else_in_string: Vec<bool>,
 }
 
 /// Parse one or more inline `name = expr?,` bindings followed by a final
@@ -6869,35 +7105,42 @@ fn parse_with_binding(s: &str) -> Option<(WithBinding, char)> {
         WithBinding {
             target: target.to_owned(),
             expr: expr.to_owned(),
+            src_line: 0,
         },
         term,
     ))
 }
 
-/// Collect a `with`-chain that starts at `lines[start]`. Returns the chain,
-/// the number of consumed lines, and the resulting triple-quoted-string state.
+/// Collect a `with`-chain that starts at `lines[start]`. Returns the chain
+/// and the number of consumed lines.
+///
+/// Every "is this line inside a string?" question — the continuation scan,
+/// the body boundary, the `else` header probe — is answered by the shared
+/// [`LexMask`], so the collector and [`render_chain`] agree by construction.
 ///
 /// Returns `None` (and consumes no lines) if the construct is malformed —
 /// the caller will then emit the source unchanged so the underlying parser
 /// can surface the syntax error with full context.
 fn collect_chain(
     lines: &[&str],
+    mask: &LexMask,
     start: usize,
     chain_indent: &str,
     inline_bindings: Vec<WithBinding>,
     first_term: char,
-    initial_string_state: Option<StringMode>,
-) -> Option<(WithChain, usize, Option<StringMode>)> {
+) -> Option<(WithChain, usize)> {
     let mut bindings = inline_bindings;
+    // Bindings parsed off the `with` header itself all live on that line.
+    for binding in &mut bindings {
+        binding.src_line = start;
+    }
     let mut idx = start + 1;
     let mut term = first_term;
-    let mut in_string = initial_string_state;
 
     // Collect continuation binding lines while the previous terminator was `,`.
     while term == ',' && idx < lines.len() {
         let line = lines[idx];
         let raw = line.trim_end_matches(['\n', '\r']);
-        let _ = scan_line_code_end(raw, &mut in_string);
 
         let indent_len = raw.find(|c: char| !c.is_whitespace()).unwrap_or(raw.len());
         let line_indent = &raw[..indent_len];
@@ -6906,7 +7149,8 @@ fn collect_chain(
             return None;
         }
         let body = &raw[indent_len..];
-        let (binding, t) = parse_with_binding(body)?;
+        let (mut binding, t) = parse_with_binding(body)?;
+        binding.src_line = idx;
         bindings.push(binding);
         term = t;
         idx += 1;
@@ -6918,23 +7162,29 @@ fn collect_chain(
 
     // The success body: every line whose indent exceeds the chain's. Strip the
     // chain indent from each line so the caller can re-indent uniformly.
+    let body_start = idx;
     let mut body = Vec::new();
+    let mut body_in_string = Vec::new();
     while idx < lines.len() {
         let line = lines[idx];
         let raw = line.trim_end_matches(['\n', '\r']);
-        if raw.trim().is_empty() {
-            // Pass blank lines through verbatim.
-            let _ = scan_line_code_end(raw, &mut in_string);
-            body.push(line.to_string());
-            idx += 1;
-            continue;
+        // A line that *begins* inside a triple-quoted string is string
+        // content: its leading whitespace is data, not layout, so the indent
+        // test below must not run on it. Without this guard a `"""` block in
+        // the body whose text starts at column 0 read as a dedent, ended the
+        // block early, and the rest of the real body surfaced as a bogus
+        // `tyc::parse` "unexpected indentation" — a valid program rejected.
+        // The same flag is handed to `render_chain`, so the boundary test and
+        // the re-indent can never disagree about which lines are content.
+        let starts_in_string = mask.line_starts_in_string(idx);
+        if !starts_in_string && !raw.trim().is_empty() {
+            let indent_len = raw.find(|c: char| !c.is_whitespace()).unwrap_or(raw.len());
+            if indent_len <= chain_indent.len() {
+                break;
+            }
         }
-        let indent_len = raw.find(|c: char| !c.is_whitespace()).unwrap_or(raw.len());
-        if indent_len <= chain_indent.len() {
-            break;
-        }
-        let _ = scan_line_code_end(raw, &mut in_string);
         body.push(line.to_string());
+        body_in_string.push(starts_in_string);
         idx += 1;
     }
     if body.is_empty() {
@@ -6948,7 +7198,12 @@ fn collect_chain(
     // mistake.
     let mut err_var = None;
     let mut else_body = Vec::new();
-    if idx < lines.len() {
+    let mut else_in_string = Vec::new();
+    let mut else_body_start = idx;
+    if idx < lines.len() && !mask.line_starts_in_string(idx) {
+        // The `!line_starts_in_string` guard matters: a physical line of
+        // string content reading `    else foo:` used to be consumed as a
+        // real `else err:` header, splitting the literal.
         let line = lines[idx];
         let raw = line.trim_end_matches(['\n', '\r']);
         let indent_len = raw.find(|c: char| !c.is_whitespace()).unwrap_or(raw.len());
@@ -6966,23 +7221,20 @@ fn collect_chain(
             } else {
                 parse_else_var(header)?
             });
-            let _ = scan_line_code_end(raw, &mut in_string);
             idx += 1;
+            else_body_start = idx;
             while idx < lines.len() {
                 let l = lines[idx];
                 let r = l.trim_end_matches(['\n', '\r']);
-                if r.trim().is_empty() {
-                    let _ = scan_line_code_end(r, &mut in_string);
-                    else_body.push(l.to_string());
-                    idx += 1;
-                    continue;
+                let starts_in_string = mask.line_starts_in_string(idx);
+                if !starts_in_string && !r.trim().is_empty() {
+                    let ind = r.find(|c: char| !c.is_whitespace()).unwrap_or(r.len());
+                    if ind <= chain_indent.len() {
+                        break;
+                    }
                 }
-                let ind = r.find(|c: char| !c.is_whitespace()).unwrap_or(r.len());
-                if ind <= chain_indent.len() {
-                    break;
-                }
-                let _ = scan_line_code_end(r, &mut in_string);
                 else_body.push(l.to_string());
+                else_in_string.push(starts_in_string);
                 idx += 1;
             }
             if else_body.is_empty() {
@@ -6996,11 +7248,14 @@ fn collect_chain(
         WithChain {
             bindings,
             body,
+            body_in_string,
+            body_start,
+            else_body_start,
             err_var,
             else_body,
+            else_in_string,
         },
         consumed,
-        in_string,
     ))
 }
 
@@ -7041,141 +7296,38 @@ fn parse_else_var(header: &str) -> Option<String> {
 /// Replace every whole-word occurrence of `from` with `to` in `line`,
 /// respecting Python identifier boundaries (a leading or trailing
 /// alphanumeric / underscore character disqualifies the match) **and**
-/// skipping over content inside regular string literals and `#`
-/// comments so the substitution can't corrupt user-visible text like
-/// `log.error("err occurred")` when renaming a synthesised `err`
-/// binding.
+/// skipping over content inside string literals and `#` comments so the
+/// substitution can't corrupt user-visible text like
+/// `log.error("err occurred")` when renaming a synthesised `err` binding.
 ///
-/// F-string interpolations (`f"... {EXPR} ..."`) are walked as code:
-/// the literal portions are left alone, but `{ ... }` expressions are
-/// rescanned so the identifier `err` inside `f"{err.field}"` is
-/// renamed exactly as it would be at top level. The scanner only
-/// handles single-line forms (matching the call site, which runs on
-/// already-line-split text from the `else err:` body).
+/// The lexical decision is the shared [`LexMask`]'s, not a private copy:
+/// [`LexMask::is_code`] treats an f-string replacement field
+/// (`f"… {EXPR} …"`) as the expression it is, so `err` inside
+/// `f"{err.field}"` is renamed exactly as it would be at top level while the
+/// literal portions around it are left alone. Nested quotes inside a field,
+/// `{{` / `}}` escapes, and a `{` nested within a field (a dict display, or
+/// a `:{width}` format spec) all fall out of the same scan.
 fn rename_whole_word(line: &str, from: &str, to: &str) -> String {
     if from.is_empty() || !line.contains(from) {
         return line.to_owned();
     }
+    let mask = LexMask::new(line);
     let bytes = line.as_bytes();
     let from_bytes = from.as_bytes();
     let mut out = String::with_capacity(line.len());
     let mut i = 0usize;
-    /// Per-active-string state used to flip between literal-text and
-    /// interpolation modes correctly for f-strings.
-    #[derive(Clone, Copy)]
-    struct StrState {
-        quote: u8,
-        /// `true` when this string opened with `f"` / `f'` (or any
-        /// case-insensitive prefix containing `f`). Drives the `{` →
-        /// interpolation transition.
-        is_fstring: bool,
-        /// `true` once we've stepped into a `{ ... }` block. While
-        /// set, the scanner treats characters as code, recursing on
-        /// nested strings as needed.
-        in_interp: bool,
-    }
-    let mut stack: Vec<StrState> = Vec::new();
     while i < bytes.len() {
-        let b = bytes[i];
-        if let Some(top) = stack.last().copied() {
-            if top.in_interp {
-                // Inside `f"... { CODE }"` we treat characters as code,
-                // recursing on nested string opens, and closing the
-                // interpolation on the matching `}` at depth 0 of the
-                // current interpolation. Track a local paren-style
-                // depth for `{ }` so dict literals inside the
-                // interpolation don't terminate it early.
-                match b {
-                    b'}' => {
-                        // Close the interpolation, fall back to string
-                        // literal mode.
-                        out.push('}');
-                        i += 1;
-                        if let Some(last) = stack.last_mut() {
-                            last.in_interp = false;
-                        }
-                        continue;
-                    }
-                    b'"' | b'\'' => {
-                        // Nested string literal inside the
-                        // interpolation. Push a fresh frame; the
-                        // outer f-string stays on the stack so we
-                        // return to it when this one closes.
-                        let is_fstring = is_fstring_prefix(bytes, i);
-                        stack.push(StrState {
-                            quote: b,
-                            is_fstring,
-                            in_interp: false,
-                        });
-                        out.push(b as char);
-                        i += 1;
-                        continue;
-                    }
-                    _ => {
-                        // Code byte — fall through to the bottom
-                        // matcher so identifier renaming applies.
-                    }
-                }
-            } else {
-                // Inside a literal portion of a string. Honour escapes
-                // and watch for the closing quote / f-string `{`.
-                if b == b'\\' && i + 1 < bytes.len() {
-                    let end = (i + 2).min(bytes.len());
-                    out.push_str(&line[i..end]);
-                    i = end;
-                    continue;
-                }
-                if b == top.quote {
-                    stack.pop();
-                    out.push(b as char);
-                    i += 1;
-                    continue;
-                }
-                if top.is_fstring && b == b'{' {
-                    // f-string interpolation opens. `{{` is a literal
-                    // brace — handle by checking the next byte.
-                    if bytes.get(i + 1) == Some(&b'{') {
-                        out.push_str("{{");
-                        i += 2;
-                        continue;
-                    }
-                    out.push('{');
-                    i += 1;
-                    if let Some(last) = stack.last_mut() {
-                        last.in_interp = true;
-                    }
-                    continue;
-                }
-                // Plain literal byte — preserve UTF-8.
-                let ch_len = utf8_char_len(bytes, i);
-                out.push_str(&line[i..i + ch_len]);
-                i += ch_len;
-                continue;
-            }
-        }
-        // Top-level (or interpolation-code) byte.
-        if b == b'#' {
-            // Comment to end of line — copy verbatim.
-            out.push_str(&line[i..]);
-            break;
-        }
-        if b == b'"' || b == b'\'' {
-            let is_fstring = is_fstring_prefix(bytes, i);
-            stack.push(StrState {
-                quote: b,
-                is_fstring,
-                in_interp: false,
-            });
-            out.push(b as char);
-            i += 1;
-            continue;
-        }
-        // Word match in code position.
-        if i + from_bytes.len() <= bytes.len() && &bytes[i..i + from_bytes.len()] == from_bytes {
+        if mask.is_code(i)
+            && i + from_bytes.len() <= bytes.len()
+            && &bytes[i..i + from_bytes.len()] == from_bytes
+        {
             let before_ok = i == 0 || !is_ident_continuation(bytes[i - 1]);
             let after_ok = i + from_bytes.len() == bytes.len()
                 || !is_ident_continuation(bytes[i + from_bytes.len()]);
-            if before_ok && after_ok {
+            // Every byte of the match must be code too: a name that starts in
+            // a replacement field and runs past its closing brace is not one.
+            let all_code = (i..i + from_bytes.len()).all(|k| mask.is_code(k));
+            if before_ok && after_ok && all_code {
                 out.push_str(to);
                 i += from_bytes.len();
                 continue;
@@ -7189,36 +7341,6 @@ fn rename_whole_word(line: &str, from: &str, to: &str) -> String {
         i += ch_len;
     }
     out
-}
-
-/// Return `true` when the quote byte at `bytes[i]` is preceded by a
-/// string-prefix that includes `f` / `F` (`f"..."`, `Rf"..."`, etc.).
-/// We scan backwards over the legal Python prefix bytes (`f`, `F`, `r`,
-/// `R`, `b`, `B`, `u`, `U`) — order doesn't matter, but `b`/`B` makes
-/// the string non-f. We only require that an `f`/`F` is present.
-fn is_fstring_prefix(bytes: &[u8], quote_idx: usize) -> bool {
-    let mut j = quote_idx;
-    let mut has_f = false;
-    let mut has_b = false;
-    while j > 0 {
-        let prev = bytes[j - 1];
-        if prev == b'f' || prev == b'F' {
-            has_f = true;
-            j -= 1;
-            continue;
-        }
-        if prev == b'r' || prev == b'R' || prev == b'u' || prev == b'U' {
-            j -= 1;
-            continue;
-        }
-        if prev == b'b' || prev == b'B' {
-            has_b = true;
-            j -= 1;
-            continue;
-        }
-        break;
-    }
-    has_f && !has_b
 }
 
 /// Length in bytes of the UTF-8 character starting at `bytes[i]`.
@@ -7245,8 +7367,16 @@ fn is_ident_continuation(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
 }
 
-fn render_chain(chain: &WithChain, chain_indent: &str, counter: &mut usize) -> String {
+fn render_chain(
+    chain: &WithChain,
+    chain_indent: &str,
+    counter: &mut usize,
+) -> (String, Vec<usize>) {
     let mut out = String::new();
+    // One entry per rendered line, naming the source line it derives from.
+    // The unwrap ladder belongs to its binding; the success and `else`
+    // bodies keep their own lines.
+    let mut src: Vec<usize> = Vec::new();
 
     // Detect the body's own indent unit (the leading whitespace beyond the
     // chain indent on the first non-blank body line). Fall back to four
@@ -7275,12 +7405,14 @@ fn render_chain(chain: &WithChain, chain_indent: &str, counter: &mut usize) -> S
         let tmp = format!("__typhon_with_{}__", *counter);
         *counter += 1;
 
+        src.push(binding.src_line);
         out.push_str(chain_indent);
         out.push_str(&tmp);
         out.push_str(" = ");
         out.push_str(&binding.expr);
         out.push('\n');
 
+        src.push(binding.src_line);
         out.push_str(chain_indent);
         out.push_str("if isinstance(");
         out.push_str(&tmp);
@@ -7298,17 +7430,30 @@ fn render_chain(chain: &WithChain, chain_indent: &str, counter: &mut usize) -> S
                 // guaranteed unique without interleaving with the
                 // chain's own `__typhon_with_N__` numbering.
                 let unique_err = format!("__typhon_with_err_{}__", *counter - 1);
+                src.push(binding.src_line);
                 out.push_str(&inner_indent);
                 out.push_str("let ");
                 out.push_str(&unique_err);
                 out.push_str(" = ");
                 out.push_str(&tmp);
                 out.push_str(".error\n");
-                for line in &chain.else_body {
-                    out.push_str(&rename_whole_word(line, name, &unique_err));
+                for (k, line) in chain.else_body.iter().enumerate() {
+                    // Each `else_body` entry is one physical line. The body
+                    // is copied into every binding's guard, so each copy
+                    // points back at the one set of lines the user wrote.
+                    src.push(chain.else_body_start + k);
+                    // A line that begins inside a triple-quoted string is
+                    // string content end to end; renaming the user's `err`
+                    // binding inside it would rewrite the literal.
+                    if chain.else_in_string.get(k).copied().unwrap_or(false) {
+                        out.push_str(line);
+                    } else {
+                        out.push_str(&rename_whole_word(line, name, &unique_err));
+                    }
                 }
             }
             _ => {
+                src.push(binding.src_line);
                 out.push_str(&inner_indent);
                 out.push_str("return ");
                 out.push_str(&tmp);
@@ -7321,6 +7466,7 @@ fn render_chain(chain: &WithChain, chain_indent: &str, counter: &mut usize) -> S
         // here, Rule-2's `tyc::missing_binding_kind` would fire on the
         // lowered statement (and the diagnostic would point at the
         // synthesised line rather than the user's `with` source).
+        src.push(binding.src_line);
         out.push_str(chain_indent);
         out.push_str("let ");
         out.push_str(&binding.target);
@@ -7331,8 +7477,20 @@ fn render_chain(chain: &WithChain, chain_indent: &str, counter: &mut usize) -> S
 
     // Success body: strip the unit-indent the `with` header imposed on each
     // line so the statements become siblings of the unwraps.
-    for line in &chain.body {
-        if line.trim().is_empty() {
+    //
+    // A line that *begins* inside a triple-quoted string is exempt: its
+    // leading whitespace is string content, and stripping it silently
+    // changed the value of the literal. A `"""` block in a `with`-chain body
+    // came out of the build with four spaces removed from every line —
+    // consistently, on both the compiled and VM paths, so nothing caught it.
+    // The flags come from `collect_chain`, i.e. from the same shared
+    // [`LexMask`] the body boundary was decided with.
+    for (i, line) in chain.body.iter().enumerate() {
+        src.push(chain.body_start + i);
+        // String content and blank lines are both emitted verbatim, for
+        // different reasons: for a string line the leading whitespace is
+        // data, for a blank line there is none to strip.
+        if chain.body_in_string.get(i).copied().unwrap_or(false) || line.trim().is_empty() {
             out.push_str(line);
         } else if let Some(stripped) = line.strip_prefix(inner_indent.as_str()) {
             out.push_str(chain_indent);
@@ -7345,7 +7503,7 @@ fn render_chain(chain: &WithChain, chain_indent: &str, counter: &mut usize) -> S
         }
     }
 
-    out
+    (out, src)
 }
 
 // ── `gather` block expansion ──────────────────────────────────────────────────
@@ -7386,19 +7544,24 @@ fn render_chain(chain: &WithChain, chain_indent: &str, counter: &mut usize) -> S
 /// blocks (no bindings, mixed body lines, etc.) are emitted unchanged so the
 /// Python parser surfaces a precise error.
 pub fn expand_gather_blocks(source: &str) -> String {
-    let mut out = String::with_capacity(source.len());
+    expand_gather_blocks_mapped(source).0
+}
+
+/// [`expand_gather_blocks`] plus an output-line → input-line table.
+pub fn expand_gather_blocks_mapped(source: &str) -> (String, Vec<usize>) {
+    let mut out = MappedOut::with_capacity(source.len());
     let mut counter: usize = 0;
-    let mut in_string: Option<StringMode> = None;
     let lines: Vec<&str> = source.split_inclusive('\n').collect();
+    // One mask for the buffer; the block collector reads the same one.
+    let mask = LexMask::new(source);
     let mut i = 0;
 
     while i < lines.len() {
         let line = lines[i];
-        let pre = in_string;
+        out.mark(i);
         let raw = line.trim_end_matches(['\n', '\r']);
-        let _ = scan_line_code_end(raw, &mut in_string);
 
-        if pre.is_some() {
+        if mask.line_starts_in_string(i) {
             out.push_str(line);
             i += 1;
             continue;
@@ -7410,14 +7573,12 @@ pub fn expand_gather_blocks(source: &str) -> String {
 
         let parsed = parse_gather_header(body);
         if let Some(strategy) = parsed {
-            let mut block_state = in_string;
-            if let Some((bindings, consumed, end_state)) =
-                collect_gather_bindings(&lines, i, header_indent, &mut block_state)
+            if let Some((bindings, consumed)) =
+                collect_gather_bindings(&lines, &mask, i, header_indent)
             {
-                let rendered =
+                let (rendered, rendered_src) =
                     render_gather_block(&bindings, header_indent, strategy, &mut counter);
-                out.push_str(&rendered);
-                in_string = end_state;
+                out.push_mapped(&rendered, &rendered_src);
                 i += consumed;
                 continue;
             }
@@ -7427,7 +7588,7 @@ pub fn expand_gather_blocks(source: &str) -> String {
         i += 1;
     }
 
-    out
+    out.finish()
 }
 
 /// Gather strategy chosen at the call site.
@@ -7439,9 +7600,26 @@ enum GatherStrategy {
     BestEffort,
 }
 
+/// Return `s` with any trailing `# comment` removed, ignoring a `#` that
+/// appears inside a quoted string.
+///
+/// Thin wrapper over the crate's single lexical scanner
+/// ([`crate::lexmask::scan_line`]).
+fn strip_trailing_comment_outside_strings(s: &str) -> &str {
+    let code_end = scan_line(s, &mut None).code_end;
+    &s[..code_end.min(s.len())]
+}
+
 /// Parse a `gather:` or `gather(strategy="..."):` header line, returning the
 /// chosen strategy when the syntax is well-formed.
 fn parse_gather_header(body: &str) -> Option<GatherStrategy> {
+    // Strip a trailing `# comment`. Every other block header in the language
+    // tolerates one, and Python does; `gather:  # run concurrently` was a hard
+    // `tyc::parse` error purely because this matched the header by exact
+    // string equality. The `#` is only a comment start when it is outside a
+    // string, and the only string a gather header can contain is the
+    // `strategy="…"` literal, so the scan stops at an open quote.
+    let body = strip_trailing_comment_outside_strings(body);
     let trimmed = body.trim_end();
     if trimmed == "gather:" {
         return Some(GatherStrategy::TaskGroup);
@@ -7470,27 +7648,35 @@ fn parse_gather_header(body: &str) -> Option<GatherStrategy> {
 struct GatherBinding {
     name: String,
     expr: String,
+    /// 0-based index of the source line this binding was written on, so the
+    /// lines it lowers to keep pointing at it.
+    src_line: usize,
 }
 
 /// Collect indented `name = expr` bindings under a `gather:` header.
-/// Returns the bindings, the number of lines consumed (header + bindings),
-/// and the resulting triple-quoted-string state.
+/// Returns the bindings and the number of lines consumed (header + bindings).
+///
+/// Block membership is decided against the shared [`LexMask`]: a physical
+/// line that begins inside a triple-quoted string is string content, never a
+/// dedent and never a binding.
 fn collect_gather_bindings(
     lines: &[&str],
+    mask: &LexMask,
     start: usize,
     header_indent: &str,
-    in_string: &mut Option<StringMode>,
-) -> Option<(Vec<GatherBinding>, usize, Option<StringMode>)> {
+) -> Option<(Vec<GatherBinding>, usize)> {
     let mut bindings = Vec::new();
     let mut idx = start + 1;
-    let mut block_state = *in_string;
 
     while idx < lines.len() {
         let line = lines[idx];
         let raw = line.trim_end_matches(['\n', '\r']);
+        if mask.line_starts_in_string(idx) {
+            idx += 1;
+            continue;
+        }
         if raw.trim().is_empty() {
             // Allow blank lines inside the block; they don't add bindings.
-            let _ = scan_line_code_end(raw, &mut block_state);
             idx += 1;
             continue;
         }
@@ -7499,14 +7685,11 @@ fn collect_gather_bindings(
             break;
         }
         let body = &raw[line_indent..];
-        // Use scan_line_code_end (which handles triple-quoted strings and raw
-        // strings) to find where code ends and a comment begins.  Only then
-        // run find_assignment_eq on the comment-free slice so that `=` inside
-        // a comment (e.g. `# note: x = 1`) can never be mistaken for the
-        // assignment operator.  FINDINGS #93 — hardened per review.
-        let mut snap = block_state;
-        let code_end = scan_line_code_end(body, &mut snap);
-        let code = body[..code_end].trim_end();
+        // Where the code ends and a comment begins comes from the shared
+        // mask, so `=` inside a comment (e.g. `# note: x = 1`) can never be
+        // mistaken for the assignment operator.  FINDINGS #93.
+        let code_end = mask.line_code_end(idx).saturating_sub(line_indent);
+        let code = body[..code_end.min(body.len())].trim_end();
         let eq = find_assignment_eq(code)?;
         let name = code[..eq].trim().to_owned();
         // A `gather:` binding holds a *coroutine expression* that is wrapped in
@@ -7520,8 +7703,11 @@ fn collect_gather_bindings(
         if !is_python_ident(&name) {
             return None;
         }
-        bindings.push(GatherBinding { name, expr });
-        let _ = scan_line_code_end(raw, &mut block_state);
+        bindings.push(GatherBinding {
+            name,
+            expr,
+            src_line: idx,
+        });
         idx += 1;
     }
 
@@ -7529,7 +7715,7 @@ fn collect_gather_bindings(
         return None;
     }
     let consumed = idx - start;
-    Some((bindings, consumed, block_state))
+    Some((bindings, consumed))
 }
 
 /// True when binding `b` at position `idx` references the name of any
@@ -7550,10 +7736,20 @@ fn gather_binding_depends_on_earlier(bindings: &[GatherBinding], idx: usize) -> 
     false
 }
 
-/// Scan `expr` for a free occurrence of `name`. Word-boundary check using
-/// Python identifier-character rules; doesn't honour string literals or
-/// nested scopes, but those almost never trigger a false positive on a
-/// gather binding name (which is necessarily a `name = expr` shape).
+/// Scan `expr` for a free occurrence of `name`, in **code** position.
+///
+/// This used to be a raw byte substring scan with no lexical awareness, and
+/// its own doc comment conceded the hole: the four bytes `user` inside
+/// `fetch_posts("user")` counted as a reference to an earlier binding named
+/// `user`, which demoted the whole `gather:` block to sequential `await`s. For
+/// `strategy="best-effort"` that silently inverts the contract — the block is
+/// documented never to raise, and the demoted form propagates the first
+/// failure. The shared [`LexMask`] supplies the missing distinction: an
+/// occurrence inside a string literal or a comment is not a reference, while
+/// one inside an f-string replacement field (`f"{user}"`) still is.
+///
+/// Attribute names after `.` and keyword-argument names are still counted;
+/// over-approximating there only costs concurrency, never correctness.
 fn expr_references_identifier(expr: &str, name: &str) -> bool {
     let bytes = expr.as_bytes();
     let needle = name.as_bytes();
@@ -7561,10 +7757,11 @@ fn expr_references_identifier(expr: &str, name: &str) -> bool {
     if n == 0 || bytes.len() < n {
         return false;
     }
+    let mask = LexMask::new(expr);
     let is_id_char = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
     let mut i = 0;
     while i + n <= bytes.len() {
-        if &bytes[i..i + n] == needle {
+        if &bytes[i..i + n] == needle && (i..i + n).all(|k| mask.is_code(k)) {
             let prev_ok = i == 0 || !is_id_char(bytes[i - 1]);
             let next_ok = i + n == bytes.len() || !is_id_char(bytes[i + n]);
             if prev_ok && next_ok {
@@ -7614,14 +7811,20 @@ fn render_gather_block(
     header_indent: &str,
     strategy: GatherStrategy,
     counter: &mut usize,
-) -> String {
+) -> (String, Vec<usize>) {
     let mut out = String::new();
+    // One entry per rendered line, naming the `.ty` line it came from. The
+    // `gather:` header itself lowers to nothing the user wrote, so its
+    // scaffolding is attributed to the first binding.
+    let mut src: Vec<usize> = Vec::new();
+    let header_src = bindings.first().map(|b| b.src_line).unwrap_or(0);
     // Dependent bindings (b's expr references a's name) cannot be concurrent.
     // Demote to sequential `let x = await expr` so the lowering is at least
     // correct; a future diagnostic could warn that the gather intent was
     // demoted. FINDINGS #60.
     if gather_has_dependent_bindings(bindings) {
         for b in bindings {
+            src.push(b.src_line);
             out.push_str(header_indent);
             out.push_str("let ");
             out.push_str(&b.name);
@@ -7629,12 +7832,13 @@ fn render_gather_block(
             out.push_str(&b.expr);
             out.push('\n');
         }
-        return out;
+        return (out, src);
     }
     match strategy {
         GatherStrategy::TaskGroup => {
             let tg = format!("__typhon_tg_{}__", *counter);
             *counter += 1;
+            src.push(header_src);
             out.push_str(header_indent);
             out.push_str("async with asyncio.TaskGroup() as ");
             out.push_str(&tg);
@@ -7644,6 +7848,7 @@ fn render_gather_block(
             for b in bindings {
                 let task_name = format!("__typhon_gather_{}__", *counter);
                 *counter += 1;
+                src.push(b.src_line);
                 out.push_str(&inner);
                 out.push_str(&task_name);
                 out.push_str(" = ");
@@ -7660,6 +7865,7 @@ fn render_gather_block(
             // the `let` here, the `tyc::missing_binding_kind` Rule-2
             // enforcement would fire on the lowered assignment.
             for (b, task) in bindings.iter().zip(task_names.iter()) {
+                src.push(b.src_line);
                 out.push_str(header_indent);
                 out.push_str("let ");
                 out.push_str(&b.name);
@@ -7671,6 +7877,7 @@ fn render_gather_block(
         GatherStrategy::BestEffort => {
             let results = format!("__typhon_gather_{}__", *counter);
             *counter += 1;
+            src.push(header_src);
             out.push_str(header_indent);
             out.push_str(&results);
             out.push_str(" = await asyncio.gather(");
@@ -7694,6 +7901,7 @@ fn render_gather_block(
             // closest surface form, and that exception only applies to
             // the strict TaskGroup lowering today).
             for (idx, b) in bindings.iter().enumerate() {
+                src.push(b.src_line);
                 out.push_str(header_indent);
                 out.push_str("let ");
                 out.push_str(&b.name);
@@ -7705,7 +7913,7 @@ fn render_gather_block(
             }
         }
     }
-    out
+    (out, src)
 }
 
 // ── `go` spawn expansion ──────────────────────────────────────────────────────
@@ -7729,11 +7937,17 @@ pub fn expand_go_calls(source: &str) -> String {
     // `go fn(` half-line, `parse_go_call` rejects it (no trailing
     // `)`), and the parser later surfaces a confusing error at the
     // callee identifier rather than at the unterminated paren.
-    let joined = join_go_continuations(source);
+    expand_go_calls_mapped(source).0
+}
+
+/// [`expand_go_calls`] plus an output-line → input-line table.
+pub fn expand_go_calls_mapped(source: &str) -> (String, Vec<usize>) {
+    let (joined, join_map) = join_go_continuations(source);
     let source = joined.as_str();
-    let mut out = String::with_capacity(source.len());
+    let mut out = MappedOut::with_capacity(source.len());
     let mut in_string: Option<StringMode> = None;
-    for line in source.split_inclusive('\n') {
+    for (line_index, line) in source.split_inclusive('\n').enumerate() {
+        out.mark(line_index);
         let raw = line.trim_end_matches(['\n', '\r']);
         let terminator = &line[raw.len()..];
         let pre = in_string;
@@ -7775,7 +7989,8 @@ pub fn expand_go_calls(source: &str) -> String {
         }
         out.push_str(line);
     }
-    out
+    let (text, map) = out.finish();
+    (text, compose_line_maps(&map, &join_map))
 }
 
 /// Parse the tail of a `go` line into `(call_expr, Option<handle_name>)`.
@@ -7858,20 +8073,22 @@ fn parse_go_call(rest: &str) -> Option<(String, Option<String>)> {
 ///
 /// Lines that aren't part of a `go ...` continuation are emitted
 /// verbatim, leaving every other parser invariant intact.
-fn join_go_continuations(source: &str) -> String {
-    let mut out = String::with_capacity(source.len());
-    let mut buffered: Option<(String, String)> = None; // (line, original terminator)
+fn join_go_continuations(source: &str) -> (String, Vec<usize>) {
+    let mut out = MappedOut::with_capacity(source.len());
+    // (line, original terminator, index of the first source line folded in)
+    let mut buffered: Option<(String, String, usize)> = None;
     let mut paren_depth: i32 = 0;
     let mut in_string: Option<StringMode> = None;
 
-    let flush = |buffered: &mut Option<(String, String)>, out: &mut String| {
-        if let Some((line, term)) = buffered.take() {
+    let flush = |buffered: &mut Option<(String, String, usize)>, out: &mut MappedOut| {
+        if let Some((line, term, src)) = buffered.take() {
+            out.mark(src);
             out.push_str(&line);
             out.push_str(&term);
         }
     };
 
-    for line in source.split_inclusive('\n') {
+    for (line_index, line) in source.split_inclusive('\n').enumerate() {
         let raw = line.trim_end_matches(['\n', '\r']);
         let terminator = &line[raw.len()..];
 
@@ -7881,6 +8098,7 @@ fn join_go_continuations(source: &str) -> String {
         // Inside a triple-quoted string — flush and emit verbatim.
         if pre_string.is_some() {
             flush(&mut buffered, &mut out);
+            out.mark(line_index);
             out.push_str(line);
             // Recompute paren_depth update for this line — but since
             // we're inside a string literal, parens don't count. The
@@ -7894,20 +8112,20 @@ fn join_go_continuations(source: &str) -> String {
             // text on with a single space so existing tokenisation keeps
             // working.
             let trimmed = raw.trim_start();
-            if let Some((prev_line, prev_term)) = buffered.take() {
+            if let Some((prev_line, prev_term, prev_src)) = buffered.take() {
                 let joined = if trimmed.is_empty() {
                     prev_line
                 } else {
                     format!("{} {}", prev_line, trimmed)
                 };
-                buffered = Some((joined, prev_term));
+                buffered = Some((joined, prev_term, prev_src));
             }
         } else {
             // Flush any prior buffered line (its parens balanced — emit
             // as-is so the existing `go` pass sees the joined form), and
             // start a fresh buffer for this line.
             flush(&mut buffered, &mut out);
-            buffered = Some((raw.to_owned(), terminator.to_owned()));
+            buffered = Some((raw.to_owned(), terminator.to_owned(), line_index));
         }
 
         // Update paren_depth based on this line's raw bytes, skipping
@@ -7942,7 +8160,7 @@ fn join_go_continuations(source: &str) -> String {
         // a `go ...` opener (or a continuation of one). A buffered
         // ordinary line that happens to be unterminated would not be a
         // `go`, so flush it now and reset.
-        if let Some((line, _)) = buffered.as_ref() {
+        if let Some((line, _, _)) = buffered.as_ref() {
             let trimmed = line.trim_start();
             if !trimmed.starts_with("go ") || paren_depth <= 0 {
                 flush(&mut buffered, &mut out);
@@ -7950,7 +8168,7 @@ fn join_go_continuations(source: &str) -> String {
         }
     }
     flush(&mut buffered, &mut out);
-    out
+    out.finish()
 }
 
 // ── `|>` pipe operator expansion ──────────────────────────────────────────────
@@ -7978,15 +8196,22 @@ pub fn expand_pipes(source: &str) -> String {
     // allows operators at the start of a continuation line inside a
     // parenthesised expression (black/ruff format `+`, `and`, `|`
     // that way); `|>` follows the same convention. FINDINGS #52.
-    let joined = join_pipe_continuations(source);
-    expand_pipes_line_by_line(&joined)
+    expand_pipes_mapped(source).0
 }
 
-fn expand_pipes_line_by_line(source: &str) -> String {
-    let mut result = String::with_capacity(source.len());
+/// [`expand_pipes`] plus an output-line → input-line table.
+pub fn expand_pipes_mapped(source: &str) -> (String, Vec<usize>) {
+    let (joined, join_map) = join_pipe_continuations(source);
+    let (text, map) = expand_pipes_line_by_line(&joined);
+    (text, compose_line_maps(&map, &join_map))
+}
+
+fn expand_pipes_line_by_line(source: &str) -> (String, Vec<usize>) {
+    let mut result = MappedOut::with_capacity(source.len());
     let mut in_string: Option<StringMode> = None;
 
-    for line in source.split_inclusive('\n') {
+    for (line_index, line) in source.split_inclusive('\n').enumerate() {
+        result.mark(line_index);
         let pre_string = in_string;
         let raw = line.trim_end_matches(['\n', '\r']);
         // Preserve the original line terminator (LF, CRLF, or bare-EOF) so
@@ -8043,7 +8268,7 @@ fn expand_pipes_line_by_line(source: &str) -> String {
         result.push_str(terminator);
     }
 
-    result
+    result.finish()
 }
 
 /// Recursively expand `|>` operators inside balanced `(...)` groups.
@@ -8153,20 +8378,22 @@ fn expand_pipes_in_subexpressions(code: &str) -> String {
 ///
 /// Lines that begin mid-string (e.g. triple-quoted continuation) are
 /// passed through verbatim so we don't perturb string contents.
-fn join_pipe_continuations(source: &str) -> String {
-    let mut out = String::with_capacity(source.len());
-    let mut buffered: Option<(String, String)> = None; // (line_without_terminator, terminator)
+fn join_pipe_continuations(source: &str) -> (String, Vec<usize>) {
+    let mut out = MappedOut::with_capacity(source.len());
+    // (line_without_terminator, terminator, first source line folded in)
+    let mut buffered: Option<(String, String, usize)> = None;
     let mut paren_depth: i32 = 0;
     let mut in_string: Option<StringMode> = None;
 
-    let flush = |buffered: &mut Option<(String, String)>, out: &mut String| {
-        if let Some((line, term)) = buffered.take() {
+    let flush = |buffered: &mut Option<(String, String, usize)>, out: &mut MappedOut| {
+        if let Some((line, term, src)) = buffered.take() {
+            out.mark(src);
             out.push_str(&line);
             out.push_str(&term);
         }
     };
 
-    for line in source.split_inclusive('\n') {
+    for (line_index, line) in source.split_inclusive('\n').enumerate() {
         let raw = line.trim_end_matches(['\n', '\r']);
         let terminator = &line[raw.len()..];
 
@@ -8179,6 +8406,7 @@ fn join_pipe_continuations(source: &str) -> String {
         // string boundaries.
         if pre_string.is_some() {
             flush(&mut buffered, &mut out);
+            out.mark(line_index);
             out.push_str(line);
             continue;
         }
@@ -8192,18 +8420,18 @@ fn join_pipe_continuations(source: &str) -> String {
 
         if is_pipe_continuation {
             // Merge with the buffered previous line.
-            if let Some((prev_line, prev_term)) = buffered.take() {
+            if let Some((prev_line, prev_term, prev_src)) = buffered.take() {
                 // Drop the terminator on the previous line and the
                 // leading whitespace on this one, joining with a single
                 // space so existing tokenization keeps working.
                 let joined = format!("{} {}", prev_line, trimmed);
-                buffered = Some((joined, prev_term));
+                buffered = Some((joined, prev_term, prev_src));
             }
         } else {
             // Different shape — flush whatever was buffered and start
             // buffering this line in its place.
             flush(&mut buffered, &mut out);
-            buffered = Some((raw.to_owned(), terminator.to_owned()));
+            buffered = Some((raw.to_owned(), terminator.to_owned(), line_index));
         }
 
         // Track parenthesis depth based on the original raw text (the
@@ -8240,7 +8468,7 @@ fn join_pipe_continuations(source: &str) -> String {
         }
     }
     flush(&mut buffered, &mut out);
-    out
+    out.finish()
 }
 
 /// Locate every `|>` token in `code` that sits at parenthesis depth 0 and
@@ -8686,131 +8914,44 @@ fn is_dotted_callable(s: &str) -> bool {
 /// Returns the byte index where the "code" portion ends — the start of a
 /// line comment (`#`) or `line.len()` if there is no comment.
 ///
-/// Single- and double-quoted strings that do not close by the end of the
-/// physical line are reset to `None` (Python syntax error territory anyway).
+/// Thin wrapper over the crate's single lexical scanner
+/// ([`crate::lexmask::scan_line`]); see that module for the rules this
+/// obeys (unterminated single/double-quoted strings reset at end-of-line,
+/// backslash escapes honoured in every string mode, a `#` inside a string
+/// is inert and a quote inside a comment is too).
 fn scan_line_code_end(line: &str, in_string: &mut Option<StringMode>) -> usize {
-    let mut chars = line.char_indices().peekable();
-
-    while let Some((i, c)) = chars.next() {
-        if let Some(mode) = *in_string {
-            match mode {
-                // Single-line strings: handle backslash escapes and closing quote.
-                StringMode::Single | StringMode::Double => {
-                    if c == '\\' {
-                        chars.next(); // skip escaped character
-                        continue;
-                    }
-                    match mode {
-                        StringMode::Single if c == '\'' => *in_string = None,
-                        StringMode::Double if c == '"' => *in_string = None,
-                        _ => {}
-                    }
-                }
-                // Triple-quoted strings: look for the three-char closing sequence.
-                StringMode::TripleSingle | StringMode::TripleDouble => {
-                    let (q, triple) = if matches!(mode, StringMode::TripleSingle) {
-                        ('\'', "'''")
-                    } else {
-                        ('"', "\"\"\"")
-                    };
-                    if c == q && line[i..].starts_with(triple) {
-                        chars.next();
-                        chars.next();
-                        *in_string = None;
-                    }
-                }
-            }
-            continue;
-        }
-
-        // Outside any string.
-        if c == '#' {
-            return i; // rest of line is a comment
-        }
-
-        if c == '"' || c == '\'' {
-            let triple = (c == '"' && line[i..].starts_with("\"\"\""))
-                || (c == '\'' && line[i..].starts_with("'''"));
-            if triple {
-                chars.next();
-                chars.next();
-                *in_string = Some(if c == '"' {
-                    StringMode::TripleDouble
-                } else {
-                    StringMode::TripleSingle
-                });
-            } else {
-                *in_string = Some(if c == '"' {
-                    StringMode::Double
-                } else {
-                    StringMode::Single
-                });
-            }
-        }
-    }
-
-    // A single/double-quoted string that didn't close before end-of-line is
-    // a Python syntax error — reset so subsequent lines parse correctly.
-    if matches!(*in_string, Some(StringMode::Single | StringMode::Double)) {
-        *in_string = None;
-    }
-
-    line.len()
+    scan_line(line, in_string).code_end
 }
 
 /// Find the position of the `=` assignment operator in `s`, ignoring `=`
-/// characters inside parentheses/brackets/strings, comparison operators
-/// (`==`, `!=`, `<=`, `>=`), augmented assignments (`+=`, `-=`, `*=`, `/=`,
-/// `%=`, `&=`, `|=`, `^=`, `**=`, `//=`, `<<=`, `>>=`, `@=`), and the walrus
-/// operator (`:=`).
+/// characters inside parentheses/brackets, string literals, `#` comments and
+/// f-string replacement fields (`f"{count=}"` is a debug specifier, not an
+/// assignment), comparison operators (`==`, `!=`, `<=`, `>=`), augmented
+/// assignments (`+=`, `-=`, `*=`, `/=`, `%=`, `&=`, `|=`, `^=`, `**=`, `//=`,
+/// `<<=`, `>>=`, `@=`), and the walrus operator (`:=`).
+///
+/// The "is this byte code, and how deep are the brackets here" decision comes
+/// from the shared [`LexMask`] rather than a private scanner.
 fn find_assignment_eq(s: &str) -> Option<usize> {
-    let mut depth = 0i32;
-    let mut in_str: Option<char> = None;
-    let chars = s.char_indices();
-
-    for (i, c) in chars {
-        if let Some(q) = in_str {
-            if c == q {
-                in_str = None;
-            }
+    let mask = LexMask::new(s);
+    for (i, c) in s.char_indices() {
+        if c != '=' || !mask.is_structural_code(i) || mask.bracket_depth(i) != 0 {
             continue;
         }
-        match c {
-            '\'' | '"' => in_str = Some(c),
-            '(' | '[' | '{' => depth += 1,
-            ')' | ']' | '}' => depth -= 1,
-            '=' if depth == 0 => {
-                let prev = if i > 0 { s[..i].chars().last() } else { None };
-                let next = s[i + 1..].chars().next();
-                // Reject `==`, `!=`, `<=`, `>=` (comparison; `prev == =` also
-                // covers `===` chains although Python rejects those), and
-                // augmented/walrus operators where `=` is preceded by one of
-                // `+ - * / % & | ^ : @`. (`**=`, `//=`, `<<=`, `>>=` are
-                // caught because their last char before `=` is one of those
-                // single-char operators already.)
-                let is_compound = matches!(
-                    prev,
-                    Some(
-                        '!' | '<'
-                            | '>'
-                            | '='
-                            | '+'
-                            | '-'
-                            | '*'
-                            | '/'
-                            | '%'
-                            | '&'
-                            | '|'
-                            | '^'
-                            | ':'
-                            | '@'
-                    )
-                );
-                if !is_compound && !matches!(next, Some('=')) {
-                    return Some(i);
-                }
-            }
-            _ => {}
+        let prev = s[..i].chars().last();
+        let next = s[i + 1..].chars().next();
+        // Reject `==`, `!=`, `<=`, `>=` (comparison; `prev == =` also
+        // covers `===` chains although Python rejects those), and
+        // augmented/walrus operators where `=` is preceded by one of
+        // `+ - * / % & | ^ : @`. (`**=`, `//=`, `<<=`, `>>=` are
+        // caught because their last char before `=` is one of those
+        // single-char operators already.)
+        let is_compound = matches!(
+            prev,
+            Some('!' | '<' | '>' | '=' | '+' | '-' | '*' | '/' | '%' | '&' | '|' | '^' | ':' | '@')
+        );
+        if !is_compound && !matches!(next, Some('=')) {
+            return Some(i);
         }
     }
     None
@@ -8818,6 +8959,194 @@ fn find_assignment_eq(s: &str) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn enum_body_rewrite_stops_at_a_docstring() {
+        // Every path out of the enum-body block `continue`s, skipping the
+        // string-state update at the bottom of the loop — so a triple quote
+        // opened inside an enum body never registered and each bare word in
+        // the docstring was rewritten to `WORD = enum.auto()` *inside the
+        // string*.
+        let src = "\
+enum Color:
+    \"\"\"
+    Members:
+    RED
+    GREEN
+    \"\"\"
+    RED
+    GREEN
+";
+        let out = preprocess(src).python_source;
+        // The docstring's own `RED` / `GREEN` lines survive untouched…
+        assert!(
+            out.contains("    Members:\n    RED\n    GREEN\n"),
+            "docstring content was rewritten; got:\n{out}"
+        );
+        // …while the real members are still expanded, exactly twice.
+        assert_eq!(
+            out.matches("= enum.auto()").count(),
+            2,
+            "expected exactly the two real members to expand; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn with_chain_body_preserves_string_indentation() {
+        // The body re-indent stripped the chain's unit indent from every
+        // line, including lines that are string *content*, silently changing
+        // the value of the literal on both the compiled and VM paths.
+        let src = "\
+def run() -> Result[str, str]:
+    with x = a()?:
+        let note: str = \"\"\"
+    indented sample
+        deeper sample
+\"\"\"
+        return Ok(note)
+";
+        let out = expand_with_chains(src);
+        assert!(
+            out.contains("\n    indented sample\n        deeper sample\n"),
+            "string content must keep its own indentation; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn with_chain_body_survives_a_column_zero_string_line() {
+        // Indent-only block collection read a `\"\"\"` at column 0 *inside* a
+        // string as a dedent, ended the block early, and the remaining real
+        // body surfaced as a bogus `tyc::parse` error on a valid program.
+        let src = "\
+def run() -> Result[str, str]:
+    with x = a()?:
+        let note: str = \"\"\"
+text
+\"\"\"
+        return Ok(note)
+";
+        let out = expand_with_chains(src);
+        assert!(
+            out.contains("return Ok(note)"),
+            "the body after the string must stay in the chain; got:\n{out}"
+        );
+        assert!(
+            !out.contains("with x = a()?:"),
+            "the chain must have been expanded; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn elif_with_propagating_question_becomes_a_nested_if() {
+        // The lifted `?` guard used to be emitted between the previous `if`
+        // body and the `elif`, so the `elif` reattached to the *generated*
+        // `if isinstance(_, Err)` instead of the user's `if`. The first
+        // branch stopped guarding it and the chain silently took the wrong
+        // arm.
+        let src = "\
+if a == \"\":
+    out = \"empty-a\"
+elif parse(b)? > 10:
+    out = \"big-b\"
+else:
+    out = \"small-b\"
+";
+        let out = expand_compound_question_headers(src);
+        assert!(
+            out.contains("else:") && out.contains("    if parse(b)? > 10:"),
+            "the elif must become an else + nested if; got:\n{out}"
+        );
+        assert!(
+            !out.lines().any(|l| l.trim_start().starts_with("elif ")),
+            "no elif may survive; got:\n{out}"
+        );
+        // The trailing `else` arm must have moved inside the new `else`.
+        assert!(
+            out.contains("        out = \"small-b\""),
+            "the else arm must be re-indented into the new else; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn while_with_propagating_question_re_evaluates_each_iteration() {
+        // The guard used to land *before* the loop, so the fallible
+        // expression ran once and the condition was frozen — a wrong result
+        // or an infinite loop.
+        let src = "\
+while next_val()? < 4:
+    steps = steps + 1
+";
+        let out = expand_compound_question_headers(src);
+        assert!(out.contains("while True:"), "got:\n{out}");
+        assert!(out.contains("    if not (next_val()? < 4):"), "got:\n{out}");
+        assert!(out.contains("        break"), "got:\n{out}");
+    }
+
+    #[test]
+    fn question_and_colon_inside_a_comment_do_not_trigger_a_header_rewrite() {
+        // A `)?` and a `:` inside the trailing comment are prose, not code:
+        // these headers carry no propagating `?` and must come through
+        // byte-identical. The comment-blind probe rewrote the `while` into
+        // `if not (n < limit:  # done (or not)? recheck): yes` — a hard
+        // parse error on a previously-correct program — and silently broke
+        // `while … else:` semantics (the loop only exited via the inserted
+        // `break`, so the `else` arm never ran).
+        for src in [
+            "while n < limit:  # done (or not)? recheck: yes\n    n = n + 1\n",
+            "if a:\n    x = 1\nelif b > 2:  # bigger (or not)? verdict: yes\n    x = 2\n",
+            "while n < 3:  # done? note: check\n    n = n + 1\nelse:\n    done = True\n",
+        ] {
+            assert_eq!(expand_compound_question_headers(src), src, "changed: {src}");
+        }
+    }
+
+    #[test]
+    fn header_comment_with_a_colon_is_carried_over_verbatim() {
+        // A *real* propagating `?` in the condition must split the header at
+        // its code colon, not at a colon inside the trailing comment.
+        let src = "while parse(b)? > 10:  # note: retry\n    n = n + 1\n";
+        let out = expand_compound_question_headers(src);
+        assert!(out.contains("while True:"), "got:\n{out}");
+        assert!(
+            out.contains("    if not (parse(b)? > 10):  # note: retry"),
+            "the comment must survive after the rebuilt header; got:\n{out}"
+        );
+        assert!(out.contains("        break"), "got:\n{out}");
+
+        let src = "if a:\n    x = 1\nelif parse(b)? > 10:  # note: retry\n    x = 2\n";
+        let out = expand_compound_question_headers(src);
+        assert!(
+            out.contains("    if parse(b)? > 10:  # note: retry"),
+            "the elif comment must survive after the rebuilt header; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn compound_headers_without_a_question_are_untouched() {
+        // Only miscompiled programs may change. A condition with no
+        // propagating `?` — including nullable-type sugar — must come
+        // through byte-identical.
+        for src in [
+            "if a:\n    x = 1\nelif b > 2:\n    x = 2\nelse:\n    x = 3\n",
+            "while n < 10:\n    n = n + 1\n",
+            "elif isinstance(v, str):\n    pass\n",
+        ] {
+            assert_eq!(expand_compound_question_headers(src), src, "changed: {src}");
+        }
+    }
+
+    #[test]
+    fn question_inside_a_docstring_does_not_trigger_a_rewrite() {
+        // The scan must not treat text inside a triple-quoted string as code.
+        let src = "\
+def f() -> None:
+    \"\"\"
+    while g()? < 3:
+    \"\"\"
+    pass
+";
+        assert_eq!(expand_compound_question_headers(src), src);
+    }
     use super::*;
 
     #[test]
@@ -8832,7 +9161,7 @@ mod tests {
              from typhon_runtime import Err as __typhon_Err__\n\
              import dataclasses\n\
              pass\n";
-        let out = prepend_typhon_err_alias_import(body.to_owned());
+        let (out, _) = prepend_typhon_err_alias_import_mapped(body.to_owned(), Vec::new());
         assert_eq!(
             out.matches("from typhon_runtime import Err as __typhon_Err__")
                 .count(),
@@ -9803,7 +10132,7 @@ mod tests {
         // The join blanks consumed continuation lines so downstream line
         // indices stay stable.
         let src = "let x: int = f(\n    a\n)?\n";
-        let joined = join_multiline_question_statements(src);
+        let (joined, _) = join_multiline_question_statements(src);
         assert_eq!(
             joined, "let x: int = f( a )?\n\n\n",
             "joined onto the head line with the continuations blanked:\n{joined:?}"
@@ -9814,7 +10143,7 @@ mod tests {
     fn join_multiline_question_leaves_plain_multiline_call_alone() {
         // A multi-line call WITHOUT a trailing `?` is re-emitted verbatim.
         let src = "let x: int = f(\n    a,\n    b,\n)\n";
-        let joined = join_multiline_question_statements(src);
+        let (joined, _) = join_multiline_question_statements(src);
         assert_eq!(joined, src, "no `?` ⇒ no rewrite:\n{joined:?}");
     }
 
@@ -9822,7 +10151,7 @@ mod tests {
     fn join_multiline_question_does_not_fuse_tokens() {
         // Joining with a space keeps `a` and `and` from fusing into `aand`.
         let src = "let x: int = g(\n    a\n    and b\n)?\n";
-        let joined = join_multiline_question_statements(src);
+        let (joined, _) = join_multiline_question_statements(src);
         assert!(
             joined.starts_with("let x: int = g( a and b )?"),
             "tokens must stay separated:\n{joined:?}"
@@ -11902,6 +12231,142 @@ def run() -> Result[str, str]:
         );
     }
 
+    #[test]
+    fn gather_binding_name_inside_a_string_is_not_a_dependency() {
+        // The dependency probe used to be a raw byte substring scan: the four
+        // bytes `user` inside `fetch_posts("user")` counted as a reference to
+        // the earlier `user` binding, demoting the whole block to sequential
+        // awaits. For `strategy="best-effort"` that silently inverts the
+        // documented contract (the block is not supposed to raise).
+        let src = concat!(
+            "async def load() -> None:\n",
+            "    gather:\n",
+            "        user = fetch_user(1)\n",
+            "        posts = fetch_posts(\"user\")\n",
+        );
+        let out = expand_gather_blocks(src);
+        assert!(
+            out.contains("asyncio.TaskGroup"),
+            "block was demoted to sequential awaits: {out}"
+        );
+
+        let best_effort = src.replace("gather:", "gather(strategy=\"best-effort\"):");
+        let out = expand_gather_blocks(&best_effort);
+        assert!(
+            out.contains("return_exceptions=True"),
+            "best-effort strategy was discarded: {out}"
+        );
+    }
+
+    #[test]
+    fn gather_binding_name_in_an_fstring_field_is_still_a_dependency() {
+        // The other half of the same rule: a replacement field is real code,
+        // so the reference there must keep demoting the block.
+        let src = concat!(
+            "async def load() -> None:\n",
+            "    gather:\n",
+            "        user = fetch_user(1)\n",
+            "        posts = fetch_posts(f\"{user}\")\n",
+        );
+        let out = expand_gather_blocks(src);
+        assert!(
+            !out.contains("asyncio.TaskGroup"),
+            "dependent block was lowered concurrently: {out}"
+        );
+    }
+
+    #[test]
+    fn enum_member_rewrite_skips_a_bracket_continuation_line() {
+        // A physical line inside an open bracket is not a statement, so a bare
+        // word on it is an argument — not an enum member.
+        let src = concat!(
+            "enum Color:\n",
+            "    RED = pick(\n",
+            "        GREEN\n",
+            "    )\n",
+            "    BLUE\n",
+        );
+        let out = preprocess(src).python_source;
+        assert!(
+            !out.contains("GREEN = enum.auto()"),
+            "continuation argument rewritten as a member: {out}"
+        );
+        assert!(
+            out.contains("BLUE = enum.auto()"),
+            "real member missed: {out}"
+        );
+    }
+
+    #[test]
+    fn with_chain_else_body_string_content_is_not_renamed() {
+        // The `else err:` body is copied into every guard with the user's
+        // error name renamed to a unique one. A physical line that begins
+        // inside a triple-quoted string is string content end to end, so
+        // renaming inside it rewrites the literal.
+        let src = concat!(
+            "def f() -> Result[int, str]:\n",
+            "    with a = g()?:\n",
+            "        return Ok(a)\n",
+            "    else err:\n",
+            "        note(\"\"\"\n",
+            "err lives here\n",
+            "\"\"\")\n",
+            "        return Err(err)\n",
+        );
+        let out = expand_with_chains(src);
+        assert!(
+            out.contains("err lives here"),
+            "string content was renamed: {out}"
+        );
+        assert!(
+            out.contains("return Err(__typhon_with_err_0__)"),
+            "code occurrence was not renamed: {out}"
+        );
+    }
+
+    #[test]
+    fn with_chain_else_header_inside_a_string_is_not_a_header() {
+        // `    else foo:` appearing as string content used to be consumed as a
+        // real `else err:` header, splitting the literal in half.
+        let src = concat!(
+            "def f() -> Result[int, str]:\n",
+            "    with a = g()?:\n",
+            "        note(\"\"\"\n",
+            "    else foo:\n",
+            "        still string\n",
+            "\"\"\")\n",
+            "        return Ok(a)\n",
+        );
+        let out = expand_with_chains(src);
+        assert!(
+            out.contains("    else foo:\n        still string\n"),
+            "string content was consumed as an else header: {out}"
+        );
+    }
+
+    #[test]
+    fn rename_whole_word_walks_fstring_fields_and_spares_literals() {
+        assert_eq!(
+            rename_whole_word("log(f\"{err.code} err\", err)", "err", "E"),
+            "log(f\"{E.code} err\", E)"
+        );
+        // A dict display nested in a replacement field does not close it.
+        assert_eq!(
+            rename_whole_word("f\"{ {'k': err} } err\"", "err", "E"),
+            "f\"{ {'k': E} } err\""
+        );
+        // `{{` is a literal brace, so what follows is string text.
+        assert_eq!(
+            rename_whole_word("f\"{{err}}\"", "err", "E"),
+            "f\"{{err}}\""
+        );
+        // Comments and plain literals are untouched.
+        assert_eq!(
+            rename_whole_word("x = err  # err here", "err", "E"),
+            "x = E  # err here"
+        );
+    }
+
     // ── go spawn ─────────────────────────────────────────────────────────────
 
     #[test]
@@ -12318,7 +12783,7 @@ impl Tree:
     def depth(self) -> int:
         return 0
 ";
-        let (out, distributed) = expand_impl_sealed_unions(src);
+        let (out, distributed, _) = expand_impl_sealed_unions(src);
         assert!(
             out.contains("impl Leaf:"),
             "expected `impl Leaf:` block; got:\n{out}"
@@ -12366,7 +12831,7 @@ impl[T] Tree[T]:
     def depth(self) -> int:
         return 0
 ";
-        let (out, _distributed) = expand_impl_sealed_unions(src);
+        let (out, _distributed, _) = expand_impl_sealed_unions(src);
         assert!(
             out.contains("impl[T] Leaf[T]:"),
             "expected `impl[T] Leaf[T]:`; got:\n{out}"
@@ -12398,7 +12863,7 @@ impl Foo:
     def bar(self) -> int:
         return 0
 ";
-        let (out, distributed) = expand_impl_sealed_unions(src);
+        let (out, distributed, _) = expand_impl_sealed_unions(src);
         assert_eq!(out, src, "non-alias impl must round-trip unchanged");
         assert!(
             distributed.is_empty(),

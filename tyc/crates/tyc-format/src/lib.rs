@@ -437,19 +437,50 @@ fn normalise_whitespace_with_map(source: &str) -> (String, Vec<usize>) {
     // don't realistically straddle newlines in idiomatic Python.
     let mut paren_depth_carry: i32 = 0;
     for raw_line in source.lines() {
-        // Triple-quoted block: keep raw, but still strip trailing spaces and
-        // expand the leading tabs so indentation matches the file style.
+        // Is this line *string content* — i.e. inside a triple-quoted literal
+        // that opened on an earlier line?
+        //
+        // If so it gets no normalisation whatsoever. This used to "keep raw,
+        // but still strip trailing spaces and expand the leading tabs so
+        // indentation matches the file style", which is not formatting at
+        // all: it edits the *value* of the literal. A `"""` block containing
+        // a tab-indented sample or a line with meaningful trailing spaces came
+        // out of `tyc fmt` with different contents — in the user's own source
+        // file, in place — and out of `tyc build` with a different constant
+        // than the VM had.
+        let starts_inside_triple = in_triple.is_some();
         let (line_owned, exited_triple) = if let Some(q) = in_triple {
             let exited = line_closes_triple_quote(raw_line, q);
-            let l = raw_line.trim_end().to_owned();
-            (l, exited)
+            (raw_line.to_owned(), exited)
         } else {
-            let trimmed = raw_line.trim_end();
+            // The line that *opens* a triple quote carries string content
+            // after the delimiter, so its trailing whitespace is data too.
+            let opens_triple = detect_triple_quote_open(raw_line).is_some();
+            let trimmed = if opens_triple {
+                raw_line
+            } else {
+                raw_line.trim_end()
+            };
             let (rewritten, new_depth) =
                 apply_simple_style_rules_with_paren_depth(trimmed, paren_depth_carry);
             paren_depth_carry = new_depth.max(0);
             (rewritten, false)
         };
+
+        if starts_inside_triple {
+            // Verbatim, and short-circuit every rule below: blank-line
+            // collapsing would eat blank lines out of a docstring, and the
+            // tab expansion at the tail would rewrite its indentation.
+            line_map.push(out_line);
+            result.push_str(&line_owned);
+            result.push('\n');
+            out_line += 1;
+            consecutive_blank = 0;
+            if exited_triple {
+                in_triple = None;
+            }
+            continue;
+        }
 
         if in_triple.is_none() && !exited_triple {
             in_triple = detect_triple_quote_open(&line_owned);
@@ -717,8 +748,15 @@ fn apply_simple_style_rules_with_paren_depth(
                 //   `==` (comparison) — never split, keep tight if user
                 //       wrote `==`, add spaces only when user already
                 //       spaced one side. Leave alone here.
-                //   `:=` (walrus) — handled by the `:` branch swallowing
-                //       the `=` chain; we never see a leading `:`.
+                //   `:=` (walrus) — the `:` branch emits the colon without
+                //       consuming the `=`, so a bare `:` DOES arrive here as
+                //       `prev`. It is listed among the glued operators below.
+                //       (The comment used to claim we never see one, and the
+                //       `:` was missing from that list, so an unparenthesised
+                //       `if n := len(xs):` was rewritten to `if n : = len(xs):`
+                //       — `tyc fmt` destroying a working program in place.
+                //       A *parenthesised* walrus was safe only by accident,
+                //       via the kwarg rule below.)
                 //   `+=` / `-=` / `*=` / `/=` / etc. — augmented assign
                 //       must stay glued to its operator. Detected by
                 //       looking at the previously-emitted char.
@@ -731,7 +769,8 @@ fn apply_simple_style_rules_with_paren_depth(
                 let is_double_eq = matches!(next, Some('='));
                 let is_augmented = matches!(
                     prev,
-                    Some('+')
+                    Some(':')
+                        | Some('+')
                         | Some('-')
                         | Some('*')
                         | Some('/')
@@ -1229,7 +1268,13 @@ pub fn format_file(path: &Path) -> Result<bool, TycError> {
 /// directory, flush it, then `rename` it over the target. Because the temp file
 /// lives on the same filesystem as the target, the rename is atomic, so readers
 /// see either the old or the new content — never a half-written file.
-fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+///
+/// Public so `tyc build` writes its artifacts the same way. A plain
+/// `std::fs::write` truncates first, so an interrupted build left a persistent
+/// **0-byte** `build/main.py` — which CPython runs successfully, with exit 0
+/// and no output. A subsequent build overwrites it, so the failure looks like
+/// "the program silently does nothing" rather than "the build was interrupted".
+pub fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
 
     // Resolve symlinks so we rename over the *real* file. A bare `fs::write`
@@ -1249,7 +1294,7 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     // Unique-enough within a run: fmt processes each path at most once, and the
     // pid disambiguates concurrent `tyc fmt` invocations. (No randomness/clock
     // is available in this crate's environment.)
-    let tmp = dir.join(format!(".{}.tycfmt-{}.tmp", file_name, std::process::id()));
+    let tmp = dir.join(format!(".{}.tyc-{}.tmp", file_name, std::process::id()));
 
     // Scope the handle so it is closed before the rename. `sync_all` (not
     // `flush`, which is a no-op on a bufferless `std::fs::File`) forces the
@@ -1281,6 +1326,63 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn unparenthesised_walrus_survives_formatting() {
+        // `tyc fmt` rewrote `if n := len(xs):` to `if n : = len(xs):`,
+        // destroying a working program in place. The `:` was missing from the
+        // glued-operator set the `=` branch checks, and the comment there
+        // claimed a bare `:` could never arrive — it does. A *parenthesised*
+        // walrus was safe only by accident, through the kwarg rule.
+        for src in [
+            "if n := len(xs):\n    print(n)\n",
+            "while j := step():\n    print(j)\n",
+            "y = (m := 3) + 1\n",
+        ] {
+            let (out, _) = normalise_whitespace_with_map(src);
+            assert!(
+                out.contains(":="),
+                "the walrus must survive formatting; got {out:?}"
+            );
+            assert!(
+                !out.contains(": ="),
+                "the walrus must not be split; got {out:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn annotation_and_assignment_spacing_still_applies() {
+        // The walrus fix must not disable ordinary `:` / `=` spacing.
+        let (out, _) = normalise_whitespace_with_map(
+            "def f(a:int,b:str=\"x\")->int:\n    z:int=a\n    return z\n",
+        );
+        assert!(out.contains("a: int"), "got {out:?}");
+        assert!(out.contains("z: int = a"), "got {out:?}");
+        assert!(out.contains(") -> int:"), "got {out:?}");
+    }
+
+    #[test]
+    fn triple_quoted_string_contents_are_never_reformatted() {
+        // The whitespace pass used to "keep raw, but still strip trailing
+        // spaces and expand the leading tabs" inside a triple-quoted block.
+        // That is not formatting — it edits the value of the literal, in the
+        // user's own source file, in place under `tyc fmt`.
+        let src = "BANNER = \"\"\"\n\tTabbed line\ntrailing spaces here   \n\n\n\nafter three blanks\n\"\"\"\n";
+        let (out, _) = normalise_whitespace_with_map(src);
+        assert!(
+            out.contains("\n\tTabbed line\n"),
+            "a tab inside a string must survive; got {out:?}"
+        );
+        assert!(
+            out.contains("trailing spaces here   \n"),
+            "trailing spaces inside a string must survive; got {out:?}"
+        );
+        assert!(
+            out.contains("\n\n\n\nafter three blanks"),
+            "blank lines inside a string must not be collapsed; got {out:?}"
+        );
+    }
     use super::*;
 
     #[test]

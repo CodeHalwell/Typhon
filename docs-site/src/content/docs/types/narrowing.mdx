@@ -15,7 +15,7 @@ Narrowing applies to:
 - **Union types** — `A | B` narrows to one side after an `isinstance` test.
 - **Sealed unions** — `type Shape = Circle | Rectangle` narrows inside a `match` arm.
 
-It does *not* apply to fields:
+…and to **attribute paths**, which are tracked by path:
 
 ```python
 def f(u: User?) -> str:
@@ -24,16 +24,18 @@ def f(u: User?) -> str:
 
 def g(u: User) -> str:
     if u.email is None: return ""
-    return u.email.upper()  # ⚠️ u.email NOT narrowed (it's a field, may be re-read)
+    return u.email.upper()  # ✅ u.email narrowed to str
 ```
 
-Narrowing only tracks **local bindings**, not fields, indexed access (`xs[0]`), or attribute paths. For those, copy into a local first:
+An attribute narrowing is dropped as soon as the base object could have changed — an assignment to the path or to any prefix of it (`u.email = …`, `u = …`), a method call on the receiver in statement position (`u.refresh()`), or a loop body that reassigns the path. Anything the checker cannot prove stable is widened back rather than trusted.
+
+Indexed access is **not** narrowed — `if xs[0] is not None:` says nothing about the next read of `xs[0]`, because the list can be mutated in between and the index expression can itself change. Copy into a local first:
 
 ```python
-def g(u: User) -> str:
-    let e: str? = u.email
-    if e is None: return ""
-    return e.upper()        # ✅ e narrowed
+def h(xs: list[str?]) -> str:
+    let first: str? = xs[0]
+    if first is None: return ""
+    return first.upper()    # ✅ first narrowed
 ```
 
 ## Narrowing forms

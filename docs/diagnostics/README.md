@@ -81,6 +81,7 @@ straight from a failed build to the corresponding documentation.
 - [`tyc::raise_non_exception`](./raise_non_exception.md) — `raise` operand is provably not a `BaseException` — would crash with `TypeError` at runtime.
 - [`tyc::resource_not_managed`](./resource_not_managed.md) — bare assignment of a context-manager-returning call (`open`, `socket.socket`, `sqlite3.connect`, `tempfile.*`) not wrapped in `with`.
 - [`tyc::result_error_mismatch`](./result_error_mismatch.md) — `?` forwards an `Err` whose type doesn't match the enclosing `Result`.
+- [`tyc::return_in_except_star`](./return_in_except_star.md) — `return` / `break` / `continue` inside an `except*` handler — CPython rejects it at compile time, so the emitted Python would not import.
 - [`tyc::self_outside_impl`](./self_outside_impl.md) — `self` referenced outside an `impl` method body.
 - [`tyc::shared_mut_across_tasks`](./shared_mut_across_tasks.md) — advice (free-threaded targets): a `go`-spawned function writes shared mutable module state — a data race under real concurrency.
 - [`tyc::stdlib_module_shadow`](./stdlib_module_shadow.md) — warning: project `.ty` file's stem matches a Python 3.13 stdlib top-level module name (`types`, `json`, `io`, …) and would intercept stdlib imports on `sys.path`.

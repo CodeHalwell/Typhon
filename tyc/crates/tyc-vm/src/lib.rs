@@ -65,10 +65,15 @@ pub fn run_source(
     // = MODULE` to a plain `import MODULE as ALIAS`, which is the right
     // shape for an in-process VM (no point deferring an import that's
     // about to be evaluated eagerly anyway).
-    let expanded = preprocess::expand_question_ops(&preprocess::expand_pipes(
-        &preprocess::expand_with_chains(&preprocess::expand_go_calls(
-            &preprocess::expand_gather_blocks(&preprocess::expand_multiline_guards(
-                &preprocess::expand_typed_let_unpack(&preprocess::expand_lazy_lets(source)),
+    let expanded = preprocess::expand_question_ops(&preprocess::expand_inline_question_ops(
+        // Shared with the CLI: the VM omitted both of these, so an
+        // inline `?` (`f(g()?)`, `elif h()? > 1:`) failed to parse under
+        // `tyc run` on a program `tyc build` compiles and runs.
+        &preprocess::expand_compound_question_headers(&preprocess::expand_pipes(
+            &preprocess::expand_with_chains(&preprocess::expand_go_calls(
+                &preprocess::expand_gather_blocks(&preprocess::expand_multiline_guards(
+                    &preprocess::expand_typed_let_unpack(&preprocess::expand_lazy_lets(source)),
+                )),
             )),
         )),
     ));
@@ -307,10 +312,15 @@ fn merge_sibling_extensions(
     registry: &mut tyc_analyse::ExtensionRegistry,
     cross_fns: &mut std::collections::HashMap<String, String>,
 ) {
-    let expanded = preprocess::expand_question_ops(&preprocess::expand_pipes(
-        &preprocess::expand_with_chains(&preprocess::expand_go_calls(
-            &preprocess::expand_gather_blocks(&preprocess::expand_multiline_guards(
-                &preprocess::expand_typed_let_unpack(&preprocess::expand_lazy_lets(source)),
+    let expanded = preprocess::expand_question_ops(&preprocess::expand_inline_question_ops(
+        // Shared with the CLI: the VM omitted both of these, so an
+        // inline `?` (`f(g()?)`, `elif h()? > 1:`) failed to parse under
+        // `tyc run` on a program `tyc build` compiles and runs.
+        &preprocess::expand_compound_question_headers(&preprocess::expand_pipes(
+            &preprocess::expand_with_chains(&preprocess::expand_go_calls(
+                &preprocess::expand_gather_blocks(&preprocess::expand_multiline_guards(
+                    &preprocess::expand_typed_let_unpack(&preprocess::expand_lazy_lets(source)),
+                )),
             )),
         )),
     ));
@@ -2579,6 +2589,582 @@ def main() -> None:
         i = i + 1
     if total != 31.25:
         raise ValueError("method slot dispatch wrong")
+
+main()
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    // ── PEP 654 exception groups / `except*` ──────────────────────────────
+    //
+    // Every expected value below was produced by running the equivalent
+    // Python under CPython 3.13 first; the VM is asserted against it.
+
+    /// A bare (non-group) exception caught by `except*` binds an implicit
+    /// `ExceptionGroup('', (exc,))` wrapper, not the exception itself — the
+    /// F7 divergence. CPython 3.13:
+    ///   type(e).__name__ == 'ExceptionGroup'
+    ///   repr(e)          == "ExceptionGroup('', (ValueError('v'),))"
+    ///   e.exceptions     == (ValueError('v'),)
+    ///   e.message        == ''
+    #[test]
+    fn except_star_wraps_a_bare_exception_in_a_group() {
+        let src = r#"
+def main() -> None:
+    mut seen: int = 0
+    try:
+        raise ValueError("v")
+    except* ValueError as e:
+        seen = 1
+        if type(e).__name__ != "ExceptionGroup":
+            raise AssertionError("handler must bind an ExceptionGroup")
+        if repr(e) != "ExceptionGroup('', (ValueError('v'),))":
+            raise AssertionError("wrapper repr wrong: " + repr(e))
+        if len(e.exceptions) != 1 or str(e.exceptions[0]) != "v":
+            raise AssertionError("wrapper members wrong")
+        if e.message != "":
+            raise AssertionError("wrapper message wrong")
+    if seen != 1:
+        raise AssertionError("handler did not run")
+
+main()
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    /// Every matching handler runs — once each — and receives only its own
+    /// members, keeping the group's message. CPython 3.13 prints
+    /// `hV g (ValueError('v'), ValueError('v2'))` then `hT g (TypeError('t'),)`.
+    #[test]
+    fn except_star_runs_each_matching_handler_once_with_its_own_subgroup() {
+        let src = r#"
+def main() -> None:
+    mut v_runs: int = 0
+    mut t_runs: int = 0
+    mut v_count: int = 0
+    try:
+        raise ExceptionGroup("g", [ValueError("v"), TypeError("t"), ValueError("v2")])
+    except* ValueError as e:
+        v_runs = v_runs + 1
+        v_count = len(e.exceptions)
+        if e.message != "g":
+            raise AssertionError("subgroup lost the group message")
+    except* TypeError as e2:
+        t_runs = t_runs + 1
+        if len(e2.exceptions) != 1:
+            raise AssertionError("TypeError subgroup wrong")
+    if v_runs != 1 or t_runs != 1:
+        raise AssertionError("each handler must run exactly once")
+    if v_count != 2:
+        raise AssertionError("ValueError subgroup should hold both members")
+
+main()
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    /// The unmatched remainder is re-raised as a group derived from the
+    /// original (same message), and a plain `except Exception` catches it
+    /// (`ExceptionGroup` derives from `Exception`).
+    #[test]
+    fn except_star_reraises_the_unhandled_remainder() {
+        let src = r#"
+def main() -> None:
+    mut caught: str = ""
+    try:
+        try:
+            raise ExceptionGroup("g", [ValueError("v"), KeyError("k")])
+        except* ValueError as e:
+            if len(e.exceptions) != 1:
+                raise AssertionError("wrong matched subgroup")
+    except Exception as outer:
+        caught = repr(outer)
+    if caught != "ExceptionGroup('g', [KeyError('k')])":
+        raise AssertionError("remainder wrong: " + caught)
+
+main()
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    /// A bare exception that no `except*` handler matches propagates as
+    /// itself — CPython does not leave the implicit wrapper behind.
+    #[test]
+    fn unmatched_bare_exception_propagates_unwrapped() {
+        let src = r#"
+def main() -> None:
+    mut name: str = ""
+    try:
+        try:
+            raise ValueError("v")
+        except* TypeError as e:
+            raise AssertionError("must not match")
+    except ValueError as outer:
+        name = type(outer).__name__ + ":" + str(outer)
+    if name != "ValueError:v":
+        raise AssertionError("bare exception was rewrapped: " + name)
+
+main()
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    /// Splitting recurses through nested groups and preserves their nesting.
+    /// CPython 3.13: the `except* TypeError` handler sees
+    /// `ExceptionGroup('outer', [ExceptionGroup('inner', [TypeError('t')])])`.
+    #[test]
+    fn except_star_split_preserves_nesting() {
+        let src = r#"
+def main() -> None:
+    mut got: str = ""
+    try:
+        raise ExceptionGroup("outer", [ValueError("v"), ExceptionGroup("inner", [TypeError("t")])])
+    except* TypeError as e:
+        got = repr(e)
+    except* ValueError as e2:
+        if repr(e2) != "ExceptionGroup('outer', [ValueError('v')])":
+            raise AssertionError("ValueError side wrong: " + repr(e2))
+    if got != "ExceptionGroup('outer', [ExceptionGroup('inner', [TypeError('t')])])":
+        raise AssertionError("nesting not preserved: " + got)
+
+main()
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    /// Group construction, `str`, `repr`, `.args`, `.exceptions`, `.message`,
+    /// and CPython's `BaseExceptionGroup` -> `ExceptionGroup` auto-downcast.
+    #[test]
+    fn exception_group_value_protocol_matches_cpython() {
+        let src = r#"
+def main() -> None:
+    let one = ExceptionGroup("g", [ValueError("v")])
+    if str(one) != "g (1 sub-exception)":
+        raise AssertionError("str wrong: " + str(one))
+    if repr(one) != "ExceptionGroup('g', [ValueError('v')])":
+        raise AssertionError("repr wrong: " + repr(one))
+    if one.message != "g":
+        raise AssertionError("message wrong")
+    if len(one.args) != 2 or one.args[0] != "g":
+        raise AssertionError("args wrong")
+    let two = ExceptionGroup("g", [ValueError("v"), TypeError("t")])
+    if str(two) != "g (2 sub-exceptions)":
+        raise AssertionError("plural str wrong: " + str(two))
+    # BaseExceptionGroup downcasts when every member is an Exception.
+    let down = BaseExceptionGroup("g", [ValueError("v")])
+    if type(down).__name__ != "ExceptionGroup":
+        raise AssertionError("BaseExceptionGroup did not downcast")
+
+main()
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    /// `except* ExceptionGroup` is a runtime `TypeError` in CPython, with
+    /// this exact message.
+    #[test]
+    fn catching_a_group_type_with_except_star_is_a_type_error() {
+        let src = r#"
+def main() -> None:
+    mut msg: str = ""
+    try:
+        try:
+            raise ExceptionGroup("g", [ValueError("v")])
+        except* ExceptionGroup as e:
+            raise AssertionError("must not run")
+    except TypeError as te:
+        msg = str(te)
+    if msg != "catching ExceptionGroup with except* is not allowed. Use except instead.":
+        raise AssertionError("wrong message: " + msg)
+
+main()
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    /// F5 — a failing `gather:` task surfaces as
+    /// `ExceptionGroup('unhandled errors in a TaskGroup', [...])`, exactly as
+    /// `asyncio.TaskGroup` does under CPython. Before this, the VM raised the
+    /// bare `ValueError` out of `create_task`, so a plain `except ValueError`
+    /// caught it under `tyc run` and the compiled build died uncaught.
+    #[test]
+    fn gather_task_failure_surfaces_as_an_exception_group() {
+        let src = r#"
+import asyncio
+
+@gatherable
+async def fine() -> int:
+    return 1
+
+@gatherable
+async def boom() -> int:
+    raise ValueError("bad")
+
+async def run() -> None:
+    mut caught: str = ""
+    try:
+        gather:
+            a = fine()
+            b = boom()
+    except* ValueError as e:
+        caught = type(e).__name__ + "|" + e.message + "|" + str(len(e.exceptions))
+    if caught != "ExceptionGroup|unhandled errors in a TaskGroup|1":
+        raise AssertionError("gather failure shape wrong: " + caught)
+
+def main() -> None:
+    asyncio.run(run())
+
+main()
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    /// The companion half of F5: a *plain* `except ValueError` around a
+    /// `gather:` must NOT catch the failure — the group does not match it —
+    /// which is exactly what the compiled CPython build does.
+    #[test]
+    fn plain_except_does_not_catch_a_gather_failure() {
+        let src = r#"
+import asyncio
+
+@gatherable
+async def boom() -> int:
+    raise ValueError("bad")
+
+@gatherable
+async def fine() -> int:
+    return 1
+
+async def run() -> None:
+    mut wrong: int = 0
+    mut group: str = ""
+    try:
+        try:
+            gather:
+                a = fine()
+                b = boom()
+        except ValueError as v:
+            wrong = 1
+    except Exception as outer:
+        group = type(outer).__name__
+    if wrong != 0:
+        raise AssertionError("plain except must not catch a TaskGroup failure")
+    if group != "ExceptionGroup":
+        raise AssertionError("expected an ExceptionGroup, got " + group)
+
+def main() -> None:
+    asyncio.run(run())
+
+main()
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    /// `else:` and `finally:` still work on a `try*`, and neither is part of
+    /// the `except*` block.
+    #[test]
+    fn except_star_honours_else_and_finally() {
+        let src = r#"
+def main() -> None:
+    mut trace: str = ""
+    try:
+        trace = trace + "b"
+    except* ValueError as e:
+        trace = trace + "h"
+    else:
+        trace = trace + "e"
+    finally:
+        trace = trace + "f"
+    if trace != "bef":
+        raise AssertionError("else/finally order wrong: " + trace)
+    mut trace2: str = ""
+    try:
+        raise ValueError("v")
+    except* ValueError as e2:
+        trace2 = trace2 + "h"
+    finally:
+        trace2 = trace2 + "f"
+    if trace2 != "hf":
+        raise AssertionError("finally after handler wrong: " + trace2)
+
+main()
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    /// A naked `raise` inside an `except*` handler is a PEP 654 *re-raise*:
+    /// CPython merges the re-raised subgroup back with the unhandled
+    /// remainder, reconstituting the original group. `raise e` of the bound
+    /// subgroup is a *new* raise and keeps the `''`-wrapped shape. Every
+    /// expected repr below is CPython 3.13 output:
+    ///   naked:    ExceptionGroup('g', [ValueError('v'), TypeError('t')])
+    ///   raise e:  ExceptionGroup('', [ExceptionGroup('g', [ValueError('v')]),
+    ///                                 ExceptionGroup('g', [TypeError('t')])])
+    ///   mixed:    ExceptionGroup('', [OSError('new'),
+    ///                                 ExceptionGroup('g', [ValueError('v'), KeyError('k')])])
+    ///   handled+naked: ExceptionGroup('g', [ValueError('v')])
+    #[test]
+    fn except_star_naked_reraise_reconstitutes_the_original_group() {
+        let src = r#"
+def main() -> None:
+    mut got: str = ""
+    try:
+        try:
+            raise ExceptionGroup("g", [ValueError("v"), TypeError("t")])
+        except* ValueError:
+            raise
+    except BaseException as e:
+        got = repr(e)
+    if got != "ExceptionGroup('g', [ValueError('v'), TypeError('t')])":
+        raise AssertionError("naked reraise wrong: " + got)
+
+    mut explicit: str = ""
+    try:
+        try:
+            raise ExceptionGroup("g", [ValueError("v"), TypeError("t")])
+        except* ValueError as ex:
+            raise ex
+    except BaseException as e2:
+        explicit = repr(e2)
+    if explicit != "ExceptionGroup('', [ExceptionGroup('g', [ValueError('v')]), ExceptionGroup('g', [TypeError('t')])])":
+        raise AssertionError("explicit raise-e wrong: " + explicit)
+
+    mut mixed: str = ""
+    try:
+        try:
+            raise ExceptionGroup("g", [ValueError("v"), TypeError("t"), KeyError("k")])
+        except* ValueError:
+            raise
+        except* TypeError:
+            raise OSError("new")
+    except BaseException as e3:
+        mixed = repr(e3)
+    if mixed != "ExceptionGroup('', [OSError('new'), ExceptionGroup('g', [ValueError('v'), KeyError('k')])])":
+        raise AssertionError("mixed reraise/raise wrong: " + mixed)
+
+    mut partial: str = ""
+    try:
+        try:
+            raise ExceptionGroup("g", [ValueError("v"), TypeError("t")])
+        except* ValueError:
+            raise
+        except* TypeError:
+            pass
+    except BaseException as e4:
+        partial = repr(e4)
+    if partial != "ExceptionGroup('g', [ValueError('v')])":
+        raise AssertionError("handled+naked wrong: " + partial)
+
+main()
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    /// `await` on a TaskGroup task that failed must re-raise the task's
+    /// exception — not silently bind `None` and keep executing the body.
+    /// CPython 3.13 terminates the body at that await (via cancellation) and
+    /// `__aexit__` raises
+    /// `ExceptionGroup('unhandled errors in a TaskGroup', [ValueError('boom')])`
+    /// with the error exactly once; the statements after the await never run.
+    #[test]
+    fn await_on_failed_taskgroup_task_raises_instead_of_yielding_none() {
+        let src = r#"
+import asyncio
+
+async def bad() -> int:
+    raise ValueError("boom")
+    return 0
+
+async def body() -> None:
+    async with asyncio.TaskGroup() as tg:
+        let t = tg.create_task(bad())
+        let r: int = await t
+        raise AssertionError("body continued past an await on a failed task")
+
+def main() -> None:
+    mut caught: str = ""
+    try:
+        asyncio.run(body())
+    except Exception as e:
+        caught = repr(e)
+    if caught != "ExceptionGroup('unhandled errors in a TaskGroup', [ValueError('boom')])":
+        raise AssertionError("wrong group: " + caught)
+
+main()
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    /// CPython's `TaskGroup._is_base_error` singles out `KeyboardInterrupt`
+    /// and `SystemExit`: the first one observed is re-raised BARE from
+    /// `__aexit__` (other collected failures dropped), while every other
+    /// failure — a bare `BaseException` included — is wrapped in the group.
+    /// All four shapes verified against CPython 3.13.
+    #[test]
+    fn taskgroup_reraises_keyboard_interrupt_and_system_exit_bare() {
+        let src = r#"
+import asyncio
+
+async def ok() -> int:
+    return 1
+
+async def bad() -> int:
+    raise ValueError("boom")
+    return 0
+
+async def badki() -> int:
+    raise KeyboardInterrupt("k")
+    return 0
+
+async def body_ki() -> None:
+    async with asyncio.TaskGroup() as tg:
+        let t = tg.create_task(ok())
+        raise KeyboardInterrupt("body")
+
+async def child_ki() -> None:
+    async with asyncio.TaskGroup() as tg:
+        let t = tg.create_task(badki())
+
+async def body_exit() -> None:
+    async with asyncio.TaskGroup() as tg:
+        let t = tg.create_task(ok())
+        raise SystemExit(3)
+
+async def base_stays_grouped() -> None:
+    async with asyncio.TaskGroup() as tg:
+        let t = tg.create_task(ok())
+        raise BaseException("b")
+
+async def child_error_then_ki() -> None:
+    async with asyncio.TaskGroup() as tg:
+        let t1 = tg.create_task(bad())
+        let t2 = tg.create_task(badki())
+
+def main() -> None:
+    mut got: str = ""
+    try:
+        asyncio.run(body_ki())
+    except KeyboardInterrupt as e:
+        got = repr(e)
+    if got != "KeyboardInterrupt('body')":
+        raise AssertionError("body KI not re-raised bare: " + got)
+
+    mut child: str = ""
+    try:
+        asyncio.run(child_ki())
+    except KeyboardInterrupt as e2:
+        child = repr(e2)
+    if child != "KeyboardInterrupt('k')":
+        raise AssertionError("child KI not re-raised bare: " + child)
+
+    mut se: str = ""
+    try:
+        asyncio.run(body_exit())
+    except SystemExit as e3:
+        se = repr(e3)
+    if se != "SystemExit(3)":
+        raise AssertionError("SystemExit not re-raised bare: " + se)
+
+    mut base: str = ""
+    try:
+        asyncio.run(base_stays_grouped())
+    except BaseException as e4:
+        base = repr(e4)
+    if base != "BaseExceptionGroup('unhandled errors in a TaskGroup', [BaseException('b')])":
+        raise AssertionError("BaseException must stay in the group: " + base)
+
+    mut first: str = ""
+    try:
+        asyncio.run(child_error_then_ki())
+    except KeyboardInterrupt as e5:
+        first = repr(e5)
+    if first != "KeyboardInterrupt('k')":
+        raise AssertionError("KI must win over the group: " + first)
+
+main()
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    /// Splitting a mixed `BaseExceptionGroup` re-derives each side through
+    /// `BaseExceptionGroup.__new__`, so the matched side downcasts to
+    /// `ExceptionGroup` when its members are all ordinary `Exception`s —
+    /// making `isinstance(e, Exception)` true inside the handler. The
+    /// constructor enforces the same member rule: an `ExceptionGroup` cannot
+    /// hold a nested `BaseExceptionGroup`, and a `BaseExceptionGroup` with
+    /// one stays base. All verified against CPython 3.13.
+    #[test]
+    fn except_star_split_downcasts_matched_side_to_exception_group() {
+        let src = r#"
+def main() -> None:
+    mut matched: str = ""
+    mut rest: str = ""
+    try:
+        try:
+            raise BaseExceptionGroup("g", [ValueError("v"), KeyboardInterrupt("k")])
+        except* ValueError as e:
+            matched = type(e).__name__ + "|" + repr(e) + "|" + str(isinstance(e, Exception))
+    except BaseException as r:
+        rest = type(r).__name__ + "|" + repr(r)
+    if matched != "ExceptionGroup|ExceptionGroup('g', [ValueError('v')])|True":
+        raise AssertionError("matched side wrong: " + matched)
+    if rest != "BaseExceptionGroup|BaseExceptionGroup('g', [KeyboardInterrupt('k')])":
+        raise AssertionError("rest side wrong: " + rest)
+
+    let inner = BaseExceptionGroup("i", [KeyboardInterrupt("k")])
+    mut nested: str = ""
+    try:
+        let outer = ExceptionGroup("o", [inner])
+        nested = "constructed"
+    except TypeError as te:
+        nested = str(te)
+    if nested != "Cannot nest BaseExceptions in an ExceptionGroup":
+        raise AssertionError("nesting rule wrong: " + nested)
+    let outer2 = BaseExceptionGroup("o", [inner])
+    if type(outer2).__name__ != "BaseExceptionGroup":
+        raise AssertionError("group holding a BaseExceptionGroup must stay base")
+
+main()
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    /// CPython's `ADJUST_INDICES` never clamps a positive `start` down to
+    /// `len`, so a start beyond the string (or an inverted range) is
+    /// no-match territory even for an empty needle: `"abc".find("", 4)` is
+    /// `-1`, `"abc".startswith("", 5)` is `False`, `"abc".count("", 2, 1)`
+    /// is `0`, `"abc".index("", 4)` raises. All verified against 3.13.
+    #[test]
+    fn str_search_start_beyond_len_matches_cpython() {
+        let src = r#"
+def main() -> None:
+    let s: str = "abc"
+    if s.find("", 4) != -1 or s.find("", 3) != 3 or s.find("", 5) != -1:
+        raise AssertionError("find empty needle beyond len wrong")
+    if s.rfind("", 4) != -1 or s.rfind("", 3) != 3:
+        raise AssertionError("rfind empty needle beyond len wrong")
+    if s.startswith("", 5) or not s.startswith("", 3):
+        raise AssertionError("startswith empty needle beyond len wrong")
+    if s.endswith("", 4) or not s.endswith("", 3):
+        raise AssertionError("endswith empty needle beyond len wrong")
+    if s.count("", 4) != 0 or s.count("", 3) != 1 or s.count("", 0) != 4:
+        raise AssertionError("count empty needle beyond len wrong")
+    if s.find("", 2, 1) != -1 or s.count("", 2, 1) != 0:
+        raise AssertionError("inverted range must not match an empty needle")
+    if s.startswith("", 2, 1) or s.endswith("", 2, 1):
+        raise AssertionError("inverted range startswith/endswith wrong")
+    if s.find("", -10) != 0 or s.rfind("", -10) != 3:
+        raise AssertionError("negative start clamps to 0")
+    let e: str = ""
+    if e.find("", 0) != 0 or e.find("", 1) != -1 or e.startswith("", 1) or e.count("", 1) != 0:
+        raise AssertionError("empty string beyond-len searches wrong")
+    mut raised: str = ""
+    try:
+        let x: int = s.index("", 4)
+    except ValueError as ve:
+        raised = str(ve)
+    if raised != "substring not found":
+        raise AssertionError("index beyond len must raise: " + raised)
 
 main()
 "#;

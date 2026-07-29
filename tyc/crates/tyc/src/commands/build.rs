@@ -23,9 +23,14 @@ use tyc_diagnostics::{Diagnostics, TycError};
 use tyc_emit::{emit_python_with_source_for_target, emit_stub};
 use tyc_format::format_source;
 use tyc_syntax::preprocess::{
-    expand_gather_blocks, expand_go_calls, expand_inline_question_ops, expand_lazy_imports,
-    expand_lazy_lets, expand_multiline_guards, expand_pipes, expand_question_ops,
-    expand_typed_let_unpack, expand_with_chains, line_byte_starts, preprocess, LazyImport,
+    compose_line_maps, expand_compound_question_headers, expand_compound_question_headers_mapped,
+    expand_gather_blocks, expand_gather_blocks_mapped, expand_go_calls, expand_go_calls_mapped,
+    expand_inline_question_ops, expand_inline_question_ops_mapped, expand_lazy_imports,
+    expand_lazy_imports_mapped, expand_lazy_lets_mapped, expand_multiline_guards,
+    expand_multiline_guards_mapped, expand_pipes, expand_pipes_mapped, expand_question_ops,
+    expand_question_ops_mapped, expand_typed_let_unpack, expand_typed_let_unpack_mapped,
+    expand_with_chains, expand_with_chains_mapped, line_byte_starts, preprocess, preprocess_mapped,
+    LazyImport,
 };
 
 use crate::commands::util::{
@@ -452,11 +457,13 @@ pub fn run(args: BuildArgs) -> Result<()> {
         if stem == "__init__" {
             continue;
         }
-        let expanded = expand_question_ops(&expand_inline_question_ops(&expand_pipes(
-            &expand_with_chains(&expand_go_calls(&expand_gather_blocks(
-                &expand_multiline_guards(&expand_lazy_imports(&expand_typed_let_unpack(source))),
+        let expanded = expand_question_ops(&expand_inline_question_ops(
+            &expand_compound_question_headers(&expand_pipes(&expand_with_chains(
+                &expand_go_calls(&expand_gather_blocks(&expand_multiline_guards(
+                    &expand_lazy_imports(&expand_typed_let_unpack(source)),
+                ))),
             ))),
-        )));
+        ));
         let prep = preprocess(&expanded);
         if prep.pub_names.is_empty() {
             continue;
@@ -499,20 +506,36 @@ pub fn run(args: BuildArgs) -> Result<()> {
         // recorded aliases drive the post-emit rewrite to native PEP 810
         // syntax further down. (This mirrors the VM / check paths, which
         // already use `expand_lazy_lets` + the `import … as …` rewrite.)
-        let lazy_expanded = if native_lazy_imports {
-            expand_lazy_lets(&expand_typed_let_unpack(source))
+        //
+        // Each pass is run through its `*_mapped` sibling and the resulting
+        // `output line -> input line` tables are folded together, so we come
+        // out of the chain holding a `preprocessed line -> .ty line` table.
+        // Without it the `.py.map` sidecar written below would record line
+        // numbers from the preprocessed buffer while claiming they are `.ty`
+        // lines — wrong for every file using `?`, `gather:`, a `with`-chain,
+        // `rescue`, pipes, or a typed unpack.
+        let mut stage = expand_typed_let_unpack_mapped(source);
+        if native_lazy_imports {
+            chain_step(&mut stage, expand_lazy_lets_mapped);
         } else {
-            expand_lazy_imports(&expand_typed_let_unpack(source))
-        };
+            chain_step(&mut stage, expand_lazy_imports_mapped);
+        }
+        chain_step(&mut stage, expand_multiline_guards_mapped);
+        chain_step(&mut stage, expand_gather_blocks_mapped);
+        chain_step(&mut stage, expand_go_calls_mapped);
+        chain_step(&mut stage, expand_with_chains_mapped);
+        chain_step(&mut stage, expand_pipes_mapped);
+        chain_step(&mut stage, expand_compound_question_headers_mapped);
         // The inline `?` pass runs before the end-of-line `?` pass so
         // `Ok(f(x)?)`-shaped sub-expressions get lifted into temps
         // first. O17 / FINDINGS #66 / R3.13 / E9.
-        let expanded = expand_question_ops(&expand_inline_question_ops(&expand_pipes(
-            &expand_with_chains(&expand_go_calls(&expand_gather_blocks(
-                &expand_multiline_guards(&lazy_expanded),
-            ))),
-        )));
-        let mut prep = preprocess(&expanded);
+        chain_step(&mut stage, expand_inline_question_ops_mapped);
+        chain_step(&mut stage, expand_question_ops_mapped);
+        let (expanded, expanded_to_ty) = stage;
+        let (mut prep, prep_to_expanded) = preprocess_mapped(&expanded);
+        // The one table the `.py.map` writer needs: preprocessed line → `.ty`
+        // line, both 0-based.
+        let preprocessed_to_ty = compose_line_maps(&prep_to_expanded, &expanded_to_ty);
 
         // `pub *` wildcard re-export aggregation.
         //
@@ -1082,20 +1105,74 @@ pub fn run(args: BuildArgs) -> Result<()> {
         // The AST's TextRange offsets land in `prep.python_source`, not
         // the user's `.ty` text, so the printer needs the preprocessed
         // buffer. O27 / FINDINGS #111.
-        let (mut python_src, line_offsets) = emit_python_with_source_for_target(
+        let (mut python_src, emitted_line_offsets) = emit_python_with_source_for_target(
             &desugar_output.module,
             target_minor,
             Some(&prep.python_source),
         );
+        // `line_offsets` must stay keyed to the buffer we actually write.
+        // The formatting step below can reflow lines, so it re-keys this.
+        let mut line_offsets = emitted_line_offsets;
 
         // Optionally normalise whitespace in the emitted Python (tabs → spaces,
         // trailing whitespace, final newline).  Full ruff-style reformatting
         // will replace this when the ruff vendor fork lands in Phase 3.
         if do_format {
             let path_str = path.to_string_lossy().into_owned();
-            if let Ok(result) = format_source(&python_src, &path_str) {
-                python_src = result.output;
-            }
+            // Do NOT swallow the error. `format_source` fails when its own
+            // parse step rejects the buffer, which means the emitter produced
+            // something that is not valid Python — exactly the condition the
+            // build must not exit 0 on.
+            let result = format_source(&python_src, &path_str).map_err(|e| {
+                miette!(
+                    "internal error: formatting the Python emitted from '{}' failed: {e}\n\
+                     This is a compiler bug — the emitted output is not valid Python. \
+                     Please report it at https://github.com/CodeHalwell/Typhon/issues",
+                    path.display()
+                )
+            })?;
+            // Re-key the source-map offsets onto the formatted text.
+            //
+            // `format_source` runs two line-count-changing passes: the
+            // in-process whitespace normaliser (which collapses runs of
+            // 3+ blank lines and inserts PEP 8 blank lines before
+            // top-level `def`/`class`) and, when `ruff` is on `$PATH`,
+            // `ruff format` — which additionally wraps long calls and
+            // signatures across several lines and joins short ones. Both
+            // shift every subsequent entry of the emitter's table
+            // relative to the file on disk, so `tyc trace`,
+            // `tyc debug --break` and `[emit] traceback-remap` reported
+            // lines that drifted further out the deeper into the file
+            // the frame was. Diffing the two buffers recovers the
+            // correspondence without the formatter having to report it.
+            line_offsets =
+                remap_line_offsets_through_format(&line_offsets, &python_src, &result.output);
+            python_src = result.output;
+        }
+
+        // Post-emit parse gate.
+        //
+        // "Every `.ty` file emits valid `.py`" is the project's central
+        // promise, and until now nothing checked it: a printer bug (missing
+        // parens, a botched string escape, a preprocessor rewrite inside a
+        // string literal) produced unparseable Python and the build still
+        // exited 0. Re-parse the bytes we are about to write with the same
+        // vendored parser the front end uses, and fail loudly if they do not
+        // round-trip.
+        //
+        // This runs *before* the PEP 810 native-lazy-import rewrite below,
+        // deliberately: that pass stamps `lazy import …` onto the buffer, and
+        // no parser — vendored or upstream — accepts that syntax on a
+        // pre-3.15 grammar. The rewrite only ever prefixes an existing,
+        // already-validated `import` line, so gating ahead of it loses no
+        // coverage.
+        if let Err(err) = tyc_syntax::parse_module(&python_src) {
+            return Err(miette!(
+                "internal error: the Python emitted from '{}' does not parse: {err}\n\
+                 This is a compiler bug — `tyc` must never write invalid Python. \
+                 Please report it at https://github.com/CodeHalwell/Typhon/issues",
+                path.display()
+            ));
         }
 
         // PEP 810 native lazy-import lowering (3.15+ targets only). The
@@ -1127,7 +1204,7 @@ pub fn run(args: BuildArgs) -> Result<()> {
                     .map_err(|e| miette!("cannot create '{}': {e}", parent.display()))?;
             }
 
-            std::fs::write(&out_file, &python_src)
+            tyc_format::atomic_write(&out_file, python_src.as_bytes())
                 .map_err(|e| miette!("cannot write '{}': {e}", out_file.display()))?;
         }
 
@@ -1158,7 +1235,12 @@ pub fn run(args: BuildArgs) -> Result<()> {
                 .display()
                 .to_string(),
         );
-        let map_body = build_source_map_v2(&source_rel, &prep.python_source, &line_offsets);
+        let map_body = build_source_map_v2(
+            &source_rel,
+            &prep.python_source,
+            &line_offsets,
+            &preprocessed_to_ty,
+        );
         if check_mode {
             println!("would write {}", display_relative(&map_path, &project_root));
             would_write_count += 1;
@@ -1168,7 +1250,7 @@ pub fn run(args: BuildArgs) -> Result<()> {
                 std::fs::create_dir_all(parent)
                     .map_err(|e| miette!("cannot create '{}': {e}", parent.display()))?;
             }
-            std::fs::write(&map_path, map_body)
+            tyc_format::atomic_write(&map_path, map_body.as_bytes())
                 .map_err(|e| miette!("cannot write '{}': {e}", map_path.display()))?;
         }
 
@@ -1200,6 +1282,26 @@ pub fn run(args: BuildArgs) -> Result<()> {
             .strip_prefix(&src_dir)
             .map_err(|_| miette!("'{}' is outside the source directory", path.display()))?;
         let dest = out_dir.join(rel);
+        // A hand-written `src/X.py` lands on exactly the path the compiled
+        // `src/X.ty` was just emitted to, so the copy silently replaced it:
+        // the shipped program was not the program `tyc check` validated, and
+        // the build still exited 0. The compiled output must win — a `.ty` is
+        // the source of truth for its own module name — and the collision is
+        // worth saying out loud, because a stale `.py` beside a `.ty` is
+        // usually a leftover the author forgot to delete.
+        //
+        // Warn rather than fail: a *draft* `.ty` beside a working `.py` builds
+        // today, and breaking that outright would reject a working project.
+        if path.with_extension("ty").is_file() {
+            let ty_rel = rel.with_extension("ty");
+            eprintln!(
+                "warning: '{}' shadows the Python compiled from '{}'. \
+                 Keeping the compiled output; delete the .py file to silence this.",
+                display_relative(path, &project_root),
+                display_relative(&src_dir.join(&ty_rel), &project_root),
+            );
+            continue;
+        }
         if check_mode {
             println!("would write {}", display_relative(&dest, &project_root));
             would_write_count += 1;
@@ -1290,11 +1392,13 @@ pub fn run(args: BuildArgs) -> Result<()> {
         // .dty files use the same syntax as .ty but typically contain only
         // declarations.  Run the preprocessor so `val`/`var`/`model` stripping
         // works, then desugar to plain Python so the printer can emit it.
-        let expanded = expand_question_ops(&expand_inline_question_ops(&expand_pipes(
-            &expand_with_chains(&expand_go_calls(&expand_gather_blocks(
-                &expand_multiline_guards(&expand_lazy_imports(&expand_typed_let_unpack(&source))),
+        let expanded = expand_question_ops(&expand_inline_question_ops(
+            &expand_compound_question_headers(&expand_pipes(&expand_with_chains(
+                &expand_go_calls(&expand_gather_blocks(&expand_multiline_guards(
+                    &expand_lazy_imports(&expand_typed_let_unpack(&source)),
+                ))),
             ))),
-        )));
+        ));
         let prep = preprocess(&expanded);
         let module = tyc_syntax::parse_module(&prep.python_source)
             .map(|p| p.into_syntax())
@@ -1332,7 +1436,7 @@ pub fn run(args: BuildArgs) -> Result<()> {
                 std::fs::create_dir_all(parent)
                     .map_err(|e| miette!("cannot create '{}': {e}", parent.display()))?;
             }
-            std::fs::write(&out_file, &stub_text)
+            tyc_format::atomic_write(&out_file, stub_text.as_bytes())
                 .map_err(|e| miette!("cannot write '{}': {e}", out_file.display()))?;
         }
         stubs_emitted += 1;
@@ -1349,7 +1453,10 @@ pub fn run(args: BuildArgs) -> Result<()> {
         let runtime_dir = out_dir.join("typhon_runtime");
         // `parallel.py` is parameterised by the configured execution backend
         // (`[strictness] parallel-backend`); the rest are static.
-        let parallel_py = typhon_runtime_parallel_py(&config.strictness.parallel_backend);
+        let parallel_py = typhon_runtime_parallel_py(
+            &config.strictness.parallel_backend,
+            config.strictness.parallel_min_size,
+        );
         let files = [
             ("__init__.py", TYPHON_RUNTIME_INIT_PY),
             ("tasks.py", TYPHON_RUNTIME_TASKS_PY),
@@ -1374,7 +1481,7 @@ pub fn run(args: BuildArgs) -> Result<()> {
                 .map_err(|e| miette!("cannot create '{}': {e}", runtime_dir.display()))?;
             for (name, body) in files {
                 let path = runtime_dir.join(name);
-                std::fs::write(&path, body)
+                tyc_format::atomic_write(&path, body.as_bytes())
                     .map_err(|e| miette!("cannot write '{}': {e}", path.display()))?;
             }
             println!("wrote typhon_runtime/ → '{}'", runtime_dir.display());
@@ -1866,11 +1973,13 @@ pub(crate) fn detect_pub_star_diagnostics(
     let mut advice: Vec<tyc_diagnostics::TycError> = Vec::new();
 
     for (path, source) in sources {
-        let expanded = expand_question_ops(&expand_inline_question_ops(&expand_pipes(
-            &expand_with_chains(&expand_go_calls(&expand_gather_blocks(
-                &expand_multiline_guards(&expand_lazy_imports(&expand_typed_let_unpack(source))),
+        let expanded = expand_question_ops(&expand_inline_question_ops(
+            &expand_compound_question_headers(&expand_pipes(&expand_with_chains(
+                &expand_go_calls(&expand_gather_blocks(&expand_multiline_guards(
+                    &expand_lazy_imports(&expand_typed_let_unpack(source)),
+                ))),
             ))),
-        )));
+        ));
         let prep = preprocess(&expanded);
         if prep.pub_star_lines.is_empty() {
             continue;
@@ -2240,13 +2349,335 @@ fn escape_json_path(s: &str) -> String {
     out
 }
 
+/// Run one `&str -> (String, line map)` stage of the sugar-expansion chain,
+/// folding its table into the one accumulated so far.
+///
+/// `stage` is `(text, text line -> .ty line)`. After the call it describes the
+/// pass's output, still keyed back to the original `.ty` file.
+fn chain_step(stage: &mut (String, Vec<usize>), pass: fn(&str) -> (String, Vec<usize>)) {
+    let (text, step_map) = pass(&stage.0);
+    stage.1 = compose_line_maps(&step_map, &stage.1);
+    stage.0 = text;
+}
+
+/// Recursion budget for [`align_range`].
+///
+/// Each level consumes at least one anchor line from both buffers, so the
+/// depth is bounded by the file length anyway; the cap only exists so a
+/// pathological input degrades to the proportional fill instead of
+/// recursing thousands of frames deep on the CLI's worker stack.
+const ALIGN_MAX_DEPTH: usize = 32;
+
+/// Align the lines of a formatted buffer back onto the buffer it was
+/// formatted from.
+///
+/// `tyc-emit` records one source offset per line of the Python it prints,
+/// but with `[emit] format = true` that buffer is then handed to the
+/// whitespace normaliser and (when `ruff` is on `$PATH`) to `ruff format`,
+/// either of which can insert, delete, join or wrap lines. The offsets
+/// therefore describe a file that is *not* the one written to disk, and
+/// every entry after the first reflow is shifted — the further into the
+/// file, the worse. Consumers (`tyc trace`, `tyc debug --break`,
+/// `[emit] traceback-remap`, `ty` re-attribution) all index the sidecar by
+/// the line number CPython reports for the file on disk, so the table has
+/// to be keyed to the formatted text.
+///
+/// The returned vector has one entry per line of `after`, holding the
+/// 0-based index of the `before` line it came from. Composing it with the
+/// emitter's table re-keys the whole map onto the formatted buffer.
+///
+/// The alignment is a patience diff: exact common prefix / suffix first
+/// (the overwhelmingly common case — most files come back byte-identical,
+/// which this resolves in one linear scan), then lines that occur exactly
+/// once in both remaining ranges are taken as anchors via a longest
+/// increasing subsequence, and the gaps between anchors recurse. A gap
+/// with no anchors is distributed proportionally, which is exactly right
+/// for the shape that motivates this: one long statement wrapped across
+/// several output lines has a one-line `before` gap, so every wrapped
+/// line lands on it.
+fn align_formatted_lines(before: &[&str], after: &[&str]) -> Vec<usize> {
+    let mut out = vec![0usize; after.len()];
+    if before.is_empty() || after.is_empty() {
+        return out;
+    }
+    align_range(before, after, 0, before.len(), 0, after.len(), 0, &mut out);
+    out
+}
+
+/// Align `after[a0..a1)` onto `before[b0..b1)`, writing into `out`.
+#[allow(clippy::too_many_arguments)]
+fn align_range(
+    before: &[&str],
+    after: &[&str],
+    mut b0: usize,
+    mut b1: usize,
+    mut a0: usize,
+    mut a1: usize,
+    depth: usize,
+    out: &mut [usize],
+) {
+    while b0 < b1 && a0 < a1 && before[b0] == after[a0] {
+        out[a0] = b0;
+        b0 += 1;
+        a0 += 1;
+    }
+    while b1 > b0 && a1 > a0 && before[b1 - 1] == after[a1 - 1] {
+        b1 -= 1;
+        a1 -= 1;
+        out[a1] = b1;
+    }
+    if a0 >= a1 {
+        // Nothing left on the formatted side: any surviving `before`
+        // lines were deleted by the formatter and simply have no entry.
+        return;
+    }
+    if b0 >= b1 {
+        // Pure insertion (a blank line the formatter added, say).
+        // Attribute it to the nearest surviving neighbour, preferring the
+        // line above so an inserted blank before a `def` keeps naming the
+        // statement it follows rather than jumping ahead.
+        let anchor = if b0 > 0 { b0 - 1 } else { 0 };
+        for slot in out.iter_mut().take(a1).skip(a0) {
+            *slot = anchor;
+        }
+        return;
+    }
+    if depth < ALIGN_MAX_DEPTH {
+        let anchors = patience_anchors(before, after, b0, b1, a0, a1);
+        if !anchors.is_empty() {
+            let mut prev_b = b0;
+            let mut prev_a = a0;
+            for (bi, ai) in anchors {
+                align_range(before, after, prev_b, bi, prev_a, ai, depth + 1, out);
+                out[ai] = bi;
+                prev_b = bi + 1;
+                prev_a = ai + 1;
+            }
+            align_range(before, after, prev_b, b1, prev_a, a1, depth + 1, out);
+            return;
+        }
+    }
+    if align_gap_by_content(before, after, b0, b1, a0, a1, out) {
+        return;
+    }
+    let bn = b1 - b0;
+    let an = a1 - a0;
+    for (k, slot) in out.iter_mut().take(a1).skip(a0).enumerate() {
+        *slot = b0 + (k * bn / an).min(bn - 1);
+    }
+}
+
+/// Bytes the formatter may insert or delete without that counting as a
+/// divergence: the brackets it adds when wrapping an expression across
+/// lines, the ones it drops when a redundant pair becomes unnecessary,
+/// and the "magic trailing comma" it appends to a wrapped argument list.
+fn is_formatter_punctuation(b: u8) -> bool {
+    matches!(b, b'(' | b')' | b',')
+}
+
+/// Align an anchor-less gap by walking both sides' non-whitespace bytes
+/// in lockstep.
+///
+/// Two adjacent statements that a formatter both wraps produce one gap
+/// with no line-level anchor in it, and splitting such a gap
+/// proportionally lands lines on the wrong statement. Reflowing does not
+/// reorder or rewrite code, though — it only moves whitespace and adds or
+/// removes the punctuation above — so the two byte streams still match
+/// almost exactly. Each formatted line takes the `before` line that owns
+/// the first byte it matched; a line that matched nothing (a blank, or a
+/// bracket the walk skipped as an insertion) inherits its predecessor,
+/// which is what a wrapped continuation line wants.
+///
+/// Returns `false`, leaving `out` untouched, on any divergence reflowing
+/// cannot explain (a quote-style or numeric-literal normalisation, say).
+/// The caller then falls back to the proportional split rather than
+/// trusting a walk that has lost sync.
+#[allow(clippy::too_many_arguments)]
+fn align_gap_by_content(
+    before: &[&str],
+    after: &[&str],
+    b0: usize,
+    b1: usize,
+    a0: usize,
+    a1: usize,
+    out: &mut [usize],
+) -> bool {
+    fn stream(lines: &[&str], lo: usize, hi: usize) -> Vec<(u8, usize)> {
+        let mut v = Vec::new();
+        for (i, line) in lines.iter().enumerate().take(hi).skip(lo) {
+            v.extend(
+                line.bytes()
+                    .filter(|b| !b.is_ascii_whitespace())
+                    .map(|b| (b, i)),
+            );
+        }
+        v
+    }
+    let bs = stream(before, b0, b1);
+    let as_ = stream(after, a0, a1);
+    if bs.is_empty() || as_.is_empty() {
+        return false;
+    }
+
+    let mut first: Vec<Option<usize>> = vec![None; a1 - a0];
+    let mut i = 0usize;
+    let mut j = 0usize;
+    while i < as_.len() {
+        let (ac, aline) = as_[i];
+        if j < bs.len() && bs[j].0 == ac {
+            first[aline - a0].get_or_insert(bs[j].1);
+            i += 1;
+            j += 1;
+            continue;
+        }
+        if j >= bs.len() {
+            // A tail the formatter added — the closing bracket of a
+            // wrapped call on a line of its own. It belongs to the last
+            // statement of the gap.
+            first[aline - a0].get_or_insert(b1 - 1);
+            i += 1;
+            continue;
+        }
+        if is_formatter_punctuation(ac) {
+            i += 1;
+            continue;
+        }
+        if is_formatter_punctuation(bs[j].0) {
+            j += 1;
+            continue;
+        }
+        return false;
+    }
+
+    let mut last = b0;
+    for (k, slot) in out.iter_mut().take(a1).skip(a0).enumerate() {
+        if let Some(b) = first[k] {
+            last = b;
+        }
+        *slot = last;
+    }
+    true
+}
+
+/// Anchor pairs for a patience diff over `before[b0..b1)` / `after[a0..a1)`.
+///
+/// A candidate is a line that appears exactly once in each range and is
+/// equal on both sides; the returned pairs are the longest increasing
+/// subsequence of those candidates, so they are strictly increasing in
+/// both indices and can be used to split the ranges. Blank lines are
+/// never unique in a real file, so they self-exclude — which is what we
+/// want, since matching them carries no information.
+fn patience_anchors(
+    before: &[&str],
+    after: &[&str],
+    b0: usize,
+    b1: usize,
+    a0: usize,
+    a1: usize,
+) -> Vec<(usize, usize)> {
+    // `(count, first index)` per distinct line, for each side.
+    let mut b_seen: HashMap<&str, (u32, usize)> = HashMap::new();
+    for (i, line) in before.iter().enumerate().take(b1).skip(b0) {
+        b_seen
+            .entry(line)
+            .and_modify(|e| e.0 += 1)
+            .or_insert((1, i));
+    }
+    let mut a_seen: HashMap<&str, (u32, usize)> = HashMap::new();
+    for (i, line) in after.iter().enumerate().take(a1).skip(a0) {
+        a_seen
+            .entry(line)
+            .and_modify(|e| e.0 += 1)
+            .or_insert((1, i));
+    }
+
+    // Candidates ordered by `before` index; each carries its `after` index.
+    let mut candidates: Vec<(usize, usize)> = b_seen
+        .iter()
+        .filter(|(_, &(count, _))| count == 1)
+        .filter_map(|(line, &(_, bi))| match a_seen.get(line) {
+            Some(&(1, ai)) => Some((bi, ai)),
+            _ => None,
+        })
+        .collect();
+    if candidates.is_empty() {
+        return Vec::new();
+    }
+    candidates.sort_unstable();
+
+    // Longest increasing subsequence over the `after` indices (patience
+    // sorting): `tails[k]` is the candidate index ending the best length-
+    // `k+1` chain found so far, `prev` threads the chain backwards.
+    let mut tails: Vec<usize> = Vec::new();
+    let mut tail_values: Vec<usize> = Vec::new();
+    let mut prev: Vec<Option<usize>> = vec![None; candidates.len()];
+    for (idx, &(_, ai)) in candidates.iter().enumerate() {
+        let pos = tail_values.partition_point(|&v| v < ai);
+        prev[idx] = if pos > 0 { Some(tails[pos - 1]) } else { None };
+        if pos == tails.len() {
+            tails.push(idx);
+            tail_values.push(ai);
+        } else {
+            tails[pos] = idx;
+            tail_values[pos] = ai;
+        }
+    }
+
+    let mut chain = Vec::with_capacity(tails.len());
+    let mut cursor = tails.last().copied();
+    while let Some(idx) = cursor {
+        chain.push(candidates[idx]);
+        cursor = prev[idx];
+    }
+    chain.reverse();
+    chain
+}
+
+/// Re-key `line_offsets` (one entry per line of the *emitted* Python) onto
+/// the formatted buffer that is actually written to disk.
+///
+/// Returns one entry per line of `formatted`. See
+/// [`align_formatted_lines`] for why this is needed.
+fn remap_line_offsets_through_format(
+    line_offsets: &[usize],
+    unformatted: &str,
+    formatted: &str,
+) -> Vec<usize> {
+    if unformatted == formatted {
+        return line_offsets.to_vec();
+    }
+    let before: Vec<&str> = unformatted.lines().collect();
+    let after: Vec<&str> = formatted.lines().collect();
+    let alignment = align_formatted_lines(&before, &after);
+    // `line_offsets` has one entry per emitted line; a formatted line that
+    // aligns past its end can only come from trailing synthesised text, so
+    // clamp to the last known offset rather than dropping the entry.
+    let fallback = line_offsets.last().copied().unwrap_or(0);
+    alignment
+        .iter()
+        .map(|&i| line_offsets.get(i).copied().unwrap_or(fallback))
+        .collect()
+}
+
 /// Build a v2 `.py.map` JSON body with a full `lines` table.
 ///
 /// `line_offsets[i]` is the byte offset in `preprocessed` that was "active"
 /// when output line `i` (0-indexed) was emitted.  Each offset is converted to
-/// a 1-indexed line number and the array is serialised inline.  Synthesised
-/// lines (offset 0) correctly land on line 1, matching the identity fallback.
-fn build_source_map_v2(source_rel: &str, preprocessed: &str, line_offsets: &[usize]) -> String {
+/// a 0-indexed line number *of the preprocessed buffer*, and then — this is
+/// the step that makes the sidecar mean what it claims — through
+/// `preprocessed_to_ty` to the 0-based `.ty` line it actually came from,
+/// emitted 1-indexed.  Synthesised lines (offset 0) land on the file's first
+/// line, matching the identity fallback.
+///
+/// Passing an empty `preprocessed_to_ty` selects the identity mapping, which
+/// is only correct for a buffer no pass changed the line count of; real builds
+/// always pass the folded chain table.
+fn build_source_map_v2(
+    source_rel: &str,
+    preprocessed: &str,
+    line_offsets: &[usize],
+    preprocessed_to_ty: &[usize],
+) -> String {
     // ⚡ Bolt optimization: Precompute newline offsets to avoid O(N^2) behavior.
     // Instead of rescanning the string for every offset, we find all newlines
     // once O(N) and binary search them for each offset O(log N).
@@ -2262,7 +2693,15 @@ fn build_source_map_v2(source_rel: &str, preprocessed: &str, line_offsets: &[usi
         .map(|&offset| {
             let clamped = offset.min(preprocessed.len());
             let count = newline_offsets.partition_point(|&nl_offset| nl_offset < clamped);
-            count as u32 + 1
+            let ty_line = if preprocessed_to_ty.is_empty() {
+                count
+            } else {
+                // Clamp rather than drop: a token offset past the last mapped
+                // line can only come from trailing synthesised text, which
+                // belongs to the last real source line.
+                preprocessed_to_ty[count.min(preprocessed_to_ty.len() - 1)]
+            };
+            ty_line as u32 + 1
         })
         .collect();
 
@@ -3140,6 +3579,22 @@ def _matches(value: Any, tp: Any) -> bool:
             return isinstance(value, (int, float)) and not isinstance(value, complex)
         if tp is complex:
             return isinstance(value, (int, float, complex))
+        # `newtype Foo = int` lowers to `typing.NewType`, which is a callable,
+        # not a type — `isinstance(tp, type)` is False, so this fell straight
+        # through to `return True` and the cast was completely unchecked on
+        # the compiled path while the VM rejected it. Unwrap to the base type
+        # and check that.
+        supertype = getattr(tp, \"__supertype__\", None)
+        if supertype is not None:
+            return _matches(value, supertype)
+        # An `interface` lowers to a `Protocol` subclass, and `isinstance`
+        # against a Protocol that is not `@runtime_checkable` *raises*
+        # TypeError — so `EXPR as! SomeInterface` could never succeed, it only
+        # ever blew up inside the guard. Check structurally instead, which is
+        # what an interface means anyway: does the value carry the members?
+        protocol_attrs = getattr(tp, \"__protocol_attrs__\", None)
+        if protocol_attrs is not None:
+            return all(hasattr(value, attr) for attr in protocol_attrs)
         if isinstance(tp, type):
             return isinstance(value, tp)
         # An unrecognised descriptor (e.g. a TypeVar) — be permissive so the
@@ -3349,7 +3804,7 @@ def _remap(text, state):
 /// backend switch are emitted for both settings, so the only difference
 /// between the two generated files is the `_BACKEND` value — the thread path
 /// is behaviourally identical to the historical single-backend runtime.
-fn typhon_runtime_parallel_py(backend: &str) -> String {
+fn typhon_runtime_parallel_py(backend: &str, min_size: u64) -> String {
     // Config load already validated the value; guard anyway so an unexpected
     // string degrades to the safe thread pool rather than an unknown backend.
     let backend = if backend == "interpreters" {
@@ -3357,7 +3812,9 @@ fn typhon_runtime_parallel_py(backend: &str) -> String {
     } else {
         "threads"
     };
-    TYPHON_RUNTIME_PARALLEL_PY_TEMPLATE.replace("@BACKEND@", backend)
+    TYPHON_RUNTIME_PARALLEL_PY_TEMPLATE
+        .replace("@BACKEND@", backend)
+        .replace("@MIN_SIZE@", &min_size.to_string())
 }
 
 const TYPHON_RUNTIME_PARALLEL_PY_TEMPLATE: &str = "\
@@ -3366,6 +3823,7 @@ const TYPHON_RUNTIME_PARALLEL_PY_TEMPLATE: &str = "\
 from __future__ import annotations
 
 import os
+import sys
 from concurrent.futures import ThreadPoolExecutor
 from typing import Callable, Iterable, TypeVar
 
@@ -3374,6 +3832,8 @@ _R = TypeVar(\"_R\")
 
 # Execution backend, baked in at build time from `[strictness] parallel-backend`.
 _BACKEND = \"@BACKEND@\"
+# Minimum item count worth a thread pool, from `[strictness] parallel-min-size`.
+_MIN_SIZE = @MIN_SIZE@
 
 
 def map_pure(
@@ -3411,7 +3871,25 @@ def map_pure(
         result = _try_interpreters(fn, items, max_workers)
         if result is not None:
             return result
-    # Thread-pool path: the default backend, and the interpreters fallback.
+    # Below this point the only backend left is threads, so the two guards the
+    # docs have always promised finally apply.
+    #
+    # They sit *after* `_try_interpreters` deliberately: a sub-interpreter pool
+    # gives real parallelism even on a GIL build, so gating it on
+    # `_is_gil_enabled()` would disable the one backend that works there.
+    #
+    # 1. On a GIL build the workers cannot run Python concurrently, so the pool
+    #    is pure overhead. The documented `sys._is_gil_enabled()` sequential
+    #    fallback did not exist: every rewritten comprehension paid thread
+    #    setup for zero parallelism, which measured as a ~60x pessimisation on
+    #    stock CPython.
+    # 2. Even on a free-threaded build, a handful of items is not worth a pool.
+    #    `[strictness] parallel-min-size` gates the *rewrite* at compile time,
+    #    but the length is only known here — a comprehension over a runtime
+    #    list of 3 took 424x longer through the pool than sequentially.
+    gil_enabled = getattr(sys, \"_is_gil_enabled\", None)
+    if (gil_enabled is None or gil_enabled()) or len(items) < _MIN_SIZE:
+        return [fn(item) for item in items]
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
         return list(pool.map(fn, items))
 
@@ -4519,7 +4997,7 @@ async def load(uid: int) -> int:
         // Three output lines, all from preprocessed line 2 (offset 6 in "line1\nline2\n")
         let preprocessed = "line1\nline2\n";
         let offsets = vec![0usize, 6, 6];
-        let json = build_source_map_v2("main.ty", preprocessed, &offsets);
+        let json = build_source_map_v2("main.ty", preprocessed, &offsets, &[]);
         assert!(
             json.contains("\"version\":2"),
             "version must be 2; got: {json}"
@@ -4535,6 +5013,14 @@ async def load(uid: int) -> int:
         assert!(
             json.contains("\"lines\":[1,2,2]"),
             "lines array wrong; got: {json}"
+        );
+
+        // With a provenance table the same offsets resolve through it: here
+        // preprocessed lines 1 and 2 both came from `.ty` line 1.
+        let json = build_source_map_v2("main.ty", preprocessed, &offsets, &[0, 0]);
+        assert!(
+            json.contains("\"lines\":[1,1,1]"),
+            "lines array must be remapped through the .ty table; got: {json}"
         );
     }
 

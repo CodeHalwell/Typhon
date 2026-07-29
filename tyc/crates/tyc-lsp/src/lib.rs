@@ -10,7 +10,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use miette::{Diagnostic as MietteDiagnostic, LabeledSpan};
-use salsa::Setter;
 use tokio::sync::Mutex;
 use tower_lsp_server::ls_types::{
     CodeAction, CodeActionKind, CodeActionOrCommand, CodeActionParams,
@@ -27,7 +26,7 @@ use tower_lsp_server::ls_types::{
 use tower_lsp_server::{jsonrpc, Client, LanguageServer, LspService, Server};
 use tyc_db::{
     check_source_file, check_source_file_with_imports, module_shapes_query, preprocessed_full,
-    preprocessed_text, resolved_module_arc, ModuleShapes, SourceFile, TycDatabase,
+    preprocessed_text, resolved_module_arc, set_source_text, ModuleShapes, SourceFile, TycDatabase,
 };
 use tyc_diagnostics::TycError;
 use tyc_resolve::{
@@ -50,9 +49,38 @@ type ResolvedCache = Arc<Mutex<HashMap<String, (String, Arc<ResolvedModule>)>>>;
 /// `typhon.toml` mtime they were read from (see the field doc on
 /// [`Backend::lint_options_cache`]). Aliased to keep the field type under
 /// clippy's `type_complexity` threshold, matching [`ResolvedCache`].
-type LintOptionsCache = Arc<
-    Mutex<HashMap<std::path::PathBuf, (Option<std::time::SystemTime>, tyc_analyse::LintOptions)>>,
->;
+/// Cache key for a project's `typhon.toml`: a hash of its bytes.
+///
+/// The caches below existed to avoid re-parsing the config on every keystroke,
+/// and were keyed on mtime alone. On a filesystem with coarse timestamp
+/// resolution two saves inside one tick share an mtime, so an editor that does
+/// not send the optional watched-file notification would keep serving the
+/// stale `off`/`warn`/`error` settings until the next write or a restart —
+/// the editor and CI disagreeing about severity, which is the exact defect
+/// these knobs were wired up to fix. Hashing the bytes removes the window
+/// entirely; the read is a page-cached ~1 KB file, negligible beside the
+/// type-check it gates, and the parse (the actual cost) is still skipped on a
+/// hit. `None` means "unreadable" and always misses. (PR #360 review, Codex P2.)
+fn config_fingerprint(root: &std::path::Path) -> Option<u64> {
+    use std::hash::{Hash, Hasher};
+    let bytes = std::fs::read(root.join("typhon.toml")).ok()?;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    Some(hasher.finish())
+}
+
+type LintOptionsCache =
+    Arc<Mutex<HashMap<std::path::PathBuf, (Option<u64>, tyc_analyse::LintOptions)>>>;
+
+/// Per-project-root cache of the `[strictness]` *severity* knobs, tagged with
+/// the `typhon.toml` mtime they were read from — the severity twin of
+/// [`LintOptionsCache`], and cached for the same reason: `check_and_publish`
+/// runs per keystroke, and re-reading + re-parsing `typhon.toml` on every one
+/// was exactly what the mtime-keyed lint-options cache was introduced to
+/// avoid (PR #192 review). `SeverityOverrides` holds `String`s, so entries are
+/// cloned rather than copied.
+type SeverityOverridesCache =
+    Arc<Mutex<HashMap<std::path::PathBuf, (Option<u64>, tyc_diagnostics::SeverityOverrides)>>>;
 
 /// The Typhon LSP backend. Holds a single shared salsa database and the
 /// `Client` handle used to send notifications back to the editor.
@@ -68,10 +96,15 @@ pub struct Backend {
     /// Per-document Salsa handles, keyed by URI string.
     ///
     /// The [`SourceFile`] handle is the Salsa input for this document; on
-    /// `did_change` it is updated via `set_text` so Salsa propagates
-    /// invalidations incrementally rather than creating a fresh entity.
+    /// `did_change` it is updated via `tyc_db::set_source_text` so Salsa
+    /// propagates invalidations incrementally rather than creating a fresh
+    /// entity — and so byte-identical text doesn't invalidate anything at all.
     /// Raw text is stored inside the Salsa input itself and read back via
     /// `source_file.text(db)` when needed, avoiding dual-state synchronisation.
+    ///
+    /// This map is also the authoritative text for *every* open file, not
+    /// just the one being checked: the cross-module shape builder reads
+    /// sibling modules through these handles rather than from disk.
     documents: Arc<Mutex<HashMap<String, SourceFile>>>,
     /// Resolved-module cache for cross-file import resolution.
     ///
@@ -124,8 +157,11 @@ pub struct Backend {
     ///
     /// Entries are refreshed lazily inside `check_and_publish`: every
     /// `.ty` / `.dty` file under the project's src tree is registered
-    /// (or its text re-uploaded via `set_text`) before the cross-
-    /// module shape map is assembled.
+    /// before the cross-module shape map is assembled. A file the client
+    /// has open reuses that document's [`SourceFile`] handle verbatim
+    /// (one input per file); the rest have their on-disk text pushed
+    /// through `tyc_db::set_source_text`, which writes only on a real
+    /// change.
     project_files: Arc<Mutex<HashMap<std::path::PathBuf, HashMap<String, SourceFile>>>>,
     /// Last document version we've already kicked off a venv-
     /// introspection prewarm for, keyed by URI. Used to debounce
@@ -150,6 +186,10 @@ pub struct Backend {
     /// `workspace/didChangeWatchedFiles`. The watcher additionally re-checks
     /// open documents on a `typhon.toml` edit so the refresh is immediate.
     lint_options_cache: LintOptionsCache,
+    /// Mtime-keyed cache of the `[strictness]` severity knobs — same policy
+    /// and staleness story as [`Self::lint_options_cache`], for the
+    /// `apply_severity_overrides` pass that runs on every check.
+    severity_overrides_cache: SeverityOverridesCache,
 }
 
 impl std::fmt::Debug for Backend {
@@ -199,13 +239,16 @@ impl Backend {
 
         // Upsert the SourceFile in the Salsa database.
         //
-        // On `did_open` we create a fresh entity; on `did_change` we call
-        // `set_text` on the existing handle so Salsa can propagate the
-        // invalidation incrementally: queries that depend on this file's text
-        // are re-evaluated on the next access, but queries for *other* files
-        // stay cached.  We hold the db lock only for this short operation so
-        // hover/completion requests can still acquire it while the heavy
-        // `check_source_file` runs on the blocking thread.
+        // On `did_open` we create a fresh entity; on `did_change` we push the
+        // new text through `set_source_text` on the existing handle so Salsa
+        // can propagate the invalidation incrementally: queries that depend on
+        // this file's text are re-evaluated on the next access, but queries for
+        // *other* files stay cached. `set_source_text` compares before it
+        // writes — raw `set_text` does not (F56) — so a `did_change` that
+        // delivers byte-identical text (a formatter round-trip, an editor
+        // re-sync) leaves the whole cache warm. We hold the db lock only for
+        // this short operation so hover/completion requests can still acquire
+        // it while the heavy `check_source_file` runs on the blocking thread.
         let source_file: SourceFile = {
             let existing = {
                 let docs = self.documents.lock().await;
@@ -213,7 +256,7 @@ impl Backend {
             };
             let mut db_guard = self.db.lock().await;
             if let Some(sf) = existing {
-                sf.set_text(&mut *db_guard).to(text.clone());
+                set_source_text(&mut db_guard, sf, text.clone());
                 sf
             } else {
                 SourceFile::new(&*db_guard, uri_str.clone(), text.clone())
@@ -222,15 +265,36 @@ impl Backend {
 
         // Cache the Salsa handle; raw text is stored inside Salsa itself and
         // retrieved via `source_file.text(db)` when needed.
-        {
+        //
+        // The same pass snapshots every open document's handle keyed by
+        // filesystem path, so the cross-module shape builder below can read
+        // sibling modules from their live buffers instead of from disk (F57).
+        // `SourceFile` is `Copy`, so this is a cheap handle snapshot — the
+        // text stays in Salsa and is only read under the db lock inside the
+        // blocking closure. Taking it here (rather than inside the closure)
+        // keeps the `documents` lock off the blocking thread entirely.
+        let open_docs: HashMap<std::path::PathBuf, SourceFile> = {
             let mut docs = self.documents.lock().await;
             docs.insert(uri_str.clone(), source_file);
-        }
+            docs.iter()
+                .filter_map(|(doc_uri, sf)| {
+                    uri_str_to_path(doc_uri).map(|p| (path_lookup_key(&p), *sf))
+                })
+                .collect()
+        };
 
         // Resolve the project root once on the async side so the
         // blocking closure (which holds the salsa db lock) only needs
         // the cheap filesystem walk + cached queries below.
-        let path_for_root = std::path::PathBuf::from(uri.path().as_str());
+        // `uri.path()` is still percent-encoded, so a workspace whose path
+        // contains a space (or any character an editor escapes) produced a
+        // path with a literal `%20` in it, `find_workspace_layout` found no
+        // `typhon.toml`, and the server silently fell back to single-file
+        // mode: no cross-module checking, no venv introspection, no
+        // `[strictness]`. `uri_to_path` is the decoding conversion the rest of
+        // this file already uses.
+        let path_for_root =
+            uri_to_path(&uri).unwrap_or_else(|| std::path::PathBuf::from(uri.path().as_str()));
         let workspace = find_workspace_layout(&path_for_root);
         let project_files_arc = Arc::clone(&self.project_files);
 
@@ -244,6 +308,8 @@ impl Backend {
         // Per-root `[strictness]` lint-knob cache, reused across keystrokes;
         // `did_change_watched_files` clears it when `typhon.toml` changes.
         let lint_options_cache_arc = Arc::clone(&self.lint_options_cache);
+        // Its severity twin, for the `apply_severity_overrides` pass.
+        let severity_overrides_cache_arc = Arc::clone(&self.severity_overrides_cache);
 
         let text_for_check = text.clone();
         let uri_str_for_check = uri_str.clone();
@@ -254,12 +320,14 @@ impl Backend {
             // blocking closure so the salsa-cached
             // `module_shapes_query` does the heavy lifting: only the
             // file whose text actually changed re-runs the parse.
-            // `set_text` on a salsa input is a no-op when the new
-            // value matches, so re-uploading every file's on-disk
-            // text per check doesn't churn the cache. The currently-
-            // edited document uses its in-flight buffer text, not
-            // the on-disk content, so cross-module diagnostics
-            // update within one keystroke.
+            // Salsa's own `set_text` is NOT value-comparing, so the
+            // builder routes every write through
+            // `tyc_db::set_source_text`, which compares first — that
+            // is what keeps re-uploading unchanged on-disk text from
+            // churning the cache. Every document the client has open
+            // is served from its live buffer input (`open_docs`), so
+            // cross-module diagnostics react to unsaved edits in any
+            // module within one keystroke, not just the edited one.
             let project_shapes = if let Some((_root, src_dir)) = workspace.as_ref() {
                 let src_root_name = src_dir
                     .file_name()
@@ -274,6 +342,7 @@ impl Backend {
                     &src_root_name,
                     &uri_str_for_check,
                     &text_for_check,
+                    &open_docs,
                 );
                 // Seed compiler-bundled stubs (httpx, requests, …) so the
                 // editor surfaces their shapes live, matching `tyc check` /
@@ -345,6 +414,40 @@ impl Backend {
                 // above so we don't need to thread them again here.)
                 check_source_file_with_imports(&mut *db, source_file, &project_shapes)
             };
+            // Apply the project's `[strictness]` severity knobs, through the
+            // same `tyc-diagnostics` rules the CLI uses. Without this the
+            // editor ignored every knob: a project that set
+            // `exhaustive-match = "off"` or `unused-import = "off"` in its
+            // `typhon.toml` still got the squiggle on every keystroke, so the
+            // editor and CI disagreed about what counted as an error.
+            //
+            // Read through the same mtime-keyed pattern as the lint-options
+            // cache below: `stat` per check (cheap), re-read + re-parse only
+            // on a real `typhon.toml` change, I/O outside the lock. A racing
+            // double-miss just reads twice and stores the same value.
+            if let Some((root, _)) = workspace.as_ref() {
+                let stamp = config_fingerprint(root);
+                let cached = severity_overrides_cache_arc
+                    .blocking_lock()
+                    .get(root)
+                    .cloned();
+                let overrides = match cached {
+                    Some((cached_stamp, overrides))
+                        if cached_stamp.is_some() && cached_stamp == stamp =>
+                    {
+                        overrides
+                    }
+                    _ => {
+                        let overrides = read_severity_overrides(root);
+                        severity_overrides_cache_arc
+                            .blocking_lock()
+                            .insert(root.clone(), (stamp, overrides.clone()));
+                        overrides
+                    }
+                };
+                diags = tyc_diagnostics::apply_severity_overrides(diags, &overrides);
+            }
+
             // Retrieve the preprocessed source for diagnostic position
             // mapping.  After `check_source_file` runs the full pipeline the
             // Salsa `preprocessed_text` query is populated; hover/definition
@@ -376,20 +479,18 @@ impl Backend {
                         // `std::fs` I/O would block concurrent checks; a racing
                         // double-miss just reads twice and stores the same
                         // value. (PR #192 review.)
-                        let mtime = std::fs::metadata(root.join("typhon.toml"))
-                            .and_then(|m| m.modified())
-                            .ok();
-                        if let Some((cached_mtime, opts)) =
+                        let stamp = config_fingerprint(root);
+                        if let Some((cached_stamp, opts)) =
                             lint_options_cache_arc.blocking_lock().get(root).copied()
                         {
-                            if cached_mtime == mtime {
+                            if cached_stamp.is_some() && cached_stamp == stamp {
                                 return opts;
                             }
                         }
                         let opts = read_lint_options(root);
                         lint_options_cache_arc
                             .blocking_lock()
-                            .insert(root.clone(), (mtime, opts));
+                            .insert(root.clone(), (stamp, opts));
                         opts
                     })
                     .unwrap_or_default();
@@ -1707,8 +1808,13 @@ fn map_preprocessed_offset_to_original(
 /// Convert an `lsp_types::Uri` into a local filesystem path.  Only `file:`
 /// URIs are supported — anything else (e.g. `untitled:`) returns `None`.
 fn uri_to_path(uri: &Uri) -> Option<std::path::PathBuf> {
-    let s = uri.as_str();
-    let stripped = s.strip_prefix("file://")?;
+    uri_str_to_path(uri.as_str())
+}
+
+/// [`uri_to_path`] for an already-stringified URI. The `documents` map is
+/// keyed by URI string, so the open-document lookup needs this form.
+fn uri_str_to_path(uri: &str) -> Option<std::path::PathBuf> {
+    let stripped = uri.strip_prefix("file://")?;
     // Strip the host component (always empty for local files but the LSP
     // URI may emit it as "//"). Anything past the first `/` is the path.
     let path = if let Some(rest) = stripped.strip_prefix('/') {
@@ -1717,6 +1823,13 @@ fn uri_to_path(uri: &Uri) -> Option<std::path::PathBuf> {
         stripped.to_owned()
     };
     Some(std::path::PathBuf::from(percent_decode(&path)))
+}
+
+/// Normalise a path for use as a lookup key: canonicalise when the file
+/// exists (so symlinks and `..` segments compare equal), fall back to the
+/// path as given when it doesn't (unsaved / network FS).
+fn path_lookup_key(path: &std::path::Path) -> std::path::PathBuf {
+    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
 }
 
 /// Convert a local filesystem path back into an `lsp_types::Uri`.
@@ -1780,17 +1893,25 @@ fn from_hex(b: u8) -> Option<u8> {
 ///
 /// Walks every `.ty` / `.dty` file under `src_dir`, ensures each one
 /// is registered as a [`SourceFile`] input in the Salsa database, and
-/// then queries [`module_shapes_query`] for each. Salsa's input
-/// equality check means re-uploading on-disk text that hasn't changed
-/// is a no-op; the per-file `module_shapes_query` cache then returns
-/// immediately. Net result: a keystroke in `main.ty` only triggers
-/// shape extraction for `main.ty`, not every sibling.
+/// then queries [`module_shapes_query`] for each. Inputs are updated
+/// through [`set_source_text`], which writes only when the text really
+/// changed, so the per-file `module_shapes_query` cache survives; net
+/// result: a keystroke in `main.ty` only triggers shape extraction for
+/// `main.ty`, not every sibling.
 ///
-/// `current_uri` + `current_text` carry the in-flight editor buffer
-/// for the document currently being checked. That text is uploaded
-/// via `set_text` (or used to create a fresh `SourceFile`) so
-/// cross-module diagnostics react to unsaved changes within one
-/// keystroke.
+/// `open_docs` maps a normalised filesystem path (see [`path_lookup_key`])
+/// to the live, buffer-backed [`SourceFile`] the backend holds for every
+/// document the client has opened. Those handles are the source of truth:
+/// a project file that is open in the editor is served straight from its
+/// document input, never re-read from disk. Before this, only the
+/// *currently-checked* document used its buffer and every other open
+/// document was overwritten with stale on-disk bytes — so adding a member
+/// in module A lit module B up red until A was saved (F57). Disk is the
+/// fallback for project files the client has not opened.
+///
+/// `current_uri` + `current_text` still carry the in-flight buffer of the
+/// document being checked, as a belt-and-braces path for a file that is
+/// being checked without a `documents` entry (the synthetic-open form).
 ///
 /// `project_files` is the per-project handle table that survives
 /// across calls — without it we'd create a new `SourceFile` on every
@@ -1806,6 +1927,7 @@ fn build_project_shapes_salsa(
     src_root_name: &str,
     current_uri: &str,
     current_text: &str,
+    open_docs: &HashMap<std::path::PathBuf, SourceFile>,
 ) -> std::collections::HashMap<String, ModuleShapes> {
     let project_root = src_dir
         .parent()
@@ -1821,51 +1943,74 @@ fn build_project_shapes_salsa(
     // `.dty` stubs first, so `.ty` insertions skip them on
     // collisions — authored stubs are the source of truth.
     let dty_files = collect_files_with_ext(src_dir, "dty");
-    for file in &dty_files {
-        let dotted = path_to_dotted(file, src_root_name);
-        if shapes.contains_key(&dotted) {
-            continue;
-        }
-        // Prefer the editor buffer for the currently-edited file,
-        // disk for everything else. Skip files we can't read.
-        let text = if uri_matches_path(current_uri, file) {
-            current_text.to_owned()
-        } else {
-            match std::fs::read_to_string(file) {
-                Ok(t) => t,
-                Err(_) => continue,
-            }
-        };
-        let source_file = upsert_source_file(db, entries, &dotted, file, text);
-        shapes.insert(dotted, (*module_shapes_query(db, source_file).0).clone());
-    }
-
     let ty_files = collect_files_with_ext(src_dir, "ty");
-    for file in &ty_files {
+    for file in dty_files.iter().chain(ty_files.iter()) {
         let dotted = path_to_dotted(file, src_root_name);
         if shapes.contains_key(&dotted) {
             continue;
         }
-        let text = if uri_matches_path(current_uri, file) {
-            current_text.to_owned()
-        } else {
-            match std::fs::read_to_string(file) {
-                Ok(t) => t,
-                Err(_) => continue,
-            }
+        let Some(source_file) = shape_input_for(
+            db,
+            entries,
+            open_docs,
+            &dotted,
+            file,
+            current_uri,
+            current_text,
+        ) else {
+            continue;
         };
-        let source_file = upsert_source_file(db, entries, &dotted, file, text);
         shapes.insert(dotted, (*module_shapes_query(db, source_file).0).clone());
     }
 
     shapes
 }
 
+/// Resolve the Salsa input that `module_shapes_query` should read for one
+/// project file.
+///
+/// Precedence, highest first:
+///
+/// 1. The live document input, when the client has this file open. Its text
+///    is already the editor buffer, so nothing is written and no filesystem
+///    read happens. The handle is also recorded in `entries`, so a file has
+///    exactly one input whether or not it happens to be open.
+/// 2. `current_text`, when this file is the document being checked but has no
+///    `documents` entry yet (synthetic open).
+/// 3. The on-disk contents.
+///
+/// Returns `None` for a file that is not open and cannot be read.
+fn shape_input_for(
+    db: &mut TycDatabase,
+    entries: &mut HashMap<String, SourceFile>,
+    open_docs: &HashMap<std::path::PathBuf, SourceFile>,
+    dotted: &str,
+    file: &std::path::Path,
+    current_uri: &str,
+    current_text: &str,
+) -> Option<SourceFile> {
+    if let Some(&sf) = open_docs.get(&path_lookup_key(file)) {
+        entries.insert(dotted.to_owned(), sf);
+        return Some(sf);
+    }
+    let text = if uri_matches_path(current_uri, file) {
+        current_text.to_owned()
+    } else {
+        std::fs::read_to_string(file).ok()?
+    };
+    Some(upsert_source_file(db, entries, dotted, file, text))
+}
+
 /// Locate or create the Salsa `SourceFile` handle for a project
 /// module. If we already have a handle, push the new text through
-/// `set_text` (a no-op when content matches); otherwise allocate one
-/// via `SourceFile::new`. Either way, returns a handle that
-/// `module_shapes_query` can consume.
+/// [`set_source_text`], which writes only when the content actually
+/// differs; otherwise allocate one via `SourceFile::new`. Either way,
+/// returns a handle that `module_shapes_query` can consume.
+///
+/// The value comparison is load-bearing: salsa's raw `set_text` stamps the
+/// field as written at the current revision without looking at the value, so
+/// the unconditional re-upload this function used to perform invalidated
+/// `module_shapes_query` for every project file on every keystroke (F56).
 fn upsert_source_file(
     db: &mut TycDatabase,
     entries: &mut HashMap<String, SourceFile>,
@@ -1874,7 +2019,7 @@ fn upsert_source_file(
     text: String,
 ) -> SourceFile {
     if let Some(&sf) = entries.get(dotted) {
-        sf.set_text(db).to(text);
+        set_source_text(db, sf, text);
         sf
     } else {
         let sf = SourceFile::new(db, path.to_string_lossy().into_owned(), text);
@@ -2066,6 +2211,42 @@ fn read_lint_options(root: &std::path::Path) -> tyc_analyse::LintOptions {
         opts.parallel_min_size = n.max(0) as u64;
     }
     opts
+}
+
+/// Read the `[strictness]` *severity* knobs from the project's `typhon.toml`.
+///
+/// Distinct from [`read_lint_options`], which reads the advice-lint *gates*.
+/// The severity knobs decide whether a diagnostic is an error, a warning, or
+/// suppressed; they were not read at all here, so `tyc lsp` and `tyc check`
+/// disagreed about the severity of these diagnostics.
+///
+/// Unreadable or malformed config falls back to defaults, matching the CLI.
+fn read_severity_overrides(root: &std::path::Path) -> tyc_diagnostics::SeverityOverrides {
+    let mut out = tyc_diagnostics::SeverityOverrides::default();
+    let Ok(text) = std::fs::read_to_string(root.join("typhon.toml")) else {
+        return out;
+    };
+    let Ok(parsed) = toml::from_str::<toml::Value>(&text) else {
+        return out;
+    };
+    let Some(strictness) = parsed.get("strictness").and_then(|s| s.as_table()) else {
+        return out;
+    };
+    let read = |key: &str| -> String {
+        strictness
+            .get(key)
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_owned()
+    };
+    out.unused_import = read("unused-import");
+    out.methods_in_class_body = read("methods-in-class-body");
+    out.nullable_use = read("nullable-use");
+    out.require_with = read("require-with");
+    out.blocking_in_async = read("blocking-in-async");
+    out.stub_check = read("stub-check");
+    out.exhaustive_match = read("exhaustive-match");
+    out
 }
 
 /// Map a dotted module name to a source file path under `src_dir`.
@@ -2544,6 +2725,7 @@ pub fn run_stdio(log_level: LogLevel) {
             project_files: Arc::new(Mutex::new(HashMap::new())),
             prewarmed_versions: Arc::new(Mutex::new(HashMap::new())),
             lint_options_cache: Arc::new(Mutex::new(HashMap::new())),
+            severity_overrides_cache: Arc::new(Mutex::new(HashMap::new())),
         });
         Server::new(stdin, stdout, socket).serve(service).await;
     });
@@ -3107,13 +3289,25 @@ pub fn compute_code_actions(
         if !diagnostic_code_matches(diag, "tyc::unused_import") {
             continue;
         }
-        let line = diag.range.start.line;
-        let line_text = nth_line_content(text, line);
-        if !is_safe_single_import_line(line_text) {
-            // Bail rather than emit an unsafe edit. The diagnostic still
-            // surfaces in the editor; the user fixes by hand for now.
+        // The diagnostic's line is an offset into the *preprocessed* buffer,
+        // and this edit is applied to the editor buffer — so any line-count
+        // change above the import (an injected prelude import, a `gather:`
+        // block, a `with`-chain) makes them disagree, and the quick-fix
+        // cheerfully deleted a completely different line. Silently removing a
+        // *used* import is about the worst thing a "safe" quick-fix can do.
+        //
+        // The diagnostic names the offending import, so require the line being
+        // deleted to actually import that name. If it does not, look for the
+        // one line in the file that does; if that is ambiguous or absent, emit
+        // no action at all. The diagnostic still shows — the user just fixes it
+        // by hand — which is the right failure direction for a destructive
+        // edit.
+        let Some(name) = unused_import_name(diag) else {
             continue;
-        }
+        };
+        let Some(line) = resolve_unused_import_line(text, diag.range.start.line, &name) else {
+            continue;
+        };
         let line_range = whole_line_range(text, line);
         let edit = TextEdit {
             range: line_range,
@@ -3137,6 +3331,72 @@ pub fn compute_code_actions(
         }));
     }
     actions
+}
+
+/// The imported name a `tyc::unused_import` diagnostic refers to.
+///
+/// The message is `imported name '<name>' is never used`.
+fn unused_import_name(diag: &Diagnostic) -> Option<String> {
+    let msg = &diag.message;
+    // Accept a backtick-quoted name too, so a future rewording of the
+    // diagnostic cannot silently disable the quick-fix.
+    let quote = msg.chars().find(|c| *c == '\'' || *c == '`')?;
+    let start = msg.find(quote)? + quote.len_utf8();
+    let end = msg[start..].find(quote)? + start;
+    let name = &msg[start..end];
+    if name.is_empty() {
+        None
+    } else {
+        Some(name.to_owned())
+    }
+}
+
+/// The line in `text` that a "Remove unused import" edit may delete.
+///
+/// Prefers `hinted` (the diagnostic's own line) when it really is a safe
+/// single import binding `name`. Otherwise falls back to the unique line in
+/// the file that is — and returns `None` when there is no such line or more
+/// than one, so no edit is offered rather than a wrong one.
+fn resolve_unused_import_line(text: &str, hinted: u32, name: &str) -> Option<u32> {
+    let binds = |line: &str| is_safe_single_import_line(line) && import_line_binds(line, name);
+    if binds(nth_line_content(text, hinted)) {
+        return Some(hinted);
+    }
+    let mut found: Option<u32> = None;
+    for (i, line) in text.lines().enumerate() {
+        if binds(line) {
+            if found.is_some() {
+                return None; // ambiguous
+            }
+            found = Some(i as u32);
+        }
+    }
+    found
+}
+
+/// True when `line` is an import statement that binds `name`.
+///
+/// Handles `import m`, `import m as n`, `import a.b` (binds `a`),
+/// `from m import x` and `from m import x as y`.
+fn import_line_binds(line: &str, name: &str) -> bool {
+    let core = line.split_once('#').map(|(b, _)| b).unwrap_or(line).trim();
+    let bound = if let Some(rest) = core.strip_prefix("from ") {
+        match rest.split_once(" import ") {
+            Some((_, after)) => after,
+            None => return false,
+        }
+    } else if let Some(rest) = core.strip_prefix("import ") {
+        rest
+    } else {
+        return false;
+    };
+    let bound = bound.trim();
+    match bound.split_once(" as ") {
+        // An `as` clause binds the alias.
+        Some((_, alias)) => alias.trim() == name,
+        // `import a.b.c` binds the root segment; `from m import x` binds `x`.
+        None => bound.split('.').next().unwrap_or(bound).trim() == name,
+    }
 }
 
 /// Extract the text content of `text`'s line `line` (0-indexed),
@@ -3995,6 +4255,93 @@ mod tests {
         );
     }
 
+    #[test]
+    fn read_severity_overrides_defaults_without_config() {
+        // No `typhon.toml` → every knob unset ("" = take the diagnostic's
+        // default), matching the CLI's behaviour for a config-less check.
+        let tmp = tempfile::tempdir().unwrap();
+        let overrides = read_severity_overrides(tmp.path());
+        assert!(overrides.unused_import.is_empty());
+        assert!(overrides.nullable_use.is_empty());
+        assert!(overrides.exhaustive_match.is_empty());
+    }
+
+    #[test]
+    fn read_severity_overrides_parses_every_knob() {
+        // The editor must honour the same `[strictness]` severity knobs as
+        // `tyc check` — including `nullable-use`, which gates the
+        // warn-emitted attribute-rooted form of `tyc::nullable_use`.
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("typhon.toml"),
+            "[project]\nname = \"x\"\nsrc = \"src\"\n\
+             [strictness]\n\
+             unused-import = \"off\"\n\
+             methods-in-class-body = \"error\"\n\
+             nullable-use = \"off\"\n\
+             require-with = \"error\"\n\
+             blocking-in-async = \"off\"\n\
+             stub-check = \"warn\"\n\
+             exhaustive-match = \"warn\"\n",
+        )
+        .unwrap();
+        let overrides = read_severity_overrides(tmp.path());
+        assert_eq!(overrides.unused_import, "off");
+        assert_eq!(overrides.methods_in_class_body, "error");
+        assert_eq!(overrides.nullable_use, "off");
+        assert_eq!(overrides.require_with, "error");
+        assert_eq!(overrides.blocking_in_async, "off");
+        assert_eq!(overrides.stub_check, "warn");
+        assert_eq!(overrides.exhaustive_match, "warn");
+    }
+
+    /// The config caches key on a content hash, not the mtime they used to
+    /// use: two saves inside one filesystem timestamp tick share an mtime, and
+    /// an editor that sends no watched-file notification would then serve the
+    /// stale severities until the next write or a restart.
+    #[test]
+    fn config_fingerprint_changes_when_content_changes_within_one_mtime_tick() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = tmp.path().join("typhon.toml");
+        let base = "[project]\nname = \"x\"\nsrc = \"src\"\n[strictness]\n";
+
+        std::fs::write(&cfg, format!("{base}unused-import = \"off\"\n")).unwrap();
+        let before = config_fingerprint(tmp.path());
+        let mtime_before = std::fs::metadata(&cfg).unwrap().modified().unwrap();
+
+        // Rewrite with different content, then force the mtime back to what it
+        // was — the coarse-timestamp collision, made deterministic.
+        std::fs::write(&cfg, format!("{base}unused-import = \"error\"\n")).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&cfg)
+            .unwrap()
+            .set_modified(mtime_before)
+            .unwrap();
+        assert_eq!(
+            std::fs::metadata(&cfg).unwrap().modified().unwrap(),
+            mtime_before,
+            "the collision must actually be reproduced for this test to mean anything"
+        );
+
+        let after = config_fingerprint(tmp.path());
+        assert!(before.is_some() && after.is_some());
+        assert_ne!(
+            before, after,
+            "an mtime-keyed cache would miss this edit and keep the stale severities"
+        );
+
+        // And the parsed result really did change, so the miss matters.
+        assert_eq!(read_severity_overrides(tmp.path()).unused_import, "error");
+    }
+
+    /// An unreadable config always misses rather than pinning a stale entry.
+    #[test]
+    fn config_fingerprint_is_none_when_the_config_is_unreadable() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert_eq!(config_fingerprint(tmp.path()), None);
+    }
+
     // ── End-to-end LSP harness ──────────────────────────────────────────────
     //
     // Drives the real `Backend` over an in-memory duplex pair (no sockets, no
@@ -4025,6 +4372,7 @@ mod tests {
             project_files: Arc::new(Mutex::new(HashMap::new())),
             prewarmed_versions: Arc::new(Mutex::new(HashMap::new())),
             lint_options_cache: Arc::new(Mutex::new(HashMap::new())),
+            severity_overrides_cache: Arc::new(Mutex::new(HashMap::new())),
         });
         let (to_server, server_in) = tokio::io::duplex(64 * 1024);
         let (server_out, from_server) = tokio::io::duplex(64 * 1024);
@@ -6015,7 +6363,11 @@ def f() -> None:
             code: Some(NumberOrString::String("tyc::unused_import".to_string())),
             code_description: None,
             source: Some("tyc".into()),
-            message: "unused import `os`".to_string(),
+            // The real `tyc::unused_import` text. The fixture used to say
+            // "unused import `os`", which no diagnostic ever produced — so the
+            // code-action tests were exercising a message shape that does not
+            // exist.
+            message: "imported name 'os' is never used".to_string(),
             related_information: None,
             tags: None,
             data: None,
@@ -6089,6 +6441,54 @@ def f() -> None:
         let diag = unused_import_diag(0, 7, 2);
         let actions = compute_code_actions(&u, text, &[diag]);
         assert_eq!(actions.len(), 1, "simple import + comment should fix");
+    }
+
+    #[test]
+    fn quick_fix_never_deletes_a_line_that_is_not_the_named_import() {
+        // The diagnostic's line indexes the *preprocessed* buffer while the
+        // edit lands in the editor buffer, so any line-count change above the
+        // import makes them disagree — and the quick-fix used to delete
+        // whatever happened to be at that index. Silently removing a *used*
+        // import is the worst thing a "safe" quick-fix can do.
+        let text = "import os\nimport json\n\ndef main() -> None:\n    print(os.name)\n";
+
+        // Diagnostic points at line 0 (`import os`) but names `json`: the
+        // hint is stale, so the edit must target the real `import json` line.
+        assert_eq!(resolve_unused_import_line(text, 0, "json"), Some(1));
+        // A correct hint is used as-is.
+        assert_eq!(resolve_unused_import_line(text, 1, "json"), Some(1));
+        // A name that is not imported anywhere yields no edit at all.
+        assert_eq!(resolve_unused_import_line(text, 0, "sys"), None);
+        // Ambiguity yields no edit rather than a guess.
+        let dupes = "import json\nimport json\n";
+        assert_eq!(resolve_unused_import_line(dupes, 5, "json"), None);
+    }
+
+    #[test]
+    fn import_line_binding_names() {
+        assert!(import_line_binds("import os", "os"));
+        assert!(import_line_binds("import os as o", "o"));
+        assert!(!import_line_binds("import os as o", "os"));
+        // `import a.b.c` binds the root name.
+        assert!(import_line_binds("import a.b.c", "a"));
+        assert!(!import_line_binds("import a.b.c", "c"));
+        assert!(import_line_binds("from typing import Callable", "Callable"));
+        assert!(import_line_binds("from typing import Callable as C", "C"));
+        assert!(!import_line_binds("print(os)", "os"));
+    }
+
+    #[test]
+    fn unused_import_name_is_read_from_the_message() {
+        let diag = Diagnostic {
+            message: "imported name 'json' is never used".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(unused_import_name(&diag).as_deref(), Some("json"));
+        let other = Diagnostic {
+            message: "something else entirely".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(unused_import_name(&other), None);
     }
 
     #[test]
@@ -6312,6 +6712,146 @@ def f() -> None:
         assert!(
             Arc::ptr_eq(&first, &second),
             "unchanged file should return the same Arc from the Salsa cache"
+        );
+    }
+
+    // ── Cross-module shape registry (F56 / F57) ──────────────────────────────
+
+    /// Lay down a two-module project on disk and return `(tmpdir, src_dir)`.
+    fn two_module_project() -> (tempfile::TempDir, std::path::PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("thing.ty"), "pub class Thing:\n    a: int\n").unwrap();
+        std::fs::write(
+            src.join("main.ty"),
+            "from thing import Thing\n\ndef main() -> None:\n    let t: Thing = Thing(a=1)\n    print(t.a)\n",
+        )
+        .unwrap();
+        (tmp, src)
+    }
+
+    /// F57 — a sibling module that the client has open must be read from its
+    /// live buffer, not from the (stale) bytes on disk. Before the fix, only
+    /// the document currently being checked used its buffer; every other open
+    /// document was overwritten with disk text, so an unsaved edit in module A
+    /// produced phantom errors in module B.
+    #[test]
+    fn project_shapes_read_open_documents_not_disk() {
+        let (_tmp, src) = two_module_project();
+        let thing_path = src.join("thing.ty");
+
+        let mut db = TycDatabase::new();
+        let project_files: Arc<Mutex<HashMap<std::path::PathBuf, HashMap<String, SourceFile>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+
+        // Control: nothing open → disk text, one field.
+        let shapes = build_project_shapes_salsa(
+            &mut db,
+            &project_files,
+            &src,
+            "src",
+            "",
+            "",
+            &HashMap::new(),
+        );
+        let disk = &shapes["thing"].class_shapes["Thing"];
+        assert!(disk.fields.contains_key("a"));
+        assert!(
+            !disk.fields.contains_key("b"),
+            "disk copy of thing.ty has no `b` field"
+        );
+
+        // Now open `thing.ty` in the editor and add a field WITHOUT saving.
+        let buffer = "pub class Thing:\n    a: int\n    b: int\n";
+        let doc = SourceFile::new(
+            &db,
+            format!("file://{}", thing_path.display()),
+            buffer.to_owned(),
+        );
+        let mut open_docs = HashMap::new();
+        open_docs.insert(path_lookup_key(&thing_path), doc);
+
+        let shapes =
+            build_project_shapes_salsa(&mut db, &project_files, &src, "src", "", "", &open_docs);
+        let live = &shapes["thing"].class_shapes["Thing"];
+        assert!(
+            live.fields.contains_key("b"),
+            "the unsaved buffer's new field must reach the registry; got {:?}",
+            live.field_order
+        );
+    }
+
+    /// F56 — re-running the registry build with nothing changed must not
+    /// invalidate `module_shapes_query`. Salsa's raw `set_text` is not
+    /// value-comparing, so the unguarded re-upload this used to perform
+    /// re-parsed every project file on every keystroke.
+    #[test]
+    fn project_shapes_rebuild_reuses_the_salsa_memo() {
+        let (_tmp, src) = two_module_project();
+        let mut db = TycDatabase::new();
+        let project_files: Arc<Mutex<HashMap<std::path::PathBuf, HashMap<String, SourceFile>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+
+        let _ = build_project_shapes_salsa(
+            &mut db,
+            &project_files,
+            &src,
+            "src",
+            "",
+            "",
+            &HashMap::new(),
+        );
+        // Grab the handle the first pass registered, and the memo it produced.
+        let handle = {
+            let per_project = project_files.blocking_lock();
+            per_project
+                .values()
+                .next()
+                .expect("one project root registered")["thing"]
+        };
+        let before = module_shapes_query(&db, handle);
+
+        // Second pass, identical on-disk text.
+        let _ = build_project_shapes_salsa(
+            &mut db,
+            &project_files,
+            &src,
+            "src",
+            "",
+            "",
+            &HashMap::new(),
+        );
+        let after = module_shapes_query(&db, handle);
+        assert!(
+            Arc::ptr_eq(&before.0, &after.0),
+            "an unchanged sibling module must stay a Salsa cache hit across \
+             registry rebuilds"
+        );
+
+        // A genuine on-disk edit must still invalidate.
+        std::fs::write(
+            src.join("thing.ty"),
+            "pub class Thing:\n    a: int\n    b: int\n",
+        )
+        .unwrap();
+        let _ = build_project_shapes_salsa(
+            &mut db,
+            &project_files,
+            &src,
+            "src",
+            "",
+            "",
+            &HashMap::new(),
+        );
+        let edited = module_shapes_query(&db, handle);
+        assert!(
+            !Arc::ptr_eq(&before.0, &edited.0),
+            "a real edit must invalidate the memo"
+        );
+        assert!(
+            edited.class_shapes["Thing"].fields.contains_key("b"),
+            "the re-run must observe the edited file"
         );
     }
 }

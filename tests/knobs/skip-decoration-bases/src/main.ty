@@ -1,0 +1,30 @@
+# `[emit] skip-decoration-bases` suppresses the automatic
+# @dataclasses.dataclass(slots=True) on classes whose base's last segment is
+# listed — the escape hatch for metaclass-driven framework bases. The knob
+# drops the decorator only; it does not synthesise an __init__, so this fixture
+# deliberately declares no fields.
+plain class WidgetBase:
+    pass
+
+
+impl WidgetBase:
+    def label(self) -> str:
+        return "widget"
+
+
+class Button(WidgetBase):
+    pass
+
+
+impl Button:
+    def caption(self) -> str:
+        return "ok"
+
+
+def main() -> None:
+    let b: Button = Button()
+    print(b.label(), b.caption())
+
+
+if __name__ == "__main__":
+    main()

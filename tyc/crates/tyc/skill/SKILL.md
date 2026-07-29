@@ -573,7 +573,7 @@ let _internal_default_port: int = 8080   # not exported
 
 When a module declares at least one `pub` name, desugar synthesises a top-of-file `__all__ = [...]` so `from foo import *`, Sphinx autoapi, IDE re-export filters, and the type checker's re-export inference all see the public surface. A hand-written `__all__` wins.
 
-Stacks with every modifier: `pub frozen class`, `pub model`, `pub let`, `pub mut`, `pub freeze let`, `pub newtype`, `pub interface`, `pub type`, `pub def`, `pub async def`, and `pub comptime let` / `pub comptime mut` / `pub comptime def` (v0.15.4). The one current exception is **`pub lazy let`, which does NOT parse** — see §7.
+Stacks with every modifier: `pub class X frozen:` (the modifier is postfix), `pub model`, `pub let`, `pub mut`, `pub freeze let`, `pub newtype`, `pub interface`, `pub type`, `pub def`, `pub async def`, and `pub comptime let` / `pub comptime mut` / `pub comptime def` (v0.15.4). The one current exception is **`pub lazy let`, which does NOT parse** — see §7.
 
 ### `pub *` — package-level re-export aggregation (v0.7.0)
 

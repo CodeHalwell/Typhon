@@ -217,6 +217,17 @@ imports in the entry point resolve correctly.
   VM mode (the descriptor-based proxy class the build path emits has
   nothing to bind against in a tree-walking VM) (v0.9.0).
 
+## Verifying the drop-in contract
+
+The VM is contractually a drop-in for `tyc build` + CPython: any difference in
+stdout or exit code between the two is a bug, not a documented limitation.
+`scripts/vm-differential.sh` is the CI gate that holds that contract — it builds
+and executes every unit in `examples/` and `stress/` both ways and diffs the
+results. Divergences that exist today are pinned in
+`scripts/differential-baseline.txt`, which the gate forces to only ever shrink.
+See [differential-testing.md](differential-testing.md); every entry in that
+baseline is a VM bug awaiting a fix.
+
 ## What the VM does not support yet
 
 Surface as `NotImplementedError` at runtime, with the feature name in the
@@ -241,6 +252,34 @@ message:
   exit — after its side effects, unlike a real cancellation.
   `@asynccontextmanager` factories share the eager-generator limitation
   below.
+- **`ExceptionGroup` / `except*`.** Modelled since v1.0.0-alpha.7. A
+  failing task inside a `gather:` block or a `TaskGroup` surfaces as
+  `ExceptionGroup('unhandled errors in a TaskGroup', [...])` raised from
+  `__aexit__`, exactly as under CPython — so it must be handled with
+  `except*`, not a plain `except ValueError:`. Before that release the VM
+  ignored `is_star` entirely and raised the bare exception out of
+  `create_task`, which a plain `except` caught under `tyc run` and did not
+  under `tyc build && python`, from the same clean `tyc check`. `except*`
+  now splits the group, runs every matching handler once with its own
+  recursively-split subgroup, re-raises the unmatched remainder, and raises
+  the same `TypeError` CPython does for `except* ExceptionGroup`.
+  A naked `raise` inside an `except*` handler reconstitutes the original
+  group (CPython's `_PyExc_PrepReraiseStar` re-raise merging); `await` on a
+  failed task re-raises the task's exception; `KeyboardInterrupt` /
+  `SystemExit` escape `TaskGroup.__aexit__` bare rather than grouped; and
+  split sides re-derive through `BaseExceptionGroup.__new__`'s downcast
+  rule, so `isinstance(e, Exception)` holds inside an `except*` handler
+  over a mixed group exactly as under CPython.
+
+  Three residual divergences: `.split()` / `.subgroup()` / `.derive()` are
+  not exposed as user-callable methods, `__context__` is not chained
+  between exceptions collected from handler bodies, and an uncaught group
+  prints the summary line (`ExceptionGroup: g (2 sub-exceptions)`) rather
+  than CPython's nested `+-+---- 1 ----` traceback tree. Inherent to
+  sequential execution: the VM cannot cancel sibling tasks, so a
+  multi-failure `gather:` may report more members than CPython would — and
+  the body of a `TaskGroup` sees a failed task's exception at the `await`
+  rather than the `CancelledError` a real cancellation would deliver.
 - **Lazy / unbounded generators.** Finite `yield` / `yield from` work
   since v0.10.0 via eager materialisation, but the worst case
   (`while True: yield`) hits the `GENERATOR_CAP = 1_000_000` ceiling and

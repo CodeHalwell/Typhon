@@ -778,12 +778,22 @@ pub fn install(interp: &mut Interpreter) {
     native!("max", |i, args| reduce_minmax(i, args, false));
 
     native!("sum", |i, args| {
-        let it = i.make_iter(
-            args.into_iter()
-                .next()
-                .ok_or_else(|| type_error("sum() requires an iterable"))?,
-        )?;
-        let mut acc = Value::Int(VmInt::from(0));
+        let mut args = args.into_iter();
+        let iterable = args
+            .next()
+            .ok_or_else(|| type_error("sum() requires an iterable"))?;
+        // `sum(xs, start)` — the second positional argument was dropped on
+        // the floor, so the call returned a total short by exactly `start`
+        // with no error. (The keyword form `sum(xs, start=n)` is handled on
+        // the kwargs path.)
+        let mut acc = match args.next() {
+            Some(start) => start,
+            None => Value::Int(VmInt::from(0)),
+        };
+        if args.next().is_some() {
+            return Err(type_error("sum() takes at most 2 arguments"));
+        }
+        let it = i.make_iter(iterable)?;
         while let Some(v) = i.iter_next(&it)? {
             acc = i.binop(&acc, ruff_python_ast::Operator::Add, &v)?;
         }
@@ -1198,6 +1208,7 @@ pub fn install(interp: &mut Interpreter) {
             properties: std::cell::RefCell::new(std::collections::HashSet::new()),
             classmethods: std::cell::RefCell::new(std::collections::HashSet::new()),
             is_exception: false,
+            is_protocol: false,
         })),
     );
     // Common typing names that show up as zero-effort bases.
@@ -1213,6 +1224,7 @@ pub fn install(interp: &mut Interpreter) {
                 properties: std::cell::RefCell::new(std::collections::HashSet::new()),
                 classmethods: std::cell::RefCell::new(std::collections::HashSet::new()),
                 is_exception: false,
+                is_protocol: false,
             })),
         );
     }
@@ -1294,6 +1306,53 @@ pub fn install(interp: &mut Interpreter) {
                 message: Rc::new(msg),
                 args: Rc::new(args),
             })
+        });
+        root.set(name, Value::Native(Rc::new(ctor)));
+    }
+
+    // PEP 654 exception groups. Two-argument constructors
+    // (`ExceptionGroup(message, [sub, ...])`) whose value keeps CPython's own
+    // layout — `args == (message, subs)` — see `value::make_exception_group`.
+    // `BaseExceptionGroup` auto-downcasts to `ExceptionGroup` when every
+    // member is an ordinary `Exception`, exactly as CPython's `__new__` does.
+    for name in ["ExceptionGroup", "BaseExceptionGroup"] {
+        let n = name.to_owned();
+        let ctor = NativeFn::new(Box::leak(n.clone().into_boxed_str()), move |_i, args| {
+            let message = args.first().map(|v| v.py_str()).unwrap_or_default();
+            let subs: Vec<Value> = match args.get(1) {
+                Some(Value::List(l)) => l.borrow().clone(),
+                Some(Value::Tuple(t)) => (**t).clone(),
+                Some(other) => {
+                    return Err(type_error(format!(
+                        "second argument (exceptions) must be a sequence, not {}",
+                        other.type_name()
+                    )))
+                }
+                None => {
+                    return Err(type_error(format!(
+                        "{n}() missing required argument 'exceptions'"
+                    )))
+                }
+            };
+            if subs.is_empty() {
+                return Err(Unwind::Exception(crate::error::VmException::new(
+                    "ValueError",
+                    "second argument (exceptions) must be a non-empty sequence",
+                )));
+            }
+            // The member test is "derives from Exception", which a nested
+            // `BaseExceptionGroup` fails — CPython rejects
+            // `ExceptionGroup("o", [BaseExceptionGroup("i", [KeyboardInterrupt()])])`
+            // with the same TypeError it gives a bare KeyboardInterrupt.
+            let kind = crate::value::exception_group_kind_for(&subs);
+            if n == "ExceptionGroup" && kind == "BaseExceptionGroup" {
+                return Err(type_error(
+                    "Cannot nest BaseExceptions in an ExceptionGroup".to_owned(),
+                ));
+            }
+            Ok(crate::value::make_exception_group(
+                kind, &message, subs, false,
+            ))
         });
         root.set(name, Value::Native(Rc::new(ctor)));
     }
@@ -1390,6 +1449,58 @@ fn value_len(v: &Value) -> Result<usize, Unwind> {
     })
 }
 
+/// Resolve the optional `start` / `end` positional arguments that CPython's
+/// search methods (`find`, `rfind`, `index`, `rindex`, `count`, `startswith`,
+/// `endswith`) accept after the needle, into a clamped `[start, end)` range
+/// over a sequence of `len` items.
+///
+/// These arguments were being dropped entirely: `single()` reads `args[0]`
+/// and ignores the rest, so `s.find(x, i)` searched from the beginning every
+/// time. That is not merely a wrong number — the canonical "scan for every
+/// occurrence" loop, `while (i := s.find(x, i + 1)) != -1:`, never advances,
+/// so it never terminates.
+///
+/// Python's rules (CPython's `ADJUST_INDICES`): a negative index counts from
+/// the end and clamps at 0; `end` clamps down to `len`; but a positive
+/// `start` is *not* clamped, so `start > end` marks the range as no-match
+/// territory — observable with an empty needle, where CPython answers
+/// `"abc".find("", 4) == -1`, `"abc".startswith("", 5) is False`,
+/// `"abc".count("", 2, 1) == 0` rather than treating the range as empty at
+/// `len` (all verified against 3.13). `None` signals that no-match state;
+/// callers map it to `-1` / `ValueError` / `False` / `0`.
+fn search_range(args: &[Value], len: usize) -> Result<Option<(usize, usize)>, Unwind> {
+    let len = len as i64;
+    let resolve = |v: Option<&Value>, default: i64| -> Result<i64, Unwind> {
+        match v {
+            None | Some(Value::None) => Ok(default),
+            Some(v) => v.to_int(),
+        }
+    };
+    let mut start = resolve(args.get(1), 0)?;
+    if start < 0 {
+        start = (start + len).max(0);
+    }
+    let mut end = resolve(args.get(2), len)?;
+    if end > len {
+        end = len;
+    } else if end < 0 {
+        end = (end + len).max(0);
+    }
+    if start > end {
+        return Ok(None);
+    }
+    Ok(Some((start as usize, end as usize)))
+}
+
+/// Byte offsets of the character range `[start, end)` within `s`, for
+/// re-slicing a string by CPython character indices.
+fn char_range_bytes(s: &str, start: usize, end: usize) -> (usize, usize) {
+    let mut it = s.char_indices().map(|(i, _)| i);
+    let bs = it.clone().nth(start).unwrap_or(s.len());
+    let be = it.nth(end).unwrap_or(s.len());
+    (bs, be)
+}
+
 pub(crate) fn is_instance_of(val: &Value, cls: &Value) -> bool {
     let want_name = match cls {
         Value::Native(n) => Some(n.name.to_owned()),
@@ -1404,7 +1515,15 @@ pub(crate) fn is_instance_of(val: &Value, cls: &Value) -> bool {
         return false;
     };
     match (name.as_str(), val) {
+        // Every value is an `object` — the root of Python's type hierarchy.
+        // Without this arm `isinstance(x, object)` was uniformly `False`,
+        // which silently inverts any control flow written around it.
+        ("object", _) => true,
         ("int", Value::Int(_)) => true,
+        // `bool` is a subclass of `int` in CPython, so `isinstance(True, int)`
+        // is `True` there. The VM answered `False`, taking the opposite branch
+        // from the compiled program on the same source.
+        ("int", Value::Bool(_)) => true,
         ("float", Value::Float(_)) => true,
         ("bool", Value::Bool(_)) => true,
         ("str", Value::Str(_)) => true,
@@ -1503,10 +1622,15 @@ fn reduce_minmax(
 /// top-level bindings (classes / functions) it produced.
 fn compile_helpers(interp: &mut Interpreter, source: &str) -> Result<Vec<(String, Value)>, Unwind> {
     use tyc_syntax::preprocess;
-    let expanded = preprocess::expand_question_ops(&preprocess::expand_pipes(
-        &preprocess::expand_with_chains(&preprocess::expand_go_calls(
-            &preprocess::expand_gather_blocks(&preprocess::expand_multiline_guards(
-                &preprocess::expand_typed_let_unpack(&preprocess::expand_lazy_lets(source)),
+    let expanded = preprocess::expand_question_ops(&preprocess::expand_inline_question_ops(
+        // Shared with the CLI: the VM omitted both of these, so an
+        // inline `?` (`f(g()?)`, `elif h()? > 1:`) failed to parse under
+        // `tyc run` on a program `tyc build` compiles and runs.
+        &preprocess::expand_compound_question_headers(&preprocess::expand_pipes(
+            &preprocess::expand_with_chains(&preprocess::expand_go_calls(
+                &preprocess::expand_gather_blocks(&preprocess::expand_multiline_guards(
+                    &preprocess::expand_typed_let_unpack(&preprocess::expand_lazy_lets(source)),
+                )),
             )),
         )),
     ));
@@ -2112,29 +2236,34 @@ fn make_math_module() -> Value {
                     Ok(Value::Float(single(&args, "sqrt")?.to_float()?.sqrt()))
                 }),
             ),
+            // `floor` / `ceil` / `trunc` all return a Python `int`, which is
+            // arbitrary-precision. Going through `as i64` saturated at
+            // `i64::MAX` for any |x| >= 2^63, so `math.floor(1e30)` silently
+            // produced 9223372036854775807 — a wrong answer with no error, in
+            // the one place the VM's bignum support is supposed to matter.
             (
                 "floor",
                 nf("floor", |_i, args| {
-                    Ok(Value::Int(VmInt::from(
-                        single(&args, "floor")?.to_float()?.floor() as i64,
-                    )))
+                    Value::Float(single(&args, "floor")?.to_float()?.floor())
+                        .to_bigint()
+                        .map(|b| Value::Int(VmInt::from(b)))
                 }),
             ),
             (
                 "ceil",
                 nf("ceil", |_i, args| {
-                    Ok(Value::Int(VmInt::from(
-                        single(&args, "ceil")?.to_float()?.ceil() as i64,
-                    )))
+                    Value::Float(single(&args, "ceil")?.to_float()?.ceil())
+                        .to_bigint()
+                        .map(|b| Value::Int(VmInt::from(b)))
                 }),
             ),
             (
                 "trunc",
                 nf("trunc", |_i, args| {
                     // Returns an int, consistent with CPython math.trunc.
-                    Ok(Value::Int(VmInt::from(
-                        single(&args, "trunc")?.to_float()?.trunc() as i64,
-                    )))
+                    Value::Float(single(&args, "trunc")?.to_float()?.trunc())
+                        .to_bigint()
+                        .map(|b| Value::Int(VmInt::from(b)))
                 }),
             ),
             (
@@ -3674,6 +3803,7 @@ fn make_re_module() -> Value {
             properties: std::cell::RefCell::new(std::collections::HashSet::new()),
             classmethods: std::cell::RefCell::new(std::collections::HashSet::new()),
             is_exception: false,
+            is_protocol: false,
         });
         Value::Instance(Rc::new(crate::value::Instance {
             class: cls,
@@ -3798,6 +3928,7 @@ fn make_re_module() -> Value {
             properties: std::cell::RefCell::new(std::collections::HashSet::new()),
             classmethods: std::cell::RefCell::new(std::collections::HashSet::new()),
             is_exception: false,
+            is_protocol: false,
         });
         Value::Instance(Rc::new(crate::value::Instance {
             class: cls,
@@ -4006,6 +4137,77 @@ fn make_re_module() -> Value {
 /// A completed-task wrapper: `TaskGroup.create_task` / `spawn` force the
 /// coroutine immediately (sequential semantics) and hand back this module
 /// so `.result()` / `await task` recover the value.
+/// The exception *value* carried by an unwind, materialising a
+/// `Value::Exception` summary when the raise site didn't attach one.
+fn exception_unwind_value(e: &crate::error::VmException) -> Value {
+    e.value.clone().unwrap_or_else(|| Value::Exception {
+        kind: Rc::new(e.kind.clone()),
+        message: Rc::new(e.message.clone()),
+        args: Rc::new(if e.message.is_empty() {
+            Vec::new()
+        } else {
+            vec![Value::Str(Rc::new(e.message.clone()))]
+        }),
+    })
+}
+
+/// CPython `TaskGroup._is_base_error`: exactly `KeyboardInterrupt` and
+/// `SystemExit` (instances, so subclasses count). Deliberately narrower than
+/// [`crate::value::is_base_only_exception`] — a bare `BaseException` or a
+/// `GeneratorExit` is *not* a base error to a TaskGroup and gets wrapped in
+/// the group like any other failure (verified against 3.13).
+fn is_taskgroup_base_error(v: &Value) -> bool {
+    match v {
+        Value::Exception { kind, .. } => {
+            let k = kind.as_str();
+            k == "KeyboardInterrupt"
+                || k == "SystemExit"
+                || crate::interp::builtin_exc_is_a(k, "KeyboardInterrupt")
+                || crate::interp::builtin_exc_is_a(k, "SystemExit")
+        }
+        Value::Instance(inst) => {
+            crate::interp::class_has_builtin_exc_base(&inst.class, "KeyboardInterrupt")
+                || crate::interp::class_has_builtin_exc_base(&inst.class, "SystemExit")
+        }
+        _ => false,
+    }
+}
+
+/// A task whose coroutine raised. `TaskGroup.__aexit__` re-raises the whole
+/// batch as an `ExceptionGroup` before the `gather:` lowering ever reads a
+/// `.result()`, so this only matters for hand-written TaskGroup use — where
+/// CPython's `Task.result()` likewise re-raises the task's exception.
+fn make_failed_task_value(exc: Value) -> Value {
+    let for_result = exc.clone();
+    make_module(
+        "Task",
+        vec![
+            // `await task` consults this sentinel (see `force_awaitable`)
+            // and re-raises, exactly like `result()` below — CPython's
+            // `await` on a completed-with-exception task re-raises it.
+            ("__typhon_task_error__", exc.clone()),
+            (
+                "result",
+                Value::Native(Rc::new(NativeFn::new("result", move |i, _args| {
+                    Err(i.value_to_exception(for_result.clone()))
+                }))),
+            ),
+            ("done", nf("done", |_i, _args| Ok(Value::Bool(true)))),
+            ("cancel", nf("cancel", |_i, _args| Ok(Value::Bool(false)))),
+            (
+                "cancelled",
+                nf("cancelled", |_i, _args| Ok(Value::Bool(false))),
+            ),
+            (
+                "exception",
+                Value::Native(Rc::new(NativeFn::new("exception", move |_i, _args| {
+                    Ok(exc.clone())
+                }))),
+            ),
+        ],
+    )
+}
+
 fn make_task_value(result: Value) -> Value {
     let result_for_member = result.clone();
     make_module(
@@ -4038,6 +4240,26 @@ fn make_asyncio_module() -> Value {
     let task_group = nf("TaskGroup", |_i, _args| {
         let tg = make_module("asyncio.TaskGroup", vec![]);
         let tg_for_enter = tg.clone();
+        // F5 — a child task that fails must NOT propagate its bare exception
+        // out of `create_task`. CPython's TaskGroup collects child failures
+        // and re-raises them from `__aexit__` wrapped in
+        // `ExceptionGroup('unhandled errors in a TaskGroup', [...])`, so a
+        // surrounding `except ValueError:` does not match and only an
+        // `except* ValueError:` does. Before this, the VM raised the bare
+        // exception straight out of `create_task`, so the identical `.ty`
+        // source caught the error under `tyc run` and died with an uncaught
+        // ExceptionGroup under `tyc build && python` — opposite outcomes from
+        // a clean check.
+        //
+        // Divergence that remains (inherent to the VM's sequential execution,
+        // documented in docs/vm.md): CPython *cancels* the sibling tasks when
+        // one fails, so a task that had not started contributes nothing to the
+        // group. The VM runs every `create_task` body to completion at its
+        // force point, so every failure is collected. The single-failure case
+        // — overwhelmingly the common one for `gather:` — is identical.
+        let failures: Rc<RefCell<Vec<Value>>> = Rc::new(RefCell::new(Vec::new()));
+        let failures_for_create = failures.clone();
+        let failures_for_exit = failures.clone();
         if let Value::Module(m) = &tg {
             let mut members = m.members.borrow_mut();
             members.insert(
@@ -4048,19 +4270,68 @@ fn make_asyncio_module() -> Value {
             );
             members.insert(
                 "__aexit__".to_owned(),
-                Value::Native(Rc::new(NativeFn::new("__aexit__", |_i, _args| {
-                    Ok(Value::Bool(false))
+                Value::Native(Rc::new(NativeFn::new("__aexit__", move |i, args| {
+                    let mut pending = failures_for_exit.borrow_mut();
+                    // CPython wraps a body-raised exception into the same
+                    // group (verified against 3.13), so fold it in here —
+                    // unless it is a task failure the group already
+                    // collected, re-raised into the body by `await t` on the
+                    // failed task. CPython's body is cancelled at that await
+                    // and the group holds the error exactly once (3.13:
+                    // `ExceptionGroup('unhandled errors in a TaskGroup',
+                    // [ValueError('boom')])`, one member).
+                    if let Some(body_exc) = args.get(1) {
+                        if !matches!(body_exc, Value::None)
+                            && !pending
+                                .iter()
+                                .any(|p| crate::value::exception_values_identical(p, body_exc))
+                        {
+                            pending.push(body_exc.clone());
+                        }
+                    }
+                    if pending.is_empty() {
+                        return Ok(Value::Bool(false));
+                    }
+                    let subs: Vec<Value> = pending.drain(..).collect();
+                    drop(pending);
+                    // CPython's TaskGroup singles out KeyboardInterrupt /
+                    // SystemExit (`_is_base_error`) as `_base_error` — the
+                    // first one observed is re-raised BARE, never wrapped in
+                    // the group, and every other collected failure is
+                    // dropped (verified against 3.13 for body- and
+                    // child-raised cases). A bare `BaseException` is *not* a
+                    // base error there and stays in the group.
+                    if let Some(base) = subs.iter().find(|v| is_taskgroup_base_error(v)) {
+                        return Err(i.value_to_exception(base.clone()));
+                    }
+                    let kind = crate::value::exception_group_kind_for(&subs);
+                    let group = crate::value::make_exception_group(
+                        kind,
+                        "unhandled errors in a TaskGroup",
+                        subs,
+                        false,
+                    );
+                    Err(Unwind::Exception(
+                        crate::error::VmException::new(kind, group.py_str()).with_value(group),
+                    ))
                 }))),
             );
             members.insert(
                 "create_task".to_owned(),
-                Value::Native(Rc::new(NativeFn::new("create_task", |i, args| {
+                Value::Native(Rc::new(NativeFn::new("create_task", move |i, args| {
                     let coro = args
                         .into_iter()
                         .next()
                         .ok_or_else(|| type_error("create_task() requires a coroutine"))?;
-                    let result = i.force_awaitable(coro)?;
-                    Ok(make_task_value(result))
+                    match i.force_awaitable(coro) {
+                        Ok(result) => Ok(make_task_value(result)),
+                        Err(Unwind::Exception(e)) => {
+                            let value = exception_unwind_value(&e);
+                            failures_for_create.borrow_mut().push(value.clone());
+                            Ok(make_failed_task_value(value))
+                        }
+                        Err(other) => Err(other),
+                    }
                 }))),
             );
         }
@@ -4714,6 +4985,7 @@ fn make_pydantic_module() -> Value {
         properties: std::cell::RefCell::new(std::collections::HashSet::new()),
         classmethods: std::cell::RefCell::new(std::collections::HashSet::new()),
         is_exception: false,
+        is_protocol: false,
     }));
     let config_dict = nf("ConfigDict", |_i, _args| {
         // Accept any kwargs and ignore — purely a config-record stub.
@@ -5805,33 +6077,60 @@ fn str_method(
             };
             Value::Str(Rc::new(replaced))
         }
-        "startswith" => Value::Bool(s.starts_with(&single(args, "startswith")?.py_str())),
-        "endswith" => Value::Bool(s.ends_with(&single(args, "endswith")?.py_str())),
-        "find" => {
-            let needle = single(args, "find")?.py_str();
-            // CPython indices are character offsets, but Rust's `str::find`
-            // returns a byte offset. Convert so `s[s.find(x):]` matches
-            // CPython on non-ASCII text (the byte index is a char boundary).
-            Value::Int(VmInt::from(
-                s.find(&needle)
-                    .map(|i| s[..i].chars().count() as i64)
-                    .unwrap_or(-1),
-            ))
+        // Each of these takes optional `start` / `end` character offsets after
+        // the needle. They were ignored; see `search_range`.
+        "startswith" | "endswith" => {
+            let needle = single(args, name)?.py_str();
+            let Some((cs, ce)) = search_range(args, s.chars().count())? else {
+                return Ok(Value::Bool(false));
+            };
+            let (bs, be) = char_range_bytes(s, cs, ce);
+            let window = &s[bs..be];
+            Value::Bool(if name == "startswith" {
+                window.starts_with(&needle)
+            } else {
+                window.ends_with(&needle)
+            })
         }
-        "rfind" => {
-            let needle = single(args, "rfind")?.py_str();
-            Value::Int(VmInt::from(
-                s.rfind(&needle)
-                    .map(|i| s[..i].chars().count() as i64)
-                    .unwrap_or(-1),
-            ))
+        "find" | "rfind" | "index" | "rindex" => {
+            let needle = single(args, name)?.py_str();
+            let hit = match search_range(args, s.chars().count())? {
+                None => None,
+                Some((cs, ce)) => {
+                    let (bs, be) = char_range_bytes(s, cs, ce);
+                    let window = &s[bs..be];
+                    let hit = if name == "find" || name == "index" {
+                        window.find(&needle)
+                    } else {
+                        window.rfind(&needle)
+                    };
+                    // CPython indices are character offsets, but Rust's
+                    // `str::find` returns a byte offset. Convert so
+                    // `s[s.find(x):]` matches CPython on non-ASCII text (the
+                    // byte index is a char boundary), and re-base onto the
+                    // window's start.
+                    hit.map(|i| cs + window[..i].chars().count())
+                }
+            };
+            match hit {
+                Some(i) => Value::Int(VmInt::from(i as i64)),
+                None if name == "index" || name == "rindex" => {
+                    return Err(value_error("substring not found"))
+                }
+                None => Value::Int(VmInt::from(-1)),
+            }
         }
         "count" => {
             let needle = single(args, "count")?.py_str();
+            let Some((cs, ce)) = search_range(args, s.chars().count())? else {
+                return Ok(Value::Int(VmInt::from(0)));
+            };
+            let (bs, be) = char_range_bytes(s, cs, ce);
+            let window = &s[bs..be];
             if needle.is_empty() {
-                Value::Int(VmInt::from(s.chars().count() as i64 + 1))
+                Value::Int(VmInt::from(window.chars().count() as i64 + 1))
             } else {
-                Value::Int(VmInt::from(s.matches(&needle).count() as i64))
+                Value::Int(VmInt::from(window.matches(&needle).count() as i64))
             }
         }
         "isdigit" => Value::Bool(!s.is_empty() && s.chars().all(|c| c.is_ascii_digit())),
@@ -5862,21 +6161,6 @@ fn str_method(
                 })
                 .collect(),
         )),
-        "index" => {
-            let needle = single(args, "index")?.py_str();
-            // Char offset, not byte offset (see `find`).
-            match s.find(&needle) {
-                Some(i) => Value::Int(VmInt::from(s[..i].chars().count() as i64)),
-                None => return Err(value_error("substring not found")),
-            }
-        }
-        "rindex" => {
-            let needle = single(args, "rindex")?.py_str();
-            match s.rfind(&needle) {
-                Some(i) => Value::Int(VmInt::from(s[..i].chars().count() as i64)),
-                None => return Err(value_error("substring not found")),
-            }
-        }
         "isnumeric" | "isdecimal" => {
             Value::Bool(!s.is_empty() && s.chars().all(|c| c.is_numeric()))
         }
@@ -7777,11 +8061,21 @@ pub fn call_with_kwargs(
                     return Err(type_error(format!("sum() got unexpected keyword: '{}'", k)));
                 }
             }
-            let it = interp.make_iter(
-                args.into_iter()
-                    .next()
-                    .ok_or_else(|| type_error("sum() requires an iterable"))?,
-            )?;
+            let mut args = args.into_iter();
+            let iterable = args
+                .next()
+                .ok_or_else(|| type_error("sum() requires an iterable"))?;
+            // `sum(xs, start)` — CPython accepts `start` positionally as well
+            // as by keyword. Only the keyword form was read, so the positional
+            // one was silently discarded and the call returned a total short
+            // by exactly `start`, with no error.
+            if let Some(start) = args.next() {
+                acc = start;
+            }
+            if args.next().is_some() {
+                return Err(type_error("sum() takes at most 2 arguments"));
+            }
+            let it = interp.make_iter(iterable)?;
             while let Some(v) = interp.iter_next(&it)? {
                 acc = interp.binop(&acc, ruff_python_ast::Operator::Add, &v)?;
             }
@@ -7818,6 +8112,26 @@ pub fn call_with_kwargs(
         "mkdir" | "makedirs" => {
             let mut args = args;
             args.push(make_kwargs_sentinel(kwargs));
+            (n.func)(interp, args)
+        }
+        // `Ok` / `Err` are natives in the VM but frozen *dataclasses* in the
+        // emitted `typhon_runtime`, where the field names are part of the
+        // public API: `Ok(value=v)` and `Err(error=e)` are ordinary calls
+        // under CPython. Accept the same keyword forms so a program does not
+        // run under `tyc build` and fail under `tyc run`.
+        "Ok" | "Err" => {
+            let field = if n.name == "Ok" { "value" } else { "error" };
+            let mut args = args;
+            for (k, v) in kwargs {
+                if k == field && args.is_empty() {
+                    args.push(v.clone());
+                } else {
+                    return Err(type_error(format!(
+                        "{}() got an unexpected keyword argument '{k}'",
+                        n.name
+                    )));
+                }
+            }
             (n.func)(interp, args)
         }
         // Bound builtin methods (the "method" native) never reach here — they
@@ -7861,6 +8175,7 @@ pub fn make_builtin_type(name: &str) -> Value {
                     properties: std::cell::RefCell::new(std::collections::HashSet::new()),
                     classmethods: std::cell::RefCell::new(std::collections::HashSet::new()),
                     is_exception: false,
+                    is_protocol: false,
                 })
             })
             .clone();

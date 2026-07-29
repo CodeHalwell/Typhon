@@ -193,6 +193,10 @@ pub fn editor_lint_diagnostics(
     perf_ctx: &perf::PerfLintContext,
 ) -> Diagnostics {
     let mut diags = Diagnostics::new();
+    // NOTE: `analyse_except_star_control_flow` is deliberately *not* called
+    // here. It is an error, not a lint, so it runs on the shared check
+    // pipeline in `tyc-db` — which `tyc build` also reaches, and this hook
+    // does not. Calling it from both would double-report it in `tyc check`.
     diags.extend(analyse_empty_collection_bindings(module, path, source));
     diags.extend(analyse_typing_alias_annotations(module, path, source));
     diags.extend(analyse_mutable_default_params(module, path, source));
@@ -1107,7 +1111,27 @@ fn eval_call(call: &ExprCall, ctx: &mut EvalContext<'_>) -> Result<ComptimeValue
                     .map(ComptimeValue::Int)
                     .map_err(|_| format!("cannot parse '{}' as int", s)),
                 ComptimeValue::Int(n) => Ok(ComptimeValue::Int(n)),
-                ComptimeValue::Float(f) => Ok(ComptimeValue::Int(f as i64)),
+                // Rust's `as i64` *saturates* at `i64::MIN`/`i64::MAX` and maps
+                // NaN to 0, so `int(1e30)` silently folded the constant
+                // 9223372036854775807 into the build and `int(float("inf"))`
+                // did the same instead of raising. A comptime value is inlined
+                // as a literal, so a wrong one is baked into the artifact with
+                // nothing downstream able to notice.
+                ComptimeValue::Float(f) => {
+                    if f.is_nan() {
+                        return Err("cannot convert float NaN to integer".into());
+                    }
+                    if f.is_infinite() {
+                        return Err("cannot convert float infinity to integer".into());
+                    }
+                    let truncated = f.trunc();
+                    if truncated < i64::MIN as f64 || truncated > i64::MAX as f64 {
+                        return Err(format!(
+                            "int({f}) is out of range for a comptime integer constant"
+                        ));
+                    }
+                    Ok(ComptimeValue::Int(truncated as i64))
+                }
                 ComptimeValue::Bool(b) => Ok(ComptimeValue::Int(if b { 1 } else { 0 })),
                 ComptimeValue::List(_)
                 | ComptimeValue::Tuple(_)
@@ -2829,6 +2853,7 @@ struct ModuleScope {
 impl ModuleScope {
     fn collect(body: &[Stmt], auto_memoise: bool) -> Self {
         let mut s = Self::default();
+        let shadowed_markers = user_bound_marker_names(body);
         for stmt in body {
             match stmt {
                 Stmt::Assign(a) => {
@@ -2847,7 +2872,8 @@ impl ModuleScope {
                     s.class_names.push(c.name.as_str().to_owned());
                 }
                 Stmt::FunctionDef(f) => {
-                    let (declared, _) = decorator_intent(&f.decorator_list, auto_memoise);
+                    let (declared, _) =
+                        decorator_intent(&f.decorator_list, auto_memoise, &shadowed_markers);
                     s.user_functions
                         .insert(f.name.as_str().to_owned(), declared);
                 }
@@ -2873,9 +2899,11 @@ fn analyse_stmts(
     // `@functools.cache` on the wrong function. Restrict the analyser to
     // top-level scope until we thread span-based identifiers through to
     // the desugarer.
+    let shadowed_markers = user_bound_marker_names(body);
     for stmt in body {
         if let Stmt::FunctionDef(f) = stmt {
-            let (declared, memo) = decorator_intent(&f.decorator_list, auto_memoise);
+            let (declared, memo) =
+                decorator_intent(&f.decorator_list, auto_memoise, &shadowed_markers);
             // Run the purity check whenever the user opted in OR the
             // project asked for automatic caching. Auto-memoise never
             // produces an error (see `purity_diagnostics`); it just
@@ -2909,10 +2937,23 @@ fn analyse_stmts(
 ///     `@pure(memo=True)`, or `auto_memoise`. The desugarer only injects
 ///     `@functools.cache` when the function ALSO passes the purity check;
 ///     `auto_memoise` is therefore a silent best-effort, never a hard error.
-fn decorator_intent(decorators: &[Decorator], auto_memoise: bool) -> (bool, bool) {
+fn decorator_intent(
+    decorators: &[Decorator],
+    auto_memoise: bool,
+    shadowed: &std::collections::HashSet<String>,
+) -> (bool, bool) {
     let mut declared = false;
     let mut memoise = auto_memoise;
     for d in decorators {
+        // A `pure` / `memo` this module defines or imports for itself is the
+        // user's decorator, not Typhon's marker. Reading it as the marker made
+        // `@functools.cache` get injected on top of an unrelated third-party
+        // decorator.
+        if let Some(name) = decorator_head_name(&d.expression) {
+            if shadowed.contains(&name) {
+                continue;
+            }
+        }
         match &d.expression {
             Expr::Name(n) if n.id.as_str() == "pure" => {
                 declared = true;
@@ -2945,6 +2986,23 @@ fn decorator_intent(decorators: &[Decorator], auto_memoise: bool) -> (bool, bool
     }
     (declared, memoise)
 }
+
+/// The bare name a decorator expression applies, for `@name` and `@name(...)`.
+fn decorator_head_name(expr: &Expr) -> Option<String> {
+    match expr {
+        Expr::Name(n) => Some(n.id.as_str().to_owned()),
+        Expr::Call(c) => decorator_head_name(&c.func),
+        _ => None,
+    }
+}
+
+/// Names among `pure` / `memo` / `gatherable` that this module defines or
+/// imports for itself. Re-exported from `tyc-syntax`, the single shared
+/// derivation — the analyser (which decides whether a decorator is Typhon's
+/// marker) and `tyc-desugar` (which decides whether to strip or replace it)
+/// must agree, so both consume the same function rather than keeping copies
+/// that can drift.
+pub use tyc_syntax::user_bound_marker_names;
 
 fn check_purity(
     name: &str,
@@ -3198,7 +3256,108 @@ fn walk_expr_purity(expr: &Expr, ctx: &mut PurityCtx) {
             walk_expr_purity(&s.value, ctx);
             walk_expr_purity(&s.slice, ctx);
         }
-        _ => {}
+        // The arms below all used to fall into `_ => {}`, which meant the
+        // purity check simply did not look inside them — so `@pure` accepted a
+        // function whose only impurity was a `random()` call in a
+        // comprehension, an f-string, a lambda body, or a dict/set literal.
+        // With `@memo` (or `auto-memoise`) that put `@functools.cache` on a
+        // *nondeterministic* function, which is a wrong answer that gets more
+        // wrong the longer the process runs.
+        //
+        // R5: no `_ => {}` in an analysis visitor. Every remaining arm is
+        // enumerated so adding a node type to the AST forces a decision here
+        // instead of silently widening what `@pure` accepts.
+        Expr::Set(x) => {
+            for e in &x.elts {
+                walk_expr_purity(e, ctx);
+            }
+        }
+        Expr::ListComp(x) => {
+            walk_expr_purity(&x.elt, ctx);
+            walk_comprehension_clauses(&x.generators, ctx);
+        }
+        Expr::SetComp(x) => {
+            walk_expr_purity(&x.elt, ctx);
+            walk_comprehension_clauses(&x.generators, ctx);
+        }
+        Expr::Generator(x) => {
+            walk_expr_purity(&x.elt, ctx);
+            walk_comprehension_clauses(&x.generators, ctx);
+        }
+        Expr::DictComp(x) => {
+            // The vendored fork models the key as optional (it is absent for
+            // a `**spread` entry in the equivalent display form).
+            if let Some(k) = x.key.as_deref() {
+                walk_expr_purity(k, ctx);
+            }
+            walk_expr_purity(&x.value, ctx);
+            walk_comprehension_clauses(&x.generators, ctx);
+        }
+        Expr::Dict(x) => {
+            for item in &x.items {
+                if let Some(k) = &item.key {
+                    walk_expr_purity(k, ctx);
+                }
+                walk_expr_purity(&item.value, ctx);
+            }
+        }
+        Expr::Lambda(x) => walk_expr_purity(&x.body, ctx),
+        Expr::FString(x) => {
+            for part in x.value.iter() {
+                if let ruff_python_ast::FStringPart::FString(f) = part {
+                    for elem in f.elements.iter() {
+                        if let ruff_python_ast::InterpolatedStringElement::Interpolation(i) = elem {
+                            walk_expr_purity(&i.expression, ctx);
+                            if let Some(spec) = &i.format_spec {
+                                for se in &spec.elements {
+                                    if let
+                                        ruff_python_ast::InterpolatedStringElement::Interpolation(n)
+                                        = se
+                                    {
+                                        walk_expr_purity(&n.expression, ctx);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Expr::Starred(x) => walk_expr_purity(&x.value, ctx),
+        // `Await` / `Yield` / `YieldFrom` are rejected outright by the first
+        // arm of this match — they are never walked into.
+        Expr::Named(x) => {
+            walk_expr_purity(&x.target, ctx);
+            walk_expr_purity(&x.value, ctx);
+        }
+        Expr::Slice(x) => {
+            for part in [&x.lower, &x.upper, &x.step].into_iter().flatten() {
+                walk_expr_purity(part, ctx);
+            }
+        }
+        // Leaves: literals and bare names carry nothing to inspect.
+        Expr::Name(_)
+        | Expr::NumberLiteral(_)
+        | Expr::StringLiteral(_)
+        | Expr::BytesLiteral(_)
+        | Expr::BooleanLiteral(_)
+        | Expr::NoneLiteral(_)
+        | Expr::EllipsisLiteral(_)
+        | Expr::IpyEscapeCommand(_) => {}
+        // `t"..."` template strings are not part of the accepted surface;
+        // treat like an f-string so a future lowering can't slip past.
+        Expr::TString(_) => {}
+    }
+}
+
+/// Walk the iterables and conditions of a comprehension's `for … in … if …`
+/// clauses. The element expression is walked by the caller.
+fn walk_comprehension_clauses(generators: &[ruff_python_ast::Comprehension], ctx: &mut PurityCtx) {
+    for g in generators {
+        walk_expr_purity(&g.iter, ctx);
+        for cond in &g.ifs {
+            walk_expr_purity(cond, ctx);
+        }
     }
 }
 
@@ -3542,6 +3701,13 @@ fn is_string_literal(expr: &Expr) -> bool {
 /// keyword as a substring (`APITOKEN` ⊃ `TOKEN`, `API_KEY` ⊃ `KEY`) must
 /// come first, so first-match reporting picks the most specific word.
 pub const SECRET_NAME_KEYWORDS: &[&str] = &[
+    // Longest-first: `APIKEY` must be tried before the bare `KEY` so a name
+    // like `KEY_APIKEY` reports the more specific suffix. `PASSPHRASE` must
+    // precede `PASS` for the same reason — and it needs its own entry at all
+    // because the word-boundary rule that (correctly) stops `PASSPORT` from
+    // matching `PASS` also stopped `PASSPHRASE`, so the single most obvious
+    // secret-shaped name after `PASSWORD` went unflagged.
+    "PASSPHRASE",
     "API_PASSWORD",
     "APIPASSWORD",
     "API_SECRET",
@@ -4284,6 +4450,207 @@ fn typing_alias_suggestion(name: &str) -> Option<&'static str> {
         "Union" => Some("A | B"),
         _ => None,
     }
+}
+
+/// `tyc::return_in_except_star` — `return` / `break` / `continue` inside an
+/// `except*` handler body.
+///
+/// CPython rejects these at *compile* time
+/// (`SyntaxError: 'break', 'continue' and 'return' cannot appear in an
+/// except* block`) because an `except*` handler can run more than once —
+/// once per matching subgroup — so a jump out of it has no defined meaning.
+/// Typhon accepted them, type-checked clean, built successfully, and emitted
+/// a `build/main.py` that CPython refused to import: a pipeline-escape defect
+/// (`F7`).
+///
+/// The rule is replicated exactly, verified against CPython 3.13's
+/// `compile()`:
+///
+/// * `return` is rejected anywhere lexically inside the handler body, at any
+///   statement-nesting depth, **except** inside a nested `def` / `class`
+///   (which open a new function scope, so their `return` binds there).
+/// * `break` / `continue` are rejected on the same terms, **except** when
+///   they are bound to a `for` / `while` declared *inside* the handler body.
+///   A jump in that loop's `else:` clause targets the *outer* loop, so it is
+///   still rejected — matching CPython.
+/// * The `try` body, the `else:` clause and the `finally:` clause of the same
+///   `try` statement are *not* part of the `except*` block, and are not
+///   flagged.
+///
+/// Only ever fires on code the emitted Python could not compile, so it is a
+/// narrowing on already-crashing programs (the v1.0.0-alpha.2 carve-out),
+/// never on a program that ran correctly.
+pub fn analyse_except_star_control_flow(
+    module: &ModModule,
+    path: &str,
+    source: &str,
+) -> Diagnostics {
+    let mut diags = Diagnostics::new();
+    walk_for_except_star(&module.body, path, source, &mut diags);
+    diags
+}
+
+/// Find every `except*` handler in `body` (descending through every
+/// statement that can nest another statement, including nested functions and
+/// classes) and scan its handler bodies.
+fn walk_for_except_star(body: &[Stmt], path: &str, source: &str, diags: &mut Diagnostics) {
+    for stmt in body {
+        match stmt {
+            Stmt::FunctionDef(f) => walk_for_except_star(&f.body, path, source, diags),
+            Stmt::ClassDef(c) => walk_for_except_star(&c.body, path, source, diags),
+            Stmt::If(i) => {
+                walk_for_except_star(&i.body, path, source, diags);
+                for clause in &i.elif_else_clauses {
+                    walk_for_except_star(&clause.body, path, source, diags);
+                }
+            }
+            Stmt::While(w) => {
+                walk_for_except_star(&w.body, path, source, diags);
+                walk_for_except_star(&w.orelse, path, source, diags);
+            }
+            Stmt::For(f) => {
+                walk_for_except_star(&f.body, path, source, diags);
+                walk_for_except_star(&f.orelse, path, source, diags);
+            }
+            Stmt::With(w) => walk_for_except_star(&w.body, path, source, diags),
+            Stmt::Match(m) => {
+                for case in &m.cases {
+                    walk_for_except_star(&case.body, path, source, diags);
+                }
+            }
+            Stmt::Try(t) => {
+                walk_for_except_star(&t.body, path, source, diags);
+                walk_for_except_star(&t.orelse, path, source, diags);
+                walk_for_except_star(&t.finalbody, path, source, diags);
+                for h in &t.handlers {
+                    let ruff_python_ast::ExceptHandler::ExceptHandler(h) = h;
+                    if t.is_star {
+                        // `in_loop = false`: no loop declared inside this
+                        // handler body has been entered yet, so any
+                        // `break`/`continue` here would target a loop outside
+                        // the `except*` block.
+                        scan_except_star_body(&h.body, false, path, source, diags);
+                    }
+                    // Still descend so a nested `except*` inside a plain
+                    // handler (or inside another `except*`) is checked too.
+                    walk_for_except_star(&h.body, path, source, diags);
+                }
+            }
+            Stmt::Return(_)
+            | Stmt::Delete(_)
+            | Stmt::TypeAlias(_)
+            | Stmt::Assign(_)
+            | Stmt::AugAssign(_)
+            | Stmt::AnnAssign(_)
+            | Stmt::Raise(_)
+            | Stmt::Assert(_)
+            | Stmt::Import(_)
+            | Stmt::ImportFrom(_)
+            | Stmt::Global(_)
+            | Stmt::Nonlocal(_)
+            | Stmt::Expr(_)
+            | Stmt::Pass(_)
+            | Stmt::Break(_)
+            | Stmt::Continue(_)
+            | Stmt::IpyEscapeCommand(_) => {}
+        }
+    }
+}
+
+/// Report every `return` / `break` / `continue` in an `except*` handler body
+/// that CPython would reject. `in_loop` tracks whether we are inside a
+/// `for` / `while` **body** declared within the handler — the only place a
+/// `break` / `continue` is legal.
+fn scan_except_star_body(
+    body: &[Stmt],
+    in_loop: bool,
+    path: &str,
+    source: &str,
+    diags: &mut Diagnostics,
+) {
+    use ruff_text_size::Ranged;
+    for stmt in body {
+        match stmt {
+            Stmt::Return(r) => {
+                push_except_star_error("return", r.range(), path, source, diags);
+            }
+            Stmt::Break(b) if !in_loop => {
+                push_except_star_error("break", b.range(), path, source, diags);
+            }
+            Stmt::Continue(c) if !in_loop => {
+                push_except_star_error("continue", c.range(), path, source, diags);
+            }
+            // A `break` / `continue` bound to a loop declared inside the
+            // handler is legal — nothing to report, nothing to descend into.
+            Stmt::Break(_) | Stmt::Continue(_) => {}
+            // A nested `def` / `class` opens a new function scope: its
+            // `return` binds there, and CPython accepts it.
+            Stmt::FunctionDef(_) | Stmt::ClassDef(_) => {}
+            Stmt::If(i) => {
+                scan_except_star_body(&i.body, in_loop, path, source, diags);
+                for clause in &i.elif_else_clauses {
+                    scan_except_star_body(&clause.body, in_loop, path, source, diags);
+                }
+            }
+            Stmt::While(w) => {
+                scan_except_star_body(&w.body, true, path, source, diags);
+                // A jump in a loop's `else:` clause targets the *enclosing*
+                // loop, not this one (verified against CPython 3.13).
+                scan_except_star_body(&w.orelse, in_loop, path, source, diags);
+            }
+            Stmt::For(f) => {
+                scan_except_star_body(&f.body, true, path, source, diags);
+                scan_except_star_body(&f.orelse, in_loop, path, source, diags);
+            }
+            Stmt::With(w) => scan_except_star_body(&w.body, in_loop, path, source, diags),
+            Stmt::Match(m) => {
+                for case in &m.cases {
+                    scan_except_star_body(&case.body, in_loop, path, source, diags);
+                }
+            }
+            Stmt::Try(t) => {
+                scan_except_star_body(&t.body, in_loop, path, source, diags);
+                scan_except_star_body(&t.orelse, in_loop, path, source, diags);
+                scan_except_star_body(&t.finalbody, in_loop, path, source, diags);
+                for h in &t.handlers {
+                    let ruff_python_ast::ExceptHandler::ExceptHandler(h) = h;
+                    scan_except_star_body(&h.body, in_loop, path, source, diags);
+                }
+            }
+            Stmt::Delete(_)
+            | Stmt::TypeAlias(_)
+            | Stmt::Assign(_)
+            | Stmt::AugAssign(_)
+            | Stmt::AnnAssign(_)
+            | Stmt::Raise(_)
+            | Stmt::Assert(_)
+            | Stmt::Import(_)
+            | Stmt::ImportFrom(_)
+            | Stmt::Global(_)
+            | Stmt::Nonlocal(_)
+            | Stmt::Expr(_)
+            | Stmt::Pass(_)
+            | Stmt::IpyEscapeCommand(_) => {}
+        }
+    }
+}
+
+fn push_except_star_error(
+    keyword: &str,
+    range: ruff_text_size::TextRange,
+    path: &str,
+    source: &str,
+    diags: &mut Diagnostics,
+) {
+    let start = range.start().to_usize();
+    let length = range.end().to_usize().saturating_sub(start).max(1);
+    diags.push_error(TycError::return_in_except_star(
+        keyword,
+        path,
+        source.to_owned(),
+        start,
+        length,
+    ));
 }
 
 /// Walk every annotation expression in `module` and warn when it
@@ -5064,5 +5431,184 @@ mod purity_tests {
             .as_ref()
             .expect("expected hashability violation");
         assert!(reason.contains("unhashable"), "got: {reason}");
+    }
+}
+
+#[cfg(test)]
+mod except_star_tests {
+    use super::*;
+
+    /// Collect the offending keywords `analyse_except_star_control_flow`
+    /// reports, in source order.
+    fn offenders(src: &str) -> Vec<String> {
+        let module = tyc_syntax::parse_module(src)
+            .expect("parse failed")
+            .into_syntax();
+        let diags = analyse_except_star_control_flow(&module, "t.py", src);
+        diags
+            .errors()
+            .iter()
+            .map(|e| {
+                // The message is "`return` cannot appear in an `except*` block".
+                let text = e.to_string();
+                text.split('`').nth(1).unwrap_or_default().to_owned()
+            })
+            .collect()
+    }
+
+    // Every case below was verified against CPython 3.13 `compile()`: the
+    // ones asserted to fire are exactly the ones that raise
+    // `SyntaxError: 'break', 'continue' and 'return' cannot appear in an
+    // except* block`, and the ones asserted clean compile successfully.
+
+    #[test]
+    fn bare_return_in_except_star_is_rejected() {
+        assert_eq!(
+            offenders(
+                "def f():\n    try:\n        pass\n    except* ValueError:\n        return 1\n"
+            ),
+            vec!["return"]
+        );
+    }
+
+    #[test]
+    fn return_nested_in_compound_statements_is_rejected() {
+        // CPython rejects a `return` at any statement depth inside the
+        // handler — `if`, `for`, `while`, `with`, `match`, and a nested
+        // `try`'s `finally` all still count as "inside the except* block".
+        for src in [
+            "def f():\n    try:\n        pass\n    except* ValueError:\n        if 1:\n            return 1\n",
+            "def f():\n    try:\n        pass\n    except* ValueError:\n        for i in range(3):\n            return 1\n",
+            "def f():\n    try:\n        pass\n    except* ValueError:\n        while 1:\n            return 1\n",
+            "def f():\n    try:\n        pass\n    except* ValueError:\n        with open('x'):\n            return 1\n",
+            "def f(x):\n    try:\n        pass\n    except* ValueError:\n        match x:\n            case 1:\n                return 1\n",
+            "def f():\n    try:\n        pass\n    except* ValueError:\n        try:\n            pass\n        finally:\n            return 1\n",
+        ] {
+            assert_eq!(offenders(src), vec!["return"], "src: {src}");
+        }
+    }
+
+    #[test]
+    fn break_and_continue_bound_outside_are_rejected() {
+        assert_eq!(
+            offenders(
+                "def f():\n    for j in range(2):\n        try:\n            pass\n        except* ValueError:\n            break\n"
+            ),
+            vec!["break"]
+        );
+        assert_eq!(
+            offenders(
+                "def f():\n    for j in range(2):\n        try:\n            pass\n        except* ValueError:\n            continue\n"
+            ),
+            vec!["continue"]
+        );
+    }
+
+    #[test]
+    fn break_bound_to_a_loop_inside_the_handler_is_allowed() {
+        // CPython accepts this: the jump target is declared inside the
+        // handler, so it never leaves the `except*` block.
+        assert!(offenders(
+            "def f():\n    try:\n        pass\n    except* ValueError:\n        for i in range(3):\n            break\n"
+        )
+        .is_empty());
+        assert!(offenders(
+            "def f():\n    try:\n        pass\n    except* ValueError:\n        while 1:\n            continue\n"
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn jump_in_a_loop_else_clause_targets_the_outer_loop_and_is_rejected() {
+        // `for ... else:` runs after the loop finishes, so a `break` there
+        // binds to the *enclosing* loop — CPython rejects it.
+        assert_eq!(
+            offenders(
+                "def f():\n    for j in range(2):\n        try:\n            pass\n        except* ValueError:\n            for i in range(3):\n                pass\n            else:\n                break\n"
+            ),
+            vec!["break"]
+        );
+    }
+
+    #[test]
+    fn nested_function_and_class_bodies_are_exempt() {
+        assert!(offenders(
+            "def f():\n    try:\n        pass\n    except* ValueError:\n        def g():\n            return 1\n"
+        )
+        .is_empty());
+        assert!(offenders(
+            "def f():\n    try:\n        pass\n    except* ValueError:\n        class C:\n            def m(self):\n                return 1\n"
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn try_body_else_and_finally_are_not_part_of_the_except_star_block() {
+        assert!(offenders(
+            "def f():\n    try:\n        return 1\n    except* ValueError:\n        pass\n"
+        )
+        .is_empty());
+        assert!(offenders(
+            "def f():\n    try:\n        pass\n    except* ValueError:\n        pass\n    else:\n        return 1\n"
+        )
+        .is_empty());
+        assert!(offenders(
+            "def f():\n    try:\n        pass\n    except* ValueError:\n        pass\n    finally:\n        return 1\n"
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn plain_except_is_never_flagged() {
+        assert!(offenders(
+            "def f():\n    try:\n        pass\n    except ValueError:\n        return 1\n"
+        )
+        .is_empty());
+        assert!(offenders(
+            "def f():\n    for j in range(2):\n        try:\n            pass\n        except ValueError:\n            continue\n"
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn except_star_nested_inside_a_plain_handler_is_still_checked() {
+        assert_eq!(
+            offenders(
+                "def f():\n    try:\n        pass\n    except ValueError:\n        try:\n            pass\n        except* TypeError:\n            return 1\n"
+            ),
+            vec!["return"]
+        );
+    }
+
+    #[test]
+    fn a_return_inside_a_nested_plain_handler_of_an_except_star_is_rejected() {
+        // Lexically still inside the `except*` block — CPython rejects it.
+        assert_eq!(
+            offenders(
+                "def f():\n    try:\n        pass\n    except* ValueError:\n        try:\n            pass\n        except TypeError:\n            return 1\n"
+            ),
+            vec!["return"]
+        );
+    }
+
+    #[test]
+    fn every_offender_is_reported_not_just_the_first() {
+        let out = offenders(
+            "def f():\n    for j in range(2):\n        try:\n            pass\n        except* ValueError:\n            if j:\n                return 1\n            break\n",
+        );
+        assert_eq!(out, vec!["return", "break"]);
+    }
+
+    #[test]
+    fn diagnostic_carries_the_expected_code() {
+        let module = tyc_syntax::parse_module(
+            "def f():\n    try:\n        pass\n    except* ValueError:\n        return 1\n",
+        )
+        .expect("parse failed")
+        .into_syntax();
+        let diags = analyse_except_star_control_flow(&module, "t.py", "");
+        let err = &diags.errors()[0];
+        let code = miette::Diagnostic::code(err).expect("code").to_string();
+        assert_eq!(code, "tyc::return_in_except_star");
     }
 }

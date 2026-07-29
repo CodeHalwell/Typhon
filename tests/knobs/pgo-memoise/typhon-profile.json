@@ -1,0 +1,4 @@
+{
+  "main.hot": { "calls": 20, "total_seconds": 0.004 },
+  "main.cold": { "calls": 1, "total_seconds": 0.0001 }
+}

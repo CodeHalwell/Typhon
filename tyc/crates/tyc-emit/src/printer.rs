@@ -128,18 +128,33 @@ impl Emitter {
 
     fn write(&mut self, s: &str) {
         self.output.push_str(s);
+        // A newline can reach the output from *inside* a token, not just
+        // from `writeln` / `newline`: a triple-quoted docstring, or any
+        // string literal the printer re-emits verbatim, carries real
+        // newlines. Each one still ends an output line, so it needs its
+        // own `line_offsets` entry — otherwise the table is shorter than
+        // the file it describes and every entry after the literal names
+        // a line one-too-early, permanently, for the rest of the module.
+        for _ in s.bytes().filter(|&b| b == b'\n') {
+            self.line_offsets.push(self.current_input_offset);
+        }
     }
 
     fn write_char(&mut self, c: char) {
         self.output.push(c);
+        if c == '\n' {
+            self.line_offsets.push(self.current_input_offset);
+        }
     }
 
     fn write_hex_escape(&mut self, byte: u8) {
+        // Always emits `\xNN` (an escape *sequence*, two literal
+        // characters) — never a raw newline — so no offset bookkeeping.
         push_hex_escape(&mut self.output, byte);
     }
 
     fn writeln(&mut self, s: &str) {
-        self.output.push_str(s);
+        self.write(s);
         self.line_offsets.push(self.current_input_offset);
         self.output.push('\n');
     }
@@ -147,6 +162,27 @@ impl Emitter {
     fn newline(&mut self) {
         self.line_offsets.push(self.current_input_offset);
         self.output.push('\n');
+    }
+
+    /// Make `range` the source provenance of every output line printed
+    /// from here until the next call.
+    ///
+    /// `emit_stmt` calls this once per statement, which is only
+    /// *statement*-level granularity: a compound statement prints several
+    /// header lines of its own (a `case` clause, an `elif`, an `except`, a
+    /// decorator) and each of those used to inherit the offset of whatever
+    /// was printed before it — typically the last line of the preceding
+    /// body, so a `case Square(s):` header resolved to the `return` above
+    /// it. The sub-statement clauses carry their own `TextRange`, so they
+    /// call this too and name the line the user actually wrote.
+    ///
+    /// Synthesised nodes (produced by the desugar pass) carry a
+    /// zero-length `TextRange`; those are ignored so they inherit the last
+    /// known real offset rather than resetting to the top of the file.
+    fn set_input_offset(&mut self, range: ruff_text_size::TextRange) {
+        if u32::from(range.start()) != u32::from(range.end()) {
+            self.current_input_offset = u32::from(range.start()) as usize;
+        }
     }
 
     /// Append newlines until `self.output` ends in *at least* `count`
@@ -316,9 +352,7 @@ impl Emitter {
         // zero-length TextRange::default(); we skip those so they inherit
         // the last real offset rather than resetting to 0.
         let range = node.range();
-        if u32::from(range.start()) != u32::from(range.end()) {
-            self.current_input_offset = u32::from(range.start()) as usize;
-        }
+        self.set_input_offset(range);
         // PEP 8: surround top-level class/def with two blank lines.  We
         // enforce this on either side of the block by checking both the
         // current statement and the previous top-level one.  Two blank
@@ -340,10 +374,19 @@ impl Emitter {
                     self.newline();
                 }
                 for decorator in &f.decorator_list {
+                    // Each decorator is its own source line. Ruff's
+                    // `StmtFunctionDef.range` starts at the first `@`, so
+                    // without this the whole decorator stack *and* the
+                    // `def` line all resolved to the first decorator.
+                    self.set_input_offset(decorator.range);
                     self.fill("@");
                     self.emit_expr(&decorator.expression);
                     self.newline();
                 }
+                // The identifier sits on the `def` line, so its range
+                // recovers the header's own provenance after the
+                // decorators above moved the cursor.
+                self.set_input_offset(f.name.range());
                 if f.is_async {
                     self.fill("async def ");
                 } else {
@@ -381,10 +424,13 @@ impl Emitter {
                     self.newline();
                 }
                 for decorator in &c.decorator_list {
+                    // See the `FunctionDef` arm: a decorator owns its line.
+                    self.set_input_offset(decorator.range);
                     self.fill("@");
                     self.emit_expr(&decorator.expression);
                     self.newline();
                 }
+                self.set_input_offset(c.name.range());
                 self.fill("class ");
                 self.write(c.name.as_str());
                 let lowering = self.lower_pep695();
@@ -599,6 +645,10 @@ impl Emitter {
                 self.emit_body(&i.body);
                 self.leave_block();
                 for clause in &i.elif_else_clauses {
+                    // An `elif` / `else` header is a source line of its
+                    // own; without this it inherited the offset of the
+                    // last statement of the preceding branch's body.
+                    self.set_input_offset(clause.range);
                     match &clause.test {
                         Some(test) => {
                             self.fill("elif ");
@@ -855,6 +905,47 @@ impl Emitter {
 
     // ── expressions ────────────────────────────────────────────────────────
 
+    /// Emit `expr` as an operand of a construct whose own precedence is
+    /// `parent_prec`, parenthesising it when it does not bind strictly
+    /// tighter. This is the shared guard for the operand positions that
+    /// `expr_precedence` alone cannot express, because the parent is not a
+    /// `BinOp`.
+    fn emit_operand_above(&mut self, expr: &Expr, parent_prec: u8) {
+        if operand_precedence(expr) <= parent_prec {
+            self.write("(");
+            self.emit_expr(expr);
+            self.write(")");
+        } else {
+            self.emit_expr(expr);
+        }
+    }
+
+    /// Open an f-string interpolation, keeping a brace-opening expression
+    /// distinguishable from an escaped literal brace.
+    ///
+    /// `f"{ {'k': 1}['k'] }"` interpolates a dict-literal subscript. Emitting
+    /// the opener and the expression back to back produces `{{`, which CPython
+    /// reads as the *escape* for a literal `{` — so the expression was never
+    /// evaluated and the f-string rendered braces as text (or failed to parse
+    /// on the closing side). A single space is enough to separate them and is
+    /// invisible in the result.
+    fn open_interpolation(&mut self, expr: &Expr) {
+        self.write("{");
+        if expr_starts_with_brace(expr) {
+            self.write(" ");
+        }
+    }
+
+    /// Close an interpolation, mirroring [`Self::open_interpolation`]: a
+    /// trailing `}` from the expression would otherwise pair with the closing
+    /// brace into `}}`, the literal-brace escape.
+    fn close_interpolation(&mut self, expr: &Expr) {
+        if expr_ends_with_brace(expr) {
+            self.write(" ");
+        }
+        self.write("}");
+    }
+
     pub fn emit_expr(&mut self, node: &Expr) {
         match node {
             Expr::BoolOp(b) => {
@@ -966,10 +1057,19 @@ impl Emitter {
             }
 
             // `IfExp` is now `Expr::If`.
+            //
+            // Python's grammar is
+            //   conditional_expression ::= or_test ["if" or_test "else" expression]
+            // so the body and the test must bind tighter than a conditional
+            // (they are `or_test`s), while the `else` arm is a full
+            // `expression` and needs no guard — that is what makes chained
+            // ternaries and a trailing lambda emit correctly. Without the
+            // guard, `(a if p else b) if q else c` re-emits as
+            // `a if p else b if q else c`, which regroups to the right.
             Expr::If(i) => {
-                self.emit_expr(&i.body);
+                self.emit_operand_above(&i.body, IF_EXP_PRECEDENCE);
                 self.write(" if ");
-                self.emit_expr(&i.test);
+                self.emit_operand_above(&i.test, IF_EXP_PRECEDENCE);
                 self.write(" else ");
                 self.emit_expr(&i.orelse);
             }
@@ -1072,7 +1172,15 @@ impl Emitter {
             }
 
             Expr::Compare(c) => {
-                self.emit_expr(&c.left);
+                // Every operand of a comparison must bind tighter than the
+                // comparison itself. Without this guard `(a if p else b) == c`
+                // re-emits as `a if p else b == c`, which Python parses as
+                // `a if p else (b == c)` — a different program that still
+                // compiles, and `(x := 1) == 1` re-emits as unparseable
+                // Python. Chained comparisons arrive as a single `Compare`
+                // node, so a nested `Compare` operand can only have come from
+                // explicit parens in the source and must keep them.
+                self.emit_operand_above(&c.left, COMPARE_PRECEDENCE);
                 for (op, right) in c.ops.iter().zip(c.comparators.iter()) {
                     let op_str = match op {
                         CmpOp::Eq => " == ",
@@ -1087,7 +1195,7 @@ impl Emitter {
                         CmpOp::NotIn => " not in ",
                     };
                     self.write(op_str);
-                    self.emit_expr(right);
+                    self.emit_operand_above(right, COMPARE_PRECEDENCE);
                 }
             }
 
@@ -1147,15 +1255,22 @@ impl Emitter {
                                         ));
                                     }
                                     InterpolatedStringElement::Interpolation(interp) => {
-                                        self.write("{");
                                         // PEP 501 debug f-string: `f"{x=}"` carries
                                         // the verbatim `x=` text on `debug_text`,
                                         // including the surrounding whitespace
                                         // (`f"{x = }"`). Emit it as-is so the
                                         // `=` marker survives the round-trip.
+                                        // Verbatim text can never begin or end
+                                        // with a bare brace (that would have been
+                                        // the `{{` / `}}` escape in the source),
+                                        // so the brace-separation spaces must not
+                                        // fire — the debug output reproduces them
+                                        // verbatim at runtime.
                                         if let Some(dt) = &interp.debug_text {
+                                            self.write("{");
                                             self.write(dt.as_str());
                                         } else {
+                                            self.open_interpolation(&interp.expression);
                                             self.emit_expr(&interp.expression);
                                         }
                                         // Emit `!r` / `!s` / `!a` conversion flags
@@ -1163,7 +1278,8 @@ impl Emitter {
                                         // AST but carried on the `conversion`
                                         // field. Losing them silently changes
                                         // runtime output of `f"{x!r}"` etc.
-                                        if let Some(c) = interp.conversion.to_char() {
+                                        let conversion = interp.conversion.to_char();
+                                        if let Some(c) = conversion {
                                             self.write("!");
                                             self.write_char(c);
                                         }
@@ -1183,14 +1299,32 @@ impl Emitter {
                                                     InterpolatedStringElement::Interpolation(
                                                         nested,
                                                     ) => {
-                                                        self.write("{");
+                                                        self.open_interpolation(&nested.expression);
                                                         self.emit_expr(&nested.expression);
-                                                        self.write("}");
+                                                        self.close_interpolation(
+                                                            &nested.expression,
+                                                        );
                                                     }
                                                 }
                                             }
                                         }
-                                        self.write("}");
+                                        // The close separator only exists to keep
+                                        // the *expression's* trailing `}` from
+                                        // pairing with the closing brace into the
+                                        // `}}` escape. Debug text, a conversion,
+                                        // or a format spec already separates them
+                                        // — and a space added after those lands
+                                        // *inside* the conversion/spec (a
+                                        // SyntaxError after `!r`; format code
+                                        // `\x20` in a spec).
+                                        if interp.debug_text.is_some()
+                                            || conversion.is_some()
+                                            || interp.format_spec.is_some()
+                                        {
+                                            self.write("}");
+                                        } else {
+                                            self.close_interpolation(&interp.expression);
+                                        }
                                     }
                                 }
                             }
@@ -1214,9 +1348,9 @@ impl Emitter {
                                 self.write(&escape_python_string(&lit.value));
                             }
                             InterpolatedStringElement::Interpolation(interp) => {
-                                self.write("{");
+                                self.open_interpolation(&interp.expression);
                                 self.emit_expr(&interp.expression);
-                                self.write("}");
+                                self.close_interpolation(&interp.expression);
                             }
                         }
                     }
@@ -1573,6 +1707,10 @@ impl Emitter {
 
     fn emit_except_handler(&mut self, handler: &ExceptHandler, star: bool) {
         let ExceptHandler::ExceptHandler(h) = handler;
+        // The handler header is its own source line; inheriting the
+        // offset left behind by the `try` body pointed it at the last
+        // statement of that body.
+        self.set_input_offset(h.range);
         if star {
             self.fill("except*");
         } else {
@@ -1593,6 +1731,11 @@ impl Emitter {
     }
 
     fn emit_match_case(&mut self, case: &MatchCase) {
+        // A `case` clause header is a source line of its own. Without
+        // this it inherited the offset of the previous arm's last
+        // statement, so `case Square(s):` resolved to the `return` above
+        // it — the canonical symptom of statement-level granularity.
+        self.set_input_offset(case.range);
         self.fill("case ");
         self.emit_pattern(&case.pattern);
         if let Some(guard) = &case.guard {
@@ -1824,6 +1967,23 @@ fn bin_op_precedence(op: &Operator) -> u8 {
 /// `not` has very low precedence in Python (between `and` and comparisons),
 /// so it is distinguished from the arithmetic unary operators which sit
 /// just below `**`.
+/// Precedence of a conditional expression (`x if c else y`).
+const IF_EXP_PRECEDENCE: u8 = 2;
+/// Precedence of a comparison chain (`a < b <= c`).
+const COMPARE_PRECEDENCE: u8 = 6;
+
+/// `expr_precedence` extended with the forms that cannot appear as a `BinOp`
+/// child without already being a syntax error, but *can* appear as an operand
+/// of a comparison or a conditional — and which therefore still need parens
+/// there. A bare `x := 1` or `yield v` in a comparison operand is a hard
+/// SyntaxError, not merely a regrouping.
+fn operand_precedence(expr: &Expr) -> u8 {
+    match expr {
+        Expr::Named(_) | Expr::Yield(_) | Expr::YieldFrom(_) => 0,
+        _ => expr_precedence(expr),
+    }
+}
+
 fn expr_precedence(expr: &Expr) -> u8 {
     match expr {
         Expr::Lambda(_) => 1,
@@ -1918,6 +2078,38 @@ fn escape_python_string_with_quote(s: &str, quote: char) -> String {
     out
 }
 
+/// True when the emitted text of `expr` begins with `{` — a dict or set
+/// display, which is the only expression form that can.
+fn expr_starts_with_brace(expr: &Expr) -> bool {
+    match expr {
+        Expr::Dict(_) | Expr::Set(_) | Expr::DictComp(_) | Expr::SetComp(_) => true,
+        // The brace belongs to the left-most leaf: `{1: 2}[k]`, `{1}.pop()`,
+        // `{1, 2} | s`, `{1: 2}["k"] if c else d`.
+        Expr::Subscript(x) => expr_starts_with_brace(&x.value),
+        Expr::Attribute(x) => expr_starts_with_brace(&x.value),
+        Expr::Call(x) => expr_starts_with_brace(&x.func),
+        Expr::BinOp(x) => expr_starts_with_brace(&x.left),
+        Expr::Compare(x) => expr_starts_with_brace(&x.left),
+        Expr::BoolOp(x) => x.values.first().is_some_and(expr_starts_with_brace),
+        Expr::If(x) => expr_starts_with_brace(&x.body),
+        _ => false,
+    }
+}
+
+/// True when the emitted text of `expr` ends with `}`.
+fn expr_ends_with_brace(expr: &Expr) -> bool {
+    match expr {
+        Expr::Dict(_) | Expr::Set(_) | Expr::DictComp(_) | Expr::SetComp(_) => true,
+        Expr::BinOp(x) => expr_ends_with_brace(&x.right),
+        Expr::BoolOp(x) => x.values.last().is_some_and(expr_ends_with_brace),
+        Expr::Compare(x) => x.comparators.last().is_some_and(expr_ends_with_brace),
+        Expr::If(x) => expr_ends_with_brace(&x.orelse),
+        Expr::UnaryOp(x) => expr_ends_with_brace(&x.operand),
+        Expr::Starred(x) => expr_ends_with_brace(&x.value),
+        _ => false,
+    }
+}
+
 /// Escape content for a triple-quoted string literal using `quote` as the
 /// delimiter character (either `'` or `"`).  Only two things need escaping:
 /// backslashes, and a run of three or more consecutive delimiter characters
@@ -1927,16 +2119,23 @@ fn escape_triple_quoted_string(s: &str, quote: char) -> String {
     let mut out = String::with_capacity(s.len());
     // Track how many consecutive unescaped quote chars we have just emitted.
     let mut run = 0usize;
-    for ch in s.chars() {
+    let mut chars = s.chars().peekable();
+    while let Some(ch) = chars.next() {
         if ch == '\\' {
             out.push_str("\\\\");
             run = 0;
         } else if ch == quote {
             run += 1;
-            if run == 3 {
-                // Third consecutive quote would close the literal — escape it
-                // so the run in the output stays at 1 (the escaped char itself
-                // is still a quote but breaks the "three unescaped" sequence).
+            // A quote that is the LAST character of the content is just as
+            // dangerous as a run of three inside it: the closing delimiter
+            // butts straight up against it. Content ending in one quote
+            // emitted `"""…""""`, which is `"""…"""` plus a stray quote — a
+            // hard SyntaxError. Content ending in two emitted `"""…"""""`,
+            // which Python reads as `"""…"""` implicitly concatenated with
+            // the empty string `""`, so the two trailing quotes vanished
+            // *silently* and the constant differed from the source.
+            let at_tail = chars.peek().is_none();
+            if run == 3 || at_tail {
                 out.push('\\');
                 run = 1;
             }
@@ -2141,6 +2340,49 @@ fn pick_fstring_outer_quote(fs: &ast::ExprFString) -> char {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn triple_quoted_tail_quote_run_is_escaped() {
+        // A quote at the very end of the content butts against the closing
+        // delimiter. One trailing quote emitted `"""…""""` — a hard
+        // SyntaxError. Two emitted `"""…"""""`, which Python reads as the
+        // literal implicitly concatenated with the empty string `""`, so the
+        // trailing quotes vanished *silently* and the constant differed from
+        // the source.
+        assert_eq!(escape_triple_quoted_string("x\"", '"'), "x\\\"");
+        assert_eq!(escape_triple_quoted_string("y\"\"", '"'), "y\"\\\"");
+        // A run of three inside the content is still escaped as before.
+        assert_eq!(escape_triple_quoted_string("a\"\"\"b", '"'), "a\"\"\\\"b");
+        // No trailing quote, no change.
+        assert_eq!(escape_triple_quoted_string("plain", '"'), "plain");
+        // The other delimiter is handled symmetrically.
+        assert_eq!(escape_triple_quoted_string("x'", '\''), "x\\'");
+        assert_eq!(escape_triple_quoted_string("x\"", '\''), "x\"");
+    }
+
+    #[test]
+    fn fstring_interpolation_of_a_brace_expression_is_separated() {
+        // `f"{ {'k': 1}['k'] }"` — the opener and a dict display back to back
+        // produce `{{`, which CPython reads as the escape for a literal brace,
+        // so the expression was never evaluated.
+        let out = round_trip("x = f\"{ {'k': 1}['k'] }\"\n");
+        assert!(
+            out.contains("f\"{ {"),
+            "the interpolation opener must be separated from the dict display; got:\n{out}"
+        );
+        assert!(
+            !out.contains("f\"{{"),
+            "must not emit the literal-brace escape; got:\n{out}"
+        );
+        // The closing side needs no space here — the expression ends in `]`.
+        // It does when the expression itself ends in a brace, which would
+        // otherwise pair with the closing one into the `}}` escape.
+        let ends_with_brace = round_trip("y = f\"{ {1, 2} }\"\n");
+        assert!(
+            ends_with_brace.contains("{ {1, 2} }"),
+            "a set display must be separated on both sides; got:\n{ends_with_brace}"
+        );
+    }
     use crate::emit;
     use crate::printer::escape_triple_quoted_string;
     use tyc_syntax::parse_module;
@@ -2148,6 +2390,103 @@ mod tests {
     fn round_trip(src: &str) -> String {
         let parsed = parse_module(src).expect("parse failed");
         emit(parsed.syntax())
+    }
+
+    /// Locate a Python 3.12+ interpreter on `PATH`; returns `None` to skip.
+    /// A bare `python3` is only accepted after a version probe (it may be
+    /// 3.11, which predates the PEP 701 f-string grammar these tests need).
+    /// `TYC_REQUIRE_PYTHON=1` turns the skip into a panic, matching the
+    /// `tyc` crate's execution-tier tests.
+    fn python() -> Option<String> {
+        for candidate in ["python3.13", "python3.12", "python3"] {
+            if let Ok(out) = std::process::Command::new(candidate)
+                .arg("--version")
+                .output()
+            {
+                if out.status.success() {
+                    let v = String::from_utf8_lossy(&out.stdout);
+                    if let Some(rest) = v.trim().strip_prefix("Python 3.") {
+                        if let Some(minor) = rest.split('.').next() {
+                            if let Ok(m) = minor.parse::<u32>() {
+                                if m >= 12 {
+                                    return Some(candidate.to_owned());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if std::env::var_os("TYC_REQUIRE_PYTHON").is_some() {
+            panic!("TYC_REQUIRE_PYTHON is set but no Python 3.12+ interpreter was found on PATH");
+        }
+        None
+    }
+
+    /// Run `code` under `py`, asserting a clean exit; returns stdout.
+    fn run_python(py: &str, code: &str) -> String {
+        let out = std::process::Command::new(py)
+            .arg("-c")
+            .arg(code)
+            .output()
+            .expect("failed to spawn python");
+        assert!(
+            out.status.success(),
+            "python rejected the code:\n{code}\nstderr:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+
+    #[test]
+    fn fstring_conversion_spec_and_debug_text_stay_flush_with_the_braces() {
+        // The brace-separation space must attach to the *expression*, never
+        // to a conversion / format spec / debug text: a space after `:spec`
+        // becomes format code `\x20` (ValueError at runtime), a space after
+        // `!r` is a SyntaxError, and synthetic spaces around debug text are
+        // reproduced verbatim in the program's output. Each emitted program
+        // is executed under a PEP 701-capable CPython (3.12+; `python3`
+        // alone may be 3.11 here) and must print exactly what the source
+        // prints.
+        let cases: [(&str, &str); 3] = [
+            // Expression ends with `}`, followed by a format spec.
+            (
+                "x = 7\nflag = True\nprint(f\"{x if flag else {} :>5}\")\n",
+                "    7\n",
+            ),
+            // PEP 501 debug text: the user's own separating space, nothing
+            // more, on both sides.
+            ("print(f\"{ {1, 2}=}\")\n", " {1, 2}={1, 2}\n"),
+            // Expression ends with `}`, followed by a conversion.
+            ("print(f\"{ {1, 2} !r}\")\n", "{1, 2}\n"),
+        ];
+        let spec_out = round_trip(cases[0].0);
+        assert!(
+            spec_out.contains("{}:>5}"),
+            "the spec must stay flush against the closing brace; got:\n{spec_out}"
+        );
+        let debug_out = round_trip(cases[1].0);
+        assert!(
+            debug_out.contains("f\"{ {1, 2}=}\""),
+            "debug text must be emitted verbatim with no synthetic spaces; got:\n{debug_out}"
+        );
+        let conv_out = round_trip(cases[2].0);
+        assert!(
+            conv_out.contains("{1, 2}!r}"),
+            "the conversion must stay flush on both sides; got:\n{conv_out}"
+        );
+        let Some(py) = python() else {
+            eprintln!("skipping execution tier: no Python 3.12+ on PATH");
+            return;
+        };
+        for (src, expected) in cases {
+            let emitted = round_trip(src);
+            assert_eq!(
+                run_python(&py, &emitted),
+                expected,
+                "emitted Python diverged from the source program:\n{emitted}"
+            );
+        }
     }
 
     #[test]

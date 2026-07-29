@@ -1,0 +1,15 @@
+# `[emit] traceback-remap = true` installs a sys.excepthook in the entry module
+# that rewrites uncaught-exception frames back to .ty source through the
+# .py.map sidecars. The stdout written before the failure must be unchanged;
+# only stderr differs, so the control build's stdout comparison still holds.
+def boom(xs: list[int]) -> int:
+    return xs[5]
+
+
+def main() -> None:
+    print("before")
+    print(boom([1, 2]))
+
+
+if __name__ == "__main__":
+    main()

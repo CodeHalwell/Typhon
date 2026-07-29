@@ -1,0 +1,16 @@
+[project]
+name = "knob-parallel-backend-interpreters"
+version = "0.1.0"
+src = "src"
+out = "build"
+
+[python]
+target = "3.13"
+
+[emit]
+format = false
+
+[strictness]
+auto-parallel = true
+parallel-min-size = 2
+parallel-backend = "interpreters"

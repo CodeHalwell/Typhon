@@ -1,0 +1,11 @@
+[project]
+name = "knob-lazy-import-pep810"
+version = "0.1.0"
+src = "src"
+out = "build"
+
+[python]
+target = "3.13"
+
+[emit]
+format = false

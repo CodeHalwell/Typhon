@@ -51,6 +51,37 @@ def f() -> None:
 
 (Note: unlike Rust, Typhon does not allow let-shadowing. Python is function-scoped, so a `let x` inside a nested `if` / `for` / `with` would still rebind the outer `x`. The checker fires `tyc::no_block_shadow` for both the same-scope and nested-scope cases.)
 
+### Inside a loop body
+
+A `let` in a loop body is freshly bound each iteration, so a *later sibling loop* may reuse the same scratch name — but reassigning it from inside the loop that declared it (or a loop nested within that one) is still an error:
+
+```python
+for a in xs:
+    let t: int = a      # ok
+for b in ys:
+    let t: int = b      # ok — a different loop, a fresh binding
+
+for a in xs:
+    let t: int = a
+    t = 99              # ❌ same loop body
+```
+
+Enforced since **v1.0.0-alpha.7**; before that the sibling-loop carve-out swallowed both cases.
+
+### Through `global` / `nonlocal`
+
+`global NAME` / `nonlocal NAME` names a binding in an outer scope, and assigning through the keyword is an assignment to *that* binding — so `let` applies:
+
+```python
+let CONFIG: str = "a"
+
+def go() -> None:
+    global CONFIG
+    CONFIG = "b"        # ❌
+```
+
+**Fix:** declare it `mut CONFIG: str = "a"` at module level if it is meant to be rebound. Also enforced since **v1.0.0-alpha.7**; before that the assignment silently created a separate function-local binding, leaving the module constant unchecked and clobbered at run time.
+
 ## `tyc::unused_import`
 
 An imported name is never used in the module:

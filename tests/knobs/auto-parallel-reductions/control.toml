@@ -1,0 +1,16 @@
+[project]
+name = "knob-auto-parallel-reductions"
+version = "0.1.0"
+src = "src"
+out = "build"
+
+[python]
+target = "3.13"
+
+[emit]
+format = false
+
+[strictness]
+auto-parallel = true
+auto-parallel-reductions = false
+parallel-min-size = 4

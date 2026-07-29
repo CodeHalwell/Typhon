@@ -59,6 +59,18 @@ pub struct Interpreter {
     /// name (e.g. "repo" or "sub.util"). Lets the same module be imported
     /// from multiple files without re-evaluating its body.
     pub module_cache: HashMap<String, Value>,
+    /// Dotted package of the module currently executing, as segments —
+    /// `["app", "domain"]` while running `src/app/domain/orders.ty`, and
+    /// empty at the source root. Saved and restored around a sibling
+    /// module's body exactly like `current_source`.
+    ///
+    /// This is what makes a relative import inside a sub-package resolve.
+    /// Every `from .sibling import X` used to be resolved against
+    /// `source_root` regardless of where the importing file lived, so
+    /// `src/app/domain/orders.ty` looked for `src/sibling.ty` — which is why
+    /// `tyc run` failed on every multi-package example app while
+    /// `tyc build` + CPython succeeded.
+    pub current_package: Vec<String>,
     /// Stack of value buffers for generator functions. The VM has no way to
     /// suspend a tree-walk mid-frame, so a `yield`-bearing function is run
     /// eagerly to completion with each yielded value pushed onto the top
@@ -172,6 +184,7 @@ impl Interpreter {
             max_stack_depth: 1000,
             script_argv: Vec::new(),
             source_root: None,
+            current_package: Vec::new(),
             module_cache: HashMap::new(),
             gen_buffers: Vec::new(),
             loading_modules: std::collections::HashSet::new(),
@@ -453,20 +466,20 @@ impl Interpreter {
                     .map(|i| i.as_str().to_owned())
                     .unwrap_or_default();
                 // Relative imports (`from .repo import X`) carry a `level`
-                // > 0. The dot-count tells us how many package levels up
-                // to start from. The VM treats the configured source_root
-                // as the package root, so any positive level resolves the
-                // import relative to it. This is enough for the common
-                // pattern of `from .sibling import x` between files
-                // sharing a `src/` directory.
+                // > 0: one dot means "this package", each extra dot strips
+                // one more segment off it. Resolving against the importing
+                // module's own package — rather than always against
+                // `source_root` — is what lets a relative import work below
+                // the top level of a project.
                 let module = if im.level > 0 {
+                    let base = self.relative_import_base(im.level);
                     if module_name.is_empty() {
                         // `from . import sibling` — load each name as a
                         // sibling module instead of going through an
                         // umbrella package object.
                         for alias in &im.names {
                             let attr = alias.name.as_str();
-                            let val = self.import_module(attr)?;
+                            let val = self.import_module(&join_module(&base, attr))?;
                             let bind = alias
                                 .asname
                                 .as_ref()
@@ -476,12 +489,28 @@ impl Interpreter {
                         }
                         return Ok(());
                     }
-                    self.import_module(&module_name)?
+                    self.import_module(&join_module(&base, &module_name))?
                 } else {
                     self.import_module(&module_name)?
                 };
                 for alias in &im.names {
                     let attr = alias.name.as_str();
+                    // `from module import *` — bind the module's public
+                    // surface rather than looking up a member literally named
+                    // `*`. Without this the VM raised
+                    // `AttributeError: module has no attribute '*'` on a
+                    // documented, supported form that `tyc build` + CPython
+                    // handles fine.
+                    //
+                    // "Public" follows Python: the module's `__all__` when it
+                    // declares one (which `pub` synthesises), otherwise every
+                    // name not starting with `_`.
+                    if attr == "*" {
+                        for (name, value) in self.module_public_members(&module) {
+                            env.set(&name, value);
+                        }
+                        continue;
+                    }
                     let val = self.get_attr(&module, attr)?;
                     let bind = alias
                         .asname
@@ -784,6 +813,44 @@ impl Interpreter {
             .decorator_list
             .iter()
             .any(|d| rightmost_name(&d.expression).as_deref() == Some("dataclass"));
+        // A `model` class emits `class Foo(BaseModel):` — no `@dataclass`
+        // decorator, because Pydantic generates the constructor itself. Its
+        // annotated assigns are still *fields*, and every one of them
+        // ordinarily carries a default. Reading `is_dataclass` alone
+        // classified each defaulted field as a class attribute, so the VM
+        // built a constructor that had never heard of it: `Foo(port=8080)`
+        // and `Foo.model_validate({...})` raised TypeError under `tyc run`
+        // while the same program worked under `tyc build` + CPython.
+        //
+        // `BaseModel` never resolves to a `Value::Class` in the VM (it is a
+        // shim), so it is absent from `bases` by the time this runs — match
+        // it on the base expression instead.
+        let is_pydantic_model = c
+            .arguments
+            .as_ref()
+            .map(|args| {
+                args.args
+                    .iter()
+                    .any(|b| rightmost_name(b).as_deref() == Some("BaseModel"))
+            })
+            .unwrap_or(false);
+        let has_generated_fields = is_dataclass || is_pydantic_model;
+        // `interface X:` lowers to `class X(Protocol):`. `typing.Protocol` is
+        // an identity native in the VM, not a class, so it never survives into
+        // `bases` — read it off the base expression instead.
+        let is_protocol = c
+            .arguments
+            .as_ref()
+            .map(|args| {
+                args.args.iter().any(|b| {
+                    let head = match b {
+                        Expr::Subscript(s) => s.value.as_ref(),
+                        other => other,
+                    };
+                    rightmost_name(head).as_deref() == Some("Protocol")
+                })
+            })
+            .unwrap_or(false);
         let is_classvar = |ann: &Expr| -> bool {
             let head = match ann {
                 Expr::Subscript(s) => s.value.as_ref(),
@@ -862,7 +929,7 @@ impl Interpreter {
                         // dataclass (`plain class`) an annotated assign with a
                         // default is also a class attribute, not an instance
                         // slot. Everything else is a dataclass field.
-                        if classvar || (!is_dataclass && default.is_some()) {
+                        if classvar || (!has_generated_fields && default.is_some()) {
                             if let Some(v) = default {
                                 class_attrs.insert(n.id.as_str().to_owned(), v);
                             }
@@ -980,6 +1047,7 @@ impl Interpreter {
             properties: RefCell::new(properties),
             classmethods: RefCell::new(classmethods),
             is_exception,
+            is_protocol,
         });
 
         // Enum subclass: convert simple class-level assignments (`RED = 1`)
@@ -1044,6 +1112,55 @@ impl Interpreter {
     }
 
     // ── Imports ────────────────────────────────────────────────────────────
+
+    /// The dotted package a relative import of `level` dots resolves
+    /// against, given where the importing module lives.
+    ///
+    /// `level == 1` is the importing module's own package; each further dot
+    /// strips one segment. Walking past the source root clamps to the root
+    /// rather than erroring — CPython raises here, but the VM has no
+    /// `__package__` to report and a clamp degrades to the pre-fix
+    /// behaviour (resolve at the root) instead of failing a program that
+    /// `tyc build` accepts.
+    fn relative_import_base(&self, level: u32) -> Vec<String> {
+        let strip = level.saturating_sub(1) as usize;
+        let keep = self.current_package.len().saturating_sub(strip);
+        self.current_package[..keep].to_vec()
+    }
+
+    /// The names `from module import *` binds: the module's `__all__` when it
+    /// declares one, otherwise every member whose name does not start with
+    /// `_`. Mirrors CPython.
+    fn module_public_members(&mut self, module: &Value) -> Vec<(String, Value)> {
+        let Value::Module(m) = module else {
+            return Vec::new();
+        };
+        let members = m.members.borrow();
+        let declared: Option<Vec<String>> = members.get("__all__").and_then(|v| match v {
+            Value::List(items) => Some(
+                items
+                    .borrow()
+                    .iter()
+                    .filter_map(|i| match i {
+                        Value::Str(s) => Some((**s).clone()),
+                        _ => None,
+                    })
+                    .collect(),
+            ),
+            _ => None,
+        });
+        match declared {
+            Some(names) => names
+                .into_iter()
+                .filter_map(|n| members.get(&n).map(|v| (n, v.clone())))
+                .collect(),
+            None => members
+                .iter()
+                .filter(|(k, _)| !k.starts_with('_'))
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
+        }
+    }
 
     fn import_module(&mut self, name: &str) -> Result<Value, Unwind> {
         // Cache hit: same name imported earlier in the same VM run.
@@ -1131,10 +1248,17 @@ impl Interpreter {
         // top-level entry, so the imported module sees identical surface
         // syntax handling.
         use tyc_syntax::preprocess;
-        let expanded = preprocess::expand_question_ops(&preprocess::expand_pipes(
-            &preprocess::expand_with_chains(&preprocess::expand_go_calls(
-                &preprocess::expand_gather_blocks(&preprocess::expand_multiline_guards(
-                    &preprocess::expand_typed_let_unpack(&preprocess::expand_lazy_lets(&source)),
+        let expanded = preprocess::expand_question_ops(&preprocess::expand_inline_question_ops(
+            // Shared with the CLI: the VM omitted both of these, so an
+            // inline `?` (`f(g()?)`, `elif h()? > 1:`) failed to parse under
+            // `tyc run` on a program `tyc build` compiles and runs.
+            &preprocess::expand_compound_question_headers(&preprocess::expand_pipes(
+                &preprocess::expand_with_chains(&preprocess::expand_go_calls(
+                    &preprocess::expand_gather_blocks(&preprocess::expand_multiline_guards(
+                        &preprocess::expand_typed_let_unpack(&preprocess::expand_lazy_lets(
+                            &source,
+                        )),
+                    )),
                 )),
             )),
         ));
@@ -1206,7 +1330,19 @@ impl Interpreter {
             path.to_string_lossy().into_owned(),
             &prep.python_source,
         )));
+        // Enter the loaded module's package so its own relative imports
+        // resolve from where it lives, not from where the import chain
+        // started. A package's `__init__.ty` *is* the package, so it keeps
+        // every segment; a plain module drops its own trailing name.
+        // Which file matched decides the module's own package: the
+        // `__init__.ty` form *is* the package `name` refers to.
+        let is_package_init = path.file_name().and_then(|f| f.to_str()) == Some("__init__.ty");
+        let saved_package = std::mem::replace(
+            &mut self.current_package,
+            package_of_module(name, is_package_init),
+        );
         let body_result = self.exec_block(&module.body, &module_env);
+        self.current_package = saved_package;
         self.current_source = saved_source;
         body_result?;
         // Correct any forward-declared `type` alias before the module's
@@ -1312,6 +1448,7 @@ impl Interpreter {
                 properties: RefCell::new(std::collections::HashSet::new()),
                 classmethods: RefCell::new(std::collections::HashSet::new()),
                 is_exception: false,
+                is_protocol: false,
             });
             members.insert(base_name.to_owned(), Value::Class(cls));
         }
@@ -1959,7 +2096,18 @@ impl Interpreter {
             }
             return Ok(Ordering::Greater);
         }
-        Ok(a.py_cmp(b).unwrap_or(Ordering::Equal))
+        // An incomparable pair used to fall back to `Equal`, which is the
+        // worst possible answer: `sorted()` / `min()` / `max()` treat every
+        // element as tied and return the input *unsorted*, silently, with no
+        // error. CPython raises here, so raise here — the VM must not be the
+        // surface that quietly produces a wrong ordering.
+        a.py_cmp(b).ok_or_else(|| {
+            type_error(format!(
+                "'<' not supported between instances of '{}' and '{}'",
+                a.type_name(),
+                b.type_name()
+            ))
+        })
     }
 
     fn cmp_op(&mut self, op: CmpOp, l: &Value, r: &Value) -> Result<bool, Unwind> {
@@ -2268,6 +2416,42 @@ impl Interpreter {
     /// shape it can't model (a TypeVar, an unresolvable name, an unknown
     /// parameterised origin) is accepted, so the cast only ever rejects a value
     /// it can prove wrong.
+    /// Match `value` against an `as!` target that has already been resolved to
+    /// a runtime value, mirroring `typhon_runtime/cast.py::_matches`.
+    ///
+    /// Two targets need more than `isinstance`:
+    ///
+    /// * An `interface` lowers to a `Protocol` subclass. Nominal
+    ///   `isinstance` can never succeed against one — the value's class chain
+    ///   does not contain the protocol — so `EXPR as! SomeInterface` always
+    ///   raised `TypeError` inside the guard, making a structurally valid cast
+    ///   to an interface impossible. Interfaces are structural by definition,
+    ///   so check for the members instead.
+    ///
+    /// * A `newtype` lowers to `typing.NewType`, which the VM models as an
+    ///   identity callable. That is not a class, so `isinstance` rejected
+    ///   *everything* — `as! SomeNewtype` could never succeed here either,
+    ///   while the compiled path (before it was fixed) accepted everything
+    ///   unchecked. The VM cannot recover the declared base from the identity
+    ///   shim, so it accepts, which is the documented rule for this matcher:
+    ///   only ever reject a value it can prove wrong.
+    fn value_matches_resolved_target(&mut self, value: &Value, target: &Value) -> bool {
+        if let Value::Native(n) = target {
+            if n.name == "NewTypeAlias" {
+                return true;
+            }
+        }
+        if let Value::Class(cls) = target {
+            if class_is_protocol(cls) {
+                let names: Vec<String> = cls.methods.borrow().keys().cloned().collect();
+                return names
+                    .iter()
+                    .all(|m| self.get_attr(value, m.as_str()).is_ok());
+            }
+        }
+        crate::builtins::is_instance_of(value, target)
+    }
+
     fn value_matches_cast_type(&mut self, value: &Value, tp: &Expr, env: &EnvRef) -> bool {
         match tp {
             Expr::NoneLiteral(_) => matches!(value, Value::None),
@@ -2290,12 +2474,12 @@ impl Interpreter {
                 // User class / unknown — resolve the name and use isinstance;
                 // be permissive when it can't be resolved in the VM env.
                 _ => match self.eval_expr(tp, env) {
-                    Ok(cls) => crate::builtins::is_instance_of(value, &cls),
+                    Ok(cls) => self.value_matches_resolved_target(value, &cls),
                     Err(_) => true,
                 },
             },
             Expr::Attribute(_) => match self.eval_expr(tp, env) {
-                Ok(cls) => crate::builtins::is_instance_of(value, &cls),
+                Ok(cls) => self.value_matches_resolved_target(value, &cls),
                 Err(_) => true,
             },
             Expr::BinOp(b) if matches!(b.op, Operator::BitOr) => {
@@ -3060,8 +3244,21 @@ impl Interpreter {
                 self.call_function(&thunk.function, args, &thunk.kwargs, thunk.receiver.clone())
             }
             Value::Module(m) if m.name == "Task" => {
-                let r = m.members.borrow().get("__typhon_task_result__").cloned();
-                Ok(r.unwrap_or(Value::None))
+                let (result, error) = {
+                    let members = m.members.borrow();
+                    (
+                        members.get("__typhon_task_result__").cloned(),
+                        members.get("__typhon_task_error__").cloned(),
+                    )
+                };
+                // `await` on a failed task re-raises the task's exception —
+                // CPython terminates the awaiting body there (a TaskGroup
+                // body would be cancelled); yielding `None` and running on
+                // is the silent-wrong-output class of divergence.
+                if let Some(err) = error {
+                    return Err(self.value_to_exception(err));
+                }
+                Ok(result.unwrap_or(Value::None))
             }
             other => Ok(other),
         }
@@ -4292,6 +4489,16 @@ impl Interpreter {
                     }
                 }
                 "kind" => Ok(Value::Str(kind.clone())),
+                // PEP 654 group members. `.exceptions` is always a tuple in
+                // CPython even when `args[1]` was passed as a list.
+                "exceptions" if crate::value::is_exception_group_kind(kind.as_str()) => {
+                    Ok(Value::Tuple(Rc::new(
+                        crate::value::exception_group_subs(value).unwrap_or_default(),
+                    )))
+                }
+                "message" if crate::value::is_exception_group_kind(kind.as_str()) => {
+                    Ok(Value::Str(message.clone()))
+                }
                 // `__cause__` / `__context__` are not tracked yet; expose None
                 // so the common introspection (`e.__cause__ is None`) works.
                 "__cause__" | "__context__" => Ok(Value::None),
@@ -4945,6 +5152,13 @@ impl Interpreter {
     // ── try/except ─────────────────────────────────────────────────────────
 
     fn exec_try(&mut self, t: &ast::StmtTry, env: &EnvRef) -> Result<(), Unwind> {
+        // `try` / `try*` share one AST node, discriminated by `is_star`.
+        // Their handler semantics have nothing in common, so they get
+        // separate executors (F7: ignoring `is_star` bound the *bare*
+        // exception where CPython binds an `ExceptionGroup`).
+        if t.is_star {
+            return self.exec_try_star(t, env);
+        }
         let body_res = self.exec_block(&t.body, env);
         let mut handled_exc: Option<Value> = None;
         let body_res = match body_res {
@@ -5013,6 +5227,299 @@ impl Interpreter {
         body_res
     }
 
+    /// `try ... except* E:` — PEP 654 exception-group handling.
+    ///
+    /// CPython semantics, replicated here (each rule verified against
+    /// CPython 3.13):
+    ///
+    /// 1. A raised exception that is not already a group is wrapped in an
+    ///    implicit `ExceptionGroup('', (exc,))` for matching purposes.
+    /// 2. Handlers are tried **in order and all of them run** (unlike plain
+    ///    `except`, which stops at the first match). Each handler receives an
+    ///    exception group containing only its matching members, splitting
+    ///    recursively through nested groups and preserving their nesting.
+    /// 3. Whatever is left unmatched after every handler is re-raised.
+    /// 4. If the original exception was *not* a group and nothing matched, the
+    ///    original bare exception propagates — not a wrapper.
+    /// 5. Exceptions raised by handler bodies are collected and combined with
+    ///    the unhandled remainder, distinguishing *re-raises* from new raises
+    ///    the way `_PyExc_PrepReraiseStar` does: a naked `raise` of the bound
+    ///    subgroup is merged back with the unhandled remainder into a
+    ///    projection of the original group (same nesting, same messages), so
+    ///    the canonical log-and-reraise handler propagates
+    ///    `ExceptionGroup('g', [ValueError('v'), TypeError('t')])`, not a
+    ///    `''`-wrapped pair of fragments. An explicit `raise e` of the bound
+    ///    subgroup is a *new* raise (CPython keys on the exception's
+    ///    metadata, which `raise e` refreshes). Newly raised exceptions come
+    ///    first, the reconstituted projection last; exactly one survivor
+    ///    propagates as itself, two or more are wrapped in a fresh
+    ///    `ExceptionGroup('', [...])` (downcast rule applied).
+    /// 6. `except* ExceptionGroup` / `except* BaseExceptionGroup` is a runtime
+    ///    `TypeError`.
+    ///
+    /// Not modelled: `__context__` / `__cause__` chaining between the
+    /// collected exceptions, and CPython's nested "Exception Group Traceback"
+    /// rendering for an uncaught group.
+    fn exec_try_star(&mut self, t: &ast::StmtTry, env: &EnvRef) -> Result<(), Unwind> {
+        let body_res = self.exec_block(&t.body, env);
+        let exc = match body_res {
+            Ok(()) => {
+                let orelse_res = self.exec_block(&t.orelse, env);
+                self.exec_block(&t.finalbody, env)?;
+                return orelse_res;
+            }
+            Err(Unwind::Exception(exc)) => exc,
+            Err(other) => {
+                self.exec_block(&t.finalbody, env)?;
+                return Err(other);
+            }
+        };
+
+        // Rule 1 — `remaining` holds whatever is still unhandled. It starts as
+        // the raised group, or — when a *bare* exception was raised — as that
+        // bare exception, which each handler tests directly and, on a match,
+        // wraps in the implicit `ExceptionGroup('', (exc,))`. Keeping the bare
+        // form here (rather than pre-wrapping) is what makes rule 4 work and
+        // what gives the wrapper CPython's tuple-shaped `args[1]`; a *derived*
+        // group from a split gets a list, as `BaseExceptionGroup.derive` does.
+        let raised_value = match &exc.value {
+            Some(v @ (Value::Instance(_) | Value::Exception { .. })) => v.clone(),
+            _ => Value::Exception {
+                kind: Rc::new(exc.kind.clone()),
+                message: Rc::new(exc.message.clone()),
+                args: Rc::new(exc_fallback_args(&exc.message)),
+            },
+        };
+        let was_group = crate::value::exception_group_subs(&raised_value).is_some();
+        // Kept for the rule-5 projection: reraised subgroups and the
+        // unhandled remainder are merged back into this group's shape.
+        let orig_value = raised_value.clone();
+        let mut remaining: Option<Value> = Some(raised_value);
+
+        let mut any_matched = false;
+        // Rule 5's two buckets: genuinely new exceptions raised by handler
+        // bodies, and naked re-raises of the bound subgroup.
+        let mut raised: Vec<Value> = Vec::new();
+        let mut reraised: Vec<Value> = Vec::new();
+
+        for handler in &t.handlers {
+            let ExceptHandler::ExceptHandler(h) = handler;
+            let Some(type_expr) = h.type_.as_deref() else {
+                // The parser rejects a bare `except*:` before we get here;
+                // treat it defensively as matching nothing.
+                continue;
+            };
+            if let Some(banned) = self.except_star_names_group_type(type_expr) {
+                self.exec_block(&t.finalbody, env)?;
+                return Err(type_error(format!(
+                    "catching {banned} with except* is not allowed. Use except instead."
+                )));
+            }
+            let Some(current) = remaining.take() else {
+                break;
+            };
+            let (matched, rest) = if crate::value::exception_group_subs(&current).is_some() {
+                self.split_exception_group(&current, type_expr, env)?
+            } else if self.exception_value_matches(type_expr, &current, env)? {
+                let kind = if crate::value::is_base_only_exception(&current) {
+                    "BaseExceptionGroup"
+                } else {
+                    "ExceptionGroup"
+                };
+                (
+                    Some(crate::value::make_exception_group(
+                        kind,
+                        "",
+                        vec![current.clone()],
+                        true,
+                    )),
+                    None,
+                )
+            } else {
+                (None, Some(current))
+            };
+            remaining = rest;
+            let Some(matched) = matched else {
+                continue;
+            };
+            any_matched = true;
+            if let Some(name) = &h.name {
+                env.set(name.as_str(), matched.clone());
+            }
+            let Unwind::Exception(mut active) = self.value_to_exception(matched.clone()) else {
+                unreachable!("value_to_exception always yields Unwind::Exception")
+            };
+            // Mark the pushed active exception so a naked `raise` (which
+            // clones it) is recognisable as a PEP 654 re-raise below.
+            active.star_handler_reraise = true;
+            self.active_exceptions.push(active);
+            let result = self.exec_block(&h.body, env);
+            self.active_exceptions.pop();
+            if let Some(name) = &h.name {
+                env.delete(name.as_str());
+            }
+            match result {
+                Ok(()) => {}
+                Err(Unwind::Exception(e)) => {
+                    // Rule 5 — collect, keep running later handlers. A naked
+                    // `raise` of the bound subgroup (marker + identity) is a
+                    // re-raise CPython merges back into the original group;
+                    // anything else — `raise e` included — is a new raise.
+                    let value = e.value.clone().unwrap_or_else(|| Value::Exception {
+                        kind: Rc::new(e.kind.clone()),
+                        message: Rc::new(e.message.clone()),
+                        args: Rc::new(exc_fallback_args(&e.message)),
+                    });
+                    if e.star_handler_reraise
+                        && crate::value::exception_values_identical(&value, &matched)
+                    {
+                        reraised.push(value);
+                    } else {
+                        raised.push(value);
+                    }
+                }
+                // `return` / `break` / `continue` out of an `except*` body is
+                // a CPython *compile* error, reported at check time as
+                // `tyc::return_in_except_star`. Should a program reach here
+                // anyway, propagating is the least surprising behaviour.
+                Err(other) => {
+                    self.exec_block(&t.finalbody, env)?;
+                    return Err(other);
+                }
+            }
+        }
+
+        self.exec_block(&t.finalbody, env)?;
+
+        // Rule 4 — an unmatched bare exception propagates unwrapped, with its
+        // original frames (so the traceback is unchanged).
+        if !any_matched && !was_group && raised.is_empty() && reraised.is_empty() {
+            return Err(Unwind::Exception(exc));
+        }
+
+        // Rule 5 — combine handler failures with the unhandled remainder.
+        // New raises come first; the naked re-raises and the remainder are
+        // both derived from the original group, so they merge back into a
+        // single projection of it — appended last, as CPython does.
+        let mut finals = raised;
+        if was_group {
+            let mut keep: Vec<Value> = Vec::new();
+            for v in &reraised {
+                crate::value::collect_exception_leaves(v, &mut keep);
+            }
+            if let Some(rest) = &remaining {
+                crate::value::collect_exception_leaves(rest, &mut keep);
+            }
+            if let Some(projection) = crate::value::project_exception_group(&orig_value, &keep) {
+                finals.push(projection);
+            }
+        } else {
+            // A bare original: its naked re-raise propagates the implicit
+            // wrapper unchanged — CPython 3.13 gives
+            // `ExceptionGroup('', (ValueError('v'),))`, not the bare value.
+            finals.extend(reraised);
+            if let Some(rest) = remaining {
+                finals.push(rest);
+            }
+        }
+        match finals.len() {
+            0 => Ok(()),
+            1 => Err(self.value_to_exception(finals.remove(0))),
+            _ => {
+                let kind = crate::value::exception_group_kind_for(&finals);
+                Err(self.value_to_exception(crate::value::make_exception_group(
+                    kind, "", finals, false,
+                )))
+            }
+        }
+    }
+
+    /// `except* ExceptionGroup` / `except* BaseExceptionGroup` is rejected by
+    /// CPython at runtime (`TypeError`), because splitting a group by a group
+    /// type is meaningless. Returns the offending name when `type_expr` — or
+    /// any member of a tuple of types — is one of them.
+    fn except_star_names_group_type(&self, type_expr: &Expr) -> Option<String> {
+        fn walk(e: &Expr) -> Option<String> {
+            match e {
+                Expr::Tuple(t) => t.elts.iter().find_map(walk),
+                Expr::Name(n) if crate::value::is_exception_group_kind(n.id.as_str()) => {
+                    Some(n.id.as_str().to_owned())
+                }
+                _ => None,
+            }
+        }
+        walk(type_expr)
+    }
+
+    /// Split `group` by `type_expr` into `(matched, rest)`, both exception
+    /// groups derived from `group` (same kind and message) or `None` when the
+    /// side is empty. Recurses through nested groups, preserving their
+    /// nesting — CPython's `BaseExceptionGroup.split` behaviour.
+    fn split_exception_group(
+        &mut self,
+        group: &Value,
+        type_expr: &Expr,
+        env: &EnvRef,
+    ) -> Result<(Option<Value>, Option<Value>), Unwind> {
+        // CPython tests the group itself first: `except* Exception` against an
+        // `ExceptionGroup` matches the *whole* group rather than recursing.
+        if self.exception_value_matches(type_expr, group, env)? {
+            return Ok((Some(group.clone()), None));
+        }
+        let message = match group {
+            Value::Exception { message, .. } => (**message).clone(),
+            _ => return Ok((None, Some(group.clone()))),
+        };
+        let subs = crate::value::exception_group_subs(group).unwrap_or_default();
+        let mut matched: Vec<Value> = Vec::new();
+        let mut rest: Vec<Value> = Vec::new();
+        for sub in subs {
+            if crate::value::exception_group_subs(&sub).is_some() {
+                let (m, r) = self.split_exception_group(&sub, type_expr, env)?;
+                if let Some(m) = m {
+                    matched.push(m);
+                }
+                if let Some(r) = r {
+                    rest.push(r);
+                }
+            } else if self.exception_value_matches(type_expr, &sub, env)? {
+                matched.push(sub);
+            } else {
+                rest.push(sub);
+            }
+        }
+        let build = |items: Vec<Value>| {
+            if items.is_empty() {
+                None
+            } else {
+                // Each derived side goes through `BaseExceptionGroup.__new__`
+                // in CPython, so its kind is recomputed per side: splitting
+                // `BaseExceptionGroup("g", [ValueError("v"), KeyboardInterrupt()])`
+                // by `except* ValueError` binds an *ExceptionGroup* on the
+                // matched side (verified on 3.13), not the parent's kind.
+                let kind = crate::value::exception_group_kind_for(&items);
+                Some(crate::value::make_exception_group(
+                    kind, &message, items, false,
+                ))
+            }
+        };
+        Ok((build(matched), build(rest)))
+    }
+
+    /// `exception_matches` for a raw exception *value* rather than an
+    /// in-flight [`VmException`] — the leaf test used by group splitting.
+    fn exception_value_matches(
+        &mut self,
+        type_expr: &Expr,
+        value: &Value,
+        env: &EnvRef,
+    ) -> Result<bool, Unwind> {
+        let Unwind::Exception(exc) = self.value_to_exception(value.clone()) else {
+            return Ok(false);
+        };
+        self.exception_matches(type_expr, &exc, env)
+    }
+
     fn exception_matches(
         &mut self,
         type_expr: &Expr,
@@ -5061,7 +5568,7 @@ impl Interpreter {
         Ok(false)
     }
 
-    fn value_to_exception(&self, v: Value) -> Unwind {
+    pub(crate) fn value_to_exception(&self, v: Value) -> Unwind {
         match v {
             Value::Exception {
                 ref kind,
@@ -5070,7 +5577,17 @@ impl Interpreter {
             } => {
                 // Keep the full value (carrying `args`) attached so the
                 // handler can bind it and `e.args` survives.
-                let (k, m) = ((**kind).clone(), (**message).clone());
+                let k = (**kind).clone();
+                // An exception group's traceback summary line is its `str()`
+                // — `ExceptionGroup: g (2 sub-exceptions)` — not the bare
+                // group message. (The VM prints that one line; it does not
+                // reproduce CPython's nested "Exception Group Traceback"
+                // rendering of each member.)
+                let m = if crate::value::is_exception_group_kind(&k) {
+                    v.py_str()
+                } else {
+                    (**message).clone()
+                };
                 Unwind::Exception(VmException::new(k, m).with_value(v))
             }
             Value::Instance(i) => {
@@ -6421,7 +6938,7 @@ fn name_is_exception_base(name: &str) -> bool {
 /// subclass of it). Reads the `__typhon_exc_bases__` record stamped on each
 /// class by `build_class`, since builtin exception bases have no
 /// `Value::Class` to walk.
-fn class_has_builtin_exc_base(class: &Rc<Class>, target: &str) -> bool {
+pub(crate) fn class_has_builtin_exc_base(class: &Rc<Class>, target: &str) -> bool {
     if let Some(Value::Tuple(names)) = class.class_attrs.borrow().get("__typhon_exc_bases__") {
         for nm in names.iter() {
             if let Value::Str(s) = nm {
@@ -6514,13 +7031,22 @@ pub fn builtin_exc_is_a(kind: &str, target: &str) -> bool {
         // CPython (where they derive from BaseException, not Exception).
         return !matches!(
             kind,
-            "BaseException" | "KeyboardInterrupt" | "SystemExit" | "GeneratorExit"
+            "BaseException"
+                | "KeyboardInterrupt"
+                | "SystemExit"
+                | "GeneratorExit"
+                // PEP 654: `BaseExceptionGroup` derives from `BaseException`
+                // only — `except Exception` must not catch it. Its
+                // `ExceptionGroup` sibling *does* derive from `Exception` and
+                // is deliberately absent from this list.
+                | "BaseExceptionGroup"
         );
     }
     // Direct parent in the standard hierarchy (subset covering the common
     // intermediate bases programs actually catch).
     fn parent(name: &str) -> Option<&'static str> {
         Some(match name {
+            "ExceptionGroup" => "BaseExceptionGroup",
             "ZeroDivisionError" | "OverflowError" | "FloatingPointError" => "ArithmeticError",
             "IndexError" | "KeyError" => "LookupError",
             "ModuleNotFoundError" => "ImportError",
@@ -7087,6 +7613,37 @@ fn insert_float_thousands(raw: &str, sep: char) -> String {
     }
     let grouped: String = grouped.chars().rev().collect();
     format!("{sign}{grouped}{rest}")
+}
+
+/// Join a package path and a module name into a dotted absolute module name.
+/// An empty package yields the bare name, so a relative import at the source
+/// root resolves exactly as it did before packages were tracked.
+fn join_module(package: &[String], name: &str) -> String {
+    if package.is_empty() {
+        name.to_owned()
+    } else {
+        format!("{}.{}", package.join("."), name)
+    }
+}
+
+/// The package segments a module body should execute under.
+///
+/// `is_package_init` distinguishes `pkg/__init__.ty` (whose package is
+/// `pkg` itself) from `pkg/mod.ty` (whose package is `pkg`, i.e. its own
+/// name dropped). Getting this wrong makes `from . import x` inside an
+/// `__init__.ty` look one level too high.
+fn package_of_module(name: &str, is_package_init: bool) -> Vec<String> {
+    let mut segs: Vec<String> = name.split('.').map(|s| s.to_owned()).collect();
+    if !is_package_init {
+        segs.pop();
+    }
+    segs
+}
+
+/// True when `cls` is (or inherits) the `Protocol` marker the VM installs for
+/// `interface` declarations.
+fn class_is_protocol(cls: &Rc<crate::value::Class>) -> bool {
+    cls.is_protocol || cls.name == "Protocol" || cls.bases.iter().any(class_is_protocol)
 }
 
 #[cfg(test)]

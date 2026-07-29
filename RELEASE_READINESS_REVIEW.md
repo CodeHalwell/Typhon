@@ -38,11 +38,24 @@ test suite pass, and the perf gate is within threshold.
 | MEDIUM — GitHub Actions unpinned | ✅ Fixed (2026-07-08) | `dependabot.yml` added in this pass (github-actions/cargo/npm); every third-party action across the five workflows SHA-pinned in the follow-up branch (version noted in a trailing comment; Dependabot keeps the pins fresh) |
 | Docs/packaging (stale versions, README quickstart, docs-site pydantic/toolchain/installers, examples #60, VS Code `val`/`var`+icon+install, stress README, SECURITY/CONTRIBUTING, `.Jules` case-collision) | ✅ Fixed | See the diff |
 | Diagnostics catalog: 4 codes missing docs + `explain` | ✅ Fixed | Added the 4 pages + wired into `tyc explain` |
-| **H6** — flow-narrowing soundness holes | ✅ Fixed | All four sub-holes closed in `tyc-types`: (1) `except` handlers now check against pre-narrowing state (a body raise can happen anywhere); (2) loop bodies widen names reassigned inside them so iteration-2 reads aren't treated with the stale pre-loop type; (3) a call in an assign/ann-assign RHS invalidates global narrowing (not just bare-call statements); (4) a bare method-call statement invalidates attribute narrowing rooted at its receiver. 7 new regression tests; corpus unchanged (998/132); full suite green |
+| **H6** — flow-narrowing soundness holes | ✅ Fixed (completed 2026-07-28 — this row over-claimed until then; see note below) | All four sub-holes closed in `tyc-types`: (1) `except` handlers now check against pre-narrowing state (a body raise can happen anywhere); (2) loop bodies widen **every** channel that can carry a stale value into iteration 2 — bare names, tuple/list/starred unpack targets, attribute paths, and a global rebound by an in-body call; (3) a call in **any** statement position invalidates global narrowing, routed through one `eval_stmt_expr` choke point so the statement list cannot drift out of sync with the reset, and restricted to globals some function actually declares `global` so it does not cost narrowings nothing can invalidate; (4) a bare method-call statement invalidates attribute narrowing rooted at its receiver. Straight-line tuple unpack re-narrows its targets too. Regression tests for each channel; corpus unchanged; full suite green |
 | **H5** — scope-blind class unification | ✅ Fixed (2026-07-08 — see addendum below; was deferred in this pass) | Attempted a safe tightening (reject the tail-unification only when both sides are non-partial project classes with different field sets). **Empirically found it introduces a false positive** and reverted: a value typed as a bare `Class("Node")` has lost its module origin, so the incompatibility check misresolves an ambiguous bare name and rejects a *correct-type* assignment (verified: passing a genuine `graph.Node` into a `graph.Node` param errored). The common bug (user class vs a *partial* library class) also can't be caught soundly — a partial shape can't be proven incompatible. A safe fix needs the larger "carry qualified module origin through inference" refactor, not a quick edit |
 | LOW — BOM not stripped; comptime "(no location)" | ⛔ Deferred | Low value; the safe fix touches offset-mapping and isn't worth the risk in this pass |
 
-H6 is now fixed (four sub-holes, seven regression tests, corpus unchanged). H5 remains the one
+> **2026-07-28 correction — H6's ✅ was premature when first written.** The
+> [2026-07-28 codebase review](docs/codebase-review-2026-07-28.md) found sub-fixes (2) and (3)
+> were each real but partial, and this row described them as complete. (3) invalidated global
+> narrowing from exactly three statement arms — assign, annotated assign, and a bare call — so
+> `if refresh():`, `while poll():`, `for row in reload():`, `assert reconnect()`,
+> `total += bump()` and `with hold():` all kept a narrowing the callee had just invalidated;
+> since `if`/`while`/`for` tests are the commonest place to put a side-effecting call, that was
+> the widest remaining hole. (2) widened only bare-`Name` assignment targets, so an attribute
+> nulled at the bottom of a drain loop, a tuple-unpack swap, and a global cleared by an in-body
+> call all stayed stale at iteration 2. Both are now closed as described above, and the row is
+> accurate. Recorded here rather than silently edited, because a status table that has been wrong
+> once is worth reading sceptically.
+
+H6 is now fixed (four sub-holes, regression tests per channel, corpus unchanged). H5 remains the one
 deferred HIGH item — not for lack of trying: a tightening was implemented and then reverted when
 it was empirically shown to reject a correct-type assignment, because Typhon's bare-`Class(name)`
 representation drops the module origin a sound check needs. That's a design-level refactor

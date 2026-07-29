@@ -17,15 +17,14 @@ use tyc_resolve::{resolve_module_with, LazyImportRemap, ResolveOptions, Resolved
 use tyc_syntax::{
     parse_module,
     preprocess::{
-        expand_gather_blocks, expand_go_calls, expand_inline_question_ops, expand_lazy_lets,
-        expand_multiline_guards, expand_pipes, expand_question_ops, expand_typed_let_unpack,
-        expand_with_chains, line_byte_starts, preprocess, validate_extend_usage,
-        validate_lazy_usage, validate_question_ops, PreprocessResult,
+        expand_compound_question_headers, expand_gather_blocks, expand_go_calls,
+        expand_inline_question_ops, expand_lazy_lets, expand_multiline_guards, expand_pipes,
+        expand_question_ops, expand_typed_let_unpack, expand_with_chains, line_byte_starts,
+        preprocess, validate_extend_usage, validate_lazy_usage, validate_question_ops,
+        PreprocessResult,
     },
 };
-use tyc_types::{
-    check_module_with, check_module_with_imports, extract_module_shapes, ExternalShapes,
-};
+use tyc_types::{check_module_with_imports, extract_module_shapes, ExternalShapes};
 
 /// Re-export so downstream crates (CLI, LSP) can name the type
 /// without depending on `tyc-types` directly.
@@ -103,11 +102,13 @@ unsafe impl salsa::Update for ArcPreprocessResult {
 #[salsa::tracked]
 pub fn preprocessed_full(db: &dyn salsa::Database, file: SourceFile) -> ArcPreprocessResult {
     let text = file.text(db);
-    let expanded = expand_question_ops(&expand_inline_question_ops(&expand_pipes(
-        &expand_with_chains(&expand_go_calls(&expand_gather_blocks(
-            &expand_multiline_guards(&expand_lazy_lets(&expand_typed_let_unpack(text))),
-        ))),
-    )));
+    let expanded = expand_question_ops(&expand_inline_question_ops(
+        &expand_compound_question_headers(&expand_pipes(&expand_with_chains(&expand_go_calls(
+            &expand_gather_blocks(&expand_multiline_guards(&expand_lazy_lets(
+                &expand_typed_let_unpack(text),
+            ))),
+        )))),
+    ));
     ArcPreprocessResult(Arc::new(preprocess(&expanded)))
 }
 
@@ -264,11 +265,13 @@ unsafe impl salsa::Update for ArcDiagnostics {
 ///
 /// The public [`check_source_file`] function unwraps the `Arc` so callers
 /// continue to receive a plain [`Diagnostics`] value.
+///
+/// The body is [`check_pipeline`] with no cross-module registry — the exact
+/// same function [`check_source_file_with_imports`] runs, so the single-file
+/// path can never drift from the project path again (F55).
 #[salsa::tracked]
 fn check_diagnostics(db: &dyn salsa::Database, file: SourceFile) -> ArcDiagnostics {
-    let path = file.path(db).clone();
-    let text = file.text(db).clone();
-    ArcDiagnostics::new(check_impl(&path, &text))
+    ArcDiagnostics::new(check_pipeline(db, file, None))
 }
 
 /// Tracked query: parse and resolve the preprocessed source of a file.
@@ -441,6 +444,37 @@ impl TycDatabase {
     }
 }
 
+/// Push new source text into a [`SourceFile`] input, but **only** when it
+/// actually differs from what the database already holds. Returns `true` when
+/// the write happened (i.e. this was a genuine edit), `false` when the call
+/// was a no-op.
+///
+/// This is the one sanctioned way to update a `SourceFile`'s text, and it
+/// exists because Salsa's own `Setter::to` is *not* value-comparing: it stamps
+/// the field as written at the current revision before it even looks at the
+/// new value, so re-uploading identical text invalidates every downstream memo
+/// (F56). The LSP re-uploads every project file's text on every keystroke;
+/// without this guard `module_shapes_query` re-parsed the whole project per
+/// character typed, which is precisely the incrementality `tyc-db` exists to
+/// provide.
+///
+/// Keeping the comparison here (rather than at each call site) also honours the
+/// project's wrap-external-crates rule: `salsa::Setter` is named in exactly one
+/// place, so a change to its semantics has a one-function blast radius.
+pub fn set_source_text(db: &mut TycDatabase, file: SourceFile, text: String) -> bool {
+    use salsa::Setter;
+    // Scope the immutable borrow so the `&mut` reborrow below is legal.
+    let unchanged = {
+        let current: &String = file.text(&*db);
+        *current == text
+    };
+    if unchanged {
+        return false;
+    }
+    file.set_text(db).to(text);
+    true
+}
+
 /// End-to-end check pipeline for a single file. Returns parse, resolve,
 /// and type-check diagnostics merged in source order (parse first).
 ///
@@ -475,15 +509,17 @@ pub fn check_source_file(db: &mut TycDatabase, source_file: SourceFile) -> Diagn
 /// before the per-file check loop, so cross-module constructor /
 /// method arity validation has the data it needs.
 ///
-/// Runs the same preprocess + parse front-end as [`check_impl`], but
+/// Runs the same preprocess + parse front-end as [`check_pipeline`], but
 /// stops there. Returns an empty [`ModuleShapes`] on any parse error
 /// — the real diagnostic surfaces when the file is checked for real.
 pub fn extract_shapes_for_path(_path: &str, text: &str) -> ModuleShapes {
-    let expanded = expand_question_ops(&expand_inline_question_ops(&expand_pipes(
-        &expand_with_chains(&expand_go_calls(&expand_gather_blocks(
-            &expand_multiline_guards(&expand_lazy_lets(&expand_typed_let_unpack(text))),
-        ))),
-    )));
+    let expanded = expand_question_ops(&expand_inline_question_ops(
+        &expand_compound_question_headers(&expand_pipes(&expand_with_chains(&expand_go_calls(
+            &expand_gather_blocks(&expand_multiline_guards(&expand_lazy_lets(
+                &expand_typed_let_unpack(text),
+            ))),
+        )))),
+    ));
     let prep = preprocess(&expanded);
     let module = match parse_module(&prep.python_source) {
         Ok(p) => p.into_syntax(),
@@ -579,6 +615,11 @@ unsafe impl salsa::Update for ArcModuleShapes {
 /// extraction only on the file whose text changed, so a keystroke
 /// in `src/main.ty` doesn't re-parse `src/clients.ty`.
 ///
+/// That only holds if callers update inputs through
+/// [`set_source_text`]. Salsa's raw `set_text` is *not* value-comparing
+/// (see [`set_source_text`]'s docs), so re-uploading identical text with
+/// it invalidates this query for every file in the project.
+///
 /// The result is wrapped in [`ArcModuleShapes`]; callers typically
 /// unwrap via `.0.clone()` to drop the wrapper.
 #[salsa::tracked]
@@ -626,6 +667,25 @@ pub fn check_source_file_with_imports(
     db: &mut TycDatabase,
     file: SourceFile,
     shapes_by_module: &std::sync::Arc<std::collections::HashMap<String, ModuleShapes>>,
+) -> Diagnostics {
+    check_pipeline(&*db, file, Some(shapes_by_module))
+}
+
+/// The one true check pipeline, shared by the Salsa-tracked
+/// [`check_diagnostics`] query (single-file / REPL / LSP fallback path,
+/// `shapes_by_module = None`) and [`check_source_file_with_imports`] (the
+/// project path, `shapes_by_module = Some(_)`).
+///
+/// Having exactly one body is deliberate: the two entry points used to be
+/// separate implementations and silently drifted — the tracked path skipped
+/// the B34 comptime substitution below, so `tyc repl` and the LSP's
+/// single-file mode rejected `comptime let T: type = int` programs that
+/// `tyc check` accepted (F55). The only thing the registry parameter now
+/// changes is whether cross-module [`ExternalShapes`] are seeded.
+fn check_pipeline(
+    db: &dyn salsa::Database,
+    file: SourceFile,
+    shapes_by_module: Option<&std::sync::Arc<std::collections::HashMap<String, ModuleShapes>>>,
 ) -> Diagnostics {
     let path = file.path(db).clone();
     let text = file.text(db).clone();
@@ -714,7 +774,23 @@ pub fn check_source_file_with_imports(
     // `resolve_module_with` here.
     diags.extend(resolved_arc.diagnostics().clone());
 
-    let external = build_external_shapes(&resolved_arc, shapes_by_module);
+    // `except*` control-flow validation. This is an *error*, not a lint: a
+    // `return` / `break` / `continue` in an `except*` handler makes CPython
+    // refuse to compile the emitted file, so it has to run on the pipeline
+    // every surface shares — `tyc build` reaches this function, but not the
+    // `editor_lint_diagnostics` hook where the rest of the pure-AST checks
+    // live. Without it here, `tyc check` reported the error and `tyc build`
+    // cheerfully wrote a `build/main.py` that could not be imported.
+    diags.extend(tyc_analyse::analyse_except_star_control_flow(
+        &module,
+        &path,
+        &prep.python_source,
+    ));
+
+    // `None` here is exactly what the pre-F55 single-file path did: with no
+    // registry there is nothing to seed, so the checker runs its
+    // in-module-only pass (`check_module_with`).
+    let external = shapes_by_module.map(|s| build_external_shapes(&resolved_arc, s));
     let type_diags = check_module_with_imports(
         path,
         &prep.python_source,
@@ -723,7 +799,7 @@ pub fn check_source_file_with_imports(
         &prep.unsafe_lines,
         &prep.frozen_class_lines,
         &prep.impl_distributed_lines,
-        Some(&external),
+        external.as_ref(),
     );
     diags.extend(type_diags);
 
@@ -1083,108 +1159,6 @@ fn build_external_shapes(
         }
     }
     external
-}
-
-/// Shared check implementation used by [`check_diagnostics`] (and transitively
-/// by [`check_file`] and [`check_source_file`]).
-fn check_impl(path: &str, text: &str) -> Diagnostics {
-    // The resolver and type-checker need the full PreprocessResult (including
-    // `stripped` and `optionals` metadata), which doesn't yet implement
-    // `salsa::Update` — so we run preprocess directly here. The
-    // `preprocessed_text` salsa query above remains the cached entry point
-    // for callers (e.g. the LSP hover handler) that only need the
-    // Python-compatible source string.
-    let mut diags = Diagnostics::new();
-
-    // Validate `?` operator context before expanding it.  This runs on the
-    // original Typhon source so it can reason about indentation-based scopes.
-    // Return early on any errors: invalid `?` usage causes `expand_question_ops`
-    // to inject `return` at top level, which would produce a cascading parse
-    // error that obscures the real problem.
-    for err in validate_question_ops(text) {
-        diags.push_error(TycError::invalid_question_op(
-            err.message,
-            path,
-            text,
-            err.offset,
-            1,
-        ));
-    }
-    // Reject unsupported `lazy from … import …` constructs early so the
-    // downstream parser doesn't try to give a misleading diagnostic.
-    for err in validate_lazy_usage(text) {
-        diags.push_error(TycError::lazy_usage(
-            err.message,
-            path,
-            text,
-            err.offset,
-            4, // length of "lazy"
-        ));
-    }
-    // Reject `extend BUILTIN:` declarations.  Python's built-in types cannot
-    // be modified at runtime, so the silent drop performed by the impl-merge
-    // desugar pass would surprise the user.
-    for err in validate_extend_usage(text) {
-        diags.push_error(TycError::extend_builtin(
-            err.message,
-            path,
-            text,
-            err.offset,
-            6, // length of "extend"
-        ));
-    }
-    if diags.has_errors() {
-        return diags;
-    }
-
-    // Apply Typhon sugar expansion in order before preprocessing so the
-    // Python parser sees valid Python.  `tyc fmt` skips these expansions to
-    // preserve Typhon syntax in the formatter's round trip.
-    let expanded = expand_question_ops(&expand_inline_question_ops(&expand_pipes(
-        &expand_with_chains(&expand_go_calls(&expand_gather_blocks(
-            &expand_multiline_guards(&expand_lazy_lets(&expand_typed_let_unpack(text))),
-        ))),
-    )));
-    let prep = preprocess(&expanded);
-
-    let module = match parse_module(&prep.python_source) {
-        Ok(p) => p.into_syntax(),
-        Err(e) => {
-            diags.push_error(TycError::parse(
-                path.to_owned(),
-                prep.python_source,
-                e.to_string(),
-                usize::from(e.location.start()),
-            ));
-            return diags;
-        }
-    };
-
-    let resolve_options = ResolveOptions {
-        raw_class_byte_starts: line_byte_starts(&prep.python_source, &prep.raw_class_lines),
-        lazy_import_remaps: build_lazy_import_remaps(text, &prep.lazy_imports),
-        original_source: Some(text.to_owned()),
-    };
-    let (resolved, resolve_diags) = resolve_module_with(
-        path.to_owned(),
-        &prep.python_source,
-        &module,
-        resolve_options,
-    );
-    diags.extend(resolve_diags);
-
-    let type_diags = check_module_with(
-        path.to_owned(),
-        &prep.python_source,
-        &resolved,
-        &module,
-        &prep.unsafe_lines,
-        &prep.frozen_class_lines,
-        &prep.impl_distributed_lines,
-    );
-    diags.extend(type_diags);
-
-    diags
 }
 
 #[cfg(test)]
@@ -2372,5 +2346,105 @@ def f(x: str?) -> None:
             "Arc must differ after set_text (cache was invalidated)"
         );
         assert!(!d2.has_errors(), "new content should be clean");
+    }
+
+    /// F55 — the tracked single-file path (`check_file` / `check_source_file`,
+    /// used by `tyc repl` and the LSP outside a workspace) used to skip the
+    /// B34 comptime substitution that `check_file_with_imports` (and therefore
+    /// `tyc check`) applies, so a `comptime let T: type = int` alias resolved
+    /// as a distinct nominal class and every call rejected its `int` argument.
+    #[test]
+    fn tracked_check_applies_comptime_type_substitution() {
+        const SRC: &str = "comptime let T: type = int\n\
+                           \n\
+                           def identity(x: T) -> T:\n    \
+                               return x\n\
+                           \n\
+                           def main() -> None:\n    \
+                               let v: int = identity(3)\n    \
+                               print(v)\n";
+        let mut db = TycDatabase::new();
+        let diags = check_file(&mut db, "<comptime>".to_owned(), SRC.to_owned());
+        assert!(
+            !diags.has_errors(),
+            "single-file check must accept a `comptime let T: type` alias: {:?}",
+            diags.errors()
+        );
+    }
+
+    /// The two entry points must agree. Same source, same verdict — the
+    /// registry parameter only adds cross-module shapes, it must never change
+    /// the in-module answer.
+    #[test]
+    fn tracked_and_imports_check_paths_agree() {
+        const SRC: &str = "comptime let T: type = int\n\
+                           \n\
+                           def identity(x: T) -> T:\n    \
+                               return x\n";
+        let mut db = TycDatabase::new();
+        let tracked = check_file(&mut db, "<agree>".to_owned(), SRC.to_owned());
+        let registry = std::sync::Arc::new(std::collections::HashMap::new());
+        let with_imports =
+            check_file_with_imports(&mut db, "<agree>".to_owned(), SRC.to_owned(), &registry);
+        assert_eq!(
+            tracked.errors().len(),
+            with_imports.errors().len(),
+            "tracked path: {:?}\nimports path: {:?}",
+            tracked.errors(),
+            with_imports.errors()
+        );
+    }
+
+    /// F56 — `set_source_text` must not touch the database when the incoming
+    /// text is byte-identical. Salsa's raw `Setter::to` stamps the field as
+    /// written before it looks at the value, so an unguarded re-upload
+    /// invalidates every downstream memo.
+    #[test]
+    fn set_source_text_is_a_no_op_on_identical_text() {
+        let mut db = TycDatabase::new();
+        let sf = SourceFile::new(&db, "<same>".to_owned(), "let x: int = 1\n".to_owned());
+        let before = module_shapes_query(&db, sf);
+
+        let wrote = set_source_text(&mut db, sf, "let x: int = 1\n".to_owned());
+        assert!(!wrote, "identical text must report no write");
+
+        let after = module_shapes_query(&db, sf);
+        assert!(
+            std::sync::Arc::ptr_eq(&before.0, &after.0),
+            "re-uploading identical text must leave the memo intact"
+        );
+    }
+
+    /// The other half of the guard: a genuine edit must still invalidate.
+    #[test]
+    fn set_source_text_invalidates_on_a_real_edit() {
+        let mut db = TycDatabase::new();
+        let sf = SourceFile::new(
+            &db,
+            "<edit>".to_owned(),
+            "pub class Thing:\n    a: int\n".to_owned(),
+        );
+        let before = module_shapes_query(&db, sf);
+        assert!(!before.class_shapes["Thing"].fields.contains_key("b"));
+
+        let wrote = set_source_text(
+            &mut db,
+            sf,
+            "pub class Thing:\n    a: int\n    b: int\n".to_owned(),
+        );
+        assert!(wrote, "a real edit must report a write");
+
+        let after = module_shapes_query(&db, sf);
+        assert!(
+            !std::sync::Arc::ptr_eq(&before.0, &after.0),
+            "a real edit must invalidate the memo"
+        );
+        assert!(
+            after.class_shapes["Thing"].fields.contains_key("b"),
+            "the re-run must observe the new text"
+        );
+        // And the check pipeline sees it too, not just the shape extractor.
+        let diags = check_source_file(&mut db, sf);
+        assert!(!diags.has_errors(), "{:?}", diags.errors());
     }
 }

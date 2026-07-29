@@ -202,6 +202,23 @@ pub(crate) fn split_spec(spec: &str) -> (&str, Option<&str>) {
     (spec.trim(), None)
 }
 
+/// Build the PEP 621 `requires-python` value for a `[python] target`.
+///
+/// The free-threaded targets (`3.13t` / `3.14t` / `3.15t`) name a *build* of
+/// CPython, not a version — `>=3.13t` is not a valid PEP 440 specifier, and
+/// every tool that reads it rejects the whole file. That took out `uv sync`,
+/// and with it `.venv` creation, `ruff format`, and third-party
+/// introspection, for three of the six documented target values. Strip the
+/// suffix so the specifier describes the version the build is of.
+///
+/// The free-threaded-ness is not lost: it is carried by `[python]
+/// free-threaded`, which is what actually drives codegen.
+fn requires_python_specifier(target: &str) -> String {
+    let target = default_str(target, "3.13");
+    let version = target.strip_suffix('t').unwrap_or(target);
+    format!(">={version}")
+}
+
 /// Render the `[dependencies]` / `[dev-dependencies]` tables as a PEP 621
 /// `pyproject.toml`. Other tables (`[project]`, `[python]`) are mapped
 /// onto their PEP 621 equivalents.
@@ -229,10 +246,9 @@ pub(crate) fn render_pyproject(config: &TyphonConfig) -> String {
         "version = \"{}\"\n",
         toml_escape(default_str(&config.project.version, "0.1.0"))
     ));
-    let py = default_str(&config.python.target, "3.13");
     out.push_str(&format!(
-        "requires-python = \">={py}\"\n",
-        py = toml_escape(py)
+        "requires-python = \"{}\"\n",
+        toml_escape(&requires_python_specifier(&config.python.target))
     ));
     let mut deps: Vec<String> = config
         .dependencies
@@ -401,8 +417,10 @@ pub(crate) fn apply_owned_keys(doc: &mut toml_edit::DocumentMut, config: &Typhon
         "version",
         value(default_str(&config.project.version, "0.1.0")),
     );
-    let py = default_str(&config.python.target, "3.13");
-    project.insert("requires-python", value(format!(">={py}")));
+    project.insert(
+        "requires-python",
+        value(requires_python_specifier(&config.python.target)),
+    );
 
     let mut deps_arr = Array::new();
     let mut deps: Vec<String> = config
@@ -728,5 +746,24 @@ lint = [\"ruff\"]
             out.contains("lint") && out.contains("ruff"),
             "other groups must survive; got:\n{out}",
         );
+    }
+    #[test]
+    fn free_threaded_targets_yield_a_valid_pep440_specifier() {
+        // `>=3.13t` is not a valid PEP 440 specifier; emitting it made every
+        // tool that reads pyproject.toml — starting with `uv sync` — reject
+        // the file, so three of the six documented targets could not build.
+        for (target, expected) in [
+            ("3.13", ">=3.13"),
+            ("3.13t", ">=3.13"),
+            ("3.14t", ">=3.14"),
+            ("3.15t", ">=3.15"),
+            ("", ">=3.13"),
+        ] {
+            assert_eq!(
+                requires_python_specifier(target),
+                expected,
+                "target {target:?}"
+            );
+        }
     }
 }

@@ -186,6 +186,15 @@ pub struct StrictnessConfig {
     /// so CI breaks on the form. `"off"` suppresses the diagnostic
     /// entirely — useful for codebases still mid-migration.
     pub methods_in_class_body: String,
+    /// Severity for the *attribute-rooted* form of `tyc::nullable_use` —
+    /// dereferencing a possibly-`None` field (`self.db.host` where `db: Db?`).
+    /// `"warn"` (default) is the v1.0.0-alpha.7 introduction severity: the
+    /// check never ran before that release, so an immediate error would
+    /// reject programs whose nullable field happens always to be populated.
+    /// `"error"` promotes it (the documented migration path); `"off"`
+    /// suppresses it. The *bare-name* form (`x.upper()` where `x: str?`) has
+    /// always been an error and is not governed by this knob.
+    pub nullable_use: String,
     /// When true, every function that passes the six-condition purity check
     /// is treated as if the user had written `@memo` — the desugarer emits a
     /// `@functools.cache` decorator. Off by default; opt in per-project.
@@ -328,6 +337,7 @@ impl Default for StrictnessConfig {
             unused_import: "warn".into(),
             exhaustive_match: "error".into(),
             methods_in_class_body: "warn".into(),
+            nullable_use: "warn".into(),
             // `None` = "absent from toml": resolved to a concrete bool by
             // `TyphonConfig::resolve_optimise` (off at optimise level 0, on at
             // level 1). An explicit toml entry deserialises to `Some(v)` and
@@ -512,6 +522,7 @@ impl TyphonConfig {
                 "methods-in-class-body",
                 &self.strictness.methods_in_class_body,
             ),
+            ("nullable-use", &self.strictness.nullable_use),
             ("require-with", &self.strictness.require_with),
             ("blocking-in-async", &self.strictness.blocking_in_async),
             ("stub-check", &self.strictness.stub_check),

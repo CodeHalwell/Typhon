@@ -58,7 +58,7 @@ pub def connect(host: str) -> Client: ...
 let _default_port: int = 8080      # not exported
 ```
 
-When a module has any `pub` name, an `__all__` is synthesised for you, so `from mod import *`, IDEs, and doc tools all see the same public surface. `pub` stacks with every modifier — `pub frozen class`, `pub model`, `pub newtype`, `pub freeze let`, `pub async def`, and so on.
+When a module has any `pub` name, an `__all__` is synthesised for you, so `from mod import *`, IDEs, and doc tools all see the same public surface. `pub` stacks with every modifier — `pub class X frozen`, `pub model`, `pub newtype`, `pub freeze let`, `pub async def`, and so on.
 
 For a package, put `pub *` in its `__init__.ty` to aggregate every sibling module's public names into the package namespace — the clean way to build a multi-file library.
 
