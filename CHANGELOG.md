@@ -4,7 +4,7 @@ All notable changes to Typhon are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely; the
 canonical phase-by-phase status lives in `docs/roadmap.md`.
 
-## Unreleased (will ship as v1.0.0-alpha.7) — codebase-review remediation (2026-07-28)
+## 1.0.0-alpha.7 — 2026-07-29 — codebase-review remediation
 
 Fixes driven by the [2026-07-28 full-codebase review](docs/codebase-review-2026-07-28.md).
 All ten of the review's 1.0 blockers are addressed here, plus the Tier-0 gates
