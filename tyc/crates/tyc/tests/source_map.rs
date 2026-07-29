@@ -618,6 +618,69 @@ fn tyc_trace_reports_the_raising_ty_line_for_a_formatted_build() {
 }
 
 #[test]
+fn adjacent_reflowed_statements_each_keep_their_own_line() {
+    // Two statements that the formatter *both* wraps produce one diff gap
+    // with no line-level anchor inside it. Splitting such a gap
+    // proportionally lands the second statement's lines on the first, so
+    // the gap is aligned by walking both sides' non-whitespace bytes.
+    const SRC: &str = "\
+class Profile frozen:
+    ident: int
+    name: str
+    rating: int
+    wins: int
+    losses: int
+
+def build(row: tuple[int, str, int, int, int], override_rating: int?) -> Profile:
+    let rating: int = override_rating if override_rating is not None else int(row[2]) * 1000 + 7
+    return Profile(ident=int(row[0]), name=str(row[1]), rating=rating, wins=int(row[3]), losses=int(row[4]))
+
+def main() -> None:
+    print(build((1, \"a\", 2, 3, 4), None))
+
+if __name__ == \"__main__\":
+    main()
+";
+    let tmp = tempfile::tempdir().unwrap();
+    scaffold_formatted(tmp.path(), SRC);
+    let (py, map) = build_and_load(tmp.path());
+
+    assert_eq!(map.len(), py.len());
+    assert_in_range(&map, SRC);
+
+    if ruff_available() {
+        assert!(
+            py.iter().any(|l| l.trim_end() == "    return Profile(")
+                && py.iter().any(|l| l.trim_end() == "    rating: int = ("),
+            "this test needs ruff to wrap BOTH statements — with no anchor \
+             line between them there is nothing for the patience diff to \
+             latch onto; got:\n{}",
+            py.join("\n")
+        );
+    }
+
+    // Every line of the wrapped `return` — including its head, which the
+    // proportional split used to attribute to the `rating` assignment
+    // above it — must name the `return`'s own line.
+    let return_ty = ty_line_of(SRC, "return Profile(");
+    let rating_ty = ty_line_of(SRC, "let rating: int =");
+    for needle in ["return Profile(", "wins=int(row[3])", "losses=int(row[4])"] {
+        let got = mapped_lines_for(&py, &map, needle);
+        assert!(
+            !got.is_empty() && got.iter().all(|&v| v == return_ty),
+            "`{needle}` must map to .ty line {return_ty}; got {got:?}"
+        );
+    }
+    // …and the statement above keeps its own line rather than being
+    // dragged forward by the `return`'s expansion.
+    let rating_got = mapped_lines_for(&py, &map, "override_rating if override_rating is not None");
+    assert!(
+        !rating_got.is_empty() && rating_got.iter().all(|&v| v == rating_ty),
+        "the wrapped `rating` assignment must map to .ty line {rating_ty}; got {rating_got:?}"
+    );
+}
+
+#[test]
 fn formatted_build_keeps_match_case_granularity() {
     // Task 1 and Task 2 have to compose: the emitter's per-clause offsets
     // survive the format-stage re-keying.

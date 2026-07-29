@@ -448,16 +448,54 @@ sample of 16 CPython stdlib modules it now produces parseable Typhon for
   `with`-chain copies its `else` body into each binding's guard, so those lines
   legitimately point back "early".
 
+- **The map is keyed to the file on disk, not to the emitter's buffer.** With
+  `[emit] format = true` the sidecar was built from offsets recorded *before*
+  formatting, so any reflow shifted every later entry — worse the further into
+  the file. Both stages move lines: the in-process normaliser collapses 3+
+  blank-line runs and inserts PEP 8 blanks before top-level `def`/`class`, and
+  `ruff format` wraps long calls and signatures. `tyc build` now diffs the pre-
+  and post-format text and re-keys the table through the result.
+
+  The alignment is a patience diff — exact common prefix/suffix, then
+  unique-and-equal lines as anchors via a longest increasing subsequence,
+  recursing into the gaps. A gap with no anchors (two adjacent statements the
+  formatter both wrapped) is resolved by walking the two sides' non-whitespace
+  bytes in lockstep, since reflowing only moves whitespace and adds or drops
+  `(`, `)` and the magic trailing `,`. Any divergence that cannot be explained
+  aborts to a proportional split, so a future formatter change can lose
+  precision but never desynchronise the table.
+
+- **Emit-side granularity is per clause, not per statement.** Only `emit_stmt`
+  ever set an offset, so a sub-statement line inherited the *preceding*
+  statement's — `case Square(s):` resolved to the `return` above it. `match`
+  cases, `elif`/`else` clauses, `except` handlers, each decorator in a stack,
+  and the `def`/`class` header now each record their own. (Ruff's
+  `StmtFunctionDef.range` starts at the first `@`, so the header recovers its
+  line from the name's range.)
+
+- **A newline inside a token no longer shifts the rest of the table.** A
+  triple-quoted docstring — or any literal the printer re-emits verbatim —
+  reaches the output through `write`, which pushed no entry for the newlines it
+  carried. The table came out shorter than the file it described and every
+  entry after the literal named a line one too early, for the rest of the
+  module. Four corpus files were affected. Found while building the format
+  diff, which needs a sound table to index.
+
+  **Invariant now held corpus-wide:** turning `[emit] format` on or off does
+  not change what the map says a given Python statement means.
+
 ### Known open
 
-- **The source map is captured before `ruff format` runs.** With
-  `[emit] format = true`, a line ruff reflows shifts the whole table relative
-  to the written `.py`. Orthogonal to the mapping fix above, which addresses
-  the `.ty` half of the composition.
-- **Emit-side granularity is statement-level.** `line_offsets` records the
-  offset active when a line was printed, so a sub-statement line — a `case`
-  clause header, say — inherits the preceding statement's offset and can name a
-  nearby rather than exact `.ty` line.
+- **Sub-*expression* attribution inside a reflowed call.** When `ruff format`
+  wraps one call across ten lines, all ten name the statement's start line
+  rather than the individual argument's. This is the only answer the v2 format
+  can express — `line_strategy: "table"` is line-granular and the emitter
+  prints the whole call as one output line, so there is exactly one offset to
+  record. Identical to what `format = false` produces. Per-argument attribution
+  needs a column-aware format and a byte-offset table from the printer.
+- **`for` / `while` / `try` `else:` and `finally:` headers** carry no AST node
+  with a range, so they keep the preceding statement's offset. They are never
+  traceback frames.
 - **`tyc::` diagnostics still report preprocessed-buffer lines** in the known
   `impl Alias:` distribution case. The tables needed to fix it now exist but
   are not yet wired into the diagnostic path.
