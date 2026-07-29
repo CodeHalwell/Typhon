@@ -134,14 +134,22 @@ pub struct VenvSignatures {
     /// and found nothing — in that case [`Self::module_shapes`] is a
     /// no-op forever.
     python_bin: Option<PathBuf>,
-    /// Working directory the introspection subprocess is spawned in.
-    /// Pinning this to the project root (rather than inheriting the
-    /// parent's CWD) keeps `tyc check` reproducible — the same
-    /// command produces the same shape registry regardless of which
-    /// subdirectory the user ran it from. Python's `sys.path[0]`
-    /// also picks up packages siblings of this directory, which is
-    /// the documented expectation.
-    cwd: PathBuf,
+    /// The directory containing the project's `typhon.toml`. Used to
+    /// re-discover the venv interpreter and re-stat `pyvenv.cfg` — it is
+    /// deliberately **not** the introspection subprocess's working
+    /// directory. For a stdin script (`python -`), `sys.path[0]` is the
+    /// process cwd, so running in the project root let an
+    /// attacker-controlled `<root>/json.py` shadow the stdlib module the
+    /// embedded helper itself imports — exactly the import-shadowing
+    /// attack `SECURITY.md` rules out. The subprocess runs in [`Self::scratch`]
+    /// instead; not inheriting the parent's cwd also keeps `tyc check`
+    /// reproducible regardless of which subdirectory it was run from.
+    project_root: PathBuf,
+    /// Empty, process-private working directory for the introspection
+    /// subprocess (see [`ScratchDir`]). `None` when no private directory
+    /// could be created — introspection is then disabled rather than run
+    /// in a shared, shadowable directory.
+    scratch: Option<ScratchDir>,
     /// Top-level package names that may be introspected. Modules
     /// whose first dotted component isn't here are skipped — this
     /// keeps `import os` from triggering a Python subprocess.
@@ -166,7 +174,8 @@ impl VenvSignatures {
         let python_bin = discover_python(project_root);
         Self {
             python_bin,
-            cwd: project_root.to_path_buf(),
+            project_root: project_root.to_path_buf(),
+            scratch: ScratchDir::new(),
             allowed_top_level,
             cache: HashMap::new(),
             venv_stamp: stat_pyvenv_cfg(project_root),
@@ -186,10 +195,10 @@ impl VenvSignatures {
     /// re-discover the Python binary so the next lookup reflects the new
     /// environment. Mirrors the completion-introspection cache's policy.
     fn refresh_if_venv_changed(&mut self) {
-        let current = stat_pyvenv_cfg(&self.cwd);
+        let current = stat_pyvenv_cfg(&self.project_root);
         if current != self.venv_stamp {
             self.cache.clear();
-            self.python_bin = discover_python(&self.cwd);
+            self.python_bin = discover_python(&self.project_root);
             self.venv_stamp = current;
         }
     }
@@ -221,6 +230,13 @@ impl VenvSignatures {
         let Some(python) = self.python_bin.as_ref() else {
             return;
         };
+        // No private scratch directory — refuse to run the subprocess in a
+        // shared (shadowable) directory. The modules stay uncached, so they
+        // surface through the `unintrospectable-dependency` warning instead
+        // of silently passing unchecked.
+        let Some(scratch) = self.scratch.as_ref() else {
+            return;
+        };
         let mut seen: HashSet<&str> = HashSet::new();
         let mut to_fetch: Vec<String> = Vec::with_capacity(dotted_names.len());
         for d in dotted_names {
@@ -238,7 +254,7 @@ impl VenvSignatures {
         if to_fetch.is_empty() {
             return;
         }
-        match introspect_batch_via_python(python, &self.cwd, &to_fetch) {
+        match introspect_batch_via_python(python, scratch.path(), &to_fetch) {
             Some(mut results) => {
                 // Consume `to_fetch` so the cache moves the owned
                 // module names rather than re-cloning each one, and
@@ -257,10 +273,13 @@ impl VenvSignatures {
                 // an unrelated heavyweight import doesn't take the
                 // whole project down with it.
                 for name in to_fetch {
-                    let shapes =
-                        introspect_batch_via_python(python, &self.cwd, std::slice::from_ref(&name))
-                            .and_then(|mut r| r.remove(name.as_str()))
-                            .map(|intro| shapes_from_introspected(&intro));
+                    let shapes = introspect_batch_via_python(
+                        python,
+                        scratch.path(),
+                        std::slice::from_ref(&name),
+                    )
+                    .and_then(|mut r| r.remove(name.as_str()))
+                    .map(|intro| shapes_from_introspected(&intro));
                     self.cache.insert(name, shapes);
                 }
             }
@@ -359,6 +378,79 @@ fn which_python3() -> Option<PathBuf> {
         }
     }
     None
+}
+
+/// An empty, process-private working directory for introspection
+/// subprocesses.
+///
+/// For a script fed over stdin (`python -`), CPython puts the process's
+/// current directory at `sys.path[0]`, searched **before** the stdlib.
+/// Running the subprocess in the project root therefore let an
+/// attacker-controlled file named after a stdlib module (`<root>/json.py`)
+/// execute in place of the real one the moment the embedded helper ran its
+/// own `import json` — the import-shadowing attack `SECURITY.md` rules out.
+/// A *fixed* path under the system temp directory is no better on a
+/// multi-user host: `/tmp` is world-writable, so another local user can
+/// pre-create the directory and plant the same shadowing file.
+///
+/// `ScratchDir` creates a fresh directory with an unpredictable name via
+/// `create_dir` — which, unlike `create_dir_all`, fails on a pre-existing
+/// path, so a directory another user pre-created is never adopted. The
+/// directory is therefore always owned by this process's user and empty at
+/// creation; on Unix it is additionally restricted to mode `0o700`. It is
+/// removed again on drop.
+///
+/// Shared by [`VenvSignatures`] (CLI + LSP diagnostics introspection) and
+/// `tyc-lsp`'s completion introspection cache, so both subprocess surfaces
+/// enforce the same boundary.
+pub struct ScratchDir {
+    path: PathBuf,
+}
+
+impl ScratchDir {
+    /// Create a fresh scratch directory. Returns `None` when none could be
+    /// created (read-only temp dir, exhausted disk, pathological name
+    /// collisions) — callers must treat that as "introspection unavailable"
+    /// rather than fall back to a shared directory.
+    pub fn new() -> Option<Self> {
+        let base = std::env::temp_dir();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        for attempt in 0u32..16 {
+            let path = base.join(format!(
+                "tyc-introspect-{}-{}-{}",
+                std::process::id(),
+                nanos,
+                attempt
+            ));
+            // `create_dir`, NOT `create_dir_all`: it fails with
+            // `AlreadyExists` on a pre-existing path, so we never adopt a
+            // directory we did not create ourselves.
+            if std::fs::create_dir(&path).is_ok() {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700));
+                }
+                return Some(Self { path });
+            }
+        }
+        None
+    }
+
+    /// The scratch directory's path — guaranteed created, owned by this
+    /// process's user, and empty at creation time.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for ScratchDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
 }
 
 /// Embedded Python helper. Reads one or more dotted module names from
@@ -2169,7 +2261,8 @@ lazy import np = numpy
             .collect();
         let mut cache = VenvSignatures {
             python_bin: Some(stub),
-            cwd: tmp.path().to_path_buf(),
+            project_root: tmp.path().to_path_buf(),
+            scratch: ScratchDir::new(),
             allowed_top_level: allowed,
             cache: HashMap::new(),
             venv_stamp: None,
@@ -2248,7 +2341,8 @@ lazy import np = numpy
             .collect();
         let mut cache = VenvSignatures {
             python_bin: Some(stub),
-            cwd: tmp.path().to_path_buf(),
+            project_root: tmp.path().to_path_buf(),
+            scratch: ScratchDir::new(),
             allowed_top_level: allowed,
             cache: HashMap::new(),
             venv_stamp: None,
@@ -2343,6 +2437,63 @@ class App:
             .expect("App shape built from introspection");
         assert!(shape.field_order.contains(&"import_name".to_owned()));
         assert!(!shape.field_defaults.contains("import_name"));
+    }
+
+    #[test]
+    fn scratch_dir_is_fresh_private_and_cleaned_up() {
+        let a = ScratchDir::new().expect("temp dir must be writable in tests");
+        let b = ScratchDir::new().expect("temp dir must be writable in tests");
+        // Fresh and empty — nothing importable inside.
+        assert!(a.path().is_dir());
+        assert!(std::fs::read_dir(a.path()).unwrap().next().is_none());
+        // Per-instance, never a fixed shared path.
+        assert_ne!(a.path(), b.path());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(a.path()).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o700, "scratch dir must be private to the user");
+        }
+        // Dropping removes the directory (and anything a subprocess left in it).
+        std::fs::write(a.path().join("leftover.txt"), "x").unwrap();
+        let a_path = a.path().to_path_buf();
+        drop(a);
+        assert!(!a_path.exists(), "scratch dir must be removed on drop");
+    }
+
+    #[test]
+    fn introspection_does_not_run_in_the_project_root() {
+        // The import-shadowing regression `SECURITY.md` rules out: the
+        // embedded helper's first statement imports stdlib modules
+        // (`import sys, json, …`), and for a stdin script `sys.path[0]` is
+        // the subprocess cwd. When that cwd was the project root, an
+        // attacker-controlled `<root>/json.py` executed with the user's
+        // privileges on any `tyc check` of the repo. The subprocess must now
+        // run in an empty scratch directory instead.
+        let Some(_python) = which_python3() else {
+            return; // no Python on PATH — nothing to verify here.
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let marker = root.join("pwned.txt");
+        std::fs::write(
+            root.join("json.py"),
+            format!(
+                "open({:?}, 'w').write('shadowed stdlib json executed')\n",
+                marker.to_string_lossy()
+            ),
+        )
+        .unwrap();
+        let allowed: HashSet<String> = ["definitely_not_installed_pkg_zz".to_owned()]
+            .into_iter()
+            .collect();
+        let mut cache = VenvSignatures::for_project_root(root, allowed);
+        cache.preload(&["definitely_not_installed_pkg_zz".to_owned()]);
+        assert!(
+            !marker.exists(),
+            "project-root json.py was executed: the introspection subprocess \
+             ran with the project root as cwd"
+        );
     }
 
     #[test]

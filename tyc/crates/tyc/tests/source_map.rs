@@ -55,12 +55,26 @@ fn scaffold_with_format(dir: &Path, src_content: &str, format: bool) {
 /// but only `ruff format` actually *reflows* — wraps a long signature,
 /// joins a short call — so the assertions that pin the reflow behaviour
 /// are gated on its presence rather than silently weakening.
+///
+/// **`TYC_REQUIRE_RUFF=1` turns the skip into a panic** (the ruff analog of
+/// `TYC_REQUIRE_PYTHON`): CI sets it so a runner without ruff fails loudly
+/// instead of passing with every reflow/re-key assertion inert — a skip
+/// nothing observes is indistinguishable from a pass.
 fn ruff_available() -> bool {
-    Command::new("ruff")
+    let available = Command::new("ruff")
         .arg("--version")
         .output()
         .map(|o| o.status.success())
-        .unwrap_or(false)
+        .unwrap_or(false);
+    if !available && std::env::var_os("TYC_REQUIRE_RUFF").is_some() {
+        panic!(
+            "TYC_REQUIRE_RUFF is set but no `ruff` binary was found on PATH. \
+             The format-stage source-map assertions only exercise the reflow/re-key \
+             logic when ruff actually reflows the output; skipping them would report \
+             a pass for a tier of the suite that never ran."
+        );
+    }
+    available
 }
 
 /// Locate a Python 3.12+ interpreter, mirroring `tests/build_features.rs`.

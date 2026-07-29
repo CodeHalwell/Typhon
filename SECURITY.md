@@ -61,9 +61,16 @@ Independently of those switches, introspection is limited to an allow-list:
 the Python standard library plus the packages the project declares in
 `[dependencies]` / `[dev-dependencies]`. A module that is merely *named* by a
 `.ty` file — including one sitting next to it in the repository — is never
-imported. The introspection subprocess also runs in an empty scratch
-directory rather than the project root, so a file named after a stdlib module
-cannot shadow it on `sys.path`.
+imported. Both introspection subprocesses (the signature introspection behind
+`tyc check` / `tyc build` / editor diagnostics, and the editor's completion
+introspection) also run in an empty scratch directory rather than the project
+root, so a file named after a stdlib module cannot shadow it on `sys.path`.
+That scratch directory is created fresh per process with an unpredictable
+name (never adopting a pre-existing directory, and mode `0700` on Unix), so
+another local user cannot pre-plant a shadowing file under the shared system
+temp directory either; it is removed again when the process is done with it.
+If no such private directory can be created, introspection is disabled
+rather than run somewhere shared.
 
 ## Supported versions
 

@@ -277,7 +277,23 @@ export -f run_unit
 RESULTS="$SCRATCH/results.tsv"
 # shellcheck disable=SC2016
 xargs -a "$UNITS" -d '\n' -P "$JOBS" -I{} bash -c 'run_unit "$@"' _ {} > "$RESULTS"
+XARGS_STATUS=$?
 sort -k2,2 -o "$RESULTS" "$RESULTS"
+
+# Reconcile: every selected unit must have produced exactly one result line.
+# A worker that dies without printing (OOM kill, a signal, xargs aborting on a
+# 255 exit) would otherwise silently drop its unit from every category — a
+# lost divergent unit makes the gate PASS, and a lost baseline unit is
+# spuriously reported as fixed. Every run_unit path ends in a printf, so a
+# non-zero xargs status is worker trouble too, even when the count matches.
+N_RESULTS="$(wc -l < "$RESULTS" | tr -d ' ')"
+if [ "$N_RESULTS" -ne "$TOTAL" ] || [ "$XARGS_STATUS" -ne 0 ]; then
+    echo "error: worker(s) lost $((TOTAL - N_RESULTS)) unit(s):" >&2
+    echo "       $TOTAL unit(s) selected but $N_RESULTS result(s) recorded (xargs exit=$XARGS_STATUS)." >&2
+    echo "       Refusing to gate on an incomplete run — a dropped unit is invisible" >&2
+    echo "       in every category, so the result would be unreliable in BOTH directions." >&2
+    exit 2
+fi
 
 # ------------------------------------------------------------- aggregation --
 count() { grep -cP "^$1\t" "$RESULTS" || true; }
@@ -330,6 +346,18 @@ if [ "$UPDATE" = "1" ]; then
         echo "#     scripts/vm-differential.sh --filter '<unit>' --keep"
         echo "# then diff cpy.out / vm.out (and read vm.err) in the kept workdir."
         echo "#"
+        echo "# ENVIRONMENT-SENSITIVE: each unit's classification (ok / diverge /"
+        echo "# vacuous) depends on which third-party packages the ambient"
+        echo "# python3.13 can import — e.g. every \`model\` class needs pydantic at"
+        echo "# runtime, and one stress unit imports yaml. Record (--update) and"
+        echo "# verify this baseline with the same package set importable:"
+        echo "#     pydantic, PyYAML"
+        echo "# (CI installs pinned versions in the differential job — see"
+        echo "# .github/workflows/ci.yml.) On a machine missing them, affected"
+        echo "# baseline entries are reported as 'unverifiable here' and skipped"
+        echo "# rather than failed; affected non-baseline units may show up as new"
+        echo "# divergences the recording environment would not produce."
+        echo "#"
         echo "# Generated $(date -u +%Y-%m-%d) against $("$TYC" --version 2>/dev/null | head -1)"
         echo "# Scope: $SCOPE${FILTER:+  filter=/$FILTER/}"
         echo "#"
@@ -354,13 +382,27 @@ grep -vE '^\s*(#|$)' "$BASELINE" | sed 's/[[:space:]]*$//' | sort -u > "$EXPECTE
 COVERED="$SCRATCH/covered_expected.txt"
 comm -12 "$EXPECTED" <(sort -u "$UNITS") > "$COVERED"
 
+# "Fixed" requires a genuinely comparable, non-divergent run — i.e. class
+# `ok`. A baseline entry classified vacuous/nobuild/noentry/nondeterministic/
+# both-timeout was not COMPARED in this environment (typically a third-party
+# package the recording environment had installed is missing here — see the
+# baseline header), so it is neither fixed nor regressed: report it as
+# "unverifiable here" without failing the gate. Without this split, a bare
+# runner flipped every pydantic/yaml-dependent divergence to `vacuous` and the
+# gate failed by design on its very first environment mismatch.
+OK_UNITS="$SCRATCH/ok_units.txt"
+grep -P '^ok\t' "$RESULTS" | cut -f2 | sort > "$OK_UNITS"
+
 NEW="$SCRATCH/new.txt"
 FIXED="$SCRATCH/fixed.txt"
+UNVERIFIABLE="$SCRATCH/unverifiable.txt"
 comm -23 "$DIVERGED" "$EXPECTED" > "$NEW"
-comm -13 "$DIVERGED" "$COVERED" > "$FIXED"
+comm -12 "$COVERED" "$OK_UNITS" > "$FIXED"
+comm -23 "$COVERED" <(sort -u "$DIVERGED" "$OK_UNITS") > "$UNVERIFIABLE"
 
 N_NEW=$(wc -l < "$NEW" | tr -d ' ')
 N_FIXED=$(wc -l < "$FIXED" | tr -d ' ')
+N_UNVER=$(wc -l < "$UNVERIFIABLE" | tr -d ' ')
 
 status=0
 if [ "$N_NEW" -gt 0 ]; then
@@ -381,6 +423,19 @@ if [ "$N_FIXED" -gt 0 ]; then
     echo "FAIL: $N_FIXED baseline entry/entries no longer diverge — remove them"
     echo "      from ${BASELINE#$REPO_ROOT/} (the baseline must only shrink, never rot):"
     sed 's/^/  - /' "$FIXED"
+    echo
+fi
+
+if [ "$N_UNVER" -gt 0 ]; then
+    echo "note: $N_UNVER baseline entry/entries are unverifiable here — their runs were"
+    echo "      not comparable in this environment (usually a third-party package the"
+    echo "      recording environment could import is missing; see the baseline header"
+    echo "      for the package set the classifications assume). Neither fixed nor"
+    echo "      regressed; not failing the gate on them:"
+    while IFS= read -r u; do
+        cls="$(grep -P "\t\Q$u\E\t" "$RESULTS" | cut -f1 | head -1)"
+        printf '  ? %s  (%s)\n' "$u" "${cls:-no result}"
+    done < "$UNVERIFIABLE"
     echo
 fi
 

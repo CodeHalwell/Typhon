@@ -108,12 +108,24 @@ pub struct IntrospectionCache {
     /// from the act of opening the folder in an editor. The CLI has always
     /// had this gate; this copy did not.
     allowed_top_level: HashSet<String>,
+    /// `typhon.toml` mtime the allow-list was computed from. Re-statted on
+    /// every [`Self::members`] call (mirroring `venv_stamp`) so a mid-session
+    /// dependency edit refreshes the allow-list — without this, a newly
+    /// declared dependency was refused completions for the rest of the
+    /// session, because installing via `uv pip install` never touches
+    /// `pyvenv.cfg` and so never tripped the venv stamp.
+    config_stamp: Option<SystemTime>,
     /// Working directory for the introspection subprocess. Deliberately
     /// **not** the project root: with the project root as cwd, Python's
     /// `sys.path[0]` is the project itself, so an attacker-controlled
     /// `<root>/json.py` shadows the stdlib module of the same name and runs
-    /// instead of it. An empty scratch directory has nothing to shadow with.
-    cwd: PathBuf,
+    /// instead of it. A [`tyc_venv::ScratchDir`] is empty (nothing to shadow
+    /// with), created fresh with an unpredictable name (never adopting a
+    /// directory another local user pre-created under the shared system temp
+    /// dir), and removed when this cache is dropped. `None` when no private
+    /// directory could be created — introspection is then refused rather
+    /// than run in a shared, shadowable directory.
+    scratch: Option<tyc_venv::ScratchDir>,
     /// Per-module failure reason (kept only for cache entries whose
     /// value is `None`). Lets the LSP surface "torch.nn import
     /// failed in <python>" diagnostics instead of silently showing
@@ -136,7 +148,8 @@ impl IntrospectionCache {
             cache: HashMap::new(),
             failures: HashMap::new(),
             allowed_top_level: introspection_allow_list(project_root),
-            cwd: scratch_cwd(),
+            config_stamp: stat_typhon_toml(project_root),
+            scratch: tyc_venv::ScratchDir::new(),
         }
     }
 
@@ -182,6 +195,19 @@ impl IntrospectionCache {
             self.python_bin = tyc_venv::discover_python(project_root);
             self.allowed_top_level = introspection_allow_list(project_root);
         }
+        // Same re-stat for `typhon.toml`: a dependency declared mid-session
+        // must refresh the allow-list, or the new dependency is refused
+        // completions until an LSP restart. Successful cache entries stay
+        // (the venv itself hasn't changed), but recorded failures are
+        // retried — declaring a dependency often follows installing it via
+        // `uv pip install`, which never touches `pyvenv.cfg`.
+        let current_config = stat_typhon_toml(project_root);
+        if current_config != self.config_stamp {
+            self.config_stamp = current_config;
+            self.allowed_top_level = introspection_allow_list(project_root);
+            self.failures.clear();
+            self.cache.retain(|_, entry| entry.is_some());
+        }
         // Allow-list gate. Refuse to import anything the project has not
         // declared as a dependency and that is not stdlib — importing it is
         // arbitrary code execution, and a completion request is not consent
@@ -202,7 +228,18 @@ impl IntrospectionCache {
             self.cache.insert(module.to_owned(), None);
             return None;
         };
-        let (result, failure) = introspect_via_python(&python, &self.cwd, module);
+        // No private scratch directory could be created — refuse to run the
+        // subprocess in a shared (shadowable) directory. Recorded like a
+        // spawn failure so the hover hint names the interpreter involved.
+        let Some(scratch) = self.scratch.as_ref() else {
+            self.failures.insert(
+                module.to_owned(),
+                IntrospectionFailure::SpawnFailed { python_bin: python },
+            );
+            self.cache.insert(module.to_owned(), None);
+            return None;
+        };
+        let (result, failure) = introspect_via_python(&python, scratch.path(), module);
         let result_arc = result.map(Arc::new);
         if result_arc.is_none() {
             if let Some(reason) = failure {
@@ -246,19 +283,11 @@ fn may_introspect(allowed: &HashSet<String>, top: &str) -> bool {
     tyc_analyse::perf::is_stdlib_top_level(top) || allowed.contains(top)
 }
 
-/// A directory to run the introspection subprocess in that contains nothing
-/// importable. Python prepends the script's directory (for `python -`, the
-/// current directory) to `sys.path`, so running in the project root lets any
-/// `.py` file there shadow the module being introspected. The system temp
-/// directory is not ideal either but is not attacker-chosen per project;
-/// falling back to the root directory keeps the call infallible.
-fn scratch_cwd() -> PathBuf {
-    let dir = std::env::temp_dir().join("tyc-lsp-introspect");
-    if std::fs::create_dir_all(&dir).is_ok() {
-        dir
-    } else {
-        std::env::temp_dir()
-    }
+/// `typhon.toml` mtime — the invalidation stamp for the dependency
+/// allow-list, the same way `pyvenv.cfg`'s mtime stamps the venv contents.
+fn stat_typhon_toml(project_root: &Path) -> Option<SystemTime> {
+    let cfg = project_root.join("typhon.toml");
+    std::fs::metadata(&cfg).ok().and_then(|m| m.modified().ok())
 }
 
 /// Embedded Python helper. Reads the module name from `sys.argv[1]`,
@@ -618,6 +647,87 @@ mod tests {
     }
 
     #[test]
+    fn allow_list_refreshes_when_typhon_toml_changes() {
+        // Declaring a new dependency mid-session must widen the allow-list.
+        // Before the `config_stamp` re-stat, the list was computed once at
+        // cache construction and refreshed only on a `pyvenv.cfg` mtime
+        // change — which `uv pip install` never touches — so a newly
+        // declared dependency silently got no completions for the rest of
+        // the session.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let toml_path = root.join("typhon.toml");
+        std::fs::write(
+            &toml_path,
+            "[project]\nname = \"p\"\n\n[dependencies]\nrich = \"*\"\n",
+        )
+        .unwrap();
+        let mut cache = IntrospectionCache::for_project_root(root);
+        assert!(may_introspect(&cache.allowed_top_level, "rich"));
+        assert!(!may_introspect(&cache.allowed_top_level, "polars"));
+
+        std::fs::write(
+            &toml_path,
+            "[project]\nname = \"p\"\n\n[dependencies]\nrich = \"*\"\npolars = \"*\"\n",
+        )
+        .unwrap();
+        // Force a visibly different mtime — two writes can land within the
+        // filesystem's timestamp granularity.
+        let f = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&toml_path)
+            .unwrap();
+        f.set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(2))
+            .unwrap();
+
+        // Any lookup re-stats the config. Use an undeclared, non-stdlib name
+        // so the refusal short-circuits before spawning a subprocess.
+        assert!(cache.members(root, "still_not_declared_zz").is_none());
+        assert!(
+            may_introspect(&cache.allowed_top_level, "polars"),
+            "editing typhon.toml must refresh the completion allow-list"
+        );
+    }
+
+    #[test]
+    fn introspection_does_not_run_in_the_project_root() {
+        // The completion-introspection twin of the tyc-venv regression test:
+        // the embedded script's first statement is `import sys, json, …`,
+        // and for a stdin script `sys.path[0]` is the subprocess cwd — so a
+        // project-root cwd executed an attacker-controlled `<root>/json.py`
+        // on any completion request. The subprocess must run in a fresh
+        // private scratch directory instead.
+        let Some(_python) = tyc_venv::which_python3_for_test() else {
+            return;
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(
+            root.join("typhon.toml"),
+            "[project]\nname = \"p\"\n\n[dependencies]\nnot_installed_zz = \"*\"\n",
+        )
+        .unwrap();
+        let marker = root.join("pwned.txt");
+        std::fs::write(
+            root.join("json.py"),
+            format!(
+                "open({:?}, 'w').write('shadowed stdlib json executed')\n",
+                marker.to_string_lossy()
+            ),
+        )
+        .unwrap();
+        let mut cache = IntrospectionCache::for_project_root(root);
+        // Declared (allow-listed) but not installed: the subprocess runs,
+        // its own stdlib imports must resolve to the real stdlib.
+        let _ = cache.members(root, "not_installed_zz");
+        assert!(
+            !marker.exists(),
+            "project-root json.py was executed: the introspection subprocess \
+             ran with the project root (or another shadowable dir) as cwd"
+        );
+    }
+
+    #[test]
     fn tyc_no_introspect_disables_the_editor_path_too() {
         // `SECURITY.md` documents `TYC_NO_INTROSPECT` as disabling dependency
         // introspection. It used to disable only the CLI's — the editor kept
@@ -646,7 +756,8 @@ mod tests {
         let Some(python) = tyc_venv::which_python3_for_test() else {
             return;
         };
-        let (members, failure) = introspect_via_python(&python, &scratch_cwd(), "os");
+        let scratch = tyc_venv::ScratchDir::new().expect("temp dir writable in tests");
+        let (members, failure) = introspect_via_python(&python, scratch.path(), "os");
         let members = match members {
             Some(m) => m,
             None => return,
@@ -667,9 +778,10 @@ mod tests {
         let Some(python) = tyc_venv::which_python3_for_test() else {
             return;
         };
+        let scratch = tyc_venv::ScratchDir::new().expect("temp dir writable in tests");
         let (members, failure) = introspect_via_python(
             &python,
-            &scratch_cwd(),
+            scratch.path(),
             "definitely_not_a_real_module_xyz_typhon",
         );
         assert!(members.is_none());

@@ -2997,58 +2997,12 @@ fn decorator_head_name(expr: &Expr) -> Option<String> {
 }
 
 /// Names among `pure` / `memo` / `gatherable` that this module defines or
-/// imports for itself. Mirrors `tyc_desugar::user_bound_marker_names`; the two
-/// must agree or the analyser and the emitter disagree about which decorators
-/// are Typhon's.
-pub fn user_bound_marker_names(body: &[Stmt]) -> std::collections::HashSet<String> {
-    const MARKERS: [&str; 3] = ["pure", "memo", "gatherable"];
-    let mut out = std::collections::HashSet::new();
-    let mut note = |name: &str| {
-        if MARKERS.contains(&name) {
-            out.insert(name.to_owned());
-        }
-    };
-    for stmt in body {
-        match stmt {
-            Stmt::Import(i) => {
-                for a in &i.names {
-                    note(
-                        a.asname
-                            .as_ref()
-                            .map(|n| n.as_str())
-                            .unwrap_or_else(|| a.name.as_str()),
-                    );
-                }
-            }
-            Stmt::ImportFrom(i) => {
-                for a in &i.names {
-                    note(
-                        a.asname
-                            .as_ref()
-                            .map(|n| n.as_str())
-                            .unwrap_or_else(|| a.name.as_str()),
-                    );
-                }
-            }
-            Stmt::FunctionDef(f) => note(f.name.as_str()),
-            Stmt::ClassDef(c) => note(c.name.as_str()),
-            Stmt::Assign(a) => {
-                for t in &a.targets {
-                    if let Expr::Name(n) = t {
-                        note(n.id.as_str());
-                    }
-                }
-            }
-            Stmt::AnnAssign(a) => {
-                if let Expr::Name(n) = a.target.as_ref() {
-                    note(n.id.as_str());
-                }
-            }
-            _ => {}
-        }
-    }
-    out
-}
+/// imports for itself. Re-exported from `tyc-syntax`, the single shared
+/// derivation — the analyser (which decides whether a decorator is Typhon's
+/// marker) and `tyc-desugar` (which decides whether to strip or replace it)
+/// must agree, so both consume the same function rather than keeping copies
+/// that can drift.
+pub use tyc_syntax::user_bound_marker_names;
 
 fn check_purity(
     name: &str,

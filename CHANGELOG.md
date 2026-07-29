@@ -572,7 +572,14 @@ sample of 16 CPython stdlib modules it now produces parseable Typhon for
 
 ### Performance
 
-- **The perf-gate baseline is re-recorded at 23 ms (was 14 ms).** The
+- **The perf-gate baseline is re-recorded at 27 ms** (was 14 ms at the start of
+  this branch, 23 ms after the first re-record). The final ~4 ms comes from the
+  pre-PR review remediation: the shared lexical mask's f-string spec-mode
+  tracking, the compound-header comment slicing, and per-clause source-map
+  offset recording — each measured, linear in file size, and
+  correctness-motivated. Recorded at idle; the +20% threshold and 5 ms
+  absolute slack are unchanged.
+- **The previous re-record, for the record:** The
   correctness work in this entry adds real per-module analysis: instance-attribute
   type checking on every assignment, reverse-MRO field ordering, the read-view
   lattice, the coinductive assignability cycle guard, the post-emit parse gate,

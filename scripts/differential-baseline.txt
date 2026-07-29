@@ -11,6 +11,18 @@
 # means deleting lines from this file — the gate also fails when a
 # listed unit stops diverging, so the list cannot rot.
 #
+# ENVIRONMENT-SENSITIVE: each unit's classification (ok / diverge /
+# vacuous) depends on which third-party packages the ambient
+# python3.13 can import — e.g. every `model` class needs pydantic at
+# runtime, and one stress unit imports yaml. Record (--update) and
+# verify this baseline with the same package set importable:
+#     pydantic, PyYAML
+# (CI installs pinned versions in the differential job — see
+# .github/workflows/ci.yml.) On a machine missing them, affected
+# baseline entries are reported as 'unverifiable here' and skipped
+# rather than failed; affected non-baseline units may show up as new
+# divergences the recording environment would not produce.
+#
 # Generated 2026-07-29 against tyc 1.0.0-alpha.6
 # Scope: all
 #

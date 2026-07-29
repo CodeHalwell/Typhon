@@ -1876,64 +1876,13 @@ fn strip_purity_decorators_in_body_with(
         .collect()
 }
 
-/// Names among `pure` / `memo` / `gatherable` that this module *defines or
-/// imports for itself*.
-///
-/// The three markers are recognised purely by their text, so a user (or a
-/// library) that legitimately owns one of those names had their decorator
-/// silently deleted — and `@memo` was worse than deleted, it was silently
-/// *replaced* by `@functools.cache`, so a third-party `memo` decorator's
-/// behaviour was substituted with a different one. Evidence that the name is
-/// bound in this module is enough to know it is not Typhon's marker.
-fn user_bound_marker_names(body: &[Stmt]) -> std::collections::HashSet<String> {
-    const MARKERS: [&str; 3] = ["pure", "memo", "gatherable"];
-    let mut out = std::collections::HashSet::new();
-    let mut note = |name: &str| {
-        if MARKERS.contains(&name) {
-            out.insert(name.to_owned());
-        }
-    };
-    for stmt in body {
-        match stmt {
-            Stmt::Import(i) => {
-                for a in &i.names {
-                    note(
-                        a.asname
-                            .as_ref()
-                            .map(|n| n.as_str())
-                            .unwrap_or_else(|| a.name.as_str()),
-                    );
-                }
-            }
-            Stmt::ImportFrom(i) => {
-                for a in &i.names {
-                    note(
-                        a.asname
-                            .as_ref()
-                            .map(|n| n.as_str())
-                            .unwrap_or_else(|| a.name.as_str()),
-                    );
-                }
-            }
-            Stmt::FunctionDef(f) => note(f.name.as_str()),
-            Stmt::ClassDef(c) => note(c.name.as_str()),
-            Stmt::Assign(a) => {
-                for t in &a.targets {
-                    if let Expr::Name(n) = t {
-                        note(n.id.as_str());
-                    }
-                }
-            }
-            Stmt::AnnAssign(a) => {
-                if let Expr::Name(n) = a.target.as_ref() {
-                    note(n.id.as_str());
-                }
-            }
-            _ => {}
-        }
-    }
-    out
-}
+// `user_bound_marker_names` — the "is this really Typhon's `@pure` /
+// `@memo` / `@gatherable` marker, or a name the module owns?" derivation —
+// is shared with `tyc-analyse` via `tyc-syntax` (the same rule-of-one home
+// as `mro::field_collection_order`): the analyser and this crate make
+// correlated decisions about the same three names, so a private copy here
+// was a drift hazard.
+use tyc_syntax::user_bound_marker_names;
 
 /// Drop `@pure`, `@pure(...)`, and `@memo` decorators from a function — they
 /// are Typhon-only metadata, not actual Python runtime decorators.

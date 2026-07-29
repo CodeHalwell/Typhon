@@ -69,17 +69,45 @@ cwd. `TYC_NO_SYNC` / `TYC_NO_INTROSPECT` keep the run network-free and stop
 Nondeterminism is detected only on the divergent path, and by re-running *both*
 sides twice more — so a clock-dependent program can never flake the gate red.
 
+After the parallel workers finish, the harness reconciles the number of
+classified results against the number of selected units and exits `2` on a
+mismatch (or a non-zero `xargs` status): a worker that crashes without
+printing would otherwise silently drop its unit from *every* category, which
+could hide a divergence or mis-report a baseline entry as fixed.
+
+### Environment sensitivity
+
+Each unit's classification depends on which third-party packages the ambient
+`python3.13` can import: a unit whose emitted Python does `from pydantic
+import BaseModel` (every `model` class) runs to completion where pydantic is
+installed but dies at the import — usually into the `vacuous` bucket, or into
+`diverge` when the VM's native shim succeeds where CPython's import fails —
+where it is not. **The baseline is therefore only meaningful relative to a
+package set**, which is recorded in its header comment (currently: `pydantic`,
+`PyYAML`). The CI differential job installs pinned versions of exactly that
+set, and `--update` runs must be performed with the same set importable, or
+the recorded classifications will not reproduce anywhere else.
+
 ### The expectations file
 
 `scripts/differential-baseline.txt` lists the unit ids that are known to
 diverge, one per line, `#` for comments. The gate fails when:
 
 * a unit diverges and is **not** listed — a regression; **and**
-* a listed unit **stops** diverging — a stale entry.
+* a listed unit produces a genuinely comparable, non-divergent run (class
+  `ok`) — a stale entry.
 
 Failing in both directions is deliberate: the baseline can only shrink, never
 rot. **Every line in it is a VM bug.** It is a burn-down list, not an
 allow-list.
+
+A listed unit whose run was **not comparable** in the current environment
+(`vacuous`, `nobuild`, `noentry`, `nondeterministic`, `both-timeout` —
+typically because a package from the baseline's recorded set is missing) is
+reported as **"unverifiable here"** with its classification, and does *not*
+fail the gate: it is neither fixed nor regressed, and failing on it would make
+the gate red on any machine whose site-packages differ from the recording
+environment's.
 
 A `--scope` / `--filter` run only compares against the slice of the baseline it
 actually covered, so a partial run can flag a regression but can never report

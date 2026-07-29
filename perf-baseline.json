@@ -3,12 +3,12 @@
   "metric": "tyc build pipeline wall-clock, median of runs, milliseconds",
   "command": "tyc build examples/47-mini-app --no-sync --check --no-format (TYC_NO_INTROSPECT=1)",
   "corpus": "examples/47-mini-app",
-  "median_ms": 23,
+  "median_ms": 27,
   "runs": 9,
   "warmup": 2,
   "threshold": 0.20,
   "threshold_meaning": "fail when measured median > median_ms * (1 + threshold)",
-  "recorded_utc": "2026-07-28T22:20:23Z",
+  "recorded_utc": "2026-07-29T21:41:26Z",
   "refresh": "Run 'scripts/perf-gate.sh --update' on a quiet machine and commit this file. Do this only for an intentional, justified change (new pass, larger corpus). The CI runner is noisier than a laptop, so this number is a conservative upper bound; expect local runs to be faster.",
   "methodology_note": "Venv introspection (Python subprocess) and `ruff format` are excluded so the measurement is compiler work only; they were ~84% of the previous 89ms figure, which made the 20% threshold tolerate a far larger regression in the code under test. A 5ms absolute floor (PERF_MIN_SLACK_MS) accompanies the percentage because the remaining median is small enough that CI process-start jitter would otherwise trip it."
 }

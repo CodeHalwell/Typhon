@@ -135,7 +135,7 @@ def connect(host: str) -> Client: ...
 _internal_default_port: int = 8080
 ```
 
-The synthesised `__all__` is emitted once at the top of the file (after imports). `pub` stacks with every modifier keyword: `pub frozen class`, `pub model`, `pub let`, `pub mut`, `pub freeze let`, `pub newtype`, `pub interface`, `pub type`, `pub def`, `pub async def`.
+The synthesised `__all__` is emitted once at the top of the file (after imports). `pub` stacks with every modifier keyword: `pub class X frozen:` (postfix modifier), `pub model`, `pub let`, `pub mut`, `pub freeze let`, `pub newtype`, `pub interface`, `pub type`, `pub def`, `pub async def`.
 
 ### 1.7 `pub *` — package-level re-export aggregation (v0.7.0)
 

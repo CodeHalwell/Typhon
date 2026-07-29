@@ -53,6 +53,25 @@ type LintOptionsCache = Arc<
     Mutex<HashMap<std::path::PathBuf, (Option<std::time::SystemTime>, tyc_analyse::LintOptions)>>,
 >;
 
+/// Per-project-root cache of the `[strictness]` *severity* knobs, tagged with
+/// the `typhon.toml` mtime they were read from — the severity twin of
+/// [`LintOptionsCache`], and cached for the same reason: `check_and_publish`
+/// runs per keystroke, and re-reading + re-parsing `typhon.toml` on every one
+/// was exactly what the mtime-keyed lint-options cache was introduced to
+/// avoid (PR #192 review). `SeverityOverrides` holds `String`s, so entries are
+/// cloned rather than copied.
+type SeverityOverridesCache = Arc<
+    Mutex<
+        HashMap<
+            std::path::PathBuf,
+            (
+                Option<std::time::SystemTime>,
+                tyc_diagnostics::SeverityOverrides,
+            ),
+        >,
+    >,
+>;
+
 /// The Typhon LSP backend. Holds a single shared salsa database and the
 /// `Client` handle used to send notifications back to the editor.
 ///
@@ -157,6 +176,10 @@ pub struct Backend {
     /// `workspace/didChangeWatchedFiles`. The watcher additionally re-checks
     /// open documents on a `typhon.toml` edit so the refresh is immediate.
     lint_options_cache: LintOptionsCache,
+    /// Mtime-keyed cache of the `[strictness]` severity knobs — same policy
+    /// and staleness story as [`Self::lint_options_cache`], for the
+    /// `apply_severity_overrides` pass that runs on every check.
+    severity_overrides_cache: SeverityOverridesCache,
 }
 
 impl std::fmt::Debug for Backend {
@@ -275,6 +298,8 @@ impl Backend {
         // Per-root `[strictness]` lint-knob cache, reused across keystrokes;
         // `did_change_watched_files` clears it when `typhon.toml` changes.
         let lint_options_cache_arc = Arc::clone(&self.lint_options_cache);
+        // Its severity twin, for the `apply_severity_overrides` pass.
+        let severity_overrides_cache_arc = Arc::clone(&self.severity_overrides_cache);
 
         let text_for_check = text.clone();
         let uri_str_for_check = uri_str.clone();
@@ -385,11 +410,30 @@ impl Backend {
             // `exhaustive-match = "off"` or `unused-import = "off"` in its
             // `typhon.toml` still got the squiggle on every keystroke, so the
             // editor and CI disagreed about what counted as an error.
+            //
+            // Read through the same mtime-keyed pattern as the lint-options
+            // cache below: `stat` per check (cheap), re-read + re-parse only
+            // on a real `typhon.toml` change, I/O outside the lock. A racing
+            // double-miss just reads twice and stores the same value.
             if let Some((root, _)) = workspace.as_ref() {
-                diags = tyc_diagnostics::apply_severity_overrides(
-                    diags,
-                    &read_severity_overrides(root),
-                );
+                let mtime = std::fs::metadata(root.join("typhon.toml"))
+                    .and_then(|m| m.modified())
+                    .ok();
+                let cached = severity_overrides_cache_arc
+                    .blocking_lock()
+                    .get(root)
+                    .cloned();
+                let overrides = match cached {
+                    Some((cached_mtime, overrides)) if cached_mtime == mtime => overrides,
+                    _ => {
+                        let overrides = read_severity_overrides(root);
+                        severity_overrides_cache_arc
+                            .blocking_lock()
+                            .insert(root.clone(), (mtime, overrides.clone()));
+                        overrides
+                    }
+                };
+                diags = tyc_diagnostics::apply_severity_overrides(diags, &overrides);
             }
 
             // Retrieve the preprocessed source for diagnostic position
@@ -2093,41 +2137,6 @@ fn parse_src_dir(toml_path: &std::path::Path) -> Option<String> {
 /// `typhon.toml` behaviour (gather on, perf on, secret-literal lint on) — so
 /// an editor buffer in a project without an explicit `[strictness]` table
 /// still gets the on-by-default advice, exactly like `tyc check`.
-/// Read the `[strictness]` *severity* knobs from the project's `typhon.toml`.
-///
-/// Distinct from [`read_lint_options`], which reads the advice-lint *gates*.
-/// The severity knobs decide whether a diagnostic is an error, a warning, or
-/// suppressed; they were not read at all here, so `tyc lsp` and `tyc check`
-/// disagreed about the severity of six diagnostics.
-///
-/// Unreadable or malformed config falls back to defaults, matching the CLI.
-fn read_severity_overrides(root: &std::path::Path) -> tyc_diagnostics::SeverityOverrides {
-    let mut out = tyc_diagnostics::SeverityOverrides::default();
-    let Ok(text) = std::fs::read_to_string(root.join("typhon.toml")) else {
-        return out;
-    };
-    let Ok(parsed) = toml::from_str::<toml::Value>(&text) else {
-        return out;
-    };
-    let Some(strictness) = parsed.get("strictness").and_then(|s| s.as_table()) else {
-        return out;
-    };
-    let read = |key: &str| -> String {
-        strictness
-            .get(key)
-            .and_then(|v| v.as_str())
-            .unwrap_or_default()
-            .to_owned()
-    };
-    out.unused_import = read("unused-import");
-    out.methods_in_class_body = read("methods-in-class-body");
-    out.require_with = read("require-with");
-    out.blocking_in_async = read("blocking-in-async");
-    out.stub_check = read("stub-check");
-    out.exhaustive_match = read("exhaustive-match");
-    out
-}
-
 fn read_lint_options(root: &std::path::Path) -> tyc_analyse::LintOptions {
     let mut opts = tyc_analyse::LintOptions::default();
     let Ok(text) = std::fs::read_to_string(root.join("typhon.toml")) else {
@@ -2192,6 +2201,42 @@ fn read_lint_options(root: &std::path::Path) -> tyc_analyse::LintOptions {
         opts.parallel_min_size = n.max(0) as u64;
     }
     opts
+}
+
+/// Read the `[strictness]` *severity* knobs from the project's `typhon.toml`.
+///
+/// Distinct from [`read_lint_options`], which reads the advice-lint *gates*.
+/// The severity knobs decide whether a diagnostic is an error, a warning, or
+/// suppressed; they were not read at all here, so `tyc lsp` and `tyc check`
+/// disagreed about the severity of these diagnostics.
+///
+/// Unreadable or malformed config falls back to defaults, matching the CLI.
+fn read_severity_overrides(root: &std::path::Path) -> tyc_diagnostics::SeverityOverrides {
+    let mut out = tyc_diagnostics::SeverityOverrides::default();
+    let Ok(text) = std::fs::read_to_string(root.join("typhon.toml")) else {
+        return out;
+    };
+    let Ok(parsed) = toml::from_str::<toml::Value>(&text) else {
+        return out;
+    };
+    let Some(strictness) = parsed.get("strictness").and_then(|s| s.as_table()) else {
+        return out;
+    };
+    let read = |key: &str| -> String {
+        strictness
+            .get(key)
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_owned()
+    };
+    out.unused_import = read("unused-import");
+    out.methods_in_class_body = read("methods-in-class-body");
+    out.nullable_use = read("nullable-use");
+    out.require_with = read("require-with");
+    out.blocking_in_async = read("blocking-in-async");
+    out.stub_check = read("stub-check");
+    out.exhaustive_match = read("exhaustive-match");
+    out
 }
 
 /// Map a dotted module name to a source file path under `src_dir`.
@@ -2670,6 +2715,7 @@ pub fn run_stdio(log_level: LogLevel) {
             project_files: Arc::new(Mutex::new(HashMap::new())),
             prewarmed_versions: Arc::new(Mutex::new(HashMap::new())),
             lint_options_cache: Arc::new(Mutex::new(HashMap::new())),
+            severity_overrides_cache: Arc::new(Mutex::new(HashMap::new())),
         });
         Server::new(stdin, stdout, socket).serve(service).await;
     });
@@ -4199,6 +4245,46 @@ mod tests {
         );
     }
 
+    #[test]
+    fn read_severity_overrides_defaults_without_config() {
+        // No `typhon.toml` → every knob unset ("" = take the diagnostic's
+        // default), matching the CLI's behaviour for a config-less check.
+        let tmp = tempfile::tempdir().unwrap();
+        let overrides = read_severity_overrides(tmp.path());
+        assert!(overrides.unused_import.is_empty());
+        assert!(overrides.nullable_use.is_empty());
+        assert!(overrides.exhaustive_match.is_empty());
+    }
+
+    #[test]
+    fn read_severity_overrides_parses_every_knob() {
+        // The editor must honour the same `[strictness]` severity knobs as
+        // `tyc check` — including `nullable-use`, which gates the
+        // warn-emitted attribute-rooted form of `tyc::nullable_use`.
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("typhon.toml"),
+            "[project]\nname = \"x\"\nsrc = \"src\"\n\
+             [strictness]\n\
+             unused-import = \"off\"\n\
+             methods-in-class-body = \"error\"\n\
+             nullable-use = \"off\"\n\
+             require-with = \"error\"\n\
+             blocking-in-async = \"off\"\n\
+             stub-check = \"warn\"\n\
+             exhaustive-match = \"warn\"\n",
+        )
+        .unwrap();
+        let overrides = read_severity_overrides(tmp.path());
+        assert_eq!(overrides.unused_import, "off");
+        assert_eq!(overrides.methods_in_class_body, "error");
+        assert_eq!(overrides.nullable_use, "off");
+        assert_eq!(overrides.require_with, "error");
+        assert_eq!(overrides.blocking_in_async, "off");
+        assert_eq!(overrides.stub_check, "warn");
+        assert_eq!(overrides.exhaustive_match, "warn");
+    }
+
     // ── End-to-end LSP harness ──────────────────────────────────────────────
     //
     // Drives the real `Backend` over an in-memory duplex pair (no sockets, no
@@ -4229,6 +4315,7 @@ mod tests {
             project_files: Arc::new(Mutex::new(HashMap::new())),
             prewarmed_versions: Arc::new(Mutex::new(HashMap::new())),
             lint_options_cache: Arc::new(Mutex::new(HashMap::new())),
+            severity_overrides_cache: Arc::new(Mutex::new(HashMap::new())),
         });
         let (to_server, server_in) = tokio::io::duplex(64 * 1024);
         let (server_out, from_server) = tokio::io::duplex(64 * 1024);
