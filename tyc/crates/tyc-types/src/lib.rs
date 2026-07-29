@@ -17911,8 +17911,41 @@ fn assign_unpacking_target(c: &mut Checker, target: &Expr, elem_ty: &Type) {
                     let span = (n.range.start().to_usize(), n.range.end().to_usize());
                     c.mismatch(&declared, elem_ty, span);
                 }
+                // Re-narrow to the assigned value, exactly as the single-name
+                // `Stmt::Assign` path does. Without this the unpack checked
+                // the new value against the *declared* type and then left the
+                // old *narrowed* type in place, so
+                //
+                //     mut a: str? = "x"
+                //     if a is None: return
+                //     (a, b) = (None, 2)
+                //     a.upper()          # AttributeError, checked clean
+                //
+                // type-checked with `a` still narrowed to `str`. The loop
+                // back-edge widening covers the same shape one level up; this
+                // is the straight-line case, which nothing covered.
+                //
+                // `Unknown` — which is what an unpack from a non-tuple RHS
+                // yields per slot — falls back to the declared type rather
+                // than erasing it, so an opaque RHS widens rather than
+                // pretending to know the slot's type.
+                let narrowed_to = if matches!(elem_ty, Type::Unknown) {
+                    declared
+                } else {
+                    elem_ty.clone()
+                };
+                c.reassigned_names.insert(name.to_owned());
+                c.env.narrow(name, narrowed_to);
+                c.env.clear_attr_narrowing(name);
             } else {
                 bind_unpacking_target(c, target, elem_ty);
+            }
+        }
+        // `(self.x, y) = (None, 1)` rebinds the attribute, so any narrowing on
+        // that path — and on anything below it — is stale.
+        Expr::Attribute(_) => {
+            if let Some(path) = attr_path_of(target) {
+                c.env.clear_attr_narrowing(&path);
             }
         }
         Expr::Tuple(t) => {
@@ -19140,6 +19173,81 @@ mod tests {
     /// `ClassKind::Raw`). Required for any test exercising plain-/raw-class
     /// awareness in the checker (manual_init / class_attr_shadows_slot /
     /// attribute_not_found suppression).
+    /// The straight-line half of the tuple-unpack narrowing hole. The loop
+    /// back-edge case was closed with F43; this one — a plain sequential
+    /// unpack — was checked against the *declared* type while the stale
+    /// *narrowed* type stayed in the environment.
+    #[test]
+    fn a_tuple_unpack_reassignment_widens_the_target() {
+        let d = check(
+            r#"
+def go() -> None:
+    mut a: str? = "x"
+    mut b: int = 1
+    if a is None:
+        return
+    (a, b) = (None, 2)
+    let _s: str = a.upper()
+"#,
+        );
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::NullableUse { .. })),
+            "`(a, b) = (None, 2)` makes the earlier `a is None` guard stale; got {:?}",
+            d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    /// …and it re-narrows rather than merely widening, so an unpack that
+    /// assigns a definitely-non-`None` value leaves the target usable.
+    #[test]
+    fn a_tuple_unpack_renarrows_to_the_assigned_slot() {
+        let d = check(
+            r#"
+def go() -> None:
+    mut a: str? = None
+    mut b: int = 1
+    (a, b) = ("hello", 2)
+    let _s: str = a.upper()
+"#,
+        );
+        assert!(
+            !d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::NullableUse { .. })),
+            "the unpacked slot is `str`, so `a` is non-None after it; got {:?}",
+            d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    /// An opaque right-hand side yields `Unknown` per slot, which must widen
+    /// to the declared type rather than erase it.
+    #[test]
+    fn a_tuple_unpack_from_an_opaque_rhs_widens_to_declared() {
+        let d = check(
+            r#"
+def source() -> tuple[str?, int]:
+    return (None, 1)
+
+def go() -> None:
+    mut a: str? = "x"
+    mut b: int = 1
+    if a is None:
+        return
+    (a, b) = source()
+    let _s: str = a.upper()
+"#,
+        );
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::NullableUse { .. })),
+            "the slot is declared `str?`, so the guard is stale; got {:?}",
+            d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
     /// F45: the forward argument pass checks against the declared formal
     /// `list[T]`, where a free TypeVar leaf makes `is_assignable` permissive,
     /// so any `list[X]` was accepted; a conflicting second binding was then

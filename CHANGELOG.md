@@ -34,6 +34,22 @@ Compatibility, using the review's own taxonomy:
   - `let` immutability is enforced inside loop bodies and through
     `global` / `nonlocal`. Both were unenforced, so this rejects programs that
     ran — but only ones already violating Rule 2 as documented.
+
+**Standing note on an alpha.2 narrowing that is *not* being reverted.** The
+subscript-assignment check added in v1.0.0-alpha.2 rejects an `object`-typed
+right-hand side, which makes the canonical `__setattr__(self, name: str, value:
+object)` override unwritable when it stores into a narrower container
+(`self._data[name] = value` with `_data: dict[str, int]`). The 2026-07-28 review
+recorded this as an additive-compatibility violation, and it is one — the shape
+checked clean and ran correctly before alpha.2. It stays, because the proposed
+fix (suppress the diagnostic when the RHS is exactly `object`) would make
+`d["k"] = v` *more* permissive than `let n: int = v` for the same `v`, which is
+a real soundness hole rather than a leniency. The write genuinely can store a
+non-`int`; Python's protocol just forces the `object` annotation. Migrate with
+an explicit `as!` at the store, or widen the container's value type.
+`stress/round-2026-06-21/repros/106-getattr-fallback.ty` is left failing on
+purpose and is recorded in the corpus baseline as a known, deliberate rejection
+rather than a silent one.
 - **Miscompilation fixes** (only change programs that were already producing
   the wrong answer): `?` in an `elif` / `while` condition; string-literal
   corruption in four passes; emitter precedence.
@@ -94,6 +110,15 @@ Compatibility, using the review's own taxonomy:
   top-of-body read checked against the pre-loop narrowing. The
   "body always leaves the loop" gate is unchanged, so single-pass bodies keep
   their narrowing.
+- **A tuple unpack re-narrows its targets.** `(a, b) = (None, 2)` checked the
+  assigned value against `a`'s *declared* type and then left its stale
+  *narrowed* type in the environment, so an earlier `if a is None: return`
+  guard survived a statement that had just assigned `None` — and `a.upper()`
+  below it type-checked clean. The loop-body widening above closes the same
+  shape across a back-edge; this is the straight-line case, which nothing
+  covered. An unpack from an opaque right-hand side widens to the declared type
+  rather than erasing it, and an attribute target (`(self.x, y) = …`) drops the
+  narrowing on that path.
 - **A nullable *field* receiver is reported.** The check was gated on the
   receiver being a bare name — not by design, but because the diagnostic wanted
   a name for its message — so `self.conn.execute()`, `cfg.db.host` and
