@@ -27,3 +27,8 @@
 **Vulnerability:** Hardcoded secret detection was missing `APIKEY` due to partial overlap with `KEY` because `KEY` was evaluated before `APIKEY`.
 **Learning:** When scanning for secrets using keyword arrays, substrings (like `KEY`) must be placed after longer matches (like `APIKEY` or `API_KEY`) to prevent premature partial matches.
 **Prevention:** Always maintain hardcoded secret matching keywords in longest-first order.
+
+## 2024-05-24 - Handle numeric and camelCase boundaries in secret detection
+**Vulnerability:** The secret detection heuristics (`is_secret_name` and `secret_suffix`) correctly checked for string edges, underscores, and lowercase-to-UPPERCASE boundaries, but failed to flag embedded secrets bounded by digits (`myPASSWORD123` or `123PASSWORD`) and UPPERCASE-to-CamelCase/PascalCase boundaries (`dbPASSWORDString`).
+**Learning:** Static analysis bounds-checking algorithms must consider digits as valid word boundaries, and must correctly evaluate trailing boundaries where an UPPERCASE acronym transitions into a CamelCase/PascalCase suffix (e.g. UPPERCASE followed by Upper/lower).
+**Prevention:** When modifying token or string matching heuristics for security keywords, ensure boundary logic correctly handles TitleCase/camelCase junctions (such as `dbPASSWORDString`) and numeric boundaries (such as `myPASSWORD123` or `123PASSWORD`) by verifying the capitalization and digit status of surrounding characters to prevent false negatives.
