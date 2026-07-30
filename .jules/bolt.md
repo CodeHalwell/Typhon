@@ -26,3 +26,6 @@
 ## 2024-11-25 - Zero-Allocation `module_level_bound_names`
 **Learning:** `module_level_bound_names` in `tyc-desugar` originally created a new `HashSet<String>` by cloning string identifiers inside AST nodes. As this is used to verify `collections.abc` types inside hot paths, the repeated allocation of strings negatively impacted compilation times.
 **Action:** By bounding the lifetime of the `HashSet<&str>` to the incoming `&[Stmt]` reference, we can avoid String allocations entirely when building the `bound_names` set and rely on dereferencing pointers for fast lookups.
+## 2024-11-26 - Zero-Allocation `module_level_mut_names` in parallel_lints
+**Learning:** Checking assignment targets for parallel lints in `tyc-analyse/src/parallel_lints.rs` allocated owned `String` instances in a `HashSet<String>` for every found identifier. In a deep AST, creating a `HashSet<String>` by cloning identifier `.as_str()` names creates high memory fragmentation and GC overhead, impacting linter speed.
+**Action:** Always borrow AST node string slices with the original lifetime directly into `HashSet<&str>`. For `module_level_mut_names`, mapping `HashSet<&str>` across the collected target scopes successfully removes string copies, dramatically shrinking the lint allocation cost.
