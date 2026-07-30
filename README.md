@@ -179,14 +179,15 @@ The single canonical design doc is **[the long-term plan](docs/long-term-plan.md
 
 ## Project status
 
-**Current release: [v1.0.0-alpha.6](https://github.com/CodeHalwell/Typhon/releases/tag/v1.0.0-alpha.6)** (2026-07-21).
+**Current release: [v1.0.0-alpha.7](https://github.com/CodeHalwell/Typhon/releases/tag/v1.0.0-alpha.7)** (2026-07-29).
 
 Typhon reached its **first feature-complete alpha** in
 [v1.0.0-alpha](https://github.com/CodeHalwell/Typhon/releases/tag/v1.0.0-alpha): the
 proven production surface *plus* the type-system frontier earlier releases deferred
 (higher-kinded type unification, user-generic variance inference, the inter-procedural
-field-init audit). Since then, the alpha.2 → alpha.6 point releases have been a
-soundness, robustness, performance, and release-engineering hardening pass.
+field-init audit). Since then, the alpha.2 → alpha.7 point releases have been a
+soundness, robustness, performance, release-engineering, and codebase-review
+hardening pass.
 
 - ✅ **The production path is stable.** `tyc build` → CPython 3.13+ carries no runtime dependency on the toolchain; the full `examples/` + `examples/apps/` corpus builds to runnable Python and checks clean.
 - ✅ **The language is additive on *correct* programs** across the whole v0.3.0 → v1.0.0-alpha line — every program that type-checked *and ran correctly* continues to behave identically. (A few deliberate diagnostics reject only code that already crashed at runtime.)

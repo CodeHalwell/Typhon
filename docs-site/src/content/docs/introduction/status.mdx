@@ -9,14 +9,15 @@ import { Aside } from '@astrojs/starlight/components';
 
 Typhon is in **active development**, and has reached its first *feature-complete* alpha.
 
-**The current release is [v1.0.0-alpha.6](https://github.com/CodeHalwell/Typhon/releases/tag/v1.0.0-alpha.6)** (2026-07-21).
+**The current release is [v1.0.0-alpha.7](https://github.com/CodeHalwell/Typhon/releases/tag/v1.0.0-alpha.7)** (2026-07-29).
 
-The [v1.0.0-alpha](https://github.com/CodeHalwell/Typhon/releases/tag/v1.0.0-alpha) milestone brought the proven production surface together with the type-system frontier earlier releases deferred — higher-kinded type unification, user-generic variance inference, and the general inter-procedural field-init audit. The **alpha.2 → alpha.6** point releases since have been a hardening pass across four fronts:
+The [v1.0.0-alpha](https://github.com/CodeHalwell/Typhon/releases/tag/v1.0.0-alpha) milestone brought the proven production surface together with the type-system frontier earlier releases deferred — higher-kinded type unification, user-generic variance inference, and the general inter-procedural field-init audit. The **alpha.2 → alpha.7** point releases since have been a hardening pass across five fronts:
 
 - **Soundness (alpha.2, alpha.4).** Flow-narrowing invalidation across calls and alias writes, short-circuit narrowing fixes, a batch of newly-typed positions, three conservative diagnostics (`not_a_context_manager`, `raise_non_exception`, `frozen_inheritance_conflict`), and the **H5** scope-blind class-unification fix.
 - **Robustness & release engineering (alpha.3).** A repository-root MIT `LICENSE`, the vendored Ruff notice, `SECURITY.md` / `CONTRIBUTING.md` / Dependabot, CI-gated release tagging, linear nested-generic assignability, six VM ↔ CPython parity fixes, a 256 MiB LSP stack, atomic `tyc fmt`, and the `TYC_NO_INTROSPECT` kill-switch.
 - **Performance (alpha.5).** VM performance Tier 1 (`tyc run`) — an allocation-light two-representation integer, method-dispatch caching, slot-resolved locals — plus the `[optimise]` profile / `tyc build -O`, seven advice-only `perf` lints, a free-threading parallelisation wave, and native PEP 810 lazy imports on 3.15 targets.
 - **Maintenance (alpha.6).** The July dependency wave carried safely across the `toml` 0.8 → 1.x major, six more secret-name lint keywords, release-pipeline re-pinning, and docs / repo hygiene.
+- **Codebase-review remediation (alpha.7).** All ten 1.0 blockers from the 2026-07-28 full-codebase review closed, plus the Tier-0 verification gates: instance-attribute type-checking, reverse-MRO constructor field order, keyword-only model constructors, terminating recursive type aliases, parametric sealed-union exhaustiveness, a new warn-level nullable-field-dereference check, `let`-immutability enforcement in loops and through `global`/`nonlocal`, a shared-lexical-mask preprocessor rewrite, five emitter/preprocessor miscompilation fixes, VM `ExceptionGroup`/`except*` support (PEP 654) plus five other VM ↔ CPython parity fixes, and two new CI gates (a full-corpus VM ↔ CPython differential baseline and an opt-in-knob codegen matrix).
 
 **What this means for you:**
 

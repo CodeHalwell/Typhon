@@ -10,6 +10,26 @@ Realistic milestones for one person plus AI assistance. The headline target is a
 
 ## Current release
 
+**[v1.0.0-alpha.7](https://github.com/CodeHalwell/Typhon/releases/tag/v1.0.0-alpha.7) — 2026-07-29.**
+The full-codebase-review remediation release. It closes all ten of the
+[2026-07-28 codebase review](codebase-review-2026-07-28.md)'s 1.0 blockers
+plus the Tier-0 gates that make them verifiable: type-checker soundness
+fixes (instance-attribute assignment is now type-checked, constructor field
+order follows reverse MRO, model constructors are keyword-only, recursive
+type aliases terminate, parametric sealed-union match exhaustiveness is
+checked, and a new nullable-field-dereference check lands at warn level),
+resolver fixes (`let` immutability is now enforced inside loop bodies and
+through `global`/`nonlocal`), a shared-lexical-mask rewrite of the
+preprocessor fixing several literal-corrupting bugs (`gather:` dependency
+scanning, `with`-chain parsing, `enum` body rewriting), five
+emitter/preprocessor miscompilation fixes, and VM `ExceptionGroup`/`except*`
+support (PEP 654) plus five other VM ↔ CPython divergence fixes. Two new CI
+gates ship alongside: a VM ↔ CPython differential gate over the full
+1342-file example+stress corpus (first run found 126 divergences, now
+pinned as a baseline), and an opt-in-knob codegen matrix. No new syntax;
+most changes are narrowings on code that was already crashing or relying on
+unsound typing, plus one warn-level diagnostic-surface addition.
+
 **[v1.0.0-alpha.6](https://github.com/CodeHalwell/Typhon/releases/tag/v1.0.0-alpha.6) — 2026-07-21.**
 A maintenance release on top of alpha.5, driven by the
 [2026-07-20 release-readiness review](release-readiness-2026-07-20.md). The
