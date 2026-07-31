@@ -27,3 +27,8 @@
 **Vulnerability:** Hardcoded secret detection was missing `APIKEY` due to partial overlap with `KEY` because `KEY` was evaluated before `APIKEY`.
 **Learning:** When scanning for secrets using keyword arrays, substrings (like `KEY`) must be placed after longer matches (like `APIKEY` or `API_KEY`) to prevent premature partial matches.
 **Prevention:** Always maintain hardcoded secret matching keywords in longest-first order.
+
+## $(date +%Y-%m-%d) - Improve secret boundary detection for TitleCase and numeric characters
+**Vulnerability:** The secret detection boundary logic correctly handled underscores and preceding camelCase transitions, but failed to identify secrets when they were flanked by numeric characters (e.g., `PASSWORD123` or `123PASSWORD`) or when a TitleCase word immediately followed the secret (e.g., `dbPASSWORDString`).
+**Learning:** Checking for boundary delimiters is not sufficient if digit-adjacency and subsequent TitleCase strings are ignored, resulting in false negatives for commonly patterned variable names containing secrets.
+**Prevention:** Always evaluate both digit adjacency (`.is_ascii_digit()`) and subsequent TitleCase boundaries when writing substring-based token detection logic to ensure all common naming conventions are thoroughly checked.
