@@ -27,3 +27,8 @@
 **Vulnerability:** Hardcoded secret detection was missing `APIKEY` due to partial overlap with `KEY` because `KEY` was evaluated before `APIKEY`.
 **Learning:** When scanning for secrets using keyword arrays, substrings (like `KEY`) must be placed after longer matches (like `APIKEY` or `API_KEY`) to prevent premature partial matches.
 **Prevention:** Always maintain hardcoded secret matching keywords in longest-first order.
+
+## 2025-02-14 - Improve Secret Detection at Numeric Boundaries and Case Junctions
+**Vulnerability:** The secret detection logic (`is_secret_name` and `secret_suffix`) correctly checked for string boundaries and basic camelCase junctions, but it failed on numeric boundaries (e.g. `123PASSWORD` or `myPASSWORD123`) and transitions from UPPER to TitleCase (e.g. `dbPASSWORDString` where `PASSWORD` is followed by `String`).
+**Learning:** Checking character casings before and after a keyword is tricky. Specifically, digits are neither uppercase nor lowercase ASCII characters, so relying solely on casing checks to identify word boundaries causes embedded numeric boundaries to fail. Furthermore, the TitleCase junction requires checking two characters ahead to verify it's the start of a new word rather than just the end of an acronym.
+**Prevention:** Always include `is_ascii_digit()` checks when evaluating substring boundaries for embedded secret keywords, and account for TitleCase transitions (an uppercase character followed by a lowercase character) at the end of the matched keyword. Both `tyc-analyse` and `tyc` build crates must be updated simultaneously.
