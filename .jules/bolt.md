@@ -26,3 +26,7 @@
 ## 2024-11-25 - Zero-Allocation `module_level_bound_names`
 **Learning:** `module_level_bound_names` in `tyc-desugar` originally created a new `HashSet<String>` by cloning string identifiers inside AST nodes. As this is used to verify `collections.abc` types inside hot paths, the repeated allocation of strings negatively impacted compilation times.
 **Action:** By bounding the lifetime of the `HashSet<&str>` to the incoming `&[Stmt]` reference, we can avoid String allocations entirely when building the `bound_names` set and rely on dereferencing pointers for fast lookups.
+
+## 2024-11-25 - Zero-Allocation `collect_multi_base_parents` and `collect_cached_property_targets_into`
+**Learning:** `collect_multi_base_parents` and `collect_cached_property_targets_into` in `tyc-desugar` originally created a `HashSet<String>` and collected owned strings from AST node identifiers. These collections are passed as `ClassMarkers` and used solely for existence checks (like `.contains`) during desugaring. Converting these string identifiers to owned `String` incurs unnecessary heap allocations.
+**Action:** By modifying `collect_multi_base_parents` and `collect_cached_property_targets_into` to use `HashSet<&'a str>`, we can borrow the string identifiers directly from the AST nodes and avoid allocations entirely. The lifetime `'a` is bound to the `&'a [Stmt]` representing the module body.
