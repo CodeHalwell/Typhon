@@ -27,3 +27,7 @@
 **Vulnerability:** Hardcoded secret detection was missing `APIKEY` due to partial overlap with `KEY` because `KEY` was evaluated before `APIKEY`.
 **Learning:** When scanning for secrets using keyword arrays, substrings (like `KEY`) must be placed after longer matches (like `APIKEY` or `API_KEY`) to prevent premature partial matches.
 **Prevention:** Always maintain hardcoded secret matching keywords in longest-first order.
+## 2024-05-18 - Hardcoded secret diagnostic fails to identify correctly bounded substrings
+**Vulnerability:** The secret detection heuristics in `tyc::contains_secret_literal` failed to correctly identify secrets bounded by numbers or embedded in strings where the boundary was adjacent to TitleCase or CamelCase junctions containing lowercase characters at the boundary (e.g. `dbPASSWORDString` or `myPASSWORD123`). This caused the compiler to miss potential hardcoded credentials.
+**Learning:** Checking string boundaries for hardcoded secrets requires identifying CamelCase/TitleCase boundaries dynamically using uppercase/lowercase lookahead/lookbehind checks, and treating digits as valid delimiters similarly to underscores.
+**Prevention:** Incorporate robust digit and TitleCase checks alongside underscore and start/end boundaries when filtering embedded substring tokens to prevent bypassing keyword detection.
