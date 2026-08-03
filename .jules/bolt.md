@@ -26,3 +26,6 @@
 ## 2024-11-25 - Zero-Allocation `module_level_bound_names`
 **Learning:** `module_level_bound_names` in `tyc-desugar` originally created a new `HashSet<String>` by cloning string identifiers inside AST nodes. As this is used to verify `collections.abc` types inside hot paths, the repeated allocation of strings negatively impacted compilation times.
 **Action:** By bounding the lifetime of the `HashSet<&str>` to the incoming `&[Stmt]` reference, we can avoid String allocations entirely when building the `bound_names` set and rely on dereferencing pointers for fast lookups.
+## $(date +%Y-%m-%d) - Zero-Copy AST Traversal (HashSet Allocations)
+**Learning:** In recursive AST walkers over the Ruff AST (e.g., `tyc-analyse`), temporary sets mapping scope state (`HashSet<String>`) for node identifiers can cause heap allocation bottlenecks during heavy traversal. The AST nodes themselves (`Name`, `Identifier`) expose an `.as_str()` method.
+**Action:** When tracking short-lived AST identifier sets, use `HashSet<&'a str>` and borrow directly from the AST node via `.as_str()` instead of `.to_string()`. This avoids heap allocations during hot paths.
