@@ -4,6 +4,74 @@ All notable changes to Typhon are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely; the
 canonical phase-by-phase status lives in `docs/roadmap.md`.
 
+## 1.0.0-alpha.8 — 2026-08-08 — maintenance
+
+A maintenance release on top of alpha.7: one VM ↔ CPython parity fix, a
+widening of the warn-level secret-name lint, two allocation reductions in the
+compiler, the early-August dependency wave, and a docs-site polish pass. **No
+language change** — no new syntax, and no new error-level diagnostic.
+
+### Fixed
+
+- **VM: unseeded `random` is now non-deterministic, matching CPython.** The
+  VM's CPython-compatible MT19937 was seeded with a fixed constant (`5489`) when
+  a program never called `random.seed()`, so `tyc run` drew the *same* sequence
+  on every run while `tyc build && python` drew a different one each time —
+  CPython seeds from OS entropy at import. That is a VM ↔ CPython divergence in
+  its own right (an unseeded program is deterministic under one execution
+  surface and not the other), and it also intermittently flaked the T0.2
+  differential gate: because the VM always agreed with *itself*, the harness's
+  self-nondeterminism filter only excluded the unit when CPython happened to
+  repeat itself across all three of its runs, and otherwise reported a spurious
+  new divergence (observed on
+  `examples/24-async-gather-and-go/async_gather_and_go.ty`, whose output
+  includes a `random.randint(0, 9)` draw). The default now seeds from entropy,
+  reusing the same source as the existing `random.seed()` / `random.seed(None)`
+  path. **Explicit integer seeding is unaffected** — `random.seed(42)` still
+  produces a byte-identical sequence under the VM and under CPython, which the
+  MT19937 implementation already guaranteed and this change preserves.
+
+### Changed
+
+- **`tyc::contains_secret_literal` recognises two more name boundaries.**
+  `is_secret_name` (`tyc-analyse`) and `secret_suffix` (the `tyc` build crate)
+  treated only string edges, underscores, and a lowercase→UPPERCASE junction as
+  word boundaries, so a secret-shaped keyword flanked by digits (`myPASSWORD123`,
+  `foo123TOKEN`) or followed by a TitleCase word (`dbPASSWORDString`) went
+  unflagged. Digits now count as boundaries on both sides, and an UPPERCASE
+  keyword followed by `Xx`-shaped TitleCase is recognised as ending a word.
+  `MONKEY` still does not match `KEY`, and `PASSPORT` still does not match
+  `PASS`. This lint is **warn-level**, so — as with the six keywords added in
+  alpha.6 — a newly-flagged name warns, it does not fail the build.
+
+### Performance
+
+- **Fewer allocations on two AST walks.** The `parallel_lints` shared-`mut`
+  analysis (`module_level_mut_names`, `collect_globals`, `body_writes`, the
+  `GoSpawn` callee, and the per-callee verdict cache) and the desugarer's
+  `collect_multi_base_parents` / `collect_cached_property_targets_into` built
+  `HashSet<String>` / `String` copies of identifiers that are only ever used for
+  `contains` checks. Both now borrow `&'a str` directly from the AST. No
+  behaviour change.
+
+### Dependencies
+
+- Cargo: `clap` 4.6.1 → 4.6.6, `thiserror` 2.0.18 → 2.0.20, `insta` 1.47.2 →
+  1.48.0, `schemars` 1.2.1 → 1.2.2, `toml` 1.1.3+spec-1.1.0 → 1.1.4+spec-1.1.0.
+  (The `clap` and `thiserror` pull requests were rebased onto the rest of the
+  wave to regenerate `Cargo.lock`, which picked up a newer patch than each
+  title names; the versions above are the ones actually locked.)
+- GitHub Actions: `actions/cache` 4.3.0 → 6.1.0 and `actions/setup-python` 5.6.0
+  → 7.0.0, both re-pinned by commit SHA.
+
+### Documentation
+
+- docs-site: `.card` and `.sl-link-card` gained the base `transition`
+  declarations their custom `:hover` / `:focus-within` states were already
+  animating against, so those states ease instead of snapping; the link-card
+  icon transition is registered in the `prefers-reduced-motion: reduce` opt-out
+  alongside the components it belongs to.
+
 ## 1.0.0-alpha.7 — 2026-07-29 — codebase-review remediation
 
 Fixes driven by the [2026-07-28 full-codebase review](docs/codebase-review-2026-07-28.md).
