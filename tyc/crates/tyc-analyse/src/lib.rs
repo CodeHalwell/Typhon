@@ -3741,13 +3741,18 @@ fn is_secret_name(name: &str) -> bool {
             // so `MONKEY` doesn't match `KEY` and `PASSPORT` doesn't match `PASS`.
             let start_ok = actual_idx == 0
                 || upper.as_bytes()[actual_idx - 1] == b'_'
+                || name.as_bytes()[actual_idx - 1].is_ascii_digit()
                 || (name.as_bytes()[actual_idx].is_ascii_uppercase()
                     && name.as_bytes()[actual_idx - 1].is_ascii_lowercase());
             let actual_end = actual_idx + word.len();
             let end_ok = actual_end == upper.len()
                 || upper.as_bytes()[actual_end] == b'_'
+                || name.as_bytes()[actual_end].is_ascii_digit()
                 || (name.as_bytes()[actual_end].is_ascii_uppercase()
-                    && !name.as_bytes()[actual_end - 1].is_ascii_uppercase());
+                    && !name.as_bytes()[actual_end - 1].is_ascii_uppercase())
+                || (name.as_bytes()[actual_end].is_ascii_uppercase()
+                    && actual_end + 1 < name.len()
+                    && name.as_bytes()[actual_end + 1].is_ascii_lowercase());
             if start_ok && end_ok {
                 return true;
             }
@@ -5156,6 +5161,11 @@ def use_np() -> object:
             "APIKEY = \"123\"\n",
             "APITOKEN = \"abc\"\n",
             "APISECRET = \"abc\"\n",
+            "TOKEN123 = \"abc\"\n",
+            "foo123TOKEN = \"abc\"\n",
+            "my123TOKEN = \"abc\"\n",
+            "TOKENString = \"abc\"\n",
+            "dbPASSWORDString = \"abc\"\n",
         ];
         for src in srcs {
             let module = parse(src);

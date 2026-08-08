@@ -27,3 +27,7 @@
 **Vulnerability:** Hardcoded secret detection was missing `APIKEY` due to partial overlap with `KEY` because `KEY` was evaluated before `APIKEY`.
 **Learning:** When scanning for secrets using keyword arrays, substrings (like `KEY`) must be placed after longer matches (like `APIKEY` or `API_KEY`) to prevent premature partial matches.
 **Prevention:** Always maintain hardcoded secret matching keywords in longest-first order.
+## 2024-05-27 - Enhance hardcoded secret detection boundary logic
+**Vulnerability:** The secret detection scanner missed hardcoded secrets when they were flanked by digits (e.g., `TOKEN123`) or functioning as acronym prefixes in PascalCase/CamelCase names (e.g., `TOKENString`). This could allow users to inadvertently embed secrets.
+**Learning:** The previous boundary logic only checked for `_` or transitions between lowercase and uppercase letters. It did not recognize numbers as valid boundary delineators for secret substrings, nor did it realize that a sequence like "TOKENString" acts as a boundary because the lower-case 't' acts as a pivot after the 'S'.
+**Prevention:** Ensured boundary logic correctly handles digits (`.is_ascii_digit()`) and correctly identifies the start of new camel/Pascalcase segments by checking `!name.as_bytes()[actual_end - 1].is_ascii_uppercase()` OR `name.as_bytes()[actual_end + 1].is_ascii_lowercase()` across both `is_secret_name` and `secret_suffix` functions.
