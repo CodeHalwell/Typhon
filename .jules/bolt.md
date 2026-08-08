@@ -26,3 +26,6 @@
 ## 2024-11-25 - Zero-Allocation `module_level_bound_names`
 **Learning:** `module_level_bound_names` in `tyc-desugar` originally created a new `HashSet<String>` by cloning string identifiers inside AST nodes. As this is used to verify `collections.abc` types inside hot paths, the repeated allocation of strings negatively impacted compilation times.
 **Action:** By bounding the lifetime of the `HashSet<&str>` to the incoming `&[Stmt]` reference, we can avoid String allocations entirely when building the `bound_names` set and rely on dereferencing pointers for fast lookups.
+## 2024-11-26 - Zero-Allocation shared mut AST traversal
+**Learning:** Checking for shared mut races in `parallel_lints` required constructing temporary `HashSet<String>` objects from AST node slices and using `clone` on variable names, creating redundant heap allocations across parallel AST traversals.
+**Action:** Always borrow string slices with `&'a str` into short-lived maps and vectors like `GoSpawn<'a>`, `HashSet<&'a str>`, and `HashMap<&'a str, bool>` where the lifetime `'a` is tied directly to the `ModModule` or `[Stmt]` to eliminate these temporary strings.
