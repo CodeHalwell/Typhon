@@ -2992,6 +2992,32 @@ fn monotonic_secs() -> f64 {
 
 fn make_random_module() -> Value {
     use std::cell::RefCell;
+    /// A non-deterministic seed, standing in for the OS entropy CPython
+    /// seeds from. Shared by the unseeded default and `seed()` / `seed(None)`.
+    ///
+    /// Two independent sources are mixed. `RandomState` is the stdlib's
+    /// hash-randomisation source: its keys come from OS randomness once per
+    /// process, and each instantiation yields a different pair, so it varies
+    /// across processes *and* across threads within one process — which
+    /// matters because the RNG below is a `thread_local`. Wall-clock nanos
+    /// are XORed in as a second source, so a platform whose clock is coarse
+    /// (Windows ticks at ~15ms, which alone would collide across fast
+    /// successive runs) cannot by itself make two seeds equal. XOR keeps the
+    /// result at least as unpredictable as the stronger of the two.
+    ///
+    /// This is emphatically not a CSPRNG seed — `random` is not cryptographic
+    /// on either surface, matching CPython, where `secrets` is the answer.
+    fn entropy_seed() -> u64 {
+        use std::hash::{BuildHasher, Hasher};
+        let os_derived = std::collections::hash_map::RandomState::new()
+            .build_hasher()
+            .finish();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+        os_derived ^ nanos
+    }
     // CPython-compatible MT19937 so seeded programs produce IDENTICAL
     // sequences under `tyc run` and `tyc build && python` — random(),
     // getrandbits/_randbelow (which back randint / randrange / choice /
@@ -3009,10 +3035,18 @@ fn make_random_module() -> Value {
                 index: 625,
                 gauss_next: None,
             };
-            // CPython seeds from urandom by default; any fixed default is
-            // fine for unseeded use — reproducibility only matters after
-            // an explicit seed().
-            s.init_genrand(5489);
+            // CPython seeds from urandom at import, so an *unseeded*
+            // program draws a different sequence on every run. A fixed
+            // default would make `tyc run` deterministic exactly where
+            // `tyc build && python` is not — a VM/CPython divergence in
+            // its own right, and one that flakes the T0.2 differential
+            // gate: the VM agrees with itself every time while CPython
+            // does not, so the harness's self-nondeterminism filter only
+            // catches it when CPython happens to repeat itself. Seed from
+            // entropy to match. An explicit `random.seed(n)` still
+            // reseeds deterministically, so seeded reproducibility across
+            // both surfaces is unaffected.
+            s.seed_int(&num_bigint::BigInt::from(entropy_seed()));
             s
         }
         fn init_genrand(&mut self, seed: u32) {
@@ -3167,14 +3201,11 @@ fn make_random_module() -> Value {
                             with_mt(|m| m.seed_int(&num_bigint::BigInt::from(*b as i64)))
                         }
                         // CPython's no-arg / None form seeds from OS
-                        // entropy — non-deterministic by design. A wall-
-                        // clock-derived seed preserves that property.
+                        // entropy — non-deterministic by design.
+                        // `entropy_seed` preserves that property.
                         Some(Value::None) | None => {
-                            let now = std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .map(|d| d.as_nanos() as u64)
-                                .unwrap_or(0);
-                            with_mt(|m| m.seed_int(&num_bigint::BigInt::from(now)));
+                            let seed = entropy_seed();
+                            with_mt(|m| m.seed_int(&num_bigint::BigInt::from(seed)));
                         }
                         // str / bytes / float seeds hash through SHA-512
                         // in CPython — silently mapping them to a fixed

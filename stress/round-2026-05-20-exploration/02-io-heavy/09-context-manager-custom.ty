@@ -11,7 +11,14 @@ impl Timer:
         return self
     def __exit__(self, et: object, ev: object, tb: object) -> None:
         self.elapsed = time.monotonic() - self.start
-        print(f"{self.name}: {self.elapsed:.3f}s")
+        # Report that the measurement happened, not the wall-clock number.
+        # `tyc run` and `tyc build` + CPython legitimately take different
+        # amounts of time, so printing the duration makes this unit's stdout
+        # incomparable between the two surfaces — and at `.3f` seconds the
+        # value is coarse enough that each side often repeats itself, which
+        # slips past the differential harness's self-nondeterminism filter
+        # and reports a spurious divergence.
+        print(f"{self.name}: measured={self.elapsed >= 0.0}")
 
 def main() -> None:
     with Timer(name="loop", start=0.0, elapsed=0.0) as t:

@@ -1,0 +1,49 @@
+# scripts/differential-nondeterministic.txt
+#
+# Units whose stdout is nondeterministic BY CONSTRUCTION — they print a
+# wall-clock duration, an unseeded random draw, an address-dependent repr, or
+# a task-completion order. Their output cannot be compared between `tyc run`
+# and `tyc build` + CPython, because the two surfaces legitimately differ on
+# exactly that value.
+#
+# THIS IS NOT THE BASELINE. `differential-baseline.txt` means "known VM bug,
+# burn it down". A line here means "not a bug, and not comparable" — the unit
+# is excluded from the VM-vs-CPython verdict entirely, the same way the
+# harness's own self-nondeterminism detection excludes one.
+#
+# Why declare instead of detect: the harness detects nondeterminism by running
+# each side three times and excluding a unit that disagrees with itself. That
+# is probabilistic. A unit whose output is coarse enough to repeat — a
+# duration printed at `.3f` seconds, say, or a `randint(0, 9)` draw — will
+# often be self-consistent on both sides while the two sides still differ, and
+# is then reported as a NEW divergence. That is a false failure, and it cost
+# this gate several red runs before the mechanism was understood.
+#
+# BEFORE ADDING A LINE, prefer fixing the unit. If the nondeterministic value
+# is not what the unit is testing, print something stable instead and keep the
+# real coverage:
+#
+#     print(f"{name}: {elapsed:.3f}s")     ->  print(f"{name}: measured={elapsed >= 0.0}")
+#
+# Two stress units were fixed that way rather than listed here (see
+# 02-io-heavy/09-context-manager-custom.ty and 08-meta-stress/23-context-mgr-impl.ty),
+# which moved them from "excluded" to real differential coverage. Only list a
+# unit when the nondeterministic value IS the point of the program.
+#
+# Each entry needs a comment saying what is nondeterministic and why it stays.
+#
+# The gate hard-fails on structural rot: an entry naming a path that no longer
+# exists, or an entry that also appears in the baseline (contradictory — a unit
+# cannot be both a VM bug and not comparable). It warns, without failing, when
+# a listed unit comes back fully reproducible AND agreeing on both sides, which
+# suggests the entry is stale. That one is deliberately a warning: a genuinely
+# nondeterministic unit is self-consistent by chance now and then, so failing
+# on a single observation would reintroduce exactly the flakiness this file
+# exists to remove.
+
+# Prints an elapsed wall-clock duration (`[label] 12.34 ms`) from a `Timer`
+# context manager. The duration is the entire point of the example — it is the
+# canonical demonstration of what a context manager is for — so it is listed
+# rather than neutered. The VM and CPython take legitimately different amounts
+# of time, so the printed value cannot agree.
+examples/58-context-managers/context_managers.ty

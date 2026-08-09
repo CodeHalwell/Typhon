@@ -63,11 +63,27 @@ cwd. `TYC_NO_SYNC` / `TYC_NO_INTROSPECT` keep the run network-free and stop
 | `vacuous` | both sides failed with empty stdout — almost always an uninstalled third-party import. Reported separately and loudly, because counting these as passes would overstate coverage | no |
 | `nobuild` | `tyc build` failed, so there is nothing to compare (chiefly the deliberately-invalid `stress/` repros and `must_fail/` fixtures) | no |
 | `noentry` | built but emitted no `build/main.py` | no |
-| `nondeterministic` | a side disagreed with **itself** across repeated runs (clocks, tempfile paths, task scheduling), so it cannot be used to judge the VM | no |
+| `nondeterministic` | not comparable: a side disagreed with **itself** across repeated runs (clocks, tempfile paths, task scheduling), or the unit is declared nondeterministic by construction | no |
 | `both-timeout` | both sides exceeded the per-side limit | no |
 
-Nondeterminism is detected only on the divergent path, and by re-running *both*
-sides twice more — so a clock-dependent program can never flake the gate red.
+Nondeterminism is detected only on the divergent path, by re-running *both*
+sides twice more.
+
+**That detection is probabilistic, and it is not sufficient on its own.** This
+document previously claimed a clock-dependent program "can never flake the gate
+red". That was wrong, and it cost several red runs on 2026-08-09 before the
+mechanism was understood. The probe excludes a unit that disagrees with
+*itself*; a unit whose output is coarse enough to repeat does not. A duration
+printed at `.3f` seconds, or an unseeded `randint(0, 9)`, is frequently
+identical across all three runs on each side — while the two sides still differ,
+because the VM and CPython legitimately take different times and draw different
+numbers. The probe clears it, and the harness reports a **new divergence** that
+is not a VM bug at all. Finer-grained output (`.2f` milliseconds) self-disagrees
+almost every time and is correctly excluded, which is why the failure looked
+sporadic and unrelated to the change that surfaced it.
+
+The fix is to stop relying on detection alone for those units — see
+[declaring nondeterminism](#declaring-nondeterminism-by-construction).
 
 After the parallel workers finish, the harness reconciles the number of
 classified results against the number of selected units and exits `2` on a
@@ -112,6 +128,47 @@ environment's.
 A `--scope` / `--filter` run only compares against the slice of the baseline it
 actually covered, so a partial run can flag a regression but can never report
 the uncovered remainder as "fixed".
+
+### Declaring nondeterminism by construction
+
+`scripts/differential-nondeterministic.txt` lists units whose stdout cannot be
+compared between the two surfaces at all, because it contains a wall-clock
+duration, an unseeded random draw, an address-dependent repr, or a
+task-completion order. They are classified `nondeterministic` and excluded from
+the verdict, without depending on the probabilistic probe above to notice.
+
+**This is not the baseline, and the distinction matters.** A baseline line means
+"known VM bug, burn it down"; the file nags you to delete entries. A declaration
+means "not a bug, and not comparable". Recording a timing program as a VM
+divergence would be recording a false claim, and would permanently retire the
+unit's coverage behind a label asserting something untrue about the VM.
+
+**Prefer fixing the unit to listing it.** If the nondeterministic value is not
+what the unit is testing, print something stable and keep the real coverage:
+
+```ty
+print(f"{name}: {elapsed:.3f}s")            # not comparable
+print(f"{name}: measured={elapsed >= 0.0}") # comparable, still proves __exit__ ran
+```
+
+Two stress units were fixed that way rather than listed, which moved them from
+*excluded* to real differential coverage. Only declare when the nondeterministic
+value **is** the point of the program — as in
+`examples/58-context-managers`, where printing an elapsed time is the
+demonstration, and neutering it to satisfy a harness would be the tail wagging
+the dog.
+
+The gate keeps the list honest from both ends, but asymmetrically:
+
+* **Hard fail** — an entry naming a path that no longer exists, or an entry that
+  also appears in the baseline (a unit cannot be both a VM bug and not
+  comparable). Both checks read the filesystem and the baseline rather than this
+  run's results, so they are deterministic and can never flake.
+* **Warn only** — a listed unit that comes back fully reproducible *and*
+  agreeing on both sides. That is evidence the entry is stale, but not proof: a
+  genuinely nondeterministic unit agrees by chance now and then, so failing on a
+  single observation would reintroduce exactly the flakiness this file exists to
+  remove.
 
 ### Running it
 

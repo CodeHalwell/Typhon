@@ -12,7 +12,10 @@ impl Stopwatch:
 
     def __exit__(self, et: object, ev: object, tb: object) -> None:
         let elapsed: float = time.monotonic() - self.start
-        print(f"{self.label}: {elapsed*1000:.1f}ms")
+        # Same reason as 02-io-heavy/09-context-manager-custom.ty: print the
+        # fact of the measurement, not a wall-clock number the two execution
+        # surfaces cannot be expected to agree on.
+        print(f"{self.label}: measured={elapsed >= 0.0}")
 
 def main() -> None:
     with Stopwatch(label="loop", start=0.0) as sw:

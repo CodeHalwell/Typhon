@@ -3706,7 +3706,10 @@ pub const SECRET_NAME_KEYWORDS: &[&str] = &[
     // precede `PASS` for the same reason — and it needs its own entry at all
     // because the word-boundary rule that (correctly) stops `PASSPORT` from
     // matching `PASS` also stopped `PASSPHRASE`, so the single most obvious
-    // secret-shaped name after `PASSWORD` went unflagged.
+    // secret-shaped name after `PASSWORD` went unflagged. `PRIVKEY` is here
+    // for exactly that reason too: the `V`→`K` junction is not a word
+    // boundary, so `PRIVKEY` / `SSH_PRIVKEY` / `PRIVKEY_PEM` never matched
+    // the bare `KEY`. It precedes `KEY` so the specific word is reported.
     "PASSPHRASE",
     "API_PASSWORD",
     "APIPASSWORD",
@@ -3719,6 +3722,7 @@ pub const SECRET_NAME_KEYWORDS: &[&str] = &[
     "TOKEN",
     "API_KEY",
     "APIKEY",
+    "PRIVKEY",
     "KEY",
     "PWD",
     "PASS",
@@ -5166,6 +5170,9 @@ def use_np() -> object:
             "my123TOKEN = \"abc\"\n",
             "TOKENString = \"abc\"\n",
             "dbPASSWORDString = \"abc\"\n",
+            "PRIVKEY = \"abc\"\n",
+            "SSH_PRIVKEY = \"abc\"\n",
+            "PRIVKEY_PEM = \"abc\"\n",
         ];
         for src in srcs {
             let module = parse(src);

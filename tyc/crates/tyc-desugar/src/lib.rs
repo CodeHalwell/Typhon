@@ -1735,12 +1735,11 @@ fn desugar_mod_module_with(m: &ModModule, options: &DesugarOptions) -> ModModule
         node_index: ruff_python_ast::AtomicNodeIndex::NONE,
         body,
     };
-    let multi_base_parents = collect_multi_base_parents(&m.body);
+    let mut multi_base_parents = collect_multi_base_parents(&m.body);
     // Classes whose impl-stub body contains a `cached_property` method (or
     // the aliased `_typhon_cached_property` form emitted by `lazy let` in
     // an impl block) need `__dict__` to back the property cache; treat them
     // as multi-base parents so the dataclass decorator drops `slots=True`.
-    let mut multi_base_parents = multi_base_parents;
     collect_cached_property_targets_into(&m.body, &mut multi_base_parents);
     // Module-level classes and the transitive exception subset among them.
     let mut module_level_classes: Vec<(String, Vec<String>)> = Vec::new();
@@ -2027,7 +2026,7 @@ struct ClassMarkers<'a> {
     /// definition to raise `TypeError: multiple bases have instance
     /// lay-out conflict`, so those classes are emitted without
     /// `slots=True`. FINDINGS #102.
-    multi_base_parents: &'a std::collections::HashSet<String>,
+    multi_base_parents: &'a std::collections::HashSet<&'a str>,
     /// User-supplied list of base names whose subclasses should skip the
     /// auto `@dataclass` decoration. Matched by last identifier segment
     /// against each base in the class header.
@@ -2563,9 +2562,9 @@ fn class_inherits_protocol(c: &ruff_python_ast::StmtClassDef) -> bool {
 /// method decorated with `cached_property` (or its aliased import name) or a
 /// plain class with such a method, and record the underlying class names.
 /// `cached_property` requires `__dict__`, which conflicts with `slots=True`.
-fn collect_cached_property_targets_into(
-    body: &[Stmt],
-    parents: &mut std::collections::HashSet<String>,
+fn collect_cached_property_targets_into<'a>(
+    body: &'a [Stmt],
+    parents: &mut std::collections::HashSet<&'a str>,
 ) {
     for stmt in body {
         if let Stmt::ClassDef(c) = stmt {
@@ -2573,8 +2572,7 @@ fn collect_cached_property_targets_into(
                 .name
                 .as_str()
                 .strip_prefix("__typhon_impl_")
-                .unwrap_or(c.name.as_str())
-                .to_owned();
+                .unwrap_or(c.name.as_str());
             if class_body_has_cached_property(&c.body) {
                 parents.insert(target);
             }
@@ -2605,13 +2603,16 @@ fn class_body_has_cached_property(body: &[Stmt]) -> bool {
     false
 }
 
-fn collect_multi_base_parents(body: &[Stmt]) -> std::collections::HashSet<String> {
-    let mut parents: std::collections::HashSet<String> = std::collections::HashSet::new();
+fn collect_multi_base_parents<'a>(body: &'a [Stmt]) -> std::collections::HashSet<&'a str> {
+    let mut parents: std::collections::HashSet<&'a str> = std::collections::HashSet::new();
     collect_multi_base_parents_into(body, &mut parents);
     parents
 }
 
-fn collect_multi_base_parents_into(body: &[Stmt], parents: &mut std::collections::HashSet<String>) {
+fn collect_multi_base_parents_into<'a>(
+    body: &'a [Stmt],
+    parents: &mut std::collections::HashSet<&'a str>,
+) {
     for stmt in body {
         match stmt {
             Stmt::ClassDef(c) => {
@@ -2623,7 +2624,7 @@ fn collect_multi_base_parents_into(body: &[Stmt], parents: &mut std::collections
                 if concrete_bases.len() > 1 {
                     for b in &concrete_bases {
                         if let Expr::Name(n) = b {
-                            parents.insert(n.id.as_str().to_owned());
+                            parents.insert(n.id.as_str());
                         }
                     }
                 }

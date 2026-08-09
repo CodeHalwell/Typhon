@@ -10,6 +10,22 @@ Realistic milestones for one person plus AI assistance. The headline target is a
 
 ## Current release
 
+**[v1.0.0-alpha.8](https://github.com/CodeHalwell/Typhon/releases/tag/v1.0.0-alpha.8) — 2026-08-08.**
+A maintenance release on top of alpha.7. One VM ↔ CPython parity fix: the VM's
+MT19937 was seeded from a fixed constant when a program never called
+`random.seed()`, so an unseeded program was deterministic under `tyc run` and
+non-deterministic under `tyc build && python` — the default now seeds from
+entropy as CPython does, while explicit `random.seed(n)` keeps producing
+byte-identical sequences on both surfaces. (The same bug intermittently flaked
+the T0.2 differential gate, because a VM that always agrees with itself slips
+past the harness's self-nondeterminism filter.) Alongside it: the warn-level
+`tyc::contains_secret_literal` name lint now treats digits and UPPERCASE→TitleCase
+junctions as word boundaries (`myPASSWORD123`, `dbPASSWORDString`), two
+allocation reductions on AST walks in `parallel_lints` and the desugarer, the
+early-August dependency wave (five crates, two GitHub Actions majors), and
+docs-site card/link-card transition polish. No new syntax and no new error-level
+diagnostic.
+
 **[v1.0.0-alpha.7](https://github.com/CodeHalwell/Typhon/releases/tag/v1.0.0-alpha.7) — 2026-07-29.**
 The full-codebase-review remediation release. It closes all ten of the
 [2026-07-28 codebase review](codebase-review-2026-07-28.md)'s 1.0 blockers

@@ -4,6 +4,143 @@ All notable changes to Typhon are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely; the
 canonical phase-by-phase status lives in `docs/roadmap.md`.
 
+## 1.0.0-alpha.8 — 2026-08-08 — maintenance
+
+A maintenance release on top of alpha.7: one VM ↔ CPython parity fix, a
+widening of the warn-level secret-name lint, two allocation reductions in the
+compiler, the early-August dependency wave, and a docs-site polish pass. **No
+language change** — no new syntax, and no new error-level diagnostic.
+
+### Fixed
+
+- **VM: unseeded `random` is now non-deterministic, matching CPython.** The
+  VM's CPython-compatible MT19937 was seeded with a fixed constant (`5489`) when
+  a program never called `random.seed()`, so `tyc run` drew the *same* sequence
+  on every run while `tyc build && python` drew a different one each time —
+  CPython seeds from OS entropy at import. That is a VM ↔ CPython divergence in
+  its own right (an unseeded program is deterministic under one execution
+  surface and not the other), and it also intermittently flaked the T0.2
+  differential gate: because the VM always agreed with *itself*, the harness's
+  self-nondeterminism filter only excluded the unit when CPython happened to
+  repeat itself across all three of its runs, and otherwise reported a spurious
+  new divergence (observed on
+  `examples/24-async-gather-and-go/async_gather_and_go.ty`, whose output
+  includes a `random.randint(0, 9)` draw). The default now seeds from entropy,
+  reusing the same source as the existing `random.seed()` / `random.seed(None)`
+  path — the stdlib's hash-randomisation keys (OS-derived once per process, and
+  distinct per instantiation, which matters because the RNG is a `thread_local`)
+  XORed with wall-clock nanos, so a platform with a coarse clock cannot on its
+  own make two runs collide. **Explicit integer seeding is unaffected** —
+  `random.seed(42)` still
+  produces a byte-identical sequence under the VM and under CPython, which the
+  MT19937 implementation already guaranteed and this change preserves.
+
+### Changed
+
+- **`tyc::contains_secret_literal` recognises two more name boundaries.**
+  `is_secret_name` (`tyc-analyse`) and `secret_suffix` (the `tyc` build crate)
+  treated only string edges, underscores, and a lowercase→UPPERCASE junction as
+  word boundaries, so a secret-shaped keyword flanked by digits (`myPASSWORD123`,
+  `foo123TOKEN`) or followed by a TitleCase word (`dbPASSWORDString`) went
+  unflagged. Digits now count as boundaries on both sides, and an UPPERCASE
+  keyword followed by `Xx`-shaped TitleCase is recognised as ending a word.
+  `MONKEY` still does not match `KEY`, and `PASSPORT` still does not match
+  `PASS`. This lint is **warn-level**, so — as with the six keywords added in
+  alpha.6 — a newly-flagged name warns, it does not fail the build.
+- **`PRIVKEY` joins the secret-name keyword table.** `PRIVKEY`, `SSH_PRIVKEY`
+  and `PRIVKEY_PEM` went unflagged because the `V`→`K` junction is not a word
+  boundary, so the bare `KEY` never matched. It is ordered ahead of `KEY` so
+  the specific word is the one reported. Also warn-level.
+
+### Performance
+
+- **Fewer allocations on two AST walks.** The `parallel_lints` shared-`mut`
+  analysis (`module_level_mut_names`, `collect_globals`, `body_writes`, the
+  `GoSpawn` callee, and the per-callee verdict cache) and the desugarer's
+  `collect_multi_base_parents` / `collect_cached_property_targets_into` built
+  `HashSet<String>` / `String` copies of identifiers that are only ever used for
+  `contains` checks. Both now borrow `&'a str` directly from the AST. No
+  behaviour change.
+
+### Dependencies
+
+- Cargo: `clap` 4.6.1 → 4.6.6, `thiserror` 2.0.18 → 2.0.20, `insta` 1.47.2 →
+  1.48.0, `schemars` 1.2.1 → 1.2.2, `toml` 1.1.3+spec-1.1.0 → 1.1.4+spec-1.1.0.
+  (The `clap` and `thiserror` pull requests were rebased onto the rest of the
+  wave to regenerate `Cargo.lock`, which picked up a newer patch than each
+  title names; the versions above are the ones actually locked.)
+- GitHub Actions: `actions/cache` 4.3.0 → 6.1.0 and `actions/setup-python` 5.6.0
+  → 7.0.0, both re-pinned by commit SHA.
+
+### Testing / CI
+
+- **The T0.2 differential gate can no longer be flaked by nondeterministic
+  program output.** Its self-nondeterminism probe re-runs each side twice more
+  and excludes a unit that disagrees with itself — but that is probabilistic,
+  and a unit whose output is coarse enough to *repeat* slips through: a duration
+  printed at `.3f` seconds, or an unseeded `randint(0, 9)`, is often identical
+  across all three runs on each side while the two sides still differ, at which
+  point the harness reports a new divergence that is not a VM bug. (Finer-
+  grained output self-disagrees almost every time and is correctly excluded,
+  which is why the failure looked sporadic.) Units whose output is
+  nondeterministic *by construction* are now declared in
+  `scripts/differential-nondeterministic.txt` and excluded outright. That file
+  is deliberately **not** the baseline — a baseline line asserts "known VM bug",
+  so recording a timing program there would record a false claim and retire the
+  unit's coverage behind it. The gate hard-fails on structural rot (an entry
+  whose path is gone, or an entry also present in the baseline — both checks are
+  deterministic) and warns, without failing, when a listed unit looks
+  reproducible, since a single agreeing run is not proof and failing on it would
+  reintroduce the very flakiness the file removes.
+- **Two stress units fixed rather than declared.** The `Timer` cases in
+  `02-io-heavy/09-context-manager-custom.ty` and
+  `08-meta-stress/23-context-mgr-impl.ty` printed a wall-clock duration that was
+  never what they were testing; they now print `measured=<bool>`, which moves
+  them from *excluded* to real differential coverage (`ok` 767 → 769). The rule:
+  make the output deterministic when the nondeterministic value is incidental,
+  declare it when the value is the point — as in `examples/58-context-managers`,
+  which is left exactly as it is.
+- **Scratch workdirs are removed per unit.** The harness kept one directory per
+  unit (~190 KB, a few hundred MB over the corpus) until process exit, which
+  made `--keep` — whose purpose is to hand you one workdir to inspect — bury it
+  under a thousand others.
+- **Resource snapshot around the differential step.** `df -h` / `free -m` before
+  and after (the latter on `always()`), so the next occurrence of the
+  runner-shutdown kills seen on 2026-08-09 is diagnosable from the log. Disk
+  exhaustion was the obvious suspect and was measured and ruled out.
+
+### Documentation
+
+- **Corrected: `docs/differential-testing.md` claimed the gate could not be
+  flaked by a clock-dependent program.** It said nondeterminism detection meant
+  such a program "can never flake the gate red". That is false, and it is why
+  the failure above was initially misread as a real regression. The section now
+  explains why the probe is probabilistic, when it fails, and how declaring
+  works.
+- **Corrected: the VM's `random` is not an xorshift PRNG.** `docs/vm.md` and the
+  bundled skill's `RUNTIME.md` had described the shim as "xorshift PRNG, not
+  cryptographic" since before it was reimplemented as a CPython-compatible
+  MT19937. That understated it in the way that matters: because the shim follows
+  `random.py` / `_randommodule.c`, `random.seed(n)` produces a **byte-identical**
+  sequence under `tyc run` and under `tyc build` + CPython. Both tables now say
+  so, list the full exported surface (`getrandbits`, `randrange`, `uniform`,
+  `gauss`, `choice`, `shuffle`, `sample` alongside `random` / `randint` / `seed`),
+  and record the alpha.8 unseeded-default change. Still not cryptographic on
+  either surface — that is `secrets`.
+- **`tyc::contains_secret_literal` docs list the real keyword table.** The
+  diagnostic page and the skill's `DIAGNOSTICS.md` entry both listed a
+  seven-entry "secret-suffix heuristic" that predated alpha.6's `API_*` additions
+  and `PASSPHRASE`. Both now name the full shared
+  `tyc_analyse::SECRET_NAME_KEYWORDS` table, explain the longest-first ordering,
+  and document the word-boundary rule — including the digit and
+  UPPERCASE→TitleCase boundaries added in this release, and why `MONKEY` still
+  does not match `KEY`.
+- docs-site: `.card` and `.sl-link-card` gained the base `transition`
+  declarations their custom `:hover` / `:focus-within` states were already
+  animating against, so those states ease instead of snapping; the link-card
+  icon transition is registered in the `prefers-reduced-motion: reduce` opt-out
+  alongside the components it belongs to.
+
 ## 1.0.0-alpha.7 — 2026-07-29 — codebase-review remediation
 
 Fixes driven by the [2026-07-28 full-codebase review](docs/codebase-review-2026-07-28.md).

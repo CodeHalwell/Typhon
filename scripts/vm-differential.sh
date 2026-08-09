@@ -16,6 +16,14 @@
 #   * a unit is in the baseline and no longer diverges     (stale baseline).
 # Both directions fail, so the baseline cannot rot; --update rewrites it.
 #
+# Units whose stdout is nondeterministic BY CONSTRUCTION (a printed duration,
+# an unseeded random draw) are declared in
+# scripts/differential-nondeterministic.txt and excluded from the verdict.
+# That is NOT the baseline: the baseline means "known VM bug", a declaration
+# means "not comparable". Declaring is necessary because the self-consistency
+# probe below is probabilistic — a coarse enough value repeats on both sides
+# and is then reported as a new divergence. See that file's header.
+#
 # Everything is network-free (TYC_NO_SYNC / TYC_NO_INTROSPECT) and needs only
 # bash, coreutils, a release `tyc`, and python3.13.
 #
@@ -48,6 +56,7 @@ cd "$REPO_ROOT"
 TYC="${TYC:-$REPO_ROOT/tyc/target/release/tyc}"
 PYTHON313="${PYTHON313:-python3.13}"
 BASELINE="$REPO_ROOT/scripts/differential-baseline.txt"
+NONDET="$REPO_ROOT/scripts/differential-nondeterministic.txt"
 SCOPE="all"
 FILTER=""
 JOBS="$(nproc 2>/dev/null || echo 4)"
@@ -66,7 +75,7 @@ while [ $# -gt 0 ]; do
         --report)   REPORT="$2"; shift 2 ;;
         --update)   UPDATE=1; shift ;;
         --keep)     KEEP=1; shift ;;
-        -h|--help)  sed -n '2,42p' "${BASH_SOURCE[0]}"; exit 0 ;;
+        -h|--help)  sed -n '2,49p' "${BASH_SOURCE[0]}"; exit 0 ;;
         *) echo "unknown option: $1" >&2; exit 2 ;;
     esac
 done
@@ -142,24 +151,61 @@ if [ "$TOTAL" -eq 0 ]; then
     exit 2
 fi
 
+# Units declared nondeterministic by construction (clock / RNG / scheduling in
+# their stdout). They are excluded from the VM-vs-CPython verdict instead of
+# being left to the probabilistic self-nondeterminism probe, which reports them
+# as NEW divergences whenever both sides happen to be self-consistent.
+DECLARED="$SCRATCH/declared.txt"
+: > "$DECLARED"
+if [ -f "$NONDET" ]; then
+    grep -vE '^\s*(#|$)' "$NONDET" | sed 's/[[:space:]]*$//' | sort -u > "$DECLARED"
+fi
+N_DECLARED_TOTAL="$(wc -l < "$DECLARED" | tr -d ' ')"
+
 echo "VM <-> CPython differential harness"
 echo "  tyc      : $TYC"
 echo "  python   : $PYTHON313 ($("$PYTHON313" --version 2>&1))"
 echo "  scope    : $SCOPE${FILTER:+  filter=/$FILTER/}"
 echo "  units    : $TOTAL   (jobs=$JOBS, per-side timeout=${TIMEOUT}s)"
 echo "  baseline : ${BASELINE#$REPO_ROOT/}"
+echo "  declared : ${NONDET#$REPO_ROOT/}  ($N_DECLARED_TOTAL nondeterministic-by-construction)"
 echo
 
 # ----------------------------------------------------------------- the work --
 # One worker per unit. Writes exactly one TSV line to $SCRATCH/results/<n>.
 mkdir -p "$SCRATCH/results"
-export REPO_ROOT TYC PYTHON313 TIMEOUT SCRATCH
+export REPO_ROOT TYC PYTHON313 TIMEOUT SCRATCH DECLARED KEEP
 
+# Wrapper: runs the unit, then drops its scratch workdir unless --keep. Without
+# this the run accumulates one directory per unit (~190 KB each, so a few
+# hundred MB over the full corpus) and `--keep`, whose whole purpose is to hand
+# you ONE workdir to inspect, buries it under a thousand others.
+#
+# The inner result is captured and re-emitted rather than printed directly so
+# the workdir can be removed after the verdict is known. An empty capture is
+# NOT printed: a worker that dies without a verdict must stay invisible here so
+# the reconciliation below still catches it as a lost unit.
 run_unit() {
     unit="$1"
     slug="$(printf '%s' "$unit" | tr '/.' '__')"
     work="$SCRATCH/w/$slug"
+    out="$(run_unit_inner "$unit" "$work")"
+    [ -n "$out" ] && printf '%s\n' "$out"
+    [ "${KEEP:-0}" = "1" ] || rm -rf "$work"
+    return 0
+}
+
+run_unit_inner() {
+    unit="$1"
+    work="$2"
     rm -rf "$work"; mkdir -p "$work"
+
+    # Declared nondeterministic by construction? Then the VM-vs-CPython
+    # comparison is meaningless for this unit and must not produce a verdict.
+    declared=0
+    if [ -s "$DECLARED" ] && grep -qxF -- "$unit" "$DECLARED"; then
+        declared=1
+    fi
 
     if [ "${unit%/}" != "$unit" ]; then
         # project unit — copy so the working tree is never mutated
@@ -233,6 +279,12 @@ TOML
         # separately so the summary cannot overstate real coverage.
         if [ ! -s "$work/cpy.out" ] && [ "$ccode" -ne 0 ]; then
             printf '%s\t%s\t%s\n' "vacuous" "$unit" "both failed, empty stdout (exit=$ccode)"
+        elif [ "$declared" = "1" ]; then
+            # Listed as nondeterministic, yet both sides agreed this run. Weak
+            # evidence the entry is stale — surfaced as a warning below, never a
+            # failure, because a genuinely nondeterministic unit does agree by
+            # chance now and then.
+            printf '%s\t%s\t%s\n' "nondeterministic" "$unit" "declared; but agreed this run — candidate for removal"
         else
             printf '%s\t%s\t%s\n' "ok" "$unit" "exit=$ccode"
         fi
@@ -270,9 +322,17 @@ TOML
         first=$(diff "$work/cpy.out" "$work/vm.out" 2>/dev/null | sed -n '2p' | cut -c1-90 | tr -d '\t')
         reason="${reason:+$reason; }stdout differs (cpython ${cl}L vs vm ${vl}L)${first:+ | ${first}}"
     fi
+    # This is the exact shape the declaration exists for: each side was
+    # self-consistent across all three runs, so the probe cleared them, yet the
+    # two disagree — because the value is nondeterministic and merely happened
+    # to repeat. Without the declaration this is reported as a NEW divergence.
+    if [ "$declared" = "1" ]; then
+        printf '%s\t%s\t%s\n' "nondeterministic" "$unit" "declared; $reason"
+        return
+    fi
     printf '%s\t%s\t%s\n' "diverge" "$unit" "$reason"
 }
-export -f run_unit
+export -f run_unit run_unit_inner
 
 RESULTS="$SCRATCH/results.tsv"
 # shellcheck disable=SC2016
@@ -315,7 +375,7 @@ printf '  %-18s %5d   %s\n' "diverge"          "$N_DIV"     "VM disagrees with C
 printf '  %-18s %5d   %s\n' "vacuous"          "$N_VAC"     "agree only because both failed with empty stdout"
 printf '  %-18s %5d   %s\n' "nobuild"          "$N_NOBUILD" "tyc build failed — not comparable"
 printf '  %-18s %5d   %s\n' "noentry"          "$N_NOENTRY" "built but emitted no build/main.py"
-printf '  %-18s %5d   %s\n' "nondeterministic" "$N_ND"      "CPython disagrees with itself — excluded"
+printf '  %-18s %5d   %s\n' "nondeterministic" "$N_ND"      "not comparable (self-inconsistent, or declared) — excluded"
 printf '  %-18s %5d   %s\n' "both-timeout"     "$N_TMO"     "both sides hit the ${TIMEOUT}s limit"
 echo
 
@@ -376,6 +436,37 @@ fi
 EXPECTED="$SCRATCH/expected.txt"
 grep -vE '^\s*(#|$)' "$BASELINE" | sed 's/[[:space:]]*$//' | sort -u > "$EXPECTED"
 
+# ---- structural integrity of the nondeterministic declarations --------------
+# Both checks are scope-independent and deterministic, so they can hard-fail
+# without ever flaking: they read the filesystem and the baseline, not this
+# run's results.
+DECL_STATUS=0
+if [ -s "$DECLARED" ]; then
+    MISSING="$SCRATCH/declared_missing.txt"
+    : > "$MISSING"
+    while IFS= read -r d; do
+        [ -e "$REPO_ROOT/${d%/}" ] || printf '%s\n' "$d" >> "$MISSING"
+    done < "$DECLARED"
+    if [ -s "$MISSING" ]; then
+        DECL_STATUS=1
+        echo "FAIL: $(wc -l < "$MISSING" | tr -d ' ') nondeterministic declaration(s) name a path that no longer exists —"
+        echo "      remove or re-point them in ${NONDET#$REPO_ROOT/}:"
+        sed 's/^/  ! /' "$MISSING"
+        echo
+    fi
+
+    BOTH="$SCRATCH/declared_and_baselined.txt"
+    comm -12 "$DECLARED" "$EXPECTED" > "$BOTH"
+    if [ -s "$BOTH" ]; then
+        DECL_STATUS=1
+        echo "FAIL: $(wc -l < "$BOTH" | tr -d ' ') unit(s) appear in BOTH the baseline and the"
+        echo "      nondeterministic declarations. A unit cannot be both a known VM bug and"
+        echo "      not comparable — decide which it is and remove the other entry:"
+        sed 's/^/  ! /' "$BOTH"
+        echo
+    fi
+fi
+
 # Only compare against the slice of the baseline this run actually covered,
 # so `--scope examples` / `--filter` never report the uncovered remainder as
 # "fixed". A partial run can regress the gate but can never shrink it.
@@ -404,7 +495,21 @@ N_NEW=$(wc -l < "$NEW" | tr -d ' ')
 N_FIXED=$(wc -l < "$FIXED" | tr -d ' ')
 N_UNVER=$(wc -l < "$UNVERIFIABLE" | tr -d ' ')
 
-status=0
+status="$DECL_STATUS"
+
+# Advisory, never fatal — see the header of the declarations file for why a
+# single agreeing run is not proof that an entry is stale.
+STALE_DECL="$SCRATCH/declared_agreed.txt"
+grep -P '^nondeterministic\t' "$RESULTS" \
+    | grep -F 'declared; but agreed this run' | cut -f2 | sort > "$STALE_DECL" || true
+if [ -s "$STALE_DECL" ]; then
+    echo "note: $(wc -l < "$STALE_DECL" | tr -d ' ') declared-nondeterministic unit(s) were fully reproducible AND"
+    echo "      agreed on both sides this run. If that holds consistently the entry is"
+    echo "      stale — drop it from ${NONDET#$REPO_ROOT/} to win back real coverage:"
+    sed 's/^/  ? /' "$STALE_DECL"
+    echo
+fi
+
 if [ "$N_NEW" -gt 0 ]; then
     status=1
     echo "FAIL: $N_NEW NEW divergence(s) not in the baseline:"
