@@ -5299,6 +5299,11 @@ let pet: Animal = Dog(name=\"Rex\")
         assert_eq!(secret_suffix("my123TOKEN"), Some("TOKEN"));
         assert_eq!(secret_suffix("TOKENString"), Some("TOKEN"));
         assert_eq!(secret_suffix("dbPASSWORDString"), Some("PASSWORD"));
+        assert_eq!(secret_suffix("PASSPHRASE"), Some("PASSPHRASE"));
+        assert_eq!(secret_suffix("CREDENTIALS"), Some("CREDENTIALS"));
+        assert_eq!(secret_suffix("DB_DSN"), Some("DSN"));
+        assert_eq!(secret_suffix("SESSION_COOKIE"), Some("COOKIE"));
+        assert_eq!(secret_suffix("SLACK_WEBHOOK_URL"), Some("WEBHOOK"));
     }
 
     #[test]

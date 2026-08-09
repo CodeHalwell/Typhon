@@ -3707,7 +3707,10 @@ pub const SECRET_NAME_KEYWORDS: &[&str] = &[
     // because the word-boundary rule that (correctly) stops `PASSPORT` from
     // matching `PASS` also stopped `PASSPHRASE`, so the single most obvious
     // secret-shaped name after `PASSWORD` went unflagged.
+    "AUTHORIZATION",
+    "CREDENTIALS",
     "PASSPHRASE",
+    "CREDENTIAL",
     "API_PASSWORD",
     "APIPASSWORD",
     "API_SECRET",
@@ -3715,18 +3718,23 @@ pub const SECRET_NAME_KEYWORDS: &[&str] = &[
     "API_TOKEN",
     "APITOKEN",
     "PASSWORD",
+    "PRIVKEY",
+    "SIGNING",
+    "WEBHOOK",
+    "COOKIE",
     "SECRET",
     "TOKEN",
     "API_KEY",
     "APIKEY",
     "KEY",
+    "DSN",
     "PWD",
     "PASS",
 ];
 
-/// True when `name` ends with one of the recognised secret-shaped
-/// suffixes. Match is case-insensitive on the suffix; the suffix may
-/// either form the whole name (e.g. `TOKEN`) or follow an underscore
+/// True when `name` contains a bounded substring matching one of the
+/// recognised secret-shaped keywords. Match is case-insensitive on the
+/// keyword; the keyword may either form the whole name (e.g. `TOKEN`) or follow an underscore
 /// (e.g. `MY_TOKEN`). The expected callers feed module-level binding
 /// names; passing a function or method name through is harmless because
 /// the caller already gated on `Stmt::Assign` / `Stmt::AnnAssign`.
@@ -5166,6 +5174,8 @@ def use_np() -> object:
             "my123TOKEN = \"abc\"\n",
             "TOKENString = \"abc\"\n",
             "dbPASSWORDString = \"abc\"\n",
+            "PASSPHRASE = \"secret\"\n",
+            "DATABASE_DSN = \"secret\"\n",
         ];
         for src in srcs {
             let module = parse(src);
