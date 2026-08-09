@@ -2994,11 +2994,29 @@ fn make_random_module() -> Value {
     use std::cell::RefCell;
     /// A non-deterministic seed, standing in for the OS entropy CPython
     /// seeds from. Shared by the unseeded default and `seed()` / `seed(None)`.
+    ///
+    /// Two independent sources are mixed. `RandomState` is the stdlib's
+    /// hash-randomisation source: its keys come from OS randomness once per
+    /// process, and each instantiation yields a different pair, so it varies
+    /// across processes *and* across threads within one process — which
+    /// matters because the RNG below is a `thread_local`. Wall-clock nanos
+    /// are XORed in as a second source, so a platform whose clock is coarse
+    /// (Windows ticks at ~15ms, which alone would collide across fast
+    /// successive runs) cannot by itself make two seeds equal. XOR keeps the
+    /// result at least as unpredictable as the stronger of the two.
+    ///
+    /// This is emphatically not a CSPRNG seed — `random` is not cryptographic
+    /// on either surface, matching CPython, where `secrets` is the answer.
     fn entropy_seed() -> u64 {
-        std::time::SystemTime::now()
+        use std::hash::{BuildHasher, Hasher};
+        let os_derived = std::collections::hash_map::RandomState::new()
+            .build_hasher()
+            .finish();
+        let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos() as u64)
-            .unwrap_or(0)
+            .unwrap_or(0);
+        os_derived ^ nanos
     }
     // CPython-compatible MT19937 so seeded programs produce IDENTICAL
     // sequences under `tyc run` and `tyc build && python` — random(),
@@ -3183,11 +3201,11 @@ fn make_random_module() -> Value {
                             with_mt(|m| m.seed_int(&num_bigint::BigInt::from(*b as i64)))
                         }
                         // CPython's no-arg / None form seeds from OS
-                        // entropy — non-deterministic by design. A wall-
-                        // clock-derived seed preserves that property.
+                        // entropy — non-deterministic by design.
+                        // `entropy_seed` preserves that property.
                         Some(Value::None) | None => {
-                            let now = entropy_seed();
-                            with_mt(|m| m.seed_int(&num_bigint::BigInt::from(now)));
+                            let seed = entropy_seed();
+                            with_mt(|m| m.seed_int(&num_bigint::BigInt::from(seed)));
                         }
                         // str / bytes / float seeds hash through SHA-512
                         // in CPython — silently mapping them to a fixed

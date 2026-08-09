@@ -672,11 +672,17 @@ comptime let NOW: float = time.time()        # error: time forbidden
 
 ### `tyc::contains_secret_literal` — warning
 
-A `comptime let` binding's name matches a secret-suffix heuristic: `*KEY`, `*TOKEN`, `*PASSWORD`, `*SECRET`, `*PASS`, `*PWD`. The build artifact would contain the resolved env-var value as a string literal.
+A `comptime let` binding's name contains a secret-shaped keyword. The build artifact would contain the resolved env-var value as a string literal.
 
 ```ty
 comptime let API_KEY: str = env("MY_API_KEY")   # warning
 ```
+
+The table is `tyc_analyse::SECRET_NAME_KEYWORDS`, shared with the `tyc build` scan so the two cannot drift: `PASSPHRASE`, `API_PASSWORD`, `APIPASSWORD`, `API_SECRET`, `APISECRET`, `API_TOKEN`, `APITOKEN`, `PASSWORD`, `SECRET`, `TOKEN`, `API_KEY`, `APIKEY`, `PRIVKEY`, `KEY`, `PWD`, `PASS`. Longest-first, so `KEY_APIKEY` reports `APIKEY` and `SSH_PRIVKEY` reports `PRIVKEY`.
+
+A keyword matches only on a **word boundary** — name start/end, `_`, a digit, or a case junction — so `MONKEY` does not match `KEY` and `PASSPORT` does not match `PASS`. Flagged: `API_KEY`, `myTokenValue`, and (v1.0.0-alpha.8) `myPASSWORD123`, `foo123TOKEN`, `dbPASSWORDString`. That same rule is why `PASSPHRASE` (alpha.6) and `PRIVKEY` (alpha.8) need their own table entries.
+
+Warn-level — never fails the build. Silence with `[strictness] allow-secret-comptime`.
 
 **Fix:** Read at runtime via `os.environ[...]`.
 

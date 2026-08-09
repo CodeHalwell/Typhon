@@ -27,7 +27,11 @@ language change** — no new syntax, and no new error-level diagnostic.
   `examples/24-async-gather-and-go/async_gather_and_go.ty`, whose output
   includes a `random.randint(0, 9)` draw). The default now seeds from entropy,
   reusing the same source as the existing `random.seed()` / `random.seed(None)`
-  path. **Explicit integer seeding is unaffected** — `random.seed(42)` still
+  path — the stdlib's hash-randomisation keys (OS-derived once per process, and
+  distinct per instantiation, which matters because the RNG is a `thread_local`)
+  XORed with wall-clock nanos, so a platform with a coarse clock cannot on its
+  own make two runs collide. **Explicit integer seeding is unaffected** —
+  `random.seed(42)` still
   produces a byte-identical sequence under the VM and under CPython, which the
   MT19937 implementation already guaranteed and this change preserves.
 
@@ -70,6 +74,24 @@ language change** — no new syntax, and no new error-level diagnostic.
 
 ### Documentation
 
+- **Corrected: the VM's `random` is not an xorshift PRNG.** `docs/vm.md` and the
+  bundled skill's `RUNTIME.md` had described the shim as "xorshift PRNG, not
+  cryptographic" since before it was reimplemented as a CPython-compatible
+  MT19937. That understated it in the way that matters: because the shim follows
+  `random.py` / `_randommodule.c`, `random.seed(n)` produces a **byte-identical**
+  sequence under `tyc run` and under `tyc build` + CPython. Both tables now say
+  so, list the full exported surface (`getrandbits`, `randrange`, `uniform`,
+  `gauss`, `choice`, `shuffle`, `sample` alongside `random` / `randint` / `seed`),
+  and record the alpha.8 unseeded-default change. Still not cryptographic on
+  either surface — that is `secrets`.
+- **`tyc::contains_secret_literal` docs list the real keyword table.** The
+  diagnostic page and the skill's `DIAGNOSTICS.md` entry both listed a
+  seven-entry "secret-suffix heuristic" that predated alpha.6's `API_*` additions
+  and `PASSPHRASE`. Both now name the full shared
+  `tyc_analyse::SECRET_NAME_KEYWORDS` table, explain the longest-first ordering,
+  and document the word-boundary rule — including the digit and
+  UPPERCASE→TitleCase boundaries added in this release, and why `MONKEY` still
+  does not match `KEY`.
 - docs-site: `.card` and `.sl-link-card` gained the base `transition`
   declarations their custom `:hover` / `:focus-within` states were already
   animating against, so those states ease instead of snapping; the link-card
