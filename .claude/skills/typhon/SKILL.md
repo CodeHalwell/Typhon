@@ -605,7 +605,7 @@ The v0.3.0 → v1.0.0-alpha.8 line is **additive on *correct* programs**. Every 
 ### v1.0.0-alpha.8 — maintenance
 
 - **VM: unseeded `random` seeds from entropy.** Previously a fixed constant, so `tyc run` was deterministic exactly where `tyc build && python` is not. Explicit `random.seed(n)` still matches CPython byte-for-byte.
-- **`tyc::contains_secret_literal` (warn) widened.** Digits and UPPERCASE→TitleCase junctions now count as name-word boundaries in both `is_secret_name` and the `tyc build` scan.
+- **`tyc::contains_secret_literal` (warn) widened.** Digits and UPPERCASE→TitleCase junctions now count as name-word boundaries in both `is_secret_name` and the `tyc build` scan, and `PRIVKEY` joins the keyword table (the `V`→`K` junction is not a boundary, so `SSH_PRIVKEY` never matched the bare `KEY`).
 - **Allocation reductions.** `parallel_lints` and the desugarer's `collect_multi_base_parents` / `collect_cached_property_targets_into` borrow `&str` from the AST instead of collecting `String`s.
 - **Dependencies.** `clap` 4.6.6, `thiserror` 2.0.20, `insta` 1.48.0, `schemars` 1.2.2, `toml` 1.1.4+spec-1.1.0; `actions/cache` 6.1.0 and `actions/setup-python` 7.0.0.
 

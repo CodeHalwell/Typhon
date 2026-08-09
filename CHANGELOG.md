@@ -43,6 +43,10 @@ language change** — no new syntax, and no new error-level diagnostic.
   `MONKEY` still does not match `KEY`, and `PASSPORT` still does not match
   `PASS`. This lint is **warn-level**, so — as with the six keywords added in
   alpha.6 — a newly-flagged name warns, it does not fail the build.
+- **`PRIVKEY` joins the secret-name keyword table.** `PRIVKEY`, `SSH_PRIVKEY`
+  and `PRIVKEY_PEM` went unflagged because the `V`→`K` junction is not a word
+  boundary, so the bare `KEY` never matched. It is ordered ahead of `KEY` so
+  the specific word is the one reported. Also warn-level.
 
 ### Performance
 

@@ -5299,6 +5299,10 @@ let pet: Animal = Dog(name=\"Rex\")
         assert_eq!(secret_suffix("my123TOKEN"), Some("TOKEN"));
         assert_eq!(secret_suffix("TOKENString"), Some("TOKEN"));
         assert_eq!(secret_suffix("dbPASSWORDString"), Some("PASSWORD"));
+        // `PRIVKEY` is reported as itself, not as the bare `KEY` it contains.
+        assert_eq!(secret_suffix("PRIVKEY"), Some("PRIVKEY"));
+        assert_eq!(secret_suffix("SSH_PRIVKEY"), Some("PRIVKEY"));
+        assert_eq!(secret_suffix("PRIVKEY_PEM"), Some("PRIVKEY"));
     }
 
     #[test]
