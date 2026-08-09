@@ -179,10 +179,28 @@ jobs:
       - name: Install baseline runtime packages (pydantic, PyYAML)
         run: python3.13 -m pip install --quiet pydantic==2.13.4 PyYAML==6.0.1
 
+      # Resource snapshot around the harness. On 2026-08-09 this job was killed
+      # mid-harness four times in an hour by "The runner has received a
+      # shutdown signal", across three branches, while other jobs on the same
+      # commits passed — then stopped, which points at a transient hosted-runner
+      # incident rather than anything in the corpus. Disk exhaustion was the
+      # obvious suspect and was measured and ruled out: the harness keeps one
+      # scratch workdir per unit at ~190 KB, a few hundred MB over the full
+      # 1130-unit corpus (and they are now removed per-unit anyway). These two
+      # lines cost nothing and make the next occurrence diagnosable instead of
+      # re-litigated from scratch. `always()` so they are captured on the run
+      # that failed, which is the only run whose numbers matter.
+      - name: Resources before differential harness
+        run: df -h . /tmp && free -m
+
       - name: Differential harness (examples + stress)
         run: scripts/vm-differential.sh --jobs 4 --report differential-report.tsv
         env:
           TYC_REQUIRE_PYTHON: "1"
+
+      - name: Resources after differential harness
+        if: always()
+        run: df -h . /tmp && free -m
 
       - name: Upload per-unit differential report
         if: always()

@@ -72,8 +72,51 @@ language change** — no new syntax, and no new error-level diagnostic.
 - GitHub Actions: `actions/cache` 4.3.0 → 6.1.0 and `actions/setup-python` 5.6.0
   → 7.0.0, both re-pinned by commit SHA.
 
+### Testing / CI
+
+- **The T0.2 differential gate can no longer be flaked by nondeterministic
+  program output.** Its self-nondeterminism probe re-runs each side twice more
+  and excludes a unit that disagrees with itself — but that is probabilistic,
+  and a unit whose output is coarse enough to *repeat* slips through: a duration
+  printed at `.3f` seconds, or an unseeded `randint(0, 9)`, is often identical
+  across all three runs on each side while the two sides still differ, at which
+  point the harness reports a new divergence that is not a VM bug. (Finer-
+  grained output self-disagrees almost every time and is correctly excluded,
+  which is why the failure looked sporadic.) Units whose output is
+  nondeterministic *by construction* are now declared in
+  `scripts/differential-nondeterministic.txt` and excluded outright. That file
+  is deliberately **not** the baseline — a baseline line asserts "known VM bug",
+  so recording a timing program there would record a false claim and retire the
+  unit's coverage behind it. The gate hard-fails on structural rot (an entry
+  whose path is gone, or an entry also present in the baseline — both checks are
+  deterministic) and warns, without failing, when a listed unit looks
+  reproducible, since a single agreeing run is not proof and failing on it would
+  reintroduce the very flakiness the file removes.
+- **Two stress units fixed rather than declared.** The `Timer` cases in
+  `02-io-heavy/09-context-manager-custom.ty` and
+  `08-meta-stress/23-context-mgr-impl.ty` printed a wall-clock duration that was
+  never what they were testing; they now print `measured=<bool>`, which moves
+  them from *excluded* to real differential coverage (`ok` 767 → 769). The rule:
+  make the output deterministic when the nondeterministic value is incidental,
+  declare it when the value is the point — as in `examples/58-context-managers`,
+  which is left exactly as it is.
+- **Scratch workdirs are removed per unit.** The harness kept one directory per
+  unit (~190 KB, a few hundred MB over the corpus) until process exit, which
+  made `--keep` — whose purpose is to hand you one workdir to inspect — bury it
+  under a thousand others.
+- **Resource snapshot around the differential step.** `df -h` / `free -m` before
+  and after (the latter on `always()`), so the next occurrence of the
+  runner-shutdown kills seen on 2026-08-09 is diagnosable from the log. Disk
+  exhaustion was the obvious suspect and was measured and ruled out.
+
 ### Documentation
 
+- **Corrected: `docs/differential-testing.md` claimed the gate could not be
+  flaked by a clock-dependent program.** It said nondeterminism detection meant
+  such a program "can never flake the gate red". That is false, and it is why
+  the failure above was initially misread as a real regression. The section now
+  explains why the probe is probabilistic, when it fails, and how declaring
+  works.
 - **Corrected: the VM's `random` is not an xorshift PRNG.** `docs/vm.md` and the
   bundled skill's `RUNTIME.md` had described the shim as "xorshift PRNG, not
   cryptographic" since before it was reimplemented as a CPython-compatible
