@@ -5303,6 +5303,16 @@ let pet: Animal = Dog(name=\"Rex\")
         assert_eq!(secret_suffix("PRIVKEY"), Some("PRIVKEY"));
         assert_eq!(secret_suffix("SSH_PRIVKEY"), Some("PRIVKEY"));
         assert_eq!(secret_suffix("PRIVKEY_PEM"), Some("PRIVKEY"));
+
+        // New high-risk keywords added in v1.0.0-alpha.X
+        assert_eq!(secret_suffix("DATABASE_DSN"), Some("DSN"));
+        assert_eq!(secret_suffix("SESSION_COOKIE"), Some("COOKIE"));
+        assert_eq!(secret_suffix("SLACK_WEBHOOK_URL"), Some("WEBHOOK"));
+        assert_eq!(secret_suffix("AUTHORIZATION_BEARER"), Some("AUTHORIZATION"));
+        assert_eq!(secret_suffix("MY_CREDENTIALS"), Some("CREDENTIALS"));
+        assert_eq!(secret_suffix("AWS_CREDENTIAL"), Some("CREDENTIAL"));
+        assert_eq!(secret_suffix("SIGNING_CERT"), Some("SIGNING"));
+        assert_eq!(secret_suffix("PASSPHRASE"), Some("PASSPHRASE"));
     }
 
     #[test]
