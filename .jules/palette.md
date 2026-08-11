@@ -63,3 +63,6 @@
 ## 2024-05-30 - Smooth transitions for custom components
 **Learning:** Found that custom Starlight components like LinkCard lacked base transition properties, causing abrupt animation snaps on hover.
 **Action:** Added missing transition properties to custom components and their internal elements to ensure smooth UX during hover states.
+## 2025-02-13 - [Make abbreviations accessible via keyboard]
+**Learning:** Standard `<abbr>` elements with a `title` attribute are not inherently focusable. Keyboard-only users and screen readers navigating by tab index cannot trigger the tooltip or read the expanded title, hiding context that mouse users get from hovering.
+**Action:** Always add `tabindex="0"` to `<abbr>` elements that contain a `title` attribute to ensure they enter the focus order and are fully accessible.
