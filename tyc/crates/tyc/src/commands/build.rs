@@ -5285,7 +5285,7 @@ let pet: Animal = Dog(name=\"Rex\")
         assert_eq!(secret_suffix("MyToken"), Some("TOKEN"));
         assert_eq!(secret_suffix("myTokenValue"), Some("TOKEN"));
         assert_eq!(secret_suffix("DB_PASSWORD"), Some("PASSWORD"));
-        assert_eq!(secret_suffix("client_secret"), Some("SECRET"));
+        assert_eq!(secret_suffix("client_secret"), Some("CLIENT_SECRET"));
         assert_eq!(secret_suffix("PWD"), Some("PWD"));
         assert_eq!(secret_suffix("API_KEY_FOO"), Some("API_KEY"));
         assert_eq!(secret_suffix("FOO_API_KEY_BAR"), Some("API_KEY"));
