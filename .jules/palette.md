@@ -63,3 +63,6 @@
 ## 2024-05-30 - Smooth transitions for custom components
 **Learning:** Found that custom Starlight components like LinkCard lacked base transition properties, causing abrupt animation snaps on hover.
 **Action:** Added missing transition properties to custom components and their internal elements to ensure smooth UX during hover states.
+## 2024-08-12 - [Ensure keyboard accessibility for `<abbr>` elements in MDX]
+**Learning:** By default, HTML `<abbr>` elements with `title` attributes are not keyboard focusable, which means users navigating via keyboard (and screen readers) miss the expanded tooltip information entirely.
+**Action:** Always add `tabindex="0"` to `<abbr title="...">` elements when authoring or modifying MDX content components (like those in `docs-site/`) to ensure the tooltip expansion is accessible to all users.
