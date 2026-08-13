@@ -5303,6 +5303,8 @@ let pet: Animal = Dog(name=\"Rex\")
         assert_eq!(secret_suffix("PRIVKEY"), Some("PRIVKEY"));
         assert_eq!(secret_suffix("SSH_PRIVKEY"), Some("PRIVKEY"));
         assert_eq!(secret_suffix("PRIVKEY_PEM"), Some("PRIVKEY"));
+        assert_eq!(secret_suffix("JWTSECRET"), Some("JWTSECRET"));
+        assert_eq!(secret_suffix("AUTHTOKEN"), Some("AUTHTOKEN"));
     }
 
     #[test]

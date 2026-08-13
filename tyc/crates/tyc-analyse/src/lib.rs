@@ -3711,12 +3711,16 @@ pub const SECRET_NAME_KEYWORDS: &[&str] = &[
     // boundary, so `PRIVKEY` / `SSH_PRIVKEY` / `PRIVKEY_PEM` never matched
     // the bare `KEY`. It precedes `KEY` so the specific word is reported.
     "PASSPHRASE",
+    "ACCESSTOKEN",
     "API_PASSWORD",
     "APIPASSWORD",
     "API_SECRET",
     "APISECRET",
     "API_TOKEN",
     "APITOKEN",
+    "APPSECRET",
+    "AUTHTOKEN",
+    "JWTSECRET",
     "PASSWORD",
     "SECRET",
     "TOKEN",
@@ -5173,6 +5177,8 @@ def use_np() -> object:
             "PRIVKEY = \"abc\"\n",
             "SSH_PRIVKEY = \"abc\"\n",
             "PRIVKEY_PEM = \"abc\"\n",
+            "ACCESSTOKEN = \"abc\"\n",
+            "APPSECRET = \"abc\"\n",
         ];
         for src in srcs {
             let module = parse(src);
