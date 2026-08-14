@@ -29,3 +29,6 @@
 ## 2024-11-26 - Zero-Allocation shared mut AST traversal
 **Learning:** Checking for shared mut races in `parallel_lints` required constructing temporary `HashSet<String>` objects from AST node slices and using `clone` on variable names, creating redundant heap allocations across parallel AST traversals.
 **Action:** Always borrow string slices with `&'a str` into short-lived maps and vectors like `GoSpawn<'a>`, `HashSet<&'a str>`, and `HashMap<&'a str, bool>` where the lifetime `'a` is tied directly to the `ModModule` or `[Stmt]` to eliminate these temporary strings.
+## 2024-11-27 - Zero-Allocation `collect_sealed_union_aliases`
+**Learning:** `collect_sealed_union_aliases` and its helpers in `tyc-desugar` created heavily redundant `HashMap<String, Vec<String>>` structures by repeatedly allocating and cloning `String` objects from AST nodes. As this is frequently executed during the `merge_impl_blocks` phase for desugaring classes, the string cloning negatively impacted compilation speeds.
+**Action:** By constraining the lifetime to `&'a [Stmt]` and traversing AST nodes utilizing `&'a str` across structures like `HashMap<&'a str, Vec<&'a str>>`, we eliminate these temporary string allocations in favor of cheap slice references, preventing unnecessary heap pressure in hot paths.

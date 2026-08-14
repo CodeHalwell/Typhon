@@ -3525,12 +3525,12 @@ const IMPL_PREFIX: &str = "__typhon_impl_";
 /// mistaken for sealed unions. Mirrors
 /// `tyc_types::extract_sealed_union_variants` so the desugar doesn't need
 /// a cross-crate dep. R2-3.
-fn collect_union_variant_names(expr: &Expr) -> Option<Vec<String>> {
+fn collect_union_variant_names(expr: &Expr) -> Option<Vec<&str>> {
     let mut names = Vec::new();
     let mut stack = vec![expr];
     while let Some(current) = stack.pop() {
         match current {
-            Expr::Name(n) => names.push(n.id.as_str().to_owned()),
+            Expr::Name(n) => names.push(n.id.as_str()),
             // Push `right` first so the stack pops left-to-right: a
             // `BinOp` reads `A | B | C` as
             // `BinOp(BinOp(A, B), C)` — pushing left last makes the
@@ -3557,13 +3557,13 @@ fn collect_union_variant_names(expr: &Expr) -> Option<Vec<String>> {
 /// `impl Union:` can distribute its methods across every variant.
 /// Keyed by the alias name; values are the ordered variant class names
 /// as they appear in `type Union = A | B | C`. R2-3.
-fn collect_sealed_union_aliases(body: &[Stmt]) -> HashMap<String, Vec<String>> {
+fn collect_sealed_union_aliases(body: &[Stmt]) -> HashMap<&str, Vec<&str>> {
     let mut out = HashMap::new();
     for stmt in body {
         if let Stmt::TypeAlias(ta) = stmt {
             if let Expr::Name(n) = ta.name.as_ref() {
                 if let Some(variants) = collect_union_variant_names(&ta.value) {
-                    out.insert(n.id.as_str().to_owned(), variants);
+                    out.insert(n.id.as_str(), variants);
                 }
             }
         }
@@ -3712,13 +3712,13 @@ fn merge_impl_blocks(body: Vec<Stmt>) -> (Vec<Stmt>, bool) {
     let union_aliases = collect_sealed_union_aliases(&body);
 
     // Phase 1: identify impl pseudo-class indices and their target names.
-    let impl_indices: Vec<(usize, String)> = body
+    let impl_indices: Vec<(usize, &str)> = body
         .iter()
         .enumerate()
         .filter_map(|(i, stmt)| {
             if let Stmt::ClassDef(c) = stmt {
                 if let Some(target) = c.name.as_str().strip_prefix(IMPL_PREFIX) {
-                    return Some((i, target.to_owned()));
+                    return Some((i, target));
                 }
             }
             None
@@ -3736,13 +3736,13 @@ fn merge_impl_blocks(body: Vec<Stmt>) -> (Vec<Stmt>, bool) {
     // those blocks lower to module-level attribute patches instead
     // (`Record.label = __typhon_extend_Record__label`). Previously they
     // were silently dropped, so the method vanished from the build output.
-    let local_classes: HashSet<String> = body
+    let local_classes: HashSet<&str> = body
         .iter()
         .filter_map(|stmt| {
             if let Stmt::ClassDef(c) = stmt {
                 let n = c.name.as_str();
                 if !n.starts_with(IMPL_PREFIX) {
-                    return Some(n.to_owned());
+                    return Some(n);
                 }
             }
             None
@@ -3766,20 +3766,22 @@ fn merge_impl_blocks(body: Vec<Stmt>) -> (Vec<Stmt>, bool) {
     let mut foreign_patches: HashMap<usize, Vec<Stmt>> = HashMap::new();
     for (impl_idx, target_name) in &impl_indices {
         if let Stmt::ClassDef(c) = &body[*impl_idx] {
+            // PERF OPTIMIZATION: Zero-allocation union aliases
+            // By utilizing `&str` references directly from the AST during phase 1, we avoid redundant string cloning during class desugaring.
             let methods: Vec<Stmt> = c.body.iter().map(insert_self_param).collect();
             // Determine the actual target class(es). A union alias expands
             // to every variant; a concrete class is its own target.
-            let targets: Vec<String> = match union_aliases.get(target_name) {
+            let targets: Vec<&str> = match union_aliases.get(target_name) {
                 Some(variants) => variants.clone(),
-                None => vec![target_name.clone()],
+                None => vec![*target_name],
             };
             let all_local = targets
                 .iter()
-                .all(|t| local_classes.contains(t) || union_aliases.contains_key(t));
+                .all(|&t| local_classes.contains(t) || union_aliases.contains_key(t));
             if all_local {
                 for target in targets {
                     impl_methods_map
-                        .entry(target)
+                        .entry(target.to_owned())
                         .or_default()
                         .extend(methods.iter().cloned());
                 }
