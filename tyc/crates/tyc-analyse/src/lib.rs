@@ -3710,6 +3710,9 @@ pub const SECRET_NAME_KEYWORDS: &[&str] = &[
     // for exactly that reason too: the `V`→`K` junction is not a word
     // boundary, so `PRIVKEY` / `SSH_PRIVKEY` / `PRIVKEY_PEM` never matched
     // the bare `KEY`. It precedes `KEY` so the specific word is reported.
+    "AUTHORIZATION",
+    "CREDENTIALS",
+    "CREDENTIAL",
     "PASSPHRASE",
     "API_PASSWORD",
     "APIPASSWORD",
@@ -3719,19 +3722,23 @@ pub const SECRET_NAME_KEYWORDS: &[&str] = &[
     "APITOKEN",
     "PASSWORD",
     "SECRET",
+    "SIGNING",
+    "WEBHOOK",
+    "COOKIE",
     "TOKEN",
     "API_KEY",
     "APIKEY",
     "PRIVKEY",
     "KEY",
+    "DSN",
     "PWD",
     "PASS",
 ];
 
-/// True when `name` ends with one of the recognised secret-shaped
-/// suffixes. Match is case-insensitive on the suffix; the suffix may
-/// either form the whole name (e.g. `TOKEN`) or follow an underscore
-/// (e.g. `MY_TOKEN`). The expected callers feed module-level binding
+/// True when `name` contains one of the recognised secret-shaped
+/// keywords as a bounded substring. Match is case-insensitive on the keyword;
+/// the keyword may either form the whole name (e.g. `TOKEN`), follow an
+/// underscore (e.g. `MY_TOKEN`), or transition in camelCase. The expected callers feed module-level binding
 /// names; passing a function or method name through is harmless because
 /// the caller already gated on `Stmt::Assign` / `Stmt::AnnAssign`.
 fn is_secret_name(name: &str) -> bool {
@@ -5173,6 +5180,13 @@ def use_np() -> object:
             "PRIVKEY = \"abc\"\n",
             "SSH_PRIVKEY = \"abc\"\n",
             "PRIVKEY_PEM = \"abc\"\n",
+            "SLACK_WEBHOOK_URL = \"url\"\n",
+            "DATABASE_DSN = \"dsn\"\n",
+            "SESSION_COOKIE = \"cookie\"\n",
+            "AUTHORIZATION = \"auth\"\n",
+            "SIGNING_CERT = \"cert\"\n",
+            "AWS_CREDENTIALS = \"cred\"\n",
+            "USER_CREDENTIAL = \"cred\"\n",
         ];
         for src in srcs {
             let module = parse(src);
