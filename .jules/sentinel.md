@@ -31,3 +31,7 @@
 **Vulnerability:** The secret detection scanner missed hardcoded secrets when they were flanked by digits (e.g., `TOKEN123`) or functioning as acronym prefixes in PascalCase/CamelCase names (e.g., `TOKENString`). This could allow users to inadvertently embed secrets.
 **Learning:** The previous boundary logic only checked for `_` or transitions between lowercase and uppercase letters. It did not recognize numbers as valid boundary delineators for secret substrings, nor did it realize that a sequence like "TOKENString" acts as a boundary because the lower-case 't' acts as a pivot after the 'S'.
 **Prevention:** Ensured boundary logic correctly handles digits (`.is_ascii_digit()`) and correctly identifies the start of new camel/Pascalcase segments by checking `!name.as_bytes()[actual_end - 1].is_ascii_uppercase()` OR `name.as_bytes()[actual_end + 1].is_ascii_lowercase()` across both `is_secret_name` and `secret_suffix` functions.
+## 2025-02-14 - Add missing standard secret keywords to blocklist
+**Vulnerability:** The hardcoded secrets check (`is_secret_name`) was missing common first-tier secret names like `CREDENTIALS`, `AUTHORIZATION`, `WEBHOOK`, `DSN`, and `COOKIE`.
+**Learning:** Security heuristics that check for sensitive variables must be comprehensive because missing common cases like `SLACK_WEBHOOK_URL` leads to false assurance.
+**Prevention:** Ensure the single source of truth for secret keyword matching (`SECRET_NAME_KEYWORDS`) is regularly updated with standard credential naming patterns, while preserving the required longest-first ordering.
