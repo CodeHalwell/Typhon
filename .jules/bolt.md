@@ -29,3 +29,6 @@
 ## 2024-11-26 - Zero-Allocation shared mut AST traversal
 **Learning:** Checking for shared mut races in `parallel_lints` required constructing temporary `HashSet<String>` objects from AST node slices and using `clone` on variable names, creating redundant heap allocations across parallel AST traversals.
 **Action:** Always borrow string slices with `&'a str` into short-lived maps and vectors like `GoSpawn<'a>`, `HashSet<&'a str>`, and `HashMap<&'a str, bool>` where the lifetime `'a` is tied directly to the `ModModule` or `[Stmt]` to eliminate these temporary strings.
+## 2024-11-26 - Zero-Allocation `module_all_names` list of elements
+**Learning:** `module_all_names` in `tyc-analyse` originally created a new `HashSet<String>` by utilizing `to_owned()` on string literals from `__all__ = [...]` lists. As this function is utilized by `rewrite_deferred_imports`, avoiding this string allocation inside hot paths speeds up AST compilation.
+**Action:** Always borrow AST string literals with `&str` instead of collecting owned `String` instances wherever possible by returning `HashSet<&str>` to reduce heap allocations.
