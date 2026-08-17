@@ -63,3 +63,6 @@
 ## 2024-05-30 - Smooth transitions for custom components
 **Learning:** Found that custom Starlight components like LinkCard lacked base transition properties, causing abrupt animation snaps on hover.
 **Action:** Added missing transition properties to custom components and their internal elements to ensure smooth UX during hover states.
+## $(date +%Y-%m-%d) - Native Tooltip Accessibility Anti-pattern
+**Learning:** Native browser tooltips from `<abbr title="...">` attributes do not display on keyboard focus. Adding `tabindex="0"` makes them focusable for screen readers but fails WCAG 1.4.13 for sighted keyboard users.
+**Action:** Avoid relying on this pattern for accessibility; use custom tooltip components instead.
