@@ -63,3 +63,6 @@
 ## 2024-05-30 - Smooth transitions for custom components
 **Learning:** Found that custom Starlight components like LinkCard lacked base transition properties, causing abrupt animation snaps on hover.
 **Action:** Added missing transition properties to custom components and their internal elements to ensure smooth UX during hover states.
+## 2024-05-17 - Complete motion reduction for target highlights
+**Learning:** Found that while the `:target` CSS animation was properly disabled inside `@media (prefers-reduced-motion: reduce)` using `animation: none;`, it lacked `transition: none;`. This oversight could potentially leave unintentional transition side-effects active for users requesting reduced motion.
+**Action:** Always pair `animation: none;` with `transition: none;` in `prefers-reduced-motion` blocks to ensure a complete removal of motion, guaranteeing compliance with WCAG 2.2.2 requirements.
