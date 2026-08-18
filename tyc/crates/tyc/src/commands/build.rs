@@ -977,25 +977,25 @@ pub fn run(args: BuildArgs) -> Result<()> {
         {
             use ruff_python_ast::Stmt;
             // Collect the set of module names this file imports.
-            let mut imported_modules: std::collections::HashSet<String> =
+            let mut imported_modules: std::collections::HashSet<&str> =
                 std::collections::HashSet::new();
             for stmt in &module.body {
                 match stmt {
                     Stmt::ImportFrom(i) => {
                         if let Some(m) = &i.module {
-                            imported_modules.insert(m.id.to_string());
+                            imported_modules.insert(m.id.as_str());
                         }
                     }
                     Stmt::Import(i) => {
                         for alias in &i.names {
-                            imported_modules.insert(alias.name.id.to_string());
+                            imported_modules.insert(alias.name.id.as_str());
                         }
                     }
                     _ => {}
                 }
             }
             for mod_name in &imported_modules {
-                let Some(shapes) = project_shapes.get(mod_name) else {
+                let Some(shapes) = project_shapes.get(*mod_name) else {
                     continue;
                 };
                 for (cls_name, shape) in &shapes.class_shapes {
@@ -1004,7 +1004,7 @@ pub fn run(args: BuildArgs) -> Result<()> {
                         for method_name in shape.methods.keys() {
                             let fn_name = format!("__typhon_ext_{builtin}__{method_name}");
                             entry.entry(method_name.clone()).or_insert_with(|| {
-                                cross_module_fns.insert(fn_name.clone(), mod_name.clone());
+                                cross_module_fns.insert(fn_name.clone(), mod_name.to_string());
                                 fn_name
                             });
                         }

@@ -29,3 +29,6 @@
 ## 2024-11-26 - Zero-Allocation shared mut AST traversal
 **Learning:** Checking for shared mut races in `parallel_lints` required constructing temporary `HashSet<String>` objects from AST node slices and using `clone` on variable names, creating redundant heap allocations across parallel AST traversals.
 **Action:** Always borrow string slices with `&'a str` into short-lived maps and vectors like `GoSpawn<'a>`, `HashSet<&'a str>`, and `HashMap<&'a str, bool>` where the lifetime `'a` is tied directly to the `ModModule` or `[Stmt]` to eliminate these temporary strings.
+## 2024-11-27 - Zero-Allocation AST Import Traversal
+**Learning:** Checking imported modules in `build.rs` required constructing a `HashSet<String>` and allocating strings for every single module import inside the source file using `.to_string()`. In files with many imports, this generated unnecessary heap allocations inside the AST traversal loop.
+**Action:** By borrowing `&str` instead via `HashSet<&str>` using `m.id.as_str()` and `alias.name.id.as_str()`, and only calling `.to_string()` conditionally for the small subset of modules that match the `builtin_ext_registry`, we avoid significant allocation overhead during the import resolution step of the build process.
