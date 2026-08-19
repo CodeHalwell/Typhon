@@ -3710,15 +3710,21 @@ pub const SECRET_NAME_KEYWORDS: &[&str] = &[
     // for exactly that reason too: the `V`→`K` junction is not a word
     // boundary, so `PRIVKEY` / `SSH_PRIVKEY` / `PRIVKEY_PEM` never matched
     // the bare `KEY`. It precedes `KEY` so the specific word is reported.
+    "AUTHORIZATION",
+    "CREDENTIALS",
     "PASSPHRASE",
     "API_PASSWORD",
     "APIPASSWORD",
+    "CREDENTIAL",
     "API_SECRET",
     "APISECRET",
     "API_TOKEN",
     "APITOKEN",
     "PASSWORD",
+    "WEBHOOK",
+    "SIGNING",
     "SECRET",
+    "COOKIE",
     "TOKEN",
     "API_KEY",
     "APIKEY",
@@ -3726,14 +3732,16 @@ pub const SECRET_NAME_KEYWORDS: &[&str] = &[
     "KEY",
     "PWD",
     "PASS",
+    "DSN",
 ];
 
-/// True when `name` ends with one of the recognised secret-shaped
-/// suffixes. Match is case-insensitive on the suffix; the suffix may
-/// either form the whole name (e.g. `TOKEN`) or follow an underscore
-/// (e.g. `MY_TOKEN`). The expected callers feed module-level binding
-/// names; passing a function or method name through is harmless because
-/// the caller already gated on `Stmt::Assign` / `Stmt::AnnAssign`.
+/// True when `name` contains one of the recognised secret-shaped
+/// keywords as a bounded substring. Match is case-insensitive; the
+/// match may form the whole name (e.g. `TOKEN`), follow an underscore
+/// (e.g. `MY_TOKEN`), or appear inside camelCase (e.g. `myTokenValue`).
+/// The expected callers feed module-level binding names; passing a
+/// function or method name through is harmless because the caller
+/// already gated on `Stmt::Assign` / `Stmt::AnnAssign`.
 fn is_secret_name(name: &str) -> bool {
     let upper = name.to_ascii_uppercase();
     for word in SECRET_NAME_KEYWORDS {
@@ -5173,6 +5181,12 @@ def use_np() -> object:
             "PRIVKEY = \"abc\"\n",
             "SSH_PRIVKEY = \"abc\"\n",
             "PRIVKEY_PEM = \"abc\"\n",
+            "AUTHORIZATION = \"abc\"\n",
+            "SESSION_COOKIE = \"abc\"\n",
+            "WEBHOOK_URL = \"abc\"\n",
+            "AWS_CREDENTIALS = \"abc\"\n",
+            "DATABASE_DSN = \"abc\"\n",
+            "SIGNING_KEY = \"abc\"\n",
         ];
         for src in srcs {
             let module = parse(src);
