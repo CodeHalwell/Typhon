@@ -307,6 +307,7 @@ abbr[title] {
 @media (prefers-reduced-motion: reduce) {
   .sl-markdown-content :target {
     animation: none;
+    transition: none;
     border-left: 4px solid var(--sl-color-accent);
     padding-left: 0.5rem;
   }
