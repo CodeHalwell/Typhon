@@ -5285,7 +5285,7 @@ let pet: Animal = Dog(name=\"Rex\")
         assert_eq!(secret_suffix("MyToken"), Some("TOKEN"));
         assert_eq!(secret_suffix("myTokenValue"), Some("TOKEN"));
         assert_eq!(secret_suffix("DB_PASSWORD"), Some("PASSWORD"));
-        assert_eq!(secret_suffix("client_secret"), Some("SECRET"));
+        assert_eq!(secret_suffix("client_secret"), Some("CLIENT_SECRET"));
         assert_eq!(secret_suffix("PWD"), Some("PWD"));
         assert_eq!(secret_suffix("API_KEY_FOO"), Some("API_KEY"));
         assert_eq!(secret_suffix("FOO_API_KEY_BAR"), Some("API_KEY"));
@@ -5303,6 +5303,13 @@ let pet: Animal = Dog(name=\"Rex\")
         assert_eq!(secret_suffix("PRIVKEY"), Some("PRIVKEY"));
         assert_eq!(secret_suffix("SSH_PRIVKEY"), Some("PRIVKEY"));
         assert_eq!(secret_suffix("PRIVKEY_PEM"), Some("PRIVKEY"));
+
+        assert_eq!(secret_suffix("APPSECRET"), Some("APPSECRET"));
+        assert_eq!(secret_suffix("CLIENT_SECRET"), Some("CLIENT_SECRET"));
+        assert_eq!(secret_suffix("ACCESSTOKEN"), Some("ACCESSTOKEN"));
+        assert_eq!(secret_suffix("AUTH_TOKEN"), Some("AUTH_TOKEN"));
+        assert_eq!(secret_suffix("SECRETKEY"), Some("SECRETKEY"));
+        assert_eq!(secret_suffix("SSH_KEY"), Some("SSH_KEY"));
     }
 
     #[test]
