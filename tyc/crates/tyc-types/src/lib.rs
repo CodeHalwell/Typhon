@@ -2454,13 +2454,13 @@ impl TypeEnv {
     /// the reset ran from only three statement arms, still unsound everywhere
     /// else. Restricting the set is what makes it affordable to run the reset
     /// from *every* statement arm that evaluates a call (F41).
-    fn reset_global_narrowings(&mut self, rebound: &std::collections::HashSet<String>) {
+    fn reset_global_narrowings(&mut self, rebound: &std::collections::HashSet<&str>) {
         if rebound.is_empty() {
             return;
         }
         if let Some(globals) = self.scopes.first_mut() {
             for (name, b) in globals.iter_mut() {
-                if rebound.contains(name) && b.narrowed != b.declared {
+                if rebound.contains(&name.as_str()) && b.narrowed != b.declared {
                     b.narrowed = b.declared.clone();
                 }
             }
@@ -2609,7 +2609,7 @@ struct Checker<'a> {
     /// See [`collect_call_rebound_globals`]; empty for the overwhelming
     /// majority of modules, which is what makes the per-statement invalidation
     /// in [`eval_stmt_expr`] free.
-    globals_rebound_by_call: std::collections::HashSet<String>,
+    globals_rebound_by_call: std::collections::HashSet<&'a str>,
     /// For each declared function name, its inferred signature type.
     function_signatures: HashMap<String, Type>,
     /// Per-function arity metadata that doesn't fit in `Type::Function`
@@ -10785,12 +10785,12 @@ fn stmt_contains_call(s: &Stmt) -> bool {
 /// one without then assigning is vanishingly rare, and over-counting only
 /// costs a narrowing — it never invents a diagnostic on a name no callee
 /// touches.
-fn collect_call_rebound_globals(stmts: &[Stmt], acc: &mut std::collections::HashSet<String>) {
+fn collect_call_rebound_globals<'a>(stmts: &'a [Stmt], acc: &mut std::collections::HashSet<&'a str>) {
     for s in stmts {
         match s {
             Stmt::Global(g) => {
                 for name in &g.names {
-                    acc.insert(name.as_str().to_owned());
+                    acc.insert(name.as_str());
                 }
             }
             Stmt::FunctionDef(f) => collect_call_rebound_globals(&f.body, acc),

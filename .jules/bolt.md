@@ -29,3 +29,6 @@
 ## 2024-11-26 - Zero-Allocation shared mut AST traversal
 **Learning:** Checking for shared mut races in `parallel_lints` required constructing temporary `HashSet<String>` objects from AST node slices and using `clone` on variable names, creating redundant heap allocations across parallel AST traversals.
 **Action:** Always borrow string slices with `&'a str` into short-lived maps and vectors like `GoSpawn<'a>`, `HashSet<&'a str>`, and `HashMap<&'a str, bool>` where the lifetime `'a` is tied directly to the `ModModule` or `[Stmt]` to eliminate these temporary strings.
+## 2024-08-20 - Avoid HashSet<String> for module-global rebinding tracking
+**Learning:** `collect_call_rebound_globals` collects global declarations to track staled narrowings across function calls, traditionally allocating `String`s repeatedly.
+**Action:** Always borrow AST string names into `HashSet<&'a str>` leveraging the AST lifetime during type checking passes to reduce temporary allocation overhead on hot paths.
