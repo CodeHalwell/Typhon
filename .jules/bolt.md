@@ -29,6 +29,9 @@
 ## 2024-11-26 - Zero-Allocation shared mut AST traversal
 **Learning:** Checking for shared mut races in `parallel_lints` required constructing temporary `HashSet<String>` objects from AST node slices and using `clone` on variable names, creating redundant heap allocations across parallel AST traversals.
 **Action:** Always borrow string slices with `&'a str` into short-lived maps and vectors like `GoSpawn<'a>`, `HashSet<&'a str>`, and `HashMap<&'a str, bool>` where the lifetime `'a` is tied directly to the `ModModule` or `[Stmt]` to eliminate these temporary strings.
+## 2024-11-26 - Zero-Allocation `module_all_names`
+**Learning:** Checking for subset matching or exhaustiveness against multiple AST node identifiers utilizing `HashSet<String>` creates temporary heap allocations. `module_all_names` in `tyc-analyse` originally constructed a new `HashSet<String>` by cloning string identifiers inside AST nodes. As this is used to verify `__all__` exports inside hot paths, the repeated allocation of strings negatively impacted compilation times.
+**Action:** By bounding the lifetime of the `HashSet<&str>` to the incoming `&[Stmt]` reference, we can avoid String allocations entirely when building the `all_names` set and rely on dereferencing pointers for fast lookups. Callers to `.contains()` just need to pass `&name`.
 
 ## 2024-06-25 - Avoid HashSet<String> for temporary AST bounds
 **Learning:** Checking for bindings and usages inside AST nodes to detect optimization candidates (e.g., `auto_gather.rs` `collect_run` and `collect_opportunity_run`) utilized `HashSet<String>`. Every encountered variable binding allocated a new String just to push it into the tracking set, even though the variables are locally scoped to the traversal.

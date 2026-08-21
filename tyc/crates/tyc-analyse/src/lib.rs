@@ -3756,7 +3756,9 @@ fn is_secret_name(name: &str) -> bool {
                     && !name.as_bytes()[actual_end - 1].is_ascii_uppercase())
                 || (name.as_bytes()[actual_end].is_ascii_uppercase()
                     && actual_end + 1 < name.len()
-                    && name.as_bytes()[actual_end + 1].is_ascii_lowercase());
+                    && name.as_bytes()[actual_end + 1].is_ascii_lowercase())
+                || (name.as_bytes()[actual_end].is_ascii_lowercase()
+                    && name.as_bytes()[actual_end - 1].is_ascii_uppercase());
             if start_ok && end_ok {
                 return true;
             }
