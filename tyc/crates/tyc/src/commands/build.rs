@@ -5286,8 +5286,8 @@ let pet: Animal = Dog(name=\"Rex\")
         assert_eq!(secret_suffix("API_KEY"), Some("API_KEY"));
         assert_eq!(secret_suffix("MyToken"), Some("TOKEN"));
         assert_eq!(secret_suffix("myTokenValue"), Some("TOKEN"));
-        assert_eq!(secret_suffix("DB_PASSWORD"), Some("PASSWORD"));
-        assert_eq!(secret_suffix("client_secret"), Some("SECRET"));
+        assert_eq!(secret_suffix("DB_PASSWORD"), Some("DB_PASSWORD"));
+        assert_eq!(secret_suffix("client_secret"), Some("CLIENT_SECRET"));
         assert_eq!(secret_suffix("PWD"), Some("PWD"));
         assert_eq!(secret_suffix("API_KEY_FOO"), Some("API_KEY"));
         assert_eq!(secret_suffix("FOO_API_KEY_BAR"), Some("API_KEY"));
@@ -5300,11 +5300,38 @@ let pet: Animal = Dog(name=\"Rex\")
         assert_eq!(secret_suffix("123TOKEN"), Some("TOKEN"));
         assert_eq!(secret_suffix("my123TOKEN"), Some("TOKEN"));
         assert_eq!(secret_suffix("TOKENString"), Some("TOKEN"));
-        assert_eq!(secret_suffix("dbPASSWORDString"), Some("PASSWORD"));
+        assert_eq!(secret_suffix("dbPASSWORDString"), Some("DBPASSWORD"));
         // `PRIVKEY` is reported as itself, not as the bare `KEY` it contains.
         assert_eq!(secret_suffix("PRIVKEY"), Some("PRIVKEY"));
         assert_eq!(secret_suffix("SSH_PRIVKEY"), Some("PRIVKEY"));
         assert_eq!(secret_suffix("PRIVKEY_PEM"), Some("PRIVKEY"));
+
+        // New high-risk keywords consolidated from the Sentinel PR batch.
+        assert_eq!(secret_suffix("DATABASE_DSN"), Some("DSN"));
+        assert_eq!(secret_suffix("SESSION_COOKIE"), Some("COOKIE"));
+        assert_eq!(secret_suffix("SLACK_WEBHOOK_URL"), Some("WEBHOOK"));
+        assert_eq!(secret_suffix("AUTHORIZATION_BEARER"), Some("AUTHORIZATION"));
+        assert_eq!(secret_suffix("MY_CREDENTIALS"), Some("CREDENTIALS"));
+        assert_eq!(secret_suffix("AWS_CREDENTIAL"), Some("CREDENTIAL"));
+        assert_eq!(secret_suffix("SIGNING_CERT"), Some("SIGNING"));
+        assert_eq!(secret_suffix("ACCESS_TOKEN"), Some("ACCESS_TOKEN"));
+        assert_eq!(secret_suffix("AUTH_TOKEN"), Some("AUTH_TOKEN"));
+        assert_eq!(secret_suffix("BEARER_TOKEN"), Some("BEARER_TOKEN"));
+        assert_eq!(secret_suffix("CSRF_TOKEN"), Some("CSRF_TOKEN"));
+        assert_eq!(secret_suffix("JWT_TOKEN"), Some("JWT_TOKEN"));
+        assert_eq!(secret_suffix("PRIVATE_KEY"), Some("PRIVATE_KEY"));
+        assert_eq!(secret_suffix("PUBLIC_KEY"), Some("PUBLIC_KEY"));
+        assert_eq!(secret_suffix("APPSECRET"), Some("APPSECRET"));
+        assert_eq!(secret_suffix("ACCESSTOKEN"), Some("ACCESSTOKEN"));
+        assert_eq!(secret_suffix("SECRETKEY"), Some("SECRETKEY"));
+        assert_eq!(secret_suffix("SSH_KEY"), Some("SSH_KEY"));
+        assert_eq!(secret_suffix("JWTSECRET"), Some("JWTSECRET"));
+        assert_eq!(secret_suffix("AUTHTOKEN"), Some("AUTHTOKEN"));
+        assert_eq!(secret_suffix("DBPASSWORD"), Some("DBPASSWORD"));
+        assert_eq!(secret_suffix("DBSECRET"), Some("DBSECRET"));
+        assert_eq!(secret_suffix("DBPASS"), Some("DBPASS"));
+        assert_eq!(secret_suffix("DBPWD"), Some("DBPWD"));
+        assert_eq!(secret_suffix("JWTTOKEN"), Some("JWTTOKEN"));
     }
 
     #[test]
