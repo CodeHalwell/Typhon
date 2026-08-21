@@ -3711,29 +3711,70 @@ pub const SECRET_NAME_KEYWORDS: &[&str] = &[
     // boundary, so `PRIVKEY` / `SSH_PRIVKEY` / `PRIVKEY_PEM` never matched
     // the bare `KEY`. It precedes `KEY` so the specific word is reported.
     "PASSPHRASE",
+    "AUTHORIZATION",
+    "CREDENTIALS",
+    "CREDENTIAL",
+    "WEBHOOK",
+    "SIGNING",
+    "COOKIE",
+    "DB_PASSWORD",
+    "DBPASSWORD",
+    "DB_PASS",
+    "DBPASS",
+    "DB_PWD",
+    "DBPWD",
     "API_PASSWORD",
     "APIPASSWORD",
+    "DB_SECRET",
+    "DBSECRET",
     "API_SECRET",
     "APISECRET",
+    "APP_SECRET",
+    "APPSECRET",
+    "CLIENT_SECRET",
+    "CLIENTSECRET",
+    "JWT_SECRET",
+    "JWTSECRET",
+    "SECRET_KEY",
+    "SECRETKEY",
+    "ACCESS_TOKEN",
+    "ACCESSTOKEN",
+    "AUTH_TOKEN",
+    "AUTHTOKEN",
+    "BEARER_TOKEN",
+    "BEARERTOKEN",
+    "CSRF_TOKEN",
+    "CSRFTOKEN",
+    "JWT_TOKEN",
+    "JWTTOKEN",
     "API_TOKEN",
     "APITOKEN",
     "PASSWORD",
     "SECRET",
     "TOKEN",
+    "PRIVATE_KEY",
+    "PRIVATEKEY",
+    "PUBLIC_KEY",
+    "PUBLICKEY",
+    "SSH_KEY",
+    "SSHKEY",
     "API_KEY",
     "APIKEY",
     "PRIVKEY",
     "KEY",
     "PWD",
     "PASS",
+    "DSN",
 ];
 
-/// True when `name` ends with one of the recognised secret-shaped
-/// suffixes. Match is case-insensitive on the suffix; the suffix may
-/// either form the whole name (e.g. `TOKEN`) or follow an underscore
-/// (e.g. `MY_TOKEN`). The expected callers feed module-level binding
-/// names; passing a function or method name through is harmless because
-/// the caller already gated on `Stmt::Assign` / `Stmt::AnnAssign`.
+/// True when `name` contains one of the recognised secret-shaped keywords
+/// as a bounded substring. Match is case-insensitive; the keyword may form
+/// the whole name (e.g. `TOKEN`), follow an underscore (e.g. `MY_TOKEN`),
+/// sit at a digit or camelCase/PascalCase boundary (e.g. `myTokenValue`,
+/// `foo123TOKEN`), or start/end the name. The expected callers feed
+/// module-level binding names; passing a function or method name through
+/// is harmless because the caller already gated on `Stmt::Assign` /
+/// `Stmt::AnnAssign`.
 fn is_secret_name(name: &str) -> bool {
     let upper = name.to_ascii_uppercase();
     for word in SECRET_NAME_KEYWORDS {
@@ -5175,6 +5216,26 @@ def use_np() -> object:
             "PRIVKEY = \"abc\"\n",
             "SSH_PRIVKEY = \"abc\"\n",
             "PRIVKEY_PEM = \"abc\"\n",
+            "AUTHORIZATION = \"abc\"\n",
+            "SESSION_COOKIE = \"abc\"\n",
+            "WEBHOOK_URL = \"abc\"\n",
+            "AWS_CREDENTIALS = \"abc\"\n",
+            "DATABASE_DSN = \"abc\"\n",
+            "SIGNING_KEY = \"abc\"\n",
+            "DBPASSWORD = \"abc\"\n",
+            "DBSECRET = \"abc\"\n",
+            "DBPASS = \"abc\"\n",
+            "DBPWD = \"abc\"\n",
+            "DB_PASS = \"abc\"\n",
+            "DB_PWD = \"abc\"\n",
+            "JWTTOKEN = \"abc\"\n",
+            "JWTSECRET = \"abc\"\n",
+            "ACCESSTOKEN = \"abc\"\n",
+            "APPSECRET = \"abc\"\n",
+            "ACCESS_TOKEN = \"abc\"\n",
+            "AUTH_TOKEN = \"abc\"\n",
+            "SECRETKEY = \"abc\"\n",
+            "SSHKEY = \"abc\"\n",
         ];
         for src in srcs {
             let module = parse(src);
