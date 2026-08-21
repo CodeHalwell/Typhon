@@ -193,7 +193,10 @@ Runtime is roughly **75 s** for the full 1130-unit corpus at `--jobs 8` on a
 four concurrent `tyc` + `python3.13` pairs took a 16 GB hosted runner to
 ~4.8 GB available with swap 99.7% exhausted by the end of the harness, and the
 job was intermittently killed with `The runner has received a shutdown signal`
-(exit 143) partway through. Halving the worker count halves that peak. Raise it
+(exit 143) partway through. Halving the worker count halves that peak — but it
+did **not** stop the kills, which continue at `--jobs 2` and remain unexplained
+(see the comment on the job in `.github/workflows/ci.yml` for the hypotheses
+ruled out so far). Re-running the job clears it. Raise the worker count
 locally if you have the headroom — the harness is CPU-bound below the memory
 ceiling, so more workers are strictly faster until you hit it.
 

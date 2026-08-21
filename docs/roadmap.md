@@ -28,9 +28,10 @@ mid-August dependency wave — with the `compact_str` 0.10 bump reverted, since
 `get-size2` 0.8 pins 0.9.1 and the duplicate broke the vendored Ruff build —
 and docs-site keyboard-accessibility (`<abbr tabindex="0">`) and
 reduced-motion (`transition: none` beside `animation: none`) polish. On the CI
-side, the T0.2 differential gate's intermittent `runner has received a shutdown
-signal` kills are finally explained — the harness at `--jobs 4` exhausted the
-runner's swap — and it now runs at `--jobs 2`. No new syntax and no new
+side, the T0.2 differential gate's harness now runs at `--jobs 2` (at `--jobs 4`
+it finished with the runner's swap 99.7% exhausted), though that does not stop
+the gate's intermittent `runner has received a shutdown signal` kills, which
+remain unexplained and clear on a re-run. No new syntax and no new
 error-level diagnostic.
 
 **[v1.0.0-alpha.8](https://github.com/CodeHalwell/Typhon/releases/tag/v1.0.0-alpha.8) — 2026-08-08.**

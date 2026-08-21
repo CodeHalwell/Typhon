@@ -191,13 +191,22 @@ jobs:
       #   after a full harness at --jobs 4:  mem 11.1G/15.9G used, available
       #   4.8G (from 14.9G), swap 3061M/3071M — 99.7% exhausted.
       #
-      # Four concurrent tyc + python3.13 pairs over 1130 units take the runner
-      # to the edge of its memory; the runs that pass are the ones that just fit,
-      # and the kills land at 52-77s into a ~78s harness, where the pressure
-      # peaks. Hence --jobs 2 below: half the peak concurrent footprint, at
-      # roughly double the wall-clock for a job that was only ~78s to begin with.
-      # Keep the snapshots — they are what made this diagnosable, and they are
-      # how a future regression gets caught instead of re-litigated.
+      # That measurement is real and worth avoiding on its own — but it is NOT
+      # the cause of the kills, and --jobs 2 below did not stop them: the gate
+      # was killed again at 59s with the same signature on the very commit that
+      # introduced the setting, while the twin run on that same commit passed.
+      #
+      # Falsified so far, each by direct evidence:
+      #   - disk            (alpha.8 measured it; ~190 KB scratch per unit)
+      #   - duplicate runs  (a run died alone; a duplicated run passed)
+      #   - memory / jobs=4 (jobs=2 dies too, and earlier in the harness)
+      #   - corpus signals  (no unit sends SIGTERM/SIGKILL or touches killpg)
+      #
+      # Observed rate is ~4 kills in 9 attempts, across both job counts, both
+      # trigger events, alone and duplicated, and independent of the diff. It
+      # reproduces only on hosted runners, and a killed runner leaves no
+      # post-mortem, which is what makes it stubborn. Re-running the job clears
+      # it. Keep the snapshots — they are the only numbers anyone gets.
       - name: Resources before differential harness
         run: df -h . /tmp && free -m
 

@@ -9,9 +9,9 @@ canonical phase-by-phase status lives in `docs/roadmap.md`.
 A maintenance release on top of alpha.8: a large widening of the **warn-level**
 `tyc::contains_secret_literal` keyword table, three more allocation reductions
 on compiler AST walks, the mid-August dependency wave (including one bump
-reverted to keep `main` green), a fix for the memory exhaustion that had been
-intermittently killing the T0.2 differential gate's runner, and docs-site
-accessibility polish. **No
+reverted to keep `main` green), a reduction in the T0.2 differential gate's
+memory footprint (which did not resolve that gate's intermittent runner
+kills — see below), and docs-site accessibility polish. **No
 language change** — no new syntax, no new error-level diagnostic, and no
 change to any emitted Python.
 
@@ -83,13 +83,22 @@ change to any emitted Python.
   run that *survived*: after a full harness at `--jobs 4`, available memory is
   down from 14.9 GB to 4.8 GB and swap is 3061 MB of 3071 MB — **99.7%
   exhausted**. Four concurrent `tyc` + `python3.13` pairs over 1130 units take
-  a 16 GB runner to its ceiling; the runs that pass are the ones that just fit,
-  and the kills land 52–77 s into a ~78 s harness, where the pressure peaks.
-  CI now runs the harness at **`--jobs 2`**, halving the peak concurrent
-  footprint for roughly double the wall-clock on a job that was only ~78 s to
-  start with. Disk was never the cause — alpha.8 measured and correctly ruled
-  it out. The snapshots stay: they are what made this diagnosable, and they are
-  how a regression gets caught rather than re-litigated.
+  a 16 GB runner to its ceiling. CI now runs the harness at **`--jobs 2`** to
+  halve that peak, which is worth doing on its own.
+  **It does not stop the kills, and the cause remains unknown.** The gate was
+  killed again at `--jobs 2`, 59 s in, on the very commit that introduced the
+  setting — while the twin run on that same commit passed. Four hypotheses are
+  now falsified by direct evidence: disk (measured in alpha.8), duplicate
+  concurrent runs (one kill happened with no twin; one duplicated run passed),
+  memory pressure from `--jobs 4` (`--jobs 2` dies too, and earlier in the
+  harness), and a corpus unit signalling its own process group (no unit in
+  `examples/` or `stress/` sends a signal at all). The observed rate is roughly
+  4 kills in 9 attempts, spanning both job counts, both trigger events, alone
+  and duplicated, and independent of the diff. **Re-running the job clears it**,
+  so the practical impact is a manual re-run — including on `main`, where
+  auto-tag needs a green CI run before it will cut a tag. The snapshots stay:
+  a killed runner leaves no post-mortem, so a surviving run's numbers are the
+  only evidence anyone gets.
 
 ### Dependencies
 
