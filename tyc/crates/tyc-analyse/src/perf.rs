@@ -1023,7 +1023,7 @@ pub fn lazy_import_opportunity_diagnostics(
             continue;
         }
         if let Some(all) = &all_names {
-            if all.contains(bound) {
+            if all.contains(&bound) {
                 continue;
             }
         }
@@ -1264,7 +1264,8 @@ fn has_main_guard(body: &[Stmt]) -> bool {
 
 /// The names in a hand-written module-level `__all__ = [...]` / `(...)`, if
 /// present.
-fn module_all_names(body: &[Stmt]) -> Option<HashSet<String>> {
+/// Optimisation: returns `HashSet<&str>` to avoid heap allocations for string copies.
+fn module_all_names(body: &[Stmt]) -> Option<HashSet<&str>> {
     for stmt in body {
         let value = match stmt {
             Stmt::Assign(a)
@@ -1289,7 +1290,7 @@ fn module_all_names(body: &[Stmt]) -> Option<HashSet<String>> {
         let mut out = HashSet::new();
         for e in elts {
             if let Expr::StringLiteral(s) = e {
-                out.insert(s.value.to_str().to_owned());
+                out.insert(s.value.to_str());
             }
         }
         return Some(out);
