@@ -32,6 +32,9 @@
 ## 2024-11-26 - Zero-Allocation `module_all_names`
 **Learning:** Checking for subset matching or exhaustiveness against multiple AST node identifiers utilizing `HashSet<String>` creates temporary heap allocations. `module_all_names` in `tyc-analyse` originally constructed a new `HashSet<String>` by cloning string identifiers inside AST nodes. As this is used to verify `__all__` exports inside hot paths, the repeated allocation of strings negatively impacted compilation times.
 **Action:** By bounding the lifetime of the `HashSet<&str>` to the incoming `&[Stmt]` reference, we can avoid String allocations entirely when building the `all_names` set and rely on dereferencing pointers for fast lookups. Callers to `.contains()` just need to pass `&name`.
+## 2024-11-27 - Zero-Allocation AST Import Traversal
+**Learning:** Checking imported modules in `build.rs` required constructing a `HashSet<String>` and allocating strings for every single module import inside the source file using `.to_string()`. In files with many imports, this generated unnecessary heap allocations inside the AST traversal loop.
+**Action:** By borrowing `&str` instead via `HashSet<&str>` using `m.id.as_str()` and `alias.name.id.as_str()`, and only calling `.to_string()` conditionally for the small subset of modules that match the `builtin_ext_registry`, we avoid significant allocation overhead during the import resolution step of the build process.
 
 ## 2024-06-25 - Avoid HashSet<String> for temporary AST bounds
 **Learning:** Checking for bindings and usages inside AST nodes to detect optimization candidates (e.g., `auto_gather.rs` `collect_run` and `collect_opportunity_run`) utilized `HashSet<String>`. Every encountered variable binding allocated a new String just to push it into the tracking set, even though the variables are locally scoped to the traversal.
