@@ -9,7 +9,9 @@ canonical phase-by-phase status lives in `docs/roadmap.md`.
 A maintenance release on top of alpha.8: a large widening of the **warn-level**
 `tyc::contains_secret_literal` keyword table, three more allocation reductions
 on compiler AST walks, the mid-August dependency wave (including one bump
-reverted to keep `main` green), and docs-site accessibility polish. **No
+reverted to keep `main` green), a fix for the memory exhaustion that had been
+intermittently killing the T0.2 differential gate's runner, and docs-site
+accessibility polish. **No
 language change** — no new syntax, no new error-level diagnostic, and no
 change to any emitted Python.
 
@@ -68,6 +70,26 @@ change to any emitted Python.
   - `tyc build`'s per-file import scan collects `HashSet<&str>` and allocates
     only for the small subset of module names that match the builtin-extension
     registry, instead of one `String` per import statement (#411).
+
+### Testing / CI
+
+- **The T0.2 differential gate was running its host out of memory.** The job
+  was intermittently killed mid-harness by `The runner has received a shutdown
+  signal` (exit 143) — four times in an hour on 2026-08-09, and five times
+  while preparing this release. alpha.8 added `df -h` / `free -m` snapshots
+  around the harness to make the next occurrence diagnosable, and read the
+  pattern as a transient hosted-runner incident. It was not. A killed runner
+  never reaches the `always()` post-step, so the numbers only arrived from a
+  run that *survived*: after a full harness at `--jobs 4`, available memory is
+  down from 14.9 GB to 4.8 GB and swap is 3061 MB of 3071 MB — **99.7%
+  exhausted**. Four concurrent `tyc` + `python3.13` pairs over 1130 units take
+  a 16 GB runner to its ceiling; the runs that pass are the ones that just fit,
+  and the kills land 52–77 s into a ~78 s harness, where the pressure peaks.
+  CI now runs the harness at **`--jobs 2`**, halving the peak concurrent
+  footprint for roughly double the wall-clock on a job that was only ~78 s to
+  start with. Disk was never the cause — alpha.8 measured and correctly ruled
+  it out. The snapshots stay: they are what made this diagnosable, and they are
+  how a regression gets caught rather than re-litigated.
 
 ### Dependencies
 

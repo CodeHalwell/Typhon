@@ -182,19 +182,27 @@ jobs:
       # Resource snapshot around the harness. On 2026-08-09 this job was killed
       # mid-harness four times in an hour by "The runner has received a
       # shutdown signal", across three branches, while other jobs on the same
-      # commits passed — then stopped, which points at a transient hosted-runner
-      # incident rather than anything in the corpus. Disk exhaustion was the
-      # obvious suspect and was measured and ruled out: the harness keeps one
-      # scratch workdir per unit at ~190 KB, a few hundred MB over the full
-      # 1130-unit corpus (and they are now removed per-unit anyway). These two
-      # lines cost nothing and make the next occurrence diagnosable instead of
-      # re-litigated from scratch. `always()` so they are captured on the run
-      # that failed, which is the only run whose numbers matter.
+      # commits passed. That was read at the time as a transient hosted-runner
+      # incident; it was not. Disk was measured and correctly ruled out (one
+      # ~190 KB scratch workdir per unit, now removed per-unit anyway), but
+      # memory was never measured — a killed runner never reaches the `always()`
+      # post-step, so only a run that SURVIVES produces the numbers that matter:
+      #
+      #   after a full harness at --jobs 4:  mem 11.1G/15.9G used, available
+      #   4.8G (from 14.9G), swap 3061M/3071M — 99.7% exhausted.
+      #
+      # Four concurrent tyc + python3.13 pairs over 1130 units take the runner
+      # to the edge of its memory; the runs that pass are the ones that just fit,
+      # and the kills land at 52-77s into a ~78s harness, where the pressure
+      # peaks. Hence --jobs 2 below: half the peak concurrent footprint, at
+      # roughly double the wall-clock for a job that was only ~78s to begin with.
+      # Keep the snapshots — they are what made this diagnosable, and they are
+      # how a future regression gets caught instead of re-litigated.
       - name: Resources before differential harness
         run: df -h . /tmp && free -m
 
       - name: Differential harness (examples + stress)
-        run: scripts/vm-differential.sh --jobs 4 --report differential-report.tsv
+        run: scripts/vm-differential.sh --jobs 2 --report differential-report.tsv
         env:
           TYC_REQUIRE_PYTHON: "1"
 

@@ -27,8 +27,11 @@ compiler AST walks (`auto_gather`'s candidate scan, `module_all_names`, and
 mid-August dependency wave — with the `compact_str` 0.10 bump reverted, since
 `get-size2` 0.8 pins 0.9.1 and the duplicate broke the vendored Ruff build —
 and docs-site keyboard-accessibility (`<abbr tabindex="0">`) and
-reduced-motion (`transition: none` beside `animation: none`) polish. No new
-syntax and no new error-level diagnostic.
+reduced-motion (`transition: none` beside `animation: none`) polish. On the CI
+side, the T0.2 differential gate's intermittent `runner has received a shutdown
+signal` kills are finally explained — the harness at `--jobs 4` exhausted the
+runner's swap — and it now runs at `--jobs 2`. No new syntax and no new
+error-level diagnostic.
 
 **[v1.0.0-alpha.8](https://github.com/CodeHalwell/Typhon/releases/tag/v1.0.0-alpha.8) — 2026-08-08.**
 A maintenance release on top of alpha.7. One VM ↔ CPython parity fix: the VM's
