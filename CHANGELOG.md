@@ -20,10 +20,12 @@ change to any emitted Python.
   proposed an overlapping set of additions; they are consolidated here as one
   deduplicated, correctly-ordered table (#421) rather than merged in sequence.
   Added: `AUTHORIZATION`, `CREDENTIALS` / `CREDENTIAL`, `WEBHOOK`, `SIGNING`,
-  `COOKIE`, `DSN`; the `DB_` / `APP_` / `CLIENT_` / `JWT_`-prefixed
-  `PASSWORD` / `SECRET` / `PASS` / `PWD` variants; the `ACCESS_` / `AUTH_` /
-  `BEARER_` / `CSRF_` / `JWT_`-prefixed `TOKEN` variants; and `PRIVATE_KEY`,
-  `PUBLIC_KEY`, `SSH_KEY`, `SECRET_KEY` — each with its squashed-acronym form
+  `COOKIE`, `DSN`; `DB_PASSWORD` / `DB_PASS` / `DB_PWD` / `DB_SECRET`, and
+  `APP_SECRET` / `CLIENT_SECRET` / `JWT_SECRET` (only `DB_` carries the full
+  password/pass/pwd set — the other prefixes are secret-only); the `ACCESS_` /
+  `AUTH_` / `BEARER_` / `CSRF_` / `JWT_`-prefixed `TOKEN` variants; and
+  `PRIVATE_KEY`, `PUBLIC_KEY`, `SSH_KEY`, `SECRET_KEY` — each with its
+  squashed-acronym form
   (`ACCESSTOKEN`, `JWTSECRET`, `SSHKEY`, …), which the word-boundary heuristics
   cannot derive on their own. Placement preserves the longest-first invariant
   from alpha.4, so a name matching more than one keyword reports the most
@@ -53,11 +55,13 @@ change to any emitted Python.
 
 - **Three more allocation reductions on AST walks**, in the same vein as
   alpha.8's `parallel_lints` / desugarer pass. None changes behaviour.
-  - `auto_gather`'s `Candidate` / `OpportunityCandidate` borrow `&'a str` from
-    the AST for `bind` / `call_func` / `args` / `keywords`, and the
-    binding-tracking sets become `HashSet<&str>`, so scanning a straight-line
-    run of awaits no longer allocates a `String` per binding and per callee
-    (#413).
+  - `auto_gather`'s `Candidate` borrows its binding name, callee name, and
+    argument / keyword slices straight from the AST — they were `String`,
+    `Box<[Expr]>` and `Box<[Keyword]>` clones — and the run's
+    binding-tracking set becomes `HashSet<&str>`, so scanning a straight-line
+    run of awaits no longer clones a name or an argument list per statement.
+    `OpportunityCandidate` borrows its binding name the same way; its `deps`
+    expressions remain owned (#413).
   - `module_all_names` (`tyc-analyse/src/perf.rs`, feeding the
     `lazy_import_opportunity` lint) returns `HashSet<&str>` instead of copying
     every hand-written `__all__` entry onto the heap (#399).

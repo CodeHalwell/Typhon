@@ -15,10 +15,11 @@ A maintenance release on top of alpha.8, with no language change. The
 warn-level `tyc::contains_secret_literal` keyword table grows from 16 entries
 to 55 — seven overlapping proposals consolidated into a single
 longest-first-ordered table (`AUTHORIZATION`, `CREDENTIALS`, `WEBHOOK`,
-`SIGNING`, `COOKIE`, `DSN`, the `DB_`/`APP_`/`CLIENT_`/`JWT_`-prefixed
-password and secret variants, the `ACCESS_`/`AUTH_`/`BEARER_`/`CSRF_`/`JWT_`
-token variants, `PRIVATE_KEY`/`PUBLIC_KEY`/`SSH_KEY`/`SECRET_KEY`, each with
-its squashed-acronym form) — and one more name-word boundary: an uppercase
+`SIGNING`, `COOKIE`, `DSN`, the `DB_`-prefixed password / pass / pwd / secret
+variants plus a secret-only `APP_` / `CLIENT_` / `JWT_`, the
+`ACCESS_`/`AUTH_`/`BEARER_`/`CSRF_`/`JWT_` token variants,
+`PRIVATE_KEY`/`PUBLIC_KEY`/`SSH_KEY`/`SECRET_KEY`, each with its
+squashed-acronym form) — and one more name-word boundary: an uppercase
 keyword directly followed by a lowercase letter (`TOKENs`,
 `dbPASSWORDstring`). Alongside it: three more allocation reductions on
 compiler AST walks (`auto_gather`'s candidate scan, `module_all_names`, and
