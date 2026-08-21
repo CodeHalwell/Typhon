@@ -18,7 +18,7 @@ ruff_text_size = { workspace = true }
 
 aho-corasick = "1.1.3"
 bitflags = "2.5.0"
-compact_str = "0.9.0"
+compact_str = "0.10.0"
 get-size2 = { version = "0.8.0", features = ["derive", "smallvec", "hashbrown", "compact-str", "ordermap"], optional = true }
 is-macro = "0.3.5"
 memchr = "2.7.1"
