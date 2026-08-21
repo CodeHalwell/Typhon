@@ -3767,12 +3767,14 @@ pub const SECRET_NAME_KEYWORDS: &[&str] = &[
     "DSN",
 ];
 
-/// True when `name` ends with one of the recognised secret-shaped
-/// suffixes. Match is case-insensitive on the suffix; the suffix may
-/// either form the whole name (e.g. `TOKEN`) or follow an underscore
-/// (e.g. `MY_TOKEN`). The expected callers feed module-level binding
-/// names; passing a function or method name through is harmless because
-/// the caller already gated on `Stmt::Assign` / `Stmt::AnnAssign`.
+/// True when `name` contains one of the recognised secret-shaped keywords
+/// as a bounded substring. Match is case-insensitive; the keyword may form
+/// the whole name (e.g. `TOKEN`), follow an underscore (e.g. `MY_TOKEN`),
+/// sit at a digit or camelCase/PascalCase boundary (e.g. `myTokenValue`,
+/// `foo123TOKEN`), or start/end the name. The expected callers feed
+/// module-level binding names; passing a function or method name through
+/// is harmless because the caller already gated on `Stmt::Assign` /
+/// `Stmt::AnnAssign`.
 fn is_secret_name(name: &str) -> bool {
     let upper = name.to_ascii_uppercase();
     for word in SECRET_NAME_KEYWORDS {
