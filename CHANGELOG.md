@@ -4,6 +4,137 @@ All notable changes to Typhon are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely; the
 canonical phase-by-phase status lives in `docs/roadmap.md`.
 
+## 1.0.0-alpha.9 — 2026-08-21 — maintenance: secret-name lint expansion, allocation reductions & dependency wave
+
+A maintenance release on top of alpha.8: a large widening of the **warn-level**
+`tyc::contains_secret_literal` keyword table, three more allocation reductions
+on compiler AST walks, the mid-August dependency wave (including one bump
+reverted to keep `main` green), a reduction in the T0.2 differential gate's
+memory footprint (which did not resolve that gate's intermittent runner
+kills — see below), and docs-site accessibility polish. **No
+language change** — no new syntax, no new error-level diagnostic, and no
+change to any emitted Python.
+
+### Changed
+
+- **`tyc::contains_secret_literal`: the keyword table grows from 16 entries to
+  55.** Seven separate PRs (#386, #397, #398, #409, #412, #415, #418) each
+  proposed an overlapping set of additions; they are consolidated here as one
+  deduplicated, correctly-ordered table (#421) rather than merged in sequence.
+  Added: `AUTHORIZATION`, `CREDENTIALS` / `CREDENTIAL`, `WEBHOOK`, `SIGNING`,
+  `COOKIE`, `DSN`; `DB_PASSWORD` / `DB_PASS` / `DB_PWD` / `DB_SECRET`, and
+  `APP_SECRET` / `CLIENT_SECRET` / `JWT_SECRET` (only `DB_` carries the full
+  password/pass/pwd set — the other prefixes are secret-only); the `ACCESS_` /
+  `AUTH_` / `BEARER_` / `CSRF_` / `JWT_`-prefixed `TOKEN` variants; and
+  `PRIVATE_KEY`, `PUBLIC_KEY`, `SSH_KEY`, `SECRET_KEY` — each with its
+  squashed-acronym form
+  (`ACCESSTOKEN`, `JWTSECRET`, `SSHKEY`, …), which the word-boundary heuristics
+  cannot derive on their own. Placement preserves the longest-first invariant
+  from alpha.4, so a name matching more than one keyword reports the most
+  specific: `DB_PASSWORD` now reports `DB_PASSWORD`, not the bare `PASSWORD`.
+  The lint stays **warn-level** — as with the additions in alpha.6 and alpha.8,
+  a newly-flagged name warns, it does not fail the build — and both consumers
+  (`tyc_analyse::is_secret_name` and the `tyc build` secret scan) still read the
+  single shared `tyc_analyse::SECRET_NAME_KEYWORDS` table, so they cannot drift.
+- **Ordering bug caught in review before it shipped.** `DB_PWD` / `DBPWD` /
+  `DB_PASS` / `DBPASS` were first placed after the bare `PWD`, so an
+  underscore-bounded `DB_PWD` matched `PWD` first and reported the less-specific
+  word — the same longest-first violation alpha.4 fixed for `KEY_APIKEY`. All
+  four now sit next to `DB_PASSWORD` / `DBPASSWORD`, ahead of every base word
+  they contain.
+- **One more name-word boundary: an uppercase keyword followed by a lowercase
+  letter** (#407). alpha.8 recognised `…TOKENString` (an uppercase keyword
+  followed by a TitleCase word) but not `…PASSWORDstring` or `TOKENs`, because
+  the end-boundary test required the next character to be an underscore, a
+  digit, or an uppercase letter. A lowercase character directly after an
+  uppercase keyword character now also ends a word, in `is_secret_name`
+  (`tyc-analyse`) and in `secret_suffix` (the `tyc` build scan) alike — the two
+  are hand-synchronised, and both gained the clause in the same change.
+  `MONKEY` still does not match `KEY` and `PASSPORT` still does not match
+  `PASS`: their boundary failures are on the *start* side, which is unchanged.
+
+### Performance
+
+- **Three more allocation reductions on AST walks**, in the same vein as
+  alpha.8's `parallel_lints` / desugarer pass. None changes behaviour.
+  - `auto_gather`'s `Candidate` borrows its binding name, callee name, and
+    argument / keyword slices straight from the AST — they were `String`,
+    `Box<[Expr]>` and `Box<[Keyword]>` clones — and the run's
+    binding-tracking set becomes `HashSet<&str>`, so scanning a straight-line
+    run of awaits no longer clones a name or an argument list per statement.
+    `OpportunityCandidate` borrows its binding name the same way; its `deps`
+    expressions remain owned (#413).
+  - `module_all_names` (`tyc-analyse/src/perf.rs`, feeding the
+    `lazy_import_opportunity` lint) returns `HashSet<&str>` instead of copying
+    every hand-written `__all__` entry onto the heap (#399).
+  - `tyc build`'s per-file import scan collects `HashSet<&str>` and allocates
+    only for the small subset of module names that match the builtin-extension
+    registry, instead of one `String` per import statement (#411).
+
+### Testing / CI
+
+- **The T0.2 differential gate was running its host out of memory.** The job
+  was intermittently killed mid-harness by `The runner has received a shutdown
+  signal` (exit 143) — four times in an hour on 2026-08-09, and five times
+  while preparing this release. alpha.8 added `df -h` / `free -m` snapshots
+  around the harness to make the next occurrence diagnosable, and read the
+  pattern as a transient hosted-runner incident. It was not. A killed runner
+  never reaches the `always()` post-step, so the numbers only arrived from a
+  run that *survived*: after a full harness at `--jobs 4`, available memory is
+  down from 14.9 GB to 4.8 GB and swap is 3061 MB of 3071 MB — **99.7%
+  exhausted**. Four concurrent `tyc` + `python3.13` pairs over 1130 units take
+  a 16 GB runner to its ceiling. CI now runs the harness at **`--jobs 2`** to
+  halve that peak, which is worth doing on its own.
+  **It does not stop the kills, and the cause remains unknown.** The gate was
+  killed again at `--jobs 2`, 59 s in, on the very commit that introduced the
+  setting — while the twin run on that same commit passed. Four hypotheses are
+  now falsified by direct evidence: disk (measured in alpha.8), duplicate
+  concurrent runs (one kill happened with no twin; one duplicated run passed),
+  memory pressure from `--jobs 4` (`--jobs 2` dies too, and earlier in the
+  harness), and a corpus unit signalling its own process group (no unit in
+  `examples/` or `stress/` sends a signal at all). The observed rate is roughly
+  4 kills in 9 attempts, spanning both job counts, both trigger events, alone
+  and duplicated, and independent of the diff. **Re-running the job clears it**,
+  so the practical impact is a manual re-run — including on `main`, where
+  auto-tag needs a green CI run before it will cut a tag. The snapshots stay:
+  a killed runner leaves no post-mortem, so a surviving run's numbers are the
+  only evidence anyone gets.
+
+### Dependencies
+
+- `serde_json` 1.0.150 → 1.0.151, `rustc-hash` 2.1.2 → 2.1.3, `aho-corasick`
+  1.1.4 → 1.1.5. VS Code extension: `@types/node` 26.1.1 → 26.2.0 (dev-only).
+- **`compact_str` is held at 0.9.1.** The 0.10.0 bump (#395) merged and was
+  reverted (#420): the two vendored Ruff crates that depend on it also depend on
+  `get-size2` 0.8.0, which pins `compact_str` 0.9.1 for its own `GetSize` impl.
+  Two `compact_str` versions in one graph mean `get-size2`'s derive macro cannot
+  find `GetSize` for the 0.10 `CompactString`, and `ruff_python_ast` fails to
+  compile under its `get-size` feature (`error[E0277]` on
+  `vendor/ruff_python_ast/src/name.rs`). `main` was red from #395 until the
+  revert. The bump can land once `get-size2` ships a 0.10-compatible release.
+
+### Documentation
+
+- `docs/diagnostics/contains_secret_literal.md` — the page `tyc explain` reads —
+  lists all 55 keywords instead of the 16 it carried through alpha.8, and its
+  word-boundary table gains the two new alpha.9 rows (`dbPASSWORDstring`,
+  `TOKENs`). One existing row is corrected while we are here: `dbPASSWORDString`
+  is now reported as `DBPASSWORD`, not `PASSWORD`, because the more specific
+  entry joined the table above it. The stale `is_secret_name` doc comment — it
+  still described suffix-only matching with underscore-only boundaries, which
+  alpha.8 superseded — is corrected too.
+- docs-site: `<abbr>` expansions on the architecture page take `tabindex="0"`,
+  putting them in the tab order for keyboard-only and screen-reader users
+  (#405); and the reduced-motion `:target` rule adds `transition: none` beside
+  its existing `animation: none`, since `animation: none` alone does not stop a
+  transition on the same element (#419).
+- `.jules/sentinel.md` carried two headings reading a literal
+  `$(date +%Y-%m-%d)` from an unexpanded shell substitution; both are dated now.
+- The bundled `typhon` skill is regenerated (`tyc install skill --force`), which
+  also re-syncs the vendored `.claude/skills/typhon/DIAGNOSTICS.md` — the
+  keyword-table update in #421 reached the embedded copy under
+  `tyc/crates/tyc/skill/` but not the vendored one.
+
 ## 1.0.0-alpha.8 — 2026-08-08 — maintenance
 
 A maintenance release on top of alpha.7: one VM ↔ CPython parity fix, a

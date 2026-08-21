@@ -27,7 +27,8 @@ reports the most specific: `KEY_APIKEY` reports `APIKEY`, not `KEY`, and
 
 A keyword only matches when it sits on a **word boundary** — otherwise `MONKEY`
 would match `KEY` and `PASSPORT` would match `PASS`. A boundary is the start or
-end of the name, an underscore, a digit, or a case junction:
+end of the name, an underscore, a digit, or a case junction in either
+direction:
 
 | Name | Matches | Why |
 |---|---|---|
@@ -35,7 +36,9 @@ end of the name, an underscore, a digit, or a case junction:
 | `myTokenValue` | `TOKEN` | `lower`→`Upper` on both sides |
 | `myPASSWORD123` | `PASSWORD` | digit closes the word (v1.0.0-alpha.8) |
 | `foo123TOKEN` | `TOKEN` | digit opens the word (v1.0.0-alpha.8) |
-| `dbPASSWORDString` | `PASSWORD` | `UPPER`→`TitleCase` junction (v1.0.0-alpha.8) |
+| `dbPASSWORDString` | `DBPASSWORD` | `UPPER`→`TitleCase` junction (v1.0.0-alpha.8); reported as `DBPASSWORD` since that entry joined the table in v1.0.0-alpha.9 |
+| `dbPASSWORDstring` | `DBPASSWORD` | `UPPER`→`lower` closes the word (v1.0.0-alpha.9) |
+| `TOKENs` | `TOKEN` | same rule — a lowercase letter after an uppercase keyword character (v1.0.0-alpha.9) |
 | `MONKEY` | — | `N` before `KEY` is not a boundary |
 | `PASSPORT` | — | `P` after `PASS` is not a boundary |
 

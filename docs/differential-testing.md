@@ -189,7 +189,16 @@ TMPDIR=/tmp/triage scripts/vm-differential.sh \
 ```
 
 Runtime is roughly **75 s** for the full 1130-unit corpus at `--jobs 8` on a
-4-core machine; CI runs it at `--jobs 4`.
+4-core machine; CI runs it at `--jobs 2`. CI used `--jobs 4` until v1.0.0-alpha.9:
+four concurrent `tyc` + `python3.13` pairs took a 16 GB hosted runner to
+~4.8 GB available with swap 99.7% exhausted by the end of the harness, and the
+job was intermittently killed with `The runner has received a shutdown signal`
+(exit 143) partway through. Halving the worker count halves that peak — but it
+did **not** stop the kills, which continue at `--jobs 2` and remain unexplained
+(see the comment on the job in `.github/workflows/ci.yml` for the hypotheses
+ruled out so far). Re-running the job clears it. Raise the worker count
+locally if you have the headroom — the harness is CPU-bound below the memory
+ceiling, so more workers are strictly faster until you hit it.
 
 ### What the first run found
 
