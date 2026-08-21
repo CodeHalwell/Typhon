@@ -4,7 +4,7 @@ The errors and surprises that bite people who try to write Typhon as if it were 
 
 For each entry: **trigger → diagnostic → fix**.
 
-Current release: **v1.0.0-alpha.8**. Pitfalls tagged with a version annotation landed in that release. Pitfalls 61–75 are the v0.9.0 cleanup additions covering the daily-driver VM, type-checker covariance and narrowing gaps, and multi-file project support; pitfalls 76+ cover the v0.10.0–v0.12.0 VM-completeness, `enum`, and third-party-type-checking surface; pitfalls 81–82 cover the v0.14.0 `as!` checked boundary cast. Releases v1.0.0-alpha.3 → v1.0.0-alpha.5 add no new syntax (and so no new pitfall categories); alpha.5's `tyc::perf_*` / parallel advice lints are catalogued in [DIAGNOSTICS.md](DIAGNOSTICS.md) §15.
+Current release: **v1.0.0-alpha.9**. Pitfalls tagged with a version annotation landed in that release. Pitfalls 61–75 are the v0.9.0 cleanup additions covering the daily-driver VM, type-checker covariance and narrowing gaps, and multi-file project support; pitfalls 76+ cover the v0.10.0–v0.12.0 VM-completeness, `enum`, and third-party-type-checking surface; pitfalls 81–82 cover the v0.14.0 `as!` checked boundary cast. Releases v1.0.0-alpha.3 → v1.0.0-alpha.5 add no new syntax (and so no new pitfall categories); alpha.5's `tyc::perf_*` / parallel advice lints are catalogued in [DIAGNOSTICS.md](DIAGNOSTICS.md) §15.
 
 ---
 

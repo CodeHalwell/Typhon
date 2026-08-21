@@ -10,6 +10,25 @@ Realistic milestones for one person plus AI assistance. The headline target is a
 
 ## Current release
 
+**[v1.0.0-alpha.9](https://github.com/CodeHalwell/Typhon/releases/tag/v1.0.0-alpha.9) — 2026-08-21.**
+A maintenance release on top of alpha.8, with no language change. The
+warn-level `tyc::contains_secret_literal` keyword table grows from 16 entries
+to 55 — seven overlapping proposals consolidated into a single
+longest-first-ordered table (`AUTHORIZATION`, `CREDENTIALS`, `WEBHOOK`,
+`SIGNING`, `COOKIE`, `DSN`, the `DB_`/`APP_`/`CLIENT_`/`JWT_`-prefixed
+password and secret variants, the `ACCESS_`/`AUTH_`/`BEARER_`/`CSRF_`/`JWT_`
+token variants, `PRIVATE_KEY`/`PUBLIC_KEY`/`SSH_KEY`/`SECRET_KEY`, each with
+its squashed-acronym form) — and one more name-word boundary: an uppercase
+keyword directly followed by a lowercase letter (`TOKENs`,
+`dbPASSWORDstring`). Alongside it: three more allocation reductions on
+compiler AST walks (`auto_gather`'s candidate scan, `module_all_names`, and
+`tyc build`'s import scan all borrow from the AST instead of allocating), the
+mid-August dependency wave — with the `compact_str` 0.10 bump reverted, since
+`get-size2` 0.8 pins 0.9.1 and the duplicate broke the vendored Ruff build —
+and docs-site keyboard-accessibility (`<abbr tabindex="0">`) and
+reduced-motion (`transition: none` beside `animation: none`) polish. No new
+syntax and no new error-level diagnostic.
+
 **[v1.0.0-alpha.8](https://github.com/CodeHalwell/Typhon/releases/tag/v1.0.0-alpha.8) — 2026-08-08.**
 A maintenance release on top of alpha.7. One VM ↔ CPython parity fix: the VM's
 MT19937 was seeded from a fixed constant when a program never called
