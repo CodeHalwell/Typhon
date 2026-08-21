@@ -5331,6 +5331,12 @@ let pet: Animal = Dog(name=\"Rex\")
         assert_eq!(secret_suffix("DBSECRET"), Some("DBSECRET"));
         assert_eq!(secret_suffix("DBPASS"), Some("DBPASS"));
         assert_eq!(secret_suffix("DBPWD"), Some("DBPWD"));
+        assert_eq!(secret_suffix("DB_PASS"), Some("DB_PASS"));
+        // Regression: with an underscore, `PWD` is a validly-bounded match
+        // inside `DB_PWD` too, so `DB_PWD` must precede the bare `PWD` or
+        // the loop reports the less-specific suffix first (P2 review catch
+        // on the PR that introduced this table entry).
+        assert_eq!(secret_suffix("DB_PWD"), Some("DB_PWD"));
         assert_eq!(secret_suffix("JWTTOKEN"), Some("JWTTOKEN"));
     }
 
