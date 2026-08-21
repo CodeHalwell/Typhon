@@ -307,21 +307,8 @@ dependencies = [
  "itoa",
  "rustversion",
  "ryu",
- "static_assertions",
-]
-
-[[package]]
-name = "compact_str"
-version = "0.10.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "79fcda08c33bb58b97008b2cdada6622500e949e060f5913361763121abd2416"
-dependencies = [
- "castaway",
- "cfg-if",
- "itoa",
  "serde",
  "static_assertions",
- "zmij",
 ]
 
 [[package]]
@@ -592,7 +579,7 @@ version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d5b6f7d040889b1980e31d03585f0150223f44eeada7a69c525cbb74c38266f6"
 dependencies = [
- "compact_str 0.9.1",
+ "compact_str",
  "get-size-derive2",
  "hashbrown 0.17.1",
  "ordermap",
@@ -1395,7 +1382,7 @@ version = "0.0.0-typhon-vendor"
 dependencies = [
  "aho-corasick",
  "bitflags",
- "compact_str 0.10.0",
+ "compact_str",
  "get-size2",
  "is-macro",
  "memchr",
@@ -1415,7 +1402,7 @@ version = "0.0.0-typhon-vendor"
 dependencies = [
  "bitflags",
  "bstr",
- "compact_str 0.10.0",
+ "compact_str",
  "get-size2",
  "insta",
  "memchr",
