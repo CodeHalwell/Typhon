@@ -35,3 +35,7 @@
 ## 2024-11-27 - Zero-Allocation AST Import Traversal
 **Learning:** Checking imported modules in `build.rs` required constructing a `HashSet<String>` and allocating strings for every single module import inside the source file using `.to_string()`. In files with many imports, this generated unnecessary heap allocations inside the AST traversal loop.
 **Action:** By borrowing `&str` instead via `HashSet<&str>` using `m.id.as_str()` and `alias.name.id.as_str()`, and only calling `.to_string()` conditionally for the small subset of modules that match the `builtin_ext_registry`, we avoid significant allocation overhead during the import resolution step of the build process.
+
+## 2024-06-25 - Avoid HashSet<String> for temporary AST bounds
+**Learning:** Checking for bindings and usages inside AST nodes to detect optimization candidates (e.g., `auto_gather.rs` `collect_run` and `collect_opportunity_run`) utilized `HashSet<String>`. Every encountered variable binding allocated a new String just to push it into the tracking set, even though the variables are locally scoped to the traversal.
+**Action:** Use `HashSet<&str>` using the exact AST nodes' string slice lifetime (`&'a [Stmt]`) instead of mapping or cloning strings. Avoid dropping the lifetime too early.

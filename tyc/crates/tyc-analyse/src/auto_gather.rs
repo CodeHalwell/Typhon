@@ -294,32 +294,36 @@ fn recurse_stmt(
 
 /// A single member of a candidate gather run.
 #[derive(Debug)]
-struct Candidate {
-    bind: String,
-    call_func: String,
-    args: Box<[Expr]>,
-    keywords: Box<[Keyword]>,
+struct Candidate<'a> {
+    bind: &'a str,
+    call_func: &'a str,
+    args: &'a [Expr],
+    keywords: &'a [Keyword],
     call_range: TextRange,
 }
 
 /// Scan `body[start..]` and collect the longest prefix that forms a safe
 /// gather run.
-fn collect_run(body: &[Stmt], start: usize, eligible: &HashSet<String>) -> Vec<Candidate> {
-    let mut run: Vec<Candidate> = Vec::new();
-    let mut bound: HashSet<String> = HashSet::new();
+fn collect_run<'a>(
+    body: &'a [Stmt],
+    start: usize,
+    eligible: &HashSet<String>,
+) -> Vec<Candidate<'a>> {
+    let mut run: Vec<Candidate<'a>> = Vec::new();
+    let mut bound: HashSet<&'a str> = HashSet::new();
     for stmt in &body[start..] {
         let Some(cand) = parse_candidate(stmt, eligible) else {
             break;
         };
-        if call_uses_any(&cand.args, &cand.keywords, &bound) {
+        if call_uses_any(cand.args, cand.keywords, &bound) {
             break;
         }
-        if bound.contains(&cand.bind) {
+        if bound.contains(cand.bind) {
             // Shadowing within the same run would change semantics of later
             // result extraction; bail.
             break;
         }
-        bound.insert(cand.bind.clone());
+        bound.insert(cand.bind);
         run.push(cand);
     }
     run
@@ -336,22 +340,22 @@ fn collect_run(body: &[Stmt], start: usize, eligible: &HashSet<String>) -> Vec<C
 /// annotation; omitting `parse_candidate`'s `AnnAssign` arm caused the
 /// auto-gather rewrite to silently fire zero candidates for every Typhon
 /// program.  FINDINGS #85.
-fn parse_candidate(stmt: &Stmt, eligible: &HashSet<String>) -> Option<Candidate> {
+fn parse_candidate<'a>(stmt: &'a Stmt, eligible: &HashSet<String>) -> Option<Candidate<'a>> {
     // Normalise the two assignment forms into (bind_name, rhs_expr).
-    let (bind, rhs): (String, &Expr) = match stmt {
+    let (bind, rhs): (&'a str, &'a Expr) = match stmt {
         Stmt::Assign(a) => {
             if a.targets.len() != 1 {
                 return None;
             }
             let bind = match &a.targets[0] {
-                Expr::Name(n) if matches!(n.ctx, ExprContext::Store) => n.id.as_str().to_owned(),
+                Expr::Name(n) if matches!(n.ctx, ExprContext::Store) => n.id.as_str(),
                 _ => return None,
             };
             (bind, &*a.value)
         }
         Stmt::AnnAssign(a) => {
             let bind = match &*a.target {
-                Expr::Name(n) if matches!(n.ctx, ExprContext::Store) => n.id.as_str().to_owned(),
+                Expr::Name(n) if matches!(n.ctx, ExprContext::Store) => n.id.as_str(),
                 _ => return None,
             };
             let rhs = a.value.as_deref()?;
@@ -369,25 +373,25 @@ fn parse_candidate(stmt: &Stmt, eligible: &HashSet<String>) -> Option<Candidate>
         _ => return None,
     };
     let call_func = match &*call.func {
-        Expr::Name(n) if eligible.contains(n.id.as_str()) => n.id.as_str().to_owned(),
+        Expr::Name(n) if eligible.contains(n.id.as_str()) => n.id.as_str(),
         _ => return None,
     };
     Some(Candidate {
         bind,
         call_func,
-        args: call.arguments.args.clone(),
-        keywords: call.arguments.keywords.clone(),
+        args: &call.arguments.args,
+        keywords: &call.arguments.keywords,
         call_range: call.range,
     })
 }
 
 /// `true` if any expression in the call references a name in `bound`.
-fn call_uses_any(args: &[Expr], keywords: &[Keyword], bound: &HashSet<String>) -> bool {
+fn call_uses_any(args: &[Expr], keywords: &[Keyword], bound: &HashSet<&str>) -> bool {
     args.iter().any(|e| expr_uses_any(e, bound))
         || keywords.iter().any(|k| expr_uses_any(&k.value, bound))
 }
 
-fn expr_uses_any(expr: &Expr, bound: &HashSet<String>) -> bool {
+fn expr_uses_any(expr: &Expr, bound: &HashSet<&str>) -> bool {
     match expr {
         Expr::Name(n) => bound.contains(n.id.as_str()),
         Expr::Call(c) => {
@@ -466,7 +470,7 @@ fn expr_uses_any(expr: &Expr, bound: &HashSet<String>) -> bool {
 
 fn comp_generators_use_any(
     generators: &[ruff_python_ast::Comprehension],
-    bound: &HashSet<String>,
+    bound: &HashSet<&str>,
 ) -> bool {
     generators.iter().any(|g| {
         expr_uses_any(&g.iter, bound)
@@ -482,7 +486,7 @@ fn comp_generators_use_any(
 /// by one `name = task.result()` extraction per candidate. The caller
 /// extends its enclosing block with the result so we don't need a wrapper
 /// statement (no `if True:` no-op block).
-fn make_autogather_block(run: &[Candidate], counter: &mut usize) -> Vec<Stmt> {
+fn make_autogather_block(run: &[Candidate<'_>], counter: &mut usize) -> Vec<Stmt> {
     let id = *counter;
     *counter += 1;
 
@@ -512,7 +516,7 @@ fn make_autogather_block(run: &[Candidate], counter: &mut usize) -> Vec<Stmt> {
     let mut out: Vec<Stmt> = Vec::with_capacity(1 + run.len());
     out.push(async_with);
     for (i, c) in run.iter().enumerate() {
-        out.push(make_result_extract(&c.bind, &task_name(i)));
+        out.push(make_result_extract(c.bind, &task_name(i)));
     }
     out
 }
@@ -556,17 +560,17 @@ fn make_taskgroup_call() -> Expr {
     })
 }
 
-fn make_create_task_assign(tg: &str, task: &str, c: &Candidate) -> Stmt {
+fn make_create_task_assign(tg: &str, task: &str, c: &Candidate<'_>) -> Stmt {
     // task = tg.create_task(callee(args))
     let inner_call = Expr::Call(ExprCall {
         node_index: AtomicNodeIndex::NONE,
         range: c.call_range,
-        func: Box::new(name_load(&c.call_func)),
+        func: Box::new(name_load(c.call_func)),
         arguments: Arguments {
             range: TextRange::default(),
             node_index: AtomicNodeIndex::NONE,
-            args: c.args.clone(),
-            keywords: c.keywords.clone(),
+            args: Box::from(c.args),
+            keywords: Box::from(c.keywords),
         },
     });
     let create_task = Expr::Call(ExprCall {
@@ -770,10 +774,10 @@ fn walk_missed_in_stmts(
         if inside_async {
             let run = collect_run(body, i, eligible_if_decorated);
             if run.len() >= 2 {
-                let missing = run.iter().find(|c| !decorated.contains(&c.call_func));
+                let missing = run.iter().find(|c| !decorated.contains(c.call_func));
                 if let Some(m) = missing {
                     out.push(MissedGather {
-                        missing_callee: m.call_func.clone(),
+                        missing_callee: m.call_func.to_string(),
                         call_range: run[0].call_range,
                     });
                 }
@@ -906,8 +910,8 @@ pub struct GatherOpportunity {
 /// to a name. Carries the sub-expressions (`callee` + arguments) that a
 /// later member must not reference for the run to stay independent.
 #[derive(Debug)]
-struct OpportunityCandidate {
-    bind: String,
+struct OpportunityCandidate<'a> {
+    bind: &'a str,
     /// The callee expression plus every positional / keyword argument —
     /// every sub-expression whose evaluation could depend on an earlier
     /// binding in the run. The callee is included so a method call whose
@@ -920,21 +924,21 @@ struct OpportunityCandidate {
 /// Match `NAME = await CALL(...)` / `NAME: T = await CALL(...)` for *any*
 /// callee (bare name, attribute/method, subscript, …). Returns the
 /// candidate or `None` when the statement isn't an awaited-call binding.
-fn parse_opportunity_candidate(stmt: &Stmt) -> Option<OpportunityCandidate> {
-    let (bind, rhs): (String, &Expr) = match stmt {
+fn parse_opportunity_candidate<'a>(stmt: &'a Stmt) -> Option<OpportunityCandidate<'a>> {
+    let (bind, rhs): (&'a str, &'a Expr) = match stmt {
         Stmt::Assign(a) => {
             if a.targets.len() != 1 {
                 return None;
             }
             let bind = match &a.targets[0] {
-                Expr::Name(n) if matches!(n.ctx, ExprContext::Store) => n.id.as_str().to_owned(),
+                Expr::Name(n) if matches!(n.ctx, ExprContext::Store) => n.id.as_str(),
                 _ => return None,
             };
             (bind, &*a.value)
         }
         Stmt::AnnAssign(a) => {
             let bind = match &*a.target {
-                Expr::Name(n) if matches!(n.ctx, ExprContext::Store) => n.id.as_str().to_owned(),
+                Expr::Name(n) if matches!(n.ctx, ExprContext::Store) => n.id.as_str(),
                 _ => return None,
             };
             (bind, a.value.as_deref()?)
@@ -964,9 +968,9 @@ fn parse_opportunity_candidate(stmt: &Stmt) -> Option<OpportunityCandidate> {
 /// awaited-call bindings. Mirrors [`collect_run`]'s independence and
 /// no-shadowing rules, but accepts any callee and checks the callee
 /// expression for dependencies too.
-fn collect_opportunity_run(body: &[Stmt], start: usize) -> Vec<OpportunityCandidate> {
-    let mut run: Vec<OpportunityCandidate> = Vec::new();
-    let mut bound: HashSet<String> = HashSet::new();
+fn collect_opportunity_run<'a>(body: &'a [Stmt], start: usize) -> Vec<OpportunityCandidate<'a>> {
+    let mut run: Vec<OpportunityCandidate<'a>> = Vec::new();
+    let mut bound: HashSet<&'a str> = HashSet::new();
     for stmt in &body[start..] {
         let Some(cand) = parse_opportunity_candidate(stmt) else {
             break;
@@ -974,10 +978,10 @@ fn collect_opportunity_run(body: &[Stmt], start: usize) -> Vec<OpportunityCandid
         if cand.deps.iter().any(|e| expr_uses_any(e, &bound)) {
             break;
         }
-        if bound.contains(&cand.bind) {
+        if bound.contains(cand.bind) {
             break;
         }
-        bound.insert(cand.bind.clone());
+        bound.insert(cand.bind);
         run.push(cand);
     }
     run
