@@ -678,7 +678,7 @@ A `comptime let` binding's name contains a secret-shaped keyword. The build arti
 comptime let API_KEY: str = env("MY_API_KEY")   # warning
 ```
 
-The table is `tyc_analyse::SECRET_NAME_KEYWORDS`, shared with the `tyc build` scan so the two cannot drift: `PASSPHRASE`, `API_PASSWORD`, `APIPASSWORD`, `API_SECRET`, `APISECRET`, `API_TOKEN`, `APITOKEN`, `PASSWORD`, `SECRET`, `TOKEN`, `API_KEY`, `APIKEY`, `PRIVKEY`, `KEY`, `PWD`, `PASS`. Longest-first, so `KEY_APIKEY` reports `APIKEY` and `SSH_PRIVKEY` reports `PRIVKEY`.
+The table is `tyc_analyse::SECRET_NAME_KEYWORDS`, shared with the `tyc build` scan so the two cannot drift: `PASSPHRASE`, `DBPASSWORD`, `DB_PASSWORD`, `API_PASSWORD`, `APIPASSWORD`, `DBSECRET`, `DB_SECRET`, `API_SECRET`, `APISECRET`, `JWTTOKEN`, `JWT_TOKEN`, `JWTSECRET`, `JWT_SECRET`, `API_TOKEN`, `APITOKEN`, `DBPASS`, `DB_PASS`, `DBPWD`, `DB_PWD`, `PASSWORD`, `SECRET`, `TOKEN`, `API_KEY`, `APIKEY`, `PRIVKEY`, `KEY`, `PWD`, `PASS`. Longest-first, so `KEY_APIKEY` reports `APIKEY` and `SSH_PRIVKEY` reports `PRIVKEY`.
 
 A keyword matches only on a **word boundary** — name start/end, `_`, a digit, or a case junction — so `MONKEY` does not match `KEY` and `PASSPORT` does not match `PASS`. Flagged: `API_KEY`, `myTokenValue`, and (v1.0.0-alpha.8) `myPASSWORD123`, `foo123TOKEN`, `dbPASSWORDString`. That same rule is why `PASSPHRASE` (alpha.6) and `PRIVKEY` (alpha.8) need their own table entries.
 

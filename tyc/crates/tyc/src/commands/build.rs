@@ -5284,7 +5284,7 @@ let pet: Animal = Dog(name=\"Rex\")
         assert_eq!(secret_suffix("API_KEY"), Some("API_KEY"));
         assert_eq!(secret_suffix("MyToken"), Some("TOKEN"));
         assert_eq!(secret_suffix("myTokenValue"), Some("TOKEN"));
-        assert_eq!(secret_suffix("DB_PASSWORD"), Some("PASSWORD"));
+        assert_eq!(secret_suffix("DB_PASSWORD"), Some("DB_PASSWORD"));
         assert_eq!(secret_suffix("client_secret"), Some("SECRET"));
         assert_eq!(secret_suffix("PWD"), Some("PWD"));
         assert_eq!(secret_suffix("API_KEY_FOO"), Some("API_KEY"));
@@ -5298,11 +5298,17 @@ let pet: Animal = Dog(name=\"Rex\")
         assert_eq!(secret_suffix("123TOKEN"), Some("TOKEN"));
         assert_eq!(secret_suffix("my123TOKEN"), Some("TOKEN"));
         assert_eq!(secret_suffix("TOKENString"), Some("TOKEN"));
-        assert_eq!(secret_suffix("dbPASSWORDString"), Some("PASSWORD"));
+        assert_eq!(secret_suffix("dbPASSWORDString"), Some("DBPASSWORD"));
         // `PRIVKEY` is reported as itself, not as the bare `KEY` it contains.
         assert_eq!(secret_suffix("PRIVKEY"), Some("PRIVKEY"));
         assert_eq!(secret_suffix("SSH_PRIVKEY"), Some("PRIVKEY"));
         assert_eq!(secret_suffix("PRIVKEY_PEM"), Some("PRIVKEY"));
+        assert_eq!(secret_suffix("DBPASSWORD"), Some("DBPASSWORD"));
+        assert_eq!(secret_suffix("DBSECRET"), Some("DBSECRET"));
+        assert_eq!(secret_suffix("DBPASS"), Some("DBPASS"));
+        assert_eq!(secret_suffix("DBPWD"), Some("DBPWD"));
+        assert_eq!(secret_suffix("JWTTOKEN"), Some("JWTTOKEN"));
+        assert_eq!(secret_suffix("JWTSECRET"), Some("JWTSECRET"));
     }
 
     #[test]
