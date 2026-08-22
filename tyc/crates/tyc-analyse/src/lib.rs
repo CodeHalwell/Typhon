@@ -3760,6 +3760,8 @@ pub const SECRET_NAME_KEYWORDS: &[&str] = &[
     "SSHKEY",
     "API_KEY",
     "APIKEY",
+    "APP_KEY",
+    "APPKEY",
     "PRIVKEY",
     "KEY",
     "PWD",
@@ -5236,6 +5238,8 @@ def use_np() -> object:
             "AUTH_TOKEN = \"abc\"\n",
             "SECRETKEY = \"abc\"\n",
             "SSHKEY = \"abc\"\n",
+            "APP_KEY = \"abc\"\n",
+            "APPKEY = \"abc\"\n",
         ];
         for src in srcs {
             let module = parse(src);
