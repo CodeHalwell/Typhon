@@ -7,7 +7,7 @@ sidebar:
 
 import { Card, CardGrid } from '@astrojs/starlight/components';
 
-`tyc` is a multi-stage compiler with an embedded <abbr tabindex="0" title="Language Server Protocol">LSP</abbr>, structured as a Cargo workspace of small crates that mirror the pipeline stages. Each stage produces a typed Rust value that the next stage consumes; analysis results are stored as Salsa queries so the <abbr tabindex="0" title="Language Server Protocol">LSP</abbr> can reuse them incrementally.
+`tyc` is a multi-stage compiler with an embedded <abbr title="Language Server Protocol">LSP</abbr>, structured as a Cargo workspace of small crates that mirror the pipeline stages. Each stage produces a typed Rust value that the next stage consumes; analysis results are stored as Salsa queries so the <abbr title="Language Server Protocol">LSP</abbr> can reuse them incrementally.
 
 ## The pipeline
 
@@ -70,18 +70,18 @@ This is the same crate-per-stage layout used by [oxc](https://github.com/oxc-pro
 | Stage | Primary choice | Fallback | Why |
 |-------|----------------|----------|-----|
 | Parser | Fork `ruff_python_parser` | `rustpython-parser` | Fastest, most spec-compliant Python parser in Rust. Not on crates.io, so vendor it. |
-| <abbr tabindex="0" title="Abstract Syntax Tree">AST</abbr> | Fork `ruff_python_ast` | Hand-written | <abbr tabindex="0" title="Abstract Syntax Tree">AST</abbr> is partly TOML-generated; adding Typhon variants is mechanical. |
+| <abbr title="Abstract Syntax Tree">AST</abbr> | Fork `ruff_python_ast` | Hand-written | <abbr title="Abstract Syntax Tree">AST</abbr> is partly TOML-generated; adding Typhon variants is mechanical. |
 | Incremental engine | `salsa` (salsa-rs) | Hand-rolled query cache | Powers `rust-analyzer` and `ty`. Free cancellation and parallel queries. |
 | Type checker | Custom on Salsa, `ty` as reference | Embed `ty` as a library | Typhon-specific rules need their own checker; `ty` handles the Python subset (deferred). |
 | Code emission | Hand-written pretty-printer | Fork `ruff_python_codegen` (deferred) | Hand-written printer tracks line offsets for `.py.map`. |
-| <abbr tabindex="0" title="Language Server Protocol">LSP</abbr> transport | `tower-lsp-server` | `lsp-server` (rust-analyzer style) | Ergonomic, active fork on `lsp-types` 0.97+. |
+| <abbr title="Language Server Protocol">LSP</abbr> transport | `tower-lsp-server` | `lsp-server` (rust-analyzer style) | Ergonomic, active fork on `lsp-types` 0.97+. |
 | CLI | `clap` v4 derive | — | Standard. |
 | Diagnostics | `miette` + `thiserror` | `ariadne` | Best-in-class source-span rendering. |
 | Config | `serde` + `toml` | — | Standard. |
 
 ## Why vendor the Ruff parser
 
-Python's significant-whitespace lexing is non-trivial. Hand-writing a full Python parser using `chumsky` or `lalrpop` would mean spending months catching up to mainstream Python syntax before writing a single new feature. Vendoring Ruff's parser inherits its battle-testing on real codebases and its same-<abbr tabindex="0" title="Abstract Syntax Tree">AST</abbr> contract with `ty`, which simplifies later type-checker integration. The cost is grammar-sync work whenever Python releases new syntax.
+Python's significant-whitespace lexing is non-trivial. Hand-writing a full Python parser using `chumsky` or `lalrpop` would mean spending months catching up to mainstream Python syntax before writing a single new feature. Vendoring Ruff's parser inherits its battle-testing on real codebases and its same-<abbr title="Abstract Syntax Tree">AST</abbr> contract with `ty`, which simplifies later type-checker integration. The cost is grammar-sync work whenever Python releases new syntax.
 
 ## Where next
 
