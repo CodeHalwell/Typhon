@@ -14,6 +14,46 @@ Additive on correct programs: the emitter/preprocessor fixes only correct
 output that was already wrong, and the type-checker change is a conservative
 widening consistent with the alpha.2 attribute-narrowing rule.
 
+A second remediation wave then closed the pre-existing backlog the review
+had reported rather than fixed. The full example+stress corpus re-checks
+clean (a false-positive net for the type-checker work) and the differential
+gate is down to 124 (two burned down, none new):
+
+- **Flow-narrowing soundness (`tyc-types`).** Narrowings no longer leak across
+  a function boundary (`check_function` snapshots/restores enclosing-scope
+  narrowings) — closing both a sibling-function unsound accept and a
+  nested-`def`/`nonlocal` false positive. `finally` is checked against the
+  intersection of the post-try join and the pre-try state; a call in a `match`
+  subject / `case` guard / `elif` invalidates a global narrowing; a
+  comprehension filter no longer leaks its narrowing; `del` invalidates both
+  narrowing and definite-assignment; and the H5 guard degrades to permissive
+  for an aliased-import base (`class Response(BaseResponse)` no longer
+  false-rejects).
+- **VM ↔ CPython parity.** Augmented assignment evaluates a subscript/attribute
+  target's receiver and index once (was twice); `str.splitlines` honours the
+  full Unicode boundary set and `keepends`; `str.casefold` folds `ß`/final
+  sigma; `"s" * n` with an oversized count raises `OverflowError`;
+  `startswith`/`endswith` accept a tuple of affixes (which let a permanent
+  differential-baseline artefact, `123_unused_import`, be rewritten to compare
+  equal and burned down). A seeded-`random` test pins the alpha.8 byte-for-byte
+  contract.
+- **Robustness / hardening.** `tyc fmt`'s atomic write uses `O_EXCL` so a
+  pre-planted symlink can't redirect it; comptime string concatenation /
+  replacement is charged against a 16 MiB budget (was OOM-able); both
+  venv-introspection stdout drainers cap the read at 32 MiB; the generated
+  `traceback.py` guards `install()`; the `TYC_NO_INTROSPECT` / `PYTHONPATH`
+  env-var tests hold the repo's `lock_env()` mutex; and
+  `vm-differential.sh --update` preflights its required runtime packages.
+- **Docs.** The `rescue` exception-boundary sugar is documented on the
+  docs-site Result reference page (it was absent from every docs-site
+  error-handling page despite shipping in v1.0.0-alpha).
+
+Deferred by design: VM `hash()` / set-repr ordering vs CPython (needs siphash +
+`PYTHONHASHSEED` and an open-addressed table — arguably a documented carve-out),
+the differential harness diffing stderr (needs a baseline re-record), `raise …
+from` chaining on the VM (`Value::Exception` field surgery), and the remaining
+additive docs-site pages / CLI-entrypoint smoke tests.
+
 ### Fixed — miscompilations (emitter / preprocessor / desugar)
 
 - **`?` inside a PEP 701 nested same-quote f-string was rewritten**, corrupting
