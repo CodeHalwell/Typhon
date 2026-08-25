@@ -266,8 +266,46 @@ impl Interpreter {
                 Ok(())
             }
             Stmt::AugAssign(a) => {
-                let current = self.eval_expr(&a.target, env)?;
+                // Resolve a subscript / attribute target's *place* exactly once.
+                // CPython's aug-assign bytecode COPYs the container and key (or
+                // the receiver) so a side-effecting index or receiver — e.g.
+                // `xs[idx()] += 1` or `make().attr += 1` — evaluates a single
+                // time. Reading the target and then re-evaluating it through
+                // `assign_target` ran those sub-expressions twice.
+                enum AugPlace {
+                    Sub(Value, Value),
+                    Attr(Value, String),
+                    Direct,
+                }
+                let (place, current) = match a.target.as_ref() {
+                    Expr::Subscript(s) => {
+                        let container = self.eval_expr(&s.value, env)?;
+                        let key = self.eval_subscript_index(&s.slice, env)?;
+                        let cur = self.subscript(&container, &key)?;
+                        (AugPlace::Sub(container, key), cur)
+                    }
+                    Expr::Attribute(at) => {
+                        let recv = self.eval_expr(&at.value, env)?;
+                        let cur = self.get_attr(&recv, at.attr.as_str())?;
+                        (AugPlace::Attr(recv, at.attr.as_str().to_owned()), cur)
+                    }
+                    // A bare name (or tuple/list target, which `+=` forbids
+                    // anyway) has no side-effecting sub-expression to double.
+                    _ => (AugPlace::Direct, self.eval_expr(&a.target, env)?),
+                };
                 let rhs = self.eval_expr(&a.value, env)?;
+
+                // Store `v` back into the resolved place.
+                macro_rules! store_back {
+                    ($me:expr, $v:expr) => {
+                        match &place {
+                            AugPlace::Sub(c, k) => $me.set_subscript(c, k, $v),
+                            AugPlace::Attr(recv, attr) => $me.set_attr(recv, attr, $v),
+                            AugPlace::Direct => $me.assign_target(&a.target, $v, env, None),
+                        }
+                    };
+                }
+
                 // In-place mutation for a mutable list target: CPython's
                 // `list.__iadd__` (`+=`) and `list.__imul__` (`*=`) mutate the
                 // existing object rather than rebinding, so aliases
@@ -307,12 +345,12 @@ impl Interpreter {
                         // setter, matching CPython's store-after-in-place. For a
                         // bare name this rebinds to the same `Rc`, so aliases are
                         // preserved.
-                        self.assign_target(&a.target, Value::List(target), env, None)?;
+                        store_back!(self, Value::List(target))?;
                         return Ok(());
                     }
                 }
                 let new = self.binop(&current, a.op, &rhs)?;
-                self.assign_target(&a.target, new, env, None)?;
+                store_back!(self, new)?;
                 Ok(())
             }
             Stmt::If(s) => {
@@ -3709,11 +3747,11 @@ impl Interpreter {
             return Ok(Str(Rc::new(format!("{}{}", a, b))));
         }
         if let (Str(a), Mult, Int(n)) = (l, op, r) {
-            let n = n.to_usize().unwrap_or(0);
+            let n = repeat_count(n)?;
             return Ok(Str(Rc::new(a.repeat(n))));
         }
         if let (Int(n), Mult, Str(a)) = (l, op, r) {
-            let n = n.to_usize().unwrap_or(0);
+            let n = repeat_count(n)?;
             return Ok(Str(Rc::new(a.repeat(n))));
         }
 
@@ -3725,11 +3763,11 @@ impl Interpreter {
             return Ok(Bytes(Rc::new(out)));
         }
         if let (Bytes(a), Mult, Int(n)) = (l, op, r) {
-            let n = n.to_usize().unwrap_or(0);
+            let n = repeat_count(n)?;
             return Ok(Bytes(Rc::new(a.repeat(n))));
         }
         if let (Int(n), Mult, Bytes(a)) = (l, op, r) {
-            let n = n.to_usize().unwrap_or(0);
+            let n = repeat_count(n)?;
             return Ok(Bytes(Rc::new(a.repeat(n))));
         }
 
@@ -3745,16 +3783,16 @@ impl Interpreter {
             return Ok(Tuple(Rc::new(out)));
         }
         if let (List(a), Mult, Int(n)) = (l, op, r) {
-            let n = n.to_usize().unwrap_or(0);
-            let mut out = Vec::with_capacity(a.borrow().len() * n);
+            let n = repeat_count(n)?;
+            let mut out = Vec::with_capacity(a.borrow().len().saturating_mul(n));
             for _ in 0..n {
                 out.extend(a.borrow().iter().cloned());
             }
             return Ok(List(Rc::new(RefCell::new(out))));
         }
         if let (Tuple(a), Mult, Int(n)) = (l, op, r) {
-            let n = n.to_usize().unwrap_or(0);
-            let mut out = Vec::with_capacity(a.len() * n);
+            let n = repeat_count(n)?;
+            let mut out = Vec::with_capacity(a.len().saturating_mul(n));
             for _ in 0..n {
                 out.extend(a.iter().cloned());
             }
@@ -6445,6 +6483,22 @@ fn overflow() -> Unwind {
     Unwind::Exception(VmException::new("OverflowError", "int overflow"))
 }
 
+/// Resolve a sequence-repetition count (`seq * n` / `n * seq`). CPython treats
+/// a negative count as an empty result but raises `OverflowError` when the
+/// count does not fit an index-sized integer — the VM previously mapped both to
+/// `0`, silently returning an empty sequence for `"a" * (2 ** 64)`.
+fn repeat_count(n: &VmInt) -> Result<usize, Unwind> {
+    if n.is_negative() {
+        return Ok(0);
+    }
+    n.to_usize().ok_or_else(|| {
+        Unwind::Exception(VmException::new(
+            "OverflowError",
+            "cannot fit 'int' into an index-sized integer",
+        ))
+    })
+}
+
 /// CPython's `float_divmod` (Objects/floatobject.c) — the exact basis for float
 /// `//` and `%` and for `divmod(float, float)`. Returns `(floordiv, mod)`.
 ///
@@ -7751,6 +7805,66 @@ d = divmod(7.0, 0.1)[0]
         assert_eq!(interp.root.get("b").unwrap().py_str(), "9.0");
         assert_eq!(interp.root.get("c").unwrap().py_str(), "19.0");
         assert_eq!(interp.root.get("d").unwrap().py_str(), "69.0");
+    }
+
+    #[test]
+    fn augassign_evaluates_a_subscript_index_once() {
+        // CPython COPYs the container and key, so a side-effecting index runs
+        // a single time. Reading then re-storing the target ran it twice.
+        let src = r#"
+calls = 0
+def idx():
+    global calls
+    calls = calls + 1
+    return 0
+xs = [10]
+xs[idx()] += 5
+result = (calls, xs[0])
+"#;
+        let (interp, res) = parse_and_run(src);
+        res.unwrap();
+        assert_eq!(interp.root.get("result").unwrap().py_str(), "(1, 15)");
+    }
+
+    #[test]
+    fn string_repeat_by_huge_count_overflows() {
+        // A count that does not fit an index-sized integer is an OverflowError,
+        // not a silently-empty string.
+        let (_i, res) = parse_and_run("r = \"a\" * (2 ** 64)");
+        match res.expect_err("huge repeat must raise") {
+            Unwind::Exception(e) => assert_eq!(e.kind, "OverflowError"),
+            other => panic!("expected OverflowError, got {other:?}"),
+        }
+        // A negative count is still the empty string, not an error.
+        let (interp, res) = parse_and_run("r = \"ab\" * -3");
+        res.unwrap();
+        assert_eq!(interp.root.get("r").unwrap().py_str(), "");
+    }
+
+    #[test]
+    fn splitlines_honours_boundaries_and_keepends() {
+        let src = r#"
+a = "a\rb".splitlines()
+b = "a\nb".splitlines(True)
+c = "x\vy\fz".splitlines()
+"#;
+        let (interp, res) = parse_and_run(src);
+        res.unwrap();
+        assert_eq!(interp.root.get("a").unwrap().py_str(), "['a', 'b']");
+        assert_eq!(interp.root.get("b").unwrap().py_str(), "['a\\n', 'b']");
+        assert_eq!(interp.root.get("c").unwrap().py_str(), "['x', 'y', 'z']");
+    }
+
+    #[test]
+    fn casefold_folds_sharp_s_and_final_sigma() {
+        let src = r#"
+a = "ß".casefold()
+b = "Σίσυφος".casefold()
+"#;
+        let (interp, res) = parse_and_run(src);
+        res.unwrap();
+        assert_eq!(interp.root.get("a").unwrap().py_str(), "ss");
+        assert_eq!(interp.root.get("b").unwrap().py_str(), "σίσυφοσ");
     }
 
     #[test]

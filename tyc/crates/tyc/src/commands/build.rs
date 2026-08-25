@@ -3633,19 +3633,26 @@ _FRAME_RE = re.compile(r'File \"([^\"]+)\", line (\\d+)')
 
 def install() -> None:
     \"\"\"Install a sys.excepthook that maps emitted-.py frames to .ty source.\"\"\"
-    state = _load_state()
-    if state is None:
+    # The whole setup is best-effort: `_load_state` walks the filesystem and
+    # `_remap`/`_source_root` call `os.path.relpath`, which raises across
+    # Windows drives. A failure here must never crash the program at import —
+    # if the hook can't be installed, the default traceback is used instead.
+    try:
+        state = _load_state()
+        if state is None:
+            return
+        previous = sys.excepthook
+
+        def hook(exc_type, exc, tb):
+            try:
+                text = ''.join(_tb.format_exception(exc_type, exc, tb))
+                sys.stderr.write(_remap(text, state))
+            except Exception:  # pragma: no cover - never hide the real error
+                previous(exc_type, exc, tb)
+
+        sys.excepthook = hook
+    except Exception:  # pragma: no cover - setup must never break startup
         return
-    previous = sys.excepthook
-
-    def hook(exc_type, exc, tb):
-        try:
-            text = ''.join(_tb.format_exception(exc_type, exc, tb))
-            sys.stderr.write(_remap(text, state))
-        except Exception:  # pragma: no cover - never hide the real error
-            previous(exc_type, exc, tb)
-
-    sys.excepthook = hook
 
 
 def _build_root():

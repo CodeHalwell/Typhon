@@ -1307,8 +1307,31 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     // `flush`, which is a no-op on a bufferless `std::fs::File`) forces the
     // bytes to disk before the rename, so a crash / power loss immediately
     // after can't leave a rename pointing at unwritten data.
+    //
+    // Create the temp with `create_new` (O_CREAT|O_EXCL): unlike
+    // `File::create` (O_CREAT|O_TRUNC) it never follows or truncates an
+    // existing path, so a symlink pre-planted at our predictable temp name
+    // (e.g. `.main.ty.tyc-<pid>.tmp` → a sensitive file, in an untrusted
+    // checkout being formatted) can't redirect the write. A genuinely stale
+    // temp from a crashed prior run is unlinked (which removes the entry
+    // itself, never a symlink's target) and the create retried exactly once.
     {
-        let mut f = std::fs::File::create(&tmp)?;
+        use std::io::ErrorKind;
+        let mut f = match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
+        {
+            Ok(f) => f,
+            Err(e) if e.kind() == ErrorKind::AlreadyExists => {
+                std::fs::remove_file(&tmp)?;
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&tmp)?
+            }
+            Err(e) => return Err(e),
+        };
         f.write_all(bytes)?;
         f.sync_all()?;
     }

@@ -59,6 +59,14 @@ use tyc_syntax::preprocess::ComptimeBinding;
 /// infinite recursion bug terminates the build instead of hanging it.
 const MAX_COMPTIME_DEPTH: usize = 64;
 
+/// Cumulative budget (in bytes) for strings produced during a single comptime
+/// evaluation. Integer arithmetic is already overflow-checked, but string
+/// concatenation / replacement had no cap: within the depth limit a doubling
+/// recursion (`grow(s + s, n)`) could allocate terabytes and abort `tyc check`
+/// via the allocator, not a catchable diagnostic. 16 MiB is far above any real
+/// build-time constant and stops a runaway build-string well before that.
+const MAX_COMPTIME_STRING_BYTES: usize = 16 * 1024 * 1024;
+
 pub mod auto_gather;
 pub use auto_gather::{
     collect_gatherable_async_fn_names, detect_gather_opportunities, detect_missed_gathers,
@@ -561,6 +569,10 @@ struct EvalContext<'a> {
     functions: &'a HashMap<&'a str, ComptimeFnDef<'a>>,
     locals: HashMap<String, ComptimeValue>,
     depth: usize,
+    /// Running total of bytes allocated by string-producing operations across
+    /// this whole evaluation (the context threads by `&mut` through recursion,
+    /// so it accumulates). Charged against [`MAX_COMPTIME_STRING_BYTES`].
+    string_bytes: usize,
 }
 
 impl<'a> EvalContext<'a> {
@@ -569,7 +581,23 @@ impl<'a> EvalContext<'a> {
             functions,
             locals: HashMap::new(),
             depth: 0,
+            string_bytes: 0,
         }
+    }
+
+    /// Account for a freshly-produced string of `bytes` length; error out once
+    /// the cumulative total crosses the budget so a runaway concatenation /
+    /// replacement fails the build with a diagnostic instead of OOM-aborting.
+    fn charge_string(&mut self, bytes: usize) -> Result<(), String> {
+        self.string_bytes = self.string_bytes.saturating_add(bytes);
+        if self.string_bytes > MAX_COMPTIME_STRING_BYTES {
+            return Err(format!(
+                "comptime string evaluation exceeded the {} MiB budget \
+                 (a runaway concatenation or replacement?)",
+                MAX_COMPTIME_STRING_BYTES / (1024 * 1024)
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -710,7 +738,14 @@ fn eval_expr(expr: &Expr, ctx: &mut EvalContext<'_>) -> Result<ComptimeValue, St
         Expr::BinOp(b) => {
             let lhs = eval_expr(&b.left, ctx)?;
             let rhs = eval_expr(&b.right, ctx)?;
-            eval_binop(b.op, lhs, rhs)
+            let result = eval_binop(b.op, lhs, rhs)?;
+            // A string concatenation is the one binop that grows an allocation
+            // — charge its length so a doubling recursion (`grow(s + s, n)`)
+            // hits the budget instead of OOM-aborting the build.
+            if let ComptimeValue::Str(s) = &result {
+                ctx.charge_string(s.len())?;
+            }
+            Ok(result)
         }
 
         // Comparison chains: `a < b`, `a == b`, `0 < n <= 10`. The
@@ -1281,7 +1316,12 @@ fn eval_method_call(
             expect_arity(method, 2, &args)?;
             let needle = expect_str(method, &args[0])?;
             let replacement = expect_str(method, &args[1])?;
-            Ok(ComptimeValue::Str(s.replace(needle, replacement)))
+            let out = s.replace(needle, replacement);
+            // `replace` can grow the string (a longer replacement than needle);
+            // charge it so a recursive `grow(s.replace(a, aaaa), n)` hits the
+            // budget rather than OOM-aborting.
+            ctx.charge_string(out.len())?;
+            Ok(ComptimeValue::Str(out))
         }
         (ComptimeValue::Str(s), "startswith") => {
             expect_arity(method, 1, &args)?;
@@ -1900,6 +1940,33 @@ mod tests {
         let (values, diags) = eval("comptime let PORT: int = 8080\n");
         assert!(!diags.has_errors(), "{:?}", diags.errors());
         assert!(matches!(values.get("PORT"), Some(ComptimeValue::Int(8080))));
+    }
+
+    #[test]
+    fn runaway_string_concat_hits_the_budget_not_ooms() {
+        // A doubling recursion within the depth cap would allocate terabytes;
+        // the byte budget must fail the build with a diagnostic instead.
+        let src = "\
+comptime def grow(s: str, n: int) -> str:
+    if n == 0:
+        return s
+    return grow(s + s, n - 1)
+
+comptime let X: str = grow(\"aaaa\", 40)
+";
+        let (_values, diags) = eval(src);
+        assert!(
+            diags.has_errors(),
+            "a runaway comptime concatenation must be rejected, not OOM"
+        );
+    }
+
+    #[test]
+    fn modest_string_concat_still_succeeds() {
+        // The budget must not reject an ordinary build-time string.
+        let (values, diags) = eval("comptime let S: str = \"a\" + \"b\" + \"c\"\n");
+        assert!(!diags.has_errors(), "{:?}", diags.errors());
+        assert!(matches!(values.get("S"), Some(ComptimeValue::Str(s)) if s == "abc"));
     }
 
     #[test]

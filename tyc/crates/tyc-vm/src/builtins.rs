@@ -74,6 +74,52 @@ fn split_with_sep(s: &str, sep: &str, maxsplit: i64, from_right: bool) -> Vec<St
     }
 }
 
+/// `str.splitlines([keepends])` — split on CPython's full line-boundary set,
+/// not Rust's `str::lines()` (which recognises only `\n` / `\r\n`). CPython
+/// breaks on `\n \r \r\n \v \f \x1c \x1d \x1e \x85    `; with
+/// `keepends=True` each terminator stays attached to its line.
+fn py_splitlines(s: &str, keepends: bool) -> Vec<String> {
+    fn is_line_boundary(c: char) -> bool {
+        matches!(
+            c,
+            '\n' | '\r'
+                | '\u{0b}'
+                | '\u{0c}'
+                | '\u{1c}'
+                | '\u{1d}'
+                | '\u{1e}'
+                | '\u{85}'
+                | '\u{2028}'
+                | '\u{2029}'
+        )
+    }
+    let mut out: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if is_line_boundary(c) {
+            if keepends {
+                cur.push(c);
+                // `\r\n` is a single boundary.
+                if c == '\r' && chars.peek() == Some(&'\n') {
+                    cur.push(chars.next().unwrap());
+                }
+            } else if c == '\r' && chars.peek() == Some(&'\n') {
+                chars.next();
+            }
+            out.push(std::mem::take(&mut cur));
+        } else {
+            cur.push(c);
+        }
+    }
+    // A trailing non-empty segment with no final boundary is its own line;
+    // CPython does NOT emit a trailing empty string after a final boundary.
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
 /// `str.split()` / `str.split(None, maxsplit)` — whitespace split that
 /// collapses runs of whitespace and drops leading/trailing empties.
 fn split_whitespace_max(s: &str, maxsplit: i64, from_right: bool) -> Vec<String> {
@@ -6091,11 +6137,17 @@ fn str_method(
                 pieces.into_iter().map(|p| Value::Str(Rc::new(p))).collect(),
             )))
         }
-        "splitlines" => Value::List(Rc::new(RefCell::new(
-            s.lines()
-                .map(|l| Value::Str(Rc::new(l.to_owned())))
-                .collect(),
-        ))),
+        "splitlines" => {
+            let keepends = match args.first() {
+                Some(v) => v.truthy(),
+                None => _kwargs.get("keepends").map(|v| v.truthy()).unwrap_or(false),
+            };
+            let lines: Vec<Value> = py_splitlines(s, keepends)
+                .into_iter()
+                .map(|l| Value::Str(Rc::new(l)))
+                .collect();
+            Value::List(Rc::new(RefCell::new(lines)))
+        }
         "join" => {
             let iterable = args
                 .first()
@@ -6223,7 +6275,17 @@ fn str_method(
             Value::Bool(!s.is_empty() && s.chars().all(|c| c.is_numeric()))
         }
         "istitle" => Value::Bool(is_title_case(s)),
-        "casefold" => Value::Str(Rc::new(s.to_lowercase())),
+        "casefold" => {
+            // `casefold` is more aggressive than `lower`: `ß` folds to `ss` and
+            // every sigma — including the *final* form `ς` — folds to `σ`.
+            // Rust's std has no case-folding. Uppercasing then lowercasing
+            // reproduces the `ß`→`SS`→`ss` full fold (and the ligatures) while
+            // leaving ASCII and common scripts identical to `lower`, but Rust's
+            // context-aware `to_lowercase` re-introduces a word-final `ς`, which
+            // casefold does not keep — so fold `ς`→`σ` explicitly afterwards.
+            // A close, dependency-free approximation of Unicode full folding.
+            Value::Str(Rc::new(s.to_uppercase().to_lowercase().replace('ς', "σ")))
+        }
         "removeprefix" => {
             let p = single(args, "removeprefix")?.py_str();
             Value::Str(Rc::new(s.strip_prefix(&p).unwrap_or(s).to_owned()))

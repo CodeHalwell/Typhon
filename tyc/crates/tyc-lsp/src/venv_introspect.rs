@@ -481,12 +481,17 @@ fn introspect_via_python(
     // fill the stdout pipe buffer (typically 64 KB on macOS/Linux) and
     // the child blocks on `print()`, never reaching `sys.exit(0)`;
     // the timeout below would kill it but the result is always None.
-    let Some(mut stdout) = child.stdout.take() else {
+    let Some(stdout) = child.stdout.take() else {
         return (None, Some(spawn_failure()));
     };
     let drainer = std::thread::spawn(move || -> Vec<u8> {
+        // Cap the read so a dependency that floods stdout can't OOM the
+        // language server (see the same guard in `tyc-venv`). 32 MiB is far
+        // above any real introspection response; an over-cap read fails to
+        // parse and is treated as a miss.
+        const CAP: u64 = 32 * 1024 * 1024;
         let mut buf = Vec::with_capacity(64 * 1024);
-        let _ = stdout.read_to_end(&mut buf);
+        let _ = std::io::Read::take(stdout, CAP).read_to_end(&mut buf);
         buf
     });
     // Wait with a timeout. `Child::wait` blocks indefinitely, so we
