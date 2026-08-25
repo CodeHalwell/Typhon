@@ -583,10 +583,22 @@ impl TyphonConfig {
         // Require both to stay within the project directory.
         for (key, value) in [("src", &self.project.src), ("out", &self.project.out)] {
             let candidate = std::path::Path::new(value.as_str());
+            // `is_absolute()` alone misses two Windows-only rooted forms that
+            // `Path::join` still treats as *replacing* the base directory, so a
+            // build there could escape the project tree: a drive-relative
+            // prefix (`out = "C:out"`, which has a `Prefix` but is not absolute)
+            // and a driveless root (`out = "\\out"`, a `RootDir` with no
+            // prefix). Require every component to be a plain in-tree step —
+            // `Normal` or `CurDir` — which rejects `..`, absolute paths, and
+            // both Windows rooted forms at once (`Prefix`/`RootDir` never arise
+            // for a relative value on Unix, so this is a no-op there).
             let escapes = candidate.is_absolute()
-                || candidate
-                    .components()
-                    .any(|c| matches!(c, std::path::Component::ParentDir));
+                || candidate.components().any(|c| {
+                    !matches!(
+                        c,
+                        std::path::Component::Normal(_) | std::path::Component::CurDir
+                    )
+                });
             if escapes {
                 return Err(ConfigError::ProjectPathEscapesRoot {
                     path: source_path.to_string_lossy().into_owned(),
@@ -863,6 +875,27 @@ mod tests {
                 cfg.validate(p).is_ok(),
                 "out = {good:?} must be accepted, got {:?}",
                 cfg.validate(p)
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn windows_drive_relative_project_paths_are_rejected() {
+        // A drive-relative prefix (`C:out`) and a driveless root (`\out`) are
+        // not `is_absolute()` on Windows, yet `Path::join` treats both as
+        // rooted and escapes the project dir. These parse as `Prefix`/`RootDir`
+        // components only on Windows, so the test is Windows-only.
+        let p = Path::new("typhon.toml");
+        for bad in ["C:out", r"\out", r"\\server\share\out"] {
+            let mut cfg = cfg_with_target("3.13");
+            cfg.project.out = bad.to_string();
+            assert!(
+                matches!(
+                    cfg.validate(p),
+                    Err(ConfigError::ProjectPathEscapesRoot { .. })
+                ),
+                "out = {bad:?} must be rejected on Windows"
             );
         }
     }

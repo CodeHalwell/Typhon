@@ -6204,11 +6204,36 @@ fn str_method(
                 }
             };
             // CPython accepts either a single string or a *tuple* of strings
-            // (`p.endswith((".py", ".ty"))`); the VM only handled the single
-            // form, coercing the tuple to its repr and always missing.
+            // (`p.endswith((".py", ".ty"))`) and enforces the element type: a
+            // non-`str` first arg — or a non-`str` element reached before any
+            // match — raises `TypeError`. Validation is lazy and in iteration
+            // order, so a match found before an invalid element returns `True`
+            // without examining the rest (`"a".startswith(("a", 1))` is `True`,
+            // but `"a".startswith((1, "a"))` raises).
             let result = match arg {
-                Value::Tuple(items) => items.iter().any(|it| matches_one(&it.py_str())),
-                other => matches_one(&other.py_str()),
+                Value::Tuple(items) => {
+                    let mut matched = false;
+                    for it in items.iter() {
+                        let Value::Str(needle) = it else {
+                            return Err(type_error(format!(
+                                "tuple for {name} must only contain str, not {}",
+                                it.type_name()
+                            )));
+                        };
+                        if matches_one(needle.as_str()) {
+                            matched = true;
+                            break;
+                        }
+                    }
+                    matched
+                }
+                Value::Str(needle) => matches_one(needle.as_str()),
+                other => {
+                    return Err(type_error(format!(
+                        "{name} first arg must be str or a tuple of str, not {}",
+                        other.type_name()
+                    )))
+                }
             };
             Value::Bool(result)
         }
@@ -6286,15 +6311,10 @@ fn str_method(
         }
         "istitle" => Value::Bool(is_title_case(s)),
         "casefold" => {
-            // `casefold` is more aggressive than `lower`: `ß` folds to `ss` and
-            // every sigma — including the *final* form `ς` — folds to `σ`.
-            // Rust's std has no case-folding. Uppercasing then lowercasing
-            // reproduces the `ß`→`SS`→`ss` full fold (and the ligatures) while
-            // leaving ASCII and common scripts identical to `lower`, but Rust's
-            // context-aware `to_lowercase` re-introduces a word-final `ς`, which
-            // casefold does not keep — so fold `ς`→`σ` explicitly afterwards.
-            // A close, dependency-free approximation of Unicode full folding.
-            Value::Str(Rc::new(s.to_uppercase().to_lowercase().replace('ς', "σ")))
+            // Full Unicode case folding via the embedded C+F mappings, for
+            // byte-exact parity with CPython's `str.casefold()`. `to_lowercase`
+            // and an uppercase round-trip both diverge (see `casefold_str`).
+            Value::Str(Rc::new(casefold_str(s)))
         }
         "removeprefix" => {
             let p = single(args, "removeprefix")?.py_str();
@@ -8311,6 +8331,32 @@ pub fn make_builtin_type(name: &str) -> Value {
             .clone();
         Value::Class(cls)
     })
+}
+
+/// Full Unicode case folding, byte-exact with CPython's `str.casefold()`.
+///
+/// Rust's std offers no case-folding, and the two obvious stand-ins are both
+/// wrong: `to_lowercase` leaves `ß` as `ß` (fold is `ss`) and maps Cherokee
+/// *away* from its folded form, while an uppercase-then-lowercase round-trip
+/// collapses distinctions the fold preserves (dotless `ı` → `I` → `i`). The
+/// authoritative C+F mappings from the Unicode Character Database are embedded
+/// in [`crate::casefold_data`] instead: each scalar is looked up (identity when
+/// absent), expanding to one or more scalars.
+fn casefold_str(s: &str) -> String {
+    use crate::casefold_data::{CASEFOLD_MULTI, CASEFOLD_SINGLE};
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        let cp = c as u32;
+        if let Ok(i) = CASEFOLD_SINGLE.binary_search_by(|&(k, _)| k.cmp(&cp)) {
+            // A table value is a fold target from the UCD, always a valid scalar.
+            out.push(char::from_u32(CASEFOLD_SINGLE[i].1).unwrap_or(c));
+        } else if let Ok(i) = CASEFOLD_MULTI.binary_search_by(|&(k, _)| k.cmp(&cp)) {
+            out.push_str(CASEFOLD_MULTI[i].1);
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 fn is_title_case(s: &str) -> bool {

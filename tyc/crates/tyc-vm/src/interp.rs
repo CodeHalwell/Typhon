@@ -7864,6 +7864,9 @@ a = "main.ty".endswith((".py", ".ty"))
 b = "main.rs".endswith((".py", ".ty"))
 c = "print(x)".startswith(("print", "log"))
 d = "x.ty".endswith(".ty")
+# A match found before an invalid tuple element returns True without ever
+# examining the invalid element — CPython's lazy, in-order validation.
+e = "print(x)".startswith(("print", 1))
 "#;
         let (interp, res) = parse_and_run(src);
         res.unwrap();
@@ -7871,6 +7874,42 @@ d = "x.ty".endswith(".ty")
         assert_eq!(interp.root.get("b").unwrap().py_str(), "False");
         assert_eq!(interp.root.get("c").unwrap().py_str(), "True");
         assert_eq!(interp.root.get("d").unwrap().py_str(), "True");
+        assert_eq!(interp.root.get("e").unwrap().py_str(), "True");
+    }
+
+    #[test]
+    fn startswith_endswith_reject_non_str() {
+        // CPython raises `TypeError` for a non-`str` first arg and for a
+        // non-`str` tuple element reached before any match — matching the exact
+        // messages so `tyc run` is a drop-in for `python`.
+        let cases = [
+            (
+                r#"r = "a".startswith(1)"#,
+                "startswith first arg must be str or a tuple of str, not int",
+            ),
+            (
+                r#"r = "a".endswith(None)"#,
+                "endswith first arg must be str or a tuple of str, not NoneType",
+            ),
+            (
+                r#"r = "a".startswith((1, "a"))"#,
+                "tuple for startswith must only contain str, not int",
+            ),
+            (
+                r#"r = "a".endswith((b"x",))"#,
+                "tuple for endswith must only contain str, not bytes",
+            ),
+        ];
+        for (src, want) in cases {
+            let (_i, res) = parse_and_run(src);
+            match res.expect_err("non-str prefix must raise") {
+                Unwind::Exception(e) => {
+                    assert_eq!(e.kind, "TypeError", "src={src}");
+                    assert_eq!(e.message, want, "src={src}");
+                }
+                other => panic!("expected TypeError for {src}, got {other:?}"),
+            }
+        }
     }
 
     #[test]
@@ -7910,6 +7949,42 @@ b = "Σίσυφος".casefold()
         res.unwrap();
         assert_eq!(interp.root.get("a").unwrap().py_str(), "ss");
         assert_eq!(interp.root.get("b").unwrap().py_str(), "σίσυφοσ");
+    }
+
+    #[test]
+    fn casefold_matches_cpython_on_tricky_scalars() {
+        // Byte-exact parity with CPython's full case folding on the exact
+        // scalars a `to_lowercase`/uppercase-round-trip approximation gets
+        // wrong: dotless `ı` folds to itself (not `i`), Cherokee folds toward
+        // its uppercase forms (not `to_lowercase`'s lowercase block), `İ`
+        // expands to `i` + combining dot, and the micro sign folds to Greek mu.
+        let src = "\
+dotless = \"\u{131}\".casefold()
+cherokee_upper = \"\u{13A0}\".casefold()
+cherokee_lower = \"\u{AB70}\".casefold()
+dotted_i = \"\u{130}\".casefold()
+micro = \"\u{B5}\".casefold()
+ligfi = \"\u{FB01}\".casefold()
+";
+        let (interp, res) = parse_and_run(src);
+        res.unwrap();
+        // ı (U+0131) folds to itself.
+        assert_eq!(interp.root.get("dotless").unwrap().py_str(), "\u{131}");
+        // Ꭰ (U+13A0) folds to itself; ꭰ (U+AB70) folds up to U+13A0.
+        assert_eq!(
+            interp.root.get("cherokee_upper").unwrap().py_str(),
+            "\u{13A0}"
+        );
+        assert_eq!(
+            interp.root.get("cherokee_lower").unwrap().py_str(),
+            "\u{13A0}"
+        );
+        // İ (U+0130) → "i" + U+0307 combining dot above.
+        assert_eq!(interp.root.get("dotted_i").unwrap().py_str(), "i\u{307}");
+        // µ (U+00B5 micro) → μ (U+03BC Greek small mu).
+        assert_eq!(interp.root.get("micro").unwrap().py_str(), "\u{3BC}");
+        // ﬁ ligature (U+FB01) → "fi".
+        assert_eq!(interp.root.get("ligfi").unwrap().py_str(), "fi");
     }
 
     #[test]

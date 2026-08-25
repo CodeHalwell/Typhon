@@ -2545,6 +2545,60 @@ impl TypeEnv {
         self.attr_narrowings
             .retain(|k, v| other.attr_narrowings.get(k) == Some(v));
     }
+
+    /// Overlay onto `self` the binding and narrowing changes a `finally` block
+    /// made, given the env it was checked *from* (`before`, the conservative
+    /// all-paths view) and the env *after* checking it (`after`).
+    ///
+    /// `self` is the post-`try` normal-exit state that flows to the code after
+    /// the statement. A `finally` runs on that path too, so its assignments,
+    /// its narrowings, and any name it freshly declares belong downstream — a
+    /// `finally: x = None` must invalidate a prior non-`None` narrowing of `x`,
+    /// and a `finally: x = "d"` must make a nullable `x` safe downstream. But
+    /// `finally` was *checked* against the weaker `before` view (only the facts
+    /// guaranteed on every path into `finally`, since a mid-body raise reaches
+    /// it too), so only the deltas it actually introduced are overlaid — the
+    /// stronger normal-path narrowings `self` holds for bindings `finally`
+    /// never touched are left intact. This keeps the downstream state identical
+    /// to checking `finally` in place from `self`, while the conservative view
+    /// governs the diagnostics *inside* `finally`.
+    fn overlay_finally_delta(&mut self, before: &TypeEnv, after: &TypeEnv) {
+        for (i, scope) in self.scopes.iter_mut().enumerate() {
+            let before_scope = before.scopes.get(i);
+            let Some(after_scope) = after.scopes.get(i) else {
+                continue;
+            };
+            for (name, ab) in after_scope {
+                // `finally` changed this binding iff its narrowed type moved
+                // away from the view it was checked against.
+                let changed = before_scope
+                    .and_then(|s| s.get(name))
+                    .map(|bb| &bb.narrowed)
+                    != Some(&ab.narrowed);
+                if let Some(b) = scope.get_mut(name) {
+                    if changed {
+                        b.narrowed = ab.narrowed.clone();
+                    }
+                } else {
+                    // A name `finally` introduced — keep it visible downstream.
+                    scope.insert(name.clone(), ab.clone());
+                }
+            }
+        }
+        // Attribute narrowings: apply `finally`'s delta — a path it added or
+        // re-narrowed is taken; one it cleared (present in `before`, gone in
+        // `after`) is dropped; paths neither side changed keep `self`'s value.
+        for (path, ty) in &after.attr_narrowings {
+            if before.attr_narrowings.get(path) != Some(ty) {
+                self.attr_narrowings.insert(path.clone(), ty.clone());
+            }
+        }
+        for path in before.attr_narrowings.keys() {
+            if !after.attr_narrowings.contains_key(path) {
+                self.attr_narrowings.remove(path);
+            }
+        }
+    }
 }
 
 /// Per-module check state.
@@ -12074,13 +12128,22 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
             // join — so snapshot it, check `finally` against the weaker view,
             // then restore it.
             if !t.finalbody.is_empty() {
-                let after_try = c.env.snapshot();
+                let mut after_try = c.env.snapshot();
                 let mut finally_view = after_try.clone();
                 finally_view.intersect_narrowings(&pre_try);
-                c.env.restore(finally_view);
+                c.env.restore(finally_view.clone());
                 for s in &t.finalbody {
                     check_stmt(c, s);
                 }
+                // `finally` ran on the normal-exit path too, so its effects
+                // flow to the code after the `try`. Overlay just the deltas it
+                // introduced (vs the conservative view it was checked against)
+                // onto the fuller post-try state — a `finally: x = None` drops
+                // a stale non-`None` narrowing downstream, and a `finally`
+                // that re-establishes safety is remembered — without discarding
+                // the normal-path narrowings `finally` never touched.
+                let finally_result = c.env.snapshot();
+                after_try.overlay_finally_delta(&finally_view, &finally_result);
                 c.env.restore(after_try);
             }
         }
@@ -24852,6 +24915,86 @@ def g(x: str | None) -> int:
         assert!(
             d.errors().is_empty(),
             "a pre-try narrowing must survive into finally: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn finally_assignment_invalidates_downstream_narrowing() {
+        // A `finally` runs on the normal-exit path, so an assignment it makes
+        // flows to the code after the `try`. Here `x` is narrowed to `str`
+        // before the `try`, but `finally: x = None` re-nullifies it — the
+        // deref after the statement must be rejected (it crashes at runtime).
+        let src = "\
+def f(v: str | None) -> int:
+    mut x: str | None = v
+    if x is None:
+        return 0
+    try:
+        pass
+    finally:
+        x = None
+    return len(x.upper())
+";
+        let d = check(src);
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::NullableUse { .. })),
+            "a finally reassignment to None must invalidate the downstream \
+             narrowing: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn finally_assignment_makes_value_safe_downstream() {
+        // The dual: a `finally` assignment that re-establishes a non-null value
+        // must be remembered downstream, so the deref is accepted — restoring
+        // the pre-finally state would drop it and fire a false positive.
+        let src = "\
+def prod() -> str:
+    return \"d\"
+
+def f(v: str | None) -> int:
+    mut x: str | None = v
+    try:
+        pass
+    finally:
+        x = prod()
+    return len(x.upper())
+";
+        let d = check(src);
+        assert!(
+            d.errors().is_empty(),
+            "a finally reassignment to a non-null value must be remembered \
+             downstream (no false positive): {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn finally_touching_one_var_keeps_another_narrowing() {
+        // Overlaying finally's effect must not clobber a normal-path narrowing
+        // the finally body never touched: `x` stays `str` even though the
+        // finally block reassigns an unrelated `y`.
+        let src = "\
+def f(x: str | None, w: str | None) -> int:
+    mut y: str | None = w
+    if x is None:
+        return 0
+    try:
+        pass
+    finally:
+        y = None
+    return len(x.upper())
+";
+        let d = check(src);
+        assert!(
+            !d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::NullableUse { .. })),
+            "a narrowing finally never touched must survive downstream: {:?}",
             d.errors()
         );
     }
