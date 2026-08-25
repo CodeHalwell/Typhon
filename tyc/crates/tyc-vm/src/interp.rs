@@ -7856,6 +7856,51 @@ c = "x\vy\fz".splitlines()
     }
 
     #[test]
+    fn startswith_endswith_accept_a_tuple() {
+        // CPython's `str.startswith` / `endswith` take a string OR a tuple of
+        // strings; the VM only handled the single-string form.
+        let src = r#"
+a = "main.ty".endswith((".py", ".ty"))
+b = "main.rs".endswith((".py", ".ty"))
+c = "print(x)".startswith(("print", "log"))
+d = "x.ty".endswith(".ty")
+"#;
+        let (interp, res) = parse_and_run(src);
+        res.unwrap();
+        assert_eq!(interp.root.get("a").unwrap().py_str(), "True");
+        assert_eq!(interp.root.get("b").unwrap().py_str(), "False");
+        assert_eq!(interp.root.get("c").unwrap().py_str(), "True");
+        assert_eq!(interp.root.get("d").unwrap().py_str(), "True");
+    }
+
+    #[test]
+    fn seeded_random_matches_cpython_byte_for_byte() {
+        // Locks the alpha.8 parity contract: an explicit `random.seed(n)` must
+        // reproduce CPython's Mersenne-Twister sequence exactly. The constants
+        // below were captured from CPython 3.13 `random.seed(42)`.
+        let src = r#"
+import random
+random.seed(42)
+a = random.random()
+b = random.randint(1, 100)
+c = random.random()
+xs = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+random.shuffle(xs)
+d = random.sample(range(100), 5)
+"#;
+        let (interp, res) = parse_and_run(src);
+        res.unwrap();
+        assert_eq!(interp.root.get("a").unwrap().py_str(), "0.6394267984578837");
+        assert_eq!(interp.root.get("b").unwrap().py_str(), "4");
+        assert_eq!(interp.root.get("c").unwrap().py_str(), "0.7415504997598329");
+        assert_eq!(
+            interp.root.get("xs").unwrap().py_str(),
+            "[9, 2, 8, 7, 5, 1, 6, 3, 10, 4]"
+        );
+        assert_eq!(interp.root.get("d").unwrap().py_str(), "[4, 3, 11, 27, 29]");
+    }
+
+    #[test]
     fn casefold_folds_sharp_s_and_final_sigma() {
         let src = r#"
 a = "ß".casefold()

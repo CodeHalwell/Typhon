@@ -108,6 +108,23 @@ case "$("$PYTHON313" -c 'import sys;print(sys.version_info[:2]>=(3,13))' 2>/dev/
     *) echo "error: '$PYTHON313' is not CPython 3.13+." >&2; exit 2 ;;
 esac
 
+# `--update` rewrites the baseline from this run. A unit whose runtime needs a
+# package the recording environment lacks (every `model` class needs pydantic;
+# one stress unit imports yaml) is classified `vacuous`/`nobuild` instead of
+# `diverge`, so a `--update` on a bare machine would silently write a TRUNCATED
+# baseline — dropping real known divergences, which the next CI run then reports
+# as regressions. Refuse to record without the baseline's declared package set,
+# the same "never pass vacuously" reasoning the python3.13 check above applies.
+if [ "$UPDATE" = "1" ]; then
+    if ! "$PYTHON313" -c 'import pydantic, yaml' >/dev/null 2>&1; then
+        echo "error: --update needs the baseline's declared runtime packages" >&2
+        echo "       (pydantic, PyYAML) importable under '$PYTHON313', or it" >&2
+        echo "       would record a truncated baseline. Install them first:" >&2
+        echo "         $PYTHON313 -m pip install pydantic PyYAML" >&2
+        exit 2
+    fi
+fi
+
 # ------------------------------------------------------------- unit listing --
 # A "unit" is one independently-executable thing:
 #   * a project        — any directory containing typhon.toml (id ends in '/')

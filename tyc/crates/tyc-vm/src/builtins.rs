@@ -6190,17 +6190,27 @@ fn str_method(
         // Each of these takes optional `start` / `end` character offsets after
         // the needle. They were ignored; see `search_range`.
         "startswith" | "endswith" => {
-            let needle = single(args, name)?.py_str();
+            let arg = single(args, name)?;
             let Some((cs, ce)) = search_range(args, s.chars().count())? else {
                 return Ok(Value::Bool(false));
             };
             let (bs, be) = char_range_bytes(s, cs, ce);
             let window = &s[bs..be];
-            Value::Bool(if name == "startswith" {
-                window.starts_with(&needle)
-            } else {
-                window.ends_with(&needle)
-            })
+            let matches_one = |needle: &str| {
+                if name == "startswith" {
+                    window.starts_with(needle)
+                } else {
+                    window.ends_with(needle)
+                }
+            };
+            // CPython accepts either a single string or a *tuple* of strings
+            // (`p.endswith((".py", ".ty"))`); the VM only handled the single
+            // form, coercing the tuple to its repr and always missing.
+            let result = match arg {
+                Value::Tuple(items) => items.iter().any(|it| matches_one(&it.py_str())),
+                other => matches_one(&other.py_str()),
+            };
+            Value::Bool(result)
         }
         "find" | "rfind" | "index" | "rindex" => {
             let needle = single(args, name)?.py_str();

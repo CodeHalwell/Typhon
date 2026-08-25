@@ -67,7 +67,6 @@ stress/round-2026-05-20-exploration/08-meta-stress/20-generator-sync.ty
 stress/round-2026-05-20-exploration/08-meta-stress/25-paren-emit-suite.ty
 stress/round-2026-05-20/cases/116_match_class_attr.ty
 stress/round-2026-05-20/cases/121_class_attr_constant.ty
-stress/round-2026-05-20/cases/123_unused_import.ty
 stress/round-2026-05-20/cases/126_class_const_methodref.ty
 stress/round-2026-05-20/cases/29_lazy_let_class.ty
 stress/round-2026-05-20/cases/63_async_context.ty

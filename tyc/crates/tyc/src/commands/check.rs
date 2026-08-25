@@ -1127,6 +1127,19 @@ fn diff_stub_against_impl(
 mod tests {
     use super::*;
 
+    /// Serialise tests that mutate the process-wide environment (here,
+    /// `PYTHONPATH`). `cargo test` runs tests on parallel threads, so an
+    /// unguarded `set_var` could leak into a concurrent test that spawns
+    /// Python. Mirrors the `lock_env()` guard used elsewhere in the workspace.
+    fn lock_env() -> std::sync::MutexGuard<'static, ()> {
+        use std::sync::{Mutex, OnceLock};
+        static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        ENV_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+    }
+
     fn write_ty(dir: &std::path::Path, name: &str, content: &str) -> std::path::PathBuf {
         let path = dir.join(name);
         std::fs::write(&path, content).unwrap();
@@ -1527,7 +1540,9 @@ class Agent:
         // `fake_introspect_pkg`, so a concurrently-running test that spawns
         // Python cannot be affected by the extra entry.
         // SAFETY: same pattern as the crate's other env-var tests; the var
-        // is removed before the test returns.
+        // is removed before the test returns. `lock_env` serialises against
+        // any other env-mutating test in this module.
+        let _env = lock_env();
         unsafe { std::env::set_var("PYTHONPATH", project_root) };
         tyc_venv::enrich_project_shapes_with_venv(
             std::slice::from_ref(&src),
