@@ -6138,9 +6138,20 @@ fn str_method(
             )))
         }
         "splitlines" => {
+            // A bound method call appends its keywords as a
+            // `__typhon_kwargs_sentinel__` tuple, which the `_kwargs` map (a
+            // different marker) does not decode — so `splitlines(keepends=False)`
+            // would see the sentinel as a truthy positional arg and behave like
+            // `keepends=True`. Unpack it here exactly as `split` does.
+            let (args, kw) = split_kwargs(args);
             let keepends = match args.first() {
                 Some(v) => v.truthy(),
-                None => _kwargs.get("keepends").map(|v| v.truthy()).unwrap_or(false),
+                None => kw
+                    .iter()
+                    .rev()
+                    .find(|(k, _)| k == "keepends")
+                    .map(|(_, v)| v.truthy())
+                    .unwrap_or(false),
             };
             let lines: Vec<Value> = py_splitlines(s, keepends)
                 .into_iter()

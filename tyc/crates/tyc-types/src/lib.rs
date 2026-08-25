@@ -2562,19 +2562,29 @@ impl TypeEnv {
     /// never touched are left intact. This keeps the downstream state identical
     /// to checking `finally` in place from `self`, while the conservative view
     /// governs the diagnostics *inside* `finally`.
-    fn overlay_finally_delta(&mut self, before: &TypeEnv, after: &TypeEnv) {
+    fn overlay_finally_delta(
+        &mut self,
+        before: &TypeEnv,
+        after: &TypeEnv,
+        assigned: &LoopReassigned,
+    ) {
         for (i, scope) in self.scopes.iter_mut().enumerate() {
             let before_scope = before.scopes.get(i);
             let Some(after_scope) = after.scopes.get(i) else {
                 continue;
             };
             for (name, ab) in after_scope {
-                // `finally` changed this binding iff its narrowed type moved
-                // away from the view it was checked against.
-                let changed = before_scope
-                    .and_then(|s| s.get(name))
-                    .map(|bb| &bb.narrowed)
-                    != Some(&ab.narrowed);
+                // `finally` affected this binding if it *assigned* to it — even
+                // to a value of the same type as the conservative entry view, a
+                // write a `before`/`after` type comparison alone cannot see —
+                // or if it moved the narrowed type (a guard, an invalidating
+                // call). Either way `finally`'s result, not the stronger
+                // post-`try` narrowing, is what a normal exit carries downstream.
+                let changed = assigned.names.contains(name)
+                    || before_scope
+                        .and_then(|s| s.get(name))
+                        .map(|bb| &bb.narrowed)
+                        != Some(&ab.narrowed);
                 if let Some(b) = scope.get_mut(name) {
                     if changed {
                         b.narrowed = ab.narrowed.clone();
@@ -2585,9 +2595,9 @@ impl TypeEnv {
                 }
             }
         }
-        // Attribute narrowings: apply `finally`'s delta — a path it added or
-        // re-narrowed is taken; one it cleared (present in `before`, gone in
-        // `after`) is dropped; paths neither side changed keep `self`'s value.
+        // Attribute narrowings: take the paths `finally` added or re-narrowed;
+        // drop the ones it cleared (present in `before`, gone in `after`); paths
+        // neither side changed keep `self`'s value.
         for (path, ty) in &after.attr_narrowings {
             if before.attr_narrowings.get(path) != Some(ty) {
                 self.attr_narrowings.insert(path.clone(), ty.clone());
@@ -2596,6 +2606,17 @@ impl TypeEnv {
         for path in before.attr_narrowings.keys() {
             if !after.attr_narrowings.contains_key(path) {
                 self.attr_narrowings.remove(path);
+            }
+        }
+        // A path `finally` *assigned* but left with an equal narrowing on both
+        // sides (so the value diff above misses it) still staled the post-`try`
+        // narrowing — drop it, and its sub-paths, unless `finally` re-narrowed
+        // it. Mirrors the same-type-write case handled for bare names above.
+        for path in &assigned.attrs {
+            if !after.attr_narrowings.contains_key(path) {
+                let sub = format!("{path}.");
+                self.attr_narrowings
+                    .retain(|k, _| k != path && !k.starts_with(&sub));
             }
         }
     }
@@ -12143,7 +12164,9 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                 // that re-establishes safety is remembered — without discarding
                 // the normal-path narrowings `finally` never touched.
                 let finally_result = c.env.snapshot();
-                after_try.overlay_finally_delta(&finally_view, &finally_result);
+                let mut finally_writes = LoopReassigned::default();
+                collect_reassigned_names(&t.finalbody, &mut finally_writes);
+                after_try.overlay_finally_delta(&finally_view, &finally_result, &finally_writes);
                 c.env.restore(after_try);
             }
         }
@@ -24995,6 +25018,41 @@ def f(x: str | None, w: str | None) -> int:
                 .iter()
                 .any(|e| matches!(e, TycError::NullableUse { .. })),
             "a narrowing finally never touched must survive downstream: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn finally_same_type_reassignment_invalidates_narrowing() {
+        // A `finally` write must be tracked as a write even when the assigned
+        // value has the *same* (nullable) type as the conservative entry view:
+        // the body narrows `x` to `str`, the handler exits, and `finally`
+        // reassigns `x = maybe(v)` (nullable). Both the pre-`finally` view and
+        // the result are nullable, so a type-diff heuristic sees "no change" and
+        // wrongly keeps the post-`try` `str` — but `maybe(v)` can return `None`,
+        // so the downstream deref must be rejected.
+        let src = "\
+def maybe(v: str | None) -> str | None:
+    return v
+
+def f(v: str | None) -> int:
+    mut x: str | None = v
+    try:
+        if x is None:
+            raise ValueError(\"nope\")
+    except ValueError:
+        return 0
+    finally:
+        x = maybe(v)
+    return len(x.upper())
+";
+        let d = check(src);
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::NullableUse { .. })),
+            "a same-type finally reassignment must still invalidate the \
+             downstream narrowing: {:?}",
             d.errors()
         );
     }

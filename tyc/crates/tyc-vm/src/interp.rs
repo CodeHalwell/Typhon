@@ -3747,11 +3747,13 @@ impl Interpreter {
             return Ok(Str(Rc::new(format!("{}{}", a, b))));
         }
         if let (Str(a), Mult, Int(n)) = (l, op, r) {
-            let n = repeat_count(n)?;
+            let n =
+                repeat_count_checked(a.len(), n, repeated_too_long("repeated string is too long"))?;
             return Ok(Str(Rc::new(a.repeat(n))));
         }
         if let (Int(n), Mult, Str(a)) = (l, op, r) {
-            let n = repeat_count(n)?;
+            let n =
+                repeat_count_checked(a.len(), n, repeated_too_long("repeated string is too long"))?;
             return Ok(Str(Rc::new(a.repeat(n))));
         }
 
@@ -3763,11 +3765,13 @@ impl Interpreter {
             return Ok(Bytes(Rc::new(out)));
         }
         if let (Bytes(a), Mult, Int(n)) = (l, op, r) {
-            let n = repeat_count(n)?;
+            let n =
+                repeat_count_checked(a.len(), n, repeated_too_long("repeated bytes are too long"))?;
             return Ok(Bytes(Rc::new(a.repeat(n))));
         }
         if let (Int(n), Mult, Bytes(a)) = (l, op, r) {
-            let n = repeat_count(n)?;
+            let n =
+                repeat_count_checked(a.len(), n, repeated_too_long("repeated bytes are too long"))?;
             return Ok(Bytes(Rc::new(a.repeat(n))));
         }
 
@@ -3783,7 +3787,7 @@ impl Interpreter {
             return Ok(Tuple(Rc::new(out)));
         }
         if let (List(a), Mult, Int(n)) = (l, op, r) {
-            let n = repeat_count(n)?;
+            let n = repeat_count_checked(a.borrow().len(), n, repeated_out_of_memory())?;
             let mut out = Vec::with_capacity(a.borrow().len().saturating_mul(n));
             for _ in 0..n {
                 out.extend(a.borrow().iter().cloned());
@@ -3791,7 +3795,7 @@ impl Interpreter {
             return Ok(List(Rc::new(RefCell::new(out))));
         }
         if let (Tuple(a), Mult, Int(n)) = (l, op, r) {
-            let n = repeat_count(n)?;
+            let n = repeat_count_checked(a.len(), n, repeated_out_of_memory())?;
             let mut out = Vec::with_capacity(a.len().saturating_mul(n));
             for _ in 0..n {
                 out.extend(a.iter().cloned());
@@ -6499,6 +6503,34 @@ fn repeat_count(n: &VmInt) -> Result<usize, Unwind> {
     })
 }
 
+/// Like [`repeat_count`], but also rejects a repetition whose *total* size
+/// (`elem_len * count`) would not fit an index-sized allocation. CPython raises
+/// here before allocating — `OverflowError` for `str`/`bytes`, `MemoryError`
+/// for `list`/`tuple` — whereas the subsequent `str::repeat` / `Vec::repeat` /
+/// `Vec::with_capacity` panics with "capacity overflow" (a capacity above
+/// `isize::MAX`), aborting `tyc run` with exit 101 instead of a catchable
+/// exception. `too_long` is the exception to raise; the caller picks its kind.
+fn repeat_count_checked(elem_len: usize, n: &VmInt, too_long: Unwind) -> Result<usize, Unwind> {
+    let count = repeat_count(n)?;
+    match elem_len.checked_mul(count) {
+        Some(total) if total <= isize::MAX as usize => Ok(count),
+        _ => Err(too_long),
+    }
+}
+
+/// CPython's `OverflowError` for an over-long `str`/`bytes` repetition. The
+/// message's verb differs by type ("string is" vs "bytes are"), so the caller
+/// passes it verbatim.
+fn repeated_too_long(message: &'static str) -> Unwind {
+    Unwind::Exception(VmException::new("OverflowError", message))
+}
+
+/// CPython raises `MemoryError` (not `OverflowError`) for an over-long
+/// `list`/`tuple` repetition.
+fn repeated_out_of_memory() -> Unwind {
+    Unwind::Exception(VmException::new("MemoryError", ""))
+}
+
 /// CPython's `float_divmod` (Objects/floatobject.c) — the exact basis for float
 /// `//` and `%` and for `divmod(float, float)`. Returns `(floordiv, mod)`.
 ///
@@ -7842,17 +7874,54 @@ result = (calls, xs[0])
     }
 
     #[test]
+    fn repeat_total_length_overflow_raises_not_panics() {
+        // The count fits an index-sized integer but `len * count` does not, so
+        // the allocation would panic with "capacity overflow" (exit 101). Match
+        // CPython: `str`/`bytes` raise OverflowError before allocating, and
+        // `list`/`tuple` raise MemoryError — never an uncatchable panic.
+        for (src, kind, msg) in [
+            (
+                "r = \"aa\" * (2 ** 62)",
+                "OverflowError",
+                "repeated string is too long",
+            ),
+            (
+                "r = b\"aa\" * (2 ** 62)",
+                "OverflowError",
+                "repeated bytes are too long",
+            ),
+            ("r = [1, 1] * (2 ** 62)", "MemoryError", ""),
+            ("r = (1, 1) * (2 ** 62)", "MemoryError", ""),
+        ] {
+            let (_i, res) = parse_and_run(src);
+            match res.expect_err("over-long repeat must raise, not panic") {
+                Unwind::Exception(e) => {
+                    assert_eq!(e.kind, kind, "src={src}");
+                    assert_eq!(e.message, msg, "src={src}");
+                }
+                other => panic!("expected {kind} for {src}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
     fn splitlines_honours_boundaries_and_keepends() {
         let src = r#"
 a = "a\rb".splitlines()
 b = "a\nb".splitlines(True)
 c = "x\vy\fz".splitlines()
+# Keyword form must decode the kwargs sentinel — keepends=False must strip,
+# keepends=True must keep, not both behave like True.
+d = "a\nb".splitlines(keepends=False)
+e = "a\nb".splitlines(keepends=True)
 "#;
         let (interp, res) = parse_and_run(src);
         res.unwrap();
         assert_eq!(interp.root.get("a").unwrap().py_str(), "['a', 'b']");
         assert_eq!(interp.root.get("b").unwrap().py_str(), "['a\\n', 'b']");
         assert_eq!(interp.root.get("c").unwrap().py_str(), "['x', 'y', 'z']");
+        assert_eq!(interp.root.get("d").unwrap().py_str(), "['a', 'b']");
+        assert_eq!(interp.root.get("e").unwrap().py_str(), "['a\\n', 'b']");
     }
 
     #[test]
