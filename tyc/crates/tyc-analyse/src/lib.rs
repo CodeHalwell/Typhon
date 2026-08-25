@@ -3700,6 +3700,8 @@ fn is_string_literal(expr: &Expr) -> bool {
 /// less-specific suffix. Invariant: any keyword that contains another
 /// keyword as a substring (`APITOKEN` ⊃ `TOKEN`, `API_KEY` ⊃ `KEY`) must
 /// come first, so first-match reporting picks the most specific word.
+/// That ordering is asserted by `secret_keyword_table_is_longest_first`
+/// (this crate's tests) — reorder freely, the test catches violations.
 pub const SECRET_NAME_KEYWORDS: &[&str] = &[
     // Longest-first: `APIKEY` must be tried before the bare `KEY` so a name
     // like `KEY_APIKEY` reports the more specific suffix. `PASSPHRASE` must
@@ -3767,15 +3769,21 @@ pub const SECRET_NAME_KEYWORDS: &[&str] = &[
     "DSN",
 ];
 
-/// True when `name` contains one of the recognised secret-shaped keywords
-/// as a bounded substring. Match is case-insensitive; the keyword may form
+/// Return the first (i.e. most specific, given the table's longest-first
+/// ordering) secret-shaped keyword that occurs in `name` as a bounded
+/// substring, or `None`. Match is case-insensitive; the keyword may form
 /// the whole name (e.g. `TOKEN`), follow an underscore (e.g. `MY_TOKEN`),
 /// sit at a digit or camelCase/PascalCase boundary (e.g. `myTokenValue`,
-/// `foo123TOKEN`), or start/end the name. The expected callers feed
-/// module-level binding names; passing a function or method name through
-/// is harmless because the caller already gated on `Stmt::Assign` /
-/// `Stmt::AnnAssign`.
-fn is_secret_name(name: &str) -> bool {
+/// `foo123TOKEN`), or start/end the name.
+///
+/// This is the ONE implementation of the word-boundary heuristic, shared by
+/// the `tyc::contains_secret_literal` lint here ([`is_secret_name`]) and the
+/// `tyc build` secret-suffix scan (`secret_suffix` in the CLI crate). The two
+/// consumers previously carried hand-synchronised copies of this logic —
+/// every new boundary rule (alpha.8's digit / TitleCase junctions, alpha.9's
+/// uppercase→lowercase junction) had to be applied to both by hand, the same
+/// drift class that produced the alpha.4 `KEY_APIKEY` ordering bug.
+pub fn secret_keyword_match(name: &str) -> Option<&'static str> {
     let upper = name.to_ascii_uppercase();
     for word in SECRET_NAME_KEYWORDS {
         let mut start_idx = 0;
@@ -3801,12 +3809,21 @@ fn is_secret_name(name: &str) -> bool {
                 || (name.as_bytes()[actual_end].is_ascii_lowercase()
                     && name.as_bytes()[actual_end - 1].is_ascii_uppercase());
             if start_ok && end_ok {
-                return true;
+                return Some(word);
             }
             start_idx = actual_idx + 1;
         }
     }
-    false
+    None
+}
+
+/// True when `name` contains one of the recognised secret-shaped keywords
+/// as a bounded substring — see [`secret_keyword_match`] for the boundary
+/// rules. The expected callers feed module-level binding names; passing a
+/// function or method name through is harmless because the caller already
+/// gated on `Stmt::Assign` / `Stmt::AnnAssign`.
+fn is_secret_name(name: &str) -> bool {
+    secret_keyword_match(name).is_some()
 }
 
 /// Walk every `let` / `mut` / `AnnAssign` binding statement in `module`
@@ -5690,5 +5707,54 @@ mod except_star_tests {
         let err = &diags.errors()[0];
         let code = miette::Diagnostic::code(err).expect("code").to_string();
         assert_eq!(code, "tyc::return_in_except_star");
+    }
+}
+
+#[cfg(test)]
+mod secret_table_tests {
+    use super::*;
+
+    /// The invariant every consumer relies on for most-specific-first
+    /// reporting: a keyword that contains another keyword as a substring
+    /// must be ordered before it. Violations of exactly this rule shipped
+    /// in v1.0.0-alpha.4 (`KEY` before `APIKEY`, so `KEY_APIKEY` reported
+    /// the bare `KEY`) and were caught again in the alpha.9 review
+    /// (`DB_PWD` initially placed after `PWD`). This test makes the next
+    /// violation a compile-gate failure instead of a review catch.
+    #[test]
+    fn secret_keyword_table_is_longest_first() {
+        for (i, a) in SECRET_NAME_KEYWORDS.iter().enumerate() {
+            for (j, b) in SECRET_NAME_KEYWORDS.iter().enumerate() {
+                if i != j && a.contains(b) {
+                    assert!(
+                        i < j,
+                        "`{a}` contains `{b}` but is ordered after it \
+                         (index {i} vs {j}); a name matching both would \
+                         report the less-specific `{b}`"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn secret_keyword_table_has_no_duplicates() {
+        let mut seen = std::collections::HashSet::new();
+        for word in SECRET_NAME_KEYWORDS {
+            assert!(seen.insert(word), "duplicate keyword `{word}`");
+        }
+    }
+
+    #[test]
+    fn secret_keyword_match_reports_most_specific_word() {
+        // Boundary behaviour itself is pinned in depth by the CLI crate's
+        // `secret_suffix_*` tests (which now exercise this same shared
+        // implementation); keep a couple of canaries here beside the table.
+        assert_eq!(secret_keyword_match("KEY_APIKEY"), Some("APIKEY"));
+        assert_eq!(secret_keyword_match("DB_PWD"), Some("DB_PWD"));
+        assert_eq!(secret_keyword_match("dbPASSWORDstring"), Some("DBPASSWORD"));
+        assert_eq!(secret_keyword_match("TOKENs"), Some("TOKEN"));
+        assert_eq!(secret_keyword_match("MONKEY"), None);
+        assert_eq!(secret_keyword_match("PASSPORT"), None);
     }
 }

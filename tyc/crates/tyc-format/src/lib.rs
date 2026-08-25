@@ -118,16 +118,15 @@ pub fn format_source(source: &str, path: &str) -> Result<FormatResult, TycError>
         && prep.optionals.is_empty()
         && prep.lazy_imports.is_empty()
         && !contains_typhon_only_tokens(&normalised);
-    let after_ruff = if can_run_ruff && ruff_available() {
-        match run_ruff_format(&normalised, path) {
+    let after_ruff = match can_run_ruff.then(ruff_path).flatten() {
+        Some(ruff) => match run_ruff_format(&ruff, &normalised, path) {
             Ok(reformatted) => reformatted,
             Err(msg) => {
                 eprintln!("tyc fmt: ruff format failed ({msg}); using in-process output");
                 normalised
             }
-        }
-    } else {
-        normalised
+        },
+        None => normalised,
     };
 
     // Step 4: post-process — restore let/mut keywords, `?` sugar, and lazy imports.
@@ -1186,15 +1185,23 @@ fn contains_typhon_only_tokens(source: &str) -> bool {
     false
 }
 
-/// Locate `ruff` on `$PATH`.  Returns `None` when the binary cannot be
-/// found, allowing the formatter to fall back to the in-process pipeline
-/// silently.  The `TYC_FMT_DISABLE_RUFF=1` env var forces this to `None`
-/// — useful for tests and for users who want deterministic local output.
-fn ruff_available() -> bool {
+/// Resolve `ruff` to an absolute path on `$PATH`.  Returns `None` when the
+/// binary cannot be found, letting the formatter fall back to the in-process
+/// pipeline silently.  The `TYC_FMT_DISABLE_RUFF=1` env var forces this to
+/// `None` — useful for tests and for deterministic local output.
+///
+/// Returning the resolved *path* (rather than a bool) is deliberate: the
+/// spawn in `run_ruff_format` must use this absolute path, not the bare name
+/// `ruff`. On Windows, `Command::new("ruff")` resolves through the
+/// CreateProcess search order, which probes the current directory before
+/// `$PATH` — so running `tyc fmt` inside an untrusted checkout that ships a
+/// `ruff.exe` would execute that binary. Spawning the `$PATH`-resolved path
+/// closes that hole (matching `tyc-venv`'s `which_python3`).
+fn ruff_path() -> Option<std::path::PathBuf> {
     if std::env::var_os("TYC_FMT_DISABLE_RUFF").is_some_and(|v| v == "1") {
-        return false;
+        return None;
     }
-    which_on_path("ruff").is_some()
+    which_on_path("ruff")
 }
 
 /// A minimal `which`: scan `$PATH` for an executable named `name`.
@@ -1213,8 +1220,8 @@ fn which_on_path(name: &str) -> Option<std::path::PathBuf> {
 /// Pipe `source` through `ruff format --stdin-filename <path> -` and return
 /// its stdout.  stderr is captured and discarded (ruff prints a "reformatted"
 /// summary there by default).  A non-zero exit yields `Err`.
-fn run_ruff_format(source: &str, path: &str) -> Result<String, String> {
-    let mut child = Command::new("ruff")
+fn run_ruff_format(ruff: &std::path::Path, source: &str, path: &str) -> Result<String, String> {
+    let mut child = Command::new(ruff)
         .arg("format")
         .arg("--stdin-filename")
         .arg(path)

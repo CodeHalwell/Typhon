@@ -336,10 +336,13 @@ pub fn install(interp: &mut Interpreter) {
                         "float divmod()",
                     )));
                 }
-                let q = (xf / yf).floor();
+                // Share CPython's `float_divmod`; `(xf / yf).floor()` rounds
+                // the intermediate quotient and gives the wrong pair (e.g.
+                // `divmod(7.0, 0.1)` → `(70.0, …)` instead of `(69.0, …)`).
+                let (q, r) = crate::interp::float_divmod(xf, yf);
                 Ok(Value::Tuple(Rc::new(vec![
                     Value::Float(q),
-                    Value::Float(xf - q * yf),
+                    Value::Float(r),
                 ])))
             }
         }
@@ -954,18 +957,9 @@ pub fn install(interp: &mut Interpreter) {
         )
     });
 
-    native!("hex", |_i, args| Ok(Value::Str(Rc::new(format!(
-        "0x{:x}",
-        single(&args, "hex")?.to_int()?
-    )))));
-    native!("bin", |_i, args| Ok(Value::Str(Rc::new(format!(
-        "0b{:b}",
-        single(&args, "bin")?.to_int()?
-    )))));
-    native!("oct", |_i, args| Ok(Value::Str(Rc::new(format!(
-        "0o{:o}",
-        single(&args, "oct")?.to_int()?
-    )))));
+    native!("hex", |_i, args| based_int_repr(&args, "hex", 16, "0x"));
+    native!("bin", |_i, args| based_int_repr(&args, "bin", 2, "0b"));
+    native!("oct", |_i, args| based_int_repr(&args, "oct", 8, "0o"));
 
     native!("chr", |_i, args| {
         let n = single(&args, "chr")?.to_int()?;
@@ -1066,12 +1060,20 @@ pub fn install(interp: &mut Interpreter) {
             std::io::stdout().flush().ok();
         }
         let mut s = String::new();
-        std::io::stdin().read_line(&mut s).map_err(|e| {
+        let read = std::io::stdin().read_line(&mut s).map_err(|e| {
             crate::error::Unwind::Exception(crate::error::VmException::new(
                 "OSError",
                 format!("{e}"),
             ))
         })?;
+        // A 0-byte read is end-of-input: CPython's `input()` raises `EOFError`
+        // there, it does not return `""`. Returning `""` silently turned a
+        // `while (line := input()) != "":` loop into a no-op under `tyc run`.
+        if read == 0 {
+            return Err(crate::error::Unwind::Exception(
+                crate::error::VmException::new("EOFError", "EOF when reading a line"),
+            ));
+        }
         // Strip trailing newline.
         if s.ends_with('\n') {
             s.pop();
@@ -1411,6 +1413,31 @@ pub fn install(interp: &mut Interpreter) {
 fn single<'a>(args: &'a [Value], name: &str) -> Result<&'a Value, Unwind> {
     args.first()
         .ok_or_else(|| type_error(format!("{}() requires an argument", name)))
+}
+
+/// `hex` / `bin` / `oct`: render an integer in the given radix with CPython's
+/// exact spelling — a leading `-` before the base prefix for negatives
+/// (`hex(-42) == "-0x2a"`), and arbitrary precision (`hex(2**64)` must not
+/// overflow). The previous implementation formatted a lossy `i64` with Rust's
+/// `{:x}`/`{:b}`/`{:o}`, which prints the two's-complement bit pattern for a
+/// negative and rejected any value outside `i64`.
+fn based_int_repr(args: &[Value], name: &str, radix: u32, prefix: &str) -> Result<Value, Unwind> {
+    let vi: VmInt = match single(args, name)? {
+        Value::Int(i) => i.clone(),
+        Value::Bool(b) => VmInt::from(*b as i64),
+        other => {
+            return Err(type_error(format!(
+                "{}() argument must be an integer, not '{}'",
+                name,
+                other.type_name()
+            )))
+        }
+    };
+    let sign = if vi.is_negative() { "-" } else { "" };
+    Ok(Value::Str(Rc::new(format!(
+        "{sign}{prefix}{}",
+        vi.abs().to_str_radix(radix)
+    ))))
 }
 
 fn value_len(v: &Value) -> Result<usize, Unwind> {

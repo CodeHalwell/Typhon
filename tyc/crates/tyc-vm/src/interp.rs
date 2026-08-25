@@ -21,7 +21,8 @@ use ruff_python_ast::{
 use crate::env::{Env, EnvRef};
 use crate::error::{
     attribute_error, index_error, key_error, name_error, not_implemented, type_error, value_error,
-    vm_unsupported_use_compile, zero_division, zero_division_floor_mod, Unwind, VmException,
+    vm_unsupported_use_compile, zero_division, zero_division_floor_mod,
+    zero_division_negative_power, Unwind, VmException,
 };
 use crate::value::{
     Class, ClassField, DictMap, Function, HashKey, Instance, IterState, NativeFn, Value, VmInt,
@@ -3540,6 +3541,10 @@ impl Interpreter {
             (Int(a), Mod, Int(b)) => return Ok(Int(a.mod_floor(b))),
             (Int(a), Pow, Int(b)) => {
                 if b.is_negative() {
+                    // `0 ** -n` is a ZeroDivisionError in CPython, not `inf`.
+                    if a.is_zero() {
+                        return Err(zero_division_negative_power());
+                    }
                     return Ok(Float(a.to_f64().powf(b.to_f64())));
                 }
                 // `pow` takes a `u32` exponent; for ridiculous exponents
@@ -3579,21 +3584,19 @@ impl Interpreter {
             (Float(_), FloorDiv, Float(b)) if *b == 0.0 => {
                 return Err(zero_division_floor_mod());
             }
-            (Float(a), FloorDiv, Float(b)) => return Ok(Float((a / b).floor())),
+            // Float `//` and `%` share CPython's `float_divmod`. `floor(a/b)`
+            // is NOT equivalent: `7.0 / 0.1 == 70.00000000000001`, so
+            // `(7.0 / 0.1).floor()` is 70.0 where CPython's fmod-based
+            // algorithm gives 69.0. Likewise `%` must carry the divisor's sign
+            // even on a zero result (`-3.0 % 3.0 == 0.0`, `7.0 % -7.0 == -0.0`).
+            (Float(a), FloorDiv, Float(b)) => return Ok(Float(float_divmod(*a, *b).0)),
             (Float(_), Mod, Float(b)) if *b == 0.0 => return Err(zero_division_floor_mod()),
-            (Float(a), Mod, Float(b)) => {
-                // CPython's float `%` takes the sign of the *divisor*
-                // (`7.0 % -3.0 == -2.0`). Rust's `%` is C `fmod` (sign of the
-                // dividend), so adjust toward the divisor when they differ —
-                // mirroring CPython's `float_rem`. `rem_euclid` was wrong: it
-                // always returns a non-negative result.
-                let mut m = a % b;
-                if m != 0.0 && ((*b < 0.0) != (m < 0.0)) {
-                    m += b;
-                }
-                return Ok(Float(m));
-            }
+            (Float(a), Mod, Float(b)) => return Ok(Float(float_divmod(*a, *b).1)),
             (Float(a), Pow, Float(b)) => {
+                // `0.0 ** -n` is a ZeroDivisionError in CPython, not `inf`.
+                if *a == 0.0 && *b < 0.0 {
+                    return Err(zero_division_negative_power());
+                }
                 // A negative base raised to a non-integer power is complex in
                 // Python (`(-8) ** (1/3)` → ~`1+1.732j`), not `nan`.
                 if *a < 0.0 && b.fract() != 0.0 {
@@ -6442,6 +6445,44 @@ fn overflow() -> Unwind {
     Unwind::Exception(VmException::new("OverflowError", "int overflow"))
 }
 
+/// CPython's `float_divmod` (Objects/floatobject.c) — the exact basis for float
+/// `//` and `%` and for `divmod(float, float)`. Returns `(floordiv, mod)`.
+///
+/// This is deliberately NOT `((a / b).floor(), a - b * (a / b).floor())`: the
+/// intermediate `a / b` rounds, so `7.0 // 0.1` would come out 70.0 instead of
+/// the correct 69.0. The fmod-based reconstruction below is what CPython does,
+/// including the divisor-signed zero for `mod` and the round-half-correction on
+/// `floordiv`. The caller guarantees `b != 0.0`.
+pub(crate) fn float_divmod(a: f64, b: f64) -> (f64, f64) {
+    let mut m = a % b; // C fmod: magnitude < |b|, sign of the dividend
+    let mut d = (a - m) / b;
+    if m != 0.0 {
+        // Push the remainder onto the divisor's side of zero (Python's rule),
+        // adjusting the quotient to match.
+        if (b < 0.0) != (m < 0.0) {
+            m += b;
+            d -= 1.0;
+        }
+    } else {
+        // Remainder is zero: its sign is the divisor's (`7.0 % -7.0 == -0.0`).
+        m = 0.0_f64.copysign(b);
+    }
+    let floordiv = if d != 0.0 {
+        let fl = d.floor();
+        // `d` was formed by an exact subtraction then a divide, so it can land
+        // just under an integer; snap up when it is within half a ULP-scale.
+        if d - fl > 0.5 {
+            fl + 1.0
+        } else {
+            fl
+        }
+    } else {
+        // Quotient is zero: its sign is that of the true quotient `a / b`.
+        0.0_f64.copysign(a / b)
+    };
+    (floordiv, m)
+}
+
 pub fn normalize_index(i: i64, len: usize) -> Option<usize> {
     let len_i = len as i64;
     let idx = if i < 0 { i + len_i } else { i };
@@ -7692,6 +7733,70 @@ result = fib(99)
         let v = interp.root.get("result").expect("defined");
         // fib(99) = 218922995834555169026
         assert_eq!(v.py_str(), "218922995834555169026");
+    }
+
+    #[test]
+    fn float_floordiv_and_mod_match_cpython() {
+        // `floor(a / b)` rounds the intermediate quotient; CPython's fmod
+        // algorithm does not. `7.0 // 0.1` is 69.0, not 70.0.
+        let src = r#"
+a = 7.0 // 0.1
+b = 1.0 // 0.1
+c = 2.0 // 0.1
+d = divmod(7.0, 0.1)[0]
+"#;
+        let (interp, res) = parse_and_run(src);
+        res.unwrap();
+        assert_eq!(interp.root.get("a").unwrap().py_str(), "69.0");
+        assert_eq!(interp.root.get("b").unwrap().py_str(), "9.0");
+        assert_eq!(interp.root.get("c").unwrap().py_str(), "19.0");
+        assert_eq!(interp.root.get("d").unwrap().py_str(), "69.0");
+    }
+
+    #[test]
+    fn float_mod_carries_divisor_sign_of_zero() {
+        // A zero remainder takes the divisor's sign in CPython.
+        let src = r#"
+a = -3.0 % 3.0
+b = 7.0 % -7.0
+"#;
+        let (interp, res) = parse_and_run(src);
+        res.unwrap();
+        assert_eq!(interp.root.get("a").unwrap().py_str(), "0.0");
+        assert_eq!(interp.root.get("b").unwrap().py_str(), "-0.0");
+    }
+
+    #[test]
+    fn zero_to_negative_power_raises() {
+        for src in ["r = 0 ** -1", "r = 0.0 ** -2.0"] {
+            let (_i, res) = parse_and_run(src);
+            let err = res.expect_err("0 ** -n must raise");
+            match err {
+                Unwind::Exception(e) => assert_eq!(e.kind, "ZeroDivisionError"),
+                other => panic!("expected ZeroDivisionError, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn hex_bin_oct_of_negatives_and_bigints() {
+        // Negatives must print `-0x..`, not the i64 two's-complement pattern,
+        // and the argument may exceed i64.
+        let src = r#"
+a = hex(-42)
+b = bin(-5)
+c = oct(-8)
+d = hex(2 ** 64)
+"#;
+        let (interp, res) = parse_and_run(src);
+        res.unwrap();
+        assert_eq!(interp.root.get("a").unwrap().py_str(), "-0x2a");
+        assert_eq!(interp.root.get("b").unwrap().py_str(), "-0b101");
+        assert_eq!(interp.root.get("c").unwrap().py_str(), "-0o10");
+        assert_eq!(
+            interp.root.get("d").unwrap().py_str(),
+            "0x10000000000000000"
+        );
     }
 
     /// The flattened method cache must not survive a runtime impl-block merge:

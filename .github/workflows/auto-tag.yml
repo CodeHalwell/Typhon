@@ -37,8 +37,15 @@ jobs:
   tag-and-release:
     name: Tag + dispatch release
     runs-on: ubuntu-latest
-    # Only tag/publish a commit whose CI run on main actually passed.
-    if: github.event.workflow_run.conclusion == 'success'
+    # Only tag/publish a commit whose CI run on main actually passed AND that
+    # originated from this repository — never a fork. A `workflow_run` with
+    # `branches: [main]` matches on the *head branch name* of the triggering
+    # run, so a fork PR opened from a branch literally named `main` would
+    # otherwise reach this privileged job (contents+actions write) and check
+    # out the fork's commit. The head-repository guard closes that.
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.head_repository.full_name == github.repository
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
@@ -68,40 +75,46 @@ jobs:
       - name: Check whether tag already exists
         id: check
         shell: bash
+        # `TAG` is passed through the environment, never interpolated into the
+        # script body with `${{ }}`: the value is derived from a `grep` over
+        # `tyc/Cargo.toml`, so treating it as data (not code) keeps a crafted
+        # version string from running as a shell command substitution.
+        env:
+          TAG: ${{ steps.ver.outputs.tag }}
         run: |
           set -euo pipefail
-          tag="${{ steps.ver.outputs.tag }}"
-          if git rev-parse "refs/tags/${tag}" >/dev/null 2>&1; then
-            echo "Tag ${tag} already exists locally — skipping."
+          if git rev-parse "refs/tags/${TAG}" >/dev/null 2>&1; then
+            echo "Tag ${TAG} already exists locally — skipping."
             echo "exists=true" >> "$GITHUB_OUTPUT"
-          elif git ls-remote --exit-code --tags origin "refs/tags/${tag}" >/dev/null 2>&1; then
-            echo "Tag ${tag} already exists on remote — skipping."
+          elif git ls-remote --exit-code --tags origin "refs/tags/${TAG}" >/dev/null 2>&1; then
+            echo "Tag ${TAG} already exists on remote — skipping."
             echo "exists=true" >> "$GITHUB_OUTPUT"
           else
-            echo "Tag ${tag} does not exist yet — will create."
+            echo "Tag ${TAG} does not exist yet — will create."
             echo "exists=false" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Create and push tag
         if: steps.check.outputs.exists == 'false'
         shell: bash
+        env:
+          TAG: ${{ steps.ver.outputs.tag }}
         run: |
           set -euo pipefail
-          tag="${{ steps.ver.outputs.tag }}"
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git tag -a "${tag}" -m "Release ${tag}"
-          git push origin "${tag}"
-          echo "Pushed ${tag} at $(git rev-parse HEAD)"
+          git tag -a "${TAG}" -m "Release ${TAG}"
+          git push origin "${TAG}"
+          echo "Pushed ${TAG} at $(git rev-parse HEAD)"
 
       - name: Dispatch Release workflow
         if: steps.check.outputs.exists == 'false'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.ver.outputs.tag }}
         shell: bash
         run: |
           set -euo pipefail
-          tag="${{ steps.ver.outputs.tag }}"
           # `release.yml`'s `workflow_dispatch` accepts a `tag` input
           # and (optionally) a `ref`. Now that the tag exists, leave
           # `ref` empty so the release workflow checks out the tag
@@ -109,5 +122,5 @@ jobs:
           # the tag points at.
           gh workflow run release.yml \
             --ref main \
-            -f tag="${tag}"
-          echo "Dispatched Release workflow for ${tag}"
+            -f tag="${TAG}"
+          echo "Dispatched Release workflow for ${TAG}"

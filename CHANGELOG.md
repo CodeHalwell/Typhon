@@ -4,6 +4,103 @@ All notable changes to Typhon are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely; the
 canonical phase-by-phase status lives in `docs/roadmap.md`.
 
+## Unreleased — full-codebase release-readiness remediation
+
+A release-readiness review of alpha.9 (seven parallel audits + the five CI
+gates run locally, all green) found and this change fixes a cluster of
+**production-path miscompilations**, VM↔CPython parity gaps, a supply-chain /
+path-safety hole, and doc drift. Every fix ships with a regression test.
+Additive on correct programs: the emitter/preprocessor fixes only correct
+output that was already wrong, and the type-checker change is a conservative
+widening consistent with the alpha.2 attribute-narrowing rule.
+
+### Fixed — miscompilations (emitter / preprocessor / desugar)
+
+- **`?` inside a PEP 701 nested same-quote f-string was rewritten**, corrupting
+  the string. `print(f"{d["a?b"]}")` emitted `f"{d['a | Noneb']}"`. The
+  `rewrite_optionals` preprocessor pass now classifies bytes through the shared
+  PEP 701-aware `lexmask` scanner (`scan_line_kinds`) instead of a private
+  string scanner that closed the f-string at the inner quote, so it only
+  rewrites a `?` in structural code.
+- **`await` was emitted with no precedence guard on its operand.**
+  `await (f() if c else g())` emitted `await f() if c else g()`, which Python
+  regroups as `(await f()) if c else g()` — a different program that parses
+  cleanly (so the post-emit gate never caught it). The operand is now
+  parenthesised unless it is a `primary`.
+- **Comprehension `iter` / `if` operands were emitted without a precedence
+  guard.** `[x for x in xs if (a if p else b)]` emitted a double-`if`
+  `SyntaxError`; the iterable form dropped an `else`. Both slots are now guarded.
+- **A raw `CR` in a triple-quoted string literal was deleted by CPython's
+  universal-newline source decode.** `"\r\n"` (triple because it also holds
+  `\n`) round-tripped to a one-character constant under `tyc build` while the VM
+  kept both bytes. The `\r` is now escaped in the triple-quoted path.
+- **`|>` inside a string / docstring was rewritten** by the pipe pass, which
+  ignored the string state its own scanner tracked; it now skips in-string
+  matches.
+- **A `ClassVar[...]` field with a mutable default was rewritten to
+  `dataclasses.field(default_factory=...)`**, which made `@dataclass` strip the
+  class attribute, so a shared `registry: ClassVar[dict[str, int]] = {}` ceased
+  to exist. `ClassVar` fields are now left untouched by the mutable-default
+  rewrite (matching the existing `class!` path).
+
+### Fixed — VM ↔ CPython parity (`tyc run`)
+
+- **Float `//` and `%` and `divmod(float, float)`** now use CPython's
+  fmod-based `float_divmod`; `floor(a / b)` rounds the intermediate quotient
+  (`7.0 // 0.1` gave `70.0`, not `69.0`). A zero float remainder now carries the
+  divisor's sign (`-3.0 % 3.0 == 0.0`, `7.0 % -7.0 == -0.0`).
+- **`hex()` / `bin()` / `oct()` of a negative or `>i64` integer** printed the
+  i64 two's-complement bit pattern (`hex(-42)` → `0xff…d6`) or overflowed; they
+  now render CPython's `-0x2a` form through the arbitrary-precision `VmInt`.
+- **`0 ** -1` / `0.0 ** -2.0`** now raise `ZeroDivisionError` instead of
+  returning `inf`.
+- **`HashKey::Float`** compared floats by bit pattern, so `0.0` and `-0.0` were
+  distinct dict/set keys (and `Eq` was non-transitive against the integral-int
+  arms). Zeros now collapse; NaN keeps its own identity.
+- **`input()` at EOF** now raises `EOFError` instead of silently returning `""`
+  (which turned a `while (line := input()) != "":` loop into a no-op). Clears a
+  differential-baseline entry.
+
+### Fixed — type checker
+
+- **An awaited method-call statement (`await self.reset()`) now invalidates the
+  receiver's attribute narrowing**, matching the sync-call behaviour from
+  alpha.2 (the fix had only matched the bare `Call`, not `Await(Call)`).
+
+### Security / robustness
+
+- **`[project] src` / `[project] out` are now validated**: an absolute path or
+  one containing a `..` component is rejected. A cloned untrusted project could
+  set `out = "/…/site-packages"` (or `"../.."`) and have `tyc build` write
+  attacker-controlled `.py` outside the project directory.
+- **`tyc fmt` now spawns the `$PATH`-resolved absolute `ruff`** instead of the
+  bare name, closing a Windows current-directory search-order hole where a
+  `ruff.exe` shipped in an untrusted checkout would run.
+- **`auto-tag.yml`** now guards on
+  `workflow_run.head_repository.full_name == github.repository` (a fork PR from
+  a branch named `main` could otherwise reach the privileged tag/publish job)
+  and passes the tag value through the environment rather than interpolating it
+  into the `run:` shell. `ci.yml` and `vscode-extension.yml` gain a
+  least-privilege `permissions: contents: read` block.
+
+### Docs
+
+- `SECRET_NAME_KEYWORDS` gains a `secret_keyword_table_is_longest_first` test
+  (plus a duplicate check) so the longest-first ordering invariant — hand-
+  maintained and mis-ordered twice before (alpha.4, alpha.9) — is now a
+  compile-gate, and the `tyc build` scan's `secret_suffix` delegates to a single
+  shared `tyc_analyse::secret_keyword_match` rather than a hand-synced copy of
+  the boundary logic.
+- `tyc::return_in_except_star` (shipped alpha.7) added to the bundled skill's
+  `DIAGNOSTICS.md`; the diagnostic-count reference corrected 87 → 88.
+- `unused-import`'s default is documented as `"warn"` (not `"error"`) in the
+  skill, `docs/configuration.md`, and the docs-site config pages, matching the
+  compiler default since v0.8.0.
+- Example-corpus counts corrected (32 exercises / 259 `.ty` files); the skill's
+  `[strictness]` reference gains the real `nullable-use` and `suggest-gather`
+  keys; `docs/diagnostics/README.md`'s `freeze_not_freezable` link points at its
+  own page; `CLAUDE.md` / `CONTRIBUTING.md` describe all five CI jobs.
+
 ## 1.0.0-alpha.9 — 2026-08-21 — maintenance: secret-name lint expansion, allocation reductions & dependency wave
 
 A maintenance release on top of alpha.8: a large widening of the **warn-level**

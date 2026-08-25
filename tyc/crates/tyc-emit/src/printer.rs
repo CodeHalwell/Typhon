@@ -1155,7 +1155,22 @@ impl Emitter {
 
             Expr::Await(a) => {
                 self.write("await ");
-                self.emit_expr(&a.value);
+                // `await` binds like a postfix operator — its operand is a
+                // `primary` in Python's grammar (`await_primary: AWAIT
+                // primary`), tighter than every binary/boolean/comparison
+                // operator and than a conditional / lambda / walrus. Without
+                // this guard `await (f() if c else g())` re-emits as
+                // `await f() if c else g()`, which Python regroups as
+                // `(await f()) if c else g()` — a different program that
+                // still parses cleanly, so the post-emit gate never sees it.
+                // `needs_paren_for_postfix` is exactly the not-a-primary test.
+                if needs_paren_for_postfix(&a.value) {
+                    self.write("(");
+                    self.emit_expr(&a.value);
+                    self.write(")");
+                } else {
+                    self.emit_expr(&a.value);
+                }
             }
 
             Expr::Yield(y) => {
@@ -1690,10 +1705,18 @@ impl Emitter {
         }
         self.emit_expr(&gen.target);
         self.write(" in ");
-        self.emit_expr(&gen.iter);
+        // Both the iterable and each `if` filter are `disjunction` slots in
+        // Python's comprehension grammar — a bare conditional / lambda /
+        // walrus is not admissible there. Without the guard, `for x in xs if
+        // (a if p else b)` re-emits as `... if a if p else b`, parsed as two
+        // separate `if` filters (SyntaxError), and `for x in (xs if p else
+        // ys)` re-emits as `for x in xs if p else ys` (also a SyntaxError).
+        // IF_EXP_PRECEDENCE wraps exactly the ternary/lambda/walrus/yield
+        // forms while leaving valid `or`/`and`/comparison operands bare.
+        self.emit_operand_above(&gen.iter, IF_EXP_PRECEDENCE);
         for cond in &gen.ifs {
             self.write(" if ");
-            self.emit_expr(cond);
+            self.emit_operand_above(cond, IF_EXP_PRECEDENCE);
         }
     }
 
@@ -2124,6 +2147,18 @@ fn escape_triple_quoted_string(s: &str, quote: char) -> String {
         if ch == '\\' {
             out.push_str("\\\\");
             run = 0;
+        } else if ch == '\r' {
+            // A raw CR inside a triple-quoted literal is silently deleted by
+            // CPython's universal-newline source decoding (a lone `\r` or the
+            // `\r` of a `\r\n` both become `\n` while the source is read), so
+            // `"\r\n"` — which lands here because it also contains `\n` and
+            // takes the triple-quoted branch — would emit as a two-char
+            // constant that CPython reads back as one. Escaping it keeps the
+            // byte. (The single-quoted branch already escapes `\r`; only the
+            // triple path missed it.) The VM keeps the CR, so this was a
+            // VM↔CPython divergence too.
+            out.push_str("\\r");
+            run = 0;
         } else if ch == quote {
             run += 1;
             // A quote that is the LAST character of the content is just as
@@ -2358,6 +2393,73 @@ mod tests {
         // The other delimiter is handled symmetrically.
         assert_eq!(escape_triple_quoted_string("x'", '\''), "x\\'");
         assert_eq!(escape_triple_quoted_string("x\"", '\''), "x\"");
+    }
+
+    #[test]
+    fn triple_quoted_carriage_return_is_escaped() {
+        // A raw CR in a triple-quoted literal is deleted by CPython's
+        // universal-newline source decode, so `"\r\n"` (triple because it
+        // also holds `\n`) would round-trip to a shorter constant. Escaping
+        // preserves the byte; the real `\n` stays a real newline.
+        assert_eq!(escape_triple_quoted_string("\r\n", '"'), "\\r\n");
+        assert_eq!(escape_triple_quoted_string("a\r\nb", '"'), "a\\r\nb");
+    }
+
+    #[test]
+    fn crlf_string_round_trips_with_its_carriage_return() {
+        // Regression for the emit half of the CR-loss bug: a `"\r\n"` literal
+        // must not emit a raw CR that CPython would then drop.
+        let out = round_trip("CRLF: str = \"\\r\\n\"\n");
+        assert!(
+            out.contains("\\r"),
+            "the carriage return must survive emission as an escape; got:\n{out}"
+        );
+        assert!(
+            !out.contains('\r'),
+            "no raw CR byte may reach the emitted source; got bytes:\n{out:?}"
+        );
+    }
+
+    #[test]
+    fn await_operand_is_parenthesised_when_not_a_primary() {
+        // `await (f() if c else g())` must keep its parens — `await` binds
+        // like a postfix operator, so the bare form regroups as
+        // `(await f()) if c else g()`.
+        let out = round_trip(
+            "async def run(c: bool) -> int:\n    v: int = await (f() if c else g())\n    return v\n",
+        );
+        assert!(
+            out.contains("await (f() if c else g())"),
+            "await's conditional operand must stay parenthesised; got:\n{out}"
+        );
+        // A plain call operand needs no parens.
+        let plain = round_trip("async def run() -> int:\n    return await f()\n");
+        assert!(
+            plain.contains("await f()") && !plain.contains("await (f())"),
+            "a primary await operand must not gain parens; got:\n{plain}"
+        );
+    }
+
+    #[test]
+    fn comprehension_iter_and_filter_ternaries_are_parenthesised() {
+        // A bare ternary in the `if` filter parses as two `if` clauses; in the
+        // iterable it dangles the `else`. Both must keep their parens.
+        let filt = round_trip("ys = [x for x in xs if (a if p else b)]\n");
+        assert!(
+            filt.contains("if (a if p else b)"),
+            "comprehension filter ternary must stay parenthesised; got:\n{filt}"
+        );
+        let iter = round_trip("ys = [x for x in (xs if p else zs)]\n");
+        assert!(
+            iter.contains("in (xs if p else zs)"),
+            "comprehension iterable ternary must stay parenthesised; got:\n{iter}"
+        );
+        // A boolean/comparison operand is a valid disjunction — no parens.
+        let boolean = round_trip("ys = [x for x in xs if a or b]\n");
+        assert!(
+            boolean.contains("if a or b"),
+            "a boolean filter must not gain parens; got:\n{boolean}"
+        );
     }
 
     #[test]

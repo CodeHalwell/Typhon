@@ -10,7 +10,7 @@ import { Aside } from '@astrojs/starlight/components';
 ```toml
 [strictness]
 no-implicit-any = true
-unused-import = "error"
+unused-import = "warn"
 exhaustive-match = "error"
 methods-in-class-body = "warn"
 nullable-use = "warn"
@@ -36,7 +36,7 @@ allow-secret-comptime = false
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `no-implicit-any` | bool | `true` | Reserved — surfaces today as the [`tyc::missing_annotation`](/Typhon/diagnostics/type-errors/) diagnostic on un-annotated parameters and return types. The flag is parsed for forward compatibility; toggling it does not currently relax the check. |
-| `unused-import` | `"error"` \| `"warn"` \| `"off"` | `"error"` | Severity for unused imports. The LSP offers a "Remove unused import" quick-fix. |
+| `unused-import` | `"error"` \| `"warn"` \| `"off"` | `"warn"` | Severity for unused imports (default `"warn"` since v0.8.0). The LSP offers a "Remove unused import" quick-fix. |
 | `exhaustive-match` | `"error"` \| `"warn"` \| `"off"` | `"error"` | Severity for non-exhaustive `match` over sealed unions. |
 | `nullable-use` | `"error"` \| `"warn"` \| `"off"` | `"warn"` | Severity for the *attribute-rooted* form of [`tyc::nullable_use`](/Typhon/diagnostics/nullability/) — dereferencing a possibly-`None` field (`self.db.host` where `db: Db?`). Introduced at `"warn"` because the check never ran before v1.0.0-alpha.7; promote to `"error"` once your code is clean. The bare-name form is always an error and is not governed by this knob. |
 | `methods-in-class-body` | `"error"` \| `"warn"` \| `"off"` | `"warn"` | Severity for [`tyc::method_in_class_body`](/Typhon/diagnostics/class-errors/) — Rule 4: methods live in `impl Name:`, not the class body. Default `"warn"` matches every other nudge diagnostic; promote to `"error"` once a codebase has finished migrating off in-body methods. `"off"` suppresses it entirely. |
@@ -69,8 +69,8 @@ Inside an `unsafe:` block, type checking is relaxed and `Any` flows freely. We s
 
 Three settings:
 
-- `"error"` (default) — fails CI on unused imports.
-- `"warn"` — flagged but doesn't fail CI.
+- `"warn"` (default since v0.8.0) — flagged but doesn't fail CI.
+- `"error"` — fails CI on unused imports.
 - `"off"` — no check.
 
 The LSP includes a "Remove unused import" code action that fires on these diagnostics.

@@ -11836,7 +11836,15 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
             // (an almost-always-mutating side-effect call) to avoid the
             // false positives that invalidating on every nested method call
             // would cause on the common `self.helper(); self.x.foo()` shape.
-            if let Expr::Call(call) = e.value.as_ref() {
+            // `await self.reset()` parses as `Await(Call(...))`, so peel a
+            // leading `await` before the call match — the awaited form is just
+            // as mutating a statement-position call as the sync one, and the
+            // alpha.2 fix only matched the bare `Call`.
+            let call_expr = match e.value.as_ref() {
+                Expr::Await(a) => a.value.as_ref(),
+                other => other,
+            };
+            if let Expr::Call(call) = call_expr {
                 if let Expr::Attribute(recv_attr) = call.func.as_ref() {
                     if let Some(recv_path) = attr_path_of(&recv_attr.value) {
                         c.env.clear_attr_narrowing(&recv_path);
@@ -24604,6 +24612,35 @@ impl Box:
                 TycError::NullableUse { .. } | TycError::TypeMismatch { .. }
             )),
             "attr narrowing must be invalidated after a method call on the receiver: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn narrowing_attr_invalidated_by_awaited_method_call() {
+        // The awaited twin of the case above: `await self.reset()` parses as
+        // `Await(Call(...))`, which the bare-`Call` match missed, so the stale
+        // narrowing survived across a suspension point that can null the field.
+        let src = "\
+class Box:
+    x: int | None
+
+impl Box:
+    async def reset(self) -> None:
+        self.x = None
+    async def use_it(self) -> int:
+        if self.x is None:
+            return -1
+        await self.reset()
+        return self.x
+";
+        let d = check(src);
+        assert!(
+            d.errors().iter().any(|e| matches!(
+                e,
+                TycError::NullableUse { .. } | TycError::TypeMismatch { .. }
+            )),
+            "attr narrowing must be invalidated after an awaited method call: {:?}",
             d.errors()
         );
     }

@@ -25,7 +25,7 @@ straight from a failed build to the corresponding documentation.
 - [`tyc::empty_collection_no_annotation`](./empty_collection_no_annotation.md) — warning: empty collection literal bound without a type annotation, so the element type cannot be inferred.
 - [`tyc::extend_builtin`](./extend_builtin.md) — `extend` targets a Python built-in type.
 - [`tyc::field_default_ordering`](./field_default_ordering.md) — class declares a non-defaulted field after a defaulted one; the synthesised `__init__` would raise at import time.
-- [`tyc::freeze_not_freezable`](./freeze.md#compile-time-validation--tycfreeze_not_freezable-v090) — `freeze let X = <expr>` RHS constructs a non-`frozen` user class. Validated at check time since v0.9.0 (was a runtime `TypeError` before).
+- [`tyc::freeze_not_freezable`](./freeze_not_freezable.md) — `freeze let X = <expr>` RHS constructs a non-`frozen` user class. Validated at check time since v0.9.0 (was a runtime `TypeError` before).
 - [`tyc::frozen_assign`](./frozen_assign.md) — field assignment on a `frozen` class outside its constructor.
 - [`tyc::frozen_inheritance_conflict`](./frozen_inheritance_conflict.md) — a dataclass and its base disagree on frozen-ness; CPython would raise `TypeError` at import.
 - [`tyc::gather_opportunity`](./gather_opportunity.md) — advice: adjacent independent awaits could run concurrently in a `gather:` block.

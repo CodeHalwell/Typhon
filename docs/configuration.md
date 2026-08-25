@@ -31,7 +31,7 @@ traceback-remap = false     # auto-install a .ty-source traceback remapper in th
 
 [strictness]
 no-implicit-any = true
-unused-import = "error"
+unused-import = "warn"      # default "warn" since v0.8.0; set "error" to fail CI on unused imports
 exhaustive-match = "error"
 methods-in-class-body = "warn"  # severity for Rule-4 violations (methods belong in `impl Name:`)
 nullable-use = "warn"       # severity for the attribute-rooted form of tyc::nullable_use (bare names are always errors)
@@ -130,7 +130,7 @@ auto-parallel = false       # …but this explicit entry keeps auto-parallel off
 | Key | Type | Description |
 |-----|------|-------------|
 | `no-implicit-any` | bool | Reserved — surfaces today as the `tyc::missing_annotation` diagnostic on un-annotated parameters and return types. The flag is parsed for forward compatibility; toggling it does not currently relax the check. |
-| `unused-import` | `"error"` \| `"warn"` \| `"off"` | Severity for unused imports. |
+| `unused-import` | `"error"` \| `"warn"` \| `"off"` | Severity for unused imports. Default `"warn"` since v0.8.0; promote to `"error"` to fail CI. |
 | `exhaustive-match` | `"error"` \| `"warn"` \| `"off"` | Severity for non-exhaustive `match` over sealed unions. |
 | `methods-in-class-body` | `"error"` \| `"warn"` \| `"off"` | Severity for `tyc::method_in_class_body` (Rule 4: methods live in `impl Name:`, not the class body). Default `"warn"` matches every other nudge diagnostic. Promote to `"error"` to break CI once your codebase has migrated. `"off"` suppresses the diagnostic entirely — useful for codebases still mid-migration. |
 | `auto-memoise` | bool | Whether to apply `@functools.cache` to functions the analyser infers as pure. Default `false`, but **defaults to `true` at `[optimise] level = 1`** (an explicit entry here always wins). Caches are *never* inserted silently: even when enabled, the analyser requires all six purity conditions (see [language.md](language.md)). |

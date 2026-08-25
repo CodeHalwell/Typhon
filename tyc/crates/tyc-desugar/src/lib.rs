@@ -2334,6 +2334,16 @@ fn rewrite_mutable_field_defaults(body: &mut [Stmt]) -> bool {
     let mut changed = false;
     for stmt in body.iter_mut() {
         let Stmt::AnnAssign(a) = stmt else { continue };
+        // A `ClassVar[...]` field is a class-level constant, not an instance
+        // field: `@dataclass` never gives it an `__init__` parameter and
+        // treats the assigned value as a genuine class attribute. Rewriting
+        // it to `field(default_factory=...)` makes `@dataclass` strip the
+        // class attribute (a `field()` sentinel with no matching init param),
+        // so a shared `registry: ClassVar[dict[str, int]] = {}` silently
+        // ceased to exist. Leave `ClassVar` fields exactly as written.
+        if is_classvar_annotation(&a.annotation) {
+            continue;
+        }
         let Some(value) = &a.value else { continue };
         let Some(factory_name) = mutable_default_factory(value) else {
             continue;
@@ -4461,6 +4471,35 @@ mod tests {
             "output:\n{out}"
         );
         assert!(out.contains("import dataclasses"), "output:\n{out}");
+    }
+
+    #[test]
+    fn classvar_mutable_default_is_not_rewritten_to_a_factory() {
+        // A `ClassVar` holds a genuine shared class attribute — rewriting it
+        // to `field(default_factory=dict)` makes `@dataclass` delete it, so
+        // the shared registry vanishes. The empty literal must survive as-is.
+        let src = "class Registry:\n    entries: ClassVar[dict[str, int]] = {}\n    count: int\n";
+        let out = parse_and_desugar(src);
+        assert!(
+            out.contains("entries: ClassVar[dict[str, int]] = {}"),
+            "ClassVar default must stay a literal, not become a field(); got:\n{out}"
+        );
+        assert!(
+            !out.contains("default_factory"),
+            "no default_factory rewrite for a ClassVar field; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn non_classvar_mutable_default_still_becomes_a_factory() {
+        // The ClassVar guard must not disturb the ordinary instance-field
+        // rewrite that motivates this pass.
+        let src = "class Bag:\n    items: list[str] = []\n";
+        let out = parse_and_desugar(src);
+        assert!(
+            out.contains("default_factory=list"),
+            "an ordinary mutable default must still become a factory; got:\n{out}"
+        );
     }
 
     fn raw_class_starts_for(src: &str) -> (ModModule, Vec<u32>) {

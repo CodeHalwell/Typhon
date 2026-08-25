@@ -2790,110 +2790,40 @@ fn make_model_class_line(after_model: &str) -> Option<String> {
 /// character right after the type token). The `in_string` argument tracks
 /// triple-quoted string state across lines.
 ///
-/// Known limitation: `?` inside an f-string expression (e.g. `f"{x?}"`) is
-/// treated as string content and not rewritten — supporting it requires a
-/// nested expression scanner, which is deferred.
+/// Only a `?` in *structural* code is rewritten — never one inside a string
+/// literal or an f-string replacement field (`f"{x?}"` is left for the parser
+/// to reject, and a `?` sitting in nested string text like `f"{d["a?b"]}"`
+/// stays untouched). The byte-classification is delegated to the shared
+/// PEP 701-aware [`crate::lexmask::scan_line_kinds`] scanner: a private
+/// scanner here previously closed a same-quote nested f-string at the inner
+/// quote and rewrote the `?` in the nested literal, silently corrupting the
+/// string constant (which then parsed cleanly, so no gate caught it).
 fn rewrite_optionals(line: &str, in_string: &mut Option<StringMode>) -> (String, Vec<usize>) {
+    let kinds = crate::lexmask::scan_line_kinds(line, in_string);
+
     let mut out = String::with_capacity(line.len());
     let mut marks = Vec::new();
-    let mut last_char: Option<char> = None;
-    let mut chars = line.char_indices().peekable();
-
-    while let Some((i, c)) = chars.next() {
-        // Comment outside any string — copy the remainder verbatim.
-        if in_string.is_none() && c == '#' {
-            out.push(c);
-            for (_, c2) in chars.by_ref() {
-                out.push(c2);
-            }
-            break;
-        }
-
-        // Inside a string literal — copy chars, look for the close.
-        if let Some(mode) = *in_string {
-            out.push(c);
-            // Backslash escape in single/double-quoted strings (but not raw —
-            // we don't try to distinguish, since copying the next char
-            // through is harmless either way).
-            if matches!(mode, StringMode::Single | StringMode::Double) && c == '\\' {
-                if let Some((_, esc)) = chars.next() {
-                    out.push(esc);
-                    last_char = Some(esc);
-                    continue;
-                }
-            }
-            match mode {
-                StringMode::Single if c == '\'' => *in_string = None,
-                StringMode::Double if c == '"' => *in_string = None,
-                StringMode::TripleSingle if c == '\'' && line[i..].starts_with("'''") => {
-                    out.push(chars.next().unwrap().1);
-                    out.push(chars.next().unwrap().1);
-                    *in_string = None;
-                }
-                StringMode::TripleDouble if c == '"' && line[i..].starts_with("\"\"\"") => {
-                    out.push(chars.next().unwrap().1);
-                    out.push(chars.next().unwrap().1);
-                    *in_string = None;
-                }
-                _ => {}
-            }
-            last_char = Some(c);
-            continue;
-        }
-
-        // Outside any string — detect a string opening.
-        if c == '"' || c == '\'' {
-            let triple = (c == '"' && line[i..].starts_with("\"\"\""))
-                || (c == '\'' && line[i..].starts_with("'''"));
-            out.push(c);
-            if triple {
-                out.push(chars.next().unwrap().1);
-                out.push(chars.next().unwrap().1);
-                *in_string = Some(if c == '"' {
-                    StringMode::TripleDouble
-                } else {
-                    StringMode::TripleSingle
-                });
-            } else {
-                *in_string = Some(if c == '"' {
-                    StringMode::Double
-                } else {
-                    StringMode::Single
-                });
-            }
-            last_char = Some(c);
-            continue;
-        }
-
-        if c == '?' {
-            let is_type_tail = matches!(
-                last_char,
+    let mut prev_char: Option<char> = None;
+    for (i, c) in line.char_indices() {
+        if c == '?'
+            && matches!(kinds.get(i), Some(ByteKind::Code))
+            && matches!(
+                prev_char,
                 Some(ch) if ch.is_alphanumeric() || ch == '_' || ch == ']'
-            );
-            if is_type_tail {
-                marks.push(out.len());
-                out.push_str(" | None");
-                last_char = Some('e'); // last char of " | None"
-                continue;
-            }
-            // Pass through unchanged; parser will surface a syntax error.
-            out.push('?');
-            last_char = Some('?');
+            )
+        {
+            marks.push(out.len());
+            out.push_str(" | None");
+            prev_char = Some('e'); // last char of " | None"
             continue;
         }
-
         out.push(c);
-        last_char = Some(c);
+        prev_char = Some(c);
     }
 
-    // Single/double-quoted strings cannot span a newline.
-    if matches!(
-        *in_string,
-        Some(StringMode::Single) | Some(StringMode::Double)
-    ) {
-        *in_string = None;
-    }
-
+    // `scan_line_kinds` has already updated `*in_string`: it carries only a
+    // triple-quoted string across the newline and resets an unterminated
+    // single/double one (a Python syntax error), so no manual fixup is needed.
     (out, marks)
 }
 
@@ -8477,8 +8407,9 @@ fn join_pipe_continuations(source: &str) -> (String, Vec<usize>) {
 fn find_top_level_pipes(code: &str) -> Vec<usize> {
     let mut positions = Vec::new();
     let bytes = code.as_bytes();
-    scan_inline_code(code, |i, depth, _in_string| {
-        if depth == 0
+    scan_inline_code(code, |i, depth, in_string| {
+        if in_string.is_none()
+            && depth == 0
             && bytes[i] == b'|'
             && i + 1 < bytes.len()
             && bytes[i + 1] == b'>'
@@ -8959,6 +8890,47 @@ fn find_assignment_eq(s: &str) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn optional_rewrite_leaves_question_marks_inside_nested_fstrings() {
+        // PEP 701: a nested same-quote string inside an f-string field is
+        // legal. A hand-rolled scanner closed the f-string at the inner quote
+        // and then rewrote the `?` in `"a?b"` to ` | None`, corrupting the
+        // string constant (which still parsed, so no gate caught it).
+        let src = "def main() -> None:\n    print(f\"{d[\"a?b\"]}\")\n";
+        let out = preprocess(src).python_source;
+        assert!(
+            out.contains("a?b"),
+            "the `?` inside the nested string literal must survive; got:\n{out}"
+        );
+        assert!(
+            !out.contains("a | Noneb"),
+            "the nested literal must not be rewritten; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn optional_rewrite_still_fires_on_real_type_tails() {
+        // The nested-fstring guard must not stop the actual `T?` sugar.
+        let src = "def f(x: int?) -> str?:\n    return None\n";
+        let out = preprocess(src).python_source;
+        assert!(
+            out.contains("int | None") && out.contains("str | None"),
+            "real nullable annotations must still expand; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn pipe_operator_inside_a_string_is_not_rewritten() {
+        // `|>` living in a docstring / string literal must stay literal — the
+        // scanner tracks string state but the caller used to ignore it.
+        let src = "def f(xs: list[int]) -> str:\n    return \"pipe: a |> b(c)\"\n";
+        let out = preprocess(src).python_source;
+        assert!(
+            out.contains("a |> b(c)"),
+            "a `|>` inside a string must be left verbatim; got:\n{out}"
+        );
+    }
 
     #[test]
     fn enum_body_rewrite_stops_at_a_docstring() {

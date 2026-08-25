@@ -70,7 +70,6 @@ stress/round-2026-05-20/cases/121_class_attr_constant.ty
 stress/round-2026-05-20/cases/123_unused_import.ty
 stress/round-2026-05-20/cases/126_class_const_methodref.ty
 stress/round-2026-05-20/cases/29_lazy_let_class.ty
-stress/round-2026-05-20/cases/56_walrus_paren_strip.ty
 stress/round-2026-05-20/cases/63_async_context.ty
 stress/round-2026-05-21/02-io/01-file-roundtrip.ty
 stress/round-2026-05-21/02-io/03-csv-unicode.ty
