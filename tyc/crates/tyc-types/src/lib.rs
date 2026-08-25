@@ -2420,6 +2420,37 @@ impl TypeEnv {
     fn restore(&mut self, snap: TypeEnv) {
         *self = snap;
     }
+    /// Capture the current *narrowed* type of every binding in every scope.
+    /// A nested checking context — a function body — narrows enclosing-scope
+    /// bindings in place through [`narrow`](Self::narrow), and `leave()` only
+    /// pops the body's own scope, so those narrowings would otherwise persist
+    /// into the *next* function (an unsound accept) or out of a nested `def`
+    /// (a false positive). `check_function` snapshots on entry and restores on
+    /// exit so a narrowing applies within the body but never escapes it.
+    fn snapshot_scope_narrowings(&self) -> Vec<Vec<(String, Type)>> {
+        self.scopes
+            .iter()
+            .map(|s| {
+                s.iter()
+                    .map(|(k, b)| (k.clone(), b.narrowed.clone()))
+                    .collect()
+            })
+            .collect()
+    }
+    /// Restore the narrowed types captured by
+    /// [`snapshot_scope_narrowings`](Self::snapshot_scope_narrowings). The
+    /// snapshot is taken before the body's scope is pushed and restored after
+    /// it is popped, so the scope stack has the same shape and `zip` aligns
+    /// each saved frame with its live counterpart.
+    fn restore_scope_narrowings(&mut self, snap: Vec<Vec<(String, Type)>>) {
+        for (scope, saved) in self.scopes.iter_mut().zip(snap) {
+            for (name, narrowed) in saved {
+                if let Some(b) = scope.get_mut(&name) {
+                    b.narrowed = narrowed;
+                }
+            }
+        }
+    }
     /// Narrow an attribute access path (`"self.value"`) to `ty`.
     fn narrow_attr(&mut self, path: String, ty: Type) {
         self.attr_narrowings.insert(path, ty);
@@ -3868,6 +3899,19 @@ impl<'a> Checker<'a> {
                     continue;
                 }
                 if n != bare && class_name_tail(n) == tail {
+                    return false;
+                }
+                // An ancestor that is not a locally-declared class is an
+                // imported base of unknown provenance — most often an *aliased*
+                // import (`from httpx import Response as BaseResponse`), whose
+                // parent name is recorded verbatim as `BaseResponse` (an
+                // `Expr::Name`, so not the `__typhon_unknown_base__` marker that
+                // only tags a dotted `Expr::Attribute` base). Its true identity
+                // and ancestry are opaque here, so distinctness cannot be
+                // proven — keep the permissive unification, exactly as for the
+                // dotted-base marker. `bare` itself is exempt (it is the local
+                // class under test, guaranteed in `local_classes` above).
+                if n != bare && !self.local_classes.contains(n) {
                     return false;
                 }
                 if let Some(parents) = self.class_parents.get(n) {
@@ -12019,12 +12063,33 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                 c.env.restore(body_end);
             }
 
-            for s in &t.finalbody {
-                check_stmt(c, s);
+            // `finally` runs on EVERY exit from the `try` — normal completion,
+            // a completing handler, AND a mid-body raise / `return` / `break` /
+            // `continue`. A narrowing established partway through the body
+            // (`if x is None: raise; <x now str>`) does NOT hold on the raise
+            // path, which still reaches `finally`. So the finally body may only
+            // rely on facts guaranteed on all those paths: the intersection of
+            // the post-try join with the pre-`try` state. Downstream code, which
+            // is reached only via a *normal* exit, keeps the fuller post-try
+            // join — so snapshot it, check `finally` against the weaker view,
+            // then restore it.
+            if !t.finalbody.is_empty() {
+                let after_try = c.env.snapshot();
+                let mut finally_view = after_try.clone();
+                finally_view.intersect_narrowings(&pre_try);
+                c.env.restore(finally_view);
+                for s in &t.finalbody {
+                    check_stmt(c, s);
+                }
+                c.env.restore(after_try);
             }
         }
         Stmt::Match(m) => {
-            let subject_type = infer_expr(c, &m.subject);
+            // `match clear():` evaluates the subject expression, so a call in
+            // it may rebind a module global via `global NAME` — invalidate any
+            // narrowing the caller held on such a global, exactly as a call in
+            // any other statement position does (`eval_stmt_expr`).
+            let subject_type = eval_stmt_expr(c, &m.subject);
             for case in &m.cases {
                 check_pattern_class_fields(c, &case.pattern);
                 // Enter scope and bind pattern names FIRST so guard expressions
@@ -12054,7 +12119,8 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                     c.env.narrow(subj.id.as_str(), t);
                 }
                 if let Some(guard) = &case.guard {
-                    let _ = infer_expr(c, guard);
+                    // A `case … if flip():` guard can also rebind a global.
+                    let _ = eval_stmt_expr(c, guard);
                 }
                 for s in &case.body {
                     check_stmt(c, s);
@@ -12132,6 +12198,22 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
             // `del cache[key()]` evaluates the subscript, calls included.
             if !c.globals_rebound_by_call.is_empty() && d.targets.iter().any(expr_contains_call) {
                 reset_globals_after_call(c);
+            }
+            // `del x` / `del self.x` removes the binding, so any flow narrowing
+            // on it is stale — a later read is an `UnboundLocalError` /
+            // `AttributeError` at runtime, not the narrowed value. Widen a
+            // deleted name to its declared type and drop an attribute-path
+            // narrowing so a subsequent use is re-checked honestly.
+            for target in &d.targets {
+                match target {
+                    Expr::Name(n) => c.env.widen_to_declared(n.id.as_str()),
+                    Expr::Attribute(_) => {
+                        if let Some(path) = attr_path_of(target) {
+                            c.env.clear_attr_narrowing(&path);
+                        }
+                    }
+                    _ => {}
+                }
             }
         }
         _ => {}
@@ -12365,6 +12447,13 @@ fn check_function(
         .get(name)
         .cloned()
         .unwrap_or_default();
+    // Snapshot the narrowed state of every enclosing scope (module globals and
+    // any outer-function locals). A narrowing applied inside this body to an
+    // enclosing binding (`if CACHE is None: return; use(CACHE)`) must hold for
+    // the rest of *this* body but must not leak into a sibling function or out
+    // of a nested `def` — `leave()` only pops this body's own scope, so without
+    // this restore the mutation to an outer frame's `narrowed` field persists.
+    let saved_scope_narrowings = c.env.snapshot_scope_narrowings();
     c.env.enter();
     // Attribute narrowings (`self.x` non-null) belong to the enclosing
     // function body — a different `self` is in scope here, so start clean.
@@ -12523,6 +12612,7 @@ fn check_function(
     }
 
     c.env.leave();
+    c.env.restore_scope_narrowings(saved_scope_narrowings);
     c.env.attr_narrowings = saved_attr_narrowings;
     c.reassigned_names = saved_reassigned_names;
     c.current_return = saved_return;
@@ -12585,6 +12675,12 @@ impl DaState {
     }
     fn assign(&mut self, name: &str) {
         self.assigned.insert(name.to_owned());
+    }
+    /// `del NAME` unbinds the name: a later read on a path where it was
+    /// deleted is a `NameError` / `UnboundLocalError`, so it is no longer
+    /// definitely-assigned.
+    fn unassign(&mut self, name: &str) {
+        self.assigned.remove(name);
     }
 }
 
@@ -12874,7 +12970,12 @@ fn da_walk_stmt(
         }
         Stmt::Delete(d) => {
             for tgt in &d.targets {
+                // The target must be bound to be deleted, so check it as a read
+                // first, then drop it from the assigned set.
                 da_check_expr(c, tgt, tracked, state);
+                if let Expr::Name(n) = tgt {
+                    state.unassign(n.id.as_str());
+                }
             }
         }
         Stmt::Continue(_) | Stmt::Break(_) => {
@@ -14352,8 +14453,11 @@ fn check_elif_else_clauses(c: &mut Checker, clauses: &[ruff_python_ast::ElifElse
     };
     match &first.test {
         Some(test) => {
-            // elif: nested-if semantics on top of the already-negated outer test.
-            let _ = infer_expr(c, test);
+            // elif: nested-if semantics on top of the already-negated outer
+            // test. A call in the `elif` condition can rebind a global, so
+            // route it through `eval_stmt_expr` (the reset lands before the
+            // branch snapshot below, so it persists into both branches).
+            let _ = eval_stmt_expr(c, test);
             let pos = collect_narrowings(c, test, /*negate=*/ false);
             let snap = c.env.snapshot();
             apply_narrowings(c, &pos);
@@ -17806,10 +17910,18 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
                 }
                 _ => None,
             };
+            // A comprehension `if` filter (`… if y is not None`) narrows
+            // through `apply_narrowings`, which walks out to whichever scope
+            // owns the name — so a narrowing of an *enclosing* binding survives
+            // `leave()` (which pops only the comprehension's own scope). Roll
+            // any such narrowing back after the comprehension; it still applies
+            // to the element expression evaluated inside.
+            let comp_saved = c.env.snapshot_scope_narrowings();
             c.env.enter();
             infer_comprehension_generators(c, &comp.generators);
             let elt = infer_expr_ctx(c, &comp.elt, elt_expected.as_ref());
             c.env.leave();
+            c.env.restore_scope_narrowings(comp_saved);
             Type::Generic("list".into(), vec![elt])
         }
         Expr::SetComp(comp) => {
@@ -17817,10 +17929,12 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
                 Some(Type::Generic(h, a)) if h == "set" && a.len() == 1 => Some(a[0].clone()),
                 _ => None,
             };
+            let comp_saved = c.env.snapshot_scope_narrowings();
             c.env.enter();
             infer_comprehension_generators(c, &comp.generators);
             let elt = infer_expr_ctx(c, &comp.elt, elt_expected.as_ref());
             c.env.leave();
+            c.env.restore_scope_narrowings(comp_saved);
             Type::Generic("set".into(), vec![elt])
         }
         Expr::Generator(comp) => {
@@ -17832,10 +17946,12 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
                 }
                 _ => None,
             };
+            let comp_saved = c.env.snapshot_scope_narrowings();
             c.env.enter();
             infer_comprehension_generators(c, &comp.generators);
             let elt = infer_expr_ctx(c, &comp.elt, elt_expected.as_ref());
             c.env.leave();
+            c.env.restore_scope_narrowings(comp_saved);
             // A generator expression is an `Iterator[T]`.
             Type::Generic("Iterator".into(), vec![elt])
         }
@@ -17846,6 +17962,7 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
                 }
                 _ => (None, None),
             };
+            let comp_saved = c.env.snapshot_scope_narrowings();
             c.env.enter();
             infer_comprehension_generators(c, &comp.generators);
             let k = match comp.key.as_ref() {
@@ -17878,6 +17995,7 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
                 }
             }
             c.env.leave();
+            c.env.restore_scope_narrowings(comp_saved);
             Type::Generic("dict".into(), vec![k, v])
         }
         _ => Type::Unknown,
@@ -24641,6 +24759,159 @@ impl Box:
                 TycError::NullableUse { .. } | TycError::TypeMismatch { .. }
             )),
             "attr narrowing must be invalidated after an awaited method call: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn global_narrowing_does_not_leak_into_a_sibling_function() {
+        // A narrowing established on a module global inside one function must
+        // not persist into the next — `narrow()` mutates the module-scope
+        // binding in place, and `check_function`'s `leave()` only pops the
+        // body's own scope.
+        let src = "\
+mut CACHE: str | None = None
+
+def use_it() -> int:
+    if CACHE is None:
+        return 0
+    return len(CACHE)
+
+def other() -> int:
+    return len(CACHE)
+";
+        let d = check(src);
+        assert!(
+            !d.errors().is_empty(),
+            "the leaked narrowing must not silence `len(CACHE)` in `other`: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn nonlocal_rebind_in_nested_def_does_not_leak_out() {
+        // The false-positive direction: a nested `def` that nulls an outer
+        // local via `nonlocal` must not leave the outer binding narrowed to
+        // `None` for the enclosing body — the def is never called here.
+        let src = "\
+def outer(v0: int | None) -> int:
+    mut v: int | None = v0
+    if v is None:
+        return 0
+    def clear() -> None:
+        nonlocal v
+        v = None
+    return v + 1
+";
+        let d = check(src);
+        assert!(
+            d.errors().is_empty(),
+            "a narrowing must not leak out of a nested def (v is still int here): {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn finally_sees_only_facts_guaranteed_on_every_path() {
+        // A narrowing established partway through the body does not hold on the
+        // raise path, which still runs `finally`.
+        let src = "\
+def f(x: str | None) -> int:
+    try:
+        if x is None:
+            raise ValueError(\"nope\")
+        return len(x)
+    finally:
+        print(x.upper())
+";
+        let d = check(src);
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::NullableUse { .. })),
+            "finally must see x as nullable (the raise path reaches it): {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn finally_keeps_a_pre_try_narrowing() {
+        // Control: a narrowing established BEFORE the try (here by an early
+        // `if x is None: return`) holds in finally — it is a pre-try fact, so
+        // the intersection with the pre-try state keeps it. No false positive.
+        let src = "\
+def g(x: str | None) -> int:
+    if x is None:
+        return 0
+    try:
+        return len(x)
+    finally:
+        print(x.upper())
+";
+        let d = check(src);
+        assert!(
+            d.errors().is_empty(),
+            "a pre-try narrowing must survive into finally: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn call_in_match_subject_invalidates_global_narrowing() {
+        let src = "\
+mut CACHE: str | None = \"hit\"
+
+def clear() -> str:
+    global CACHE
+    CACHE = None
+    return \"k\"
+
+def use_it() -> int:
+    if CACHE is None:
+        return 0
+    match clear():
+        case _:
+            pass
+    return len(CACHE)
+";
+        let d = check(src);
+        assert!(
+            !d.errors().is_empty(),
+            "a call in the match subject must invalidate the CACHE narrowing: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn comprehension_filter_narrowing_does_not_leak() {
+        let src = "\
+def f(y: str | None) -> int:
+    let hits: list[int] = [1 for _ in range(3) if y is not None]
+    return len(y)
+";
+        let d = check(src);
+        assert!(
+            !d.errors().is_empty(),
+            "the comprehension filter narrowing on y must not leak out: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn del_invalidates_definite_assignment() {
+        let src = "\
+def f() -> int:
+    let x: int
+    x = 1
+    del x
+    return x
+";
+        let d = check(src);
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::UseOfUninitialised { .. })),
+            "a read after `del x` must be use-of-uninitialised: {:?}",
             d.errors()
         );
     }
