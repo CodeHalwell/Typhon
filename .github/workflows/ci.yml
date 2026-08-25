@@ -10,6 +10,12 @@ env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-D warnings"
 
+# Least privilege: every job here only checks out and builds/tests. Pinning the
+# token to read-only means a compromised build script or dependency cannot use
+# the workflow token to write to the repo. Bump per-job if a job ever needs more.
+permissions:
+  contents: read
+
 jobs:
   test:
     name: Test

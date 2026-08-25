@@ -751,7 +751,19 @@ impl PartialEq for HashKey {
                 b.to_i64().is_some_and(|v| v == *a as i64)
             }
             (HashKey::Int(a), HashKey::Int(b)) => a == b,
-            (HashKey::Float(a), HashKey::Float(b)) => a == b,
+            // Compare floats by numeric value, not bit pattern: CPython
+            // collapses `0.0` and `-0.0` into one dict/set slot (they are
+            // `==` and hash-equal). Bit equality alone also broke `Eq`
+            // transitivity — `Float(-0.0) == Int(0) == Float(0.0)` held via
+            // the integral arms below while `Float(-0.0) != Float(0.0)`.
+            // The bit-pattern fallback keeps NaN keys reflexively equal to
+            // themselves (`f64::NAN == f64::NAN` is false), which `Eq`
+            // requires; hashing stays consistent because both zeros hash
+            // through `integral_float_to_bigint` to the integer 0 and a
+            // NaN hashes by its own bits.
+            (HashKey::Float(a), HashKey::Float(b)) => {
+                a == b || f64::from_bits(*a) == f64::from_bits(*b)
+            }
             // Python: an integral float shares a slot with the equal int /
             // bool (`1 == 1.0 == True`, all hash-equal). A non-integral float
             // never equals an int/bool.
@@ -2428,6 +2440,30 @@ mod tests {
             HashKey::Int(VmInt::from(1i64)),
             HashKey::Float(1.5f64.to_bits())
         );
+    }
+
+    #[test]
+    fn hashkey_zero_floats_collapse_regardless_of_sign() {
+        // CPython: `0.0 == -0.0` and `hash(0.0) == hash(-0.0)`, so
+        // `{0.0: "a", -0.0: "b"}` is a single entry. The keys differ in
+        // bit pattern (`-0.0` has the sign bit set), so a bit-pattern
+        // `Eq` split them into two slots — and broke transitivity, since
+        // both were already equal to `Int(0)` through the integral arms.
+        let pz = HashKey::Float(0.0f64.to_bits());
+        let nz = HashKey::Float((-0.0f64).to_bits());
+        let zero = HashKey::Int(VmInt::from(0i64));
+        assert_eq!(pz, nz);
+        assert_eq!(pz, zero);
+        assert_eq!(nz, zero);
+        assert_eq!(hash_of(&pz), hash_of(&nz));
+        assert_eq!(hash_of(&pz), hash_of(&zero));
+
+        // NaN keys stay reflexively equal (same bits) — required for `Eq` —
+        // while NaNs with different payloads remain distinct keys.
+        let nan = HashKey::Float(f64::NAN.to_bits());
+        assert_eq!(nan, nan.clone());
+        let other_nan = HashKey::Float(f64::NAN.to_bits() ^ 1);
+        assert_ne!(nan, other_nan);
     }
     use std::rc::Rc;
 

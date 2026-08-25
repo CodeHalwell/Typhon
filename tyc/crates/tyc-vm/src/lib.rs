@@ -22,6 +22,9 @@
 #![allow(clippy::mutable_key_type)]
 
 pub mod builtins;
+/// Generated Unicode case-folding tables for `str.casefold()` — see the module
+/// header and `scripts/gen-casefold.py`.
+mod casefold_data;
 pub mod env;
 pub mod error;
 pub mod ffi;

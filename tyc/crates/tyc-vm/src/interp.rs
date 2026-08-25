@@ -21,7 +21,8 @@ use ruff_python_ast::{
 use crate::env::{Env, EnvRef};
 use crate::error::{
     attribute_error, index_error, key_error, name_error, not_implemented, type_error, value_error,
-    vm_unsupported_use_compile, zero_division, zero_division_floor_mod, Unwind, VmException,
+    vm_unsupported_use_compile, zero_division, zero_division_floor_mod,
+    zero_division_negative_power, Unwind, VmException,
 };
 use crate::value::{
     Class, ClassField, DictMap, Function, HashKey, Instance, IterState, NativeFn, Value, VmInt,
@@ -265,8 +266,46 @@ impl Interpreter {
                 Ok(())
             }
             Stmt::AugAssign(a) => {
-                let current = self.eval_expr(&a.target, env)?;
+                // Resolve a subscript / attribute target's *place* exactly once.
+                // CPython's aug-assign bytecode COPYs the container and key (or
+                // the receiver) so a side-effecting index or receiver — e.g.
+                // `xs[idx()] += 1` or `make().attr += 1` — evaluates a single
+                // time. Reading the target and then re-evaluating it through
+                // `assign_target` ran those sub-expressions twice.
+                enum AugPlace {
+                    Sub(Value, Value),
+                    Attr(Value, String),
+                    Direct,
+                }
+                let (place, current) = match a.target.as_ref() {
+                    Expr::Subscript(s) => {
+                        let container = self.eval_expr(&s.value, env)?;
+                        let key = self.eval_subscript_index(&s.slice, env)?;
+                        let cur = self.subscript(&container, &key)?;
+                        (AugPlace::Sub(container, key), cur)
+                    }
+                    Expr::Attribute(at) => {
+                        let recv = self.eval_expr(&at.value, env)?;
+                        let cur = self.get_attr(&recv, at.attr.as_str())?;
+                        (AugPlace::Attr(recv, at.attr.as_str().to_owned()), cur)
+                    }
+                    // A bare name (or tuple/list target, which `+=` forbids
+                    // anyway) has no side-effecting sub-expression to double.
+                    _ => (AugPlace::Direct, self.eval_expr(&a.target, env)?),
+                };
                 let rhs = self.eval_expr(&a.value, env)?;
+
+                // Store `v` back into the resolved place.
+                macro_rules! store_back {
+                    ($me:expr, $v:expr) => {
+                        match &place {
+                            AugPlace::Sub(c, k) => $me.set_subscript(c, k, $v),
+                            AugPlace::Attr(recv, attr) => $me.set_attr(recv, attr, $v),
+                            AugPlace::Direct => $me.assign_target(&a.target, $v, env, None),
+                        }
+                    };
+                }
+
                 // In-place mutation for a mutable list target: CPython's
                 // `list.__iadd__` (`+=`) and `list.__imul__` (`*=`) mutate the
                 // existing object rather than rebinding, so aliases
@@ -306,12 +345,12 @@ impl Interpreter {
                         // setter, matching CPython's store-after-in-place. For a
                         // bare name this rebinds to the same `Rc`, so aliases are
                         // preserved.
-                        self.assign_target(&a.target, Value::List(target), env, None)?;
+                        store_back!(self, Value::List(target))?;
                         return Ok(());
                     }
                 }
                 let new = self.binop(&current, a.op, &rhs)?;
-                self.assign_target(&a.target, new, env, None)?;
+                store_back!(self, new)?;
                 Ok(())
             }
             Stmt::If(s) => {
@@ -3540,6 +3579,10 @@ impl Interpreter {
             (Int(a), Mod, Int(b)) => return Ok(Int(a.mod_floor(b))),
             (Int(a), Pow, Int(b)) => {
                 if b.is_negative() {
+                    // `0 ** -n` is a ZeroDivisionError in CPython, not `inf`.
+                    if a.is_zero() {
+                        return Err(zero_division_negative_power());
+                    }
                     return Ok(Float(a.to_f64().powf(b.to_f64())));
                 }
                 // `pow` takes a `u32` exponent; for ridiculous exponents
@@ -3579,21 +3622,19 @@ impl Interpreter {
             (Float(_), FloorDiv, Float(b)) if *b == 0.0 => {
                 return Err(zero_division_floor_mod());
             }
-            (Float(a), FloorDiv, Float(b)) => return Ok(Float((a / b).floor())),
+            // Float `//` and `%` share CPython's `float_divmod`. `floor(a/b)`
+            // is NOT equivalent: `7.0 / 0.1 == 70.00000000000001`, so
+            // `(7.0 / 0.1).floor()` is 70.0 where CPython's fmod-based
+            // algorithm gives 69.0. Likewise `%` must carry the divisor's sign
+            // even on a zero result (`-3.0 % 3.0 == 0.0`, `7.0 % -7.0 == -0.0`).
+            (Float(a), FloorDiv, Float(b)) => return Ok(Float(float_divmod(*a, *b).0)),
             (Float(_), Mod, Float(b)) if *b == 0.0 => return Err(zero_division_floor_mod()),
-            (Float(a), Mod, Float(b)) => {
-                // CPython's float `%` takes the sign of the *divisor*
-                // (`7.0 % -3.0 == -2.0`). Rust's `%` is C `fmod` (sign of the
-                // dividend), so adjust toward the divisor when they differ —
-                // mirroring CPython's `float_rem`. `rem_euclid` was wrong: it
-                // always returns a non-negative result.
-                let mut m = a % b;
-                if m != 0.0 && ((*b < 0.0) != (m < 0.0)) {
-                    m += b;
-                }
-                return Ok(Float(m));
-            }
+            (Float(a), Mod, Float(b)) => return Ok(Float(float_divmod(*a, *b).1)),
             (Float(a), Pow, Float(b)) => {
+                // `0.0 ** -n` is a ZeroDivisionError in CPython, not `inf`.
+                if *a == 0.0 && *b < 0.0 {
+                    return Err(zero_division_negative_power());
+                }
                 // A negative base raised to a non-integer power is complex in
                 // Python (`(-8) ** (1/3)` → ~`1+1.732j`), not `nan`.
                 if *a < 0.0 && b.fract() != 0.0 {
@@ -3706,11 +3747,13 @@ impl Interpreter {
             return Ok(Str(Rc::new(format!("{}{}", a, b))));
         }
         if let (Str(a), Mult, Int(n)) = (l, op, r) {
-            let n = n.to_usize().unwrap_or(0);
+            let n =
+                repeat_count_checked(a.len(), n, repeated_too_long("repeated string is too long"))?;
             return Ok(Str(Rc::new(a.repeat(n))));
         }
         if let (Int(n), Mult, Str(a)) = (l, op, r) {
-            let n = n.to_usize().unwrap_or(0);
+            let n =
+                repeat_count_checked(a.len(), n, repeated_too_long("repeated string is too long"))?;
             return Ok(Str(Rc::new(a.repeat(n))));
         }
 
@@ -3722,11 +3765,13 @@ impl Interpreter {
             return Ok(Bytes(Rc::new(out)));
         }
         if let (Bytes(a), Mult, Int(n)) = (l, op, r) {
-            let n = n.to_usize().unwrap_or(0);
+            let n =
+                repeat_count_checked(a.len(), n, repeated_too_long("repeated bytes are too long"))?;
             return Ok(Bytes(Rc::new(a.repeat(n))));
         }
         if let (Int(n), Mult, Bytes(a)) = (l, op, r) {
-            let n = n.to_usize().unwrap_or(0);
+            let n =
+                repeat_count_checked(a.len(), n, repeated_too_long("repeated bytes are too long"))?;
             return Ok(Bytes(Rc::new(a.repeat(n))));
         }
 
@@ -3742,16 +3787,16 @@ impl Interpreter {
             return Ok(Tuple(Rc::new(out)));
         }
         if let (List(a), Mult, Int(n)) = (l, op, r) {
-            let n = n.to_usize().unwrap_or(0);
-            let mut out = Vec::with_capacity(a.borrow().len() * n);
+            let n = repeat_count_checked(a.borrow().len(), n, repeated_out_of_memory())?;
+            let mut out = Vec::with_capacity(a.borrow().len().saturating_mul(n));
             for _ in 0..n {
                 out.extend(a.borrow().iter().cloned());
             }
             return Ok(List(Rc::new(RefCell::new(out))));
         }
         if let (Tuple(a), Mult, Int(n)) = (l, op, r) {
-            let n = n.to_usize().unwrap_or(0);
-            let mut out = Vec::with_capacity(a.len() * n);
+            let n = repeat_count_checked(a.len(), n, repeated_out_of_memory())?;
+            let mut out = Vec::with_capacity(a.len().saturating_mul(n));
             for _ in 0..n {
                 out.extend(a.iter().cloned());
             }
@@ -6442,6 +6487,88 @@ fn overflow() -> Unwind {
     Unwind::Exception(VmException::new("OverflowError", "int overflow"))
 }
 
+/// Resolve a sequence-repetition count (`seq * n` / `n * seq`). CPython treats
+/// a negative count as an empty result but raises `OverflowError` when the
+/// count does not fit an index-sized integer — the VM previously mapped both to
+/// `0`, silently returning an empty sequence for `"a" * (2 ** 64)`.
+fn repeat_count(n: &VmInt) -> Result<usize, Unwind> {
+    if n.is_negative() {
+        return Ok(0);
+    }
+    n.to_usize().ok_or_else(|| {
+        Unwind::Exception(VmException::new(
+            "OverflowError",
+            "cannot fit 'int' into an index-sized integer",
+        ))
+    })
+}
+
+/// Like [`repeat_count`], but also rejects a repetition whose *total* size
+/// (`elem_len * count`) would not fit an index-sized allocation. CPython raises
+/// here before allocating — `OverflowError` for `str`/`bytes`, `MemoryError`
+/// for `list`/`tuple` — whereas the subsequent `str::repeat` / `Vec::repeat` /
+/// `Vec::with_capacity` panics with "capacity overflow" (a capacity above
+/// `isize::MAX`), aborting `tyc run` with exit 101 instead of a catchable
+/// exception. `too_long` is the exception to raise; the caller picks its kind.
+fn repeat_count_checked(elem_len: usize, n: &VmInt, too_long: Unwind) -> Result<usize, Unwind> {
+    let count = repeat_count(n)?;
+    match elem_len.checked_mul(count) {
+        Some(total) if total <= isize::MAX as usize => Ok(count),
+        _ => Err(too_long),
+    }
+}
+
+/// CPython's `OverflowError` for an over-long `str`/`bytes` repetition. The
+/// message's verb differs by type ("string is" vs "bytes are"), so the caller
+/// passes it verbatim.
+fn repeated_too_long(message: &'static str) -> Unwind {
+    Unwind::Exception(VmException::new("OverflowError", message))
+}
+
+/// CPython raises `MemoryError` (not `OverflowError`) for an over-long
+/// `list`/`tuple` repetition.
+fn repeated_out_of_memory() -> Unwind {
+    Unwind::Exception(VmException::new("MemoryError", ""))
+}
+
+/// CPython's `float_divmod` (Objects/floatobject.c) — the exact basis for float
+/// `//` and `%` and for `divmod(float, float)`. Returns `(floordiv, mod)`.
+///
+/// This is deliberately NOT `((a / b).floor(), a - b * (a / b).floor())`: the
+/// intermediate `a / b` rounds, so `7.0 // 0.1` would come out 70.0 instead of
+/// the correct 69.0. The fmod-based reconstruction below is what CPython does,
+/// including the divisor-signed zero for `mod` and the round-half-correction on
+/// `floordiv`. The caller guarantees `b != 0.0`.
+pub(crate) fn float_divmod(a: f64, b: f64) -> (f64, f64) {
+    let mut m = a % b; // C fmod: magnitude < |b|, sign of the dividend
+    let mut d = (a - m) / b;
+    if m != 0.0 {
+        // Push the remainder onto the divisor's side of zero (Python's rule),
+        // adjusting the quotient to match.
+        if (b < 0.0) != (m < 0.0) {
+            m += b;
+            d -= 1.0;
+        }
+    } else {
+        // Remainder is zero: its sign is the divisor's (`7.0 % -7.0 == -0.0`).
+        m = 0.0_f64.copysign(b);
+    }
+    let floordiv = if d != 0.0 {
+        let fl = d.floor();
+        // `d` was formed by an exact subtraction then a divide, so it can land
+        // just under an integer; snap up when it is within half a ULP-scale.
+        if d - fl > 0.5 {
+            fl + 1.0
+        } else {
+            fl
+        }
+    } else {
+        // Quotient is zero: its sign is that of the true quotient `a / b`.
+        0.0_f64.copysign(a / b)
+    };
+    (floordiv, m)
+}
+
 pub fn normalize_index(i: i64, len: usize) -> Option<usize> {
     let len_i = len as i64;
     let idx = if i < 0 { i + len_i } else { i };
@@ -7692,6 +7819,287 @@ result = fib(99)
         let v = interp.root.get("result").expect("defined");
         // fib(99) = 218922995834555169026
         assert_eq!(v.py_str(), "218922995834555169026");
+    }
+
+    #[test]
+    fn float_floordiv_and_mod_match_cpython() {
+        // `floor(a / b)` rounds the intermediate quotient; CPython's fmod
+        // algorithm does not. `7.0 // 0.1` is 69.0, not 70.0.
+        let src = r#"
+a = 7.0 // 0.1
+b = 1.0 // 0.1
+c = 2.0 // 0.1
+d = divmod(7.0, 0.1)[0]
+"#;
+        let (interp, res) = parse_and_run(src);
+        res.unwrap();
+        assert_eq!(interp.root.get("a").unwrap().py_str(), "69.0");
+        assert_eq!(interp.root.get("b").unwrap().py_str(), "9.0");
+        assert_eq!(interp.root.get("c").unwrap().py_str(), "19.0");
+        assert_eq!(interp.root.get("d").unwrap().py_str(), "69.0");
+    }
+
+    #[test]
+    fn augassign_evaluates_a_subscript_index_once() {
+        // CPython COPYs the container and key, so a side-effecting index runs
+        // a single time. Reading then re-storing the target ran it twice.
+        let src = r#"
+calls = 0
+def idx():
+    global calls
+    calls = calls + 1
+    return 0
+xs = [10]
+xs[idx()] += 5
+result = (calls, xs[0])
+"#;
+        let (interp, res) = parse_and_run(src);
+        res.unwrap();
+        assert_eq!(interp.root.get("result").unwrap().py_str(), "(1, 15)");
+    }
+
+    #[test]
+    fn string_repeat_by_huge_count_overflows() {
+        // A count that does not fit an index-sized integer is an OverflowError,
+        // not a silently-empty string.
+        let (_i, res) = parse_and_run("r = \"a\" * (2 ** 64)");
+        match res.expect_err("huge repeat must raise") {
+            Unwind::Exception(e) => assert_eq!(e.kind, "OverflowError"),
+            other => panic!("expected OverflowError, got {other:?}"),
+        }
+        // A negative count is still the empty string, not an error.
+        let (interp, res) = parse_and_run("r = \"ab\" * -3");
+        res.unwrap();
+        assert_eq!(interp.root.get("r").unwrap().py_str(), "");
+    }
+
+    #[test]
+    fn repeat_total_length_overflow_raises_not_panics() {
+        // The count fits an index-sized integer but `len * count` does not, so
+        // the allocation would panic with "capacity overflow" (exit 101). Match
+        // CPython: `str`/`bytes` raise OverflowError before allocating, and
+        // `list`/`tuple` raise MemoryError — never an uncatchable panic.
+        for (src, kind, msg) in [
+            (
+                "r = \"aa\" * (2 ** 62)",
+                "OverflowError",
+                "repeated string is too long",
+            ),
+            (
+                "r = b\"aa\" * (2 ** 62)",
+                "OverflowError",
+                "repeated bytes are too long",
+            ),
+            ("r = [1, 1] * (2 ** 62)", "MemoryError", ""),
+            ("r = (1, 1) * (2 ** 62)", "MemoryError", ""),
+        ] {
+            let (_i, res) = parse_and_run(src);
+            match res.expect_err("over-long repeat must raise, not panic") {
+                Unwind::Exception(e) => {
+                    assert_eq!(e.kind, kind, "src={src}");
+                    assert_eq!(e.message, msg, "src={src}");
+                }
+                other => panic!("expected {kind} for {src}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn splitlines_honours_boundaries_and_keepends() {
+        let src = r#"
+a = "a\rb".splitlines()
+b = "a\nb".splitlines(True)
+c = "x\vy\fz".splitlines()
+# Keyword form must decode the kwargs sentinel — keepends=False must strip,
+# keepends=True must keep, not both behave like True.
+d = "a\nb".splitlines(keepends=False)
+e = "a\nb".splitlines(keepends=True)
+"#;
+        let (interp, res) = parse_and_run(src);
+        res.unwrap();
+        assert_eq!(interp.root.get("a").unwrap().py_str(), "['a', 'b']");
+        assert_eq!(interp.root.get("b").unwrap().py_str(), "['a\\n', 'b']");
+        assert_eq!(interp.root.get("c").unwrap().py_str(), "['x', 'y', 'z']");
+        assert_eq!(interp.root.get("d").unwrap().py_str(), "['a', 'b']");
+        assert_eq!(interp.root.get("e").unwrap().py_str(), "['a\\n', 'b']");
+    }
+
+    #[test]
+    fn startswith_endswith_accept_a_tuple() {
+        // CPython's `str.startswith` / `endswith` take a string OR a tuple of
+        // strings; the VM only handled the single-string form.
+        let src = r#"
+a = "main.ty".endswith((".py", ".ty"))
+b = "main.rs".endswith((".py", ".ty"))
+c = "print(x)".startswith(("print", "log"))
+d = "x.ty".endswith(".ty")
+# A match found before an invalid tuple element returns True without ever
+# examining the invalid element — CPython's lazy, in-order validation.
+e = "print(x)".startswith(("print", 1))
+"#;
+        let (interp, res) = parse_and_run(src);
+        res.unwrap();
+        assert_eq!(interp.root.get("a").unwrap().py_str(), "True");
+        assert_eq!(interp.root.get("b").unwrap().py_str(), "False");
+        assert_eq!(interp.root.get("c").unwrap().py_str(), "True");
+        assert_eq!(interp.root.get("d").unwrap().py_str(), "True");
+        assert_eq!(interp.root.get("e").unwrap().py_str(), "True");
+    }
+
+    #[test]
+    fn startswith_endswith_reject_non_str() {
+        // CPython raises `TypeError` for a non-`str` first arg and for a
+        // non-`str` tuple element reached before any match — matching the exact
+        // messages so `tyc run` is a drop-in for `python`.
+        let cases = [
+            (
+                r#"r = "a".startswith(1)"#,
+                "startswith first arg must be str or a tuple of str, not int",
+            ),
+            (
+                r#"r = "a".endswith(None)"#,
+                "endswith first arg must be str or a tuple of str, not NoneType",
+            ),
+            (
+                r#"r = "a".startswith((1, "a"))"#,
+                "tuple for startswith must only contain str, not int",
+            ),
+            (
+                r#"r = "a".endswith((b"x",))"#,
+                "tuple for endswith must only contain str, not bytes",
+            ),
+        ];
+        for (src, want) in cases {
+            let (_i, res) = parse_and_run(src);
+            match res.expect_err("non-str prefix must raise") {
+                Unwind::Exception(e) => {
+                    assert_eq!(e.kind, "TypeError", "src={src}");
+                    assert_eq!(e.message, want, "src={src}");
+                }
+                other => panic!("expected TypeError for {src}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn seeded_random_matches_cpython_byte_for_byte() {
+        // Locks the alpha.8 parity contract: an explicit `random.seed(n)` must
+        // reproduce CPython's Mersenne-Twister sequence exactly. The constants
+        // below were captured from CPython 3.13 `random.seed(42)`.
+        let src = r#"
+import random
+random.seed(42)
+a = random.random()
+b = random.randint(1, 100)
+c = random.random()
+xs = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+random.shuffle(xs)
+d = random.sample(range(100), 5)
+"#;
+        let (interp, res) = parse_and_run(src);
+        res.unwrap();
+        assert_eq!(interp.root.get("a").unwrap().py_str(), "0.6394267984578837");
+        assert_eq!(interp.root.get("b").unwrap().py_str(), "4");
+        assert_eq!(interp.root.get("c").unwrap().py_str(), "0.7415504997598329");
+        assert_eq!(
+            interp.root.get("xs").unwrap().py_str(),
+            "[9, 2, 8, 7, 5, 1, 6, 3, 10, 4]"
+        );
+        assert_eq!(interp.root.get("d").unwrap().py_str(), "[4, 3, 11, 27, 29]");
+    }
+
+    #[test]
+    fn casefold_folds_sharp_s_and_final_sigma() {
+        let src = r#"
+a = "ß".casefold()
+b = "Σίσυφος".casefold()
+"#;
+        let (interp, res) = parse_and_run(src);
+        res.unwrap();
+        assert_eq!(interp.root.get("a").unwrap().py_str(), "ss");
+        assert_eq!(interp.root.get("b").unwrap().py_str(), "σίσυφοσ");
+    }
+
+    #[test]
+    fn casefold_matches_cpython_on_tricky_scalars() {
+        // Byte-exact parity with CPython's full case folding on the exact
+        // scalars a `to_lowercase`/uppercase-round-trip approximation gets
+        // wrong: dotless `ı` folds to itself (not `i`), Cherokee folds toward
+        // its uppercase forms (not `to_lowercase`'s lowercase block), `İ`
+        // expands to `i` + combining dot, and the micro sign folds to Greek mu.
+        let src = "\
+dotless = \"\u{131}\".casefold()
+cherokee_upper = \"\u{13A0}\".casefold()
+cherokee_lower = \"\u{AB70}\".casefold()
+dotted_i = \"\u{130}\".casefold()
+micro = \"\u{B5}\".casefold()
+ligfi = \"\u{FB01}\".casefold()
+";
+        let (interp, res) = parse_and_run(src);
+        res.unwrap();
+        // ı (U+0131) folds to itself.
+        assert_eq!(interp.root.get("dotless").unwrap().py_str(), "\u{131}");
+        // Ꭰ (U+13A0) folds to itself; ꭰ (U+AB70) folds up to U+13A0.
+        assert_eq!(
+            interp.root.get("cherokee_upper").unwrap().py_str(),
+            "\u{13A0}"
+        );
+        assert_eq!(
+            interp.root.get("cherokee_lower").unwrap().py_str(),
+            "\u{13A0}"
+        );
+        // İ (U+0130) → "i" + U+0307 combining dot above.
+        assert_eq!(interp.root.get("dotted_i").unwrap().py_str(), "i\u{307}");
+        // µ (U+00B5 micro) → μ (U+03BC Greek small mu).
+        assert_eq!(interp.root.get("micro").unwrap().py_str(), "\u{3BC}");
+        // ﬁ ligature (U+FB01) → "fi".
+        assert_eq!(interp.root.get("ligfi").unwrap().py_str(), "fi");
+    }
+
+    #[test]
+    fn float_mod_carries_divisor_sign_of_zero() {
+        // A zero remainder takes the divisor's sign in CPython.
+        let src = r#"
+a = -3.0 % 3.0
+b = 7.0 % -7.0
+"#;
+        let (interp, res) = parse_and_run(src);
+        res.unwrap();
+        assert_eq!(interp.root.get("a").unwrap().py_str(), "0.0");
+        assert_eq!(interp.root.get("b").unwrap().py_str(), "-0.0");
+    }
+
+    #[test]
+    fn zero_to_negative_power_raises() {
+        for src in ["r = 0 ** -1", "r = 0.0 ** -2.0"] {
+            let (_i, res) = parse_and_run(src);
+            let err = res.expect_err("0 ** -n must raise");
+            match err {
+                Unwind::Exception(e) => assert_eq!(e.kind, "ZeroDivisionError"),
+                other => panic!("expected ZeroDivisionError, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn hex_bin_oct_of_negatives_and_bigints() {
+        // Negatives must print `-0x..`, not the i64 two's-complement pattern,
+        // and the argument may exceed i64.
+        let src = r#"
+a = hex(-42)
+b = bin(-5)
+c = oct(-8)
+d = hex(2 ** 64)
+"#;
+        let (interp, res) = parse_and_run(src);
+        res.unwrap();
+        assert_eq!(interp.root.get("a").unwrap().py_str(), "-0x2a");
+        assert_eq!(interp.root.get("b").unwrap().py_str(), "-0b101");
+        assert_eq!(interp.root.get("c").unwrap().py_str(), "-0o10");
+        assert_eq!(
+            interp.root.get("d").unwrap().py_str(),
+            "0x10000000000000000"
+        );
     }
 
     /// The flattened method cache must not survive a runtime impl-block merge:

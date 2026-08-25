@@ -4,6 +4,178 @@ All notable changes to Typhon are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely; the
 canonical phase-by-phase status lives in `docs/roadmap.md`.
 
+## Unreleased — full-codebase release-readiness remediation
+
+A release-readiness review of alpha.9 (seven parallel audits + the five CI
+gates run locally, all green) found and this change fixes a cluster of
+**production-path miscompilations**, VM↔CPython parity gaps, a supply-chain /
+path-safety hole, and doc drift. Every fix ships with a regression test.
+Additive on correct programs: the emitter/preprocessor fixes only correct
+output that was already wrong, and the type-checker change is a conservative
+widening consistent with the alpha.2 attribute-narrowing rule.
+
+A second remediation wave then closed the pre-existing backlog the review
+had reported rather than fixed. The full example+stress corpus re-checks
+clean (a false-positive net for the type-checker work) and the differential
+gate is down to 124 (two burned down, none new):
+
+- **Flow-narrowing soundness (`tyc-types`).** Narrowings no longer leak across
+  a function boundary (`check_function` snapshots/restores enclosing-scope
+  narrowings) — closing both a sibling-function unsound accept and a
+  nested-`def`/`nonlocal` false positive. `finally` is checked against the
+  intersection of the post-try join and the pre-try state; a call in a `match`
+  subject / `case` guard / `elif` invalidates a global narrowing; a
+  comprehension filter no longer leaks its narrowing; `del` invalidates both
+  narrowing and definite-assignment; and the H5 guard degrades to permissive
+  for an aliased-import base (`class Response(BaseResponse)` no longer
+  false-rejects).
+- **VM ↔ CPython parity.** Augmented assignment evaluates a subscript/attribute
+  target's receiver and index once (was twice); `str.splitlines` honours the
+  full Unicode boundary set and `keepends`; `str.casefold` folds `ß`/final
+  sigma; `"s" * n` with an oversized count raises `OverflowError`;
+  `startswith`/`endswith` accept a tuple of affixes (which let a permanent
+  differential-baseline artefact, `123_unused_import`, be rewritten to compare
+  equal and burned down). A seeded-`random` test pins the alpha.8 byte-for-byte
+  contract.
+- **Robustness / hardening.** `tyc fmt`'s atomic write uses `O_EXCL` so a
+  pre-planted symlink can't redirect it; comptime string concatenation /
+  replacement is charged against a 16 MiB budget (was OOM-able); both
+  venv-introspection stdout drainers cap the read at 32 MiB; the generated
+  `traceback.py` guards `install()`; the `TYC_NO_INTROSPECT` / `PYTHONPATH`
+  env-var tests hold the repo's `lock_env()` mutex; and
+  `vm-differential.sh --update` preflights its required runtime packages.
+- **Docs.** The `rescue` exception-boundary sugar is documented on the
+  docs-site Result reference page (it was absent from every docs-site
+  error-handling page despite shipping in v1.0.0-alpha).
+
+Deferred by design: VM `hash()` / set-repr ordering vs CPython (needs siphash +
+`PYTHONHASHSEED` and an open-addressed table — arguably a documented carve-out),
+the differential harness diffing stderr (needs a baseline re-record), `raise …
+from` chaining on the VM (`Value::Exception` field surgery), and the remaining
+additive docs-site pages / CLI-entrypoint smoke tests.
+
+### Fixed — miscompilations (emitter / preprocessor / desugar)
+
+- **`?` inside a PEP 701 nested same-quote f-string was rewritten**, corrupting
+  the string. `print(f"{d["a?b"]}")` emitted `f"{d['a | Noneb']}"`. The
+  `rewrite_optionals` preprocessor pass now classifies bytes through the shared
+  PEP 701-aware `lexmask` scanner (`scan_line_kinds`) instead of a private
+  string scanner that closed the f-string at the inner quote, so it only
+  rewrites a `?` in structural code.
+- **`await` was emitted with no precedence guard on its operand.**
+  `await (f() if c else g())` emitted `await f() if c else g()`, which Python
+  regroups as `(await f()) if c else g()` — a different program that parses
+  cleanly (so the post-emit gate never caught it). The operand is now
+  parenthesised unless it is a `primary`.
+- **Comprehension `iter` / `if` operands were emitted without a precedence
+  guard.** `[x for x in xs if (a if p else b)]` emitted a double-`if`
+  `SyntaxError`; the iterable form dropped an `else`. Both slots are now guarded.
+- **A raw `CR` in a triple-quoted string literal was deleted by CPython's
+  universal-newline source decode.** `"\r\n"` (triple because it also holds
+  `\n`) round-tripped to a one-character constant under `tyc build` while the VM
+  kept both bytes. The `\r` is now escaped in the triple-quoted path.
+- **`|>` inside a string / docstring was rewritten** by the pipe pass, which
+  ignored the string state its own scanner tracked; it now skips in-string
+  matches.
+- **A `ClassVar[...]` field with a mutable default was rewritten to
+  `dataclasses.field(default_factory=...)`**, which made `@dataclass` strip the
+  class attribute, so a shared `registry: ClassVar[dict[str, int]] = {}` ceased
+  to exist. `ClassVar` fields are now left untouched by the mutable-default
+  rewrite (matching the existing `class!` path).
+
+### Fixed — VM ↔ CPython parity (`tyc run`)
+
+- **Float `//` and `%` and `divmod(float, float)`** now use CPython's
+  fmod-based `float_divmod`; `floor(a / b)` rounds the intermediate quotient
+  (`7.0 // 0.1` gave `70.0`, not `69.0`). A zero float remainder now carries the
+  divisor's sign (`-3.0 % 3.0 == 0.0`, `7.0 % -7.0 == -0.0`).
+- **`hex()` / `bin()` / `oct()` of a negative or `>i64` integer** printed the
+  i64 two's-complement bit pattern (`hex(-42)` → `0xff…d6`) or overflowed; they
+  now render CPython's `-0x2a` form through the arbitrary-precision `VmInt`.
+- **`0 ** -1` / `0.0 ** -2.0`** now raise `ZeroDivisionError` instead of
+  returning `inf`.
+- **`HashKey::Float`** compared floats by bit pattern, so `0.0` and `-0.0` were
+  distinct dict/set keys (and `Eq` was non-transitive against the integral-int
+  arms). Zeros now collapse; NaN keeps its own identity.
+- **`input()` at EOF** now raises `EOFError` instead of silently returning `""`
+  (which turned a `while (line := input()) != "":` loop into a no-op). Clears a
+  differential-baseline entry.
+- **`str.startswith` / `str.endswith` now enforce CPython's argument typing.**
+  A non-`str` first argument, or a non-`str` element reached in a prefix tuple,
+  raises `TypeError` with CPython's exact message instead of being coerced via
+  `str()` (which silently returned a wrong `bool`). Validation is lazy and in
+  iteration order — `"a".startswith(("a", 1))` is `True`, but
+  `"a".startswith((1, "a"))` raises — matching CPython byte-for-byte.
+- **`str.casefold()` is now full Unicode case folding**, byte-exact with
+  CPython across all 1,112,064 scalar values. The previous
+  uppercase-then-lowercase approximation regressed characters whose uppercase
+  mapping loses distinctions (dotless `ı` folded through `I` to `i`; Cherokee
+  folded the wrong direction). The Unicode Character Database's C+F mappings are
+  now embedded directly (`casefold_data.rs`, regenerated by
+  `scripts/gen-casefold.py`) with no new dependency.
+- **Over-long sequence repetition raises instead of panicking.** When the count
+  fits an index-sized integer but `len * count` does not (`"aa" * (2 ** 62)`),
+  the VM previously aborted with a Rust `capacity overflow` panic (exit 101); it
+  now raises the same catchable exception CPython does before allocating —
+  `OverflowError` ("repeated string/bytes … too long") for `str`/`bytes`,
+  `MemoryError` for `list`/`tuple`.
+- **`str.splitlines(keepends=…)` in keyword form** was ignored: the bound-method
+  kwargs sentinel wasn't decoded, so `keepends=False` behaved like `keepends=True`
+  (`"a\nb".splitlines(keepends=False)` returned `['a\n', 'b']`). It now decodes
+  the sentinel like `str.split`, matching CPython.
+
+### Fixed — type checker
+
+- **An awaited method-call statement (`await self.reset()`) now invalidates the
+  receiver's attribute narrowing**, matching the sync-call behaviour from
+  alpha.2 (the fix had only matched the bare `Call`, not `Await(Call)`).
+- **A `finally` block's assignments and narrowings now flow to the code after
+  the `try`.** The flow-narrowing rework checked `finally` against the
+  conservative all-paths state (correct — a mid-body raise reaches it too) but
+  then restored the pre-`finally` state, discarding the block's own effects: a
+  `finally: x = None` left a stale non-`None` narrowing downstream (an unsound
+  accept), and a `finally` assignment that re-established a value was forgotten
+  (a false positive). The block's deltas are now overlaid onto the post-`try`
+  state, so downstream code sees them while the conservative view still governs
+  diagnostics inside `finally`.
+
+### Security / robustness
+
+- **`[project] src` / `[project] out` are now validated**: only a plain
+  in-tree relative path is accepted. An absolute path, a `..` component, or —
+  on Windows — a drive-relative prefix (`C:out`) or driveless root (`\out`),
+  both of which `is_absolute()` misses yet `Path::join` still treats as
+  replacing the base, is rejected. A cloned untrusted project could otherwise
+  set `out = "/…/site-packages"` (or `"../.."`, or `"C:out"`) and have
+  `tyc build` write attacker-controlled `.py` outside the project directory.
+- **`tyc fmt` now spawns the `$PATH`-resolved absolute `ruff`** instead of the
+  bare name, closing a Windows current-directory search-order hole where a
+  `ruff.exe` shipped in an untrusted checkout would run.
+- **`auto-tag.yml`** now guards on
+  `workflow_run.head_repository.full_name == github.repository` (a fork PR from
+  a branch named `main` could otherwise reach the privileged tag/publish job)
+  and passes the tag value through the environment rather than interpolating it
+  into the `run:` shell. `ci.yml` and `vscode-extension.yml` gain a
+  least-privilege `permissions: contents: read` block.
+
+### Docs
+
+- `SECRET_NAME_KEYWORDS` gains a `secret_keyword_table_is_longest_first` test
+  (plus a duplicate check) so the longest-first ordering invariant — hand-
+  maintained and mis-ordered twice before (alpha.4, alpha.9) — is now a
+  compile-gate, and the `tyc build` scan's `secret_suffix` delegates to a single
+  shared `tyc_analyse::secret_keyword_match` rather than a hand-synced copy of
+  the boundary logic.
+- `tyc::return_in_except_star` (shipped alpha.7) added to the bundled skill's
+  `DIAGNOSTICS.md`; the diagnostic-count reference corrected 87 → 88.
+- `unused-import`'s default is documented as `"warn"` (not `"error"`) in the
+  skill, `docs/configuration.md`, and the docs-site config pages, matching the
+  compiler default since v0.8.0.
+- Example-corpus counts corrected (32 exercises / 259 `.ty` files); the skill's
+  `[strictness]` reference gains the real `nullable-use` and `suggest-gather`
+  keys; `docs/diagnostics/README.md`'s `freeze_not_freezable` link points at its
+  own page; `CLAUDE.md` / `CONTRIBUTING.md` describe all five CI jobs.
+
 ## 1.0.0-alpha.9 — 2026-08-21 — maintenance: secret-name lint expansion, allocation reductions & dependency wave
 
 A maintenance release on top of alpha.8: a large widening of the **warn-level**

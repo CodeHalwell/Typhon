@@ -12,6 +12,11 @@ on:
       - "editors/vscode/**"
       - ".github/workflows/vscode-extension.yml"
 
+# Least privilege: this workflow only builds and packages the extension. A
+# read-only token keeps a compromised npm dependency from writing to the repo.
+permissions:
+  contents: read
+
 jobs:
   build:
     name: Build & package

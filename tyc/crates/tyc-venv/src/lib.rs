@@ -714,10 +714,16 @@ fn introspect_batch_via_python(
     // only read after `wait()`. The batched output is also larger
     // than a single-module response, so the dedicated reader matters
     // more here.
-    let mut stdout = child.stdout.take()?;
+    let stdout = child.stdout.take()?;
     let drainer = std::thread::spawn(move || -> Vec<u8> {
+        // Cap the read: a hostile (or merely chatty) dependency that writes to
+        // stdout at pipe speed for the whole timeout window would otherwise
+        // fill RAM. Introspection output is a few KB of JSON; 32 MiB is vast
+        // headroom yet bounds the worst case. An over-cap response simply fails
+        // to parse downstream and is treated as a miss.
+        const CAP: u64 = 32 * 1024 * 1024;
         let mut buf = Vec::with_capacity(64 * 1024);
-        let _ = stdout.read_to_end(&mut buf);
+        let _ = std::io::Read::take(stdout, CAP).read_to_end(&mut buf);
         buf
     });
     // 5 s startup baseline + 1 s per module in the batch. Generous

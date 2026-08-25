@@ -481,12 +481,17 @@ fn introspect_via_python(
     // fill the stdout pipe buffer (typically 64 KB on macOS/Linux) and
     // the child blocks on `print()`, never reaching `sys.exit(0)`;
     // the timeout below would kill it but the result is always None.
-    let Some(mut stdout) = child.stdout.take() else {
+    let Some(stdout) = child.stdout.take() else {
         return (None, Some(spawn_failure()));
     };
     let drainer = std::thread::spawn(move || -> Vec<u8> {
+        // Cap the read so a dependency that floods stdout can't OOM the
+        // language server (see the same guard in `tyc-venv`). 32 MiB is far
+        // above any real introspection response; an over-cap read fails to
+        // parse and is treated as a miss.
+        const CAP: u64 = 32 * 1024 * 1024;
         let mut buf = Vec::with_capacity(64 * 1024);
-        let _ = stdout.read_to_end(&mut buf);
+        let _ = std::io::Read::take(stdout, CAP).read_to_end(&mut buf);
         buf
     });
     // Wait with a timeout. `Child::wait` blocks indefinitely, so we
@@ -569,6 +574,22 @@ pub fn find_project_root(start: &Path) -> Option<PathBuf> {
 mod tests {
     use super::*;
 
+    /// Serialise every test that reads or writes `TYC_NO_INTROSPECT`.
+    /// `cargo test` runs tests on parallel threads, and the environment is
+    /// process-wide, so the one test that sets the var and the several that
+    /// read it (through `IntrospectionCache::for_project_root`, which consults
+    /// it) would otherwise race — an intermittent, load-dependent flake. This
+    /// mirrors the `lock_env()` guard already used in `tyc-analyse`,
+    /// `tyc-format`, and the `tyc` binary's tests.
+    fn lock_env() -> std::sync::MutexGuard<'static, ()> {
+        use std::sync::{Mutex, OnceLock};
+        static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        ENV_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+    }
+
     #[test]
     fn find_project_root_walks_upward() {
         let tmp = tempfile::tempdir().unwrap();
@@ -593,6 +614,7 @@ mod tests {
 
     #[test]
     fn cache_remembers_failures() {
+        let _env = lock_env();
         // Without a venv and without a `python3` on PATH this is a
         // sanity-only test: it confirms that `members` doesn't panic
         // and that a second call doesn't re-shell. We can't assert on
@@ -614,6 +636,7 @@ mod tests {
 
     #[test]
     fn undeclared_module_is_never_introspected() {
+        let _env = lock_env();
         // The security property: naming a module in a `.ty` file must not be
         // enough to make the editor import it. Only stdlib and the project's
         // declared dependencies are importable.
@@ -648,6 +671,7 @@ mod tests {
 
     #[test]
     fn allow_list_refreshes_when_typhon_toml_changes() {
+        let _env = lock_env();
         // Declaring a new dependency mid-session must widen the allow-list.
         // Before the `config_stamp` re-stat, the list was computed once at
         // cache construction and refreshed only on a `pyvenv.cfg` mtime
@@ -691,6 +715,7 @@ mod tests {
 
     #[test]
     fn introspection_does_not_run_in_the_project_root() {
+        let _env = lock_env();
         // The completion-introspection twin of the tyc-venv regression test:
         // the embedded script's first statement is `import sys, json, …`,
         // and for a stdin script `sys.path[0]` is the subprocess cwd — so a
@@ -729,6 +754,7 @@ mod tests {
 
     #[test]
     fn tyc_no_introspect_disables_the_editor_path_too() {
+        let _env = lock_env();
         // `SECURITY.md` documents `TYC_NO_INTROSPECT` as disabling dependency
         // introspection. It used to disable only the CLI's — the editor kept
         // executing dependency import-time code past the kill-switch.

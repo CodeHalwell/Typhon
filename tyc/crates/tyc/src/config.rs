@@ -573,6 +573,40 @@ impl TyphonConfig {
                 allowed: ALLOWED_PARALLEL_BACKENDS.join(", "),
             });
         }
+        // `[project] src` / `[project] out` are joined onto the project
+        // directory to read sources and write build artifacts. An absolute
+        // value replaces the base entirely and a `..` component walks out of
+        // it, so a cloned untrusted project could set `out =
+        // "/…/site-packages"` (or `"../../"`) and have `tyc build` write
+        // attacker-controlled `.py` outside the project — exactly the flow
+        // SECURITY.md documents as the safe way to inspect untrusted code.
+        // Require both to stay within the project directory.
+        for (key, value) in [("src", &self.project.src), ("out", &self.project.out)] {
+            let candidate = std::path::Path::new(value.as_str());
+            // `is_absolute()` alone misses two Windows-only rooted forms that
+            // `Path::join` still treats as *replacing* the base directory, so a
+            // build there could escape the project tree: a drive-relative
+            // prefix (`out = "C:out"`, which has a `Prefix` but is not absolute)
+            // and a driveless root (`out = "\\out"`, a `RootDir` with no
+            // prefix). Require every component to be a plain in-tree step —
+            // `Normal` or `CurDir` — which rejects `..`, absolute paths, and
+            // both Windows rooted forms at once (`Prefix`/`RootDir` never arise
+            // for a relative value on Unix, so this is a no-op there).
+            let escapes = candidate.is_absolute()
+                || candidate.components().any(|c| {
+                    !matches!(
+                        c,
+                        std::path::Component::Normal(_) | std::path::Component::CurDir
+                    )
+                });
+            if escapes {
+                return Err(ConfigError::ProjectPathEscapesRoot {
+                    path: source_path.to_string_lossy().into_owned(),
+                    key: key.to_owned(),
+                    value: value.clone(),
+                });
+            }
+        }
         Ok(())
     }
 
@@ -683,6 +717,14 @@ pub enum ConfigError {
         value: String,
         allowed: String,
     },
+    /// `[project] src` or `[project] out` is absolute or contains a `..`
+    /// component, which lets a build read from / write to a path outside the
+    /// project directory. Emitted by [`TyphonConfig::validate`].
+    ProjectPathEscapesRoot {
+        path: String,
+        key: String,
+        value: String,
+    },
 }
 
 impl std::fmt::Display for ConfigError {
@@ -761,6 +803,15 @@ impl std::fmt::Display for ConfigError {
                     "invalid `[strictness] parallel-backend = \"{value}\"` in '{path}': allowed values are {allowed}",
                 )
             }
+            ConfigError::ProjectPathEscapesRoot { path, key, value } => {
+                write!(
+                    f,
+                    "invalid `[project] {key} = \"{value}\"` in '{path}': the path must be \
+                     relative to the project directory and must not contain a `..` component \
+                     (an absolute path or `..` would let a build read from or write to files \
+                     outside the project)",
+                )
+            }
         }
     }
 }
@@ -786,6 +837,67 @@ mod tests {
         let cfg = TyphonConfig::default();
         assert_eq!(cfg.checker.external, "none");
         assert!(cfg.checker.external_args.is_empty());
+    }
+
+    #[test]
+    fn project_paths_escaping_the_root_are_rejected() {
+        let p = Path::new("typhon.toml");
+        for bad in ["/etc", "../../elsewhere", "sub/../../up", "..", "a/../../b"] {
+            let mut cfg = cfg_with_target("3.13");
+            cfg.project.out = bad.to_string();
+            assert!(
+                matches!(
+                    cfg.validate(p),
+                    Err(ConfigError::ProjectPathEscapesRoot { .. })
+                ),
+                "out = {bad:?} must be rejected"
+            );
+            let mut cfg = cfg_with_target("3.13");
+            cfg.project.src = bad.to_string();
+            assert!(
+                matches!(
+                    cfg.validate(p),
+                    Err(ConfigError::ProjectPathEscapesRoot { .. })
+                ),
+                "src = {bad:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn ordinary_relative_project_paths_are_accepted() {
+        let p = Path::new("typhon.toml");
+        for good in ["src", "build", "nested/src", "./out", "a/b/c"] {
+            let mut cfg = cfg_with_target("3.13");
+            cfg.project.src = "src".into();
+            cfg.project.out = good.to_string();
+            assert!(
+                cfg.validate(p).is_ok(),
+                "out = {good:?} must be accepted, got {:?}",
+                cfg.validate(p)
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn windows_drive_relative_project_paths_are_rejected() {
+        // A drive-relative prefix (`C:out`) and a driveless root (`\out`) are
+        // not `is_absolute()` on Windows, yet `Path::join` treats both as
+        // rooted and escapes the project dir. These parse as `Prefix`/`RootDir`
+        // components only on Windows, so the test is Windows-only.
+        let p = Path::new("typhon.toml");
+        for bad in ["C:out", r"\out", r"\\server\share\out"] {
+            let mut cfg = cfg_with_target("3.13");
+            cfg.project.out = bad.to_string();
+            assert!(
+                matches!(
+                    cfg.validate(p),
+                    Err(ConfigError::ProjectPathEscapesRoot { .. })
+                ),
+                "out = {bad:?} must be rejected on Windows"
+            );
+        }
     }
 
     #[test]

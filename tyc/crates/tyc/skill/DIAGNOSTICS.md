@@ -613,6 +613,25 @@ def main() -> Result[int, IOErr]:
 
 **Fix:** Convert at the boundary with `match` or `.map_err(...)`, or align error types.
 
+### `tyc::return_in_except_star` — error (v1.0.0-alpha.7)
+
+A `return`, `break`, or `continue` inside an `except*` handler body. PEP 654
+forbids these control-flow escapes from an `except*` suite because the group may
+still have unhandled sub-exceptions to re-raise after every handler has run;
+CPython raises a `SyntaxError` at compile time. Typhon surfaces it as this
+diagnostic instead.
+
+```ty
+def f() -> int:
+    try:
+        pass
+    except* ValueError:
+        return 1        # error: return inside except* handler
+```
+
+**Fix:** Compute the result inside the handler and `return` it after the whole
+`try`/`except*` statement, or restructure to a plain `try`/`except`.
+
 ### `tyc::missing_return` — error
 
 A function with non-`None` return type has at least one path that reaches the end without `return`/`raise`. Exhaustive `match` over a sealed union or `Result` satisfies the analysis (v0.6.0+, including `match` on subject expressions like `match self.field:` or `match get_state():`).
@@ -1127,7 +1146,7 @@ Standard values for severity keys are `"off"`, `"warn"`, `"error"`. The `suggest
 
 ## Severity-only summary
 
-**Errors** (block the build by default): `arg_count`, `attribute_not_found`, `comptime`, `cyclic_type_alias`, `div_by_zero_literal`, `duplicate_class`, `duplicate_method`, `extend_builtin`, `field_default_ordering`, `frozen_assign`, `generator_return_type`, `generic`, `immutable_assign`, `impl_unknown_class`, `implicit_any`, `impure_pure_fn`, `interface_isinstance`, `interface_not_conforming`, `invalid_config_value`, `invalid_question_op`, `io`, `lazy_usage`, `manual_init`, `method_in_class_body` (default warn but commonly bumped), `missing_annotation`, `missing_argument`, `missing_await`, `missing_binding_kind`, `missing_field_init`, `missing_initialiser`, `missing_return`, `newtype_violation`, `no_block_shadow`, `non_exhaustive_match`, `not_callable`, `nullable_use`, `operator_type_mismatch`, `parse`, `pattern_shadows_outer`, `pub_name_collision`, `result_error_mismatch`, `self_outside_impl`, `stub_mismatch`, `tuple_index_out_of_range`, `type_mismatch`, `typevar_bound`, `typevar_import_rejected`, `typing_alias_deprecated`, `unknown_kwarg`, `unknown_module`, `unknown_name`, `unsafe_value_leak`, `unused_import`, `use_of_uninitialised`.
+**Errors** (block the build by default): `arg_count`, `attribute_not_found`, `comptime`, `cyclic_type_alias`, `div_by_zero_literal`, `duplicate_class`, `duplicate_method`, `extend_builtin`, `field_default_ordering`, `frozen_assign`, `generator_return_type`, `generic`, `immutable_assign`, `impl_unknown_class`, `implicit_any`, `impure_pure_fn`, `interface_isinstance`, `interface_not_conforming`, `invalid_config_value`, `invalid_question_op`, `io`, `lazy_usage`, `manual_init`, `method_in_class_body` (default warn but commonly bumped), `missing_annotation`, `missing_argument`, `missing_await`, `missing_binding_kind`, `missing_field_init`, `missing_initialiser`, `missing_return`, `newtype_violation`, `no_block_shadow`, `non_exhaustive_match`, `not_callable`, `nullable_use`, `operator_type_mismatch`, `parse`, `pattern_shadows_outer`, `pub_name_collision`, `result_error_mismatch`, `return_in_except_star`, `self_outside_impl`, `stub_mismatch`, `tuple_index_out_of_range`, `type_mismatch`, `typevar_bound`, `typevar_import_rejected`, `typing_alias_deprecated`, `unknown_kwarg`, `unknown_module`, `unknown_name`, `unsafe_value_leak`, `unused_import`, `use_of_uninitialised`.
 
 **Warnings**: `async_without_await`, `class_attr_shadows_slot`, `blocking_in_async`, `contains_secret_literal`, `orphan_py_import`, `python_semantic_drift`, `resource_not_managed`, `stdlib_module_shadow`.
 

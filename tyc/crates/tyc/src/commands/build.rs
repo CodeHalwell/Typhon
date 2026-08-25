@@ -1620,55 +1620,15 @@ fn display_relative(path: &std::path::Path, project_root: &std::path::Path) -> S
 }
 
 /// Return `Some(suffix)` if `name` looks like a credential identifier.
-/// The match is case-insensitive and ensures the token is bounded by the
-/// start/end of the string or underscores.
-/// Used by the secret-comptime lint.
+/// Used by the secret-comptime lint. Delegates to the single shared
+/// word-boundary matcher in `tyc-analyse` (which also backs the
+/// `tyc::contains_secret_literal` lint), so the two consumers can no
+/// longer drift — the boundary logic used to be a hand-synchronised
+/// copy of that function, the same drift class that produced the
+/// alpha.4 `KEY_APIKEY` ordering bug. The `secret_suffix_*` tests below
+/// pin the shared behaviour from this call site.
 fn secret_suffix(name: &str) -> Option<&'static str> {
-    let upper = name.to_ascii_uppercase();
-    // Keyword table shared with the `tyc::contains_secret_literal` lint —
-    // see `tyc_analyse::SECRET_NAME_KEYWORDS` for the longest-first
-    // ordering invariant both consumers rely on.
-    for &candidate in tyc_analyse::SECRET_NAME_KEYWORDS {
-        // We match if the substring is bounded by:
-        // - start/end of string
-        // - underscore (`_`)
-        // - or if it's preceded/followed by a casing change (for camelCase)
-        // e.g. "myTokenValue" -> "my" + "Token" + "Value" -> preceded by 'y' (lowercase),
-        // followed by 'V' (uppercase).
-        // Ensure "PASSPORT" does not match "PASS" by checking that the matched prefix/suffix
-        // boundaries are actually word boundaries (i.e. we don't have uppercase letters directly next to uppercase letters in original, etc).
-        // The simplest check for camelCase/PascalCase is:
-        // start_ok: actual_idx == 0 OR previous char is `_` OR (previous char is lowercase AND current char is uppercase).
-        // end_ok: actual_end == len OR next char is `_` OR (next char is uppercase AND last char of match was NOT uppercase).
-        let mut start_idx = 0;
-        while let Some(idx) = upper[start_idx..].find(candidate) {
-            let actual_idx = start_idx + idx;
-
-            let start_ok = actual_idx == 0
-                || upper.as_bytes()[actual_idx - 1] == b'_'
-                || name.as_bytes()[actual_idx - 1].is_ascii_digit()
-                || (name.as_bytes()[actual_idx].is_ascii_uppercase()
-                    && name.as_bytes()[actual_idx - 1].is_ascii_lowercase());
-
-            let actual_end = actual_idx + candidate.len();
-            let end_ok = actual_end == upper.len()
-                || upper.as_bytes()[actual_end] == b'_'
-                || name.as_bytes()[actual_end].is_ascii_digit()
-                || (name.as_bytes()[actual_end].is_ascii_uppercase()
-                    && !name.as_bytes()[actual_end - 1].is_ascii_uppercase())
-                || (name.as_bytes()[actual_end].is_ascii_uppercase()
-                    && actual_end + 1 < name.len()
-                    && name.as_bytes()[actual_end + 1].is_ascii_lowercase())
-                || (name.as_bytes()[actual_end].is_ascii_lowercase()
-                    && name.as_bytes()[actual_end - 1].is_ascii_uppercase());
-
-            if start_ok && end_ok {
-                return Some(candidate);
-            }
-            start_idx = actual_idx + 1;
-        }
-    }
-    None
+    tyc_analyse::secret_keyword_match(name)
 }
 
 /// Scan `source` for `from .NAME import …` lines and return
@@ -3673,19 +3633,26 @@ _FRAME_RE = re.compile(r'File \"([^\"]+)\", line (\\d+)')
 
 def install() -> None:
     \"\"\"Install a sys.excepthook that maps emitted-.py frames to .ty source.\"\"\"
-    state = _load_state()
-    if state is None:
+    # The whole setup is best-effort: `_load_state` walks the filesystem and
+    # `_remap`/`_source_root` call `os.path.relpath`, which raises across
+    # Windows drives. A failure here must never crash the program at import —
+    # if the hook can't be installed, the default traceback is used instead.
+    try:
+        state = _load_state()
+        if state is None:
+            return
+        previous = sys.excepthook
+
+        def hook(exc_type, exc, tb):
+            try:
+                text = ''.join(_tb.format_exception(exc_type, exc, tb))
+                sys.stderr.write(_remap(text, state))
+            except Exception:  # pragma: no cover - never hide the real error
+                previous(exc_type, exc, tb)
+
+        sys.excepthook = hook
+    except Exception:  # pragma: no cover - setup must never break startup
         return
-    previous = sys.excepthook
-
-    def hook(exc_type, exc, tb):
-        try:
-            text = ''.join(_tb.format_exception(exc_type, exc, tb))
-            sys.stderr.write(_remap(text, state))
-        except Exception:  # pragma: no cover - never hide the real error
-            previous(exc_type, exc, tb)
-
-    sys.excepthook = hook
 
 
 def _build_root():

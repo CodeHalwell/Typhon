@@ -34,9 +34,9 @@ The canonical sources are:
 - **`docs/ty-integration.md`** — how `tyc ty` and the `[checker] external = "ty"` build hook cooperate with Astral's checker (Phase 1 shipped; Phase 2 embedded prototyped, not shipped).
 - **`docs/performance-baseline.md`** — measured numbers we don't want to regress.
 - **`docs/roadmap.md`** / **`docs/risks.md`** / **`docs/prior-art.md`** / **`docs/findings.md`** — context.
-- **`examples/NN-*/`** — 29 curated stdlib-only exercises (sparsely numbered `01`–`68`, leaving room between topics).
+- **`examples/NN-*/`** — 32 curated stdlib-only exercises (sparsely numbered `01`–`68`, leaving room between topics).
 - **`examples/apps/01..15-*/`** — 15 production-shaped multi-file projects (event-sourced banking, distributed KV, mini-compiler, search engine, GraphQL server, game ECS, trading engine, ML orchestrator, web crawler, task scheduler, real-time game server, static site generator, vector DB, API gateway, stream processor).
-- The full example corpus is **256 `.ty` files** (exercises + apps + `examples/testing/`); the v0.12.0 third-party-introspection work was verified against it with zero false positives.
+- The full example corpus is **259 `.ty` files** (exercises + apps + `examples/testing/`); the v0.12.0 third-party-introspection work was verified against it with zero false positives.
 - **`tyc/vendor/README.md`** — Ruff fork rationale.
 - **`editors/vscode/README.md`** — reference VS Code extension (v0.2.3).
 - **`docs-site/`** — the published Astro + Starlight documentation site (`src/content/docs/*.mdx`); self-contained, not generated from `docs/`. Deployed to GitHub Pages.
@@ -1343,12 +1343,14 @@ traceback-remap = false          # (v0.14.0) inject a `.ty`-source traceback rem
 
 [strictness]
 no-implicit-any = true           # reserved for forward compat; today the check is always on
-unused-import = "error"          # or "warn" | "off"
+unused-import = "warn"           # default "warn" (since v0.8.0); or "error" | "off"
 exhaustive-match = "error"
 methods-in-class-body = "warn"   # or "error" (break CI) | "off"
+nullable-use = "error"           # severity for tyc::nullable_use; or "warn" | "off"
 require-with = "warn"            # severity for tyc::resource_not_managed
 blocking-in-async = "warn"       # severity for tyc::blocking_in_async
 stub-check = "error"             # severity for tyc::stub_mismatch
+suggest-gather = true            # advice: surfaces tyc::gather_opportunity
 auto-memoise = false             # opt-in; inserts @functools.cache on inferred pure fns (defaults true at [optimise] level = 1)
 auto-gather = false              # opt-in; folds independent awaits into TaskGroup (needs @gatherable; defaults true at level = 1)
 auto-parallel = false            # opt-in; pure list/set/dict comprehensions → thread-pool map (defaults true at level = 1)
@@ -1585,7 +1587,7 @@ Consumers:
 
 ## 19. Diagnostics catalog (top tier)
 
-The recurring diagnostic codes and what they actually mean. **See [DIAGNOSTICS.md](DIAGNOSTICS.md) for the exhaustive 87-code reference** — what follows is the daily-driver subset.
+The recurring diagnostic codes and what they actually mean. **See [DIAGNOSTICS.md](DIAGNOSTICS.md) for the exhaustive 88-code reference** — what follows is the daily-driver subset.
 
 | Code | Meaning | Fix |
 |---|---|---|

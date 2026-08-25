@@ -4,7 +4,12 @@ import json
 import sys
 
 def main() -> None:
-    print(sys.argv[0])
+    # `sys.argv[0]` is the entry path, which legitimately differs between the
+    # two surfaces (`build/main.py` under `tyc build` + CPython vs the `.ty`
+    # source under `tyc run`), so printing it raw made this unit a permanent
+    # differential-harness artefact that could never agree. Print a
+    # surface-independent property instead, so the unit provides real coverage.
+    print(sys.argv[0].endswith((".py", ".ty")))
 
 if __name__ == "__main__":
     main()

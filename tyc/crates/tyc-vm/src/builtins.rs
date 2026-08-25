@@ -74,6 +74,52 @@ fn split_with_sep(s: &str, sep: &str, maxsplit: i64, from_right: bool) -> Vec<St
     }
 }
 
+/// `str.splitlines([keepends])` — split on CPython's full line-boundary set,
+/// not Rust's `str::lines()` (which recognises only `\n` / `\r\n`). CPython
+/// breaks on `\n \r \r\n \v \f \x1c \x1d \x1e \x85    `; with
+/// `keepends=True` each terminator stays attached to its line.
+fn py_splitlines(s: &str, keepends: bool) -> Vec<String> {
+    fn is_line_boundary(c: char) -> bool {
+        matches!(
+            c,
+            '\n' | '\r'
+                | '\u{0b}'
+                | '\u{0c}'
+                | '\u{1c}'
+                | '\u{1d}'
+                | '\u{1e}'
+                | '\u{85}'
+                | '\u{2028}'
+                | '\u{2029}'
+        )
+    }
+    let mut out: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if is_line_boundary(c) {
+            if keepends {
+                cur.push(c);
+                // `\r\n` is a single boundary.
+                if c == '\r' && chars.peek() == Some(&'\n') {
+                    cur.push(chars.next().unwrap());
+                }
+            } else if c == '\r' && chars.peek() == Some(&'\n') {
+                chars.next();
+            }
+            out.push(std::mem::take(&mut cur));
+        } else {
+            cur.push(c);
+        }
+    }
+    // A trailing non-empty segment with no final boundary is its own line;
+    // CPython does NOT emit a trailing empty string after a final boundary.
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
 /// `str.split()` / `str.split(None, maxsplit)` — whitespace split that
 /// collapses runs of whitespace and drops leading/trailing empties.
 fn split_whitespace_max(s: &str, maxsplit: i64, from_right: bool) -> Vec<String> {
@@ -336,10 +382,13 @@ pub fn install(interp: &mut Interpreter) {
                         "float divmod()",
                     )));
                 }
-                let q = (xf / yf).floor();
+                // Share CPython's `float_divmod`; `(xf / yf).floor()` rounds
+                // the intermediate quotient and gives the wrong pair (e.g.
+                // `divmod(7.0, 0.1)` → `(70.0, …)` instead of `(69.0, …)`).
+                let (q, r) = crate::interp::float_divmod(xf, yf);
                 Ok(Value::Tuple(Rc::new(vec![
                     Value::Float(q),
-                    Value::Float(xf - q * yf),
+                    Value::Float(r),
                 ])))
             }
         }
@@ -954,18 +1003,9 @@ pub fn install(interp: &mut Interpreter) {
         )
     });
 
-    native!("hex", |_i, args| Ok(Value::Str(Rc::new(format!(
-        "0x{:x}",
-        single(&args, "hex")?.to_int()?
-    )))));
-    native!("bin", |_i, args| Ok(Value::Str(Rc::new(format!(
-        "0b{:b}",
-        single(&args, "bin")?.to_int()?
-    )))));
-    native!("oct", |_i, args| Ok(Value::Str(Rc::new(format!(
-        "0o{:o}",
-        single(&args, "oct")?.to_int()?
-    )))));
+    native!("hex", |_i, args| based_int_repr(&args, "hex", 16, "0x"));
+    native!("bin", |_i, args| based_int_repr(&args, "bin", 2, "0b"));
+    native!("oct", |_i, args| based_int_repr(&args, "oct", 8, "0o"));
 
     native!("chr", |_i, args| {
         let n = single(&args, "chr")?.to_int()?;
@@ -1066,12 +1106,20 @@ pub fn install(interp: &mut Interpreter) {
             std::io::stdout().flush().ok();
         }
         let mut s = String::new();
-        std::io::stdin().read_line(&mut s).map_err(|e| {
+        let read = std::io::stdin().read_line(&mut s).map_err(|e| {
             crate::error::Unwind::Exception(crate::error::VmException::new(
                 "OSError",
                 format!("{e}"),
             ))
         })?;
+        // A 0-byte read is end-of-input: CPython's `input()` raises `EOFError`
+        // there, it does not return `""`. Returning `""` silently turned a
+        // `while (line := input()) != "":` loop into a no-op under `tyc run`.
+        if read == 0 {
+            return Err(crate::error::Unwind::Exception(
+                crate::error::VmException::new("EOFError", "EOF when reading a line"),
+            ));
+        }
         // Strip trailing newline.
         if s.ends_with('\n') {
             s.pop();
@@ -1411,6 +1459,31 @@ pub fn install(interp: &mut Interpreter) {
 fn single<'a>(args: &'a [Value], name: &str) -> Result<&'a Value, Unwind> {
     args.first()
         .ok_or_else(|| type_error(format!("{}() requires an argument", name)))
+}
+
+/// `hex` / `bin` / `oct`: render an integer in the given radix with CPython's
+/// exact spelling — a leading `-` before the base prefix for negatives
+/// (`hex(-42) == "-0x2a"`), and arbitrary precision (`hex(2**64)` must not
+/// overflow). The previous implementation formatted a lossy `i64` with Rust's
+/// `{:x}`/`{:b}`/`{:o}`, which prints the two's-complement bit pattern for a
+/// negative and rejected any value outside `i64`.
+fn based_int_repr(args: &[Value], name: &str, radix: u32, prefix: &str) -> Result<Value, Unwind> {
+    let vi: VmInt = match single(args, name)? {
+        Value::Int(i) => i.clone(),
+        Value::Bool(b) => VmInt::from(*b as i64),
+        other => {
+            return Err(type_error(format!(
+                "{}() argument must be an integer, not '{}'",
+                name,
+                other.type_name()
+            )))
+        }
+    };
+    let sign = if vi.is_negative() { "-" } else { "" };
+    Ok(Value::Str(Rc::new(format!(
+        "{sign}{prefix}{}",
+        vi.abs().to_str_radix(radix)
+    ))))
 }
 
 fn value_len(v: &Value) -> Result<usize, Unwind> {
@@ -6064,11 +6137,28 @@ fn str_method(
                 pieces.into_iter().map(|p| Value::Str(Rc::new(p))).collect(),
             )))
         }
-        "splitlines" => Value::List(Rc::new(RefCell::new(
-            s.lines()
-                .map(|l| Value::Str(Rc::new(l.to_owned())))
-                .collect(),
-        ))),
+        "splitlines" => {
+            // A bound method call appends its keywords as a
+            // `__typhon_kwargs_sentinel__` tuple, which the `_kwargs` map (a
+            // different marker) does not decode — so `splitlines(keepends=False)`
+            // would see the sentinel as a truthy positional arg and behave like
+            // `keepends=True`. Unpack it here exactly as `split` does.
+            let (args, kw) = split_kwargs(args);
+            let keepends = match args.first() {
+                Some(v) => v.truthy(),
+                None => kw
+                    .iter()
+                    .rev()
+                    .find(|(k, _)| k == "keepends")
+                    .map(|(_, v)| v.truthy())
+                    .unwrap_or(false),
+            };
+            let lines: Vec<Value> = py_splitlines(s, keepends)
+                .into_iter()
+                .map(|l| Value::Str(Rc::new(l)))
+                .collect();
+            Value::List(Rc::new(RefCell::new(lines)))
+        }
         "join" => {
             let iterable = args
                 .first()
@@ -6111,17 +6201,52 @@ fn str_method(
         // Each of these takes optional `start` / `end` character offsets after
         // the needle. They were ignored; see `search_range`.
         "startswith" | "endswith" => {
-            let needle = single(args, name)?.py_str();
+            let arg = single(args, name)?;
             let Some((cs, ce)) = search_range(args, s.chars().count())? else {
                 return Ok(Value::Bool(false));
             };
             let (bs, be) = char_range_bytes(s, cs, ce);
             let window = &s[bs..be];
-            Value::Bool(if name == "startswith" {
-                window.starts_with(&needle)
-            } else {
-                window.ends_with(&needle)
-            })
+            let matches_one = |needle: &str| {
+                if name == "startswith" {
+                    window.starts_with(needle)
+                } else {
+                    window.ends_with(needle)
+                }
+            };
+            // CPython accepts either a single string or a *tuple* of strings
+            // (`p.endswith((".py", ".ty"))`) and enforces the element type: a
+            // non-`str` first arg — or a non-`str` element reached before any
+            // match — raises `TypeError`. Validation is lazy and in iteration
+            // order, so a match found before an invalid element returns `True`
+            // without examining the rest (`"a".startswith(("a", 1))` is `True`,
+            // but `"a".startswith((1, "a"))` raises).
+            let result = match arg {
+                Value::Tuple(items) => {
+                    let mut matched = false;
+                    for it in items.iter() {
+                        let Value::Str(needle) = it else {
+                            return Err(type_error(format!(
+                                "tuple for {name} must only contain str, not {}",
+                                it.type_name()
+                            )));
+                        };
+                        if matches_one(needle.as_str()) {
+                            matched = true;
+                            break;
+                        }
+                    }
+                    matched
+                }
+                Value::Str(needle) => matches_one(needle.as_str()),
+                other => {
+                    return Err(type_error(format!(
+                        "{name} first arg must be str or a tuple of str, not {}",
+                        other.type_name()
+                    )))
+                }
+            };
+            Value::Bool(result)
         }
         "find" | "rfind" | "index" | "rindex" => {
             let needle = single(args, name)?.py_str();
@@ -6196,7 +6321,12 @@ fn str_method(
             Value::Bool(!s.is_empty() && s.chars().all(|c| c.is_numeric()))
         }
         "istitle" => Value::Bool(is_title_case(s)),
-        "casefold" => Value::Str(Rc::new(s.to_lowercase())),
+        "casefold" => {
+            // Full Unicode case folding via the embedded C+F mappings, for
+            // byte-exact parity with CPython's `str.casefold()`. `to_lowercase`
+            // and an uppercase round-trip both diverge (see `casefold_str`).
+            Value::Str(Rc::new(casefold_str(s)))
+        }
         "removeprefix" => {
             let p = single(args, "removeprefix")?.py_str();
             Value::Str(Rc::new(s.strip_prefix(&p).unwrap_or(s).to_owned()))
@@ -8212,6 +8342,32 @@ pub fn make_builtin_type(name: &str) -> Value {
             .clone();
         Value::Class(cls)
     })
+}
+
+/// Full Unicode case folding, byte-exact with CPython's `str.casefold()`.
+///
+/// Rust's std offers no case-folding, and the two obvious stand-ins are both
+/// wrong: `to_lowercase` leaves `ß` as `ß` (fold is `ss`) and maps Cherokee
+/// *away* from its folded form, while an uppercase-then-lowercase round-trip
+/// collapses distinctions the fold preserves (dotless `ı` → `I` → `i`). The
+/// authoritative C+F mappings from the Unicode Character Database are embedded
+/// in [`crate::casefold_data`] instead: each scalar is looked up (identity when
+/// absent), expanding to one or more scalars.
+fn casefold_str(s: &str) -> String {
+    use crate::casefold_data::{CASEFOLD_MULTI, CASEFOLD_SINGLE};
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        let cp = c as u32;
+        if let Ok(i) = CASEFOLD_SINGLE.binary_search_by(|&(k, _)| k.cmp(&cp)) {
+            // A table value is a fold target from the UCD, always a valid scalar.
+            out.push(char::from_u32(CASEFOLD_SINGLE[i].1).unwrap_or(c));
+        } else if let Ok(i) = CASEFOLD_MULTI.binary_search_by(|&(k, _)| k.cmp(&cp)) {
+            out.push_str(CASEFOLD_MULTI[i].1);
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 fn is_title_case(s: &str) -> bool {

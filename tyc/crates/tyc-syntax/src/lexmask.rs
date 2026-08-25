@@ -447,6 +447,23 @@ pub(crate) fn scan_line(line: &str, in_string: &mut Option<StringMode>) -> LineS
     scan_line_core(line, in_string, &mut depth, |_, _, _| {})
 }
 
+/// Scan one physical line and return the [`ByteKind`] of every byte, threading
+/// triple-quoted-string state through `in_string` (so a string opened on an
+/// earlier line resumes correctly). This is the per-byte view a line-oriented
+/// rewrite pass needs to tell structural code from string / f-string-field
+/// content without maintaining its own — necessarily PEP 701-incomplete —
+/// scanner. Positions not written by the scan default to [`ByteKind::Code`].
+pub(crate) fn scan_line_kinds(line: &str, in_string: &mut Option<StringMode>) -> Vec<ByteKind> {
+    let mut depth = 0i32;
+    let mut kinds = vec![ByteKind::Code; line.len()];
+    scan_line_core(line, in_string, &mut depth, |i, kind, _d| {
+        if i < kinds.len() {
+            kinds[i] = kind;
+        }
+    });
+    kinds
+}
+
 /// A whole-buffer lexical mask: byte kinds, bracket depths, and the derived
 /// per-line facts every block-structure pass needs.
 pub(crate) struct LexMask {

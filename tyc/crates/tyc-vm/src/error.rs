@@ -116,6 +116,15 @@ pub fn zero_division_floor_mod() -> Unwind {
         "integer division or modulo by zero",
     ))
 }
+
+/// CPython's message for a zero base raised to a negative power
+/// (`0 ** -1`, `0.0 ** -2.0`).
+pub fn zero_division_negative_power() -> Unwind {
+    Unwind::Exception(VmException::new(
+        "ZeroDivisionError",
+        "0.0 cannot be raised to a negative power",
+    ))
+}
 pub fn not_implemented(feature: &str) -> Unwind {
     Unwind::Exception(VmException::new(
         "NotImplementedError",

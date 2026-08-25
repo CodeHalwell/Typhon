@@ -28,8 +28,10 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 ```
 
 CI treats **all warnings as errors** — keep the tree warning-clean. It runs
-three jobs: `test` (fmt → clippy → test), `security` (`cargo-deny`), and a
-perf gate (`scripts/perf-gate.sh`).
+five jobs: `test` (fmt → clippy → test), `security` (`cargo-deny`), a
+perf gate (`scripts/perf-gate.sh`), the VM↔CPython `differential` gate
+(`scripts/vm-differential.sh`), and the opt-in-knob `knob-matrix`
+(`scripts/knob-matrix.sh`).
 
 ## Working in the Typhon language
 
