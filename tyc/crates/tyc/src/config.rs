@@ -581,6 +581,33 @@ impl TyphonConfig {
         // attacker-controlled `.py` outside the project — exactly the flow
         // SECURITY.md documents as the safe way to inspect untrusted code.
         // Require both to stay within the project directory.
+        //
+        // A purely in-tree relative value can still escape through a symlinked
+        // component checked into an untrusted project (`build -> ../../outside`):
+        // the lexical check below passes, yet `tyc build` writes through the
+        // resolved directory. Canonicalize the nearest existing ancestor of
+        // `<project dir>/<value>` and require it to stay beneath the canonical
+        // project dir — any non-existent tail is all `Normal` components (the
+        // lexical guard rejected the rest), which cannot escape, so only a
+        // symlink in an existing prefix can. Skipped when the project dir is not
+        // on disk (a synthetic path in a unit test); the lexical guard still
+        // applies there.
+        fn escapes_via_symlink(source_path: &Path, value: &str) -> bool {
+            let root = source_path.parent().unwrap_or(source_path);
+            let Ok(canonical_root) = root.canonicalize() else {
+                return false;
+            };
+            let mut ancestor = root.join(value);
+            let canonical_ancestor = loop {
+                if let Ok(resolved) = ancestor.canonicalize() {
+                    break resolved;
+                }
+                if !ancestor.pop() {
+                    return false;
+                }
+            };
+            !canonical_ancestor.starts_with(&canonical_root)
+        }
         for (key, value) in [("src", &self.project.src), ("out", &self.project.out)] {
             let candidate = std::path::Path::new(value.as_str());
             // `is_absolute()` alone misses two Windows-only rooted forms that
@@ -598,7 +625,8 @@ impl TyphonConfig {
                         c,
                         std::path::Component::Normal(_) | std::path::Component::CurDir
                     )
-                });
+                })
+                || escapes_via_symlink(source_path, value.as_str());
             if escapes {
                 return Err(ConfigError::ProjectPathEscapesRoot {
                     path: source_path.to_string_lossy().into_owned(),
@@ -877,6 +905,42 @@ mod tests {
                 cfg.validate(p)
             );
         }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn project_paths_escaping_via_symlink_are_rejected() {
+        use std::os::unix::fs::symlink;
+        // A relative value that is lexically in-tree can still resolve outside
+        // the project through a checked-in symlink (`build -> <outside>`); the
+        // canonicalization check must reject it while accepting a real in-tree
+        // directory of the same spelling.
+        let outside = tempfile::tempdir().unwrap();
+        let proj = tempfile::tempdir().unwrap();
+        let toml_path = proj.path().join("typhon.toml");
+        std::fs::write(&toml_path, "").unwrap();
+        symlink(outside.path(), proj.path().join("build")).unwrap();
+
+        let mut cfg = cfg_with_target("3.13");
+        cfg.project.out = "build".into();
+        assert!(
+            matches!(
+                cfg.validate(&toml_path),
+                Err(ConfigError::ProjectPathEscapesRoot { .. })
+            ),
+            "a symlinked out dir escaping the project must be rejected: {:?}",
+            cfg.validate(&toml_path)
+        );
+
+        // Control: a real in-tree subdirectory of the same shape is accepted.
+        std::fs::create_dir(proj.path().join("realout")).unwrap();
+        let mut cfg = cfg_with_target("3.13");
+        cfg.project.out = "realout".into();
+        assert!(
+            cfg.validate(&toml_path).is_ok(),
+            "a real in-tree out dir must be accepted: {:?}",
+            cfg.validate(&toml_path)
+        );
     }
 
     #[test]

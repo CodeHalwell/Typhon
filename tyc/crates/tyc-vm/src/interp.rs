@@ -3747,13 +3747,21 @@ impl Interpreter {
             return Ok(Str(Rc::new(format!("{}{}", a, b))));
         }
         if let (Str(a), Mult, Int(n)) = (l, op, r) {
-            let n =
-                repeat_count_checked(a.len(), n, repeated_too_long("repeated string is too long"))?;
+            let n = repeat_count_checked(
+                a.len(),
+                1,
+                n,
+                repeated_too_long("repeated string is too long"),
+            )?;
             return Ok(Str(Rc::new(a.repeat(n))));
         }
         if let (Int(n), Mult, Str(a)) = (l, op, r) {
-            let n =
-                repeat_count_checked(a.len(), n, repeated_too_long("repeated string is too long"))?;
+            let n = repeat_count_checked(
+                a.len(),
+                1,
+                n,
+                repeated_too_long("repeated string is too long"),
+            )?;
             return Ok(Str(Rc::new(a.repeat(n))));
         }
 
@@ -3765,13 +3773,21 @@ impl Interpreter {
             return Ok(Bytes(Rc::new(out)));
         }
         if let (Bytes(a), Mult, Int(n)) = (l, op, r) {
-            let n =
-                repeat_count_checked(a.len(), n, repeated_too_long("repeated bytes are too long"))?;
+            let n = repeat_count_checked(
+                a.len(),
+                1,
+                n,
+                repeated_too_long("repeated bytes are too long"),
+            )?;
             return Ok(Bytes(Rc::new(a.repeat(n))));
         }
         if let (Int(n), Mult, Bytes(a)) = (l, op, r) {
-            let n =
-                repeat_count_checked(a.len(), n, repeated_too_long("repeated bytes are too long"))?;
+            let n = repeat_count_checked(
+                a.len(),
+                1,
+                n,
+                repeated_too_long("repeated bytes are too long"),
+            )?;
             return Ok(Bytes(Rc::new(a.repeat(n))));
         }
 
@@ -3787,7 +3803,12 @@ impl Interpreter {
             return Ok(Tuple(Rc::new(out)));
         }
         if let (List(a), Mult, Int(n)) = (l, op, r) {
-            let n = repeat_count_checked(a.borrow().len(), n, repeated_out_of_memory())?;
+            let n = repeat_count_checked(
+                a.borrow().len(),
+                size_of::<Value>(),
+                n,
+                repeated_out_of_memory(),
+            )?;
             let mut out = Vec::with_capacity(a.borrow().len().saturating_mul(n));
             for _ in 0..n {
                 out.extend(a.borrow().iter().cloned());
@@ -3795,7 +3816,7 @@ impl Interpreter {
             return Ok(List(Rc::new(RefCell::new(out))));
         }
         if let (Tuple(a), Mult, Int(n)) = (l, op, r) {
-            let n = repeat_count_checked(a.len(), n, repeated_out_of_memory())?;
+            let n = repeat_count_checked(a.len(), size_of::<Value>(), n, repeated_out_of_memory())?;
             let mut out = Vec::with_capacity(a.len().saturating_mul(n));
             for _ in 0..n {
                 out.extend(a.iter().cloned());
@@ -6503,18 +6524,34 @@ fn repeat_count(n: &VmInt) -> Result<usize, Unwind> {
     })
 }
 
-/// Like [`repeat_count`], but also rejects a repetition whose *total* size
-/// (`elem_len * count`) would not fit an index-sized allocation. CPython raises
-/// here before allocating — `OverflowError` for `str`/`bytes`, `MemoryError`
-/// for `list`/`tuple` — whereas the subsequent `str::repeat` / `Vec::repeat` /
-/// `Vec::with_capacity` panics with "capacity overflow" (a capacity above
-/// `isize::MAX`), aborting `tyc run` with exit 101 instead of a catchable
-/// exception. `too_long` is the exception to raise; the caller picks its kind.
-fn repeat_count_checked(elem_len: usize, n: &VmInt, too_long: Unwind) -> Result<usize, Unwind> {
+/// Like [`repeat_count`], but also rejects a repetition whose *total allocation*
+/// (`elem_len * count * elem_size` bytes) would not fit an index-sized
+/// allocation. CPython raises here before allocating — `OverflowError` for
+/// `str`/`bytes`, `MemoryError` for `list`/`tuple` — whereas the subsequent
+/// `str::repeat` / `Vec::with_capacity` panics with "capacity overflow" (a byte
+/// capacity above `isize::MAX`), aborting `tyc run` with exit 101 instead of a
+/// catchable exception.
+///
+/// `elem_size` is the size in bytes of one repeated unit: `1` for the `u8`/byte
+/// backing of `str`/`bytes`, but `size_of::<Value>()` for a `Vec<Value>` — a
+/// count of `Value`s that fits `isize::MAX` can still overflow the *byte*
+/// capacity `with_capacity` demands (`[1, 1] * (2 ** 60)`). `too_long` is the
+/// exception to raise; the caller picks its kind.
+fn repeat_count_checked(
+    elem_len: usize,
+    elem_size: usize,
+    n: &VmInt,
+    too_long: Unwind,
+) -> Result<usize, Unwind> {
     let count = repeat_count(n)?;
-    match elem_len.checked_mul(count) {
-        Some(total) if total <= isize::MAX as usize => Ok(count),
-        _ => Err(too_long),
+    let fits = elem_len
+        .checked_mul(count)
+        .and_then(|elems| elems.checked_mul(elem_size))
+        .is_some_and(|bytes| bytes <= isize::MAX as usize);
+    if fits {
+        Ok(count)
+    } else {
+        Err(too_long)
     }
 }
 
@@ -7892,6 +7929,10 @@ result = (calls, xs[0])
             ),
             ("r = [1, 1] * (2 ** 62)", "MemoryError", ""),
             ("r = (1, 1) * (2 ** 62)", "MemoryError", ""),
+            // Element COUNT (2**61) fits isize::MAX, but count * size_of::<Value>()
+            // does not — the guard must weigh the allocation, not just the count.
+            ("r = [1, 1] * (2 ** 60)", "MemoryError", ""),
+            ("r = (1, 1) * (2 ** 60)", "MemoryError", ""),
         ] {
             let (_i, res) = parse_and_run(src);
             match res.expect_err("over-long repeat must raise, not panic") {
@@ -7936,6 +7977,8 @@ d = "x.ty".endswith(".ty")
 # A match found before an invalid tuple element returns True without ever
 # examining the invalid element — CPython's lazy, in-order validation.
 e = "print(x)".startswith(("print", 1))
+# A valid str prefix with an empty search window (start > end) is just False.
+f = "a".startswith("a", 5)
 "#;
         let (interp, res) = parse_and_run(src);
         res.unwrap();
@@ -7944,6 +7987,7 @@ e = "print(x)".startswith(("print", 1))
         assert_eq!(interp.root.get("c").unwrap().py_str(), "True");
         assert_eq!(interp.root.get("d").unwrap().py_str(), "True");
         assert_eq!(interp.root.get("e").unwrap().py_str(), "True");
+        assert_eq!(interp.root.get("f").unwrap().py_str(), "False");
     }
 
     #[test]
@@ -7967,6 +8011,16 @@ e = "print(x)".startswith(("print", 1))
             (
                 r#"r = "a".endswith((b"x",))"#,
                 "tuple for endswith must only contain str, not bytes",
+            ),
+            // An empty search window (start > end) must not bypass the type
+            // check — CPython validates the prefix before considering the range.
+            (
+                r#"r = "a".startswith(1, 5)"#,
+                "startswith first arg must be str or a tuple of str, not int",
+            ),
+            (
+                r#"r = "a".startswith((1,), 5)"#,
+                "tuple for startswith must only contain str, not int",
             ),
         ];
         for (src, want) in cases {

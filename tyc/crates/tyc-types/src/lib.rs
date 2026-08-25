@@ -10483,47 +10483,99 @@ struct LoopReassigned {
     attrs: std::collections::HashSet<String>,
 }
 
-fn collect_reassigned_names(stmts: &[Stmt], acc: &mut LoopReassigned) {
-    fn add_target(t: &Expr, acc: &mut LoopReassigned) {
-        match t {
-            Expr::Name(n) => {
-                acc.names.insert(n.id.as_str().to_owned());
+/// Record one assignment/deletion target — a bare name, or an attribute path —
+/// into the reassigned set, descending through tuple/list/starred unpackings.
+fn add_reassign_target(t: &Expr, acc: &mut LoopReassigned) {
+    match t {
+        Expr::Name(n) => {
+            acc.names.insert(n.id.as_str().to_owned());
+        }
+        // `(prev, cur) = (cur, None)` / `[a, b] = ...` / `first, *rest =
+        // ...` rebind every element, so each one carries a new value into
+        // the next iteration exactly as a bare name does.
+        Expr::Tuple(t) => {
+            for e in &t.elts {
+                add_reassign_target(e, acc);
             }
-            // `(prev, cur) = (cur, None)` / `[a, b] = ...` / `first, *rest =
-            // ...` rebind every element, so each one carries a new value into
-            // the next iteration exactly as a bare name does.
-            Expr::Tuple(t) => {
-                for e in &t.elts {
-                    add_target(e, acc);
-                }
+        }
+        Expr::List(l) => {
+            for e in &l.elts {
+                add_reassign_target(e, acc);
             }
-            Expr::List(l) => {
-                for e in &l.elts {
-                    add_target(e, acc);
-                }
-            }
-            Expr::Starred(s) => add_target(&s.value, acc),
-            // `self.buffer = None` at the bottom of a drain loop stales any
-            // `if self.buffer is not None:` narrowing established before the
-            // loop. Attribute narrowings live in a separate map that
-            // `widen_to_declared` cannot reach, so they are collected apart
-            // and cleared by path.
-            _ => {
-                if let Some(path) = attr_path_of(t) {
-                    acc.attrs.insert(path);
-                }
+        }
+        Expr::Starred(s) => add_reassign_target(&s.value, acc),
+        // `self.buffer = None` at the bottom of a drain loop stales any
+        // `if self.buffer is not None:` narrowing established before the
+        // loop. Attribute narrowings live in a separate map that
+        // `widen_to_declared` cannot reach, so they are collected apart
+        // and cleared by path.
+        _ => {
+            if let Some(path) = attr_path_of(t) {
+                acc.attrs.insert(path);
             }
         }
     }
+}
+
+/// Collect the names and attribute paths a `del` statement unbinds anywhere in
+/// `stmts` (recursing through nested blocks). A `del x` in a `finally` body
+/// leaves `x` unbound on the normal exit, so the overlay must treat it as a
+/// write — otherwise a post-`try` narrowing of `x` is wrongly retained and a
+/// later use is accepted though it raises `UnboundLocalError`. Kept apart from
+/// [`collect_reassigned_names`] so the loop-narrowing caller's precision is
+/// untouched.
+fn collect_deleted_names(stmts: &[Stmt], acc: &mut LoopReassigned) {
+    for s in stmts {
+        match s {
+            Stmt::Delete(d) => {
+                for t in &d.targets {
+                    add_reassign_target(t, acc);
+                }
+            }
+            Stmt::If(i) => {
+                collect_deleted_names(&i.body, acc);
+                for clause in &i.elif_else_clauses {
+                    collect_deleted_names(&clause.body, acc);
+                }
+            }
+            Stmt::For(f) => {
+                collect_deleted_names(&f.body, acc);
+                collect_deleted_names(&f.orelse, acc);
+            }
+            Stmt::While(w) => {
+                collect_deleted_names(&w.body, acc);
+                collect_deleted_names(&w.orelse, acc);
+            }
+            Stmt::With(w) => collect_deleted_names(&w.body, acc),
+            Stmt::Try(t) => {
+                collect_deleted_names(&t.body, acc);
+                for h in &t.handlers {
+                    let ruff_python_ast::ExceptHandler::ExceptHandler(h) = h;
+                    collect_deleted_names(&h.body, acc);
+                }
+                collect_deleted_names(&t.orelse, acc);
+                collect_deleted_names(&t.finalbody, acc);
+            }
+            Stmt::Match(m) => {
+                for case in &m.cases {
+                    collect_deleted_names(&case.body, acc);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn collect_reassigned_names(stmts: &[Stmt], acc: &mut LoopReassigned) {
     for s in stmts {
         match s {
             Stmt::Assign(a) => {
                 for t in &a.targets {
-                    add_target(t, acc);
+                    add_reassign_target(t, acc);
                 }
             }
-            Stmt::AnnAssign(a) => add_target(&a.target, acc),
-            Stmt::AugAssign(a) => add_target(&a.target, acc),
+            Stmt::AnnAssign(a) => add_reassign_target(&a.target, acc),
+            Stmt::AugAssign(a) => add_reassign_target(&a.target, acc),
             Stmt::If(i) => {
                 if !body_always_leaves_loop(&i.body) {
                     collect_reassigned_names(&i.body, acc);
@@ -12166,6 +12218,10 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                 let finally_result = c.env.snapshot();
                 let mut finally_writes = LoopReassigned::default();
                 collect_reassigned_names(&t.finalbody, &mut finally_writes);
+                // A `del` in the finally body unbinds the name too, and its
+                // conservative before/after types can be identical — count it
+                // as a write so the stronger post-try narrowing is not retained.
+                collect_deleted_names(&t.finalbody, &mut finally_writes);
                 after_try.overlay_finally_delta(&finally_view, &finally_result, &finally_writes);
                 c.env.restore(after_try);
             }
@@ -25053,6 +25109,30 @@ def f(v: str | None) -> int:
                 .any(|e| matches!(e, TycError::NullableUse { .. })),
             "a same-type finally reassignment must still invalidate the \
              downstream narrowing: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn finally_del_invalidates_downstream_narrowing() {
+        // `del x` in a finally body unbinds `x`, so a post-`try` narrowing of it
+        // must not survive — a later `x.upper()` would raise `UnboundLocalError`
+        // at runtime. Its conservative before/after types are identical, so the
+        // fix hinges on treating the `del` as a write, not on a type delta.
+        let src = "\
+def f(v: str | None) -> int:
+    mut x: str | None = v
+    try:
+        if x is None:
+            return 0
+    finally:
+        del x
+    return len(x.upper())
+";
+        let d = check(src);
+        assert!(
+            !d.errors().is_empty(),
+            "a finally `del x` must invalidate the downstream narrowing: {:?}",
             d.errors()
         );
     }

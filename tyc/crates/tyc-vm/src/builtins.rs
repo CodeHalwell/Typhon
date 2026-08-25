@@ -6202,17 +6202,23 @@ fn str_method(
         // the needle. They were ignored; see `search_range`.
         "startswith" | "endswith" => {
             let arg = single(args, name)?;
-            let Some((cs, ce)) = search_range(args, s.chars().count())? else {
-                return Ok(Value::Bool(false));
-            };
-            let (bs, be) = char_range_bytes(s, cs, ce);
-            let window = &s[bs..be];
-            let matches_one = |needle: &str| {
-                if name == "startswith" {
-                    window.starts_with(needle)
-                } else {
-                    window.ends_with(needle)
+            // The optional start/end offsets may select an empty window
+            // (start > end); nothing matches then, but CPython still type-checks
+            // the prefix — and each tuple element, lazily in iteration order —
+            // and raises `TypeError` before returning False. So resolve the
+            // window first and fold "empty range" into a never-matching needle,
+            // rather than short-circuiting ahead of the type checks below.
+            let window = match search_range(args, s.chars().count())? {
+                Some((cs, ce)) => {
+                    let (bs, be) = char_range_bytes(s, cs, ce);
+                    Some(&s[bs..be])
                 }
+                None => None,
+            };
+            let matches_one = |needle: &str| match window {
+                Some(w) if name == "startswith" => w.starts_with(needle),
+                Some(w) => w.ends_with(needle),
+                None => false,
             };
             // CPython accepts either a single string or a *tuple* of strings
             // (`p.endswith((".py", ".ty"))`) and enforces the element type: a

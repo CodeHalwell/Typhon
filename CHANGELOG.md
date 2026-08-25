@@ -148,6 +148,10 @@ additive docs-site pages / CLI-entrypoint smoke tests.
   replacing the base, is rejected. A cloned untrusted project could otherwise
   set `out = "/…/site-packages"` (or `"../.."`, or `"C:out"`) and have
   `tyc build` write attacker-controlled `.py` outside the project directory.
+  Beyond the lexical check, the nearest existing ancestor of the resolved
+  path is canonicalized and required to stay beneath the canonical project
+  root, so a checked-in **symlink** (`build -> ../../outside`) can no longer
+  smuggle writes out of the tree.
 - **`tyc fmt` now spawns the `$PATH`-resolved absolute `ruff`** instead of the
   bare name, closing a Windows current-directory search-order hole where a
   `ruff.exe` shipped in an untrusted checkout would run.
