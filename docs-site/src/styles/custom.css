@@ -90,6 +90,11 @@
   box-shadow: 0 4px 12px color-mix(in srgb, var(--sl-color-accent) 20%, transparent);
 }
 
+.card:active {
+  transform: translateY(0);
+  box-shadow: 0 1px 4px color-mix(in srgb, var(--sl-color-accent) 20%, transparent);
+}
+
 .card h3 {
   font-size: 1rem;
   margin-top: 0;
@@ -231,6 +236,11 @@ textarea:focus-visible,
   border-color: var(--sl-color-accent);
   transform: translateY(-2px);
   box-shadow: 0 4px 12px color-mix(in srgb, var(--sl-color-accent) 20%, transparent);
+}
+
+.sl-link-card:active {
+  transform: translateY(0);
+  box-shadow: 0 1px 4px color-mix(in srgb, var(--sl-color-accent) 20%, transparent);
 }
 
 .sl-link-card .icon {
