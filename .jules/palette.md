@@ -66,3 +66,6 @@
 ## 2026-06-27 - [Disable transitions alongside animations for reduced motion]
 **Learning:** In CSS `@media (prefers-reduced-motion: reduce)` blocks, explicitly declaring `animation: none` on elements like `:target` does not inherently disable CSS transitions that might be applied to the same element.
 **Action:** Always declare `transition: none` alongside `animation: none` when respecting reduced motion preferences to fully disable all unintended animated states.
+## 2024-08-27 - [Tactile feedback on container components]
+**Learning:** Container components that elevate on hover lack a physical response when clicked. Adding a subtle `:active` state that resets the transformation to simulate a button press provides immediate tactile feedback.
+**Action:** Added `.card:active` and `.sl-link-card:active` with `transform: translateY(0)` and reduced `box-shadow` in `custom.css` to simulate a physical press, and added them to the reduced-motion block.
