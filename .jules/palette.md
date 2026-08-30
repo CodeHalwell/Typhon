@@ -66,3 +66,6 @@
 ## 2026-06-27 - [Disable transitions alongside animations for reduced motion]
 **Learning:** In CSS `@media (prefers-reduced-motion: reduce)` blocks, explicitly declaring `animation: none` on elements like `:target` does not inherently disable CSS transitions that might be applied to the same element.
 **Action:** Always declare `transition: none` alongside `animation: none` when respecting reduced motion preferences to fully disable all unintended animated states.
+## 2024-08-30 - Tactile feedback on interactive container components
+**Learning:** Interactive container components that elevate on hover lack tactile feedback on click.
+**Action:** Implemented an `:active` state that resets the transformation and reduces box-shadow to simulate a physical button press.
