@@ -3746,13 +3746,13 @@ fn merge_impl_blocks(body: Vec<Stmt>) -> (Vec<Stmt>, bool) {
     // those blocks lower to module-level attribute patches instead
     // (`Record.label = __typhon_extend_Record__label`). Previously they
     // were silently dropped, so the method vanished from the build output.
-    let local_classes: HashSet<String> = body
+    let local_classes: HashSet<&str> = body
         .iter()
         .filter_map(|stmt| {
             if let Stmt::ClassDef(c) = stmt {
                 let n = c.name.as_str();
                 if !n.starts_with(IMPL_PREFIX) {
-                    return Some(n.to_owned());
+                    return Some(n);
                 }
             }
             None
@@ -3785,7 +3785,7 @@ fn merge_impl_blocks(body: Vec<Stmt>) -> (Vec<Stmt>, bool) {
             };
             let all_local = targets
                 .iter()
-                .all(|t| local_classes.contains(t) || union_aliases.contains_key(t));
+                .all(|t| local_classes.contains(t.as_str()) || union_aliases.contains_key(t));
             if all_local {
                 for target in targets {
                     impl_methods_map
@@ -3803,6 +3803,7 @@ fn merge_impl_blocks(body: Vec<Stmt>) -> (Vec<Stmt>, bool) {
     // replacing foreign-target pseudo-classes with their attribute patches
     // (in place, so they run after the import that binds the class), and
     // dropping the local-target pseudo-classes.
+    drop(local_classes);
     let mut new_body: Vec<Stmt> = Vec::with_capacity(body.len());
     for (i, stmt) in body.into_iter().enumerate() {
         if let Some(patches) = foreign_patches.remove(&i) {
