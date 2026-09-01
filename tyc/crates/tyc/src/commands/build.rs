@@ -5276,7 +5276,7 @@ let pet: Animal = Dog(name=\"Rex\")
         // New high-risk keywords consolidated from the Sentinel PR batch.
         assert_eq!(secret_suffix("DATABASE_DSN"), Some("DSN"));
         assert_eq!(secret_suffix("SESSION_COOKIE"), Some("COOKIE"));
-        assert_eq!(secret_suffix("SLACK_WEBHOOK_URL"), Some("WEBHOOK"));
+        assert_eq!(secret_suffix("SLACK_WEBHOOK_URL"), Some("WEBHOOK_URL"));
         assert_eq!(secret_suffix("AUTHORIZATION_BEARER"), Some("AUTHORIZATION"));
         assert_eq!(secret_suffix("MY_CREDENTIALS"), Some("CREDENTIALS"));
         assert_eq!(secret_suffix("AWS_CREDENTIAL"), Some("CREDENTIAL"));
@@ -5305,6 +5305,24 @@ let pet: Animal = Dog(name=\"Rex\")
         // on the PR that introduced this table entry).
         assert_eq!(secret_suffix("DB_PWD"), Some("DB_PWD"));
         assert_eq!(secret_suffix("JWTTOKEN"), Some("JWTTOKEN"));
+        assert_eq!(secret_suffix("AUTHORIZATION_TOKEN"), Some("AUTHORIZATION_TOKEN"));
+        assert_eq!(secret_suffix("AUTHORIZATIONTOKEN"), Some("AUTHORIZATIONTOKEN"));
+        assert_eq!(secret_suffix("ENCRYPTION_KEY"), Some("ENCRYPTION_KEY"));
+        assert_eq!(secret_suffix("ENCRYPTIONKEY"), Some("ENCRYPTIONKEY"));
+        assert_eq!(secret_suffix("OAUTH_TOKEN"), Some("OAUTH_TOKEN"));
+        assert_eq!(secret_suffix("OAUTHTOKEN"), Some("OAUTHTOKEN"));
+        assert_eq!(secret_suffix("REFRESH_TOKEN"), Some("REFRESH_TOKEN"));
+        assert_eq!(secret_suffix("REFRESHTOKEN"), Some("REFRESHTOKEN"));
+        assert_eq!(secret_suffix("SESSION_TOKEN"), Some("SESSION_TOKEN"));
+        assert_eq!(secret_suffix("SESSIONTOKEN"), Some("SESSIONTOKEN"));
+        assert_eq!(secret_suffix("WEBHOOK_URL"), Some("WEBHOOK_URL"));
+        assert_eq!(secret_suffix("WEBHOOKURL"), Some("WEBHOOKURL"));
+        assert_eq!(secret_suffix("ID_TOKEN"), Some("ID_TOKEN"));
+        assert_eq!(secret_suffix("IDTOKEN"), Some("IDTOKEN"));
+        assert_eq!(secret_suffix("MASTER_KEY"), Some("MASTER_KEY"));
+        assert_eq!(secret_suffix("MASTERKEY"), Some("MASTERKEY"));
+        assert_eq!(secret_suffix("AUTH_KEY"), Some("AUTH_KEY"));
+        assert_eq!(secret_suffix("AUTHKEY"), Some("AUTHKEY"));
     }
 
     #[test]
