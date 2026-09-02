@@ -43,10 +43,10 @@ tyc run --compile --temp      # legacy with ephemeral build dir
   `return`, `pass`, `match` (literal / capture / wildcard / sequence /
   class patterns including the native `Ok(x)` / `Err(e)` cases).
 - Functions: positional, keyword, default, `*args`, `**kwargs`, closures,
-  recursion (a fixed 1000-frame limit since v0.8.0, matching CPython's
-  default `sys.getrecursionlimit()`; it is **not** configurable — the
-  `Interpreter`'s depth field has no public setter and the VM's `sys` shim
-  has no `setrecursionlimit` — and exceeding it raises `RecursionError`).
+  recursion (a 1000-frame limit by default, matching CPython's
+  `sys.getrecursionlimit()`; `sys.setrecursionlimit(n)` moves it, rejecting
+  `n < 1` with CPython's own `ValueError`, and exceeding it raises
+  `RecursionError`).
 - Classes: annotated fields (constructor synthesised at instantiation),
   explicit `__init__`, methods declared inside `class` body, methods
   declared in a sibling `impl Foo:` block (merged on the fly), single

@@ -26,6 +26,10 @@ The fixes landed alongside this review close **35** of the findings
 (listed below) and every gate stays green. What remains is documented as a
 backlog with a recommended beta gate at the end.
 
+> **Status update (2026-09-02).** The backlog below has since been worked
+> through; see [the follow-up section](#follow-up-2026-09-02) at the end for
+> what is closed, what changed, and what is left.
+
 ## Gate results at the reviewed commit
 
 | Gate | Result |
@@ -354,6 +358,75 @@ The structural recommendations of the 2026-07-28 review (one lexical mask,
 one class layout, no `_ => {}` in analysis visitors, no semantics inferred
 from surface text) still describe the right direction; this review mostly
 found the places they have not reached yet.
+
+## Follow-up (2026-09-02)
+
+Everything in this section landed after the review, on the same branch,
+with every gate green at each step.
+
+### The beta gate, item by item
+
+1. **Preprocessor.** Closed in the wave immediately after the review: the
+   block collectors and join passes read logical lines through the shared
+   `LexMask`; the `?` / `|>` / `as!` lowerings refuse what they cannot
+   prove is a simple statement; diagnostics are remapped to `.ty` lines in
+   `tyc check` and the LSP. A corpus-mutation sweep (CRLF, no trailing
+   newline, BOM, column-zero comments, tabs) over all 1 692 files reports
+   **zero** sensitive files, down from four.
+2. **Type checker.** Container-method signatures, lambda bodies, opaque
+   `T` inside generic bodies, a builtin first-argument table, `except`
+   handler widening, `*args` / `**kwargs` in `Callable` assignability and
+   the interface-conformance predicates all landed. The `class!`
+   grandchild inheritance hole is closed in both the arity check and the
+   concrete argument check. `tyc::possibly_unbound` (warn) and
+   `tyc::invalid_pattern` (error) are new.
+3. **Optimisation profile.** The purity verifier now states what it
+   proves; `auto-gather` and the reduction rewrite were narrowed to what
+   they can justify, and the docs say so.
+4. **VM — the drop-in contract is now decided and enforced.** The VM
+   models a documented stdlib subset, and `tyc run` scans a program's
+   imports before executing anything: an import outside that subset takes
+   the compiled path automatically, with a `note:` naming it, and
+   `--no-fallback` refuses instead. The subset itself grew substantially
+   (the whole filesystem/IO surface, plus `string` / `operator` /
+   `bisect` / `base64` / `csv` / `__future__` and the `contextlib` /
+   `functools` / `sys` / `typing` gaps), and the object model gained
+   `NamedTuple` / `TypedDict` semantics, `issubclass`, function
+   `__dict__`, identity-hashable classes and per-module dunders. **The
+   differential baseline is down from 167 entries to 70**, and the six
+   diverging curated examples are gone.
+5. **Gates.** The differential job now also byte-compiles every emitted
+   `.py` with `compileall` — an *emitter* verdict that is never baselined,
+   which found `tyc::invalid_pattern` on its first run — and pins the
+   non-building corpus in `scripts/nobuild-baseline.txt`, failing in both
+   directions. The expression-level sweep the review asked for is the
+   `stress/round-2026-09-01/vm/` corpus, which the harness already covers
+   unit by unit.
+6. **Tooling.** The `migrate` panic (non-ASCII in a docstring) and its
+   comment-only-class-body output bug, the quadratic `tyc check`
+   (35.1 s → 0.49 s on 4 000 functions), the closed-pipe panic, the
+   `explain --list` topic/code confusion, `tyc init` quoting, comment-
+   destroying `tyc add` / `remove`, the `TYC_NO_INTROSPECT` severity
+   downgrade, the LSP's acceptance of config the CLI rejects, the VS Code
+   settings scope, the duplicated orphan-import warning and the `httpx`
+   stub's wrong `Response.url` type are all fixed. The documentation list
+   is closed.
+
+### What is still open
+
+- **The 70 remaining differential entries.** Each is a VM bug and the file
+  names them. The clusters left are eager generator expressions, the thin
+  `re` shim, `Counter` / `deque` corners, and a handful of formatting and
+  exception-chaining differences. None of them is a *silent* wrong answer
+  on the compiled path — they are VM-only.
+- **`tyc run --compile <file>` diagnostics name the scaffold.** The
+  single-file compile path stages the source into a temp project, so a
+  diagnostic from the build reports `/tmp/tyc-script-…/src/main.ty` rather
+  than the file the user named. Cosmetic, pre-existing, and now more
+  visible because the automatic fallback uses that path.
+- **The open type-system frontier** in `TYPE_SYSTEM_FRONTIER.md`
+  (embedded `ty` Phase 2, accumulator-loop parallelisation) is unchanged
+  and remains post-beta.
 
 ## Method notes
 

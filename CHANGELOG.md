@@ -4,7 +4,107 @@ All notable changes to Typhon are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely; the
 canonical phase-by-phase status lives in `docs/roadmap.md`.
 
-## Unreleased — full-codebase release-readiness remediation
+## Unreleased — beta readiness
+
+Two waves on top of alpha.9. The first was the release-readiness review
+remediation described below; the second closed the backlog that review
+deferred, and is summarised here.
+
+**`tyc run` is a real drop-in for `tyc build` + CPython.** It scans a
+program's imports *before* executing anything; an import the VM does not
+model (`sqlite3`, `subprocess`, `numpy`, …) prints a `note:` naming it and
+takes the compiled path, so a program never dies with `ModuleNotFoundError`
+on code the compiled path runs fine, and never half-executes before
+switching. `--no-fallback` refuses instead. Two bugs this surfaced are also
+fixed: `tyc run --compile <file>` was broken outright (the single-file
+scaffold and `--temp` produced two temp directories, and the build refused
+to write outside the root it was handed), and `--python` defaulted to
+whatever `python3` came first on `PATH` — 3.11 on many systems — so the
+emitted PEP 695 syntax failed with a `SyntaxError`. It now resolves to the
+project's `.venv`, then `python3.<minor>` for `[python] target`, then
+`python3`. Build *progress* moved from stdout to stderr, as every
+compiler's does.
+
+**The VM's stdlib and object model.** `class X(NamedTuple)` is a real tuple
+and `class X(TypedDict)` constructs a plain `dict` (both built an opaque
+instance before, so `p[0]` and `u["k"]` raised). New shims for `string`,
+`operator`, `bisect`, `base64`, `csv` and `__future__`, each checked
+value-for-value against CPython 3.13; `contextlib` gains `suppress` /
+`nullcontext` / `closing` / `redirect_stdout` / `redirect_stderr` /
+`ExitStack`; `functools` gains `cmp_to_key` / `total_ordering` /
+`singledispatch` and `partial` binds keyword arguments; `sys` gains
+`modules` and `exc_info`; `typing` gains the narrowing / variadic /
+`Supports*` names. `issubclass` was missing entirely. Added
+`str.isascii` / `isidentifier` / `isprintable`, the `numbers` tower on
+`int` / `float`, the classmethod `int.from_bytes`, and the unbound method
+form of every builtin type (`str.upper(s)`, `dict.get(d, k)`). A function
+object has its own `__dict__` and a class object is hashable by identity,
+so decorator-published API and type-keyed registries work. `print`
+resolves `sys.stdout` on every call, so `redirect_stdout` works. Every
+module gets its own `__name__` / `__doc__` / `__file__` — an imported
+sibling used to inherit the entry's `"__main__"`, so its main-guard block
+ran under `tyc run` but not after `tyc build`. The filesystem surface
+(`os`, `os.path`, `pathlib`, `io`, `shutil`, `tempfile`, `glob`,
+`hashlib`, `random`) was rebuilt as Python shims over native primitives.
+**The differential baseline falls from 167 entries to 70.**
+
+**Checking a module is linear in its definitions again.** Every branch,
+`try` and loop clones the whole `TypeEnv`, and each clone deep-copied every
+binding in every scope, so a module was quadratic in its top-level
+definitions. Scope maps are copy-on-write now and the narrowing merges skip
+a scope neither side wrote. 4 000 one-`if` functions: 35.1 s → 0.49 s;
+10 000: ~40 s → 1.8 s. The perf-gate baseline moves 27 ms → 22 ms.
+
+**Two new gates**, both riding on the differential harness's existing build
+pass. Every emitted `.py` is byte-compiled with `compileall` — running
+`build/main.py` only exercises the modules it imports, so an emitter bug in
+a module no code path reaches used to sail through; a failure here is an
+*emitter* verdict and is never baselined. And units that do not survive
+`tyc build` are pinned in `scripts/nobuild-baseline.txt`, failing in both
+directions so a unit that stops building is caught as a regression and one
+that starts building is caught as a diagnostic that stopped firing.
+
+**`tyc::invalid_pattern` (new, error).** Found by that compile gate on its
+first run: a `match` pattern the Python *grammar* accepts but the CPython
+*compiler* rejects — two `*rest` captures in one sequence pattern, or the
+same capture name bound twice — made `tyc build` report success and write a
+`.py` that raises `SyntaxError` on import.
+
+**Constructor argument order (`tyc-types`).** The *concrete*
+constructor-argument check read `field_order` verbatim while the arity
+check used the required-first order a synthesised `class!` constructor
+actually has, so a `class! Grand(Child)` whose parent contributes a
+defaulted field matched positional arguments against the wrong field.
+
+**Mutable class-body defaults (`tyc-desugar`).** A default that names only
+outer-scope symbols (`ys: list[int] = [f()]`) becomes a `default_factory`
+lambda like every other unhashable default; `@dataclass` rejected it at
+import time. Only a literal naming a *class-body* symbol stays put, since a
+class-body lambda cannot see class scope.
+
+**Tooling.** `tyc migrate` panicked on any non-ASCII character in a
+triple-quoted string (the string scan advanced by bytes) and left a class
+body holding only comments once its methods moved to `impl`, which is not a
+suite — its own output failed to parse. Writing to a closed pipe
+(`tyc explain --list | head -3`) exited 101 with a panic; `SIGPIPE` is
+restored to its default disposition. `tyc explain --list` advertised
+`tyc::freeze` / `tyc::pub`, which no diagnostic reports — they are listed
+as language topics now. `tyc init 'a"b'` wrote an unparseable manifest; an
+explicit name is validated against PEP 508 and an inferred one sanitised.
+`tyc add` / `tyc remove` re-serialised the parsed config, expanding every
+defaulted key and dropping every comment — they edit the dependency table
+in place now, and add-then-remove round-trips to the original bytes.
+`TYC_NO_INTROSPECT=1` made `unintrospectable-dependency = "error"` fail for
+the introspection the user had just turned off; it downgrades to a warning
+with a `note:` saying why. The language server no longer honours a
+`[strictness]` severity the CLI rejects. The VS Code extension's
+`typhon.server.path` / `arguments` are `machine-overridable`, so a cloned
+workspace cannot choose the binary. The bundled `httpx` stub types
+`Response.url` as `httpx.URL` (it was `str`), returns `str?` from
+`Headers.get`, drops the removed-in-0.28 `proxies=` / `app=`, and models
+the exception hierarchy so `except httpx.HTTPStatusError` checks.
+
+### The alpha.9 release-readiness review remediation
 
 A release-readiness review of alpha.9 (seven parallel audits + the five CI
 gates run locally, all green) found and this change fixes a cluster of
@@ -366,12 +466,10 @@ additive on correct programs except the one marked **narrowing**.
   `missing_return`, `unknown_name` and `immutable_assign` diagnostic pages
   gained sections for the checker changes above.
 
-Deferred (all reproduced, all listed with severities in the review): the
-remaining preprocessor line-count desyncs, unchecked container-method
-arguments and lambda bodies in the checker, the `class!` grandchild
-inheritance hole, the VM's eager generator expressions and thin `re` /
-`collections` / `datetime` / `pathlib` shims, `tyc migrate` panics on
-non-ASCII, and the quadratic `tyc check` on very large modules.
+Everything that review deferred is closed by the beta wave above, except
+the VM's eager generator expressions and the thin `re` shim, which remain
+in `scripts/differential-baseline.txt` — the 70 entries there are the
+honest list of what the VM still gets wrong, and each one is a bug.
 
 ## 1.0.0-alpha.9 — 2026-08-21 — maintenance: secret-name lint expansion, allocation reductions & dependency wave
 
