@@ -71,18 +71,7 @@ pub fn run_source(
     // = MODULE` to a plain `import MODULE as ALIAS`, which is the right
     // shape for an in-process VM (no point deferring an import that's
     // about to be evaluated eagerly anyway).
-    let expanded = preprocess::expand_question_ops(&preprocess::expand_inline_question_ops(
-        // Shared with the CLI: the VM omitted both of these, so an
-        // inline `?` (`f(g()?)`, `elif h()? > 1:`) failed to parse under
-        // `tyc run` on a program `tyc build` compiles and runs.
-        &preprocess::expand_compound_question_headers(&preprocess::expand_pipes(
-            &preprocess::expand_with_chains(&preprocess::expand_go_calls(
-                &preprocess::expand_gather_blocks(&preprocess::expand_multiline_guards(
-                    &preprocess::expand_typed_let_unpack(&preprocess::expand_lazy_lets(source)),
-                )),
-            )),
-        )),
-    ));
+    let expanded = preprocess::expand_all(source);
     let prep = preprocess::preprocess(&expanded);
 
     let parsed = tyc_syntax::parse_module(&prep.python_source).map_err(|e| {
@@ -364,18 +353,7 @@ fn merge_sibling_extensions(
     registry: &mut tyc_analyse::ExtensionRegistry,
     cross_fns: &mut std::collections::HashMap<String, String>,
 ) {
-    let expanded = preprocess::expand_question_ops(&preprocess::expand_inline_question_ops(
-        // Shared with the CLI: the VM omitted both of these, so an
-        // inline `?` (`f(g()?)`, `elif h()? > 1:`) failed to parse under
-        // `tyc run` on a program `tyc build` compiles and runs.
-        &preprocess::expand_compound_question_headers(&preprocess::expand_pipes(
-            &preprocess::expand_with_chains(&preprocess::expand_go_calls(
-                &preprocess::expand_gather_blocks(&preprocess::expand_multiline_guards(
-                    &preprocess::expand_typed_let_unpack(&preprocess::expand_lazy_lets(source)),
-                )),
-            )),
-        )),
-    ));
+    let expanded = preprocess::expand_all(source);
     let prep = preprocess::preprocess(&expanded);
     let Ok(parsed) = tyc_syntax::parse_module(&prep.python_source) else {
         return;
@@ -2340,6 +2318,144 @@ def main() -> None:
         raise ValueError(f"repr wrong: {CONFIG['limits']!r}")
     if str(CONFIG) != "{'limits': mappingproxy({'max': 100})}":
         raise ValueError(f"nested str wrong: {CONFIG}")
+
+main()
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    /// A value-mixin enum member *is* its value: it converts, indexes,
+    /// joins, and inherits the mixin's methods.
+    #[test]
+    fn vm_value_mixin_enum_members_behave_as_their_value() {
+        let src = r#"
+from enum import IntEnum, StrEnum
+
+class IntE(IntEnum):
+    ONE = 1
+    TWO = 2
+
+class StrE(StrEnum):
+    X = "x"
+    Y = "y"
+
+def main() -> None:
+    if "%d" % IntE.ONE != "1" or "%.1f" % IntE.ONE != "1.0":
+        raise ValueError("printf conversion wrong")
+    if abs(IntE.ONE) != 1 or IntE.ONE.bit_length() != 1:
+        raise ValueError("numeric surface wrong")
+    if [10, 20, 30][IntE.ONE] != 20 or "abc"[IntE.ONE] != "b":
+        raise ValueError("indexing wrong")
+    if len(StrE.X) != 1 or StrE.X.upper() != "X":
+        raise ValueError("str surface wrong")
+    if ",".join([StrE.X, StrE.Y]) != "x,y":
+        raise ValueError("join wrong")
+    if len(IntE) != 2 or IntE.ONE not in IntE:
+        raise ValueError("enum class is sized and contains its members")
+    try:
+        let _ = IntE["NOPE"]
+        raise ValueError("expected a KeyError")
+    except KeyError as e:
+        if str(e) != "'NOPE'":
+            raise ValueError(f"KeyError message wrong: {e}")
+
+main()
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    /// Slices are values: a multi-axis subscript carries them (and
+    /// `Ellipsis`) through to `__getitem__`, and they repr as CPython does.
+    #[test]
+    fn vm_slice_and_ellipsis_values() {
+        let src = r#"
+plain class Probe:
+    pass
+
+impl Probe:
+    def __getitem__(self, key: object) -> object:
+        return key
+
+def main() -> None:
+    let p: Probe = Probe()
+    if repr(p[1:2, 3]) != "(slice(1, 2, None), 3)":
+        raise ValueError(f"multi-axis slice wrong: {p[1:2, 3]!r}")
+    if repr(p[::2]) != "slice(None, None, 2)":
+        raise ValueError("bare slice wrong")
+    if repr(p[..., 0]) != "(Ellipsis, 0)":
+        raise ValueError(f"ellipsis wrong: {p[..., 0]!r}")
+    if p[...] is not Ellipsis:
+        raise ValueError("Ellipsis should be a singleton")
+
+main()
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    /// A type-keyed registry sees one key for `type(5)` and the `int`
+    /// constructor — what makes `functools.singledispatch` dispatch.
+    #[test]
+    fn vm_builtin_type_objects_are_one_registry_key() {
+        let src = r#"
+from functools import singledispatch
+
+@singledispatch
+def describe(x: object) -> str:
+    return "object"
+
+@describe.register(int)
+def describe_int(x: int) -> str:
+    return "int"
+
+@describe.register(str)
+def describe_str(x: str) -> str:
+    return "str"
+
+def main() -> None:
+    if describe(42) != "int" or describe("a") != "str" or describe(1.5) != "object":
+        raise ValueError("singledispatch did not dispatch on the builtin type")
+    let registry: dict[object, str] = {}
+    registry[int] = "hit"
+    if registry.get(type(42), "miss") != "hit":
+        raise ValueError("type(5) and int must be the same dict key")
+
+main()
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    /// `re.findall` returns the group (or a tuple of groups) for a pattern
+    /// that has any, and a `range` matches a sequence pattern.
+    #[test]
+    fn vm_findall_groups_and_range_sequence_pattern() {
+        let src = r#"
+import re
+
+def shape(v: object) -> str:
+    match v:
+        case []:
+            return "empty"
+        case [x]:
+            return f"one {x}"
+        case [x, *rest]:
+            return f"many {x} {rest}"
+        case _:
+            return "other"
+
+def main() -> None:
+    let pairs = re.findall(r"(\w+)=(\d+)", "a=1 b=22")
+    if pairs != [("a", "1"), ("b", "22")]:
+        raise ValueError(f"two groups should give tuples: {pairs}")
+    let ones = re.findall(r"(\d+)", "a=1 b=22")
+    if ones != ["1", "22"]:
+        raise ValueError(f"one group should give strings: {ones}")
+    let whole = re.findall(r"\d+", "a=1 b=22")
+    if whole != ["1", "22"]:
+        raise ValueError(f"no groups should give matches: {whole}")
+    if shape(range(3)) != "many 0 [1, 2]":
+        raise ValueError(f"a range is a sequence: {shape(range(3))}")
+    if shape(range(0)) != "empty":
+        raise ValueError("an empty range matches the empty pattern")
 
 main()
 "#;

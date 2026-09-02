@@ -91,8 +91,22 @@ errno, `defaultdict` equality with a plain dict, `isinstance` through a
 builtin exception base (`json.JSONDecodeError` is a `ValueError`), and
 CPython's exact wording for the `ZeroDivisionError` family, `round(nan)` /
 `round(inf)`, `float("abc")`, `chr` / `ord`, `min` / `max` on an empty
-iterable, and `list.pop`. **The
-differential baseline falls from 167 entries to 25.**
+iterable, and `list.pop`. A seventh closed the remaining crashes: a
+value-mixin enum member now *is* its value everywhere (printf, `abs`,
+indexing, `len`, `str.join`, and the mixin's own methods), an enum class is
+sized and contains its members, `slice` and `Ellipsis` are first-class
+values so a multi-axis subscript (`p[1:2, 3]`, `p[..., 0]`) reaches
+`__getitem__`, a `range` matches a sequence pattern, `type(5)` and the
+`int` constructor are one dict key (which is what makes
+`functools.singledispatch` dispatch), `re.findall` returns groups rather
+than whole matches, `round()` / `int()` / `float()` honour the conversion
+dunders (so a `lazy let` proxy works), and the VM's lazy proxy gained the
+seventeen dunders the emitted runtime already had. `tyc run`'s
+unmodelled-import scan also ran the wrong preprocessing chain, so a file
+using `as!`, `?`, `|>` or `gather:` failed to parse there and was skipped
+— silently disabling the fall-back-to-CPython guarantee for exactly the
+programs most likely to need it. **The
+differential baseline falls from 167 entries to 19.**
 
 **Checking a module is linear in its definitions again.** Every branch,
 `try` and loop clones the whole `TypeEnv`, and each clone deep-copied every
@@ -514,7 +528,7 @@ additive on correct programs except the one marked **narrowing**.
 
 Everything that review deferred is closed by the beta wave above, except
 the VM's eager generator expressions and the thin `re` shim, which remain
-in `scripts/differential-baseline.txt` — the 25 entries there are the
+in `scripts/differential-baseline.txt` — the 19 entries there are the
 honest list of what the VM still gets wrong, and each one is a bug.
 
 ## 1.0.0-alpha.9 — 2026-08-21 — maintenance: secret-name lint expansion, allocation reductions & dependency wave

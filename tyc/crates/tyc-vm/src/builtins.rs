@@ -305,13 +305,23 @@ pub fn install(interp: &mut Interpreter) {
         })))
     });
 
-    native!("int", |_i, args| {
+    native!("int", |i, args| {
         // `int()` with no argument is 0 (matches CPython; used by
         // `defaultdict(int)` as a zero-factory).
         if args.is_empty() {
             return Ok(Value::Int(VmInt::from(0)));
         }
         let v = single(&args, "int")?;
+        // A user `__int__` (then `__index__`) — CPython's conversion
+        // protocol, and how `int()` reaches a `lazy let` proxy.
+        if let Value::Instance(_) = v {
+            let v = v.clone();
+            for dunder in ["__int__", "__index__"] {
+                if let Some(r) = i.call_dunder0(&v, dunder)? {
+                    return Ok(r);
+                }
+            }
+        }
         // A value-mixin enum member (`IntEnum` / `IntFlag` / `StrEnum`) IS
         // its value in CPython, so `int(Colour.RED)` is `1`.
         let unwrapped;
@@ -533,8 +543,18 @@ pub fn install(interp: &mut Interpreter) {
         Ok(Value::Str(Rc::new(out)))
     });
 
-    native!("float", |_i, args| {
+    native!("float", |i, args| {
         let v = single(&args, "float")?;
+        // A user `__float__` (then `__index__`), as CPython's conversion
+        // protocol prescribes.
+        if let Value::Instance(_) = v {
+            let v = v.clone();
+            for dunder in ["__float__", "__index__"] {
+                if let Some(r) = i.call_dunder0(&v, dunder)? {
+                    return Ok(Value::Float(r.to_float()?));
+                }
+            }
+        }
         Ok(Value::Float(v.to_float()?))
     });
 
@@ -979,6 +999,9 @@ pub fn install(interp: &mut Interpreter) {
             // User `__abs__` dunder.
             if let Some(r) = i.call_dunder0(v, "__abs__")? {
                 Ok(r)
+            } else if let Some(inner) = crate::value::enum_mixin_value(v) {
+                // A value-mixin enum member *is* its value.
+                i.call_value(i.root.get("abs").unwrap_or(Value::None), vec![inner], &[])
             } else {
                 Err(type_error(format!(
                     "bad operand type for abs(): '{}'",
@@ -1272,7 +1295,7 @@ pub fn install(interp: &mut Interpreter) {
         }
     });
 
-    native!("round", |_i, args| match args.first() {
+    native!("round", |i, args| match args.first() {
         // round(int, ndigits): non-negative ndigits is a no-op; a negative
         // ndigits rounds to tens/hundreds/… (half-to-even, staying an int).
         Some(Value::Int(i)) => {
@@ -1337,6 +1360,19 @@ pub fn install(interp: &mut Interpreter) {
                 // silently returned 0 / `i64::MAX`.
                 _ => Ok(Value::Int(VmInt::from_bigint(
                     Value::Float(round_half_even(x)).to_bigint()?,
+                ))),
+            }
+        }
+        // A user `__round__(self[, ndigits])` — how `round()` reaches a
+        // `lazy let` proxy, a Decimal-like wrapper, or any custom numeric.
+        Some(v @ Value::Instance(_)) => {
+            let v = v.clone();
+            let extra: Vec<Value> = args.iter().skip(1).cloned().collect();
+            match i.call_dunder(&v, "__round__", extra)? {
+                Some(r) => Ok(r),
+                None => Err(type_error(format!(
+                    "type {} doesn't define __round__ method",
+                    v.type_name()
                 ))),
             }
         }
@@ -1459,6 +1495,7 @@ pub fn install(interp: &mut Interpreter) {
     root.set("True", Value::Bool(true));
     root.set("False", Value::Bool(false));
     root.set("None", Value::None);
+    root.set("Ellipsis", crate::value::ellipsis_value());
 
     // `object` exists as a placeholder so synthesised bases (`class
     // __typhon_impl_Foo(object):` from impl-block lowering, or user code
@@ -1955,6 +1992,17 @@ fn based_int_repr(args: &[Value], name: &str, radix: u32, prefix: &str) -> Resul
 }
 
 fn value_len(v: &Value) -> Result<usize, Unwind> {
+    // A `StrEnum` member *is* its string, so `len(StrE.X)` is the value's.
+    if let Some(inner) = crate::value::enum_mixin_value(v) {
+        return value_len(&inner);
+    }
+    // `len(Colour)` is the enum's member count, as CPython's `EnumType` has
+    // it — an enum class is iterable and sized.
+    if let Value::Class(c) = v {
+        if let Some(members) = crate::interp::enum_members_pub(c) {
+            return Ok(members.len());
+        }
+    }
     Ok(match v {
         Value::Str(s) => s.chars().count(),
         Value::Bytes(b) => b.len(),
@@ -5724,10 +5772,7 @@ fn make_re_module() -> Value {
             "findall".into(),
             Value::Native(Rc::new(NativeFn::new("findall", move |_i, args| {
                 let s = single(&args, "findall")?.py_str();
-                let hits: Vec<Value> = p3
-                    .find_iter(&s)
-                    .map(|m| Value::Str(Rc::new(m.as_str().to_owned())))
-                    .collect();
+                let hits = re_findall_hits(&p3, &s);
                 Ok(Value::List(Rc::new(RefCell::new(hits))))
             }))),
         );
@@ -5803,6 +5848,35 @@ fn make_re_module() -> Value {
     // Build a match object from a `regex::Captures`. Group 0 is the whole
     // match; groups 1.. are the capture groups. Non-participating optional
     // groups are represented as `None`.
+    /// CPython's `findall` result shape: the whole match when the pattern has no
+    /// capture groups, the single group when it has one, and a tuple of groups
+    /// when it has more. An unmatched optional group is the empty string.
+    fn re_findall_hits(re: &regex::Regex, text: &str) -> Vec<Value> {
+        let groups = re.captures_len() - 1;
+        if groups == 0 {
+            return re
+                .find_iter(text)
+                .map(|m| Value::Str(Rc::new(m.as_str().to_owned())))
+                .collect();
+        }
+        re.captures_iter(text)
+            .map(|c| {
+                let mut parts: Vec<Value> = (1..=groups)
+                    .map(|i| {
+                        Value::Str(Rc::new(
+                            c.get(i).map(|m| m.as_str()).unwrap_or("").to_owned(),
+                        ))
+                    })
+                    .collect();
+                if groups == 1 {
+                    parts.remove(0)
+                } else {
+                    Value::Tuple(Rc::new(parts))
+                }
+            })
+            .collect()
+    }
+
     fn captures_to_value(
         caps: Option<regex::Captures<'_>>,
         names: &HashMap<String, usize>,
@@ -6070,10 +6144,7 @@ fn make_re_module() -> Value {
                         .ok_or_else(|| type_error("findall() needs string"))?
                         .py_str();
                     let r = compile_one(&p)?;
-                    let hits: Vec<Value> = r
-                        .find_iter(&s)
-                        .map(|m| Value::Str(Rc::new(m.as_str().to_owned())))
-                        .collect();
+                    let hits = re_findall_hits(&r, &s);
                     Ok(Value::List(Rc::new(RefCell::new(hits))))
                 }),
             ),
@@ -7956,9 +8027,19 @@ fn str_method(
             let mut parts: Vec<String> = Vec::new();
             let it = interp.make_iter(iterable)?;
             while let Some(v) = interp.iter_next(&it)? {
+                // A `StrEnum` member *is* its string, so it joins like one.
+                let v = match crate::value::enum_mixin_value(&v) {
+                    Some(inner @ Value::Str(_)) => inner,
+                    _ => v,
+                };
                 match v {
                     Value::Str(s) => parts.push((*s).clone()),
-                    _ => return Err(type_error("sequence item: expected str")),
+                    other => {
+                        return Err(type_error(format!(
+                            "sequence item: expected str instance, {} found",
+                            other.type_display_name()
+                        )))
+                    }
                 }
             }
             Value::Str(Rc::new(parts.join(s)))
@@ -10937,18 +11018,32 @@ pub fn call_with_kwargs(
     }
 }
 
+thread_local! {
+    /// One canonical `Class` object per builtin type name, so repeated
+    /// `type(x)` calls return the *same* object — `type(5) == type(6)` then
+    /// holds by identity (Class equality is identity-based; see `py_eq`).
+    static BUILTIN_TYPE_CACHE: RefCell<HashMap<String, Rc<crate::value::Class>>> =
+        RefCell::new(HashMap::new());
+}
+
+/// Whether `c` is the cached stand-in class `type(x)` hands back for a
+/// builtin — as opposed to a user class that happens to be named `int`.
+/// A type-keyed registry has to see the stand-in and the constructor native
+/// of the same name as one key.
+pub(crate) fn is_builtin_type_class(c: &Rc<crate::value::Class>) -> bool {
+    BUILTIN_TYPE_CACHE.with(|cache| {
+        cache
+            .borrow()
+            .get(&c.name)
+            .is_some_and(|cached| Rc::ptr_eq(cached, c))
+    })
+}
+
 /// A lightweight type object for a built-in type (`int`, `str`, …) — an empty
 /// `Class` whose only meaningful attribute is its `name`. Used by `type(x)`
 /// so type comparisons and `.__name__` work uniformly with user classes.
 pub fn make_builtin_type(name: &str) -> Value {
-    // Cache one canonical `Class` object per builtin type name so repeated
-    // `type(x)` calls return the *same* object — `type(5) == type(6)` then
-    // holds by identity (Class equality is identity-based; see `py_eq`).
-    thread_local! {
-        static CACHE: RefCell<HashMap<String, Rc<crate::value::Class>>> =
-            RefCell::new(HashMap::new());
-    }
-    CACHE.with(|c| {
+    BUILTIN_TYPE_CACHE.with(|c| {
         let cls = c
             .borrow_mut()
             .entry(name.to_owned())

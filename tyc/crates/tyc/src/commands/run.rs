@@ -422,8 +422,18 @@ fn unmodelled_imports(path: &std::path::Path, entry: &std::path::Path) -> Option
         let Ok(text) = std::fs::read_to_string(file) else {
             continue;
         };
-        let prep = tyc_syntax::preprocess::preprocess(&text);
+        // The same expansion chain the VM's own entry point runs. Skipping
+        // it meant a file using any expanded form (`?`, `|>`, `gather:`)
+        // failed to parse here, and a failed parse silently skipped the
+        // file — taking the VM into a program whose unmodelled import it
+        // never saw.
+        let expanded = tyc_syntax::preprocess::expand_all(&text);
+        let prep = tyc_syntax::preprocess::preprocess(&expanded);
         let Ok(parsed) = tyc_syntax::parse_module(&prep.python_source) else {
+            // Falling back to the compiled path is the safe answer for a
+            // file this scan cannot read: the build reports the parse
+            // error properly, and the VM never starts on an unknown import.
+            missing.insert(format!("<unparsed {}>", file.display()));
             continue;
         };
         let module = parsed.into_syntax();

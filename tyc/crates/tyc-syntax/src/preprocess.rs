@@ -5822,6 +5822,29 @@ fn join_multiline_question_statements(source: &str) -> (String, Vec<usize>) {
     out.finish()
 }
 
+/// Every source-level expansion the front end runs before
+/// [`preprocess`], in the order the pipeline applies them.
+///
+/// Three callers used to keep their own copy of this chain (the VM's entry
+/// point, its sibling-extension scan, and `tyc run`'s import scan), and a
+/// copy that drifted meant a program that parsed on one path failed to
+/// parse on another — which for the import scan silently disabled the
+/// VM's fall-back-to-CPython guarantee.
+///
+/// `expand_lazy_lets` is deliberately the lazy pass used here rather than
+/// the full `expand_lazy_imports`: the latter lowers `lazy import np =
+/// numpy` to a descriptor-protocol proxy class, which the VM does not
+/// model. `tyc build` applies `expand_lazy_imports` on top of this chain.
+pub fn expand_all(source: &str) -> String {
+    expand_question_ops(&expand_inline_question_ops(
+        &expand_compound_question_headers(&expand_pipes(&expand_with_chains(&expand_go_calls(
+            &expand_gather_blocks(&expand_multiline_guards(&expand_typed_let_unpack(
+                &expand_lazy_lets(source),
+            ))),
+        )))),
+    ))
+}
+
 pub fn expand_question_ops(source: &str) -> String {
     // A `?` propagation operator that terminates a *multi-line* call
     // expression sits on the physical line that closes the call, e.g.

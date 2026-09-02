@@ -157,3 +157,61 @@ class _LazyValue:
 
     def __rshift__(self, other):
         return self._materialise() >> other
+
+    def __matmul__(self, other):
+        return self._materialise() @ other
+
+    def __rmatmul__(self, other):
+        return other @ self._materialise()
+
+    def __rand__(self, other):
+        return other & self._materialise()
+
+    def __ror__(self, other):
+        return other | self._materialise()
+
+    def __rxor__(self, other):
+        return other ^ self._materialise()
+
+    def __rlshift__(self, other):
+        return other << self._materialise()
+
+    def __rrshift__(self, other):
+        return other >> self._materialise()
+
+    def __divmod__(self, other):
+        return divmod(self._materialise(), other)
+
+    def __rdivmod__(self, other):
+        return divmod(other, self._materialise())
+
+    def __round__(self, ndigits=None):
+        value = self._materialise()
+        return round(value) if ndigits is None else round(value, ndigits)
+
+    def __trunc__(self):
+        import math
+
+        return math.trunc(self._materialise())
+
+    def __floor__(self):
+        import math
+
+        return math.floor(self._materialise())
+
+    def __ceil__(self):
+        import math
+
+        return math.ceil(self._materialise())
+
+    def __complex__(self):
+        return complex(self._materialise())
+
+    def __reversed__(self):
+        return reversed(self._materialise())
+
+    def __enter__(self):
+        return self._materialise().__enter__()
+
+    def __exit__(self, exc_type, exc, tb):
+        return self._materialise().__exit__(exc_type, exc, tb)

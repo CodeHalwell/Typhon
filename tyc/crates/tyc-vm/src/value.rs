@@ -722,6 +722,22 @@ pub fn native_repr(name: &str) -> String {
 
 /// The VM models a `slice` as the tuple `("__slice__", start, stop, step)`
 /// (what `eval_subscript_index` builds for `a[i:j:k]`).
+/// The `Ellipsis` singleton. Like the slice marker it rides inside a tagged
+/// tuple rather than its own `Value` variant, and it is one shared `Rc` per
+/// thread so `x is Ellipsis` holds.
+pub fn ellipsis_value() -> Value {
+    thread_local! {
+        static ELLIPSIS: Rc<Vec<Value>> =
+            Rc::new(vec![Value::Str(Rc::new("__ellipsis__".to_owned()))]);
+    }
+    Value::Tuple(ELLIPSIS.with(|e| e.clone()))
+}
+
+/// Whether a tuple is the [`ellipsis_value`] marker.
+pub fn is_ellipsis_marker(items: &[Value]) -> bool {
+    items.len() == 1 && matches!(&items[0], Value::Str(tag) if tag.as_str() == "__ellipsis__")
+}
+
 pub fn is_slice_marker(items: &[Value]) -> bool {
     items.len() == 4 && matches!(&items[0], Value::Str(tag) if tag.as_str() == "__slice__")
 }
@@ -1878,6 +1894,16 @@ fn dict_render(v: &Value, wrap_frozen: bool) -> String {
 }
 
 impl Value {
+    /// The type name CPython puts in an error message: a user instance
+    /// reports its *class*, everything else its structural `type_name`.
+    pub fn type_display_name(&self) -> String {
+        match self {
+            Value::Instance(i) => i.class.name.clone(),
+            Value::Class(c) => c.name.clone(),
+            other => other.type_name().to_owned(),
+        }
+    }
+
     pub fn type_name(&self) -> &'static str {
         match self {
             Value::None => "NoneType",
@@ -1889,6 +1915,7 @@ impl Value {
             Value::Bytes(_) => "bytes",
             Value::List(_) => "list",
             Value::Tuple(t) if is_slice_marker(t) => "slice",
+            Value::Tuple(t) if is_ellipsis_marker(t) => "ellipsis",
             Value::Tuple(_) => "tuple",
             Value::Dict(_) => "dict",
             Value::Set(_) => "set",
@@ -1899,6 +1926,9 @@ impl Value {
             // need the specific class name read `instance.class.name`
             // directly; everywhere else `"instance"` is descriptive enough
             // for an error message.
+            // A class name is not `'static`, so callers that want it in a
+            // message reach for `type_display_name`. This stays the coarse
+            // structural label.
             Value::Instance(_) => "instance",
             Value::ResultOk(_) => "Ok",
             Value::ResultErr(_) => "Err",
@@ -2045,7 +2075,18 @@ impl Value {
             // A class object is hashable by identity in CPython — this is
             // what makes a type-keyed registry (`functools.singledispatch`,
             // a visitor table) work.
-            Value::Class(c) => Ok(HashKey::Class(c.clone())),
+            Value::Class(c) => {
+                // `type(5)` hands back the VM's cached stand-in class for
+                // `int` while the global `int` is the constructor native —
+                // a type-keyed registry (`functools.singledispatch`) has to
+                // see a single key for the two.
+                if crate::builtins::is_builtin_type_class(c) {
+                    return Ok(HashKey::BuiltinType(crate::interp::intern_type_name(
+                        &c.name,
+                    )));
+                }
+                Ok(HashKey::Class(c.clone()))
+            }
             Value::Native(n) => Ok(HashKey::BuiltinType(n.name)),
             other => Err(type_error(format!(
                 "unhashable type: '{}'",
@@ -2260,9 +2301,16 @@ impl Value {
                     Value::Str(s.clone()).py_repr()
                 ))
             }),
+            Value::Instance(_) => match enum_mixin_value(self) {
+                Some(inner) => inner.to_int(),
+                None => Err(type_error(format!(
+                    "int() argument must be a string, a bytes-like object or a real number, not '{}'",
+                    self.type_display_name()
+                ))),
+            },
             _ => Err(type_error(format!(
                 "int() argument must be a string, a bytes-like object or a real number, not '{}'",
-                self.type_name()
+                self.type_display_name()
             ))),
         }
     }
@@ -2286,9 +2334,19 @@ impl Value {
                     Value::Str(s.clone()).py_repr()
                 ))
             }),
+            // An `IntEnum` / `IntFlag` / `StrEnum` member *is* its value in
+            // CPython, so every numeric conversion sees through the member —
+            // `"%d" % IntE.ONE` and `math.sqrt(Size.BIG)` included.
+            Value::Instance(_) => match enum_mixin_value(self) {
+                Some(inner) => inner.to_bigint(),
+                None => Err(type_error(format!(
+                    "int() argument must be a string, a bytes-like object or a real number, not '{}'",
+                    self.type_display_name()
+                ))),
+            },
             _ => Err(type_error(format!(
                 "int() argument must be a string, a bytes-like object or a real number, not '{}'",
-                self.type_name()
+                self.type_display_name()
             ))),
         }
     }
@@ -2304,9 +2362,16 @@ impl Value {
                     Value::Str(s.clone()).py_repr()
                 ))
             }),
+            Value::Instance(_) => match enum_mixin_value(self) {
+                Some(inner) => inner.to_float(),
+                None => Err(type_error(format!(
+                    "float() argument must be a string or a number, not '{}'",
+                    self.type_display_name()
+                ))),
+            },
             _ => Err(type_error(format!(
                 "float() argument must be a string or a number, not '{}'",
-                self.type_name()
+                self.type_display_name()
             ))),
         }
     }
@@ -2337,6 +2402,9 @@ impl Value {
             Value::Tuple(t) => {
                 if is_slice_marker(t) {
                     return slice_repr(t);
+                }
+                if is_ellipsis_marker(t) {
+                    return "Ellipsis".to_owned();
                 }
                 let mut s = String::from("(");
                 for (i, v) in t.iter().enumerate() {

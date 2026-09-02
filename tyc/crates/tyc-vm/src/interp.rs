@@ -20,7 +20,7 @@ use ruff_python_ast::{
 
 use crate::env::{Env, EnvRef};
 use crate::error::{
-    attribute_error, index_error, key_error, name_error, not_implemented, type_error, value_error,
+    attribute_error, index_error, name_error, not_implemented, type_error, value_error,
     zero_division, zero_division_floor_mod, zero_division_named, zero_division_negative_power,
     Unwind, VmException,
 };
@@ -2281,7 +2281,7 @@ impl Interpreter {
     /// True when `value` is an enum *member* instance (an `Instance` of an
     /// enum class carrying the synthesised `_name_` field).
     /// The materialised member list for an enum class, if any.
-    fn enum_members(class: &Rc<Class>) -> Option<Vec<Value>> {
+    pub(crate) fn enum_members(class: &Rc<Class>) -> Option<Vec<Value>> {
         match class.class_attrs.borrow().get("__typhon_enum_members__") {
             Some(Value::List(l)) => Some(l.borrow().clone()),
             _ => None,
@@ -2342,7 +2342,11 @@ impl Interpreter {
                 }
             }
         }
-        Err(key_error(format!("'{}'", name)))
+        // The KeyError carries the *name*, not its repr: `str(e)` renders
+        // the repr itself, so pre-quoting produced `"'Z'"`.
+        Err(crate::error::key_error_for(&Value::Str(Rc::new(
+            name.to_owned(),
+        ))))
     }
 
     fn is_enum_member(value: &Value) -> bool {
@@ -2455,7 +2459,7 @@ impl Interpreter {
             }
             Expr::BooleanLiteral(b) => Ok(Value::Bool(b.value)),
             Expr::NoneLiteral(_) => Ok(Value::None),
-            Expr::EllipsisLiteral(_) => Err(not_implemented("Ellipsis literal")),
+            Expr::EllipsisLiteral(_) => Ok(crate::value::ellipsis_value()),
             Expr::FString(f) => self.eval_fstring(f, env),
             Expr::Name(n) => env
                 .get_name_node(n)
@@ -2731,6 +2735,17 @@ impl Interpreter {
     }
 
     fn eval_subscript_index(&mut self, expr: &Expr, env: &EnvRef) -> Result<Value, Unwind> {
+        // A multi-axis subscript (`p[1:2, 3]`, `p[..., 0]`) is a tuple whose
+        // elements may themselves be slices, so each element resolves the
+        // same way rather than through plain expression evaluation — which
+        // rejects a slice outright.
+        if let Expr::Tuple(t) = expr {
+            let mut items = Vec::with_capacity(t.elts.len());
+            for elt in &t.elts {
+                items.push(self.eval_subscript_index(elt, env)?);
+            }
+            return Ok(Value::Tuple(Rc::new(items)));
+        }
         if let Expr::Slice(s) = expr {
             let lower = match &s.lower {
                 Some(e) => self.eval_expr(e, env)?,
@@ -3520,12 +3535,27 @@ impl Interpreter {
                 }
                 Err(type_error(format!(
                     "argument of type '{}' is not iterable",
-                    container.type_name()
+                    container.type_display_name()
                 )))
             }
+            // `Colour.RED in Colour` — an enum class contains its members.
+            Value::Class(c) => match Self::enum_members(c) {
+                Some(members) => {
+                    for m in members {
+                        if self.values_equal(item, &m)? {
+                            return Ok(true);
+                        }
+                    }
+                    Ok(false)
+                }
+                None => Err(type_error(format!(
+                    "argument of type '{}' is not iterable",
+                    container.type_display_name()
+                ))),
+            },
             other => Err(type_error(format!(
                 "argument of type '{}' is not iterable",
-                other.type_name()
+                other.type_display_name()
             ))),
         }
     }
@@ -4669,6 +4699,16 @@ impl Interpreter {
 
     /// Invoke a zero-argument dunder method on an instance, if defined.
     pub fn call_dunder0(&mut self, v: &Value, name: &str) -> Result<Option<Value>, Unwind> {
+        self.call_dunder(v, name, Vec::new())
+    }
+
+    /// Invoke a dunder method on an instance with `args`, if it is defined.
+    pub fn call_dunder(
+        &mut self,
+        v: &Value,
+        name: &str,
+        args: Vec<Value>,
+    ) -> Result<Option<Value>, Unwind> {
         if let Value::Instance(i) = v {
             if let Some(m) = self.find_method(&i.class, name) {
                 let r = self.call_value(
@@ -4676,7 +4716,7 @@ impl Interpreter {
                         receiver: Box::new(v.clone()),
                         function: m,
                     },
-                    vec![],
+                    args,
                     &[],
                 )?;
                 return Ok(Some(r));
@@ -4802,6 +4842,9 @@ impl Interpreter {
             Value::Tuple(t) => {
                 if crate::value::is_slice_marker(t) {
                     return Ok(crate::value::slice_repr(t));
+                }
+                if crate::value::is_ellipsis_marker(t) {
+                    return Ok("Ellipsis".to_owned());
                 }
                 let items: Vec<Value> = t.iter().cloned().collect();
                 let mut s = String::from("(");
@@ -5412,6 +5455,12 @@ impl Interpreter {
                 key_owned = self.call_dunder0(key, "__index__")?.unwrap_or(Value::None);
                 &key_owned
             }
+            // An `IntEnum` / `StrEnum` member *is* its value, so it indexes
+            // and keys exactly as that value does.
+            Value::Instance(_) if crate::value::enum_mixin_value(key).is_some() => {
+                key_owned = crate::value::enum_mixin_value(key).expect("checked by the guard");
+                &key_owned
+            }
             _ => key,
         };
         match target {
@@ -5533,14 +5582,18 @@ impl Interpreter {
                     )?;
                     return Ok(value);
                 }
+                // A value-mixin enum member subscripts as its value does.
+                if let Some(inner) = crate::value::enum_mixin_value(target) {
+                    return self.subscript(&inner, key);
+                }
                 Err(type_error(format!(
                     "'{}' object is not subscriptable",
-                    target.type_name()
+                    target.type_display_name()
                 )))
             }
             other => Err(type_error(format!(
                 "'{}' object is not subscriptable",
-                other.type_name()
+                other.type_display_name()
             ))),
         }
     }
@@ -5952,6 +6005,12 @@ impl Interpreter {
                             &[],
                         );
                     }
+                }
+                // An `IntEnum` / `IntFlag` / `StrEnum` member inherits its
+                // mixin's methods in CPython, so `IntE.ONE.bit_length()` and
+                // `StrE.X.upper()` resolve through the underlying value.
+                if let Some(inner) = crate::value::enum_mixin_value(value) {
+                    return self.get_attr(&inner, attr);
                 }
                 Err(attribute_error(format!(
                     "'{}' object has no attribute '{}'",
@@ -7953,6 +8012,27 @@ impl Interpreter {
             MatchSequence(s) => match subject {
                 Value::List(l) => self.pattern_match_seq(&s.patterns, &l.borrow(), env),
                 Value::Tuple(t) => self.pattern_match_seq(&s.patterns, t, env),
+                // A `range` is a `collections.abc.Sequence`, so CPython
+                // matches it against a sequence pattern. The arity is
+                // checked before materialising, so `case [x]` against
+                // `range(10**9)` fails without building the list.
+                Value::Range { start, stop, step } => {
+                    let len = range_len(*start, *stop, *step);
+                    let has_star = s
+                        .patterns
+                        .iter()
+                        .any(|p| matches!(p, ast::Pattern::MatchStar(_)));
+                    if !has_star && len != s.patterns.len() {
+                        return Ok(false);
+                    }
+                    if has_star && len + 1 < s.patterns.len() {
+                        return Ok(false);
+                    }
+                    let items: Vec<Value> = (0..len)
+                        .map(|i| Value::Int(crate::value::VmInt::from(start + (i as i64) * step)))
+                        .collect();
+                    self.pattern_match_seq(&s.patterns, &items, env)
+                }
                 _ => Ok(false),
             },
             MatchClass(c) => self.pattern_match_class(c, subject, env),
@@ -8532,6 +8612,12 @@ fn is_enum_sentinel(name: &str) -> bool {
 /// The set is bounded by the builtin method tables (a few hundred names at
 /// most) and each name is allocated once, so repeated `str.upper` lookups
 /// reuse the same string rather than leaking one per access.
+/// [`intern_method_name`] for a builtin *type* name — the shared hash key
+/// that makes `type(5)` and the `int` constructor one dict key.
+pub(crate) fn intern_type_name(name: &str) -> &'static str {
+    intern_method_name(name)
+}
+
 fn intern_method_name(name: &str) -> &'static str {
     thread_local! {
         static INTERNED: RefCell<std::collections::HashSet<&'static str>> =
@@ -10501,6 +10587,22 @@ pub(crate) fn format_cast_type(tp: &Expr) -> String {
             format!("{}[{}]", format_cast_type(&s.value), inner)
         }
         _ => "<type>".to_owned(),
+    }
+}
+
+/// [`Interpreter::enum_members`] for the builtins agent.
+pub(crate) fn enum_members_pub(class: &Rc<Class>) -> Option<Vec<Value>> {
+    Interpreter::enum_members(class)
+}
+
+/// `len(range(start, stop, step))`.
+fn range_len(start: i64, stop: i64, step: i64) -> usize {
+    if step > 0 {
+        ((stop - start).max(0) as usize).div_ceil(step as usize)
+    } else if step < 0 {
+        ((start - stop).max(0) as usize).div_ceil((-step) as usize)
+    } else {
+        0
     }
 }
 
