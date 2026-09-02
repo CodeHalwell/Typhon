@@ -1232,6 +1232,7 @@ fn arity_info_from_params(
     let mut kwonly_required: Vec<String> = Vec::new();
     let mut has_kwarg = false;
     let mut has_vararg = false;
+    let mut posonly_count = 0usize;
     for p in params {
         let ty = param_type_from(p);
         match p.kind.as_str() {
@@ -1245,6 +1246,9 @@ fn arity_info_from_params(
                 }
             }
             _ => {
+                if p.kind == "positional_only" {
+                    posonly_count += 1;
+                }
                 param_names.push(p.name.clone());
                 param_types.push(ty);
                 required_positional.push(!p.has_default);
@@ -1263,6 +1267,7 @@ fn arity_info_from_params(
         min_positional,
         required_positional,
         max_positional,
+        posonly_count,
         kwonly_names,
         kwonly_required,
         has_kwarg,
@@ -1543,8 +1548,21 @@ pub fn report_unintrospectable_dependencies(packages: &[String], severity: &str)
     if packages.is_empty() || severity == "off" {
         return false;
     }
-    let is_error = severity == "error";
+    // `TYC_NO_INTROSPECT=1` switches introspection off deliberately — for a
+    // sandbox, a hermetic CI job, or to keep a dependency's import-time code
+    // from running. Failing the build because the thing the user turned off
+    // did not happen makes the escape hatch unusable, so the severity
+    // downgrades to a warning that says why.
+    let suppressed = std::env::var_os("TYC_NO_INTROSPECT").is_some();
+    let is_error = severity == "error" && !suppressed;
     let label = if is_error { "error" } else { "warning" };
+    if suppressed && severity == "error" {
+        eprintln!(
+            "note: `TYC_NO_INTROSPECT` is set, so venv introspection did not run; \
+`[strictness] unintrospectable-dependency = \"error\"` is reported as a warning \
+rather than failing the build."
+        );
+    }
     eprintln!(
         "{label}: declared {} could not be introspected: {}\n  \
          third-party argument/type checks for {} were skipped. Install the project's \
@@ -2562,5 +2580,47 @@ class App:
         };
         let shapes = shapes_from_introspected(&intro);
         assert!(shapes.class_shapes.is_empty());
+    }
+
+    /// `TYC_NO_INTROSPECT` turns introspection off on purpose. Failing the
+    /// build because the thing the user disabled did not happen makes the
+    /// escape hatch unusable, so `"error"` downgrades to a warning.
+    /// Rust runs tests in parallel and `set_var` / `remove_var` mutate
+    /// process-global state, so an env-mutating test has to serialise
+    /// against every other one in this binary.
+    fn lock_env() -> std::sync::MutexGuard<'static, ()> {
+        use std::sync::{Mutex, OnceLock};
+        static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        ENV_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    #[test]
+    fn no_introspect_downgrades_the_error_severity() {
+        let _guard = lock_env();
+        let pkgs = vec!["somepkg".to_owned()];
+        let previous = std::env::var_os("TYC_NO_INTROSPECT");
+        // SAFETY: single-threaded test body; restored before returning.
+        unsafe { std::env::remove_var("TYC_NO_INTROSPECT") };
+        assert!(
+            report_unintrospectable_dependencies(&pkgs, "error"),
+            "without the escape hatch, `error` must fail the build"
+        );
+        // SAFETY: as above.
+        unsafe { std::env::set_var("TYC_NO_INTROSPECT", "1") };
+        assert!(
+            !report_unintrospectable_dependencies(&pkgs, "error"),
+            "with introspection disabled, `error` must downgrade to a warning"
+        );
+        assert!(!report_unintrospectable_dependencies(&pkgs, "warning"));
+        assert!(!report_unintrospectable_dependencies(&[], "error"));
+        assert!(!report_unintrospectable_dependencies(&pkgs, "off"));
+        match previous {
+            // SAFETY: as above.
+            Some(v) => unsafe { std::env::set_var("TYC_NO_INTROSPECT", v) },
+            None => unsafe { std::env::remove_var("TYC_NO_INTROSPECT") },
+        }
     }
 }

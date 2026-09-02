@@ -1,0 +1,216 @@
+import enum
+import asyncio
+from typing import AsyncIterator
+
+enum Color:
+    RED
+    GREEN
+    BLUE
+
+enum Http:
+    OK = 200
+    NOT_FOUND = 404
+    TEAPOT
+
+enum Flag2:
+    A = "a"
+    B = "b"
+
+class StrE(enum.StrEnum):
+    X = "x"
+    Y = "y"
+
+class IntE(enum.IntEnum):
+    ONE = 1
+    TWO = 2
+
+class Pt:
+    x: int
+    y: int
+
+class Circle:
+    r: float
+
+class Sq:
+    s: float
+
+type Shape = Circle | Sq
+
+def describe(v: object) -> str:
+    match v:
+        case 0 | 1 as small:
+            return f"small {small}"
+        case int(n) if n > 100:
+            return f"big {n}"
+        case int(n):
+            return f"int {n}"
+        case float(f):
+            return f"float {f}"
+        case str(s) if len(s) > 3:
+            return f"long str {s}"
+        case str(s):
+            return f"str {s}"
+        case []:
+            return "empty list"
+        case [x]:
+            return f"one {x}"
+        case [x, y]:
+            return f"two {x} {y}"
+        case [x, *rest]:
+            return f"many {x} {rest}"
+        case {"type": "circle", "r": r}:
+            return f"circle {r}"
+        case {"type": t, **rest}:
+            return f"mapping {t} {sorted(rest.items())}"
+        case Pt(x=0, y=0):
+            return "origin"
+        case Pt(x=0, y=yy):
+            return f"on y axis {yy}"
+        case Pt(x, y):
+            return f"pt {x} {y}"
+        case Color.RED:
+            return "red!"
+        case Color():
+            return f"color {v}"
+        case None:
+            return "none"
+        case True:
+            return "true"
+        case False:
+            return "false"
+        case (a, b, c):
+            return f"triple {a} {b} {c}"
+        case _:
+            return f"other {type(v).__name__}"
+
+def area(s: Shape) -> float:
+    match s:
+        case Circle(r):
+            return 3.0 * r * r
+        case Sq(s=side):
+            return side * side
+
+mut calls: int = 0
+
+def g(v: int) -> bool:
+    global calls
+    calls += 1
+    return v > 0
+
+def guard_test(v: int) -> str:
+    match v:
+        case n if g(n):
+            return "pos"
+        case n if g(-n):
+            return "neg"
+        case _:
+            return "zero"
+
+def main() -> None:
+    print("N1", [describe(v) for v in [0, 1, 500, 5, 2.5, "hello", "hi", [], [1], [1, 2], [1, 2, 3], (1, 2, 3), "abc", b"ab", {"type": "circle", "r": 2}, {"type": "sq", "s": 3, "z": 1}, {"type": "sq"}, Pt(x=0, y=0), Pt(x=0, y=5), Pt(x=1, y=2), Color.RED, Color.BLUE, None, True, False, 1.0, {1: 2}, set(), range(3), ["a", "b", "c", "d"]]])
+    print("N2", area(Circle(r=1.0)), area(Sq(s=2.0)), guard_test(5), guard_test(-5), guard_test(0), calls)
+    print("N3", Color.RED, repr(Color.RED), Color.RED.name, Color.RED.value, Color.GREEN.value, list(Color), [c.name for c in Color], Color(2), Color["BLUE"], Color.RED == Color.RED, Color.RED is Color.RED, Color.RED == 1, Color.RED != Color.GREEN, Http.TEAPOT.value, Http(404), Http.OK, str(Http.OK), f"{Http.OK}", f"{Http.OK.value}", Flag2.A.value, Flag2("b"), str(Flag2.A), hash(Color.RED) == hash(Color.RED), {Color.RED: 1}[Color.RED], sorted([Color.BLUE, Color.RED], key=lambda c: c.value), Color.RED.__class__.__name__ if False else "skip", type(Color.RED).__name__, isinstance(Color.RED, Color), isinstance(Color.RED, enum.Enum), Color.__name__, Color.__members__["RED"] if False else "skip")
+    print("N4", StrE.X, repr(StrE.X), StrE.X == "x", StrE.X.value, f"{StrE.X}", str(StrE.Y), IntE.ONE, repr(IntE.ONE), IntE.ONE == 1, IntE.ONE + 1, IntE.TWO > IntE.ONE, str(IntE.TWO), f"{IntE.TWO}", IntE(2), sorted([IntE.TWO, IntE.ONE]), [e.value for e in IntE], list(StrE), "x" in [StrE.X], StrE("y"), IntE.ONE < 2, format(IntE.ONE, "03d") if False else "skip", "{}".format(StrE.X), "%s" % StrE.X, "%s" % IntE.ONE, "%d" % IntE.ONE, str([StrE.X]), str([IntE.ONE]), {StrE.X: 1}["x"], {IntE.ONE: 1}[1])
+    try:
+        Color(9)
+    except ValueError as e:
+        print("N5", e)
+    try:
+        Color["NOPE"]
+    except KeyError as e:
+        print("N6", e)
+    try:
+        Color.RED < Color.GREEN
+    except TypeError as e:
+        print("N7", str(e)[:40])
+
+async def work(name: str, delay: float) -> str:
+    print("  start", name)
+    await asyncio.sleep(delay)
+    print("  end", name)
+    return name.upper()
+
+async def failing() -> int:
+    await asyncio.sleep(0)
+    raise ValueError("fail")
+
+async def amain() -> None:
+    print("A1")
+    let r: str = await work("a", 0.01)
+    print("  got", r)
+    print("A2 gather")
+    let res = await asyncio.gather(work("b", 0.02), work("c", 0.01), work("d", 0.0))
+    print("  ", res)
+    print("A3 create_task")
+    let t1 = asyncio.create_task(work("e", 0.01))
+    let t2 = asyncio.create_task(work("f", 0.0))
+    print("  tasks created")
+    await asyncio.sleep(0)
+    print("  after sleep 0")
+    print("  ", await t1, await t2, t1.done(), t2.result())
+    print("A4 taskgroup")
+    async with asyncio.TaskGroup() as tg:
+        let ta = tg.create_task(work("g", 0.01))
+        let tb = tg.create_task(work("h", 0.0))
+        print("  in tg body")
+    print("  ", ta.result(), tb.result())
+    print("A5 gather exceptions")
+    let res2 = await asyncio.gather(failing(), work("i", 0.0), return_exceptions=True)
+    print("  ", [repr(x) for x in res2])
+    try:
+        await asyncio.gather(failing(), work("j", 0.0))
+    except ValueError as e:
+        print("  caught", e)
+    try:
+        async with asyncio.TaskGroup() as tg2:
+            tg2.create_task(failing())
+            tg2.create_task(work("k", 0.0))
+    except* ValueError as eg:
+        print("  eg", type(eg).__name__, [repr(x) for x in eg.exceptions], eg.message if False else "skip")
+    print("A6 wait_for/timeout")
+    try:
+        await asyncio.wait_for(work("l", 0.5), timeout=0.01)
+    except asyncio.TimeoutError:
+        print("  timeout")
+    except TimeoutError:
+        print("  timeout2")
+    print("A7 misc")
+    let loop = asyncio.get_event_loop() if False else None
+    let q: asyncio.Queue[int] = asyncio.Queue()
+    await q.put(1)
+    q.put_nowait(2)
+    print("  q", q.qsize(), await q.get(), q.get_nowait(), q.empty())
+    let ev = asyncio.Event()
+    print("  ev", ev.is_set())
+    ev.set()
+    await ev.wait()
+    print("  ev", ev.is_set())
+    let lock = asyncio.Lock()
+    async with lock:
+        print("  locked", lock.locked())
+    let sem = asyncio.Semaphore(2)
+    async with sem:
+        print("  sem")
+    let fut = asyncio.get_running_loop().create_future() if False else None
+    print("  sleep result", await asyncio.sleep(0, result="R"))
+    let co = work("m", 0)
+    print("  coro type", type(co).__name__)
+    print("  ", await co)
+    print("  iscoro", asyncio.iscoroutinefunction(work), asyncio.iscoroutine(work("n", 0)) if False else "skip")
+    async def agen() -> AsyncIterator[int]:
+        for i in range(3):
+            await asyncio.sleep(0)
+            yield i
+    print("  agen", [v async for v in agen()])
+    mut acc: list[int] = []
+    async for v in agen():
+        acc.append(v * 2)
+    print("  async for", acc)
+    print("  shield", await asyncio.shield(work("o", 0)))
+    let done, pending = await asyncio.wait([asyncio.create_task(work("p", 0))])
+    print("  wait", len(done), len(pending))
+    print("  as_completed", sorted([await c for c in asyncio.as_completed([work("q", 0.01), work("r", 0)])]))
+
+main()
+asyncio.run(amain())
+print("A8", asyncio.run(work("z", 0)))

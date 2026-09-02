@@ -1,0 +1,12 @@
+"""Doc."""
+import os
+
+pub let A: int = 1
+
+pub class K:
+    x: int
+
+pub def f() -> int:
+    return 2
+
+print(__all__, __doc__, A, K(x=1), f(), os.sep != "")

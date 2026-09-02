@@ -1,0 +1,7 @@
+def main() -> None:
+    let d: dict[str, int] = {"a": 1}
+    d.update({"b": "s"})
+    print(d["b"] + 1)
+
+if __name__ == "__main__":
+    main()

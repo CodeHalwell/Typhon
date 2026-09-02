@@ -1,0 +1,9 @@
+def lookup(k: str) -> int?:
+    return None
+
+def main() -> None:
+    let n: int = lookup("x") + 1
+    print(n)
+
+if __name__ == "__main__":
+    main()

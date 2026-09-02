@@ -119,6 +119,7 @@ pub fn run(args: TyArgs) -> Result<()> {
             no_sync: false,
             with_ty: false,
             optimise: false,
+            source_label: None,
         })?;
     }
 

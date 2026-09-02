@@ -1,0 +1,7 @@
+def main() -> None:
+    let d: dict[str, int] = {"a": 1}
+    let v = d.get("zz", "s")
+    print(v.bit_length())
+
+if __name__ == "__main__":
+    main()

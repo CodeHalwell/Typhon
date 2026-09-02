@@ -1,0 +1,30 @@
+"""Source-map probe."""
+import os
+
+
+class Widget:
+    name: str
+    size: int = 3
+
+impl Widget:
+    def describe(self, prefix: str, suffix: str, extra_argument_one: int, extra_argument_two: int, extra_argument_three: int) -> str:
+        return prefix + self.name + suffix + str(extra_argument_one + extra_argument_two + extra_argument_three)
+
+def parse(s: str) -> Result[int, str]:
+    if s.isdigit():
+        return Ok(int(s))
+    return Err("bad")
+
+def use(s: str) -> Result[int, str]:
+    let n: int = parse(s)?
+    let w: Widget = Widget(name="w")
+    print(w.describe("a", "b", 1, 2, 3))
+    let xs: list[int] = [1, 2]
+    return Ok(xs[n])
+
+def main() -> None:
+    print(use("1"))
+    print(use("7"))
+    print(os.sep != "")
+
+main()

@@ -544,6 +544,88 @@ pub fn check_unknown_modules(
 /// Batched variant of [`check_unknown_modules`]. Identical semantics
 /// but reuses a caller-built [`ImportVettingContext`] so the project
 /// and dependency HashSets aren't reconstructed per file.
+/// Every absolute module a source imports, as its **top-level** name
+/// (`os.path` → `os`). Relative imports are excluded: they name a sibling
+/// in the project, not an external module.
+///
+/// Used by `tyc run` to decide, before executing anything, whether the
+/// program needs a module the VM does not model — see the fallback in
+/// `commands::run`.
+pub fn collect_imported_roots(
+    module: &ruff_python_ast::ModModule,
+) -> std::collections::BTreeSet<String> {
+    use ruff_python_ast::Stmt;
+
+    fn root_of(name: &str) -> Option<String> {
+        let root = name.split('.').next().unwrap_or(name);
+        if root.is_empty() {
+            None
+        } else {
+            Some(root.to_owned())
+        }
+    }
+
+    fn walk(stmts: &[Stmt], out: &mut std::collections::BTreeSet<String>) {
+        for stmt in stmts {
+            match stmt {
+                Stmt::Import(imp) => {
+                    for alias in &imp.names {
+                        if let Some(root) = root_of(alias.name.as_str()) {
+                            out.insert(root);
+                        }
+                    }
+                }
+                Stmt::ImportFrom(imp) => {
+                    if imp.level > 0 {
+                        continue;
+                    }
+                    if let Some(name) = imp.module.as_ref() {
+                        if let Some(root) = root_of(name.as_str()) {
+                            out.insert(root);
+                        }
+                    }
+                }
+                Stmt::FunctionDef(f) => walk(&f.body, out),
+                Stmt::ClassDef(c) => walk(&c.body, out),
+                Stmt::If(s) => {
+                    walk(&s.body, out);
+                    for c in &s.elif_else_clauses {
+                        walk(&c.body, out);
+                    }
+                }
+                Stmt::Try(s) => {
+                    walk(&s.body, out);
+                    walk(&s.orelse, out);
+                    walk(&s.finalbody, out);
+                    for handler in &s.handlers {
+                        let ruff_python_ast::ExceptHandler::ExceptHandler(h) = handler;
+                        walk(&h.body, out);
+                    }
+                }
+                Stmt::For(s) => {
+                    walk(&s.body, out);
+                    walk(&s.orelse, out);
+                }
+                Stmt::While(s) => {
+                    walk(&s.body, out);
+                    walk(&s.orelse, out);
+                }
+                Stmt::With(s) => walk(&s.body, out),
+                Stmt::Match(s) => {
+                    for case in &s.cases {
+                        walk(&case.body, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let mut out = std::collections::BTreeSet::new();
+    walk(&module.body, &mut out);
+    out
+}
+
 pub fn check_unknown_modules_with(
     path: &str,
     source: &str,
@@ -861,6 +943,13 @@ struct Resolver<'a> {
     /// minimal form here unblocks the heterogeneous-error /
     /// `_load_or_default(...)` workaround R2-7 / R3-8 documented.
     uninit_let_spans: std::collections::HashSet<(usize, usize)>,
+    /// Spans of PEP 695 type-parameter bindings (`class Box[T]:`,
+    /// `impl[T] Box[T]:`, `def f[T](...)`). They are declared into the
+    /// class / function scope like ordinary names, but unlike a class
+    /// attribute they *are* visible from the methods inside a generic class
+    /// (PEP 695 gives them their own annotation scope), so the class-scope
+    /// skip in `report_unknown_names` must let them through.
+    type_param_spans: std::collections::HashSet<(usize, usize)>,
     /// `(declaration span, write span)` pairs where a `global` / `nonlocal`
     /// redirected write consumed an uninitialised-`let` marker, i.e. *was*
     /// the initialiser. The redirect path pushes no binding, so unlike
@@ -921,6 +1010,7 @@ impl<'a> Resolver<'a> {
             preprocessed_line_starts: std::cell::OnceCell::new(),
             in_pattern: 0,
             uninit_let_spans: std::collections::HashSet::new(),
+            type_param_spans: std::collections::HashSet::new(),
             outer_initialiser_spans: std::collections::HashSet::new(),
             params_with_explicit_rebind: std::collections::HashSet::new(),
             loop_body_depth: 0,
@@ -1184,6 +1274,21 @@ impl<'a> Resolver<'a> {
                 self.mark_loop_origin(span);
                 return;
             }
+            // `_` is the conventional throwaway: a second `let _ = ...`
+            // discards another value rather than rebinding a `let`. Replace
+            // the binding in place so later references see the newest span.
+            if name == "_" {
+                if let Some(b) = self.scopes[scope]
+                    .bindings
+                    .iter_mut()
+                    .find(|b| b.name == name)
+                {
+                    b.span = span;
+                    b.mutability = mutability;
+                    b.kind = kind;
+                }
+                return;
+            }
             if existing.mutability == Mutability::Let || mutability == Mutability::Let {
                 let decl_span = existing.span;
                 // R3-8: the FIRST assignment to an uninitialised `let
@@ -1192,6 +1297,26 @@ impl<'a> Resolver<'a> {
                 // hit the standard immutable-assign path below because
                 // the span is no longer in the uninit set.
                 if self.uninit_let_spans.remove(&decl_span) {
+                    // ...unless the initialiser sits inside a loop body the
+                    // declaration is not part of: it then runs once per
+                    // iteration, and iteration two rebinds a `let`. Only the
+                    // innermost open loop counts as "the declaration's own"
+                    // (a `let` declared in an outer loop and assigned in an
+                    // inner one is rebound per inner iteration all the same).
+                    let decl_loop = self.loop_origin_spans.get(&decl_span).copied();
+                    let repeats = self.loop_body_depth > 0
+                        && decl_loop != self.loop_body_stack.last().copied();
+                    if repeats && self.seen_immutable_redecl.insert((decl_span, span)) {
+                        self.diagnostics.push_error(TycError::immutable_assign(
+                            name,
+                            &self.path,
+                            self.source,
+                            decl_span.0,
+                            decl_span.1.saturating_sub(decl_span.0).max(1),
+                            span.0,
+                            span.1.saturating_sub(span.0).max(1),
+                        ));
+                    }
                     return;
                 }
                 if self.seen_immutable_redecl.insert((decl_span, span)) {
@@ -1262,9 +1387,35 @@ impl<'a> Resolver<'a> {
             // the build.
             let mut found = false;
             let mut wildcard_in_scope = false;
+            // Python's scoping rule: a class body is NOT an enclosing scope
+            // for the functions (methods, lambdas) or comprehensions defined
+            // inside it — a method or a comprehension clause reading a class
+            // attribute by bare name raises `NameError` at runtime. So when
+            // the reference sits in a function or comprehension scope, class
+            // scopes on the chain are skipped. (A comprehension's outermost
+            // iterable is walked in the enclosing scope by `walk_comp`, so it
+            // still sees the class body, exactly as CPython evaluates it.)
+            let origin_is_function = matches!(
+                self.scopes[r.scope].kind,
+                ScopeKind::Function | ScopeKind::Comprehension
+            );
             let mut current = Some(r.scope);
             while let Some(id) = current {
                 let scope = &self.scopes[id];
+                if origin_is_function && id != r.scope && scope.kind == ScopeKind::Class {
+                    // Only the class's PEP 695 type parameters are visible
+                    // from inside its methods.
+                    if scope
+                        .bindings
+                        .iter()
+                        .any(|b| b.name == r.name && self.type_param_spans.contains(&b.span))
+                    {
+                        found = true;
+                        break;
+                    }
+                    current = scope.parent;
+                    continue;
+                }
                 if scope.bindings.iter().any(|b| b.name == r.name) {
                     found = true;
                     break;
@@ -1925,7 +2076,9 @@ fn declare_target(
             // declaration (`BindingKind::Value`). A parameter / loop
             // target / import / function / class re-declaration is a
             // separate problem and not what this finding is about.
-            if ast_mutability.is_some() {
+            // `_` is the conventional throwaway; a second `let _ = ...` in
+            // the same function is discarding another value, not shadowing.
+            if ast_mutability.is_some() && n.id.as_str() != "_" {
                 if let Some(existing) = r.lookup_local(scope, n.id.as_str()) {
                     // The loop-origin carve-out only suppresses the shadow
                     // diagnostic while we are still inside a loop body (the
@@ -2307,8 +2460,19 @@ fn walk_stmt(r: &mut Resolver, scope: ScopeId, stmt: &Stmt) {
             }
         }
         Stmt::AugAssign(a) => {
-            walk_expr(r, scope, &a.target);
             walk_expr(r, scope, &a.value);
+            // `x += 1` rebinds `x` exactly as `x = x + 1` does, so a bare-name
+            // target goes through the same declaration path as a plain
+            // assignment — which is what fires `tyc::immutable_assign` on a
+            // `let` (or an un-`mut` parameter) and routes a `global` /
+            // `nonlocal` write to the binding it names. It was walked as a
+            // *read* before, so `let x = 1; x += 1` compiled clean.
+            if matches!(a.target.as_ref(), Expr::Name(_)) {
+                let default_val = r.scopes[scope].kind == ScopeKind::Module;
+                declare_target(r, scope, &a.target, default_val, None);
+            } else {
+                walk_expr(r, scope, &a.target);
+            }
         }
         Stmt::Return(ret) => {
             if let Some(v) = &ret.value {
@@ -2422,10 +2586,31 @@ fn walk_stmt(r: &mut Resolver, scope: ScopeId, stmt: &Stmt) {
             }
         }
         Stmt::Try(t) => {
+            // The `try` body and each `except` handler are alternative arms,
+            // like `if` / `elif` / `else` and `match` cases: a `let msg` in
+            // one handler must not shadow a `let msg` in the next, and a
+            // handler's assignment to a declare-only `let n: int` is the
+            // initialiser on *its* path (`try: n = int(s) except ValueError:
+            // n = 0` is the documented declare-then-assign idiom). Same
+            // drain / restore and uninit snapshot / union as `Stmt::If`.
+            let pre_len = r.scopes[scope].bindings.len();
+            let mut arm_bindings: Vec<Binding> = Vec::new();
+            let initial_uninit = r.uninit_let_spans.clone();
+            let mut union_initialised: std::collections::HashSet<(usize, usize)> =
+                std::collections::HashSet::new();
             for s in &t.body {
                 walk_stmt(r, scope, s);
             }
+            for span in initial_uninit.difference(&r.uninit_let_spans) {
+                union_initialised.insert(*span);
+            }
+            // Bindings made by the `try` body stay live for the `else` /
+            // `finally` clauses and the code after the statement, so they
+            // are kept in place; only the handlers are drained.
+            let body_len = r.scopes[scope].bindings.len();
+            let _ = pre_len;
             for h in &t.handlers {
+                r.uninit_let_spans = initial_uninit.clone();
                 let ast::ExceptHandler::ExceptHandler(h) = h;
                 if let Some(typ) = &h.type_ {
                     walk_expr(r, scope, typ);
@@ -2446,7 +2631,17 @@ fn walk_stmt(r: &mut Resolver, scope: ScopeId, stmt: &Stmt) {
                 for s in &h.body {
                     walk_stmt(r, scope, s);
                 }
+                for span in initial_uninit.difference(&r.uninit_let_spans) {
+                    union_initialised.insert(*span);
+                }
+                let drained: Vec<Binding> = r.scopes[scope].bindings.drain(body_len..).collect();
+                arm_bindings.extend(drained);
             }
+            r.uninit_let_spans = initial_uninit;
+            for span in &union_initialised {
+                r.uninit_let_spans.remove(span);
+            }
+            r.scopes[scope].bindings.extend(arm_bindings);
             for s in &t.orelse {
                 walk_stmt(r, scope, s);
             }
@@ -2761,6 +2956,7 @@ fn declare_type_params(r: &mut Resolver, scope: ScopeId, type_params: Option<&as
             range.start().to_usize(),
             range.start().to_usize() + name.len(),
         );
+        r.type_param_spans.insert(span);
         r.declare(scope, name, BindingKind::Value, Mutability::Let, span);
     }
 }
@@ -2917,8 +3113,13 @@ fn walk_expr(r: &mut Resolver, scope: ScopeId, expr: &Expr) {
         Expr::Generator(g) => walk_comp(r, scope, range_to_span(g.range), &g.elt, &g.generators),
         Expr::DictComp(c) => {
             let scope2 = r.push_scope(ScopeKind::Comprehension, scope, range_to_span(c.range));
-            for gen in &c.generators {
-                walk_expr(r, scope2, &gen.iter);
+            for (i, gen) in c.generators.iter().enumerate() {
+                // Outermost iterable in the enclosing scope (see `walk_comp`).
+                if i == 0 {
+                    walk_expr(r, scope, &gen.iter);
+                } else {
+                    walk_expr(r, scope2, &gen.iter);
+                }
                 // Dict-comp targets share the recursive shape of `for`/`with`
                 // targets — e.g. `{k: v for k, v in d.items()}` binds both
                 // `k` and `v`. Use the same helper as list/set comps so tuple
@@ -2960,16 +3161,12 @@ fn walk_expr(r: &mut Resolver, scope: ScopeId, expr: &Expr) {
         // visited via the same path on the next pass through this code.
         Expr::FString(fs) => {
             for elem in fs.value.elements() {
-                if let ast::InterpolatedStringElement::Interpolation(interp) = elem {
-                    walk_expr(r, scope, &interp.expression);
-                }
+                walk_interpolated_element(r, scope, elem);
             }
         }
         Expr::TString(ts) => {
             for elem in ts.value.elements() {
-                if let ast::InterpolatedStringElement::Interpolation(interp) = elem {
-                    walk_expr(r, scope, &interp.expression);
-                }
+                walk_interpolated_element(r, scope, elem);
             }
         }
         Expr::Named(n) => {
@@ -2991,6 +3188,42 @@ fn walk_expr(r: &mut Resolver, scope: ScopeId, expr: &Expr) {
     }
 }
 
+/// Walk one element of an f-string / t-string: the interpolated expression
+/// and — recursively — every interpolation nested inside its format spec
+/// (`f"{v:{prec}f}"` reads `prec`; `f"{v:{string.digits[3]}}"` uses the
+/// `string` import). Skipping the spec left those references invisible to
+/// the unknown-name and unused-import passes.
+fn walk_interpolated_element(
+    r: &mut Resolver,
+    scope: ScopeId,
+    elem: &ast::InterpolatedStringElement,
+) {
+    if let ast::InterpolatedStringElement::Interpolation(interp) = elem {
+        walk_expr(r, scope, &interp.expression);
+        if let Some(spec) = &interp.format_spec {
+            for inner in &spec.elements {
+                walk_interpolated_element(r, scope, inner);
+            }
+        }
+    }
+}
+
+/// [`declare_walrus_leaks`] for one f-string element, format spec included.
+fn leak_walrus_in_interpolated_element(
+    r: &mut Resolver,
+    scope: ScopeId,
+    elem: &ast::InterpolatedStringElement,
+) {
+    if let ast::InterpolatedStringElement::Interpolation(interp) = elem {
+        declare_walrus_leaks(r, scope, &interp.expression);
+        if let Some(spec) = &interp.format_spec {
+            for inner in &spec.elements {
+                leak_walrus_in_interpolated_element(r, scope, inner);
+            }
+        }
+    }
+}
+
 fn walk_comp(
     r: &mut Resolver,
     scope: ScopeId,
@@ -2999,8 +3232,17 @@ fn walk_comp(
     generators: &[ast::Comprehension],
 ) {
     let scope2 = r.push_scope(ScopeKind::Comprehension, scope, span);
-    for gen in generators {
-        walk_expr(r, scope2, &gen.iter);
+    for (i, gen) in generators.iter().enumerate() {
+        // CPython evaluates the *outermost* iterable in the enclosing scope
+        // (it is passed into the comprehension as its one argument); every
+        // other iterable, every condition and the element run inside the
+        // comprehension's own scope — which, like a function body, cannot
+        // see a surrounding class body.
+        if i == 0 {
+            walk_expr(r, scope, &gen.iter);
+        } else {
+            walk_expr(r, scope2, &gen.iter);
+        }
         // Comprehension targets share the recursive shape of `for`/`with`
         // targets — e.g. `[v for k, v in d.items()]` binds both `k` and `v`.
         declare_loop_target(r, scope2, &gen.target);
@@ -3119,12 +3361,11 @@ fn declare_walrus_leaks(r: &mut Resolver, scope: ScopeId, expr: &Expr) {
                 declare_walrus_leaks(r, scope, &item.value);
             }
         }
-        // `f"{(x := ...)}"` — walrus inside an f-string interpolation.
+        // `f"{(x := ...)}"` — walrus inside an f-string interpolation (or
+        // inside a nested format spec, `f"{v:{(w := 4)}}"`).
         Expr::FString(fs) => {
             for elem in fs.value.elements() {
-                if let ast::InterpolatedStringElement::Interpolation(interp) = elem {
-                    declare_walrus_leaks(r, scope, &interp.expression);
-                }
+                leak_walrus_in_interpolated_element(r, scope, elem);
             }
         }
         // Other expression heads either bind no names (literals, plain
@@ -3217,6 +3458,8 @@ fn builtin_names() -> std::collections::HashSet<&'static str> {
         "Ellipsis",
         "NotImplemented",
         "__name__",
+        // Synthesised by the `pub` lowering (and legal to read in any module).
+        "__all__",
         "__file__",
         "__doc__",
         "__builtins__",
@@ -3371,6 +3614,136 @@ mod tests {
         resolve_with_options(src, ResolveOptions::default())
     }
 
+    // ── Beta hardening: f-string specs, class-body comprehensions, `_` ──
+
+    #[test]
+    fn format_spec_interpolations_are_resolved() {
+        let (_, diags) = resolve("def f(v: float) -> str:\n    return f\"{v:{prec}f}\"\n");
+        assert!(
+            diags
+                .errors()
+                .iter()
+                .any(|e| matches!(e, TycError::UnknownName { name, .. } if name == "prec")),
+            "the spec's `prec` must be an unknown name: {:?}",
+            diags.errors()
+        );
+        let (_, diags) = resolve(
+            "import string\n\ndef f(v: float) -> str:\n    return f\"{v:{string.digits[3]}}\"\n",
+        );
+        assert!(
+            !diags
+                .warnings()
+                .iter()
+                .any(|w| matches!(w, TycError::UnusedImport { .. })),
+            "an import used only inside a format spec is used: {:?}",
+            diags.warnings()
+        );
+        assert!(!diags.has_errors(), "{:?}", diags.errors());
+    }
+
+    #[test]
+    fn class_body_comprehension_sees_only_its_outermost_iterable() {
+        // CPython evaluates the first `for` iterable in the class body and
+        // everything else in the comprehension's own scope, which cannot
+        // see class attributes: `xs` in the second clause is a NameError.
+        let src = "\
+class Grid:
+    xs: list[int] = [1, 2]
+    pairs: list[int] = [a + b for a in xs for b in xs]
+";
+        let (_, diags) = resolve(src);
+        let unknown: Vec<&TycError> = diags
+            .errors()
+            .iter()
+            .filter(|e| matches!(e, TycError::UnknownName { name, .. } if name == "xs"))
+            .collect();
+        assert_eq!(
+            unknown.len(),
+            1,
+            "exactly the second `xs`: {:?}",
+            diags.errors()
+        );
+        let ok = "\
+class Grid:
+    xs: list[int] = [1, 2]
+    doubled: list[int] = [a * 2 for a in xs if a > 0]
+    table: dict[int, int] = {a: a * a for a in xs}
+";
+        let (_, diags) = resolve(ok);
+        assert!(!diags.has_errors(), "{:?}", diags.errors());
+    }
+
+    #[test]
+    fn declare_only_let_initialised_inside_a_later_loop_is_a_reassignment() {
+        // `last` is declared once, outside the loop; the body assigns it on
+        // every iteration, so iteration two rebinds a `let`.
+        let src = "\
+def f(xs: list[int]) -> None:
+    let last: int
+    for x in xs:
+        last = x
+        print(last)
+";
+        let (_, d) = resolve(src);
+        assert!(has_immutable_assign(&d), "{:?}", d.errors());
+        // Declared and initialised inside the same loop body: fresh per
+        // iteration, fine.
+        let ok = "\
+def g(xs: list[int]) -> None:
+    for x in xs:
+        let cur: int
+        cur = x
+        print(cur)
+";
+        let (_, d) = resolve(ok);
+        assert!(!has_immutable_assign(&d), "{:?}", d.errors());
+        // Declared in an outer loop, initialised in an inner one: rebound
+        // per inner iteration.
+        let nested = "\
+def h(xss: list[list[int]]) -> None:
+    for xs in xss:
+        let cur: int
+        for x in xs:
+            cur = x
+        print(cur)
+";
+        let (_, d) = resolve(nested);
+        assert!(has_immutable_assign(&d), "{:?}", d.errors());
+        // The plain declare-then-assign idiom outside loops is untouched.
+        let plain = "\
+def k(c: bool) -> int:
+    let v: int
+    if c:
+        v = 1
+    else:
+        v = 2
+    return v
+";
+        let (_, d) = resolve(plain);
+        assert!(!has_immutable_assign(&d), "{:?}", d.errors());
+    }
+
+    #[test]
+    fn underscore_can_be_rebound_with_let() {
+        let src = "\
+def a() -> int:
+    return 1
+
+def f() -> None:
+    let _: int = a()
+    let _: int = a()
+";
+        let (_, diags) = resolve(src);
+        assert!(
+            !diags.errors().iter().any(|e| matches!(
+                e,
+                TycError::NoBlockShadow { .. } | TycError::ImmutableAssign { .. }
+            )),
+            "`let _` twice is not block shadowing: {:?}",
+            diags.errors()
+        );
+    }
+
     fn resolve_with_options(src: &str, options: ResolveOptions) -> (ResolvedModule, Diagnostics) {
         let prep = preprocess(src);
         let module = tyc_syntax::parse_module(&prep.python_source)
@@ -3412,6 +3785,103 @@ mod tests {
         d.errors()
             .iter()
             .any(|e| matches!(e, TycError::ImmutableAssign { .. }))
+    }
+
+    /// `x += 1` rebinds `x`, so it is subject to the `let` contract exactly
+    /// like `x = x + 1` — for locals, un-`mut` parameters and `global` writes.
+    #[test]
+    fn augmented_assignment_to_a_let_is_an_immutable_assign() {
+        for src in [
+            "def f() -> int:\n    let x: int = 1\n    x += 1\n    return x\n",
+            "def g(n: int) -> int:\n    n += 1\n    return n\n",
+            "let LIMIT: int = 10\ndef bump() -> None:\n    global LIMIT\n    LIMIT += 1\n",
+        ] {
+            let (_, d) = resolve(src);
+            assert!(
+                has_immutable_assign(&d),
+                "expected immutable_assign for:\n{src}"
+            );
+        }
+        let (_, d) = resolve("def h() -> int:\n    mut y: int = 1\n    y += 1\n    return y\n");
+        assert!(!has_immutable_assign(&d), "a `mut` may be augmented");
+        // A loop target is an immutable binding too (plain `x = x + 1` inside
+        // the body is already rejected), so the augmented form matches.
+        let (_, d) = resolve("def k(xs: list[int]) -> None:\n    for x in xs:\n        x += 1\n");
+        assert!(has_immutable_assign(&d), "a loop target is a `let`");
+    }
+
+    /// `try` / `except` arms are alternatives, like `if` / `elif`: a `let` in
+    /// two handlers does not shadow, and a handler's assignment initialises a
+    /// declare-only `let` on its path.
+    #[test]
+    fn try_handlers_are_sibling_arms() {
+        let src = "\
+def f(s: str) -> str:
+    try:
+        return str(int(s))
+    except ValueError:
+        let msg: str = \"value\"
+        return msg
+    except TypeError:
+        let msg: str = \"type\"
+        return msg
+
+def g(s: str) -> int:
+    let n: int
+    try:
+        n = int(s)
+    except ValueError:
+        n = 0
+    return n
+";
+        let (_, d) = resolve(src);
+        assert!(
+            !d.has_errors(),
+            "handlers must not shadow / re-assign: {d:?}"
+        );
+    }
+
+    /// A class body is not an enclosing scope for the methods inside it: a
+    /// bare reference to a class attribute from a method is a `NameError` at
+    /// runtime, while the class's PEP 695 type parameters stay visible.
+    #[test]
+    fn class_scope_names_are_not_visible_from_methods_but_type_params_are() {
+        let bad = "\
+plain class Registry:
+    LIMIT: int = 10
+
+impl Registry:
+    def check(self, n: int) -> bool:
+        return n < LIMIT
+";
+        let (_, d) = resolve(bad);
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::UnknownName { .. })),
+            "bare class-attribute read must be unknown: {d:?}"
+        );
+        let good = "\
+class Box[T]:
+    value: T
+
+impl[T] Box[T]:
+    def get(self) -> T:
+        let v: T = self.value
+        return v
+
+plain class Registry:
+    LIMIT: int = 10
+
+impl Registry:
+    def check(self, n: int) -> bool:
+        return n < self.LIMIT
+";
+        let (_, d) = resolve(good);
+        assert!(
+            !d.has_errors(),
+            "type params and self-qualified reads stay clean: {d:?}"
+        );
     }
 
     /// F25: the sequential-loop carve-out keyed on the declaration span

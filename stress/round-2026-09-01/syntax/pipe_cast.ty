@@ -1,0 +1,11 @@
+import json
+
+def f(x: int) -> int:
+    return x + 1
+
+def main() -> None:
+    let n = json.loads("1") |> f() as! int
+    print(n)
+
+if __name__ == "__main__":
+    main()

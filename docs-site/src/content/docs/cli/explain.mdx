@@ -7,6 +7,7 @@ sidebar:
 
 ```
 tyc explain <code>
+tyc explain --list
 ```
 
 Prints the catalog page for a diagnostic code. Mirrors `rustc --explain`: when a diagnostic fires in your terminal and the inline help isn't enough, `tyc explain <code>` is the answer.
@@ -20,17 +21,19 @@ tyc explain frozen_assign              # any catalog page
 tyc explain orphan_py_import           # Phase 5 diagnostic
 tyc explain arg_count                  # constructor / method arity (v0.2.0)
 tyc explain missing_field_init         # __new__ bypass audit (v0.2.0)
+tyc explain --list                     # every code the explainer knows, one per line
+tyc explain --list | fzf | xargs tyc explain   # interactive picker
 ```
 
 ## How it works
 
-Every Markdown file under `docs/diagnostics/` is embedded into the `tyc` binary at build time. `tyc explain <code>` looks up the page by short code (the part after `tyc::`) and writes it to stdout. The catalog pages also live on the docs site under `/lang/diagnostics/<code>/` and are linked from each diagnostic via miette's `url(...)` attribute, so the same content is one click away in any terminal that linkifies URLs.
+Every Markdown file under `docs/diagnostics/` is embedded into the `tyc` binary at build time. `tyc explain <code>` looks up the page by short code (the part after `tyc::`) and writes it to stdout. The same pages live in the repository at `docs/diagnostics/<code>.md`, which is where every diagnostic's miette `url(...)` attribute points (`https://github.com/CodeHalwell/Typhon/blob/main/docs/diagnostics/<code>.md`), so the same content is one click away in any terminal that linkifies URLs. This site groups the same codes by category under the [Diagnostics Catalog](/Typhon/diagnostics/reading/).
 
 When a code is misspelled or doesn't yet have a catalog page, `tyc explain` exits non-zero with a pointer to the [diagnostics catalog](https://github.com/CodeHalwell/Typhon/tree/main/docs/diagnostics) for the full catalog.
 
 ## The catalog
 
-The catalog covers every `tyc::` diagnostic shipping today: ~50+ pages spanning binding rules (`immutable_assign`, `missing_binding_kind`), type errors (`type_mismatch`, `nullable_use`, `operator_type_mismatch`, `arg_count`), class rules (`manual_init`, `frozen_assign`, `class_attr_shadows_slot`, `method_in_class_body`, `missing_field_init`), match exhaustiveness (`non_exhaustive_match`), async (`missing_await`, `async_without_await`), Result (`result_error_mismatch`, `invalid_question_op`), interop (`orphan_py_import`, `python_semantic_drift`, `contains_secret_literal`, `invalid_config_value`), stubs (`stub_mismatch`), and the everyday parse/resolve diagnostics.
+The catalog covers every `tyc::` diagnostic shipping today — 90 pages as of v1.0.0-alpha.9 (`tyc explain --list` prints the current set) — spanning binding rules (`immutable_assign`, `missing_binding_kind`), type errors (`type_mismatch`, `nullable_use`, `operator_type_mismatch`, `arg_count`), class rules (`manual_init`, `frozen_assign`, `class_attr_shadows_slot`, `method_in_class_body`, `missing_field_init`), match exhaustiveness (`non_exhaustive_match`), async (`missing_await`, `async_without_await`), Result (`result_error_mismatch`, `invalid_question_op`), interop (`orphan_py_import`, `python_semantic_drift`, `contains_secret_literal`, `invalid_config_value`), stubs (`stub_mismatch`), and the everyday parse/resolve diagnostics.
 
 Each page follows the same shape: **what it means**, **a minimal failing example**, **why Typhon flags it**, and **how to fix it**.
 
@@ -42,7 +45,10 @@ Each page follows the same shape: **what it means**, **a minimal failing example
 
 ## Flags
 
-`tyc explain` takes a single positional argument: the code. No other flags today.
+| Flag | Effect |
+|------|--------|
+| `CODE` | The diagnostic code to explain, short (`immutable_assign`) or fully-qualified (`tyc::immutable_assign`). Optional when `--list` is given. |
+| `--list` | Print every diagnostic code the explainer knows about, one fully-qualified code per line — pipe into `grep` or `fzf`. |
 
 ## Where next
 

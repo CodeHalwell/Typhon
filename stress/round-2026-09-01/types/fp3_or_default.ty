@@ -1,0 +1,14 @@
+def f(maybe: str?, d: dict[str, list[int]]) -> str:
+    let name: str = maybe or "default"
+    let xs: list[int] = d.get("k") or []
+    mut y: int? = None
+    if y is None:
+        y = 0
+    let z: int = y + 1
+    return name + str(len(xs)) + str(z)
+
+def main() -> None:
+    print(f(None, {}))
+
+if __name__ == "__main__":
+    main()

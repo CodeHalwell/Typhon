@@ -1,0 +1,6 @@
+def f(xs: list[int]) -> int:
+    for x in xs:
+        pass
+    return x
+
+print(f([]))

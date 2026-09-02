@@ -1,0 +1,7 @@
+def main() -> None:
+    let e: int = -1
+    let n: int = 2 ** e
+    print(n.bit_length())
+
+if __name__ == "__main__":
+    main()

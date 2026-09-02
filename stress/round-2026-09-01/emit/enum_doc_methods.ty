@@ -1,0 +1,14 @@
+enum Color:
+    """Colours."""
+    RED
+    GREEN = 5
+    BLUE
+
+impl Color:
+    def label(self) -> str:
+        return self.name.lower()
+
+def main() -> None:
+    print(list(Color), Color.BLUE.value, Color.RED.label(), Color.__doc__)
+
+main()

@@ -1,0 +1,8 @@
+class A:
+    x: int = "s"
+
+def main() -> None:
+    print(A().x + 1)
+
+if __name__ == "__main__":
+    main()

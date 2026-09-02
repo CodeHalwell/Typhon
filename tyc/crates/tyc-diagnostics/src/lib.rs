@@ -1532,6 +1532,81 @@ pub enum TycError {
         decl_span: SourceSpan,
     },
 
+    /// `go f(x)` spawns a task on the *running* event loop. Module-level
+    /// code runs at import with none — so a `go` there, or a module-level
+    /// call to a sync function that spawns, raised `RuntimeError: no
+    /// running event loop` at the call and left the coroutine never
+    /// awaited.
+    #[error("`go` needs a running event loop — `{callee}` is spawned from module-level code, where none is running")]
+    #[diagnostic(
+        code(tyc::go_outside_async),
+        url(
+            "https://github.com/CodeHalwell/Typhon/blob/main/docs/diagnostics/go_outside_async.md"
+        ),
+        help(
+            "move the `go` into an `async def` (and drive it with `asyncio.run(...)`), \
+             or call `asyncio.run({callee}(...))` to run the coroutine to completion here"
+        )
+    )]
+    GoOutsideAsync {
+        callee: String,
+        #[source_code]
+        src: NamedSource<String>,
+        #[label("runs at import time, with no event loop")]
+        span: SourceSpan,
+    },
+
+    /// An ordinary function-local name is read where the
+    /// definite-assignment pass cannot see an assignment on every path
+    /// that reaches it — or can see that *no* assignment does (a read
+    /// before the first assignment, after `del`, or after the
+    /// `except ... as` handler that bound it). CPython raises
+    /// `UnboundLocalError` / `NameError` on the path in question; the
+    /// warning names the read so the branch that forgot to assign can be
+    /// fixed. Advice-level: a program whose runtime never takes that path
+    /// keeps building.
+    #[error("`{name}` {reason}")]
+    #[diagnostic(
+        code(tyc::possibly_unbound),
+        url(
+            "https://github.com/CodeHalwell/Typhon/blob/main/docs/diagnostics/possibly_unbound.md"
+        ),
+        help(
+            "assign `{name}` on every path before this read (an `else` branch, a default \
+             before the loop or `try`), or restructure so the read sits where the \
+             assignment is certain"
+        )
+    )]
+    PossiblyUnbound {
+        name: String,
+        reason: String,
+        #[source_code]
+        src: NamedSource<String>,
+        #[label("read here")]
+        span: SourceSpan,
+    },
+
+    /// A `match` pattern the Python grammar accepts but the CPython
+    /// *compiler* rejects: two `*rest` captures in one sequence pattern,
+    /// or the same capture name bound twice in one pattern. The emitted
+    /// `.py` is then not valid Python at all — `tyc build` reported
+    /// success and wrote a file that fails to import — so this is an
+    /// error even though nothing about it is type-related.
+    #[error("invalid `match` pattern: {reason}")]
+    #[diagnostic(
+        code(tyc::invalid_pattern),
+        url("https://github.com/CodeHalwell/Typhon/blob/main/docs/diagnostics/invalid_pattern.md"),
+        help("{fix}")
+    )]
+    InvalidPattern {
+        reason: String,
+        fix: String,
+        #[source_code]
+        src: NamedSource<String>,
+        #[label("rejected by the Python compiler")]
+        span: SourceSpan,
+    },
+
     /// Two sibling modules aggregated by a `pub *` re-export in
     /// `__init__.ty` both expose the same name. The synthesised
     /// `from .a import X` + `from .b import X` would silently shadow
@@ -1917,6 +1992,201 @@ pub enum TycError {
         #[label("not allowed inside an `except*` handler")]
         span: SourceSpan,
     },
+}
+
+impl TycError {
+    /// The source text and span a diagnostic is anchored to, when it carries
+    /// one, for callers that relocate diagnostics from the preprocessed
+    /// buffer back onto the `.ty` text the user wrote.
+    /// The text a diagnostic's span indexes into, when it carries one.
+    pub fn source_text(&self) -> Option<&str> {
+        match self {
+            Self::Parse { src, span, .. }
+            | Self::FrozenAssign { src, span, .. }
+            | Self::MissingFieldInit { src, span, .. }
+            | Self::UnknownName { src, span, .. }
+            | Self::SelfOutsideImpl { src, span, .. }
+            | Self::TypeVarImportRejected { src, span, .. }
+            | Self::TypingAliasDeprecated { src, span, .. }
+            | Self::UnknownKwarg { src, span, .. }
+            | Self::MissingReturn { src, span, .. }
+            | Self::MissingInitialiser { src, span, .. }
+            | Self::ImplicitAny { src, span, .. }
+            | Self::NoBlockShadow { src, span, .. }
+            | Self::TypeMismatch { src, span, .. }
+            | Self::TypeReassignMismatch { src, span, .. }
+            | Self::OperatorTypeMismatch { src, span, .. }
+            | Self::TupleIndexOutOfRange { src, span, .. }
+            | Self::NullableUse { src, span, .. }
+            | Self::ResultErrorMismatch { src, span, .. }
+            | Self::WrongArgCount { src, span, .. }
+            | Self::MissingArgument { src, span, .. }
+            | Self::NotCallable { src, span, .. }
+            | Self::GeneratorReturnType { src, span, .. }
+            | Self::ManualInit { src, span, .. }
+            | Self::FieldDefaultOrdering { src, span, .. }
+            | Self::MissingAwait { src, span, .. }
+            | Self::NonExhaustiveMatch { src, span, .. }
+            | Self::InvalidQuestionOp { src, span, .. }
+            | Self::UnusedImport { src, span, .. }
+            | Self::LazyUsage { src, span, .. }
+            | Self::ExtendBuiltin { src, span, .. }
+            | Self::StdlibModuleShadow { src, span, .. }
+            | Self::UnsafeValueLeak { src, span, .. }
+            | Self::StubMismatch { src, span, .. }
+            | Self::ImpurePureFn { src, span, .. }
+            | Self::InterfaceIsinstance { src, span, .. }
+            | Self::InterfaceNotConforming { src, span, .. }
+            | Self::TypeVarBoundViolation { src, span, .. }
+            | Self::KindMismatch { src, span, .. }
+            | Self::AttributeNotFound { src, span, .. }
+            | Self::MethodInClassBody { src, span, .. }
+            | Self::ClassAttrShadowsSlot { src, span, .. }
+            | Self::MissingAnnotation { src, span, .. }
+            | Self::MissingBindingKind { src, span, .. }
+            | Self::AutoGatherMissed { src, span, .. }
+            | Self::GatherOpportunity { src, span, .. }
+            | Self::PerfMembershipInLoop { src, span, .. }
+            | Self::PerfListShiftInLoop { src, span, .. }
+            | Self::PerfStrConcatInLoop { src, span, .. }
+            | Self::PerfSortInLoop { src, span, .. }
+            | Self::PerfSortedFirst { src, span, .. }
+            | Self::PerfKeysMembership { src, span, .. }
+            | Self::LazyImportOpportunity { src, span, .. }
+            | Self::ParallelOpportunity { src, span, .. }
+            | Self::SharedMutAcrossTasks { src, span, .. }
+            | Self::MainNotCalled { src, span, .. }
+            | Self::UnknownModule { src, span, .. }
+            | Self::DuplicateClass { src, span, .. }
+            | Self::DuplicateMethod { src, span, .. }
+            | Self::ImplUnknownClass { src, span, .. }
+            | Self::CyclicTypeAlias { src, span, .. }
+            | Self::BlockingInAsync { src, span, .. }
+            | Self::ResourceNotManaged { src, span, .. }
+            | Self::DivByZeroLiteral { src, span, .. }
+            | Self::NewtypeViolation { src, span, .. }
+            | Self::FreezeNotFreezable { src, span, .. }
+            | Self::NewtypeInvalidBase { src, span, .. }
+            | Self::UseOfUninitialised { src, span, .. }
+            | Self::PossiblyUnbound { src, span, .. }
+            | Self::InvalidPattern { src, span, .. }
+            | Self::GoOutsideAsync { src, span, .. }
+            | Self::PubNameCollision { src, span, .. }
+            | Self::PubStarOutsideInit { src, span, .. }
+            | Self::AsyncWithoutAwait { src, span, .. }
+            | Self::OrphanPyImport { src, span, .. }
+            | Self::PythonSemanticDrift { src, span, .. }
+            | Self::SecretLiteralInline { src, span, .. }
+            | Self::EmptyCollectionNoAnnotation { src, span, .. }
+            | Self::TypingAliasInAnnotation { src, span, .. }
+            | Self::MutableDefaultParam { src, span, .. }
+            | Self::IsLiteralComparison { src, span, .. }
+            | Self::IncompatibleOverride { src, span, .. }
+            | Self::LoopClosureCapture { src, span, .. }
+            | Self::FrozenInheritanceConflict { src, span, .. }
+            | Self::RaiseNonException { src, span, .. }
+            | Self::NotAContextManager { src, span, .. }
+            | Self::ReturnInExceptStar { src, span, .. } => {
+                let _ = span;
+                Some(src.inner().as_str())
+            }
+            #[allow(unreachable_patterns)]
+            _ => None,
+        }
+    }
+
+    pub fn source_and_span_mut(&mut self) -> Option<(&mut NamedSource<String>, &mut SourceSpan)> {
+        match self {
+            Self::Parse { src, span, .. }
+            | Self::FrozenAssign { src, span, .. }
+            | Self::MissingFieldInit { src, span, .. }
+            | Self::UnknownName { src, span, .. }
+            | Self::SelfOutsideImpl { src, span, .. }
+            | Self::TypeVarImportRejected { src, span, .. }
+            | Self::TypingAliasDeprecated { src, span, .. }
+            | Self::UnknownKwarg { src, span, .. }
+            | Self::MissingReturn { src, span, .. }
+            | Self::MissingInitialiser { src, span, .. }
+            | Self::ImplicitAny { src, span, .. }
+            | Self::NoBlockShadow { src, span, .. }
+            | Self::TypeMismatch { src, span, .. }
+            | Self::TypeReassignMismatch { src, span, .. }
+            | Self::OperatorTypeMismatch { src, span, .. }
+            | Self::TupleIndexOutOfRange { src, span, .. }
+            | Self::NullableUse { src, span, .. }
+            | Self::ResultErrorMismatch { src, span, .. }
+            | Self::WrongArgCount { src, span, .. }
+            | Self::MissingArgument { src, span, .. }
+            | Self::NotCallable { src, span, .. }
+            | Self::GeneratorReturnType { src, span, .. }
+            | Self::ManualInit { src, span, .. }
+            | Self::FieldDefaultOrdering { src, span, .. }
+            | Self::MissingAwait { src, span, .. }
+            | Self::NonExhaustiveMatch { src, span, .. }
+            | Self::InvalidQuestionOp { src, span, .. }
+            | Self::UnusedImport { src, span, .. }
+            | Self::LazyUsage { src, span, .. }
+            | Self::ExtendBuiltin { src, span, .. }
+            | Self::StdlibModuleShadow { src, span, .. }
+            | Self::UnsafeValueLeak { src, span, .. }
+            | Self::StubMismatch { src, span, .. }
+            | Self::ImpurePureFn { src, span, .. }
+            | Self::InterfaceIsinstance { src, span, .. }
+            | Self::InterfaceNotConforming { src, span, .. }
+            | Self::TypeVarBoundViolation { src, span, .. }
+            | Self::KindMismatch { src, span, .. }
+            | Self::AttributeNotFound { src, span, .. }
+            | Self::MethodInClassBody { src, span, .. }
+            | Self::ClassAttrShadowsSlot { src, span, .. }
+            | Self::MissingAnnotation { src, span, .. }
+            | Self::MissingBindingKind { src, span, .. }
+            | Self::AutoGatherMissed { src, span, .. }
+            | Self::GatherOpportunity { src, span, .. }
+            | Self::PerfMembershipInLoop { src, span, .. }
+            | Self::PerfListShiftInLoop { src, span, .. }
+            | Self::PerfStrConcatInLoop { src, span, .. }
+            | Self::PerfSortInLoop { src, span, .. }
+            | Self::PerfSortedFirst { src, span, .. }
+            | Self::PerfKeysMembership { src, span, .. }
+            | Self::LazyImportOpportunity { src, span, .. }
+            | Self::ParallelOpportunity { src, span, .. }
+            | Self::SharedMutAcrossTasks { src, span, .. }
+            | Self::MainNotCalled { src, span, .. }
+            | Self::UnknownModule { src, span, .. }
+            | Self::DuplicateClass { src, span, .. }
+            | Self::DuplicateMethod { src, span, .. }
+            | Self::ImplUnknownClass { src, span, .. }
+            | Self::CyclicTypeAlias { src, span, .. }
+            | Self::BlockingInAsync { src, span, .. }
+            | Self::ResourceNotManaged { src, span, .. }
+            | Self::DivByZeroLiteral { src, span, .. }
+            | Self::NewtypeViolation { src, span, .. }
+            | Self::FreezeNotFreezable { src, span, .. }
+            | Self::NewtypeInvalidBase { src, span, .. }
+            | Self::UseOfUninitialised { src, span, .. }
+            | Self::PossiblyUnbound { src, span, .. }
+            | Self::InvalidPattern { src, span, .. }
+            | Self::GoOutsideAsync { src, span, .. }
+            | Self::PubNameCollision { src, span, .. }
+            | Self::PubStarOutsideInit { src, span, .. }
+            | Self::AsyncWithoutAwait { src, span, .. }
+            | Self::OrphanPyImport { src, span, .. }
+            | Self::PythonSemanticDrift { src, span, .. }
+            | Self::SecretLiteralInline { src, span, .. }
+            | Self::EmptyCollectionNoAnnotation { src, span, .. }
+            | Self::TypingAliasInAnnotation { src, span, .. }
+            | Self::MutableDefaultParam { src, span, .. }
+            | Self::IsLiteralComparison { src, span, .. }
+            | Self::IncompatibleOverride { src, span, .. }
+            | Self::LoopClosureCapture { src, span, .. }
+            | Self::FrozenInheritanceConflict { src, span, .. }
+            | Self::RaiseNonException { src, span, .. }
+            | Self::NotAContextManager { src, span, .. }
+            | Self::ReturnInExceptStar { src, span, .. } => Some((src, span)),
+            #[allow(unreachable_patterns)]
+            _ => None,
+        }
+    }
 }
 
 impl TycError {
@@ -3141,6 +3411,59 @@ impl TycError {
         }
     }
 
+    /// Construct a [`TycError::GoOutsideAsync`] error for a `go` spawn that
+    /// sits outside any `async def`.
+    pub fn go_outside_async(
+        callee: impl Into<String>,
+        path: impl Into<String>,
+        source: impl Into<String>,
+        offset: usize,
+        length: usize,
+    ) -> Self {
+        Self::GoOutsideAsync {
+            callee: callee.into(),
+            src: NamedSource::new(path.into(), source.into()),
+            span: SourceSpan::new(SourceOffset::from(offset), length),
+        }
+    }
+
+    /// Construct a [`TycError::PossiblyUnbound`] warning for a read of a
+    /// function-local name that may not (or certainly does not) have a
+    /// binding on the path that reaches it.
+    pub fn possibly_unbound(
+        name: impl Into<String>,
+        reason: impl Into<String>,
+        path: impl Into<String>,
+        source: impl Into<String>,
+        offset: usize,
+        length: usize,
+    ) -> Self {
+        Self::PossiblyUnbound {
+            name: name.into(),
+            reason: reason.into(),
+            src: NamedSource::new(path.into(), source.into()),
+            span: SourceSpan::new(SourceOffset::from(offset), length),
+        }
+    }
+
+    /// Construct a [`TycError::InvalidPattern`] error for a `match`
+    /// pattern the CPython compiler rejects.
+    pub fn invalid_pattern(
+        reason: impl Into<String>,
+        fix: impl Into<String>,
+        path: impl Into<String>,
+        source: impl Into<String>,
+        offset: usize,
+        length: usize,
+    ) -> Self {
+        Self::InvalidPattern {
+            reason: reason.into(),
+            fix: fix.into(),
+            src: NamedSource::new(path.into(), source.into()),
+            span: SourceSpan::new(SourceOffset::from(offset), length),
+        }
+    }
+
     /// Construct a [`TycError::PubNameCollision`] diagnostic for a
     /// name aggregated by `pub *` and exported by two distinct
     /// sibling modules.
@@ -3528,6 +3851,18 @@ pub struct Diagnostics {
     warnings: Vec<TycError>,
 }
 
+/// Byte offset of the start of every line in `text` (always at least one
+/// entry, for the first line).
+fn line_starts(text: &str) -> Vec<usize> {
+    let mut starts = vec![0];
+    for (i, b) in text.bytes().enumerate() {
+        if b == b'\n' && i + 1 < text.len() {
+            starts.push(i + 1);
+        }
+    }
+    starts
+}
+
 impl Diagnostics {
     pub fn new() -> Self {
         Self::default()
@@ -3552,6 +3887,81 @@ impl Diagnostics {
 
     pub fn errors(&self) -> &[TycError] {
         &self.errors
+    }
+
+    /// Relocate every diagnostic anchored to `expanded` (the preprocessed
+    /// buffer the parser and checker saw) onto `original` (the `.ty` text the
+    /// user wrote), through `line_map[expanded_line] = original_line`.
+    ///
+    /// Sugar expansion inserts and removes lines, so a byte offset into the
+    /// expanded buffer names the wrong line of the file — every diagnostic
+    /// below a `?`, `gather:` or `with`-chain expansion reported the
+    /// preprocessed buffer's line number, and the LSP could publish a range
+    /// past the end of the document. The column is carried across unchanged
+    /// (rewritten lines shift by at most a keyword) and clamped to the target
+    /// line; a span that would run past the end of its line is shortened.
+    /// Diagnostics already anchored to a different text (the `?` validator
+    /// reports against the original source) are left alone.
+    pub fn remap_lines(
+        &mut self,
+        expanded: &str,
+        line_map: &[usize],
+        original_name: &str,
+        original: &str,
+    ) {
+        if line_map.is_empty() || expanded == original {
+            return;
+        }
+        let expanded_starts = line_starts(expanded);
+        let original_starts = line_starts(original);
+        let original_line_len = |line: usize| -> usize {
+            let start = original_starts[line];
+            let end = original_starts
+                .get(line + 1)
+                .copied()
+                .unwrap_or(original.len());
+            original[start..end].trim_end_matches(['\n', '\r']).len()
+        };
+        for err in self.errors.iter_mut().chain(self.warnings.iter_mut()) {
+            let Some((src, span)) = err.source_and_span_mut() else {
+                continue;
+            };
+            if src.inner().as_str() != expanded {
+                continue;
+            }
+            let offset = span.offset().min(expanded.len());
+            let line = match expanded_starts.binary_search(&offset) {
+                Ok(l) => l,
+                Err(l) => l.saturating_sub(1),
+            };
+            let col = offset - expanded_starts[line];
+            let target = line_map
+                .get(line)
+                .copied()
+                .unwrap_or(line)
+                .min(original_starts.len().saturating_sub(1));
+            let width = original_line_len(target);
+            let new_col = col.min(width);
+            let new_len = span.len().clamp(1, (width - new_col).max(1));
+            *src = NamedSource::new(original_name, original.to_owned());
+            *span = SourceSpan::new(
+                SourceOffset::from(original_starts[target] + new_col),
+                new_len,
+            );
+        }
+    }
+
+    /// Report every diagnostic under `name` instead of the file it was
+    /// produced from. `tyc run --compile <file>` stages the script into a
+    /// temp scaffold, so without this the user is pointed at
+    /// `/tmp/tyc-script-…/src/main.ty` rather than their own file.
+    pub fn rename_source(&mut self, name: &str) {
+        for err in self.errors.iter_mut().chain(self.warnings.iter_mut()) {
+            let Some((src, _)) = err.source_and_span_mut() else {
+                continue;
+            };
+            *src = NamedSource::new(name, src.inner().clone());
+        }
     }
 
     pub fn warnings(&self) -> &[TycError] {
@@ -4653,6 +5063,45 @@ pub fn sanitised_named_source_for(err: &TycError) -> Option<NamedSource<String>>
     Some(NamedSource::new(src.name(), cleaned))
 }
 
+/// A sanitised-source cache for one render pass.
+///
+/// Sanitising is O(file), so a renderer that calls it per diagnostic is
+/// O(n_diags × file_size). The obvious fix — sanitise the first diagnostic
+/// of a file and reuse it for the rest — is wrong: diagnostics grouped by
+/// file do NOT all carry the same buffer. Most are remapped onto the
+/// original `.ty` text, but any that isn't still carries the preprocessed
+/// one, and lending that buffer to a remapped diagnostic renders its
+/// (original-coordinate) span against preprocessed text. In `stress/…/
+/// 07-sdk-client` that put a `tyc::type_mismatch` two lines off, inside a
+/// comment, under a line showing `dict[str, object] | None` where the
+/// source says `?`.
+///
+/// So the cache is keyed by the buffer a diagnostic actually carries. In
+/// the common case (every diagnostic remapped onto the same source) that
+/// is still one sanitise per file.
+#[derive(Default)]
+pub struct SanitisedSourceCache {
+    entries: Vec<(String, NamedSource<String>)>,
+}
+
+impl SanitisedSourceCache {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The sanitised source for `err`'s own buffer, or `None` when the
+    /// diagnostic embeds no source at all.
+    pub fn get(&mut self, err: &TycError) -> Option<NamedSource<String>> {
+        let src = err.embedded_source()?;
+        if let Some((_, cached)) = self.entries.iter().find(|(raw, _)| raw == src.inner()) {
+            return Some(cached.clone());
+        }
+        let cleaned = NamedSource::new(src.name(), sanitize_synthetic_source(src.inner()));
+        self.entries.push((src.inner().to_owned(), cleaned.clone()));
+        Some(cleaned)
+    }
+}
+
 impl std::fmt::Debug for SanitisedDiagnostic {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         std::fmt::Debug::fmt(&self.inner, f)
@@ -4790,6 +5239,45 @@ fn dedup_vec(v: &mut Vec<TycError>) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn remap_lines_moves_a_diagnostic_onto_the_original_line() {
+        // The expanded buffer has two synthesised lines (a temp binding and
+        // its guard) before the user's statement; the map says every expanded
+        // line 1..=3 came from original line 1.
+        let original = "def f() -> int:\n    let x: int = g()?\n    return x\n";
+        let expanded = "def f() -> int:\n    __q = g()\n    if isinstance(__q, Err):\n        return __q\n    x: int = __q.value\n    return x\n";
+        let line_map = vec![0, 1, 1, 1, 1, 2];
+        // `return x` sits on expanded line 5 (offset of its `x`).
+        let offset = expanded.rfind("return x").unwrap() + "return ".len();
+        let mut diags = super::Diagnostics::new();
+        diags.push_error(super::TycError::nullable_use(
+            "x", "int", "f.ty", expanded, offset, 1,
+        ));
+        // Anchored to the original text already: must be left alone.
+        diags.push_warning(super::TycError::nullable_use(
+            "y", "int", "f.ty", original, 4, 1,
+        ));
+        diags.remap_lines(expanded, &line_map, "f.ty", original);
+        let e = &diags.errors()[0];
+        assert_eq!(e.source_text(), Some(original));
+        let (_, span) = e
+            .clone()
+            .source_and_span_mut()
+            .map(|(s, sp)| (s.clone(), *sp))
+            .unwrap();
+        // Original line 2 is `    return x`; the column (11) is carried across.
+        let line2 = original.find("    return x").unwrap();
+        assert_eq!(span.offset(), line2 + "    return ".len());
+        assert_eq!(span.len(), 1);
+        let w = &diags.warnings()[0];
+        let (_, wspan) = w
+            .clone()
+            .source_and_span_mut()
+            .map(|(s, sp)| (s.clone(), *sp))
+            .unwrap();
+        assert_eq!(wspan.offset(), 4);
+    }
+
     use super::*;
 
     // ── TycError constructor correctness ─────────────────────────────────────
@@ -5627,6 +6115,46 @@ mod tests {
     }
 
     #[test]
+    fn sanitised_cache_gives_each_diagnostic_its_own_source() {
+        // The cache must be keyed by the buffer a diagnostic actually
+        // carries, not by the file it belongs to: two diagnostics in one
+        // file can hold different buffers (one remapped onto the `.ty`
+        // text, one still on the preprocessed one), and lending the first's
+        // buffer to the second renders its span against the wrong text.
+        let original = "impl SDK:\n    def req(self, b: int?) -> int:\n        return b\n";
+        let preprocessed = concat!(
+            "class __typhon_impl_SDK(object):\n",
+            "    def req(self, b: int | None) -> int:\n",
+            "        return b\n",
+        );
+        let a = TycError::parse("k.ty", original, "boom", 0);
+        let b = TycError::parse("k.ty", preprocessed, "boom", 0);
+
+        let mut cache = SanitisedSourceCache::new();
+        let sa = cache.get(&a).expect("source a");
+        let sb = cache.get(&b).expect("source b");
+        assert_eq!(
+            sa.inner().as_str(),
+            original,
+            "a diagnostic on the original source keeps it verbatim"
+        );
+        assert!(
+            !sb.inner().contains("__typhon_impl_"),
+            "the preprocessed one is still sanitised: {}",
+            sb.inner()
+        );
+        assert_ne!(
+            sa.inner(),
+            sb.inner(),
+            "the two must not be given the same buffer"
+        );
+        // Asking again for the same buffer reuses the cached entry rather
+        // than sanitising a second time.
+        let again = cache.get(&b).expect("source b again");
+        assert_eq!(again.inner(), sb.inner());
+    }
+
+    #[test]
     fn new_variant_codes_are_stable() {
         use miette::Diagnostic;
         let cases: &[(&str, TycError)] = &[
@@ -5667,6 +6195,19 @@ mod tests {
 /// in a crate both surfaces already depend on.
 ///
 /// An empty string means "not configured" and takes the diagnostic's default.
+/// The `[strictness]` severity values `tyc check` / `tyc build` accept. A
+/// value outside this set is a hard config error on the CLI, so no surface
+/// may quietly honour one: shared here so the language server applies the
+/// same rule instead of passing an unrecognised string through.
+pub const ALLOWED_SEVERITIES: [&str; 3] = ["off", "warn", "error"];
+
+/// True when `value` is a severity the CLI would accept, or the empty
+/// string that means "not configured".
+pub fn is_valid_severity(value: &str) -> bool {
+    let v = value.trim();
+    v.is_empty() || ALLOWED_SEVERITIES.contains(&v)
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct SeverityOverrides {
     /// `"warn"` (default) | `"error"` | `"off"`.

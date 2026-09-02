@@ -1,0 +1,12 @@
+type Shape = Circle | Square
+
+class Circle:
+    r: float
+
+class Square:
+    s: float
+
+def area(sh: Shape) -> float:
+    match sh:
+        case Circle(r=r):
+            return 3.14 * r * r

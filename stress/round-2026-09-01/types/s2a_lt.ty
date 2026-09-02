@@ -1,0 +1,8 @@
+def f(x: int?) -> bool:
+    return x < 1
+
+def main() -> None:
+    print(f(None))
+
+if __name__ == "__main__":
+    main()

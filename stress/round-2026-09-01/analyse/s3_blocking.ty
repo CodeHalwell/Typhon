@@ -1,0 +1,15 @@
+import asyncio
+import time as t
+import subprocess
+import os
+import sys
+from time import sleep
+
+async def work() -> None:
+    await asyncio.sleep(0)
+    t.sleep(0.1)
+    sleep(0.1)
+    subprocess.Popen(["true"])
+    os.system("true")
+    sys.stdin.readline()
+    time.sleep(0.1)

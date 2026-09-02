@@ -1,0 +1,20 @@
+def f(x: int) -> int:
+    return x + 1
+
+def g(x: int) -> int:
+    return x * 10
+
+def main() -> None:
+    let r: int = (
+        1
+        |> f()  # add one
+        |> g()
+    )
+    let s: int = (
+        1  # start
+        |> g()
+    )
+    print(r, s)
+
+if __name__ == "__main__":
+    main()

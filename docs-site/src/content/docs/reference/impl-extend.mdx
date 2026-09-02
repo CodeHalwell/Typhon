@@ -172,13 +172,13 @@ For built-in types (`str`, `list`, `int`, `dict`, `bytes`, `set`, `frozenset`, `
   </TabItem>
   <TabItem label="Emitted Python">
     ```python
-    def __typhon_ext_str__to_slug(self: str) -> str:
+    def __typhon_ext_str__to_slug__(self: str) -> str:
         return self.lower().replace(" ", "-")
 
 
     def main() -> None:
         title: str = "Hello World"
-        slug: str = __typhon_ext_str__to_slug(title)
+        slug: str = __typhon_ext_str__to_slug__(title)
         print(slug)
     ```
   </TabItem>

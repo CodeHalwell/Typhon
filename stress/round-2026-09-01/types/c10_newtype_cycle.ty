@@ -1,0 +1,6 @@
+newtype A = B
+newtype B = A
+
+def main() -> None:
+    let a: A = A(1)
+    print(a)

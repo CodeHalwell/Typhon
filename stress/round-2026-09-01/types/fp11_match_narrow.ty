@@ -1,0 +1,14 @@
+def f(x: int | str | None) -> str:
+    match x:
+        case int():
+            return str(x + 1)
+        case str():
+            return x.upper()
+        case None:
+            return "none"
+
+def main() -> None:
+    print(f(1), f("a"), f(None))
+
+if __name__ == "__main__":
+    main()

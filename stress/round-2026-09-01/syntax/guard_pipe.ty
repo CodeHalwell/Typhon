@@ -1,0 +1,12 @@
+def f(x: int) -> int?:
+    return x + 1 if x > 0 else None
+
+def run(x: int) -> int:
+    guard v = x |> f() else: return -1
+    return v
+
+def main() -> None:
+    print(run(1), run(-5))
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,17 @@
+mut N: int = 0
+
+def nid() -> int:
+    global N
+    N += 1
+    return N
+
+class A:
+    id: int = nid()
+
+class B(A):
+    y: int = 0
+
+def main() -> None:
+    print(N, A(), B())
+
+main()

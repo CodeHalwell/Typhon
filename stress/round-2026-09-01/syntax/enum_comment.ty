@@ -1,0 +1,10 @@
+enum Color:
+    RED  # the primary
+    GREEN
+    BLUE
+
+def main() -> None:
+    print(Color.RED, Color.GREEN.value)
+
+if __name__ == "__main__":
+    main()

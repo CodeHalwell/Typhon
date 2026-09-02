@@ -1,0 +1,16 @@
+interface HasX:
+    x: int
+
+class P frozen:
+    x: int
+
+def poke(h: HasX) -> None:
+    h.x = 5
+
+def main() -> None:
+    let p: P = P(x=1)
+    poke(p)
+    print(p.x)
+
+if __name__ == "__main__":
+    main()

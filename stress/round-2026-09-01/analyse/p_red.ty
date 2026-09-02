@@ -1,0 +1,9 @@
+def total_of(xs: list[int], flag: bool) -> int:
+    mut total: int = 0
+    if flag:
+        for x in xs:
+            total += x * 2
+    print("last x:", x)
+    return total
+
+print(total_of([1, 2, 3], True))

@@ -1,0 +1,13 @@
+from typing import Callable
+
+def only_one(x: int, **kw: object) -> int:
+    return x
+
+def apply(f: Callable[[int, str], int]) -> int:
+    return f(1, "two")
+
+def main() -> None:
+    print(apply(only_one))
+
+if __name__ == "__main__":
+    main()

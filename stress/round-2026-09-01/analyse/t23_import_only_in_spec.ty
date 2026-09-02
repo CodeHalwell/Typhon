@@ -1,0 +1,6 @@
+import string
+
+def f(v: float) -> str:
+    return f"{v:{string.digits[3]}}"
+
+print(f(1.5))

@@ -1,0 +1,25 @@
+from collections.abc import Callable
+
+class A:
+    x: int
+
+impl A:
+    def name(self) -> str:
+        return "A"
+
+class B(A):
+    y: int
+
+impl B:
+    def name(self) -> str:
+        let f: Callable[[], str] = lambda: super().name()
+        return "B>" + f()
+
+    def names(self) -> list[str]:
+        return [super().name() for _ in range(2)]
+
+def main() -> None:
+    let b: B = B(x=1, y=2)
+    print(b.name(), b.names())
+
+main()

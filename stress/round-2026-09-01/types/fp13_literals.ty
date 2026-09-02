@@ -1,0 +1,15 @@
+def main() -> None:
+    let a: dict[str, object] = {"a": 1, "b": "x"}
+    let b: list[float] = [1, 2, 3]
+    let c: list[int | str] = [1, "a"]
+    let d: tuple[int, ...] = (1, 2)
+    let e: float = sum(b) / len(b)
+    let f: list[tuple[str, int]] = sorted({"a": 1}.items(), key=lambda kv: kv[1])
+    let g: str = "".join(str(i) for i in range(3))
+    let h: dict[str, int] = dict(zip(["a"], [1]))
+    let i: list[str] = [w for w in "a b".split()]
+    let j: set[int] = set(b)
+    print(a, b, c, d, e, f, g, h, i, j)
+
+if __name__ == "__main__":
+    main()

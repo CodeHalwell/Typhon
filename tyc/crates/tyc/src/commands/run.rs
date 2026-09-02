@@ -37,6 +37,11 @@ use crate::commands::build::{self, BuildArgs};
 use crate::commands::check::{self, CheckArgs};
 use crate::config::TyphonConfig;
 
+/// The `--python` default. Recognised as "not explicitly chosen" by
+/// [`resolve_interpreter`], which then prefers the project's own venv or a
+/// `python3.<minor>` matching `[python] target`.
+const DEFAULT_PYTHON: &str = "python3";
+
 /// Arguments for `tyc run`.
 #[derive(Args, Debug)]
 pub struct RunArgs {
@@ -62,15 +67,15 @@ pub struct RunArgs {
     )]
     pub entry: PathBuf,
 
-    /// Python interpreter to use in `--compile` mode (defaults to `python3`).
-    /// Requires `--compile`.
-    #[arg(
-        long,
-        value_name = "PATH",
-        default_value = "python3",
-        requires = "compile"
-    )]
-    pub python: String,
+    /// Python interpreter to use for the compiled path (defaults to the
+    /// project's `.venv`, else `python3.<minor>` for `[python] target`,
+    /// else `python3`). Applies to `--compile` and to the automatic
+    /// fallback the VM takes for an unmodelled import.
+    /// `None` when the flag was not given: `--python python3` has to mean
+    /// *that* interpreter, not "fall back to the venv", so the default
+    /// cannot be baked in as a string.
+    #[arg(long, value_name = "PATH")]
+    pub python: Option<String>,
 
     /// Build into a temporary directory that is deleted when the process
     /// exits, instead of the configured `out` dir. No build artifacts
@@ -83,6 +88,14 @@ pub struct RunArgs {
     /// Incompatible with `--temp`. Requires `--compile`.
     #[arg(long, requires = "compile")]
     pub no_build: bool,
+
+    /// Never fall back to the compiled path: fail with the VM's own
+    /// `ModuleNotFoundError` when the program imports a module the VM does
+    /// not model, instead of transparently building and running it under
+    /// CPython. Use this to keep a run hermetic, or to find out whether the
+    /// VM covers a program's imports.
+    #[arg(long, conflicts_with = "compile")]
+    pub no_fallback: bool,
 
     /// Extra arguments forwarded to the program after `--`.
     #[arg(last = true, value_name = "ARGS")]
@@ -102,6 +115,7 @@ pub fn run(args: RunArgs) -> Result<()> {
     // this shape outright; the scaffold makes it just work.
     let mut _scaffold_guard: Option<TempDir> = None;
     let mut scaffold_no_sync = false;
+    let mut source_label: Option<String> = None;
     if args.path.is_file() {
         if args.no_build {
             return Err(miette!(
@@ -122,18 +136,42 @@ pub fn run(args: RunArgs) -> Result<()> {
             .map_err(|e| miette!("cannot create temp scaffold src/: {e}"))?;
         std::fs::copy(&src_file, scaffold.path().join("src").join("main.ty"))
             .map_err(|e| miette!("cannot stage '{}': {}", src_file.display(), e))?;
+        // The modules the script imports from beside itself come too — the
+        // VM loads them on demand, so a compiled run that omitted them would
+        // fail on an import the VM resolves.
+        for sibling in sibling_modules(&src_file) {
+            let Some(name) = sibling.file_name() else {
+                continue;
+            };
+            std::fs::copy(&sibling, scaffold.path().join("src").join(name))
+                .map_err(|e| miette!("cannot stage '{}': {}", sibling.display(), e))?;
+        }
+        // An adjacent package comes too, shape intact.
+        for package in sibling_packages(&src_file) {
+            let Some(name) = package.file_name() else {
+                continue;
+            };
+            stage_package(&package, &scaffold.path().join("src").join(name))?;
+        }
         let name = src_file
             .file_stem()
             .and_then(|n| n.to_str())
             .unwrap_or("script")
             .replace(|c: char| !c.is_alphanumeric() && c != '-' && c != '_', "-");
+        // `traceback-remap` is default-off for projects (it costs an import
+        // in the entry module), but a staged script has no build directory
+        // the user can inspect: without it an uncaught exception's traceback
+        // names `/tmp/tyc-script-…/build/main.py` lines they cannot read.
         std::fs::write(
             scaffold.path().join("typhon.toml"),
             format!(
-                "[project]\nname = \"{name}\"\nversion = \"0.0.0\"\nsrc = \"src\"\nout = \"build\"\n\n[python]\ntarget = \"3.13\"\n"
+                "[project]\nname = \"{name}\"\nversion = \"0.0.0\"\nsrc = \"src\"\nout = \"build\"\n\n[python]\ntarget = \"3.13\"\n\n[emit]\ntraceback-remap = true\n"
             ),
         )
         .map_err(|e| miette!("cannot write temp typhon.toml: {e}"))?;
+        // Diagnostics from the build must name the file the user ran, not
+        // the staged copy inside the scaffold.
+        source_label = Some(args.path.display().to_string());
         args.path = scaffold.path().to_path_buf();
         args.temp = true;
         scaffold_no_sync = true;
@@ -142,7 +180,16 @@ pub fn run(args: RunArgs) -> Result<()> {
     // 1. Decide where build outputs go.  In `--temp` mode we own a
     //    TempDir guard whose Drop removes the directory; we keep it
     //    alive across the child process by binding it to a local.
-    let (out_dir, _tmp_guard): (PathBuf, Option<TempDir>) = if args.temp {
+    //
+    //    For a single-file scaffold the output has to live *inside* that
+    //    scaffold: `tyc build` refuses to write outside the project root it
+    //    was handed, so a second, sibling temp directory made
+    //    `tyc run --compile script.ty` fail outright with "refusing to
+    //    write … outside the project root". The scaffold is itself a
+    //    TempDir, so nothing persists either way.
+    let (out_dir, _tmp_guard): (PathBuf, Option<TempDir>) = if scaffold_no_sync {
+        (args.path.join("build"), None)
+    } else if args.temp {
         let tmp = tempfile::Builder::new()
             .prefix("tyc-run-")
             .tempdir()
@@ -187,6 +234,7 @@ pub fn run(args: RunArgs) -> Result<()> {
             no_sync: scaffold_no_sync,
             with_ty: false,
             optimise: false,
+            source_label: source_label.clone(),
         })?;
     }
 
@@ -197,6 +245,13 @@ pub fn run(args: RunArgs) -> Result<()> {
             entry.display()
         ));
     }
+
+    // The project root, for locating a `.venv` and reading `[python] target`
+    // when picking the interpreter below.
+    let project_root_for_python = args
+        .path
+        .canonicalize()
+        .unwrap_or_else(|_| args.path.clone());
 
     // 3. Decide between two spawn shapes:
     //    (a) script mode: `python build/main.py` — works for single-file
@@ -211,7 +266,8 @@ pub fn run(args: RunArgs) -> Result<()> {
     //    For module mode we set the cwd to the build dir's parent so
     //    Python picks up the package automatically; we also stash the
     //    parent in `PYTHONPATH` for good measure.
-    let mut cmd = Command::new(&args.python);
+    let interpreter = resolve_interpreter(&args, &project_root_for_python);
+    let mut cmd = Command::new(&interpreter);
     // Decide between script mode (`python entry.py`) and module mode
     // (`python -m pkg.sub.entry`). We use module mode whenever the
     // entry's immediate parent directory has an `__init__.py` — i.e.
@@ -261,7 +317,7 @@ pub fn run(args: RunArgs) -> Result<()> {
 
     let status = cmd
         .status()
-        .map_err(|e| miette!("cannot spawn '{}': {e}", args.python))?;
+        .map_err(|e| miette!("cannot spawn '{}': {e}", interpreter))?;
 
     // 4. Propagate the child's exit code verbatim, but drop the TempDir
     //    guard first so its Drop runs — process::exit skips destructors.
@@ -272,6 +328,70 @@ pub fn run(args: RunArgs) -> Result<()> {
     // leaks a temp directory.
     drop(_scaffold_guard);
     std::process::exit(code);
+}
+
+/// The interpreter to exec the built program with.
+///
+/// An explicit `--python` always wins. Otherwise the default `python3` is
+/// only a last resort: a project targeting 3.13+ must not be run by
+/// whatever `python3` happens to be first on `PATH` (3.11 on many
+/// systems), because the emitted code uses PEP 695 syntax that older
+/// interpreters reject with a `SyntaxError`. Prefer, in order, the
+/// project's own `.venv` (which `uv sync` provisions for the configured
+/// target), then `python3.<minor>` for that target, then `python3`.
+fn resolve_interpreter(args: &RunArgs, project_root: &std::path::Path) -> String {
+    if let Some(explicit) = &args.python {
+        return explicit.clone();
+    }
+    // A Windows virtualenv puts its interpreter somewhere else entirely.
+    let venv = if cfg!(windows) {
+        project_root
+            .join(".venv")
+            .join("Scripts")
+            .join("python.exe")
+    } else {
+        project_root.join(".venv").join("bin").join("python")
+    };
+    if venv.exists() {
+        return venv.to_string_lossy().into_owned();
+    }
+    let target = TyphonConfig::load(project_root)
+        .ok()
+        .flatten()
+        .map(|(_, cfg)| cfg.python.target)
+        .unwrap_or_default();
+    // `3.13` / `3.14t` → `python3.13` / `python3.14`.
+    let minor: String = target
+        .split('.')
+        .nth(1)
+        .unwrap_or_default()
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect();
+    if !minor.is_empty() {
+        let versioned = format!("python3.{minor}");
+        if which_on_path(&versioned) {
+            return versioned;
+        }
+    }
+    DEFAULT_PYTHON.to_owned()
+}
+
+/// Whether `name` resolves to an executable on `PATH`.
+fn which_on_path(name: &str) -> bool {
+    let Some(paths) = std::env::var_os("PATH") else {
+        return false;
+    };
+    // On Windows an executable is only found with one of `PATHEXT`'s
+    // suffixes appended: `python3.13` never matches `python3.13.exe`.
+    let mut names: Vec<String> = vec![name.to_owned()];
+    if cfg!(windows) {
+        let exts = std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_owned());
+        for ext in exts.split(';').filter(|e| !e.is_empty()) {
+            names.push(format!("{name}{ext}"));
+        }
+    }
+    std::env::split_paths(&paths).any(|dir| names.iter().any(|n| dir.join(n).is_file()))
 }
 
 /// Default execution path — the in-process tree-walking VM. Resolves the
@@ -290,6 +410,27 @@ pub fn run(args: RunArgs) -> Result<()> {
 /// deliberately-broken inputs in stress harnesses).
 fn run_vm(args: RunArgs) -> Result<()> {
     let entry = resolve_vm_entry(&args.path)?;
+    // `tyc run` is contractually a drop-in for `tyc build` + CPython, and
+    // the VM models a documented subset of the stdlib. Rather than dying
+    // with `ModuleNotFoundError` on a program the compiled path runs fine,
+    // take that path automatically. The decision is made *before* the
+    // pre-run check and before any user code runs, so a program never
+    // half-executes and then restarts, and its diagnostics are reported
+    // once (by the build) rather than by both paths.
+    if !args.no_fallback {
+        if let Some(missing) = unmodelled_imports(&args.path, &entry) {
+            eprintln!(
+                "note: `{}` {} not modelled by the in-process VM — running via \
+                 `--compile` (build + CPython) so the program behaves as it \
+                 does after `tyc build`. Pass `--no-fallback` to require the VM.",
+                missing.join("`, `"),
+                if missing.len() == 1 { "is" } else { "are" },
+            );
+            let mut compiled = args;
+            compiled.compile = true;
+            return run(compiled);
+        }
+    }
     if std::env::var_os("TYC_SKIP_CHECK").is_none() {
         check::run(CheckArgs {
             paths: vm_check_scope(&args.path, &entry),
@@ -300,6 +441,156 @@ fn run_vm(args: RunArgs) -> Result<()> {
     }
     let code = tyc_vm::run_file(&entry, &args.script_args).map_err(|e| miette!("{e}"))?;
     std::process::exit(code);
+}
+
+/// Modules the program imports that the VM cannot serve, or `None` when
+/// every import is either VM-modelled or a module of this project.
+///
+/// Scans the same file set the pre-run check covers, so an unmodelled
+/// import in a sibling module is caught before the entry starts running.
+fn unmodelled_imports(path: &std::path::Path, entry: &std::path::Path) -> Option<Vec<String>> {
+    let scope = vm_check_scope(path, entry);
+    let mut files: Vec<PathBuf> = Vec::new();
+    for p in scope {
+        if p.is_dir() {
+            files.extend(crate::commands::util::collect_ty_files(&p).unwrap_or_default());
+        } else {
+            files.push(p);
+        }
+    }
+    // A bare file outside a project has only itself in scope, but the VM
+    // still loads `.ty` modules sitting beside it. Without them here, a
+    // `from helper import …` looked like an unmodelled external module and
+    // sent a perfectly runnable program down the compiled path — which then
+    // failed, since the scaffold stages only the entry.
+    for sibling in sibling_modules(entry) {
+        if !files.contains(&sibling) {
+            files.push(sibling);
+        }
+    }
+    // A sibling `.ty` is a module of this project, not an external import.
+    let project_roots: std::collections::HashSet<String> = files
+        .iter()
+        .filter_map(|f| f.file_stem().and_then(|s| s.to_str()).map(str::to_owned))
+        .collect();
+    // An adjacent *package* is local too, but the VM will load every module
+    // in it — so its files are scanned as well. They are added after
+    // `project_roots` is computed, so a submodule's name does not start
+    // standing in for a top-level import.
+    for package in sibling_packages(entry) {
+        for file in crate::commands::util::collect_ty_files(&package).unwrap_or_default() {
+            if !files.contains(&file) {
+                files.push(file);
+            }
+        }
+    }
+    let mut missing: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for file in &files {
+        let Some(roots) = imported_roots(file) else {
+            // Falling back to the compiled path is the safe answer for a
+            // file this scan cannot read: the build reports the parse
+            // error properly, and the VM never starts on an unknown import.
+            missing.insert(format!("<unparsed {}>", file.display()));
+            continue;
+        };
+        for root in roots {
+            if tyc_vm::models_module(&root) || project_roots.contains(&root) {
+                continue;
+            }
+            // A directory next to the entry is a project package.
+            if entry
+                .parent()
+                .is_some_and(|dir| dir.join(&root).join("__init__.ty").exists())
+            {
+                continue;
+            }
+            missing.insert(root);
+        }
+    }
+    if missing.is_empty() {
+        None
+    } else {
+        Some(missing.into_iter().collect())
+    }
+}
+
+/// The `.ty` files beside `entry` that the program reaches by import,
+/// transitively — the modules the VM would load on demand.
+///
+/// Only plain siblings resolve here (`from helper import x` →
+/// `<entry dir>/helper.ty`); a package directory is recognised separately by
+/// its `__init__.ty`, and a project invocation has already widened to the
+/// whole `src` tree.
+fn sibling_modules(entry: &std::path::Path) -> Vec<PathBuf> {
+    let Some(dir) = entry.parent() else {
+        return Vec::new();
+    };
+    let mut seen: std::collections::BTreeSet<PathBuf> = std::collections::BTreeSet::new();
+    let mut queue: Vec<PathBuf> = vec![entry.to_path_buf()];
+    while let Some(file) = queue.pop() {
+        for root in imported_roots(&file).unwrap_or_default() {
+            let candidate = dir.join(format!("{root}.ty"));
+            if candidate.is_file() && seen.insert(candidate.clone()) {
+                queue.push(candidate);
+            }
+        }
+    }
+    seen.into_iter().collect()
+}
+
+/// The import roots `file` names, or `None` when it cannot be read or parsed.
+///
+/// Runs the same expansion chain the VM's entry point does, so a file using
+/// `?`, `|>` or `gather:` is read rather than silently skipped.
+fn imported_roots(file: &std::path::Path) -> Option<std::collections::BTreeSet<String>> {
+    let text = std::fs::read_to_string(file).ok()?;
+    let expanded = tyc_syntax::preprocess::expand_all(&text);
+    let prep = tyc_syntax::preprocess::preprocess(&expanded);
+    let parsed = tyc_syntax::parse_module(&prep.python_source).ok()?;
+    Some(tyc_resolve::collect_imported_roots(&parsed.into_syntax()))
+}
+
+/// Package directories beside `entry` that the program reaches by import — a
+/// `<root>/__init__.ty` next to it, or next to one of its siblings.
+///
+/// The VM loads these on demand exactly as it loads a plain sibling, so the
+/// unmodelled-import scan has to look inside them (a package importing
+/// `sqlite3` must send the program down the compiled path, not into a VM
+/// that dies on it) and the scaffold has to stage them.
+fn sibling_packages(entry: &std::path::Path) -> Vec<PathBuf> {
+    let Some(dir) = entry.parent() else {
+        return Vec::new();
+    };
+    let mut sources: Vec<PathBuf> = vec![entry.to_path_buf()];
+    sources.extend(sibling_modules(entry));
+    let mut packages: std::collections::BTreeSet<PathBuf> = std::collections::BTreeSet::new();
+    for file in sources {
+        for root in imported_roots(&file).unwrap_or_default() {
+            let candidate = dir.join(&root);
+            if candidate.join("__init__.ty").is_file() {
+                packages.insert(candidate);
+            }
+        }
+    }
+    packages.into_iter().collect()
+}
+
+/// Copy a package's `.ty` sources into the temp scaffold, preserving shape.
+fn stage_package(from: &std::path::Path, to: &std::path::Path) -> Result<()> {
+    std::fs::create_dir_all(to).map_err(|e| miette!("cannot create '{}': {e}", to.display()))?;
+    let entries =
+        std::fs::read_dir(from).map_err(|e| miette!("cannot read '{}': {e}", from.display()))?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let target = to.join(entry.file_name());
+        if path.is_dir() {
+            stage_package(&path, &target)?;
+        } else if path.extension().is_some_and(|e| e == "ty") {
+            std::fs::copy(&path, &target)
+                .map_err(|e| miette!("cannot stage '{}': {e}", path.display()))?;
+        }
+    }
+    Ok(())
 }
 
 /// Decide which path(s) the pre-run `tyc check` should cover.
@@ -425,7 +716,15 @@ mod tests {
     #[test]
     fn args_default_to_python3_and_main_py() {
         let parsed = <WrapRun as clap::Parser>::try_parse_from(["run"]).unwrap();
-        assert_eq!(parsed.args.python, "python3");
+        assert_eq!(parsed.args.python, None);
+        assert_eq!(
+            <WrapRun as clap::Parser>::try_parse_from(["run", "--python", "python3"])
+                .unwrap()
+                .args
+                .python
+                .as_deref(),
+            Some("python3")
+        );
         assert_eq!(parsed.args.entry, PathBuf::from("main.py"));
         assert_eq!(parsed.args.path, PathBuf::from("."));
         assert!(parsed.args.script_args.is_empty());
@@ -496,9 +795,10 @@ mod tests {
             path: file,
             compile: true,
             entry: PathBuf::from("main.py"),
-            python: "python3".into(),
+            python: None,
             temp: false,
             no_build: true,
+            no_fallback: false,
             script_args: vec![],
         };
         let err = run(args).expect_err("--compile --no-build on a single file must fail");
@@ -520,9 +820,10 @@ mod tests {
             path: tmp.path().to_path_buf(),
             compile: true,
             entry: PathBuf::from("main.py"),
-            python: "python3".into(),
+            python: None,
             temp: false,
             no_build: true,
+            no_fallback: false,
             script_args: vec![],
         };
         let err = run(args).expect_err("missing entry must fail");

@@ -138,7 +138,7 @@ The 30-second mental model. Every later section in this skill is detail under on
 | Enum (v0.11.0) | `enum Color: RED; GREEN` / `enum C: RED = 1` | `class Color(enum.Enum): RED = enum.auto(); ...` (`import enum` injected) |
 | Methods | `impl User: def display(self) -> str: ...` | merged into the class body |
 | Extend foreign class | `extend User: def x(self) -> int: ...` | merged at desugar |
-| Extend built-in | `extend str: def slug(self) -> str: ...` | extracted to `__typhon_ext_str__slug` free fn + call-site rewrites |
+| Extend built-in | `extend str: def slug(self) -> str: ...` | extracted to `__typhon_ext_str__slug__` free fn + call-site rewrites |
 | Sealed union | `type Shape = Circle \| Rectangle` | `Shape = Circle \| Rectangle` (just a type alias) |
 | `impl` on sealed union (v0.6.0) | `impl Shape: def area(self) -> float: ...` | distributes the method to every variant |
 | Exhaustive match | `match s: case Circle(r): ...` (no `_` needed) | vanilla Python `match` |
@@ -150,7 +150,7 @@ The 30-second mental model. Every later section in this skill is detail under on
 | Result chain | `with a = f()?, b = g()?: ...  else err: ...` | sequenced if-isinstance ladder |
 | Generic fn | `def first[T](xs: list[T]) -> T?:` | same (PEP 695) |
 | Generic class | `class Box[T]: value: T` / `impl[T] Box[T]:` | preserved (PEP 695) |
-| HKT scaffold (v0.5.0) | `class Functor[F[_]]:` | parsed; staged for unification |
+| HKT (v0.5.0 scaffold; unification landed v1.0.0-alpha) | `class Functor[F[_]]:` | preserved (PEP 695); `F[A]` unifies against a concrete head |
 | Interface | `interface Drawable: def draw(self) -> None` | `class Drawable(Protocol): ...` |
 | Pipe | `a \|> f() \|> g(arg)` | `g(f(a), arg)` |
 | Guard | `guard x = expr else: return ...` | `if expr is None: return ...; x = expr` |
@@ -319,7 +319,7 @@ The resolver tracks each uninitialised `let` declaration's span; the first subse
 
 | Type | Notes |
 |---|---|
-| `int` | Arbitrary precision (matches CPython). VM today uses `i64`. |
+| `int` | Arbitrary precision (matches CPython). The VM's `VmInt` keeps `i64`-sized values inline and promotes to a `BigInt` on overflow (v0.8.0 / v1.0.0-alpha.5). |
 | `float` | 64-bit IEEE 754. |
 | `bool` | **Subtype of `int`** (v0.4.0). `let x: int = True` type-checks; `let b: bool = 1` does not — assignability is one-way. |
 | `str`, `bytes` | Identical to Python. |
@@ -488,7 +488,7 @@ enum Color:                       # → class Color(enum.Enum):
 - `impl[T] ClassName[T]:` introduces type parameters scoped over the methods; methods may add their own (`def map[U](...)`).
 - `impl OtherType:` on an **alias** of a sealed union distributes the methods to every variant (v0.6.0). Duplicate-method check fires when the same method exists on both `impl Union:` and `impl Variant:`.
 - `extend ClassName:` is `impl`'s twin for cross-module method addition. Same merge semantics.
-- `extend BUILTIN:` (`str`, `list`, `int`, `dict`, …) extracts each method to a module-level free function `__typhon_ext_<TYPE>__<METHOD>`, and rewrites `x.method(...)` to the free-function call **whenever the receiver `x` is statically annotated as that built-in**. No monkey-patching — un-annotated receivers still raise `AttributeError` at runtime. `extend list[int]:` (parametric target) fires `tyc::extend_builtin` — drop the brackets. **As of v0.15.5, `extend BUILTIN:` crosses module boundaries** — importing a module that declares `extend str: def slug(...)` makes `title.slug()` resolve in the consumer (the type checker, build/codegen, and VM all propagate the extension registry). In earlier releases this was module-local; the free-function workaround (`pub def to_slug(s: str) -> str: …`) still works but is no longer necessary.
+- `extend BUILTIN:` (`str`, `list`, `int`, `dict`, …) extracts each method to a module-level free function `__typhon_ext_<TYPE>__<METHOD>__`, and rewrites `x.method(...)` to the free-function call **whenever the receiver `x` is statically annotated as that built-in**. No monkey-patching — un-annotated receivers still raise `AttributeError` at runtime. `extend list[int]:` (parametric target) fires `tyc::extend_builtin` — drop the brackets. **As of v0.15.5, `extend BUILTIN:` crosses module boundaries** — importing a module that declares `extend str: def slug(...)` makes `title.slug()` resolve in the consumer (the type checker, build/codegen, and VM all propagate the extension registry). In earlier releases this was module-local; the free-function workaround (`pub def to_slug(s: str) -> str: …`) still works but is no longer necessary.
 
 ### 5.9 `unsafe:` boundary
 
@@ -653,7 +653,7 @@ A focused hardening pass on top of alpha.3. **No new syntax; no previously-*corr
 
 - **H5 — scope-blind class unification closed at the declaration boundary** (the one HIGH finding `RELEASE_READINESS_REVIEW.md` deferred). The v0.15.0 qualified↔bare tail-unification let a *locally declared* class satisfy a same-named class from another module (a user `class Response:` type-checked into an `httpx.Response`-typed slot, and vice versa). `is_assignable` now refuses that unification when the bare side names a class declared in the module being checked and the qualified side's declaration — resolved through its **exact** module key, never the ambiguous reverse scan that sank the first fix attempt — has a different shape. The guard is evidence-gated and degrades to the previous permissive unification on any uncertainty (unresolvable module, unknown shape, facade re-export with an equivalent shape, interfaces, bare names of unknown provenance such as provider return types), so the example/stress corpus is byte-identically unchanged. Four regression tests cover both rejection directions plus the facade-equivalence and unknown-provenance carve-outs.
 - **Secret-name diagnostics match longest-first** — the keyword tables behind `contains_secret_literal` (`tyc-analyse`) and the `tyc build` secret-suffix scan ordered the bare `KEY` ahead of `APIKEY`, so a name like `KEY_APIKEY` matched the shorter `KEY` and reported the less-specific suffix. `APIKEY` now precedes `KEY`, restoring the intended longest-first heuristic.
-- **Supply-chain & packaging** — every third-party GitHub Action across the workflows is SHA-pinned (Dependabot's `github-actions` ecosystem keeps the pins fresh), with a dispatch-only `normalize-release-flags` workflow to retro-flag hyphenated release tags as pre-releases; `install.sh` / `install.ps1` resolve "latest" via the release *list* (`/releases?per_page=1`, pre-releases included) instead of `/releases/latest` (which excludes them), so a default install no longer silently fetches older binaries; and a round of dependency / advisory bumps lands (`crossbeam-epoch` 0.9.18 → 0.9.20 for RUSTSEC-2026-0204, `regex` 1.12.4, `memchr` 2.8.2, `compact_str` 0.9.1).
+- **Supply-chain & packaging** — every third-party GitHub Action across the workflows is SHA-pinned (Dependabot's `github-actions` ecosystem keeps the pins fresh), with a dispatch-only `normalize-release-flags` workflow to retro-flag hyphenated release tags as pre-releases; `install.sh` / `install.ps1` resolve "latest" via the release *list* (`/releases?per_page=5`, drafts filtered, pre-releases included) instead of `/releases/latest` (which excludes them), so a default install no longer silently fetches older binaries; and a round of dependency / advisory bumps lands (`crossbeam-epoch` 0.9.18 → 0.9.20 for RUSTSEC-2026-0204, `regex` 1.12.4, `memchr` 2.8.2, `compact_str` 0.9.1).
 
 ### v1.0.0-alpha.3 — release-readiness remediation: licensing, packaging & robustness
 
@@ -949,7 +949,6 @@ The big v0.8.1 → v0.9.0 sweep. Closes 32 of 36 findings from a v0.8.1 stress s
 - **`from typing import List` / `Dict` / `Tuple` etc.** is rejected — use lowercase builtins.
 - **Bounded TypeVars** parse; multi-argument constraint solving is partial.
 - **PEP 612 `ParamSpec`** is not modelled — annotate decorator layers with `Callable[..., Any]`.
-- **Full HKT unification** is in progress; the parser accepts `F[_]` but checker treatment is staged.
 
 ---
 
@@ -1346,12 +1345,12 @@ no-implicit-any = true           # reserved for forward compat; today the check 
 unused-import = "warn"           # default "warn" (since v0.8.0); or "error" | "off"
 exhaustive-match = "error"
 methods-in-class-body = "warn"   # or "error" (break CI) | "off"
-nullable-use = "error"           # severity for tyc::nullable_use; or "warn" | "off"
+nullable-use = "warn"            # severity of the attribute-rooted tyc::nullable_use form (`self.conn.execute()`); "error" promotes it, "off" drops it. The bare-name form is always an error.
 require-with = "warn"            # severity for tyc::resource_not_managed
 blocking-in-async = "warn"       # severity for tyc::blocking_in_async
 stub-check = "error"             # severity for tyc::stub_mismatch
 suggest-gather = true            # advice: surfaces tyc::gather_opportunity
-auto-memoise = false             # opt-in; inserts @functools.cache on inferred pure fns (defaults true at [optimise] level = 1)
+auto-memoise = false             # opt-in; caches *provably* pure fns with immutable, hashable params + return (defaults true at [optimise] level = 1)
 auto-gather = false              # opt-in; folds independent awaits into TaskGroup (needs @gatherable; defaults true at level = 1)
 auto-parallel = false            # opt-in; pure list/set/dict comprehensions → thread-pool map (defaults true at level = 1)
 auto-parallel-reductions = false # opt-in; parallelises `mut total: int` accumulator loops (requires auto-parallel; int-only — exact/associative, floats never reordered)
@@ -1418,7 +1417,7 @@ See [CLI.md](CLI.md) and `docs/cli.md` for the full surface. The most-used comma
 | `tyc lsp` | LSP on stdio (diagnostics, hover, go-to-def, member completions via venv introspection, from-import members from sibling files, "Remove unused import"; v0.12.0 also surfaces live third-party arg/type diagnostics via `tyc-venv`) | editor |
 | `tyc init NAME` | scaffold `typhon.toml`, `src/`, `tests/` with a worked `main.ty` (frozen dataclass + `impl` + `Result`/`?`/`match`) | new project |
 | `tyc trace traceback.txt` | map Python frames back to `.ty` via `.py.map` v2 | debugging emitted code |
-| `tyc profile` | instrument top-level fns with call-count + wall-clock; writes `typhon-profile.json` on interpreter exit | feeds `pgo-memoise` |
+| `tyc profile` | build, then instrument every top-level fn with call-count + wall-clock (it does not run the program — you run the instrumented build from the project root, and `typhon-profile.json` is written on interpreter exit; the entry module's functions record as `__main__.<fn>`, accepted alongside `main.<fn>` for `src/main.ty`) | feeds `pgo-memoise` |
 | `tyc migrate src/app.py` | typed Python → Typhon: rewrites `Optional[T]`/`T \| None` → `T?`, `Generic[T]` → PEP 695, `NewType` → `newtype`, `Protocol` → `interface`, drops `@dataclass`/`@dataclass(frozen=True)`, adds `let`/`mut` to module-level annotated assigns | `--check` for CI |
 | `tyc ty` | builds, then runs Astral's `ty` checker over emitted Python with `.ty` path attribution via `.py.map` (v0.5.0). The same pass runs automatically when `[checker] external = "ty"` or `--with-ty` is set on build/check (v0.12.0) | second-opinion type-checking; needs `pip install ty` |
 | `tyc stubtest` | builds, then runs `python -m mypy.stubtest` against every emitted `.pyi` | runtime probe complementing `tyc check --stubs` |
@@ -1441,6 +1440,10 @@ Notable flags:
 - `tyc ty --watch` / `tyc ty --out DIR` / `tyc ty -- --strict` / `tyc ty --raw`
 - `tyc repl --load src/lib.ty` / `tyc repl --python python3.13`
 - `tyc debug --entry api.py --debugger pudb --break src/main.ty:42` / `tyc debug --raw-pdb`
+- `tyc lsp --log-level debug` — threshold (`error` / `warn` / `info` / `debug`, default `info`) for the status messages forwarded to the editor over `window/logMessage`.
+- `tyc trace err.log --map-dir DIR` — extra directory to search for `.py.map` sidecars; with no file argument, `tyc trace` reads the traceback from stdin.
+- `tyc fmt --check src/` (`-c`) — exit non-zero if anything would change; `fmt`'s only flag.
+- `tyc init NAME --dir DIR` (`-d`) — scaffold into `<DIR>/<NAME>/`; `tyc add` / `tyc remove --dir DIR` edit another project's `typhon.toml`.
 - `tyc add --dev pytest@8.2` / `tyc add --no-sync` / `tyc sync --dry-run`
 
 `tyc repl` quirks: each prompt re-executes the entire accumulated session (pure-scratch semantics, side effects fire once per prompt), multi-line blocks end on the first blank line, no readline/arrow-key support yet. Bare single-line expressions auto-print their `repr(...)` — `>>> 1 + 1` prints `2`.
@@ -1587,7 +1590,7 @@ Consumers:
 
 ## 19. Diagnostics catalog (top tier)
 
-The recurring diagnostic codes and what they actually mean. **See [DIAGNOSTICS.md](DIAGNOSTICS.md) for the exhaustive 88-code reference** — what follows is the daily-driver subset.
+The recurring diagnostic codes and what they actually mean. **See [DIAGNOSTICS.md](DIAGNOSTICS.md) for the exhaustive reference** (`tyc explain --list` prints all 90 codes the compiler ships as of v1.0.0-alpha.9) — what follows is the daily-driver subset.
 
 | Code | Meaning | Fix |
 |---|---|---|
@@ -1596,6 +1599,8 @@ The recurring diagnostic codes and what they actually mean. **See [DIAGNOSTICS.m
 | `tyc::immutable_assign` | Reassigning a `let` binding | Change to `mut`, or extract a new `let` |
 | `tyc::missing_initialiser` | `let NAME: T` written that is never assigned | Initialise inline, or assign on every non-diverging path |
 | `tyc::use_of_uninitialised` | (v0.7.0) Read of `let NAME: T` on a path that didn't assign | Initialise inline, or assign in every non-diverging arm |
+| `tyc::go_outside_async` | `go f(x)` reached from module-level code (directly or via a sync function called at module level) — no running event loop, `RuntimeError` at the call | Move the `go` into an `async def` driven by `asyncio.run(...)`, or `asyncio.run(f(x))` |
+| `tyc::possibly_unbound` | (warning) Ordinary local read on a path that may not — or provably does not — assign it (`if` without `else`, after `del`, `except … as e` after the handler, loop target after a possibly-empty loop) | Assign a default before the branch / loop, or `return` in the arm that has nothing to assign |
 | `tyc::no_block_shadow` | Inner `let`/`mut` would shadow an outer binding | Rename inner binding (no block scope in Python) |
 | `tyc::pattern_shadows_outer` | `case Wrap(value):` against outer `let value` | Rename the capture (`case Wrap(inner):`) |
 | `tyc::nullable_use` | Passing `T?` where `T` required | Narrow with `is None` / `guard` / early-return |

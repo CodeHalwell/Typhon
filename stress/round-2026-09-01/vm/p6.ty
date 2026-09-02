@@ -1,0 +1,148 @@
+from typing import Callable, Iterator
+import functools
+import itertools
+
+def side(x: int) -> int:
+    print("  side", x)
+    return x * 2
+
+def dflt(x: int, acc2: list[int] = []) -> list[int]:
+    acc2.append(x)
+    return acc2
+
+def kw(a: int, b: int = 2, *args: int, c: int = 3, **kwargs: int) -> str:
+    return f"{a} {b} {args} {c} {kwargs}"
+
+def kwonly(*, a: int, b: int = 1) -> int:
+    return a + b
+
+def posonly(a: int, b: int, /, c: int = 0) -> int:
+    return a * 100 + b * 10 + c
+
+def main() -> None:
+    print("I1 map/filter laziness")
+    let m = map(side, [1, 2, 3])
+    print("  after map")
+    let first: int = next(m)
+    print("  first", first)
+    let rest: list[int] = list(m)
+    print("  rest", rest)
+    let fl = filter(lambda v: v > 2, map(side, [1, 2, 3]))
+    print("  after filter")
+    print("  ", list(fl))
+    let z = zip(map(side, [1, 2]), map(side, [10, 20]))
+    print("  after zip")
+    print("  ", list(z))
+    let ge = (side(v) for v in [5, 6])
+    print("  after genexp")
+    print("  ", list(ge))
+    print("  any", any(side(v) > 2 for v in [1, 2, 3]))
+    print("  all", all(side(v) < 3 for v in [1, 2, 3]))
+    print("  sum", sum(side(v) for v in [1, 2]))
+    print("  enum", list(enumerate(map(side, [7]), start=5)))
+    print("  sorted", sorted(map(side, [3, 1])))
+    print("  minmax", min(map(side, [3, 1])), max(side(v) for v in [1, 2]))
+    print("  in", 4 in list(map(side, [1, 2, 3])))
+    print("  dictcomp", {k: side(k) for k in [1, 2]})
+    print("  setcomp", {side(k) for k in [1, 2]})
+    print("  nested", [side(a) + side(b) for a in [1] for b in [2, 3]])
+    print("  star", [*map(side, [1])], (*map(side, [2]),))
+    print("  zip strict", list(zip([1, 2], "ab", strict=True)), list(zip([1, 2, 3], "ab")), list(zip([1])), list(zip(*[(1, 2), (3, 4)])), dict(zip("ab", range(2))))
+    try:
+        list(zip([1, 2], "abc", strict=True))
+    except ValueError as e:
+        print("  strict err", e)
+    print("I2 iter protocol")
+    let it: Iterator[int] = iter([1, 2, 3])
+    print("  ", next(it), next(it), next(it), list(it))
+    let it2 = iter([1, 2, 3])
+    print("  ", list(it2), list(it2))
+    let it3 = iter([1, 2, 3, 4, 5])
+    next(it3)
+    print("  partial", list(zip(it3, it3)))
+    let it4 = iter(range(5))
+    print("  ", [next(it4) for _ in range(2)], list(it4))
+    let it5 = iter("ab")
+    print("  ", next(it5), list(it5), list(reversed("abc")), list(reversed(range(3))), list(reversed([1, 2, 3])), list(enumerate("ab")), list(enumerate([9], 1)), list(enumerate([], 1)))
+    print("  ", list(iter(lambda: 0, 1)) if False else "skip", iter([]) is not None, next(iter({"a": 1})), next(iter({"a": 1}.items())), next(iter({7})), next(iter(b"ab")), list(iter(range(2))), list(filter(str.isdigit, ["1", "a"])))
+    print("I3 closures")
+    let fns: list[Callable[[], int]] = [lambda: i for i in range(3)]
+    print("  late", [f() for f in fns])
+    mut acc: list[Callable[[], int]] = []
+    for k in range(3):
+        acc.append(lambda: k * 10)
+    print("  loop", [f() for f in acc])
+    def counter() -> Callable[[], int]:
+        mut n: int = 0
+        def inc() -> int:
+            nonlocal n
+            n += 1
+            return n
+        return inc
+    let c1 = counter()
+    let c2 = counter()
+    print("  nonlocal", c1(), c1(), c2(), c1())
+    print("  mutable default", dflt(1), dflt(2), dflt(3, []), dflt(4))
+    print("  kw", kw(1), kw(1, 5, 6, 7, c=8, d=9, e=10), kw(*[1, 2, 3], **{"c": 4, "z": 5}), kw(b=1, a=0), kw(1, **{"b": 9}))
+    print("  kwonly", kwonly(a=1), kwonly(b=5, a=1), posonly(1, 2), posonly(1, 2, 3), posonly(1, 2, c=3))
+    let p = functools.partial(kw, 1)
+    print("  partial", p(), p(2), functools.reduce(lambda a, b: a - b, [1, 2, 3]), functools.reduce(lambda a, b: a - b, [1, 2, 3], 100), functools.reduce(lambda a, b: a + b, [], 0), functools.reduce(lambda a, b: a + b, [5]))
+    @functools.lru_cache(maxsize=None)
+    def fib(n: int) -> int:
+        return n if n < 2 else fib(n - 1) + fib(n - 2)
+    print("  lru", fib(50), fib.cache_info().hits > 0 if False else "skip")
+    @functools.cache
+    def sq(n: int) -> int:
+        print("  compute", n)
+        return n * n
+    print("  cache", sq(3), sq(3), sq(4))
+    def deco(fn: Callable[[int], int]) -> Callable[[int], int]:
+        @functools.wraps(fn)
+        def wrapper(x: int) -> int:
+            return fn(x) + 1
+        return wrapper
+    @deco
+    def plus(x: int) -> int:
+        return x * 2
+    print("  deco", plus(3), plus.__name__)
+    print("I4 generators")
+    def gen(n: int) -> Iterator[int]:
+        print("  gen start")
+        for i in range(n):
+            print("  yielding", i)
+            yield i
+        print("  gen end")
+    let g = gen(2)
+    print("  created")
+    print("  got", next(g))
+    print("  got", next(g))
+    try:
+        next(g)
+    except StopIteration:
+        print("  stop")
+    def early() -> Iterator[int]:
+        yield 1
+        yield 2
+        yield 3
+    for v in early():
+        if v == 2:
+            break
+        print("  early", v)
+    def fromg() -> Iterator[int]:
+        yield from range(2)
+        yield from [9]
+        yield from gen(1)
+    print("  yield from", list(fromg()))
+    def geninfinite() -> Iterator[int]:
+        mut i: int = 0
+        while True:
+            yield i
+            i += 1
+    print("  islice", list(itertools.islice(geninfinite(), 3)), list(itertools.islice(geninfinite(), 2, 5)), list(itertools.islice("abcdef", 1, None, 2)))
+    print("  takewhile", list(itertools.takewhile(lambda v: v < 3, geninfinite())))
+    print("  zip inf", list(zip(geninfinite(), "ab")))
+    print("  count", list(itertools.islice(itertools.count(5, 2), 3)), list(itertools.islice(itertools.cycle("ab"), 5)), list(itertools.accumulate([1, 2, 3])), list(itertools.accumulate([1, 2, 3], lambda a, b: a * b)), list(itertools.accumulate([1, 2], initial=10)), list(itertools.chain([1], "ab", (3,))), list(itertools.chain.from_iterable([[1], [2]])), list(itertools.product("ab", repeat=2)), list(itertools.product([1, 2], "x")), list(itertools.permutations([1, 2, 3], 2)), list(itertools.combinations("abc", 2)), list(itertools.combinations_with_replacement("ab", 2)), [(k, list(g2)) for k, g2 in itertools.groupby("aabbbc")], [(k, len(list(g2))) for k, g2 in itertools.groupby([1, 1, 2, 1])], list(itertools.dropwhile(lambda v: v < 2, [1, 2, 3, 1])), list(itertools.zip_longest([1, 2], "abc", fillvalue=0)), list(itertools.starmap(pow, [(2, 3), (3, 2)])), list(itertools.repeat(7, 3)), list(itertools.compress("abcd", [1, 0, 1, 0])), list(itertools.pairwise([1, 2, 3])), list(itertools.batched([1, 2, 3, 4, 5], 2)), list(itertools.filterfalse(lambda v: v % 2, range(5))), [list(t) for t in itertools.tee([1, 2], 2)])
+    let gg = (v for v in range(3))
+    print("  genexp2", 1 in gg, list(gg), sum([]), sum([1.5, 2]), sum([0.1] * 10), sum([0.1] * 10) == 1.0, sum([1, 2], 10), sum([[1], [2]], []), sum(range(101)), sum([True, True]), type(sum([True])).__name__, sum([1, 2.0]), type(sum([])).__name__, sum([1e16, 1.0, -1e16]), sum([1e100, 1.0, -1e100, 1.0]), sum([0.1, 0.2, 0.3]), sum((0.1, 0.2)) == 0.1 + 0.2)
+
+main()

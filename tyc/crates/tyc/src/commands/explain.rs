@@ -23,7 +23,18 @@ pub struct ExplainArgs {
 pub fn run(args: ExplainArgs) -> Result<()> {
     if args.list {
         for code in catalog_codes() {
+            if LANGUAGE_TOPICS.contains(code) {
+                continue;
+            }
             println!("tyc::{code}");
+        }
+        // `freeze` and `pub` have catalog pages but are not diagnostics —
+        // nothing ever reports `tyc::freeze`. Listing them under the code
+        // prefix sent readers looking for a diagnostic that does not exist.
+        println!();
+        println!("language topics (no tyc:: prefix — `tyc explain <topic>`):");
+        for topic in LANGUAGE_TOPICS {
+            println!("  {topic}");
         }
         return Ok(());
     }
@@ -40,6 +51,12 @@ pub fn run(args: ExplainArgs) -> Result<()> {
         )),
     }
 }
+
+/// Catalog pages that explain a *language feature* rather than a
+/// diagnostic. They resolve through `tyc explain` like any other page but
+/// are never reported by the compiler, so `--list` shows them separately
+/// instead of under the `tyc::` prefix.
+const LANGUAGE_TOPICS: &[&str] = &["freeze", "pub"];
 
 /// Every short diagnostic code the explainer knows about, in
 /// alphabetical order. Backs `tyc explain --list` (FINDINGS O25).
@@ -77,6 +94,7 @@ fn catalog_codes() -> &'static [&'static str] {
         "interface_isinstance",
         "interface_not_conforming",
         "invalid_config_value",
+        "invalid_pattern",
         "invalid_question_op",
         "io",
         "lazy_import_opportunity",
@@ -96,6 +114,8 @@ fn catalog_codes() -> &'static [&'static str] {
         "missing_initialiser",
         "missing_return",
         "mutable_default_param",
+        "possibly_unbound",
+        "go_outside_async",
         "newtype_invalid_base",
         "newtype_violation",
         "no_block_shadow",
@@ -208,6 +228,7 @@ fn catalog_entry(short_code: &str) -> Option<&'static str> {
         "invalid_config_value" => {
             include_str!("../../../../../docs/diagnostics/invalid_config_value.md")
         }
+        "invalid_pattern" => include_str!("../../../../../docs/diagnostics/invalid_pattern.md"),
         "invalid_question_op" => {
             include_str!("../../../../../docs/diagnostics/invalid_question_op.md")
         }
@@ -244,6 +265,8 @@ fn catalog_entry(short_code: &str) -> Option<&'static str> {
         "missing_field_init" => {
             include_str!("../../../../../docs/diagnostics/missing_field_init.md")
         }
+        "possibly_unbound" => include_str!("../../../../../docs/diagnostics/possibly_unbound.md"),
+        "go_outside_async" => include_str!("../../../../../docs/diagnostics/go_outside_async.md"),
         "missing_initialiser" => {
             include_str!("../../../../../docs/diagnostics/missing_initialiser.md")
         }
@@ -413,6 +436,40 @@ mod tests {
             assert!(
                 catalog_entry(code).is_some(),
                 "Phase 5 diagnostic `{code}` should be explainable"
+            );
+        }
+    }
+
+    #[test]
+    fn language_topics_are_listed_apart_from_diagnostic_codes() {
+        // `--list` printed `tyc::freeze` / `tyc::pub`, which no diagnostic
+        // ever reports — readers went looking for a code that cannot fire.
+        for topic in LANGUAGE_TOPICS {
+            assert!(
+                catalog_codes().contains(topic),
+                "`{topic}` must still resolve through `tyc explain`"
+            );
+            assert!(
+                catalog_entry(topic).is_some_and(|e| !e.trim().is_empty()),
+                "`{topic}` must have a catalog page"
+            );
+            assert!(
+                !catalog_entry(topic).unwrap().starts_with("# tyc::"),
+                "`{topic}` is listed as a language topic, so its page must not \
+                 present itself as a diagnostic code"
+            );
+        }
+        // Everything else in the catalog IS a diagnostic page.
+        for code in catalog_codes() {
+            if LANGUAGE_TOPICS.contains(code) {
+                continue;
+            }
+            assert!(
+                catalog_entry(code)
+                    .unwrap()
+                    .starts_with(&format!("# tyc::{code}")),
+                "`{code}` is listed as a diagnostic, so its page must open with \
+                 `# tyc::{code}`"
             );
         }
     }

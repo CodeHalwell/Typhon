@@ -63,6 +63,15 @@ impl Env {
         env
     }
 
+    /// A module namespace under `parent` (the root): `global NAME` inside
+    /// functions defined here binds in *this* scope, not in the root — the
+    /// namespace a loaded sibling module or a stdlib shim owns.
+    pub fn new_module(parent: &EnvRef) -> EnvRef {
+        let env = Self::new_child(parent);
+        *env.module.borrow_mut() = Some(env.clone());
+        env
+    }
+
     pub fn new_child(parent: &EnvRef) -> EnvRef {
         Rc::new(Env {
             bindings: RefCell::new(HashMap::new()),
@@ -104,6 +113,16 @@ impl Env {
 
     pub fn declare_nonlocal(&self, name: &str) {
         self.nonlocals.borrow_mut().insert(name.to_string());
+    }
+
+    /// Look up `name` in this scope only (no parent walk).
+    pub fn get_own(&self, name: &str) -> Option<Value> {
+        if let Some(info) = &self.slot_info {
+            if let Some(k) = info.slot_of_name(name) {
+                return self.slots.borrow()[k as usize].clone();
+            }
+        }
+        self.bindings.borrow().get(name).cloned()
     }
 
     /// Look up `name` walking parent links until the module scope.

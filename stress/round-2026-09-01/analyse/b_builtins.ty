@@ -1,0 +1,9 @@
+def home() -> str:
+    return env("HOME", "x")
+
+async def main() -> None:
+    await asyncio.sleep(0)
+    print("slept")
+
+print(home())
+asyncio.run(main())

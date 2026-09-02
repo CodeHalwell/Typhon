@@ -1,0 +1,16 @@
+class Node[T]:
+    value: T
+    next: Node[T]?
+
+impl[T] Node[T]:
+    def length(self) -> int:
+        mut cur: Node[T]? = self
+        mut n: int = 0
+        while cur is not None:
+            n += 1
+            cur = cur.next
+        return n
+
+def main() -> None:
+    let n: Node[int] = Node(value=1, next=Node(value=2, next=None))
+    print(n.length())

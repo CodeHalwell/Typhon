@@ -1,0 +1,11 @@
+def f(x: int | str | list[int]) -> int:
+    if isinstance(x, (int, str)):
+        let probe: bytes = x
+        return 0
+    return 1
+
+def main() -> None:
+    print(f(1))
+
+if __name__ == "__main__":
+    main()

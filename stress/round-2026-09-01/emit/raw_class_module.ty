@@ -1,0 +1,24 @@
+plain class Module:
+    pass
+
+impl Module:
+    def __init__(self) -> None:
+        object.__setattr__(self, "_ready", True)
+
+    def __setattr__(self, name: str, value: object) -> None:
+        if not hasattr(self, "_ready"):
+            raise AttributeError("cannot assign before Module.__init__() call")
+        object.__setattr__(self, name, value)
+
+class! Net(Module):
+    width: int
+
+class! DeepNet(Net):
+    depth: int
+
+def main() -> None:
+    let n: Net = Net(4)
+    let d: DeepNet = DeepNet(4, 2)
+    print(n.width, d.width, d.depth)
+
+main()

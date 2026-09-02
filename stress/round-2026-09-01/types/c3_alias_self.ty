@@ -1,0 +1,5 @@
+type A = list[A]
+
+def main() -> None:
+    let x: A = [[]]
+    print(x)

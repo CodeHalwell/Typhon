@@ -102,14 +102,12 @@ unsafe impl salsa::Update for ArcPreprocessResult {
 #[salsa::tracked]
 pub fn preprocessed_full(db: &dyn salsa::Database, file: SourceFile) -> ArcPreprocessResult {
     let text = file.text(db);
-    let expanded = expand_question_ops(&expand_inline_question_ops(
-        &expand_compound_question_headers(&expand_pipes(&expand_with_chains(&expand_go_calls(
-            &expand_gather_blocks(&expand_multiline_guards(&expand_lazy_lets(
-                &expand_typed_let_unpack(text),
-            ))),
-        )))),
-    ));
-    ArcPreprocessResult(Arc::new(preprocess(&expanded)))
+    // The mapped chain leaves `line_map` (preprocessed line → `.ty` line) on
+    // the result, which `check_pipeline` uses to report the line the user
+    // wrote rather than the preprocessed buffer's.
+    ArcPreprocessResult(Arc::new(
+        tyc_syntax::preprocess::expand_and_preprocess_mapped(text, false),
+    ))
 }
 
 /// Tracked query: the names declared at the top level of the module.
@@ -743,11 +741,12 @@ fn check_pipeline(
         Ok(p) => p.into_syntax(),
         Err(e) => {
             diags.push_error(TycError::parse(
-                path,
+                path.clone(),
                 prep.python_source.clone(),
                 e.to_string(),
                 usize::from(e.location.start()),
             ));
+            diags.remap_lines(&prep.python_source, &prep.line_map, &path, &text);
             return diags;
         }
     };
@@ -792,7 +791,7 @@ fn check_pipeline(
     // in-module-only pass (`check_module_with`).
     let external = shapes_by_module.map(|s| build_external_shapes(&resolved_arc, s));
     let type_diags = check_module_with_imports(
-        path,
+        path.clone(),
         &prep.python_source,
         &resolved_arc,
         &module,
@@ -802,6 +801,10 @@ fn check_pipeline(
         external.as_ref(),
     );
     diags.extend(type_diags);
+
+    // Every diagnostic above is anchored to the preprocessed buffer; report
+    // it against the `.ty` text and line the user actually wrote.
+    diags.remap_lines(&prep.python_source, &prep.line_map, &path, &text);
 
     diags
 }
@@ -1185,6 +1188,51 @@ mod tests {
         assert!(resp.methods.contains_key("json"), "Response.json modeled");
         assert!(resp.partial, "bundled shapes must be marked partial");
         assert!(shapes.contains_key("requests"), "requests stub seeded");
+
+        // `Response.url` is an `httpx.URL`, not a `str` — the stub typed it
+        // as `str`, so `resp.url.host` was rejected and
+        // `resp.url.startswith(...)` (which crashes at runtime) was accepted.
+        assert_eq!(
+            resp.fields.get("url").map(|t| format!("{t:?}")),
+            Some("Class(\"httpx.URL\")".to_owned()),
+            "Response.url must be typed as httpx.URL"
+        );
+        assert!(
+            httpx.class_shapes.contains_key("URL"),
+            "the URL class it refers to must be modeled too"
+        );
+        // httpx 0.28 removed `proxies=` and `app=`; accepting them let a
+        // call that raises `TypeError` at runtime pass `tyc check`.
+        for client in ["Client", "AsyncClient"] {
+            let shape = httpx
+                .class_shapes
+                .get(client)
+                .unwrap_or_else(|| panic!("httpx.{client} shape"));
+            for removed in ["proxies", "app"] {
+                assert!(
+                    !shape.fields.contains_key(removed),
+                    "httpx.{client} must not accept the removed `{removed}=` kwarg"
+                );
+            }
+            assert!(
+                shape.fields.contains_key("proxy"),
+                "httpx.{client} keeps the replacement `proxy=`"
+            );
+        }
+        // The exception hierarchy `raise_for_status` / a transport failure
+        // raises has to exist for `except httpx.HTTPStatusError` to check.
+        for exc in [
+            "HTTPError",
+            "HTTPStatusError",
+            "RequestError",
+            "TimeoutException",
+            "ConnectError",
+        ] {
+            assert!(
+                httpx.class_shapes.contains_key(exc),
+                "httpx.{exc} must be modeled"
+            );
+        }
     }
 
     #[test]

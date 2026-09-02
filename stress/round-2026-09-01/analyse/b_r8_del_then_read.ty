@@ -1,0 +1,6 @@
+def f() -> int:
+    mut x: int = 1
+    del x
+    return x
+
+print(f())

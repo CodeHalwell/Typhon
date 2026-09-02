@@ -1,0 +1,12 @@
+def add1[T](x: T) -> int:
+    return x + 1
+
+def up[T](x: T) -> str:
+    return x.upper()
+
+def main() -> None:
+    print(up(1))
+    print(add1("s"))
+
+if __name__ == "__main__":
+    main()

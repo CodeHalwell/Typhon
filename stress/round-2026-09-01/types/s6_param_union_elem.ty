@@ -1,0 +1,16 @@
+class Some[T]:
+    value: T
+class Nothing frozen:
+    pass
+type Opt[T] = Some[T] | Nothing
+
+def main() -> None:
+    let o: Opt[int] = Some(value="s")
+    match o:
+        case Some(v):
+            print(v + 1)
+        case Nothing():
+            print("none")
+
+if __name__ == "__main__":
+    main()

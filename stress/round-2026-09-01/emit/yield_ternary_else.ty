@@ -1,0 +1,15 @@
+from collections.abc import Generator
+
+def gen(c: bool) -> Generator[int, int, None]:
+    let v: int = 0 if c else (yield 1)
+    print(v)
+
+def main() -> None:
+    let g: Generator[int, int, None] = gen(False)
+    next(g)
+    try:
+        g.send(7)
+    except StopIteration:
+        pass
+
+main()

@@ -4,7 +4,604 @@ All notable changes to Typhon are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely; the
 canonical phase-by-phase status lives in `docs/roadmap.md`.
 
-## Unreleased — full-codebase release-readiness remediation
+## Unreleased — beta readiness
+
+Two waves on top of alpha.9. The first was the release-readiness review
+remediation described below; the second closed the backlog that review
+deferred, and is summarised here.
+
+**`tyc run` is a real drop-in for `tyc build` + CPython.** It scans a
+program's imports *before* executing anything; an import the VM does not
+model (`sqlite3`, `subprocess`, `numpy`, …) prints a `note:` naming it and
+takes the compiled path, so a program never dies with `ModuleNotFoundError`
+on code the compiled path runs fine, and never half-executes before
+switching. `--no-fallback` refuses instead. Two bugs this surfaced are also
+fixed: `tyc run --compile <file>` was broken outright (the single-file
+scaffold and `--temp` produced two temp directories, and the build refused
+to write outside the root it was handed), and `--python` defaulted to
+whatever `python3` came first on `PATH` — 3.11 on many systems — so the
+emitted PEP 695 syntax failed with a `SyntaxError`. It now resolves to the
+project's `.venv`, then `python3.<minor>` for `[python] target`, then
+`python3`. Build *progress* moved from stdout to stderr, as every
+compiler's does.
+
+**The VM's stdlib and object model.** `class X(NamedTuple)` is a real tuple
+and `class X(TypedDict)` constructs a plain `dict` (both built an opaque
+instance before, so `p[0]` and `u["k"]` raised). New shims for `string`,
+`operator`, `bisect`, `base64`, `csv` and `__future__`, each checked
+value-for-value against CPython 3.13; `contextlib` gains `suppress` /
+`nullcontext` / `closing` / `redirect_stdout` / `redirect_stderr` /
+`ExitStack`; `functools` gains `cmp_to_key` / `total_ordering` /
+`singledispatch` and `partial` binds keyword arguments; `sys` gains
+`modules` and `exc_info`; `typing` gains the narrowing / variadic /
+`Supports*` names. `issubclass` was missing entirely. Added
+`str.isascii` / `isidentifier` / `isprintable`, the `numbers` tower on
+`int` / `float`, the classmethod `int.from_bytes`, and the unbound method
+form of every builtin type (`str.upper(s)`, `dict.get(d, k)`). A function
+object has its own `__dict__` and a class object is hashable by identity,
+so decorator-published API and type-keyed registries work. `print`
+resolves `sys.stdout` on every call, so `redirect_stdout` works. Every
+module gets its own `__name__` / `__doc__` / `__file__` — an imported
+sibling used to inherit the entry's `"__main__"`, so its main-guard block
+ran under `tyc run` but not after `tyc build`. The filesystem surface
+(`os`, `os.path`, `pathlib`, `io`, `shutil`, `tempfile`, `glob`,
+`hashlib`, `random`) was rebuilt as Python shims over native primitives.
+A second VM pass added `bytearray` (mutable, CPython `repr`, unhashable,
+`fromhex`) and `x in b"…"` containment, which the VM rejected outright;
+`float.hex()` and `as_integer_ratio()`; the `str.format` `!r` / `!s` /
+`!a` conversions and `{0.attr}` / `{name[key]}` accessors; CPython's
+`str.center` padding bias; `Cls.__doc__` / `Cls.__mro__` /
+`fn.__type_params__`; `asyncio.to_thread` / `Lock` / `Semaphore` /
+`Event`; and the rest of the builtin exception hierarchy. A third pass
+took the async protocols — `async for` over a hand-written `__aiter__` /
+`__anext__` iterator, and `@asynccontextmanager` actually driving its
+generator rather than being the identity — which also made generator
+bodies run lazily whether or not they are `async`, so a context
+manager's teardown runs *after* the `with` body instead of at the call.
+Alongside: set comparison as subset / superset, PEP 584 `d1 | d2`, and
+value-mixin enum members behaving as their value under arithmetic,
+`int()` and flag membership. A fourth closed the deferred-binding and
+last-mile-builtin gaps: a module-level `lazy let` now defers to first
+*use* (running its initialiser at the binding raised `NameError` when the
+helper was defined lower in the file), `%(key)s` printf conversions read
+a mapping, `sys.modules` always carries `__main__`, and `eval` of a
+single expression exists. A fifth took decorators and exception chaining:
+`functools.wraps` copies the wrapped function's `__name__` / `__qualname__`
+/ `__doc__` / `__module__` and sets `__wrapped__`, a decorated *method* is
+registered under the name it was declared with rather than the wrapper's
+(so `@log def greet` stayed callable as `greet`), `x.__class__` reads as
+the type object it is instead of a bound method, and PEP 3134 chaining is
+real — `raise X from Y` records `__cause__` and `__suppress_context__`,
+an exception leaving an `except` handler or raised by a `finally` records
+the one it interrupted as `__context__`, and an unchained exception
+answers `None` / `False` as CPython's does. A sixth went after the object
+model and the messages: the builtin-value dunder table is per-type now, as
+CPython's is (`hasattr(5, "__len__")` and `hasattr("s", "__int__")` were
+both `True`), which is also what makes a `@runtime_checkable` Protocol
+match structurally under `isinstance`; a parameter before `/` no longer
+binds by keyword (with `**kwargs` the keyword lands there, without one the
+call is rejected as CPython rejects it); `sys.modules["__main__"]` is the
+running module's own namespace, so the `__all__` that `pub` synthesises
+reads back; a frozen dict's `str()` is the mapping it wraps while its
+`repr()` names the `mappingproxy`; a replacement field nested in a format
+spec (`{n:>{w}}`) resolves; and a batch of conversions and messages came
+into line — `float.fromhex`, `str.format_map`, signed `int.to_bytes` /
+`int.from_bytes`, `issubclass(bool, int)`, `OSError` with a non-integer
+errno, `defaultdict` equality with a plain dict, `isinstance` through a
+builtin exception base (`json.JSONDecodeError` is a `ValueError`), and
+CPython's exact wording for the `ZeroDivisionError` family, `round(nan)` /
+`round(inf)`, `float("abc")`, `chr` / `ord`, `min` / `max` on an empty
+iterable, and `list.pop`. A seventh closed the remaining crashes: a
+value-mixin enum member now *is* its value everywhere (printf, `abs`,
+indexing, `len`, `str.join`, and the mixin's own methods), an enum class is
+sized and contains its members, `slice` and `Ellipsis` are first-class
+values so a multi-axis subscript (`p[1:2, 3]`, `p[..., 0]`) reaches
+`__getitem__`, a `range` matches a sequence pattern, `type(5)` and the
+`int` constructor are one dict key (which is what makes
+`functools.singledispatch` dispatch), `re.findall` returns groups rather
+than whole matches, `round()` / `int()` / `float()` honour the conversion
+dunders (so a `lazy let` proxy works), and the VM's lazy proxy gained the
+seventeen dunders the emitted runtime already had. `tyc run`'s
+unmodelled-import scan also ran the wrong preprocessing chain, so a file
+using `as!`, `?`, `|>` or `gather:` failed to parse there and was skipped
+— silently disabling the fall-back-to-CPython guarantee for exactly the
+programs most likely to need it. An eighth wave took the last of the
+cross-surface splits: a flat source root's `from .sibling import x` now
+emits absolute, because `build/` is not a package and `python
+build/main.py` (and `tyc run --compile`) died on the relative form while
+the VM resolved it fine — a multi-file layout `tyc check` accepts could
+not be run at all after building. Alongside it, a plain `enum.Flag`
+combines into the composite pseudo-members CPython synthesises and
+`auto()` in a flag enum numbers by bit, `model_validate` builds nested
+models from nested mappings (and `model_validate_json` exists). A ninth
+took the numeric surface: the shortest float repr breaks an exact tie
+toward the even last digit as CPython's does (`1e15 + 0.3` printed
+`…0.3` under `tyc run` and `…0.2` after `tyc build`) and picks
+fixed-point notation from the true exponent rather than `log10`, which
+rounds up at `9999999999999998.0`; `int()` / `float()` accept Unicode
+decimal digits and digit-group underscores (and reject the misplaced
+ones CPython rejects) and take a bytes-like; `bool` orders against
+`float`; `pow(a, -e, m)` computes the modular inverse; and a complex
+formats its components with the spec (`f"{1+2j:.1f}"` → `1.0+2.0j`).
+A tenth took the `pathlib`
+surface: a bound method reprs as CPython's does (the class it is *defined*
+on, and the receiver through its own `__repr__`, so `Path("/t").iterdir`
+reads `<bound method Path.iterdir of PosixPath('/t')>`), the shim gained
+the `Path` / `PosixPath` split that name comes from, and an `OSError` from
+an `os` call reports the filesystem path rather than `PosixPath('…')` —
+while `shutil.rmtree` re-points its error at the argument it was given, as
+CPython's does. **The
+differential baseline falls from 167 entries to 13.**
+
+**Shims that were quietly lax about the filesystem.** A read-through of the
+VM's stdlib shims turned up a run of fidelity gaps with real consequences.
+`tempfile.mkstemp` and `NamedTemporaryFile` created their file through an
+exclusive-create that left the mode to the umask — 0644 under the usual
+022, where CPython guarantees 0600 — and `os.mkdir(path, mode)` discarded
+its mode outright, so `mkdtemp` and `TemporaryDirectory` were readable by
+every local user too. Both apply the mode in the creating syscall now,
+rather than for a window afterwards. A file opened `a` or `a+` seeked to
+the end only once, so a `seek(0)` followed by a write overwrote the start
+instead of appending; an append-mode write always lands at end-of-file now,
+whatever the cursor says. `shutil.copytree(..., symlinks=True)` tested
+`os.path.isdir` first, which resolves a link, so a symlink to a directory
+was copied *through* and a cycle recursed forever, and `copystat` copied
+permission bits only — leaving `copy2` with a fresh mtime — because
+`os.utime` ignored the times it was given. `base64.b64decode(...,
+validate=True)` never passed the flag on, so strict mode was the permissive
+one. And an `argparse` positional with `nargs` of `*`, `?`, `+` or
+`REMAINDER` swallowed everything in front of it, where CPython matches all
+the positionals in one pass and hands back whatever the later ones still
+need: `files` with `nargs="*"` ahead of a required `dest` failed on every
+one-argument command line.
+
+**Format specs that quietly rounded the wrong way.** An eleventh wave took
+the PEP 3101 mini-language. A float with a precision but no presentation
+type is not quite `g`: it reaches for an exponent one decade sooner, so
+`f"{100.0:.3}"` is `1e+02` where `.3g` is `100` — the VM printed `100.0`.
+The alternate form `#` was ignored on floats altogether, where CPython
+always leaves a decimal point and stops `g` stripping trailing zeros
+(`f"{3.0:#g}"` is `3.00000`, `f"{3:#.0e}"` is `3.e+00`); it is honoured now
+for `e`, `f`, `g`, `%` and the printf-style `%#g` alike, and the non-finite
+values print lower-case through the printf path as they already did
+through the spec path. An `_` on a binary, octal or hex integer groups in
+fours, not at all (`f"{1234567:_x}"` → `12_d687`). A nested replacement
+field inside a spec restarted auto-numbering, so `"{:{}}".format(3, 5)`
+took `3` as its own width; the counter is shared with the outer template
+now. And `!a` in an f-string was a synonym for `!r`, leaving non-ASCII
+unescaped — `f"{'ü'!a}"` is `'\xfc'`. **The differential baseline falls to
+12.**
+
+**Unicode properties Rust's std does not have.** A twelfth wave took the
+string surface. `isdigit()`, `isdecimal()` and `isnumeric()` are three
+different questions in Python — `"²"` is a digit but not a decimal, `"½"` is
+numeric but neither — and the VM answered all three from Rust's
+`char::is_numeric`. `isprintable()` was a hand-rolled approximation that let
+the format and unassigned characters through, and `repr()` escapes exactly
+what it rejects, so a zero-width space or a soft hyphen printed *invisibly*
+where CPython writes `'\u200b'`. Python's whitespace is wider than the
+White_Space property (it counts `\x1c`-`\x1f`), so `split()`, `strip()` and
+`isspace()` disagreed on the separators. And there is no titlecase mapping in
+std at all: `"ǆemal".title()` gave `Ǆemal` for `ǅemal`, `"ß".title()` gave
+`SS` for `Ss`, while `swapcase()` took only the first character of a mapping
+that expands — `"ß"` became `S` and `"İ"` lost its combining dot. The five
+tables are generated from the hosting CPython by
+`scripts/gen-unicode-props.py`, alongside the case-folding ones. A whitespace
+`split()` with a `maxsplit` also trimmed the remainder CPython hands back
+verbatim (`" a b ".split(None, 1)` is `["a", "b "]`).
+
+**A bytes surface with a quarter of its methods missing.** `bytes` had 17 of
+CPython's 40 methods, and the rest raised `AttributeError` rather than
+falling back to anything: the `is*` predicates, `title`, `capitalize`,
+`swapcase`, `partition`, `rpartition`, `ljust`, `rjust`, `center`, `zfill`,
+`removeprefix`, `removesuffix`, `rfind`, `rindex`, `expandtabs` and
+`splitlines` are all there now, ASCII-only as CPython's are, and `hex()`
+takes its separator and group size. Alongside them the printf-style operator
+grew `%u` and `%a`, learned that a precision on an integer conversion is a
+minimum digit count (`"%.3d" % 5` is `005`), and gained the `cp1252` codec.
+
+**Comparisons that raised where CPython answers False.** Every ordering
+comparison went through a total order, so a NaN — which is unordered but
+perfectly comparable — became a `TypeError`: `max(1, float("nan"))`,
+`min(...)` and `sorted([3, float("nan"), 1])` all raised where CPython
+returns `1`, `1` and the list. Two numbers can only come back unordered
+because one is a NaN, so that case answers `False` now, and `min`/`max` ask
+the operator the way CPython does rather than demanding a total order. Two
+more `bool`-is-an-`int` gaps went with them: `divmod(True, 2)` returned the
+float pair `(0.0, 1.0)`, and `round(True)` raised. **The differential
+baseline falls to 9.**
+
+**Two kinds of reflection the VM answered wrongly.** A class object reprs
+with the module its body ran in — CPython writes `<class '__main__.User'>`
+where the VM wrote `<class 'User'>`, so any program printing a class or a
+`type(x)` disagreed. The module was already recorded (it is what
+`object.__repr__` uses); the class repr consults it now, and a stdlib shim's
+classes stay bare rather than claiming the caller's module. `BaseModel`,
+`enum.auto` and `NewType` — three prelude names the VM models as
+placeholders — print with the module and the *kind* CPython gives them
+(`<class 'pydantic.main.BaseModel'>`, `<class 'enum.auto'>`,
+`<class 'typing.NewType'>`).
+
+PEP 695 type parameters were erased at definition time, so
+`__type_params__` was the empty tuple for *every* function and class,
+generic or not, and a PEP 696 default was unreachable. Each parameter is a
+real object now — `TypeVar`, `ParamSpec` or `TypeVarTuple`, carrying its
+`__name__`, `__bound__`, `__constraints__`, `__default__` and
+`has_default()`, and reprs bare as an inferred-variance parameter does. A
+non-generic function or class still reports `()`. **The differential
+baseline falls to 7, and every entry left is an inherent design
+limitation** — the sequential coroutine scheduler (3), the VM's
+non-validating pydantic stand-in (3), and one line whose value depends on
+which sort algorithm sees an all-false comparator.
+
+**Docs that had fallen behind the VM.** `model_dump` did not recurse, so a
+nested model came back as a model object where pydantic gives a nested dict;
+it does now. The VM reference and the published site still listed
+nested-model `model_validate` and `@contextmanager` bodies inside `with` as
+unsupported, both of which have worked since earlier in this cycle — the
+real remaining pydantic gap is *validation*, which the VM does not do at
+all, and that is what they say now.
+
+**A shim audit, twenty findings deep.** The last review sweep turned up a
+long tail across the stdlib shims and the CLI, and closing it took the
+`bytes`-and-`str` work of the previous waves down into the corners.
+*Filesystem and permissions:* `os.umask` returned `0o022` without setting
+anything, so a program hardening its mask before writing credentials got the
+ambient one anyway; `shutil.copyfile(..., follow_symlinks=False)` copied
+*through* a symlink instead of recreating it, which can drag files out of a
+backup tree; and `shutil.which("./x")` reported a non-executable file as
+runnable. *Streams:* a seek past end-of-file left no NUL gap, so writing at
+offset 5 of a three-byte file gave `abcX` rather than `abc\0\0X`, and
+`truncate` past the end grew neither a file nor its text wrapper (an
+in-memory `BytesIO` correctly does not). *Parsers:* `csv` opened a quoted
+field on a quote *anywhere*, merging `ab"c,d` into one column, and
+`QUOTE_NONE` wrote a field containing the delimiter unescaped instead of
+escaping it or refusing; `base64`'s permissive decode discarded only CR and
+LF where CPython discards everything outside the alphabet, and its padding
+errors named the wrong one of CPython's two messages; `argparse` ignored
+`exit_on_error=False` for unrecognised arguments. *Collections:*
+`ChainMap` inherited six mutators that reach for a `_data` it does not have,
+so `pop` raised `AttributeError`; `bytearray.extend`, `insert` and slice
+assignment skipped the 0-255 check `append` applies (and slice assignment
+never reached the shim at all, because the interpreter dispatched a slice
+key before consulting `__setitem__`). *Elsewhere:* `contextlib.ExitStack`
+stopped unwinding at the first callback that raised, leaving outer files
+open; `pathlib.glob` discarded both `case_sensitive` and `recurse_symlinks`;
+and `hashlib` documented `sha224`, `sha384`, `blake2b` and `blake2s` without
+implementing them — all four are implemented now rather than struck from the
+docs. `base64.Error` is no longer exported, because CPython's `base64` has
+no such name.
+
+On the CLI side, `tyc build --check --out <new-dir>` created the directory it
+promised not to touch; a `"BaseModel"` *string literal* pulled pydantic into
+a project's dependencies, because the scan predated the shared lexical mask;
+`--python python3` was indistinguishable from the default, so an explicitly
+requested interpreter lost to the project venv; the venv probe hard-coded
+the POSIX layout, so no Windows build could ever find one; and an adjacent
+*package* was treated as local without being scanned, so a package importing
+something the VM does not model took the VM anyway and died there instead of
+compiling.
+
+Three more in the same sweep: `hashlib` and `random.seed` rejected a
+`bytearray` — the buffer protocol makes it bytes-like, and `random`'s own
+error message already listed it — and `itertools.permutations` /
+`combinations` / `combinations_with_replacement` accepted a negative `r`,
+silently yielding plausible nonsense where CPython raises.
+
+**`from pkg import submodule` never worked in the VM.** The most common way
+to reach into a package raised `AttributeError: module 'pkg' has no attribute
+'store'` under `tyc run` on a program `tyc build` compiles and runs — the VM
+looked the name up on the package object and stopped there, where CPython
+imports `pkg.store` when the attribute is absent. It imports it now, and
+stamps it onto the package so a later `pkg.store` resolves without
+re-importing. A name the package genuinely does not have raises `ImportError`
+with CPython's message rather than `AttributeError`, which is the type an
+`except ImportError` around an optional dependency is written to catch.
+
+A last pass over the same shims: an append-mode stream seeked *past* the end
+filled the gap with NULs before honouring the append, so `a+` plus
+`seek(10)` plus `write("X")` grew the file instead of appending to it — the
+`O_APPEND` reset now comes first, and the sparse-write padding applies only
+where the cursor really is the write position. `PurePath.match` and
+`full_match` discarded `case_sensitive` even after `glob` learned it.
+`timezone.fromutc` relabelled a datetime belonging to another timezone
+instead of refusing it. And `os.path` dropped `bytes` paths entirely
+(`os.path.join(b"/tmp", b"x")` raised `TypeError`) — the pure path functions
+round-trip them through latin-1 now, which is a byte-for-byte bijection over
+the ASCII separators they inspect, and `join` refuses a str/bytes mixture as
+CPython does.
+
+**One accepted form added: `"Node"?`.** The nullable suffix is a type-level
+operator, and a quoted forward reference is a type expression, but the
+rewriter's tail test only recognised an identifier, `]` or `_` — so
+`parent: "Node"?`, the way a self-referential model spells its optional
+back-pointer, was a raw parse error naming an "unexpected token ?". It is
+accepted now. This is purely additive: `"Node?"` (the `?` inside the quotes)
+and `"Node" | None` already worked and are unchanged, and a `?` inside any
+string literal is still just text. Two stress units in the corpus were
+written against the form and had been sitting in the non-building baseline
+because of it.
+
+And four more shim corners: `b32decode` stripped padding without checking
+it, so `b32decode(b"A")` returned `b""` and an unpadded `b"MY"` returned
+`b"f"` where CPython raises — base32 is written in eight-character quanta
+with five legal padding shapes, and anything else is malformed.
+`itertools.groupby` compared keys by *identity* when the caller advanced the
+outer iterator without draining a subgroup, so a key function returning a
+fresh object per item (`key=lambda x: [x]`) split one group into several.
+`itertools.product` accepted a negative `repeat`, yielding a single empty
+tuple. And `Path.touch(mode=0o600)` discarded its mode, creating the file
+`0644` under the usual umask — the mode now applies to a file the call
+creates, leaving an existing one's permissions alone, as CPython does.
+
+**The differential harness told a half-truth about its own coverage.** 134
+units "agree" only because both sides fail with empty stdout, and the summary
+called that "usually an uninstalled third-party import". Only 92 are. The
+other 42 type-check, build, and then crash *the same way* under the VM and
+under CPython — so the VM is a faithful drop-in there and the gate is right
+not to flag them, but the accepted program is still wrong, and reading them
+as a missing package hid that. The two populations are counted and explained
+apart now (`vacuous` / `vacuous-runtime`). Auditing the second: 29 pass `tyc
+check` with no diagnostic at all, three of those are harness artefacts (no
+argv, no stdin, a traceback fixture), and every one of the remaining 26
+reproduces a limitation the beta-readiness review already lists. Nothing
+unknown was hiding there — but nothing was watching either.
+
+**A diagnostic could be rendered against the wrong buffer.** Found by
+sweeping `tyc check` over the corpus and asking, of every diagnostic, only
+that its anchor line exist and not be blank. One unit failed
+(`stress/…/07-sdk-client`), and behind it was a renderer bug rather than a
+mapping one.
+
+`tyc check` groups diagnostics by file and — for speed, since sanitising
+the source listing is O(file) — sanitised the **first** diagnostic's source
+and lent that buffer to every other diagnostic in the group. Diagnostics in
+one file do not all carry the same buffer: most are remapped onto the
+original `.ty` text, but any that isn't still carries the preprocessed one.
+Lending that to a remapped diagnostic renders its original-coordinate span
+against preprocessed text. Here it put a `tyc::type_mismatch` two lines
+off, inside a comment, under a line reading `dict[str, object] | None`
+where the source says `?` — the user is pointed at a line that shows
+something else, and the lowering leaks into the listing. The cache is keyed
+by the buffer a diagnostic actually carries now, which keeps the one
+sanitise per file in the common case where they do all share one.
+
+With that fixed, every diagnostic across the corpus anchors on a real,
+non-blank line of the file it names.
+
+**Three formatter bugs, found by auditing what `tyc fmt` does to the whole
+corpus.** Nobody had run the formatter over `examples/` and `stress/` and
+asked the three questions that matter — does it converge, does it accept
+what the checker accepts, and does it preserve meaning. It did not.
+
+*It wrote source it could not read back.* `freeze let BANNER = """…"""`
+lowers to `let BANNER = __typhon_freeze__("""…` with the closing `)`
+appended to the line that ends the string, and the restoration paired
+that `)` by bracket depth alone — which a triple-quoted right-hand side
+never opens. So the opener kept its `__typhon_freeze__(`, and the file
+`tyc fmt` left behind no longer parsed. The pairing walk now tracks the
+string literal alongside the brackets, and seeds the close line's scan
+with the state it is entered in so a `)` *inside* the string is never
+mistaken for the wrapper's.
+
+*It rejected programs `tyc check` accepts.* The formatter validated a
+throw-away copy built by running the sugar passes over the
+already-preprocessed buffer — the reverse of the order every other
+surface uses. `preprocess` rewrites nullable `T?` to `T | None`, so a
+postfix `?` was eaten before `expand_with_chains` could see it and
+`with x = a?,` arrived as `with x = a | None,`, which is not a chain.
+Any multi-line `with`-chain using `?` was unformattable. The copy is
+built from the original source through the shared `expand_sugar` chain
+now, which also re-syncs it: the hand-rolled composition had fallen two
+passes behind.
+
+*One bad file stopped the walk.* `tyc fmt src/` bailed out at the first
+file it could not parse, having already written every file before it —
+a half-formatted tree, no record of what was skipped, and a
+`--check` run in CI that surfaced one error per invocation. It reports
+each failure and carries on now, exiting non-zero at the end with a
+count, as every other formatter in the ecosystem does.
+
+With those fixed the audit is clean: all 1,684 formattable corpus files
+reach a fixed point in a single pass; the 8 the formatter rejects are
+exactly the 8 `tyc check` rejects; and formatting changes no emitted
+Python anywhere — 1,199 standalone units and all 19 buildable projects
+build byte-identically before and after, with nine files differing only
+in a `__typhon_guard_N` temporary whose number is derived from a line
+that moved.
+
+**A wrapped `def` signature could not carry a nullable parameter.** Found by
+running `tyc migrate` over the hosting CPython's whole `lib/python3.13`
+tree and asking whether the result parses. It didn't, 78 files out of
+1,114 — and the largest cluster was not a migrator bug at all:
+
+```typhon
+def scroll(
+    top: int, bottom: int, left: int? = None, right: int? = None
+) -> None:
+```
+
+`tyc check` rejected that. The `?` classifier ran on the *physical* line,
+and a continuation line's whole-line annotation span stops at the first
+`=` — so every later `?` read as the propagation operator and the
+signature lowered to a guard whose `return` sits mid-parameter-list. Three
+narrowings fix it, all of them additive (they can only turn a `?` the
+compiler called a value into a type, never the reverse). A `?` in a
+comma-separated element of a **parenthesised** list is a parameter
+annotation, scoped to that element rather than the line — parentheses only,
+so `{"k": self.cache?}` in a dict display keeps propagating. A continuation
+line now also reads the **head of its logical line**, which is where the
+`type` / `def` keyword that settles the question lives (`type Provider =
+Callable[` opens a type expression that runs for several lines). And at
+**module level** a `?` inside a subscript is always nullable sugar, because
+a propagation lowers to a `return` and there is no function there to return
+from — `Provider = Callable[[str, int?], int]`, Python's legacy type-alias
+form, used to *build* and then fail at import with a `return` outside a
+function.
+
+**`?` inside a wrapped call now works.** The same audit turned up the
+converse of the signature bug: a propagation operator on the *continuation*
+line of a multi-line call or list.
+
+```typhon
+let t: int = sum([
+    parse(a)?,  # first
+    parse(b)?,
+])
+```
+
+That could not compile. The lift a `?` performs puts a guard statement
+above the expression, and on a continuation line there is nowhere to put
+one — an open bracket sits across the line's left edge — so the pass
+spliced an `if` into the middle of an argument list and the user got
+"Expected `else`, found `:`", naming neither the line nor the construct.
+The lift now buffers a logical statement's physical lines and emits every
+guard it raises above the statement's *first* line, at that line's
+indentation. It is the same hoist the single-line path has always done, in
+the same left-to-right order, so argument evaluation order is unchanged;
+comments on the continuation lines survive, because the physical lines are
+re-emitted rather than joined. A trailing `?` on a continuation line
+(`sum([\n    parse(a)?\n])`) goes to the same lift, since the end-of-line
+pass rewrites whole statements and that line does not end one.
+
+**A traceback that says `.ty` now shows `.ty`.** The source maps were
+audited the way the formatter was — every buildable unit built, every
+`.py.map` checked against its source (mapped lines in range, the table
+covering every emitted line, and each emitted `def` / `class` header
+landing on a `.ty` row that names it). 1,203 of 1,208 pass; the five that
+don't are synthesised constructors, which have no `.ty` line of their own
+and honestly map to the last field. So the tables are right. What was
+wrong was what surrounded them.
+
+*The rows under a frame were still emitted Python.* Both the runtime
+remapper and `tyc trace` rewrote the `File "…", line N` header and left
+CPython's source row beneath it untouched — so a frame read
+
+```
+  File "src/main.ty", line 10, in total
+    __typhon_qi_1__ = parse(b)
+```
+
+where line 10 of that file is `parse(b)?,`. Opening the line named in the
+traceback showed something else, and a generated name leaked into the one
+place the source maps exist to keep clean. Both now substitute the real
+`.ty` row and drop the column anchors, whose columns no longer mean
+anything; where the `.ty` file cannot be read (a build shipped without its
+sources) the original row is kept rather than dropped.
+
+*The knob did nothing for a script without a `__main__` guard.* The
+installer was only ever injected into an existing `if __name__ ==
+"__main__":` block, and most single-file programs just call `main()` at the
+bottom. `[emit] traceback-remap = true` was silently inert for them. A
+guard is synthesised now, placed after the module docstring and imports and
+ahead of the first executable statement — inside a guard still, so
+importing the module as a library never installs a hook.
+
+*And a hoisted `?` guard maps to its own line.* The guards the new
+wrapped-call lift raises are recorded against the physical line their `?`
+came from rather than the head of the statement, so the frame points at
+`parse(b)?` and not at the `sum([` three lines above it.
+
+**Four more in `tyc migrate` itself, three of them corruption.** The
+rewrite loop counted brackets but tracked no strings, so docstring prose
+was read as code: a bullet whose item was `like:` on its own line came back
+as `let like:` (CPython's `importlib.metadata` has one), and an unbalanced
+bracket inside a docstring knocked the continuation flag out of step for
+the rest of the file. The `impl`-relocation seeded its bracket depth from
+an item's *first* line, so when the item began at a decorator the depth
+stayed zero through `def discover(` and the `) -> T:` closing the signature
+was read as the end of the item — the method's own body left orphaned in
+the class body. The same scan treated a docstring line at column zero (a
+backslash continuation puts one there) as the end of the item, splitting
+the literal in two. Migrate now shares the crate's single lexical scanner
+for all three, and its two private ones are gone. Separately,
+`@dataclass(frozen=True)` on a class *with a base* emitted `class X(Base)
+frozen:`, which is not the form the preprocessor accepts — the modifier
+binds to the name, ahead of the bases. And when a rewrite deleted the only
+statement of a block (a `Protocol` import that `interface` made dead), the
+header was left with no suite; a repair pass puts `pass` under it.
+
+1,110 of the 1,114 stdlib and site-packages files now migrate to source
+that parses, up from 1,036. The four that don't are deeply
+metaprogrammed (`typing_extensions`, `pkg_resources`, `yaml.resolver`).
+
+**A prelude name that only the VM could resolve.** `BaseModel` and
+`NewType` resolve without an import — the `model` and `newtype` lowerings
+introduce them — so naming either directly passes `tyc check`. Their
+imports were injected only when a lowering actually fired, so
+`print(BaseModel)`, or a hand-written `class C(BaseModel)` in a module
+with no `model` declaration, type-checked, built, and then raised
+`NameError` under CPython while `tyc run` (which has both in scope) ran
+it. The desugar injects the import for a bare reference now, and a source
+naming `BaseModel` adds the pydantic dependency the same way a `model`
+declaration does — otherwise the artefact would swap the `NameError` for a
+`ModuleNotFoundError`.
+
+**A staged script is reported as the script.** `tyc run --compile <file>`
+(and the automatic fallback, which now fires whenever a program imports
+something the VM does not model) stages the source into a temp project, so
+every diagnostic named `/tmp/tyc-script-…/src/main.ty` and every traceback
+named `/tmp/tyc-script-…/build/main.py`. Diagnostics now carry the path
+the user gave, and the scaffold enables `traceback-remap`, so an uncaught
+exception points at the user's own `.ty` file and lines.
+
+**Checking a module is linear in its definitions again.** Every branch,
+`try` and loop clones the whole `TypeEnv`, and each clone deep-copied every
+binding in every scope, so a module was quadratic in its top-level
+definitions. Scope maps are copy-on-write now and the narrowing merges skip
+a scope neither side wrote. 4 000 one-`if` functions: 35.1 s → 0.49 s;
+10 000: ~40 s → 1.8 s. The perf-gate baseline moves 27 ms → 22 ms.
+
+**Two new gates**, both riding on the differential harness's existing build
+pass. Every emitted `.py` is byte-compiled with `compileall` — running
+`build/main.py` only exercises the modules it imports, so an emitter bug in
+a module no code path reaches used to sail through; a failure here is an
+*emitter* verdict and is never baselined. And units that do not survive
+`tyc build` are pinned in `scripts/nobuild-baseline.txt`, failing in both
+directions so a unit that stops building is caught as a regression and one
+that starts building is caught as a diagnostic that stopped firing.
+
+**`tyc::invalid_pattern` (new, error).** Found by that compile gate on its
+first run: a `match` pattern the Python *grammar* accepts but the CPython
+*compiler* rejects — two `*rest` captures in one sequence pattern, or the
+same capture name bound twice — made `tyc build` report success and write a
+`.py` that raises `SyntaxError` on import.
+
+**Constructor argument order (`tyc-types`).** The *concrete*
+constructor-argument check read `field_order` verbatim while the arity
+check used the required-first order a synthesised `class!` constructor
+actually has, so a `class! Grand(Child)` whose parent contributes a
+defaulted field matched positional arguments against the wrong field.
+
+**Mutable class-body defaults (`tyc-desugar`).** A default that names only
+outer-scope symbols (`ys: list[int] = [f()]`) becomes a `default_factory`
+lambda like every other unhashable default; `@dataclass` rejected it at
+import time. Only a literal naming a *class-body* symbol stays put, since a
+class-body lambda cannot see class scope.
+
+**Tooling.** `tyc migrate` panicked on any non-ASCII character in a
+triple-quoted string (the string scan advanced by bytes) and left a class
+body holding only comments once its methods moved to `impl`, which is not a
+suite — its own output failed to parse. Writing to a closed pipe
+(`tyc explain --list | head -3`) exited 101 with a panic; `SIGPIPE` is
+restored to its default disposition. `tyc explain --list` advertised
+`tyc::freeze` / `tyc::pub`, which no diagnostic reports — they are listed
+as language topics now. `tyc init 'a"b'` wrote an unparseable manifest; an
+explicit name is validated against PEP 508 and an inferred one sanitised.
+`tyc add` / `tyc remove` re-serialised the parsed config, expanding every
+defaulted key and dropping every comment — they edit the dependency table
+in place now, and add-then-remove round-trips to the original bytes.
+`TYC_NO_INTROSPECT=1` made `unintrospectable-dependency = "error"` fail for
+the introspection the user had just turned off; it downgrades to a warning
+with a `note:` saying why. The language server no longer honours a
+`[strictness]` severity the CLI rejects. The VS Code extension's
+`typhon.server.path` / `arguments` are `machine-overridable`, so a cloned
+workspace cannot choose the binary. The bundled `httpx` stub types
+`Response.url` as `httpx.URL` (it was `str`), returns `str?` from
+`Headers.get`, drops the removed-in-0.28 `proxies=` / `app=`, and models
+the exception hierarchy so `except httpx.HTTPStatusError` checks.
+
+### The alpha.9 release-readiness review remediation
 
 A release-readiness review of alpha.9 (seven parallel audits + the five CI
 gates run locally, all green) found and this change fixes a cluster of
@@ -175,6 +772,201 @@ additive docs-site pages / CLI-entrypoint smoke tests.
   `[strictness]` reference gains the real `nullable-use` and `suggest-gather`
   keys; `docs/diagnostics/README.md`'s `freeze_not_freezable` link points at its
   own page; `CLAUDE.md` / `CONTRIBUTING.md` describe all five CI jobs.
+
+### 2026-09-01 beta-readiness review — 35 verified defects fixed
+
+A second, broader review (`docs/beta-readiness-review-2026-09-01.md`: the five
+gates run locally, both corpora type-checked and executed both ways, six
+parallel adversarial reviewers each required to reproduce every finding
+against the release binary) found about 120 defects and this change fixes 35
+of them, each with a regression test. The reproductions are committed as
+`stress/round-2026-09-01/`. Nine long-standing differential-baseline entries
+(three curated examples among them) stop diverging and are burned down; the
+new probe round pins its still-open divergences in the same baseline, so the
+list is now an honest picture of the VM's remaining gaps. Every fix below is
+additive on correct programs except the one marked **narrowing**.
+
+#### Fixed — miscompilations (`tyc build` exit 0, wrong program)
+
+- **A one-line `guard … else: …` desynchronised every line-indexed side
+  table.** The main preprocessor loop expanded it to three lines *after* the
+  `class … frozen` / `unsafe:` / `lazy let` side tables had been keyed by line
+  number, so a later `class P frozen:` silently lost `frozen`, `unsafe:` blocks
+  stopped being recognised and `tyc fmt` rewrote the file. The one-liner is now
+  lowered in the mapped `expand_multiline_guards` pre-pass, before any table is
+  built, and the main-loop branch is gone.
+- **`|>` pipelines:** a `# comment` on a continuation line swallowed every
+  later step (comments are lifted out of the join and re-attached), and any
+  pipe line containing a non-ASCII character was rewritten byte-by-byte
+  (`"café"` → `CAFÃ©`); whole UTF-8 characters are copied now.
+- **`yield` lost its parentheses as an operand** — `(yield t) + 1` emitted
+  `yield (t + 1)`, and `yield` inside a tuple, call argument or `return` was
+  regrouped the same way. It is emitted bare only as a whole statement or the
+  right-hand side of an assignment, and parenthesised everywhere else.
+- **`case (x,):` emitted as `case (x):`** — a one-element tuple pattern became
+  a capture pattern that matched everything. The trailing comma is kept.
+- **The default `[emit] format = true` spacing pass rewrote string contents:**
+  a nested f-string format spec (`:.2f` → `: .2f`) and a PEP 701 same-quote
+  field (`d["a:b"]` → `d["a: b"]`). The pass now masks string bytes through
+  the shared PEP 701-aware `lexmask` scanner (comments stay unmasked).
+- **`ClassVar` fields were cloned into every dataclass subclass**, forking a
+  shared registry into one copy per class. They stay on the parent.
+- **Non-finite float literals:** `1e400` emitted the bare name `inf`
+  (`NameError` at import) and `1e400j` emitted `infj`; they emit
+  `float("inf")` / `complex(...)`. A NUL (or any other C0 control except
+  `\n` `\t` `\r`) inside a triple-quoted string was written raw (`SyntaxError`
+  at import); it is escaped.
+- **Valid programs rejected by the post-emit parse gate:** `[*(a or b)]`,
+  `{**(a if c else b)}`, `case (A() as x) | (B() as x)` and a literal brace
+  next to an f-string part (`"{" f"{x}"`). Precedence guards and brace
+  doubling were added.
+- **A non-empty mutable field default survived to `@dataclass`.** The
+  mutable-default rewrite only recognised the empty forms (`[]`, `{}`,
+  `set()`, …), but `@dataclass` rejects *every* unhashable default, so
+  `xs: list[int] = [1, 2]` was a `ValueError` at import while `tyc run`
+  happily ran the program. A non-empty `list` / `dict` / `set` display built
+  only from constants is now rewritten to
+  `dataclasses.field(default_factory=lambda: [1, 2])` — one fresh copy per
+  instance on both surfaces. A display that names anything (`[SIZE]`,
+  `[f()]`) is deliberately left alone: a class-body lambda cannot see
+  class-scope names. A dataclass-*instance* default (`p: P = P(x=1)`) is
+  still open and listed in the review.
+
+#### Fixed — preprocessor robustness
+
+- `unsafe:  # comment` was a parse error (the comment is stripped before the
+  header check), and `pub *` on a final line with no trailing newline emitted
+  `__all__` but no re-export — `tyc fmt` then produced an empty file. The
+  marker's line is always kept.
+
+#### Fixed — type checker and resolver
+
+- **An un-awaited call to an `async def` inside another `async def` was typed
+  as its return type** (`let s: str = fetch(3)` passed and crashed on
+  `s.upper()`). It is now `Coroutine[T]`; `await` unwraps it and every
+  coroutine-accepting API (`gather`, `create_task`, `go`) is untouched.
+  Narrowing on already-crashing code.
+- **The nullable-operand check was gated on a bare name.** `d.get(k) + 1`,
+  `xs[0] * 2` and `lookup(x) < 3` passed silently and raised `TypeError` at
+  runtime. Every operand shape is now reported, ordering comparisons included;
+  an attribute-rooted operand reports at the `[strictness] nullable-use`
+  level (warn by default), like the alpha.7 nullable-field check. Narrowing
+  on already-crashing code.
+- **`isinstance(x, (A, B))` narrowed to `Unknown`** on the positive branch
+  (unsound) and did not narrow the negative branch at all (a false positive
+  on the remainder). A tuple of classes is a union on both branches.
+- **`sys.exit(...)`, `exit()`, `assert False` and a call to a `-> NoReturn`
+  function are now exits** for `missing_return` — including inside the
+  `NoReturn` body itself — so a function ending in one no longer needs a dead
+  `return`. Relaxation.
+- **A fresh comprehension is accepted against a wider annotation**
+  (`let names: list[object] = [a.name for a in agents]`) exactly as the list
+  literal already was: the comprehension adopts the annotated element type
+  when every element fits. Relaxation.
+- **`x += 1` bypassed the `let` contract** for locals, parameters and
+  `global` / `nonlocal` writes: `let n = 0; n += 1` was accepted while
+  `n = n + 1` was correctly rejected. Augmented assignment now goes through
+  the same path. **Narrowing on code that ran correctly** — declare the
+  binding `mut`, which is what the same program written as `n = n + 1` already
+  required. One stress probe (`round-2026-05-23-drift-round-4/probes.ty`,
+  `let x; x += 10`) now fails as intended.
+- **`try` / `except` handlers are sibling arms** like `if` / `match` branches:
+  two handlers declaring the same `let`, or a handler that initialises a
+  declare-only `let`, are no longer `immutable_assign` false positives.
+  Relaxation.
+- **Class-body names were visible from methods and lambdas.** `return n <
+  LIMIT` inside a method type-checked against the class attribute `LIMIT` and
+  raised `NameError` at runtime (Python skips the class scope from a function
+  body). Class scopes are now skipped for function-origin references; PEP 695
+  type parameters declared on the class stay visible. Narrowing on
+  already-crashing code.
+
+#### Fixed — VM ↔ CPython parity (`tyc run`)
+
+- **`json` rewritten to CPython's contract.** `json.loads` re-encoded each
+  UTF-8 byte as its own character (`"héllo"` → `hÃ©llo`), rejected every `\u`
+  escape, accepted raw control characters, rejected `NaN` / `Infinity`, and
+  raised a bare `ValueError` with a private message — `except
+  json.JSONDecodeError` never caught it. The decoder now produces CPython's
+  messages and character positions, handles surrogate pairs, and raises a
+  real `json.JSONDecodeError` (a `ValueError` subclass) exported from the
+  module. `json.dumps` honours `ensure_ascii` (on by default), `separators`,
+  `allow_nan` and `indent=0`, and raises `TypeError` for an unserialisable
+  value instead of embedding its repr.
+- **pydantic parity:** `model_dump_json()` is compact like pydantic's;
+  `str(model)` / `repr(model)` no longer leak `model_config`.
+- **`dataclasses` parity:** `asdict` iterated an unordered map (its output
+  changed between runs) and did not recurse; `astuple`, `fields`,
+  `is_dataclass` and `replace` were missing. All five are implemented in
+  declaration order; `fields(...)` carries the annotation text as `Field.type`.
+- **`except json.JSONDecodeError:` / `except asyncio.CancelledError:` — any
+  attribute-qualified exception class — never matched.** Qualified handlers
+  are resolved by class identity or native kind. `asyncio.TimeoutError`,
+  `CancelledError`, `InvalidStateError`, `QueueEmpty` and `QueueFull` were
+  missing; `CancelledError` escapes `except Exception` as in CPython.
+- **`sys.exit` called `process::exit`** — no `finally`, no `except
+  SystemExit`, and `sys.exit("msg")` exited 0 without printing. It raises
+  `SystemExit`; an uncaught one maps to CPython's status (`None` → 0, an int →
+  that code, anything else → printed to stderr, status 1). `exit()` / `quit()`
+  exist.
+- **Long-tail builtins:** `next(it, default)` ignored the default;
+  `enumerate(xs, 1)` ignored the start; `list.index(x, start, stop)` ignored
+  the bounds; `True & False` was `0` (bool bitwise ops stay `bool`);
+  `KeyError` payloads (`e.args[0]` was the string `"'k'"`, `pop` reported
+  `'Str("k")'`); `int("x")`'s message; `"%s" % obj` ignored a user
+  `__repr__` / `__str__`; the `as!` failure message printed `int` where the
+  compiled runtime prints `<class 'int'>`.
+- **Format specs:** `f"{1.5:10}"` gave `1.500000` (a no-type float spec is
+  `repr`), `f"{3.14159:.3}"` gave `3.142` (significant digits, not decimals),
+  and `f"{'hello':.3}"` ignored the precision.
+- **`3 * [0]` / `2 * (1, 2)` raised `TypeError`** — only `seq * n` was
+  implemented — and so did `True * [1]`. Both operand orders and `bool`
+  counts work. `[1] * (2 ** 63)` raised `MemoryError` where CPython raises
+  `OverflowError` (the count is bounded by `isize::MAX`, not `usize::MAX`),
+  and a repeat whose total fits an index but not the machine
+  (`[1, 1] * (2 ** 40)`) aborted the process on allocation failure: the
+  `list` / `tuple` allocation now goes through `try_reserve_exact` and
+  surfaces as a catchable `MemoryError`.
+- **`list(zip())` yielded `()` forever** until the process was OOM-killed —
+  the loop over zero inner iterators was vacuously satisfied. It is exhausted
+  immediately. `zip(..., strict=True)` reports CPython's wording (`zip()
+  argument 2 is longer than argument 1`, `... shorter than arguments 1-2`)
+  instead of a private message.
+
+#### Security / robustness
+
+- **`tyc build --no-sync` wrote through symlinks.** A pre-planted
+  `build/main.py -> <victim>`, a symlinked `build/` or `.sourcemaps/`
+  directory, or a symlinked `pyproject.toml` all received attacker-controlled
+  bytes outside the project — under the exact flags `SECURITY.md` recommends
+  for building untrusted code. `atomic_write` refuses a symlink target; every
+  artifact destination is confined to the canonical project root before it is
+  written; `pyproject.toml` merges are atomic and refuse links.
+- **`tyc fmt src/` / `tyc check src/` followed symlinks out of the tree**
+  (formatting the link targets in place; walking `/usr`). A link that
+  resolves outside the walk root is skipped with a warning.
+- **`tyc build --check` wrote `pyproject.toml`** and, without `--no-sync`,
+  ran `uv sync`. The dry run skips the environment bootstrap entirely.
+- **`tyc profile` → `[optimise] pgo-memoise` never promoted anything:** the
+  profile records `__main__.fib`, the pass looked for `main.fib`. The entry
+  module accepts both spellings.
+
+#### Docs
+
+- `SECURITY.md` / `CONTRIBUTING.md` no longer say "currently `v1.0.0-alpha`";
+  the bundled skill's `[strictness] nullable-use` default is `"warn"`, its VM
+  integer row says arbitrary precision (not `i64`), and two stale HKT lines
+  are gone; the docs-site exit-code table had its rows inverted (1 is a
+  compile / run failure, 2 an invocation error) and the installer pin syntax
+  is `--version=`; cookbook example counts corrected; `docs/language.md`
+  describes the widened mutable-default rewrite; the `nullable_use`,
+  `missing_return`, `unknown_name` and `immutable_assign` diagnostic pages
+  gained sections for the checker changes above.
+
+Everything that review deferred is closed by the beta wave above, except
+the VM's eager generator expressions and the thin `re` shim, which remain
+in `scripts/differential-baseline.txt` — the 13 entries there are the
+honest list of what the VM still gets wrong, and each one is a bug.
 
 ## 1.0.0-alpha.9 — 2026-08-21 — maintenance: secret-name lint expansion, allocation reductions & dependency wave
 

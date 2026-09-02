@@ -1,0 +1,6 @@
+def main() -> None:
+    let s: str = "café" |> str.upper()
+    print(s)
+
+if __name__ == "__main__":
+    main()

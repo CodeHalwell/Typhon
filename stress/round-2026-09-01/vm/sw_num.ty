@@ -1,0 +1,169 @@
+
+try:
+    print("X000", (2.5).is_integer(), (2.0).is_integer())
+except Exception as _e:
+    print("X000", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X001", (0.5).as_integer_ratio(), (0.1).as_integer_ratio())
+except Exception as _e:
+    print("X001", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X002", (1.0).hex(), (-0.5).hex())
+except Exception as _e:
+    print("X002", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X003", float.fromhex("0x1.8p1"))
+except Exception as _e:
+    print("X003", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X004", (255).to_bytes(2, "big"), (255).to_bytes(2, "little"))
+except Exception as _e:
+    print("X004", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X005", (-1).to_bytes(2, "big", signed=True))
+except Exception as _e:
+    print("X005", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X006", (255).to_bytes(), (255).to_bytes(length=2, byteorder="big"))
+except Exception as _e:
+    print("X006", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X007", int.from_bytes(b"\x01\x00", "big"), int.from_bytes(b"\x01\x00", "little"))
+except Exception as _e:
+    print("X007", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X008", int.from_bytes(b"\xff", "big", signed=True))
+except Exception as _e:
+    print("X008", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X009", (10).bit_count(), (-10).bit_count(), (0).bit_count(), (2**70 + 1).bit_count())
+except Exception as _e:
+    print("X009", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X010", (5).conjugate(), (5).real, (5).imag, (2.5).real, (2.5).imag)
+except Exception as _e:
+    print("X010", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X011", (1).numerator, (1).denominator, (5).as_integer_ratio())
+except Exception as _e:
+    print("X011", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X012", float("1e309"), float("-1e309"))
+except Exception as _e:
+    print("X012", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X013", int("１２３"), int("٣"), float("１.５"))
+except Exception as _e:
+    print("X013", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X014", int(" 12 "), int("0"), int("-0"), int("00012"), int("0_0"))
+except Exception as _e:
+    print("X014", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X015", int(b"12"), int(bytearray(b"7")), float(b"1.5"))
+except Exception as _e:
+    print("X015", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X016", complex("1+2j"), complex(1, 2), complex(1), complex("j"), complex("-1j"), complex(0, 0), complex(1.5, -0.0))
+except Exception as _e:
+    print("X016", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X017", 1j * 1j, (1 + 2j).real, (1 + 2j).imag, (1 + 2j).conjugate(), abs(3 + 4j))
+except Exception as _e:
+    print("X017", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X018", 1j ** 2, (2j).real, complex(1, 2) + 1, 1 - 2j, -(1 + 2j), (1 + 1j) / 2, (1 + 1j) * 2)
+except Exception as _e:
+    print("X018", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X019", repr(1 + 0j), repr(0j), repr(-0j), repr(1.5 + 2.5j), repr(1e20 + 1j), repr(1e-20j))
+except Exception as _e:
+    print("X019", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X020", str(1 + 2j), f"{1 + 2j}", f"{1+2j:.1f}", format(1 + 2j, ""))
+except Exception as _e:
+    print("X020", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X021", complex("(1+2j)"), complex(" 1+2j "), bool(0j), bool(1j), hash(1 + 0j) == hash(1))
+except Exception as _e:
+    print("X021", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X022", pow(3, -1, 7), pow(2, -2, 9))
+except Exception as _e:
+    print("X022", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X023", float("1_000.5"), int("1_000"), float("1_0e1_0") if False else "skip")
+except Exception as _e:
+    print("X023", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X024", divmod(2**70, 3), divmod(-2**70, 3))
+except Exception as _e:
+    print("X024", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X025", round(2.5), round(-2.5), round(0.5), round(1.5))
+except Exception as _e:
+    print("X025", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X026", round(float("nan")), round(float("inf")))
+except Exception as _e:
+    print("X026", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X027", (2**64).bit_length(), (2**64 - 1).bit_length())
+except Exception as _e:
+    print("X027", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X028", True & False, True | False, True ^ True, True & 1, 1 & True, ~True, True << 1)
+except Exception as _e:
+    print("X028", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X029", type(True & False).__name__, type(True | False).__name__, type(True ^ False).__name__, type(True + True).__name__)
+except Exception as _e:
+    print("X029", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X030", -True, +False, abs(True), True * 1.5, True / 1, True // 1, True % 2, True ** 2)
+except Exception as _e:
+    print("X030", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X031", 1 == True, 1.0 == True, 0 == False, hash(True) == hash(1), {True: 1, 1: 2})
+except Exception as _e:
+    print("X031", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X032", [1, 2, 3][True], "ab"[False], range(5)[True])
+except Exception as _e:
+    print("X032", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X033", sum([True, False, True]), min(True, False), max(True, 2), sorted([True, False, 0.5]))
+except Exception as _e:
+    print("X033", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X034", True < 1.5, 1.5 > True, True <= 1.0, False < 0.5, True == 1.0)
+except Exception as _e:
+    print("X034", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X035", int("0x1f", 16), int("0X1F", 16), int("1f", 16), int("0b101", 0), int("0o17", 0), int("0x1f", 0))
+except Exception as _e:
+    print("X035", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X036", int("12", 8), int("z", 36), int("  -0b1 ", 0), int("0", 0), int("00", 0) if False else "skip")
+except Exception as _e:
+    print("X036", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X037", int(3.99), int(-3.99), int("3.99") if False else "skip")
+except Exception as _e:
+    print("X037", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X038", float("  1e1  "), float("-.5"), float("5e-1"), float("1E5"), float("infINity"), float("-InF"), float("nAn"))
+except Exception as _e:
+    print("X038", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X039", str(1e16), str(1e-4), str(0.0001), str(0.00001), repr(1e16), str(1e22), str(1e21), str(123456789012345678.0))
+except Exception as _e:
+    print("X039", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X040", 1e15 + 0.3, 9999999999999998.0, 9.999999999999998e15, 1e16 - 2, 4503599627370497.0, 2**53 + 0.0, 1e15 * 9.999999999999998)
+except Exception as _e:
+    print("X040", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X041", 0.1 + 0.2, 1 / 3, 2 / 3, 1.1 * 3, 100 * 1.1, 3 * 0.1, 0.1 * 3, 1e-7, 1e-5)
+except Exception as _e:
+    print("X041", "ERR", type(_e).__name__, str(_e)[:70])

@@ -75,6 +75,10 @@ The value affects every `model` class in the project. To override for a single c
 traceback-remap = true
 ```
 
+When the entry module has **no** `__main__` guard — a script that simply calls `main()` at the bottom, which most single-file programs are — one is synthesised, placed after the module docstring and imports and ahead of the first executable statement. The knob is never silently inert.
+
+Every row of the traceback is rewritten, not just the `File "…", line N` header: the source row CPython prints under each frame is replaced with the real `.ty` row, and the column anchors (`~~~~^^^^`), whose columns no longer line up, are dropped. Without that, a frame reading `File "src/main.ty", line 10` could sit above a line of emitted Python — including a generated name like `__typhon_qi_0__` — that does not exist at `main.ty:10`. Where the `.ty` file cannot be read (a build shipped without its sources) the original row is kept rather than dropped.
+
 It only touches the **entry** script — library imports never trip the `__main__` guard, so imported modules are left byte-for-byte unchanged. On any failure (missing sidecar, malformed map) the hook falls back to the previously-installed `sys.excepthook`, so it can only ever improve a traceback, never suppress one.
 
 <Aside type="note">

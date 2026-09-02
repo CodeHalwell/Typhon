@@ -1,0 +1,13 @@
+def g() -> Result[int, str]:
+    return Err("no")
+
+def f() -> int:
+    match g():
+        case Ok(v):
+            return v
+
+def main() -> None:
+    print(f() + 1)
+
+if __name__ == "__main__":
+    main()

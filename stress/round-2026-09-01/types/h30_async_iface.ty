@@ -1,0 +1,21 @@
+import asyncio
+
+interface Fetcher:
+    async def fetch(self) -> int
+
+class Sync:
+    n: int
+
+impl Sync:
+    def fetch(self) -> int:
+        return self.n
+
+async def use(f: Fetcher) -> int:
+    let v: int = await f.fetch()
+    return v
+
+def main() -> None:
+    print(asyncio.run(use(Sync(n=1))))
+
+if __name__ == "__main__":
+    main()

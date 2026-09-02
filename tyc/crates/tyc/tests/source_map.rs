@@ -773,3 +773,83 @@ if __name__ == \"__main__\":
         "the raising frame must land on .ty line {expected}; got:\n{remapped}"
     );
 }
+
+/// A bare script (no `if __name__ == "__main__":` guard, which is how most
+/// single-file programs are written) with `[emit] traceback-remap = true`
+/// must produce a traceback entirely in `.ty` terms — file, line, AND the
+/// source row shown under each frame. Before this, the guard was only ever
+/// found, never synthesised, so the knob silently did nothing for that
+/// shape; and where it did fire, the row under the frame was still emitted
+/// Python, so `__typhon_qi_0__ = parse(b)` appeared under a `.ty` line that
+/// reads something else entirely.
+#[test]
+fn traceback_remap_reports_a_bare_script_against_ty_source() {
+    let Some(py_bin) = python() else {
+        return;
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+    std::fs::write(
+        tmp.path().join("typhon.toml"),
+        "[project]\nname = \"test\"\nversion = \"0.1.0\"\nsrc = \"src\"\nout = \"build\"\n\
+         [python]\ntarget = \"3.13\"\n[emit]\nformat = false\ntraceback-remap = true\n\
+         [strictness]\n[env]\n",
+    )
+    .unwrap();
+    std::fs::write(
+        tmp.path().join("src").join("main.ty"),
+        concat!(
+            "def parse(s: str) -> Result[int, str]:\n",
+            "    if s == \"\":\n",
+            "        raise ValueError(\"boom\")\n",
+            "    return Ok(len(s))\n",
+            "\n",
+            "\n",
+            "def total(a: str, b: str) -> Result[int, str]:\n",
+            "    let t: int = sum([\n",
+            "        parse(a)?,\n",
+            "        parse(b)?,\n",
+            "    ])\n",
+            "    return Ok(t)\n",
+            "\n",
+            "\n",
+            "def main() -> None:\n",
+            "    print(total(\"ab\", \"\"))\n",
+            "\n",
+            "\n",
+            "main()\n",
+        ),
+    )
+    .unwrap();
+
+    let status = tyc()
+        .arg("build")
+        .arg("--no-sync")
+        .arg(tmp.path())
+        .status()
+        .unwrap();
+    assert!(status.success(), "build should succeed");
+
+    let run = Command::new(&py_bin)
+        .arg(tmp.path().join("build").join("main.py"))
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&run.stderr);
+    assert!(
+        err.contains("main.ty"),
+        "the traceback should name the .ty source:\n{err}"
+    );
+    assert!(
+        !err.contains("main.py"),
+        "no emitted-Python frame should survive:\n{err}"
+    );
+    assert!(
+        !err.contains("__typhon_qi_"),
+        "a generated name must not reach the user:\n{err}"
+    );
+    assert!(
+        err.contains("parse(b)?"),
+        "the failing propagation is the row to show:\n{err}"
+    );
+    assert!(err.contains("ValueError: boom"), "message kept:\n{err}");
+}

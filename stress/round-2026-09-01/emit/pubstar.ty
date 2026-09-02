@@ -1,0 +1,6 @@
+from pkg import A, fa, B, ORDER, fg
+
+def main() -> None:
+    print(A, fa(), B(x=1), ORDER, fg())
+
+main()

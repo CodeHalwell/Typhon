@@ -43,8 +43,10 @@ tyc run --compile --temp      # legacy with ephemeral build dir
   `return`, `pass`, `match` (literal / capture / wildcard / sequence /
   class patterns including the native `Ok(x)` / `Err(e)` cases).
 - Functions: positional, keyword, default, `*args`, `**kwargs`, closures,
-  recursion (1000-frame default depth since v0.8.0 to match CPython,
-  configurable on the `Interpreter`).
+  recursion (a 1000-frame limit by default, matching CPython's
+  `sys.getrecursionlimit()`; `sys.setrecursionlimit(n)` moves it, rejecting
+  `n < 1` with CPython's own `ValueError`, and exceeding it raises
+  `RecursionError`).
 - Classes: annotated fields (constructor synthesised at instantiation),
   explicit `__init__`, methods declared inside `class` body, methods
   declared in a sibling `impl Foo:` block (merged on the fly), single
@@ -55,7 +57,14 @@ tyc run --compile --temp      # legacy with ephemeral build dir
   Other decorators run as regular function calls.
 - Error handling: `try` / `except T as e` / `else` / `finally`, `raise`,
   the `Result[T, E]` ADT with native `Ok(...)`, `Err(...)`, and the `?`
-  propagation operator.
+  propagation operator. PEP 3134 chaining is tracked: `raise X from Y`
+  sets `__cause__` (and `__suppress_context__`), an exception leaving an
+  `except` handler — or raised by a `finally` over one still propagating —
+  records the interrupted exception as its `__context__`, and an unchained
+  exception answers `None` / `False`. `hasattr` on a builtin value reads a
+  per-type dunder table taken from CPython (`hasattr(5, "__len__")` is
+  `False`), which is also how a `@runtime_checkable` Protocol matches
+  structurally under `isinstance`.
 - Imports: `import`, `from ... import`, `as` aliasing, dotted module
   access. The full list of modules the VM can resolve natively is below.
 - Comprehensions: list, set, dict, generator (eagerly materialised in v1).
@@ -72,6 +81,10 @@ tyc run --compile --temp      # legacy with ephemeral build dir
 `max`, `sum`, `sorted` (incl. `key=` / `reverse=`), `reversed`,
 `enumerate`, `zip`, `map`, `filter`, `all`, `any`, `next`, `iter`, `hex`,
 `bin`, `oct`, `chr`, `ord`, `round`, `input`, `hash`, `id`, `callable`,
+`issubclass` (v1.0.0-beta.1, incl. a tuple of classes),
+`eval` (v1.0.0-beta.1 — a single *expression*, resolved against the module
+globals since the VM has no frame introspection; `exec` is deliberately
+absent),
 `open` (read / write / append / binary modes since v0.9.0, plus
 `__enter__` / `__exit__` for `with` blocks). Since v0.10.0 also `divmod`
 (raises `ZeroDivisionError` with CPython messages), `pow` (2- and 3-arg
@@ -94,15 +107,27 @@ since v0.9.0), the singletons `True`, `False`, `None`, and the
 placeholder bases `object`, `Protocol`, `BaseModel`, `Generic`,
 `TypedDict`. `frozenset(...)` is hashable as a dict key since v0.9.0
 via a `HashKey::FrozenSet` variant with insertion-order-independent
-hashing.
+hashing; a **class object** is hashable by identity since v1.0.0-beta.1,
+so a type-keyed registry (`{SomeClass: handler}`,
+`functools.singledispatch`) works.
+
+A **function object has its own `__dict__`** since v1.0.0-beta.1:
+`wrapper.register = …` and other decorator-published API work as they do
+in CPython.
+
+A `class X(NamedTuple)` is a real tuple (indexable, iterable, comparable
+with a plain tuple, `X(a=1, b=2)` repr, `_fields` / `_asdict` /
+`_replace`) and a `class X(TypedDict)` constructs a plain `dict`, both
+since v1.0.0-beta.1 — before that each built an opaque instance, so
+`p[0]` and `u["k"]` raised.
 
 ### Native stdlib modules
 
 | Module | What you get |
 |---|---|
 | `math` | `pi`, `e`, `inf`, `nan`, `sqrt`, `floor`, `ceil`, `log` (with base), `log2`, `log10`, `exp`, `sin`, `cos`, `tan`, `pow`, `fabs`. v0.10.0: `gcd`, `lcm`, `factorial`, `isqrt`, `comb`, `perm` (all reject non-integer args) |
-| `os` | `getenv`, `environ`, `os.path.exists`, `isfile`, `isdir` |
-| `sys` | `argv`, `platform`, `version`, `exit(code)` |
+| `os` / `os.path` (rebuilt v1.0.0-beta.1) | The process and filesystem surface: `getenv`, `environ`, `getcwd`, `chdir`, `listdir`, `scandir`, `walk`, `mkdir`, `makedirs`, `remove`, `rmdir`, `rename`, `replace`, `stat`, `access`, `getpid`, `cpu_count`, `system`, `strerror`, `urandom`, the `O_*` / `*_OK` / `SEEK_*` constants, `PathLike` / `fspath`, and a full `posixpath` (`join`, `split`, `splitext`, `basename`, `dirname`, `normpath`, `abspath`, `realpath`, `relpath`, `commonpath`, `commonprefix`, `expanduser`, `expandvars`, `isabs`, `exists`, `isfile`, `isdir`, `islink`, `getsize`, `getmtime`, `samefile`), which keeps a `bytes` path in bytes. Errors carry CPython's `errno` / `strerror` / `filename`. `import os.path` and `import posixpath` resolve to the same shim |
+| `sys` | `argv`, `platform`, `version`, `version_info`, `byteorder`, `maxsize`, `exit(code)`, `stdout`, `stderr`, `stdin`, `getrecursionlimit` / `setrecursionlimit`. v1.0.0-beta.1: `modules` (a live view of the import cache, always carrying `__main__`) and `exc_info()` (the exception being handled, with `None` for the traceback slot — the VM has no traceback object). Assigning `sys.stdout` redirects `print`, so `contextlib.redirect_stdout` works |
 | `json` | `dumps`, `loads` (full JSON 7159 surface). v0.10.0: `dumps(indent=…)` pretty-prints |
 | `time` | `time()`, `sleep()`, `monotonic()`. v0.10.0: `perf_counter()`, `process_time()` |
 | `random` | `random()`, `seed(n)`, `getrandbits`, `randint`, `randrange`, `uniform`, `gauss`, `choice`, `shuffle`, `sample` — a **CPython-compatible MT19937**, following `random.py` / `_randommodule.c`, so `random.seed(n)` produces a **byte-identical sequence** under `tyc run` and under `tyc build` + CPython. An *unseeded* program seeds from OS-derived entropy, as CPython does at import, so it draws a different sequence on every run (v1.0.0-alpha.8 — before that the default was a fixed constant, making `tyc run` repeatable where CPython is not). `seed()` / `seed(None)` reseeds from entropy; string / bytes / float seeds are rejected (CPython hashes them through SHA-512) — use `tyc run --compile` for those. NOT cryptographic on either surface: use `secrets` |
@@ -110,18 +135,50 @@ hashing.
 | `datetime` (v0.11.0) | `datetime.datetime(y, mo, d, ...)`, `.now()`, `.fromisoformat(...)`, `.isoformat()`, `+ timedelta`, comparisons, `timedelta(seconds=...)` arithmetic. Naïve / UTC only; tz-aware arithmetic needs `--compile` |
 | `re` (v0.8.0, capture groups in v0.11.0) | `match`, `search`, `findall`, `sub`, `split`, `compile`. `match` is anchored at the start of the string. Some flag arguments (`re.MULTILINE`, etc.) are accepted but ignored — `tyc::python_semantic_drift` warns when the impact would change behaviour. v0.11.0: `re.Match.group(n)` / `.groups()` / `.groupdict()` return real capture groups (prior shim returned the whole match for every index) |
 | `typing` (v0.8.0) | Generic constructors used at runtime are no-ops; `Callable`, `List`, etc. are accepted in import position and ignored at runtime. Type-only imports are stripped by the desugar pre-pass |
+| `collections.abc` | The abstract container types (`Callable`, `Iterable`, `Iterator`, `Generator`, `Sequence`, `Mapping`, `MutableMapping`, `Set`, `Hashable`, `Awaitable`, `Coroutine`, `AsyncIterator`, the `*View`s, …) as identity natives — annotation-only at runtime, mirroring the `typing` shim |
+| `abc` (v0.15.6) | `ABC`, `ABCMeta`, `abstractmethod`, `abstractclassmethod`, `abstractstaticmethod`, `abstractproperty`, `update_abstractmethods` — identity natives; a non-class base such as `ABC` is ignored at class creation, so `class H(ABC): @abstractmethod def handle(...)` runs |
+| `asyncio` | The cooperative-sequential shim: `run`, `gather` (incl. `return_exceptions=True`), `TaskGroup` (`create_task`, `__aenter__` / `__aexit__`), `sleep` (real wall-clock), `timeout` (checked at scope exit), `Queue` (fails loudly instead of deadlocking), and the exception classes (`TimeoutError`, `CancelledError`, …). Coroutines are forced to completion at their `await` — see "What the VM does not support yet" below for the interleaving caveat |
 | `collections` (v0.8.0, defaultdict in v0.11.0) | `OrderedDict`, `defaultdict` (v0.11.0: `factory` is actually invoked on missing-key access via the subscript `__missing__` hook, so `dd[k] += 1` works), `Counter`, `namedtuple` |
-| `functools` (v0.8.0) | `lru_cache`, `cache`, `cached_property`, `reduce`, `partial` |
+| `functools` (v0.8.0) | `lru_cache`, `cache`, `cached_property`, `reduce`, `partial`, `wraps`. v1.0.0-beta.1: `partial` binds keyword arguments too (`partial(pow, exp=2)`), plus `cmp_to_key`, `total_ordering` and `singledispatch` |
 | `itertools` (v0.8.0) | `chain`, `count`, `cycle` (materialise a bounded prefix), `accumulate`, `combinations`, `permutations`, `product`, `islice`, `takewhile`, `dropwhile`, `groupby` |
 | `dataclasses` (v0.8.0) | `dataclass`, `field`, `fields`, `asdict`, `astuple`. v0.9.0: `field(default_factory=list)` actually invokes the factory per instance — `tags: list[str] = []` no longer shares one list across every instance |
-| `pathlib` (v0.8.0, expanded v0.11.0) | `Path` with `exists`, `read_text`, `write_text`, `parent`, `name`, `stem`, `suffix`, `with_suffix`, `joinpath` / `/`. v0.11.0: `__truediv__` dispatch (`Path("a") / "b"`), `.suffixes`, `.parts`, and `str(Path(...))` / `repr(Path(...))` match CPython |
+| `pathlib` (v0.8.0, rebuilt v1.0.0-beta.1) | `PurePath` / `Path` over the `os` shim: construction and normalisation, `parts`, `parent`, `parents`, `name`, `stem`, `suffix`, `suffixes`, `with_name` / `with_stem` / `with_suffix`, `joinpath` / `/`, `relative_to`, `is_absolute`, `match`, `as_posix`, `as_uri`, comparison and hashing, `home` / `cwd` / `absolute` / `resolve` / `expanduser`, `exists` / `is_file` / `is_dir` / `stat`, `read_text` / `write_text` / `read_bytes` / `write_bytes` / `open`, `iterdir` / `glob` / `rglob` / `walk`, `mkdir` / `touch` / `unlink` / `rmdir` / `rename`. `repr` and error messages match CPython |
 | `collections.deque` (v0.9.0) | Rides on `Value::List` via new `popleft` / `appendleft` / `extendleft` / `rotate` list methods. Graph / BFS / queue algorithms work end-to-end |
 | `heapq` (v0.9.0) | `heappush`, `heappop`, `heapify`, `heappushpop`, `heapreplace`, `nsmallest`, `nlargest` |
-| `contextlib` (v0.9.0) | `@contextmanager` identity decorator and `contextmanager`-decorated factories. `with` block honours the wrapped `__enter__` / `__exit__` shape |
-| `pydantic` (v0.9.0, expanded v0.10.0) | `BaseModel` is a placeholder so declaring a `model` doesn't `ImportError`. Since v0.10.0 `Model.model_validate(mapping)` constructs an instance from a dict, `inst.model_dump()` returns a dict of fields in declaration order, and `model_dump_json()` the JSON form — flat `model` classes are usable under `tyc run`. Nested-model validation is not type-directed yet; deeply-nested models still need `--compile` |
-| `typhon_runtime` | `Ok`, `Err`, `tasks.spawn`, `lazy.lazy_let`, `lazy.lazy_import` — the `spawn` shim runs synchronously. `Ok` / `Err` carry bound `.map` / `.map_err` / `.and_then` / `.or_else` combinators since v0.9.0 |
+| `contextlib` (v0.9.0) | `@contextmanager` identity decorator and `contextmanager`-decorated factories. `with` block honours the wrapped `__enter__` / `__exit__` shape. v1.0.0-beta.1: `@asynccontextmanager` really drives its generator (it was an identity decorator, so `async with` raised), plus `suppress`, `nullcontext`, `closing`, `redirect_stdout`, `redirect_stderr`, `ExitStack` |
+| `pydantic` (v0.9.0, expanded v0.10.0 and v1.0.0-beta.1) | `BaseModel` is a placeholder so declaring a `model` doesn't `ImportError`. `Model.model_validate(mapping)` constructs an instance from a dict — annotated sub-models included, recursively, since v1.0.0-beta.1, alongside `model_validate_json` — `inst.model_dump()` returns a dict of the fields in declaration order (unwrapping nested models back to dicts, as pydantic's does), and `model_dump_json()` the JSON form. It does not *validate*: a field of the wrong type is stored as given rather than raising `ValidationError` |
+| `io` (v1.0.0-beta.1) | `open` and the file objects behind it (`TextIOWrapper`, `BufferedReader` / `BufferedWriter`, `FileIO`), `StringIO`, `BytesIO`, `SEEK_*`, `UnsupportedOperation`. Modes, encodings, newline translation, `seek` / `tell` / `truncate` / `flush`, iteration by line, and the CPython error messages for a closed or wrong-mode file |
+| `shutil` (v1.0.0-beta.1) | `copy`, `copy2`, `copyfile`, `copytree`, `move`, `rmtree`, `which`, `disk_usage`, `SameFileError` |
+| `tempfile` (v1.0.0-beta.1) | `mkdtemp`, `mkstemp`, `gettempdir`, `NamedTemporaryFile`, `TemporaryDirectory`, `TemporaryFile` |
+| `glob` (v1.0.0-beta.1) | `glob`, `iglob`, `escape`, `has_magic` — the same matcher `pathlib.Path.glob` uses, including `**` |
+| `hashlib` (v1.0.0-beta.1) | `md5`, `sha1`, `sha224`, `sha256`, `sha384`, `sha512`, plus unkeyed `blake2b` / `blake2s` at their default digest sizes (a `key=` / `digest_size=` argument raises rather than returning a wrong digest), `new`, with `update` / `digest` / `hexdigest` / `copy` and the `digest_size` / `block_size` / `name` attributes |
+| `base64` (v1.0.0-beta.1) | `b64encode` / `b64decode` (incl. `altchars`), `urlsafe_*`, `standard_*`, `b32encode` / `b32decode`, `b16encode` / `b16decode`, `encodebytes` / `decodebytes` |
+| `csv` (v1.0.0-beta.1) | `reader`, `writer`, `DictReader`, `DictWriter`, the `QUOTE_*` policies, `excel` / `excel-tab` / `unix` dialects and `register_dialect`. Quoted fields spanning lines are parsed, and `escapechar` escapes on both sides — `QUOTE_NONE` raises `csv.Error` for a field it cannot write without one, as CPython does. No `Sniffer` |
+| `string` (v1.0.0-beta.1) | The constant tables (`ascii_letters`, `digits`, `punctuation`, …), `capwords`, `Template` (`substitute` / `safe_substitute`) |
+| `operator` (v1.0.0-beta.1) | The function forms of every operator plus `itemgetter`, `attrgetter`, `methodcaller`, `countOf`, `indexOf`, `length_hint` |
+| `bisect` (v1.0.0-beta.1) | `bisect_left`, `bisect_right`, `insort_left`, `insort_right` (and the `bisect` / `insort` aliases), with `lo` / `hi` / `key` |
+| `__future__` (v1.0.0-beta.1) | The feature flags, so `from __future__ import annotations` imports rather than raising |
+| `asyncio` additions (v1.0.0-beta.1) | `to_thread` (runs the call inline — there is no other thread under the sequential scheduler), and `Lock` / `Semaphore` / `BoundedSemaphore` / `Event`. Acquisition always succeeds at once, since two coroutines are never inside the same critical section; `Event.wait()` on an unset event fails loudly rather than deadlocking, like `Queue.get` on an empty queue |
+| `typhon_runtime` (and `typhon_runtime.*`) | `Ok`, `Err`, `tasks.spawn`, `lazy.lazy_let`, `lazy.lazy_import` — the `spawn` shim runs synchronously. `Ok` / `Err` carry bound `.map` / `.map_err` / `.and_then` / `.or_else` combinators since v0.9.0. Submodule imports (`from typhon_runtime.freeze import deep_freeze`) resolve to the matching submodule |
 
-Any other module raises `ImportError` with a pointer to `--compile`.
+`enum` is resolved separately by the interpreter (it backs the `enum` keyword), not through the module table.
+
+**Anything outside this set takes the compiled path automatically**
+(v1.0.0-beta.1). `tyc run` scans the program's imports *before* executing
+anything; if one names a module the VM does not model, it prints a `note:`
+saying which, then builds the project and runs it under CPython — exactly
+what `tyc run --compile` does. Nothing half-executes and restarts, so the
+program's output and exit code are the compiled path's. `--no-fallback`
+turns the scan into a hard failure instead (the VM's own
+`ModuleNotFoundError`), which is what you want for a hermetic run or to
+find out whether the VM covers a program.
+
+Modules the VM deliberately does **not** model, because they need a real
+CPython runtime rather than a shim: `sqlite3`, `subprocess`, `threading`
+/ `multiprocessing`, `socket` / `urllib` / `http`, `ctypes`, `decimal`,
+`fractions`, `logging`, `configparser`, `struct`, and every third-party
+package (`pydantic` has the placeholder above; `numpy`, `requests`,
+`yaml`, … do not). Importing one is not an error — it is a slower run.
 
 ### Built-in methods on values
 
@@ -133,7 +190,13 @@ Any other module raises `ImportError` with a pointer to `--compile`.
   `partition`, `rpartition`, `removeprefix`, `removesuffix`, `casefold`,
   `isnumeric`, `istitle`, `expandtabs`. `strip` / `lstrip` / `rstrip`
   now honour their `chars` argument (previously silently ignored), and
-  `str.format` stringifies values through a user `__str__`.
+  `str.format` stringifies values through a user `__str__`. Since
+  v1.0.0-beta.1 also `isascii`, `isidentifier`, `isprintable`. The
+  character properties behind `isdigit` / `isdecimal` / `isnumeric` /
+  `isprintable` / `isspace`, and the titlecase mapping behind `title` /
+  `capitalize`, come from tables generated out of the hosting CPython
+  (`scripts/gen-unicode-props.py`) — Rust's std has none of them, and
+  `char::is_numeric` answers a different question from all three.
 - `list`: `append`, `extend`, `insert`, `pop`, `remove`, `index`, `count`,
   `clear`, `reverse`, `sort`, `copy`. Since v0.10.0 `sort` accepts
   `reverse=` / `key=` kwargs and honours a user `__lt__` / `__eq__`;
@@ -149,7 +212,48 @@ Any other module raises `ImportError` with a pointer to `--compile`.
   the frozen sentinel through `union` / `intersection` / `difference` /
   `symmetric_difference`; `update` is rejected on frozensets.
 - `tuple`: `count`, `index`.
-- `int`: `bit_length`. `float`: `is_integer`.
+- Set comparison is subset / superset (`{1} <= {1, 2}`), `d1 | d2` merges
+  two dicts (PEP 584), a value-mixin enum member is its value under
+  arithmetic and `int()` (`-Colour.RED`, `int(Colour.RED)`), and
+  `Perm.READ in (Perm.READ | Perm.WRITE)` is a flag bit-test — all
+  v1.0.0-beta.1; a bare `1 in 3` still raises, as in CPython.
+- `bytes`: `decode`, `hex` (with a separator and group size),
+  `split` / `rsplit`, `splitlines`, `strip` / `lstrip` / `rstrip`, `join`,
+  `replace`, `startswith` / `endswith`, `find` / `index` / `rfind` /
+  `rindex`, `count`, `lower` / `upper` / `title` / `capitalize` /
+  `swapcase`, the `is*` predicates, `partition` / `rpartition`,
+  `ljust` / `rjust` / `center` / `zfill`, `removeprefix` / `removesuffix`
+  and `expandtabs` — ASCII-only, as CPython's are (v1.0.0-beta.1 filled
+  the surface out from 17 methods to CPython's 40).
+- `bytearray` (v1.0.0-beta.1): the mutable sibling of `bytes` —
+  construction from bytes / an int / an iterable of ints / `str` plus an
+  encoding, `append` / `extend` / `insert` / `pop` / `remove` / `clear` /
+  `reverse` / `copy`, index and slice read *and* write, `+` / `*` /
+  `in` / comparison against `bytes`, the `bytes` read methods, and
+  `bytearray.fromhex`. `repr` is CPython's `bytearray(b'…')`, and it is
+  unhashable, as CPython's is. `x in b"…"` (a byte value or a
+  subsequence) works too — the VM rejected both.
+- `int`: `bit_length`, `bit_count`, `to_bytes`, and the classmethod
+  `int.from_bytes`. `float`: `is_integer`. Both carry the `numbers`
+  tower's read-only components since v1.0.0-beta.1 — `real`, `imag`,
+  `conjugate()`, plus `numerator` / `denominator` on `int`.
+- Every builtin *type* also exposes its methods unbound, as CPython does:
+  `str.upper(s)`, `dict.get(d, k)`, `list.count(xs, x)` (v1.0.0-beta.1),
+  plus the classmethods `int.from_bytes` and `bytes.fromhex`.
+- `float.hex()` and `int` / `float` `as_integer_ratio()` (v1.0.0-beta.1).
+- Reflection (v1.0.0-beta.1): a class object reprs with the module its body
+  ran in (`<class '__main__.User'>`), and PEP 695 type parameters are real
+  `TypeVar` / `ParamSpec` / `TypeVarTuple` objects on `__type_params__`,
+  carrying `__name__`, `__bound__`, `__constraints__`, `__default__` (PEP
+  696) and `has_default()`. A non-generic function or class reports `()`.
+  A stdlib shim's classes repr without a module: the VM's name for one is
+  not always CPython's (`pathlib.Path` is modelled as `PosixPath`), so
+  qualifying them would assert something untrue.
+- `str.format` handles the `!r` / `!s` / `!a` conversions and the
+  `{0.attr}` / `{name[key]}` accessors (v1.0.0-beta.1); `str.center`
+  biases its extra pad character the way CPython does.
+- A class exposes `__doc__` and `__mro__`, and a function
+  `__type_params__` (v1.0.0-beta.1).
 - `bytes`: `repr` matches CPython byte-for-byte (`b'hi'` by default,
   `b"with 'embedded'"` fallback, `\xNN` for non-printable bytes). Since
   v0.11.0 also `decode`, `hex`, `fromhex`, `count`, `find`, `rfind`,
@@ -200,6 +304,14 @@ without any `.py` emission. `tyc run --compile` now spawns
 `python -m <pkg>.main` instead of `python build/main.py` so relative
 imports in the entry point resolve correctly.
 
+Since v1.0.0-beta.1 `from repo import users` — reaching a submodule through
+its package, rather than naming it in full — loads `repo.users` when the
+package has no such attribute, exactly as CPython's import system does; a
+name the package genuinely lacks raises `ImportError`, not
+`AttributeError`. A bare-file invocation whose adjacent package imports
+something the VM does not model takes the compiled fallback, package and
+all.
+
 ## Comptime, freeze, lazy
 
 - `comptime let X = ...` inlines in the VM via the substitution pass
@@ -239,8 +351,10 @@ message:
   `asyncio.run`, `asyncio.gather` (including `return_exceptions=True`),
   `TaskGroup.create_task`, and `typhon_runtime.tasks.spawn` (the `go`
   lowering) force it to completion in program order. `gather:` blocks,
-  `go f(x) -> task` + `await task`, `async for` over (eagerly
-  materialised) async generators, `async with`, `asyncio.sleep`
+  `go f(x) -> task` + `await task`, `async for` over an async generator or
+  a hand-written `__aiter__` / `__anext__` iterator, `async with` (over a
+  user `__aenter__` / `__aexit__` **or** an `@asynccontextmanager`
+  generator), `asyncio.sleep`
   (real wall-clock sleep), `asyncio.timeout` (checked at scope exit),
   and `asyncio.Queue` all work — with results identical to CPython
   whenever the program's correctness doesn't depend on task
@@ -291,18 +405,28 @@ message:
   protocol are unsupported — the generator runs to its cap before the
   first `send` could ever reach it. Bidirectional generators need
   `tyc build`. (Plain forward iteration is unaffected.)
-- **`@contextmanager` generators inside `with` blocks.** Eager collection
-  runs the generator's setup and teardown at call time, so the `with`
-  body can't run between them; the VM emits a clear "use `tyc build`"
-  message.
+- **A generator whose `yield` sits where the tree-walk cannot suspend.**
+  Most generator bodies run lazily (`@contextmanager` and
+  `@asynccontextmanager` factories included, since v1.0.0-beta.1, so the
+  `with` body runs between setup and teardown). A `yield` in a loop test,
+  a `with` item, a call argument after another call, or two yields in one
+  expression falls back to eager collection, where setup and teardown both
+  run at call time.
 - Template strings (`t"…"`).
 - IPython escape commands.
-- `with` statements other than `open()` and `contextlib.@contextmanager`-decorated
-  factories (basic context-manager protocol since v0.9.0).
+- A `with` / `async with` over anything that is neither `open()`, a
+  `@contextmanager` / `@asynccontextmanager` factory, nor an object
+  implementing `__enter__` / `__exit__` (or `__aenter__` / `__aexit__`).
 - `lazy let` inside a class body uses an identity decorator; callers must
-  use the method-call form `obj.x()`.
-- **Nested-model `pydantic.model_validate`** is not type-directed — a
-  nested dict stays a dict; deeply-nested models need `tyc build`.
+  use the method-call form `obj.x()`. (A *module-level* `lazy let` defers
+  properly since v1.0.0-beta.1 — the VM hands back the same
+  materialise-on-first-use proxy the emitted runtime does, rather than
+  running the initialiser at the binding.)
+- **Pydantic *validation*.** `model_validate` builds the model — nested
+  models included, since v1.0.0-beta.1, and `model_dump` unwraps them back
+  to nested dicts — but it does not *validate*: a field of the wrong type
+  is stored as given rather than raising `ValidationError`. A program whose
+  output is pydantic's own error text needs `tyc build`.
 
 If your program needs any of these, run with `--compile` for now.
 

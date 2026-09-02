@@ -1,0 +1,16 @@
+def step(n: int) -> Result[bool, str]:
+  if n > 100:
+    return Err("too big")
+  return Ok(n < 3)
+
+def run() -> Result[int, str]:
+  mut n: int = 0
+  while step(n)?:
+    n += 1
+  return Ok(n)
+
+def main() -> None:
+  print(run())
+
+if __name__ == "__main__":
+  main()

@@ -61,3 +61,20 @@ It becomes an error by default in a later release. The bare-name form
 (`name.upper()` where `name: str?`) has always been, and remains, an error.
 
 See https://github.com/CodeHalwell/Typhon/blob/main/docs/diagnostics/nullable_use.md
+
+## Operands
+
+An arithmetic operator or an *ordering* comparison (`<`, `<=`, `>`, `>=`)
+rejects `None` at runtime, so a nullable operand is reported whatever shape
+the expression has — a bare name, a call result, a subscript:
+
+```ty
+let counts: dict[str, int] = {"a": 1}
+let total: int = counts.get("b") + 1   # error: `dict.get` is `int | None`
+let small: bool = lookup("x") < 3      # error: `<` on a possibly-None value
+```
+
+Equality and identity (`==`, `!=`, `is`, `is not`) accept `None` on either side
+and are not reported. An attribute-rooted operand (`self.count + 1`) reports
+through the warn-level field form above, governed by `[strictness]
+nullable-use`.

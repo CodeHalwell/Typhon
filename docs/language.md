@@ -28,6 +28,11 @@ The rest of this document is the detail under these rules. The
 
 A plain `T` forbids `None`; `T?` is the optional form. Internally `T?` is represented as a `Nullable[T]` wrapper but emits as `T | None` in Python annotations. The checker uses flow-sensitive analysis to narrow `T?` to `T` inside guards and null-checks. Attempting to call a method on a `T?` without a check is a compile error.
 
+The suffix applies to a quoted forward reference too — `parent: "Node"?` is
+the nullable form of `"Node"`, which is how a self-referential model spells
+its optional back-pointer. (`"Node?"`, with the `?` inside the quotes, is
+equivalent and was the only accepted spelling before v1.0.0-beta.1.)
+
 Narrowing forms the checker recognises:
 
 - `is None` / `is not None`
@@ -179,7 +184,7 @@ class ApiUser(BaseModel):
 
 #### Mutable field defaults
 
-`@dataclass` rejects bare mutable literals at class-definition time (`tags: list[str] = []` raises `ValueError` in Python). Typhon rewrites every `field: T = [] | {} | set() | list() | dict()` on a class that emits as a dataclass into `dataclasses.field(default_factory=<ctor>)` at desugar time, so the literal form just works:
+`@dataclass` rejects bare mutable literals at class-definition time (`tags: list[str] = []` raises `ValueError` in Python). Typhon rewrites every `field: T = [] | {} | set() | list() | dict()` on a class that emits as a dataclass into `dataclasses.field(default_factory=<ctor>)` at desugar time, so the literal form just works. A non-empty `list` / `dict` / `set` display built only from constants (`xs: list[int] = [1, 2]`, `d: dict[str, int] = {"a": 1}`) is rewritten the same way, to `dataclasses.field(default_factory=lambda: [1, 2])` — `@dataclass` rejects those too, since it refuses any unhashable default. A display that names something (`[SIZE]`, `[f()]`) is left exactly as written, because a class-body `lambda` cannot see class-scope names:
 
 ```python
 # Typhon
@@ -250,6 +255,7 @@ What `class!` changes versus a plain `class`:
 - **`__init__` is auto-synthesised** when the body declares no `def __init__` and at least one base is present. The synthesised constructor calls `super().__init__()` and then assigns every annotated field through `self`, in source order. Field defaults flow into the parameter signature; fields without defaults are positional, fields with defaults are keyword-or-positional after them.
 - **Class-level field defaults are stripped from the body** when `__init__` is synthesised — the default is carried only in the generated parameter list. Leaving the literal at class scope would evaluate it twice (once at class-definition time as a shared class attribute, then again per-instance in `__init__`), which silently breaks libraries that introspect class attributes — e.g. PyTorch parameter registration would see a dead class-level `Linear(10, 5)` instance. Annotations survive so type checkers still see the field shape.
 - **A hand-written `__init__` is preserved verbatim.** Use this when the base class needs configuration arguments that aren't 1:1 with your declared fields.
+- **A `class!` chain composes its constructors.** When the first base is another in-module `class!` without a hand-written `__init__`, the subclass's synthesised constructor takes the base's parameters (defaults included) ahead of its own fields, forwards them by keyword — `super().__init__(a=a, b=b)` — and assigns only its own fields; required parameters come before defaulted ones in the signature, so `class! Grand(Child): c: str` over `class! Child(Base): a: int; b: int = 2` is `Grand(a, c, b=2)`. The checker models the same order. The chain still reaches a framework base's `__init__` first (`torch.nn.Module` sees its setup run before any field is assigned).
 
 ### `plain class` (raw Python class)
 
@@ -534,13 +540,15 @@ loaded.use()        # OK — every non-diverging arm assigned `loaded`
 
 `match` over a sealed union or `Result[T, E]` is treated as exhaustive for definite-assignment purposes when every variant is covered by a class pattern; the canonical `case Ok(v): / case Err(e): return Err(e)` shape works without a `case _:` wildcard. `return` / `raise` / `continue` / `break` mark a branch as diverging — the branch is excluded from the intersection of "definitely-assigned" paths. Loop bodies do not propagate assignments out (the body may execute zero times).
 
+The same pass watches every *ordinary* local of a function — a name the body binds that is not a parameter, a declare-only `let`, or a `global` / `nonlocal` — and reports a read that is not definitely assigned as the advice-level `tyc::possibly_unbound`: assigned in one arm of an `if` without `else`, read after a `for` over a possibly-empty iterable, read before the first assignment, after `del`, or after the `except ... as e` handler that bound it (CPython unbinds `e` when the handler finishes). The message says which certainty applies ("not assigned on every path" versus "read before any assignment reaches it"). A literal `while True:` body counts as running at least once up to its first `break`; `match` captures are bound before the guard; a `try` statement's `else` clause continues from the clean-body path rather than the join with the handlers; reads inside nested functions, lambdas and comprehension bodies are left to the closure. Declare-only `let`s keep the error-level `tyc::use_of_uninitialised`.
+
 `mut NAME: T` without an initialiser is also accepted and follows the usual `mut` semantics — any number of subsequent assignments are legal.
 
 ## Lazy loading
 
 - `lazy import np = numpy` → defers module loading until first attribute access. On a **3.13 / 3.14 target** this lowers to a call to the generated `typhon_runtime.lazy.lazy_import` helper (which wraps the stdlib `importlib.util.LazyLoader`). On a **3.15+ target** it lowers to native [PEP 810](https://peps.python.org/pep-0810/) syntax instead — see below.
 - `lazy from foo import a, b` is **rejected** at parse time: PEP 690 notes that `from`-imports eagerly touch attributes on the source module and therefore defeat deferral. Use `lazy import foo` and access `foo.a` / `foo.b`. (Note: PEP 810 permits a `lazy from … import` form upstream, but Typhon keeps the single `lazy import ALIAS = MODULE` surface for now — supporting the `from` form is a future surface decision.)
-- `lazy let` module-level bindings → cached getter with a sentinel + lock helper in `typhon_runtime` (not `functools.cached_property`, which is instance-scoped, race-prone, and writable after first evaluation).
+- `lazy let` module-level bindings → cached getter with a sentinel + lock helper in `typhon_runtime` (not `functools.cached_property`, which is instance-scoped, race-prone, and writable after first evaluation). The proxy forwards attribute access, calls, indexing, iteration, `len`, truthiness, equality, hashing, every arithmetic / bitwise / comparison operator, `divmod`, `round`, `math.trunc` / `floor` / `ceil`, `int` / `float` / `complex` / `operator.index`, `format` (so `f"{RATE:.2f}"` works), `in`, `reversed` and the context-manager protocol, so a lazily-computed primitive is transparent in ordinary expressions.
 - `lazy let` instance-level bindings on effectively immutable classes → `functools.cached_property`.
 - `lazy[list[T]]` return types → generator functions instead of materialised lists.
 
@@ -587,6 +595,48 @@ A function is **inferable as pure** only if every one of the following holds:
 When all six hold, the analyser **may** emit `@functools.cache` or `@functools.lru_cache(maxsize=N)` — but only with an explicit opt-in: a `@memo` attribute on the function, an `@pure(memo=True)` annotation, or `[strictness] auto-memoise = true` in `typhon.toml`. The checker never inserts caches silently; caches extend the lifetime of every argument and return value, which is not a transparent change.
 
 Manually marking a function `@pure` that fails any of the six conditions is a hard error.
+
+### What the verifier proves
+
+The analyser is syntactic: it reads the function body, the module's own bindings and its import
+aliases, never the runtime. Every call and every read it inspects lands in one of three verdicts:
+
+- **Provably impure** — an I/O builtin (`print`, `open`, `input`, …), a clock or entropy read
+  through any spelling (`time.perf_counter()`, `datetime.datetime.now()`, `datetime.now()` after
+  `from datetime import datetime`, any `.now()` / `.today()` / `.utcnow()`, `random.*`,
+  `np.random.*`), a logging call on a logger-named receiver (`logger.warning(...)`), an I/O method
+  on any receiver (`.read_text()`, `.write()`, `.send()`, `.sleep()`, `.execute()`, …), a
+  mutating method or attribute/subscript write on an *argument* or a *module binding*
+  (`REGISTRY.append(x)`, `c.n = c.n + 1`, `next(it)` on a parameter), a read of a `mut` (or
+  rebound, or `global`-declared) module binding, `raise`, `try`, `global`, `nonlocal`, `await`,
+  `yield`, or a call to a same-module helper that is not itself `@pure`. These are what
+  `tyc::impure_pure_fn` reports.
+- **Provably pure** — arithmetic and comparisons, pure builtins (including the container
+  constructors), constructors of same-module classes, calls into a fixed stdlib allow-list
+  (`math`, `cmath`, `operator`, `itertools`, `functools`, `string`, `re`, `json`, `statistics`,
+  `fractions`, `decimal`, `numbers`, `typing`, `enum`, `textwrap`, `unicodedata`, `base64`,
+  `binascii`, `struct`, `bisect`, `heapq`, `copy`, `dataclasses`, `abc`, `collections`,
+  `datetime` constructors, `zoneinfo`, `hashlib`, `hmac`, `difflib`, `ipaddress`, `pathlib`
+  constructors, `urllib.parse`, `html`, `keyword`, `codecs`, `array`, `types`, and the pure
+  string operations of `os.path`), non-mutating methods of a receiver whose builtin type is
+  evident (a literal, a display, a builtin constructor call, an annotated parameter or local, a
+  `let X: str` module constant), mutating methods on a *fresh* local (`out: list[int] = []` then
+  `out.append(...)`), reads of immutable module constants, and calls to other `@pure` helpers.
+- **Not provably pure** — everything else: a method on a value of unknown type (`p.length()`), a
+  call into a module outside the allow-list (`np.sqrt(x)`, `mylib.helper(x)`), a read of a module
+  `let` whose value could be mutated in place (`TABLE: dict[str, int]`), a `with` block, a
+  computed callee. An explicit `@pure` **trusts the author** here — no diagnostic — but the
+  silent optimisations never act on such a function.
+
+The silent paths (`auto-memoise`, `pgo-memoise`, and the callee set of `auto-parallel`) require
+the function to be *provably* pure. `auto-memoise` and `pgo-memoise` additionally require a
+cache-safe signature: every parameter annotated with an immutable, hashable type and an immutable
+return type — scalars, `str` / `bytes`, `tuple[...]` / `frozenset[...]` of such, `Result` /
+`Ok` / `Err` of such, `Literal`, enums, `NamedTuple`s, `frozen` classes, `@dataclass(frozen=True)`
+classes. A function returning `list[int]`, an `Iterator`, or an ordinary (mutable) class is never
+auto-cached, because `functools.cache` would hand every caller the same object. An explicit
+`@memo` keeps its contract: it is honoured whenever nothing provably impure is found, whatever the
+return type — the author asked for the shared object.
 
 ## Compile-time evaluation (`comptime`)
 
@@ -699,4 +749,4 @@ extend User:
         return f"user-{id:08d}"
 ```
 
-`extend BUILTIN:` (extending the recognised Python built-ins — `str`, `list`, `int`, `dict`, …) is also supported. Each method is extracted at desugar time to a module-level free function `__typhon_ext_<TYPE>__<METHOD>`, and call sites `x.method(...)` are rewritten to `__typhon_ext_<TYPE>__method(x, ...)` whenever the receiver `x` has a static annotation matching one of the registered built-ins. There is no monkey-patching of built-in types; the rewrite is strictly opt-in by type annotation, so calls on un-annotated receivers continue to raise `AttributeError` at runtime, matching Python's existing semantics.
+`extend BUILTIN:` (extending the recognised Python built-ins — `str`, `list`, `int`, `dict`, …) is also supported. Each method is extracted at desugar time to a module-level free function `__typhon_ext_<TYPE>__<METHOD>__`, and call sites `x.method(...)` are rewritten to `__typhon_ext_<TYPE>__method(x, ...)` whenever the receiver `x` has a static annotation matching one of the registered built-ins. There is no monkey-patching of built-in types; the rewrite is strictly opt-in by type annotation, so calls on un-annotated receivers continue to raise `AttributeError` at runtime, matching Python's existing semantics. The receiver's type is taken from an annotation on the name (`t: str`), a literal or f-string (`"Lit X".slug()`), a field of an annotated object — `self.title.slug()` inside `impl Post:` when `Post.title: str`, or `post.title.slug()` with `post: Post` — or a chain of type-preserving builtin methods (`t.strip().lower().slug()`); a receiver whose type the pass cannot see is left as a native attribute access (and raises `AttributeError` at runtime). The free-function name ends in a double underscore so CPython does not name-mangle it when the rewritten call sits inside a class body.

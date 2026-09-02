@@ -158,17 +158,17 @@ A fresh adversarial sweep (~35 programs run through both `tyc run` and `tyc buil
 
 ### Tooling
 
-- ✅ `tyc init`, `tyc fmt`, `tyc check`, `tyc build` (with `--check` dry-run), `tyc run` (VM default + `--compile` fallback), `tyc lsp`, `tyc repl`, `tyc debug` (with `--break <ty>:<line>` source-mapped breakpoints), `tyc trace`, `tyc profile`, `tyc migrate`, `tyc stubtest`, `tyc add` / `remove` / `sync`, `tyc ty`, `tyc explain`, `tyc cheatsheet`.
+- ✅ `tyc init`, `tyc fmt`, `tyc check`, `tyc build` (with `--check` dry-run), `tyc run` (VM default + `--compile` fallback), `tyc lsp`, `tyc repl`, `tyc debug` (with `--break <ty>:<line>` source-mapped breakpoints), `tyc trace`, `tyc profile`, `tyc migrate`, `tyc stubtest`, `tyc add` / `remove` / `sync`, `tyc ty`, `tyc explain`, `tyc cheatsheet`, `tyc install skill`.
 - ✅ Source maps (`.py.map` v2 with per-statement `out_line → ty_line` tables) for `tyc trace`, cross-file go-to-definition, and `tyc debug --break`.
 - ✅ `tyc-vm`: in-process tree-walking interpreter for `.ty` source. Default execution mode for `tyc run` (no `.py` written, no CPython spawn). `--compile` falls back to build-then-exec for CPython interop.
 - ✅ `tower-lsp-server`-backed LSP: diagnostics, hover, go-to-definition, completion (visible bindings + keywords + builtins + venv-driven member access + from-import members), "Remove unused import" code action.
 - ✅ `tyc fmt` wraps `ruff format` after the in-process whitespace pass.
-- ✅ Diagnostic deep-links: every `tyc::` code carries a miette `url(...)` clause; 50+ catalog pages under `docs/diagnostics/` are embedded into the binary for offline `tyc explain` lookup.
+- ✅ Diagnostic deep-links: every `tyc::` code carries a miette `url(...)` clause; 90 catalog pages under `docs/diagnostics/` are embedded into the binary for offline `tyc explain` lookup.
 - ✅ Reference VS Code extension under `editors/vscode/`.
 
 ### Project plumbing
 
-- ✅ CI (`cargo fmt`, `clippy -D warnings`, `cargo test --workspace`, `cargo-deny`).
+- ✅ CI — five jobs on every push to `main` / `dev/**` / `claude/**`: `test` (`cargo fmt --check` → `clippy -D warnings` → `cargo test --workspace`), `security` (`cargo-deny` advisories / licences / source bans), `perf-gate` (the build-pipeline performance regression gate), `differential` (the VM ↔ CPython differential gate over the full example + stress corpus), and `knob-matrix` (the opt-in-knob codegen matrix).
 - ✅ Generated `typhon_runtime/` ships as local source — no PyPI dependency.
 
 ## Landed in v0.9.0 (stress-test cleanup release)
@@ -798,13 +798,13 @@ The v0.5.0 release lands the seven Phase 4+ items shipped on PR #105 plus four f
 
 These items appear on the roadmap but are not actively being worked. They will land when the value justifies the effort.
 
-- ⏳ **Full HKT unification.** v0.5.0 ships the `Type::TypeConstructor` variant and `F[_]` parameter-syntax recognition, but `bind_typevars_and_substitute` does not yet unify constructor application. See [`TYPE_SYSTEM_FRONTIER.md`](https://github.com/CodeHalwell/Typhon/blob/main/TYPE_SYSTEM_FRONTIER.md) for the design sketch.
-- ⏳ **Variance inference on user-declared generics.** Today's default is invariant; mypy / pyright-style classification (covariant when `T` only appears in read positions, contravariant in write positions) is the next step.
-- ⏳ **General inter-procedural field-init audit.** v0.5.0 ships the trivial-factory case and a design doc (`stress/interprocedural-audit-design.md`) for the summary-IR generalisation; the implementation is the remaining work.
+- ✅ *(landed in v1.0.0-alpha)* **HKT unification** — a constructor variable `F` in `class Functor[F[_]]:` now binds against a concrete head, with `tyc::kind_mismatch` on wrong arity / conflicting binding. Still deferred: function-level `def f[F[_]]` params, non-class constructor application, and constructor composition. See [`TYPE_SYSTEM_FRONTIER.md`](https://github.com/CodeHalwell/Typhon/blob/main/TYPE_SYSTEM_FRONTIER.md) for the design sketch.
+- ✅ *(landed in v1.0.0-alpha)* **Variance inference on user-declared generics** — covariant / contravariant type-params are inferred from usage, including across module boundaries, with `@covariant` / `@contravariant` overrides.
+- ✅ *(landed in v1.0.0-alpha)* **General inter-procedural field-init audit** — partial instances are tracked across helper chains, not just the trivial-factory case.
 - ⏳ **`ty` Phase 2** — embedded library sharing the Salsa db (currently a subprocess call via `tyc ty`). See [docs/ty-integration.md](https://github.com/CodeHalwell/Typhon/blob/main/docs/ty-integration.md).
 - ⏳ **Cached parsed-module AST behind `salsa::Update`.** Today `check_source_file_with_imports` re-parses on every call; an `ArcParsedModule` wrapper would close that loop.
 - ⏳ **Accumulator-loop parallelisation.** `for x in xs: out.append(...)` still rewrites manually; the comprehension shape is the only auto-parallel form.
-- ⏳ **`[emit] model-extra` knob to relax Pydantic `extra="forbid"`.** Currently the default is always `extra="forbid"`; the config key is documented as roadmap-only.
+- ✅ *(shipped)* **`[emit] model-extra`** — `"forbid"` (default) / `"ignore"` / `"allow"` control the `ConfigDict(extra=…)` injected into every `model` class. See [`[emit]`](/Typhon/configuration/emit/).
 - ⏳ **Async public-API stability rules** if Phase 4+ ever introduces async inference on exported functions. (Likely answer: inference applies to file-internal functions only; exported functions stay explicit.)
 
 ## What "Phase X complete" means

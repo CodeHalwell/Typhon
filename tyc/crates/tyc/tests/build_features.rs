@@ -669,7 +669,7 @@ fn build_accepts_extend_str_and_emits_free_function() {
     build(tmp.path());
     let py = main_py(tmp.path());
     assert!(
-        py.contains("def __typhon_ext_str__shout"),
+        py.contains("def __typhon_ext_str__shout__"),
         "extend str: should lower to a free function; got:\n{py}"
     );
     assert!(
@@ -689,7 +689,7 @@ fn build_rewrites_str_extension_call_site() {
     build(tmp.path());
     let py = main_py(tmp.path());
     assert!(
-        py.contains("__typhon_ext_str__shout(greeting)"),
+        py.contains("__typhon_ext_str__shout__(greeting)"),
         "call site must be rewritten; got:\n{py}"
     );
     if let Some(out) = run_main(tmp.path()) {
@@ -730,12 +730,12 @@ fn build_cross_module_extend_str_rewrites_consumer_call_site() {
     let py = std::fs::read_to_string(tmp.path().join("build").join("main.py")).unwrap();
     // The consumer's call site must be rewritten to the free-function form.
     assert!(
-        py.contains("__typhon_ext_str__slug(title)"),
+        py.contains("__typhon_ext_str__slug__(title)"),
         "cross-module extension call site must be rewritten; got:\n{py}"
     );
     // An explicit import for the free function must be injected.
     assert!(
-        py.contains("from textutil import __typhon_ext_str__slug"),
+        py.contains("from textutil import __typhon_ext_str__slug__"),
         "cross-module extension must inject import; got:\n{py}"
     );
     // Runtime: the emitted Python must actually work.

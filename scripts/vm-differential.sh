@@ -4,11 +4,20 @@
 # The VM (`tyc run`) is contractually a drop-in for `tyc build && python`.
 # This harness proves or disproves that, per unit, over the whole `.ty` corpus:
 #
-#   1. build the unit with `tyc build` and execute the emitted Python under
-#      python3.13                                    → (stdout_cpython, exit_cpython)
+#   1. build the unit with `tyc build`, byte-compile EVERY emitted `.py`
+#      (an emitted file CPython cannot compile is an emitter bug, reported
+#      as `noncompiling` and never baselined), then execute the emitted
+#      Python under python3.13               → (stdout_cpython, exit_cpython)
 #   2. execute the same source with the in-process VM (`tyc run`)
 #                                                     → (stdout_vm,      exit_vm)
 #   3. diverges iff stdout or exit code differ.
+#
+# Units that do not survive `tyc build` are pinned in
+# scripts/nobuild-baseline.txt — mostly diagnostic probes written to be
+# rejected. That list is not a burn-down, but it must not drift silently:
+# a unit that stops building is a regression, and one that starts building
+# means a diagnostic stopped firing. Both directions fail; --update
+# rewrites it alongside the divergence baseline.
 #
 # Known divergences live in a checked-in expectations file
 # (scripts/differential-baseline.txt). The gate fails when:
@@ -23,6 +32,15 @@
 # means "not comparable". Declaring is necessary because the self-consistency
 # probe below is probabilistic — a coarse enough value repeats on both sides
 # and is then reported as a new divergence. See that file's header.
+#
+# A unit where BOTH sides fail with empty stdout proves nothing, so it is
+# never counted as a pass. The two reasons are reported apart, because they
+# say different things: `vacuous` is an import this machine does not have
+# (an environment fact), while `vacuous-runtime` means the program
+# type-checked, built, and then crashed *the same way* on both surfaces —
+# the VM is a faithful drop-in there and the accepted program is the problem.
+# Every current `vacuous-runtime` unit is a reproduction of a limitation
+# already listed in docs/beta-readiness-review-2026-09-01.md.
 #
 # Everything is network-free (TYC_NO_SYNC / TYC_NO_INTROSPECT) and needs only
 # bash, coreutils, a release `tyc`, and python3.13.
@@ -56,6 +74,7 @@ cd "$REPO_ROOT"
 TYC="${TYC:-$REPO_ROOT/tyc/target/release/tyc}"
 PYTHON313="${PYTHON313:-python3.13}"
 BASELINE="$REPO_ROOT/scripts/differential-baseline.txt"
+NOBUILD_BASELINE="$REPO_ROOT/scripts/nobuild-baseline.txt"
 NONDET="$REPO_ROOT/scripts/differential-nondeterministic.txt"
 SCOPE="all"
 FILTER=""
@@ -271,6 +290,24 @@ TOML
 
     common_env=(env PYTHONHASHSEED=0 PYTHONDONTWRITEBYTECODE=1 TZ=UTC LC_ALL=C.UTF-8)
 
+    # -- 1b. every emitted file must COMPILE ---------------------------------
+    # Running `build/main.py` only exercises the modules it imports, so an
+    # emitter bug in a module reached by no code path — or in a program that
+    # exits early — sails through. `compileall` parses AND compiles every
+    # emitted `.py`, which is the strongest statement the "every .ty emits
+    # valid .py" contract can make without executing it. A failure here is an
+    # emitter bug, never a VM one, so it is reported separately and is never
+    # baselined away.
+    # Judged by exit status, not output: `compileall` also prints
+    # `SyntaxWarning`s (`"is" with a literal`, an invalid escape), which are
+    # style notes about *valid* Python and must not fail an emitter gate.
+    compile_log=$( cd "$work" && "$PYTHON313" -m compileall -q -x '(^|/)\.venv/' build 2>&1 )
+    if [ $? -ne 0 ]; then
+        first=$(printf '%s' "$compile_log" | tr '\n' ' ' | cut -c1-140)
+        printf '%s\t%s\t%s\n' "noncompiling" "$unit" "$first"
+        return
+    fi
+
     # -- 2. CPython side -----------------------------------------------------
     ( cd "$work" && "${common_env[@]}" \
         timeout "$TIMEOUT" "$PYTHON313" build/main.py \
@@ -278,8 +315,14 @@ TOML
     ccode=$?
 
     # -- 3. VM side ----------------------------------------------------------
-    ( cd "$work" && "${common_env[@]}" TYC_NO_INTROSPECT=1 \
-        timeout "$TIMEOUT" "$TYC" run "$vm_target" \
+    # `TYC_NO_SYNC=1` matches the build side: `tyc run` falls back to the
+    # compiled path for a program importing a module the VM does not model,
+    # and that fallback would otherwise `uv sync` the project — giving the
+    # VM side a populated `.venv` the CPython side never had, so the two
+    # would differ on the *environment* rather than on semantics.
+    # `PYTHON313` is exported so the fallback execs the same interpreter.
+    ( cd "$work" && "${common_env[@]}" TYC_NO_SYNC=1 TYC_NO_INTROSPECT=1 \
+        timeout "$TIMEOUT" "$TYC" run --python "$PYTHON313" "$vm_target" \
         </dev/null >vm.out 2>vm.err )
     vcode=$?
 
@@ -292,10 +335,20 @@ TOML
     if cmp -s "$work/cpy.out" "$work/vm.out" && [ "$ccode" = "$vcode" ]; then
         # Agreement is only meaningful if at least one side actually produced
         # output or succeeded. Both-crash-with-empty-stdout agreement is a
-        # vacuous pass (typically a missing third-party import); count it
-        # separately so the summary cannot overstate real coverage.
+        # vacuous pass; count it separately so the summary cannot overstate
+        # real coverage. The two reasons are very different, so say which:
+        # an uninstalled third-party import is an environment fact, while a
+        # *shared runtime failure* means the program type-checked, built and
+        # then crashed the same way on both surfaces — a compiler limitation
+        # rather than a missing package.
         if [ ! -s "$work/cpy.out" ] && [ "$ccode" -ne 0 ]; then
-            printf '%s\t%s\t%s\n' "vacuous" "$unit" "both failed, empty stdout (exit=$ccode)"
+            if grep -qE '^(ModuleNotFoundError|ImportError)' "$work/cpy.err"; then
+                printf '%s\t%s\t%s\n' "vacuous" "$unit" "both failed, empty stdout — uninstalled import (exit=$ccode)"
+            else
+                reason=$(grep -oE '^[A-Za-z_.]*(Error|Exception)[A-Za-z]*' "$work/cpy.err" | tail -1)
+                [ -z "$reason" ] && reason="no exception"
+                printf '%s\t%s\t%s\n' "vacuous-runtime" "$unit" "both failed the same way at runtime — $reason (exit=$ccode)"
+            fi
         elif [ "$declared" = "1" ]; then
             # Listed as nondeterministic, yet both sides agreed this run. Weak
             # evidence the entry is stale — surfaced as a warning below, never a
@@ -321,8 +374,8 @@ TOML
             printf '%s\t%s\t%s\n' "nondeterministic" "$unit" "CPython disagrees with itself"
             return
         fi
-        ( cd "$work" && "${common_env[@]}" TYC_NO_INTROSPECT=1 \
-            timeout "$TIMEOUT" "$TYC" run "$vm_target" \
+        ( cd "$work" && "${common_env[@]}" TYC_NO_SYNC=1 TYC_NO_INTROSPECT=1 \
+            timeout "$TIMEOUT" "$TYC" run --python "$PYTHON313" "$vm_target" \
             </dev/null >vm2.out 2>/dev/null )
         v2code=$?
         if ! cmp -s "$work/vm.out" "$work/vm2.out" || [ "$vcode" != "$v2code" ]; then
@@ -376,10 +429,16 @@ fi
 count() { grep -cP "^$1\t" "$RESULTS" || true; }
 N_OK=$(count ok); N_DIV=$(count diverge); N_NOBUILD=$(count nobuild)
 N_NOENTRY=$(count noentry); N_VAC=$(count vacuous)
+N_VACRT=$(count vacuous-runtime)
 N_TMO=$(count both-timeout); N_ND=$(count nondeterministic)
+N_NOCOMPILE=$(count noncompiling)
 
 DIVERGED="$SCRATCH/diverged.txt"
 grep -P '^diverge\t' "$RESULTS" | cut -f2 | sort > "$DIVERGED"
+NOBUILT="$SCRATCH/nobuilt.txt"
+grep -P '^nobuild\t' "$RESULTS" | cut -f2 | sort > "$NOBUILT"
+NOCOMPILE_LIST="$SCRATCH/noncompiling.txt"
+grep -P '^noncompiling\t' "$RESULTS" | sort > "$NOCOMPILE_LIST"
 
 if [ -n "$REPORT" ]; then
     cp "$RESULTS" "$REPORT"
@@ -389,17 +448,31 @@ fi
 echo "results over $TOTAL unit(s):"
 printf '  %-18s %5d   %s\n' "ok"               "$N_OK"      "stdout + exit code agree"
 printf '  %-18s %5d   %s\n' "diverge"          "$N_DIV"     "VM disagrees with CPython"
-printf '  %-18s %5d   %s\n' "vacuous"          "$N_VAC"     "agree only because both failed with empty stdout"
+printf '  %-18s %5d   %s\n' "vacuous"          "$N_VAC"     "agree only because an import is not installed here"
+printf '  %-18s %5d   %s\n' "vacuous-runtime"  "$N_VACRT"   "agree only because both crashed the same way at runtime"
+printf '  %-18s %5d   %s\n' "noncompiling"     "$N_NOCOMPILE" "emitted .py that CPython cannot compile — an EMITTER bug"
 printf '  %-18s %5d   %s\n' "nobuild"          "$N_NOBUILD" "tyc build failed — not comparable"
 printf '  %-18s %5d   %s\n' "noentry"          "$N_NOENTRY" "built but emitted no build/main.py"
 printf '  %-18s %5d   %s\n' "nondeterministic" "$N_ND"      "not comparable (self-inconsistent, or declared) — excluded"
 printf '  %-18s %5d   %s\n' "both-timeout"     "$N_TMO"     "both sides hit the ${TIMEOUT}s limit"
 echo
 
-if [ "$N_VAC" -gt 0 ]; then
-    echo "note: $N_VAC unit(s) 'agree' only because both execution paths failed with"
-    echo "      empty stdout (usually an uninstalled third-party import). They are"
-    echo "      NOT counted as passes; they are not real differential coverage."
+if [ "$N_VAC" -gt 0 ] || [ "$N_VACRT" -gt 0 ]; then
+    echo "note: $((N_VAC + N_VACRT)) unit(s) 'agree' only because both execution paths failed"
+    echo "      with empty stdout. They are NOT counted as passes; they are not real"
+    echo "      differential coverage."
+    if [ "$N_VAC" -gt 0 ]; then
+        echo "      $N_VAC of them fail on an import this machine does not have — an"
+        echo "      environment fact, not a compiler one."
+    fi
+    if [ "$N_VACRT" -gt 0 ]; then
+        echo "      $N_VACRT type-checked, built, and then crashed *the same way* on both"
+        echo "      surfaces. The VM is doing its job there; the accepted program is"
+        echo "      the problem. Each maps to a known limitation in the beta-readiness"
+        echo "      review — list them with:"
+        echo "          scripts/vm-differential.sh --report /tmp/r.tsv \\"
+        echo "            && grep '^vacuous-runtime' /tmp/r.tsv"
+    fi
     echo
 fi
 
@@ -441,6 +514,26 @@ if [ "$UPDATE" = "1" ]; then
         cat "$DIVERGED"
     } > "$BASELINE"
     echo "baseline rewritten: ${BASELINE#$REPO_ROOT/}  ($N_DIV entry/entries)"
+    {
+        echo "# scripts/nobuild-baseline.txt"
+        echo "#"
+        echo "# Units that do NOT survive \`tyc build\`. Generated by:"
+        echo "#     scripts/vm-differential.sh --update"
+        echo "#"
+        echo "# Unlike the divergence baseline, most lines here are INTENDED:"
+        echo "# the stress corpus exists partly to pin diagnostics, so a probe"
+        echo "# written to be rejected belongs in this list. The gate fails in"
+        echo "# both directions anyway — a unit that stops building is a"
+        echo "# regression, and one that starts building means a diagnostic"
+        echo "# stopped firing. Either way the list, and the reason, must be"
+        echo "# updated deliberately."
+        echo "#"
+        echo "# Generated $(date -u +%Y-%m-%d) against $("$TYC" --version 2>/dev/null | head -1)"
+        echo "# Scope: $SCOPE${FILTER:+  filter=/$FILTER/}"
+        echo "#"
+        cat "$NOBUILT"
+    } > "$NOBUILD_BASELINE"
+    echo "baseline rewritten: ${NOBUILD_BASELINE#$REPO_ROOT/}  ($N_NOBUILD entry/entries)"
     exit 0
 fi
 
@@ -491,7 +584,7 @@ COVERED="$SCRATCH/covered_expected.txt"
 comm -12 "$EXPECTED" <(sort -u "$UNITS") > "$COVERED"
 
 # "Fixed" requires a genuinely comparable, non-divergent run — i.e. class
-# `ok`. A baseline entry classified vacuous/nobuild/noentry/nondeterministic/
+# `ok`. A baseline entry classified vacuous/vacuous-runtime/nobuild/noentry/nondeterministic/
 # both-timeout was not COMPARED in this environment (typically a third-party
 # package the recording environment had installed is missing here — see the
 # baseline header), so it is neither fixed nor regressed: report it as
@@ -513,6 +606,58 @@ N_FIXED=$(wc -l < "$FIXED" | tr -d ' ')
 N_UNVER=$(wc -l < "$UNVERIFIABLE" | tr -d ' ')
 
 status="$DECL_STATUS"
+
+# An emitted `.py` CPython cannot compile is an EMITTER bug, and is never
+# baselined: the whole contract is that every `.ty` emits valid Python.
+# Running `build/main.py` only exercises the modules it imports, so this is
+# the check that covers the rest of the emitted tree.
+if [ "$N_NOCOMPILE" -gt 0 ]; then
+    status=1
+    echo "FAIL: $N_NOCOMPILE unit(s) emitted Python that CPython cannot compile."
+    echo '      This is an EMITTER bug: `tyc build` reported success and wrote'
+    echo "      a file that is not valid Python."
+    while IFS=$'\t' read -r _ unit detail; do
+        printf '  ! %s\n      %s\n' "$unit" "$detail"
+    done < "$NOCOMPILE_LIST"
+    echo
+fi
+
+# Units that do not survive `tyc build`, pinned the same way divergences are.
+# Most are intended (a diagnostic probe written to be rejected), so the list
+# is not a burn-down — but it must not drift silently in either direction: a
+# unit that stops building is a regression, and one that starts building means
+# a diagnostic stopped firing.
+if [ ! -f "$NOBUILD_BASELINE" ]; then
+    echo "error: baseline '$NOBUILD_BASELINE' does not exist." >&2
+    echo "       create it with: scripts/vm-differential.sh --update" >&2
+    exit 2
+fi
+NB_EXPECTED="$SCRATCH/nobuild_expected.txt"
+grep -vE '^\s*(#|$)' "$NOBUILD_BASELINE" | sed 's/[[:space:]]*$//' | sort -u > "$NB_EXPECTED"
+NB_COVERED="$SCRATCH/nobuild_covered.txt"
+comm -12 "$NB_EXPECTED" <(sort -u "$UNITS") > "$NB_COVERED"
+NB_NEW="$SCRATCH/nobuild_new.txt"
+NB_GONE="$SCRATCH/nobuild_gone.txt"
+comm -23 "$NOBUILT" "$NB_EXPECTED" > "$NB_NEW"
+comm -23 "$NB_COVERED" "$NOBUILT" > "$NB_GONE"
+if [ -s "$NB_NEW" ]; then
+    status=1
+    echo "FAIL: $(wc -l < "$NB_NEW" | tr -d ' ') unit(s) newly fail \`tyc build\`:"
+    while IFS= read -r u; do
+        printf '  + %s\n      %s\n' "$u" "$(grep -P "^nobuild\t\Q$u\E\t" "$RESULTS" | cut -f3)"
+    done < "$NB_NEW"
+    echo "  Either the build regressed, or the unit is a new diagnostic probe —"
+    echo "  in which case record it with scripts/vm-differential.sh --update."
+    echo
+fi
+if [ -s "$NB_GONE" ]; then
+    status=1
+    echo "FAIL: $(wc -l < "$NB_GONE" | tr -d ' ') unit(s) listed as non-building now BUILD:"
+    sed 's/^/  - /' "$NB_GONE"
+    echo "  A probe that was pinned to be rejected is now accepted — check the"
+    echo "  diagnostic still fires, then re-record with --update."
+    echo
+fi
 
 # Advisory, never fatal — see the header of the declarations file for why a
 # single agreeing run is not proof that an entry is stale.

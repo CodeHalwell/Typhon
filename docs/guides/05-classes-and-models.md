@@ -269,7 +269,7 @@ extend User:
 
 The merge happens at desugar; downstream callers see a single class with both sets of methods.
 
-Built-in extensions (e.g. `extend str:`) are also supported: each method is extracted to a module-level free function `__typhon_ext_str__METHOD` at desugar time, and call sites like `"hi".to_slug()` are rewritten to `__typhon_ext_str__to_slug("hi")` whenever the receiver has a static `str` annotation. There is no monkey-patching of built-ins; un-annotated receivers fall back to native attribute lookup (i.e. `AttributeError` when the method does not exist on the underlying type).
+Built-in extensions (e.g. `extend str:`) are also supported: each method is extracted to a module-level free function `__typhon_ext_str__METHOD` at desugar time, and call sites like `"hi".to_slug()` are rewritten to `__typhon_ext_str__to_slug__("hi")` whenever the receiver has a static `str` annotation. There is no monkey-patching of built-ins; un-annotated receivers fall back to native attribute lookup (i.e. `AttributeError` when the method does not exist on the underlying type).
 
 > **`extend BUILTIN:` is module-local.** Unlike `extend ClassName:` (which merges into a user class and so crosses module boundaries), a built-in extension only rewrites call sites **inside the module that declares the `extend str:` block**. Importing that module does *not* carry the extension to the consumer — `title.slug()` in another module fires `tyc::attribute_not_found` on `str`, because the rewrite keys off the local block. This is deliberate: the rewrite is purely static (no runtime monkey-patch), so there is nothing for an `import` to bring along. When you need to share the behaviour across modules, wrap it in a plain free function and import *that*:
 >

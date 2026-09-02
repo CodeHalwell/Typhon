@@ -1,0 +1,17 @@
+import json
+import sqlite3
+import contextlib
+
+def a(p: str) -> str:
+    return open(p).read()
+
+def b(p: str) -> dict[str, int]:
+    return json.load(open(p)) as! dict[str, int]
+
+def c() -> int:
+    with contextlib.closing(sqlite3.connect(":memory:")) as conn:
+        return 1
+
+def d(p: str) -> list[str]:
+    let lines: list[str] = open(p).read().splitlines()
+    return lines

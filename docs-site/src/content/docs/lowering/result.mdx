@@ -191,6 +191,64 @@ def try_result(thunk, on_err=None):
 - The checker special-cases `try_result` (like `as!`): `T` is inferred from the thunk body and `E` from the mapper body, and a wrong **return annotation** still fires `tyc::type_mismatch` — it is a real `Result`, not an `Any` escape hatch.
 - The VM registers `try_result` as a prelude native for `tyc run`, materialising the caught exception exactly as an `except E as e:` handler would (so `lambda e: str(e)` works), and enforcing its 1–2-argument arity.
 
+## `rescue`
+
+`rescue` (v1.0.0-alpha) is the lambda-free spelling of the same boundary. It is pure surface sugar, lowered in `tyc-syntax`'s preprocessor before the parser runs, so nothing new reaches the emitted Python.
+
+**Postfix form** — `EXPR rescue NAME: ERR` becomes `try_result(lambda: EXPR, lambda NAME: ERR)?`, which then takes the ordinary `?` lowering:
+
+<Tabs>
+  <TabItem label="Typhon">
+    ```python
+    def load_port(raw: str) -> Result[int, str]:
+        let n: int = int(raw) rescue e: f"bad port: {e}"
+        return Ok(n)
+    ```
+  </TabItem>
+  <TabItem label="Emitted">
+    ```python
+    from typhon_runtime import try_result
+    from typhon_runtime import Err as __typhon_Err__
+
+    def load_port(raw: str) -> Result[int, str]:
+        __typhon_q_0__ = try_result(lambda: int(raw), lambda e: f"bad port: {e}")
+        if isinstance(__typhon_q_0__, __typhon_Err__):
+            return __typhon_q_0__
+        n: int = __typhon_q_0__.value
+        return Ok(n)
+    ```
+  </TabItem>
+</Tabs>
+
+The left operand is found with the same bracket-, string-, and comment-aware scan `as!` uses, so the two compose (`json.loads(t) as! dict[str, str] rescue e: …`). It is lowered in statement-tail position only (the last thing on the logical line); a mid-expression `rescue` is left for the parser to reject.
+
+**Block form** — `rescue NAME: ERR:` over a suite becomes a real `try` / `except`, returning an `Err`:
+
+<Tabs>
+  <TabItem label="Typhon">
+    ```python
+    def load_config(text: str) -> Result[Config, str]:
+        rescue e: f"bad config: {e}":
+            let data: dict[str, str] = json.loads(text) as! dict[str, str]
+            return Ok(Config(host=data["host"], port=int(data["port"])))
+    ```
+  </TabItem>
+  <TabItem label="Emitted">
+    ```python
+    from typhon_runtime.cast import checked_cast as __typhon_checked_cast__
+
+    def load_config(text: str) -> Result[Config, str]:
+        try:
+            data: dict[str, str] = __typhon_checked_cast__(json.loads(text), dict[str, str])
+            return Ok(Config(host=data["host"], port=int(data["port"])))
+        except Exception as e:
+            return Err(f"bad config: {e}")
+    ```
+  </TabItem>
+</Tabs>
+
+Because the block form emits a literal `return Err(...)`, the checker's ordinary error-type check applies to `ERR` in both forms (`tyc::result_error_mismatch` when it does not fit the function's declared `E`). Both forms behave identically under `tyc check`, `tyc run`, and `tyc build` + CPython, and `tyc fmt` round-trips them. See the [reference](/Typhon/reference/result/#bridging-exceptions-try_result-and-rescue).
+
 ## Why a separate runtime module?
 
 Two reasons:

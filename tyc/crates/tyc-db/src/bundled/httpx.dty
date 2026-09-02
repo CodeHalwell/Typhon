@@ -8,24 +8,151 @@
 # An authored project `.dty`/`.ty` for `httpx` overrides this bundle. The bundle
 # is seeded before venv introspection (which skips already-shaped modules), so
 # for a bundled module the stub takes precedence over venv.
+#
+# Tracks httpx 0.28: `proxies=` and `app=` were removed there (use `proxy=` and
+# `transport=WSGITransport(app=...)` / `ASGITransport(app=...)`), so the stub no
+# longer accepts them.
+
+# `httpx.URL` is a real object, not a string: `resp.url.host`, `resp.url.path`
+# and `str(resp.url)` all work, but `resp.url.startswith(...)` does not.
+class URL:
+    scheme: str = ""
+    host: str = ""
+    port: int? = None
+    path: str = "/"
+    query: bytes = b""
+    fragment: str = ""
+    raw_path: bytes = b"/"
+    netloc: bytes = b""
+    is_absolute_url: bool = True
+    is_relative_url: bool = False
+
+impl URL:
+    def copy_with(self, **kwargs: object) -> httpx.URL: ...
+    def join(self, url: str) -> httpx.URL: ...
+
+class Headers:
+    encoding: str = "utf-8"
+
+impl Headers:
+    # `Headers` is a case-insensitive multi-dict of strings, so `get` really
+    # does hand back `str | None` — typing it `object` made every
+    # `let ct: str? = resp.headers.get(...)` a type mismatch.
+    def get(self, key: str, default: str? = None) -> str?: ...
+    def get_list(self, key: str, split_commas: bool = False) -> list[str]: ...
+    def keys(self) -> object: ...
+    def values(self) -> object: ...
+    def items(self) -> object: ...
+
+class Request:
+    method: str = ""
+    url: httpx.URL
+    headers: httpx.Headers
+    content: bytes = b""
 
 class Response:
     status_code: int = 0
     text: str = ""
     content: bytes = b""
     encoding: str? = None
-    url: str = ""
+    url: httpx.URL
+    headers: httpx.Headers
+    request: httpx.Request
     reason_phrase: str = ""
     http_version: str = ""
     is_success: bool = True
     is_error: bool = False
     is_redirect: bool = False
+    is_client_error: bool = False
+    is_server_error: bool = False
+    has_redirect_location: bool = False
 
 impl Response:
     def json(self, **kwargs: object) -> object: ...
     def raise_for_status(self) -> httpx.Response: ...
     def read(self) -> bytes: ...
     async def aread(self) -> bytes: ...
+    def close(self) -> None: ...
+    async def aclose(self) -> None: ...
+
+# Exception hierarchy — `raise_for_status()` raises `HTTPStatusError`, and a
+# transport failure raises a `RequestError` subclass.
+class HTTPError(Exception):
+    pass
+
+class RequestError(httpx.HTTPError):
+    pass
+
+class HTTPStatusError(httpx.HTTPError):
+    pass
+
+class TransportError(httpx.RequestError):
+    pass
+
+class TimeoutException(httpx.TransportError):
+    pass
+
+class ConnectTimeout(httpx.TimeoutException):
+    pass
+
+class ReadTimeout(httpx.TimeoutException):
+    pass
+
+class WriteTimeout(httpx.TimeoutException):
+    pass
+
+class PoolTimeout(httpx.TimeoutException):
+    pass
+
+class NetworkError(httpx.TransportError):
+    pass
+
+class ConnectError(httpx.NetworkError):
+    pass
+
+class ReadError(httpx.NetworkError):
+    pass
+
+class WriteError(httpx.NetworkError):
+    pass
+
+class CloseError(httpx.NetworkError):
+    pass
+
+class ProtocolError(httpx.TransportError):
+    pass
+
+class ProxyError(httpx.TransportError):
+    pass
+
+class UnsupportedProtocol(httpx.TransportError):
+    pass
+
+class DecodingError(httpx.RequestError):
+    pass
+
+class TooManyRedirects(httpx.RequestError):
+    pass
+
+class InvalidURL(Exception):
+    pass
+
+class CookieConflict(Exception):
+    pass
+
+class StreamError(Exception):
+    pass
+
+class Timeout:
+    connect: float? = None
+    read: float? = None
+    write: float? = None
+    pool: float? = None
+
+class Limits:
+    max_connections: int? = None
+    max_keepalive_connections: int? = None
+    keepalive_expiry: float? = None
 
 class AsyncClient:
     base_url: str = ""
@@ -39,14 +166,12 @@ class AsyncClient:
     http1: bool = True
     http2: bool = False
     proxy: object = None
-    proxies: object = None
     mounts: object = None
     follow_redirects: bool = False
     limits: object = None
     max_redirects: int = 20
     event_hooks: object = None
     transport: object = None
-    app: object = None
     trust_env: bool = True
     default_encoding: str = "utf-8"
 
@@ -71,14 +196,12 @@ class Client:
     verify: object = None
     cert: object = None
     proxy: object = None
-    proxies: object = None
     mounts: object = None
     follow_redirects: bool = False
     limits: object = None
     max_redirects: int = 20
     event_hooks: object = None
     transport: object = None
-    app: object = None
     trust_env: bool = True
     default_encoding: str = "utf-8"
 

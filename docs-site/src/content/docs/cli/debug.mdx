@@ -6,7 +6,7 @@ sidebar:
 ---
 
 ```
-tyc debug [--entry FILE] [--debugger MODULE] [--python PATH] [--break TY:LINE]... [--no-build] [-- ARGS...]
+tyc debug [PATH] [--entry FILE] [--debugger MODULE] [--python PATH] [--break TY:LINE]... [--no-build] [--raw-pdb] [-- ARGS...]
 ```
 
 Builds the project, then execs `python -m pdb build/<entry>.py` (or another debugger module). Repeatable `--break <ty-file>:<line>` flags translate Typhon source locations through the v2 `.py.map` and inject `-c "break …"` commands into the debugger session, so you set breakpoints in `.ty` coordinates and they fire on the corresponding emitted Python lines.
@@ -20,6 +20,7 @@ tyc debug --debugger pudb          # use pudb instead
 tyc debug --debugger ipdb          # ipdb if you have it
 tyc debug -- --verbose --port 8080  # forward args to the script
 tyc debug --no-build               # reuse existing build/
+tyc debug --raw-pdb                # plain pdb, without the .ty-coordinate wrapper
 
 # Set a breakpoint on a Typhon line:
 tyc debug --break src/main.ty:42
@@ -37,6 +38,7 @@ tyc debug --break src/main.ty:42 --break src/lib/io.ty:7
 | `--debugger MODULE` | `pdb` | Module to launch via `python -m`. Common choices: `pdb`, `ipdb`, `pudb`, `debugpy`. |
 | `--break TY:LINE` | — | Break at `<ty-file>:<line>` (e.g. `src/main.ty:42`). Repeatable. The line number is parsed from the segment after the *last* `:`, so Windows-style drive letters (`C:\foo.ty:10`) and POSIX paths both round-trip. Lines that don't appear in the `.py.map` table surface a warning and are skipped. |
 | `--no-build` | off | Skip rebuilding; assume `build/` is current. |
+| `--raw-pdb` | off | Launch `python -m pdb` directly, without the Typhon-aware `pdb.Pdb` subclass that shows `.ty` locations on every pause. Only meaningful with `--debugger pdb` (the default); choosing another debugger disables the wrapper automatically. |
 
 ## How `--break` works
 
@@ -46,7 +48,7 @@ The mapping is one-to-many in the other direction — a single Typhon line can l
 
 ## Frame remapping after a crash
 
-Frames in the debugger session still surface as `build/*.py` paths. To map a captured traceback back to `.ty` source, run `tyc trace` on the saved traceback file:
+By default `tyc debug` runs pdb through a small generated subclass (`TyphonPdb`) that loads every `.py.map` at startup and overrides `do_list` / `do_where` / the prompt, so listings, stack displays, and the prompt itself read `.ty` coordinates. With `--raw-pdb` (or any `--debugger` other than `pdb`) that layer is dropped and frames surface as `build/*.py` paths. To map a captured traceback back to `.ty` source, run `tyc trace` on the saved traceback file:
 
 ```bash
 tyc run --compile -- --bad-arg 2>err.log
@@ -55,7 +57,7 @@ tyc trace err.log          # remaps frames to .ty
 
 ## What's not implemented yet
 
-A Typhon-native source-mapping debugger UI — one that displays stack frames with `.ty` source and steps a `.ty` statement at a time (one Python statement → one Typhon statement, even when `gather:` lowers to several Python lines) — is still on the roadmap. `--break` covers the most common workflow (set a breakpoint in `.ty`, drop into pdb at that frame) without the full source-mapped TUI.
+A fully Typhon-native debugger — one that steps a `.ty` statement at a time (one Python statement → one Typhon statement, even when `gather:` lowers to several Python lines) — is still on the roadmap. The pdb wrapper covers listing, stack display, and the prompt in `.ty` coordinates, and `--break` covers breakpoint placement, without the full source-mapped TUI.
 
 ## Where next
 

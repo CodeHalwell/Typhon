@@ -54,6 +54,30 @@ def bad(cond: bool) -> int:
 
 **Fix:** Initialise inline (`let x: int = 0`), or assign in every non-diverging arm.
 
+### `tyc::go_outside_async` — error
+
+`go f(x)` run from module-level code — directly, or through a module-level call to a sync function whose body spawns — where no event loop is running: the lowered `typhon_runtime.tasks.spawn(f(x))` raised `RuntimeError: no running event loop` at the call and the coroutine was never awaited. A `go` inside a sync `def` is not flagged on its own (the function may be called from a coroutine).
+
+```ty
+def kick() -> None:
+    go work()       # error: no event loop is running here
+```
+
+**Fix:** move the `go` into an `async def` driven by `asyncio.run(...)`, or call `asyncio.run(work())` to run the coroutine to completion here.
+
+### `tyc::possibly_unbound` — warning
+
+An ordinary function-local name (not a declare-only `let`) is read on a path that may not assign it — or provably never does: a read before the first assignment, a read after `del`, an `except E as e` name used after its handler (CPython unbinds it), a loop target read after a loop that may run zero times, a name assigned in only one arm of an `if` without `else`.
+
+```ty
+def first_word(s: str) -> str:
+    if s:
+        word = s.split()[0]
+    return word     # warning: `word` is not assigned on every path that reaches here
+```
+
+**Fix:** give the name a default before the branch / loop / `try`, or `return` in the arm that has nothing to assign. Advice-level: the build continues.
+
 ### `tyc::no_block_shadow` — error
 
 A second `let`/`mut` would shadow an outer function-scoped binding of the same name. Python has no block scope, so the "inner" binding would actually rebind the outer one. Sibling `if`/`elif` and `case` arms each get fresh-binding behaviour (v0.6.0+/v0.7.0+); only true shadow situations fire.
@@ -737,6 +761,8 @@ def now_plus(n: int) -> float:
     return time.time() + n      # error: clock read
 ```
 
+The verifier reports only what it can *prove*: I/O and clock/entropy calls under any import alias (`datetime.now()` after `from datetime import datetime`), logging calls, I/O method names on any receiver (`.read_text()`, `.write()`), mutation of an argument or module binding through a method or attribute write (`REGISTRY.append(x)`, `c.n = c.n + 1`, `next(it)` on a parameter), reads of `mut` / rebound module bindings, and calls to non-`@pure` same-module helpers. A call it cannot classify (a method on a value of unknown type, a module outside the pure stdlib allow-list) is trusted under `@pure` — but `auto-memoise` / `pgo-memoise` / `auto-parallel` act only on *provably* pure functions with immutable, hashable parameters and an immutable return type.
+
 **Fix:** Drop `@pure`, or restructure so impure work happens at the caller.
 
 ---
@@ -978,6 +1004,24 @@ class-default = "plain"   # error: expected `dataclass` | `pydantic`
 
 **Fix:** Use one of the allowed values listed in the error message.
 
+### `tyc::invalid_pattern` — error
+
+A `match` pattern the Python **grammar** accepts but the CPython
+**compiler** rejects, so the emitted `.py` raises `SyntaxError` on import.
+Two shapes: two `*rest` captures in one sequence pattern, and the same
+capture name bound twice in one pattern.
+
+```typhon
+case [*a, *b]:     # error: a sequence pattern may bind at most one `*rest`
+case [a, a]:       # error: `a` is captured twice in the same pattern
+```
+
+Alternatives of a `|` pattern bind on their own paths, so `case [a] | (a,):`
+is legal (and CPython *requires* both sides to bind the same names).
+
+**Fix:** Keep one `*rest`; rename the duplicate capture and compare in a
+guard (`case [a, b] if a == b:`) if equality was what you meant.
+
 ### `tyc::stub_mismatch` — error (controlled by `[strictness] stub-check`)
 
 `tyc check --stubs` finds a mismatch between a `.dty` stub and its implementation module.
@@ -1146,7 +1190,7 @@ Standard values for severity keys are `"off"`, `"warn"`, `"error"`. The `suggest
 
 ## Severity-only summary
 
-**Errors** (block the build by default): `arg_count`, `attribute_not_found`, `comptime`, `cyclic_type_alias`, `div_by_zero_literal`, `duplicate_class`, `duplicate_method`, `extend_builtin`, `field_default_ordering`, `frozen_assign`, `generator_return_type`, `generic`, `immutable_assign`, `impl_unknown_class`, `implicit_any`, `impure_pure_fn`, `interface_isinstance`, `interface_not_conforming`, `invalid_config_value`, `invalid_question_op`, `io`, `lazy_usage`, `manual_init`, `method_in_class_body` (default warn but commonly bumped), `missing_annotation`, `missing_argument`, `missing_await`, `missing_binding_kind`, `missing_field_init`, `missing_initialiser`, `missing_return`, `newtype_violation`, `no_block_shadow`, `non_exhaustive_match`, `not_callable`, `nullable_use`, `operator_type_mismatch`, `parse`, `pattern_shadows_outer`, `pub_name_collision`, `result_error_mismatch`, `return_in_except_star`, `self_outside_impl`, `stub_mismatch`, `tuple_index_out_of_range`, `type_mismatch`, `typevar_bound`, `typevar_import_rejected`, `typing_alias_deprecated`, `unknown_kwarg`, `unknown_module`, `unknown_name`, `unsafe_value_leak`, `unused_import`, `use_of_uninitialised`.
+**Errors** (block the build by default): `arg_count`, `attribute_not_found`, `comptime`, `cyclic_type_alias`, `div_by_zero_literal`, `duplicate_class`, `duplicate_method`, `extend_builtin`, `field_default_ordering`, `frozen_assign`, `generator_return_type`, `generic`, `immutable_assign`, `impl_unknown_class`, `implicit_any`, `impure_pure_fn`, `interface_isinstance`, `interface_not_conforming`, `invalid_config_value`, `invalid_pattern`, `invalid_question_op`, `io`, `lazy_usage`, `manual_init`, `method_in_class_body` (default warn but commonly bumped), `missing_annotation`, `missing_argument`, `missing_await`, `missing_binding_kind`, `missing_field_init`, `missing_initialiser`, `missing_return`, `newtype_violation`, `no_block_shadow`, `non_exhaustive_match`, `not_callable`, `nullable_use`, `operator_type_mismatch`, `parse`, `pattern_shadows_outer`, `pub_name_collision`, `result_error_mismatch`, `return_in_except_star`, `self_outside_impl`, `stub_mismatch`, `tuple_index_out_of_range`, `type_mismatch`, `typevar_bound`, `typevar_import_rejected`, `typing_alias_deprecated`, `unknown_kwarg`, `unknown_module`, `unknown_name`, `unsafe_value_leak`, `unused_import`, `use_of_uninitialised`.
 
 **Warnings**: `async_without_await`, `class_attr_shadows_slot`, `blocking_in_async`, `contains_secret_literal`, `orphan_py_import`, `python_semantic_drift`, `resource_not_managed`, `stdlib_module_shadow`.
 

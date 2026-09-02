@@ -1,0 +1,12 @@
+def main() -> None:
+    mut x: int? = 1
+    mut i: int = 0
+    if x is None:
+        return
+    while i < 2:
+        print(x + 1)
+        x = None
+        i += 1
+
+if __name__ == "__main__":
+    main()

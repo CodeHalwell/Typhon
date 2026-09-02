@@ -1,0 +1,22 @@
+class Vec:
+    x: float
+    y: float
+
+impl Vec:
+    def __add__(self, other: Vec) -> Vec:
+        return Vec(x=self.x + other.x, y=self.y + other.y)
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, Vec):
+            return False
+        return self.x == other.x and self.y == other.y
+    def __lt__(self, other: Vec) -> bool:
+        return self.x < other.x
+    def scaled(self, k: float) -> Vec:
+        return Vec(x=self.x * k, y=self.y * k)
+
+def main() -> None:
+    let v: Vec = Vec(x=1.0, y=2.0) + Vec(x=1.0, y=1.0)
+    print(v == Vec(x=2.0, y=3.0), v < v.scaled(2), sorted([v, v.scaled(0.5)])[0])
+
+if __name__ == "__main__":
+    main()

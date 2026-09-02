@@ -1,0 +1,16 @@
+extend str:
+    def slug(self) -> str:
+        return self.strip().lower().replace(" ", "-")
+
+class Post:
+    title: str
+
+impl Post:
+    def key(self) -> str:
+        return self.title.slug()
+
+def main() -> None:
+    let t: str = " Hello World "
+    print(t.slug(), t.strip().slug(), Post(title="A B").key(), "Lit X".slug())
+
+main()

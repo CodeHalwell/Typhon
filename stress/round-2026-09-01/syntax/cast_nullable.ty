@@ -1,0 +1,11 @@
+import json
+
+def load(s: str) -> int?:
+    let v = json.loads(s) as! int?
+    return v
+
+def main() -> None:
+    print(load("5"), load("null"))
+
+if __name__ == "__main__":
+    main()

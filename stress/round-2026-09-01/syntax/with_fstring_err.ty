@@ -1,0 +1,17 @@
+def f() -> Result[int, str]:
+    return Err("boom")
+
+def run() -> Result[int, str]:
+    with a = f()?:
+        return Ok(a)
+    else err:
+        print(f"""
+        failed: {err}
+        """.strip())
+        return Err(err)
+
+def main() -> None:
+    print(run())
+
+if __name__ == "__main__":
+    main()

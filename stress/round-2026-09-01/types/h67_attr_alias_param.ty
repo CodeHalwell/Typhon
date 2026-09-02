@@ -1,0 +1,15 @@
+class Box:
+    val: int?
+
+def f(a: Box, b: Box) -> int:
+    if a.val is None:
+        return 0
+    b.val = None
+    return a.val + 1
+
+def main() -> None:
+    let x: Box = Box(val=1)
+    print(f(x, x))
+
+if __name__ == "__main__":
+    main()

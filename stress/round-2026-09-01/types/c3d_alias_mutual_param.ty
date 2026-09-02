@@ -1,0 +1,9 @@
+type A[T] = B[T] | int
+type B[T] = A[T] | str
+
+def f(x: A[int]) -> B[str]:
+    return x
+
+def main() -> None:
+    let y: A[int] = 1
+    print(f(y))

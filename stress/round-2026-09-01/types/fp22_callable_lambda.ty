@@ -1,0 +1,25 @@
+from typing import Callable
+
+class Calc:
+    base: int
+
+impl Calc:
+    def add(self, x: int) -> int:
+        return self.base + x
+
+def apply(f: Callable[[int], int], v: int) -> int:
+    return f(v)
+
+def apply2(f: Callable[[int, int], int]) -> int:
+    return f(1, 2)
+
+def plus(a: int, b: int = 0) -> int:
+    return a + b
+
+def main() -> None:
+    let c: Calc = Calc(base=1)
+    print(apply(lambda x: x + 1, 1), apply(c.add, 1), apply(plus, 1), apply2(plus))
+    print(apply(abs, -1))
+
+if __name__ == "__main__":
+    main()

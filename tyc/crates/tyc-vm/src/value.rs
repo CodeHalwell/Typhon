@@ -42,7 +42,7 @@ thread_local! {
 /// once the (now-unreachable) limit is hit. Thread-locals persist across tasks
 /// on a reused thread, so this matters in the LSP / test harness where a
 /// panic may be caught.
-struct StructuralDepthGuard;
+pub(crate) struct StructuralDepthGuard;
 
 impl Drop for StructuralDepthGuard {
     fn drop(&mut self) {
@@ -53,7 +53,7 @@ impl Drop for StructuralDepthGuard {
 /// Enter one level of structural recursion, returning a guard that restores the
 /// depth on drop. Returns `None` when the depth bound has been reached (the
 /// caller should bail without recursing).
-fn structural_depth_enter() -> Option<StructuralDepthGuard> {
+pub(crate) fn structural_depth_enter() -> Option<StructuralDepthGuard> {
     STRUCTURAL_DEPTH.with(|d| {
         let cur = d.get();
         if cur >= MAX_STRUCTURAL_DEPTH {
@@ -550,6 +550,211 @@ pub enum HashKey {
         instance: Rc<Instance>,
         key: Rc<InstanceKey>,
     },
+    /// An instance whose class inherits `object.__hash__` (a plain class, an
+    /// enum member, an exception): CPython keys it by identity.
+    Identity(Rc<Instance>),
+    /// A *class object* used as a key (`registry[SomeClass]`). CPython hashes
+    /// a type by identity, so two distinct classes with the same name are
+    /// different keys. Builtin types reach the VM as native constructors
+    /// rather than `Class` values, so they key on their name instead.
+    Class(Rc<Class>),
+    BuiltinType(&'static str),
+    /// An instance whose class defines `__hash__`. `hash` is what the user
+    /// method returned; `__eq__` is consulted by `Interpreter::settle_key`
+    /// *before* the key reaches a container, so inside the container two
+    /// keys are equal only when they wrap the very same instance.
+    UserHashed {
+        hash: i64,
+        instance: Rc<Instance>,
+    },
+}
+
+/// How instances of a class hash and compare as dict/set keys — CPython's
+/// `__hash__` slot resolved along the MRO the way attribute lookup would:
+/// a class body's own `__hash__` wins; `@dataclass` applies its hash-action
+/// table (`eq=True` without `frozen=True` sets `__hash__ = None`, while
+/// `frozen=True` / `unsafe_hash=True` synthesise a field-tuple hash); a body
+/// defining `__eq__` without `__hash__` (or assigning `__hash__ = None`) is
+/// unhashable; a pydantic `model` (field-based `BaseModel.__eq__`) is
+/// unhashable; anything that inherits nothing better keys by identity like
+/// `object`.
+pub enum HashMode {
+    Unhashable,
+    Identity,
+    Fields,
+    User(Rc<Function>),
+}
+
+/// A boolean class-kind marker (`__typhon_*` class attribute) with a default.
+pub fn class_flag(class: &Class, name: &str, default: bool) -> bool {
+    match class.class_attrs.borrow().get(name) {
+        Some(Value::Bool(b)) => *b,
+        _ => default,
+    }
+}
+
+pub fn instance_hash_mode(class: &Rc<Class>) -> HashMode {
+    fn own_hash(c: &Rc<Class>) -> Option<Rc<Function>> {
+        if class_flag(c, "__typhon_own_hash__", false) {
+            c.methods.borrow().get("__hash__").cloned()
+        } else {
+            None
+        }
+    }
+    fn walk(c: &Rc<Class>) -> Option<HashMode> {
+        let own = own_hash(c);
+        let hash_none = class_flag(c, "__typhon_hash_none__", false);
+        let own_eq = class_flag(c, "__typhon_own_eq__", false);
+        let decided = if class_is_dataclass(c) {
+            let eq = class_flag(c, "__typhon_dc_eq__", true);
+            let frozen = class_flag(c, "__typhon_dc_frozen__", false);
+            let unsafe_hash = class_flag(c, "__typhon_dc_unsafe_hash__", false);
+            match own {
+                Some(f) => Some(HashMode::User(f)),
+                None if unsafe_hash || (eq && frozen) => Some(HashMode::Fields),
+                None if eq || hash_none => Some(HashMode::Unhashable),
+                None => None,
+            }
+        } else if class_is_pydantic_model(c) {
+            Some(match own {
+                Some(f) => HashMode::User(f),
+                None => HashMode::Unhashable,
+            })
+        } else {
+            match own {
+                Some(f) => Some(HashMode::User(f)),
+                None if hash_none || own_eq => Some(HashMode::Unhashable),
+                None => None,
+            }
+        };
+        if decided.is_some() {
+            return decided;
+        }
+        c.bases.iter().find_map(walk)
+    }
+    if class_is_enum(class) {
+        return HashMode::Identity;
+    }
+    walk(class).unwrap_or(HashMode::Identity)
+}
+
+/// Whether `a == b` on two instances of `class` compares fields (a dataclass
+/// with `eq=True`, a pydantic model, or — as the best interpreter-free
+/// approximation — a class with its own `__eq__`, which `Interpreter::cmp_op`
+/// dispatches for real) rather than identity (`object.__eq__`).
+pub fn class_eq_by_fields(class: &Rc<Class>) -> bool {
+    fn walk(c: &Rc<Class>) -> Option<bool> {
+        if class_flag(c, "__typhon_own_eq__", false) {
+            return Some(true);
+        }
+        if class_is_dataclass(c) {
+            if class_flag(c, "__typhon_dc_eq__", true) {
+                return Some(true);
+            }
+        } else if class_is_pydantic_model(c) {
+            return Some(true);
+        }
+        c.bases.iter().find_map(walk)
+    }
+    if class_is_enum(class) {
+        return false;
+    }
+    walk(class).unwrap_or(false)
+}
+
+/// Whether any class along the MRO is a `@dataclass(frozen=True)` — its
+/// `__setattr__` / `__delattr__` raise `FrozenInstanceError`, and subclasses
+/// inherit them.
+pub fn class_is_frozen_dataclass(class: &Rc<Class>) -> bool {
+    (class_is_dataclass(class) && class_flag(class, "__typhon_dc_frozen__", false))
+        || class.bases.iter().any(class_is_frozen_dataclass)
+}
+
+/// `repr()` of a native: the builtin *types* the VM models as constructor
+/// natives print as classes (`<class 'int'>`, `<class 'ValueError'>`),
+/// everything else as `<built-in function name>`.
+pub fn native_repr(name: &str) -> String {
+    let is_type = matches!(
+        name,
+        "int"
+            | "float"
+            | "str"
+            | "bool"
+            | "list"
+            | "dict"
+            | "set"
+            | "frozenset"
+            | "tuple"
+            | "bytes"
+            | "bytearray"
+            | "object"
+            | "type"
+            | "range"
+            | "complex"
+            | "slice"
+            | "memoryview"
+            | "enumerate"
+            | "zip"
+            | "map"
+            | "filter"
+            | "reversed"
+            | "property"
+            | "staticmethod"
+            | "classmethod"
+            | "super"
+            | "BaseException"
+            | "KeyboardInterrupt"
+            | "SystemExit"
+            | "GeneratorExit"
+            | "StopIteration"
+            | "StopAsyncIteration"
+            | "ExceptionGroup"
+            | "BaseExceptionGroup"
+    ) || name.ends_with("Error")
+        || name.ends_with("Exception")
+        || name.ends_with("Warning");
+    if is_type {
+        return format!("<class '{name}'>");
+    }
+    // Two prelude names the VM models as natives are *classes* in CPython,
+    // and print with the module that defines them.
+    match name {
+        "enum.auto" => "<class 'enum.auto'>".to_owned(),
+        "NewType" => "<class 'typing.NewType'>".to_owned(),
+        _ => format!("<built-in function {name}>"),
+    }
+}
+
+/// The VM models a `slice` as the tuple `("__slice__", start, stop, step)`
+/// (what `eval_subscript_index` builds for `a[i:j:k]`).
+/// The `Ellipsis` singleton. Like the slice marker it rides inside a tagged
+/// tuple rather than its own `Value` variant, and it is one shared `Rc` per
+/// thread so `x is Ellipsis` holds.
+pub fn ellipsis_value() -> Value {
+    thread_local! {
+        static ELLIPSIS: Rc<Vec<Value>> =
+            Rc::new(vec![Value::Str(Rc::new("__ellipsis__".to_owned()))]);
+    }
+    Value::Tuple(ELLIPSIS.with(|e| e.clone()))
+}
+
+/// Whether a tuple is the [`ellipsis_value`] marker.
+pub fn is_ellipsis_marker(items: &[Value]) -> bool {
+    items.len() == 1 && matches!(&items[0], Value::Str(tag) if tag.as_str() == "__ellipsis__")
+}
+
+pub fn is_slice_marker(items: &[Value]) -> bool {
+    items.len() == 4 && matches!(&items[0], Value::Str(tag) if tag.as_str() == "__slice__")
+}
+
+/// `repr(slice(1, 5, None))`.
+pub fn slice_repr(items: &[Value]) -> String {
+    format!(
+        "slice({}, {}, {})",
+        items[1].py_repr(),
+        items[2].py_repr(),
+        items[3].py_repr()
+    )
 }
 
 /// When `v` is a member of an enum class that mixes in a value type
@@ -559,6 +764,43 @@ pub enum HashKey {
 /// members genuine `str` / `int` subclasses, so equality, ordering,
 /// hashing, and `str()` all flow through the value; plain `Enum` members
 /// intentionally return `None` here (`Color.RED == 1` is False).
+/// Whether `class` is a plain `enum.Flag` subclass — one whose members
+/// combine into composite pseudo-members under `|` / `&` / `^` / `~` but,
+/// unlike `IntFlag`, are *not* ints. `IntFlag` deliberately answers `false`
+/// here: its members already flow through their int mixin.
+pub fn is_plain_flag_class(class: &Rc<Class>) -> bool {
+    fn marker(class: &Rc<Class>) -> Option<&'static str> {
+        if class
+            .class_attrs
+            .borrow()
+            .contains_key("__typhon_enum_base__")
+        {
+            return match class.name.as_str() {
+                "Flag" => Some("Flag"),
+                "IntFlag" => Some("IntFlag"),
+                _ => None,
+            };
+        }
+        class.bases.iter().find_map(marker)
+    }
+    marker(class) == Some("Flag")
+}
+
+/// The integer a `Flag` member carries, if it is one.
+pub fn flag_member_bits(v: &Value) -> Option<i64> {
+    let Value::Instance(inst) = v else {
+        return None;
+    };
+    if !is_plain_flag_class(&inst.class) {
+        return None;
+    }
+    match inst.fields.borrow().get("_value_") {
+        Some(Value::Int(i)) => i.to_i64(),
+        Some(Value::Bool(b)) => Some(i64::from(*b)),
+        _ => None,
+    }
+}
+
 pub fn enum_mixin_value(v: &Value) -> Option<Value> {
     fn mixin_base(class: &Rc<Class>) -> bool {
         let is_marker = class
@@ -709,6 +951,26 @@ impl HashKey {
                     out.extend_from_slice(&inner);
                 }
             }
+            // Identity-keyed instances order by address (stable for the
+            // life of the instance, which the key retains).
+            HashKey::Identity(inst) => {
+                out.push(9);
+                out.extend_from_slice(&(Rc::as_ptr(inst) as usize as u64).to_be_bytes());
+            }
+            HashKey::UserHashed { hash, instance } => {
+                out.push(10);
+                out.extend_from_slice(&hash.to_be_bytes());
+                out.extend_from_slice(&(Rc::as_ptr(instance) as usize as u64).to_be_bytes());
+            }
+            HashKey::Class(c) => {
+                out.push(9);
+                out.extend_from_slice(&(Rc::as_ptr(c) as usize as u64).to_be_bytes());
+            }
+            HashKey::BuiltinType(name) => {
+                out.push(10);
+                out.extend_from_slice(&(name.len() as u32).to_be_bytes());
+                out.extend_from_slice(name.as_bytes());
+            }
         }
         out
     }
@@ -734,6 +996,10 @@ impl HashKey {
                 Value::Set(Rc::new(RefCell::new(set)))
             }
             HashKey::Instance { instance, .. } => Value::Instance(instance),
+            HashKey::Identity(instance) => Value::Instance(instance),
+            HashKey::Class(c) => Value::Class(c),
+            HashKey::BuiltinType(name) => Value::Str(Rc::new(name.to_owned())),
+            HashKey::UserHashed { instance, .. } => Value::Instance(instance),
         }
     }
 }
@@ -786,6 +1052,21 @@ impl PartialEq for HashKey {
             // class name and equal field set. The original `instance`
             // Rc is ignored so two distinct-but-equal instances match.
             (HashKey::Instance { key: a, .. }, HashKey::Instance { key: b, .. }) => a == b,
+            (HashKey::Identity(a), HashKey::Identity(b)) => Rc::ptr_eq(a, b),
+            (HashKey::Class(a), HashKey::Class(b)) => Rc::ptr_eq(a, b),
+            (HashKey::BuiltinType(a), HashKey::BuiltinType(b)) => a == b,
+            // Equal-by-`__eq__` probes are settled onto the stored key's
+            // instance before they get here (`Interpreter::settle_key`).
+            (
+                HashKey::UserHashed {
+                    hash: ha,
+                    instance: a,
+                },
+                HashKey::UserHashed {
+                    hash: hb,
+                    instance: b,
+                },
+            ) => ha == hb && Rc::ptr_eq(a, b),
             _ => false,
         }
     }
@@ -819,6 +1100,13 @@ impl std::hash::Hash for HashKey {
             // Hash only the canonical projection so it stays consistent
             // with `Eq` (which ignores the retained `instance` Rc).
             HashKey::Instance { key, .. } => key.hash(state),
+            HashKey::Identity(inst) => (Rc::as_ptr(inst) as usize).hash(state),
+            HashKey::Class(c) => (Rc::as_ptr(c) as usize).hash(state),
+            HashKey::BuiltinType(name) => name.hash(state),
+            // Only the user hash feeds the hasher, so every probe with the
+            // same `__hash__` lands in the same bucket chain and
+            // `Interpreter::settle_key` can find its `__eq__` candidates.
+            HashKey::UserHashed { hash, .. } => hash.hash(state),
         }
     }
 }
@@ -878,6 +1166,7 @@ pub fn make_exception_group(kind: &str, message: &str, subs: Vec<Value>, as_tupl
         kind: Rc::new(kind.to_owned()),
         message: Rc::new(message.to_owned()),
         args: Rc::new(vec![Value::Str(Rc::new(message.to_owned())), subs_value]),
+        chain: None,
     }
 }
 
@@ -922,6 +1211,101 @@ pub fn exception_group_kind_for(members: &[Value]) -> &'static str {
     } else {
         "BaseExceptionGroup"
     }
+}
+
+/// The PEP 3134 chaining state attached to an exception value, if any.
+/// Handles both exception shapes: the built-in `Value::Exception` and a
+/// user-defined exception `Instance`.
+pub fn exception_chain(v: &Value) -> Option<Rc<ExcChain>> {
+    match v {
+        Value::Exception { chain, .. } => chain.clone(),
+        Value::Instance(i) => i.chain.borrow().clone(),
+        _ => None,
+    }
+}
+
+/// Whether `v` is an exception value at all — the two shapes a raise can
+/// produce, a built-in `Value::Exception` and an instance of a user class
+/// deriving from `Exception`.
+pub fn is_exception_value(v: &Value) -> bool {
+    match v {
+        Value::Exception { .. } => true,
+        Value::Instance(i) => i.class.is_exception,
+        _ => false,
+    }
+}
+
+/// Read one of `__cause__` / `__context__` / `__suppress_context__` off an
+/// exception value. An unchained exception answers `None` / `False`, which is
+/// what CPython gives a freshly constructed one.
+pub fn exception_chain_attr(v: &Value, attr: &str) -> Option<Value> {
+    if !is_exception_value(v) {
+        return None;
+    }
+    let chain = exception_chain(v);
+    match attr {
+        "__cause__" => Some(chain.and_then(|c| c.cause.clone()).unwrap_or(Value::None)),
+        "__context__" => Some(chain.and_then(|c| c.context.clone()).unwrap_or(Value::None)),
+        "__suppress_context__" => Some(Value::Bool(chain.is_some_and(|c| c.suppress_context))),
+        _ => None,
+    }
+}
+
+fn update_exception_chain(v: Value, edit: impl FnOnce(&mut ExcChain)) -> Value {
+    match v {
+        Value::Exception {
+            kind,
+            message,
+            args,
+            chain,
+        } => {
+            let mut next = chain.map(|c| (*c).clone()).unwrap_or_default();
+            edit(&mut next);
+            Value::Exception {
+                kind,
+                message,
+                args,
+                chain: Some(Rc::new(next)),
+            }
+        }
+        Value::Instance(i) => {
+            let mut next = i
+                .chain
+                .borrow()
+                .as_ref()
+                .map(|c| (**c).clone())
+                .unwrap_or_default();
+            edit(&mut next);
+            *i.chain.borrow_mut() = Some(Rc::new(next));
+            Value::Instance(i)
+        }
+        other => other,
+    }
+}
+
+/// Record `raise X from cause`: sets `__cause__`, and with it the
+/// `__suppress_context__` flag CPython sets on the same statement.
+/// `raise X from None` passes `Value::None` and just suppresses the context.
+pub fn with_exception_cause(v: Value, cause: Value) -> Value {
+    update_exception_chain(v, |c| {
+        c.cause = Some(cause);
+        c.suppress_context = true;
+    })
+}
+
+/// Record the exception that was being handled when this one was raised
+/// (`__context__`). Never overwrites a context already set, and never chains
+/// an exception to itself — both would build a cycle CPython does not.
+pub fn with_exception_context(v: Value, context: Value) -> Value {
+    if exception_values_identical(&v, &context) {
+        return v;
+    }
+    if let Some(chain) = exception_chain(&v) {
+        if chain.context.is_some() {
+            return v;
+        }
+    }
+    update_exception_chain(v, |c| c.context = Some(context))
 }
 
 /// Object identity (`is`) for exception values. Clones of one raised
@@ -981,6 +1365,19 @@ pub fn project_exception_group(orig: &Value, keep: &[Value]) -> Option<Value> {
     }
 }
 
+/// PEP 3134 exception-chaining state carried by an exception *value*.
+///
+/// `cause` is what `raise X from Y` records (`__cause__`, which also implies
+/// `__suppress_context__`); `context` is the exception that was being handled
+/// when this one was raised (`__context__`). Both hold the chained exception
+/// *value*, so `e.__cause__.args` works.
+#[derive(Clone, Default)]
+pub struct ExcChain {
+    pub cause: Option<Value>,
+    pub context: Option<Value>,
+    pub suppress_context: bool,
+}
+
 #[derive(Clone)]
 pub enum Value {
     None,
@@ -1032,6 +1429,10 @@ pub enum Value {
         kind: RcStr,
         message: RcStr,
         args: Rc<Vec<Value>>,
+        /// PEP 3134 chaining state (`__cause__` / `__context__`), `None`
+        /// until something chains onto this exception. Exception values are
+        /// copied freely, so the chain rides along with every clone.
+        chain: Option<Rc<ExcChain>>,
     },
     /// Iterator state — opaque to the AST walker; consumed by `next`.
     Iter(Rc<RefCell<IterState>>),
@@ -1099,6 +1500,114 @@ pub struct Function {
     /// computed once from `params` + `body` when the function value is built.
     /// Ineligible functions use the classic per-call `Env` HashMap path.
     pub slot_info: std::rc::Rc<crate::slots::SlotInfo>,
+    /// Whether the body contains a `yield`, and if so which execution
+    /// strategy the VM uses for it — computed once at def time.
+    pub generator: GeneratorKind,
+    /// A function's own `__dict__`. CPython lets any attribute be attached
+    /// to a function object, which is how decorators publish extra API on
+    /// the wrapper they return (`wrapper.register = …` in `singledispatch`,
+    /// `fn.cache_clear`, a test framework's markers).
+    pub attrs: RefCell<HashMap<String, Value>>,
+}
+
+/// How a `yield`-bearing function body is executed.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum GeneratorKind {
+    /// No `yield` in the body — an ordinary function.
+    NotGenerator,
+    /// Every `yield` sits in a resumable statement position (`yield v` as a
+    /// statement, `x = yield v`, `yield from it`), so the body runs lazily:
+    /// calling the function returns a suspended generator object and each
+    /// `next()` re-enters the tree-walk at the recorded resume path
+    /// (`Interpreter::generator_resume`).
+    Lazy,
+    /// A `yield` sits inside a larger expression (`f((yield x))`,
+    /// `return (yield)`, a `yield` in a `while` test, …) or the function is
+    /// an `async` generator. The tree-walker cannot resume mid-expression, so
+    /// the body runs eagerly to completion and the call returns an iterator
+    /// over the collected values (bounded by `GENERATOR_CAP`).
+    Eager,
+}
+
+/// One level of the path at which a lazy generator body is suspended.
+///
+/// A `yield` unwinds out of the tree-walk as `Unwind::Yield`; every enclosing
+/// construct it passes through records the frame describing how to re-enter
+/// it (innermost first). On the next `next()` the frames are consumed
+/// outermost-first: each construct pops the frame that describes itself and
+/// jumps straight back into the recorded branch / iteration / handler instead
+/// of re-evaluating its header.
+#[derive(Clone, Debug)]
+pub enum ResumeFrame {
+    /// Inside a statement list, at statement `index`.
+    Block { index: usize },
+    /// The suspended `yield` statement itself.
+    YieldPoint,
+    /// The suspended `yield from` statement; `iter` is the delegated-to
+    /// sub-iterator.
+    YieldFrom { iter: Value },
+    /// Inside an `if` body (`None`) or the `elif` / `else` clause at `clause`.
+    IfBranch { clause: Option<usize> },
+    /// Inside a `while` body.
+    WhileBody,
+    /// Inside a loop's `else` clause.
+    LoopElse,
+    /// Inside a `for` body; `iter` is the live loop iterator.
+    ForBody { iter: Value },
+    /// Inside a `try` body.
+    TryBody,
+    /// Inside the `except` handler at `index`, handling `exc` (boxed to keep
+    /// the frame small — it travels through every statement executor).
+    TryHandler {
+        index: usize,
+        exc: Box<crate::error::VmException>,
+    },
+    /// Inside a `try` statement's `else` block.
+    TryElse,
+    /// Inside a `finally` block; `pending` is the outcome the block will
+    /// re-deliver when it completes (`None` = the guarded code finished
+    /// normally).
+    TryFinally {
+        pending: Option<Box<crate::error::Unwind>>,
+    },
+    /// Inside a `with` body; `entered` are the context managers whose
+    /// `__exit__` still has to run.
+    WithBody { entered: Vec<Value> },
+    /// Inside the `case` body at `index` of a `match`.
+    MatchCase { index: usize },
+}
+
+/// A lazy generator object: the function's own call frame kept alive between
+/// `next()` calls, plus the resume path recorded at the last `yield`.
+pub struct GeneratorState {
+    pub function: Rc<Function>,
+    /// The generator's local scope — persists across suspensions.
+    pub env: crate::env::EnvRef,
+    /// The suspension path (innermost frame first, consumed from the back).
+    /// Empty before the first `next()` and after exhaustion.
+    pub resume: Vec<ResumeFrame>,
+    pub started: bool,
+    pub finished: bool,
+    /// Set while the body is executing — a re-entrant `next()` raises
+    /// `ValueError: generator already executing` as CPython does.
+    pub running: bool,
+    /// The value carried by the terminating `return` (`StopIteration.value`).
+    pub return_value: Option<Value>,
+}
+
+/// A lazy generator expression `(elt for … in … if …)`: the comprehension AST
+/// plus one live iterator per `for` clause.
+pub struct GenExprState {
+    pub node: Rc<ruff_python_ast::ExprGenerator>,
+    /// The comprehension's private scope (targets bind here).
+    pub env: crate::env::EnvRef,
+    /// `iters[i]` is the live iterator of the i-th `for` clause; `None` past
+    /// the innermost active clause. `iters[0]` is created eagerly when the
+    /// expression is evaluated (CPython evaluates the outermost iterable at
+    /// once), everything else on demand.
+    pub iters: Vec<Option<Value>>,
+    pub finished: bool,
+    pub running: bool,
 }
 
 pub struct Class {
@@ -1141,11 +1650,34 @@ pub struct Class {
 pub struct ClassField {
     pub name: String,
     pub default: Option<Value>,
+    /// The field's annotation as source text (`int`, `list[str]`,
+    /// `Address | None`), when the class body declared one. Surfaced by
+    /// `dataclasses.fields(...)` as `Field.type` — the emitted Python runs
+    /// under `from __future__ import annotations`, so CPython's `Field.type`
+    /// is that same string.
+    pub annotation: Option<String>,
 }
+
+/// Instance attributes, in assignment order — `vars(obj)`, `__dict__` and
+/// every dict built from them iterate in that order, as in CPython.
+pub type FieldMap = IndexMap<String, Value>;
 
 pub struct Instance {
     pub class: Rc<Class>,
-    pub fields: RefCell<HashMap<String, Value>>,
+    pub fields: RefCell<FieldMap>,
+    /// PEP 3134 chaining state for a user-defined exception instance. Kept
+    /// out of `fields` because CPython holds `__cause__` / `__context__` in
+    /// slots, not in `__dict__` — `vars(e)` must not show them.
+    pub chain: RefCell<Option<Rc<ExcChain>>>,
+}
+
+// Hand-written so `HashKey::Class` can `#[derive(Debug)]` without pulling
+// the whole class graph into a `Debug` bound: the name is what a key dump
+// needs to be readable.
+impl fmt::Debug for Class {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "<class '{}'>", self.name)
+    }
 }
 
 // Hand-written so `HashKey::Instance` (which retains an `Rc<Instance>`)
@@ -1169,6 +1701,11 @@ pub struct CoroutineThunk {
 pub struct Module {
     pub name: String,
     pub members: RefCell<HashMap<String, Value>>,
+    /// The namespace the module body ran in, for modules the VM executed
+    /// (loaded siblings, stdlib shims): attribute reads consult it first so a
+    /// global a module function rebinds later (`global counter`) is seen
+    /// through `module.counter`, as in CPython. `None` for native modules.
+    pub env: Option<crate::env::EnvRef>,
 }
 
 pub enum IterState {
@@ -1212,6 +1749,44 @@ pub enum IterState {
         func: Value,
         inner: Rc<RefCell<IterState>>,
     },
+    /// `reversed(seq)` — `items` already reversed. Kept distinct from `List`
+    /// only so `type(reversed(xs)).__name__` reports `list_reverseiterator`.
+    Reversed {
+        items: Rc<Vec<Value>>,
+        index: usize,
+    },
+    /// A lazily-driven generator function body.
+    Generator(Rc<RefCell<GeneratorState>>),
+    /// A lazily-driven generator expression.
+    GenExpr(Rc<RefCell<GenExprState>>),
+    /// A user iterator object (an instance whose class defines `__next__`),
+    /// stepped through `__next__` on demand.
+    UserIter(Value),
+    /// The legacy sequence protocol: `obj[0]`, `obj[1]`, … until `IndexError`.
+    SeqIter {
+        obj: Value,
+        index: usize,
+    },
+}
+
+/// The `type(it).__name__` CPython reports for an iterator of this shape.
+pub fn iter_type_name(state: &IterState) -> &'static str {
+    match state {
+        IterState::Range { .. } => "range_iterator",
+        IterState::List { .. } => "list_iterator",
+        IterState::Tuple { .. } => "tuple_iterator",
+        IterState::Str { .. } => "str_ascii_iterator",
+        IterState::Dict { .. } => "dict_keyiterator",
+        IterState::Set { .. } => "set_iterator",
+        IterState::Enumerate { .. } => "enumerate",
+        IterState::Zip { .. } => "zip",
+        IterState::Map { .. } => "map",
+        IterState::Filter { .. } => "filter",
+        IterState::Reversed { .. } => "list_reverseiterator",
+        IterState::Generator(_) | IterState::GenExpr(_) => "generator",
+        IterState::UserIter(_) => "iterator",
+        IterState::SeqIter { .. } => "iterator",
+    }
 }
 
 // ── Debug / display ────────────────────────────────────────────────────────
@@ -1259,7 +1834,7 @@ impl fmt::Debug for Value {
             Value::Range { start, stop, step } => {
                 write!(f, "range({start}, {stop}, {step})")
             }
-            Value::Native(n) => write!(f, "<built-in function {}>", n.name),
+            Value::Native(n) => write!(f, "{}", native_repr(n.name)),
             Value::Function(func) => write!(f, "<function {}>", func.name),
             Value::BoundMethod { function, .. } => {
                 write!(f, "<bound method {}>", function.name)
@@ -1282,6 +1857,7 @@ impl fmt::Debug for Value {
                 kind,
                 message,
                 args,
+                ..
             } => {
                 if args.is_empty() {
                     if message.is_empty() {
@@ -1330,7 +1906,46 @@ fn float_to_bigint(x: f64) -> Result<BigInt, Unwind> {
     })
 }
 
+/// A dict's `{k: v, …}` rendering. `wrap_frozen` adds the `mappingproxy(…)`
+/// wrapper a `freeze`-marked dict shows under `repr` — CPython's proxy
+/// delegates `__str__` to the mapping it wraps, so only `repr` names it.
+fn dict_render(v: &Value, wrap_frozen: bool) -> String {
+    let Value::Dict(d) = v else {
+        return String::new();
+    };
+    let frozen_key = HashKey::Str(Rc::new("__typhon_frozen__".to_owned()));
+    let wrap = wrap_frozen && matches!(d.borrow().get(&frozen_key), Some(Value::Bool(true)));
+    let d = d.borrow();
+    let mut s = String::new();
+    s.push_str(if wrap { "mappingproxy({" } else { "{" });
+    let mut emitted = 0usize;
+    for (k, v) in d.iter() {
+        if matches!(k, HashKey::Str(name) if name.as_str() == "__typhon_frozen__") {
+            continue;
+        }
+        if emitted > 0 {
+            s.push_str(", ");
+        }
+        s.push_str(&k.clone().into_value().py_repr());
+        s.push_str(": ");
+        s.push_str(&v.py_repr());
+        emitted += 1;
+    }
+    s.push_str(if wrap { "})" } else { "}" });
+    s
+}
+
 impl Value {
+    /// The type name CPython puts in an error message: a user instance
+    /// reports its *class*, everything else its structural `type_name`.
+    pub fn type_display_name(&self) -> String {
+        match self {
+            Value::Instance(i) => i.class.name.clone(),
+            Value::Class(c) => c.name.clone(),
+            other => other.type_name().to_owned(),
+        }
+    }
+
     pub fn type_name(&self) -> &'static str {
         match self {
             Value::None => "NoneType",
@@ -1341,6 +1956,8 @@ impl Value {
             Value::Str(_) => "str",
             Value::Bytes(_) => "bytes",
             Value::List(_) => "list",
+            Value::Tuple(t) if is_slice_marker(t) => "slice",
+            Value::Tuple(t) if is_ellipsis_marker(t) => "ellipsis",
             Value::Tuple(_) => "tuple",
             Value::Dict(_) => "dict",
             Value::Set(_) => "set",
@@ -1351,13 +1968,16 @@ impl Value {
             // need the specific class name read `instance.class.name`
             // directly; everywhere else `"instance"` is descriptive enough
             // for an error message.
+            // A class name is not `'static`, so callers that want it in a
+            // message reach for `type_display_name`. This stays the coarse
+            // structural label.
             Value::Instance(_) => "instance",
             Value::ResultOk(_) => "Ok",
             Value::ResultErr(_) => "Err",
             Value::Module(_) => "module",
             Value::Coroutine(_) => "coroutine",
             Value::Exception { .. } => "Exception",
-            Value::Iter(_) => "iterator",
+            Value::Iter(it) => iter_type_name(&it.borrow()),
             Value::DictView { kind, .. } => match kind {
                 DictViewKind::Keys => "dict_keys",
                 DictViewKind::Values => "dict_values",
@@ -1461,6 +2081,21 @@ impl Value {
                 if let Some(v) = enum_mixin_value(self) {
                     return v.to_hash_key();
                 }
+                match instance_hash_mode(&inst.class) {
+                    HashMode::Unhashable => {
+                        return Err(type_error(format!(
+                            "unhashable type: '{}'",
+                            inst.class.name
+                        )))
+                    }
+                    HashMode::Identity => return Ok(HashKey::Identity(inst.clone())),
+                    // A user `__hash__` needs the interpreter
+                    // (`Interpreter::hash_key`). This interpreter-free
+                    // fallback keys on the field structure, which agrees
+                    // with the usual "hash the fields, compare the fields"
+                    // implementations.
+                    HashMode::User(_) | HashMode::Fields => {}
+                }
                 let mut fields: Vec<(String, HashKey)> = Vec::new();
                 for (name, v) in inst.fields.borrow().iter() {
                     fields.push((name.clone(), v.to_hash_key()?));
@@ -1479,6 +2114,22 @@ impl Value {
                     key: Rc::new(key),
                 })
             }
+            // A class object is hashable by identity in CPython — this is
+            // what makes a type-keyed registry (`functools.singledispatch`,
+            // a visitor table) work.
+            Value::Class(c) => {
+                // `type(5)` hands back the VM's cached stand-in class for
+                // `int` while the global `int` is the constructor native —
+                // a type-keyed registry (`functools.singledispatch`) has to
+                // see a single key for the two.
+                if crate::builtins::is_builtin_type_class(c) {
+                    return Ok(HashKey::BuiltinType(crate::interp::intern_type_name(
+                        &c.name,
+                    )));
+                }
+                Ok(HashKey::Class(c.clone()))
+            }
+            Value::Native(n) => Ok(HashKey::BuiltinType(n.name)),
             other => Err(type_error(format!(
                 "unhashable type: '{}'",
                 other.type_name()
@@ -1569,7 +2220,15 @@ impl Value {
             // `Rc<Class>` per definition), NOT name equality — two distinct
             // classes that share a name must not compare equal.
             (Instance(a), Instance(b)) => {
+                if Rc::ptr_eq(a, b) {
+                    return true;
+                }
                 if !Rc::ptr_eq(&a.class, &b.class) {
+                    return false;
+                }
+                // `object.__eq__` is identity: a plain class (no dataclass
+                // `__eq__`, no user `__eq__`) never equals another instance.
+                if !class_eq_by_fields(&a.class) {
                     return false;
                 }
                 let fa = a.fields.borrow();
@@ -1626,6 +2285,10 @@ impl Value {
             (Bool(a), Bool(b)) => a.partial_cmp(b),
             (Bool(a), Int(b)) => VmInt::from(*a as i64).partial_cmp(b),
             (Int(a), Bool(b)) => a.partial_cmp(&VmInt::from(*b as i64)),
+            // `bool` is an `int` in CPython, so it orders against floats too
+            // — `sorted([True, False, 0.5])` needs this.
+            (Bool(a), Float(b)) => f64::from(*a).partial_cmp(b),
+            (Float(a), Bool(b)) => a.partial_cmp(&f64::from(*b)),
             (Str(a), Str(b)) => a.partial_cmp(b),
             // `bytes` is ordered in CPython (lexicographic over the byte
             // values). Without this arm every bytes pair was "incomparable",
@@ -1678,13 +2341,30 @@ impl Value {
                     "Python int too large to convert to C int",
                 ))
             }),
-            Value::Str(s) => s
-                .trim()
-                .parse::<i64>()
-                .map_err(|_| value_error(format!("invalid literal for int(): {:?}", s.as_str()))),
+            // `int(b"12")` / `float(b"1.5")` — CPython parses a
+            // bytes-like the same way it parses a string.
+            Value::Bytes(b) => parse_decimal_str::<i64>(&String::from_utf8_lossy(b)).map_err(|_| {
+                value_error(format!(
+                    "invalid literal for int() with base 10: {}",
+                    Value::Bytes(b.clone()).py_repr()
+                ))
+            }),
+            Value::Str(s) => parse_decimal_str::<i64>(s).map_err(|_| {
+                value_error(format!(
+                    "invalid literal for int() with base 10: {}",
+                    Value::Str(s.clone()).py_repr()
+                ))
+            }),
+            Value::Instance(_) => match enum_mixin_value(self) {
+                Some(inner) => inner.to_int(),
+                None => Err(type_error(format!(
+                    "int() argument must be a string, a bytes-like object or a real number, not '{}'",
+                    self.type_display_name()
+                ))),
+            },
             _ => Err(type_error(format!(
-                "int() argument must be a string or a number, not '{}'",
-                self.type_name()
+                "int() argument must be a string, a bytes-like object or a real number, not '{}'",
+                self.type_display_name()
             ))),
         }
     }
@@ -1702,13 +2382,33 @@ impl Value {
             // and CPython raises `OverflowError` / `ValueError` here — so
             // convert exactly and reject what has no integer value.
             Value::Float(x) => float_to_bigint(*x),
-            Value::Str(s) => s
-                .trim()
-                .parse::<BigInt>()
-                .map_err(|_| value_error(format!("invalid literal for int(): {:?}", s.as_str()))),
+            Value::Bytes(b) => {
+                parse_decimal_str::<BigInt>(&String::from_utf8_lossy(b)).map_err(|_| {
+                    value_error(format!(
+                        "invalid literal for int() with base 10: {}",
+                        Value::Bytes(b.clone()).py_repr()
+                    ))
+                })
+            }
+            Value::Str(s) => parse_decimal_str::<BigInt>(s).map_err(|_| {
+                value_error(format!(
+                    "invalid literal for int() with base 10: {}",
+                    Value::Str(s.clone()).py_repr()
+                ))
+            }),
+            // An `IntEnum` / `IntFlag` / `StrEnum` member *is* its value in
+            // CPython, so every numeric conversion sees through the member —
+            // `"%d" % IntE.ONE` and `math.sqrt(Size.BIG)` included.
+            Value::Instance(_) => match enum_mixin_value(self) {
+                Some(inner) => inner.to_bigint(),
+                None => Err(type_error(format!(
+                    "int() argument must be a string, a bytes-like object or a real number, not '{}'",
+                    self.type_display_name()
+                ))),
+            },
             _ => Err(type_error(format!(
-                "int() argument must be a string or a number, not '{}'",
-                self.type_name()
+                "int() argument must be a string, a bytes-like object or a real number, not '{}'",
+                self.type_display_name()
             ))),
         }
     }
@@ -1718,15 +2418,30 @@ impl Value {
             Value::Float(x) => Ok(*x),
             Value::Int(i) => Ok(i.to_f64()),
             Value::Bool(b) => Ok(*b as i64 as f64),
-            Value::Str(s) => s.trim().parse::<f64>().map_err(|_| {
+            Value::Bytes(b) => {
+                parse_decimal_str::<f64>(&String::from_utf8_lossy(b)).map_err(|_| {
+                    value_error(format!(
+                        "could not convert string to float: {}",
+                        Value::Bytes(b.clone()).py_repr()
+                    ))
+                })
+            }
+            Value::Str(s) => parse_decimal_str::<f64>(s).map_err(|_| {
                 value_error(format!(
-                    "could not convert string to float: {:?}",
-                    s.as_str()
+                    "could not convert string to float: {}",
+                    Value::Str(s.clone()).py_repr()
                 ))
             }),
+            Value::Instance(_) => match enum_mixin_value(self) {
+                Some(inner) => inner.to_float(),
+                None => Err(type_error(format!(
+                    "float() argument must be a string or a number, not '{}'",
+                    self.type_display_name()
+                ))),
+            },
             _ => Err(type_error(format!(
                 "float() argument must be a string or a number, not '{}'",
-                self.type_name()
+                self.type_display_name()
             ))),
         }
     }
@@ -1755,6 +2470,12 @@ impl Value {
                 s
             }
             Value::Tuple(t) => {
+                if is_slice_marker(t) {
+                    return slice_repr(t);
+                }
+                if is_ellipsis_marker(t) {
+                    return "Ellipsis".to_owned();
+                }
                 let mut s = String::from("(");
                 for (i, v) in t.iter().enumerate() {
                     if i > 0 {
@@ -1768,36 +2489,7 @@ impl Value {
                 s.push(')');
                 s
             }
-            Value::Dict(d) => {
-                let frozen_key = HashKey::Str(Rc::new("__typhon_frozen__".to_owned()));
-                let is_frozen = matches!(d.borrow().get(&frozen_key), Some(Value::Bool(true)));
-                let d = d.borrow();
-                let mut s = String::new();
-                if is_frozen {
-                    s.push_str("mappingproxy({");
-                } else {
-                    s.push('{');
-                }
-                let mut emitted = 0usize;
-                for (k, v) in d.iter() {
-                    if matches!(k, HashKey::Str(name) if name.as_str() == "__typhon_frozen__") {
-                        continue;
-                    }
-                    if emitted > 0 {
-                        s.push_str(", ");
-                    }
-                    s.push_str(&k.clone().into_value().py_repr());
-                    s.push_str(": ");
-                    s.push_str(&v.py_repr());
-                    emitted += 1;
-                }
-                if is_frozen {
-                    s.push_str("})");
-                } else {
-                    s.push('}');
-                }
-                s
-            }
+            Value::Dict(_) => dict_render(self, false),
             Value::Set(set) => {
                 let s = set.borrow();
                 let frozen_key = HashKey::Str(Rc::new("__typhon_frozen__".to_owned()));
@@ -1840,14 +2532,29 @@ impl Value {
                     format!("range({}, {}, {})", start, stop, step)
                 }
             }
-            Value::Native(n) => format!("<built-in function {}>", n.name),
+            Value::Native(n) => native_repr(n.name),
             Value::Function(func) => format!("<function {}>", func.name),
-            Value::BoundMethod { function, .. } => format!("<bound method {}>", function.name),
-            Value::Class(c) => format!("<class '{}'>", c.name),
+            // CPython names the class the method was found on and reprs
+            // the receiver: `<bound method Path.iterdir of PosixPath('/t')>`.
+            Value::BoundMethod { function, receiver } => {
+                let owner = match receiver.as_ref() {
+                    Value::Instance(i) => format!("{}.", i.class.name),
+                    Value::Class(c) => format!("{}.", c.name),
+                    _ => String::new(),
+                };
+                format!(
+                    "<bound method {}{} of {}>",
+                    owner,
+                    function.name,
+                    receiver.py_repr()
+                )
+            }
+            Value::Class(c) => class_repr(c),
             // `str(exc)` differs from `repr(exc)` for a field-less exception
             // instance: the message/args, not `ClassName('msg')`.
             Value::Instance(i) => match exception_instance_args(i) {
                 Some(args) => exception_instance_str(i, &args),
+                None if class_is_pydantic_model(&i.class) => model_instance_str(i),
                 None => instance_repr(i),
             },
             // Match the dataclass-default `repr` shape that
@@ -1858,12 +2565,22 @@ impl Value {
             // stdout from diverging on Result printing (FINDINGS O24).
             Value::ResultOk(v) => format!("Ok(value={})", v.py_repr()),
             Value::ResultErr(v) => format!("Err(error={})", v.py_repr()),
-            Value::Module(m) => format!("<module '{}'>", m.name),
+            Value::Module(m) => {
+                if m.members
+                    .borrow()
+                    .contains_key(crate::interp::LAZY_MODULE_TARGET)
+                {
+                    format!("<lazy module '{}': unloaded>", m.name)
+                } else {
+                    format!("<module '{}'>", m.name)
+                }
+            }
             Value::Coroutine(c) => format!("<coroutine object {}>", c.function.name),
             Value::Exception {
                 kind,
                 message,
                 args,
+                ..
             } => match args.len() {
                 // `str(ExceptionGroup("g", [e]))` is `"g (1 sub-exception)"`,
                 // not the generic multi-arg tuple form below.
@@ -1871,6 +2588,11 @@ impl Value {
                     let n = exception_group_subs(self).map(|s| s.len()).unwrap_or(0);
                     let plural = if n == 1 { "" } else { "s" };
                     format!("{message} ({n} sub-exception{plural})")
+                }
+                // `OSError(errno, strerror[, filename])` renders the
+                // `[Errno N] strerror: 'filename'` form kept in `message`.
+                n if n >= 2 && crate::builtins::is_os_error_kind(kind.as_str()) => {
+                    (**message).clone()
                 }
                 // `str(ValueError("a", "b"))` is the tuple `('a', 'b')`.
                 n if n >= 2 => {
@@ -1882,15 +2604,32 @@ impl Value {
                 // `"'k'"`, not `"k"` (so a missing key is unambiguous).
                 1 if kind.as_str() == "KeyError" => args[0].py_repr(),
                 1 => args[0].py_str(),
-                _ => {
-                    if message.is_empty() {
-                        format!("{kind}()")
-                    } else {
-                        (**message).clone()
-                    }
-                }
+                // No arguments: `str(ValueError())` is the empty string. A
+                // VM-raised exception that carries only a message (no
+                // `args`) still renders that message.
+                _ => (**message).clone(),
             },
-            Value::Iter(_) => "<iterator>".into(),
+            Value::Iter(it) => {
+                let state = it.borrow();
+                match &*state {
+                    IterState::Generator(g) => format!(
+                        "<generator object {} at {:#x}>",
+                        g.borrow().function.name,
+                        Rc::as_ptr(it) as usize
+                    ),
+                    IterState::GenExpr(_) => {
+                        format!(
+                            "<generator object <genexpr> at {:#x}>",
+                            Rc::as_ptr(it) as usize
+                        )
+                    }
+                    other => format!(
+                        "<{} object at {:#x}>",
+                        iter_type_name(other),
+                        Rc::as_ptr(it) as usize
+                    ),
+                }
+            }
             Value::DictView { kind, items } => {
                 let prefix = match kind {
                     DictViewKind::Keys => "dict_keys",
@@ -1913,13 +2652,23 @@ impl Value {
     pub fn py_repr(&self) -> String {
         match self {
             Value::Str(s) => python_repr_str(s.as_str()),
+            Value::Dict(_) => dict_render(self, true),
             // `repr(exc)` keeps the `ClassName('msg')` form even though
             // `str(exc)` (py_str) renders just the message.
             Value::Instance(i) => instance_repr(i),
             // `repr(ValueError("boom"))` is `ValueError('boom')` (and
             // `KeyError('k')`, `ValueError()` for no args) — the constructor
-            // form, not the `str()` message.
-            Value::Exception { kind, args, .. } => {
+            // form, not the `str()` message. A VM-raised exception carrying
+            // only a message renders it as the single argument.
+            Value::Exception {
+                kind,
+                args,
+                message,
+                ..
+            } => {
+                if args.is_empty() && !message.is_empty() {
+                    return format!("{}({})", kind, python_repr_str(message));
+                }
                 let parts: Vec<String> = args.iter().map(|a| a.py_repr()).collect();
                 format!("{}({})", kind, parts.join(", "))
             }
@@ -1970,7 +2719,7 @@ fn python_repr_bytes(b: &[u8]) -> String {
 /// the string itself contains a `'` but no `"`. The escape set matches
 /// CPython's reprlib: `\\`, `\n`, `\r`, `\t`, and `\x..` for other
 /// ASCII control characters.
-fn python_repr_str(s: &str) -> String {
+pub(crate) fn python_repr_str(s: &str) -> String {
     let has_single = s.contains('\'');
     let has_double = s.contains('"');
     let quote = if has_single && !has_double { '"' } else { '\'' };
@@ -1986,11 +2735,18 @@ fn python_repr_str(s: &str) -> String {
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 || c as u32 == 0x7f => {
-                out.push_str("\\x");
-                let hex = b"0123456789abcdef";
-                out.push(hex[(c as u32 as usize >> 4) & 0xf] as char);
-                out.push(hex[c as u32 as usize & 0xf] as char);
+            // CPython escapes exactly what `str.isprintable()` rejects — the
+            // controls, but also the format, separator, private-use and
+            // unassigned characters, which pass through invisibly otherwise.
+            c if !crate::builtins::unicode_is_printable(c) => {
+                let n = c as u32;
+                if n <= 0xff {
+                    out.push_str(&format!("\\x{n:02x}"));
+                } else if n <= 0xffff {
+                    out.push_str(&format!("\\u{n:04x}"));
+                } else {
+                    out.push_str(&format!("\\U{n:08x}"));
+                }
             }
             c => out.push(c),
         }
@@ -2143,6 +2899,15 @@ fn instance_repr(inst: &Instance) -> String {
 
 fn instance_repr_inner(inst: &Instance) -> String {
     let fields = inst.fields.borrow();
+    // A `__slots__` member descriptor (`Cls.field` on a slots dataclass)
+    // reprs as CPython's `<member 'name' of 'Cls' objects>`.
+    if inst.class.name == "member_descriptor" {
+        if let (Some(Value::Str(name)), Some(Value::Str(owner))) =
+            (fields.get("__name__"), fields.get("__objclass__"))
+        {
+            return format!("<member '{name}' of '{owner}' objects>");
+        }
+    }
     // Enum members repr as `<Class.NAME: value>` (CPython default), not as
     // their backing dataclass fields.
     if class_is_enum(&inst.class) {
@@ -2151,23 +2916,85 @@ fn instance_repr_inner(inst: &Instance) -> String {
         }
     }
     let mut parts: Vec<String> = Vec::with_capacity(fields.len());
-    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
     for cf in &inst.class.fields {
         if let Some(v) = fields.get(&cf.name) {
             parts.push(format!("{}={}", cf.name, v.py_repr()));
-            seen.insert(cf.name.as_str());
         }
     }
-    // Any extra attributes not declared as class fields, in name order.
-    let mut extras: Vec<(&String, &Value)> = fields
-        .iter()
-        .filter(|(k, _)| !seen.contains(k.as_str()))
-        .collect();
-    extras.sort_by(|a, b| a.0.cmp(b.0));
-    for (k, v) in extras {
-        parts.push(format!("{}={}", k, v.py_repr()));
+    // A dataclass (or pydantic model) repr shows its declared fields and
+    // nothing else — not class attributes copied onto the instance (a
+    // `model`'s `model_config` leaked into every repr before this) and not
+    // attributes assigned later. A class with no declared fields that is
+    // neither (a `plain class` / `class!` without a `__repr__`) gets
+    // `object.__repr__`, exactly like CPython.
+    if inst.class.fields.is_empty()
+        && !class_is_dataclass(&inst.class)
+        && !class_is_pydantic_model(&inst.class)
+    {
+        return object_default_repr(inst);
     }
     format!("{}({})", inst.class.name, parts.join(", "))
+}
+
+/// `repr()` of a class object. CPython qualifies it with the module the class
+/// body ran in — `<class '__main__.User'>`, not `<class 'User'>` — which the
+/// VM records as `__typhon_module__`. A stdlib shim's classes carry no module
+/// (CPython's name for them is not the shim's), so those stay bare.
+pub fn class_repr(class: &Class) -> String {
+    match class.class_attrs.borrow().get("__typhon_module__") {
+        Some(Value::Str(m)) if !m.is_empty() => format!("<class '{m}.{}'>", class.name),
+        _ => format!("<class '{}'>", class.name),
+    }
+}
+
+/// `object.__repr__`: `<module.Class object at 0x…>`. The module is the one
+/// the class body ran in (`__typhon_module__`, recorded by `build_class`);
+/// the address is the instance's allocation, stable for its lifetime.
+pub fn object_default_repr(inst: &Instance) -> String {
+    let module = match inst.class.class_attrs.borrow().get("__typhon_module__") {
+        Some(Value::Str(s)) => (**s).clone(),
+        _ => "__main__".to_owned(),
+    };
+    format!(
+        "<{}.{} object at {:#x}>",
+        module, inst.class.name, inst as *const Instance as usize
+    )
+}
+
+/// `str()` of a pydantic `model` instance: `BaseModel.__str__` renders the
+/// fields space-separated with no class name — `id=2 name='Grace' age=None`.
+fn model_instance_str(inst: &Instance) -> String {
+    let fields = inst.fields.borrow();
+    let parts: Vec<String> = inst
+        .class
+        .fields
+        .iter()
+        .filter_map(|cf| {
+            fields
+                .get(&cf.name)
+                .map(|v| format!("{}={}", cf.name, v.py_repr()))
+        })
+        .collect();
+    parts.join(" ")
+}
+
+/// Whether a class was declared with Typhon's `model` keyword (a pydantic
+/// `BaseModel` subclass). The interpreter stamps the marker at class-definition
+/// time; it inherits along with the other class attributes.
+pub fn class_is_pydantic_model(class: &Class) -> bool {
+    class
+        .class_attrs
+        .borrow()
+        .contains_key("__typhon_pydantic_model__")
+}
+
+/// Whether a class is a dataclass — Typhon's default `class` (and `class …
+/// frozen`) — as `dataclasses.is_dataclass` reports it.
+pub fn class_is_dataclass(class: &Class) -> bool {
+    class
+        .class_attrs
+        .borrow()
+        .contains_key("__typhon_dataclass__")
 }
 
 /// CPython-compatible `repr(float)`. Produces the shortest string that
@@ -2214,6 +3041,101 @@ fn format_complex(re: f64, im: f64) -> String {
     }
 }
 
+/// The code point of `0` in each Unicode decimal-digit (`Nd`) block, from
+/// the Unicode data CPython itself uses (generated with `unicodedata`).
+/// Every block is exactly ten consecutive code points, so a character's
+/// digit value is its offset from the block's zero.
+const DECIMAL_DIGIT_BLOCKS: &[u32] = &[
+    0x0030, 0x0660, 0x06F0, 0x07C0, 0x0966, 0x09E6, 0x0A66, 0x0AE6, 0x0B66, 0x0BE6, 0x0C66, 0x0CE6,
+    0x0D66, 0x0DE6, 0x0E50, 0x0ED0, 0x0F20, 0x1040, 0x1090, 0x17E0, 0x1810, 0x1946, 0x19D0, 0x1A80,
+    0x1A90, 0x1B50, 0x1BB0, 0x1C40, 0x1C50, 0xA620, 0xA8D0, 0xA900, 0xA9D0, 0xA9F0, 0xAA50, 0xABF0,
+    0xFF10, 0x104A0, 0x10D30, 0x11066, 0x110F0, 0x11136, 0x111D0, 0x112F0, 0x11450, 0x114D0,
+    0x11650, 0x116C0, 0x11730, 0x118E0, 0x11950, 0x11C50, 0x11D50, 0x11DA0, 0x11F50, 0x16A60,
+    0x16AC0, 0x16B50, 0x1D7CE, 0x1D7D8, 0x1D7E2, 0x1D7EC, 0x1D7F6, 0x1E140, 0x1E2F0, 0x1E4F0,
+    0x1E950, 0x1FBF0,
+];
+
+/// The decimal value of a Unicode digit character, as CPython's `int()` /
+/// `float()` accept: ASCII plus every `Nd` block, so `int("１２３")` is 123
+/// and `int("٣")` is 3.
+pub fn unicode_decimal_digit(c: char) -> Option<u32> {
+    if c.is_ascii_digit() {
+        return Some(c as u32 - u32::from(b'0'));
+    }
+    let cp = c as u32;
+    DECIMAL_DIGIT_BLOCKS
+        .iter()
+        .find(|&&zero| cp >= zero && cp < zero + 10)
+        .map(|&zero| cp - zero)
+}
+
+/// `s` with every Unicode decimal digit folded to its ASCII counterpart,
+/// or `None` when it holds no non-ASCII digit (the overwhelmingly common
+/// case, which then needs no allocation).
+pub fn fold_unicode_digits(s: &str) -> Option<String> {
+    if s.is_ascii() {
+        return None;
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut folded = false;
+    for c in s.chars() {
+        match unicode_decimal_digit(c) {
+            Some(d) if !c.is_ascii() => {
+                out.push(char::from(b'0' + d as u8));
+                folded = true;
+            }
+            _ => out.push(c),
+        }
+    }
+    if folded {
+        Some(out)
+    } else {
+        None
+    }
+}
+
+/// `str::parse` over a Python numeric literal: leading / trailing
+/// whitespace is stripped, and Unicode decimal digits are folded to ASCII
+/// first, so `int("１２３")` and `float("１.５")` work as they do in CPython.
+fn parse_decimal_str<T: std::str::FromStr>(s: &str) -> Result<T, T::Err> {
+    let trimmed = s.trim();
+    let folded = fold_unicode_digits(trimmed);
+    let text = folded.as_deref().unwrap_or(trimmed);
+    match strip_python_underscores(text) {
+        Some(clean) => clean.parse::<T>(),
+        // Python allows a single `_` only *between* digits (`1_000.5` yes,
+        // `1__0` / `_1` / `1_` no). `num-bigint` accepts the invalid forms
+        // and `f64` rejects the valid one, so both are settled here; a
+        // string no parser accepts produces the right error type.
+        None => "\u{0}".parse::<T>(),
+    }
+}
+
+/// `s` without its Python digit-group underscores, or `None` when one of
+/// them is not between two digits.
+fn strip_python_underscores(s: &str) -> Option<std::borrow::Cow<'_, str>> {
+    if !s.contains('_') {
+        return Some(std::borrow::Cow::Borrowed(s));
+    }
+    let bytes = s.as_bytes();
+    for (i, b) in bytes.iter().enumerate() {
+        if *b != b'_' {
+            continue;
+        }
+        let prev = i.checked_sub(1).map(|p| bytes[p]);
+        let next = bytes.get(i + 1).copied();
+        if !prev.is_some_and(|c| c.is_ascii_digit()) || !next.is_some_and(|c| c.is_ascii_digit()) {
+            return None;
+        }
+    }
+    Some(std::borrow::Cow::Owned(s.replace('_', "")))
+}
+
+/// `str(x)` for a float, for callers outside this module.
+pub fn float_str(x: f64) -> String {
+    format_float(x)
+}
+
 fn format_float(x: f64) -> String {
     if x.is_nan() {
         return "nan".into();
@@ -2235,19 +3157,80 @@ fn format_float(x: f64) -> String {
     // a trailing `.0`. CPython's `repr` switches to scientific notation
     // based on the decimal exponent of the most-significant digit, so we
     // derive that exponent and reformat to match.
-    let mag = x.abs();
-    let exp10 = mag.log10().floor() as i32;
+    // The exponent comes from the shortest round-tripping form itself, not
+    // from `log10`: `9999999999999998.0_f64.log10()` rounds up to exactly
+    // 16.0, which pushed a value CPython prints in full into scientific
+    // notation.
+    let sci = format!("{:e}", x);
+    let exp10: i32 = sci
+        .split_once('e')
+        .and_then(|(_, e)| e.parse().ok())
+        .unwrap_or(0);
 
     if !(-4..16).contains(&exp10) {
         return format_float_scientific(x);
     }
 
-    let s = format!("{}", x);
+    let s = tie_break_even(&format!("{}", x), x);
     if s.contains('.') || s.contains('e') || s.contains('E') {
         s
     } else {
         format!("{}.0", s)
     }
+}
+
+/// CPython's shortest float repr breaks an *exact* tie toward the even last
+/// digit; Rust's Ryū picks the larger one, so `1e15 + 0.3` — exactly
+/// `1000000000000000.25` — printed as `…0.3` under `tyc run` and `…0.2`
+/// after `tyc build`.
+///
+/// The tie has to be established, not guessed: `3.3000000000000003` also has
+/// a neighbour that round-trips, but it is genuinely the closer of the two
+/// and both surfaces print it. So compare against the double's exact decimal
+/// expansion and only swap when the digit after the repr's last is a `5`
+/// with nothing but zeros behind it.
+fn tie_break_even(s: &str, x: f64) -> String {
+    let digits: Vec<u8> = s.bytes().filter(u8::is_ascii_digit).collect();
+    // A tie needs the full 17 significant digits, and only an odd last digit
+    // can be replaced by an even neighbour.
+    if digits.len() < 16 || (digits[digits.len() - 1] - b'0').is_multiple_of(2) {
+        return s.to_owned();
+    }
+    let significant = digits.iter().skip_while(|d| **d == b'0').count();
+    // A double's exact decimal expansion is finite, and only one that
+    // *terminates* in a `5` can be a tie — 80 significant digits is far more
+    // than such a value needs.
+    let exact = format!("{:.*e}", 80, x.abs());
+    let mantissa: Vec<u8> = exact[..exact.find('e').unwrap_or(exact.len())]
+        .bytes()
+        .filter(u8::is_ascii_digit)
+        .collect();
+    if mantissa.len() <= significant
+        || mantissa[significant] != b'5'
+        || mantissa[significant + 1..].iter().any(|d| *d != b'0')
+    {
+        return s.to_owned();
+    }
+    let mantissa_end = s.find(['e', 'E']).unwrap_or(s.len());
+    let Some(last) = s[..mantissa_end].rfind(|c: char| c.is_ascii_digit()) else {
+        return s.to_owned();
+    };
+    let digit = s.as_bytes()[last];
+    // The last digit is odd, so both neighbours are digits and both even;
+    // whichever round-trips is the one CPython prints.
+    for neighbour in [digit + 1, digit - 1] {
+        let mut candidate = String::with_capacity(s.len());
+        candidate.push_str(&s[..last]);
+        candidate.push(neighbour as char);
+        candidate.push_str(&s[last + 1..]);
+        if candidate
+            .parse::<f64>()
+            .is_ok_and(|v| v.to_bits() == x.to_bits())
+        {
+            return candidate;
+        }
+    }
+    s.to_owned()
 }
 
 /// Format a float in CPython's scientific-notation style: shortest
@@ -2264,6 +3247,7 @@ fn format_float_scientific(x: f64) -> String {
     };
     let exp: i32 = exp_str.parse().unwrap_or(0);
     let sign = if exp < 0 { '-' } else { '+' };
+    let mantissa = tie_break_even(mantissa, x);
     format!("{}e{}{:02}", mantissa, sign, exp.abs())
 }
 
@@ -2497,7 +3481,12 @@ mod tests {
         assert_eq!(e.py_repr(), "Err(error='oops')");
     }
 
+    /// A `class X frozen:` shape — a frozen dataclass, whose instances
+    /// compare and hash by their fields.
     fn mk_class(name: &str, field_names: &[&str]) -> Rc<Class> {
+        let mut class_attrs = HashMap::new();
+        class_attrs.insert("__typhon_dataclass__".to_owned(), Value::Bool(true));
+        class_attrs.insert("__typhon_dc_frozen__".to_owned(), Value::Bool(true));
         Rc::new(Class {
             name: name.to_owned(),
             methods: RefCell::new(HashMap::new()),
@@ -2506,9 +3495,10 @@ mod tests {
                 .map(|n| ClassField {
                     name: (*n).to_owned(),
                     default: Option::None,
+                    annotation: Option::None,
                 })
                 .collect(),
-            class_attrs: RefCell::new(HashMap::new()),
+            class_attrs: RefCell::new(class_attrs),
             bases: vec![],
             properties: RefCell::new(std::collections::HashSet::new()),
             classmethods: RefCell::new(std::collections::HashSet::new()),
@@ -2518,13 +3508,14 @@ mod tests {
     }
 
     fn mk_instance(class: &Rc<Class>, fields: &[(&str, Value)]) -> Value {
-        let mut map: HashMap<String, Value> = HashMap::new();
+        let mut map: FieldMap = FieldMap::new();
         for (k, v) in fields {
             map.insert((*k).to_owned(), v.clone());
         }
         Value::Instance(Rc::new(Instance {
             class: class.clone(),
             fields: RefCell::new(map),
+            chain: RefCell::new(None),
         }))
     }
 

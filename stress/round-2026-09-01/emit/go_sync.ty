@@ -1,0 +1,9 @@
+import asyncio
+
+async def work() -> None:
+    print("w")
+
+def kick() -> None:
+    go work()
+
+kick()

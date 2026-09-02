@@ -1,0 +1,17 @@
+import asyncio
+
+async def fa() -> int:
+    await asyncio.sleep(0.01)
+    return 1
+
+async def fb(x: int) -> int:
+    await asyncio.sleep(0.01)
+    return x + 1
+
+async def main() -> None:
+    gather:
+        a = fa()
+        b = fb(a)
+    print(a, b)
+
+asyncio.run(main())

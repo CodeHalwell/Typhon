@@ -1,0 +1,11 @@
+def pick(x: int?) -> int:
+    guard v = x else: return 0
+    return v
+
+comptime let PORT: int = int(env("PORT_UNSET_XYZ", "8080"))
+
+def main() -> None:
+    print(pick(None), pick(3), PORT)
+
+if __name__ == "__main__":
+    main()

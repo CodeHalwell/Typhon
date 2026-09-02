@@ -1,0 +1,18 @@
+class Circle:
+    r: float
+class Square:
+    s: float
+type Shape = Circle | Square
+
+def f(a: Shape, b: Shape) -> int:
+    match (a, b):
+        case (Circle(), _):
+            return 1
+        case (_, Square()):
+            return 2
+
+def main() -> None:
+    print(f(Square(s=1.0), Circle(r=1.0)) + 1)
+
+if __name__ == "__main__":
+    main()

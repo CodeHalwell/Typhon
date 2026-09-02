@@ -1,0 +1,17 @@
+def norm(x: str | bytes) -> str:
+    if isinstance(x, bytes):
+        return x.decode()
+    return x
+
+def norm2(x: str | bytes | int) -> str:
+    if isinstance(x, (str, bytes)):
+        if isinstance(x, bytes):
+            return x.decode()
+        return x
+    return str(x + 1)
+
+def main() -> None:
+    print(norm(b"a"), norm2(1))
+
+if __name__ == "__main__":
+    main()

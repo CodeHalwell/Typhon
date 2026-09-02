@@ -1,0 +1,10 @@
+enum Color:
+    RED
+# a column-zero comment inside the body
+    GREEN
+
+def main() -> None:
+    print(Color.RED, Color.GREEN)
+
+if __name__ == "__main__":
+    main()

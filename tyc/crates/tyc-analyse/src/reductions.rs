@@ -173,6 +173,7 @@ pub fn rewrite_reduction_loops(
 ) -> ReductionStats {
     let captures = collect_capturable_names(module);
     let env = ScopeEnv::for_scope(&module.body, None, None);
+    let dead = dead_loop_targets(&module.body);
     let ctx = RewriteCtx::new(pure_callees, min_size, &captures);
     let mut stats = ReductionStats::default();
     rewrite_stmts(
@@ -181,6 +182,7 @@ pub fn rewrite_reduction_loops(
         &env,
         &mut stats,
         /*in_try=*/ false,
+        &dead,
     );
     stats
 }
@@ -191,13 +193,14 @@ fn rewrite_stmts(
     env: &ScopeEnv,
     stats: &mut ReductionStats,
     in_try: bool,
+    dead: &HashSet<TextRange>,
 ) {
-    for idx in 0..body.len() {
+    for stmt in body.iter_mut() {
         // Recurse first so nested loops inside a matched loop's *sibling*
         // blocks are considered (a matched leaf loop has no nested statements
         // to recurse into anyway).
-        recurse_children(&mut body[idx], ctx, env, stats, in_try);
-        let Stmt::For(f) = &body[idx] else { continue };
+        recurse_children(stmt, ctx, env, stats, in_try, dead);
+        let Stmt::For(f) = &*stmt else { continue };
         let Some(m) = match_reduction_loop(f, ctx, &env.int_mut, env) else {
             continue;
         };
@@ -222,41 +225,244 @@ fn rewrite_stmts(
         // a `NameError` on emitted code that type-checked clean, or, when the
         // name happened to be pre-declared, silently kept its pre-loop value
         // instead of the last element. Only rewrite when the target is dead
-        // after the loop.
-        if name_read_in(&body[idx + 1..], &m.target) {
+        // after the loop — anywhere it could still be read: later statements
+        // of this block, later statements of every enclosing block up to the
+        // function boundary, the next iteration of an enclosing loop, or the
+        // handlers of an enclosing `try` (see `dead_loop_targets`).
+        if !dead.contains(&f.range()) {
             continue;
         }
-        body[idx] = build_reduction_stmt(&m);
+        *stmt = build_reduction_stmt(&m);
         stats.rewrites += 1;
     }
 }
 
-/// True when `name` is read anywhere in `stmts` (at any nesting depth).
+/// Byte ranges of every `for` statement whose loop target is provably dead
+/// once the loop finishes, computed for the whole module in one backward
+/// pass per block.
 ///
-/// Deliberately conservative: it does not model re-binding, so a later
-/// `for name in …` that would shadow the stale value still counts as a read
-/// and suppresses the rewrite. Missing a parallelisation opportunity costs
-/// speed; taking one that changes the program's meaning costs correctness.
-fn name_read_in(stmts: &[Stmt], name: &str) -> bool {
+/// A target is live after its loop when a later statement of the same
+/// block reads it, when any later statement of an *enclosing* block does
+/// (the old sibling-suffix check missed exactly this: a loop inside an `if`
+/// whose target is printed after the `if`), when an enclosing loop runs the
+/// block again (the read may sit *before* the loop textually), or when an
+/// enclosing `try` / `with` can transfer control to a handler, `else` or
+/// `finally` block that reads it. Reads inside nested functions and lambdas
+/// count (closures), `del NAME` counts (deleting an unbound name raises), and
+/// a `global` / `nonlocal` name is never dead. Only a plain `NAME = ...`
+/// after the loop kills the name; compound statements never do. Loops in a
+/// class body bind a class attribute that stays observable, so they are
+/// never dead.
+fn dead_loop_targets(body: &[Stmt]) -> HashSet<TextRange> {
+    let mut out = HashSet::new();
+    let mut pinned = HashSet::new();
+    collect_pinned_names(body, &mut pinned);
+    collect_dead_targets(body, &HashSet::new(), &pinned, &mut out);
+    out
+}
+
+/// `global` / `nonlocal` names declared anywhere in `body` (this scope's
+/// statements only — nested functions pin their own names on entry).
+fn collect_pinned_names(body: &[Stmt], into: &mut HashSet<String>) {
+    for stmt in body {
+        match stmt {
+            Stmt::Global(g) => into.extend(g.names.iter().map(|n| n.as_str().to_owned())),
+            Stmt::Nonlocal(nl) => into.extend(nl.names.iter().map(|n| n.as_str().to_owned())),
+            Stmt::If(s) => {
+                collect_pinned_names(&s.body, into);
+                for clause in &s.elif_else_clauses {
+                    collect_pinned_names(&clause.body, into);
+                }
+            }
+            Stmt::While(s) => {
+                collect_pinned_names(&s.body, into);
+                collect_pinned_names(&s.orelse, into);
+            }
+            Stmt::For(s) => {
+                collect_pinned_names(&s.body, into);
+                collect_pinned_names(&s.orelse, into);
+            }
+            Stmt::With(s) => collect_pinned_names(&s.body, into),
+            Stmt::Try(t) => {
+                collect_pinned_names(&t.body, into);
+                collect_pinned_names(&t.orelse, into);
+                collect_pinned_names(&t.finalbody, into);
+                for h in &t.handlers {
+                    let ruff_python_ast::ExceptHandler::ExceptHandler(h) = h;
+                    collect_pinned_names(&h.body, into);
+                }
+            }
+            Stmt::Match(m) => {
+                for case in &m.cases {
+                    collect_pinned_names(&case.body, into);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Every name read (loaded or deleted) anywhere in `stmt`, at any nesting
+/// depth including nested function bodies and lambdas.
+fn collect_names_read(stmt: &Stmt, into: &mut HashSet<String>) {
     struct V<'a> {
-        name: &'a str,
-        found: bool,
+        into: &'a mut HashSet<String>,
     }
     impl ruff_python_ast::visitor::Visitor<'_> for V<'_> {
         fn visit_expr(&mut self, e: &Expr) {
             if let Expr::Name(n) = e {
-                if n.id.as_str() == self.name {
-                    self.found = true;
+                if !n.ctx.is_store() {
+                    self.into.insert(n.id.as_str().to_owned());
                 }
             }
             ruff_python_ast::visitor::walk_expr(self, e);
         }
+        fn visit_stmt(&mut self, s: &Stmt) {
+            match s {
+                Stmt::Global(g) => {
+                    self.into
+                        .extend(g.names.iter().map(|n| n.as_str().to_owned()));
+                }
+                Stmt::Nonlocal(nl) => {
+                    self.into
+                        .extend(nl.names.iter().map(|n| n.as_str().to_owned()));
+                }
+                _ => {}
+            }
+            ruff_python_ast::visitor::walk_stmt(self, s);
+        }
     }
-    let mut v = V { name, found: false };
+    let mut v = V { into };
+    ruff_python_ast::visitor::walk_stmt(&mut v, stmt);
+}
+
+fn collect_names_read_in(stmts: &[Stmt], into: &mut HashSet<String>) {
     for s in stmts {
-        ruff_python_ast::visitor::walk_stmt(&mut v, s);
+        collect_names_read(s, into);
     }
-    v.found
+}
+
+/// Bare names a plain assignment statement overwrites on every path through
+/// it (`x = ...`, `x: int = ...`, `a = b = ...`). Anything else — unpacking,
+/// attribute or subscript targets, augmented assignment, loops — kills
+/// nothing.
+fn plain_assignment_kills(stmt: &Stmt) -> Vec<String> {
+    match stmt {
+        Stmt::Assign(a) => {
+            let names: Vec<String> = a
+                .targets
+                .iter()
+                .filter_map(|t| match t {
+                    Expr::Name(n) => Some(n.id.as_str().to_owned()),
+                    _ => None,
+                })
+                .collect();
+            if names.len() == a.targets.len() {
+                names
+            } else {
+                Vec::new()
+            }
+        }
+        Stmt::AnnAssign(a) if a.value.is_some() => match a.target.as_ref() {
+            Expr::Name(n) => vec![n.id.as_str().to_owned()],
+            _ => Vec::new(),
+        },
+        _ => Vec::new(),
+    }
+}
+
+fn collect_dead_targets(
+    body: &[Stmt],
+    live_after: &HashSet<String>,
+    pinned: &HashSet<String>,
+    out: &mut HashSet<TextRange>,
+) {
+    // Walk the block backwards, carrying the set of names that may still be
+    // read after the current statement.
+    let mut live: HashSet<String> = live_after.clone();
+    for stmt in body.iter().rev() {
+        match stmt {
+            Stmt::For(f) => {
+                if let Expr::Name(target) = f.target.as_ref() {
+                    let name = target.id.as_str();
+                    if !live.contains(name) && !pinned.contains(name) {
+                        out.insert(f.range());
+                    }
+                }
+                // The next iteration runs the whole loop again, so every
+                // read inside it is "after" any statement of its body.
+                let mut inner = live.clone();
+                collect_names_read(stmt, &mut inner);
+                collect_dead_targets(&f.body, &inner, pinned, out);
+                collect_dead_targets(&f.orelse, &live, pinned, out);
+            }
+            Stmt::While(w) => {
+                let mut inner = live.clone();
+                collect_names_read(stmt, &mut inner);
+                collect_dead_targets(&w.body, &inner, pinned, out);
+                collect_dead_targets(&w.orelse, &live, pinned, out);
+            }
+            Stmt::If(s) => {
+                collect_dead_targets(&s.body, &live, pinned, out);
+                for clause in &s.elif_else_clauses {
+                    collect_dead_targets(&clause.body, &live, pinned, out);
+                }
+            }
+            Stmt::With(s) => collect_dead_targets(&s.body, &live, pinned, out),
+            Stmt::Try(t) => {
+                // A raise anywhere in the body can land in a handler; the
+                // `else` clause runs after the body; `finally` runs after all
+                // of them.
+                let mut after_body = live.clone();
+                for h in &t.handlers {
+                    let ruff_python_ast::ExceptHandler::ExceptHandler(h) = h;
+                    collect_names_read_in(&h.body, &mut after_body);
+                }
+                collect_names_read_in(&t.orelse, &mut after_body);
+                collect_names_read_in(&t.finalbody, &mut after_body);
+                collect_dead_targets(&t.body, &after_body, pinned, out);
+                let mut after_handler = live.clone();
+                collect_names_read_in(&t.finalbody, &mut after_handler);
+                for h in &t.handlers {
+                    let ruff_python_ast::ExceptHandler::ExceptHandler(h) = h;
+                    collect_dead_targets(&h.body, &after_handler, pinned, out);
+                }
+                collect_dead_targets(&t.orelse, &after_handler, pinned, out);
+                collect_dead_targets(&t.finalbody, &live, pinned, out);
+            }
+            Stmt::Match(m) => {
+                for case in &m.cases {
+                    collect_dead_targets(&case.body, &live, pinned, out);
+                }
+            }
+            // A nested function is its own frame: nothing after the `def`
+            // reads its locals, and its own `global` / `nonlocal` names pin
+            // themselves.
+            Stmt::FunctionDef(f) => {
+                let mut inner_pinned = HashSet::new();
+                collect_pinned_names(&f.body, &mut inner_pinned);
+                collect_dead_targets(&f.body, &HashSet::new(), &inner_pinned, out);
+            }
+            // Class-body loops bind class attributes (never dead); methods
+            // are frames of their own.
+            Stmt::ClassDef(c) => {
+                for inner in &c.body {
+                    if let Stmt::FunctionDef(f) = inner {
+                        let mut inner_pinned = HashSet::new();
+                        collect_pinned_names(&f.body, &mut inner_pinned);
+                        collect_dead_targets(&f.body, &HashSet::new(), &inner_pinned, out);
+                    }
+                }
+            }
+            _ => {}
+        }
+        for killed in plain_assignment_kills(stmt) {
+            if !pinned.contains(&killed) {
+                live.remove(&killed);
+            }
+        }
+        collect_names_read(stmt, &mut live);
+    }
 }
 
 fn recurse_children(
@@ -265,6 +471,7 @@ fn recurse_children(
     env: &ScopeEnv,
     stats: &mut ReductionStats,
     in_try: bool,
+    dead: &HashSet<TextRange>,
 ) {
     match stmt {
         // A `def` / `class` opens a new scope: rebuild the environment from
@@ -274,49 +481,63 @@ fn recurse_children(
         // frame and takes its accumulator with it.
         Stmt::FunctionDef(f) => {
             let inner = ScopeEnv::for_scope(&f.body, Some(&f.parameters), Some(env));
-            rewrite_stmts(&mut f.body, ctx, &inner, stats, /*in_try=*/ false);
+            rewrite_stmts(
+                &mut f.body,
+                ctx,
+                &inner,
+                stats,
+                /*in_try=*/ false,
+                dead,
+            );
         }
         Stmt::ClassDef(c) => {
             let inner = ScopeEnv::for_scope(&c.body, None, Some(env));
-            rewrite_stmts(&mut c.body, ctx, &inner, stats, /*in_try=*/ false);
+            rewrite_stmts(
+                &mut c.body,
+                ctx,
+                &inner,
+                stats,
+                /*in_try=*/ false,
+                dead,
+            );
         }
         // Control-flow blocks share the enclosing scope: thread it unchanged.
         Stmt::If(s) => {
-            rewrite_stmts(&mut s.body, ctx, env, stats, in_try);
+            rewrite_stmts(&mut s.body, ctx, env, stats, in_try, dead);
             for clause in &mut s.elif_else_clauses {
-                rewrite_stmts(&mut clause.body, ctx, env, stats, in_try);
+                rewrite_stmts(&mut clause.body, ctx, env, stats, in_try, dead);
             }
         }
         Stmt::While(s) => {
-            rewrite_stmts(&mut s.body, ctx, env, stats, in_try);
-            rewrite_stmts(&mut s.orelse, ctx, env, stats, in_try);
+            rewrite_stmts(&mut s.body, ctx, env, stats, in_try, dead);
+            rewrite_stmts(&mut s.orelse, ctx, env, stats, in_try, dead);
         }
         Stmt::For(s) => {
-            rewrite_stmts(&mut s.body, ctx, env, stats, in_try);
-            rewrite_stmts(&mut s.orelse, ctx, env, stats, in_try);
+            rewrite_stmts(&mut s.body, ctx, env, stats, in_try, dead);
+            rewrite_stmts(&mut s.orelse, ctx, env, stats, in_try, dead);
         }
         // A `with` body is guarded like a `try` body: the context manager's
         // `__exit__` can suppress the exception in this same frame
         // (`contextlib.suppress` exists to do exactly that), after which the
         // accumulator's partial state is observable. We cannot prove an
         // arbitrary manager non-suppressing, so every `with` body counts.
-        Stmt::With(s) => rewrite_stmts(&mut s.body, ctx, env, stats, /*in_try=*/ true),
+        Stmt::With(s) => rewrite_stmts(&mut s.body, ctx, env, stats, /*in_try=*/ true, dead),
         Stmt::Try(s) => {
             // Only the `try` body is guarded by this statement's handlers.
             // Python does not route a raise in the `else` clause, a handler
             // body, or the `finally` block through the same handlers, so those
             // inherit whatever guarded this `try` itself.
-            rewrite_stmts(&mut s.body, ctx, env, stats, /*in_try=*/ true);
-            rewrite_stmts(&mut s.orelse, ctx, env, stats, in_try);
-            rewrite_stmts(&mut s.finalbody, ctx, env, stats, in_try);
+            rewrite_stmts(&mut s.body, ctx, env, stats, /*in_try=*/ true, dead);
+            rewrite_stmts(&mut s.orelse, ctx, env, stats, in_try, dead);
+            rewrite_stmts(&mut s.finalbody, ctx, env, stats, in_try, dead);
             for h in &mut s.handlers {
                 let ruff_python_ast::ExceptHandler::ExceptHandler(h) = h;
-                rewrite_stmts(&mut h.body, ctx, env, stats, in_try);
+                rewrite_stmts(&mut h.body, ctx, env, stats, in_try, dead);
             }
         }
         Stmt::Match(s) => {
             for case in &mut s.cases {
-                rewrite_stmts(&mut case.body, ctx, env, stats, in_try);
+                rewrite_stmts(&mut case.body, ctx, env, stats, in_try, dead);
             }
         }
         _ => {}
@@ -666,7 +887,7 @@ fn mentions_name_anywhere(expr: &Expr, name: &str) -> bool {
 
 /// True when any parameter of `parameters` (positional-only, positional,
 /// keyword-only, `*args`, `**kwargs`) is named `name`.
-fn params_bind_name(parameters: &ruff_python_ast::Parameters, name: &str) -> bool {
+pub(crate) fn params_bind_name(parameters: &ruff_python_ast::Parameters, name: &str) -> bool {
     parameters
         .posonlyargs
         .iter()
@@ -692,7 +913,7 @@ fn params_bind_name(parameters: &ruff_python_ast::Parameters, name: &str) -> boo
 /// NAME`, and `match` pattern captures. Used to keep the reduction rewrite
 /// from emitting a bare `sum` call where user code rebinds `sum`; false
 /// positives merely skip an optimisation, so ambiguity resolves to `true`.
-fn scope_binds_name(body: &[Stmt], name: &str) -> bool {
+pub(crate) fn scope_binds_name(body: &[Stmt], name: &str) -> bool {
     use ruff_python_ast::visitor::source_order::{
         walk_expr, walk_pattern, walk_stmt, SourceOrderVisitor,
     };
@@ -882,9 +1103,10 @@ pub fn detect_reduction_loops(
     // container proof — in its own scope, never a same-named binding from
     // another function.
     let env = ScopeEnv::for_scope(&module.body, None, None);
+    let dead = dead_loop_targets(&module.body);
     let ctx = RewriteCtx::new(pure_callees, min_size, &captures);
     let mut out = Vec::new();
-    detect_in_stmts(&module.body, &ctx, &env, &mut out);
+    detect_in_stmts(&module.body, &ctx, &env, &dead, &mut out);
     out
 }
 
@@ -892,11 +1114,18 @@ fn detect_in_stmts(
     body: &[Stmt],
     ctx: &RewriteCtx<'_>,
     env: &ScopeEnv,
+    dead: &HashSet<TextRange>,
     out: &mut Vec<ReductionHit>,
 ) {
     for stmt in body {
-        detect_children(stmt, ctx, env, out);
+        detect_children(stmt, ctx, env, dead, out);
         if let Stmt::For(f) = stmt {
+            // A loop whose target is still read afterwards can never be
+            // rewritten (the rewrite deletes the binding), so advising
+            // "this could be parallel" would be noise.
+            if !dead.contains(&f.range()) {
+                continue;
+            }
             // int accumulator → eligible for the rewrite (unless a user
             // binding of `sum` would capture the rewrite's emitted call).
             if !env.sum_shadowed {
@@ -930,45 +1159,51 @@ fn detect_in_stmts(
     }
 }
 
-fn detect_children(stmt: &Stmt, ctx: &RewriteCtx<'_>, env: &ScopeEnv, out: &mut Vec<ReductionHit>) {
+fn detect_children(
+    stmt: &Stmt,
+    ctx: &RewriteCtx<'_>,
+    env: &ScopeEnv,
+    dead: &HashSet<TextRange>,
+    out: &mut Vec<ReductionHit>,
+) {
     match stmt {
         // New scope: rebuild the environment from that body (see
         // `recurse_children`, this walker's sibling in the rewrite path).
         Stmt::FunctionDef(f) => {
             let inner = ScopeEnv::for_scope(&f.body, Some(&f.parameters), Some(env));
-            detect_in_stmts(&f.body, ctx, &inner, out);
+            detect_in_stmts(&f.body, ctx, &inner, dead, out);
         }
         Stmt::ClassDef(c) => {
             let inner = ScopeEnv::for_scope(&c.body, None, Some(env));
-            detect_in_stmts(&c.body, ctx, &inner, out);
+            detect_in_stmts(&c.body, ctx, &inner, dead, out);
         }
         Stmt::If(s) => {
-            detect_in_stmts(&s.body, ctx, env, out);
+            detect_in_stmts(&s.body, ctx, env, dead, out);
             for clause in &s.elif_else_clauses {
-                detect_in_stmts(&clause.body, ctx, env, out);
+                detect_in_stmts(&clause.body, ctx, env, dead, out);
             }
         }
         Stmt::While(s) => {
-            detect_in_stmts(&s.body, ctx, env, out);
-            detect_in_stmts(&s.orelse, ctx, env, out);
+            detect_in_stmts(&s.body, ctx, env, dead, out);
+            detect_in_stmts(&s.orelse, ctx, env, dead, out);
         }
         Stmt::For(s) => {
-            detect_in_stmts(&s.body, ctx, env, out);
-            detect_in_stmts(&s.orelse, ctx, env, out);
+            detect_in_stmts(&s.body, ctx, env, dead, out);
+            detect_in_stmts(&s.orelse, ctx, env, dead, out);
         }
-        Stmt::With(s) => detect_in_stmts(&s.body, ctx, env, out),
+        Stmt::With(s) => detect_in_stmts(&s.body, ctx, env, dead, out),
         Stmt::Try(s) => {
-            detect_in_stmts(&s.body, ctx, env, out);
-            detect_in_stmts(&s.orelse, ctx, env, out);
-            detect_in_stmts(&s.finalbody, ctx, env, out);
+            detect_in_stmts(&s.body, ctx, env, dead, out);
+            detect_in_stmts(&s.orelse, ctx, env, dead, out);
+            detect_in_stmts(&s.finalbody, ctx, env, dead, out);
             for h in &s.handlers {
                 let ruff_python_ast::ExceptHandler::ExceptHandler(h) = h;
-                detect_in_stmts(&h.body, ctx, env, out);
+                detect_in_stmts(&h.body, ctx, env, dead, out);
             }
         }
         Stmt::Match(s) => {
             for case in &s.cases {
-                detect_in_stmts(&case.body, ctx, env, out);
+                detect_in_stmts(&case.body, ctx, env, dead, out);
             }
         }
         _ => {}
@@ -1601,5 +1836,143 @@ def b(ys: list[int]) -> int:
             stats.rewrites, 2,
             "both same-named int accumulators should rewrite in their own scope:\n{out}"
         );
+    }
+
+    // ── Liveness of the loop target beyond the sibling suffix ──────────────
+
+    #[test]
+    fn target_read_after_an_enclosing_block_suppresses_the_rewrite() {
+        // The loop sits inside an `if`; the target is printed after the `if`.
+        // The old sibling-suffix check saw no read and deleted the binding
+        // (`NameError` at runtime).
+        let src = "\
+@pure
+def sq(n: int) -> int:
+    return n * n
+
+def total_of(xs: list[int], flag: bool) -> int:
+    mut total: int = 0
+    if flag:
+        for x in xs:
+            total += sq(x)
+    print(\"last x:\", x)
+    return total
+";
+        let (out, stats) = rewrite(src, &["sq"], 0);
+        assert_eq!(stats.rewrites, 0, "{out}");
+        assert!(out.contains("for x in xs:"), "{out}");
+    }
+
+    #[test]
+    fn target_read_on_the_next_iteration_of_an_enclosing_loop_suppresses_the_rewrite() {
+        // The read sits textually *before* the loop, but the enclosing
+        // `while` runs it again after the loop has bound `x`.
+        let src = "\
+@pure
+def sq(n: int) -> int:
+    return n * n
+
+def f(xs: list[int]) -> int:
+    mut total: int = 0
+    mut i: int = 0
+    mut x: int = -1
+    while i < 2:
+        print(\"prev x:\", x)
+        for x in xs:
+            total += sq(x)
+        i += 1
+    return total
+";
+        let (out, stats) = rewrite(src, &["sq"], 0);
+        assert_eq!(stats.rewrites, 0, "{out}");
+    }
+
+    #[test]
+    fn target_dead_after_an_enclosing_block_is_still_rewritten() {
+        let src = "\
+@pure
+def sq(n: int) -> int:
+    return n * n
+
+def total_of(xs: list[int], flag: bool) -> int:
+    mut total: int = 0
+    if flag:
+        for x in xs:
+            total += sq(x)
+    return total
+";
+        let (out, stats) = rewrite(src, &["sq"], 0);
+        assert_eq!(stats.rewrites, 1, "{out}");
+        assert!(out.contains("map_pure"), "{out}");
+    }
+
+    #[test]
+    fn a_plain_reassignment_after_the_loop_kills_the_target() {
+        let src = "\
+@pure
+def sq(n: int) -> int:
+    return n * n
+
+def total_of(xs: list[int]) -> int:
+    mut total: int = 0
+    for x in xs:
+        total += sq(x)
+    x = 0
+    print(x)
+    return total
+";
+        let (out, stats) = rewrite(src, &["sq"], 0);
+        assert_eq!(stats.rewrites, 1, "{out}");
+    }
+
+    #[test]
+    fn a_closure_read_or_del_or_global_keeps_the_target_alive() {
+        for tail in [
+            "    return lambda: x\n",
+            "    del x\n    return total\n",
+            "    def g() -> int:\n        return x\n    return g()\n",
+        ] {
+            let src = format!(
+                "@pure\ndef sq(n: int) -> int:\n    return n * n\n\ndef total_of(xs: list[int]) -> int:\n    mut total: int = 0\n    for x in xs:\n        total += sq(x)\n{tail}"
+            );
+            let (out, stats) = rewrite(&src, &["sq"], 0);
+            assert_eq!(stats.rewrites, 0, "{out}");
+        }
+        let src = "\
+@pure
+def sq(n: int) -> int:
+    return n * n
+
+def total_of(xs: list[int]) -> int:
+    global x
+    mut total: int = 0
+    for x in xs:
+        total += sq(x)
+    return total
+";
+        let (out, stats) = rewrite(src, &["sq"], 0);
+        assert_eq!(stats.rewrites, 0, "{out}");
+    }
+
+    #[test]
+    fn a_target_read_by_an_enclosing_try_handler_keeps_it_alive() {
+        let src = "\
+@pure
+def sq(n: int) -> int:
+    return n * n
+
+def total_of(xs: list[int]) -> int:
+    mut total: int = 0
+    x = -1
+    try:
+        if xs:
+            for x in xs:
+                total += sq(x)
+    except ValueError:
+        print(x)
+    return total
+";
+        let (out, stats) = rewrite(src, &["sq"], 0);
+        assert_eq!(stats.rewrites, 0, "{out}");
     }
 }

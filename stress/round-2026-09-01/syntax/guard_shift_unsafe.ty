@@ -1,0 +1,17 @@
+import json
+
+def pick(x: int?) -> int:
+    guard v = x else: return 0
+    return v
+
+def load(s: str) -> int:
+    unsafe:
+        let v = json.loads(s)
+        let n: int = int(v)
+    return n
+
+def main() -> None:
+    print(pick(None), pick(3), load("5"))
+
+if __name__ == "__main__":
+    main()

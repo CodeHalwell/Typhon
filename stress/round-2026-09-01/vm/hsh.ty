@@ -1,0 +1,48 @@
+plain class CI:
+    s: str = ""
+
+impl CI:
+    def __init__(self, s: str) -> None:
+        self.s = s
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, CI) and other.s.lower() == self.s.lower()
+    def __hash__(self) -> int:
+        return hash(self.s.lower())
+    def __repr__(self) -> str:
+        return f"CI({self.s!r})"
+
+plain class Boxed:
+    items: list[int] = []
+
+impl Boxed:
+    def __init__(self, items: list[int]) -> None:
+        self.items = items
+    def __hash__(self) -> int:
+        return hash(tuple(self.items))
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, Boxed) and other.items == self.items
+
+class Pt frozen:
+    x: int
+    y: int
+
+class Mut:
+    x: int
+
+def main() -> None:
+    let d: dict[CI, int] = {CI("A"): 1}
+    print("H1", d[CI("a")], CI("a") in d, CI("A") in {CI("a")}, len({CI("a"), CI("A")}), hash(CI("A")) == hash(CI("a")), d.get(CI("a")))
+    let b: Boxed = Boxed([1, 2])
+    print("H2", hash(b) == hash((1, 2)), {b: 1}[Boxed([1, 2])], b in {Boxed([1, 2])}, len({b, Boxed([1, 2])}))
+    print("H3", hash(Pt(x=1, y=2)) == hash(Pt(x=1, y=2)), {Pt(x=1, y=2): "v"}[Pt(x=1, y=2)], len({Pt(x=1, y=2), Pt(x=1, y=2)}))
+    try:
+        print("H4", hash(Mut(x=1)))
+    except TypeError as e:
+        print("H4", e)
+    try:
+        print("H5", {Mut(x=1): 1})
+    except TypeError as e:
+        print("H5", e)
+    print("H6", Mut(x=1) == Mut(x=1), Mut(x=1) in [Mut(x=1)], [Mut(x=1)].index(Mut(x=1)))
+
+main()

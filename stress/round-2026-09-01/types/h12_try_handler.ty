@@ -1,0 +1,15 @@
+def risky() -> None:
+    raise ValueError("boom")
+
+def main() -> None:
+    mut x: int? = 1
+    if x is None:
+        return
+    try:
+        x = None
+        risky()
+    except ValueError:
+        print(x + 1)
+
+if __name__ == "__main__":
+    main()

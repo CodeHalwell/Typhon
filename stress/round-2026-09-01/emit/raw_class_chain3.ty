@@ -1,0 +1,19 @@
+plain class Base:
+    pass
+
+impl Base:
+    def __init__(self) -> None:
+        print("base init")
+
+class! Child(Base):
+    a: int
+
+class! Grand(Child):
+    c: str
+
+def main() -> None:
+    let ch: Child = Child(1)
+    let g: Grand = Grand(1, "x")
+    print(ch.a, g.a, g.c)
+
+main()

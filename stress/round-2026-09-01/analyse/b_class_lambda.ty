@@ -1,0 +1,7 @@
+from typing import Callable
+
+plain class Scale:
+    N: int = 3
+    f: Callable[[int], int] = lambda x: x + N
+
+print(Scale.f(1))

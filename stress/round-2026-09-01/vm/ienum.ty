@@ -1,0 +1,34 @@
+import enum
+
+class IntE(enum.IntEnum):
+    ONE = 1
+    TWO = 2
+
+class StrE(enum.StrEnum):
+    X = "x"
+    Y = "y"
+
+enum Plain:
+    A
+    B
+
+print("IE1", IntE.ONE + 1)
+print("IE2", IntE.TWO > IntE.ONE, IntE.ONE < 2, IntE.ONE == 1)
+print("IE3", sorted([IntE.TWO, IntE.ONE]))
+
+print("IE5", "%s" % IntE.ONE, str(IntE.TWO), f"{IntE.TWO}", repr(IntE.ONE))
+print("IE6", {IntE.ONE: 1}[1], IntE(2), [e.value for e in IntE], IntE.ONE * 3, -IntE.ONE, abs(IntE.ONE), IntE.ONE + IntE.TWO, int(IntE.TWO), float(IntE.TWO), hash(IntE.ONE) == hash(1), IntE.ONE in [1, 2], 1 in [IntE.ONE], IntE.ONE.bit_length(), f"{IntE.ONE:03d}", format(IntE.ONE, "x"), "%.1f" % IntE.ONE, IntE.ONE / 2, IntE.ONE // 1, IntE.TWO % 2, IntE.TWO ** 2, list(range(IntE.TWO)), [1, 2, 3][IntE.ONE], "abc"[IntE.ONE])
+print("SE1", StrE.X == "x", StrE.X.upper(), f"{StrE.X}", str(StrE.Y), "%s" % StrE.X, "{}".format(StrE.X), StrE.X + "!", "x" in [StrE.X], StrE.X in ["x"], {StrE.X: 1}["x"], len(StrE.X), StrE.X[0], StrE.X.startswith("x"), StrE("y"), list(StrE), sorted([StrE.Y, StrE.X]), StrE.X < StrE.Y, repr(StrE.X), StrE.X.value, StrE.X.name, ",".join(StrE), ",".join([StrE.X, StrE.Y]), StrE.X == StrE.X, StrE.X is StrE.X, hash(StrE.X) == hash("x"))
+print("PE1", Plain.A, repr(Plain.A), Plain.A.value, Plain.B.value, len(Plain), Plain.A in Plain, list(Plain), Plain(1), Plain["B"], Plain.A == Plain.A, Plain.A == 1, Plain.A.name, type(Plain.A).__name__, isinstance(Plain.A, Plain), Plain.__members__ if False else "skip", [m.name for m in Plain], Plain.A is Plain(1))
+try:
+    print(Plain.A < Plain.B)
+except TypeError as e:
+    print("PE2", "TypeError")
+try:
+    Plain(9)
+except ValueError as e:
+    print("PE3", e)
+try:
+    Plain["Z"]
+except KeyError as e:
+    print("PE4", e)

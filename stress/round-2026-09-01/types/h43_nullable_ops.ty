@@ -1,0 +1,15 @@
+def f(x: int?, xs: list[int]?, s: str?) -> None:
+    if x < 1:
+        print("lt")
+    print(x + 1)
+    print(-x)
+    print(len(xs))
+    print(int(s))
+    print(xs[0])
+    print(", ".join([1, 2]))
+
+def main() -> None:
+    f(None, None, None)
+
+if __name__ == "__main__":
+    main()

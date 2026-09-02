@@ -1,0 +1,7 @@
+def main() -> None:
+    let d: dict[str, int] = {"a": 1}
+    let s: str = d.get("a", "fallback")
+    print(s.upper())
+
+if __name__ == "__main__":
+    main()

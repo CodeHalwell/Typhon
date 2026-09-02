@@ -1,0 +1,9 @@
+def f() -> None:
+    return 1
+
+def main() -> None:
+    let x = f()
+    print(x)
+
+if __name__ == "__main__":
+    main()

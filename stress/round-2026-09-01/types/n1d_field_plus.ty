@@ -1,0 +1,11 @@
+class Box:
+    val: int?
+
+def f(b: Box) -> int:
+    return b.val + 1
+
+def main() -> None:
+    print(f(Box(val=None)))
+
+if __name__ == "__main__":
+    main()

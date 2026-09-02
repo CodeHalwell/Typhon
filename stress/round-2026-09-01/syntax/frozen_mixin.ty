@@ -1,0 +1,14 @@
+class A:
+    x: int
+
+class frozen_mixin:
+    pass
+
+class Foo(A, frozen_mixin):
+    y: int
+
+def main() -> None:
+    print(Foo(x=1, y=2))
+
+if __name__ == "__main__":
+    main()

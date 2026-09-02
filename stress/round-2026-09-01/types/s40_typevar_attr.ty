@@ -1,0 +1,12 @@
+def show[T](x: T) -> str:
+    return x.name
+
+class P:
+    name: str
+
+def main() -> None:
+    print(show(P(name="a")))
+    print(show(3))
+
+if __name__ == "__main__":
+    main()

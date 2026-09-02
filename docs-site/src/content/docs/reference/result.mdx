@@ -265,7 +265,7 @@ def load_port(raw: str) -> Result[int, str]:
     return Ok(n)
 ```
 
-`EXPR rescue NAME: ERR` runs `EXPR`; on any exception it binds the exception to `NAME`, evaluates `ERR`, and propagates `Err(ERR)` to the enclosing function exactly like `?` (so the enclosing function must return a compatible `Result`). It is surface sugar for `try_result(lambda: EXPR, lambda NAME: ERR)?`, and composes with [`as!`](/Typhon/reference/checked-cast/):
+`EXPR rescue NAME: ERR` runs `EXPR`; on any exception it binds the exception to `NAME`, evaluates `ERR`, and propagates `Err(ERR)` to the enclosing function exactly like `?` (so the enclosing function must return a compatible `Result`). It is surface sugar for `try_result(lambda: EXPR, lambda NAME: ERR)?`, and composes with [`as!`](/Typhon/reference/unsafe/#as-the-checked-boundary-cast):
 
 ```python
 let data: dict[str, str] = json.loads(text) as! dict[str, str] rescue e: f"bad json: {e}"

@@ -1,0 +1,14 @@
+plain class Probe:
+    pass
+
+impl Probe:
+    def __getitem__(self, key: object) -> object:
+        return key
+
+def main() -> None:
+    let p: Probe = Probe()
+    print(p[1:2, 3], p[::2], p[::-1], p[-1:], p[:, 0], p[..., 0], p[1,], p[1], p[1:2:3, ::2])
+    let xs: list[int] = [1, 2, 3, 4]
+    print(xs[1:-1], xs[::-1], xs[-1:], xs[:2])
+
+main()

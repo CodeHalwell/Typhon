@@ -145,9 +145,10 @@ The v1 contract:
 | `return` | ✅ (inside `comptime def`) |
 | Local bindings (`x = EXPR`, `let x: T = EXPR`, `mut x: T = EXPR`) | ✅ |
 | Calls to other `comptime def` functions | ✅ |
-| Container literals (`[...]`, `{...}`, `(...)`) | ⏳ roadmap |
-| String methods (`"hi".upper()`) | ⏳ roadmap |
-| Loops (`for`, `while`) | ⏳ roadmap |
+| Container literals (`[...]`, `{...}`, `(...)`, including empty containers and the trailing-comma single-element tuple) | ✅ (v0.3.1) |
+| Pure string methods (`upper`, `lower`, `strip` / `lstrip` / `rstrip`, `replace`, `startswith`, `endswith`, `split`, `join`) | ✅ (v0.3.1) |
+| `len()`, subscripts with Python negative indexing | ✅ |
+| Loops (`for`, `while`) | ❌ |
 | Exception handling (`try`, `raise`) | ❌ |
 | `with` statements | ❌ |
 | `class` / `def` declarations inside a comptime function | ❌ |
@@ -236,10 +237,14 @@ Use `lazy let NOW: float = time.time()` for one-shot runtime caching.
 ### Unsupported form
 
 ```python
-comptime let xs: list[int] = [1, 2, 3]    # ⏳ container literals not supported in v1
+comptime def total(n: int) -> int:
+    mut acc: int = 0
+    for i in [1, 2, 3]:          # ❌ loops are not part of the sandbox
+        acc = acc + i
+    return acc
 ```
 
-Compute container literals at runtime; only scalar `comptime` results in v1.
+Loops, exceptions, `with`, nested declarations, and imports are rejected by the sandbox; express the computation with arithmetic / ternaries and calls to other `comptime def` functions (recursion depth is capped at 64), or compute it at runtime.
 
 ## Where next
 

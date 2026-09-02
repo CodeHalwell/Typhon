@@ -1,0 +1,9 @@
+class A(B):
+    x: int
+
+class B(A):
+    y: int
+
+def main() -> None:
+    let a: A = A(x=1, y=2)
+    print(a.z)

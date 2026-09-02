@@ -1,0 +1,8 @@
+class A:
+    xs: list[int] = [1, 2]
+    d: dict[str, int] = {"a": 1}
+
+def main() -> None:
+    print(A())
+
+main()

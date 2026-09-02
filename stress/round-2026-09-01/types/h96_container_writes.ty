@@ -1,0 +1,19 @@
+def main() -> None:
+    mut xs: list[int] = [1]
+    xs.append("s")
+    xs.extend(["t"])
+    xs.insert(0, "u")
+    xs[0] = "v"
+    xs += ["w"]
+    let d: dict[str, int] = {"a": 1}
+    d.update({"b": "s"})
+    d.setdefault("c", "s")
+    d["e"] = "f"
+    let ss: set[int] = {1}
+    ss.add("x")
+    let nested: dict[str, list[int]] = {"k": [1]}
+    nested["k"].append("z")
+    print(xs, d, ss, nested)
+
+if __name__ == "__main__":
+    main()

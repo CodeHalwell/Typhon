@@ -1,0 +1,23 @@
+import asyncio
+
+class Client:
+    n: int
+
+impl Client:
+    @gatherable
+    async def fetch(self) -> int:
+        return self.n
+
+order: list[str] = []
+
+async def fetch(tag: str, delay: float) -> str:
+    await asyncio.sleep(delay)
+    order.append(tag)
+    return tag
+
+async def main() -> None:
+    let a: str = await fetch("a", 0.05)
+    let b: str = await fetch("b", 0.0)
+    print(order, a, b)
+
+asyncio.run(main())

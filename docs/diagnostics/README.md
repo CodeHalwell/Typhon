@@ -39,6 +39,7 @@ straight from a failed build to the corresponding documentation.
 - [`tyc::interface_isinstance`](./interface_isinstance.md) — `isinstance(x, Interface)` without `@runtime_checkable` opt-in.
 - [`tyc::interface_not_conforming`](./interface_not_conforming.md) — value doesn't structurally conform to interface.
 - [`tyc::invalid_config_value`](./invalid_config_value.md) — `typhon.toml` value outside the allowed enumeration.
+- [`tyc::invalid_pattern`](./invalid_pattern.md) — a `match` pattern the Python grammar accepts but the CPython compiler rejects (two `*rest` captures, a name captured twice), so the emitted `.py` would not import.
 - [`tyc::invalid_question_op`](./invalid_question_op.md) — `?` outside a `Result`-returning function, or inside a comprehension.
 - [`tyc::io`](./io.md) — source file could not be read.
 - [`tyc::is_literal_comparison`](./is_literal_comparison.md) — warning: `is` / `is not` against a literal compares identity, not value.
@@ -98,6 +99,8 @@ straight from a failed build to the corresponding documentation.
 - [`tyc::unsafe_value_leak`](./unsafe_value_leak.md) — value introduced inside an `unsafe:` block returned from a function whose annotated return is concrete, without re-asserting the type at the boundary.
 - [`tyc::unused_import`](./unused_import.md) — imported name is never used in the module.
 - [`tyc::use_of_uninitialised`](./use_of_uninitialised.md) — read on a declare-only `let NAME: T` binding via a control-flow path that didn't assign it.
+- [`tyc::go_outside_async`](./go_outside_async.md) — `go f(x)` outside an `async def`: no event loop is running there, so the spawn raised `RuntimeError` at the call.
+- [`tyc::possibly_unbound`](./possibly_unbound.md) — warning: an ordinary function-local name is read on a path that may not (or certainly does not) assign it — a missing `else`, a read after `del`, an `except ... as` name used after its handler, a loop target after a possibly-empty loop.
 
 Language-level reference pages (no `tyc::` code):
 

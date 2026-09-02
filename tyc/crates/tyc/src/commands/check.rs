@@ -14,15 +14,16 @@ use tyc_analyse::{
     analyse_purity, editor_lint_diagnostics, evaluate_comptime_with_functions, purity_diagnostics,
 };
 use tyc_db::{check_file_with_imports, extract_shapes_for_path, TycDatabase};
-use tyc_diagnostics::{sanitised_named_source_for, Diagnostics, SanitisedDiagnostic, TycError};
+use tyc_diagnostics::{Diagnostics, SanitisedDiagnostic, TycError};
 use tyc_emit::{compare_modules, StubTestKind};
 #[cfg(test)]
 use tyc_resolve::check_unknown_modules;
 use tyc_resolve::{check_unknown_modules_with, ImportVettingContext};
 use tyc_syntax::preprocess::{
-    expand_compound_question_headers, expand_gather_blocks, expand_go_calls,
+    compose_line_maps, expand_compound_question_headers, expand_gather_blocks, expand_go_calls,
     expand_inline_question_ops, expand_lazy_imports, expand_multiline_guards, expand_pipes,
-    expand_question_ops, expand_typed_let_unpack, expand_with_chains, preprocess,
+    expand_question_ops, expand_sugar_mapped, expand_typed_let_unpack, expand_with_chains,
+    preprocess, preprocess_mapped,
 };
 
 use crate::commands::util::{apply_strictness, collect_dty_files, collect_ty_files};
@@ -563,6 +564,7 @@ pub fn run(args: CheckArgs) -> Result<()> {
                 no_sync: true,
                 with_ty: true,
                 optimise: false,
+                source_label: None,
             })?;
         }
     }
@@ -669,7 +671,11 @@ fn render_diagnostics(
     let render_group = |label: &str, groups: &[(String, Vec<&TycError>)]| {
         for (file, items) in groups {
             eprintln!("── {} in {} ──", label, file);
-            let cached = items.first().and_then(|d| sanitised_named_source_for(d));
+            // Keyed by the buffer each diagnostic actually carries — see
+            // `SanitisedSourceCache`. Reusing the first diagnostic's source
+            // for the whole file rendered remapped spans against
+            // preprocessed text.
+            let mut cache = tyc_diagnostics::SanitisedSourceCache::new();
             // Prefer the preprocessor's RECORDED distributed-impl lines for
             // this file (B15 / Finding 1). When the map has no entry — e.g.
             // the diagnostic's path string didn't match any checked file —
@@ -678,7 +684,7 @@ fn render_diagnostics(
             // render path with no distributed-line data.
             let recorded = distributed_by_path.get(file);
             for d in items {
-                let wrapped = match (cached.clone(), recorded) {
+                let wrapped = match (cache.get(d), recorded) {
                     (Some(src), Some(lines)) => {
                         SanitisedDiagnostic::wrap_with_source_and_distributed(
                             (*d).clone(),
@@ -909,8 +915,9 @@ fn run_secondary_passes(
     lint_opts: tyc_analyse::LintOptions,
 ) -> Diagnostics {
     let mut diags = Diagnostics::new();
-    let expanded = expand_for_check(source);
-    let prep = preprocess(&expanded);
+    let (expanded, expanded_to_source) = expand_sugar_mapped(source, true);
+    let (mut prep, prep_to_expanded) = preprocess_mapped(&expanded);
+    prep.line_map = compose_line_maps(&prep_to_expanded, &expanded_to_source);
 
     // `pub *` outside `__init__.ty` is a no-op with confusing intent.
     // Surface the advice in `tyc check` (mirroring `tyc build`) so CI
@@ -992,6 +999,10 @@ fn run_secondary_passes(
         let module_diags = check_unknown_modules_with(path, &prep.python_source, &module, ctx);
         diags.extend(module_diags);
     }
+
+    // Everything above is anchored to the preprocessed buffer; report it
+    // against the `.ty` text and line the user wrote.
+    diags.remap_lines(&prep.python_source, &prep.line_map, path, source);
 
     diags
 }

@@ -439,11 +439,11 @@ print("untyped".slug())              # AttributeError at runtime — no static `
 
 ```python
 # Emitted Python (sketch)
-def __typhon_ext_str__slug(self: str) -> str:
+def __typhon_ext_str__slug__(self: str) -> str:
     return self.strip().lower().replace(" ", "-")
 
 title: str = "Hello World"
-print(__typhon_ext_str__slug(title))
+print(__typhon_ext_str__slug__(title))
 print("untyped".slug())              # untouched; falls back to native attribute lookup
 ```
 
@@ -1222,7 +1222,7 @@ def fib(n: int) -> int:
 def expensive(k: str) -> int: ...
 ```
 
-`@pure` alone emits nothing — it's a static assertion. `@memo` (or `@pure(memo=True)`) inserts `functools.cache` / `lru_cache`. Manual `@pure` on a function failing any of the six purity conditions is `tyc::impure_pure_fn`.
+`@pure` alone emits nothing — it's a static assertion. `@memo` (or `@pure(memo=True)`) inserts `functools.cache` / `lru_cache`. Manual `@pure` on a function failing any of the six purity conditions is `tyc::impure_pure_fn`. The verifier is syntactic: it errors on what it can prove impure (I/O, clocks and entropy under any alias, logging, I/O method names, mutation of arguments or module bindings, `mut` reads, non-`@pure` helpers), trusts what it cannot classify, and hands only *provably* pure functions with immutable, hashable parameters and an immutable return type to `auto-memoise` / `pgo-memoise` / `auto-parallel`.
 
 `@gatherable` (no-op at emit) opts a function into auto-gather rewriting under `[strictness] auto-gather = true`. See [SKILL.md](SKILL.md) §10.
 
@@ -1306,4 +1306,4 @@ Modelled shapes: scalars (`int` / `str` / `bool` / `float` / `bytes` / `None`), 
 - `tyc debug` source-mapping wrapper (v0.5.0) consumes to overload pdb's `do_list`/`do_where`/`format_stack_entry`/`prompt` so the entire debugger UI reads `.ty`
 - `tyc ty` (v0.5.0) consumes to remap `ty`'s `.py:LINE:COL` diagnostics back to `.ty` coordinates
 - `tyc lsp` consumes for go-to-definition across the `.ty` ↔ `.py` boundary
-- `typhon_runtime/traceback.py` (v0.14.0, when `[emit] traceback-remap = true`) consumes them at **runtime**: the installed `sys.excepthook` reads the sidecars from the running script's `.sourcemaps/` dir and rewrites an uncaught exception's frames to `.ty` — the `tyc trace` mapping, applied automatically
+- `typhon_runtime/traceback.py` (v0.14.0, when `[emit] traceback-remap = true`) consumes them at **runtime**: the installed `sys.excepthook` reads the sidecars from the running script's `.sourcemaps/` dir and rewrites an uncaught exception's frames to `.ty` — header, source row and all — the `tyc trace` mapping, applied automatically

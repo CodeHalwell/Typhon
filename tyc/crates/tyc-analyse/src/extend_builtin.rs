@@ -60,9 +60,16 @@ fn annotate_self_param_with_builtin(f: &mut ruff_python_ast::StmtFunctionDef, bu
     })));
 }
 
-/// Free-function naming convention. `__typhon_ext_<TYPE>__<METHOD>`.
+/// Free-function naming convention: `__typhon_ext_<TYPE>__<METHOD>__`.
+///
+/// The trailing `__` matters: CPython name-mangles any identifier that
+/// starts with two underscores and does *not* end with two, wherever it
+/// appears inside a class body — so a call rewritten inside `impl Post:`
+/// (`self.title.slug()` → `__typhon_ext_str__slug__(self.title)`) became
+/// `_Post__typhon_ext_str__slug` and raised `NameError`. A dunder-shaped
+/// name is exempt from mangling.
 fn free_fn_name(ty: &str, method: &str) -> String {
-    format!("__typhon_ext_{ty}__{method}")
+    format!("__typhon_ext_{ty}__{method}__")
 }
 
 /// Maps `type-name → method-name → free-function-name`.
@@ -156,6 +163,7 @@ pub fn rewrite_builtin_extension_calls_tracking(
     if registry.is_empty() {
         return (0, HashSet::new());
     }
+    let ctx = RewriteCtx::new(registry, module);
     let mut module_env = collect_module_annotations(module);
     let mut rewrites = 0usize;
     let mut used_fns: HashSet<String> = HashSet::new();
@@ -164,7 +172,7 @@ pub fn rewrite_builtin_extension_calls_tracking(
     for stmt in body {
         new_body.push(rewrite_stmt(
             stmt,
-            registry,
+            &ctx,
             &mut module_env,
             &mut rewrites,
             &mut used_fns,
@@ -174,7 +182,146 @@ pub fn rewrite_builtin_extension_calls_tracking(
     (rewrites, used_fns)
 }
 
-/// Map from variable name to the built-in type it is annotated as.
+/// What one rewrite pass knows beyond the local annotation environment:
+/// the extension registry and, for every module class, the built-in type
+/// of each annotated field (so `self.title.slug()` inside `impl Post` and
+/// `post.title.slug()` on a `post: Post` local both resolve to `str`).
+pub(crate) struct RewriteCtx<'a> {
+    registry: &'a ExtensionRegistry,
+    class_fields: HashMap<String, HashMap<String, String>>,
+}
+
+impl<'a> RewriteCtx<'a> {
+    fn new(registry: &'a ExtensionRegistry, module: &ModModule) -> Self {
+        Self {
+            registry,
+            class_fields: collect_class_field_types(module),
+        }
+    }
+}
+
+/// Built-in type of every annotated field of every class in `module`
+/// (`impl Post:` pseudo-classes are folded into their target class).
+fn collect_class_field_types(module: &ModModule) -> HashMap<String, HashMap<String, String>> {
+    let mut out: HashMap<String, HashMap<String, String>> = HashMap::new();
+    for stmt in &module.body {
+        if let Stmt::ClassDef(c) = stmt {
+            let name = c
+                .name
+                .as_str()
+                .strip_prefix("__typhon_impl_")
+                .unwrap_or(c.name.as_str())
+                .to_owned();
+            let entry = out.entry(name).or_default();
+            for member in &c.body {
+                if let Stmt::AnnAssign(a) = member {
+                    if let (Expr::Name(n), Some(ty)) =
+                        (a.target.as_ref(), annotation_to_type(&a.annotation))
+                    {
+                        entry.insert(n.id.as_str().to_owned(), ty);
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// The `self` binding's class, recorded in the local environment under a
+/// key no Python identifier can collide with.
+const SELF_CLASS_KEY: &str = "<self-class>";
+
+/// The built-in type a receiver expression evaluates to, when it is
+/// evident: an annotated name, a literal or display, a field of an
+/// annotated object (`self.title`, `post.title`), or a chain of
+/// type-preserving builtin methods (`t.strip().lower()`).
+fn receiver_type(expr: &Expr, env: &Env, ctx: &RewriteCtx<'_>) -> Option<String> {
+    match expr {
+        Expr::Name(n) => env.get(n.id.as_str()).cloned(),
+        Expr::StringLiteral(_) | Expr::FString(_) => Some("str".to_owned()),
+        Expr::BytesLiteral(_) => Some("bytes".to_owned()),
+        Expr::NumberLiteral(n) => Some(
+            match n.value {
+                ruff_python_ast::Number::Int(_) => "int",
+                ruff_python_ast::Number::Float(_) => "float",
+                ruff_python_ast::Number::Complex { .. } => "complex",
+            }
+            .to_owned(),
+        ),
+        Expr::List(_) | Expr::ListComp(_) => Some("list".to_owned()),
+        Expr::Dict(_) | Expr::DictComp(_) => Some("dict".to_owned()),
+        Expr::Set(_) | Expr::SetComp(_) => Some("set".to_owned()),
+        Expr::Tuple(_) => Some("tuple".to_owned()),
+        Expr::Attribute(a) => {
+            let owner = match a.value.as_ref() {
+                Expr::Name(n) if n.id.as_str() == "self" => env.get(SELF_CLASS_KEY).cloned(),
+                other => receiver_type(other, env, ctx),
+            }?;
+            ctx.class_fields
+                .get(&owner)
+                .and_then(|fields| fields.get(a.attr.as_str()))
+                .cloned()
+        }
+        Expr::Call(call) => match call.func.as_ref() {
+            Expr::Name(n) => match n.id.as_str() {
+                "str" | "repr" | "format" | "chr" | "ascii" => Some("str".to_owned()),
+                "bytes" => Some("bytes".to_owned()),
+                "int" | "len" | "ord" => Some("int".to_owned()),
+                "float" => Some("float".to_owned()),
+                "list" | "sorted" => Some("list".to_owned()),
+                "dict" => Some("dict".to_owned()),
+                "set" => Some("set".to_owned()),
+                "tuple" => Some("tuple".to_owned()),
+                _ => None,
+            },
+            Expr::Attribute(a) => {
+                let recv = receiver_type(&a.value, env, ctx)?;
+                let method = a.attr.as_str();
+                let preserved = match recv.as_str() {
+                    "str" => matches!(
+                        method,
+                        "strip"
+                            | "lstrip"
+                            | "rstrip"
+                            | "lower"
+                            | "upper"
+                            | "title"
+                            | "capitalize"
+                            | "casefold"
+                            | "swapcase"
+                            | "replace"
+                            | "join"
+                            | "format"
+                            | "format_map"
+                            | "center"
+                            | "ljust"
+                            | "rjust"
+                            | "zfill"
+                            | "removeprefix"
+                            | "removesuffix"
+                            | "expandtabs"
+                            | "translate"
+                    ),
+                    "bytes" => matches!(
+                        method,
+                        "strip" | "lstrip" | "rstrip" | "lower" | "upper" | "replace" | "join"
+                    ),
+                    "list" => matches!(method, "copy"),
+                    "dict" => matches!(method, "copy"),
+                    "set" => matches!(
+                        method,
+                        "copy" | "union" | "intersection" | "difference" | "symmetric_difference"
+                    ),
+                    _ => false,
+                };
+                preserved.then_some(recv)
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 ///
 /// Each scope owns its own [`Env`].  Function scopes start *empty* (so a
 /// shadowing local rebinding never inherits an outer annotation that
@@ -221,15 +368,19 @@ fn annotation_to_type(ann: &Expr) -> Option<String> {
 /// rebinding as opaque).
 fn rewrite_stmt(
     stmt: Stmt,
-    registry: &ExtensionRegistry,
+    ctx: &RewriteCtx<'_>,
     env: &mut Env,
     rewrites: &mut usize,
     used_fns: &mut HashSet<String>,
 ) -> Stmt {
     match stmt {
         Stmt::FunctionDef(mut f) => {
-            // Fresh scope: nothing from the enclosing block leaks in.
+            // Fresh scope: nothing from the enclosing block leaks in —
+            // except the enclosing class of `self`, for methods.
             let mut local = Env::new();
+            if let Some(cls) = env.get(SELF_CLASS_KEY) {
+                local.insert(SELF_CLASS_KEY.to_owned(), cls.clone());
+            }
             for param in f.parameters.posonlyargs.iter().chain(
                 f.parameters
                     .args
@@ -258,7 +409,7 @@ fn rewrite_stmt(
             }
             f.body = walk_body(
                 std::mem::take(&mut f.body),
-                registry,
+                ctx,
                 &mut local,
                 rewrites,
                 used_fns,
@@ -266,11 +417,21 @@ fn rewrite_stmt(
             Stmt::FunctionDef(f)
         }
         Stmt::ClassDef(mut c) => {
-            // Class bodies also open a fresh scope.
+            // Class bodies also open a fresh scope. Methods inherit one
+            // fact from it: which class `self` belongs to (an `impl Post:`
+            // pseudo-class counts as `Post`), so `self.<field>` receivers
+            // can be typed from the class's field annotations.
+            let class_name = c
+                .name
+                .as_str()
+                .strip_prefix("__typhon_impl_")
+                .unwrap_or(c.name.as_str())
+                .to_owned();
             let mut local = Env::new();
+            local.insert(SELF_CLASS_KEY.to_owned(), class_name);
             c.body = walk_body(
                 std::mem::take(&mut c.body),
-                registry,
+                ctx,
                 &mut local,
                 rewrites,
                 used_fns,
@@ -279,7 +440,7 @@ fn rewrite_stmt(
         }
         Stmt::AnnAssign(mut a) => {
             if let Some(v) = a.value.as_mut() {
-                rewrite_expr(v, registry, env, rewrites, used_fns);
+                rewrite_expr(v, ctx, env, rewrites, used_fns);
             }
             // Update the live environment so subsequent statements in
             // this block can rely on the new annotated binding.
@@ -291,7 +452,7 @@ fn rewrite_stmt(
             Stmt::AnnAssign(a)
         }
         Stmt::Assign(mut a) => {
-            rewrite_expr(&mut a.value, registry, env, rewrites, used_fns);
+            rewrite_expr(&mut a.value, ctx, env, rewrites, used_fns);
             // A bare assignment without annotation shadows any prior
             // typed binding for the same name — invalidate it so a
             // later use isn't rewritten against a stale type.
@@ -303,50 +464,44 @@ fn rewrite_stmt(
             Stmt::Assign(a)
         }
         Stmt::AugAssign(mut a) => {
-            rewrite_expr(&mut a.value, registry, env, rewrites, used_fns);
+            rewrite_expr(&mut a.value, ctx, env, rewrites, used_fns);
             Stmt::AugAssign(a)
         }
         Stmt::Expr(mut e) => {
-            rewrite_expr(&mut e.value, registry, env, rewrites, used_fns);
+            rewrite_expr(&mut e.value, ctx, env, rewrites, used_fns);
             Stmt::Expr(e)
         }
         Stmt::Return(mut r) => {
             if let Some(v) = r.value.as_mut() {
-                rewrite_expr(v, registry, env, rewrites, used_fns);
+                rewrite_expr(v, ctx, env, rewrites, used_fns);
             }
             Stmt::Return(r)
         }
         Stmt::Raise(mut r) => {
             if let Some(v) = r.exc.as_mut() {
-                rewrite_expr(v, registry, env, rewrites, used_fns);
+                rewrite_expr(v, ctx, env, rewrites, used_fns);
             }
             if let Some(v) = r.cause.as_mut() {
-                rewrite_expr(v, registry, env, rewrites, used_fns);
+                rewrite_expr(v, ctx, env, rewrites, used_fns);
             }
             Stmt::Raise(r)
         }
         Stmt::Delete(mut d) => {
             for t in &mut d.targets {
-                rewrite_expr(t, registry, env, rewrites, used_fns);
+                rewrite_expr(t, ctx, env, rewrites, used_fns);
             }
             Stmt::Delete(d)
         }
         Stmt::If(mut i) => {
-            rewrite_expr(&mut i.test, registry, env, rewrites, used_fns);
-            i.body = walk_body(
-                std::mem::take(&mut i.body),
-                registry,
-                env,
-                rewrites,
-                used_fns,
-            );
+            rewrite_expr(&mut i.test, ctx, env, rewrites, used_fns);
+            i.body = walk_body(std::mem::take(&mut i.body), ctx, env, rewrites, used_fns);
             for clause in &mut i.elif_else_clauses {
                 if let Some(t) = clause.test.as_mut() {
-                    rewrite_expr(t, registry, env, rewrites, used_fns);
+                    rewrite_expr(t, ctx, env, rewrites, used_fns);
                 }
                 clause.body = walk_body(
                     std::mem::take(&mut clause.body),
-                    registry,
+                    ctx,
                     env,
                     rewrites,
                     used_fns,
@@ -355,89 +510,41 @@ fn rewrite_stmt(
             Stmt::If(i)
         }
         Stmt::While(mut w) => {
-            rewrite_expr(&mut w.test, registry, env, rewrites, used_fns);
-            w.body = walk_body(
-                std::mem::take(&mut w.body),
-                registry,
-                env,
-                rewrites,
-                used_fns,
-            );
-            w.orelse = walk_body(
-                std::mem::take(&mut w.orelse),
-                registry,
-                env,
-                rewrites,
-                used_fns,
-            );
+            rewrite_expr(&mut w.test, ctx, env, rewrites, used_fns);
+            w.body = walk_body(std::mem::take(&mut w.body), ctx, env, rewrites, used_fns);
+            w.orelse = walk_body(std::mem::take(&mut w.orelse), ctx, env, rewrites, used_fns);
             Stmt::While(w)
         }
         Stmt::For(mut f) => {
-            rewrite_expr(&mut f.target, registry, env, rewrites, used_fns);
-            rewrite_expr(&mut f.iter, registry, env, rewrites, used_fns);
-            f.body = walk_body(
-                std::mem::take(&mut f.body),
-                registry,
-                env,
-                rewrites,
-                used_fns,
-            );
-            f.orelse = walk_body(
-                std::mem::take(&mut f.orelse),
-                registry,
-                env,
-                rewrites,
-                used_fns,
-            );
+            rewrite_expr(&mut f.target, ctx, env, rewrites, used_fns);
+            rewrite_expr(&mut f.iter, ctx, env, rewrites, used_fns);
+            f.body = walk_body(std::mem::take(&mut f.body), ctx, env, rewrites, used_fns);
+            f.orelse = walk_body(std::mem::take(&mut f.orelse), ctx, env, rewrites, used_fns);
             Stmt::For(f)
         }
         Stmt::With(mut w) => {
             for item in &mut w.items {
-                rewrite_expr(&mut item.context_expr, registry, env, rewrites, used_fns);
+                rewrite_expr(&mut item.context_expr, ctx, env, rewrites, used_fns);
                 if let Some(v) = item.optional_vars.as_mut() {
-                    rewrite_expr(v, registry, env, rewrites, used_fns);
+                    rewrite_expr(v, ctx, env, rewrites, used_fns);
                 }
             }
-            w.body = walk_body(
-                std::mem::take(&mut w.body),
-                registry,
-                env,
-                rewrites,
-                used_fns,
-            );
+            w.body = walk_body(std::mem::take(&mut w.body), ctx, env, rewrites, used_fns);
             Stmt::With(w)
         }
         Stmt::Try(mut t) => {
-            t.body = walk_body(
-                std::mem::take(&mut t.body),
-                registry,
-                env,
-                rewrites,
-                used_fns,
-            );
+            t.body = walk_body(std::mem::take(&mut t.body), ctx, env, rewrites, used_fns);
             for handler in &mut t.handlers {
                 let ruff_python_ast::ExceptHandler::ExceptHandler(h) = handler;
                 if let Some(ty) = h.type_.as_mut() {
-                    rewrite_expr(ty, registry, env, rewrites, used_fns);
+                    rewrite_expr(ty, ctx, env, rewrites, used_fns);
                 }
-                h.body = walk_body(
-                    std::mem::take(&mut h.body),
-                    registry,
-                    env,
-                    rewrites,
-                    used_fns,
-                );
+                h.body = walk_body(std::mem::take(&mut h.body), ctx, env, rewrites, used_fns);
             }
-            t.orelse = walk_body(
-                std::mem::take(&mut t.orelse),
-                registry,
-                env,
-                rewrites,
-                used_fns,
-            );
+            t.orelse = walk_body(std::mem::take(&mut t.orelse), ctx, env, rewrites, used_fns);
             t.finalbody = walk_body(
                 std::mem::take(&mut t.finalbody),
-                registry,
+                ctx,
                 env,
                 rewrites,
                 used_fns,
@@ -445,18 +552,12 @@ fn rewrite_stmt(
             Stmt::Try(t)
         }
         Stmt::Match(mut m) => {
-            rewrite_expr(&mut m.subject, registry, env, rewrites, used_fns);
+            rewrite_expr(&mut m.subject, ctx, env, rewrites, used_fns);
             for case in &mut m.cases {
                 if let Some(g) = case.guard.as_mut() {
-                    rewrite_expr(g, registry, env, rewrites, used_fns);
+                    rewrite_expr(g, ctx, env, rewrites, used_fns);
                 }
-                case.body = walk_body(
-                    std::mem::take(&mut case.body),
-                    registry,
-                    env,
-                    rewrites,
-                    used_fns,
-                );
+                case.body = walk_body(std::mem::take(&mut case.body), ctx, env, rewrites, used_fns);
             }
             Stmt::Match(m)
         }
@@ -466,13 +567,13 @@ fn rewrite_stmt(
 
 fn walk_body(
     body: Vec<Stmt>,
-    registry: &ExtensionRegistry,
+    ctx: &RewriteCtx<'_>,
     env: &mut Env,
     rewrites: &mut usize,
     used_fns: &mut HashSet<String>,
 ) -> Vec<Stmt> {
     body.into_iter()
-        .map(|s| rewrite_stmt(s, registry, env, rewrites, used_fns))
+        .map(|s| rewrite_stmt(s, ctx, env, rewrites, used_fns))
         .collect()
 }
 
@@ -481,7 +582,7 @@ fn walk_body(
 /// or `f(x.shout())` reaches the rewrite logic.
 fn rewrite_expr(
     expr: &mut Expr,
-    registry: &ExtensionRegistry,
+    ctx: &RewriteCtx<'_>,
     env: &Env,
     rewrites: &mut usize,
     used_fns: &mut HashSet<String>,
@@ -492,15 +593,15 @@ fn rewrite_expr(
         // Recurse into call arguments and (for non-extension calls) the
         // callee expression itself so nested receivers still get fixed.
         for arg in &mut call.arguments.args {
-            rewrite_expr(arg, registry, env, rewrites, used_fns);
+            rewrite_expr(arg, ctx, env, rewrites, used_fns);
         }
         for kw in &mut call.arguments.keywords {
-            rewrite_expr(&mut kw.value, registry, env, rewrites, used_fns);
+            rewrite_expr(&mut kw.value, ctx, env, rewrites, used_fns);
         }
         if let Expr::Attribute(attr) = call.func.as_ref() {
-            if let Expr::Name(recv) = attr.value.as_ref() {
-                if let Some(ty) = env.get(recv.id.as_str()) {
-                    if let Some(methods) = registry.get(ty) {
+            if let Some(ty) = receiver_type(&attr.value, env, ctx) {
+                {
+                    if let Some(methods) = ctx.registry.get(&ty) {
                         if let Some(fn_name) = methods.get(attr.attr.as_str()) {
                             let range = call.range;
                             let receiver = (*attr.value).clone();
@@ -538,7 +639,7 @@ fn rewrite_expr(
         // Not an extension call — still descend into the callee so a
         // receiver buried inside a more complex call expression
         // (lambda, subscript, attribute chain) gets visited.
-        rewrite_expr(&mut call.func, registry, env, rewrites, used_fns);
+        rewrite_expr(&mut call.func, ctx, env, rewrites, used_fns);
         return;
     }
 
@@ -548,18 +649,18 @@ fn rewrite_expr(
     match expr {
         Expr::BoolOp(b) => {
             for v in &mut b.values {
-                rewrite_expr(v, registry, env, rewrites, used_fns);
+                rewrite_expr(v, ctx, env, rewrites, used_fns);
             }
         }
         Expr::Named(n) => {
-            rewrite_expr(&mut n.target, registry, env, rewrites, used_fns);
-            rewrite_expr(&mut n.value, registry, env, rewrites, used_fns);
+            rewrite_expr(&mut n.target, ctx, env, rewrites, used_fns);
+            rewrite_expr(&mut n.value, ctx, env, rewrites, used_fns);
         }
         Expr::BinOp(b) => {
-            rewrite_expr(&mut b.left, registry, env, rewrites, used_fns);
-            rewrite_expr(&mut b.right, registry, env, rewrites, used_fns);
+            rewrite_expr(&mut b.left, ctx, env, rewrites, used_fns);
+            rewrite_expr(&mut b.right, ctx, env, rewrites, used_fns);
         }
-        Expr::UnaryOp(u) => rewrite_expr(&mut u.operand, registry, env, rewrites, used_fns),
+        Expr::UnaryOp(u) => rewrite_expr(&mut u.operand, ctx, env, rewrites, used_fns),
         Expr::Lambda(l) => {
             // Lambda opens a fresh scope; its parameters can add to a
             // local env. Simpler approach: walk the body with an empty
@@ -580,103 +681,103 @@ fn rewrite_expr(
                     }
                 }
             }
-            rewrite_expr(&mut l.body, registry, &local, rewrites, used_fns);
+            rewrite_expr(&mut l.body, ctx, &local, rewrites, used_fns);
         }
         Expr::If(i) => {
-            rewrite_expr(&mut i.test, registry, env, rewrites, used_fns);
-            rewrite_expr(&mut i.body, registry, env, rewrites, used_fns);
-            rewrite_expr(&mut i.orelse, registry, env, rewrites, used_fns);
+            rewrite_expr(&mut i.test, ctx, env, rewrites, used_fns);
+            rewrite_expr(&mut i.body, ctx, env, rewrites, used_fns);
+            rewrite_expr(&mut i.orelse, ctx, env, rewrites, used_fns);
         }
         Expr::Dict(d) => {
             for item in &mut d.items {
                 if let Some(k) = item.key.as_mut() {
-                    rewrite_expr(k, registry, env, rewrites, used_fns);
+                    rewrite_expr(k, ctx, env, rewrites, used_fns);
                 }
-                rewrite_expr(&mut item.value, registry, env, rewrites, used_fns);
+                rewrite_expr(&mut item.value, ctx, env, rewrites, used_fns);
             }
         }
         Expr::Set(s) => {
             for e in &mut s.elts {
-                rewrite_expr(e, registry, env, rewrites, used_fns);
+                rewrite_expr(e, ctx, env, rewrites, used_fns);
             }
         }
         Expr::ListComp(lc) => {
-            rewrite_expr(&mut lc.elt, registry, env, rewrites, used_fns);
+            rewrite_expr(&mut lc.elt, ctx, env, rewrites, used_fns);
             for gen in &mut lc.generators {
-                rewrite_expr(&mut gen.iter, registry, env, rewrites, used_fns);
+                rewrite_expr(&mut gen.iter, ctx, env, rewrites, used_fns);
                 for f in &mut gen.ifs {
-                    rewrite_expr(f, registry, env, rewrites, used_fns);
+                    rewrite_expr(f, ctx, env, rewrites, used_fns);
                 }
             }
         }
         Expr::SetComp(c) => {
-            rewrite_expr(&mut c.elt, registry, env, rewrites, used_fns);
+            rewrite_expr(&mut c.elt, ctx, env, rewrites, used_fns);
             for gen in &mut c.generators {
-                rewrite_expr(&mut gen.iter, registry, env, rewrites, used_fns);
+                rewrite_expr(&mut gen.iter, ctx, env, rewrites, used_fns);
                 for f in &mut gen.ifs {
-                    rewrite_expr(f, registry, env, rewrites, used_fns);
+                    rewrite_expr(f, ctx, env, rewrites, used_fns);
                 }
             }
         }
         Expr::DictComp(c) => {
             if let Some(k) = c.key.as_mut() {
-                rewrite_expr(k, registry, env, rewrites, used_fns);
+                rewrite_expr(k, ctx, env, rewrites, used_fns);
             }
-            rewrite_expr(&mut c.value, registry, env, rewrites, used_fns);
+            rewrite_expr(&mut c.value, ctx, env, rewrites, used_fns);
             for gen in &mut c.generators {
-                rewrite_expr(&mut gen.iter, registry, env, rewrites, used_fns);
+                rewrite_expr(&mut gen.iter, ctx, env, rewrites, used_fns);
                 for f in &mut gen.ifs {
-                    rewrite_expr(f, registry, env, rewrites, used_fns);
+                    rewrite_expr(f, ctx, env, rewrites, used_fns);
                 }
             }
         }
         Expr::Generator(g) => {
-            rewrite_expr(&mut g.elt, registry, env, rewrites, used_fns);
+            rewrite_expr(&mut g.elt, ctx, env, rewrites, used_fns);
             for gen in &mut g.generators {
-                rewrite_expr(&mut gen.iter, registry, env, rewrites, used_fns);
+                rewrite_expr(&mut gen.iter, ctx, env, rewrites, used_fns);
                 for f in &mut gen.ifs {
-                    rewrite_expr(f, registry, env, rewrites, used_fns);
+                    rewrite_expr(f, ctx, env, rewrites, used_fns);
                 }
             }
         }
-        Expr::Await(a) => rewrite_expr(&mut a.value, registry, env, rewrites, used_fns),
+        Expr::Await(a) => rewrite_expr(&mut a.value, ctx, env, rewrites, used_fns),
         Expr::Yield(y) => {
             if let Some(v) = y.value.as_mut() {
-                rewrite_expr(v, registry, env, rewrites, used_fns);
+                rewrite_expr(v, ctx, env, rewrites, used_fns);
             }
         }
-        Expr::YieldFrom(y) => rewrite_expr(&mut y.value, registry, env, rewrites, used_fns),
+        Expr::YieldFrom(y) => rewrite_expr(&mut y.value, ctx, env, rewrites, used_fns),
         Expr::Compare(c) => {
-            rewrite_expr(&mut c.left, registry, env, rewrites, used_fns);
+            rewrite_expr(&mut c.left, ctx, env, rewrites, used_fns);
             for cmp in &mut c.comparators {
-                rewrite_expr(cmp, registry, env, rewrites, used_fns);
+                rewrite_expr(cmp, ctx, env, rewrites, used_fns);
             }
         }
-        Expr::Attribute(a) => rewrite_expr(&mut a.value, registry, env, rewrites, used_fns),
+        Expr::Attribute(a) => rewrite_expr(&mut a.value, ctx, env, rewrites, used_fns),
         Expr::Subscript(s) => {
-            rewrite_expr(&mut s.value, registry, env, rewrites, used_fns);
-            rewrite_expr(&mut s.slice, registry, env, rewrites, used_fns);
+            rewrite_expr(&mut s.value, ctx, env, rewrites, used_fns);
+            rewrite_expr(&mut s.slice, ctx, env, rewrites, used_fns);
         }
-        Expr::Starred(s) => rewrite_expr(&mut s.value, registry, env, rewrites, used_fns),
+        Expr::Starred(s) => rewrite_expr(&mut s.value, ctx, env, rewrites, used_fns),
         Expr::List(l) => {
             for e in &mut l.elts {
-                rewrite_expr(e, registry, env, rewrites, used_fns);
+                rewrite_expr(e, ctx, env, rewrites, used_fns);
             }
         }
         Expr::Tuple(t) => {
             for e in &mut t.elts {
-                rewrite_expr(e, registry, env, rewrites, used_fns);
+                rewrite_expr(e, ctx, env, rewrites, used_fns);
             }
         }
         Expr::Slice(s) => {
             if let Some(v) = s.lower.as_mut() {
-                rewrite_expr(v, registry, env, rewrites, used_fns);
+                rewrite_expr(v, ctx, env, rewrites, used_fns);
             }
             if let Some(v) = s.upper.as_mut() {
-                rewrite_expr(v, registry, env, rewrites, used_fns);
+                rewrite_expr(v, ctx, env, rewrites, used_fns);
             }
             if let Some(v) = s.step.as_mut() {
-                rewrite_expr(v, registry, env, rewrites, used_fns);
+                rewrite_expr(v, ctx, env, rewrites, used_fns);
             }
         }
         // Leaves and the previously-handled `Call` are no-ops here.
@@ -712,7 +813,7 @@ mod tests {
         assert!(registry.contains_key("str"));
         assert_eq!(
             registry["str"].get("shout").map(String::as_str),
-            Some("__typhon_ext_str__shout")
+            Some("__typhon_ext_str__shout__")
         );
         // The stub class is gone from the AST.
         for stmt in &m.body {
@@ -726,7 +827,7 @@ mod tests {
         }
         // The free function is emitted.
         assert!(m.body.iter().any(|s| matches!(
-            s, Stmt::FunctionDef(f) if f.name.as_str() == "__typhon_ext_str__shout"
+            s, Stmt::FunctionDef(f) if f.name.as_str() == "__typhon_ext_str__shout__"
         )));
     }
 
@@ -740,8 +841,38 @@ mod tests {
         assert_eq!(rewrites, 1);
         let out = tyc_emit::emit_python(&m);
         assert!(
-            out.contains("__typhon_ext_str__shout(greeting)"),
+            out.contains("__typhon_ext_str__shout__(greeting)"),
             "expected call-site rewrite; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn rewrite_types_field_literal_and_chain_receivers() {
+        let src =
+            "extend str:\n    def slug(self) -> str:\n        return self.strip().lower()\n\n\
+class Post:\n    title: str\n\n\
+impl Post:\n    def key(self) -> str:\n        return self.title.slug()\n\n\
+def f(t: str, p: Post) -> str:\n    return t.strip().slug() + \"Lit X\".slug() + p.title.slug()\n";
+        let mut m = prep_parse(src);
+        let (registry, _) = extract_builtin_extensions(&mut m);
+        let rewrites = rewrite_builtin_extension_calls(&mut m, &registry);
+        assert_eq!(rewrites, 4);
+        let out = tyc_emit::emit_python(&m);
+        assert!(
+            out.contains("__typhon_ext_str__slug__(self.title)"),
+            "got:\n{out}"
+        );
+        assert!(
+            out.contains("__typhon_ext_str__slug__(t.strip())"),
+            "got:\n{out}"
+        );
+        assert!(
+            out.contains("__typhon_ext_str__slug__(\"Lit X\")"),
+            "got:\n{out}"
+        );
+        assert!(
+            out.contains("__typhon_ext_str__slug__(p.title)"),
+            "got:\n{out}"
         );
     }
 
@@ -766,7 +897,10 @@ mod tests {
         let rewrites = rewrite_builtin_extension_calls(&mut m, &registry);
         assert_eq!(rewrites, 1);
         let out = tyc_emit::emit_python(&m);
-        assert!(out.contains("__typhon_ext_str__shout(name)"), "got:\n{out}");
+        assert!(
+            out.contains("__typhon_ext_str__shout__(name)"),
+            "got:\n{out}"
+        );
     }
 
     #[test]

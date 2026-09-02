@@ -1,0 +1,16 @@
+def parse_host(s: str) -> Result[str, str]:
+    return Ok(s)
+
+
+def parse_port(s: str) -> Result[int, str]:
+    return Ok(int(s))
+
+
+def connect(h: str, p: str) -> Result[str, str]:
+    with host = parse_host(h)?, port = parse_port(p)?:
+        return Ok(f"{host}:{port}")
+    else:
+        return Err("bad")
+
+
+let z: int = "oops"

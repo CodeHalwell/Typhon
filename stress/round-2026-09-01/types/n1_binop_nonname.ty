@@ -1,0 +1,19 @@
+class Box:
+    val: int?
+
+def g() -> int?:
+    return None
+
+def f(b: Box, d: dict[str, int], xs: list[int?]) -> int:
+    let a: int = b.val + 1
+    let c: int = g() + 1
+    let e: int = d.get("zz") + 1
+    let h: int = xs[0] * 2
+    let k: bool = b.val > 1
+    return a + c + e + h
+
+def main() -> None:
+    print(f(Box(val=None), {}, [None]))
+
+if __name__ == "__main__":
+    main()

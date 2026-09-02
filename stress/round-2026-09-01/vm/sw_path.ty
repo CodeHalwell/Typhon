@@ -1,0 +1,160 @@
+import os
+from pathlib import Path
+tmp: str = "/tmp/claude-0/-home-user-Typhon/cc16f461-ddff-5c1b-8a56-a4556c5e7a41/scratchpad/review-vm/work/sw_path/tmpdir"
+os.makedirs(tmp + "/sub/deep", exist_ok=True)
+p: Path = Path(tmp) / "sub" / "file.txt"
+p.write_text("héllo\nwörld\n")
+(Path(tmp) / "sub" / "z.py").write_text("x")
+(Path(tmp) / "sub" / "deep" / "n.py").write_text("")
+try:
+    print("X000", p.name, p.stem, p.suffix, p.suffixes, p.parent.name, p.parts[-2:], p.exists(), p.is_file(), p.is_dir(), p.parent.is_dir())
+except Exception as _e:
+    print("X000", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X001", p.read_text(), repr(p.read_text()), p.read_bytes(), len(p.read_bytes()))
+except Exception as _e:
+    print("X001", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X002", p.stat().st_size, p.stat().st_mtime > 0)
+except Exception as _e:
+    print("X002", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X003", p.with_suffix(".md").name, p.with_name("x.y").name, p.with_stem("q").name)
+except Exception as _e:
+    print("X003", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X004", Path("a/b/c.tar.gz").suffixes, Path("a/b/c.tar.gz").stem, Path("/a/b").is_absolute(), Path("a/b").is_absolute())
+except Exception as _e:
+    print("X004", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X005", Path("a/b").parent, Path("a").parent, Path("/").parent, Path("a/b/../c"), Path("a//b"), Path("./a"), Path("a/./b"), Path(""), Path("."))
+except Exception as _e:
+    print("X005", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X006", Path("a/b").parts, Path("/a/b").parts, Path("/a/b").anchor, Path("a/b").root, Path("/a/b").root, Path("a/b").as_posix())
+except Exception as _e:
+    print("X006", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X007", str(Path("a") / "b" / "c"), Path("a") / Path("b"), "a" / Path("b"), Path("a").joinpath("b", "c"), Path("/a/b/c").relative_to("/a"))
+except Exception as _e:
+    print("X007", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X008", Path("a/b").match("*.py"), Path("a/b.py").match("*.py"), Path("a/b.py").match("a/*.py"))
+except Exception as _e:
+    print("X008", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X009", Path("a/b") == Path("a/b"), Path("a/b") == Path("a//b"), Path("a") == "a", hash(Path("a")) == hash(Path("a")), sorted([Path("b"), Path("a")]), Path("a") < Path("b"))
+except Exception as _e:
+    print("X009", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X010", repr(Path("a/b")), str(Path("a/b")), f"{Path('a')}", [Path("x")], Path("~").expanduser() != Path("~"), Path.home().is_absolute(), Path.cwd().is_absolute())
+except Exception as _e:
+    print("X010", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X011", Path("/a/b.c").name, Path("/a/b.c").stem, Path("b.").suffix, Path(".b").suffix, Path(".b").stem, Path("a.b.c").with_suffix(""), Path("a").with_suffix(".x"), Path("a/b").name, Path("a/").name, Path("/").name, Path("/").stem, Path("a").suffix)
+except Exception as _e:
+    print("X011", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X012", Path("a/b").parents[0], list(Path("a/b/c").parents), len(Path("/a/b").parents), Path("a/b").is_relative_to("a"), Path("a/b").is_relative_to("b"))
+except Exception as _e:
+    print("X012", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X013", sorted(q.name for q in (Path(tmp) / "sub").iterdir()))
+except Exception as _e:
+    print("X013", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X014", sorted(q.name for q in (Path(tmp) / "sub").glob("*.py")))
+except Exception as _e:
+    print("X014", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X015", sorted(str(q.relative_to(tmp)) for q in Path(tmp).rglob("*.py")))
+except Exception as _e:
+    print("X015", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X016", sorted(str(q.relative_to(tmp)) for q in Path(tmp).glob("**/*.py")))
+except Exception as _e:
+    print("X016", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X017", sorted(os.listdir(Path(tmp) / "sub")), sorted(os.listdir(tmp + "/sub")))
+except Exception as _e:
+    print("X017", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X018", [len(x) for x in os.walk(tmp)][:1], sorted(f for _, _, fs in os.walk(tmp) for f in fs))
+except Exception as _e:
+    print("X018", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X019", os.path.getsize(p), os.path.exists(p), os.path.isfile(str(p)), Path(tmp, "sub", "file.txt").exists(), (Path(tmp) / "nope").exists())
+except Exception as _e:
+    print("X019", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X020", Path(tmp + "/sub/z.py").unlink(), (Path(tmp) / "sub" / "z.py").exists())
+except Exception as _e:
+    print("X020", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X021", os.remove(p) if False else "skip", (Path(tmp) / "sub" / "deep" / "n.py").rename(Path(tmp) / "sub" / "m.py"), (Path(tmp) / "sub" / "m.py").exists())
+except Exception as _e:
+    print("X021", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X022", os.rename(Path(tmp) / "sub" / "m.py", Path(tmp) / "sub" / "k.py"), sorted(q.name for q in (Path(tmp) / "sub").iterdir()))
+except Exception as _e:
+    print("X022", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X023", os.makedirs(Path(tmp) / "x" / "y", exist_ok=True), os.path.isdir(Path(tmp) / "x" / "y"), os.rmdir(Path(tmp) / "sub" / "deep"), (Path(tmp) / "sub" / "deep").exists())
+except Exception as _e:
+    print("X023", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X024", (Path(tmp) / "sub").mkdir())
+except Exception as _e:
+    print("X024", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X025", (Path(tmp) / "sub" / "new").mkdir(parents=True, exist_ok=True), (Path(tmp) / "sub" / "new").is_dir(), (Path(tmp) / "sub" / "new").rmdir(), (Path(tmp) / "sub" / "new").exists())
+except Exception as _e:
+    print("X025", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X026", p.touch(), p.exists(), (Path(tmp) / "t.txt").touch(), (Path(tmp) / "t.txt").read_text() == "")
+except Exception as _e:
+    print("X026", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X027", p.write_text("a\r\nb\n"), repr(p.read_text()), repr(p.read_bytes()))
+except Exception as _e:
+    print("X027", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X028", p.write_bytes(b"\x00\xff"), p.read_bytes(), p.write_text("x", encoding="utf-8"), p.read_text(encoding="utf-8"))
+except Exception as _e:
+    print("X028", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X029", p.samefile(p), p.resolve() == p.absolute(), p.absolute().is_absolute(), p.owner() if False else "skip", p.is_symlink(), p.lstat().st_size)
+except Exception as _e:
+    print("X029", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X030", Path(tmp).iterdir)
+except Exception as _e:
+    print("X030", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X031", sorted(x.name for x in Path(tmp).iterdir() if x.is_dir()))
+except Exception as _e:
+    print("X031", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X032", [x.name for x in sorted(Path(tmp).glob("*.txt"))])
+except Exception as _e:
+    print("X032", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X033", p.open().read() if False else "skip", p.open("r").readline(), p.open("rb").read(1))
+except Exception as _e:
+    print("X033", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X034", open(Path(tmp) / "nope" / "x"))
+except Exception as _e:
+    print("X034", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X035", open(tmp))
+except Exception as _e:
+    print("X035", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X036", p.write_text(123))
+except Exception as _e:
+    print("X036", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X037", (Path(tmp) / "sub").mkdir(exist_ok=True), os.remove(Path(tmp) / "nope"))
+except Exception as _e:
+    print("X037", "ERR", type(_e).__name__, str(_e)[:70])

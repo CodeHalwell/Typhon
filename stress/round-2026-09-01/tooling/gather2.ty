@@ -1,0 +1,30 @@
+import asyncio
+
+
+async def a() -> int:
+    return 1
+
+
+async def b() -> int:
+    return 2
+
+
+async def main() -> None:
+    gather:
+        x = a()
+        y = b()
+    print(x + y)
+
+
+def parse(s: str) -> Result[int, str]:
+    return Ok(int(s))
+
+
+def twice(s: str) -> Result[int, str]:
+    let n: int = parse(s)?
+    return Ok(n * 2)
+
+
+let z: int = "oops"
+let w: str = 42
+asyncio.run(main())

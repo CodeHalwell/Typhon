@@ -1,0 +1,12 @@
+class Box:
+    val: int?
+
+impl Box:
+    def go(self) -> int:
+        return self.val.bit_length()
+
+def main() -> None:
+    print(Box(val=1).go())
+
+if __name__ == "__main__":
+    main()

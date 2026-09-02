@@ -1,0 +1,18 @@
+import asyncio
+
+@gatherable
+async def fetch(tag: str) -> str:
+    await asyncio.sleep(0)
+    if tag == "a":
+        raise ValueError("boom")
+    return tag
+
+async def main() -> None:
+    try:
+        let a: str = await fetch("a")
+        let b: str = await fetch("b")
+        print(a, b)
+    except ValueError as e:
+        print("caught:", e)
+
+asyncio.run(main())

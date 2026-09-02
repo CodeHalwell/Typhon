@@ -1,0 +1,5 @@
+﻿pub def main() -> None:
+    print("bom ok")
+
+if __name__ == "__main__":
+    main()

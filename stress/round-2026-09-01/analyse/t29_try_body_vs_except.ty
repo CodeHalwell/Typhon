@@ -1,0 +1,7 @@
+def f(s: str) -> int:
+    try:
+        let v: int = int(s)
+        return v
+    except ValueError:
+        let v: int = 0
+        return v

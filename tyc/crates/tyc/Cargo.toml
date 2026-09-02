@@ -35,7 +35,13 @@ tyc-vm          = { workspace = true }
 tyc-venv          = { path = "../tyc-venv" }
 tempfile        = { workspace = true }
 notify          = { workspace = true }
-itoa = "1.0.18"
+# Not Unix-only: `build.rs` formats line numbers with `itoa::Buffer` on every
+# platform. It sat under the `cfg(unix)` table below (added for `libc`), which
+# would have failed to build on Windows.
+itoa            = "1.0.18"
+
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
 
 [dev-dependencies]
 tempfile   = { workspace = true }

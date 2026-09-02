@@ -1,0 +1,18 @@
+from typing import Self
+
+class Node[T]:
+    value: T
+    next: Node[T]?
+
+impl[T] Node[T]:
+    def me(self) -> Self:
+        return self
+    def tail(self) -> Node[T]?:
+        return self.next
+
+def main() -> None:
+    let n: Node[int] = Node(value=1, next=None)
+    print(n.me().value + 1)
+
+if __name__ == "__main__":
+    main()

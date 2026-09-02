@@ -1,0 +1,7 @@
+def f() -> int:
+    let x: int = 5
+    for x in [1, 2]:
+        pass
+    return x
+
+print(f())

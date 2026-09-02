@@ -38,9 +38,8 @@ use tyc_diagnostics::TycError;
 use tyc_syntax::{
     parse_module,
     preprocess::{
-        expand_gather_blocks, expand_go_calls, expand_inline_question_ops, expand_multiline_guards,
-        expand_pipes, expand_question_ops, expand_typed_let_unpack, expand_with_chains,
-        postprocess_full, preprocess_opts, PreprocessOptions, StrippedKeyword, StrippedOptional,
+        expand_sugar, postprocess_full, preprocess, preprocess_opts, PreprocessOptions,
+        StrippedKeyword, StrippedOptional,
     },
 };
 
@@ -80,14 +79,20 @@ pub fn format_source(source: &str, path: &str) -> Result<FormatResult, TycError>
     // The formatter does not want to rewrite the user's `?`, `|>`, or
     // `with`-chain syntax (that's `tyc build`'s job), but the underlying
     // Python parser cannot accept those constructs directly. Expand them in
-    // a throw-away copy of the source purely for validation; the normalised
-    // output below is still derived from `prep.python_source` so the Typhon
-    // sugar is preserved when the file is rewritten.
-    let validation_input = expand_question_ops(&expand_inline_question_ops(&expand_pipes(
-        &expand_with_chains(&expand_go_calls(&expand_gather_blocks(
-            &expand_multiline_guards(&expand_typed_let_unpack(&prep.python_source)),
-        ))),
-    )));
+    // a throw-away copy purely for validation; the normalised output below
+    // is still derived from `prep.python_source` so the Typhon sugar is
+    // preserved when the file is rewritten.
+    //
+    // The throw-away copy is built from the ORIGINAL source through the
+    // shared sugar chain and only then preprocessed — the same order every
+    // other surface uses. Running the sugar passes over `prep.python_source`
+    // instead (preprocess first) inverts that order, and `preprocess`'s
+    // nullable-`?` rewrite then eats the postfix `?` operator a later pass
+    // needed: `with x = a?,` reaches `expand_with_chains` as
+    // `with x = a | None,`, which it cannot recognise, and the formatter
+    // rejects a file `tyc check` accepts. Sharing the chain also stops the
+    // two from drifting — this copy had fallen two passes behind.
+    let validation_input = preprocess(&expand_sugar(source, true)).python_source;
     parse_module(&validation_input).map_err(|e| {
         let offset = usize::from(e.location.start());
         TycError::parse(path, &validation_input, e.to_string(), offset)
@@ -594,6 +599,62 @@ fn apply_simple_style_rules_with_paren_depth(
     line: &str,
     initial_paren_depth: i32,
 ) -> (String, i32) {
+    // Classify every byte with the preprocessor's shared, PEP 701-aware
+    // scanner and hide every string literal — quotes included — and every
+    // f-string replacement field behind a placeholder character before the
+    // spacing rules run. The rules then see only code (and comments, whose
+    // own `#` spacing rule still applies), and the hidden characters are
+    // restored one-for-one afterwards.
+    //
+    // The rule engine's own quote tracking below predates PEP 701 and cannot
+    // tell a nested same-quote f-string field (`f"{d["a:b"]}"`) or a format
+    // spec (`f"{x:.2f}"`) from code: it rewrote `d["a:b"]` to `d["a: b"]`
+    // (a `KeyError` at runtime) and `:.2f` to `: .2f` (a different format —
+    // the sign-aware space flag). The masking makes the engine's quote logic
+    // unreachable rather than trying to teach it the grammar.
+    const PLACEHOLDER: char = '\u{E000}';
+    let mut in_string: Option<tyc_syntax::lexmask::StringMode> = None;
+    let kinds = tyc_syntax::lexmask::scan_line_kinds(line, &mut in_string);
+    let mut masked = String::with_capacity(line.len());
+    let mut hidden: Vec<char> = Vec::new();
+    for (offset, ch) in line.char_indices() {
+        let is_code = kinds.get(offset).is_none_or(|k| {
+            matches!(
+                k,
+                tyc_syntax::lexmask::ByteKind::Code | tyc_syntax::lexmask::ByteKind::Comment
+            )
+        });
+        if is_code {
+            masked.push(ch);
+        } else {
+            masked.push(PLACEHOLDER);
+            hidden.push(ch);
+        }
+    }
+    let (styled, depth) = apply_simple_style_rules_unmasked(&masked, initial_paren_depth);
+    if hidden.is_empty() {
+        return (styled, depth);
+    }
+    let mut restored = String::with_capacity(styled.len());
+    let mut hidden = hidden.into_iter();
+    for ch in styled.chars() {
+        if ch == PLACEHOLDER {
+            // The engine only ever adds or removes whitespace, so every
+            // placeholder survives in order.
+            restored.push(hidden.next().unwrap_or(PLACEHOLDER));
+        } else {
+            restored.push(ch);
+        }
+    }
+    (restored, depth)
+}
+
+/// The spacing-rule engine proper. Operates on a line whose string,
+/// f-string-field and comment bytes have already been replaced by a
+/// placeholder character (see [`apply_simple_style_rules_with_paren_depth`]);
+/// its own quote tracking is kept for the case of a placeholder-free line but
+/// is no longer what keeps the rules out of literals.
+fn apply_simple_style_rules_unmasked(line: &str, initial_paren_depth: i32) -> (String, i32) {
     let mut out = String::with_capacity(line.len());
     let mut chars = line.chars().peekable();
     let mut quote: Option<char> = None;
@@ -1284,14 +1345,24 @@ pub fn format_file(path: &Path) -> Result<bool, TycError> {
 pub fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
 
-    // Resolve symlinks so we rename over the *real* file. A bare `fs::write`
-    // followed the link and preserved it; renaming over the link path would
-    // instead replace the symlink with a regular file. Canonicalising and
-    // renaming over the target keeps the link intact (it still points at the
-    // freshly-written target). Falls back to the path itself if it can't be
-    // resolved (e.g. a broken link) — writing through then behaves like the
-    // previous in-place write.
-    let target = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    // Refuse to write through a symlink. This used to canonicalise the path
+    // and rename over the *resolved* file so a user's own link stayed intact
+    // — but every caller writes into a tree it did not author (`tyc fmt` on
+    // a checkout, `tyc build` into `build/`), and git preserves symlinks, so
+    // a pre-planted `build/main.py -> ~/.ssh/authorized_keys` (or a linked
+    // `build/` directory) turned a build into an arbitrary file write
+    // outside the project, even under `--no-sync` / `TYC_NO_INTROSPECT`.
+    // A link at the destination is an error the caller reports; nothing is
+    // written and the link is left as it was.
+    if let Ok(meta) = std::fs::symlink_metadata(path) {
+        if meta.file_type().is_symlink() {
+            return Err(std::io::Error::other(format!(
+                "refusing to write through symlink '{}'",
+                path.display()
+            )));
+        }
+    }
+    let target = path.to_path_buf();
 
     let dir = target.parent().unwrap_or_else(|| Path::new("."));
     let file_name = target
@@ -1379,6 +1450,29 @@ mod tests {
                 "the walrus must not be split; got {out:?}"
             );
         }
+    }
+
+    #[test]
+    fn nested_fstring_fields_and_format_specs_are_left_alone() {
+        // PEP 701 same-quote nested fields and format specs are not code the
+        // spacing rules may touch: `d["a:b"]` must not become `d["a: b"]`
+        // (a `KeyError`) and `:.2f` must not become `: .2f` (a different
+        // format). The engine's own scanner could not tell; the lexmask can.
+        for src in [
+            "print(f\"{d[\"content-type\"]} {d[\"a,b\"]} {d[\"a:b\"]} {d[\"x+y\"]}\")\n",
+            "print(f\"{f'{x:.2f}'}|\")\n",
+            "print(f\"{x:.2f} {y:>8,} {z!r:^10}\")\n",
+            // (One space before an inline comment: the engine collapses
+            // internal space runs; PEP 8's two is ruff's job.)
+            "s = \"a,b:c=d->e\" # x,y:z\n",
+            "t = 'it''s' # don't\n",
+        ] {
+            let (out, _) = normalise_whitespace_with_map(src);
+            assert_eq!(out, src, "string / f-string contents must survive verbatim");
+        }
+        // Ordinary code around a literal is still normalised.
+        let (out, _) = normalise_whitespace_with_map("x={\"a:b\":1,\"c\":2}\n");
+        assert_eq!(out, "x = {\"a:b\": 1, \"c\": 2}\n");
     }
 
     #[test]
@@ -2302,6 +2396,105 @@ def run() -> Result[int, str]:
             assert!(
                 !result.changed,
                 "clean snippet must report unchanged:\n{src:?}"
+            );
+        }
+        unsafe {
+            match prior {
+                Some(v) => std::env::set_var("TYC_FMT_DISABLE_RUFF", v),
+                None => std::env::remove_var("TYC_FMT_DISABLE_RUFF"),
+            }
+        }
+    }
+
+    #[test]
+    fn format_round_trips_a_freeze_let_with_a_multi_line_string() {
+        // `freeze let X = """…"""` lowers to `let X = __typhon_freeze__("""…`
+        // with the closing `)` appended to the line that closes the string.
+        // The restoration paired that `)` by bracket depth alone, which a
+        // triple-quoted RHS never opens — so the opener kept its
+        // `__typhon_freeze__(` and `tyc fmt` wrote source it could no
+        // longer parse. Round-tripping every shape here proves the pairing
+        // now tracks the literal too.
+        let _guard = lock_env();
+        let prior = std::env::var_os("TYC_FMT_DISABLE_RUFF");
+        unsafe {
+            std::env::set_var("TYC_FMT_DISABLE_RUFF", "1");
+        }
+        let sources = [
+            // The plain shape: nothing but a string.
+            "freeze let BANNER = \"\"\"\nhello\n\"\"\"\n",
+            // A `)` inside the string must not be mistaken for the wrapper's.
+            "freeze let DOC = \"\"\"\nline with ) paren\n\"\"\"\n",
+            // Single-quoted triples take the same path.
+            "freeze let TXT = '''a\nb'''\n",
+            // A comment on the opener survives the round-trip.
+            "freeze let N = \"\"\"\nx\n\"\"\"  # note\n",
+            // Brackets AND a literal open on the same line: both have to
+            // close before the appended `)` is found.
+            "freeze let CFG: dict[str, str] = {\n    \"sql\": \"\"\"\nselect 1)\n\"\"\",\n}\n",
+        ];
+        for src in sources {
+            let once = format_source(src, "<test>").unwrap();
+            assert!(
+                !once.output.contains("__typhon_freeze__"),
+                "the desugaring leaked into formatted source:\n{src:?}\n-> {:?}",
+                once.output
+            );
+            assert_eq!(
+                once.output, src,
+                "a freeze/string binding must round-trip exactly:\n{src:?}"
+            );
+            // And the output must still be formattable — the corruption
+            // showed up as a parse error on the SECOND pass.
+            let twice = format_source(&once.output, "<test>").unwrap();
+            assert_eq!(twice.output, once.output, "second pass changed the file");
+        }
+        unsafe {
+            match prior {
+                Some(v) => std::env::set_var("TYC_FMT_DISABLE_RUFF", v),
+                None => std::env::remove_var("TYC_FMT_DISABLE_RUFF"),
+            }
+        }
+    }
+
+    #[test]
+    fn format_accepts_the_sugar_the_checker_accepts() {
+        // The validation copy used to run the sugar passes over the
+        // ALREADY-preprocessed buffer. `preprocess` rewrites nullable `T?`
+        // to `T | None`, so a postfix `?` in a multi-line `with` chain was
+        // eaten before `expand_with_chains` could see it and the formatter
+        // rejected a file `tyc check` accepts. Building the copy from the
+        // original source through the shared chain fixes the order — and
+        // sharing it stops the two drifting apart again.
+        let _guard = lock_env();
+        let prior = std::env::var_os("TYC_FMT_DISABLE_RUFF");
+        unsafe {
+            std::env::set_var("TYC_FMT_DISABLE_RUFF", "1");
+        }
+        let sources = [
+            // The multi-line `with` chain that regressed.
+            concat!(
+                "def f(a: Result[str, str], b: Result[int, str]) -> Result[str, str]:\n",
+                "    with x = a?,\n",
+                "         y = b?:\n",
+                "        return Ok(f\"{x}{y}\")\n",
+                "    else err:\n",
+                "        return Err(err)\n",
+            ),
+            // A compound `?` header — the pass the copy had fallen behind on.
+            concat!(
+                "def g(a: Result[int, str]) -> Result[int, str]:\n",
+                "    if a? > 0:\n",
+                "        return Ok(1)\n",
+                "    return Ok(0)\n",
+            ),
+        ];
+        for src in sources {
+            let result = format_source(src, "<test>");
+            assert!(
+                result.is_ok(),
+                "the formatter rejected source the checker accepts:\n{src}\n{:?}",
+                result.err()
             );
         }
         unsafe {

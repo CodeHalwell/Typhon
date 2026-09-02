@@ -770,6 +770,132 @@ fn vm_run_resolves_siblings_and_binds_sealed_union_alias() {
 }
 
 #[test]
+fn tyc_run_falls_back_to_the_compiled_path_for_an_unmodelled_module() {
+    // The VM models a documented subset of the stdlib. `tyc run` is
+    // contractually a drop-in for `tyc build` + CPython, so a program
+    // importing something outside that subset must run, not die with
+    // `ModuleNotFoundError` on code the compiled path handles.
+    let project = tempfile::tempdir().unwrap();
+    let script = project.path().join("uses_sqlite.ty");
+    std::fs::write(
+        &script,
+        "import sqlite3\n\n\
+         def main() -> None:\n    \
+             with sqlite3.connect(\":memory:\") as conn:\n        \
+                 let cur = conn.cursor()\n        \
+                 cur.execute(\"CREATE TABLE t (x INTEGER)\")\n        \
+                 cur.execute(\"INSERT INTO t VALUES (42)\")\n        \
+                 for row in cur.execute(\"SELECT x FROM t\"):\n            \
+                     print(row[0])\n\n\
+         main()\n",
+    )
+    .unwrap();
+
+    let out = tyc().arg("run").arg(&script).output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "tyc run must fall back rather than fail:\n{stderr}{stdout}"
+    );
+    assert!(
+        stdout.contains("42"),
+        "the program must actually run:\n{stderr}{stdout}"
+    );
+    assert!(
+        stderr.contains("not modelled by the in-process VM"),
+        "the fallback must say why it happened:\n{stderr}"
+    );
+
+    // `--no-fallback` keeps the VM's own failure, for a hermetic run or to
+    // find out whether the VM covers a program's imports.
+    let strict = tyc()
+        .arg("run")
+        .arg("--no-fallback")
+        .arg(&script)
+        .output()
+        .unwrap();
+    let strict_err = String::from_utf8_lossy(&strict.stderr);
+    assert!(
+        strict_err.contains("No module named 'sqlite3'"),
+        "--no-fallback must surface the VM's ModuleNotFoundError:\n{strict_err}"
+    );
+
+    // A program whose imports the VM *does* model must not be diverted.
+    let plain = project.path().join("plain.ty");
+    std::fs::write(
+        &plain,
+        "import json\n\ndef main() -> None:\n    print(json.dumps({\"a\": 1}))\n\nmain()\n",
+    )
+    .unwrap();
+    let out = tyc().arg("run").arg(&plain).output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("not modelled"),
+        "a modelled-import program must stay in the VM:\n{stderr}"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("{\"a\": 1}"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn vm_binds_module_dunders_like_cpython() {
+    // CPython gives every module its own `__name__`, `__doc__` and
+    // `__file__`. The VM bound `__name__` only on the entry module, so an
+    // imported sibling saw the entry's `"__main__"` and its
+    // `if __name__ == "__main__":` block ran under `tyc run` but not after
+    // `tyc build` — and `__doc__` was missing everywhere.
+    let project = tempfile::tempdir().unwrap();
+    let src = project.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(
+        project.path().join("typhon.toml"),
+        "[project]\nname = \"u\"\nversion = \"0.1.0\"\nsrc = \"src\"\nout = \"build\"\n\
+         [python]\ntarget = \"3.13\"\n[emit]\nformat = false\n[strictness]\n[env]\n",
+    )
+    .unwrap();
+    std::fs::write(
+        src.join("sib.ty"),
+        "\"\"\"Sibling doc.\"\"\"\n\n\
+         print(\"sib\", __name__)\n\
+         if __name__ == \"__main__\":\n    print(\"SHOULD NOT RUN\")\n",
+    )
+    .unwrap();
+    std::fs::write(
+        src.join("main.ty"),
+        "\"\"\"Main doc.\"\"\"\n\
+         import sib\n\n\
+         print(\"main\", __name__, __doc__, sib.__doc__, sib.__name__)\n",
+    )
+    .unwrap();
+    let out = tyc().arg("run").arg(project.path()).output().unwrap();
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stderr),
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(
+        out.status.success(),
+        "tyc run must succeed, got: {combined}"
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("sib sib\n"),
+        "an imported module's `__name__` is its own module name, got: {combined}"
+    );
+    assert!(
+        !stdout.contains("SHOULD NOT RUN"),
+        "an imported module's main-guard must stay shut, got: {combined}"
+    );
+    assert!(
+        stdout.contains("main __main__ Main doc. Sibling doc. sib"),
+        "module dunders must match CPython, got: {combined}"
+    );
+}
+
+#[test]
 fn pub_enum_parses_checks_and_exports() {
     // `pub enum` must parse (it was a hard parse error), check clean, and
     // contribute its name to the synthesised `__all__`.
@@ -941,6 +1067,457 @@ fn build_produces_py_file_from_simple_source() {
     assert!(
         tmp.path().join("build").join("main.py").exists(),
         "build/main.py should be emitted"
+    );
+}
+
+/// A flat source root is not a package, so a sibling import emits as
+/// absolute: `python build/main.py` puts `build/` on `sys.path`, and the
+/// relative form would fail there with "attempted relative import with no
+/// known parent package" — while the VM resolves it, splitting the two
+/// surfaces on a layout `tyc check` accepts.
+#[test]
+fn build_flattens_relative_imports_in_a_flat_source_root() {
+    let tmp = tempfile::tempdir().unwrap();
+    scaffold(
+        tmp.path(),
+        "from .models import Point\n\ndef main() -> None:\n    print(Point(x=1, y=2))\n\nmain()\n",
+    );
+    std::fs::write(
+        tmp.path().join("src").join("models.ty"),
+        "pub class Point:\n    x: int\n    y: int\n",
+    )
+    .unwrap();
+    let status = tyc().arg("build").arg(tmp.path()).status().unwrap();
+    assert!(status.success(), "tyc build should succeed");
+    let emitted = std::fs::read_to_string(tmp.path().join("build").join("main.py")).unwrap();
+    assert!(
+        emitted.contains("from models import Point"),
+        "sibling import should emit absolute, got:\n{emitted}"
+    );
+    assert!(
+        !emitted.contains("from .models"),
+        "the relative form must not survive:\n{emitted}"
+    );
+}
+
+/// `tyc run --compile <file>` stages the script into a temp scaffold, so
+/// without a label the user is pointed at `/tmp/tyc-script-…/src/main.ty`
+/// for a diagnostic in a file they can see right there.
+#[test]
+fn single_file_compile_reports_the_user_s_own_path() {
+    let tmp = tempfile::tempdir().unwrap();
+    let script = tmp.path().join("scriptish.ty");
+    std::fs::write(&script, "let x: int = \"not an int\"\n").unwrap();
+    let out = tyc()
+        .arg("run")
+        .arg("--compile")
+        .arg("--temp")
+        .arg(&script)
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("scriptish.ty"),
+        "diagnostics should name the script, got:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("tyc-script-"),
+        "the temp scaffold path must not leak into diagnostics:\n{stderr}"
+    );
+}
+
+/// A bare `.ty` file that imports a sibling is a program the VM runs on its
+/// own — the import scan must not read `helper` as an unmodelled external
+/// module and send it down the compiled path, which used to stage only the
+/// entry and then fail on the very import the VM resolves.
+#[test]
+fn run_resolves_sibling_modules_beside_a_bare_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join("helper.ty"),
+        "pub def greet(name: str) -> str:\n    return f\"hi {name}\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        tmp.path().join("prog.ty"),
+        "from helper import greet\n\ndef main() -> None:\n    print(greet(\"ada\"))\n\nmain()\n",
+    )
+    .unwrap();
+    let out = tyc()
+        .arg("run")
+        .arg(tmp.path().join("prog.ty"))
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stdout.contains("hi ada"),
+        "sibling import should just run:\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains("not modelled"),
+        "a sibling module is not an unmodelled import:\n{stderr}"
+    );
+}
+
+/// `--temp` builds into a scratch directory outside the project, which the
+/// output confinement check has to allow — it exists to stop a checked-out
+/// tree redirecting the *default* `out`, not to veto a destination the
+/// caller named.
+#[test]
+fn run_compile_temp_builds_outside_the_project_root() {
+    let tmp = tempfile::tempdir().unwrap();
+    scaffold(
+        tmp.path(),
+        "def main() -> None:\n    print(\"temp ok\")\n\nmain()\n",
+    );
+    let out = tyc()
+        .arg("run")
+        .arg("--compile")
+        .arg("--temp")
+        .arg(tmp.path())
+        .env("TYC_NO_SYNC", "1")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stdout.contains("temp ok"),
+        "--temp should build and run:\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains("outside"),
+        "the scratch build directory must not be refused:\n{stderr}"
+    );
+}
+
+#[test]
+fn check_mode_does_not_create_the_output_directory() {
+    let tmp = tempfile::tempdir().unwrap();
+    scaffold(
+        tmp.path(),
+        "def main() -> None:\n    print(\"hi\")\n\nmain()\n",
+    );
+    let out = tyc()
+        .arg("build")
+        .arg("--check")
+        .arg("--out")
+        .arg("newdir")
+        .arg(tmp.path())
+        .env("TYC_NO_SYNC", "1")
+        .output()
+        .unwrap();
+    // `--check` reports on stderr, leaving stdout for the program's output.
+    let reported = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(
+        reported.contains("would write"),
+        "--check should report what it would write:\n{reported}"
+    );
+    assert!(
+        !tmp.path().join("newdir").exists(),
+        "--check must not create the output directory"
+    );
+    // The same invocation without `--check` still creates it.
+    tyc()
+        .arg("build")
+        .arg("--out")
+        .arg("newdir")
+        .arg(tmp.path())
+        .env("TYC_NO_SYNC", "1")
+        .output()
+        .unwrap();
+    assert!(
+        tmp.path().join("newdir").join("main.py").is_file(),
+        "a real build still writes into the output directory"
+    );
+}
+
+#[test]
+fn a_basemodel_string_literal_does_not_pull_in_pydantic() {
+    let tmp = tempfile::tempdir().unwrap();
+    scaffold(
+        tmp.path(),
+        "def main() -> None:\n    let banner: str = \"BaseModel\"\n    # BaseModel here too\n    print(banner)\n\nmain()\n",
+    );
+    tyc()
+        .arg("build")
+        .arg(tmp.path())
+        .env("TYC_NO_SYNC", "1")
+        .output()
+        .unwrap();
+    let manifest = std::fs::read_to_string(tmp.path().join("pyproject.toml")).unwrap_or_default();
+    assert!(
+        !manifest.contains("pydantic"),
+        "a string literal must not add pydantic as a dependency:\n{manifest}"
+    );
+}
+
+#[test]
+fn run_scans_an_adjacent_package_for_unmodelled_imports() {
+    let tmp = tempfile::tempdir().unwrap();
+    let pkg = tmp.path().join("pkg");
+    std::fs::create_dir_all(&pkg).unwrap();
+    std::fs::write(
+        tmp.path().join("app.ty"),
+        "from pkg.store import name\n\n\ndef main() -> None:\n    print(name())\n\n\nmain()\n",
+    )
+    .unwrap();
+    std::fs::write(pkg.join("__init__.ty"), "").unwrap();
+    // `sqlite3` is not modelled by the VM, so the run has to compile.
+    std::fs::write(
+        pkg.join("store.ty"),
+        "import sqlite3\n\n\ndef name() -> str:\n    return sqlite3.version if False else \"store\"\n",
+    )
+    .unwrap();
+    let out = tyc()
+        .arg("run")
+        .arg(tmp.path().join("app.ty"))
+        .env("TYC_NO_SYNC", "1")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stdout.contains("store"),
+        "the package's unmodelled import should send the run down the compiled path:\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("sqlite3"),
+        "the fallback should name the import it could not model:\n{stderr}"
+    );
+}
+
+#[test]
+fn vm_imports_a_submodule_through_its_package() {
+    let tmp = tempfile::tempdir().unwrap();
+    scaffold(
+        tmp.path(),
+        "from pkg import store\nfrom pkg.inner import deep\n\n\ndef main() -> None:\n    print(store.name(), deep.value())\n    try:\n        from pkg import nope\n    except ImportError as e:\n        print(\"ImportError\", str(e)[:44])\n\n\nmain()\n",
+    );
+    let pkg = tmp.path().join("src").join("pkg");
+    std::fs::create_dir_all(pkg.join("inner")).unwrap();
+    std::fs::write(pkg.join("__init__.ty"), "").unwrap();
+    std::fs::write(
+        pkg.join("store.ty"),
+        "def name() -> str:\n    return \"store\"\n",
+    )
+    .unwrap();
+    std::fs::write(pkg.join("inner").join("__init__.ty"), "").unwrap();
+    std::fs::write(
+        pkg.join("inner").join("deep.ty"),
+        "def value() -> int:\n    return 7\n",
+    )
+    .unwrap();
+    let out = tyc()
+        .arg("run")
+        .arg("--no-fallback")
+        .arg(tmp.path())
+        .env("TYC_NO_SYNC", "1")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stdout.contains("store 7"),
+        "`from pkg import submodule` should load the submodule:\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(
+        stdout.contains("ImportError cannot import name 'nope' from 'pkg'"),
+        "a name the package does not have is an ImportError, not an AttributeError:\n{stdout}"
+    );
+}
+
+#[test]
+fn fmt_round_trips_the_corpus_shapes_it_used_to_corrupt() {
+    // End-to-end, through the real binary (so the `ruff format` wrap is in
+    // play, unlike the crate-level tests which disable it):
+    //
+    //   * a `freeze let` bound to a multi-line string must survive
+    //     formatting — it used to come back with the desugaring's
+    //     `__typhon_freeze__(` baked in and no longer parse;
+    //   * a multi-line `with`-chain using `?` must be accepted — the
+    //     formatter used to reject source `tyc check` accepts;
+    //   * formatting must converge in one pass, and the program must still
+    //     run to the same output afterwards.
+    let tmp = tempfile::tempdir().unwrap();
+    let source = concat!(
+        "freeze let BANNER = \"\"\"\n",
+        "hi ) there\n",
+        "\"\"\"\n",
+        "\n",
+        "\n",
+        "def pair(a: Result[str, str], b: Result[str, str]) -> Result[str, str]:\n",
+        "    with x = a?,\n",
+        "         y = b?:\n",
+        "        return Ok(x + y)\n",
+        "    else err:\n",
+        "        return Err(err)\n",
+        "\n",
+        "\n",
+        "def main() -> None:\n",
+        "    print(BANNER.strip(), pair(Ok(\"a\"), Ok(\"b\")))\n",
+        "\n",
+        "\n",
+        "main()\n",
+    );
+    scaffold(tmp.path(), source);
+    let entry = tmp.path().join("src").join("main.ty");
+
+    let before = tyc()
+        .arg("run")
+        .arg("--no-fallback")
+        .arg(tmp.path())
+        .env("TYC_NO_SYNC", "1")
+        .output()
+        .unwrap();
+    let before_out = String::from_utf8_lossy(&before.stdout).into_owned();
+    assert!(
+        before_out.contains("hi ) there"),
+        "the unformatted program should run: {before_out}"
+    );
+
+    let fmt1 = tyc().arg("fmt").arg(&entry).output().unwrap();
+    assert!(
+        fmt1.status.success(),
+        "tyc fmt rejected source tyc check accepts:\n{}",
+        String::from_utf8_lossy(&fmt1.stderr)
+    );
+    let pass1 = std::fs::read_to_string(&entry).unwrap();
+    assert!(
+        !pass1.contains("__typhon_freeze__"),
+        "the freeze desugaring leaked into the formatted source:\n{pass1}"
+    );
+
+    // Convergence: a second pass must be a no-op, and `--check` must agree.
+    let fmt2 = tyc().arg("fmt").arg(&entry).output().unwrap();
+    assert!(fmt2.status.success(), "second fmt pass failed");
+    assert_eq!(
+        pass1,
+        std::fs::read_to_string(&entry).unwrap(),
+        "tyc fmt is not idempotent on this file"
+    );
+    let check = tyc()
+        .arg("fmt")
+        .arg("--check")
+        .arg(&entry)
+        .output()
+        .unwrap();
+    assert!(
+        check.status.success(),
+        "tyc fmt --check should pass on already-formatted source:\n{}",
+        String::from_utf8_lossy(&check.stderr)
+    );
+
+    // And meaning is preserved.
+    let after = tyc()
+        .arg("run")
+        .arg("--no-fallback")
+        .arg(tmp.path())
+        .env("TYC_NO_SYNC", "1")
+        .output()
+        .unwrap();
+    assert_eq!(
+        before_out,
+        String::from_utf8_lossy(&after.stdout),
+        "formatting changed the program's output"
+    );
+}
+
+#[test]
+fn fmt_reports_a_broken_file_and_still_formats_the_rest() {
+    // One unparseable file must not stop the walk: `tyc fmt <dir>` used to
+    // bail out at the first failure, leaving the tree half-formatted with
+    // no record of what it never reached.
+    let tmp = tempfile::tempdir().unwrap();
+    scaffold(
+        tmp.path(),
+        "def main() -> None:\n    print(1)\n\n\nmain()\n",
+    );
+    let src = tmp.path().join("src");
+    // Sorts before `main.ty`, so it is visited first.
+    std::fs::write(src.join("aa_broken.ty"), "def f(:\n").unwrap();
+    std::fs::write(src.join("zz_messy.ty"), "def g():\n\tpass\n").unwrap();
+
+    let out = tyc().arg("fmt").arg(&src).output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success(),
+        "an unformattable file must still fail the run"
+    );
+    assert!(
+        stderr.contains("1 file could not be formatted"),
+        "the failure should be counted and named:\n{stderr}"
+    );
+    let messy = std::fs::read_to_string(src.join("zz_messy.ty")).unwrap();
+    assert!(
+        messy.contains("    pass"),
+        "the file after the broken one must still be formatted, got {messy:?}"
+    );
+}
+
+#[test]
+fn diagnostics_in_one_file_keep_their_own_source() {
+    // The renderer sanitised the FIRST diagnostic of a file and lent that
+    // buffer to every other one in the group. Diagnostics grouped by file
+    // do not all carry the same buffer: most are remapped onto the
+    // original `.ty` text, but any that isn't still carries the
+    // preprocessed one. Lending that to a remapped diagnostic renders its
+    // original-coordinate span against preprocessed text — which put a
+    // `tyc::type_mismatch` two lines off, inside a comment, under a line
+    // reading `dict[str, object] | None` where the source says `?`.
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join("k.ty");
+    std::fs::write(
+        &file,
+        concat!(
+            "class E:\n",        // 1
+            "    status: int\n", // 2
+            "\n",                // 3
+            "\n",                // 4
+            "class SDK:\n",      // 5
+            "    url: str\n",    // 6
+            "\n",                // 7
+            "\n",                // 8
+            "impl SDK:\n",       // 9
+            // The `?` here lengthens the preprocessed line by six bytes,
+            // which is what drags every later span out of alignment.
+            "    def req(self, body: dict[str, object]?) -> Result[dict[str, object], E]:\n", // 10
+            "        # a comment\n",                                                          // 11
+            "        if body is None:\n",                                                     // 12
+            "            return Ok({\"a\": 1})\n", // 13  <- the mismatch
+            "        return Err(E(status=404))\n", // 14
+            "\n",                                  // 15
+            "\n",                                  // 16
+            "def main() -> None:\n",               // 17
+            "    let u: int = 1\n",                // 18
+            "    match u:\n",                      // 19
+            "        case int(u): print(u)\n",     // 20
+        ),
+    )
+    .unwrap();
+
+    let out = tyc().arg("check").arg(&file).output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let block = stderr
+        .split("type mismatch")
+        .nth(1)
+        .unwrap_or_else(|| panic!("expected a type mismatch:\n{stderr}"));
+    let anchor = block
+        .lines()
+        .find(|l| l.contains("╭─["))
+        .unwrap_or_else(|| panic!("no anchor line:\n{stderr}"));
+    assert!(
+        anchor.contains("k.ty:13:"),
+        "the mismatch is on line 13; got {anchor}\n{stderr}"
+    );
+    // And the rendered listing is the user's source, not the lowering.
+    assert!(
+        !stderr.contains("dict[str, object] | None"),
+        "the preprocessed form leaked into the listing:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("__typhon_impl_"),
+        "the impl lowering leaked into the listing:\n{stderr}"
     );
 }
 

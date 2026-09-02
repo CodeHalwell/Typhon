@@ -39,10 +39,12 @@ error[tyc::impure_pure_fn]: `fetch` is annotated `@pure` but performs I/O
 ## What's I/O?
 
 - `open(...)`, `socket`, `subprocess`, `urllib`, `requests`, `httpx`, `aiohttp`.
-- `print()`, logger calls.
+- `print()`, logger calls (`logger.warning(...)` on any logger-named receiver).
 - Database drivers.
-- Filesystem operations.
+- Filesystem operations, and I/O method names on any receiver (`.read_text()`, `.write()`, `.send()`, `.sleep()`, `.execute()`).
 - `unsafe:` calls (unless the stub is annotated `@pure`).
+
+Calls are resolved through the module's import aliases, so `datetime.now()` after `from datetime import datetime` and `np.random.rand()` after `import numpy as np` are seen for what they are. A call the checker cannot classify — a method on a value of unknown type, a module outside the pure stdlib allow-list — is *trusted* under `@pure`; only the automatic optimisations insist on provable purity.
 
 ## What's non-determinism?
 
@@ -53,8 +55,9 @@ error[tyc::impure_pure_fn]: `fetch` is annotated `@pure` but performs I/O
 
 ## What's mutable module state?
 
-- Reads from a module-level `mut` binding.
-- Writes to any module-level binding (including `let`, via mutation through fields).
+- Reads from a module-level `mut` binding (or one rebound after its definition, or declared `global` in some function).
+- Writes to any module-level binding (including `let`, via mutation through fields or a mutating method such as `REGISTRY.append(x)`).
+- Writes to an *argument* — `c.n = c.n + 1`, `xs.pop()`, `next(it)` on a parameter — are impure for the same reason: the caller can see them.
 
 `comptime let` reads are fine — those are inlined as literals.
 

@@ -1,0 +1,5 @@
+plain class Grid:
+    xs: list[int] = [1, 2]
+    pairs: list[int] = [a + b for a in xs for b in xs]
+
+print(Grid.pairs)

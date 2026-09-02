@@ -1,0 +1,14 @@
+﻿"""Module docstring."""
+
+def f() -> Result[int, str]:
+    return Ok(1)
+
+def g() -> Result[int, str]:
+    let x: int = f()?
+    return Ok(x + 1)
+
+def main() -> None:
+    print(g())
+
+if __name__ == "__main__":
+    main()

@@ -73,3 +73,18 @@ separate function-local binding instead, so the module constant was left alone
 at check time and clobbered at run time.
 
 See https://github.com/CodeHalwell/Typhon/blob/main/docs/diagnostics/immutable_assign.md
+
+## Augmented assignment
+
+`x += 1` rebinds `x` exactly as `x = x + 1` does, so it is subject to the same
+rule: a `let` binding, an un-`mut` parameter, a loop target, or a `global` /
+`nonlocal` `let` cannot be augmented. Declare the binding `mut` when it needs
+to accumulate.
+
+```ty
+def total(xs: list[int]) -> int:
+    let acc: int = 0
+    for x in xs:
+        acc += x          # error: cannot assign to immutable binding 'acc'
+    return acc            # fix: `mut acc: int = 0`
+```

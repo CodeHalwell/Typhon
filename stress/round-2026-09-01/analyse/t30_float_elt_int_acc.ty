@@ -1,0 +1,5 @@
+def f(xs: list[int]) -> int:
+    mut total: int = 0
+    for x in xs:
+        total += x / 2
+    return total

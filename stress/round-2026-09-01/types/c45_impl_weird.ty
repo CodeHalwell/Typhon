@@ -1,0 +1,11 @@
+impl Nope:
+    def f(self) -> int:
+        return 1
+
+extend int:
+    def twice(self) -> int:
+        return self.twice() * 2
+
+def main() -> None:
+    let n: int = 2
+    print(n.twice())

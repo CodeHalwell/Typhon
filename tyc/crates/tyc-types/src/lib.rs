@@ -21,6 +21,7 @@
 //! coverage.
 
 use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 
 use ruff_python_ast::{Expr, MatchCase, ModModule, Number, Operator, Pattern, Stmt, StmtAssign};
 use ruff_text_size::{Ranged, TextRange};
@@ -425,6 +426,15 @@ pub fn assignable(expected: &Type, actual: &Type) -> bool {
                     }
                 })
         }
+        // A `str` is an iterable (and a sequence) of one-character `str`s and
+        // `bytes` one of `int`s, so each satisfies the read-only protocols
+        // when the element type does (`"".join("abc")`, `set(b"ab")`).
+        (Type::Generic(an, aa), Type::Str) if is_read_view_abc(an) && aa.len() == 1 => {
+            assignable(&aa[0], &Type::Str)
+        }
+        (Type::Generic(an, aa), Type::Bytes) if is_read_view_abc(an) && aa.len() == 1 => {
+            assignable(&aa[0], &Type::Int)
+        }
         // Bare (unparameterized) `Ok` or `Err` is assignable to `Result[T, E]`
         // without parameter checking. This arises when the `?` operator expands
         // into `if isinstance(x, Err): return x`, and the isinstance-narrowing
@@ -810,6 +820,94 @@ fn is_dynamic_type(t: &Type) -> bool {
 /// asyncio entry-points that accept coroutines as direct arguments.
 /// Used by the `missing_await` check (FINDINGS #49) to suppress
 /// false positives on the canonical `asyncio.run(coro())` pattern.
+/// `Some(spawned callee)` when a function body spawns a task with `go` in
+/// its own statements (nested `def`s are separate frames).
+fn body_spawns_task(body: &[Stmt]) -> Option<String> {
+    struct V {
+        found: Option<String>,
+    }
+    impl ruff_python_ast::visitor::Visitor<'_> for V {
+        fn visit_stmt(&mut self, s: &Stmt) {
+            if self.found.is_some() || matches!(s, Stmt::FunctionDef(_) | Stmt::ClassDef(_)) {
+                return;
+            }
+            ruff_python_ast::visitor::walk_stmt(self, s);
+        }
+        fn visit_expr(&mut self, e: &Expr) {
+            if self.found.is_some() {
+                return;
+            }
+            if let Expr::Call(call) = e {
+                if let Some(callee) = task_spawn_callee(call) {
+                    self.found = Some(callee);
+                    return;
+                }
+            }
+            ruff_python_ast::visitor::walk_expr(self, e);
+        }
+    }
+    let mut v = V { found: None };
+    for s in body {
+        ruff_python_ast::visitor::walk_stmt(&mut v, s);
+        if v.found.is_some() {
+            break;
+        }
+    }
+    v.found
+}
+
+/// `Some(callee)` when `call` is the lowered `go` form
+/// `typhon_runtime.tasks.spawn(<callee>(...))`; the callee is rendered for
+/// the diagnostic (`fetch`, `client.get`, or `the coroutine`).
+fn task_spawn_callee(call: &ruff_python_ast::ExprCall) -> Option<String> {
+    let Expr::Attribute(spawn) = call.func.as_ref() else {
+        return None;
+    };
+    if spawn.attr.as_str() != "spawn" {
+        return None;
+    }
+    let Expr::Attribute(tasks) = spawn.value.as_ref() else {
+        return None;
+    };
+    if tasks.attr.as_str() != "tasks"
+        || !matches!(tasks.value.as_ref(), Expr::Name(n) if n.id.as_str() == "typhon_runtime")
+    {
+        return None;
+    }
+    let callee = match call.arguments.args.first() {
+        Some(Expr::Call(inner)) => match inner.func.as_ref() {
+            Expr::Name(n) => n.id.as_str().to_owned(),
+            Expr::Attribute(a) => match a.value.as_ref() {
+                Expr::Name(base) => format!("{}.{}", base.id.as_str(), a.attr.as_str()),
+                _ => a.attr.as_str().to_owned(),
+            },
+            _ => "the coroutine".to_owned(),
+        },
+        _ => "the coroutine".to_owned(),
+    };
+    Some(callee)
+}
+
+/// Whether the callee of `call` is a known `async def`: a module-level async
+/// function called by bare name, or an `async def` method called on a
+/// receiver whose class shape is known.
+fn callee_is_async(c: &Checker, call: &ruff_python_ast::ExprCall) -> bool {
+    match call.func.as_ref() {
+        Expr::Name(n) => c.async_functions.contains(n.id.as_str()),
+        Expr::Attribute(a) => {
+            let recv = infer_expr_readonly(c, &a.value);
+            let class_name = match recv.strip_none() {
+                Type::Class(name) => name,
+                Type::Generic(name, _) => name,
+                _ => return false,
+            };
+            c.find_method(&class_name, a.attr.as_str())
+                .is_some_and(|sig| sig.is_async)
+        }
+        _ => false,
+    }
+}
+
 fn call_targets_coro_acceptor(call: &ruff_python_ast::ExprCall) -> bool {
     let Expr::Attribute(a) = call.func.as_ref() else {
         return false;
@@ -919,9 +1017,23 @@ fn contains_free_typevar(ty: &Type) -> bool {
 /// are the non-generic constructor path's responsibility, out of scope
 /// here). Assignability uses the normal [`Checker::is_assignable`] rule
 /// so int→float widening, None→optional, and subclassing still pass.
+/// The order positional constructor arguments fill a class's fields: the
+/// declared order for a dataclass, and — for a `class!`, whose `__init__`
+/// the desugarer synthesises — the required fields first, then the
+/// defaulted ones.
+fn constructor_positional_order(c: &Checker, name: &str, shape: &InterfaceShape) -> Vec<String> {
+    if !c.is_raw_class(name) {
+        return shape.field_order.clone();
+    }
+    let mut order = shape.field_order.clone();
+    order.sort_by_key(|field| shape.field_defaults.contains(field));
+    order
+}
+
 fn check_generic_constructor_args(
     c: &mut Checker,
     shape: &InterfaceShape,
+    positional_order: &[String],
     bindings: &HashMap<String, Type>,
     pos_args: &[Expr],
     kw_args: &[ruff_python_ast::Keyword],
@@ -932,7 +1044,7 @@ fn check_generic_constructor_args(
             // `*iter` unpack — can't map to a specific field.
             continue;
         }
-        let Some(field_name) = shape.field_order.get(idx) else {
+        let Some(field_name) = positional_order.get(idx) else {
             continue;
         };
         let Some(field_ty) = shape.fields.get(field_name) else {
@@ -1003,9 +1115,14 @@ fn check_one_generic_ctor_arg(
 /// shape it can't fully model. The two helpers target disjoint field kinds
 /// (concrete here, type-parameter there), so a generic class running both
 /// checks never double-reports.
+///
+/// `positional_order` is the order positional arguments fill fields — see
+/// [`constructor_positional_order`]; for a `class!` it is required-first,
+/// not declaration order.
 fn check_concrete_constructor_args(
     c: &mut Checker,
     shape: &InterfaceShape,
+    positional_order: &[String],
     pos_args: &[Expr],
     kw_args: &[ruff_python_ast::Keyword],
 ) {
@@ -1013,7 +1130,7 @@ fn check_concrete_constructor_args(
         if matches!(arg, Expr::Starred(_)) {
             continue;
         }
-        let Some(field_name) = shape.field_order.get(idx) else {
+        let Some(field_name) = positional_order.get(idx) else {
             continue;
         };
         let Some(field_ty) = shape.fields.get(field_name).cloned() else {
@@ -1149,7 +1266,8 @@ fn check_explicit_typearg_constructor(
         })
         .map(|(i, _)| i)
         .collect();
-    check_generic_constructor_args(c, &shape, &bindings, pos_args, kw_args);
+    let positional_order = constructor_positional_order(c, &name, &shape);
+    check_generic_constructor_args(c, &shape, &positional_order, &bindings, pos_args, kw_args);
     for (i, arg) in pos_args.iter().enumerate() {
         if !typevar_field_idxs.contains(&i) {
             let _ = infer_expr(c, arg);
@@ -1247,6 +1365,7 @@ pub fn generic_param_variance(head: &str, idx: usize) -> Variance {
         // discoverability.
         | ("Awaitable", 0)
         | ("Coroutine", 0)
+        | ("Coroutine", 2)
         | ("AsyncIterable", 0)
         | ("AsyncIterator", 0)
         | ("Generator", 0)
@@ -1809,6 +1928,15 @@ pub fn type_from_annotation_with_params(
             Expr::Name(n) => Type::Class(format!("{}.{}", n.id.as_str(), a.attr.as_str())),
             _ => Type::Unknown,
         },
+        // `isinstance(x, (int, str))` — a tuple of classes is the union of
+        // its members. (No annotation is a tuple, so this arm only serves
+        // the narrowing helpers.)
+        Expr::Tuple(t) => Type::union_of(
+            t.elts
+                .iter()
+                .map(|e| type_from_annotation_with_params(e, classes, type_params))
+                .collect(),
+        ),
         _ => Type::Unknown,
     }
 }
@@ -2357,11 +2485,20 @@ struct TypeBinding {
     from_unsafe: bool,
 }
 
+/// One scope's bindings. Held behind an `Rc` so cloning a whole `TypeEnv`
+/// — which every branch, `try` and loop does, several times per statement —
+/// costs one pointer bump per scope instead of a deep copy of every binding
+/// in the module. A scope is deep-copied only when it is actually written
+/// (`Rc::make_mut`), which for a function body means its own frame and not
+/// the module's. Before this, checking a module was quadratic in its
+/// top-level definitions: 4 000 one-`if` functions took 35 s.
+type ScopeMap = Rc<HashMap<String, TypeBinding>>;
+
 /// Type-environment stack — a map of name → TypeBinding per scope.
 #[derive(Debug, Default, Clone)]
 struct TypeEnv {
     /// `scopes[i].get(name)` → binding.
-    scopes: Vec<HashMap<String, TypeBinding>>,
+    scopes: Vec<ScopeMap>,
     /// Flow-sensitive narrowings keyed by attribute access path
     /// (`"self.value"`, `"b.value"`). Lets `if self.x is None: return …`
     /// narrow `self.x` to non-`None` for the rest of the block. Cleared
@@ -2372,14 +2509,14 @@ struct TypeEnv {
 
 impl TypeEnv {
     fn enter(&mut self) {
-        self.scopes.push(HashMap::new());
+        self.scopes.push(Rc::new(HashMap::new()));
     }
     fn leave(&mut self) {
         self.scopes.pop();
     }
     fn declare(&mut self, b: TypeBinding) {
         if let Some(top) = self.scopes.last_mut() {
-            top.insert(b.name.clone(), b);
+            Rc::make_mut(top).insert(b.name.clone(), b);
         }
     }
     fn lookup(&self, name: &str) -> Option<&TypeBinding> {
@@ -2390,13 +2527,22 @@ impl TypeEnv {
         }
         None
     }
+    /// The index of the innermost scope holding `name`. Resolving read-only
+    /// first is what lets a mutation `make_mut` exactly one scope.
+    fn scope_of(&self, name: &str) -> Option<usize> {
+        self.scopes.iter().rposition(|s| s.contains_key(name))
+    }
     /// Apply a narrowing within the topmost frame for the given name.
     fn narrow(&mut self, name: &str, new_type: Type) {
-        for scope in self.scopes.iter_mut().rev() {
-            if let Some(b) = scope.get_mut(name) {
-                b.narrowed = new_type;
-                return;
-            }
+        let Some(idx) = self.scope_of(name) else {
+            return;
+        };
+        // Writing the same type back would deep-copy the scope for nothing.
+        if self.scopes[idx].get(name).map(|b| &b.narrowed) == Some(&new_type) {
+            return;
+        }
+        if let Some(b) = Rc::make_mut(&mut self.scopes[idx]).get_mut(name) {
+            b.narrowed = new_type;
         }
     }
     /// Reset `name`'s narrowing back to its declared type. Used to invalidate a
@@ -2405,13 +2551,17 @@ impl TypeEnv {
     /// is whatever the previous iteration's bottom assigned, not the pre-loop
     /// narrowed value.
     fn widen_to_declared(&mut self, name: &str) {
-        for scope in self.scopes.iter_mut().rev() {
-            if let Some(b) = scope.get_mut(name) {
-                if b.narrowed != b.declared {
-                    b.narrowed = b.declared.clone();
-                }
-                return;
-            }
+        let Some(idx) = self.scope_of(name) else {
+            return;
+        };
+        if self.scopes[idx]
+            .get(name)
+            .is_none_or(|b| b.narrowed == b.declared)
+        {
+            return;
+        }
+        if let Some(b) = Rc::make_mut(&mut self.scopes[idx]).get_mut(name) {
+            b.narrowed = b.declared.clone();
         }
     }
     fn snapshot(&self) -> TypeEnv {
@@ -2427,27 +2577,31 @@ impl TypeEnv {
     /// into the *next* function (an unsound accept) or out of a nested `def`
     /// (a false positive). `check_function` snapshots on entry and restores on
     /// exit so a narrowing applies within the body but never escapes it.
-    fn snapshot_scope_narrowings(&self) -> Vec<Vec<(String, Type)>> {
-        self.scopes
-            .iter()
-            .map(|s| {
-                s.iter()
-                    .map(|(k, b)| (k.clone(), b.narrowed.clone()))
-                    .collect()
-            })
-            .collect()
+    fn snapshot_scope_narrowings(&self) -> Vec<ScopeMap> {
+        self.scopes.clone()
     }
     /// Restore the narrowed types captured by
     /// [`snapshot_scope_narrowings`](Self::snapshot_scope_narrowings). The
     /// snapshot is taken before the body's scope is pushed and restored after
     /// it is popped, so the scope stack has the same shape and `zip` aligns
     /// each saved frame with its live counterpart.
-    fn restore_scope_narrowings(&mut self, snap: Vec<Vec<(String, Type)>>) {
+    fn restore_scope_narrowings(&mut self, snap: Vec<ScopeMap>) {
         for (scope, saved) in self.scopes.iter_mut().zip(snap) {
-            for (name, narrowed) in saved {
-                if let Some(b) = scope.get_mut(&name) {
-                    b.narrowed = narrowed;
-                }
+            // Untouched scope: the body never wrote it, so there is nothing
+            // to undo. This is the common case for every scope outside the
+            // function's own frame, and it keeps the restore O(1) there.
+            if Rc::ptr_eq(scope, &saved) {
+                continue;
+            }
+            let live = Rc::make_mut(scope);
+            for (name, b) in live.iter_mut() {
+                // A binding the snapshot knew: restore its narrowing.
+                // One the body introduced: widen it to its declared type,
+                // which is the state an un-narrowed binding has.
+                b.narrowed = match saved.get(name) {
+                    Some(sb) => sb.narrowed.clone(),
+                    None => b.declared.clone(),
+                };
             }
         }
     }
@@ -2489,11 +2643,21 @@ impl TypeEnv {
         if rebound.is_empty() {
             return;
         }
-        if let Some(globals) = self.scopes.first_mut() {
-            for (name, b) in globals.iter_mut() {
-                if rebound.contains(name) && b.narrowed != b.declared {
-                    b.narrowed = b.declared.clone();
-                }
+        let Some(globals) = self.scopes.first_mut() else {
+            return;
+        };
+        // Read-only first: the module scope is the largest one, and the
+        // overwhelmingly common case is that nothing needs widening — do
+        // not deep-copy it to discover that.
+        let needs_reset = globals
+            .iter()
+            .any(|(name, b)| rebound.contains(name) && b.narrowed != b.declared);
+        if !needs_reset {
+            return;
+        }
+        for (name, b) in Rc::make_mut(globals).iter_mut() {
+            if rebound.contains(name) && b.narrowed != b.declared {
+                b.narrowed = b.declared.clone();
             }
         }
     }
@@ -2513,7 +2677,21 @@ impl TypeEnv {
     fn reset_narrowings_to(&mut self, base: &TypeEnv) {
         for (i, scope) in self.scopes.iter_mut().enumerate() {
             let base_scope = base.scopes.get(i);
-            for (name, b) in scope.iter_mut() {
+            // Identical scope objects already agree on every narrowing.
+            if base_scope.is_some_and(|b| Rc::ptr_eq(scope, b)) {
+                continue;
+            }
+            let differs =
+                scope
+                    .iter()
+                    .any(|(name, b)| match base_scope.and_then(|s| s.get(name)) {
+                        Some(bb) => bb.narrowed != b.narrowed,
+                        None => b.narrowed != b.declared,
+                    });
+            if !differs {
+                continue;
+            }
+            for (name, b) in Rc::make_mut(scope).iter_mut() {
                 match base_scope.and_then(|s| s.get(name)) {
                     Some(bb) => b.narrowed = bb.narrowed.clone(),
                     None => b.narrowed = b.declared.clone(),
@@ -2533,7 +2711,19 @@ impl TypeEnv {
     fn intersect_narrowings(&mut self, other: &TypeEnv) {
         for (i, scope) in self.scopes.iter_mut().enumerate() {
             let other_scope = other.scopes.get(i);
-            for (name, b) in scope.iter_mut() {
+            if other_scope.is_some_and(|o| Rc::ptr_eq(scope, o)) {
+                continue;
+            }
+            let widens = scope.iter().any(|(name, b)| {
+                b.narrowed != b.declared
+                    && !other_scope
+                        .and_then(|s| s.get(name))
+                        .is_some_and(|ob| ob.narrowed == b.narrowed)
+            });
+            if !widens {
+                continue;
+            }
+            for (name, b) in Rc::make_mut(scope).iter_mut() {
                 let agree = other_scope
                     .and_then(|s| s.get(name))
                     .is_some_and(|ob| ob.narrowed == b.narrowed);
@@ -2573,25 +2763,48 @@ impl TypeEnv {
             let Some(after_scope) = after.scopes.get(i) else {
                 continue;
             };
-            for (name, ab) in after_scope {
-                // `finally` affected this binding if it *assigned* to it — even
-                // to a value of the same type as the conservative entry view, a
-                // write a `before`/`after` type comparison alone cannot see —
-                // or if it moved the narrowed type (a guard, an invalidating
-                // call). Either way `finally`'s result, not the stronger
-                // post-`try` narrowing, is what a normal exit carries downstream.
-                let changed = assigned.names.contains(name)
+            // `finally` never wrote this scope, so it has no delta to
+            // overlay. Identity is exact for *types*, but a same-type
+            // reassignment moves no type at all — the shared allocation
+            // cannot see it — so a name `finally` assigned in this scope
+            // still has to go through the comparison below.
+            let assigned_here = assigned
+                .names
+                .iter()
+                .any(|n| after_scope.contains_key(n.as_str()));
+            if !assigned_here && before_scope.is_some_and(|b| Rc::ptr_eq(b, after_scope)) {
+                continue;
+            }
+            // `finally` affected a binding if it *assigned* to it — even to a
+            // value of the same type as the conservative entry view, a write a
+            // `before`/`after` type comparison alone cannot see — or if it
+            // moved the narrowed type (a guard, an invalidating call). Either
+            // way `finally`'s result, not the stronger post-`try` narrowing,
+            // is what a normal exit carries downstream.
+            let changed_of = |name: &String, ab: &TypeBinding| -> bool {
+                assigned.names.contains(name.as_str())
                     || before_scope
                         .and_then(|s| s.get(name))
                         .map(|bb| &bb.narrowed)
-                        != Some(&ab.narrowed);
-                if let Some(b) = scope.get_mut(name) {
+                        != Some(&ab.narrowed)
+            };
+            let has_delta = after_scope.iter().any(|(name, ab)| match scope.get(name) {
+                Some(b) => changed_of(name, ab) && b.narrowed != ab.narrowed,
+                None => true,
+            });
+            if !has_delta {
+                continue;
+            }
+            let live = Rc::make_mut(scope);
+            for (name, ab) in after_scope.iter() {
+                let changed = changed_of(name, ab);
+                if let Some(b) = live.get_mut(name) {
                     if changed {
                         b.narrowed = ab.narrowed.clone();
                     }
                 } else {
                     // A name `finally` introduced — keep it visible downstream.
-                    scope.insert(name.clone(), ab.clone());
+                    live.insert(name.clone(), ab.clone());
                 }
             }
         }
@@ -2640,14 +2853,78 @@ impl TypeEnv {
 /// conservative direction: the assignment falls through to the ordinary
 /// nominal check rather than being waved through.
 const READ_VIEW_LATTICE: &[(&str, &[&str])] = &[
-    ("Sequence", &["list", "tuple"]),
-    ("Reversible", &["list", "tuple"]),
-    ("Iterable", &["list", "tuple", "set", "frozenset"]),
-    ("Collection", &["list", "tuple", "set", "frozenset"]),
-    ("Container", &["list", "tuple", "set", "frozenset"]),
-    // `Iterator` intentionally has no built-in members.
-    ("Iterator", &[]),
+    ("Sequence", &["list", "tuple", "deque", "range", "Sequence"]),
+    (
+        "Reversible",
+        &["list", "tuple", "deque", "range", "Sequence", "Reversible"],
+    ),
+    // Every iterable: the concrete containers, the dict views (iterating a
+    // `dict` itself yields its keys, which is what `dict[K, V]`'s first
+    // parameter is), the read-only ABCs, and the iterators (an iterator is an
+    // iterable of itself — `", ".join(x for x in xs)` is the everyday case).
+    (
+        "Iterable",
+        &[
+            "list",
+            "tuple",
+            "set",
+            "frozenset",
+            "deque",
+            "range",
+            "dict",
+            "KeysView",
+            "ValuesView",
+            "ItemsView",
+            "Sequence",
+            "Collection",
+            "Iterable",
+            "Iterator",
+            "Generator",
+        ],
+    ),
+    (
+        "Collection",
+        &[
+            "list",
+            "tuple",
+            "set",
+            "frozenset",
+            "deque",
+            "range",
+            "dict",
+            "KeysView",
+            "ValuesView",
+            "ItemsView",
+            "Sequence",
+            "Collection",
+        ],
+    ),
+    (
+        "Container",
+        &[
+            "list",
+            "tuple",
+            "set",
+            "frozenset",
+            "deque",
+            "range",
+            "dict",
+            "KeysView",
+            "ItemsView",
+            "Sequence",
+            "Collection",
+            "Container",
+        ],
+    ),
+    // No built-in *container* is an `Iterator`; only iterators and generators
+    // are (`for` over a list calls `iter()` first, `next(xs)` does not).
+    ("Iterator", &["Iterator", "Generator"]),
 ];
+
+/// True when `abc` names one of the read-only iteration protocols above.
+fn is_read_view_abc(abc: &str) -> bool {
+    READ_VIEW_LATTICE.iter().any(|(name, _)| *name == abc)
+}
 
 /// True when `container` satisfies the read-only ABC `abc`.
 fn read_view_head_accepts(abc: &str, container: &str) -> bool {
@@ -2767,6 +3044,15 @@ struct Checker<'a> {
     /// (`time.sleep`, `requests.get`, …) that should be wrapped in
     /// `await asyncio.to_thread(...)` instead.
     in_async_function: bool,
+    /// Number of `async def` bodies lexically enclosing the current point
+    /// (a sync `def` nested in an `async def` still counts as inside one:
+    /// a running loop may exist when it is called).
+    async_enclosing_depth: u32,
+    /// Top-level sync functions whose body spawns a task with `go`
+    /// (directly, not in a nested def), mapped to the spawned callee's
+    /// name. Calling one from module-level code runs the spawn with no
+    /// event loop.
+    sync_spawners: HashMap<String, String>,
     /// True while we are checking the body of a generator function
     /// (any `def f() -> Iterator[T]` / `Generator[Y, S, R]` whose body
     /// contains `yield` / `yield from`). Inside a generator, `return`
@@ -2786,6 +3072,15 @@ struct Checker<'a> {
     /// `Expr::Attribute` resolution can look up what interface a `T: Iface`
     /// parameter conforms to.
     active_typevar_bounds: HashMap<String, Type>,
+    /// The PEP 695 type parameters of the function body currently being
+    /// checked (`def first[T](xs: list[T]) -> T`). Inside that body a `T` is
+    /// *opaque*: the only values of type `T` are the ones the caller passed
+    /// in, so `return 42` against `-> T`, or `let s: str = x` for `x: T`, is a
+    /// `tyc::type_mismatch` — exactly the two crashes a caller sees when the
+    /// binding is not what the signature promised. At a call site of the
+    /// generic (outside its body) the same `T` stays permissive, because the
+    /// unifier binds it from the arguments.
+    active_type_params: Vec<String>,
     /// Sealed union declarations: name → ordered list of variant class names.
     /// Populated from `type Foo = A | B | C` statements in the first pass.
     sealed_unions: HashMap<String, Vec<String>>,
@@ -2863,6 +3158,13 @@ struct Checker<'a> {
     /// as written in the source (`class Dog(Animal):` → `{"Dog": ["Animal"]}`).
     /// Used by `class_inherits_from` to resolve nominal subtype relationships.
     class_parents: HashMap<String, Vec<String>>,
+    /// The last segment of every declared base, per class — `enum.StrEnum`
+    /// records `StrEnum`, `list[int]` records `list`. `class_parents` maps a
+    /// dotted base to an opaque marker on purpose (an unknown foreign base
+    /// keeps the hierarchy "not fully known"), so this is the only place a
+    /// builtin-derived class (`class Colour(enum.StrEnum)` *is a* `str`) can
+    /// be recognised without disturbing that guard rail.
+    class_base_tails: HashMap<String, Vec<String>>,
     /// Names of classes DEFINED in this module via a real `class` statement
     /// (not imported by name, not seeded from a venv shape). Lets a check
     /// reason about a class's full ancestry with certainty — e.g.
@@ -3007,6 +3309,11 @@ pub struct ArityInfo {
     /// posonlyargs + args. Kw-only params don't count. `None` for
     /// `*args` functions, which accept unbounded positionals.
     pub max_positional: Option<usize>,
+    /// How many leading entries of `param_names` sit before a `/` and are
+    /// therefore positional-*only*. A keyword of that name never binds such
+    /// a parameter: with `**kwargs` it lands there instead, and without one
+    /// CPython rejects the call outright.
+    pub posonly_count: usize,
     /// Names of kw-only parameters (after `*` or `*args`).
     pub kwonly_names: Vec<String>,
     /// Kw-only names that don't have a default value.
@@ -3188,9 +3495,12 @@ impl<'a> Checker<'a> {
             in_question_temp_rhs: false,
             in_sync_function: false,
             in_async_function: false,
+            async_enclosing_depth: 0,
+            sync_spawners: HashMap::new(),
             in_generator: false,
             function_type_bounds: HashMap::new(),
             active_typevar_bounds: HashMap::new(),
+            active_type_params: Vec::new(),
             interfaces: HashMap::new(),
             class_shapes: HashMap::new(),
             class_type_params: HashMap::new(),
@@ -3198,6 +3508,7 @@ impl<'a> Checker<'a> {
             class_param_variance: HashMap::new(),
             frozen_classes: std::collections::HashSet::new(),
             class_parents: HashMap::new(),
+            class_base_tails: HashMap::new(),
             local_classes: std::collections::HashSet::new(),
             self_attrs: HashMap::new(),
             unsafe_depth: 0,
@@ -3323,9 +3634,127 @@ impl<'a> Checker<'a> {
         result
     }
 
+    /// Inside a generic function body its own type parameters are opaque:
+    /// `T` accepts only `T` (plus the permissive `Any` / `Unknown`), and a
+    /// `T`-typed value flows only into `T`, `object`, or — for a bounded
+    /// `T: Base` — anything its bound flows into. `None` means "not an opaque
+    /// position, decide as usual". Only *this* body's parameters are opaque:
+    /// a callee's `U` (or a recursive call's re-instantiation) stays
+    /// permissive because the unifier binds it from the arguments, and a
+    /// constrained parameter (`T: (int, str)`) stays permissive because the
+    /// body legitimately works with whichever constraint was chosen.
+    fn opaque_typevar_verdict(&self, expected: &Type, actual: &Type) -> Option<bool> {
+        if self.active_type_params.is_empty() {
+            return None;
+        }
+        // An annotation resolved without the parameter list in scope spells
+        // the same parameter as `Class("T")`; read both spellings as the
+        // type variable so `let y: T = x` (for `x: T`) is `T` against `T`.
+        let normalise = |t: &Type| -> Type {
+            match t {
+                Type::Class(name) if self.active_type_params.iter().any(|p| p == name) => {
+                    Type::TypeVar(name.clone())
+                }
+                other => other.clone(),
+            }
+        };
+        let (expected_n, actual_n) = (normalise(expected), normalise(actual));
+        let (expected, actual) = (&expected_n, &actual_n);
+        let opaque = |t: &Type| match t {
+            Type::TypeVar(name) => {
+                self.active_type_params.iter().any(|p| p == name)
+                    && !matches!(
+                        self.active_typevar_bounds.get(name),
+                        Some(Type::Union(_)) | Some(Type::Generic(..))
+                    )
+            }
+            _ => false,
+        };
+        match (expected, actual) {
+            (Type::TypeVar(e), Type::TypeVar(a)) if opaque(expected) || opaque(actual) => {
+                Some(e == a)
+            }
+            (Type::TypeVar(_), other) if opaque(expected) => Some(matches!(
+                other,
+                Type::Any | Type::Unknown | Type::TypeConstructor(..)
+            )),
+            (other, Type::TypeVar(name)) if opaque(actual) => {
+                if matches!(other, Type::Any | Type::Unknown | Type::TypeConstructor(..))
+                    || is_object_type(other)
+                {
+                    return Some(true);
+                }
+                // A union target accepts `T` when one of its members does
+                // (`T | None` for a `T` value is the everyday case).
+                if let Type::Union(members) = other {
+                    return Some(members.iter().any(|m| {
+                        matches!(m, Type::TypeVar(n) if n == name)
+                            || self
+                                .active_typevar_bounds
+                                .get(name)
+                                .is_some_and(|b| self.is_assignable(m, b))
+                    }));
+                }
+                Some(
+                    self.active_typevar_bounds
+                        .get(name)
+                        .is_some_and(|bound| self.is_assignable(other, bound)),
+                )
+            }
+            _ => None,
+        }
+    }
+
     fn is_assignable_inner(&self, expected: &Type, actual: &Type) -> bool {
+        if let Some(verdict) = self.opaque_typevar_verdict(expected, actual) {
+            return verdict;
+        }
         if assignable(expected, actual) {
             return true;
+        }
+        // A coroutine is awaitable: `Coroutine[Y, S, R]` satisfies
+        // `Awaitable[R]` when the result types agree — what makes an
+        // `async def` value assignable to a `Callable[..., Awaitable[R]]`
+        // parameter.
+        if let (Type::Generic(eh, ea), Type::Generic(ah, aa)) = (expected, actual) {
+            if eh == "Awaitable" && ah == "Coroutine" && ea.len() == 1 {
+                // The checker's own shorthand is `Coroutine[R]`; the typeshed
+                // form is `Coroutine[Y, S, R]`.
+                let result = match aa.len() {
+                    1 => &aa[0],
+                    3 => &aa[2],
+                    _ => return false,
+                };
+                return self.is_assignable(&ea[0], result);
+            }
+        }
+        // A user class deriving from a builtin *is* that builtin: a
+        // `class Colour(StrEnum)` member is a `str` (`",".join(Colour)` works),
+        // an `IntEnum` member is an `int`. Only the declared-base chain is
+        // consulted, so an unrelated class stays a mismatch.
+        if let Type::Class(name) = actual {
+            let derives = |bases: &[&str]| self.class_derives_from_builtin(name, bases);
+            match expected {
+                Type::Str if derives(&["str", "StrEnum", "enum.StrEnum"]) => return true,
+                Type::Int
+                    if derives(&["int", "IntEnum", "enum.IntEnum", "IntFlag", "enum.IntFlag"]) =>
+                {
+                    return true
+                }
+                Type::Float
+                    if derives(&[
+                        "float",
+                        "int",
+                        "IntEnum",
+                        "enum.IntEnum",
+                        "IntFlag",
+                        "enum.IntFlag",
+                    ]) =>
+                {
+                    return true
+                }
+                _ => {}
+            }
         }
         // Higher-kinded positions are unbound until call-site inference
         // binds them. A formal `F[A]` (a `Generic` whose head is a
@@ -3720,6 +4149,16 @@ impl<'a> Checker<'a> {
             let exp_name = exp_head.as_str();
             if exp_args.len() == 1 && matches!(exp_name, "Iterator" | "Iterable") {
                 if let Type::Class(act_name) | Type::Generic(act_name, _) = actual {
+                    // An `enum` class iterates over its members (`",".join(Colour)`
+                    // for a `StrEnum`), and a member of a `str`-derived enum is
+                    // itself a `str`, so either is an `Iterable[T]` when the member
+                    // type is.
+                    if exp_name == "Iterable"
+                        && self.enums.contains_key(act_name.as_str())
+                        && self.is_assignable(&exp_args[0], &Type::Class(act_name.clone()))
+                    {
+                        return true;
+                    }
                     // `Iterator[T]` needs `__next__(self) -> T` AND `__iter__`
                     // — a `__next__`-only class is not iterable (`iter(obj)` /
                     // `for x in obj` require `__iter__`; the standard iterator
@@ -4175,19 +4614,33 @@ impl<'a> Checker<'a> {
             n == iface_name || n == iface_bare
         };
         for (m, iface_sig) in &iface_shape.methods {
+            // Skip the return check when the interface method returns the same
+            // interface type to avoid infinite recursion for self-referential
+            // interfaces (e.g. `def next(self) -> Node`).
+            let iface_ret = if iface_subst.is_empty() {
+                iface_sig.return_type.clone()
+            } else {
+                substitute_typevars(&iface_sig.return_type, iface_subst)
+            };
             match self.find_method(cls_name, m) {
                 Some(cls_sig) if cls_sig.arity == iface_sig.arity => {
+                    // `async def` is part of the contract in both directions: a
+                    // caller `await`s an interface coroutine method (an `int`
+                    // from a sync implementation crashes) and calls a sync one
+                    // directly (a coroutine from an async implementation never
+                    // runs).
+                    if cls_sig.is_async != iface_sig.is_async {
+                        return false;
+                    }
+                    // A `@property` is read as a value, a plain method is
+                    // called; an implementation that swaps one for the other
+                    // does not provide the member as written.
+                    if cls_sig.is_property != iface_sig.is_property {
+                        return false;
+                    }
                     // Both return types must be known to enforce compatibility.
                     // Unknown return type on either side is treated as compatible
                     // so unannotated methods don't block conformance.
-                    // Skip the check when the interface method returns the same
-                    // interface type to avoid infinite recursion for
-                    // self-referential interfaces (e.g. `def next(self) -> Node`).
-                    let iface_ret = if iface_subst.is_empty() {
-                        iface_sig.return_type.clone()
-                    } else {
-                        substitute_typevars(&iface_sig.return_type, iface_subst)
-                    };
                     if iface_ret != Type::Unknown
                         && cls_sig.return_type != Type::Unknown
                         && !is_self_ref(&iface_ret)
@@ -4223,6 +4676,15 @@ impl<'a> Checker<'a> {
                         }
                     }
                 }
+                // A `@property` member is also satisfied by a plain field of the
+                // right type — reading either yields the value.
+                None if iface_sig.is_property => match self.find_field(cls_name, m) {
+                    Some(cls_type)
+                        if iface_ret == Type::Unknown
+                            || is_self_ref(&iface_ret)
+                            || self.is_assignable(&iface_ret, cls_type) => {}
+                    _ => return false,
+                },
                 _ => return false,
             }
         }
@@ -4235,7 +4697,15 @@ impl<'a> Checker<'a> {
             match self.find_field(cls_name, f) {
                 Some(cls_type) if self.is_assignable(&iface_type, cls_type) => {}
                 Some(_) => return false, // field present but wrong type
-                None if self.find_method(cls_name, f).is_some_and(|s| s.arity == 0) => {} // property-like method satisfies field
+                // A `@property` of the right type satisfies a field — reading
+                // it yields the value. A plain zero-argument *method* does not:
+                // `obj.f` would be a bound method where the interface promised
+                // the value itself.
+                None if self.find_method(cls_name, f).is_some_and(|s| {
+                    s.is_property
+                        && (s.return_type == Type::Unknown
+                            || self.is_assignable(&iface_type, &s.return_type))
+                }) => {}
                 None => return false,
             }
         }
@@ -4297,6 +4767,30 @@ impl<'a> Checker<'a> {
     /// Return `true` when `child` transitively inherits from `parent` via the
     /// `class_parents` map built during the first collection pass.  Uses an
     /// iterative depth-first search to avoid stack overflow on deep hierarchies.
+    /// `true` when `class_name`, or a user class in its declared parent chain,
+    /// lists one of `tails` (a builtin such as `str`, or `StrEnum`) among its
+    /// bases — see `class_base_tails`.
+    fn class_derives_from_builtin(&self, class_name: &str, tails: &[&str]) -> bool {
+        let mut stack: Vec<&str> = vec![class_name];
+        let mut visited: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        while let Some(name) = stack.pop() {
+            if !visited.insert(name) {
+                continue;
+            }
+            if self
+                .class_base_tails
+                .get(name)
+                .is_some_and(|bases| bases.iter().any(|b| tails.contains(&b.as_str())))
+            {
+                return true;
+            }
+            if let Some(parents) = self.class_parents.get(name) {
+                stack.extend(parents.iter().map(String::as_str));
+            }
+        }
+        false
+    }
+
     fn class_inherits_from(&self, child: &str, parent: &str) -> bool {
         let mut stack: Vec<&str> = vec![child];
         let mut visited: std::collections::HashSet<&str> = std::collections::HashSet::new();
@@ -7891,6 +8385,17 @@ fn collect_classes_and_functions(c: &mut Checker, body: &[Stmt]) {
                         _ => "__typhon_unknown_base__".to_owned(),
                     })
                     .collect();
+                let tails: Vec<String> = cd
+                    .bases()
+                    .iter()
+                    .filter_map(base_last_segment)
+                    .map(str::to_owned)
+                    .collect();
+                if tails.is_empty() {
+                    c.class_base_tails.remove(name);
+                } else {
+                    c.class_base_tails.insert(name.to_owned(), tails);
+                }
                 if !parents.is_empty() {
                     c.class_parents.insert(name.to_owned(), parents);
                 } else {
@@ -8270,8 +8775,18 @@ fn collect_classes_and_functions(c: &mut Checker, body: &[Stmt]) {
     for stmt in body {
         if let Stmt::FunctionDef(f) = stmt {
             let tps = type_param_names_from(f.type_params.as_deref());
-            let sig =
+            let mut sig =
                 function_signature(&classes, f.parameters.as_ref(), f.returns.as_deref(), &tps);
+            // Calling an `async def` yields a coroutine, so as a *value* the
+            // function is a `Callable[..., Coroutine[Any, Any, R]]` — which is
+            // what lets it stand in for a `Callable[..., Awaitable[R]]`
+            // parameter. `await` unwraps the coroutine back to `R`.
+            if f.is_async {
+                if let Type::Function { ret, .. } = &mut sig {
+                    let inner = std::mem::replace(&mut **ret, Type::Unknown);
+                    **ret = Type::Generic("Coroutine".into(), vec![inner]);
+                }
+            }
             c.function_signatures
                 .insert(f.name.as_str().to_owned(), sig);
             // Record per-function arity metadata so the call-site arity
@@ -8297,6 +8812,8 @@ fn collect_classes_and_functions(c: &mut Checker, body: &[Stmt]) {
             // alongside the body walk.
             if f.is_async {
                 c.async_functions.insert(f.name.as_str().to_owned());
+            } else if let Some(callee) = body_spawns_task(&f.body) {
+                c.sync_spawners.insert(f.name.as_str().to_owned(), callee);
             }
             // Also extract any declared TypeVar bounds so they can be checked
             // at call sites.
@@ -9468,6 +9985,9 @@ fn strip_receiver_from_arity(mut info: ArityInfo) -> ArityInfo {
     }
     info.min_positional = info.min_positional.saturating_sub(1);
     info.max_positional = info.max_positional.map(|n| n.saturating_sub(1));
+    // The receiver slot that just went is itself positional-only whenever
+    // any slot is (`self` always precedes a `/`).
+    info.posonly_count = info.posonly_count.saturating_sub(1);
     info
 }
 
@@ -9630,6 +10150,29 @@ fn missing_required_params(
     missing
 }
 
+/// Stable-partition an arity model so required positional parameters come
+/// before defaulted ones — the shape a synthesised `class!` constructor has.
+fn required_first(info: ArityInfo) -> ArityInfo {
+    let mut order: Vec<usize> = (0..info.param_names.len()).collect();
+    order.sort_by_key(|&i| !info.required_positional.get(i).copied().unwrap_or(true));
+    let pick = |v: &[String]| -> Vec<String> { order.iter().map(|&i| v[i].clone()).collect() };
+    let param_names = pick(&info.param_names);
+    let param_types: Vec<Type> = order
+        .iter()
+        .map(|&i| info.param_types.get(i).cloned().unwrap_or(Type::Unknown))
+        .collect();
+    let required_positional: Vec<bool> = order
+        .iter()
+        .map(|&i| info.required_positional.get(i).copied().unwrap_or(true))
+        .collect();
+    ArityInfo {
+        param_names,
+        param_types,
+        required_positional,
+        ..info
+    }
+}
+
 fn class_constructor_arity(shape: &InterfaceShape) -> ArityInfo {
     class_constructor_arity_for(shape, None)
 }
@@ -9670,6 +10213,7 @@ fn class_constructor_arity_for(shape: &InterfaceShape, class_name: Option<&str>)
             min_positional: 0,
             required_positional: Vec::new(),
             max_positional: Some(0),
+            posonly_count: 0,
             kwonly_names: shape.field_order.clone(),
             kwonly_required: shape
                 .field_order
@@ -9689,6 +10233,7 @@ fn class_constructor_arity_for(shape: &InterfaceShape, class_name: Option<&str>)
         min_positional,
         required_positional,
         max_positional: Some(max_positional),
+        posonly_count: 0,
         kwonly_names: Vec::new(),
         kwonly_required: Vec::new(),
         has_kwarg: false,
@@ -9957,6 +10502,11 @@ fn infer_expr_readonly(c: &Checker, e: &Expr) -> Type {
                 }
             }
             let recv = infer_expr_readonly(c, &a.value);
+            // Builtin container methods carry a real signature (`d.get(k)` is
+            // `V | None`, `xs.pop()` is `T`), so a wrapping call sees it.
+            if let Some(method_type) = builtin_generic_method(&recv, a.attr.as_str()) {
+                return method_type;
+            }
             match &recv {
                 Type::Class(class_name) | Type::Generic(class_name, _) => {
                     if let Some(field_ty) = c.find_field(class_name, a.attr.as_str()) {
@@ -10040,6 +10590,39 @@ fn infer_expr_readonly(c: &Checker, e: &Expr) -> Type {
                     return Type::Generic("Result".into(), vec![ok_ty, err_ty]);
                 }
             }
+            // `<dict[K, V]>.get(k, default)` is `V | type(default)` — never
+            // `None` — exactly as the main inference path types it (FINDINGS
+            // #71); the one-argument signature's `V | None` must not leak in
+            // here either, or a read-only consumer (the builtin-argument
+            // check, a `match` subject) would call `int(d.get(k, 0))` nullable.
+            if let Expr::Attribute(attr) = call.func.as_ref() {
+                if attr.attr.as_str() == "get" {
+                    let default_expr: Option<&Expr> = match call.arguments.args.len() {
+                        2 => Some(&call.arguments.args[1]),
+                        1 => call
+                            .arguments
+                            .keywords
+                            .iter()
+                            .find(|k| k.arg.as_ref().is_some_and(|i| i.as_str() == "default"))
+                            .map(|k| &k.value),
+                        _ => None,
+                    };
+                    if let Some(default_expr) = default_expr {
+                        if let Type::Generic(head, dict_args) = infer_expr_readonly(c, &attr.value)
+                        {
+                            if head == "dict" && dict_args.len() == 2 {
+                                let v = dict_args[1].clone();
+                                let default_ty = infer_expr_readonly(c, default_expr);
+                                return if assignable(&v, &default_ty) {
+                                    v
+                                } else {
+                                    Type::union_of(vec![v, default_ty])
+                                };
+                            }
+                        }
+                    }
+                }
+            }
             // Resolve the callee's return type so chained call
             // expressions (`get_client().method(...)`) can walk
             // through. A constructor call returning `Type::Class(_)`
@@ -10060,7 +10643,16 @@ fn infer_expr_readonly(c: &Checker, e: &Expr) -> Type {
         // subscript fired missing_return).
         Expr::Subscript(s) => {
             let recv = infer_expr_readonly(c, &s.value);
+            // A slice yields the container itself (`xs[::-1]` on a
+            // `list[int]` is still a `list[int]`), never an element —
+            // returning the element type here made `iter(xs[::-1])` look
+            // like `iter(int)` to the builtin-argument check.
+            if matches!(s.slice.as_ref(), Expr::Slice(_)) {
+                return subscript_slice_type(&recv).unwrap_or(Type::Unknown);
+            }
             match recv {
+                Type::Str => Type::Str,
+                Type::Bytes => Type::Int,
                 Type::Generic(name, args) => match name.as_str() {
                     "list" | "Sequence" | "MutableSequence" | "deque" | "set" | "frozenset"
                     | "Iterable" | "Iterator"
@@ -10089,6 +10681,101 @@ fn infer_expr_readonly(c: &Checker, e: &Expr) -> Type {
             t.elts.iter().map(|e| infer_expr_readonly(c, e)).collect(),
         ),
         _ => Type::Unknown,
+    }
+}
+
+/// What a CPython builtin's *first positional argument* must be, for the
+/// handful of builtins whose misuse is both everyday and a guaranteed
+/// `TypeError`: `int(d.get("n"))` on a possibly-missing key, `len(count)`,
+/// `sorted(total)`. Returns `None` for a builtin this table does not cover
+/// (or a call shape it cannot judge — `min(a, b)` / `max(a, b)` / the
+/// two-argument `iter(callable, sentinel)` take scalars, so only the
+/// single-argument forms are checked).
+fn builtin_accepted_first_argument(name: &str, positional: usize) -> Option<Type> {
+    let iterable = Type::Class("Iterable".into());
+    match name {
+        "int" | "float" => Some(Type::union_of(vec![
+            Type::Int,
+            Type::Float,
+            Type::Str,
+            Type::Bytes,
+        ])),
+        "len" | "sorted" | "reversed" | "sum" | "any" | "all" | "enumerate" | "list" | "tuple"
+        | "set" | "frozenset" => Some(iterable),
+        "min" | "max" | "iter" if positional == 1 => Some(iterable),
+        "chr" => Some(Type::Int),
+        "ord" => Some(Type::union_of(vec![Type::Str, Type::Bytes])),
+        "abs" | "round" => Some(Type::union_of(vec![Type::Int, Type::Float])),
+        _ => None,
+    }
+}
+
+/// `true` when `actual` can never be accepted by `name`'s first parameter —
+/// a scalar where an iterable is required, a container where a number or
+/// string is. Anything not provably wrong (a user class that may define the
+/// relevant dunder, `Unknown`, a type variable) is left alone.
+fn builtin_first_argument_definitely_rejected(name: &str, actual: &Type) -> bool {
+    let scalar = matches!(
+        actual,
+        Type::Int | Type::Float | Type::Bool | Type::None | Type::Function { .. }
+    );
+    let container_or_callable = matches!(
+        actual,
+        Type::Generic(..) | Type::Function { .. } | Type::None
+    );
+    match name {
+        "int" | "float" => container_or_callable,
+        "len" | "sorted" | "reversed" | "sum" | "any" | "all" | "enumerate" | "list" | "tuple"
+        | "set" | "frozenset" | "min" | "max" | "iter" => scalar,
+        "chr" => matches!(actual, Type::Str | Type::Bytes | Type::Float) || container_or_callable,
+        "ord" => scalar || matches!(actual, Type::Generic(..)),
+        "abs" | "round" => matches!(actual, Type::Str | Type::Bytes) || container_or_callable,
+        _ => false,
+    }
+}
+
+/// Check the first positional argument of a covered builtin call (see
+/// [`builtin_accepted_first_argument`]). A possibly-`None` argument is the
+/// `nullable_use` shape the rest of the checker reports for an unguarded
+/// optional; a definitely-wrong type is a `type_mismatch`. Skipped when the
+/// name is shadowed by a user binding, inside `unsafe:`, or when the argument
+/// type is not known well enough to judge.
+fn check_builtin_first_argument(
+    c: &mut Checker,
+    fn_name: &ruff_python_ast::ExprName,
+    pos_args: &[Expr],
+) {
+    let name = fn_name.id.as_str();
+    if c.unsafe_depth > 0 || c.env.lookup(name).is_some() {
+        return;
+    }
+    let Some(first) = pos_args.first() else {
+        return;
+    };
+    if matches!(first, Expr::Starred(_)) {
+        return;
+    }
+    let Some(accepted) = builtin_accepted_first_argument(name, pos_args.len()) else {
+        return;
+    };
+    let actual = infer_expr_readonly(c, first);
+    if matches!(actual, Type::Unknown | Type::Any | Type::TypeVar(_)) {
+        return;
+    }
+    let span = (
+        first.range().start().to_usize(),
+        first.range().end().to_usize(),
+    );
+    if actual.is_nullable() && !matches!(actual, Type::None) {
+        if let Expr::Name(n) = first {
+            c.nullable_use(n.id.as_str(), &accepted, span);
+        } else {
+            c.mismatch(&accepted, &actual, span);
+        }
+        return;
+    }
+    if builtin_first_argument_definitely_rejected(name, &actual) {
+        c.mismatch(&accepted, &actual, span);
     }
 }
 
@@ -10181,10 +10868,17 @@ fn check_arity_with_info(
         }
     }
 
-    // Rule 2: a positional-bound name can't also appear as a kw.
+    // Rule 2: a positional-bound name can't also appear as a kw — except
+    // for a positional-only parameter, whose name is free for `**kwargs`
+    // to take (`def update(self, other, /, **kw)` accepts `other=1`).
     let filled_positionally = pos_args.len().min(info.param_names.len());
+    let conflict_from = if info.has_kwarg {
+        info.posonly_count.min(filled_positionally)
+    } else {
+        0
+    };
     for name in &named_kwargs {
-        if info.param_names[..filled_positionally]
+        if info.param_names[conflict_from..filled_positionally]
             .iter()
             .any(|p| p == name)
         {
@@ -10356,6 +11050,7 @@ fn arity_info_from_parameters_with_returns(
         min_positional,
         required_positional,
         max_positional,
+        posonly_count: parameters.posonlyargs.len(),
         kwonly_names,
         kwonly_required,
         has_kwarg: parameters.kwarg.is_some(),
@@ -11405,6 +12100,13 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                 .as_deref()
                 .map(|r| type_from_annotation_with_params(r, &classes, &tps))
                 .unwrap_or(Type::Unknown);
+            // An `async def` value is a coroutine-returning callable (see the
+            // module-level signature pass for the same wrapping).
+            let ret = if f.is_async {
+                Type::Generic("Coroutine".into(), vec![ret])
+            } else {
+                ret
+            };
             let variadic = all_params().any(|pwd| pwd.default.is_some())
                 || f.parameters.vararg.is_some()
                 || f.parameters.kwarg.is_some();
@@ -12098,6 +12800,15 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
             // that mutates a narrowed variable (`except: x = None`) is reflected
             // downstream — restoring only `body_end` would silently drop it.
             let mut post_states: Vec<TypeEnv> = Vec::new();
+            // A name the body *rebinds* may hold any of the values assigned
+            // along the way when a handler runs — the raise can happen between
+            // any two statements — so even its pre-`try` narrowing is not a
+            // fact the handler may rely on (`x: int | None` narrowed to `int`,
+            // then `x = None` in the body, is `None` in `except`). Widen every
+            // such name to its declared type on entry to each handler; the
+            // same goes for attribute paths the body assigns.
+            let mut body_writes = LoopReassigned::default();
+            collect_reassigned_names(&t.body, &mut body_writes);
             for h in &t.handlers {
                 let ruff_python_ast::ExceptHandler::ExceptHandler(h) = h;
                 // Enter the handler with the pre-`try` narrowings (keeping any
@@ -12105,6 +12816,12 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                 // the body established, which a raise may have skipped.
                 c.env.restore(body_end.clone());
                 c.env.reset_narrowings_to(&pre_try);
+                for name in &body_writes.names {
+                    c.env.widen_to_declared(name);
+                }
+                for path in &body_writes.attrs {
+                    c.env.clear_attr_narrowing(path);
+                }
                 for s in &h.body {
                     check_stmt(c, s);
                 }
@@ -12518,6 +13235,9 @@ fn check_function(
     c.in_sync_function = !is_async;
     let saved_in_async = c.in_async_function;
     c.in_async_function = is_async;
+    if is_async {
+        c.async_enclosing_depth += 1;
+    }
     // Track whether the current function body is a generator so the
     // return-statement validator can skip the usual assignability
     // check (FINDINGS O6): inside a generator, `return` raises
@@ -12533,6 +13253,17 @@ fn check_function(
         .get(name)
         .cloned()
         .unwrap_or_default();
+    // The body's own type parameters are opaque inside it (see
+    // `active_type_params`). Compiler-synthesised helpers keep the permissive
+    // reading — their bodies are generated, not user-written.
+    let saved_type_params = std::mem::replace(
+        &mut c.active_type_params,
+        if name.starts_with("__typhon_") {
+            Vec::new()
+        } else {
+            type_params.to_vec()
+        },
+    );
     // Snapshot the narrowed state of every enclosing scope (module globals and
     // any outer-function locals). A narrowing applied inside this body to an
     // enclosing binding (`if CACHE is None: return; use(CACHE)`) must hold for
@@ -12669,7 +13400,7 @@ fn check_function(
     // Compiler-synthesised helpers (`__typhon_*`) and stub bodies are
     // exempted for the same reasons Rule 1 / missing-return are.
     if !name.starts_with("__typhon_") && !body_is_stub(body) {
-        run_definite_assignment_pass(c, body);
+        run_definite_assignment_pass(c, body, parameters);
     }
 
     // Missing-return analysis (FINDINGS #82): when the declared return
@@ -12683,6 +13414,9 @@ fn check_function(
     if !name.starts_with("__typhon_")
         && returns.is_some()
         && return_type_requires_value(&ret_type)
+        // A `-> NoReturn` body never returns a value by definition; the
+        // contract is that it always raises or exits.
+        && !is_noreturn_type(&ret_type)
         && !body_has_yield(body)
         && !body_is_stub(body)
         && !body_always_exits_aware(c, body)
@@ -12704,7 +13438,11 @@ fn check_function(
     c.current_return = saved_return;
     c.unsafe_origin_bindings = saved_unsafe_origins;
     c.active_typevar_bounds = saved_bounds;
+    c.active_type_params = saved_type_params;
     c.in_sync_function = saved_in_sync;
+    if is_async {
+        c.async_enclosing_depth -= 1;
+    }
     c.in_async_function = saved_in_async;
     c.in_generator = saved_in_generator;
 }
@@ -12712,21 +13450,41 @@ fn check_function(
 /// R3-8 definite-assignment pass. Walks a function body looking for
 /// reads of `let NAME: T` (no initialiser) bindings on a path where
 /// the name has not yet been assigned, and emits
-/// `tyc::use_of_uninitialised` for each.
+/// `tyc::use_of_uninitialised` for each. The same walk covers every
+/// *ordinary* local of the function (a name the body binds that is not
+/// a parameter, a declare-only `let`, or a `global` / `nonlocal`): a read
+/// of one that is not definitely assigned is the advice-level
+/// `tyc::possibly_unbound`, worded by certainty — "not assigned on every
+/// path" when some path assigns it, "read before any assignment reaches
+/// it" / "deleted" / "unbound once its handler finishes" when none does.
 ///
-/// The analysis is structural-recursive — no explicit CFG. Branch
-/// constructs (`if` / `match`) snapshot the "definitely-assigned"
-/// set, walk each arm fresh, and intersect the results so only
-/// assignments that happen on EVERY arm propagate out. Loops
-/// (`for` / `while`) discard the body's assignments because the loop
-/// may execute zero times. `try` joins body + handlers + orelse with
-/// intersection; `finally` extends unconditionally.
+/// The analysis is structural-recursive — no explicit CFG. Two sets
+/// travel with the walk: the *definitely-assigned* names and the
+/// *definitely-unassigned* ones (a name is in neither when some paths
+/// assign it and some do not). Branch constructs (`if` / `match` /
+/// `try`) snapshot both, walk each arm fresh, and intersect the results
+/// so only what holds on EVERY arm propagates out. Loops (`for` /
+/// `while`) discard the body's assignments because the loop may execute
+/// zero times — except a literal `while True:` body, which runs at least
+/// once up to its first `break` — and forget the body's un-assignments
+/// too. `try` joins the clean-body-plus-`else` path with each handler
+/// (an `except ... as NAME` handler unbinds `NAME` when it finishes, as
+/// CPython does); `finally` extends unconditionally. `del NAME` unbinds.
 ///
 /// `return` / `raise` / `continue` / `break` in a branch mark the
 /// branch as "diverges" — the intersection step skips diverging
 /// branches so `let x: T; if cond: x = a else: return` still reads
 /// `x` cleanly after the if (the else-branch never reaches the join).
-fn run_definite_assignment_pass(c: &mut Checker, body: &[Stmt]) {
+///
+/// Reads inside nested functions, lambdas and comprehension bodies are
+/// not checked: closures resolve their free names when they are called.
+/// A comprehension's outermost iterable is evaluated in the enclosing
+/// scope and is checked.
+fn run_definite_assignment_pass(
+    c: &mut Checker,
+    body: &[Stmt],
+    parameters: &ruff_python_ast::Parameters,
+) {
     // First, scan the body for `let NAME: T` / `mut NAME: T` (no
     // initialiser) declarations. These are the names we track. Each
     // entry remembers (name → declaration-span) so the diagnostic can
@@ -12734,11 +13492,41 @@ fn run_definite_assignment_pass(c: &mut Checker, body: &[Stmt]) {
     // span is for the diagnostic only.
     let mut tracked: HashMap<String, (usize, usize)> = HashMap::new();
     collect_uninit_let_decls(body, &mut tracked);
-    if tracked.is_empty() {
+    // Then every other name the body binds in this scope.
+    let mut locals = da_collect_local_names(body);
+    let params = da_parameter_names(parameters);
+    for p in &params {
+        locals.remove(p);
+    }
+    for declared in da_collect_global_nonlocal_names(body) {
+        locals.remove(&declared);
+    }
+    for name in tracked.keys() {
+        locals.remove(name);
+    }
+    if tracked.is_empty() && locals.is_empty() {
         return;
     }
     let mut state = DaState::new();
-    da_walk_stmts(c, body, &tracked, &mut state);
+    for p in &params {
+        state.assign(p);
+    }
+    for name in tracked.keys().chain(locals.iter()) {
+        state.unassigned.insert(name.clone());
+    }
+    let ctx = DaCtx { tracked, locals };
+    da_walk_stmts(c, body, &ctx, &mut state);
+}
+
+/// What the definite-assignment walk is watching.
+struct DaCtx {
+    /// Declare-only `let NAME: T` bindings → declaration span. A read
+    /// that is not definitely assigned is the error
+    /// `tyc::use_of_uninitialised`.
+    tracked: HashMap<String, (usize, usize)>,
+    /// Every other function-local name. A read that is not definitely
+    /// assigned is the warning `tyc::possibly_unbound`.
+    locals: std::collections::HashSet<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -12746,6 +13534,13 @@ struct DaState {
     /// Names that have been assigned on every path reaching the
     /// current point.
     assigned: std::collections::HashSet<String>,
+    /// Names that have been assigned on *no* path reaching the current
+    /// point — never bound yet, or unbound again by `del` / the end of an
+    /// `except ... as` handler on every path.
+    unassigned: std::collections::HashSet<String>,
+    /// Why a name in `unassigned` is unbound, when it is more specific
+    /// than "not assigned yet".
+    unbound_reason: HashMap<String, &'static str>,
     /// True when control flow definitely cannot fall through (a
     /// `return` / `raise` / unconditional terminator has been seen).
     /// A diverging branch is ignored by the intersection step.
@@ -12756,18 +13551,211 @@ impl DaState {
     fn new() -> Self {
         Self {
             assigned: std::collections::HashSet::new(),
+            unassigned: std::collections::HashSet::new(),
+            unbound_reason: HashMap::new(),
             diverges: false,
         }
     }
     fn assign(&mut self, name: &str) {
         self.assigned.insert(name.to_owned());
+        self.unassigned.remove(name);
+        self.unbound_reason.remove(name);
     }
     /// `del NAME` unbinds the name: a later read on a path where it was
     /// deleted is a `NameError` / `UnboundLocalError`, so it is no longer
-    /// definitely-assigned.
-    fn unassign(&mut self, name: &str) {
+    /// definitely-assigned — and is definitely *un*assigned on this path.
+    fn unassign(&mut self, name: &str, reason: &'static str) {
         self.assigned.remove(name);
+        self.unassigned.insert(name.to_owned());
+        self.unbound_reason.insert(name.to_owned(), reason);
     }
+}
+
+fn da_parameter_names(parameters: &ruff_python_ast::Parameters) -> Vec<String> {
+    let mut out: Vec<String> = parameters
+        .posonlyargs
+        .iter()
+        .chain(parameters.args.iter())
+        .chain(parameters.kwonlyargs.iter())
+        .map(|p| p.parameter.name.as_str().to_owned())
+        .collect();
+    if let Some(v) = &parameters.vararg {
+        out.push(v.name.as_str().to_owned());
+    }
+    if let Some(k) = &parameters.kwarg {
+        out.push(k.name.as_str().to_owned());
+    }
+    out
+}
+
+/// Every name the function body binds in its own scope: assignment,
+/// augmented-assignment, loop and `with` targets (including unpacking),
+/// walrus targets (also inside comprehensions, where they leak out),
+/// `except ... as` names, `match` captures, imports, nested `def` /
+/// `class` names, `del` targets. Comprehension variables and lambda
+/// parameters are scoped to their expression and do not count; nested
+/// function and class bodies are separate scopes.
+fn da_collect_local_names(body: &[Stmt]) -> std::collections::HashSet<String> {
+    use ruff_python_ast::visitor::source_order::{
+        walk_expr, walk_pattern, walk_stmt, SourceOrderVisitor,
+    };
+
+    #[derive(Default)]
+    struct V {
+        names: std::collections::HashSet<String>,
+    }
+    impl<'ast> SourceOrderVisitor<'ast> for V {
+        fn visit_stmt(&mut self, s: &'ast Stmt) {
+            match s {
+                Stmt::FunctionDef(f) => {
+                    self.names.insert(f.name.as_str().to_owned());
+                }
+                Stmt::ClassDef(cd) => {
+                    self.names.insert(cd.name.as_str().to_owned());
+                }
+                Stmt::Import(i) => {
+                    for alias in &i.names {
+                        let bound = match &alias.asname {
+                            Some(asname) => asname.as_str(),
+                            None => alias.name.as_str().split('.').next().unwrap_or(""),
+                        };
+                        self.names.insert(bound.to_owned());
+                    }
+                }
+                Stmt::ImportFrom(i) => {
+                    for alias in &i.names {
+                        let bound = match &alias.asname {
+                            Some(asname) => asname.as_str(),
+                            None => alias.name.as_str(),
+                        };
+                        if bound != "*" {
+                            self.names.insert(bound.to_owned());
+                        }
+                    }
+                }
+                Stmt::Try(t) => {
+                    for h in &t.handlers {
+                        let ruff_python_ast::ExceptHandler::ExceptHandler(h) = h;
+                        if let Some(alias) = &h.name {
+                            self.names.insert(alias.id.as_str().to_owned());
+                        }
+                    }
+                    walk_stmt(self, s);
+                }
+                _ => walk_stmt(self, s),
+            }
+        }
+
+        fn visit_expr(&mut self, e: &'ast Expr) {
+            match e {
+                Expr::Name(n) => {
+                    if !n.ctx.is_load() {
+                        self.names.insert(n.id.as_str().to_owned());
+                    }
+                }
+                // Comprehension variables belong to the comprehension; a
+                // walrus inside its element or conditions leaks out, so
+                // those parts are still walked.
+                Expr::ListComp(x) => {
+                    da_visit_comprehension_parts(self, &x.elt, &x.generators);
+                }
+                Expr::SetComp(x) => {
+                    da_visit_comprehension_parts(self, &x.elt, &x.generators);
+                }
+                Expr::Generator(x) => {
+                    da_visit_comprehension_parts(self, &x.elt, &x.generators);
+                }
+                Expr::DictComp(x) => {
+                    if let Some(k) = x.key.as_deref() {
+                        self.visit_expr(k);
+                    }
+                    da_visit_comprehension_parts(self, &x.value, &x.generators);
+                }
+                // A lambda's parameters and body are its own scope.
+                Expr::Lambda(_) => {}
+                _ => walk_expr(self, e),
+            }
+        }
+
+        fn visit_pattern(&mut self, p: &'ast Pattern) {
+            let captured = match p {
+                Pattern::MatchAs(m) => m.name.as_ref(),
+                Pattern::MatchStar(m) => m.name.as_ref(),
+                Pattern::MatchMapping(m) => m.rest.as_ref(),
+                _ => None,
+            };
+            if let Some(id) = captured {
+                self.names.insert(id.as_str().to_owned());
+            }
+            walk_pattern(self, p);
+        }
+    }
+
+    fn da_visit_comprehension_parts<'ast>(
+        v: &mut V,
+        elt: &'ast Expr,
+        generators: &'ast [ruff_python_ast::Comprehension],
+    ) {
+        for g in generators {
+            v.visit_expr(&g.iter);
+            for cond in &g.ifs {
+                v.visit_expr(cond);
+            }
+        }
+        v.visit_expr(elt);
+    }
+
+    let mut v = V::default();
+    for stmt in body {
+        v.visit_stmt(stmt);
+    }
+    v.names
+}
+
+/// Names declared `global` / `nonlocal` anywhere in the function body
+/// (not inside nested functions): those are not locals of this scope.
+fn da_collect_global_nonlocal_names(body: &[Stmt]) -> std::collections::HashSet<String> {
+    let mut out = std::collections::HashSet::new();
+    fn go(stmts: &[Stmt], out: &mut std::collections::HashSet<String>) {
+        for stmt in stmts {
+            match stmt {
+                Stmt::Global(g) => out.extend(g.names.iter().map(|n| n.as_str().to_owned())),
+                Stmt::Nonlocal(nl) => out.extend(nl.names.iter().map(|n| n.as_str().to_owned())),
+                Stmt::If(s) => {
+                    go(&s.body, out);
+                    for clause in &s.elif_else_clauses {
+                        go(&clause.body, out);
+                    }
+                }
+                Stmt::For(s) => {
+                    go(&s.body, out);
+                    go(&s.orelse, out);
+                }
+                Stmt::While(s) => {
+                    go(&s.body, out);
+                    go(&s.orelse, out);
+                }
+                Stmt::With(s) => go(&s.body, out),
+                Stmt::Try(t) => {
+                    go(&t.body, out);
+                    for h in &t.handlers {
+                        let ruff_python_ast::ExceptHandler::ExceptHandler(h) = h;
+                        go(&h.body, out);
+                    }
+                    go(&t.orelse, out);
+                    go(&t.finalbody, out);
+                }
+                Stmt::Match(m) => {
+                    for case in &m.cases {
+                        go(&case.body, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    go(body, &mut out);
+    out
 }
 
 fn collect_uninit_let_decls(body: &[Stmt], out: &mut HashMap<String, (usize, usize)>) {
@@ -12825,12 +13813,7 @@ fn collect_uninit_let_decls_stmt(stmt: &Stmt, out: &mut HashMap<String, (usize, 
     }
 }
 
-fn da_walk_stmts(
-    c: &mut Checker,
-    stmts: &[Stmt],
-    tracked: &HashMap<String, (usize, usize)>,
-    state: &mut DaState,
-) {
+fn da_walk_stmts(c: &mut Checker, stmts: &[Stmt], ctx: &DaCtx, state: &mut DaState) {
     for stmt in stmts {
         if state.diverges {
             // Unreachable after divergence — still walk to satisfy
@@ -12838,23 +13821,108 @@ fn da_walk_stmts(
             // surprising user-facing diagnostics.
             return;
         }
-        da_walk_stmt(c, stmt, tracked, state);
+        da_walk_stmt(c, stmt, ctx, state);
     }
 }
 
-fn da_walk_stmt(
-    c: &mut Checker,
-    stmt: &Stmt,
-    tracked: &HashMap<String, (usize, usize)>,
-    state: &mut DaState,
-) {
+/// `while True:` (or any constant-true test): the body runs at least once.
+fn da_test_is_constant_true(test: &Expr) -> bool {
+    match test {
+        Expr::BooleanLiteral(b) => b.value,
+        Expr::NumberLiteral(n) => match &n.value {
+            ruff_python_ast::Number::Int(i) => i.as_u64().is_some_and(|v| v != 0),
+            ruff_python_ast::Number::Float(f) => *f != 0.0,
+            ruff_python_ast::Number::Complex { .. } => true,
+        },
+        _ => false,
+    }
+}
+
+/// `true` when a `break` in `stmts` targets the loop whose body this is:
+/// nested loops own their breaks (their `else` clauses do not).
+fn da_stmts_contain_break(stmts: &[Stmt]) -> bool {
+    stmts.iter().any(|stmt| match stmt {
+        Stmt::Break(_) => true,
+        Stmt::If(s) => {
+            da_stmts_contain_break(&s.body)
+                || s.elif_else_clauses
+                    .iter()
+                    .any(|clause| da_stmts_contain_break(&clause.body))
+        }
+        Stmt::For(s) => da_stmts_contain_break(&s.orelse),
+        Stmt::While(s) => da_stmts_contain_break(&s.orelse),
+        Stmt::With(s) => da_stmts_contain_break(&s.body),
+        Stmt::Try(t) => {
+            da_stmts_contain_break(&t.body)
+                || t.handlers.iter().any(|h| {
+                    let ruff_python_ast::ExceptHandler::ExceptHandler(h) = h;
+                    da_stmts_contain_break(&h.body)
+                })
+                || da_stmts_contain_break(&t.orelse)
+                || da_stmts_contain_break(&t.finalbody)
+        }
+        Stmt::Match(m) => m
+            .cases
+            .iter()
+            .any(|case| da_stmts_contain_break(&case.body)),
+        _ => false,
+    })
+}
+
+/// Names a `while True:` body definitely assigns before it can first
+/// `break`: the plain assignments of its straight-line prefix, up to the
+/// first statement that contains a `break`.
+fn da_while_true_prefix_assignments(body: &[Stmt]) -> Vec<String> {
+    let mut out = Vec::new();
+    for stmt in body {
+        if da_stmts_contain_break(std::slice::from_ref(stmt)) {
+            break;
+        }
+        match stmt {
+            Stmt::Assign(a) => {
+                for t in &a.targets {
+                    let mut probe = DaState::new();
+                    da_collect_assign_targets(t, &mut probe);
+                    out.extend(probe.assigned);
+                }
+            }
+            Stmt::AnnAssign(a) if a.value.is_some() => {
+                if let Expr::Name(n) = a.target.as_ref() {
+                    out.push(n.id.as_str().to_owned());
+                }
+            }
+            Stmt::AugAssign(a) => {
+                if let Expr::Name(n) = a.target.as_ref() {
+                    out.push(n.id.as_str().to_owned());
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// After a loop that may run zero times: assignments made in the body do
+/// not propagate, but neither does the body's "definitely unassigned"
+/// knowledge — a name the body may have bound is no longer certainly
+/// unbound.
+fn da_join_loop_exit(state: &mut DaState, body_state: &DaState) {
+    state
+        .unassigned
+        .retain(|name| body_state.unassigned.contains(name));
+    state
+        .unbound_reason
+        .retain(|name, _| state.unassigned.contains(name));
+}
+
+fn da_walk_stmt(c: &mut Checker, stmt: &Stmt, ctx: &DaCtx, state: &mut DaState) {
     match stmt {
         Stmt::AnnAssign(a) => {
             // Check the annotation and the RHS for uses first
             // (`let x: T = use_of_x_would_fire_here`).
-            da_check_expr(c, &a.annotation, tracked, state);
+            da_check_expr(c, &a.annotation, ctx, state);
             if let Some(v) = a.value.as_deref() {
-                da_check_expr(c, v, tracked, state);
+                da_check_expr(c, v, ctx, state);
             }
             // Then mark the target as assigned (the binding becomes
             // initialised from this point forward).
@@ -12862,57 +13930,73 @@ fn da_walk_stmt(
                 if a.value.is_some() {
                     state.assign(n.id.as_str());
                 }
+            } else if a.value.is_some() {
+                // `obj.attr: T = v` / `xs[i]: T = v` read their receiver.
+                da_check_expr(c, &a.target, ctx, state);
             }
         }
         Stmt::Assign(a) => {
-            da_check_expr(c, &a.value, tracked, state);
+            da_check_expr(c, &a.value, ctx, state);
             for t in &a.targets {
+                da_check_target_receivers(c, t, ctx, state);
                 da_collect_assign_targets(t, state);
             }
         }
         Stmt::AugAssign(a) => {
             // Augmented assignment reads first (`x += 1` requires x to
             // be initialised), then writes.
-            da_check_expr(c, &a.target, tracked, state);
-            da_check_expr(c, &a.value, tracked, state);
+            da_check_expr(c, &a.target, ctx, state);
+            da_check_expr(c, &a.value, ctx, state);
             if let Expr::Name(n) = a.target.as_ref() {
                 state.assign(n.id.as_str());
             }
         }
-        Stmt::Expr(e) => da_check_expr(c, &e.value, tracked, state),
+        Stmt::Expr(e) => da_check_expr(c, &e.value, ctx, state),
         Stmt::Return(r) => {
             if let Some(v) = r.value.as_deref() {
-                da_check_expr(c, v, tracked, state);
+                da_check_expr(c, v, ctx, state);
             }
             state.diverges = true;
         }
         Stmt::Raise(r) => {
             if let Some(exc) = &r.exc {
-                da_check_expr(c, exc, tracked, state);
+                da_check_expr(c, exc, ctx, state);
             }
             if let Some(cause) = &r.cause {
-                da_check_expr(c, cause, tracked, state);
+                da_check_expr(c, cause, ctx, state);
             }
             state.diverges = true;
         }
+        Stmt::Assert(a) => {
+            da_check_expr(c, &a.test, ctx, state);
+            if let Some(msg) = &a.msg {
+                da_check_expr(c, msg, ctx, state);
+            }
+        }
         Stmt::If(s) => {
-            da_check_expr(c, &s.test, tracked, state);
+            da_check_expr(c, &s.test, ctx, state);
+            // `if True:` — the shape `unsafe:` lowers to — always runs its
+            // body and never its arms: walk it as straight-line code.
+            if da_test_is_constant_true(&s.test) {
+                da_walk_stmts(c, &s.body, ctx, state);
+                return;
+            }
             // Snapshot, walk each branch fresh, intersect non-diverging
             // branches afterwards.
             let pre = state.clone();
             let mut branch_states: Vec<DaState> = Vec::new();
             let mut after_then = pre.clone();
-            da_walk_stmts(c, &s.body, tracked, &mut after_then);
+            da_walk_stmts(c, &s.body, ctx, &mut after_then);
             branch_states.push(after_then);
             let mut had_else = false;
             for clause in &s.elif_else_clauses {
                 if let Some(test) = &clause.test {
-                    da_check_expr(c, test, tracked, state);
+                    da_check_expr(c, test, ctx, state);
                 } else {
                     had_else = true;
                 }
                 let mut arm_state = pre.clone();
-                da_walk_stmts(c, &clause.body, tracked, &mut arm_state);
+                da_walk_stmts(c, &clause.body, ctx, &mut arm_state);
                 branch_states.push(arm_state);
             }
             // Without an `else`, the implicit fall-through path adds a
@@ -12924,15 +14008,17 @@ fn da_walk_stmt(
             *state = intersect_branches(&pre, &branch_states);
         }
         Stmt::Match(m) => {
-            da_check_expr(c, &m.subject, tracked, state);
+            da_check_expr(c, &m.subject, ctx, state);
             let pre = state.clone();
             let mut branch_states: Vec<DaState> = Vec::new();
             for case in &m.cases {
-                if let Some(g) = &case.guard {
-                    da_check_expr(c, g, tracked, state);
-                }
                 let mut arm_state = pre.clone();
-                da_walk_stmts(c, &case.body, tracked, &mut arm_state);
+                // Captures are bound by the pattern before the guard runs.
+                da_collect_pattern_captures(&case.pattern, &mut arm_state);
+                if let Some(g) = &case.guard {
+                    da_check_expr(c, g, ctx, &mut arm_state);
+                }
+                da_walk_stmts(c, &case.body, ctx, &mut arm_state);
                 branch_states.push(arm_state);
             }
             // R3-8: `match` is exhaustive (no implicit fall-through
@@ -12953,67 +14039,119 @@ fn da_walk_stmt(
             *state = intersect_branches(&pre, &branch_states);
         }
         Stmt::For(f) => {
-            da_check_expr(c, &f.iter, tracked, state);
+            da_check_expr(c, &f.iter, ctx, state);
             // Loop body may execute zero times; assignments inside do
             // not propagate out. Mark the loop variable as assigned
             // for the body walk so a `for k in d:` body can read `k`.
             let mut body_state = state.clone();
+            da_check_target_receivers(c, &f.target, ctx, &mut body_state);
             da_collect_for_target(&f.target, &mut body_state);
-            da_walk_stmts(c, &f.body, tracked, &mut body_state);
+            da_walk_stmts(c, &f.body, ctx, &mut body_state);
+            da_join_loop_exit(state, &body_state);
             // orelse runs after the loop completes naturally — same
             // pre-state as the surrounding code.
-            da_walk_stmts(c, &f.orelse, tracked, state);
+            da_walk_stmts(c, &f.orelse, ctx, state);
         }
         Stmt::While(w) => {
-            da_check_expr(c, &w.test, tracked, state);
+            da_check_expr(c, &w.test, ctx, state);
             let mut body_state = state.clone();
-            da_walk_stmts(c, &w.body, tracked, &mut body_state);
-            da_walk_stmts(c, &w.orelse, tracked, state);
+            da_walk_stmts(c, &w.body, ctx, &mut body_state);
+            da_join_loop_exit(state, &body_state);
+            if da_test_is_constant_true(&w.test) {
+                // The body runs at least once: what it assigns before it
+                // can first `break` holds afterwards; without any `break`
+                // the statement after the loop is unreachable.
+                if !da_stmts_contain_break(&w.body) {
+                    state.diverges = true;
+                } else {
+                    for name in da_while_true_prefix_assignments(&w.body) {
+                        state.assign(&name);
+                    }
+                }
+            }
+            da_walk_stmts(c, &w.orelse, ctx, state);
         }
         Stmt::With(w) => {
             for item in &w.items {
-                da_check_expr(c, &item.context_expr, tracked, state);
+                da_check_expr(c, &item.context_expr, ctx, state);
                 if let Some(target) = item.optional_vars.as_deref() {
+                    da_check_target_receivers(c, target, ctx, state);
                     da_collect_assign_targets(target, state);
                 }
             }
-            da_walk_stmts(c, &w.body, tracked, state);
+            da_walk_stmts(c, &w.body, ctx, state);
         }
         Stmt::Try(t) => {
             // Body may raise at any point, so handlers see the
             // pre-state, not the post-body state.
             let pre = state.clone();
             let mut body_state = pre.clone();
-            da_walk_stmts(c, &t.body, tracked, &mut body_state);
-            let mut branch_states: Vec<DaState> = Vec::new();
-            // The body path is one branch — assignments from there
-            // are only valid if no handler caught an early
-            // exception. Conservatively include it.
-            branch_states.push(body_state);
+            da_walk_stmts(c, &t.body, ctx, &mut body_state);
+            // `else` runs only after a clean body: it continues from the
+            // body's state and forms the no-exception path of the join.
+            let mut clean_path = body_state;
+            da_walk_stmts(c, &t.orelse, ctx, &mut clean_path);
+            let mut branch_states: Vec<DaState> = vec![clean_path];
             for h in &t.handlers {
                 let ruff_python_ast::ExceptHandler::ExceptHandler(h) = h;
                 let mut h_state = pre.clone();
+                if let Some(ty) = &h.type_ {
+                    da_check_expr(c, ty, ctx, &mut h_state);
+                }
                 if let Some(name) = &h.name {
                     h_state.assign(name.as_str());
                 }
-                da_walk_stmts(c, &h.body, tracked, &mut h_state);
+                da_walk_stmts(c, &h.body, ctx, &mut h_state);
+                // CPython deletes the `as NAME` binding when the handler
+                // finishes, so a read after the `try` is a `NameError`.
+                if let Some(name) = &h.name {
+                    if !h_state.diverges {
+                        h_state.unassign(
+                            name.as_str(),
+                            "is unbound once its `except ... as` handler finishes",
+                        );
+                    }
+                }
                 branch_states.push(h_state);
             }
             *state = intersect_branches(&pre, &branch_states);
-            // orelse runs only after a clean body (no exception);
-            // walk it from the joined state.
-            da_walk_stmts(c, &t.orelse, tracked, state);
             // finally always runs; walk it unconditionally.
-            da_walk_stmts(c, &t.finalbody, tracked, state);
+            da_walk_stmts(c, &t.finalbody, ctx, state);
         }
         Stmt::FunctionDef(_) | Stmt::ClassDef(_) | Stmt::TypeAlias(_) => {
             // Nested defs / classes / type aliases are local-bound
             // names but their body's flow doesn't affect the outer
-            // DA state.
+            // DA state. Decorators, defaults and base classes evaluate
+            // here, though.
             if let Stmt::FunctionDef(f) = stmt {
+                for d in &f.decorator_list {
+                    da_check_expr(c, &d.expression, ctx, state);
+                }
+                for pwd in f
+                    .parameters
+                    .posonlyargs
+                    .iter()
+                    .chain(f.parameters.args.iter())
+                    .chain(f.parameters.kwonlyargs.iter())
+                {
+                    if let Some(default) = pwd.default.as_deref() {
+                        da_check_expr(c, default, ctx, state);
+                    }
+                }
                 state.assign(f.name.as_str());
             }
             if let Stmt::ClassDef(cd) = stmt {
+                for d in &cd.decorator_list {
+                    da_check_expr(c, &d.expression, ctx, state);
+                }
+                if let Some(args) = cd.arguments.as_deref() {
+                    for a in &args.args {
+                        da_check_expr(c, a, ctx, state);
+                    }
+                    for kw in &args.keywords {
+                        da_check_expr(c, &kw.value, ctx, state);
+                    }
+                }
                 state.assign(cd.name.as_str());
             }
         }
@@ -13058,9 +14196,9 @@ fn da_walk_stmt(
             for tgt in &d.targets {
                 // The target must be bound to be deleted, so check it as a read
                 // first, then drop it from the assigned set.
-                da_check_expr(c, tgt, tracked, state);
+                da_check_expr(c, tgt, ctx, state);
                 if let Expr::Name(n) = tgt {
-                    state.unassign(n.id.as_str());
+                    state.unassign(n.id.as_str(), "was deleted before this read");
                 }
             }
         }
@@ -13071,12 +14209,31 @@ fn da_walk_stmt(
     }
 }
 
-fn da_check_expr(
-    c: &mut Checker,
-    expr: &Expr,
-    tracked: &HashMap<String, (usize, usize)>,
-    state: &mut DaState,
-) {
+/// The receivers of attribute / subscript targets are reads (`xs[i] = v`
+/// needs `xs`; `p.x = v` needs `p`).
+fn da_check_target_receivers(c: &mut Checker, target: &Expr, ctx: &DaCtx, state: &mut DaState) {
+    match target {
+        Expr::Attribute(a) => da_check_expr(c, &a.value, ctx, state),
+        Expr::Subscript(s) => {
+            da_check_expr(c, &s.value, ctx, state);
+            da_check_expr(c, &s.slice, ctx, state);
+        }
+        Expr::Tuple(t) => {
+            for elt in &t.elts {
+                da_check_target_receivers(c, elt, ctx, state);
+            }
+        }
+        Expr::List(l) => {
+            for elt in &l.elts {
+                da_check_target_receivers(c, elt, ctx, state);
+            }
+        }
+        Expr::Starred(s) => da_check_target_receivers(c, &s.value, ctx, state),
+        _ => {}
+    }
+}
+
+fn da_check_expr(c: &mut Checker, expr: &Expr, ctx: &DaCtx, state: &mut DaState) {
     // Pre-order walk. `Expr::Named` (walrus `x := expr`) checks its
     // RHS for reads and then marks the target as assigned in the
     // surrounding state so subsequent uses in the same statement (or
@@ -13087,8 +14244,11 @@ fn da_check_expr(
     match expr {
         Expr::Name(n) => {
             let name = n.id.as_str();
-            if let Some(&(decl_offset, decl_len)) = tracked.get(name) {
-                if !state.assigned.contains(name) && c.unsafe_depth == 0 {
+            if n.ctx.is_store() || state.diverges || c.unsafe_depth != 0 {
+                return;
+            }
+            if let Some(&(decl_offset, decl_len)) = ctx.tracked.get(name) {
+                if !state.assigned.contains(name) {
                     let use_offset = n.range.start().to_usize();
                     let use_len = name.len();
                     c.diagnostics.push_error(TycError::use_of_uninitialised(
@@ -13101,117 +14261,209 @@ fn da_check_expr(
                         decl_len,
                     ));
                 }
+            } else if ctx.locals.contains(name) && !state.assigned.contains(name) {
+                let reason = if state.unassigned.contains(name) {
+                    state
+                        .unbound_reason
+                        .get(name)
+                        .copied()
+                        .unwrap_or("is read before any assignment reaches it")
+                } else {
+                    "is not assigned on every path that reaches here"
+                };
+                c.diagnostics.push_warning(TycError::possibly_unbound(
+                    name,
+                    reason,
+                    c.path.clone(),
+                    c.source,
+                    n.range.start().to_usize(),
+                    name.len().max(1),
+                ));
             }
         }
-        Expr::Attribute(a) => da_check_expr(c, &a.value, tracked, state),
+        Expr::Attribute(a) => da_check_expr(c, &a.value, ctx, state),
         Expr::Subscript(s) => {
-            da_check_expr(c, &s.value, tracked, state);
-            da_check_expr(c, &s.slice, tracked, state);
+            da_check_expr(c, &s.value, ctx, state);
+            da_check_expr(c, &s.slice, ctx, state);
         }
         Expr::Call(call) => {
-            da_check_expr(c, &call.func, tracked, state);
+            da_check_expr(c, &call.func, ctx, state);
             for a in &call.arguments.args {
-                da_check_expr(c, a, tracked, state);
+                da_check_expr(c, a, ctx, state);
             }
             for kw in &call.arguments.keywords {
-                da_check_expr(c, &kw.value, tracked, state);
+                da_check_expr(c, &kw.value, ctx, state);
             }
         }
         Expr::BinOp(b) => {
-            da_check_expr(c, &b.left, tracked, state);
-            da_check_expr(c, &b.right, tracked, state);
+            da_check_expr(c, &b.left, ctx, state);
+            da_check_expr(c, &b.right, ctx, state);
         }
-        Expr::UnaryOp(u) => da_check_expr(c, &u.operand, tracked, state),
+        Expr::UnaryOp(u) => da_check_expr(c, &u.operand, ctx, state),
         Expr::BoolOp(b) => {
             for v in &b.values {
-                da_check_expr(c, v, tracked, state);
+                da_check_expr(c, v, ctx, state);
             }
         }
         Expr::Compare(cmp) => {
-            da_check_expr(c, &cmp.left, tracked, state);
+            da_check_expr(c, &cmp.left, ctx, state);
             for v in &cmp.comparators {
-                da_check_expr(c, v, tracked, state);
+                da_check_expr(c, v, ctx, state);
             }
         }
         Expr::If(i) => {
-            da_check_expr(c, &i.test, tracked, state);
-            da_check_expr(c, &i.body, tracked, state);
-            da_check_expr(c, &i.orelse, tracked, state);
+            da_check_expr(c, &i.test, ctx, state);
+            da_check_expr(c, &i.body, ctx, state);
+            da_check_expr(c, &i.orelse, ctx, state);
         }
         Expr::Tuple(t) => {
             for v in &t.elts {
-                da_check_expr(c, v, tracked, state);
+                da_check_expr(c, v, ctx, state);
             }
         }
         Expr::List(l) => {
             for v in &l.elts {
-                da_check_expr(c, v, tracked, state);
+                da_check_expr(c, v, ctx, state);
             }
         }
         Expr::Set(s) => {
             for v in &s.elts {
-                da_check_expr(c, v, tracked, state);
+                da_check_expr(c, v, ctx, state);
             }
         }
         Expr::Dict(d) => {
             for item in &d.items {
                 if let Some(k) = &item.key {
-                    da_check_expr(c, k, tracked, state);
+                    da_check_expr(c, k, ctx, state);
                 }
-                da_check_expr(c, &item.value, tracked, state);
+                da_check_expr(c, &item.value, ctx, state);
             }
         }
         Expr::FString(fs) => {
             for part in &fs.value {
                 if let ruff_python_ast::FStringPart::FString(f) = part {
                     for el in &f.elements {
-                        if let ruff_python_ast::InterpolatedStringElement::Interpolation(e) = el {
-                            da_check_expr(c, &e.expression, tracked, state);
-                        }
+                        da_check_interpolated_element(c, el, ctx, state);
                     }
                 }
             }
         }
         Expr::Slice(s) => {
             if let Some(lower) = &s.lower {
-                da_check_expr(c, lower, tracked, state);
+                da_check_expr(c, lower, ctx, state);
             }
             if let Some(upper) = &s.upper {
-                da_check_expr(c, upper, tracked, state);
+                da_check_expr(c, upper, ctx, state);
             }
             if let Some(step) = &s.step {
-                da_check_expr(c, step, tracked, state);
+                da_check_expr(c, step, ctx, state);
             }
         }
-        Expr::Starred(s) => da_check_expr(c, &s.value, tracked, state),
-        Expr::Await(a) => da_check_expr(c, &a.value, tracked, state),
+        Expr::Starred(s) => da_check_expr(c, &s.value, ctx, state),
+        Expr::Await(a) => da_check_expr(c, &a.value, ctx, state),
         Expr::Yield(y) => {
             if let Some(v) = &y.value {
-                da_check_expr(c, v, tracked, state);
+                da_check_expr(c, v, ctx, state);
             }
         }
-        Expr::YieldFrom(y) => da_check_expr(c, &y.value, tracked, state),
+        Expr::YieldFrom(y) => da_check_expr(c, &y.value, ctx, state),
         Expr::Named(n) => {
             // `(x := expr)` — check expr for uses first, then mark
             // the target as assigned so the surrounding statement
             // sees the binding initialised.
-            da_check_expr(c, &n.value, tracked, state);
+            da_check_expr(c, &n.value, ctx, state);
             if let Expr::Name(target) = n.target.as_ref() {
                 state.assign(target.id.as_str());
             }
         }
-        Expr::Lambda(_)
-        | Expr::ListComp(_)
-        | Expr::SetComp(_)
-        | Expr::DictComp(_)
-        | Expr::Generator(_) => {
-            // Comprehensions and lambdas introduce their own scope;
-            // a tracked-uninit name used inside is fine as long as it
-            // would be initialised by the time the comprehension
-            // actually runs. The body's uses are checked by the
-            // resolver / type-checker through their own mechanisms.
+        // Comprehensions and lambdas introduce their own scope; a
+        // tracked-uninit name used inside is fine as long as it would be
+        // initialised by the time the comprehension actually runs. Only
+        // the outermost iterable is evaluated here and now, so it is the
+        // one part that is checked; a walrus in the element or a
+        // condition binds in this scope once the comprehension runs, so
+        // it is recorded as assigned.
+        Expr::ListComp(x) => da_check_comprehension(c, &x.elt, &x.generators, ctx, state),
+        Expr::SetComp(x) => da_check_comprehension(c, &x.elt, &x.generators, ctx, state),
+        Expr::Generator(x) => {
+            if let Some(first) = x.generators.first() {
+                da_check_expr(c, &first.iter, ctx, state);
+            }
         }
+        Expr::DictComp(x) => {
+            if let Some(first) = x.generators.first() {
+                da_check_expr(c, &first.iter, ctx, state);
+            }
+            if let Some(k) = x.key.as_deref() {
+                da_collect_walrus_targets(k, state);
+            }
+            da_collect_walrus_targets(&x.value, state);
+            for g in &x.generators {
+                for cond in &g.ifs {
+                    da_collect_walrus_targets(cond, state);
+                }
+            }
+        }
+        Expr::Lambda(_) => {}
         _ => {}
+    }
+}
+
+fn da_check_comprehension(
+    c: &mut Checker,
+    elt: &Expr,
+    generators: &[ruff_python_ast::Comprehension],
+    ctx: &DaCtx,
+    state: &mut DaState,
+) {
+    if let Some(first) = generators.first() {
+        da_check_expr(c, &first.iter, ctx, state);
+    }
+    da_collect_walrus_targets(elt, state);
+    for g in generators {
+        for cond in &g.ifs {
+            da_collect_walrus_targets(cond, state);
+        }
+    }
+}
+
+/// Every walrus target inside `expr` (comprehension-local names excluded),
+/// marked assigned: a comprehension that runs binds them in this scope.
+fn da_collect_walrus_targets(expr: &Expr, state: &mut DaState) {
+    struct V<'a> {
+        state: &'a mut DaState,
+    }
+    impl ruff_python_ast::visitor::Visitor<'_> for V<'_> {
+        fn visit_expr(&mut self, e: &Expr) {
+            match e {
+                Expr::Named(n) => {
+                    if let Expr::Name(target) = n.target.as_ref() {
+                        self.state.assign(target.id.as_str());
+                    }
+                    ruff_python_ast::visitor::walk_expr(self, e);
+                }
+                Expr::Lambda(_) => {}
+                _ => ruff_python_ast::visitor::walk_expr(self, e),
+            }
+        }
+    }
+    let mut v = V { state };
+    ruff_python_ast::visitor::walk_expr(&mut v, expr);
+}
+
+fn da_check_interpolated_element(
+    c: &mut Checker,
+    el: &ruff_python_ast::InterpolatedStringElement,
+    ctx: &DaCtx,
+    state: &mut DaState,
+) {
+    if let ruff_python_ast::InterpolatedStringElement::Interpolation(e) = el {
+        da_check_expr(c, &e.expression, ctx, state);
+        if let Some(spec) = &e.format_spec {
+            for inner in &spec.elements {
+                da_check_interpolated_element(c, inner, ctx, state);
+            }
+        }
     }
 }
 
@@ -13235,6 +14487,54 @@ fn da_collect_assign_targets(target: &Expr, state: &mut DaState) {
 
 fn da_collect_for_target(target: &Expr, state: &mut DaState) {
     da_collect_assign_targets(target, state);
+}
+
+/// Names a `match` pattern binds: `case Point(x=px)`, `case [first,
+/// *rest]`, `case {"k": v, **others}`, `case _ as whole`. Alternatives of
+/// an or-pattern must bind the same names, so the union is exact.
+fn da_collect_pattern_captures(pattern: &Pattern, state: &mut DaState) {
+    match pattern {
+        Pattern::MatchAs(m) => {
+            if let Some(name) = &m.name {
+                state.assign(name.as_str());
+            }
+            if let Some(inner) = &m.pattern {
+                da_collect_pattern_captures(inner, state);
+            }
+        }
+        Pattern::MatchStar(m) => {
+            if let Some(name) = &m.name {
+                state.assign(name.as_str());
+            }
+        }
+        Pattern::MatchMapping(m) => {
+            for p in &m.patterns {
+                da_collect_pattern_captures(p, state);
+            }
+            if let Some(rest) = &m.rest {
+                state.assign(rest.as_str());
+            }
+        }
+        Pattern::MatchSequence(m) => {
+            for p in &m.patterns {
+                da_collect_pattern_captures(p, state);
+            }
+        }
+        Pattern::MatchClass(m) => {
+            for p in &m.arguments.patterns {
+                da_collect_pattern_captures(p, state);
+            }
+            for kw in &m.arguments.keywords {
+                da_collect_pattern_captures(&kw.pattern, state);
+            }
+        }
+        Pattern::MatchOr(m) => {
+            for p in &m.patterns {
+                da_collect_pattern_captures(p, state);
+            }
+        }
+        Pattern::MatchValue(_) | Pattern::MatchSingleton(_) => {}
+    }
 }
 
 /// True when a `match` is exhaustive enough for the DA pass to skip
@@ -13373,15 +14673,28 @@ fn intersect_branches(pre: &DaState, branches: &[DaState]) -> DaState {
     if non_diverging.is_empty() {
         return DaState {
             assigned: pre.assigned.clone(),
+            unassigned: pre.unassigned.clone(),
+            unbound_reason: pre.unbound_reason.clone(),
             diverges: true,
         };
     }
-    let mut intersection: std::collections::HashSet<String> = non_diverging[0].assigned.clone();
+    // Definitely assigned / definitely unassigned only when so on every
+    // non-diverging arm; a name in neither set is "possibly" bound.
+    let mut assigned: std::collections::HashSet<String> = non_diverging[0].assigned.clone();
+    let mut unassigned: std::collections::HashSet<String> = non_diverging[0].unassigned.clone();
+    let mut reasons: HashMap<String, &'static str> = non_diverging[0].unbound_reason.clone();
     for branch in &non_diverging[1..] {
-        intersection.retain(|name| branch.assigned.contains(name));
+        assigned.retain(|name| branch.assigned.contains(name));
+        unassigned.retain(|name| branch.unassigned.contains(name));
+        for (name, reason) in &branch.unbound_reason {
+            reasons.entry(name.clone()).or_insert(reason);
+        }
     }
+    reasons.retain(|name, _| unassigned.contains(name));
     DaState {
-        assigned: intersection,
+        assigned,
+        unassigned,
+        unbound_reason: reasons,
         diverges: false,
     }
 }
@@ -13656,9 +14969,60 @@ fn body_always_exits_aware(c: &Checker, stmts: &[Stmt]) -> bool {
     stmts.last().is_some_and(|s| stmt_always_exits_aware(c, s))
 }
 
+/// A call that never returns: `sys.exit(...)`, `exit()`, `quit()`,
+/// `os._exit(...)`, `os.abort()`, or a project function declared
+/// `-> NoReturn` / `-> Never`.
+fn call_never_returns(c: &Checker, expr: &Expr) -> bool {
+    let Expr::Call(call) = expr else {
+        return false;
+    };
+    match call.func.as_ref() {
+        Expr::Name(n) => {
+            let name = n.id.as_str();
+            if matches!(name, "exit" | "quit") {
+                return true;
+            }
+            matches!(
+                c.function_signatures.get(name),
+                Some(Type::Function { ret, .. }) if is_noreturn_type(ret)
+            )
+        }
+        Expr::Attribute(a) => {
+            let module = match a.value.as_ref() {
+                Expr::Name(m) => m.id.as_str(),
+                _ => return false,
+            };
+            matches!(
+                (module, a.attr.as_str()),
+                ("sys", "exit") | ("os", "_exit") | ("os", "abort")
+            )
+        }
+        _ => false,
+    }
+}
+
+/// `NoReturn` / `Never` (bare or `typing.`-qualified) as a return type.
+fn is_noreturn_type(t: &Type) -> bool {
+    matches!(
+        t,
+        Type::Class(name) if matches!(
+            name.as_str(),
+            "NoReturn" | "Never" | "typing.NoReturn" | "typing.Never"
+        )
+    )
+}
+
 fn stmt_always_exits_aware(c: &Checker, stmt: &Stmt) -> bool {
     match stmt {
         Stmt::Return(_) | Stmt::Raise(_) | Stmt::Break(_) | Stmt::Continue(_) => true,
+        // A call to something that never returns ends the path as surely as
+        // `raise`: `usage()` declared `-> NoReturn`, or `sys.exit(2)`.
+        Stmt::Expr(e) => call_never_returns(c, &e.value),
+        // `assert False` always raises.
+        Stmt::Assert(a) => matches!(
+            a.test.as_ref(),
+            Expr::BooleanLiteral(lit) if !lit.value
+        ),
         Stmt::If(s) => {
             // `if True:` (constant-True test) is unconditional flow —
             // the body always runs, so it exits iff the body exits. The
@@ -14715,6 +16079,38 @@ fn collect_narrowings_inner(c: &Checker, test: &Expr, negate: bool, out: &mut Ve
             // isinstance(x, T)
             if let Expr::Name(fn_name) = call.func.as_ref() {
                 let pos_args = &call.arguments.args;
+                // A user-defined type guard: `def is_str_list(xs: list[object])
+                // -> TypeGuard[list[str]]`. In the true branch of
+                // `if is_str_list(xs):` the first argument *is* the guarded
+                // type (PEP 647). `TypeIs[T]` (PEP 742) additionally narrows
+                // the false branch by removing `T`; `TypeGuard` says nothing
+                // about it.
+                if let Some(Type::Function { ret, .. }) =
+                    c.function_signatures.get(fn_name.id.as_str())
+                {
+                    if let Type::Generic(head, guard_args) = ret.as_ref() {
+                        if (head == "TypeGuard" || head == "TypeIs") && guard_args.len() == 1 {
+                            if let Some(Expr::Name(target)) = pos_args.first() {
+                                if let Some(b) = c.env.lookup(target.id.as_str()) {
+                                    let replacement = if !negate {
+                                        Some(guard_args[0].clone())
+                                    } else if head == "TypeIs" {
+                                        Some(strip_variant(&b.narrowed, &guard_args[0]))
+                                    } else {
+                                        None
+                                    };
+                                    if let Some(replacement) = replacement {
+                                        out.push(Narrowing {
+                                            name: target.id.as_str().to_owned(),
+                                            attr_path: None,
+                                            replacement,
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
                 if fn_name.id.as_str() == "isinstance" && pos_args.len() == 2 {
                     if let Expr::Name(target) = &pos_args[0] {
                         let new_type = type_from_annotation(&pos_args[1], &c.classes);
@@ -15139,10 +16535,114 @@ fn emit_builtin_attr_not_found(
     ));
 }
 
+/// Signatures for the element-typed methods of the builtin containers, so
+/// `xs.append("str")` on a `list[int]`, `s.add(1)` on a `set[str]` or
+/// `d.setdefault(1, …)` on a `dict[str, int]` is a `tyc::type_mismatch` at the
+/// call instead of a silently corrupted container. Every entry mirrors the
+/// CPython signature: the checked parameters are the ones that take an element
+/// (or key / value); anything else (`key=` / `reverse=` on `sort`, the index
+/// on `pop`, the iterable on `extend` / `update`) is left `variadic` so the
+/// arity rule stays permissive. Return types follow CPython (`None` for the
+/// in-place mutators, `T` for `pop`, `int` for `index` / `count`).
+fn builtin_container_mutator(head: &str, attr: &str, args: &[Type]) -> Option<Type> {
+    let sig = |params: Vec<Type>, ret: Type, variadic: bool| {
+        Some(Type::Function {
+            params,
+            ret: Box::new(ret),
+            variadic,
+            min_params: None,
+        })
+    };
+    match (head, attr, args) {
+        ("list", "append", [t]) => sig(vec![t.clone()], Type::None, false),
+        ("list", "insert", [t]) => sig(vec![Type::Int, t.clone()], Type::None, false),
+        ("list", "remove", [t]) => sig(vec![t.clone()], Type::None, false),
+        ("list", "index", [t]) => sig(vec![t.clone()], Type::Int, true),
+        ("list", "count", [t]) => sig(vec![t.clone()], Type::Int, false),
+        ("list", "pop", [t]) => sig(vec![], t.clone(), true),
+        ("list", "extend", [_]) => sig(vec![Type::Unknown], Type::None, false),
+        ("list", "clear", [_]) | ("list", "reverse", [_]) => sig(vec![], Type::None, false),
+        ("list", "sort", [_]) => sig(vec![], Type::None, true),
+        ("list", "copy", [t]) => sig(vec![], Type::Generic("list".into(), vec![t.clone()]), false),
+        ("set", "add", [t]) | ("set", "discard", [t]) | ("set", "remove", [t]) => {
+            sig(vec![t.clone()], Type::None, false)
+        }
+        ("set", "pop", [t]) => sig(vec![], t.clone(), false),
+        ("set", "clear", [_]) => sig(vec![], Type::None, false),
+        ("set", "update", [_]) => sig(vec![], Type::None, true),
+        ("set", "copy", [t]) => sig(vec![], Type::Generic("set".into(), vec![t.clone()]), false),
+        ("set", "issubset", [_]) | ("set", "issuperset", [_]) | ("set", "isdisjoint", [_]) => {
+            sig(vec![Type::Unknown], Type::Bool, false)
+        }
+        ("dict", "setdefault", [k, v]) => sig(vec![k.clone()], v.clone(), true),
+        ("dict", "pop", [k, v]) => sig(vec![k.clone()], v.clone(), true),
+        ("dict", "clear", [_, _]) => sig(vec![], Type::None, false),
+        ("dict", "update", [_, _]) => sig(vec![], Type::None, true),
+        ("dict", "copy", [k, v]) => sig(
+            vec![],
+            Type::Generic("dict".into(), vec![k.clone(), v.clone()]),
+            false,
+        ),
+        _ => None,
+    }
+}
+
+/// Signatures for the `str` methods, so `", ".join([1, 2])` is a
+/// `tyc::type_mismatch` at the call and `s.split(",")` is a `list[str]` rather
+/// than `Unknown`. Checked parameters are the ones whose misuse is a certain
+/// `TypeError` (`join`'s iterable of `str`, `replace`'s two strings, the width
+/// of `center` / `zfill`, the affix of `removeprefix`); optional trailing
+/// parameters (`start` / `end`, `count`, `maxsplit`, `chars`) are left
+/// `variadic` so the arity rule stays permissive. `startswith` / `endswith`
+/// take a `str` *or a tuple of them*, so their affix stays unchecked.
+fn builtin_str_method(attr: &str) -> Option<Type> {
+    let sig = |params: Vec<Type>, ret: Type, variadic: bool| {
+        Some(Type::Function {
+            params,
+            ret: Box::new(ret),
+            variadic,
+            min_params: None,
+        })
+    };
+    let list_str = || Type::Generic("list".into(), vec![Type::Str]);
+    match attr {
+        "upper" | "lower" | "title" | "capitalize" | "casefold" | "swapcase" => {
+            sig(vec![], Type::Str, false)
+        }
+        "strip" | "lstrip" | "rstrip" | "format" | "expandtabs" => sig(vec![], Type::Str, true),
+        "replace" => sig(vec![Type::Str, Type::Str], Type::Str, true),
+        "removeprefix" | "removesuffix" => sig(vec![Type::Str], Type::Str, false),
+        "center" | "ljust" | "rjust" => sig(vec![Type::Int], Type::Str, true),
+        "zfill" => sig(vec![Type::Int], Type::Str, false),
+        "join" => sig(
+            vec![Type::Generic("Iterable".into(), vec![Type::Str])],
+            Type::Str,
+            false,
+        ),
+        "split" | "rsplit" | "splitlines" => sig(vec![], list_str(), true),
+        "partition" | "rpartition" => sig(
+            vec![Type::Str],
+            Type::Generic("tuple".into(), vec![Type::Str, Type::Str, Type::Str]),
+            false,
+        ),
+        "find" | "rfind" | "index" | "rindex" | "count" => sig(vec![Type::Str], Type::Int, true),
+        "startswith" | "endswith" => sig(vec![Type::Unknown], Type::Bool, true),
+        "isdigit" | "isalpha" | "isalnum" | "isspace" | "isupper" | "islower" | "istitle"
+        | "isnumeric" | "isdecimal" | "isidentifier" | "isprintable" | "isascii" => {
+            sig(vec![], Type::Bool, false)
+        }
+        "encode" => sig(vec![], Type::Bytes, true),
+        _ => None,
+    }
+}
+
 fn builtin_generic_method(recv: &Type, attr: &str) -> Option<Type> {
     let Type::Generic(head, args) = recv else {
         return None;
     };
+    if let Some(sig) = builtin_container_mutator(head, attr, args) {
+        return Some(sig);
+    }
     match (head.as_str(), attr, args.as_slice()) {
         ("dict", "get", [k, v]) => {
             // `d.get(k)` → V?  ;  `d.get(k, default)` → also typed as V?
@@ -15482,6 +16982,73 @@ fn extract_generator_return_type(typ: &Type) -> Option<Type> {
 /// checker tracks them as the async function's declared return type,
 /// not as `Awaitable[T]`), so this path is the typed-callable hole that
 /// R3-1 documents.
+/// Report a possibly-`None` operand of an arithmetic or ordering operator.
+///
+/// A bare name reports as `tyc::nullable_use` at error level (the value can
+/// be narrowed with `if x is not None:`). An attribute path (`self.count + 1`)
+/// goes through the warn-level attribute-rooted form added in alpha.7, since
+/// a field can be populated in practice without the checker seeing it.
+/// Any other shape — `d.get(k) + 1`, `xs[0] * 2`, `find(x) < 3` — is the
+/// classic unguarded-`None` bug and reports at error level under a display
+/// name derived from the expression.
+fn report_nullable_operand(c: &mut Checker, expr: &Expr, ty: &Type) {
+    if c.unsafe_depth > 0 {
+        return;
+    }
+    let span = (
+        expr.range().start().to_usize(),
+        expr.range().end().to_usize(),
+    );
+    match expr {
+        Expr::Name(n) => {
+            let span = (
+                n.range.start().to_usize(),
+                n.range.start().to_usize() + n.id.as_str().len(),
+            );
+            c.nullable_use(n.id.as_str(), ty, span);
+        }
+        Expr::Attribute(_) => {
+            if let Some(path) = attr_path_of(expr) {
+                c.nullable_attr_use(&path, ty, span);
+            }
+        }
+        other => {
+            let display = match other {
+                Expr::Call(call) => match call.func.as_ref() {
+                    Expr::Attribute(a) => format!("{}(...)", a.attr.as_str()),
+                    Expr::Name(n) => format!("{}(...)", n.id.as_str()),
+                    _ => "the call result".to_owned(),
+                },
+                Expr::Subscript(sub) => match sub.value.as_ref() {
+                    Expr::Name(n) => format!("{}[...]", n.id.as_str()),
+                    _ => "the subscript".to_owned(),
+                },
+                _ => "the expression".to_owned(),
+            };
+            c.nullable_use(&display, ty, span);
+        }
+    }
+}
+
+/// The element type a freshly-built container adopts: the annotated element
+/// type when the inferred one is assignable to it (and neither side is
+/// unknown or a free type parameter), otherwise the inferred type — which then
+/// surfaces the genuine mismatch at the assignment.
+fn widen_fresh_element(c: &Checker, inferred: Type, expected: Option<&Type>) -> Type {
+    match expected {
+        Some(exp)
+            if !matches!(exp, Type::Unknown | Type::Any)
+                && !matches!(inferred, Type::Unknown)
+                && !mentions_type_param(exp)
+                && exp != &inferred
+                && c.is_assignable(exp, &inferred) =>
+        {
+            exp.clone()
+        }
+        _ => inferred,
+    }
+}
+
 fn unwrap_awaitable(typ: &Type, user_classes: &[String]) -> Option<Type> {
     let Type::Generic(name, args) = typ else {
         return None;
@@ -15518,6 +17085,15 @@ fn refine_isinstance_target(current: &Type, narrowed_to: &Type) -> Type {
 }
 
 fn strip_variant(typ: &Type, variant: &Type) -> Type {
+    // A union variant (`isinstance(x, (A, B))` on the negative branch)
+    // removes each of its members.
+    if let Type::Union(members) = variant {
+        let mut out = typ.clone();
+        for m in members {
+            out = strip_variant(&out, m);
+        }
+        return out;
+    }
     if let Type::Union(xs) = typ {
         let kept: Vec<Type> = xs.iter().filter(|t| *t != variant).cloned().collect();
         Type::union_of(kept)
@@ -15827,6 +17403,37 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
     result
 }
 
+/// The structural type of a lambda with no expected `Callable` to check it
+/// against: its *arity* (so a call site expecting `Callable[[int, int], int]`
+/// rejects `lambda x: x` at check time instead of TypeError-ing at runtime)
+/// with `Unknown` parameter and return types, since a lambda carries no
+/// annotations. `params` lists every positional parameter; a defaulted tail
+/// is recorded through `min_params` (exactly as `def` signatures do), so
+/// `lambda x, y=1: …` satisfies both `Callable[[int], R]` and
+/// `Callable[[int, int], R]`. Only `*args` makes the lambda variadic —
+/// `**kwargs` never absorbs a positional argument.
+fn lambda_structural_type(lam: &ruff_python_ast::ExprLambda) -> Type {
+    let (n, required, variadic) = match lam.parameters.as_deref() {
+        Some(p) => {
+            let positional = p.posonlyargs.len() + p.args.len();
+            let required = p
+                .posonlyargs
+                .iter()
+                .chain(p.args.iter())
+                .take_while(|a| a.default.is_none())
+                .count();
+            (positional, required, p.vararg.is_some())
+        }
+        None => (0, 0, false),
+    };
+    Type::Function {
+        params: vec![Type::Unknown; n],
+        ret: Box::new(Type::Unknown),
+        variadic,
+        min_params: (required < n).then_some(required),
+    }
+}
+
 fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type {
     match expr {
         Expr::BooleanLiteral(_) => Type::Bool,
@@ -15856,6 +17463,96 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
         }
         Expr::BytesLiteral(_) => Type::Bytes,
         Expr::NoneLiteral(_) => Type::None,
+        // A lambda in a position whose expected type is a `Callable` — a
+        // `Callable[[…], R]` parameter, an annotated `let`, a declared return —
+        // is checked *against that contract*: each positional parameter is
+        // bound to the corresponding expected parameter type, the body is
+        // inferred (so its own diagnostics surface: a misspelt attribute, a
+        // method that does not exist on the parameter's type), and the body's
+        // type must be assignable to `R`. Without an expected `Callable` the
+        // lambda keeps its structural shape from `infer_expr` (parameters
+        // `Unknown`), because a lambda has no annotations of its own.
+        Expr::Lambda(lam) => {
+            let expected_fn = match expected.map(|t| c.unwrap_alias(t)) {
+                Some(Type::Function { params, ret, .. }) => Some((params, *ret)),
+                _ => None,
+            };
+            let shape = lambda_structural_type(lam);
+            let Some((exp_params, exp_ret)) = expected_fn else {
+                return shape;
+            };
+            let (variadic, min_params) = match &shape {
+                Type::Function {
+                    variadic,
+                    min_params,
+                    ..
+                } => (*variadic, *min_params),
+                _ => (false, None),
+            };
+            let mut bound_params: Vec<Type> = Vec::new();
+            c.env.enter();
+            if let Some(params) = lam.parameters.as_deref() {
+                let positional = params.posonlyargs.iter().chain(params.args.iter());
+                for (i, pwd) in positional.enumerate() {
+                    let ty = exp_params.get(i).cloned().unwrap_or(Type::Unknown);
+                    bound_params.push(ty.clone());
+                    let name = pwd.parameter.name.as_str();
+                    let start = pwd.parameter.name.range.start().to_usize();
+                    c.env.declare(TypeBinding {
+                        name: name.to_owned(),
+                        declared: ty.clone(),
+                        narrowed: ty,
+                        span: (start, start + name.len()),
+                        from_unsafe: c.unsafe_depth > 0,
+                    });
+                }
+                // Keyword-only, `*args` and `**kwargs` parameters have no
+                // positional slot in a `Callable` to take a type from.
+                let rest = params
+                    .kwonlyargs
+                    .iter()
+                    .map(|pwd| &pwd.parameter)
+                    .chain(params.vararg.iter().map(|p| p.as_ref()))
+                    .chain(params.kwarg.iter().map(|p| p.as_ref()));
+                for param in rest {
+                    let name = param.name.as_str();
+                    let start = param.name.range.start().to_usize();
+                    c.env.declare(TypeBinding {
+                        name: name.to_owned(),
+                        declared: Type::Unknown,
+                        narrowed: Type::Unknown,
+                        span: (start, start + name.len()),
+                        from_unsafe: c.unsafe_depth > 0,
+                    });
+                }
+            }
+            let body_ty = infer_expr_ctx(c, &lam.body, Some(&exp_ret));
+            c.env.leave();
+            // The body must produce what the contract promises. Report it on
+            // the body and hand back the *expected* return so the enclosing
+            // assignability check does not report the same span twice.
+            let ret = if !matches!(exp_ret, Type::Unknown | Type::Any)
+                && !matches!(body_ty, Type::Unknown)
+                && !c.is_assignable(&exp_ret, &body_ty)
+            {
+                let span = (
+                    lam.body.range().start().to_usize(),
+                    lam.body.range().end().to_usize(),
+                );
+                c.mismatch(&exp_ret, &body_ty, span);
+                exp_ret
+            } else if matches!(body_ty, Type::Unknown) {
+                exp_ret
+            } else {
+                body_ty
+            };
+            Type::Function {
+                params: bound_params,
+                ret: Box::new(ret),
+                variadic,
+                min_params,
+            }
+        }
         // Walrus `(target := value)` — bind `target` in the current scope to
         // the value's type and evaluate to that type. Without this arm the
         // binding was invisible to the checker (every read of `target`
@@ -15919,40 +17616,6 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
             }
             Type::Str
         }
-        // Lambdas carry their *arity* into the type so a call site
-        // expecting `Callable[[int, int], int]` rejects `lambda x: x`
-        // at check time instead of TypeError-ing at runtime. Parameter
-        // and return types stay `Unknown` (no annotations on lambdas);
-        // defaults or `*args` / `**kwargs` mark the function variadic so
-        // optional-argument lambdas keep matching any arity.
-        Expr::Lambda(lam) => {
-            let (n, variadic) = match lam.parameters.as_deref() {
-                Some(p) => {
-                    let required = p
-                        .posonlyargs
-                        .iter()
-                        .chain(p.args.iter())
-                        .filter(|a| a.default.is_none())
-                        .count();
-                    let has_optional = p
-                        .posonlyargs
-                        .iter()
-                        .chain(p.args.iter())
-                        .any(|a| a.default.is_some());
-                    (
-                        required,
-                        has_optional || p.vararg.is_some() || p.kwarg.is_some(),
-                    )
-                }
-                None => (0, false),
-            };
-            Type::Function {
-                params: vec![Type::Unknown; n],
-                ret: Box::new(Type::Unknown),
-                variadic,
-                min_params: None,
-            }
-        }
         Expr::Name(n) => {
             if let Some(b) = c.env.lookup(n.id.as_str()) {
                 b.narrowed.clone()
@@ -15968,13 +17631,7 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
             // `if x is not None:`.
             for (side, ty) in [(b.left.as_ref(), &l), (b.right.as_ref(), &r)] {
                 if ty.is_nullable() {
-                    if let Expr::Name(n) = side {
-                        let span = (
-                            n.range.start().to_usize(),
-                            n.range.start().to_usize() + n.id.as_str().len(),
-                        );
-                        c.nullable_use(n.id.as_str(), ty, span);
-                    }
+                    report_nullable_operand(c, side, ty);
                 }
             }
             let l_stripped = l.strip_none();
@@ -16178,7 +17835,40 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
             }
         }
         Expr::BoolOp(b) => infer_bool_op(c, b),
-        Expr::Compare(_) => Type::Bool,
+        Expr::Compare(cmp) => {
+            // Operands are inferred (so their own diagnostics fire) and an
+            // ordering comparison (`<`, `<=`, `>`, `>=`) or membership test
+            // on a possibly-`None` operand is reported: CPython raises
+            // `TypeError: '<' not supported between 'NoneType' and 'int'`.
+            // Equality and identity (`==`, `!=`, `is`, `is not`) accept
+            // `None` on either side and are left alone.
+            let left_ty = infer_expr(c, &cmp.left);
+            let mut operand_tys: Vec<(&Expr, Type)> = vec![(cmp.left.as_ref(), left_ty)];
+            for comparator in cmp.comparators.iter() {
+                let ty = infer_expr(c, comparator);
+                operand_tys.push((comparator, ty));
+            }
+            for (i, op) in cmp.ops.iter().enumerate() {
+                let ordering = matches!(
+                    op,
+                    ruff_python_ast::CmpOp::Lt
+                        | ruff_python_ast::CmpOp::LtE
+                        | ruff_python_ast::CmpOp::Gt
+                        | ruff_python_ast::CmpOp::GtE
+                );
+                if !ordering {
+                    continue;
+                }
+                for idx in [i, i + 1] {
+                    if let Some((expr, ty)) = operand_tys.get(idx) {
+                        if ty.is_nullable() {
+                            report_nullable_operand(c, expr, ty);
+                        }
+                    }
+                }
+            }
+            Type::Bool
+        }
         Expr::UnaryOp(u) => {
             let operand = infer_expr(c, &u.operand);
             match u.op {
@@ -16392,6 +18082,7 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
                         }
                     }
                 }
+                check_builtin_first_argument(c, fn_name, pos_args);
             }
 
             // Phase E: blocking-in-async call detection. When the
@@ -16457,6 +18148,32 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
                         let span = (n.range.start().to_usize(), n.range.end().to_usize());
                         c.missing_await(n.id.as_str(), span);
                     }
+                }
+            }
+            // `go f(x)` lowers to `typhon_runtime.tasks.spawn(f(x))`, which
+            // needs a *running* event loop. Module-level code runs at import
+            // with none, so a spawn there — or a module-level call to a sync
+            // function that spawns — raised `RuntimeError` at runtime. A
+            // spawn inside a sync `def` is left alone: the function may well
+            // be called from a coroutine.
+            let at_module_level = c.current_return.is_none() && c.async_enclosing_depth == 0;
+            if at_module_level && c.unsafe_depth == 0 {
+                let offender = task_spawn_callee(call).or_else(|| match call.func.as_ref() {
+                    Expr::Name(n) => c
+                        .sync_spawners
+                        .get(n.id.as_str())
+                        .map(|spawned| format!("{spawned} (via {})", n.id.as_str())),
+                    _ => None,
+                });
+                if let Some(callee) = offender {
+                    let span = (call.range.start().to_usize(), call.range.end().to_usize());
+                    c.diagnostics.push_error(TycError::go_outside_async(
+                        callee,
+                        c.path.clone(),
+                        c.source,
+                        span.0,
+                        span.1.saturating_sub(span.0).max(1),
+                    ));
                 }
             }
             let suppresses_missing_await = call_targets_coro_acceptor(call);
@@ -16894,6 +18611,26 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
                             }
                         }
                     }
+                    // Calling an `async def` without `await` yields a coroutine,
+                    // not the declared return type — `let s: str = fetch(3)`
+                    // used to type-check and then crash on `s.upper()`. Wrap
+                    // the result unless this call is the operand of `await`
+                    // (or an argument to a coroutine-accepting API such as
+                    // `asyncio.gather`, which bumps the same counter). In a
+                    // *sync* function the bare call is already reported as
+                    // `tyc::missing_await`; the wrapper is what keeps the
+                    // value from masquerading as `T` in an async one.
+                    if c.inside_await == 0
+                        && !matches!(result, Type::Unknown | Type::Any)
+                        && callee_is_async(c, call)
+                    {
+                        // A same-module `async def` already carries the
+                        // coroutine in its signature; wrap only a bare type.
+                        if matches!(&result, Type::Generic(head, _) if head == "Coroutine") {
+                            return result;
+                        }
+                        return Type::Generic("Coroutine".into(), vec![result]);
+                    }
                     result
                 }
                 Type::Class(name) => {
@@ -16981,7 +18718,15 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
                         // `TypeError: missing 1 required positional argument`.
                         // The shape here is `effective_class_shape`, so the
                         // arity sees inherited parent fields too.
-                        let info = class_constructor_arity(&shape);
+                        let mut info = class_constructor_arity(&shape);
+                        // A `class!` constructor is synthesised by the desugarer
+                        // with the required fields first and the defaulted ones
+                        // after (Python forbids a defaulted positional before a
+                        // required one, and an inherited default may precede a
+                        // subclass's required field). Model the same order.
+                        if c.is_raw_class(&name) {
+                            info = required_first(info);
+                        }
                         // Run the arity check when the shape is authoritative
                         // for the constructor — even with zero fields, so
                         // `ZeroFieldClass(1)` / `Session(1)` is caught as
@@ -16997,12 +18742,25 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
                             || (!c.is_plain_class(&name)
                                 && !c.is_raw_class(&name)
                                 && c.class_hierarchy_fully_known(&name));
-                        // `kwonly_names` matters as much as `param_names`
-                        // here: a `model` class files every field as
-                        // keyword-only (Pydantic's `__init__` is `**data`), so
-                        // reading only `param_names` would skip the check for
-                        // exactly the classes that need it.
-                        if !info.param_names.is_empty()
+                        // A `plain class` gets no generated constructor: its
+                        // annotations are not `__init__` parameters. Without a
+                        // hand-written `__init__` it is `object.__init__` —
+                        // zero arguments — so `Bag()` is right and `Bag(1)` is
+                        // the TypeError; with one, its own signature governs
+                        // (checked through the method arity path, not the
+                        // field list). `class!` keeps the field check: its
+                        // `__init__` is synthesised from the fields.
+                        let user_init = c.find_method(&name, "__init__").is_some();
+                        if c.is_plain_class(&name) {
+                            if !user_init
+                                && (!pos_args.is_empty() || kw_args.iter().any(|k| k.arg.is_some()))
+                            {
+                                c.wrong_args(&name, 0, pos_args.len() + kw_args.len(), call_span);
+                            }
+                        } else if user_init && c.is_raw_class(&name) {
+                            // A hand-written `__init__` on a `class!` need not
+                            // mirror the fields; leave the arity to it.
+                        } else if !info.param_names.is_empty()
                             || !info.kwonly_names.is_empty()
                             || shape_is_authoritative
                         {
@@ -17049,7 +18807,14 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
                         // from a venv-introspected third-party `__init__`.
                         // Type-parameter fields on a generic class are handled
                         // separately below by `check_generic_constructor_args`.
-                        check_concrete_constructor_args(c, &shape, pos_args, kw_args);
+                        let positional_order = constructor_positional_order(c, &name, &shape);
+                        check_concrete_constructor_args(
+                            c,
+                            &shape,
+                            &positional_order,
+                            pos_args,
+                            kw_args,
+                        );
                     }
                     if let Some(tparams) = c.class_type_params.get(&name).cloned() {
                         let mut bindings: HashMap<String, Type> = HashMap::new();
@@ -17093,12 +18858,16 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
                         // bindings (inserted above) win because
                         // `bind_field_typevars` only fills vacant slots.
                         let class_shape = c.class_shapes.get(&name).cloned();
+                        let positional_order: Vec<String> = class_shape
+                            .as_ref()
+                            .map(|shape| constructor_positional_order(c, &name, shape))
+                            .unwrap_or_default();
                         if let Some(shape) = class_shape.clone() {
                             for (idx, arg) in pos_args.iter().enumerate() {
                                 if matches!(arg, Expr::Starred(_)) {
                                     continue;
                                 }
-                                if let Some(field_name) = shape.field_order.get(idx) {
+                                if let Some(field_name) = positional_order.get(idx) {
                                     if let Some(field_ty) = shape.fields.get(field_name).cloned() {
                                         let arg_ty = infer_expr(c, arg);
                                         bind_field_typevars(&field_ty, &arg_ty, &mut bindings);
@@ -17121,7 +18890,14 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
                         // fires when a type parameter is actually pinned
                         // — see `check_generic_constructor_args`.
                         if let Some(shape) = class_shape {
-                            check_generic_constructor_args(c, &shape, &bindings, pos_args, kw_args);
+                            check_generic_constructor_args(
+                                c,
+                                &shape,
+                                &positional_order,
+                                &bindings,
+                                pos_args,
+                                kw_args,
+                            );
                         }
                         let args: Vec<Type> = tparams
                             .iter()
@@ -17605,6 +19381,9 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
                     Type::Unknown
                 }
                 Type::Str => {
+                    if let Some(sig) = builtin_str_method(attr_name) {
+                        return sig;
+                    }
                     if !is_known_primitive_attr("str", attr_name)
                         && !is_user_builtin_extension(c, "str", attr_name)
                     {
@@ -18008,6 +19787,12 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
             let elt = infer_expr_ctx(c, &comp.elt, elt_expected.as_ref());
             c.env.leave();
             c.env.restore_scope_narrowings(comp_saved);
+            // A comprehension builds a *fresh* list, so — like a list literal —
+            // it takes the annotated element type whenever every element fits
+            // it: `let xs: list[object] = [a.name for a in agents]` is sound
+            // (nothing else aliases the new list), and rejecting it on
+            // invariance was a false positive the literal form never had.
+            let elt = widen_fresh_element(c, elt, elt_expected.as_ref());
             Type::Generic("list".into(), vec![elt])
         }
         Expr::SetComp(comp) => {
@@ -18021,6 +19806,7 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
             let elt = infer_expr_ctx(c, &comp.elt, elt_expected.as_ref());
             c.env.leave();
             c.env.restore_scope_narrowings(comp_saved);
+            let elt = widen_fresh_element(c, elt, elt_expected.as_ref());
             Type::Generic("set".into(), vec![elt])
         }
         Expr::Generator(comp) => {
@@ -18875,6 +20661,17 @@ fn check_override_compatibility(c: &mut Checker, body: &[Stmt]) {
 
 /// `true` when any base of `cd` is one of the standard enum bases (bare or
 /// `enum.`-qualified) — the shape the `enum Name:` keyword desugars to.
+/// The last name segment of a base-class expression: `Base` → `Base`,
+/// `enum.StrEnum` → `StrEnum`, `Generic[T]` → `Generic`.
+fn base_last_segment(e: &Expr) -> Option<&str> {
+    match e {
+        Expr::Name(n) => Some(n.id.as_str()),
+        Expr::Attribute(a) => Some(a.attr.as_str()),
+        Expr::Subscript(s) => base_last_segment(&s.value),
+        _ => None,
+    }
+}
+
 fn class_has_enum_family_base(cd: &ruff_python_ast::StmtClassDef) -> bool {
     fn last_segment(e: &Expr) -> Option<&str> {
         match e {
@@ -19046,6 +20843,28 @@ fn check_pattern_class_fields(c: &mut Checker, pattern: &Pattern) {
             }
         }
         Pattern::MatchSequence(seq) => {
+            // CPython's *compiler* (not its grammar) rejects a second
+            // `*rest` in one sequence pattern: "multiple starred names in
+            // sequence pattern". The parser accepts it, so `tyc build`
+            // reported success and wrote a `.py` that cannot even be
+            // imported. Reject it here instead.
+            let stars: Vec<&Pattern> = seq
+                .patterns
+                .iter()
+                .filter(|p| matches!(p, Pattern::MatchStar(_)))
+                .collect();
+            if stars.len() > 1 {
+                let extra = stars[1];
+                c.diagnostics.push_error(TycError::invalid_pattern(
+                    "a sequence pattern may bind at most one `*rest`",
+                    "keep the first `*rest` and match the remaining elements \
+                     positionally, or split the case in two",
+                    c.path.clone(),
+                    c.source,
+                    extra.range().start().to_usize(),
+                    (extra.range().end().to_usize() - extra.range().start().to_usize()).max(1),
+                ));
+            }
             for p in &seq.patterns {
                 check_pattern_class_fields(c, p);
             }
@@ -19057,6 +20876,105 @@ fn check_pattern_class_fields(c: &mut Checker, pattern: &Pattern) {
         }
         _ => {}
     }
+    // The same capture name twice in one pattern is also a compile error in
+    // CPython ("multiple assignments to name … in pattern"), and equally
+    // produces a `.py` that will not import.
+    if let Some((name, span)) = duplicate_pattern_capture(pattern) {
+        c.diagnostics.push_error(TycError::invalid_pattern(
+            format!("`{name}` is captured twice in the same pattern"),
+            "rename one of the captures — a pattern binds each name once",
+            c.path.clone(),
+            c.source,
+            span.0,
+            span.1,
+        ));
+    }
+}
+
+/// The first capture name bound more than once anywhere in `pattern`,
+/// with the span of its second occurrence.
+///
+/// Only called on the *top* of each `case` pattern (the recursive walk in
+/// [`check_pattern_class_fields`] re-enters through the same door, so the
+/// check is scoped to the whole pattern exactly once per case). `MatchOr`
+/// alternatives are checked independently: `case [a] | (a,):` binds `a` once
+/// on each path and is legal.
+fn duplicate_pattern_capture(pattern: &Pattern) -> Option<(String, (usize, usize))> {
+    fn walk(
+        p: &Pattern,
+        seen: &mut HashMap<String, ()>,
+        found: &mut Option<(String, (usize, usize))>,
+    ) {
+        if found.is_some() {
+            return;
+        }
+        fn note(
+            name: &str,
+            range: TextRange,
+            seen: &mut HashMap<String, ()>,
+            found: &mut Option<(String, (usize, usize))>,
+        ) {
+            if seen.insert(name.to_owned(), ()).is_some() && found.is_none() {
+                *found = Some((
+                    name.to_owned(),
+                    (
+                        range.start().to_usize(),
+                        (range.end().to_usize() - range.start().to_usize()).max(1),
+                    ),
+                ));
+            }
+        }
+        match p {
+            Pattern::MatchAs(a) => {
+                if let Some(inner) = &a.pattern {
+                    walk(inner, seen, found);
+                }
+                if let Some(name) = &a.name {
+                    note(name.as_str(), name.range, seen, found);
+                }
+            }
+            Pattern::MatchStar(st) => {
+                if let Some(name) = &st.name {
+                    note(name.as_str(), name.range, seen, found);
+                }
+            }
+            Pattern::MatchSequence(seq) => {
+                for inner in &seq.patterns {
+                    walk(inner, seen, found);
+                }
+            }
+            Pattern::MatchMapping(m) => {
+                for inner in &m.patterns {
+                    walk(inner, seen, found);
+                }
+                if let Some(rest) = &m.rest {
+                    note(rest.as_str(), rest.range, seen, found);
+                }
+            }
+            Pattern::MatchClass(mc) => {
+                for inner in &mc.arguments.patterns {
+                    walk(inner, seen, found);
+                }
+                for kw in &mc.arguments.keywords {
+                    walk(&kw.pattern, seen, found);
+                }
+            }
+            // Each alternative binds its own names, so they do not collide
+            // with one another — CPython requires them to bind the *same*
+            // set, which is the opposite rule.
+            Pattern::MatchOr(o) => {
+                for inner in &o.patterns {
+                    let mut branch: HashMap<String, ()> = HashMap::new();
+                    walk(inner, &mut branch, found);
+                }
+            }
+            Pattern::MatchValue(_) | Pattern::MatchSingleton(_) => {}
+        }
+    }
+    let mut seen = HashMap::new();
+    let mut found = None;
+    walk(pattern, &mut seen, &mut found);
+    found
 }
 
 /// Declare pattern-bound names in the current scope as `Type::Unknown`, so
@@ -21243,6 +23161,1054 @@ def f(x: int | None) -> int:
         assert!(!d.has_errors(), "{:?}", d.errors());
     }
 
+    /// An un-awaited call to an `async def` inside another `async def` is a
+    /// coroutine, not the declared return type: `let s: str = fetch(3)`
+    /// type-checked and then crashed on `s.upper()` under both surfaces.
+    #[test]
+    fn unawaited_async_call_is_a_coroutine_not_its_return_type() {
+        let src = "\
+import asyncio
+
+async def fetch(x: int) -> str:
+    await asyncio.sleep(0)
+    return str(x)
+
+async def run() -> None:
+    let u: str = fetch(3)
+    print(u)
+";
+        let d = check(src);
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::TypeMismatch { .. })),
+            "a coroutine bound to `str` must be a type mismatch: {d:?}"
+        );
+        // The awaited forms — direct, stored-then-awaited, and passed to a
+        // coroutine-accepting API — are untouched.
+        let ok = "\
+import asyncio
+
+async def fetch(x: int) -> str:
+    await asyncio.sleep(0)
+    return str(x)
+
+async def run() -> None:
+    let a: str = await fetch(1)
+    let pending = fetch(2)
+    let b: str = await pending
+    let both = await asyncio.gather(fetch(3), fetch(4))
+    print(a, b, both)
+";
+        let d = check(ok);
+        assert!(!d.has_errors(), "awaited forms must stay clean: {d:?}");
+    }
+
+    /// The nullable-operand check was gated on a bare `Name`, so the single
+    /// most common unguarded-`None` shape — `d.get(k) + 1` — and every
+    /// ordering comparison passed silently. Now every arithmetic operand
+    /// shape and the operands of `<`/`<=`/`>`/`>=` are reported; equality and
+    /// identity still accept `None`.
+    #[test]
+    fn nullable_operands_of_any_shape_are_reported() {
+        let src = "\
+def lookup(k: str) -> int | None:
+    return None if k == \"\" else 1
+
+def main() -> None:
+    let counts: dict[str, int] = {\"a\": 1}
+    let total: int = counts.get(\"b\") + 1
+    let ordered: bool = lookup(\"x\") < 3
+    let xs: list[int | None] = [1, None]
+    let doubled: int = xs[0] * 2
+    print(total, ordered, doubled)
+";
+        let d = check(src);
+        let n = d
+            .errors()
+            .iter()
+            .filter(|e| matches!(e, TycError::NullableUse { .. }))
+            .count();
+        assert_eq!(n, 3, "three nullable operands expected: {d:?}");
+        let fine = "\
+def lookup(k: str) -> int | None:
+    return None if k == \"\" else 1
+
+def main() -> None:
+    let eq: bool = lookup(\"x\") == 1
+    let ident: bool = lookup(\"x\") is None
+    print(eq, ident)
+";
+        let d = check(fine);
+        assert!(!d.has_errors(), "equality / identity accept None: {d:?}");
+    }
+
+    /// `sys.exit(...)` and a call to a `-> NoReturn` function end a path as
+    /// surely as `raise`; neither the caller nor the `NoReturn` body itself
+    /// is missing a return.
+    #[test]
+    fn noreturn_calls_and_sys_exit_are_definite_exits() {
+        let src = "\
+import sys
+from typing import NoReturn
+
+def usage() -> NoReturn:
+    print(\"usage: prog FILE\")
+    sys.exit(2)
+
+def parse(args: list[str]) -> str:
+    if len(args) > 1:
+        return args[1]
+    usage()
+
+def other(flag: bool) -> int:
+    if flag:
+        return 1
+    sys.exit(3)
+
+def asserted(flag: bool) -> int:
+    if flag:
+        return 1
+    assert False
+";
+        let d = check(src);
+        assert!(!d.has_errors(), "no missing_return expected: {d:?}");
+    }
+
+    /// A comprehension builds a fresh container, so it adopts the annotated
+    /// element type when every element fits it — the list-literal form
+    /// always did, and rejecting `[a.name for a in agents]` against
+    /// `list[object]` on invariance was a false positive.
+    #[test]
+    fn fresh_comprehension_adopts_the_annotated_element_type() {
+        let src = "\
+class Agent:
+    name: str
+
+def names(agents: list[Agent]) -> None:
+    let t1: list[object] = [a.name for a in agents]
+    let t2: list[object] = [a for a in agents]
+    let t3: set[float] = {n for n in [1, 2]}
+    print(t1, t2, t3)
+";
+        let d = check(src);
+        assert!(
+            !d.has_errors(),
+            "widening to the annotated element type: {d:?}"
+        );
+        // A genuinely wrong element type is still a mismatch.
+        let bad = "\
+def names(xs: list[str]) -> None:
+    let t: list[int] = [x for x in xs]
+    print(t)
+";
+        assert!(
+            check(bad).has_errors(),
+            "list[str] elements into list[int] must fail"
+        );
+    }
+
+    /// `isinstance(x, (A, B))` narrows to `A | B` on the positive branch and
+    /// removes both members on the negative one.
+    #[test]
+    fn isinstance_with_a_tuple_of_classes_narrows_both_branches() {
+        let src = "\
+def f(x: int | str | list[int]) -> int:
+    if isinstance(x, (int, str)):
+        return len(str(x))
+    return x[0]
+
+def g(x: str | bytes | int) -> str:
+    if isinstance(x, (str, bytes)):
+        return \"sb\"
+    return str(x + 1)
+";
+        let d = check(src);
+        assert!(!d.has_errors(), "tuple isinstance must narrow: {d:?}");
+        // The positive branch is `int | str`, not `int`: a method only `int`
+        // has must be rejected there. (Attribute access is checked per union
+        // member; subscripting a union is not, so `x[0]` would prove nothing.)
+        let positive_is_the_union = "\
+def f(x: int | str | list[int]) -> int:
+    if isinstance(x, (int, str)):
+        return x.bit_length()
+    return x[0]
+";
+        assert!(
+            check(positive_is_the_union).has_errors(),
+            "str has no bit_length, so the positive branch must still be int | str"
+        );
+        // The negative branch is `list[int]` — neither the original union nor
+        // Unknown — so a `str` method must be rejected there.
+        let negative_is_the_remainder = "\
+def f(x: int | str | list[int]) -> int:
+    if isinstance(x, (int, str)):
+        return len(str(x))
+    return len(x.upper())
+";
+        assert!(
+            check(negative_is_the_remainder).has_errors(),
+            "list[int] has no upper, so the negative branch must be the remainder"
+        );
+    }
+
+    /// A name the `try` body rebinds is widened on entry to each handler:
+    /// the raise may have happened after the rebind, so neither the body's
+    /// narrowing nor the pre-`try` one holds there.
+    #[test]
+    fn except_handler_widens_names_the_try_body_rebinds() {
+        let unsound = "\
+def risky() -> None:
+    pass
+
+def f(x: int | None) -> int:
+    if x is None:
+        return 0
+    try:
+        x = None
+        risky()
+    except ValueError:
+        return x + 1
+    return 1
+";
+        assert!(
+            check(unsound).has_errors(),
+            "x may be None in the handler after the body rebinds it"
+        );
+        // A rebind to a value of the declared type is still fine to use.
+        let ok = "\
+def risky() -> None:
+    pass
+
+def g(x: int) -> int:
+    try:
+        x = 2
+        risky()
+    except ValueError:
+        return x + 1
+    return x
+";
+        let d = check(ok);
+        assert!(!d.has_errors(), "declared int stays usable: {d:?}");
+    }
+
+    /// A lambda's defaulted tail widens the `Callable` shapes it satisfies,
+    /// exactly like a `def`'s; `**kwargs` does not absorb positionals.
+    #[test]
+    fn lambda_shape_honours_defaults_and_kwargs() {
+        let ok = "\
+def apply1(f: Callable[[int], int], x: int) -> int:
+    return f(x)
+
+def apply2(f: Callable[[int, int], int], x: int) -> int:
+    return f(x, x)
+
+def main() -> None:
+    print(apply1(lambda a, b=1: a + b, 2))
+    print(apply2(lambda a, b=1: a + b, 2))
+";
+        let d = check(ok);
+        assert!(
+            !d.has_errors(),
+            "defaulted lambda tail must satisfy both shapes: {d:?}"
+        );
+        let bad = "\
+def apply1(f: Callable[[int], int], x: int) -> int:
+    return f(x)
+
+def main() -> None:
+    print(apply1(lambda **kw: 1, 2))
+";
+        assert!(
+            check(bad).has_errors(),
+            "a **kwargs-only lambda cannot take the positional the Callable passes"
+        );
+    }
+
+    /// A lambda passed where a `Callable` is expected is checked against
+    /// that contract: parameter types flow into the body, and the body's
+    /// type must match the declared return.
+    #[test]
+    fn lambda_body_is_checked_against_the_expected_callable() {
+        let bad_attr = "\
+class Item:
+    name: str
+
+def pick(items: list[Item], key: Callable[[Item], str]) -> str:
+    return key(items[0])
+
+def main() -> None:
+    print(pick([Item(name=\"a\")], lambda it: it.nmae))
+";
+        assert!(
+            check(bad_attr).has_errors(),
+            "a misspelt attribute inside the lambda body must be reported"
+        );
+        let bad_ret = "\
+def apply(f: Callable[[int], str], x: int) -> str:
+    return f(x)
+
+def main() -> None:
+    print(apply(lambda n: n + 1, 2))
+";
+        assert!(
+            check(bad_ret).has_errors(),
+            "an int-valued body does not satisfy Callable[[int], str]"
+        );
+        let ok = "\
+class Item:
+    name: str
+
+def pick(items: list[Item], key: Callable[[Item], str]) -> str:
+    return key(items[0])
+
+def apply(f: Callable[[int], str], x: int) -> str:
+    return f(x)
+
+def main() -> None:
+    print(pick([Item(name=\"a\")], lambda it: it.name))
+    print(apply(lambda n: str(n + 1), 2))
+    let g: Callable[[int], int] = lambda v: v * 2
+    print(g(3))
+";
+        let d = check(ok);
+        assert!(!d.has_errors(), "well-typed lambda bodies pass: {d:?}");
+    }
+
+    /// Element-typed container methods check their arguments.
+    #[test]
+    fn container_mutators_check_element_types() {
+        for (src, what) in [
+            (
+                "def f(xs: list[int]) -> None:\n    xs.append(\"s\")\n",
+                "list.append",
+            ),
+            (
+                "def f(xs: list[int]) -> None:\n    xs.insert(0, \"s\")\n",
+                "list.insert",
+            ),
+            ("def f(s: set[str]) -> None:\n    s.add(1)\n", "set.add"),
+            (
+                "def f(d: dict[str, int]) -> None:\n    d.setdefault(1, 2)\n",
+                "dict.setdefault key",
+            ),
+            (
+                "def f(xs: list[int]) -> str:\n    return xs.pop()\n",
+                "list.pop returns the element type",
+            ),
+        ] {
+            assert!(check(src).has_errors(), "{what} must be rejected");
+        }
+        let ok = "\
+def f(xs: list[int], s: set[str], d: dict[str, list[int]]) -> int:
+    xs.append(1)
+    xs.insert(0, 2)
+    xs.extend([3, 4])
+    xs.sort(reverse=True)
+    s.add(\"a\")
+    s.update([\"b\"])
+    d.setdefault(\"k\", []).append(1)
+    let n: int = xs.pop() + xs.count(1) + xs.index(2)
+    let copy: list[int] = xs.copy()
+    return n + len(copy)
+";
+        let d = check(ok);
+        assert!(!d.has_errors(), "well-typed container use passes: {d:?}");
+    }
+
+    /// Inside a generic body its own type parameter is opaque: only a `T`
+    /// flows into `T`, and a `T` flows only into `T` (or its bound / object).
+    #[test]
+    fn type_parameters_are_opaque_inside_their_own_body() {
+        let holes = [
+            ("def ident[T](x: T) -> T:\n    return 42\n", "int into T"),
+            ("def to_int[T](x: T) -> int:\n    return x\n", "T into int"),
+            (
+                "def ident[T](x: T) -> T:\n    let s: str = x\n    return x\n",
+                "T into a str binding",
+            ),
+        ];
+        for (src, what) in holes {
+            assert!(check(src).has_errors(), "{what} must be rejected");
+        }
+        let ok = "\
+class Base:
+    n: int
+
+def first[T](xs: list[T]) -> T:
+    return xs[0]
+
+def pick[T](a: T, b: T, c: bool) -> T:
+    return a if c else b
+
+def wrap[T](x: T) -> list[T]:
+    return [x]
+
+def opt[T](x: T | None, d: T) -> T:
+    return d if x is None else x
+
+def twice[T](f: Callable[[T], T], x: T) -> T:
+    return f(f(x))
+
+def ident[T](x: T) -> T:
+    return x
+
+def chain[T](x: T) -> T:
+    return ident(x)
+
+def as_object[T](x: T) -> object:
+    return x
+
+def via_bound[T: Base](x: T) -> Base:
+    return x
+
+def maybe[T](x: T) -> T | None:
+    return x
+
+def main() -> None:
+    print(first([1]), pick(1, 2, True), wrap(\"a\"), opt(None, 3), twice(lambda v: v, 1), chain(5))
+    print(as_object(1), via_bound(Base(n=1)).n, maybe(2))
+";
+        let d = check(ok);
+        assert!(!d.has_errors(), "legitimate generic bodies pass: {d:?}");
+    }
+
+    /// `async` and `@property` are part of an interface member's contract.
+    #[test]
+    fn interface_conformance_checks_async_and_property() {
+        let sync_for_async = "\
+interface Fetcher:
+    async def fetch(self) -> int
+
+class Sync:
+    n: int
+
+impl Sync:
+    def fetch(self) -> int:
+        return self.n
+
+def use(f: Fetcher) -> None:
+    pass
+
+def main() -> None:
+    use(Sync(n=1))
+";
+        assert!(
+            check(sync_for_async).has_errors(),
+            "a sync method does not implement an async interface method"
+        );
+        let method_for_property = "\
+interface Shape:
+    @property
+    def area(self) -> float
+
+class Sq:
+    side: float
+
+impl Sq:
+    def area(self) -> float:
+        return self.side * self.side
+
+def use(s: Shape) -> float:
+    return s.area
+
+def main() -> None:
+    print(use(Sq(side=2.0)))
+";
+        assert!(
+            check(method_for_property).has_errors(),
+            "a plain method does not implement a @property member"
+        );
+        let method_for_field = "\
+interface Named:
+    name: str
+
+class Thing:
+    n: int
+
+impl Thing:
+    def name(self) -> str:
+        return \"t\"
+
+def use(x: Named) -> str:
+    return x.name
+
+def main() -> None:
+    print(use(Thing(n=1)))
+";
+        assert!(
+            check(method_for_field).has_errors(),
+            "a zero-argument method does not implement a field"
+        );
+        let ok = "\
+import asyncio
+
+interface Fetcher:
+    async def fetch(self) -> int
+
+interface Shape:
+    @property
+    def area(self) -> float
+
+interface Named:
+    name: str
+
+class Async:
+    n: int
+
+impl Async:
+    async def fetch(self) -> int:
+        await asyncio.sleep(0)
+        return self.n
+
+class Sq:
+    side: float
+
+impl Sq:
+    @property
+    def area(self) -> float:
+        return self.side * self.side
+
+class Flat:
+    area: float
+
+class Thing:
+    name: str
+
+class Prop:
+    n: int
+
+impl Prop:
+    @property
+    def name(self) -> str:
+        return \"p\"
+
+def use_f(f: Fetcher) -> None:
+    pass
+
+def use_s(s: Shape) -> float:
+    return s.area
+
+def use_n(x: Named) -> str:
+    return x.name
+
+def main() -> None:
+    use_f(Async(n=1))
+    print(use_s(Sq(side=2.0)), use_s(Flat(area=1.0)))
+    print(use_n(Thing(name=\"a\")), use_n(Prop(n=1)))
+";
+        let d = check(ok);
+        assert!(!d.has_errors(), "conforming implementations pass: {d:?}");
+    }
+
+    /// The first argument of the everyday builtins is checked for nullability
+    /// and for definitely-wrong types.
+    #[test]
+    fn async_function_values_are_awaitable_callables() {
+        let src = "\
+from typing import Awaitable, Callable
+
+async def slow_fetch(tag: str) -> str:
+    return tag
+
+async def run(fetch: Callable[[str], Awaitable[str]]) -> None:
+    let a: str = await fetch(\"a\")
+    print(a)
+
+async def main() -> None:
+    let g: Callable[[str], Awaitable[str]] = slow_fetch
+    await run(slow_fetch)
+    await run(g)
+    let direct: str = await slow_fetch(\"x\")
+    print(direct)
+";
+        let d = check(src);
+        assert!(!d.has_errors(), "{:?}", d.errors());
+        // A plain function is not awaitable.
+        let bad = "\
+from typing import Awaitable, Callable
+
+def sync_fetch(tag: str) -> str:
+    return tag
+
+async def run(fetch: Callable[[str], Awaitable[str]]) -> None:
+    print(await fetch(\"a\"))
+
+async def main() -> None:
+    await run(sync_fetch)
+";
+        assert!(
+            check(bad).has_errors(),
+            "a sync function is not an awaitable callable"
+        );
+    }
+
+    #[test]
+    fn possibly_unbound_reports_reads_that_may_miss_their_assignment() {
+        let cases = [
+            (
+                "def f() -> int:\n    print(x)\n    x = 1\n    return x\n",
+                "is read before any assignment",
+            ),
+            (
+                "def f(c: bool) -> int:\n    if c:\n        x = 1\n    return x\n",
+                "not assigned on every path",
+            ),
+            (
+                "def f() -> str:\n    try:\n        int(\"x\")\n    except ValueError as e:\n        pass\n    return str(e)\n",
+                "handler finishes",
+            ),
+            (
+                "def f() -> int:\n    mut x: int = 1\n    del x\n    return x\n",
+                "was deleted",
+            ),
+            (
+                "def f(xs: list[int]) -> int:\n    for x in xs:\n        pass\n    return x\n",
+                "not assigned on every path",
+            ),
+        ];
+        for (src, expect) in cases {
+            let d = check(src);
+            let msg = d
+                .warnings()
+                .iter()
+                .find(|w| matches!(w, TycError::PossiblyUnbound { .. }))
+                .map(|w| format!("{w}"))
+                .unwrap_or_default();
+            assert!(
+                msg.contains(expect),
+                "{src}\nexpected `{expect}` in `{msg}`; warnings: {:?}",
+                d.warnings()
+            );
+        }
+    }
+
+    #[test]
+    fn possibly_unbound_stays_quiet_on_definite_shapes() {
+        let ok = [
+            "def f(c: bool) -> int:\n    if c:\n        x = 1\n    else:\n        x = 2\n    return x\n",
+            "def f(c: bool) -> int:\n    if c:\n        x = 1\n    else:\n        return 0\n    return x\n",
+            "def f() -> int:\n    while True:\n        x = 1\n        if x > 0:\n            break\n    return x\n",
+            "def f(v: int) -> int:\n    match v:\n        case 0:\n            y = 1\n        case n:\n            y = n\n    return y\n",
+            "def f() -> int:\n    try:\n        x = int(\"1\")\n    except ValueError:\n        return 0\n    else:\n        print(x)\n    return x\n",
+            "def f() -> int:\n    try:\n        x = int(\"1\")\n    except ValueError:\n        x = 0\n    return x\n",
+            "def f(xs: list[int]) -> list[int]:\n    ys = [y for y in xs if (z := y) > 0]\n    return ys + [z]\n",
+            "def f() -> int:\n    def g() -> int:\n        return x\n    x = 1\n    return g()\n",
+            "def f(xs: list[int]) -> int:\n    total = 0\n    for x in xs:\n        total += x\n    return total\n",
+            "def f(s: str) -> str:\n    for ch in s:\n        last = ch\n    else:\n        last = \"\"\n    return last\n",
+            "def f(p: str) -> int:\n    with open(p) as fh:\n        n = len(fh.read())\n    return n\n",
+            "def f(n: int) -> int:\n    global COUNT\n    COUNT = n\n    return COUNT\n",
+            "def f(t: tuple[int, str]) -> bool:\n    unsafe:\n        let z: bool = t[2]\n    return z\n",
+            "def f() -> int:\n    if True:\n        x = 1\n    return x\n",
+        ];
+        for src in ok {
+            let d = check(src);
+            assert!(
+                !d.warnings()
+                    .iter()
+                    .any(|w| matches!(w, TycError::PossiblyUnbound { .. })),
+                "{src}: {:?}",
+                d.warnings()
+            );
+        }
+    }
+
+    #[test]
+    fn go_outside_async_fires_only_from_module_level_code() {
+        // Module-level spawn, and a module-level call to a sync function
+        // that spawns: no event loop is running at import time.
+        for src in [
+            "async def work() -> None:\n    pass\n\ntyphon_runtime.tasks.spawn(work())\n",
+            "async def work() -> None:\n    pass\n\ndef kick() -> None:\n    typhon_runtime.tasks.spawn(work())\n\nkick()\n",
+        ] {
+            let d = check(src);
+            assert!(
+                d.errors().iter().any(|e| matches!(e, TycError::GoOutsideAsync { .. })),
+                "{src}: {:?}",
+                d.errors()
+            );
+        }
+        // A spawn inside a sync def that is only called from a coroutine, or
+        // inside an async def, is fine.
+        for src in [
+            "async def work() -> None:\n    pass\n\ndef kick() -> None:\n    typhon_runtime.tasks.spawn(work())\n\nasync def main() -> None:\n    kick()\n",
+            "async def work() -> None:\n    pass\n\nasync def main() -> None:\n    typhon_runtime.tasks.spawn(work())\n",
+        ] {
+            let d = check(src);
+            assert!(
+                !d.errors().iter().any(|e| matches!(e, TycError::GoOutsideAsync { .. })),
+                "{src}: {:?}",
+                d.errors()
+            );
+        }
+    }
+
+    #[test]
+    fn patterns_cpython_cannot_compile_are_rejected() {
+        // The Python *grammar* accepts these; the CPython *compiler* does
+        // not. `tyc build` reported success and wrote a `.py` that fails to
+        // import — the differential harness's compile gate caught it.
+        let two_stars = "\
+def f(xs: list[int]) -> int:
+    match xs:
+        case [*a, *b]:
+            return 1
+        case _:
+            return 0
+";
+        let d = check(two_stars);
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| format!("{e:?}").contains("InvalidPattern")),
+            "two `*rest` captures must be rejected: {:?}",
+            d.errors()
+        );
+
+        let dup = "\
+def f(xs: list[int]) -> int:
+    match xs:
+        case [a, a]:
+            return a
+        case _:
+            return 0
+";
+        assert!(
+            check(dup)
+                .errors()
+                .iter()
+                .any(|e| format!("{e:?}").contains("InvalidPattern")),
+            "a name captured twice in one pattern must be rejected"
+        );
+
+        // Legal shapes must stay legal: one `*rest`, and the same name in
+        // different `|` alternatives (CPython *requires* the alternatives to
+        // bind the same set).
+        for ok in [
+            "def f(xs: list[int]) -> int:\n    match xs:\n        case [a, *rest]:\n            return a + len(rest)\n        case _:\n            return 0\n",
+            "def f(xs: list[int]) -> int:\n    match xs:\n        case [a] | [a, _]:\n            return a\n        case _:\n            return 0\n",
+            "def f(d: dict[str, int]) -> int:\n    match d:\n        case {\"k\": v, **rest}:\n            return v + len(rest)\n        case _:\n            return 0\n",
+        ] {
+            let d = check(ok);
+            assert!(
+                !d.errors()
+                    .iter()
+                    .any(|e| format!("{e:?}").contains("InvalidPattern")),
+                "legal pattern rejected: {ok}\n{:?}",
+                d.errors()
+            );
+        }
+    }
+
+    #[test]
+    fn env_snapshots_share_untouched_scopes() {
+        // Checking a module clones the whole `TypeEnv` on every branch,
+        // `try` and loop. When each clone deep-copied every binding, a
+        // module was quadratic in its top-level definitions — 4 000
+        // one-`if` functions took 35 s. Scopes are copy-on-write now, so a
+        // snapshot shares them until something writes.
+        let mut env = TypeEnv::default();
+        env.enter();
+        env.declare(TypeBinding {
+            name: "g".into(),
+            declared: Type::optional(Type::Int),
+            narrowed: Type::optional(Type::Int),
+            span: (0, 0),
+            from_unsafe: false,
+        });
+        env.enter();
+        let snap = env.snapshot();
+        assert!(
+            env.scopes
+                .iter()
+                .zip(&snap.scopes)
+                .all(|(a, b)| Rc::ptr_eq(a, b)),
+            "an untouched snapshot must share every scope"
+        );
+        // Writing the inner scope copies only that one.
+        env.declare(TypeBinding {
+            name: "local".into(),
+            declared: Type::Int,
+            narrowed: Type::Int,
+            span: (0, 0),
+            from_unsafe: false,
+        });
+        assert!(
+            Rc::ptr_eq(&env.scopes[0], &snap.scopes[0]),
+            "the module scope must stay shared when only a local is declared"
+        );
+        assert!(
+            !Rc::ptr_eq(&env.scopes[1], &snap.scopes[1]),
+            "the written scope must have been copied"
+        );
+        // Re-narrowing to the type a binding already has is a no-op, so it
+        // must not copy the scope either.
+        let before = env.scopes[0].clone();
+        env.narrow("g", Type::optional(Type::Int));
+        assert!(
+            Rc::ptr_eq(&env.scopes[0], &before),
+            "a narrowing that changes nothing must not copy the scope"
+        );
+        env.narrow("g", Type::Int);
+        assert!(
+            !Rc::ptr_eq(&env.scopes[0], &before),
+            "a real narrowing must copy the scope it writes"
+        );
+        assert_eq!(env.lookup("g").map(|b| b.narrowed.clone()), Some(Type::Int));
+    }
+
+    #[test]
+    fn a_function_body_narrowing_does_not_escape_into_the_next_function() {
+        // The copy-on-write scopes changed how `check_function` restores
+        // narrowings; the guarantee they exist for must still hold.
+        let src = "\
+def a(x: int | None) -> int:
+    if x is None:
+        return 0
+    return x
+
+def b(x: int | None) -> int:
+    return x
+";
+        let d = check(src);
+        assert!(
+            d.has_errors(),
+            "`b` must not inherit `a`'s narrowing of `x`: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn raw_class_chain_constructor_takes_required_fields_first() {
+        // The desugarer synthesises `Grand.__init__(self, a, c, b=2)`: the
+        // inherited default moves behind the subclass's required field.
+        let src = "\
+class Base:
+    pass
+
+class! Child(Base):
+    a: int
+    b: int = 2
+
+class! Grand(Child):
+    c: str
+
+def main() -> None:
+    let g: Grand = Grand(1, \"x\")
+    let h: Grand = Grand(1, \"x\", 3)
+    let k: Grand = Grand(a=1, c=\"x\")
+    print(g.a, g.b, g.c, h.b, k.c)
+";
+        let d = check_class_kinds(src);
+        assert!(!d.has_errors(), "{:?}", d.errors());
+        let bad = "\
+class Base:
+    pass
+
+class! Child(Base):
+    a: int
+    b: int = 2
+
+class! Grand(Child):
+    c: str
+
+def main() -> None:
+    let g: Grand = Grand(1, 2)
+";
+        assert!(
+            check_class_kinds(bad).has_errors(),
+            "the second positional is `c: str`"
+        );
+        // Same chain, but rooted at a `plain class` with an `impl` block and
+        // carrying a `ClassVar` on the middle class -- the shape that reaches
+        // the *concrete* constructor-argument check rather than the generic
+        // one. Both must agree on the required-first positional order.
+        let concrete = "\
+from typing import ClassVar
+
+plain class Base:
+    pass
+
+impl Base:
+    def __init__(self) -> None:
+        pass
+
+class! Child(Base):
+    tag: ClassVar[str] = \"child\"
+    a: int
+    b: int = 2
+
+class! Grand(Child):
+    c: str
+
+def main() -> None:
+    let g: Grand = Grand(1, \"x\")
+    print(g.a, g.b, g.c, Grand.tag)
+";
+        let d = check_class_kinds(concrete);
+        assert!(!d.has_errors(), "{:?}", d.errors());
+        assert!(
+            check_class_kinds(&concrete.replace("Grand(1, \"x\")", "Grand(1, 2)")).has_errors(),
+            "the second positional is still `c: str` on the concrete path"
+        );
+    }
+
+    #[test]
+    fn builtin_first_argument_is_checked() {
+        for (src, what) in [
+            (
+                "def f(d: dict[str, str]) -> int:\n    return int(d.get(\"n\"))\n",
+                "int() of a possibly-None value",
+            ),
+            (
+                "def f(n: int) -> int:\n    return len(n)\n",
+                "len() of an int",
+            ),
+            (
+                "def f(n: float) -> list[int]:\n    return sorted(n)\n",
+                "sorted() of a float",
+            ),
+            (
+                "def f(xs: list[int]) -> int:\n    return int(xs)\n",
+                "int() of a list",
+            ),
+            (
+                "def f(s: str) -> str:\n    return chr(s)\n",
+                "chr() of a str",
+            ),
+            (
+                "def f(xs: list[int] | None) -> int:\n    return sum(xs)\n",
+                "sum() of a nullable list",
+            ),
+        ] {
+            assert!(check(src).has_errors(), "{what} must be rejected");
+        }
+        let ok = "\
+class Money:
+    cents: int
+
+def f(d: dict[str, str], xs: list[int], s: str, m: Money, n: int, w: str | None, b: bytes) -> None:
+    print(int(d.get(\"n\", \"0\")), int(\"3\"), int(2.5), float(n), len(xs), len(s))
+    print(sorted(xs), sum(xs), min(1, 2), max(xs), any(xs), list(s), set(xs))
+    print(chr(65), ord(\"a\"), abs(-1), round(2.5), round(1.234, 2))
+    print(int(m), len(m), iter(xs), min(xs), int(n), sum([1.5]))
+    print(iter(xs[::-1]), sorted(xs[1:]), len(s[1:]), ord(s[0]), int(s[-1]), chr(b[0]), len(b[1:]))
+    if w is not None:
+        print(int(w))
+";
+        let d = check(ok);
+        assert!(!d.has_errors(), "well-typed builtin calls pass: {d:?}");
+    }
+
+    /// `str` methods carry real signatures: element-checked `join`, typed
+    /// results for `split` / `find` / `startswith`.
+    #[test]
+    fn str_methods_are_typed() {
+        for (src, what) in [
+            (
+                "def f(xs: list[int]) -> str:\n    return \", \".join(xs)\n",
+                "join over list[int]",
+            ),
+            (
+                "def f(s: str) -> str:\n    return s.replace(1, \"x\")\n",
+                "replace with an int pattern",
+            ),
+            (
+                "def f(s: str) -> int:\n    return s.split(\",\")\n",
+                "split is a list[str], not an int",
+            ),
+            (
+                "def f(s: str) -> str:\n    return s.zfill(\"8\")\n",
+                "zfill takes an int",
+            ),
+        ] {
+            assert!(check(src).has_errors(), "{what} must be rejected");
+        }
+        let ok = "\
+def f(s: str, names: list[str], parts: tuple[str, str], d: dict[str, int]) -> None:
+    let joined: str = \", \".join(names) + \"\".join(str(n) for n in [1, 2]) + \"-\".join(parts)
+    let keys: str = \" \".join(d.keys()) + \" \".join(sorted(names))
+    let words: list[str] = s.split() + s.split(\",\", 1) + s.splitlines()
+    let n: int = s.find(\"x\") + s.count(\"a\", 1) + s.index(\"b\", 0, 3)
+    let ok: bool = s.startswith(\"a\") or s.endswith((\"x\", \"y\")) or s.isdigit()
+    let t: str = s.strip().upper().replace(\"a\", \"b\", 1).center(10, \"*\").zfill(3)
+    let head, sep, tail = s.partition(\":\")
+    let b: bytes = s.encode() + s.encode(\"utf-8\", errors=\"ignore\")
+    print(joined, keys, words, n, ok, t, head, sep, tail, b)
+";
+        let d = check(ok);
+        assert!(!d.has_errors(), "well-typed str method use passes: {d:?}");
+    }
+
+    /// A `TypeGuard[T]` / `TypeIs[T]` function narrows its argument.
+    #[test]
+    fn type_guard_functions_narrow_their_argument() {
+        let src = "\
+from typing import TypeGuard, TypeIs
+
+def is_str_list(xs: list[object]) -> TypeGuard[list[str]]:
+    return all(isinstance(x, str) for x in xs)
+
+def is_int(x: int | str) -> TypeIs[int]:
+    return isinstance(x, int)
+
+def join_all(xs: list[object]) -> str:
+    if is_str_list(xs):
+        return \",\".join(xs)
+    return \"\"
+
+def describe(x: int | str) -> str:
+    if is_int(x):
+        return str(x + 1)
+    return x.upper()
+";
+        let d = check(src);
+        assert!(!d.has_errors(), "guards must narrow: {d:?}");
+        let unguarded = "\
+def join_all(xs: list[object]) -> str:
+    return \",\".join(xs)
+";
+        assert!(
+            check(unguarded).has_errors(),
+            "without the guard list[object] is not an Iterable[str]"
+        );
+    }
+
+    /// A `plain class` has no generated constructor: zero arguments without an
+    /// `__init__`, its own signature with one.
+    #[test]
+    fn plain_class_constructor_takes_no_field_arguments() {
+        let ok = "\
+plain class Bag:
+    items: list[str]
+
+plain class Box:
+    n: int
+
+    def __init__(self, n: int) -> None:
+        self.n = n
+
+def main() -> None:
+    let b: Bag = Bag()
+    let x: Box = Box(3)
+    print(type(b).__name__, x.n)
+";
+        let d = check_class_kinds(ok);
+        assert!(!d.has_errors(), "plain constructors: {d:?}");
+        let bad = "\
+plain class Bag:
+    items: list[str]
+
+def main() -> None:
+    let b: Bag = Bag([\"x\"])
+    print(b)
+";
+        assert!(
+            check_class_kinds(bad).has_errors(),
+            "object.__init__ takes no arguments"
+        );
+    }
+
     #[test]
     fn nullable_use_without_guard_errors() {
         let src = "\
@@ -21361,6 +24327,21 @@ let r: int = add(1)
             "got {}",
             msg
         );
+    }
+
+    /// A parameter before `/` is positional-*only*, so its name is free for
+    /// `**kwargs` to take: `g(1, a=2)` binds `a` positionally and puts the
+    /// keyword in `kw`, exactly as CPython does. The arity check used to
+    /// read that as a positional/keyword conflict and reject the call.
+    #[test]
+    fn positional_only_name_is_free_for_kwargs() {
+        let src = "\
+def g(a: int, /, **kw: int) -> int:
+    return a + len(kw)
+
+let r: int = g(1, a=2)
+";
+        assert!(!check(src).has_errors());
     }
 
     #[test]
@@ -28628,10 +31609,12 @@ let p: Owner = Person(pet=Dog(name=\"Fido\"))
     }
 
     #[test]
-    fn interface_field_satisfied_by_zero_arity_method_passes() {
-        // A zero-argument method (property-like) may satisfy an interface field.
-        // In Typhon's class shape, `def name(self)` records arity 0 (self excluded).
-        let src = "\
+    fn interface_field_satisfied_by_property_not_by_plain_method() {
+        // Reading `d.name` through `Named` must yield the `str` the interface
+        // promises. A `@property` does; a plain zero-argument method yields a
+        // bound method instead (so `d.name.upper()` raises AttributeError and
+        // `print(d.name)` prints `<bound method …>`), and no longer conforms.
+        let plain = "\
 interface Named:
     name: str
 
@@ -28641,10 +31624,25 @@ class Dog:
 
 let d: Named = Dog()
 ";
-        let d = check(src);
+        assert!(
+            check(plain).has_errors(),
+            "a plain zero-arity method must not satisfy an interface field"
+        );
+        let property = "\
+interface Named:
+    name: str
+
+class Dog:
+    @property
+    def name(self) -> str:
+        return \"Fido\"
+
+let d: Named = Dog()
+";
+        let d = check(property);
         assert!(
             !d.has_errors(),
-            "zero-arity method should satisfy interface field; errors: {:?}",
+            "a @property of the right type satisfies the field; errors: {:?}",
             d.errors()
         );
     }

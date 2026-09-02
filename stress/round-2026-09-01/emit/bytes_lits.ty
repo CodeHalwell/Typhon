@@ -1,0 +1,7 @@
+def main() -> None:
+    let a: bytes = rb"\d+"
+    let b: bytes = b"it's \x80\xff\"\\"
+    let c: bytes = b'single' b"two"
+    print(a, b, c, len(b))
+
+main()

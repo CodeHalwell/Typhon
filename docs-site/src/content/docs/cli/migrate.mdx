@@ -34,6 +34,45 @@ Together these mean migrated output checks with **zero errors *and* zero warning
 
 Migrated output is intended to pass `tyc check` on first try.
 
+## What it never touches
+
+Rewrites fire on **code only**. Text inside a string literal — a docstring's
+prose, a doctest, an embedded SQL or HTML template — is copied through
+verbatim, whatever it happens to look like. A line of docstring that reads
+like a binding is still a line of docstring.
+
+A method also travels into its `impl` block whole, however its signature or
+docstring is laid out: a parameter list wrapped over several lines, a
+docstring whose backslash continuation puts a line at column zero, a stack
+of decorators above it.
+
+## Where the `frozen` modifier lands
+
+`@dataclass(frozen=True)` becomes Typhon's `frozen` modifier, which binds
+to the class **name** and sits ahead of any base list:
+
+```typhon
+class Vec frozen(Base):   # not `class Vec(Base) frozen:`
+    x: int
+```
+
+Type parameters stay glued to the name too — `class Stack[T] frozen(Base):`.
+
+## Blocks a rewrite empties
+
+When a rewrite deletes the only statement of a block — a `Protocol` import
+that `interface` made dead inside a `if sys.version_info >= ...:` guard, say
+— the header would be left with no suite. The migrator puts a `pass` under
+it so the output still parses.
+
+## How far it gets
+
+As a scale check: 1,110 of the 1,114 `.py` files in a CPython 3.13 `lib/`
+tree — the stdlib plus `site-packages` — migrate to source that parses as
+Typhon. The four that do not are heavily metaprogrammed
+(`typing_extensions`, `pkg_resources`, `yaml.resolver`). Parsing is not
+type-checking: the sequence below is still the way to port a real codebase.
+
 ## Examples
 
 ```bash

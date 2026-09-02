@@ -1,0 +1,7 @@
+type A = A?
+
+def f(x: A) -> A:
+    return x
+
+def main() -> None:
+    print(f(None))

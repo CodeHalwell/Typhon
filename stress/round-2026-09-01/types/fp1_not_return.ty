@@ -1,0 +1,15 @@
+def f(name: str?) -> str:
+    if not name:
+        return ""
+    return name.upper()
+
+def g(xs: list[int]?) -> int:
+    if not xs:
+        return 0
+    return xs[0]
+
+def main() -> None:
+    print(f("a"), g([1]))
+
+if __name__ == "__main__":
+    main()

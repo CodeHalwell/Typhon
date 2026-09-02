@@ -22,6 +22,11 @@ pub enum Unwind {
     /// Compiler-internal sentinel for `?` short-circuit when the call site
     /// isn't inside a function (should never happen with valid Typhon).
     QuestionMark(Value),
+    /// A lazy generator body suspending at a `yield` — carries the yielded
+    /// value. Every enclosing construct records its resume frame as this
+    /// passes through, and `Interpreter::generator_resume` catches it at the
+    /// generator's frame boundary. It never crosses a function call.
+    Yield(Value),
 }
 
 #[derive(Debug, Clone)]
@@ -102,6 +107,44 @@ pub fn attribute_error(msg: impl Into<String>) -> Unwind {
 pub fn key_error(msg: impl Into<String>) -> Unwind {
     Unwind::Exception(VmException::new("KeyError", msg))
 }
+
+/// `KeyError(key)` for a missing mapping key. The exception *value* carries
+/// the key itself as `args[0]` (so `e.args[0] == "k"` holds) while the
+/// message — what the traceback and `str(e)` show — is the key's repr, as in
+/// CPython (`KeyError: 'k'`). The previous shape stored the repr string as
+/// the argument, so `e.args[0]` was `"'k'"` and `str(e)` double-quoted it.
+pub fn key_error_for(key: &Value) -> Unwind {
+    let repr = key.py_repr();
+    Unwind::Exception(
+        VmException::new("KeyError", repr.clone()).with_value(Value::Exception {
+            kind: std::rc::Rc::new("KeyError".to_owned()),
+            message: std::rc::Rc::new(repr),
+            args: std::rc::Rc::new(vec![key.clone()]),
+            chain: None,
+        }),
+    )
+}
+
+/// `SystemExit` as raised by `sys.exit()` / `exit()` / `quit()`. It is an
+/// ordinary exception value — `finally` blocks run, `except SystemExit`
+/// catches it, `except Exception` does not — and `run_source` turns an
+/// uncaught one into the process exit status the way CPython does: no
+/// argument or `None` → 0, an `int` → that code, anything else → printed to
+/// stderr with status 1.
+pub fn system_exit(args: Vec<Value>) -> Unwind {
+    let message = match args.first() {
+        None | Some(Value::None) => String::new(),
+        Some(v) => v.py_str(),
+    };
+    Unwind::Exception(VmException::new("SystemExit", message.clone()).with_value(
+        Value::Exception {
+            kind: std::rc::Rc::new("SystemExit".to_owned()),
+            message: std::rc::Rc::new(message),
+            args: std::rc::Rc::new(args),
+            chain: None,
+        },
+    ))
+}
 pub fn index_error(msg: impl Into<String>) -> Unwind {
     Unwind::Exception(VmException::new("IndexError", msg))
 }
@@ -109,12 +152,17 @@ pub fn zero_division() -> Unwind {
     Unwind::Exception(VmException::new("ZeroDivisionError", "division by zero"))
 }
 
+/// CPython names the operation *and* the operand type in every other
+/// `ZeroDivisionError`: `1//0` is "integer division or modulo by zero",
+/// `1%0` "integer modulo by zero", and the float forms are "float division
+/// by zero" / "float floor division by zero" / "float modulo by zero".
+pub fn zero_division_named(what: &'static str) -> Unwind {
+    Unwind::Exception(VmException::new("ZeroDivisionError", what))
+}
+
 /// CPython's message for `//` and `%` by zero differs from true division's.
 pub fn zero_division_floor_mod() -> Unwind {
-    Unwind::Exception(VmException::new(
-        "ZeroDivisionError",
-        "integer division or modulo by zero",
-    ))
+    zero_division_named("integer division or modulo by zero")
 }
 
 /// CPython's message for a zero base raised to a negative power

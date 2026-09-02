@@ -1,0 +1,4 @@
+def main() -> None:
+    let café: int = 1
+    let 変数: str = "x"
+    print(café, 変数)

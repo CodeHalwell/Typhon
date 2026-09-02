@@ -1,0 +1,15 @@
+class Loader:
+    path: str
+
+impl Loader:
+    lazy let size: int = self.compute()
+
+    def compute(self) -> int:
+        print("computing")
+        return len(self.path)
+
+def main() -> None:
+    let l: Loader = Loader(path="abc")
+    print(l.size, l.size)
+
+main()

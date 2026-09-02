@@ -1,0 +1,231 @@
+"""Module docstring."""
+import sys
+from typing import Callable
+
+print("M1", __name__, type(__file__).__name__, __file__.endswith((".py", ".ty")), __spec__ is None if False else "skip", __builtins__ is not None if False else "skip", "__main__" == __name__)
+
+def side(tag: str) -> int:
+    print("  eval", tag)
+    return 1
+
+def with_default(x: int = side("default")) -> int:
+    return x
+
+print("M2 after def")
+print("M3", with_default(), with_default(5))
+
+def deco_a(f: Callable[[], str]) -> Callable[[], str]:
+    print("  deco_a applied")
+    return f
+
+def deco_b(f: Callable[[], str]) -> Callable[[], str]:
+    print("  deco_b applied")
+    return f
+
+@deco_a
+@deco_b
+def decorated() -> str:
+    return "d"
+
+print("M4", decorated())
+
+def tf1() -> str:
+    mut out: str = ""
+    try:
+        try:
+            out += "a"
+            raise ValueError("x")
+        except ValueError:
+            out += "b"
+            raise
+        finally:
+            out += "c"
+    except ValueError:
+        out += "d"
+    finally:
+        out += "e"
+    return out
+
+def tf2() -> str:
+    for i in range(3):
+        try:
+            if i == 0:
+                continue
+            if i == 2:
+                break
+            return "returned"
+        finally:
+            print("  fin", i)
+    return "end"
+
+def tf3() -> int:
+    try:
+        try:
+            return 1
+        finally:
+            return 2
+    finally:
+        print("  outer fin")
+
+def tf4() -> str:
+    mut out: str = ""
+    try:
+        out += "t"
+    except Exception:
+        out += "x"
+    else:
+        try:
+            raise KeyError("in else")
+        except KeyError as e:
+            out += f"e{e}"
+    return out
+
+def tf5() -> str:
+    try:
+        raise ValueError("first")
+    except ValueError as e:
+        try:
+            raise TypeError("second")
+        except TypeError as e2:
+            return f"{e}|{e2}|{e2.__context__}"
+    return "no"
+
+def tf6() -> str:
+    try:
+        raise ValueError("a")
+    except (TypeError, ValueError) as e:
+        return f"tuple {type(e).__name__}"
+
+def tf7() -> str:
+    mut log: list[str] = []
+    try:
+        try:
+            raise ValueError("inner")
+        finally:
+            log.append("f1")
+    except ValueError as e:
+        log.append(str(e))
+    return ",".join(log)
+
+def tf8() -> str:
+    try:
+        return "try"
+    except ValueError:
+        return "exc"
+    else:
+        return "else"
+    finally:
+        pass
+
+def tf9() -> str:
+    mut out: str = ""
+    for x in [1, 2]:
+        try:
+            out += str(x)
+        except Exception:
+            pass
+        else:
+            out += "e"
+        finally:
+            out += "f"
+    return out
+
+def tf10() -> str:
+    let e_after: str = "unset"
+    try:
+        raise ValueError("v")
+    except ValueError as e:
+        pass
+    try:
+        print(e)
+    except NameError:
+        return "e deleted"
+    return "e survives"
+
+print("M5", tf1(), tf2(), tf3(), tf4(), tf5(), tf6(), tf7(), tf8(), tf9(), tf10())
+
+class Holder:
+    n: int
+    items: list[int]
+
+h: Holder = Holder(n=1, items=[1])
+h.n += 5
+h.items += [2]
+h.items[0] += 10
+d: dict[str, int] = {"a": 1}
+d["a"] += 1
+d["b"] = d.get("b", 0) + 1
+xs: list[int] = [1, 2, 3]
+xs[0] += 10
+xs[-1] *= 2
+mut a: int = 1
+mut b: int = 2
+a, b = b, a
+[c, dd] = [3, 4]
+(e, f), g = (5, 6), 7
+print("M6", h, d, xs, a, b, c, dd, e, f, g)
+names: list[str] = []
+del xs[0]
+del d["a"]
+try:
+    del d["zzz"]
+except KeyError as err:
+    print("M7", err)
+try:
+    del xs[10]
+except IndexError as err:
+    print("M8", err)
+print("M9", xs, d)
+counter: int = 0
+def incr() -> None:
+    global counter
+    counter += 1
+incr()
+incr()
+print("M10", counter)
+def make_adders() -> list[Callable[[int], int]]:
+    return [lambda x, k=k: x + k for k in range(3)]
+
+def outer_fn() -> Callable[[], list[int]]:
+    mut cell: list[int] = []
+    def inner() -> list[int]:
+        cell.append(len(cell))
+        return cell
+    return inner
+fn = outer_fn()
+fn()
+print("M12", fn(), outer_fn()())
+class Cfg:
+    name: str
+    debug: bool = False
+    level: int = 0
+
+cfg: Cfg = Cfg(name="n")
+cfg.level = 3
+print("M13", cfg, cfg == Cfg(name="n", level=3), cfg == Cfg(name="n"), Cfg(name="z", debug=True))
+def kw_dict(**kw: int) -> list[str]:
+    return [f"{k}={v}" for k, v in kw.items()]
+print("M14", kw_dict(z=1, a=2, m=3), kw_dict(**{"b": 1, "a": 2}), kw_dict(c=0, **{"b": 1}))
+def star(*args: int) -> tuple[int, ...]:
+    return args
+print("M15", star(*[1, 2], 3, *(4, 5)), star(), [*range(2), *[9]], {**{"a": 1}, **{"a": 2, "b": 3}}, {"x": 0, **{"x": 1}})
+i: int = 0
+while i < 3:
+    i += 1
+    if i == 2:
+        continue
+    print("M16", i)
+print("M17", [i for i in range(3)], i, [j for j in range(2) for i2 in range(2)], i)
+v: int = 10
+def shadow() -> int:
+    let v: int = 20
+    return v
+print("M18", shadow(), v)
+print("M19", "yes" if 1 else "no", "a" or "b", "" or "b", 0 or [], None or 0, 1 and 2, 0 and 2, [] and 1, "a" and "" and "c", not "" or 0, 1 if [] else 2, (0 or None) is None, "x" if None else "y")
+def gen_side() -> None:
+    print("  gen_side called")
+lst: list[int] = [gen_side() or 1 for _ in range(2)]
+print("M20", lst)
+print("M21", sys.argv[1:], len(sys.argv) >= 1)
+if __name__ == "__main__":
+    print("M22 main guard")

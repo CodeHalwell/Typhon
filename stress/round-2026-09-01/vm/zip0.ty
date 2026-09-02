@@ -1,0 +1,3 @@
+print("before")
+print(list(zip()))
+print("after")

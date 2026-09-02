@@ -1,0 +1,16 @@
+from typing import Callable
+
+def total(*nums: int) -> int:
+    mut acc: int = 0
+    for n in nums:
+        acc += n
+    return acc
+
+def apply(f: Callable[[str, str], int]) -> int:
+    return f("a", "b")
+
+def main() -> None:
+    print(apply(total))
+
+if __name__ == "__main__":
+    main()

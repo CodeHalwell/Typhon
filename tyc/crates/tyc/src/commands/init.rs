@@ -20,6 +20,12 @@ pub struct InitArgs {
 pub fn run(args: InitArgs) -> Result<()> {
     let (dir, name) = match args.name {
         Some(name) => {
+            // An explicit name is the user's choice, so it is validated
+            // rather than rewritten: it goes verbatim into `typhon.toml`,
+            // the generated `pyproject.toml` and the scaffolded source, and
+            // a quote or a newline in it produced a manifest that could not
+            // be parsed by the very next command.
+            let name = validate_project_name(&name)?;
             let target = args.dir.join(&name);
             std::fs::create_dir_all(&target)
                 .map_err(|e| miette!("cannot create {}: {}", target.display(), e))?;
@@ -28,11 +34,10 @@ pub fn run(args: InitArgs) -> Result<()> {
         }
         None => {
             let base = args.dir.canonicalize().unwrap_or(args.dir.clone());
-            let inferred = base
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("myproject")
-                .to_owned();
+            // Inferred from the directory: a directory named `my project`
+            // is perfectly ordinary, so sanitise rather than refuse.
+            let inferred =
+                sanitise_project_name(base.file_name().and_then(|n| n.to_str()).unwrap_or(""));
             (base, inferred)
         }
     };
@@ -136,6 +141,57 @@ if __name__ == "__main__":
 "#,
         name = name
     )
+}
+
+/// A project name usable everywhere the scaffold writes it: a TOML basic
+/// string, a `pyproject.toml` `[project] name`, and a directory. The shape
+/// is PEP 508's: letters, digits, and `.`/`-`/`_` between them.
+fn project_name_is_valid(name: &str) -> bool {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !first.is_ascii_alphanumeric() {
+        return false;
+    }
+    let Some(last) = name.chars().next_back() else {
+        return false;
+    };
+    if !last.is_ascii_alphanumeric() {
+        return false;
+    }
+    name.chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
+}
+
+fn validate_project_name(name: &str) -> Result<String> {
+    if project_name_is_valid(name) {
+        return Ok(name.to_owned());
+    }
+    let suggestion = sanitise_project_name(name);
+    Err(miette!(
+        "`{name}` is not a usable project name. Use letters, digits, and `.`, `-` or `_` between them (PEP 508) — try `{suggestion}`."
+    ))
+}
+
+/// Coerce an arbitrary directory name into a valid project name. Every
+/// character outside the allowed set becomes `-`, runs collapse, and the
+/// ends are trimmed; an empty result falls back to `myproject`.
+fn sanitise_project_name(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    for c in raw.chars() {
+        if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_') {
+            out.push(c);
+        } else if !out.ends_with('-') {
+            out.push('-');
+        }
+    }
+    let trimmed = out.trim_matches(|c: char| !c.is_ascii_alphanumeric());
+    if trimmed.is_empty() {
+        "myproject".to_owned()
+    } else {
+        trimmed.to_owned()
+    }
 }
 
 fn render_typhon_toml(name: &str) -> String {
@@ -365,5 +421,42 @@ mod tests {
         let cfg: crate::config::TyphonConfig =
             toml::from_str(&toml).expect("generated typhon.toml must parse");
         assert_eq!(cfg.optimise.level, 0);
+    }
+
+    #[test]
+    fn a_name_that_cannot_round_trip_through_toml_is_rejected() {
+        // `tyc init 'a"b'` wrote `name = "a"b"` — a manifest the very next
+        // command could not parse.
+        for bad in ["a\"b", "", "-lead", "trail-", "a b", "a\nb", "café"] {
+            assert!(
+                validate_project_name(bad).is_err(),
+                "`{bad}` must be rejected"
+            );
+        }
+        for good in ["a", "my-app", "my_app", "a.b", "proj2"] {
+            assert_eq!(validate_project_name(good).unwrap(), good);
+        }
+    }
+
+    #[test]
+    fn an_inferred_name_is_sanitised_rather_than_rejected() {
+        // A directory called `my project` is perfectly ordinary, so
+        // `tyc init` with no NAME coerces instead of refusing.
+        assert_eq!(sanitise_project_name("my project"), "my-project");
+        assert_eq!(sanitise_project_name("a\"b"), "a-b");
+        assert_eq!(sanitise_project_name("--weird--"), "weird");
+        assert_eq!(sanitise_project_name(""), "myproject");
+        assert_eq!(sanitise_project_name("!!!"), "myproject");
+        assert_eq!(
+            sanitise_project_name("Already-Fine_1.0"),
+            "Already-Fine_1.0"
+        );
+        for raw in ["my project", "a\"b", "--weird--", "", "!!!", "café"] {
+            let out = sanitise_project_name(raw);
+            assert!(
+                project_name_is_valid(&out),
+                "sanitising {raw:?} produced an invalid name {out:?}"
+            );
+        }
     }
 }

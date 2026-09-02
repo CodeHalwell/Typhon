@@ -6,6 +6,7 @@
 //! path and, in v2 maps, a per-line mapping table for sugar-expanded
 //! constructs (`?`, `gather:`, `with`-chains).
 
+use std::collections::HashMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
@@ -49,17 +50,111 @@ pub fn run(args: TraceArgs) -> Result<()> {
 // ── core rewrite ─────────────────────────────────────────────────────────────
 
 /// Rewrite every Python `  File "PATH.py", line N` frame in `text`.
+///
+/// The rows *under* a frame are rewritten too. CPython prints the emitted
+/// `.py` source there, plus a row of column anchors; leaving them under a
+/// `.ty` path and line is worse than showing nothing, because the reader
+/// opens that line and finds something else — and a generated name
+/// (`__typhon_qi_0__`) leaks into the very traceback the source map exists
+/// to keep clean. The `.ty` row is substituted in and the anchors, whose
+/// columns no longer mean anything, are dropped.
 pub fn rewrite_traceback(text: &str, map_dir: Option<&Path>) -> String {
     let mut out = String::with_capacity(text.len());
-    for line in text.lines() {
-        out.push_str(&try_rewrite_frame(line, map_dir));
+    let mut sources: HashMap<String, Option<Vec<String>>> = HashMap::new();
+    let lines: Vec<&str> = text.lines().collect();
+    let mut i = 0usize;
+    while i < lines.len() {
+        let line = lines[i];
+        let rewritten = try_rewrite_frame(line, map_dir);
+        let remapped = rewritten != line;
+        out.push_str(&rewritten);
         out.push('\n');
+        i += 1;
+        if !remapped {
+            continue;
+        }
+        // A source row under the frame: indented, and not a frame itself.
+        if i < lines.len()
+            && lines[i].starts_with(' ')
+            && !lines[i].trim_start().starts_with("File \"")
+        {
+            let py_dir = frame_file(line)
+                .and_then(|p| {
+                    Path::new(&p)
+                        .parent()
+                        .map(|d| d.to_string_lossy().into_owned())
+                })
+                .unwrap_or_default();
+            match ty_source_row(&rewritten, &py_dir, &mut sources) {
+                Some(text) => {
+                    out.push_str("    ");
+                    out.push_str(&text);
+                    out.push('\n');
+                    i += 1;
+                    // The anchors point into the row we just replaced.
+                    if i < lines.len() && is_anchor_row(lines[i]) {
+                        i += 1;
+                    }
+                }
+                // The `.ty` file is not readable from here (a traceback
+                // pasted on another machine, say). Keep what CPython
+                // printed rather than dropping the row.
+                None => {
+                    out.push_str(lines[i]);
+                    out.push('\n');
+                    i += 1;
+                }
+            }
+        }
     }
     // Preserve trailing-newline parity with the original.
     if !text.ends_with('\n') && out.ends_with('\n') {
         out.pop();
     }
     out
+}
+
+/// The path inside a `File "PATH", line N` frame row.
+fn frame_file(line: &str) -> Option<String> {
+    let rest = line.trim_start().strip_prefix("File \"")?;
+    let end = rest.find('"')?;
+    Some(rest[..end].to_owned())
+}
+
+/// A 3.11+ column-anchor row (`    ~~~~^^^^`) under a source row.
+fn is_anchor_row(line: &str) -> bool {
+    let body = line.trim();
+    !body.is_empty() && body.chars().all(|c| c == '~' || c == '^')
+}
+
+/// The `.ty` source row a rewritten frame header points at, if it can be
+/// read. `sources` caches one read per file (and its failure).
+fn ty_source_row(
+    frame: &str,
+    py_dir: &str,
+    sources: &mut HashMap<String, Option<Vec<String>>>,
+) -> Option<String> {
+    let rest = frame.trim_start().strip_prefix("File \"")?;
+    let path_end = rest.find('"')?;
+    let path = &rest[..path_end];
+    let (line_no, _, _) = parse_line_suffix(&rest[path_end + 1..])?;
+    // `resolve_ty_path` falls back to the bare source name when there is no
+    // `typhon.toml` next to the build. Read that relative to the emitted
+    // file's own directory rather than the process's working directory, so
+    // an unrelated file of the same name is never picked up.
+    let candidate = if Path::new(path).is_absolute() {
+        PathBuf::from(path)
+    } else {
+        Path::new(py_dir).join(path)
+    };
+    let lines = sources.entry(path.to_owned()).or_insert_with(|| {
+        std::fs::read_to_string(&candidate)
+            .ok()
+            .map(|t| t.lines().map(str::to_owned).collect())
+    });
+    let lines = lines.as_ref()?;
+    let row = lines.get(line_no.checked_sub(1)? as usize)?.trim();
+    (!row.is_empty()).then(|| row.to_owned())
 }
 
 /// Try to rewrite one frame line; return it unchanged when no rewrite applies.
@@ -294,6 +389,55 @@ mod tests {
         assert!(
             result.contains("line 2"),
             "line 3 in Python should map to line 2 in Typhon; got: {result}"
+        );
+    }
+
+    #[test]
+    fn rewrite_traceback_shows_the_ty_source_row() {
+        // Rewriting the frame header but leaving CPython's row under it
+        // showed emitted Python — including generated names like
+        // `__typhon_qi_0__` — under a `.ty` path and line, so opening that
+        // line showed something else entirely. The row is substituted, and
+        // the column anchors, which no longer line up, are dropped.
+        let dir = tempfile::tempdir().unwrap();
+        let py = dir.path().join("main.py");
+        let map = dir.path().join("main.py.map");
+        let ty = dir.path().join("main.ty");
+        std::fs::write(&py, "").unwrap();
+        std::fs::write(
+            &ty,
+            "def go() -> int:\n    let v: int = parse(b)?\n    return v\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &map,
+            r#"{"version":2,"source":"main.ty","line_strategy":"table","lines":[1,2,2,3]}"#,
+        )
+        .unwrap();
+
+        let text = format!(
+            "Traceback (most recent call last):\n  File \"{py}\", line 3, in go\n    __typhon_qi_0__ = parse(b)\n    ~~~~~~~^^^^\nValueError: bad\n",
+            py = py.display()
+        );
+        let result = rewrite_traceback(&text, None);
+
+        assert!(result.contains("main.ty"), "path rewritten:\n{result}");
+        assert!(result.contains("line 2"), "line remapped:\n{result}");
+        assert!(
+            result.contains("let v: int = parse(b)?"),
+            "the .ty row should be shown:\n{result}"
+        );
+        assert!(
+            !result.contains("__typhon_qi_0__"),
+            "the generated name must not survive:\n{result}"
+        );
+        assert!(
+            !result.contains("~~~~~~~^^^^"),
+            "anchors into the old row must be dropped:\n{result}"
+        );
+        assert!(
+            result.contains("ValueError: bad"),
+            "message kept:\n{result}"
         );
     }
 

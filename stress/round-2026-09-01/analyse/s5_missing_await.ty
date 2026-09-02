@@ -1,0 +1,28 @@
+import asyncio
+
+async def g() -> int:
+    return 1
+
+class C:
+    n: int
+
+impl C:
+    async def fetch(self) -> int:
+        return self.n
+
+async def main() -> None:
+    let xs: list[int] = [await g() for _ in range(2)]
+    let both: list[int] = await asyncio.gather(g(), g())
+    let task: asyncio.Task[int] = asyncio.create_task(g())
+    let v: int = await task
+    let c: C = C(n=1)
+    let bad: int = c.fetch()
+    let bad2: int = g()
+    print(xs, both, v, bad, bad2)
+
+def sync_caller() -> None:
+    g()
+    let c: C = C(n=1)
+    c.fetch()
+
+asyncio.run(main())

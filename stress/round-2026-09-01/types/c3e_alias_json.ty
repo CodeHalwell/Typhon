@@ -1,0 +1,14 @@
+type Json = str | int | list[Json] | dict[str, Json]
+
+def depth(j: Json) -> int:
+    match j:
+        case list():
+            return 1 + max([depth(x) for x in j], default=0)
+        case dict():
+            return 1
+        case _:
+            return 0
+
+def main() -> None:
+    let j: Json = [1, [2, ["x"]]]
+    print(depth(j))

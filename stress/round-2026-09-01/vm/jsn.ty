@@ -1,0 +1,17 @@
+import json
+for src in ['"\\u0041"', '"\\u00e9"', '"\\ud83d\\ude00"', '"é"', '"😀"', '"\\b\\f"', '"\\/"', '["é", {"k": "ü"}]', '"\\u00e9\\u00e9"', '"\\uD83D\\uDE00"', '"\\u0000"', '"tab\\there"']:
+    try:
+        r = json.loads(src)
+        print("OK", src, repr(r), len(r) if isinstance(r, str) else "-")
+    except json.JSONDecodeError as e:
+        print("DecodeErr", src, type(e).__name__)
+    except ValueError as e:
+        print("ValErr", src, type(e).__name__, e)
+try:
+    json.loads("{bad")
+except json.JSONDecodeError as e:
+    print("E1", type(e).__name__, isinstance(e, ValueError), str(e)[:30])
+except ValueError as e:
+    print("E2 ValueError", type(e).__name__)
+print(json.dumps("é😀"), json.dumps("é", ensure_ascii=False), json.dumps({"k": "ü"}), json.dumps("\x7f "), json.dumps("a/b"), json.dumps(["é"], indent=1), json.dumps([1, 2], separators=(",", ":")), json.dumps({"a": [1]}, separators=(",", ":")), json.dumps({"a": 1}, indent=0), json.dumps({"b": 1, "a": {"d": 1, "c": 2}}, sort_keys=True, indent=2))
+print(json.loads(json.dumps("é😀")) == "é😀", json.loads('"\\u00e9"') == "é")

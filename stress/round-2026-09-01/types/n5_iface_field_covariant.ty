@@ -1,0 +1,23 @@
+class Animal:
+    name: str
+class Dog(Animal):
+    breed: str
+class Cat(Animal):
+    lives: int
+
+interface HasPet:
+    pet: Animal
+
+class Kennel:
+    pet: Dog
+
+def swap(h: HasPet) -> None:
+    h.pet = Cat(name="c", lives=9)
+
+def main() -> None:
+    let k: Kennel = Kennel(pet=Dog(name="d", breed="b"))
+    swap(k)
+    print(k.pet.breed.upper())
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,20 @@
+class Temp:
+    c: float
+
+impl Temp:
+    @staticmethod
+    def zero() -> Temp:
+        return Temp(c=0.0)
+    @classmethod
+    def from_f(cls, f: float) -> Temp:
+        return cls(c=(f - 32) * 5 / 9)
+    @property
+    def f(self) -> float:
+        return self.c * 9 / 5 + 32
+
+def main() -> None:
+    let t: Temp = Temp.from_f(212.0)
+    print(t.f + 1, Temp.zero().c)
+
+if __name__ == "__main__":
+    main()

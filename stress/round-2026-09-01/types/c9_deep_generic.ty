@@ -1,0 +1,4 @@
+def main() -> None:
+    let x: list[list[list[list[list[list[list[list[list[list[list[list[list[list[list[list[list[list[list[list[list[list[list[list[list[list[list[list[list[list[list[list[list[list[list[list[list[list[list[list[list[list[list[list[list[list[list[list[list[list[list[list[list[list[list[list[list[list[list[list[int]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]] = [[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[1]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]
+    let y: list[list[list[list[list[list[list[list[list[list[list[list[list[list[list[list[list[list[list[list[list[list[list[list[list[list[list[list[list[list[list[list[list[list[list[list[list[list[list[list[list[list[list[list[list[list[list[list[list[list[list[list[list[list[list[list[list[list[list[list[str]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]] = x
+    print(y)

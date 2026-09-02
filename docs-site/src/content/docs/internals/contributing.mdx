@@ -50,8 +50,9 @@ Typhon is open to contributions. The project is small enough that you can read t
 
 - **One concern per PR.** Mixing a bug fix with a feature makes reviews painful.
 - **Add a test for every behaviour change.** The test corpus is fast; there's no reason not to.
-- **Run `cargo fmt --workspace` and `cargo clippy --workspace --all-targets`** before pushing. CI gates on both.
+- **Run `cargo fmt --workspace` and `cargo clippy --workspace --all-targets --all-features -- -D warnings`** before pushing. CI treats every warning as an error.
 - **Run `cargo deny check`** for dependency audits. (Not always required for docs-only PRs.)
+- **Know the five CI jobs** that run on every push to `main`, `dev/**`, and `claude/**`: `test` (`cargo fmt --check` → clippy → `cargo test --workspace`), `security` (`cargo-deny` — advisories, licences, source/registry bans per `tyc/deny.toml`), `perf-gate` (`scripts/perf-gate.sh` — the full `tyc build` pipeline over a fixed corpus must not regress >20% past `perf-baseline.json`), `differential` (the VM ↔ CPython differential gate over the whole `examples/` + `stress/` corpus; its baseline may only shrink), and `knob-matrix` (the opt-in-knob codegen matrix). A compiler change should keep all five green; a docs-only change only exercises `test`.
 
 ## Where to make changes
 

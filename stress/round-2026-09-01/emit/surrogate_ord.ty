@@ -1,0 +1,6 @@
+def main() -> None:
+    let s: str = "\ud800"
+    let t: str = "\udcff" "x"
+    print(hex(ord(s)), len(t), hex(ord(t[0])))
+
+main()

@@ -1,0 +1,9 @@
+class A:
+    b: "B"
+class B:
+    a: "A"?
+
+def main() -> None:
+    let b: B = B(a=None)
+    let a: A = A(b=b)
+    print(a.b.a)

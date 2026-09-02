@@ -1,0 +1,20 @@
+import asyncio
+
+interface Counter:
+    def count(self) -> int
+
+class AsyncCounter:
+    n: int
+
+impl AsyncCounter:
+    async def count(self) -> int:
+        return self.n
+
+def use(c: Counter) -> int:
+    return c.count() + 1
+
+def main() -> None:
+    print(use(AsyncCounter(n=1)))
+
+if __name__ == "__main__":
+    main()

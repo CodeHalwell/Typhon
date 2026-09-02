@@ -1,0 +1,54 @@
+from datetime import datetime, timedelta
+import datetime as dtmod
+from pathlib import Path
+import dataclasses
+class TC:
+    a: int
+    b: str = "x"
+    c: list[int] = []
+@dataclasses.dataclass
+class DC:
+    a: int
+    b: str = "x"
+    c: list[int] = dataclasses.field(default_factory=list)
+d: datetime = datetime(2024, 2, 29, 13, 5, 9, 123456)
+try:
+    print("X000", d, str(d), repr(d), d.isoformat())
+except Exception as _e:
+    print("X000", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X001", datetime.now() > datetime(2020, 1, 1))
+except Exception as _e:
+    print("X001", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X002", datetime.fromisoformat("2024-01-02T03:04:05"))
+except Exception as _e:
+    print("X002", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X003", d.strftime("%Y-%m-%d"))
+except Exception as _e:
+    print("X003", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X004", d + timedelta(seconds=90), (d + timedelta(seconds=90)).second)
+except Exception as _e:
+    print("X004", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X005", d.replace(year=2028))
+except Exception as _e:
+    print("X005", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X006", dtmod.datetime.now() > dtmod.datetime(2020, 1, 1))
+except Exception as _e:
+    print("X006", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X007", type(Path("a") / "b").__name__, str(Path("a") / "b" / "c"), (Path("a") / "b").name, Path("a/b").name, Path("a").joinpath("b").name, (Path("a") / "b" / "c").name)
+except Exception as _e:
+    print("X007", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X008", dataclasses.asdict(TC(a=1)), list(dataclasses.asdict(TC(a=1)).keys()))
+except Exception as _e:
+    print("X008", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X009", dataclasses.asdict(DC(1)), list(dataclasses.asdict(DC(1)).keys()))
+except Exception as _e:
+    print("X009", "ERR", type(_e).__name__, str(_e)[:70])

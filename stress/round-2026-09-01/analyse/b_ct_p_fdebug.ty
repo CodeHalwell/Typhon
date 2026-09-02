@@ -1,0 +1,2 @@
+comptime let P: str = f"{1 + 1=}"
+print(P)

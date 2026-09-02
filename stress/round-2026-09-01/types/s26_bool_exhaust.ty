@@ -1,0 +1,10 @@
+def f(b: bool) -> int:
+    match b:
+        case True:
+            return 1
+
+def main() -> None:
+    print(f(False) + 1)
+
+if __name__ == "__main__":
+    main()

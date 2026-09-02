@@ -1,0 +1,7 @@
+def main() -> None:
+    let d: dict[str, str] = {"a": "1"}
+    let n: int = int(d.get("b"))
+    print(n)
+
+if __name__ == "__main__":
+    main()

@@ -6,7 +6,7 @@ sidebar:
 ---
 
 ```
-tyc check [PATHS]... [--stubs]
+tyc check [PATHS]... [--stubs] [--with-ty]
 ```
 
 Runs everything up to the analyser — lex, parse, resolve, type-check, purity check, async check, comptime evaluation — without emitting any `.py`. Exits non-zero if any error-severity diagnostic fires.
@@ -17,7 +17,8 @@ Runs everything up to the analyser — lex, parse, resolve, type-check, purity c
 tyc check                 # check the whole project (default: src/)
 tyc check src/users.ty    # check a single file
 tyc check src/ tests/     # multiple paths
-tyc check --stubs         # also diff .dty stubs against runtime modules
+tyc check --stubs         # also diff .dty stubs against their sibling implementation modules
+tyc check --with-ty       # also run Astral's `ty` over a throwaway build
 ```
 
 ## What it does
@@ -29,11 +30,11 @@ Per file:
 3. **Type-check** signatures, assignments, narrowing, exhaustiveness, `?` validity, etc.
 4. **Analyse** purity, async correctness, comptime evaluation, auto-gather candidates.
 
-If everything is clean, exits 0 with no output. Otherwise, emits miette-formatted diagnostics and exits 2.
+If everything is clean, exits 0 with a one-line `checked N file(s)` summary. Otherwise, emits miette-formatted diagnostics and exits 1.
 
 ## `--stubs`
 
-Additionally diffs every `.dty` stub against the runtime symbols of the module it describes. Emits `tyc::stub_mismatch` diagnostics for missing-in-impl / missing-in-stub / signature-mismatch findings.
+Additionally parses and type-checks every `.dty` stub under the checked paths, then diffs each stub's surface against the sibling implementation module with the same stem — a `.ty` is preferred over a `.py`; a stub with no sibling stands alone and is not diffed. Findings surface as `tyc::stub_mismatch` (missing-in-implementation / missing-in-stub / signature-mismatch) at the severity set by [`[strictness] stub-check`](/Typhon/configuration/strictness/#stub-check) (default `"error"`). The runtime-introspection counterpart is [`tyc stubtest`](/Typhon/cli/stubtest/).
 
 ```bash
 tyc check --stubs
@@ -46,6 +47,7 @@ Useful as a CI gate when you ship `.dty` stubs.
 | Flag | Effect |
 |------|--------|
 | `--stubs` | Also diff every `.dty` stub against its sibling `.ty` / `.py` implementation. |
+| `--with-ty` | Build to a temporary directory and run Astral's `ty` over the emitted Python as a typeshed-backed second-stage check — the same behaviour as [`[checker] external = "ty"`](/Typhon/configuration/overview/#checker), for one invocation. Requires `ty` on `PATH`. |
 
 `tyc check` walks up from the first checked path looking for `typhon.toml`. To target a different project, pass an explicit path: `tyc check path/to/project`.
 
@@ -54,8 +56,8 @@ Useful as a CI gate when you ship `.dty` stubs.
 | Code | Meaning |
 |------|---------|
 | 0 | No errors. |
-| 1 | Invalid input (missing path, bad flag). |
-| 2 | At least one error-severity diagnostic. |
+| 1 | At least one error-severity diagnostic, or invalid input (missing path). |
+| 2 | Malformed command line (rejected by the argument parser). |
 
 Warning-severity diagnostics do not change the exit code. To gate CI on warnings as well, raise `[strictness]` levels in `typhon.toml`.
 

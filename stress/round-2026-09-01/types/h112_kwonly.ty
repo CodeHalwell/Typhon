@@ -1,0 +1,12 @@
+def f(a: int, *, b: int) -> int:
+    return a + b
+
+def g(a: int, /, b: int) -> int:
+    return a + b
+
+def main() -> None:
+    print(f(1, 2))
+    print(g(a=1, b=2))
+
+if __name__ == "__main__":
+    main()

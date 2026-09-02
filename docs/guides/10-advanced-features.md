@@ -217,7 +217,7 @@ def hash_password(salt: str, pw: str) -> str:
 auto-memoise = true
 ```
 
-With this on, any function the analyser infers as pure gets `@functools.cache` automatically. **Disabled by default.** Caches extend the lifetime of every argument and return value, which is not a transparent change — opt in deliberately.
+With this on, any function the analyser can *prove* pure — and whose parameters and return type are immutable and hashable — gets `@functools.cache` automatically. **Disabled by default.** Caches extend the lifetime of every argument and return value, which is not a transparent change — opt in deliberately. A function returning a `list`, an iterator or a mutable object is never auto-cached (every caller would share one object); a function calling something the analyser cannot classify is left alone rather than guessed at.
 
 ### What `@memo` emits
 

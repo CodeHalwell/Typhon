@@ -1,0 +1,12 @@
+import sys
+
+def f(c: bool) -> int:
+    if c:
+        return 1
+    sys.exit(1)
+
+def main() -> None:
+    print(f(True))
+
+if __name__ == "__main__":
+    main()

@@ -311,8 +311,8 @@ impl Backend {
         // Its severity twin, for the `apply_severity_overrides` pass.
         let severity_overrides_cache_arc = Arc::clone(&self.severity_overrides_cache);
 
-        let text_for_check = text.clone();
         let uri_str_for_check = uri_str.clone();
+        let text_for_check = text.clone();
         let result = tokio::task::spawn_blocking(move || {
             // Hold the mutex only for the duration of the salsa call.
             let mut db = db.blocking_lock();
@@ -510,13 +510,22 @@ impl Backend {
                     pub_names: prep_full.pub_names.clone(),
                     has_pub_star: !prep_full.pub_star_lines.is_empty(),
                 };
-                diags.extend(tyc_analyse::editor_lint_diagnostics(
+                let mut lint_diags = tyc_analyse::editor_lint_diagnostics(
                     &parsed.into_syntax(),
                     &uri_str_for_check,
                     &mapping_source,
                     opts,
                     &perf_ctx,
-                ));
+                );
+                // Same relocation the shared pipeline applies to its own
+                // diagnostics: report the editor's line, not the buffer's.
+                lint_diags.remap_lines(
+                    &mapping_source,
+                    &prep_full.line_map,
+                    &uri_str_for_check,
+                    &text_for_check,
+                );
+                diags.extend(lint_diags);
             }
             (diags, mapping_source)
         })
@@ -2232,12 +2241,22 @@ fn read_severity_overrides(root: &std::path::Path) -> tyc_diagnostics::SeverityO
     let Some(strictness) = parsed.get("strictness").and_then(|s| s.as_table()) else {
         return out;
     };
+    // A value the CLI rejects (`"eror"`, `"WARN"`) must not be honoured
+    // here either: `tyc check` refuses to run with it, so silently taking
+    // it in the editor is exactly the CLI/LSP disagreement the severity
+    // plumbing exists to prevent. An invalid value falls back to the
+    // diagnostic's default, which is the state the project is really in
+    // until the manifest is fixed.
     let read = |key: &str| -> String {
-        strictness
+        let raw = strictness
             .get(key)
             .and_then(|v| v.as_str())
-            .unwrap_or_default()
-            .to_owned()
+            .unwrap_or_default();
+        if tyc_diagnostics::is_valid_severity(raw) {
+            raw.to_owned()
+        } else {
+            String::new()
+        }
     };
     out.unused_import = read("unused-import");
     out.methods_in_class_body = read("methods-in-class-body");
@@ -4174,9 +4193,14 @@ fn first_label(err: &TycError) -> Option<LabeledSpan> {
 /// diagnostic variant keeps published LSP ranges aligned with the editor
 /// buffer instead of drifting by a column or two after `val` is removed.
 fn diagnostic_source<'a>(err: &TycError, original: &'a str, preprocessed: &'a str) -> &'a str {
+    // A diagnostic already relocated onto the editor buffer
+    // (`Diagnostics::remap_lines`, run by the shared check pipeline) carries
+    // that text; so do the `?` / `lazy` validators, which run before any sugar
+    // expansion. Everything else is anchored to the preprocessed buffer.
+    if err.source_text() == Some(original) {
+        return original;
+    }
     match err {
-        // Both validators run against the original Typhon source, before any
-        // sugar expansion, so their byte offsets refer to the editor buffer.
         TycError::InvalidQuestionOp { .. } | TycError::LazyUsage { .. } => original,
         _ => preprocessed,
     }
@@ -4264,6 +4288,36 @@ mod tests {
         assert!(overrides.unused_import.is_empty());
         assert!(overrides.nullable_use.is_empty());
         assert!(overrides.exhaustive_match.is_empty());
+    }
+
+    #[test]
+    fn read_severity_overrides_ignores_values_the_cli_rejects() {
+        // `tyc check` refuses to run with an unknown `[strictness]`
+        // severity, so the editor must not quietly honour one — otherwise a
+        // typo silences a check in the editor while CI still fails on it.
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("typhon.toml"),
+            "[project]\nname = \"x\"\nsrc = \"src\"\n\
+             [strictness]\n\
+             unused-import = \"eror\"\n\
+             nullable-use = \"WARN\"\n\
+             require-with = \"error\"\n",
+        )
+        .unwrap();
+        let overrides = read_severity_overrides(tmp.path());
+        assert!(
+            overrides.unused_import.is_empty(),
+            "a typo must fall back to the default, not be honoured"
+        );
+        assert!(
+            overrides.nullable_use.is_empty(),
+            "severity values are case-sensitive on the CLI, so they are here too"
+        );
+        assert_eq!(
+            overrides.require_with, "error",
+            "a valid value alongside an invalid one still applies"
+        );
     }
 
     #[test]

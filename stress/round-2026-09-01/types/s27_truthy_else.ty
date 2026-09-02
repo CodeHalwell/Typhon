@@ -1,0 +1,11 @@
+def f(x: int?) -> int:
+    if x:
+        return x
+    else:
+        return x + 1
+
+def main() -> None:
+    print(f(None))
+
+if __name__ == "__main__":
+    main()

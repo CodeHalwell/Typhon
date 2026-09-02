@@ -1,0 +1,46 @@
+plain class R:
+    n: int = 0
+
+impl R:
+    def __init__(self, n: int) -> None:
+        self.n = n
+    def __repr__(self) -> str:
+        return f"R<{self.n}>"
+
+plain class S:
+    n: int = 0
+
+impl S:
+    def __init__(self, n: int) -> None:
+        self.n = n
+    def __str__(self) -> str:
+        return f"S:{self.n}"
+    def __repr__(self) -> str:
+        return f"S<{self.n}>"
+
+class D:
+    n: int
+
+impl D:
+    def __repr__(self) -> str:
+        return f"D<{self.n}>"
+
+class E:
+    n: int
+
+impl E:
+    def __str__(self) -> str:
+        return f"E:{self.n}"
+
+def main() -> None:
+    let r: R = R(1)
+    let s: S = S(2)
+    let d: D = D(n=3)
+    let e: E = E(n=4)
+    print("F1", r, str(r), repr(r), f"{r}", f"{r!r}", f"{r!s}", "%s" % r, "%r" % r, "{}".format(r), "{!r}".format(r) if False else "skip", [r], (r,), {"k": r}, str([r]))
+    print("F2", s, str(s), repr(s), f"{s}", f"{s!r}", "%s" % s, "%r" % s, "{}".format(s), [s], str([s]), {s.n: s})
+    print("F3", d, str(d), repr(d), f"{d}", "%s" % d, "%r" % d, "{}".format(d), [d])
+    print("F4", e, str(e), repr(e), f"{e}", "%s" % e, "%r" % e, "{}".format(e), [e])
+    print("F5", f"{r:>10}|", f"{s:>10}|", "{:>10}|".format(r), "%10s|" % r, "%-10s|" % s, f"{d:>10}|" if False else "skip")
+
+main()

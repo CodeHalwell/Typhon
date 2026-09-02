@@ -1,0 +1,7 @@
+lazy let RATE: float = 2.5 * 2
+
+def main() -> None:
+    print(f"{RATE}", RATE + 1, round(RATE), int(RATE))
+    print(f"{RATE:.2f}")
+
+main()

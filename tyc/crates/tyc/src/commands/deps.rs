@@ -85,18 +85,21 @@ pub fn run_add(args: AddArgs) -> Result<()> {
         .unwrap_or_else(|| args.dir.clone());
 
     let mut new_pkgs: Vec<String> = Vec::new();
+    let mut upserts: Vec<(String, String)> = Vec::new();
     for spec in &args.packages {
         let (name, version) = split_spec(spec);
+        let version = version.unwrap_or("*").to_owned();
         let table = if args.dev {
             &mut config.dev_dependencies
         } else {
             &mut config.dependencies
         };
-        table.insert(name.to_owned(), version.unwrap_or("*").to_owned());
+        table.insert(name.to_owned(), version.clone());
+        upserts.push((name.to_owned(), version));
         new_pkgs.push(spec.clone());
     }
 
-    write_typhon_toml(&toml_path, &config)?;
+    edit_typhon_dependencies(&toml_path, args.dev, &upserts, &[], &config)?;
     println!(
         "updated {} ({} package{})",
         toml_path.display(),
@@ -118,7 +121,7 @@ pub fn run_remove(args: RemoveArgs) -> Result<()> {
         .map(Path::to_path_buf)
         .unwrap_or_else(|| args.dir.clone());
 
-    let mut removed = 0usize;
+    let mut removed_names: Vec<String> = Vec::new();
     let table = if args.dev {
         &mut config.dev_dependencies
     } else {
@@ -126,16 +129,17 @@ pub fn run_remove(args: RemoveArgs) -> Result<()> {
     };
     for name in &args.packages {
         if table.remove(name).is_some() {
-            removed += 1;
+            removed_names.push(name.clone());
         } else {
             eprintln!("warning: {name} was not listed in typhon.toml");
         }
     }
+    let removed = removed_names.len();
     if removed == 0 {
         return Ok(());
     }
 
-    write_typhon_toml(&toml_path, &config)?;
+    edit_typhon_dependencies(&toml_path, args.dev, &[], &removed_names, &config)?;
     println!("updated {} ({removed} removed)", toml_path.display());
 
     if args.no_sync {
@@ -176,6 +180,54 @@ fn load_or_default(dir: &Path) -> Result<(PathBuf, TyphonConfig)> {
         Ok(None) => Ok((canon.join("typhon.toml"), TyphonConfig::default())),
         Err(e) => Err(miette!("{e}")),
     }
+}
+
+/// Apply dependency edits to `typhon.toml` **in place**.
+///
+/// `tyc add` / `tyc remove` used to re-serialise the whole parsed config,
+/// which expanded every defaulted key and dropped every comment the user had
+/// written — a manifest people hand-edit is not a round-trippable struct.
+/// `toml_edit` keeps the rest of the document byte-identical and touches only
+/// the dependency table. A missing file still gets a full manifest.
+fn edit_typhon_dependencies(
+    path: &Path,
+    dev: bool,
+    upserts: &[(String, String)],
+    removals: &[String],
+    config: &TyphonConfig,
+) -> Result<()> {
+    let Ok(existing) = std::fs::read_to_string(path) else {
+        return write_typhon_toml(path, config);
+    };
+    let mut doc: toml_edit::DocumentMut = existing
+        .parse()
+        .map_err(|e| miette!("cannot parse {}: {e}", path.display()))?;
+    let table_name = if dev {
+        "dev-dependencies"
+    } else {
+        "dependencies"
+    };
+    if !doc.contains_key(table_name) {
+        if !removals.is_empty() && upserts.is_empty() {
+            return Ok(());
+        }
+        doc[table_name] = toml_edit::Item::Table(toml_edit::Table::new());
+    }
+    let Some(table) = doc[table_name].as_table_like_mut() else {
+        // `dependencies = "…"` — not a table we can edit safely.
+        return Err(miette!(
+            "`[{table_name}]` in {} is not a table",
+            path.display()
+        ));
+    };
+    for (name, version) in upserts {
+        table.insert(name, toml_edit::value(version.as_str()));
+    }
+    for name in removals {
+        table.remove(name);
+    }
+    std::fs::write(path, doc.to_string())
+        .map_err(|e| miette!("cannot write {}: {e}", path.display()))
 }
 
 fn write_typhon_toml(path: &Path, config: &TyphonConfig) -> Result<()> {
@@ -372,9 +424,20 @@ pub fn bootstrap_python_env_with(
 /// via [`render_pyproject`].
 fn merge_pyproject(project_root: &Path, config: &TyphonConfig) -> Result<()> {
     let path = project_root.join("pyproject.toml");
+    // A symlinked `pyproject.toml` in an untrusted checkout would otherwise
+    // have its *target* rewritten with `typhon.toml`-derived content.
+    // `atomic_write` refuses symlinks; check up front so the message names
+    // the manifest rather than a temp file.
+    if std::fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_symlink()) {
+        return Err(miette!(
+            "refusing to update {}: it is a symlink (resolve or remove it first)",
+            path.display()
+        ));
+    }
     if !path.exists() {
         let text = render_pyproject(config);
-        std::fs::write(&path, text).map_err(|e| miette!("cannot write {}: {e}", path.display()))?;
+        tyc_format::atomic_write(&path, text.as_bytes())
+            .map_err(|e| miette!("cannot write {}: {e}", path.display()))?;
         return Ok(());
     }
 
@@ -386,7 +449,7 @@ fn merge_pyproject(project_root: &Path, config: &TyphonConfig) -> Result<()> {
 
     apply_owned_keys(&mut doc, config);
 
-    std::fs::write(&path, doc.to_string())
+    tyc_format::atomic_write(&path, doc.to_string().as_bytes())
         .map_err(|e| miette!("cannot write {}: {e}", path.display()))
 }
 
@@ -529,6 +592,26 @@ fn has_uv() -> bool {
 
 #[cfg(test)]
 mod tests {
+    /// A symlinked `pyproject.toml` in a checkout must not have its target
+    /// rewritten with `typhon.toml`-derived content.
+    #[cfg(unix)]
+    #[test]
+    fn merge_pyproject_refuses_symlink() {
+        let outside = tempfile::tempdir().unwrap();
+        let victim = outside.path().join("victim.toml");
+        std::fs::write(&victim, "[tool.mine]\nx = 1\n").unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(&victim, tmp.path().join("pyproject.toml")).unwrap();
+        let config = crate::config::TyphonConfig::default();
+        let err = super::merge_pyproject(tmp.path(), &config)
+            .expect_err("a symlinked pyproject.toml must be refused");
+        assert!(format!("{err:?}").contains("symlink"), "{err:?}");
+        assert_eq!(
+            std::fs::read_to_string(&victim).unwrap(),
+            "[tool.mine]\nx = 1\n"
+        );
+    }
+
     use super::*;
 
     #[test]
@@ -765,5 +848,77 @@ lint = [\"ruff\"]
                 "target {target:?}"
             );
         }
+    }
+
+    #[test]
+    fn dependency_edits_preserve_comments_and_formatting() {
+        // `tyc add` / `tyc remove` re-serialised the parsed config, which
+        // expanded every defaulted key and threw away every comment in a
+        // file people hand-edit.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("typhon.toml");
+        let original = "\
+[project]
+name = \"ni\"
+version = \"0.1.0\"
+
+[strictness]
+# CI gates on this
+unintrospectable-dependency = \"error\"
+
+# runtime deps -- keep this list short
+[dependencies]
+httpx = \"*\"  # pinned loose on purpose
+";
+        std::fs::write(&path, original).unwrap();
+        let config = crate::config::TyphonConfig::default();
+
+        edit_typhon_dependencies(
+            &path,
+            false,
+            &[("rich".to_owned(), ">=13".to_owned())],
+            &[],
+            &config,
+        )
+        .unwrap();
+        let after_add = std::fs::read_to_string(&path).unwrap();
+        assert!(after_add.contains("# CI gates on this"), "{after_add}");
+        assert!(
+            after_add.contains("# runtime deps -- keep this list short"),
+            "{after_add}"
+        );
+        assert!(
+            after_add.contains("httpx = \"*\"  # pinned loose on purpose"),
+            "{after_add}"
+        );
+        assert!(after_add.contains("rich = \">=13\""), "{after_add}");
+        assert!(
+            !after_add.contains("class-default"),
+            "defaulted keys must not be expanded into the file:\n{after_add}"
+        );
+
+        edit_typhon_dependencies(&path, false, &[], &["rich".to_owned()], &config).unwrap();
+        let after_remove = std::fs::read_to_string(&path).unwrap();
+        assert!(!after_remove.contains("rich"), "{after_remove}");
+        assert_eq!(
+            after_remove, original,
+            "add-then-remove must round-trip to the original file"
+        );
+    }
+
+    #[test]
+    fn dependency_edit_writes_a_full_manifest_when_none_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("typhon.toml");
+        let config = crate::config::TyphonConfig::default();
+        edit_typhon_dependencies(
+            &path,
+            true,
+            &[("pytest".to_owned(), "*".to_owned())],
+            &[],
+            &config,
+        )
+        .unwrap();
+        assert!(path.exists(), "a missing manifest must still be created");
     }
 }

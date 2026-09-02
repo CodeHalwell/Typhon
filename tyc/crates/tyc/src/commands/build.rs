@@ -10,12 +10,12 @@ use std::path::PathBuf;
 use clap::Args;
 use miette::{miette, Result};
 use tyc_analyse::{
-    analyse_purity, collect_gatherable_async_fn_names, detect_missed_gathers,
-    evaluate_comptime_with_functions, extract_builtin_extensions, load_profile_samples,
-    parallel_opportunity_diagnostics, pgo_memoise_targets, purity_diagnostics, rewrite_auto_gather,
-    rewrite_builtin_extension_calls_tracking, rewrite_parallel_comprehensions,
-    rewrite_reduction_loops, shared_mut_across_tasks_diagnostics, substitute_comptime_literals,
-    ProfileSample,
+    analyse_purity_with, class_names_at_marker_starts, collect_gatherable_async_fn_names,
+    detect_missed_gathers, evaluate_comptime_with_functions, extract_builtin_extensions,
+    load_profile_samples, parallel_opportunity_diagnostics, pgo_memoise_targets,
+    purity_diagnostics, rewrite_auto_gather, rewrite_builtin_extension_calls_tracking,
+    rewrite_parallel_comprehensions, rewrite_reduction_loops, shared_mut_across_tasks_diagnostics,
+    substitute_comptime_literals, ProfileSample,
 };
 use tyc_db::{check_file_with_imports, extract_shapes_for_path, TycDatabase};
 use tyc_desugar::{desugar_module_with, DesugarOptions};
@@ -81,6 +81,13 @@ pub struct BuildArgs {
     /// so `-O` never overrides a knob you set by hand.
     #[arg(short = 'O', long = "optimise", visible_alias = "optimize")]
     pub optimise: bool,
+
+    /// Report diagnostics under this name instead of the file they came
+    /// from. `tyc run --compile <file>` stages the script into a temp
+    /// scaffold, so without it the user is pointed at
+    /// `/tmp/tyc-script-…/src/main.ty` rather than their own file.
+    #[arg(skip)]
+    pub source_label: Option<String>,
 }
 
 pub fn run(args: BuildArgs) -> Result<()> {
@@ -180,6 +187,11 @@ pub fn run(args: BuildArgs) -> Result<()> {
 
     // Resolve --out relative to project_root so `tyc build path/to/proj -o build`
     // writes to `path/to/proj/build` rather than the caller's cwd.
+    // An explicit `--out` is the caller's own choice of destination (and is
+    // how `tyc run --temp` hands the build a scratch directory); the default
+    // comes from `typhon.toml`, which a checked-out tree controls. That is
+    // the difference `confine_root` below turns on.
+    let out_is_explicit = args.out.is_some();
     let out_dir = match args.out {
         Some(out) => {
             if out.is_absolute() {
@@ -189,6 +201,24 @@ pub fn run(args: BuildArgs) -> Result<()> {
             }
         }
         None => config_dir.join(&config.project.out),
+    };
+    // Where artifacts must land. For a repo-controlled `out`, that is the
+    // project root: a `build/` symlink planted in git would otherwise
+    // redirect the whole build outside it. For an explicit `--out` the user
+    // named the destination, so the out directory itself is the boundary —
+    // still enough to catch a symlink *inside* the output tree, and without
+    // it `tyc run --compile --temp` could never write its scratch build.
+    let (confine_root, confine_label) = if out_is_explicit {
+        // `--check` promises to touch nothing, so the boundary is derived
+        // from the nearest existing ancestor rather than by creating the
+        // directory that a real build would want.
+        if !args.check {
+            std::fs::create_dir_all(&out_dir)
+                .map_err(|e| miette!("cannot create '{}': {e}", out_dir.display()))?;
+        }
+        (canonical_or_lexical(&out_dir), "the output directory")
+    } else {
+        (project_root.clone(), "the project root")
     };
 
     let do_format = config.emit.format && !args.no_format;
@@ -225,10 +255,20 @@ pub fn run(args: BuildArgs) -> Result<()> {
         ));
     }
 
+    // Whether the source root is itself a Python package. A package root
+    // emits an `__init__.py` and is run as a module (`python -m pkg.main`),
+    // so its modules keep their relative imports; a flat root does not.
+    let src_root_is_package = src_dir.join("__init__.ty").exists();
     let ty_files = collect_ty_files(&src_dir)?;
 
     if ty_files.is_empty() {
-        println!("no .ty files found in '{}'", src_dir.display());
+        // Build *progress* goes to stderr, as every compiler's does: the
+        // program's own stdout must stay the program's. `tyc run --compile`
+        // (and the automatic fallback to it) execs the built program in the
+        // same terminal, so a "built 1 file(s)" line on stdout would land in
+        // the middle of that program's output. Diagnostics already went to
+        // stderr; this makes the whole non-data surface consistent.
+        eprintln!("no .ty files found in '{}'", src_dir.display());
         return Ok(());
     }
 
@@ -293,7 +333,18 @@ pub fn run(args: BuildArgs) -> Result<()> {
     // still merging the manifest, so stress harnesses and REPL-like
     // iteration don't pay the per-invocation reprovision cost.
     let skip_sync = args.no_sync || std::env::var_os("TYC_NO_SYNC").is_some_and(|v| v == "1");
-    crate::commands::deps::bootstrap_python_env_with(&config_dir, &config, skip_sync)?;
+    // `--check` is documented as a dry run that touches nothing on disk. The
+    // environment bootstrap writes `pyproject.toml` and (without `--no-sync`)
+    // runs `uv sync`, creating `.venv` and `uv.lock` — so it is skipped in
+    // check mode and reported like every other write.
+    if args.check {
+        eprintln!(
+            "would update {}",
+            display_relative(&config_dir.join("pyproject.toml"), &config_dir)
+        );
+    } else {
+        crate::commands::deps::bootstrap_python_env_with(&config_dir, &config, skip_sync)?;
+    }
 
     // Phase 1: type-check all files first and fail fast on errors.
     let mut db = TycDatabase::new();
@@ -410,7 +461,10 @@ pub fn run(args: BuildArgs) -> Result<()> {
     }
 
     // Apply strictness rules (e.g. promote unused-import warnings to errors).
-    let all_phase1_diags = apply_strictness(all_phase1_diags, &config);
+    let mut all_phase1_diags = apply_strictness(all_phase1_diags, &config);
+    if let Some(label) = &args.source_label {
+        all_phase1_diags.rename_source(label);
+    }
 
     // Emit warnings even when there are no errors so they are always visible.
     for warn in all_phase1_diags.warnings() {
@@ -757,8 +811,18 @@ pub fn run(args: BuildArgs) -> Result<()> {
         // Phase 3 purity analysis: every `@pure` / `@memo` function is verified
         // against the six-condition rule, and the desugarer is told which
         // functions to wrap in `@functools.cache`.
-        let purity_findings =
-            analyse_purity(&module, config.strictness.auto_memoise.unwrap_or(false));
+        // `class NAME frozen:` markers only survive as line indexes, so hand
+        // the analyser the frozen class names: their instances count as
+        // immutable (and hashable) for the cache-safety checks.
+        let frozen_class_names = class_names_at_marker_starts(
+            &module,
+            &line_byte_starts(&prep.python_source, &prep.frozen_class_lines),
+        );
+        let purity_findings = analyse_purity_with(
+            &module,
+            config.strictness.auto_memoise.unwrap_or(false),
+            &frozen_class_names,
+        );
         let purity_diags = purity_diagnostics(&purity_findings, &path.to_string_lossy(), source);
         if purity_diags.has_errors() {
             for err in purity_diags.errors() {
@@ -770,9 +834,19 @@ pub fn run(args: BuildArgs) -> Result<()> {
                 path.display()
             ));
         }
+        // An explicit `@memo` / `@pure(memo=True)` is honoured once nothing
+        // provably impure was found; an `auto-memoise` candidate must be
+        // provably pure with cache-safe parameters and return type.
         let mut memoise_targets: Vec<String> = purity_findings
             .iter()
-            .filter(|f| f.violation.is_none() && f.memoise)
+            .filter(|f| {
+                f.memoise
+                    && if f.declared_pure {
+                        f.violation.is_none()
+                    } else {
+                        f.auto_cacheable()
+                    }
+            })
             .map(|f| f.name.clone())
             .collect();
 
@@ -784,9 +858,11 @@ pub fn run(args: BuildArgs) -> Result<()> {
         // already in `memoise_targets` are skipped so the desugarer
         // doesn't emit two cache decorators on the same definition.
         if !profile_samples.is_empty() {
+            // PGO promotes functions the user never asked to cache, so it
+            // needs the full cache-safety proof, not just "nothing impure".
             let pgo_candidates: Vec<String> = purity_findings
                 .iter()
-                .filter(|f| f.violation.is_none())
+                .filter(|f| f.auto_cacheable())
                 .map(|f| f.name.clone())
                 .collect();
             let module_name = python_module_name_from_path(path, &src_dir);
@@ -939,7 +1015,7 @@ pub fn run(args: BuildArgs) -> Result<()> {
             }
             let pure_names: std::collections::HashSet<String> = purity_findings
                 .iter()
-                .filter(|f| f.violation.is_none())
+                .filter(|f| f.callable_as_pure())
                 .map(|f| f.name.clone())
                 .collect();
             for advice in parallel_opportunity_diagnostics(
@@ -1002,7 +1078,7 @@ pub fn run(args: BuildArgs) -> Result<()> {
                     if let Some(builtin) = cls_name.strip_prefix("__typhon_builtin_ext_") {
                         let entry = builtin_ext_registry.entry(builtin.to_owned()).or_default();
                         for method_name in shape.methods.keys() {
-                            let fn_name = format!("__typhon_ext_{builtin}__{method_name}");
+                            let fn_name = format!("__typhon_ext_{builtin}__{method_name}__");
                             entry.entry(method_name.clone()).or_insert_with(|| {
                                 cross_module_fns.insert(fn_name.clone(), mod_name.to_string());
                                 fn_name
@@ -1038,9 +1114,11 @@ pub fn run(args: BuildArgs) -> Result<()> {
         // on stock CPython the rewrite still happens but the GIL serialises
         // the workers (correctness preserved, no speedup).
         if config.strictness.auto_parallel.unwrap_or(false) {
+            // Calls to an explicit `@pure` are trusted once nothing provably
+            // impure was found; an inferred candidate must be provably pure.
             let pure_names: std::collections::HashSet<String> = purity_findings
                 .iter()
-                .filter(|f| f.violation.is_none())
+                .filter(|f| f.callable_as_pure())
                 .map(|f| f.name.clone())
                 .collect();
             let stats = rewrite_parallel_comprehensions(
@@ -1075,7 +1153,7 @@ pub fn run(args: BuildArgs) -> Result<()> {
             line_byte_starts(&prep.python_source, &prep.frozen_class_lines);
         let plain_class_line_starts =
             line_byte_starts(&prep.python_source, &prep.plain_class_lines);
-        let desugar_output = desugar_module_with(
+        let mut desugar_output = desugar_module_with(
             &module,
             DesugarOptions {
                 memoise_functions: memoise_targets,
@@ -1098,6 +1176,18 @@ pub fn run(args: BuildArgs) -> Result<()> {
         // lower PEP 695 syntax for targets < 3.12 (FINDINGS #47).
         // Anything we can't parse falls back to `0` (no lowering),
         // matching the previous default.
+        // A module sitting directly in a *non-package* source root emits
+        // `from models import X`, not `from .models import X`. The build
+        // directory is what `python build/main.py` (and `tyc run --compile`)
+        // puts on `sys.path`, so the relative form fails there with
+        // "attempted relative import with no known parent package" — while
+        // the VM resolves it fine, which split the two surfaces on a layout
+        // `tyc check` accepts. A source root that *is* a package (it has an
+        // `__init__.ty`) emits an `__init__.py` and is run as a package, so
+        // its relative imports stay.
+        if !src_root_is_package && path.parent() == Some(src_dir.as_path()) {
+            flatten_root_relative_imports(&mut desugar_output.module.body);
+        }
         let target_minor = parse_python_minor(&config.python.target);
         // Pass the preprocessed source so the printer can recover
         // stylistic choices the AST collapses — currently the bracket
@@ -1196,13 +1286,14 @@ pub fn run(args: BuildArgs) -> Result<()> {
         let out_file = out_dir.join(rel).with_extension("py");
 
         if check_mode {
-            println!("would write {}", display_relative(&out_file, &project_root));
+            eprintln!("would write {}", display_relative(&out_file, &project_root));
             would_write_count += 1;
         } else {
             if let Some(parent) = out_file.parent() {
                 std::fs::create_dir_all(parent)
                     .map_err(|e| miette!("cannot create '{}': {e}", parent.display()))?;
             }
+            confine_output_path(&confine_root, confine_label, &out_file)?;
 
             tyc_format::atomic_write(&out_file, python_src.as_bytes())
                 .map_err(|e| miette!("cannot write '{}': {e}", out_file.display()))?;
@@ -1228,13 +1319,21 @@ pub fn run(args: BuildArgs) -> Result<()> {
             .join(".sourcemaps")
             .join(rel)
             .with_extension("py.map");
-        let source_rel = escape_json_path(
-            &path
+        // The remapper joins this with the source root, so the *absolute*
+        // form of a `source_label` (a script staged by `tyc run --compile
+        // <file>`) wins outright and the traceback names the user's own
+        // file rather than the scaffold's copy of it.
+        let source_rel = escape_json_path(&match &args.source_label {
+            Some(label) => std::path::Path::new(label)
+                .canonicalize()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|_| label.clone()),
+            None => path
                 .strip_prefix(&src_dir)
                 .unwrap_or(path)
                 .display()
                 .to_string(),
-        );
+        });
         let map_body = build_source_map_v2(
             &source_rel,
             &prep.python_source,
@@ -1242,7 +1341,7 @@ pub fn run(args: BuildArgs) -> Result<()> {
             &preprocessed_to_ty,
         );
         if check_mode {
-            println!("would write {}", display_relative(&map_path, &project_root));
+            eprintln!("would write {}", display_relative(&map_path, &project_root));
             would_write_count += 1;
             let _ = map_body;
         } else {
@@ -1250,6 +1349,7 @@ pub fn run(args: BuildArgs) -> Result<()> {
                 std::fs::create_dir_all(parent)
                     .map_err(|e| miette!("cannot create '{}': {e}", parent.display()))?;
             }
+            confine_output_path(&confine_root, confine_label, &map_path)?;
             tyc_format::atomic_write(&map_path, map_body.as_bytes())
                 .map_err(|e| miette!("cannot write '{}': {e}", map_path.display()))?;
         }
@@ -1303,13 +1403,14 @@ pub fn run(args: BuildArgs) -> Result<()> {
             continue;
         }
         if check_mode {
-            println!("would write {}", display_relative(&dest, &project_root));
+            eprintln!("would write {}", display_relative(&dest, &project_root));
             would_write_count += 1;
         } else {
             if let Some(parent) = dest.parent() {
                 std::fs::create_dir_all(parent)
                     .map_err(|e| miette!("cannot create '{}': {e}", parent.display()))?;
             }
+            confine_output_path(&confine_root, confine_label, &dest)?;
             std::fs::copy(path, &dest).map_err(|e| {
                 miette!(
                     "cannot copy '{}' → '{}': {e}",
@@ -1321,7 +1422,7 @@ pub fn run(args: BuildArgs) -> Result<()> {
         py_copied += 1;
     }
     if py_copied > 0 && !check_mode {
-        println!("copied {} .py file(s)", py_copied);
+        eprintln!("copied {} .py file(s)", py_copied);
     }
 
     // Phase 5.4 orphan-import warning: scan every `.ty` source for
@@ -1340,18 +1441,29 @@ pub fn run(args: BuildArgs) -> Result<()> {
         }
     }
     for (path, source) in &sources {
+        // The two scans below overlap: `from .helper import …` in a
+        // top-level module is *both* an over-deep relative import and an
+        // orphaned sibling `.py`, and reporting the same line twice reads
+        // like two separate problems. Report each import once.
+        let mut reported: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        let mut warn_once = |snippet: String, offset: usize, length: usize| {
+            if !reported.insert(offset) {
+                return;
+            }
+            let warn = TycError::orphan_py_import(
+                snippet,
+                path.to_string_lossy().into_owned(),
+                source.clone(),
+                offset,
+                length,
+            );
+            eprintln!("{:?}", miette::Report::new_boxed(Box::new(warn)));
+        };
         // Relative imports that escape the source root (`from ..x import …`
         // from a top-level module) crash at import — surface them here.
         if let Some(depth) = module_depth_below(path, &src_dir) {
             for (snippet, offset, length) in scan_overdeep_relative_imports(source, depth) {
-                let warn = TycError::orphan_py_import(
-                    snippet,
-                    path.to_string_lossy().into_owned(),
-                    source.clone(),
-                    offset,
-                    length,
-                );
-                eprintln!("{:?}", miette::Report::new_boxed(Box::new(warn)));
+                warn_once(snippet, offset, length);
             }
         }
         for (module_name, snippet, offset, length) in scan_relative_py_imports(source) {
@@ -1368,14 +1480,7 @@ pub fn run(args: BuildArgs) -> Result<()> {
                 walker = dir.parent();
             }
             if found_orphan_parent {
-                let warn = TycError::orphan_py_import(
-                    snippet,
-                    path.to_string_lossy().into_owned(),
-                    source.clone(),
-                    offset,
-                    length,
-                );
-                eprintln!("{:?}", miette::Report::new_boxed(Box::new(warn)));
+                warn_once(snippet, offset, length);
             }
         }
     }
@@ -1428,7 +1533,7 @@ pub fn run(args: BuildArgs) -> Result<()> {
             .map_err(|_| miette!("'{}' is outside the source directory", path.display()))?;
         let out_file = out_dir.join(rel).with_extension("pyi");
         if check_mode {
-            println!("would write {}", display_relative(&out_file, &project_root));
+            eprintln!("would write {}", display_relative(&out_file, &project_root));
             would_write_count += 1;
             let _ = stub_text;
         } else {
@@ -1436,13 +1541,14 @@ pub fn run(args: BuildArgs) -> Result<()> {
                 std::fs::create_dir_all(parent)
                     .map_err(|e| miette!("cannot create '{}': {e}", parent.display()))?;
             }
+            confine_output_path(&confine_root, confine_label, &out_file)?;
             tyc_format::atomic_write(&out_file, stub_text.as_bytes())
                 .map_err(|e| miette!("cannot write '{}': {e}", out_file.display()))?;
         }
         stubs_emitted += 1;
     }
     if stubs_emitted > 0 && !check_mode {
-        println!("emitted {} stub(s) (.pyi)", stubs_emitted);
+        eprintln!("emitted {} stub(s) (.pyi)", stubs_emitted);
     }
 
     // Emit the typhon_runtime helper alongside the Python output when any
@@ -1471,7 +1577,7 @@ pub fn run(args: BuildArgs) -> Result<()> {
         if check_mode {
             for (name, _body) in files {
                 let path = runtime_dir.join(name);
-                println!("would write {}", display_relative(&path, &project_root));
+                eprintln!("would write {}", display_relative(&path, &project_root));
                 would_write_count += 1;
             }
         } else {
@@ -1481,20 +1587,21 @@ pub fn run(args: BuildArgs) -> Result<()> {
                 .map_err(|e| miette!("cannot create '{}': {e}", runtime_dir.display()))?;
             for (name, body) in files {
                 let path = runtime_dir.join(name);
+                confine_output_path(&confine_root, confine_label, &path)?;
                 tyc_format::atomic_write(&path, body.as_bytes())
                     .map_err(|e| miette!("cannot write '{}': {e}", path.display()))?;
             }
-            println!("wrote typhon_runtime/ → '{}'", runtime_dir.display());
+            eprintln!("wrote typhon_runtime/ → '{}'", runtime_dir.display());
         }
     }
 
     if check_mode {
-        println!(
+        eprintln!(
             "would write {} file(s) (no changes made)",
             would_write_count
         );
     } else {
-        println!("built {} file(s) → '{}'", emitted, out_dir.display());
+        eprintln!("built {} file(s) → '{}'", emitted, out_dir.display());
     }
     // R3 frontier: fail the build when `pub *` aggregated colliding
     // re-exports. The diagnostics were already printed to stderr in
@@ -1520,7 +1627,7 @@ pub fn run(args: BuildArgs) -> Result<()> {
         } else {
             "[checker] external = \"ty\""
         };
-        println!("running `ty` over emitted Python ({reason})…");
+        eprintln!("running `ty` over emitted Python ({reason})…");
         crate::commands::ty::run_ty_check(
             &project_root,
             &out_dir,
@@ -1613,6 +1720,71 @@ fn inject_cross_module_ext_imports(
 /// Render `path` as a project-root-relative display string when possible,
 /// falling back to the absolute path. Used by the `--check` dry-run mode
 /// to keep `would write …` lines readable.
+/// Refuse an output destination that a checked-out tree could redirect.
+///
+/// `tyc build` writes into `out_dir` — a directory the project controls and
+/// git preserves symlinks in — so a pre-planted link (`build/main.py`,
+/// `build/.sourcemaps/`, or `build/` itself pointing outside the project)
+/// would turn the build into a write to an arbitrary path the user can
+/// write. Every artifact destination therefore goes through here first: the
+/// leaf must not be a symlink (`atomic_write` refuses those too) and its
+/// parent directory, once it exists, must resolve inside the canonical
+/// project root.
+/// A canonical path for a directory that may not exist yet: canonicalise the
+/// nearest existing ancestor and re-attach the components below it. `--check`
+/// needs this because it must not create the output directory just to work
+/// out where the boundary is.
+fn canonical_or_lexical(path: &std::path::Path) -> std::path::PathBuf {
+    if let Ok(real) = std::fs::canonicalize(path) {
+        return real;
+    }
+    let mut missing: Vec<&std::ffi::OsStr> = Vec::new();
+    let mut probe = path;
+    while let Some(parent) = probe.parent() {
+        if let Some(name) = probe.file_name() {
+            missing.push(name);
+        }
+        if let Ok(real) = std::fs::canonicalize(parent) {
+            let mut out = real;
+            for part in missing.iter().rev() {
+                out.push(part);
+            }
+            return out;
+        }
+        probe = parent;
+    }
+    path.to_path_buf()
+}
+
+fn confine_output_path(
+    root: &std::path::Path,
+    root_label: &str,
+    dest: &std::path::Path,
+) -> Result<()> {
+    if std::fs::symlink_metadata(dest).is_ok_and(|m| m.file_type().is_symlink()) {
+        return Err(miette!(
+            "refusing to write '{}': it is a symlink (remove it and rebuild)",
+            dest.display()
+        ));
+    }
+    let root = std::fs::canonicalize(root)
+        .map_err(|e| miette!("cannot resolve output root '{}': {e}", root.display()))?;
+    if let Some(parent_dir) = dest.parent() {
+        let parent = std::fs::canonicalize(parent_dir)
+            .map_err(|e| miette!("cannot resolve '{}': {e}", parent_dir.display()))?;
+        if !parent.starts_with(&root) {
+            return Err(miette!(
+                "refusing to write '{}': its directory resolves to '{}', outside {} '{}'",
+                dest.display(),
+                parent.display(),
+                root_label,
+                root.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn display_relative(path: &std::path::Path, project_root: &std::path::Path) -> String {
     path.strip_prefix(project_root)
         .map(|p| p.to_string_lossy().into_owned())
@@ -1829,6 +2001,51 @@ fn replace_line(source: &str, line_idx: usize, replacement: &str) -> String {
 }
 
 /// Compute the effective public surface of a package directory.
+/// Rewrite `from .sibling import X` to `from sibling import X` throughout a
+/// statement list (recursing into every nested body). Only the single-dot
+/// form with a named module is touched: `from . import x` and any deeper
+/// `..` form addresses a package this layout does not have.
+fn flatten_root_relative_imports(body: &mut [ruff_python_ast::Stmt]) {
+    use ruff_python_ast::Stmt;
+    for stmt in body.iter_mut() {
+        match stmt {
+            Stmt::ImportFrom(i) if i.level == 1 && i.module.is_some() => i.level = 0,
+            Stmt::FunctionDef(f) => flatten_root_relative_imports(&mut f.body),
+            Stmt::ClassDef(c) => flatten_root_relative_imports(&mut c.body),
+            Stmt::If(i) => {
+                flatten_root_relative_imports(&mut i.body);
+                for clause in i.elif_else_clauses.iter_mut() {
+                    flatten_root_relative_imports(&mut clause.body);
+                }
+            }
+            Stmt::For(f) => {
+                flatten_root_relative_imports(&mut f.body);
+                flatten_root_relative_imports(&mut f.orelse);
+            }
+            Stmt::While(w) => {
+                flatten_root_relative_imports(&mut w.body);
+                flatten_root_relative_imports(&mut w.orelse);
+            }
+            Stmt::With(w) => flatten_root_relative_imports(&mut w.body),
+            Stmt::Try(t) => {
+                flatten_root_relative_imports(&mut t.body);
+                flatten_root_relative_imports(&mut t.orelse);
+                flatten_root_relative_imports(&mut t.finalbody);
+                for handler in t.handlers.iter_mut() {
+                    let ruff_python_ast::ExceptHandler::ExceptHandler(h) = handler;
+                    flatten_root_relative_imports(&mut h.body);
+                }
+            }
+            Stmt::Match(m) => {
+                for case in m.cases.iter_mut() {
+                    flatten_root_relative_imports(&mut case.body);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 /// Walks `__init__.ty`'s top-level `pub` names, then — if that
 /// `__init__.ty` itself contains a `pub *` marker — recurses into
 /// every direct sub-package and direct .ty sibling at one level
@@ -2145,7 +2362,43 @@ fn python_module_name_from_path(path: &std::path::Path, src_dir: &std::path::Pat
 /// merge, since the emitter will produce `from pydantic import …`
 /// statements for those classes.
 fn sources_use_model_keyword(sources: &[(PathBuf, String)]) -> bool {
-    sources.iter().any(|(_, text)| source_uses_model(text))
+    sources
+        .iter()
+        .any(|(_, text)| source_uses_model(text) || source_names_basemodel(text))
+}
+
+/// Whether a source names `BaseModel` outside a string or comment. The
+/// desugar injects `from pydantic import BaseModel` for a bare reference
+/// (a hand-written `class C(BaseModel)`, say) exactly as it does for
+/// `model X:`, so the dependency has to be declared for both — otherwise
+/// the artefact swaps a `NameError` for a `ModuleNotFoundError`.
+fn source_names_basemodel(text: &str) -> bool {
+    use tyc_syntax::lexmask::{scan_line_kinds, ByteKind};
+    // The same lexical mask the preprocessor uses, so an ordinary string
+    // literal (`let banner: str = "BaseModel"`) does not pull pydantic into
+    // the project's dependencies.
+    let mut in_string = None;
+    for line in text.split_inclusive('\n') {
+        let kinds = scan_line_kinds(line, &mut in_string);
+        let bytes = line.as_bytes();
+        let boundary = |i: usize| match bytes.get(i) {
+            Some(c) => !(c.is_ascii_alphanumeric() || *c == b'_'),
+            None => true,
+        };
+        let mut at = 0usize;
+        while let Some(found) = line[at..].find("BaseModel") {
+            let start = at + found;
+            let end = start + "BaseModel".len();
+            let is_code = kinds
+                .get(start)
+                .is_some_and(|k| matches!(k, ByteKind::Code | ByteKind::FStringExpr));
+            if is_code && (start == 0 || boundary(start - 1)) && boundary(end) {
+                return true;
+            }
+            at = end;
+        }
+    }
+    false
 }
 
 fn source_uses_model(text: &str) -> bool {
@@ -2803,13 +3056,13 @@ class Err(Generic[_E]):
 
 # Use `typing.Union` rather than PEP 695 `type Result[T, E] = …` so the
 # generated runtime loads under Python 3.10 / 3.11 / 3.12 as well as the
-# 3.13+ default. The runtime never inspects the alias's generic
-# parameters — `isinstance(x, Err)` and the dataclass shape are what the
-# rest of the runtime relies on — so dropping the parameters here is
-# harmless. Static type checkers still see `Result` as a union of `Ok`
-# and `Err`.
+# 3.13+ default. The alias is parameterised over the same type variables
+# as `Ok` / `Err`, so `Result[int, str]` is a real generic alias:
+# `typing.get_type_hints` resolves a `Result[int, str]` field instead of
+# raising `TypeError: ... is not a generic class`. The runtime itself only
+# relies on `isinstance(x, Err)` and the dataclass shape.
 from typing import TypeAlias, Union
-Result: TypeAlias = Union[Ok, Err]
+Result: TypeAlias = Union[Ok[_T], Err[_E]]
 
 
 def try_result(thunk, on_err=None):
@@ -3070,6 +3323,68 @@ class _LazyValue:
 
     def __abs__(self) -> object:
         return abs(self._materialise())
+
+    def __invert__(self) -> object:
+        return ~self._materialise()
+
+    def __ne__(self, other: object) -> bool:
+        return self._materialise() != other
+
+    def __matmul__(self, other: object) -> object:
+        return self._materialise() @ other
+
+    def __rmatmul__(self, other: object) -> object:
+        return other @ self._materialise()
+
+    def __divmod__(self, other: object) -> object:
+        return divmod(self._materialise(), other)
+
+    def __rdivmod__(self, other: object) -> object:
+        return divmod(other, self._materialise())
+
+    def __round__(self, ndigits: object = None) -> object:
+        value = self._materialise()
+        return round(value) if ndigits is None else round(value, ndigits)
+
+    def __trunc__(self) -> object:
+        import math
+        return math.trunc(self._materialise())
+
+    def __floor__(self) -> object:
+        import math
+        return math.floor(self._materialise())
+
+    def __ceil__(self) -> object:
+        import math
+        return math.ceil(self._materialise())
+
+    def __int__(self) -> int:
+        return int(self._materialise())
+
+    def __float__(self) -> float:
+        return float(self._materialise())
+
+    def __complex__(self) -> complex:
+        return complex(self._materialise())
+
+    def __index__(self) -> int:
+        import operator
+        return operator.index(self._materialise())
+
+    def __format__(self, spec: str) -> str:
+        return format(self._materialise(), spec)
+
+    def __contains__(self, item: object) -> bool:
+        return item in self._materialise()
+
+    def __reversed__(self) -> object:
+        return reversed(self._materialise())
+
+    def __enter__(self) -> object:
+        return self._materialise().__enter__()
+
+    def __exit__(self, *exc: object) -> object:
+        return self._materialise().__exit__(*exc)
 
     def __invert__(self) -> object:
         return ~self._materialise()
@@ -3395,6 +3710,13 @@ const TYPHON_RUNTIME_FREEZE_PY: &str = "\
 \"\"\"Deep-freeze helper backing Typhon's `freeze let` keyword.\"\"\"
 from __future__ import annotations
 
+import datetime as _datetime
+import decimal as _decimal
+import enum as _enum
+import fractions as _fractions
+import pathlib as _pathlib
+import types as _types
+import uuid as _uuid
 from types import MappingProxyType
 from typing import Any
 
@@ -3408,6 +3730,22 @@ _FROZEN_PRIMITIVES = (
     complex,
     type(Ellipsis),
     type(NotImplemented),
+    # Immutable stdlib value types: an enum member, a date / time /
+    # timedelta / tzinfo, a Decimal or Fraction, a (Pure)Path, a UUID, a
+    # class object or a function. None of them can be mutated through the
+    # frozen value, so they pass through like the primitives above.
+    _enum.Enum,
+    _datetime.date,
+    _datetime.time,
+    _datetime.timedelta,
+    _datetime.tzinfo,
+    _decimal.Decimal,
+    _fractions.Fraction,
+    _pathlib.PurePath,
+    _uuid.UUID,
+    type,
+    _types.FunctionType,
+    _types.BuiltinFunctionType,
 )
 
 # Containers that are already immutable at runtime — pass through unchanged.
@@ -3418,7 +3756,8 @@ def deep_freeze(value: Any) -> Any:
     \"\"\"Return a deeply-immutable version of *value*.
 
     Recursively replaces `list → tuple`, `dict → MappingProxyType`,
-    `set → frozenset`. Primitives, strings, and already-immutable
+    `set → frozenset`. Primitives, strings, immutable stdlib values
+    (enum members, dates, Decimals, Paths, UUIDs, …) and already-immutable
     containers are returned as-is. Raises `TypeError` when *value*
     holds something with no clean immutable equivalent so users find
     out at startup rather than via a subtle aliasing bug later.
@@ -3729,25 +4068,79 @@ def _load_state():
     return (build_root, maps, _source_root(build_root))
 
 
+# Written as chr(10) because this module is emitted from a Rust string
+# literal, where a backslash escape would have to be doubled.
+_NL = chr(10)
+
+
+def _ty_source(path, cache):
+    # Lines of a `.ty` file, or None when it cannot be read.
+    if path not in cache:
+        try:
+            with open(path, 'r', encoding='utf-8', errors='replace') as fh:
+                cache[path] = fh.read().split(_NL)
+        except OSError:
+            cache[path] = None
+    return cache[path]
+
+
+def _is_anchor(line):
+    # A 3.11+ column-anchor row (`    ~~~~^^^^`) under a source line.
+    body = line.strip()
+    return bool(body) and set(body) <= set('~^')
+
+
 def _remap(text, state):
     build_root, maps, source_root = state
-
-    def repl(match):
-        path, lineno = match.group(1), int(match.group(2))
-        try:
-            rel = os.path.normpath(os.path.relpath(os.path.abspath(path), build_root))
-        except ValueError:  # pragma: no cover - different drive on Windows
-            return match.group(0)
-        entry = maps.get(rel)
-        if not entry:
-            return match.group(0)
-        source, lines = entry
-        if not (1 <= lineno <= len(lines)):
-            return match.group(0)
-        ty_path = os.path.join(source_root, source) if source_root else source
-        return 'File \"' + ty_path + '\", line ' + str(lines[lineno - 1])
-
-    return _FRAME_RE.sub(repl, text)
+    cache = {}
+    out = []
+    rows = text.split(_NL)
+    i = 0
+    while i < len(rows):
+        row = rows[i]
+        match = _FRAME_RE.search(row)
+        target = None
+        if match:
+            path, lineno = match.group(1), int(match.group(2))
+            try:
+                rel = os.path.normpath(os.path.relpath(os.path.abspath(path), build_root))
+            except ValueError:  # pragma: no cover - different drive on Windows
+                rel = None
+            entry = maps.get(rel) if rel else None
+            if entry:
+                source, table = entry
+                if 1 <= lineno <= len(table):
+                    ty_path = os.path.join(source_root, source) if source_root else source
+                    target = (ty_path, table[lineno - 1])
+        if target is None:
+            out.append(row)
+            i += 1
+            continue
+        ty_path, ty_line = target
+        head = 'File \"' + ty_path + '\", line ' + str(ty_line)
+        out.append(row[: match.start()] + head + row[match.end():])
+        i += 1
+        # The rows under a frame header are the EMITTED source and its column
+        # anchors. Leaving them under a `.ty` path and line is worse than
+        # showing nothing: the reader opens that line and finds something
+        # else, and a generated name (`__typhon_qi_0__`) leaks into the very
+        # traceback the source map exists to keep clean. Swap in the real
+        # `.ty` row and drop the anchors, whose columns no longer mean
+        # anything.
+        if i < len(rows) and rows[i].startswith(' ') and not _FRAME_RE.search(rows[i]):
+            src = _ty_source(ty_path, cache)
+            replacement = ''
+            if src is not None and 1 <= ty_line <= len(src):
+                replacement = src[ty_line - 1].strip()
+            # With no readable `.ty` row (a build shipped without its
+            # sources), keep what CPython printed rather than dropping it.
+            if replacement:
+                out.append('    ' + replacement)
+                i += 1
+                # The anchors point into the row just replaced.
+                if i < len(rows) and _is_anchor(rows[i]):
+                    i += 1
+    return _NL.join(out)
 ";
 
 /// Render `typhon_runtime/parallel.py`, baking the auto-parallel execution
@@ -4045,6 +4438,7 @@ mod tests {
             no_sync: false,
             with_ty: false,
             optimise: false,
+            source_label: None,
         })
         .expect("build must succeed despite the stdlib-shadow warning");
         assert!(
@@ -4065,6 +4459,7 @@ mod tests {
             no_sync: false,
             with_ty: false,
             optimise: false,
+            source_label: None,
         })
         .unwrap();
         assert!(
@@ -4086,6 +4481,7 @@ mod tests {
             no_sync: false,
             with_ty: false,
             optimise: false,
+            source_label: None,
         })
         .unwrap();
         assert!(
@@ -4106,6 +4502,7 @@ mod tests {
             no_sync: false,
             with_ty: false,
             optimise: false,
+            source_label: None,
         });
         assert!(result.is_err(), "build should fail on type mismatch");
     }
@@ -4149,6 +4546,7 @@ mod tests {
             no_sync: false,
             with_ty: false,
             optimise: false,
+            source_label: None,
         })
         .unwrap();
         let init_py =
@@ -4197,6 +4595,7 @@ mod tests {
             no_sync: false,
             with_ty: false,
             optimise: false,
+            source_label: None,
         })
         .unwrap();
         let py = std::fs::read_to_string(out_dir.join("main.py")).unwrap();
@@ -4222,6 +4621,7 @@ mod tests {
             no_sync: false,
             with_ty: false,
             optimise: false,
+            source_label: None,
         })
         .unwrap();
         // Phase 3 made `typhon_runtime` a package (with submodules `tasks`
@@ -4268,6 +4668,7 @@ async def load(id: int) -> None:
             no_sync: false,
             with_ty: false,
             optimise: false,
+            source_label: None,
         })
         .unwrap();
         let py = std::fs::read_to_string(out_dir.join("main.py")).unwrap();
@@ -4302,6 +4703,7 @@ let result: int = 3 |> double |> inc
             no_sync: false,
             with_ty: false,
             optimise: false,
+            source_label: None,
         })
         .unwrap();
         let py = std::fs::read_to_string(out_dir.join("main.py")).unwrap();
@@ -4331,6 +4733,7 @@ let result: int = 3 |> double |> inc
             no_sync: false,
             with_ty: false,
             optimise: false,
+            source_label: None,
         })
         .unwrap();
         let py = std::fs::read_to_string(out_dir.join("main.py")).unwrap();
@@ -4397,6 +4800,7 @@ class Foo:
             no_sync: false,
             with_ty: false,
             optimise: false,
+            source_label: None,
         })
         .unwrap();
         let py = std::fs::read_to_string(out_dir.join("main.py")).unwrap();
@@ -4424,6 +4828,7 @@ class Foo:
             no_sync: false,
             with_ty: false,
             optimise: false,
+            source_label: None,
         })
         .unwrap();
         let py = std::fs::read_to_string(out_dir.join("main.py")).unwrap();
@@ -4485,6 +4890,7 @@ def area(s: Shape) -> float:
             no_sync: false,
             with_ty: false,
             optimise: false,
+            source_label: None,
         })
         .unwrap();
         let py = std::fs::read_to_string(out_dir.join("main.py")).unwrap();
@@ -4520,6 +4926,7 @@ def area(s: Shape) -> float:
             no_sync: false,
             with_ty: false,
             optimise: false,
+            source_label: None,
         });
         // Verify the failure is specifically a type-checking error, not a
         // configuration or I/O error, by checking the returned error message.
@@ -4548,6 +4955,7 @@ def fib(n: int) -> int:
             no_sync: false,
             with_ty: false,
             optimise: false,
+            source_label: None,
         })
         .unwrap();
         let py = std::fs::read_to_string(out_dir.join("main.py")).unwrap();
@@ -4584,6 +4992,7 @@ let pet: Animal = Dog(name=\"Rex\")
             no_sync: false,
             with_ty: false,
             optimise: false,
+            source_label: None,
         });
         // Verify the failure is specifically a type-checking error (structural
         // conformance failure), not a configuration or I/O error.
@@ -4615,6 +5024,7 @@ def hot(n: int) -> int:
             no_sync: false,
             with_ty: false,
             optimise: false,
+            source_label: None,
         })
         .unwrap();
         let py = std::fs::read_to_string(out_dir.join("main.py")).unwrap();
@@ -4648,6 +5058,7 @@ def cold(n: int) -> int:
             no_sync: false,
             with_ty: false,
             optimise: false,
+            source_label: None,
         })
         .unwrap();
         let py = std::fs::read_to_string(out_dir.join("main.py")).unwrap();
@@ -4689,6 +5100,7 @@ def cold(n: int) -> int:
             no_sync: false,
             with_ty: false,
             optimise: false,
+            source_label: None,
         })
         .unwrap();
         let py = std::fs::read_to_string(out_dir.join("main.py")).unwrap();
@@ -4724,6 +5136,7 @@ async def load() -> int:
             no_sync: false,
             with_ty: false,
             optimise: false,
+            source_label: None,
         })
         .unwrap();
         let py = std::fs::read_to_string(out_dir.join("main.py")).unwrap();
@@ -4760,6 +5173,7 @@ async def load() -> int:
             no_sync: false,
             with_ty: false,
             optimise: false,
+            source_label: None,
         })
         .unwrap();
         let py = std::fs::read_to_string(out_dir.join("main.py")).unwrap();
@@ -4798,6 +5212,7 @@ async def load() -> int:
             no_sync: false,
             with_ty: false,
             optimise: false,
+            source_label: None,
         })
         .unwrap();
         let py = std::fs::read_to_string(out_dir.join("main.py")).unwrap();
@@ -4842,6 +5257,7 @@ async def load() -> int:
             no_sync: false,
             with_ty: false,
             optimise: false,
+            source_label: None,
         })
         .unwrap();
         let py = std::fs::read_to_string(out_dir.join("main.py")).unwrap();
@@ -4908,6 +5324,7 @@ async def load(uid: int) -> int:
             no_sync: true,
             with_ty: false,
             optimise: false,
+            source_label: None,
         })
         .unwrap();
         let py = std::fs::read_to_string(out_dir.join("main.py")).unwrap();
@@ -4951,6 +5368,7 @@ async def load(uid: int) -> int:
             no_sync: true,
             with_ty: false,
             optimise: false,
+            source_label: None,
         })
         .unwrap();
         let py = std::fs::read_to_string(out_dir.join("main.py")).unwrap();
@@ -5010,6 +5428,7 @@ async def load(uid: int) -> int:
             no_sync: false,
             with_ty: false,
             optimise: false,
+            source_label: None,
         })
         .unwrap();
         let map_path = out_dir.join(".sourcemaps").join("main.py.map");
@@ -5059,6 +5478,7 @@ let pet: Animal = Dog(name=\"Rex\")
             no_sync: false,
             with_ty: false,
             optimise: false,
+            source_label: None,
         })
         .unwrap();
         let py = std::fs::read_to_string(out_dir.join("main.py")).unwrap();
@@ -5088,6 +5508,7 @@ let pet: Animal = Dog(name=\"Rex\")
             no_sync: false,
             with_ty: false,
             optimise: false,
+            source_label: None,
         })
         .unwrap();
         assert!(
@@ -5125,6 +5546,7 @@ let pet: Animal = Dog(name=\"Rex\")
             no_sync: false,
             with_ty: false,
             optimise: false,
+            source_label: None,
         })
         .unwrap();
         assert!(
@@ -5151,6 +5573,7 @@ let pet: Animal = Dog(name=\"Rex\")
             no_sync: false,
             with_ty: false,
             optimise: false,
+            source_label: None,
         })
         .unwrap();
         assert!(
@@ -5160,6 +5583,94 @@ let pet: Animal = Dog(name=\"Rex\")
         assert!(
             !out_dir.join(".sourcemaps").join("main.py.map").exists(),
             "--check must not write .py.map sidecar"
+        );
+    }
+
+    /// `--check` is a dry run: it must not bootstrap the Python environment
+    /// either (which wrote `pyproject.toml` and, without `--no-sync`, ran
+    /// `uv sync`).
+    #[test]
+    fn build_check_does_not_write_pyproject() {
+        let tmp = tempfile::tempdir().unwrap();
+        scaffold(tmp.path(), "let x: int = 1\n");
+        run(BuildArgs {
+            path: tmp.path().to_path_buf(),
+            out: None,
+            no_format: true,
+            check: true,
+            no_sync: true,
+            with_ty: false,
+            optimise: false,
+            source_label: None,
+        })
+        .unwrap();
+        assert!(
+            !tmp.path().join("pyproject.toml").exists(),
+            "--check must not write pyproject.toml"
+        );
+    }
+
+    /// A symlink pre-planted at an artifact path must not redirect the
+    /// write: a checkout can carry `build/main.py -> <anything the user can
+    /// write>` and git preserves it.
+    #[cfg(unix)]
+    #[test]
+    fn build_refuses_symlinked_artifact_destination() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (_, out_dir) = scaffold(tmp.path(), "let x: int = 1\n");
+        let victim = tmp.path().join("victim.txt");
+        std::fs::write(&victim, "PRECIOUS\n").unwrap();
+        std::fs::create_dir_all(&out_dir).unwrap();
+        std::os::unix::fs::symlink(&victim, out_dir.join("main.py")).unwrap();
+        let err = run(BuildArgs {
+            path: tmp.path().to_path_buf(),
+            out: None,
+            no_format: true,
+            check: false,
+            no_sync: true,
+            with_ty: false,
+            optimise: false,
+            source_label: None,
+        })
+        .expect_err("a symlinked destination must fail the build");
+        assert!(
+            format!("{err:?}").contains("symlink"),
+            "error should name the symlink; got {err:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&victim).unwrap(),
+            "PRECIOUS\n",
+            "the link target must be untouched"
+        );
+    }
+
+    /// A symlinked output *directory* that resolves outside the project must
+    /// be refused too — every emitted file would otherwise land outside.
+    #[cfg(unix)]
+    #[test]
+    fn build_refuses_output_dir_escaping_project() {
+        let outside = tempfile::tempdir().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let (_, out_dir) = scaffold(tmp.path(), "let x: int = 1\n");
+        std::os::unix::fs::symlink(outside.path(), &out_dir).unwrap();
+        let err = run(BuildArgs {
+            path: tmp.path().to_path_buf(),
+            out: None,
+            no_format: true,
+            check: false,
+            no_sync: true,
+            with_ty: false,
+            optimise: false,
+            source_label: None,
+        })
+        .expect_err("an escaping output directory must fail the build");
+        assert!(
+            format!("{err:?}").contains("outside the project root"),
+            "error should explain the escape; got {err:?}"
+        );
+        assert!(
+            !outside.path().join("main.py").exists(),
+            "nothing may be written outside the project"
         );
     }
 
@@ -5175,6 +5686,7 @@ let pet: Animal = Dog(name=\"Rex\")
             no_sync: false,
             with_ty: false,
             optimise: false,
+            source_label: None,
         })
         .unwrap();
         assert!(!out_dir.join("main.py").exists());
@@ -5193,6 +5705,7 @@ let pet: Animal = Dog(name=\"Rex\")
             no_sync: false,
             with_ty: false,
             optimise: false,
+            source_label: None,
         });
         assert!(
             result.is_err(),
@@ -5233,6 +5746,7 @@ let pet: Animal = Dog(name=\"Rex\")
             no_sync: false,
             with_ty: false,
             optimise: false,
+            source_label: None,
         });
         std::env::remove_var("FAKE_API_KEY");
         assert!(

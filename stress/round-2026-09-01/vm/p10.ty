@@ -1,0 +1,206 @@
+from typing import Iterator
+
+plain class Vec:
+    xs: list[int] = []
+
+impl Vec:
+    def __init__(self, xs: list[int]) -> None:
+        self.xs = list(xs)
+    def __repr__(self) -> str:
+        return f"Vec{tuple(self.xs)}"
+    def __getitem__(self, i: int) -> int:
+        return self.xs[i]
+    def __len__(self) -> int:
+        return len(self.xs)
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, Vec) and self.xs == other.xs
+    def __lt__(self, other: "Vec") -> bool:
+        return sum(self.xs) < sum(other.xs)
+    def __mul__(self, k: int) -> "Vec":
+        return Vec([x * k for x in self.xs])
+    def __rmul__(self, k: int) -> "Vec":
+        return Vec([k * x for x in self.xs])
+    def __matmul__(self, other: "Vec") -> int:
+        return sum(a * b for a, b in zip(self.xs, other.xs))
+    def __truediv__(self, k: int) -> "Vec":
+        return Vec([x // k for x in self.xs])
+    def __floordiv__(self, k: int) -> str:
+        return "floordiv"
+    def __mod__(self, k: int) -> str:
+        return "mod"
+    def __pow__(self, k: int) -> str:
+        return "pow"
+    def __and__(self, o: int) -> str:
+        return "and"
+    def __or__(self, o: int) -> str:
+        return "or"
+    def __xor__(self, o: int) -> str:
+        return "xor"
+    def __lshift__(self, o: int) -> str:
+        return "lshift"
+    def __rshift__(self, o: int) -> str:
+        return "rshift"
+    def __invert__(self) -> str:
+        return "invert"
+    def __pos__(self) -> str:
+        return "pos"
+    def __abs__(self) -> str:
+        return "abs"
+    def __int__(self) -> int:
+        return len(self.xs)
+    def __float__(self) -> float:
+        return float(len(self.xs))
+    def __index__(self) -> int:
+        return len(self.xs)
+    def __round__(self, n: int = 0) -> str:
+        return f"round{n}"
+    def __hash__(self) -> int:
+        return hash(tuple(self.xs))
+    def __enter__(self) -> "Vec":
+        print("  enter")
+        return self
+    def __exit__(self, et: object, ev: object, tb: object) -> bool:
+        print("  exit", et is None, repr(ev))
+        return True
+    def __reversed__(self) -> Iterator[int]:
+        return iter(self.xs[::-1])
+    def __setitem__(self, i: int, v: int) -> None:
+        self.xs[i] = v
+    def __delitem__(self, i: int) -> None:
+        del self.xs[i]
+
+plain class OnlyStr:
+    pass
+
+impl OnlyStr:
+    def __str__(self) -> str:
+        return "only-str"
+
+plain class OnlyRepr:
+    pass
+
+impl OnlyRepr:
+    def __repr__(self) -> str:
+        return "only-repr"
+
+plain class OnlyLen:
+    n: int = 0
+
+impl OnlyLen:
+    def __init__(self, n: int) -> None:
+        self.n = n
+    def __len__(self) -> int:
+        return self.n
+
+plain class IterOnly:
+    pass
+
+impl IterOnly:
+    def __iter__(self) -> Iterator[int]:
+        yield 1
+        yield 2
+
+plain class GetitemOnly:
+    pass
+
+impl GetitemOnly:
+    def __getitem__(self, i: int) -> int:
+        if i >= 3:
+            raise IndexError(i)
+        return i * 10
+
+plain class EqNoHash:
+    v: int = 0
+
+impl EqNoHash:
+    def __init__(self, v: int) -> None:
+        self.v = v
+    def __eq__(self, o: object) -> bool:
+        return isinstance(o, EqNoHash) and o.v == self.v
+
+plain class Cls:
+    a: int = 1
+
+plain class WithClassAttr:
+    shared: list[int] = []
+    counter: int = 0
+
+impl WithClassAttr:
+    def bump(self) -> int:
+        self.counter += 1
+        return self.counter
+
+plain class Slotted:
+    __slots__ = ("a", "b")
+
+impl Slotted:
+    def __init__(self, a: int) -> None:
+        self.a = a
+
+class A:
+    pass
+
+impl A:
+    def who(self) -> str:
+        return "A"
+    def chain(self) -> str:
+        return "A"
+
+class B(A):
+    pass
+
+impl B:
+    def who(self) -> str:
+        return "B"
+    def chain(self) -> str:
+        return "B>" + super().chain()
+
+class C(B):
+    pass
+
+impl C:
+    def chain(self) -> str:
+        return "C>" + super().chain()
+
+def main() -> None:
+    let v: Vec = Vec([1, 2, 3])
+    print("V1", v, repr(v), str(v), v[0], v[-1], len(v), v == Vec([1, 2, 3]), v != Vec([1]), v < Vec([9]), v > Vec([0]), Vec([1]) <= Vec([1]) if False else "skip", v * 2, 2 * v, v @ Vec([1, 1, 1]), v / 2, v // 2, v % 2, v ** 2, v & 1, v | 1, v ^ 1, v << 1, v >> 1, ~v, +v, abs(v), bool(v), bool(Vec([])), sorted([Vec([5]), Vec([1])]), max(Vec([5]), Vec([1])), [1, 2, 3][v[0]], f"{v}", "%s %r" % (v, v), "{}".format(v), str([v]), [v], (v,), {"k": v})
+    v[0] = 9
+    del v[1]
+    print("V2", v)
+    with Vec([1]) as w:
+        print("  in with", w)
+    with Vec([2]) as w2:
+        raise ValueError("suppressed")
+    print("V3 after suppressed")
+    print("V4", str(OnlyStr()), repr(OnlyStr())[:8], f"{OnlyStr()}", "%s" % OnlyStr(), str([OnlyStr()])[:9], repr(OnlyRepr()), str(OnlyRepr()), f"{OnlyRepr()}", [OnlyRepr()], "%s" % OnlyRepr(), "{}".format(OnlyRepr()), bool(OnlyLen(0)), bool(OnlyLen(3)), len(OnlyLen(3)), list(IterOnly()), EqNoHash(1) == EqNoHash(1), EqNoHash(1) != EqNoHash(2), EqNoHash(1) in [EqNoHash(1)])
+    try:
+        hash(EqNoHash(1))
+    except TypeError as e:
+        print("V5", e)
+    try:
+        {EqNoHash(1)}
+    except TypeError as e:
+        print("V6", e)
+    let c1: WithClassAttr = WithClassAttr()
+    let c2: WithClassAttr = WithClassAttr()
+    c1.shared.append(1)
+    c1.bump()
+    c1.bump()
+    c2.bump()
+    WithClassAttr.counter = 100
+    let c3: WithClassAttr = WithClassAttr()
+    print("V7", c1.shared, c2.shared, WithClassAttr.shared, c1.counter, c2.counter, c3.counter, WithClassAttr.counter, c3.bump(), Cls.a, Cls().a)
+    let s: Slotted = Slotted(1)
+    s.b = 2
+    print("V8", s.a, s.b, hasattr(s, "c"))
+    try:
+        s.c = 3
+    except AttributeError as e:
+        print("V9", e)
+    print("V10", C().who(), C().chain(), B().chain(), A().chain(), isinstance(C(), A), type(C()).__name__, C.__bases__[0].__name__ if False else "skip", [k.__name__ for k in C.__mro__] if False else "skip")
+    print("V11", getattr(v, "xs"), getattr(v, "nope", None), setattr(v, "extra", 5) if False else "skip", hasattr(v, "__len__"), hasattr(1, "__add__"), hasattr("s", "upper"), hasattr([], "append"), hasattr(None, "x"), callable(v.__len__) if False else "skip", vars(WithClassAttr()) if False else "skip")
+    let x: object = 5
+    print("V12", isinstance(x, int), x == 5, str(x), repr(x), type(x).__name__, x is not None, [x] * 2, {x: x})
+
+main()

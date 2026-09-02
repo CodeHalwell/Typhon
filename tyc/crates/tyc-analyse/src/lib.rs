@@ -48,7 +48,7 @@
 //! insert a `@functools.cache` / `@functools.lru_cache(maxsize=N)` decorator —
 //! that emission lives in the desugar crate.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use ruff_python_ast::{Decorator, Expr, ExprCall, ModModule, Number, Parameters, Stmt};
 use tyc_diagnostics::{Diagnostics, TycError};
@@ -231,7 +231,7 @@ pub fn editor_lint_diagnostics(
         diags.extend(shared_mut_across_tasks_diagnostics(module, path, source));
         let pure: std::collections::HashSet<String> = analyse_purity(module, false)
             .iter()
-            .filter(|f| f.violation.is_none())
+            .filter(|f| f.callable_as_pure())
             .map(|f| f.name.clone())
             .collect();
         diags.extend(parallel_opportunity_diagnostics(
@@ -279,15 +279,18 @@ impl ComptimeValue {
     pub fn to_python_literal(&self) -> String {
         match self {
             ComptimeValue::Int(n) => n.to_string(),
-            ComptimeValue::Float(f) => {
-                let s = format!("{}", f);
-                // Ensure Python can parse it as a float (add `.0` if needed).
-                if s.contains('.') || s.contains('e') || s.contains('E') {
-                    s
-                } else {
-                    format!("{}.0", s)
-                }
+            // CPython's `repr` (shortest round-trip digits, exponent form
+            // outside 1e-4 ..= 1e16) so the inlined literal is byte-for-byte
+            // what the runtime would have printed. `inf` / `nan` are not
+            // literals, so they are spelled as the calls that produce them.
+            ComptimeValue::Float(f) if f.is_nan() => "float(\"nan\")".to_owned(),
+            ComptimeValue::Float(f) if f.is_infinite() => if *f > 0.0 {
+                "float(\"inf\")"
+            } else {
+                "-float(\"inf\")"
             }
+            .to_owned(),
+            ComptimeValue::Float(f) => python_float_repr(*f),
             ComptimeValue::Str(s) => python_string_literal(s),
             ComptimeValue::Bool(b) => if *b { "True" } else { "False" }.into(),
             ComptimeValue::List(xs) => {
@@ -715,9 +718,10 @@ fn eval_expr(expr: &Expr, ctx: &mut EvalContext<'_>) -> Result<ComptimeValue, St
         Expr::UnaryOp(u) => {
             let operand = eval_expr(&u.operand, ctx)?;
             match (u.op, operand) {
-                (ruff_python_ast::UnaryOp::USub, ComptimeValue::Int(n)) => {
-                    Ok(ComptimeValue::Int(-n))
-                }
+                (ruff_python_ast::UnaryOp::USub, ComptimeValue::Int(n)) => n
+                    .checked_neg()
+                    .map(ComptimeValue::Int)
+                    .ok_or_else(|| COMPTIME_INT_OVERFLOW("negation")),
                 (ruff_python_ast::UnaryOp::USub, ComptimeValue::Float(f)) => {
                     Ok(ComptimeValue::Float(-f))
                 }
@@ -857,6 +861,22 @@ fn eval_expr(expr: &Expr, ctx: &mut EvalContext<'_>) -> Result<ComptimeValue, St
                                                 .into(),
                                         );
                                     }
+                                    // `f"{expr=}"` renders the source text of
+                                    // the field (`expr=`) followed by the
+                                    // value's `repr` (`!s` switches to `str`).
+                                    if let Some(debug) = &interp.debug_text {
+                                        let v = eval_expr(&interp.expression, ctx)?;
+                                        out.push_str(debug.as_str());
+                                        let rendered = match interp.conversion.to_char() {
+                                            None | Some('r') => comptime_repr(&v)?,
+                                            Some('s') => comptime_str(&v)?,
+                                            Some(_) => {
+                                                return Err("f-string conversion flag `!a` is not supported in comptime expressions".into())
+                                            }
+                                        };
+                                        out.push_str(&rendered);
+                                        continue;
+                                    }
                                     if interp.conversion.to_char().is_some() {
                                         return Err(
                                             "f-string conversion flags (`!r`, `!s`, `!a`) are not \
@@ -903,16 +923,10 @@ fn eval_expr(expr: &Expr, ctx: &mut EvalContext<'_>) -> Result<ComptimeValue, St
 fn comptime_str(v: &ComptimeValue) -> Result<String, String> {
     match v {
         ComptimeValue::Int(n) => Ok(n.to_string()),
-        ComptimeValue::Float(f) => {
-            if f.is_finite() && f.fract() == 0.0 {
-                Ok(format!("{:.1}", f))
-            } else {
-                Ok(format!("{}", f))
-            }
-        }
+        ComptimeValue::Float(f) => Ok(python_float_repr(*f)),
         ComptimeValue::Str(s) => Ok(s.clone()),
         ComptimeValue::Bool(b) => Ok(if *b { "True" } else { "False" }.to_owned()),
-        ComptimeValue::Type(t) => Ok(t.clone()),
+        ComptimeValue::Type(t) => Ok(python_type_str(t)),
         ComptimeValue::List(_) | ComptimeValue::Tuple(_) | ComptimeValue::Dict(_) => Err(
             "f-string interpolation of list/tuple/dict values is not supported at comptime — \
              Python's `str([...])` uses single-quoted string repr internally and the comptime \
@@ -1071,6 +1085,22 @@ fn values_equal(a: &ComptimeValue, b: &ComptimeValue) -> bool {
     match (a, b) {
         (ComptimeValue::Str(x), ComptimeValue::Str(y)) => x == y,
         (ComptimeValue::Type(x), ComptimeValue::Type(y)) => x == y,
+        // Containers compare structurally, like Python: element-wise for
+        // lists and tuples (never across the two kinds), key/value-wise for
+        // dicts regardless of insertion order.
+        (ComptimeValue::List(x), ComptimeValue::List(y))
+        | (ComptimeValue::Tuple(x), ComptimeValue::Tuple(y)) => {
+            x.len() == y.len() && x.iter().zip(y).all(|(p, q)| values_equal(p, q))
+        }
+        (ComptimeValue::Dict(x), ComptimeValue::Dict(y)) => {
+            x.len() == y.len()
+                && x.iter().all(|(k, v)| {
+                    y.iter()
+                        .any(|(k2, v2)| values_equal(k, k2) && values_equal(v, v2))
+                })
+        }
+        (ComptimeValue::List(_) | ComptimeValue::Tuple(_) | ComptimeValue::Dict(_), _)
+        | (_, ComptimeValue::List(_) | ComptimeValue::Tuple(_) | ComptimeValue::Dict(_)) => false,
         // Numeric (int/float/bool) equality. `bool` folds into `int`
         // (`True == 1`); two integers compare exactly (no lossy f64 round-trip).
         _ => match (cmp_num_int(a), cmp_num_int(b)) {
@@ -1205,19 +1235,15 @@ fn eval_call(call: &ExprCall, ctx: &mut EvalContext<'_>) -> Result<ComptimeValue
             Ok(ComptimeValue::Str(match v {
                 ComptimeValue::Str(s) => s,
                 ComptimeValue::Int(n) => n.to_string(),
-                // Python-faithful float string: `str(2.0)` → `"2.0"` (the bare
-                // `f.to_string()` dropped the trailing `.0`, inlining a wrong
-                // constant). An integer-valued float gets `.0`; everything else
-                // its shortest round-trip form.
-                ComptimeValue::Float(f) => {
-                    if f.is_finite() && f.fract() == 0.0 {
-                        format!("{f:.1}")
-                    } else {
-                        format!("{f}")
-                    }
-                }
+                // Python-faithful float string: CPython's `repr` — `str(2.0)`
+                // is `"2.0"`, `str(1e16)` is `"1e+16"`, `str(1e-5)` is
+                // `"1e-05"` — so the inlined constant is what the runtime
+                // would have printed.
+                ComptimeValue::Float(f) => python_float_repr(f),
                 ComptimeValue::Bool(b) => if b { "True" } else { "False" }.into(),
-                ComptimeValue::Type(t) => t,
+                // `str(int)` is `"<class 'int'>"`; a parameterised alias
+                // (`list[int]`) and `None` print as themselves.
+                ComptimeValue::Type(t) => python_type_str(&t),
                 // Reject `str(container)` at comptime: matching Python's
                 // `str(["a"])` -> `"['a']"` (single-quoted nested strings) would
                 // require a separate Python-flavoured repr serialiser, and the
@@ -1733,8 +1759,11 @@ fn eval_binop(
                 Err("integer division or modulo by zero in comptime floor division".to_string())
             } else {
                 // Rust's `/` truncates toward zero; Python floors toward -inf.
-                let q = a / b;
-                let r = a % b;
+                // `i64::MIN // -1` is the one quotient that does not fit.
+                let q = a
+                    .checked_div(*b)
+                    .ok_or_else(|| COMPTIME_INT_OVERFLOW("floor division"))?;
+                let r = a.checked_rem(*b).unwrap_or(0);
                 let q = if (r != 0) && ((r < 0) != (*b < 0)) {
                     q - 1
                 } else {
@@ -1752,7 +1781,7 @@ fn eval_binop(
             if b == 0.0 {
                 Err("float floor division by zero in comptime floor division".to_string())
             } else {
-                Ok(ComptimeValue::Float((a / b).floor()))
+                Ok(ComptimeValue::Float(python_float_divmod(a, b).0))
             }
         }
         // ── Mod (`%`) — Python modulo, sign follows the divisor ──────────────
@@ -1761,7 +1790,9 @@ fn eval_binop(
                 Err("integer division or modulo by zero in comptime modulo".to_string())
             } else {
                 // Python's `%` result has the same sign as the divisor.
-                let r = a % b;
+                // (`i64::MIN % -1` overflows the machine remainder; Python
+                // says 0.)
+                let r = a.checked_rem(*b).unwrap_or(0);
                 let r = if (r != 0) && ((r < 0) != (*b < 0)) {
                     r + b
                 } else {
@@ -1779,9 +1810,9 @@ fn eval_binop(
             if b == 0.0 {
                 Err("float modulo by zero in comptime modulo".to_string())
             } else {
-                // Python `%` for floats: result has the sign of the divisor.
-                let r = a - (a / b).floor() * b;
-                Ok(ComptimeValue::Float(r))
+                // Python `%` for floats: `fmod` corrected so the result takes
+                // the divisor's sign (CPython's `float_rem`).
+                Ok(ComptimeValue::Float(python_float_divmod(a, b).1))
             }
         }
         // ── Pow (`**`) ───────────────────────────────────────────────────────
@@ -1815,6 +1846,117 @@ fn eval_binop(
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
+/// CPython's `float_divmod`: `(a // b, a % b)` for floats. The remainder is
+/// `fmod` corrected to take the divisor's sign; the quotient is derived from
+/// that remainder (not from a bare `floor(a / b)`, which is off by one
+/// whenever `a / b` rounds up to an integer — `7.0 // 0.1` is `69.0`, not
+/// `70.0`), with `-0.0` where CPython produces it.
+fn python_float_divmod(vx: f64, wx: f64) -> (f64, f64) {
+    let mut modulus = vx % wx;
+    let mut div = (vx - modulus) / wx;
+    if modulus != 0.0 {
+        if (wx < 0.0) != (modulus < 0.0) {
+            modulus += wx;
+            div -= 1.0;
+        }
+    } else {
+        modulus = 0.0f64.copysign(wx);
+    }
+    let floordiv = if div != 0.0 {
+        let mut fl = div.floor();
+        if div - fl > 0.5 {
+            fl += 1.0;
+        }
+        fl
+    } else {
+        0.0f64.copysign(vx / wx)
+    };
+    (floordiv, modulus)
+}
+
+/// CPython's `repr(float)`: the shortest round-tripping digits, a `.0` on
+/// integral values, and scientific notation (`1e+16`, `1e-05`) once the
+/// decimal exponent leaves `-4..16`. Mirrors the VM's formatter so `str(x)`
+/// folded at comptime equals `str(x)` evaluated at runtime.
+pub fn python_float_repr(x: f64) -> String {
+    if x.is_nan() {
+        return "nan".into();
+    }
+    if x.is_infinite() {
+        return if x > 0.0 { "inf".into() } else { "-inf".into() };
+    }
+    if x == 0.0 {
+        return if x.is_sign_negative() {
+            "-0.0".into()
+        } else {
+            "0.0".into()
+        };
+    }
+    let exp10 = x.abs().log10().floor() as i32;
+    if !(-4..16).contains(&exp10) {
+        let raw = format!("{:e}", x);
+        let (mantissa, exp_str) = match raw.split_once('e') {
+            Some((m, e)) => (m, e),
+            None => return raw,
+        };
+        let exp: i32 = exp_str.parse().unwrap_or(0);
+        let sign = if exp < 0 { '-' } else { '+' };
+        return format!("{}e{}{:02}", mantissa, sign, exp.abs());
+    }
+    let s = format!("{}", x);
+    if s.contains('.') || s.contains('e') || s.contains('E') {
+        s
+    } else {
+        format!("{}.0", s)
+    }
+}
+
+/// `str(T)` for a comptime type value: `<class 'int'>` for a bare class,
+/// the alias text for a parameterised one (`list[int]`), `None` for `None`.
+fn python_type_str(t: &str) -> String {
+    if t == "None" || t.contains('[') {
+        t.to_owned()
+    } else {
+        format!("<class '{t}'>")
+    }
+}
+
+/// `repr` of a comptime value: strings gain Python's quoting (single quotes
+/// unless the text contains a single quote and no double quote), everything
+/// else prints as `str` does. Containers are rejected like `comptime_str`.
+fn comptime_repr(v: &ComptimeValue) -> Result<String, String> {
+    match v {
+        ComptimeValue::Str(s) => {
+            let quote = if s.contains('\'') && !s.contains('"') {
+                '"'
+            } else {
+                '\''
+            };
+            let mut out = String::with_capacity(s.len() + 2);
+            out.push(quote);
+            for c in s.chars() {
+                match c {
+                    '\\' => out.push_str("\\\\"),
+                    '\n' => out.push_str("\\n"),
+                    '\r' => out.push_str("\\r"),
+                    '\t' => out.push_str("\\t"),
+                    c if c == quote => {
+                        out.push('\\');
+                        out.push(c);
+                    }
+                    c if (c as u32) < 0x20 || c as u32 == 0x7f => {
+                        out.push_str(&format!("\\x{:02x}", c as u32));
+                    }
+                    c => out.push(c),
+                }
+            }
+            out.push(quote);
+            Ok(out)
+        }
+        other => comptime_str(other),
+    }
+}
+
 fn python_string_literal(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('"');
@@ -1825,6 +1967,11 @@ fn python_string_literal(s: &str) -> String {
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
+            // A raw NUL (or any other control character) in emitted source
+            // is a `SyntaxError` on CPython; spell it as an escape.
+            c if (c as u32) < 0x20 || c as u32 == 0x7f => {
+                out.push_str(&format!("\\x{:02x}", c as u32));
+            }
             c => out.push(c),
         }
     }
@@ -2094,6 +2241,139 @@ comptime let X: str = grow(\"aaaa\", 40)
             Some(ComptimeValue::Float(f)) => assert!((f - 1.5).abs() < 1e-12),
             other => panic!("expected Float(1.5), got {:?}", other),
         }
+    }
+
+    #[test]
+    fn comptime_float_floor_division_matches_cpython_rounding() {
+        // `floor(7.0 / 0.1)` is 70.0 because the quotient rounds up to an
+        // integer; CPython derives the quotient from the remainder and gets
+        // 69.0 (with remainder 0.09999999999999962).
+        let (values, diags) = eval("comptime let A: float = 7.0 // 0.1\n");
+        assert!(!diags.has_errors(), "{:?}", diags.errors());
+        assert!(
+            matches!(values.get("A"), Some(ComptimeValue::Float(f)) if *f == 69.0),
+            "{:?}",
+            values.get("A")
+        );
+        let (values, _) = eval("comptime let E: float = 7.0 % 0.1\n");
+        match values.get("E") {
+            Some(ComptimeValue::Float(f)) => {
+                assert!((f - 0.09999999999999962).abs() < 1e-15, "{f}")
+            }
+            other => panic!("{other:?}"),
+        }
+        let (values, _) = eval("comptime let N: float = -7.0 // 2.0\n");
+        assert!(matches!(values.get("N"), Some(ComptimeValue::Float(f)) if *f == -4.0));
+        let (values, _) = eval("comptime let M: float = -7.5 % 2.0\n");
+        assert!(matches!(values.get("M"), Some(ComptimeValue::Float(f)) if *f == 0.5));
+        let (values, _) = eval("comptime let Z: float = 4.0 % -2.0\n");
+        assert!(
+            matches!(values.get("Z"), Some(ComptimeValue::Float(f)) if *f == 0.0 && f.is_sign_negative())
+        );
+    }
+
+    #[test]
+    fn comptime_container_equality_is_structural() {
+        for (src, expect) in [
+            ("comptime let B: bool = [1, 2] == [1, 2]\n", true),
+            ("comptime let B: bool = (1, 2) == (1, 2)\n", true),
+            ("comptime let B: bool = [1, 2] == (1, 2)\n", false),
+            ("comptime let B: bool = [1, 2] != [1, 3]\n", true),
+            ("comptime let B: bool = {\"a\": 1} == {\"a\": 1}\n", true),
+            ("comptime let B: bool = {\"a\": 1} == {\"a\": 2}\n", false),
+            ("comptime let B: bool = [1, 2.0] == [1.0, 2]\n", true),
+        ] {
+            let (values, diags) = eval(src);
+            assert!(!diags.has_errors(), "{src}: {:?}", diags.errors());
+            assert!(
+                matches!(values.get("B"), Some(ComptimeValue::Bool(b)) if *b == expect),
+                "{src}"
+            );
+        }
+    }
+
+    #[test]
+    fn comptime_str_of_floats_and_types_matches_cpython() {
+        for (src, expect) in [
+            ("comptime let C: str = str(1e16)\n", "1e+16"),
+            ("comptime let C: str = str(1e15)\n", "1000000000000000.0"),
+            ("comptime let C: str = str(1e-5)\n", "1e-05"),
+            ("comptime let C: str = str(0.0001)\n", "0.0001"),
+            (
+                "comptime let C: str = str(123456789012345678.0)\n",
+                "1.2345678901234568e+17",
+            ),
+            ("comptime let C: str = str(2.0)\n", "2.0"),
+            ("comptime let C: str = str(-0.0)\n", "-0.0"),
+            ("comptime let C: str = str(int)\n", "<class 'int'>"),
+            (
+                "comptime let C: str = f\"{1.5e20}|{str}\"\n",
+                "1.5e+20|<class 'str'>",
+            ),
+        ] {
+            let (values, diags) = eval(src);
+            assert!(!diags.has_errors(), "{src}: {:?}", diags.errors());
+            assert!(
+                matches!(values.get("C"), Some(ComptimeValue::Str(c)) if c == expect),
+                "{src}: {:?}",
+                values.get("C")
+            );
+        }
+        assert_eq!(ComptimeValue::Float(1e16).to_python_literal(), "1e+16");
+        assert_eq!(
+            ComptimeValue::Float(f64::INFINITY).to_python_literal(),
+            "float(\"inf\")"
+        );
+        assert_eq!(
+            ComptimeValue::Float(f64::NEG_INFINITY).to_python_literal(),
+            "-float(\"inf\")"
+        );
+        assert_eq!(
+            ComptimeValue::Float(f64::NAN).to_python_literal(),
+            "float(\"nan\")"
+        );
+    }
+
+    #[test]
+    fn comptime_fstring_debug_specifier_renders_source_and_repr() {
+        for (src, expect) in [
+            ("comptime let P: str = f\"{1 + 1=}\"\n", "1 + 1=2"),
+            ("comptime let P: str = f\"{'a'=}\"\n", "'a'='a'"),
+            ("comptime let P: str = f\"{ 2 * 3 = }\"\n", " 2 * 3 = 6"),
+            ("comptime let P: str = f\"{'x'=!s}\"\n", "'x'=x"),
+        ] {
+            let (values, diags) = eval(src);
+            assert!(!diags.has_errors(), "{src}: {:?}", diags.errors());
+            assert!(
+                matches!(values.get("P"), Some(ComptimeValue::Str(p)) if p == expect),
+                "{src}: {:?}",
+                values.get("P")
+            );
+        }
+    }
+
+    #[test]
+    fn comptime_int_overflow_on_negation_and_min_over_minus_one_is_an_error() {
+        for src in [
+            "comptime let M: int = -(-9223372036854775807 - 1)\n",
+            "comptime let M: int = (-9223372036854775807 - 1) // -1\n",
+        ] {
+            let (_, diags) = eval(src);
+            assert!(diags.has_errors(), "{src} must be an overflow error");
+        }
+        // `i64::MIN % -1` is 0 in Python and must not panic.
+        let (values, diags) = eval("comptime let R: int = (-9223372036854775807 - 1) % -1\n");
+        assert!(!diags.has_errors(), "{:?}", diags.errors());
+        assert!(matches!(values.get("R"), Some(ComptimeValue::Int(0))));
+    }
+
+    #[test]
+    fn comptime_string_with_control_characters_emits_escapes() {
+        let (values, diags) = eval("comptime let R: str = \"a\\x00b\"\n");
+        assert!(!diags.has_errors(), "{:?}", diags.errors());
+        let v = values.get("R").expect("R");
+        assert!(matches!(v, ComptimeValue::Str(s) if s.len() == 3));
+        assert_eq!(v.to_python_literal(), "\"a\\x00b\"");
     }
 
     #[test]
@@ -2863,11 +3143,63 @@ pub struct PurityFinding {
     /// `true` if the user opted into memoisation alongside the purity check
     /// (`@memo`, `@pure(memo=True)`, or the project-wide auto-memoise toggle).
     pub memoise: bool,
-    /// Empty when the function satisfies every purity condition; otherwise the
-    /// first reason it fails.
+    /// Empty when nothing in the body is *provably* impure; otherwise the
+    /// first proven violation — I/O, a clock or entropy read, `raise`, a
+    /// mutation of module state or of an argument, a read of `mut` module
+    /// state, or a call to a helper known to be impure. This is what an
+    /// explicit `@pure` / `@memo` reports as `tyc::impure_pure_fn`.
     pub violation: Option<String>,
+    /// Empty when every call and read in the body is *provably* pure;
+    /// otherwise the first thing the analyser could not prove either way —
+    /// a method on a value of unknown type, a call into a module outside the
+    /// pure allow-list, a read of a module binding that may be mutated
+    /// elsewhere. Never a diagnostic: an explicit `@pure` trusts the author
+    /// here, but the silent optimisation paths (`auto-memoise`,
+    /// `pgo-memoise`, `auto-parallel`) require [`Self::is_provably_pure`].
+    pub unproven: Option<String>,
+    /// Set when the declared return type is, or may be, a mutable or lazy
+    /// value — `list[...]`, `dict[...]`, an `Iterator`, a non-frozen class,
+    /// or no annotation at all. A shared cache would hand every caller the
+    /// same object, so the silent memoisation paths never cache such a
+    /// function; an explicit `@memo` still does (the author asked for it).
+    pub unshareable_return: Option<String>,
+    /// Set when a parameter's annotation is not a provably hashable and
+    /// immutable type. A cache keyed on a mutable argument returns stale
+    /// results once the caller mutates it, so the silent memoisation paths
+    /// skip the function; an explicit `@memo` is only refused the
+    /// known-unhashable containers (`list` / `dict` / `set` / `bytearray`).
+    pub uncacheable_params: Option<String>,
     /// Byte span of the `def` name (for diagnostic placement).
     pub span: (usize, usize),
+}
+
+impl PurityFinding {
+    /// `true` when the body is provably pure: nothing impure was found *and*
+    /// nothing was left unproven.
+    pub fn is_provably_pure(&self) -> bool {
+        self.violation.is_none() && self.unproven.is_none()
+    }
+
+    /// `true` when a silent optimisation (`auto-memoise`, `pgo-memoise`) may
+    /// wrap the function in `@functools.cache`: provably pure, hashable and
+    /// immutable parameters, and an immutable return value.
+    pub fn auto_cacheable(&self) -> bool {
+        self.is_provably_pure()
+            && self.unshareable_return.is_none()
+            && self.uncacheable_params.is_none()
+    }
+
+    /// `true` when the optimiser may treat *calls* to the function as
+    /// side-effect-free (the `auto-parallel` callee set). An explicit
+    /// `@pure` / `@memo` is trusted once nothing provably impure is found;
+    /// an inferred candidate must be provably pure.
+    pub fn callable_as_pure(&self) -> bool {
+        if self.declared_pure {
+            self.violation.is_none()
+        } else {
+            self.is_provably_pure()
+        }
+    }
 }
 
 /// Walk every top-level function in `module` and report on its purity status.
@@ -2876,19 +3208,29 @@ pub struct PurityFinding {
 /// `typhon.toml` (defaulting to `false`). When `true`, every pure function is
 /// treated as if the user had written `@memo` so the desugarer emits a cache
 /// decorator.
+///
+/// This entry point knows nothing about `class NAME frozen:` markers (the
+/// preprocessor strips them before parsing), so every user class counts as
+/// mutable for the return / parameter cache-safety checks. The build pipeline
+/// uses [`analyse_purity_with`] and passes the frozen class names through.
 pub fn analyse_purity(module: &ModModule, auto_memoise: bool) -> Vec<PurityFinding> {
+    analyse_purity_with(module, auto_memoise, &HashSet::new())
+}
+
+/// [`analyse_purity`] with the set of `frozen` user classes, which count as
+/// immutable (and hashable) for the cache-safety checks.
+pub fn analyse_purity_with(
+    module: &ModModule,
+    auto_memoise: bool,
+    frozen_classes: &HashSet<String>,
+) -> Vec<PurityFinding> {
     let mut out = Vec::new();
     // Phase 1: collect a module-scope view that purity decisions depend
-    // on. We need three things:
-    //   - The set of module-level names introduced by *any* assignment
-    //     (including `AnnAssign`). Pure functions are forbidden from
-    //     mutating these through attribute or subscript writes.
-    //   - The set of class names declared at module level — they double
-    //     as legitimate constructors and so are pure-callable.
-    //   - The set of user-defined functions declared at module level,
-    //     keyed by name, along with whether each is itself declared pure
-    //     (so we can enforce transitive purity through call graphs).
-    let scope = ModuleScope::collect(&module.body, auto_memoise);
+    // on: the module-level bindings and how mutable each one is, the class
+    // names (pure constructors) and which of them are immutable, the
+    // user-defined functions and whether each is declared pure, and the
+    // import aliases so a callee can be resolved to its module path.
+    let scope = ModuleScope::collect(&module.body, auto_memoise, frozen_classes);
     analyse_stmts(
         &module.body,
         &scope,
@@ -2899,44 +3241,186 @@ pub fn analyse_purity(module: &ModModule, auto_memoise: bool) -> Vec<PurityFindi
     out
 }
 
+/// Names of the classes whose `class` keyword sits on one of the marker
+/// line starts (the `frozen_class_lines` of the preprocessor, converted to
+/// byte offsets with [`tyc_syntax::preprocess::line_byte_starts`]). Mirrors
+/// the desugarer's marker matching: a marker covers a class when its offset
+/// lies in `[class_start, name_start)`, i.e. on the line of the `class`
+/// keyword even when decorators precede it.
+pub fn class_names_at_marker_starts(module: &ModModule, starts: &[u32]) -> HashSet<String> {
+    let mut out = HashSet::new();
+    if starts.is_empty() {
+        return out;
+    }
+    let mut sorted: Vec<u32> = starts.to_vec();
+    sorted.sort_unstable();
+    for stmt in &module.body {
+        if let Stmt::ClassDef(c) = stmt {
+            let class_start = c.range.start().to_u32();
+            let name_start = c.name.range.start().to_u32();
+            let covered = sorted.partition_point(|&off| off < class_start)
+                != sorted.partition_point(|&off| off < name_start);
+            if covered {
+                out.insert(c.name.as_str().to_owned());
+            }
+        }
+    }
+    out
+}
+
+/// How a module-level binding may change after the module is loaded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ModuleState {
+    /// `mut`, rebound, augmented, declared `global` somewhere, or bound by a
+    /// module-level loop: reading it makes a result depend on *when* the
+    /// call happens.
+    Mutable,
+    /// A single `let` binding whose declared (or literal) type is immutable:
+    /// safe to read.
+    Immutable,
+    /// A single `let` binding whose value could still be mutated in place
+    /// elsewhere (a `list`, a mutable dataclass, an unannotated call result).
+    Opaque,
+}
+
 /// Snapshot of the module surface that purity decisions need to consult.
 #[derive(Debug, Default)]
 struct ModuleScope {
     /// Names bound at module level by any assignment form. A pure function
-    /// is allowed to *read* these but not to mutate them via attribute or
-    /// subscript writes (`MODULE_LIST.append(x)` / `MODULE_DICT[k] = v`).
+    /// is allowed to *read* these (subject to `bindings`) but not to mutate
+    /// them via attribute or subscript writes (`MODULE_LIST.append(x)` /
+    /// `MODULE_DICT[k] = v`).
     module_names: Vec<String>,
+    /// Mutability classification of each module-level binding.
+    bindings: HashMap<String, ModuleState>,
+    /// Module-level bindings whose value is provably a builtin type, keyed
+    /// to the type head (`str`, `int`, `tuple`, ...). Lets `SEP.join(...)`
+    /// on a `let SEP: str` count as a pure builtin method call.
+    builtin_typed: HashMap<String, String>,
     /// Class names declared at module level. Class names are treated as
     /// pure callables (the default `@dataclass(slots=True)` emission has
     /// no side effects).
     class_names: Vec<String>,
+    /// Module-level classes whose instances are immutable and hashable:
+    /// `frozen` classes, enums, `NamedTuple`s, `@dataclass(frozen=True)`.
+    immutable_classes: HashSet<String>,
     /// User-defined function name → whether the function is itself declared
     /// pure (`@pure` / `@memo` / `@pure(memo=True)` / auto-memoise). When
     /// a `@pure` function calls another module-defined function, the callee
     /// must also be in this map with `true` to satisfy transitive purity.
     user_functions: HashMap<String, bool>,
+    /// Import alias → dotted module path (`import numpy as np` → `np: numpy`,
+    /// `from datetime import datetime` → `datetime: datetime.datetime`).
+    /// Relative imports map to a `.`-prefixed path that no allow-list
+    /// matches, so calls through them are never provably pure.
+    imports: HashMap<String, String>,
 }
 
 impl ModuleScope {
-    fn collect(body: &[Stmt], auto_memoise: bool) -> Self {
+    fn collect(body: &[Stmt], auto_memoise: bool, frozen_classes: &HashSet<String>) -> Self {
         let mut s = Self::default();
         let shadowed_markers = user_bound_marker_names(body);
+        // Classes first: annotation immutability below needs to know them.
+        s.immutable_classes = frozen_classes.clone();
+        for stmt in body {
+            if let Stmt::ClassDef(c) = stmt {
+                s.class_names.push(c.name.as_str().to_owned());
+                if class_def_is_immutable(c) {
+                    s.immutable_classes.insert(c.name.as_str().to_owned());
+                }
+            }
+        }
+        // Rebinding evidence anywhere in the module: `global NAME` inside a
+        // function, a module-level `+=`, a second assignment, a loop target.
+        let mut rebound: HashSet<String> = HashSet::new();
+        let mut assigned_once: HashSet<String> = HashSet::new();
+        let mut note_binding = |name: &str, rebound: &mut HashSet<String>| {
+            if !assigned_once.insert(name.to_owned()) {
+                rebound.insert(name.to_owned());
+            }
+        };
+        collect_global_declarations(body, &mut rebound);
         for stmt in body {
             match stmt {
                 Stmt::Assign(a) => {
                     for t in &a.targets {
-                        if let Expr::Name(n) = t {
-                            s.module_names.push(n.id.as_str().to_owned());
+                        for name in bound_names_in_target(t) {
+                            note_binding(&name, &mut rebound);
+                            if a.mutability == Some(ruff_python_ast::Mutability::Mut) {
+                                rebound.insert(name);
+                            }
                         }
                     }
                 }
                 Stmt::AnnAssign(a) => {
                     if let Expr::Name(n) = a.target.as_ref() {
-                        s.module_names.push(n.id.as_str().to_owned());
+                        note_binding(n.id.as_str(), &mut rebound);
+                        if a.mutability == Some(ruff_python_ast::Mutability::Mut) {
+                            rebound.insert(n.id.as_str().to_owned());
+                        }
                     }
                 }
-                Stmt::ClassDef(c) => {
-                    s.class_names.push(c.name.as_str().to_owned());
+                Stmt::AugAssign(a) => {
+                    if let Expr::Name(n) = a.target.as_ref() {
+                        rebound.insert(n.id.as_str().to_owned());
+                    }
+                }
+                Stmt::For(f) => {
+                    for name in bound_names_in_target(&f.target) {
+                        rebound.insert(name);
+                    }
+                }
+                Stmt::With(w) => {
+                    for item in &w.items {
+                        if let Some(v) = &item.optional_vars {
+                            for name in bound_names_in_target(v) {
+                                rebound.insert(name);
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        for stmt in body {
+            match stmt {
+                Stmt::Assign(a) => {
+                    let value_head = builtin_head_of_value(&a.value);
+                    let immutable = value_is_immutable_literal(&a.value);
+                    for t in &a.targets {
+                        if let Expr::Name(n) = t {
+                            let name = n.id.as_str();
+                            s.module_names.push(name.to_owned());
+                            let state = if rebound.contains(name) {
+                                ModuleState::Mutable
+                            } else if immutable {
+                                ModuleState::Immutable
+                            } else {
+                                ModuleState::Opaque
+                            };
+                            s.bindings.insert(name.to_owned(), state);
+                            if let Some(head) = value_head {
+                                s.builtin_typed.insert(name.to_owned(), head.to_owned());
+                            }
+                        }
+                    }
+                }
+                Stmt::AnnAssign(a) => {
+                    if let Expr::Name(n) = a.target.as_ref() {
+                        let name = n.id.as_str();
+                        s.module_names.push(name.to_owned());
+                        let state = if rebound.contains(name) {
+                            ModuleState::Mutable
+                        } else if annotation_is_immutable(&a.annotation, &s.immutable_classes) {
+                            ModuleState::Immutable
+                        } else {
+                            ModuleState::Opaque
+                        };
+                        s.bindings.insert(name.to_owned(), state);
+                        if let Some(head) = annotation_builtin_head(&a.annotation) {
+                            s.builtin_typed.insert(name.to_owned(), head.to_owned());
+                        }
+                    }
                 }
                 Stmt::FunctionDef(f) => {
                     let (declared, _) =
@@ -2944,10 +3428,318 @@ impl ModuleScope {
                     s.user_functions
                         .insert(f.name.as_str().to_owned(), declared);
                 }
+                Stmt::Import(i) => {
+                    for alias in &i.names {
+                        let full = alias.name.as_str();
+                        match &alias.asname {
+                            Some(asname) => {
+                                s.imports
+                                    .insert(asname.as_str().to_owned(), full.to_owned());
+                            }
+                            None => {
+                                // `import a.b` binds `a`, which resolves to
+                                // the `a` package.
+                                let head = full.split('.').next().unwrap_or(full);
+                                s.imports.insert(head.to_owned(), head.to_owned());
+                            }
+                        }
+                    }
+                }
+                Stmt::ImportFrom(i) => {
+                    let base = match (&i.module, i.level) {
+                        (Some(m), 0) => m.as_str().to_owned(),
+                        (Some(m), _) => format!(".{}", m.as_str()),
+                        (None, _) => ".".to_owned(),
+                    };
+                    for alias in &i.names {
+                        let name = alias.name.as_str();
+                        if name == "*" {
+                            continue;
+                        }
+                        let bound = alias.asname.as_ref().map(|a| a.as_str()).unwrap_or(name);
+                        s.imports.insert(bound.to_owned(), format!("{base}.{name}"));
+                    }
+                }
                 _ => {}
             }
         }
         s
+    }
+
+    /// Expand the leading import alias of a dotted call path:
+    /// `np.sqrt` → `numpy.sqrt`, `datetime.now` (after `from datetime import
+    /// datetime`) → `datetime.datetime.now`.
+    fn resolve_path(&self, path: &str) -> String {
+        let (head, rest) = match path.split_once('.') {
+            Some((h, r)) => (h, Some(r)),
+            None => (path, None),
+        };
+        match (self.imports.get(head), rest) {
+            (Some(full), Some(r)) => format!("{full}.{r}"),
+            (Some(full), None) => full.clone(),
+            (None, _) => path.to_owned(),
+        }
+    }
+}
+
+/// Every `global NAME` declaration anywhere in `body` (at any nesting depth).
+pub(crate) fn collect_global_declarations(body: &[Stmt], into: &mut HashSet<String>) {
+    struct V<'a> {
+        into: &'a mut HashSet<String>,
+    }
+    impl ruff_python_ast::visitor::Visitor<'_> for V<'_> {
+        fn visit_stmt(&mut self, s: &Stmt) {
+            if let Stmt::Global(g) = s {
+                for n in &g.names {
+                    self.into.insert(n.as_str().to_owned());
+                }
+            }
+            ruff_python_ast::visitor::walk_stmt(self, s);
+        }
+    }
+    let mut v = V { into };
+    for s in body {
+        ruff_python_ast::visitor::walk_stmt(&mut v, s);
+    }
+}
+
+/// Bare names bound by an assignment / loop / `with` target, including
+/// tuple and list unpacking and starred elements.
+fn bound_names_in_target(target: &Expr) -> Vec<String> {
+    let mut out = Vec::new();
+    fn go(e: &Expr, out: &mut Vec<String>) {
+        match e {
+            Expr::Name(n) => out.push(n.id.as_str().to_owned()),
+            Expr::Tuple(t) => t.elts.iter().for_each(|e| go(e, out)),
+            Expr::List(l) => l.elts.iter().for_each(|e| go(e, out)),
+            Expr::Starred(s) => go(&s.value, out),
+            _ => {}
+        }
+    }
+    go(target, &mut out);
+    out
+}
+
+/// A class whose instances are immutable and hashable by construction: an
+/// enum, a `NamedTuple`, or an explicit `@dataclass(frozen=True)`. (`class
+/// NAME frozen:` is reported by the preprocessor and arrives through
+/// [`analyse_purity_with`].)
+fn class_def_is_immutable(c: &ruff_python_ast::StmtClassDef) -> bool {
+    if let Some(args) = c.arguments.as_deref() {
+        for base in &args.args {
+            let last = match base {
+                Expr::Name(n) => n.id.as_str(),
+                Expr::Attribute(a) => a.attr.as_str(),
+                Expr::Subscript(s) => match s.value.as_ref() {
+                    Expr::Name(n) => n.id.as_str(),
+                    Expr::Attribute(a) => a.attr.as_str(),
+                    _ => "",
+                },
+                _ => "",
+            };
+            if matches!(
+                last,
+                "Enum" | "IntEnum" | "StrEnum" | "Flag" | "IntFlag" | "ReprEnum" | "NamedTuple"
+            ) {
+                return true;
+            }
+        }
+    }
+    c.decorator_list.iter().any(|d| match &d.expression {
+        Expr::Call(call) => {
+            let is_dataclass = match call.func.as_ref() {
+                Expr::Name(n) => n.id.as_str() == "dataclass",
+                Expr::Attribute(a) => a.attr.as_str() == "dataclass",
+                _ => false,
+            };
+            is_dataclass
+                && call.arguments.keywords.iter().any(|k| {
+                    k.arg.as_ref().is_some_and(|a| a.as_str() == "frozen")
+                        && matches!(&k.value, Expr::BooleanLiteral(b) if b.value)
+                })
+        }
+        _ => false,
+    })
+}
+
+/// Type heads whose values are immutable and hashable.
+fn is_immutable_type_head(head: &str) -> bool {
+    matches!(
+        head,
+        "int"
+            | "float"
+            | "str"
+            | "bool"
+            | "bytes"
+            | "complex"
+            | "None"
+            | "NoneType"
+            | "tuple"
+            | "Tuple"
+            | "frozenset"
+            | "FrozenSet"
+            | "range"
+            | "Decimal"
+            | "Fraction"
+            | "datetime"
+            | "date"
+            | "time"
+            | "timedelta"
+            | "timezone"
+            | "UUID"
+            | "PurePath"
+            | "PurePosixPath"
+            | "PureWindowsPath"
+            | "Path"
+            | "PosixPath"
+            | "WindowsPath"
+            | "Pattern"
+            | "Enum"
+            | "IntEnum"
+            | "StrEnum"
+            | "Flag"
+            | "IntFlag"
+            | "Literal"
+            | "LiteralString"
+            | "Never"
+            | "NoReturn"
+            | "Callable"
+    )
+}
+
+/// `true` when values of the annotated type are immutable and hashable, so
+/// a cache may both key on them and hand them out to every caller. Unknown
+/// heads (user classes that are not frozen, `Any`, `object`, protocols,
+/// containers) are `false`.
+fn annotation_is_immutable(ann: &Expr, immutable_classes: &HashSet<String>) -> bool {
+    match ann {
+        Expr::Name(n) => {
+            is_immutable_type_head(n.id.as_str()) || immutable_classes.contains(n.id.as_str())
+        }
+        Expr::Attribute(a) => is_immutable_type_head(a.attr.as_str()),
+        Expr::NoneLiteral(_)
+        | Expr::EllipsisLiteral(_)
+        | Expr::NumberLiteral(_)
+        | Expr::BooleanLiteral(_)
+        | Expr::BytesLiteral(_) => true,
+        // A quoted forward reference (`"Point"`); the string values inside
+        // `Literal[...]` never reach here (that head is accepted whole).
+        Expr::StringLiteral(s) => {
+            let text = s.value.to_str().trim();
+            is_immutable_type_head(text) || immutable_classes.contains(text)
+        }
+        Expr::BinOp(b) if matches!(b.op, ruff_python_ast::Operator::BitOr) => {
+            annotation_is_immutable(&b.left, immutable_classes)
+                && annotation_is_immutable(&b.right, immutable_classes)
+        }
+        Expr::Subscript(s) => {
+            let head = match s.value.as_ref() {
+                Expr::Name(n) => n.id.as_str(),
+                Expr::Attribute(a) => a.attr.as_str(),
+                _ => return false,
+            };
+            let args: Vec<&Expr> = match s.slice.as_ref() {
+                Expr::Tuple(t) => t.elts.iter().collect(),
+                other => vec![other],
+            };
+            match head {
+                "Literal" => true,
+                "Callable" => true,
+                "Annotated" => args
+                    .first()
+                    .is_some_and(|a| annotation_is_immutable(a, immutable_classes)),
+                "tuple" | "Tuple" | "frozenset" | "FrozenSet" | "Result" | "Ok" | "Err"
+                | "Optional" | "Union" | "type" | "Type" | "Final" | "ClassVar" => args
+                    .iter()
+                    .all(|a| annotation_is_immutable(a, immutable_classes)),
+                _ => false,
+            }
+        }
+        _ => false,
+    }
+}
+
+/// The builtin type head an annotation names, when it is one of the types
+/// whose methods the purity walker knows (`str`, `int`, `tuple`, ...).
+fn annotation_builtin_head(ann: &Expr) -> Option<&'static str> {
+    let head = match ann {
+        Expr::Name(n) => n.id.as_str(),
+        Expr::Subscript(s) => match s.value.as_ref() {
+            Expr::Name(n) => n.id.as_str(),
+            _ => return None,
+        },
+        _ => return None,
+    };
+    builtin_type_head(head)
+}
+
+fn builtin_type_head(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "str" => "str",
+        "bytes" => "bytes",
+        "int" => "int",
+        "float" => "float",
+        "complex" => "complex",
+        "bool" => "bool",
+        "tuple" | "Tuple" => "tuple",
+        "frozenset" | "FrozenSet" => "frozenset",
+        "list" | "List" | "Sequence" | "MutableSequence" => "list",
+        "dict" | "Dict" | "Mapping" | "MutableMapping" => "dict",
+        "set" | "Set" | "MutableSet" => "set",
+        "Result" | "Ok" | "Err" => "Result",
+        _ => return None,
+    })
+}
+
+/// The builtin type head of a value expression, when it is a literal
+/// display, an f-string, or a call to a builtin constructor.
+fn builtin_head_of_value(value: &Expr) -> Option<&'static str> {
+    match value {
+        Expr::StringLiteral(_) | Expr::FString(_) => Some("str"),
+        Expr::BytesLiteral(_) => Some("bytes"),
+        Expr::NumberLiteral(n) => Some(match n.value {
+            Number::Int(_) => "int",
+            Number::Float(_) => "float",
+            Number::Complex { .. } => "complex",
+        }),
+        Expr::BooleanLiteral(_) => Some("bool"),
+        Expr::Tuple(_) => Some("tuple"),
+        Expr::List(_) | Expr::ListComp(_) => Some("list"),
+        Expr::Dict(_) | Expr::DictComp(_) => Some("dict"),
+        Expr::Set(_) | Expr::SetComp(_) => Some("set"),
+        Expr::Call(c) => match c.func.as_ref() {
+            Expr::Name(n) => match n.id.as_str() {
+                "sorted" => Some("list"),
+                "Ok" | "Err" => Some("Result"),
+                other => builtin_type_head(other),
+            },
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// `true` when a value expression is an immutable constant: a scalar or
+/// string literal, a tuple of such, or arithmetic over them.
+fn value_is_immutable_literal(value: &Expr) -> bool {
+    match value {
+        Expr::StringLiteral(_)
+        | Expr::BytesLiteral(_)
+        | Expr::NumberLiteral(_)
+        | Expr::BooleanLiteral(_)
+        | Expr::NoneLiteral(_)
+        | Expr::EllipsisLiteral(_) => true,
+        Expr::Tuple(t) => t.elts.iter().all(value_is_immutable_literal),
+        Expr::BinOp(b) => {
+            value_is_immutable_literal(&b.left) && value_is_immutable_literal(&b.right)
+        }
+        Expr::UnaryOp(u) => value_is_immutable_literal(&u.operand),
+        Expr::Call(c) => {
+            matches!(c.func.as_ref(), Expr::Name(n) if matches!(n.id.as_str(), "frozenset" | "tuple" | "int" | "float" | "str" | "bytes" | "bool"))
+                && c.arguments.args.iter().all(value_is_immutable_literal)
+                && c.arguments.keywords.is_empty()
+        }
+        _ => false,
     }
 }
 
@@ -2977,13 +3769,15 @@ fn analyse_stmts(
             // gates cache-decorator injection on the function silently
             // passing.
             if declared || memo {
-                let violation =
-                    check_purity(f.name.as_str(), &f.parameters, &f.body, f.is_async, module);
+                let verdict = check_purity(f, module);
                 out.push(PurityFinding {
                     name: f.name.as_str().to_owned(),
                     declared_pure: declared,
                     memoise: memo,
-                    violation,
+                    violation: verdict.violation,
+                    unproven: verdict.unproven,
+                    unshareable_return: verdict.unshareable_return,
+                    uncacheable_params: verdict.uncacheable_params,
                     span: (
                         f.range.start().to_usize(),
                         f.range.start().to_usize() + f.name.as_str().len(),
@@ -3071,31 +3865,124 @@ fn decorator_head_name(expr: &Expr) -> Option<String> {
 /// that can drift.
 pub use tyc_syntax::user_bound_marker_names;
 
-fn check_purity(
-    name: &str,
-    parameters: &Parameters,
-    body: &[Stmt],
-    is_async: bool,
-    module: &ModuleScope,
-) -> Option<String> {
-    let _ = name;
+/// The four channels a purity check reports on (see [`PurityFinding`]).
+#[derive(Debug, Default)]
+struct PurityVerdict {
+    violation: Option<String>,
+    unproven: Option<String>,
+    unshareable_return: Option<String>,
+    uncacheable_params: Option<String>,
+}
+
+fn check_purity(f: &ruff_python_ast::StmtFunctionDef, module: &ModuleScope) -> PurityVerdict {
+    let parameters: &Parameters = &f.parameters;
+    let body: &[Stmt] = &f.body;
+    let mut verdict = PurityVerdict::default();
     // 1. Synchronous.
-    if is_async {
-        return Some("function is async — pure functions must be synchronous".into());
+    if f.is_async {
+        verdict.violation = Some("function is async — pure functions must be synchronous".into());
+        return verdict;
     }
     // 2. Hashable parameter types — memoisation backs every cache hit with a
     //    dict keyed on `args`. Reject obviously unhashable annotations so the
     //    cache decorator the desugarer injects never crashes at runtime.
     if let Some(reason) = unhashable_param_reason(parameters) {
-        return Some(reason);
+        verdict.violation = Some(reason);
+        return verdict;
     }
-    // The remaining four conditions are checked by walking the body.
+    // Cache-safety of the signature (silent memoisation paths only): every
+    // parameter provably hashable *and* immutable, the return value
+    // immutable. Neither is a purity violation.
+    verdict.uncacheable_params = uncacheable_param_reason(parameters, module);
+    verdict.unshareable_return = match f.returns.as_deref() {
+        None => Some(format!(
+            "`{}` has no return annotation, so its result cannot be proven safe to share from a cache",
+            f.name.as_str()
+        )),
+        Some(ann) if annotation_is_immutable(ann, &module.immutable_classes) => None,
+        Some(ann) => Some(format!(
+            "`{}` returns `{}`, a mutable or lazy value that a shared cache would alias between callers",
+            f.name.as_str(),
+            annotation_text(ann)
+        )),
+    };
+    // The remaining conditions are checked by walking the body.
+    let bindings = collect_local_bindings(body, module);
     let mut ctx = PurityCtx {
         violation: None,
+        unproven: None,
         module,
+        params: parameter_names(parameters),
+        locals: bindings.names,
+        builtin_typed: bindings.types,
+        fresh: bindings.fresh,
     };
+    for pwd in parameters
+        .posonlyargs
+        .iter()
+        .chain(parameters.args.iter())
+        .chain(parameters.kwonlyargs.iter())
+    {
+        if let Some(head) = pwd
+            .parameter
+            .annotation
+            .as_deref()
+            .and_then(annotation_builtin_head)
+        {
+            ctx.builtin_typed
+                .insert(pwd.parameter.name.as_str().to_owned(), head.to_owned());
+        }
+    }
     walk_stmts_purity(body, &mut ctx);
-    ctx.violation
+    verdict.violation = ctx.violation;
+    verdict.unproven = ctx.unproven;
+    verdict
+}
+
+/// Rough source text of an annotation for messages.
+fn annotation_text(ann: &Expr) -> String {
+    match ann {
+        Expr::Name(n) => n.id.as_str().to_owned(),
+        Expr::Attribute(a) => format!("{}.{}", annotation_text(&a.value), a.attr.as_str()),
+        Expr::Subscript(s) => {
+            let inner = match s.slice.as_ref() {
+                Expr::Tuple(t) => t
+                    .elts
+                    .iter()
+                    .map(annotation_text)
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                other => annotation_text(other),
+            };
+            format!("{}[{}]", annotation_text(&s.value), inner)
+        }
+        Expr::BinOp(b) => format!(
+            "{} | {}",
+            annotation_text(&b.left),
+            annotation_text(&b.right)
+        ),
+        Expr::NoneLiteral(_) => "None".to_owned(),
+        Expr::StringLiteral(s) => s.value.to_str().to_owned(),
+        Expr::EllipsisLiteral(_) => "...".to_owned(),
+        _ => "…".to_owned(),
+    }
+}
+
+fn parameter_names(parameters: &Parameters) -> HashSet<String> {
+    let mut out: HashSet<String> = parameters
+        .posonlyargs
+        .iter()
+        .chain(parameters.args.iter())
+        .chain(parameters.kwonlyargs.iter())
+        .map(|p| p.parameter.name.as_str().to_owned())
+        .collect();
+    if let Some(v) = &parameters.vararg {
+        out.insert(v.name.as_str().to_owned());
+    }
+    if let Some(k) = &parameters.kwarg {
+        out.insert(k.name.as_str().to_owned());
+    }
+    out
 }
 
 /// If `parameters` declares a parameter whose annotation is a known-unhashable
@@ -3125,6 +4012,45 @@ fn unhashable_param_reason(parameters: &Parameters) -> Option<String> {
     None
 }
 
+/// The stricter, cache-safety version of [`unhashable_param_reason`] used by
+/// the silent memoisation paths: every parameter must be annotated with a
+/// provably immutable (hence hashable) type, and `*args` / `**kwargs` are
+/// out (a `**kwargs` dict never hashes; `*args` may carry anything).
+fn uncacheable_param_reason(parameters: &Parameters, module: &ModuleScope) -> Option<String> {
+    if let Some(v) = &parameters.vararg {
+        return Some(format!(
+            "`*{}` may carry unhashable or mutable values",
+            v.name.as_str()
+        ));
+    }
+    if let Some(k) = &parameters.kwarg {
+        return Some(format!("`**{}` is never hashable", k.name.as_str()));
+    }
+    for pwd in parameters
+        .posonlyargs
+        .iter()
+        .chain(parameters.args.iter())
+        .chain(parameters.kwonlyargs.iter())
+    {
+        let name = pwd.parameter.name.as_str();
+        match pwd.parameter.annotation.as_deref() {
+            None => {
+                return Some(format!(
+                    "parameter `{name}` has no annotation, so it cannot be proven hashable and immutable"
+                ))
+            }
+            Some(ann) if annotation_is_immutable(ann, &module.immutable_classes) => {}
+            Some(ann) => {
+                return Some(format!(
+                    "parameter `{name}: {}` is not provably hashable and immutable — a cache keyed on it would go stale if the caller mutates it",
+                    annotation_text(ann)
+                ))
+            }
+        }
+    }
+    None
+}
+
 fn annotation_unhashable_name(ann: &Expr) -> Option<String> {
     // Both `list` and `list[int]` are unhashable. Look at the head identifier.
     let head = match ann {
@@ -3142,9 +4068,198 @@ fn annotation_unhashable_name(ann: &Expr) -> Option<String> {
     .then_some(head)
 }
 
+/// What [`collect_local_bindings`] learns about a function body.
+#[derive(Default)]
+struct LocalBindings {
+    /// Every name bound in this scope.
+    names: HashSet<String>,
+    /// Locals whose annotation or initialiser fixes a builtin type head.
+    types: HashMap<String, String>,
+    /// Locals whose every initialiser creates a fresh object.
+    fresh: HashSet<String>,
+}
+
+/// Names bound in a function body (this scope only — nested `def` / `class`
+/// bodies are their own scopes, though their *names* bind here), plus the
+/// builtin type head of every local whose annotation or initialiser makes it
+/// obvious (`let s: str = ...`, `n = 0`, `xs = sorted(...)`), plus the locals
+/// that are provably fresh objects.
+fn collect_local_bindings(body: &[Stmt], module: &ModuleScope) -> LocalBindings {
+    use ruff_python_ast::visitor::source_order::{
+        walk_expr, walk_pattern, walk_stmt, SourceOrderVisitor,
+    };
+    use ruff_python_ast::Pattern;
+
+    #[derive(Default)]
+    struct V<'m> {
+        names: HashSet<String>,
+        types: HashMap<String, String>,
+        fresh_candidates: HashSet<String>,
+        not_fresh: HashSet<String>,
+        class_names: &'m [String],
+    }
+    impl<'ast> SourceOrderVisitor<'ast> for V<'_> {
+        fn visit_stmt(&mut self, s: &'ast Stmt) {
+            match s {
+                Stmt::FunctionDef(f) => {
+                    self.names.insert(f.name.as_str().to_owned());
+                }
+                Stmt::ClassDef(c) => {
+                    self.names.insert(c.name.as_str().to_owned());
+                }
+                Stmt::Import(i) => {
+                    for alias in &i.names {
+                        let bound = match &alias.asname {
+                            Some(asname) => asname.as_str(),
+                            None => alias.name.as_str().split('.').next().unwrap_or(""),
+                        };
+                        self.names.insert(bound.to_owned());
+                    }
+                }
+                Stmt::ImportFrom(i) => {
+                    for alias in &i.names {
+                        let bound = match &alias.asname {
+                            Some(asname) => asname.as_str(),
+                            None => alias.name.as_str(),
+                        };
+                        self.names.insert(bound.to_owned());
+                    }
+                }
+                Stmt::Assign(a) => {
+                    if let [Expr::Name(n)] = a.targets.as_slice() {
+                        let name = n.id.as_str().to_owned();
+                        if let Some(head) = builtin_head_of_value(&a.value) {
+                            self.types.insert(name.clone(), head.to_owned());
+                        }
+                        if value_is_fresh(&a.value, self.class_names) {
+                            self.fresh_candidates.insert(name.clone());
+                        } else {
+                            self.not_fresh.insert(name.clone());
+                        }
+                        self.names.insert(name);
+                        // Only the value is walked: the target is accounted
+                        // for above (walking it would mark it not-fresh).
+                        self.visit_expr(&a.value);
+                        return;
+                    }
+                    walk_stmt(self, s);
+                }
+                Stmt::AnnAssign(a) => {
+                    if let Expr::Name(n) = a.target.as_ref() {
+                        let name = n.id.as_str().to_owned();
+                        self.names.insert(name.clone());
+                        if let Some(head) = annotation_builtin_head(&a.annotation) {
+                            self.types.insert(name.clone(), head.to_owned());
+                        }
+                        if let Some(v) = a.value.as_deref() {
+                            if value_is_fresh(v, self.class_names) {
+                                self.fresh_candidates.insert(name);
+                            } else {
+                                self.not_fresh.insert(name);
+                            }
+                            self.visit_expr(v);
+                        }
+                        return;
+                    }
+                    walk_stmt(self, s);
+                }
+                Stmt::Try(t) => {
+                    for h in &t.handlers {
+                        let ruff_python_ast::ExceptHandler::ExceptHandler(h) = h;
+                        if let Some(alias) = &h.name {
+                            self.names.insert(alias.id.as_str().to_owned());
+                        }
+                    }
+                    walk_stmt(self, s);
+                }
+                _ => walk_stmt(self, s),
+            }
+        }
+
+        fn visit_expr(&mut self, e: &'ast Expr) {
+            if let Expr::Name(n) = e {
+                if !n.ctx.is_load() {
+                    // Loop / `with` / unpacking / walrus targets: bound
+                    // here, but to an object of unknown provenance.
+                    self.names.insert(n.id.as_str().to_owned());
+                    self.not_fresh.insert(n.id.as_str().to_owned());
+                }
+            }
+            walk_expr(self, e);
+        }
+
+        fn visit_pattern(&mut self, p: &'ast Pattern) {
+            let captured = match p {
+                Pattern::MatchAs(m) => m.name.as_ref(),
+                Pattern::MatchStar(m) => m.name.as_ref(),
+                Pattern::MatchMapping(m) => m.rest.as_ref(),
+                _ => None,
+            };
+            if let Some(id) = captured {
+                self.names.insert(id.as_str().to_owned());
+            }
+            walk_pattern(self, p);
+        }
+    }
+
+    let mut v = V {
+        class_names: &module.class_names,
+        ..Default::default()
+    };
+    for stmt in body {
+        v.visit_stmt(stmt);
+    }
+    let fresh = v
+        .fresh_candidates
+        .difference(&v.not_fresh)
+        .cloned()
+        .collect();
+    LocalBindings {
+        names: v.names,
+        types: v.types,
+        fresh,
+    }
+}
+
+/// `true` when evaluating `value` necessarily creates a new object: a
+/// container display or comprehension, a builtin container constructor, or
+/// a call to one of this module's classes.
+fn value_is_fresh(value: &Expr, class_names: &[String]) -> bool {
+    match value {
+        Expr::List(_)
+        | Expr::ListComp(_)
+        | Expr::Dict(_)
+        | Expr::DictComp(_)
+        | Expr::Set(_)
+        | Expr::SetComp(_) => true,
+        Expr::Call(c) => match c.func.as_ref() {
+            Expr::Name(n) => {
+                matches!(
+                    n.id.as_str(),
+                    "list" | "dict" | "set" | "sorted" | "bytearray" | "reversed"
+                ) || class_names.iter().any(|c| c == n.id.as_str())
+            }
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
 struct PurityCtx<'a> {
     violation: Option<String>,
+    unproven: Option<String>,
     module: &'a ModuleScope,
+    /// The function's parameter names.
+    params: HashSet<String>,
+    /// Names bound in the function body (plus comprehension / lambda
+    /// variables as the walk enters them).
+    locals: HashSet<String>,
+    /// Parameters and locals provably of a builtin type: name → type head.
+    builtin_typed: HashMap<String, String>,
+    /// Locals whose every initialiser creates a fresh object (a display,
+    /// comprehension, builtin constructor or module class constructor):
+    /// mutating them in place is unobservable outside the function.
+    fresh: HashSet<String>,
 }
 
 impl PurityCtx<'_> {
@@ -3152,6 +4267,29 @@ impl PurityCtx<'_> {
         if self.violation.is_none() {
             self.violation = Some(reason.into());
         }
+    }
+
+    fn unproven(&mut self, reason: impl Into<String>) {
+        if self.unproven.is_none() {
+            self.unproven = Some(reason.into());
+        }
+    }
+
+    fn is_param(&self, name: &str) -> bool {
+        self.params.contains(name)
+    }
+
+    fn is_local(&self, name: &str) -> bool {
+        self.locals.contains(name)
+    }
+
+    /// The builtin type head of a parameter, local or module binding, when
+    /// it is provable from an annotation or a literal initialiser.
+    fn builtin_type_of(&self, name: &str) -> Option<&str> {
+        if self.is_param(name) || self.is_local(name) {
+            return self.builtin_typed.get(name).map(String::as_str);
+        }
+        self.module.builtin_typed.get(name).map(String::as_str)
     }
 }
 
@@ -3240,6 +4378,13 @@ fn walk_stmt_purity(stmt: &Stmt, ctx: &mut PurityCtx) {
                 ctx.fail("pure functions must not use async constructs");
                 return;
             }
+            // A context manager runs `__enter__` / `__exit__` — code the
+            // walker cannot see. `open(...)` is caught as an I/O call; any
+            // other manager is not provably pure.
+            for item in &s.items {
+                walk_expr_purity(&item.context_expr, ctx);
+            }
+            ctx.unproven("uses a `with` block — the context manager's `__enter__` / `__exit__` are not provably pure");
             walk_stmts_purity(&s.body, ctx);
         }
         Stmt::Match(s) => {
@@ -3264,22 +4409,29 @@ fn walk_expr_purity(expr: &Expr, ctx: &mut PurityCtx) {
             ctx.fail("pure functions must not be async or generator-flavoured (`await`, `yield`)")
         }
         Expr::Call(c) => {
-            if let Some(reason) = forbidden_callee(&c.func) {
-                ctx.fail(reason);
-                return;
-            }
-            // Transitive purity: a `@pure` function that calls another
-            // module-defined function may only do so when the callee is
-            // itself declared pure. Builtin callables and module-level class
-            // constructors are allowed by the known-pure allow-list.
-            if let Expr::Name(n) = c.func.as_ref() {
-                let callee = n.id.as_str();
-                if let Some(reason) = check_callee_purity(callee, ctx.module) {
+            match classify_call(c, ctx) {
+                CallVerdict::Impure(reason) => {
                     ctx.fail(reason);
                     return;
                 }
+                CallVerdict::Unproven(reason) => ctx.unproven(reason),
+                CallVerdict::Pure => {}
             }
-            walk_expr_purity(&c.func, ctx);
+            // The receiver of a method call is walked for the reads it
+            // performs; the callee name itself was classified above. A
+            // receiver that is a module path (`json.dumps`) was resolved as
+            // part of the callee and is not a value read.
+            if let Expr::Attribute(a) = c.func.as_ref() {
+                let rooted_at_import = dotted_path(&a.value).is_some_and(|base| {
+                    let head = base.split('.').next().unwrap_or("");
+                    ctx.module.imports.contains_key(head)
+                        && !ctx.is_param(head)
+                        && !ctx.is_local(head)
+                });
+                if !rooted_at_import {
+                    walk_expr_purity(&a.value, ctx);
+                }
+            }
             for a in c.arguments.args.iter() {
                 walk_expr_purity(a, ctx);
             }
@@ -3340,18 +4492,22 @@ fn walk_expr_purity(expr: &Expr, ctx: &mut PurityCtx) {
             }
         }
         Expr::ListComp(x) => {
+            bind_comprehension_targets(&x.generators, ctx);
             walk_expr_purity(&x.elt, ctx);
             walk_comprehension_clauses(&x.generators, ctx);
         }
         Expr::SetComp(x) => {
+            bind_comprehension_targets(&x.generators, ctx);
             walk_expr_purity(&x.elt, ctx);
             walk_comprehension_clauses(&x.generators, ctx);
         }
         Expr::Generator(x) => {
+            bind_comprehension_targets(&x.generators, ctx);
             walk_expr_purity(&x.elt, ctx);
             walk_comprehension_clauses(&x.generators, ctx);
         }
         Expr::DictComp(x) => {
+            bind_comprehension_targets(&x.generators, ctx);
             // The vendored fork models the key as optional (it is absent for
             // a `**spread` entry in the equivalent display form).
             if let Some(k) = x.key.as_deref() {
@@ -3368,7 +4524,12 @@ fn walk_expr_purity(expr: &Expr, ctx: &mut PurityCtx) {
                 walk_expr_purity(&item.value, ctx);
             }
         }
-        Expr::Lambda(x) => walk_expr_purity(&x.body, ctx),
+        Expr::Lambda(x) => {
+            if let Some(params) = x.parameters.as_deref() {
+                ctx.locals.extend(parameter_names(params));
+            }
+            walk_expr_purity(&x.body, ctx)
+        }
         Expr::FString(x) => {
             for part in x.value.iter() {
                 if let ruff_python_ast::FStringPart::FString(f) = part {
@@ -3394,7 +4555,9 @@ fn walk_expr_purity(expr: &Expr, ctx: &mut PurityCtx) {
         // `Await` / `Yield` / `YieldFrom` are rejected outright by the first
         // arm of this match — they are never walked into.
         Expr::Named(x) => {
-            walk_expr_purity(&x.target, ctx);
+            if let Expr::Name(n) = x.target.as_ref() {
+                ctx.locals.insert(n.id.as_str().to_owned());
+            }
             walk_expr_purity(&x.value, ctx);
         }
         Expr::Slice(x) => {
@@ -3402,9 +4565,17 @@ fn walk_expr_purity(expr: &Expr, ctx: &mut PurityCtx) {
                 walk_expr_purity(part, ctx);
             }
         }
-        // Leaves: literals and bare names carry nothing to inspect.
-        Expr::Name(_)
-        | Expr::NumberLiteral(_)
+        // A bare name read: fine for parameters, locals, immutable module
+        // constants, classes and pure helpers; a proven violation for `mut`
+        // module state; unprovable for anything that could change under the
+        // function's feet.
+        Expr::Name(n) => {
+            if n.ctx.is_load() {
+                check_name_read(n.id.as_str(), ctx);
+            }
+        }
+        // Leaves: literals carry nothing to inspect.
+        Expr::NumberLiteral(_)
         | Expr::StringLiteral(_)
         | Expr::BytesLiteral(_)
         | Expr::BooleanLiteral(_)
@@ -3414,6 +4585,16 @@ fn walk_expr_purity(expr: &Expr, ctx: &mut PurityCtx) {
         // `t"..."` template strings are not part of the accepted surface;
         // treat like an f-string so a future lowering can't slip past.
         Expr::TString(_) => {}
+    }
+}
+
+/// Comprehension variables are bound inside the expression; register them
+/// as locals so their reads are not mistaken for module-state reads.
+fn bind_comprehension_targets(generators: &[ruff_python_ast::Comprehension], ctx: &mut PurityCtx) {
+    for g in generators {
+        for name in bound_names_in_target(&g.target) {
+            ctx.locals.insert(name);
+        }
     }
 }
 
@@ -3428,11 +4609,54 @@ fn walk_comprehension_clauses(generators: &[ruff_python_ast::Comprehension], ctx
     }
 }
 
+/// A bare-name read inside a pure body.
+fn check_name_read(name: &str, ctx: &mut PurityCtx) {
+    if ctx.is_param(name) || ctx.is_local(name) {
+        return;
+    }
+    if let Some(state) = ctx.module.bindings.get(name) {
+        match state {
+            ModuleState::Mutable => ctx.fail(format!(
+                "reads mutable module state `{name}` — a `mut` (or rebound) module binding \
+                 makes the result depend on when the call happens"
+            )),
+            ModuleState::Opaque => ctx.unproven(format!(
+                "reads module-level `{name}`, whose value could be mutated in place elsewhere"
+            )),
+            ModuleState::Immutable => {}
+        }
+        return;
+    }
+    if ctx.module.class_names.iter().any(|c| c == name) {
+        return;
+    }
+    match ctx.module.user_functions.get(name) {
+        Some(true) => return,
+        Some(false) => {
+            ctx.unproven(format!(
+                "passes helper `{name}` around as a value, and `{name}` is not declared pure"
+            ));
+            return;
+        }
+        None => {}
+    }
+    if ctx.module.imports.contains_key(name) {
+        ctx.unproven(format!("uses imported `{name}` as a value"));
+        return;
+    }
+    if is_pure_builtin(name) || matches!(name, "True" | "False" | "None" | "Ellipsis") {
+        return;
+    }
+    ctx.unproven(format!(
+        "uses `{name}` as a value, which is not provably pure"
+    ));
+}
+
 /// Check whether an assignment / aug-assign / delete target mutates state
 /// the pure function isn't allowed to touch. Bare-name targets are local
 /// variables (Python scoping makes them so once `global` is forbidden) and
 /// are fine; attribute and subscript targets whose root is a module-level
-/// binding are not.
+/// binding or a parameter are not.
 fn check_mutation_target(target: &Expr, ctx: &mut PurityCtx) {
     match target {
         Expr::Name(_) => {
@@ -3442,13 +4666,28 @@ fn check_mutation_target(target: &Expr, ctx: &mut PurityCtx) {
         }
         Expr::Attribute(_) | Expr::Subscript(_) => {
             if let Some(root) = mutation_root_name(target) {
-                if ctx.module.module_names.iter().any(|m| m == &root) {
+                if ctx.module.module_names.iter().any(|m| m == &root) && !ctx.is_local(&root) {
                     ctx.fail(format!(
                         "pure functions must not mutate module-level state \
                          (`{}.…` or `{}[…]` would write to a binding declared at module scope)",
                         root, root
                     ));
+                } else if ctx.is_param(&root) {
+                    ctx.fail(format!(
+                        "pure functions must not mutate their arguments \
+                         (`{}.…` or `{}[…]` writes to caller-visible state)",
+                        root, root
+                    ));
+                } else if !ctx.fresh.contains(&root) {
+                    // A local whose object may alias something the caller
+                    // holds (`q = p; q.x = 1`): not provable either way. A
+                    // fresh local (`q = Point(...)`) is fine to mutate.
+                    ctx.unproven(format!(
+                        "writes through local `{root}`, whose object could alias caller-visible state"
+                    ));
                 }
+            } else {
+                ctx.unproven("writes through a computed receiver");
             }
         }
         Expr::Tuple(t) => {
@@ -3475,6 +4714,504 @@ fn mutation_root_name(target: &Expr) -> Option<String> {
         Expr::Attribute(a) => mutation_root_name(&a.value),
         Expr::Subscript(s) => mutation_root_name(&s.value),
         _ => None,
+    }
+}
+
+/// What the walker concluded about one call.
+enum CallVerdict {
+    Pure,
+    Unproven(String),
+    Impure(String),
+}
+
+/// Classify a call inside a pure body: a bare-name call is checked against
+/// the pure builtins, the module's own `@pure` helpers and the pure stdlib
+/// allow-list (through the import map); a method call is classified by its
+/// receiver — a value of provable builtin type may use that type's
+/// non-mutating methods, a module path is checked against the allow-list,
+/// and everything else is at best unproven.
+fn classify_call(c: &ExprCall, ctx: &PurityCtx) -> CallVerdict {
+    if let Some(reason) = forbidden_callee(&c.func, &c.arguments, ctx.module) {
+        return CallVerdict::Impure(reason);
+    }
+    match c.func.as_ref() {
+        Expr::Name(n) => {
+            let callee = n.id.as_str();
+            if ctx.is_param(callee) || ctx.is_local(callee) {
+                // A callable parameter or local: nothing is known about it.
+                // Rejected outright (as before) so `@pure` cannot launder an
+                // arbitrary callback.
+                return CallVerdict::Impure(format!(
+                    "pure functions may only call pure-builtin helpers or other \
+                     `@pure` / `@memo` functions; `{callee}` is a local callable of unknown purity"
+                ));
+            }
+            if let Some(path) = ctx.module.imports.get(callee) {
+                return module_path_verdict(path);
+            }
+            if callee == "next" {
+                // `next(it)` advances the iterator: a proven side effect on
+                // the caller's object when `it` is a parameter, and merely
+                // unprovable when the iterator is a local.
+                if let Some(Expr::Name(arg)) = c.arguments.args.first() {
+                    if ctx.is_param(arg.id.as_str()) {
+                        return CallVerdict::Impure(format!(
+                            "pure functions must not mutate their arguments — `next({})` advances the caller's iterator",
+                            arg.id.as_str()
+                        ));
+                    }
+                }
+                return CallVerdict::Unproven(
+                    "`next(...)` advances an iterator, which is not provably pure".to_owned(),
+                );
+            }
+            if matches!(callee, "vars" | "id") {
+                return CallVerdict::Unproven(format!(
+                    "`{callee}(...)` exposes object identity or live state, which is not provably pure"
+                ));
+            }
+            match check_callee_purity(callee, ctx.module) {
+                None => CallVerdict::Pure,
+                Some(reason) => CallVerdict::Impure(reason),
+            }
+        }
+        Expr::Attribute(a) => classify_method_call(a, ctx),
+        // `fns[i](x)`, `(lambda: ...)()`, `f()(x)`: the callee is computed.
+        _ => CallVerdict::Unproven("calls through a computed callee".to_owned()),
+    }
+}
+
+fn classify_method_call(a: &ruff_python_ast::ExprAttribute, ctx: &PurityCtx) -> CallVerdict {
+    let method = a.attr.as_str();
+    if is_io_method(method) {
+        return CallVerdict::Impure(format!(
+            "pure functions must not perform I/O, read clocks or entropy, or mutate resources — `.{method}()` does"
+        ));
+    }
+    let root = mutation_root_name(&a.value);
+    let Some(root) = root else {
+        // Literal, display, comprehension or call receivers: the value's
+        // builtin type is known when the expression makes it obvious.
+        return match builtin_head_of_value(&a.value) {
+            Some(head) => builtin_method_verdict(head, method),
+            None => {
+                CallVerdict::Unproven(format!("calls `.{method}()` on a value of unknown type"))
+            }
+        };
+    };
+    // Receiver rooted at a name: parameter, local, module binding, import,
+    // class, or a builtin type object (`str.join`).
+    if let Some(base) = dotted_path(&a.value) {
+        let head = base.split('.').next().unwrap_or("");
+        if ctx.module.imports.contains_key(head) && !ctx.is_param(head) && !ctx.is_local(head) {
+            let path = format!("{base}.{method}");
+            return module_path_verdict(&ctx.module.resolve_path(&path));
+        }
+    }
+    if is_logging_method(method) && looks_like_logger(&root) {
+        return CallVerdict::Impure(format!(
+            "pure functions must not log — `{root}.{method}(...)` writes to a handler"
+        ));
+    }
+    let is_param = ctx.is_param(&root);
+    let is_local = ctx.is_local(&root);
+    let module_state = if is_param || is_local {
+        None
+    } else {
+        ctx.module.bindings.get(&root).copied()
+    };
+    if module_state == Some(ModuleState::Mutable) {
+        return CallVerdict::Impure(format!(
+            "reads mutable module state `{root}` — a `mut` (or rebound) module binding makes the result depend on when the call happens"
+        ));
+    }
+    if is_mutator_method(method) {
+        if is_param {
+            return CallVerdict::Impure(format!(
+                "pure functions must not mutate their arguments — `{root}.{method}(...)` does"
+            ));
+        }
+        if module_state.is_some() {
+            return CallVerdict::Impure(format!(
+                "pure functions must not mutate module-level state — `{root}.{method}(...)` does"
+            ));
+        }
+        // A local container being built up is unobservable from outside —
+        // provided the object is fresh (every initialiser is a display,
+        // comprehension, builtin constructor or module class constructor)
+        // rather than an alias of something the caller holds.
+        if ctx.fresh.contains(&root) {
+            return CallVerdict::Pure;
+        }
+        return CallVerdict::Unproven(format!(
+            "mutates local `{root}` via `.{method}()`, which is only pure if `{root}` aliases nothing the caller holds"
+        ));
+    }
+    if let Some(head) = ctx.builtin_type_of(&root) {
+        let head = head.to_owned();
+        return match module_state {
+            Some(ModuleState::Opaque) => CallVerdict::Unproven(format!(
+                "reads module-level `{root}`, whose value could be mutated in place elsewhere"
+            )),
+            _ => builtin_method_verdict(&head, method),
+        };
+    }
+    if builtin_type_head(&root).is_some() && !is_param && !is_local && module_state.is_none() {
+        // `str.join(sep, xs)` / `int.from_bytes(...)`: unbound builtin method.
+        return builtin_method_verdict(builtin_type_head(&root).unwrap_or(""), method);
+    }
+    CallVerdict::Unproven(format!(
+        "calls `.{method}()` on `{root}`, whose type is not provably a builtin"
+    ))
+}
+
+/// Verdict for a method of a known builtin type: non-mutating methods are
+/// pure, mutators depend on the receiver (handled by the caller), anything
+/// else is unproven.
+fn builtin_method_verdict(head: &str, method: &str) -> CallVerdict {
+    if is_pure_builtin_method(head, method) {
+        CallVerdict::Pure
+    } else if is_mutator_method(method) {
+        CallVerdict::Unproven(format!(
+            "`.{method}()` mutates its receiver, which is only pure when the receiver is a fresh local"
+        ))
+    } else {
+        CallVerdict::Unproven(format!(
+            "`{head}.{method}()` is not in the pure method table"
+        ))
+    }
+}
+
+/// Verdict for a call resolved to a dotted module path (`math.sqrt`,
+/// `datetime.datetime`, `numpy.zeros`).
+fn module_path_verdict(path: &str) -> CallVerdict {
+    if path_is_in_pure_module(path) {
+        CallVerdict::Pure
+    } else {
+        CallVerdict::Unproven(format!(
+            "calls `{path}`, which is outside the pure stdlib allow-list"
+        ))
+    }
+}
+
+/// Stdlib modules whose public callables are pure given pure arguments (no
+/// I/O, no clocks, no entropy, no mutation of shared state). Mutable
+/// containers built here (`collections.Counter`) are fine to *use* inside a
+/// pure body; whether they may be *returned* from a cached function is the
+/// return-annotation check's business.
+fn path_is_in_pure_module(path: &str) -> bool {
+    const PURE_MODULES: &[&str] = &[
+        "math",
+        "cmath",
+        "operator",
+        "itertools",
+        "functools",
+        "string",
+        "re",
+        "json",
+        "statistics",
+        "fractions",
+        "decimal",
+        "numbers",
+        "typing",
+        "typing_extensions",
+        "enum",
+        "textwrap",
+        "unicodedata",
+        "base64",
+        "binascii",
+        "struct",
+        "bisect",
+        "heapq",
+        "copy",
+        "dataclasses",
+        "abc",
+        "collections",
+        "datetime",
+        "zoneinfo",
+        "hashlib",
+        "hmac",
+        "difflib",
+        "ipaddress",
+        "pathlib",
+        "urllib.parse",
+        "html",
+        "keyword",
+        "codecs",
+        "array",
+        "types",
+    ];
+    if let Some(rest) = path.strip_prefix("os.path.") {
+        return matches!(
+            rest,
+            "join"
+                | "basename"
+                | "dirname"
+                | "splitext"
+                | "split"
+                | "normpath"
+                | "normcase"
+                | "commonpath"
+                | "commonprefix"
+                | "isabs"
+                | "splitdrive"
+                | "splitroot"
+        );
+    }
+    if path.starts_with("typhon_runtime.") {
+        return true;
+    }
+    PURE_MODULES.iter().any(|m| {
+        path == *m
+            || path
+                .strip_prefix(m)
+                .is_some_and(|rest| rest.starts_with('.'))
+    })
+}
+
+/// Method names that perform I/O, read a clock or entropy source, or drive a
+/// resource — impure on any receiver.
+fn is_io_method(method: &str) -> bool {
+    matches!(
+        method,
+        "now"
+            | "today"
+            | "utcnow"
+            | "read"
+            | "write"
+            | "read_text"
+            | "write_text"
+            | "read_bytes"
+            | "write_bytes"
+            | "readline"
+            | "readlines"
+            | "writelines"
+            | "readinto"
+            | "mkdir"
+            | "unlink"
+            | "rmdir"
+            | "touch"
+            | "rename"
+            | "send"
+            | "sendall"
+            | "sendto"
+            | "recv"
+            | "recvfrom"
+            | "connect"
+            | "listen"
+            | "accept"
+            | "execute"
+            | "executemany"
+            | "commit"
+            | "rollback"
+            | "put_nowait"
+            | "get_nowait"
+            | "acquire"
+            | "release"
+            | "sleep"
+            | "flush"
+            | "seek"
+            | "truncate"
+            | "shuffle"
+            | "randint"
+            | "randrange"
+            | "randbytes"
+            | "choice"
+            | "choices"
+            | "sample"
+            | "uniform"
+            | "gauss"
+            | "random"
+            | "open"
+            | "close"
+            | "print"
+            | "input"
+            | "system"
+            | "popen"
+            | "kill"
+            | "terminate"
+            | "urandom"
+    )
+}
+
+/// Logging-style method names; impure when the receiver looks like a logger.
+fn is_logging_method(method: &str) -> bool {
+    matches!(
+        method,
+        "warning"
+            | "warn"
+            | "info"
+            | "debug"
+            | "error"
+            | "critical"
+            | "exception"
+            | "fatal"
+            | "log"
+    )
+}
+
+fn looks_like_logger(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    lower == "log" || lower == "logging" || lower.ends_with("logger") || lower.ends_with("_log")
+}
+
+/// Methods that mutate their receiver in place.
+fn is_mutator_method(method: &str) -> bool {
+    matches!(
+        method,
+        "append"
+            | "extend"
+            | "insert"
+            | "pop"
+            | "remove"
+            | "clear"
+            | "sort"
+            | "reverse"
+            | "update"
+            | "setdefault"
+            | "popitem"
+            | "add"
+            | "discard"
+            | "appendleft"
+            | "popleft"
+            | "extendleft"
+            | "rotate"
+            | "__setitem__"
+            | "__delitem__"
+            | "__iadd__"
+            | "difference_update"
+            | "intersection_update"
+            | "symmetric_difference_update"
+    )
+}
+
+/// Non-mutating methods of the builtin types the walker can prove a
+/// receiver to be.
+fn is_pure_builtin_method(head: &str, method: &str) -> bool {
+    match head {
+        "str" => matches!(
+            method,
+            "upper"
+                | "lower"
+                | "strip"
+                | "lstrip"
+                | "rstrip"
+                | "split"
+                | "rsplit"
+                | "splitlines"
+                | "join"
+                | "replace"
+                | "startswith"
+                | "endswith"
+                | "find"
+                | "rfind"
+                | "index"
+                | "rindex"
+                | "count"
+                | "format"
+                | "format_map"
+                | "encode"
+                | "isdigit"
+                | "isalpha"
+                | "isalnum"
+                | "isspace"
+                | "isupper"
+                | "islower"
+                | "istitle"
+                | "isnumeric"
+                | "isdecimal"
+                | "isidentifier"
+                | "isprintable"
+                | "isascii"
+                | "title"
+                | "capitalize"
+                | "casefold"
+                | "swapcase"
+                | "center"
+                | "ljust"
+                | "rjust"
+                | "zfill"
+                | "partition"
+                | "rpartition"
+                | "removeprefix"
+                | "removesuffix"
+                | "expandtabs"
+                | "translate"
+                | "maketrans"
+        ),
+        "bytes" => matches!(
+            method,
+            "decode"
+                | "hex"
+                | "fromhex"
+                | "upper"
+                | "lower"
+                | "strip"
+                | "split"
+                | "join"
+                | "replace"
+                | "startswith"
+                | "endswith"
+                | "find"
+                | "count"
+                | "index"
+        ),
+        "int" | "bool" => matches!(
+            method,
+            "bit_length"
+                | "bit_count"
+                | "to_bytes"
+                | "from_bytes"
+                | "conjugate"
+                | "as_integer_ratio"
+        ),
+        "float" => matches!(
+            method,
+            "is_integer" | "as_integer_ratio" | "hex" | "fromhex" | "conjugate"
+        ),
+        "complex" => matches!(method, "conjugate"),
+        "tuple" => matches!(method, "count" | "index"),
+        "frozenset" => matches!(
+            method,
+            "union"
+                | "intersection"
+                | "difference"
+                | "symmetric_difference"
+                | "issubset"
+                | "issuperset"
+                | "isdisjoint"
+                | "copy"
+        ),
+        "list" => matches!(method, "count" | "index" | "copy"),
+        "dict" => matches!(method, "get" | "items" | "keys" | "values" | "copy"),
+        "set" => matches!(
+            method,
+            "union"
+                | "intersection"
+                | "difference"
+                | "symmetric_difference"
+                | "issubset"
+                | "issuperset"
+                | "isdisjoint"
+                | "copy"
+        ),
+        "Result" => matches!(
+            method,
+            "is_ok"
+                | "is_err"
+                | "unwrap"
+                | "unwrap_or"
+                | "unwrap_err"
+                | "expect"
+                | "ok"
+                | "err"
+                | "map"
+                | "map_err"
+                | "and_then"
+                | "or_else"
+                | "unwrap_or_else"
+        ),
+        _ => false,
     }
 }
 
@@ -3518,11 +5255,14 @@ fn check_callee_purity(name: &str, module: &ModuleScope) -> Option<String> {
 }
 
 /// Conservative allow-list of CPython builtins whose contract is pure (no
-/// I/O, no clocks, no entropy, no mutation of arguments). Constructors of
-/// hashable / immutable types and basic transformations are included; any
-/// callable that materialises a mutable container (`list`, `dict`, `set`,
-/// `bytearray`) is intentionally excluded because constructing one inside a
-/// pure function leaks identity through the cache.
+/// I/O, no clocks, no entropy, no mutation of arguments). Constructors —
+/// including the mutable containers `list` / `dict` / `set` / `bytearray`,
+/// which are as pure to *build* as a display is — and basic transformations
+/// are included. Lazy iterator builtins (`map`, `filter`, `zip`, ...) are
+/// pure to use; whether a mutable or lazy result may escape a *cached*
+/// function is the return-annotation check's business. `next` / `vars` /
+/// `id` are deliberately absent: they advance or expose state the walker
+/// cannot see.
 fn is_pure_builtin(name: &str) -> bool {
     matches!(
         name,
@@ -3530,57 +5270,116 @@ fn is_pure_builtin(name: &str) -> bool {
         "abs" | "all" | "any" | "ascii" | "bin" | "bool" | "callable"
         | "chr" | "complex" | "divmod" | "enumerate" | "filter"
         | "float" | "format" | "frozenset" | "hasattr" | "hash" | "hex"
-        | "id" | "int" | "isinstance" | "issubclass" | "iter" | "len"
-        | "map" | "max" | "min" | "next" | "oct" | "ord" | "pow"
+        | "int" | "isinstance" | "issubclass" | "iter" | "len"
+        | "map" | "max" | "min" | "oct" | "ord" | "pow"
         | "range" | "repr" | "reversed" | "round" | "sorted" | "str"
-        | "sum" | "tuple" | "type" | "vars" | "zip" | "bytes" | "object"
+        | "sum" | "tuple" | "type" | "zip" | "bytes" | "object"
+        | "list" | "dict" | "set" | "bytearray" | "slice"
         // Typhon `Result` constructors emitted by the desugar pass.
         | "Ok" | "Err" | "Result"
     )
 }
 
 /// If `func` references a forbidden callable (I/O, entropy, clock), return a
-/// concrete reason string. Otherwise return `None`.
-fn forbidden_callee(func: &Expr) -> Option<String> {
-    let path = dotted_path(func)?;
+/// concrete reason string. Otherwise return `None`. Import aliases are
+/// expanded first, so `from datetime import datetime; datetime.now()` and
+/// `import numpy as np; np.random.rand()` are both seen for what they are.
+fn forbidden_callee(
+    func: &Expr,
+    args: &ruff_python_ast::Arguments,
+    module: &ModuleScope,
+) -> Option<String> {
+    let raw = dotted_path(func)?;
+    let path = module.resolve_path(&raw);
     // Bare-name builtins.
-    match path.as_str() {
-        "print" | "open" | "input" | "exec" | "eval" | "compile" => {
-            return Some(format!("pure functions must not call I/O builtin `{path}`"));
+    if !path.contains('.') {
+        match path.as_str() {
+            "print" | "open" | "input" | "exec" | "eval" | "compile" | "breakpoint" | "exit"
+            | "quit" | "setattr" | "delattr" | "globals" | "locals" | "__import__" => {
+                return Some(format!(
+                    "pure functions must not call `{path}` — it performs I/O or mutates state"
+                ));
+            }
+            _ => return None,
         }
-        _ => {}
     }
-    // Stdlib module attributes.
-    if path.starts_with("os.")
-        || path.starts_with("sys.stdout")
-        || path.starts_with("sys.stderr")
-        || path.starts_with("sys.stdin")
-        || path.starts_with("subprocess.")
-        || path.starts_with("socket.")
-        || path.starts_with("requests.")
-        || path.starts_with("urllib.")
-        || path.starts_with("httpx.")
-        || path.starts_with("logging.")
-    {
-        return Some(format!(
-            "pure functions must not perform I/O — call `{path}` is impure"
-        ));
+    // Pure carve-outs under otherwise impure prefixes.
+    if path_is_in_pure_module(&path) && !path.starts_with("datetime.") {
+        return None;
     }
-    if path.starts_with("time.time")
-        || path.starts_with("time.monotonic")
-        || path.starts_with("time.perf_counter")
-    {
+    let last = path.rsplit('.').next().unwrap_or("");
+    if matches!(last, "now" | "today" | "utcnow") {
         return Some(format!(
             "pure functions must not read a clock — `{path}` is non-deterministic"
         ));
+    }
+    if path.starts_with("datetime.") {
+        return None;
+    }
+    if let Some(rest) = path.strip_prefix("time.") {
+        let no_time_arg = args.args.is_empty() && args.keywords.is_empty();
+        let clock_read = match rest {
+            "gmtime" | "localtime" | "ctime" | "asctime" => no_time_arg,
+            "strftime" => args.args.len() + args.keywords.len() < 2,
+            "strptime" | "mktime" | "struct_time" => false,
+            _ => true,
+        };
+        if clock_read {
+            return Some(format!(
+                "pure functions must not read a clock or sleep — `{path}` is non-deterministic"
+            ));
+        }
+        return None;
     }
     if path.starts_with("random.")
         || path.starts_with("secrets.")
         || path.starts_with("uuid.uuid")
         || path == "os.urandom"
+        || path.split('.').any(|seg| seg == "random")
     {
         return Some(format!(
             "pure functions must not read entropy — `{path}` is non-deterministic"
+        ));
+    }
+    // Stdlib module attributes.
+    const IO_PREFIXES: &[&str] = &[
+        "os.",
+        "sys.stdout",
+        "sys.stderr",
+        "sys.stdin",
+        "sys.exit",
+        "sys.settrace",
+        "sys.setrecursionlimit",
+        "subprocess.",
+        "socket.",
+        "requests.",
+        "urllib.",
+        "httpx.",
+        "aiohttp.",
+        "logging.",
+        "shutil.",
+        "tempfile.",
+        "glob.",
+        "sqlite3.",
+        "threading.",
+        "multiprocessing.",
+        "signal.",
+        "atexit.",
+        "getpass.",
+        "webbrowser.",
+        "smtplib.",
+        "ftplib.",
+        "http.",
+        "select.",
+        "selectors.",
+        "asyncio.",
+        "builtins.print",
+        "builtins.open",
+        "builtins.input",
+    ];
+    if IO_PREFIXES.iter().any(|p| path.starts_with(p)) {
+        return Some(format!(
+            "pure functions must not perform I/O — call `{path}` is impure"
         ));
     }
     None
@@ -5595,6 +7394,215 @@ mod purity_tests {
             .as_ref()
             .expect("expected hashability violation");
         assert!(reason.contains("unhashable"), "got: {reason}");
+    }
+
+    // ── Beta hardening: attribute callees, module state, cache safety ──────
+
+    fn analyse_auto(src: &str) -> Vec<PurityFinding> {
+        let module = tyc_syntax::parse_module(src)
+            .expect("parse failed")
+            .into_syntax();
+        analyse_purity(&module, /*auto_memoise=*/ true)
+    }
+
+    #[test]
+    fn clock_reads_through_attribute_callees_are_rejected() {
+        for src in [
+            "import datetime\n@pure\ndef stamp() -> str:\n    return datetime.datetime.now().isoformat()\n",
+            "from datetime import datetime\n@pure\ndef stamp() -> str:\n    return datetime.now().isoformat()\n",
+            "import datetime\n@pure\ndef today() -> str:\n    return datetime.date.today().isoformat()\n",
+            "import time as t\n@pure\ndef tick() -> float:\n    return t.perf_counter()\n",
+        ] {
+            let f = analyse(src);
+            assert!(f[0].violation.is_some(), "must be rejected: {src}");
+        }
+    }
+
+    #[test]
+    fn logger_calls_and_io_methods_are_rejected() {
+        for src in [
+            "import logging\nlogger: logging.Logger = logging.getLogger(\"t\")\n@pure\ndef f(x: int) -> int:\n    logger.warning(\"x=%d\", x)\n    return x\n",
+            "import pathlib\n@pure\ndef read(p: str) -> str:\n    return pathlib.Path(p).read_text()\n",
+            "from typing import Iterator\n@pure\ndef take(it: Iterator[int]) -> int:\n    return next(it)\n",
+            "@pure\ndef f(p: str) -> str:\n    with open(p) as fh:\n        return fh.name\n",
+        ] {
+            let f = analyse(src);
+            assert!(f[0].violation.is_some(), "must be rejected: {src}");
+        }
+    }
+
+    #[test]
+    fn mutating_module_state_or_arguments_through_methods_is_rejected() {
+        for src in [
+            "REGISTRY: list[int] = []\n@pure\ndef register(x: int) -> int:\n    REGISTRY.append(x)\n    return len(REGISTRY)\n",
+            "class Counter:\n    n: int = 0\n\n@pure\ndef bump(c: Counter) -> int:\n    c.n = c.n + 1\n    return c.n\n",
+            "class Bag:\n    items: tuple[int, ...] = ()\n\n@pure\ndef put(b: Bag, x: int) -> int:\n    b.items.append(x)\n    return x\n",
+        ] {
+            let f = analyse(src);
+            assert!(f[0].violation.is_some(), "must be rejected: {src}");
+        }
+    }
+
+    #[test]
+    fn reading_mutable_module_state_is_rejected() {
+        for src in [
+            "mut COUNTER: int = 0\n\n@pure\ndef offset(x: int) -> int:\n    return x + COUNTER\n",
+            "COUNTER: int = 0\n\ndef tick() -> None:\n    global COUNTER\n    COUNTER += 1\n\n@pure\ndef offset(x: int) -> int:\n    return x + COUNTER\n",
+        ] {
+            let f = analyse(src);
+            let offset = f.iter().find(|f| f.name == "offset").expect("offset finding");
+            assert!(offset.violation.is_some(), "must be rejected: {src}");
+        }
+    }
+
+    #[test]
+    fn immutable_module_constants_and_pure_stdlib_calls_are_provably_pure() {
+        let src = "\
+import math
+import json
+from decimal import Decimal
+SEP: str = \", \"
+LIMIT: int = 10
+
+@pure
+def f(xs: tuple[int, ...], s: str) -> str:
+    parts = [str(x) for x in xs]
+    out: list[str] = []
+    out.append(s.upper())
+    return SEP.join(parts) + json.dumps(math.sqrt(LIMIT)) + str(Decimal(\"1.5\")) + \", \".join(out)
+";
+        let f = analyse(src);
+        assert!(f[0].violation.is_none(), "{:?}", f[0].violation);
+        assert!(f[0].unproven.is_none(), "{:?}", f[0].unproven);
+        assert!(f[0].is_provably_pure());
+    }
+
+    #[test]
+    fn unknown_method_calls_are_unproven_not_violations() {
+        for src in [
+            "class Point:\n    x: float\n\n@pure\ndef norm(p: Point) -> float:\n    return p.length()\n",
+            "import numpy as np\n@pure\ndef f(x: float) -> float:\n    return np.sqrt(x)\n",
+            "TABLE: dict[str, int] = {}\n@pure\ndef look(k: str) -> int:\n    return TABLE.get(k, 0)\n",
+        ] {
+            let f = analyse(src);
+            assert!(f[0].violation.is_none(), "{src}: {:?}", f[0].violation);
+            assert!(f[0].unproven.is_some(), "{src} must be unproven");
+            assert!(!f[0].is_provably_pure());
+        }
+    }
+
+    #[test]
+    fn auto_memoise_requires_provable_purity_and_cache_safe_signatures() {
+        let make =
+            analyse_auto("def make(n: int) -> list[int]:\n    return [i for i in range(n)]\n");
+        assert!(
+            make[0].is_provably_pure(),
+            "{:?} {:?}",
+            make[0].violation,
+            make[0].unproven
+        );
+        assert!(make[0].unshareable_return.is_some());
+        assert!(!make[0].auto_cacheable());
+
+        let evens = analyse_auto(
+            "from typing import Iterator\ndef evens(n: int) -> Iterator[int]:\n    return filter(lambda v: v % 2 == 0, range(n))\n",
+        );
+        assert!(evens[0].unshareable_return.is_some());
+        assert!(!evens[0].auto_cacheable());
+
+        let scale = analyse_auto(
+            "class Point:\n    x: float\n\ndef scale(p: Point, k: float) -> float:\n    return p.x * k\n",
+        );
+        let scale = scale.iter().find(|f| f.name == "scale").unwrap();
+        assert!(
+            scale.is_provably_pure(),
+            "{:?} {:?}",
+            scale.violation,
+            scale.unproven
+        );
+        assert!(scale.uncacheable_params.is_some());
+        assert!(!scale.auto_cacheable());
+
+        let unproven =
+            analyse_auto("import mylib\ndef area(w: float) -> float:\n    return mylib.area(w)\n");
+        assert!(unproven[0].violation.is_none());
+        assert!(!unproven[0].auto_cacheable());
+        assert!(!unproven[0].callable_as_pure());
+
+        let add = analyse_auto("def add(a: int, b: int) -> int:\n    return a + b\n");
+        assert!(add[0].auto_cacheable());
+        assert!(add[0].callable_as_pure());
+    }
+
+    #[test]
+    fn frozen_classes_are_cache_safe_through_analyse_purity_with() {
+        let src = "class Point:\n    x: float\n\ndef scale(p: Point, k: float) -> Point:\n    return Point(x=p.x * k)\n";
+        let module = tyc_syntax::parse_module(src).unwrap().into_syntax();
+        let plain = analyse_purity(&module, true);
+        let scale = plain.iter().find(|f| f.name == "scale").unwrap();
+        assert!(!scale.auto_cacheable());
+        let frozen: HashSet<String> = ["Point".to_owned()].into_iter().collect();
+        let with = analyse_purity_with(&module, true, &frozen);
+        let scale = with.iter().find(|f| f.name == "scale").unwrap();
+        assert!(
+            scale.auto_cacheable(),
+            "{:?} {:?} {:?} {:?}",
+            scale.violation,
+            scale.unproven,
+            scale.unshareable_return,
+            scale.uncacheable_params
+        );
+    }
+
+    #[test]
+    fn explicit_pure_still_trusts_unproven_calls_but_optimiser_does_not() {
+        // An `@pure` author calling into an unknown module gets no error (as
+        // before), yet the function is not handed to the optimiser as pure.
+        let f = analyse(
+            "import mylib\n@pure\ndef area(w: float) -> float:\n    return mylib.area(w)\n",
+        );
+        assert!(f[0].declared_pure);
+        assert!(f[0].violation.is_none());
+        assert!(f[0].unproven.is_some());
+        assert!(
+            f[0].callable_as_pure(),
+            "explicit @pure is trusted for the callee set"
+        );
+        assert!(!f[0].is_provably_pure());
+    }
+
+    #[test]
+    fn fresh_locals_may_be_mutated_in_place() {
+        for src in [
+            "@pure\ndef f(n: int) -> tuple[int, ...]:\n    out: list[int] = []\n    for i in range(n):\n        out.append(i)\n    return tuple(out)\n",
+            "@pure\ndef g(xs: tuple[int, ...]) -> int:\n    ys = list(xs)\n    ys.sort()\n    return ys[0]\n",
+        ] {
+            let f = analyse(src);
+            assert!(f[0].is_provably_pure(), "{src}: {:?} {:?}", f[0].violation, f[0].unproven);
+        }
+        // An aliased local is not fresh.
+        let f = analyse("@pure\ndef h(xs: tuple[int, ...], ys: Bag) -> int:\n    zs = ys\n    zs.add(1)\n    return 0\n");
+        assert!(f[0].violation.is_none());
+        assert!(f[0].unproven.is_some());
+    }
+
+    #[test]
+    fn class_names_at_marker_starts_matches_decorated_classes() {
+        let src = "@dataclass\nclass A:\n    x: int\n\nclass B:\n    y: int\n";
+        let module = tyc_syntax::parse_module(src).unwrap().into_syntax();
+        let a_line = src.find("class A").unwrap() as u32;
+        let b_line = src.find("class B").unwrap() as u32;
+        assert_eq!(
+            class_names_at_marker_starts(&module, &[a_line]),
+            ["A".to_owned()].into_iter().collect()
+        );
+        assert_eq!(
+            class_names_at_marker_starts(&module, &[b_line]),
+            ["B".to_owned()].into_iter().collect()
+        );
+        // A marker past the class name (the body line) covers nothing.
+        let body_line = src.find("    y: int").unwrap() as u32;
+        assert!(class_names_at_marker_starts(&module, &[body_line]).is_empty());
     }
 }
 

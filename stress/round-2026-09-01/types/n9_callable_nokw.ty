@@ -1,0 +1,17 @@
+from typing import Callable
+
+def one(x: int) -> int:
+    return x
+
+def one_def(x: int, y: int = 0) -> int:
+    return x + y
+
+def apply(f: Callable[[int, str], int]) -> int:
+    return f(1, "two")
+
+def main() -> None:
+    print(apply(one))
+    print(apply(one_def))
+
+if __name__ == "__main__":
+    main()

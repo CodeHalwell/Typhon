@@ -1,0 +1,5 @@
+from pathlib import Path
+q: Path = Path("/x") / "y" / "z.txt"
+print(type(q).__name__, str(q))
+print(q.name, q.stem, q.suffix, q.parent)
+print(Path("/x/z.txt").name, (Path("/x") / "z.txt").name)

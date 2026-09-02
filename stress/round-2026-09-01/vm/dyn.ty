@@ -1,0 +1,41 @@
+import json
+
+def main() -> None:
+    unsafe:
+        let a = json.loads('"a"')
+        let n = json.loads('1')
+        let lst = json.loads('[1, 2]')
+        try:
+            print(a + n)
+        except TypeError as e:
+            print("T1", e)
+        try:
+            print(n + a)
+        except TypeError as e:
+            print("T2", e)
+        try:
+            a.foo()
+        except AttributeError as e:
+            print("T3", e)
+        try:
+            lst[1.0]
+        except TypeError as e:
+            print("T4", e)
+        try:
+            print(a < n)
+        except TypeError as e:
+            print("T5", e)
+        try:
+            len(n)
+        except TypeError as e:
+            print("T6", e)
+        try:
+            sorted(lst + [a])
+        except TypeError as e:
+            print("T7", e)
+        try:
+            a * 1.5
+        except TypeError as e:
+            print("T8", e)
+
+main()

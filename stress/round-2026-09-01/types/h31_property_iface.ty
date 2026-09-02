@@ -1,0 +1,19 @@
+interface Sized2:
+    def size(self) -> int
+
+class Bag:
+    items: list[int]
+
+impl Bag:
+    @property
+    def size(self) -> int:
+        return len(self.items)
+
+def use(s: Sized2) -> int:
+    return s.size() + 1
+
+def main() -> None:
+    print(use(Bag(items=[1])))
+
+if __name__ == "__main__":
+    main()

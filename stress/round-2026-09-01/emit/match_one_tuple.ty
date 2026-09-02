@@ -1,0 +1,15 @@
+def f(v: object) -> str:
+    match v:
+        case (x,):
+            return f"one:{x}"
+        case ():
+            return "empty"
+        case [a, b]:
+            return f"two:{a},{b}"
+        case _:
+            return "other"
+
+def main() -> None:
+    print(f([1]), f(5), f([1, 2]), f(()), f((7,)))
+
+main()

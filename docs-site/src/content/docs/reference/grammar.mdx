@@ -25,7 +25,7 @@ statement ::= import_stmt
             | extend_block
             | type_alias
             | if_stmt | while_stmt | for_stmt | match_stmt
-            | try_stmt | with_stmt | unsafe_block | gather_block | guard_stmt
+            | try_stmt | with_stmt | unsafe_block | gather_block | guard_stmt | rescue_block
             | go_stmt | return_stmt | raise_stmt | pass | break | continue
             | expression_stmt
             | comptime_let | comptime_def
@@ -149,9 +149,12 @@ question_expr ::= EXPR "?"          (only on Result-typed expressions in Result-
 Result_type   ::= "Result" "[" TYPE "," TYPE "]"
 Ok_call       ::= "Ok" "(" EXPR ")"
 Err_call      ::= "Err" "(" EXPR ")"
+try_result    ::= "try_result" "(" EXPR ["," EXPR] ")"     (prelude name; thunk [, mapper])
+rescue_expr   ::= EXPR "rescue" NAME ":" EXPR             (statement-tail position)
+rescue_block  ::= "rescue" NAME ":" EXPR ":" suite
 ```
 
-See [`Result, Ok, Err`](/Typhon/reference/result/), [The ? Operator](/Typhon/reference/question-operator/).
+Postfix `rescue` lowers to `try_result(lambda: EXPR, lambda NAME: EXPR)?` — the left operand is found with the same bracket-/string-/comment-aware scan as `as!`, and the two compose (`json.loads(t) as! dict[str, str] rescue e: …`). The block form lowers to `try: suite / except Exception as NAME: return Err(EXPR)`. Both are checked against the enclosing function's declared error type. See [`Result, Ok, Err`](/Typhon/reference/result/#bridging-exceptions-try_result-and-rescue), [The ? Operator](/Typhon/reference/question-operator/).
 
 ## Types
 

@@ -19,5 +19,11 @@ num-bigint         = { workspace = true }
 num-traits         = { workspace = true }
 num-integer        = { workspace = true }
 
+# `os.umask` has no `std` equivalent: only the raw syscall can read *and*
+# set the process mask, and a program that sets one before writing a
+# credentials file is relying on it.
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
 [dev-dependencies]
 tempfile = { workspace = true }

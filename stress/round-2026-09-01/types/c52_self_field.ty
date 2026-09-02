@@ -1,0 +1,17 @@
+class A:
+    kids: list[A]
+    parent: A?
+
+def depth(a: A) -> int:
+    mut d: int = 0
+    mut cur: A? = a
+    while cur is not None:
+        d += 1
+        cur = cur.parent
+    return d
+
+def main() -> None:
+    let root: A = A(kids=[], parent=None)
+    let kid: A = A(kids=[], parent=root)
+    root.kids.append(kid)
+    print(depth(kid))

@@ -1,0 +1,15 @@
+interface Cmp:
+    def cmp(self, other: Cmp) -> int
+
+class N:
+    v: int
+
+impl N:
+    def cmp(self, other: Cmp) -> int:
+        return 0
+
+def f(a: Cmp, b: Cmp) -> int:
+    return a.cmp(b)
+
+def main() -> None:
+    print(f(N(v=1), N(v=2)))

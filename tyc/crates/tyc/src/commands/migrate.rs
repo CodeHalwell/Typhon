@@ -135,18 +135,33 @@ pub fn migrate_source(source: &str) -> String {
     let mut scope_stack: Vec<Scope> = Vec::new();
 
     let mut out = String::with_capacity(source.len());
-    // Residual bracket depth carried across lines. A line that *starts* inside
-    // an open bracket is a continuation, not a statement — `name: str,` on the
-    // second line of a multi-line `def` signature is a parameter, and
-    // `[name] * count,` inside a multi-line call is an argument. Both matched
-    // the assignment shapes below and had `let` prepended, producing a `.ty`
-    // file that does not parse.
-    let mut bracket_depth: i32 = 0;
+    // Continuation and string state both come from the crate's single
+    // lexical scanner rather than a private accumulator. Two things depend
+    // on it. A line that *starts* inside an open bracket is a continuation,
+    // not a statement — `name: str,` on the second line of a multi-line
+    // `def` signature is a parameter, and `[name] * count,` inside a
+    // multi-line call is an argument; both match the assignment shapes
+    // below and had `let` prepended, producing a `.ty` file that does not
+    // parse. And a line that starts inside a triple-quoted string is
+    // *text*: nothing in a docstring is ever a statement, so no rewrite
+    // may fire there. The private per-line bracket counter this replaces
+    // saw neither — it could not close a triple-quote, so a docstring
+    // holding an unbalanced bracket knocked the continuation flag out of
+    // step for the rest of the file, and prose in a docstring was rewritten
+    // as code (`like:` on its own line became `let like:` in CPython's own
+    // `importlib.metadata`).
+    let mask = tyc_syntax::lexmask::LexMask::new(source);
     for (line_index, line) in source.split_inclusive('\n').enumerate() {
         let raw = line.trim_end_matches(['\n', '\r']);
         let terminator = &line[raw.len()..];
-        let starts_inside_brackets = bracket_depth > 0;
-        bracket_depth = (bracket_depth + bracket_delta(raw)).max(0);
+        // String content is copied through untouched — no rewrite, and no
+        // scope bookkeeping either, since its apparent indentation is not
+        // block structure.
+        if mask.line_starts_in_string(line_index) {
+            out.push_str(line);
+            continue;
+        }
+        let starts_inside_brackets = mask.line_entry_depth(line_index) > 0;
 
         // FINDINGS #33: drop lines belonging to a stripped trivial `__init__`.
         // Skipping the whole line (including its trailing newline) keeps
@@ -270,7 +285,10 @@ pub fn migrate_source(source: &str) -> String {
     let out = rewrite_enum_classes(&out);
     let out = simplify_field_default_factories(&out);
     let out = move_methods_to_impl(&out);
-    prune_stale_migration_imports(&out)
+    let out = prune_stale_migration_imports(&out);
+    // Last: every pass above can delete the only statement of a block, and
+    // a header with no suite is a file the migrator cannot read back.
+    insert_pass_for_empty_blocks(&out)
 }
 
 /// `class X(Enum):` / `class X(enum.Enum):` → `enum X:`. Only the bare
@@ -347,60 +365,71 @@ fn simplify_field_default_factories(source: &str) -> String {
     out
 }
 
-/// Indices of the lines that *begin* inside a triple-quoted string.
+/// Insert `pass` under any block header this rewrite left with an empty
+/// suite.
 ///
-/// Passes that decide structure from indentation and leading text need this,
-/// because a docstring's contents look exactly like structure: an indented
-/// line inside a class docstring that starts with `@` reads as a decorator.
-fn lines_starting_inside_string(lines: &[&str]) -> Vec<bool> {
-    const DQ3: &str = "\"\"\"";
-    const SQ3: &str = "'''";
-    let mut out = Vec::with_capacity(lines.len());
-    let mut delim: Option<&'static str> = None;
-    for line in lines {
-        out.push(delim.is_some());
-        let bytes = line.as_bytes();
-        let mut i = 0usize;
-        while i < bytes.len() {
-            match delim {
-                Some(d) => {
-                    if line[i..].starts_with(d) {
-                        delim = None;
-                        i += 3;
-                        continue;
-                    }
-                }
-                None => {
-                    if bytes[i] == b'#' {
-                        break;
-                    }
-                    if line[i..].starts_with(DQ3) {
-                        delim = Some(DQ3);
-                        i += 3;
-                        continue;
-                    }
-                    if line[i..].starts_with(SQ3) {
-                        delim = Some(SQ3);
-                        i += 3;
-                        continue;
-                    }
-                    // A single-quoted literal cannot span lines; skip over it
-                    // so a triple delimiter inside one is not mistaken for a
-                    // real one.
-                    if bytes[i] == b'"' || bytes[i] == b'\'' {
-                        let q = bytes[i];
-                        i += 1;
-                        while i < bytes.len() && bytes[i] != q {
-                            if bytes[i] == b'\\' {
-                                i += 1;
-                            }
-                            i += 1;
-                        }
-                    }
-                }
-            }
-            i += 1;
+/// Several passes delete lines: a `from typing import Protocol` that
+/// `interface` made dead, an `Optional` import that `T?` made dead, a
+/// trivial `__init__` whose fields moved to the class body. When the
+/// deleted line was the *only* statement of its block the header is left
+/// dangling, and the migrator's own output no longer parses —
+/// `rich._ratio` has `if sys.version_info >= (3, 8):` over a lone
+/// `from typing import Protocol`, and migrating it produced a header with
+/// nothing under it.
+///
+/// A body of nothing but comments counts as empty, for the same reason.
+fn insert_pass_for_empty_blocks(source: &str) -> String {
+    let lines: Vec<&str> = source.split_inclusive('\n').collect();
+    let mask = tyc_syntax::lexmask::LexMask::new(source);
+    let indent_of = |l: &str| {
+        let t = l.trim_end_matches(['\n', '\r']);
+        t.len() - t.trim_start().len()
+    };
+    let mut out = String::with_capacity(source.len());
+    // A physical line that continues the previous one is not a header, and
+    // its leading whitespace is layout rather than block indentation. Both
+    // kinds of continuation have to be recognised: an open bracket (which
+    // the mask tracks) and a backslash at end of line (which it does not).
+    // `with A() as a, \` + `     B():` in `runpy` reads as a header at the
+    // *continuation's* indent otherwise, and a `pass` under it lands at an
+    // indentation level that does not exist.
+    let mut after_backslash = false;
+    for (i, line) in lines.iter().enumerate() {
+        out.push_str(line);
+        let was_continuation = after_backslash;
+        let code_end = mask.line_code_end(i).min(line.len());
+        let code = line[..code_end].trim_end();
+        after_backslash = !mask.line_starts_in_string(i) && code.ends_with('\\');
+        if mask.line_starts_in_string(i) || was_continuation {
+            continue;
         }
+        if !code.ends_with(':') || mask.line_bracket_delta(i) != 0 || mask.line_entry_depth(i) != 0
+        {
+            continue;
+        }
+        let header_indent = indent_of(line);
+        if code.trim_start().is_empty() {
+            continue;
+        }
+        // The suite is whatever statement follows at a deeper indent.
+        // Blank lines, comment lines and string content are not statements.
+        let body = lines[i + 1..].iter().enumerate().find_map(|(k, l)| {
+            let j = i + 1 + k;
+            if mask.line_starts_in_string(j) {
+                return None;
+            }
+            let t = l.trim();
+            if t.is_empty() || t.starts_with('#') {
+                return None;
+            }
+            Some(indent_of(l))
+        });
+        if body.is_some_and(|indent| indent > header_indent) {
+            continue;
+        }
+        let pad = &line[..header_indent];
+        out.push_str(pad);
+        out.push_str("    pass\n");
     }
     out
 }
@@ -418,7 +447,10 @@ fn move_methods_to_impl(source: &str) -> String {
     // read as a decorator and hauled out of the class body into the `impl`
     // block, corrupting both the docstring and the method list. CPython's own
     // `typing.py` migrates through here and hit exactly that.
-    let in_string = lines_starting_inside_string(&lines);
+    let mask = tyc_syntax::lexmask::LexMask::new(source);
+    let in_string: Vec<bool> = (0..lines.len())
+        .map(|i| mask.line_starts_in_string(i))
+        .collect();
     let mut out = String::with_capacity(source.len());
     let mut i = 0usize;
     while i < lines.len() {
@@ -510,16 +542,31 @@ fn move_methods_to_impl(source: &str) -> String {
                 // before it and left the `):` behind in the class body while
                 // the rest moved into the `impl` block — an unparseable file
                 // from the migrator's own output. `ast.py` does this.
-                let mut header_depth = bracket_delta(lines[j]).max(0);
+                //
+                // The depth has to accumulate over EVERY line the item takes,
+                // not just the ones taken while it was already open. When the
+                // item starts at a decorator the header is on a *later* line,
+                // so seeding from the first line alone left the depth at zero
+                // through `def discover(`, and the `) -> T:` that closed it
+                // was read as the end of the item. `importlib.metadata` and
+                // `pip._internal.build_env` both migrated to unparseable
+                // files that way.
+                let mut header_depth = mask.line_bracket_delta(j).max(0);
                 j += 1;
                 while j < end {
                     let r2 = lines[j].trim_end_matches(['\n', '\r']);
                     let t2 = r2.trim_start();
                     let ind2 = r2.len() - t2.len();
-                    if header_depth > 0 {
-                        // Still inside the signature: this line belongs to the
-                        // item whatever its indentation looks like.
-                        header_depth = (header_depth + bracket_delta(lines[j])).max(0);
+                    if header_depth > 0 || in_string[j] {
+                        // Still inside the signature, or inside a docstring:
+                        // this line belongs to the item whatever its
+                        // indentation looks like. String content is not
+                        // indentation — a docstring line at column zero (a
+                        // backslash-continued first line puts one there, and
+                        // `xmlrpc.server` and `pydoc` both do) ended the item
+                        // and left the rest of the docstring behind in the
+                        // class body, splitting the string in two.
+                        header_depth = (header_depth + mask.line_bracket_delta(j)).max(0);
                         j += 1;
                         continue;
                     }
@@ -557,6 +604,7 @@ fn move_methods_to_impl(source: &str) -> String {
                         }
                         break;
                     }
+                    header_depth = (header_depth + mask.line_bracket_delta(j)).max(0);
                     j += 1;
                 }
                 // Extend through the decorated def's body when the item
@@ -573,13 +621,14 @@ fn move_methods_to_impl(source: &str) -> String {
                 }
                 continue;
             }
-            // Non-method item: extent = this line + deeper lines.
+            // Non-method item: extent = this line + deeper lines (and any
+            // string content, whose apparent indentation is text).
             others.push(lines[j]);
             j += 1;
             while j < end {
                 let r2 = lines[j].trim_end_matches(['\n', '\r']);
                 let t2 = r2.trim_start();
-                if t2.is_empty() || r2.len() - t2.len() > 4 {
+                if in_string[j] || t2.is_empty() || r2.len() - t2.len() > 4 {
                     others.push(lines[j]);
                     j += 1;
                 } else {
@@ -614,11 +663,25 @@ fn move_methods_to_impl(source: &str) -> String {
         while others_trimmed.last().is_some_and(|l| l.trim().is_empty()) {
             others_trimmed.pop();
         }
+        // A body of nothing but comments is not a suite: Python needs a
+        // statement, so `class D:` followed only by `# note` is a parse
+        // error on the migrator's own output. Keep the comments and add the
+        // `pass` they cannot stand in for.
+        let body_has_statement = others_trimmed.iter().any(|l| {
+            let t = l.trim_start();
+            !t.is_empty() && !t.starts_with('#')
+        });
         if others_trimmed.is_empty() {
             out.push_str("    pass\n");
         } else {
             for l in &others_trimmed {
                 out.push_str(l);
+            }
+            if !body_has_statement {
+                if !out.ends_with('\n') {
+                    out.push('\n');
+                }
+                out.push_str("    pass\n");
             }
         }
         out.push('\n');
@@ -720,39 +783,6 @@ fn prune_stale_migration_imports(source: &str) -> String {
         out.push_str(terminator);
     }
     out
-}
-
-/// Net bracket delta of `line`, ignoring brackets inside string literals and
-/// after a `#` comment. Used to tell a statement from the continuation of a
-/// multi-line signature or call.
-fn bracket_delta(line: &str) -> i32 {
-    let bytes = line.as_bytes();
-    let mut depth = 0i32;
-    let mut quote: Option<u8> = None;
-    let mut i = 0;
-    while i < bytes.len() {
-        let b = bytes[i];
-        match quote {
-            Some(q) => {
-                if b == b'\\' {
-                    i += 2;
-                    continue;
-                }
-                if b == q {
-                    quote = None;
-                }
-            }
-            None => match b {
-                b'"' | b'\'' => quote = Some(b),
-                b'#' => break,
-                b'(' | b'[' | b'{' => depth += 1,
-                b')' | b']' | b'}' => depth -= 1,
-                _ => {}
-            },
-        }
-        i += 1;
-    }
-    depth
 }
 
 /// Walk every line and apply rewrite rules in order.  Returns the
@@ -1798,15 +1828,52 @@ fn collect_frozen_class_lines(source: &str) -> HashSet<usize> {
 /// `class Vec(Base):` → `class Vec(Base) frozen:`
 /// `class! Counter:` → left alone (unsupported combination)
 fn append_frozen_modifier(header: &str) -> String {
-    if !header.starts_with("class ") {
-        return header.to_owned();
-    }
-    let Some(colon_idx) = header.rfind(':') else {
+    let Some(after_class) = header.strip_prefix("class ") else {
         return header.to_owned();
     };
-    let before = &header[..colon_idx];
-    let after = &header[colon_idx..];
-    format!("{before} frozen{after}")
+    // The modifier binds to the class NAME, before any base list:
+    // `class Ge frozen(Gt):`, not `class Ge(Gt) frozen:`. Appending it at
+    // the end of the header produced a `.ty` file the preprocessor rejects
+    // — every `@dataclass(frozen=True)` class with a base migrated to
+    // something that would not parse (`annotated_types` is full of them).
+    let Some(name_end) = after_class
+        .bytes()
+        .position(|b| !(b.is_ascii_alphanumeric() || b == b'_'))
+    else {
+        return header.to_owned();
+    };
+    if name_end == 0 {
+        return header.to_owned();
+    }
+    let name = &after_class[..name_end];
+    let after_name = &after_class[name_end..];
+    // A PEP 695 type-parameter list stays glued to the name
+    // (`class Box[T] frozen(Base):`), so step over it first.
+    let rest = if after_name.starts_with('[') {
+        let mut depth = 0i32;
+        let mut end = None;
+        for (i, b) in after_name.bytes().enumerate() {
+            match b {
+                b'[' => depth += 1,
+                b']' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = Some(i + 1);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        match end {
+            Some(end) => end,
+            None => return header.to_owned(),
+        }
+    } else {
+        0
+    };
+    let (type_params, tail) = after_name.split_at(rest);
+    format!("class {name}{type_params} frozen{}", tail.trim_start())
 }
 
 /// Rewrite `class X(Protocol):` to `interface X:`.
@@ -3044,13 +3111,17 @@ class Point:
 
     #[test]
     fn dataclass_frozen_with_base_keeps_base() {
+        // The modifier binds to the NAME, ahead of the base list — the
+        // preprocessor accepts `class X frozen(Base):`, not
+        // `class X(Base) frozen:`, which is what this used to emit (and
+        // what no `@dataclass(frozen=True)` subclass could survive).
         let src = "\
 @dataclass(frozen=True)
 class Vec(Base):
     x: int
 ";
         let out = migrate_source(src);
-        assert!(out.contains("class Vec(Base) frozen:"), "got:\n{out}");
+        assert!(out.contains("class Vec frozen(Base):"), "got:\n{out}");
     }
 
     // ── Rule 8: Protocol → interface ────────────────────────────────────────
@@ -3187,6 +3258,183 @@ class Vec:
         assert!(
             out.contains("newtype User_ID = int"),
             "rewrite must work with a trailing real comment; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn non_ascii_in_a_docstring_does_not_panic() {
+        // The string scan advanced by bytes, so a non-ASCII character in a
+        // docstring left the index mid-codepoint and panicked the whole run
+        // on the next slice. CPython's own stdlib migrates through here.
+        let src = "class C:\n    \"\"\"Doc with \u{e9} accent \u{2014} and a dash.\"\"\"\n\n    def f(self) -> int:\n        return 1\n";
+        let out = migrate_source(src);
+        assert!(
+            out.contains("Doc with \u{e9} accent"),
+            "the docstring must survive intact; got:\n{out}"
+        );
+        assert!(
+            out.contains("impl C:"),
+            "the method must still move to an impl block; got:\n{out}"
+        );
+        // Emoji (4-byte) and a quote-adjacent accent, in one line each.
+        let tricky = "class D:\n    \"\"\"\u{1f600}\"\"\"\n    x: int = 1\n\n    def g(self) -> int:\n        return self.x\n";
+        assert!(migrate_source(tricky).contains("impl D:"));
+    }
+
+    #[test]
+    fn migrate_never_rewrites_inside_a_docstring() {
+        // The rewrite loop tracked brackets but not strings, so prose in a
+        // docstring was read as code: a bullet list whose item happened to
+        // be `like:` came back as `let like:`. CPython's own
+        // `importlib.metadata` has one.
+        let src = "\
+class Dist:
+    def read_text(self, filename):
+        \"\"\"Load the metadata file.
+
+        These files include things
+        like:
+
+        - METADATA: the fields
+        \"\"\"
+        return \"x\"
+";
+        let out = migrate_source(src);
+        assert!(
+            out.contains("\n        like:\n"),
+            "docstring prose must be copied through verbatim; got:\n{out}"
+        );
+        assert!(!out.contains("let like"), "got:\n{out}");
+    }
+
+    #[test]
+    fn migrate_moves_a_whole_multi_line_method_signature() {
+        // The `impl` relocation seeded its bracket depth from the item's
+        // FIRST line. When the item starts at a decorator the `def` is on a
+        // later line, so the depth stayed zero through `def discover(` and
+        // the `) -> T:` that closed the signature was read as the end of
+        // the item — leaving it, and the body, orphaned in the class body.
+        let src = "\
+class Finder:
+    @classmethod
+    def discover(
+        cls, *, context: str = \"\", **kwargs
+    ) -> list[str]:
+        return []
+";
+        let out = migrate_source(src);
+        assert!(
+            out.contains("impl Finder:"),
+            "the method should move; got:\n{out}"
+        );
+        let (class_part, impl_part) = out.split_once("impl Finder:").unwrap();
+        assert!(
+            !class_part.contains(") -> list[str]:"),
+            "the signature's closing line was left behind:\n{out}"
+        );
+        assert!(
+            impl_part.contains("def discover(")
+                && impl_part.contains(") -> list[str]:")
+                && impl_part.contains("return []"),
+            "the whole method should move together; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn migrate_keeps_a_docstring_whole_when_it_reaches_column_zero() {
+        // A backslash continuation inside a docstring puts a line of string
+        // content at column zero. The item-extent scan read that as the end
+        // of the method and left the rest of the docstring in the class
+        // body, splitting the literal in two. `xmlrpc.server` does it.
+        let src = "\
+class S:
+    def multicall(self, calls):
+        \"\"\"multicall([{'m': 'add'}, ...]) => \\
+[[4], ...]
+
+        Package several calls into one.
+        \"\"\"
+        return []
+";
+        let out = migrate_source(src);
+        let (class_part, impl_part) = out.split_once("impl S:").unwrap();
+        assert!(
+            !class_part.contains("[[4], ...]"),
+            "the docstring was split; got:\n{out}"
+        );
+        assert!(
+            impl_part.contains("[[4], ...]") && impl_part.contains("Package several calls"),
+            "the whole docstring should travel with its method; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn migrate_leaves_pass_where_it_emptied_a_block() {
+        // `Protocol` became `interface`, so the import that named it is
+        // dead — but it was the only statement of a version guard, and
+        // deleting it left a header with no suite. `rich._ratio` does this.
+        let src = "\
+import sys
+
+if sys.version_info >= (3, 8):
+    from typing import Protocol
+else:
+    from typing_extensions import Protocol
+
+
+class Edge(Protocol):
+    size: int
+";
+        let out = migrate_source(src);
+        assert!(
+            out.contains("if sys.version_info >= (3, 8):\n    pass\n"),
+            "an emptied block needs a `pass`; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn migrate_does_not_add_pass_under_a_continuation_line() {
+        // `with A() as a, \` + `     B():` is one header spread over two
+        // physical lines. Reading the second as a header of its own put a
+        // `pass` at an indentation level that does not exist, and the whole
+        // file stopped parsing. `runpy` has exactly this shape.
+        let src = "\
+import contextlib
+
+
+def run():
+    with contextlib.nullcontext() as a, \\
+         contextlib.nullcontext() as b:
+        value = 1
+        return value
+";
+        let out = migrate_source(src);
+        assert!(!out.contains("pass"), "no `pass` belongs here; got:\n{out}");
+    }
+
+    #[test]
+    fn comment_only_class_body_keeps_a_pass() {
+        // Every statement moved to the `impl` block and only a comment was
+        // left behind — which is not a suite, so the migrator's own output
+        // failed to parse ("Expected an indented block after `class`").
+        let src =
+            "class D:\n    # only a comment here\n    def g(self) -> int:\n        return 2\n";
+        let out = migrate_source(src);
+        assert!(
+            out.contains("    # only a comment here"),
+            "the comment must be kept; got:\n{out}"
+        );
+        assert!(
+            out.contains("    pass"),
+            "a comment-only body needs a `pass`; got:\n{out}"
+        );
+        assert!(out.contains("impl D:"), "{out}");
+        // A body with a real statement must NOT gain a spurious `pass`.
+        let with_field = "class E:\n    # a note\n    x: int = 1\n    def g(self) -> int:\n        return self.x\n";
+        let out = migrate_source(with_field);
+        assert!(
+            !out.contains("pass"),
+            "a body that already has a statement must not gain `pass`; got:\n{out}"
         );
     }
 }

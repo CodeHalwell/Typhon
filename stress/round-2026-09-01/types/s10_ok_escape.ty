@@ -1,0 +1,15 @@
+def g() -> Result[int, str]:
+    return Ok(1)
+
+def main() -> None:
+    let r: Result[int, str] = g()
+    if isinstance(r, Ok):
+        let r2: Result[str, int] = r
+        match r2:
+            case Ok(v):
+                print(v.upper())
+            case Err(e):
+                print(e + 1)
+
+if __name__ == "__main__":
+    main()
