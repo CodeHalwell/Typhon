@@ -65,7 +65,7 @@ criterion = { version = "0.5", features = ["html_reports"] }
 # VM runtime — pinned here so every crate that grows VM-facing deps
 # (interp, builtins, value) stays version-aligned.
 indexmap    = "2"
-num-bigint  = "0.4"
+num-bigint  = "0.5"
 num-integer = "0.1"
 num-traits  = "0.2"
 regex       = "1"
