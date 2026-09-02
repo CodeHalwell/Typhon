@@ -257,7 +257,13 @@ shim): `sqlite3`, `subprocess`, `threading` / `multiprocessing`, `socket`
 / `urllib` / `http`, `ctypes`, `decimal`, `fractions`, `logging`,
 `configparser`, `struct`, and every third-party package.
 
-Also new in v1.0.0-beta.1: `async for` over a hand-written `__aiter__` /
+Also new in v1.0.0-beta.1: a module-level `lazy let` deferring to first
+*use* (the VM ran its initialiser at the binding, so a helper defined
+lower in the file raised `NameError`); `%(key)s` printf conversions
+reading a mapping; `sys.modules` always carrying `__main__`; `eval` of a
+single expression (module globals only — the VM has no frame
+introspection; `exec` is deliberately absent); `async for` over a
+hand-written `__aiter__` /
 `__anext__` iterator, and generator bodies (sync *and* async) running
 lazily wherever the tree-walk can suspend, so a `@contextmanager` /
 `@asynccontextmanager` body runs between setup and teardown; set

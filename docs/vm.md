@@ -75,6 +75,9 @@ tyc run --compile --temp      # legacy with ephemeral build dir
 `enumerate`, `zip`, `map`, `filter`, `all`, `any`, `next`, `iter`, `hex`,
 `bin`, `oct`, `chr`, `ord`, `round`, `input`, `hash`, `id`, `callable`,
 `issubclass` (v1.0.0-beta.1, incl. a tuple of classes),
+`eval` (v1.0.0-beta.1 — a single *expression*, resolved against the module
+globals since the VM has no frame introspection; `exec` is deliberately
+absent),
 `open` (read / write / append / binary modes since v0.9.0, plus
 `__enter__` / `__exit__` for `with` blocks). Since v0.10.0 also `divmod`
 (raises `ZeroDivisionError` with CPython messages), `pow` (2- and 3-arg
@@ -117,7 +120,7 @@ since v1.0.0-beta.1 — before that each built an opaque instance, so
 |---|---|
 | `math` | `pi`, `e`, `inf`, `nan`, `sqrt`, `floor`, `ceil`, `log` (with base), `log2`, `log10`, `exp`, `sin`, `cos`, `tan`, `pow`, `fabs`. v0.10.0: `gcd`, `lcm`, `factorial`, `isqrt`, `comb`, `perm` (all reject non-integer args) |
 | `os` / `os.path` (rebuilt v1.0.0-beta.1) | The process and filesystem surface: `getenv`, `environ`, `getcwd`, `chdir`, `listdir`, `scandir`, `walk`, `mkdir`, `makedirs`, `remove`, `rmdir`, `rename`, `replace`, `stat`, `access`, `getpid`, `cpu_count`, `system`, `strerror`, `urandom`, the `O_*` / `*_OK` / `SEEK_*` constants, `PathLike` / `fspath`, and a full `posixpath` (`join`, `split`, `splitext`, `basename`, `dirname`, `normpath`, `abspath`, `realpath`, `relpath`, `commonpath`, `commonprefix`, `expanduser`, `expandvars`, `isabs`, `exists`, `isfile`, `isdir`, `islink`, `getsize`, `getmtime`, `samefile`). Errors carry CPython's `errno` / `strerror` / `filename`. `import os.path` and `import posixpath` resolve to the same shim |
-| `sys` | `argv`, `platform`, `version`, `version_info`, `byteorder`, `maxsize`, `exit(code)`, `stdout`, `stderr`, `stdin`, `getrecursionlimit` / `setrecursionlimit`. v1.0.0-beta.1: `modules` (a live view of the import cache) and `exc_info()` (the exception being handled, with `None` for the traceback slot — the VM has no traceback object). Assigning `sys.stdout` redirects `print`, so `contextlib.redirect_stdout` works |
+| `sys` | `argv`, `platform`, `version`, `version_info`, `byteorder`, `maxsize`, `exit(code)`, `stdout`, `stderr`, `stdin`, `getrecursionlimit` / `setrecursionlimit`. v1.0.0-beta.1: `modules` (a live view of the import cache, always carrying `__main__`) and `exc_info()` (the exception being handled, with `None` for the traceback slot — the VM has no traceback object). Assigning `sys.stdout` redirects `print`, so `contextlib.redirect_stdout` works |
 | `json` | `dumps`, `loads` (full JSON 7159 surface). v0.10.0: `dumps(indent=…)` pretty-prints |
 | `time` | `time()`, `sleep()`, `monotonic()`. v0.10.0: `perf_counter()`, `process_time()` |
 | `random` | `random()`, `seed(n)`, `getrandbits`, `randint`, `randrange`, `uniform`, `gauss`, `choice`, `shuffle`, `sample` — a **CPython-compatible MT19937**, following `random.py` / `_randommodule.c`, so `random.seed(n)` produces a **byte-identical sequence** under `tyc run` and under `tyc build` + CPython. An *unseeded* program seeds from OS-derived entropy, as CPython does at import, so it draws a different sequence on every run (v1.0.0-alpha.8 — before that the default was a fixed constant, making `tyc run` repeatable where CPython is not). `seed()` / `seed(None)` reseeds from entropy; string / bytes / float seeds are rejected (CPython hashes them through SHA-512) — use `tyc run --compile` for those. NOT cryptographic on either surface: use `secrets` |
@@ -379,7 +382,10 @@ message:
   `@contextmanager` / `@asynccontextmanager` factory, nor an object
   implementing `__enter__` / `__exit__` (or `__aenter__` / `__aexit__`).
 - `lazy let` inside a class body uses an identity decorator; callers must
-  use the method-call form `obj.x()`.
+  use the method-call form `obj.x()`. (A *module-level* `lazy let` defers
+  properly since v1.0.0-beta.1 — the VM hands back the same
+  materialise-on-first-use proxy the emitted runtime does, rather than
+  running the initialiser at the binding.)
 - **Nested-model `pydantic.model_validate`** is not type-directed — a
   nested dict stays a dict; deeply-nested models need `tyc build`.
 

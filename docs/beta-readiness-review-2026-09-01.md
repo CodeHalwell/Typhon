@@ -393,7 +393,7 @@ with every gate green at each step.
    `functools` / `sys` / `typing` gaps), and the object model gained
    `NamedTuple` / `TypedDict` semantics, `issubclass`, function
    `__dict__`, identity-hashable classes and per-module dunders. **The
-   differential baseline is down from 167 entries to 54**, and the six
+   differential baseline is down from 167 entries to 43**, and the six
    diverging curated examples are gone.
 5. **Gates.** The differential job now also byte-compiles every emitted
    `.py` with `compileall` — an *emitter* verdict that is never baselined,
@@ -414,7 +414,7 @@ with every gate green at each step.
 
 ### What is still open
 
-- **The 54 remaining differential entries.** Each is a VM bug and the file
+- **The 43 remaining differential entries.** Each is a VM bug and the file
   names them. The clusters left are the thin `re` shim, `Counter` / `deque`
   corners, `lazy let`, deep Unicode casing and repr escaping, and a
   handful of exception-chaining differences. None of them is a *silent* wrong answer

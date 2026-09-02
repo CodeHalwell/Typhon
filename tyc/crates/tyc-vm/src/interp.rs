@@ -5018,11 +5018,29 @@ impl Interpreter {
         // common conversions. A single non-tuple value is treated as one
         // positional argument.
         if let (Str(fmt), Mod, _) = (l, op, r) {
+            // A mapping right operand feeds `%(key)s` conversions; anything
+            // else is the positional sequence. A dict is *also* a valid
+            // single positional value for `%s`, so it is passed as both and
+            // the conversion decides.
             let values: Vec<Value> = match r {
                 Tuple(t) => t.as_ref().clone(),
                 other => vec![other.clone()],
             };
-            return Ok(Str(Rc::new(printf_format(self, fmt, &values)?)));
+            let mapping: Option<Value> = match r {
+                Dict(_) => Some(r.clone()),
+                Instance(i) if self.find_method(&i.class, "__getitem__").is_some() => {
+                    Some(r.clone())
+                }
+                // `None` is `Value::None` here (`use Value::*`), so the
+                // absent case has to be spelled out.
+                _ => Option::None,
+            };
+            return Ok(Str(Rc::new(printf_format_with(
+                self,
+                fmt,
+                &values,
+                mapping.as_ref(),
+            )?)));
         }
 
         // PEP 461: bytes printf-style `%` formatting (`b"%d items" % 5`,
@@ -8797,17 +8815,36 @@ pub(crate) fn translate_bytes_format(fmt: &str) -> String {
 }
 
 fn printf_format(interp: &mut Interpreter, fmt: &str, values: &[Value]) -> Result<String, Unwind> {
+    printf_format_with(interp, fmt, values, None)
+}
+
+/// [`printf_format`] with an optional mapping for `%(key)s` conversions.
+fn printf_format_with(
+    interp: &mut Interpreter,
+    fmt: &str,
+    values: &[Value],
+    mapping: Option<&Value>,
+) -> Result<String, Unwind> {
     let chars: Vec<char> = fmt.chars().collect();
     let mut out = String::new();
     let mut i = 0usize;
     let mut arg = 0usize;
-    let next_arg = |arg: &mut usize| -> Result<&Value, Unwind> {
+    // A `%(key)s` conversion takes its value from the mapping instead of
+    // the positional sequence, and consumes no positional argument.
+    fn take_arg<'a>(
+        keyed: &'a Option<Value>,
+        values: &'a [Value],
+        arg: &mut usize,
+    ) -> Result<&'a Value, Unwind> {
+        if let Some(v) = keyed {
+            return Ok(v);
+        }
         let v = values
             .get(*arg)
             .ok_or_else(|| type_error("not enough arguments for format string"))?;
         *arg += 1;
         Ok(v)
-    };
+    }
     while i < chars.len() {
         if chars[i] != '%' {
             out.push(chars[i]);
@@ -8822,6 +8859,39 @@ fn printf_format(interp: &mut Interpreter, fmt: &str, values: &[Value]) -> Resul
             out.push('%');
             i += 1;
             continue;
+        }
+        // `%(key)s` — a mapping key. CPython requires the right operand to
+        // be a mapping when any conversion names one, and the key can hold
+        // anything but an unbalanced parenthesis.
+        let mut keyed: Option<Value> = None;
+        if chars[i] == '(' {
+            let mut depth = 1usize;
+            let mut j = i + 1;
+            let mut key = String::new();
+            while j < chars.len() && depth > 0 {
+                match chars[j] {
+                    '(' => {
+                        depth += 1;
+                        key.push('(');
+                    }
+                    ')' => {
+                        depth -= 1;
+                        if depth > 0 {
+                            key.push(')');
+                        }
+                    }
+                    c => key.push(c),
+                }
+                j += 1;
+            }
+            if depth != 0 {
+                return Err(value_error("incomplete format key"));
+            }
+            let Some(map) = mapping else {
+                return Err(type_error("format requires a mapping"));
+            };
+            keyed = Some(interp.subscript(map, &Value::Str(Rc::new(key)))?);
+            i = j;
         }
         // Flags.
         let mut flag_minus = false;
@@ -8874,7 +8944,7 @@ fn printf_format(interp: &mut Interpreter, fmt: &str, values: &[Value]) -> Resul
             's' => {
                 // Through the interpreter so a user `__str__` / `__repr__`
                 // is honoured, as `str()` / f-strings already do.
-                let v = next_arg(&mut arg)?.clone();
+                let v = take_arg(&keyed, values, &mut arg)?.clone();
                 let mut s = interp.str_of(&v)?;
                 if let Some(p) = precision {
                     s = s.chars().take(p).collect();
@@ -8882,7 +8952,7 @@ fn printf_format(interp: &mut Interpreter, fmt: &str, values: &[Value]) -> Resul
                 s
             }
             'r' => {
-                let v = next_arg(&mut arg)?.clone();
+                let v = take_arg(&keyed, values, &mut arg)?.clone();
                 let mut s = interp.repr_of(&v)?;
                 if let Some(p) = precision {
                     s = s.chars().take(p).collect();
@@ -8890,7 +8960,7 @@ fn printf_format(interp: &mut Interpreter, fmt: &str, values: &[Value]) -> Resul
                 s
             }
             'c' => {
-                let v = next_arg(&mut arg)?;
+                let v = take_arg(&keyed, values, &mut arg)?;
                 match v {
                     Value::Str(s) => s.chars().next().map(String::from).unwrap_or_default(),
                     other => {
@@ -8902,7 +8972,7 @@ fn printf_format(interp: &mut Interpreter, fmt: &str, values: &[Value]) -> Resul
                 }
             }
             'd' | 'i' => {
-                let v = next_arg(&mut arg)?;
+                let v = take_arg(&keyed, values, &mut arg)?;
                 let iv = v.to_bigint()?;
                 printf_signed(
                     &iv.abs().to_str_radix(10),
@@ -8912,7 +8982,7 @@ fn printf_format(interp: &mut Interpreter, fmt: &str, values: &[Value]) -> Resul
                 )
             }
             'x' | 'X' | 'o' => {
-                let v = next_arg(&mut arg)?;
+                let v = take_arg(&keyed, values, &mut arg)?;
                 let iv = v.to_bigint()?;
                 let neg = iv.is_negative();
                 let abs = iv.abs();
@@ -8932,7 +9002,7 @@ fn printf_format(interp: &mut Interpreter, fmt: &str, values: &[Value]) -> Resul
                 printf_signed(&digits, neg, flag_plus, flag_space)
             }
             'f' | 'F' | 'e' | 'E' | 'g' | 'G' => {
-                let v = next_arg(&mut arg)?;
+                let v = take_arg(&keyed, values, &mut arg)?;
                 let x = v.to_float()?;
                 let p = precision.unwrap_or(6);
                 let neg = x.is_sign_negative() && x != 0.0;

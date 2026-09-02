@@ -60,8 +60,13 @@ bodies run lazily whether or not they are `async`, so a context
 manager's teardown runs *after* the `with` body instead of at the call.
 Alongside: set comparison as subset / superset, PEP 584 `d1 | d2`, and
 value-mixin enum members behaving as their value under arithmetic,
-`int()` and flag membership. **The
-differential baseline falls from 167 entries to 54.**
+`int()` and flag membership. A fourth closed the deferred-binding and
+last-mile-builtin gaps: a module-level `lazy let` now defers to first
+*use* (running its initialiser at the binding raised `NameError` when the
+helper was defined lower in the file), `%(key)s` printf conversions read
+a mapping, `sys.modules` always carries `__main__`, and `eval` of a
+single expression exists. **The
+differential baseline falls from 167 entries to 43.**
 
 **Checking a module is linear in its definitions again.** Every branch,
 `try` and loop clones the whole `TypeEnv`, and each clone deep-copied every
@@ -483,7 +488,7 @@ additive on correct programs except the one marked **narrowing**.
 
 Everything that review deferred is closed by the beta wave above, except
 the VM's eager generator expressions and the thin `re` shim, which remain
-in `scripts/differential-baseline.txt` — the 54 entries there are the
+in `scripts/differential-baseline.txt` — the 43 entries there are the
 honest list of what the VM still gets wrong, and each one is a bug.
 
 ## 1.0.0-alpha.9 — 2026-08-21 — maintenance: secret-name lint expansion, allocation reductions & dependency wave

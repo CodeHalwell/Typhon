@@ -773,6 +773,38 @@ pub fn install(interp: &mut Interpreter) {
         }
     });
 
+    // `eval(source)` — parse the string as a Python *expression* and
+    // evaluate it. The VM has no frame introspection, so names resolve
+    // against the module globals rather than the caller's locals: enough
+    // for the calculator / expression-evaluator idiom `eval` is reached
+    // for, and a `NameError` (as in CPython) for anything that needed a
+    // local. `exec` is deliberately absent — it would need statement
+    // execution against a caller frame the VM cannot see.
+    native!("eval", |i, args| {
+        let (pos, _kw) = split_kwargs(&args);
+        let Some(Value::Str(src)) = pos.first() else {
+            return Err(type_error(
+                "eval() arg 1 must be a string, bytes or code object",
+            ));
+        };
+        let source = src.trim().to_owned();
+        let module = tyc_syntax::parse_module(&source).map_err(|e| {
+            crate::error::Unwind::Exception(crate::error::VmException::new(
+                "SyntaxError",
+                format!("invalid syntax: {e}"),
+            ))
+        })?;
+        let module = module.into_syntax();
+        let [ruff_python_ast::Stmt::Expr(expr)] = module.body.as_slice() else {
+            return Err(crate::error::Unwind::Exception(
+                crate::error::VmException::new("SyntaxError", "eval() takes a single expression"),
+            ));
+        };
+        let expr = expr.value.clone();
+        let env = i.root.clone();
+        i.eval_expr(&expr, &env)
+    });
+
     native!("bytearray", |i, args| {
         let (pos, kw) = split_kwargs(&args);
         let cls = bytearray_class(i)?;
@@ -2185,6 +2217,7 @@ mod shims {
     pub const CSV: &str = include_str!("shims/csv.py");
     pub const FUNCTOOLS_EXTRA: &str = include_str!("shims/functools_extra.py");
     pub const BYTEARRAY: &str = include_str!("shims/bytearray.py");
+    pub const LAZY: &str = include_str!("shims/lazy.py");
 }
 
 fn compile_helpers(interp: &mut Interpreter, source: &str) -> Result<Vec<(String, Value)>, Unwind> {
@@ -2481,6 +2514,12 @@ pub(crate) fn namedtuple_base_class(interp: &mut Interpreter) -> Result<Value, U
 /// The `bytearray` class, cached. `Value::Bytes` is immutable, so the
 /// mutable sibling is a shim class whose `__typhon_builtin_bases__` marks
 /// it as a `bytearray` for `isinstance`.
+/// The `lazy let` proxy class, cached. Mirrors the emitted runtime's
+/// `_LazyValue`: the factory runs on first *use*, not at the binding.
+fn lazy_value_class(interp: &mut Interpreter) -> Result<Value, Unwind> {
+    cached_helper_class(interp, "__shim_lazy_value__", shims::LAZY, "_LazyValue")
+}
+
 pub(crate) fn bytearray_class(interp: &mut Interpreter) -> Result<Value, Unwind> {
     cached_helper_class(interp, "__shim_bytearray__", shims::BYTEARRAY, "bytearray")
 }
@@ -2743,8 +2782,15 @@ fn make_typhon_runtime_module(interp: &Interpreter) -> Value {
             (
                 "lazy_let",
                 nf("lazy_let", |i, args| {
+                    // The factory must NOT run here: `lazy let X = helper()`
+                    // at module level is lowered above the `def helper`, so
+                    // calling it eagerly failed with `NameError` on a
+                    // program `tyc build` runs fine. Hand back the same
+                    // materialise-on-first-use proxy the emitted runtime
+                    // uses.
                     let f = args.into_iter().next().unwrap_or(Value::None);
-                    i.call_value(f, vec![], &[])
+                    let cls = lazy_value_class(i)?;
+                    i.call_value(cls, vec![f], &[])
                 }),
             ),
             (
@@ -4321,6 +4367,13 @@ fn make_glob_module(interp: &mut Interpreter) -> Result<Value, Unwind> {
 /// not modules and are filtered out.
 pub(crate) fn sys_modules_dict(interp: &Interpreter) -> Value {
     let mut map = crate::value::DictMap::new();
+    // CPython always has the entry module here, under the name it runs as.
+    // A program checking `"__main__" in sys.modules` (or reaching for it to
+    // find its own globals) got a `KeyError`.
+    map.insert(
+        HashKey::Str(Rc::new("__main__".to_owned())),
+        make_module("__main__", vec![]),
+    );
     let mut names: Vec<&String> = interp
         .module_cache
         .keys()

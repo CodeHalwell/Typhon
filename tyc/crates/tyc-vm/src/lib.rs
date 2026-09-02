@@ -4565,6 +4565,43 @@ main()
         assert_eq!(run_capturing(src).unwrap(), 0);
     }
 
+    /// `lazy let` must defer to first *use*, `%(key)s` must read a mapping,
+    /// `sys.modules` must carry `__main__`, and `eval` must exist.
+    #[test]
+    fn deferred_binding_and_the_remaining_builtins_match_cpython() {
+        let src = r#"
+import sys
+
+lazy let SLOW: int = expensive()
+
+def expensive() -> int:
+    log.append("computed")
+    return 42
+
+mut log: list[str] = []
+
+def main() -> None:
+    # The initialiser is lowered above `def expensive`, so running it at the
+    # binding raised `NameError` on a program `tyc build` runs fine.
+    if log != []:
+        raise AssertionError("lazy let must not run its factory at the binding")
+    if SLOW != 42 or SLOW + 1 != 43 or str(SLOW) != "42":
+        raise AssertionError("lazy let value wrong")
+    if log != ["computed"]:
+        raise AssertionError("lazy let must materialise exactly once: " + str(log))
+
+    if "%(a)s-%(b)d" % {"a": "x", "b": 2} != "x-2":
+        raise AssertionError("printf mapping key wrong")
+    if "__main__" not in sys.modules:
+        raise AssertionError("sys.modules must carry the entry module")
+    if eval("1 + 2") != 3 or eval("'a' * 3") != "aaa":
+        raise AssertionError("eval wrong")
+
+main()
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
     /// The async iteration and context-manager protocols, and the enum /
     /// set / dict operator corners a real program reaches.
     #[test]
