@@ -322,6 +322,18 @@ string literal is still just text. Two stress units in the corpus were
 written against the form and had been sitting in the non-building baseline
 because of it.
 
+And four more shim corners: `b32decode` stripped padding without checking
+it, so `b32decode(b"A")` returned `b""` and an unpadded `b"MY"` returned
+`b"f"` where CPython raises — base32 is written in eight-character quanta
+with five legal padding shapes, and anything else is malformed.
+`itertools.groupby` compared keys by *identity* when the caller advanced the
+outer iterator without draining a subgroup, so a key function returning a
+fresh object per item (`key=lambda x: [x]`) split one group into several.
+`itertools.product` accepted a negative `repeat`, yielding a single empty
+tuple. And `Path.touch(mode=0o600)` discarded its mode, creating the file
+`0644` under the usual umask — the mode now applies to a file the call
+creates, leaving an existing one's permissions alone, as CPython does.
+
 **A prelude name that only the VM could resolve.** `BaseModel` and
 `NewType` resolve without an import — the `model` and `newtype` lowerings
 introduce them — so naming either directly passes `tyc check`. Their

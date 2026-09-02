@@ -181,7 +181,14 @@ def b32decode(s, casefold=False):
         s = s.decode("ascii")
     if casefold:
         s = s.upper()
+    # Base32 is written in eight-character quanta, and only five padding
+    # shapes are reachable (0, 1, 3, 4 or 6 `=`). Anything else is malformed,
+    # where the old decoder just returned whatever whole bytes it had.
+    if len(s) % 8 != 0:
+        raise Error("Incorrect padding")
     stripped = s.rstrip("=")
+    if (len(s) - len(stripped)) not in (0, 1, 3, 4, 6):
+        raise Error("Incorrect padding")
     index = {}
     i = 0
     for ch in _B32:

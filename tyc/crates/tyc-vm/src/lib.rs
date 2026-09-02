@@ -2887,6 +2887,35 @@ def main() -> None:
         raise ValueError("mixing str and bytes should be refused")
     except TypeError as e:
         check("bytes-mix", str(e), "Can't mix strings and bytes in path components")
+
+    # Base32 is written in eight-character quanta with five legal padding
+    # shapes; anything else is malformed rather than half-decodable.
+    check("b32-ok", str(base64.b32decode(b"MZXW6===")), "b'foo'")
+    check("b32-casefold", str(base64.b32decode(b"mzxw6===", casefold=True)), "b'foo'")
+    for bad in [b"A", b"MY", b"MZXW6Y==", b"========", b"MZXW6YTBO==="]:
+        try:
+            let _ = base64.b32decode(bad)
+            raise ValueError("b32decode should refuse " + str(bad))
+        except ValueError as e:
+            check("b32-" + str(bad), str(e), "Incorrect padding")
+
+    # `groupby` compares keys by equality, so a fresh key object per item
+    # still collapses into one group.
+    check("groupby-eq", str([k for k, _ in itertools.groupby([1, 1], key=lambda x: [x])]), "[[1]]")
+    check("groupby-runs", str([(k, list(g)) for k, g in itertools.groupby([1, 1, 2, 1])]), "[(1, [1, 1]), (2, [2]), (1, [1])]")
+    try:
+        let _ = list(itertools.product("ab", repeat=-1))
+        raise ValueError("product should refuse a negative repeat")
+    except ValueError as e:
+        check("product-negative", str(e), "repeat argument cannot be negative")
+
+    # `Path.touch` applies its mode to a file it creates, and leaves an
+    # existing one's permissions alone.
+    let touched: pathlib.Path = pathlib.Path("touched.txt")
+    touched.touch(mode=0o600)
+    check("touch-mode", oct(os.stat("touched.txt").st_mode & 0o777), "0o600")
+    touched.touch()
+    check("touch-again", oct(os.stat("touched.txt").st_mode & 0o777), "0o600")
     print("ok")
 
 

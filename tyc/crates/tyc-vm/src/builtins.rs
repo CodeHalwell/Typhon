@@ -4362,7 +4362,17 @@ fn fs_natives() -> Vec<(&'static str, Value)> {
                     _ => None,
                 };
                 if !p.exists() {
-                    std::fs::File::create(p).map_err(|e| fs_unwind(&display, e))?;
+                    // A creation mode may be requested (`Path.touch(mode=)`);
+                    // setting it in the open is what makes an owner-only file
+                    // owner-only from the start.
+                    let mut opts = std::fs::OpenOptions::new();
+                    opts.write(true).create(true);
+                    #[cfg(unix)]
+                    if let Some(mode) = args.get(3).and_then(|v| v.to_int().ok()) {
+                        use std::os::unix::fs::OpenOptionsExt;
+                        opts.mode(mode as u32);
+                    }
+                    opts.open(p).map_err(|e| fs_unwind(&display, e))?;
                 }
                 // A directory can never be opened for writing, and its
                 // timestamps are still settable through a read-only handle.

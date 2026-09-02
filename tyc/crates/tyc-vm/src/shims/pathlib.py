@@ -639,7 +639,9 @@ class Path(PurePosixPath):
     def touch(self, mode=0o666, exist_ok=True):
         if not exist_ok and self.exists():
             raise FileExistsError(17, "File exists", self._str)
-        _fs_touch(self._str)
+        # `mode` applies to a file this call *creates*; an existing one keeps
+        # the permissions it has and only its timestamps move.
+        _fs_touch(self._str, None, None, mode)
 
     def mkdir(self, mode=0o777, parents=False, exist_ok=False):
         try:

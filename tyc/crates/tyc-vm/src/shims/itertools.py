@@ -114,7 +114,10 @@ class groupby:
 
     def __next__(self):
         self._id += 1
-        while self._currkey is self._tgtkey:
+        # Keys are compared by *equality*, as CPython does: advancing the
+        # outer iterator without draining a subgroup must still skip the rest
+        # of it when the key is a fresh object each time (`key=lambda x: [x]`).
+        while self._currkey == self._tgtkey:
             try:
                 self._currvalue = next(self._it)
             except StopIteration:
@@ -230,6 +233,8 @@ def zip_longest(*iterables, fillvalue=None):
 
 
 def product(*iterables, repeat=1):
+    if repeat < 0:
+        raise ValueError("repeat argument cannot be negative")
     pools = [tuple(pool) for pool in iterables] * repeat
     result = [[]]
     for pool in pools:
