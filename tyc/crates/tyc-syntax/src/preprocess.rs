@@ -5919,6 +5919,7 @@ fn expand_question_ops_inner(source: &str) -> (String, Vec<usize>) {
     let mut counter = 0usize;
     let mut in_string: Option<StringMode> = None;
     let mut needs_err_alias_import = false;
+    let entry_brackets = q_contexts(source);
 
     for (line_index, line) in source.split_inclusive('\n').enumerate() {
         result.mark(line_index);
@@ -5989,6 +5990,27 @@ fn expand_question_ops_inner(source: &str) -> (String, Vec<usize>) {
         let before_q = &content[..content.len() - 1];
         let last_ch = before_q.chars().last();
         let trailing_is_close_paren = matches!(last_ch, Some(')'));
+        // A trailing `?` that closes a parameter annotation on the
+        // continuation line of a wrapped `def` header
+        // (`    x: int = 1, b: str?`) is nullable sugar, not propagation.
+        // The `find_assignment_eq` split below sees only the FIRST `=` on
+        // the line and reads everything after it as a value, so it called
+        // this one propagation and lowered a valid signature to nonsense.
+        if !trailing_is_close_paren
+            && question_is_parameter_annotation(
+                content,
+                content.len() - 1,
+                &compute_in_string_mask(content),
+                entry_brackets
+                    .get(line_index)
+                    .copied()
+                    .unwrap_or_default()
+                    .bracket,
+            )
+        {
+            result.push_str(line);
+            continue;
+        }
         if !trailing_is_close_paren {
             // We're at `<expr>?` where <expr> ends with an identifier, `]`,
             // or `_`. Decide whether this is value-position propagation or
@@ -6184,7 +6206,7 @@ const ONE_LINER_HEADERS: &[&str] = &[
 
 /// Does the code portion of a line carry a *propagating* `)?` outside any
 /// string literal? (`T?` nullable sugar never follows a `)`.)
-fn code_has_propagation_q(code: &str) -> bool {
+fn code_has_propagation_q(code: &str, ctx: QContext<'_>) -> bool {
     let mask = compute_in_string_mask(code);
     let bytes = code.as_bytes();
     (1..bytes.len()).any(|i| {
@@ -6194,7 +6216,7 @@ fn code_has_propagation_q(code: &str) -> bool {
         let prev = bytes[i - 1];
         prev == b')'
             || ((prev == b']' || is_ident_byte(prev))
-                && !question_is_type_position(code, i, &mask)
+                && !question_is_type_position(code, i, &mask, ctx)
                 && operand_start(code, i).is_some())
     })
 }
@@ -6299,6 +6321,7 @@ pub fn expand_question_one_liners(source: &str) -> String {
 pub fn expand_question_one_liners_mapped(source: &str) -> (String, Vec<usize>) {
     let mut out = MappedOut::with_capacity(source.len() + 64);
     let mut in_string: Option<StringMode> = None;
+    let entry_brackets = q_contexts(source);
     for (line_index, line) in source.split_inclusive('\n').enumerate() {
         out.mark(line_index);
         let raw = line.trim_end_matches(['\n', '\r']);
@@ -6312,7 +6335,8 @@ pub fn expand_question_one_liners_mapped(source: &str) -> (String, Vec<usize>) {
         // The trailing comment keeps the whitespace that separated it.
         let comment = raw[code.len()..].trim_end();
         let nl = if line.ends_with('\n') { "\n" } else { "" };
-        if !code_has_propagation_q(code) {
+        let carried = entry_brackets.get(line_index).copied().unwrap_or_default();
+        if !code_has_propagation_q(code, carried) {
             out.push_str(line);
             continue;
         }
@@ -6419,7 +6443,7 @@ fn rewrite_first_compound_question_header(source: &str) -> Option<(String, Vec<u
             continue;
         }
         // Only a *propagating* `?` matters; `T?` nullable sugar is not one.
-        if find_first_inline_propagation_q(code).is_none() {
+        if find_first_inline_propagation_q(code, QContext::default()).is_none() {
             continue;
         }
         let indent = indent_width(line);
@@ -6626,12 +6650,14 @@ fn expand_inline_question_ops_split(source: &str) -> (String, Vec<usize>) {
     let mut counter = 0usize;
     let mut in_string: Option<StringMode> = None;
     let mut needs_err_alias_import = false;
+    let entry_brackets = q_contexts(source);
 
     for (line_index, line) in source.split_inclusive('\n').enumerate() {
         out.mark(line_index);
         let raw = line.trim_end_matches(['\n', '\r']);
         let pre_string = in_string;
         let code_end = scan_line_code_end(raw, &mut in_string);
+        let carried = entry_brackets.get(line_index).copied().unwrap_or_default();
 
         // Lines that begin inside a triple-quoted string have no
         // executable code on this row — emit verbatim.
@@ -6644,7 +6670,7 @@ fn expand_inline_question_ops_split(source: &str) -> (String, Vec<usize>) {
         let comment = &raw[code_end..];
         let nl = if line.ends_with('\n') { "\n" } else { "" };
 
-        match rewrite_inline_question_ops_one_line(content, &mut counter) {
+        match rewrite_inline_question_ops_one_line(content, &mut counter, carried) {
             Some((rewritten, lifted)) => {
                 for l in lifted {
                     out.push_str(&l);
@@ -6676,6 +6702,7 @@ fn expand_inline_question_ops_split(source: &str) -> (String, Vec<usize>) {
 fn rewrite_inline_question_ops_one_line(
     content: &str,
     counter: &mut usize,
+    ctx: QContext<'_>,
 ) -> Option<(String, Vec<String>)> {
     let indent_len = content
         .find(|c: char| !c.is_whitespace())
@@ -6685,7 +6712,7 @@ fn rewrite_inline_question_ops_one_line(
     let mut lifted: Vec<String> = Vec::new();
     let mut current = content.to_owned();
 
-    while let Some(q_pos) = find_first_inline_propagation_q(&current) {
+    while let Some(q_pos) = find_first_inline_propagation_q(&current, ctx) {
         // The operand is a call, a subscript or a dotted name; a
         // parenthesised expression (`(a + b)?`) is skipped so the diagnostic
         // stays crisp instead of emitting an `(a + b).value` that runs but
@@ -6732,7 +6759,7 @@ fn rewrite_inline_question_ops_one_line(
 /// When the call *is* the whole value (`x = parse(a)?`, `return f()?`), the
 /// trailing `?` is left to the end-of-line pass (preserving its temp naming and
 /// `return`/`yield`/`rescue` handling).
-fn find_first_inline_propagation_q(s: &str) -> Option<usize> {
+fn find_first_inline_propagation_q(s: &str, ctx: QContext<'_>) -> Option<usize> {
     let trimmed_end = s.trim_end().len();
     let bytes = s.as_bytes();
     // Reuse the central in-string mask so triple-quoted strings (`"""…"""`,
@@ -6751,7 +6778,7 @@ fn find_first_inline_propagation_q(s: &str) -> Option<usize> {
         // `]` or an identifier the same `?` is more often `T?` sugar.
         let after_operand = prev == b']' || is_ident_byte(prev);
         let propagating =
-            after_call || (after_operand && !question_is_type_position(s, i, &in_str_mask));
+            after_call || (after_operand && !question_is_type_position(s, i, &in_str_mask, ctx));
         if !propagating {
             continue;
         }
@@ -6849,7 +6876,30 @@ fn find_matching_open(s: &str, close_pos: usize, open: u8, close: u8) -> Option<
 /// top-level `:` and the top-level `=`. Everything else — the right-hand side
 /// of an assignment, a call argument, a `return` value, an operand — is value
 /// position.
-fn question_is_type_position(code: &str, q_pos: usize, mask: &[bool]) -> bool {
+fn question_is_type_position(code: &str, q_pos: usize, mask: &[bool], ctx: QContext<'_>) -> bool {
+    // A continuation line carries no keyword of its own, so the head of its
+    // logical line answers first: `type Provider = Callable[` opens a type
+    // expression that runs for several lines, and every `?` inside it is
+    // nullable sugar. Without this, the second line of a wrapped type alias
+    // read as a value and lowered to a propagation guard.
+    if let Some(head) = ctx.head {
+        let head_code = head.trim_end_matches(['\n', '\r']);
+        let head_trimmed = head_code.trim_start();
+        let after_pub = head_trimmed
+            .strip_prefix("pub ")
+            .unwrap_or(head_trimmed)
+            .trim_start();
+        let word = after_pub
+            .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+            .next()
+            .unwrap_or("");
+        if matches!(word, "type" | "newtype")
+            || after_pub.starts_with("def ")
+            || after_pub.starts_with("async def ")
+        {
+            return true;
+        }
+    }
     let trimmed = code.trim_start();
     // `pub` is a visibility modifier that stacks with `type` / `newtype` /
     // `def`; look past it (`pub type Pick = Callable[[A], B?]`).
@@ -6890,7 +6940,208 @@ fn question_is_type_position(code: &str, q_pos: usize, mask: &[bool]) -> bool {
             return true;
         }
     }
-    false
+    // Inside a parameter list the physical line is a *run* of `name: type`
+    // elements, not one binding, and the whole-line span above only ever
+    // sees the first: on `a: int? = None, b: int? = None` it stops at the
+    // first `=`, so every later `?` read as a propagation operator and the
+    // wrapped signature lowered to nonsense. Scope the same test to the
+    // comma-delimited element the `?` actually sits in.
+    //
+    // Only a `(` qualifies. `name: value` inside `{}` is a dict display and
+    // inside `[]` a subscript, where a `?` on a bare name really is a
+    // propagation (`{"k": self.cache?}`) — narrowing to parentheses keeps
+    // those working, since a `name: type` element is only ever a parameter.
+    // Module level: a `?` propagation lowers to a `return`, so outside any
+    // function it is never that operator — and inside a subscript there it
+    // is a type expression. Python's legacy type-alias form
+    // (`Provider = Callable[[str, int?], int]`, which `tyc migrate` emits
+    // for an `Optional` inside one) was lowered to a module-level guard
+    // whose `return` CPython rejects at import time.
+    if ctx.head_indent == 0
+        && matches!(
+            enclosing_list_element(code, q_pos, mask, ctx.bracket),
+            Some((b'[', _, _))
+        )
+    {
+        return true;
+    }
+    question_is_parameter_annotation(code, q_pos, mask, ctx.bracket)
+}
+
+/// Is the `?` at `q_pos` the nullable suffix of a *parameter* annotation —
+/// one element of a parenthesised list, as in the continuation line of a
+/// wrapped `def` header?
+///
+/// The whole-line annotation span cannot see this: on
+/// `a: int? = None, b: int? = None` it stops at the first `=`, so every
+/// later `?` read as a propagation operator and a wrapped signature lowered
+/// to nonsense. Scoping the same `colon < q < eq` test to the comma-
+/// delimited element the `?` sits in answers it correctly.
+///
+/// Only a `(` qualifies. `name: value` inside `{}` is a dict display and
+/// inside `[]` a subscript, where a `?` on a bare name really is a
+/// propagation (`{"k": self.cache?}`) — narrowing to parentheses keeps those
+/// working, since a `name: type` element is only ever a parameter.
+fn question_is_parameter_annotation(
+    code: &str,
+    q_pos: usize,
+    mask: &[bool],
+    carried_bracket: Option<u8>,
+) -> bool {
+    let Some((b'(', start, end)) = enclosing_list_element(code, q_pos, mask, carried_bracket)
+    else {
+        return false;
+    };
+    let Some((colon, eq)) = annotation_span(&code[start..end], &mask[start..end]) else {
+        return false;
+    };
+    let rel = q_pos - start;
+    rel > colon && eq.is_none_or(|e| rel < e)
+}
+
+/// The innermost open bracket carried into each physical line, if any.
+///
+/// A `?` on a line that *continues* a bracketed construct cannot be
+/// classified from that line alone. `a: int? = None, b: int? = None` reads
+/// as one annotated binding followed by junk, but inside a `(` it is a
+/// parameter list where every comma-separated element carries its own
+/// annotation. Which bracket is open is what tells the two apart, and it
+/// lives on an earlier line, so it is computed once per source here.
+fn line_entry_brackets(source: &str) -> Vec<QLineContext> {
+    let mut stack: Vec<u8> = Vec::new();
+    let mut in_string: Option<StringMode> = None;
+    let mut out: Vec<QLineContext> = Vec::new();
+    let mut head = 0usize;
+    for (index, line) in source.split_inclusive('\n').enumerate() {
+        if stack.is_empty() && in_string.is_none() {
+            head = index;
+        }
+        out.push(QLineContext {
+            bracket: stack.last().copied(),
+            head_line: head,
+        });
+        let kinds = crate::lexmask::scan_line_kinds(line, &mut in_string);
+        for (i, b) in line.bytes().enumerate() {
+            if !matches!(kinds.get(i), Some(ByteKind::Code)) {
+                continue;
+            }
+            match b {
+                b'(' | b'[' | b'{' => stack.push(b),
+                b')' | b']' | b'}' => {
+                    stack.pop();
+                }
+                _ => {}
+            }
+        }
+    }
+    out
+}
+
+/// What a physical line inherits from the ones before it, for the purpose of
+/// classifying a `?` on it.
+#[derive(Clone, Copy)]
+struct QLineContext {
+    /// The innermost bracket open across the line's left edge.
+    bracket: Option<u8>,
+    /// Index of the physical line that *starts* this logical line.
+    head_line: usize,
+}
+
+/// The `?` classifier's view of the lines around the one being rewritten.
+#[derive(Clone, Copy, Default)]
+struct QContext<'a> {
+    /// The innermost bracket open across this line's left edge.
+    bracket: Option<u8>,
+    /// The first physical line of this logical line, when that is a
+    /// *different* line — the keyword that decides whether a `?` is a type
+    /// or a value lives there (`type Provider = Callable[` opens a type
+    /// expression that continues for several lines), and the continuation
+    /// line on its own carries no trace of it.
+    head: Option<&'a str>,
+    /// Indentation of the line that starts this logical line. Zero means
+    /// module level, where a `?` propagation is never legal — it lowers to
+    /// a `return`, which needs a function around it.
+    head_indent: usize,
+}
+
+/// Per-line `?` context for `source`, indexed by physical line.
+fn q_contexts(source: &str) -> Vec<QContext<'_>> {
+    let lines: Vec<&str> = source.split_inclusive('\n').collect();
+    line_entry_brackets(source)
+        .into_iter()
+        .enumerate()
+        .map(|(i, ctx)| {
+            let head = lines[ctx.head_line];
+            QContext {
+                bracket: ctx.bracket,
+                head: (ctx.head_line != i).then_some(head),
+                head_indent: head.len() - head.trim_start().len(),
+            }
+        })
+        .collect()
+}
+
+/// The innermost bracket enclosing `q_pos` and the comma-delimited element
+/// it sits in, as `(bracket, element_start, element_end)`.
+///
+/// `carried` is the bracket open across the line's left edge, used when the
+/// `?` sits at the line's own depth zero — i.e. on a continuation line.
+/// `None` when nothing encloses it.
+fn enclosing_list_element(
+    code: &str,
+    q_pos: usize,
+    mask: &[bool],
+    carried: Option<u8>,
+) -> Option<(u8, usize, usize)> {
+    let bytes = code.as_bytes();
+    // Walk to `q_pos`, tracking the open brackets and, per level, where the
+    // current comma-separated element began.
+    let mut stack: Vec<(u8, usize)> = Vec::new();
+    let mut top_level_start = 0usize;
+    for i in 0..q_pos.min(bytes.len()) {
+        if mask[i] {
+            continue;
+        }
+        match bytes[i] {
+            b'(' | b'[' | b'{' => stack.push((bytes[i], i + 1)),
+            b')' | b']' | b'}' => {
+                stack.pop();
+            }
+            b',' => match stack.last_mut() {
+                Some(top) => top.1 = i + 1,
+                None => top_level_start = i + 1,
+            },
+            _ => {}
+        }
+    }
+    let (bracket, start) = match stack.last() {
+        Some(&(b, s)) => (b, s),
+        None => (carried?, top_level_start),
+    };
+    // The element ends at the next `,` or the bracket that closes this level.
+    let mut depth = 0i32;
+    let mut end = code.len();
+    for i in q_pos..bytes.len() {
+        if mask[i] {
+            continue;
+        }
+        match bytes[i] {
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => {
+                if depth == 0 {
+                    end = i;
+                    break;
+                }
+                depth -= 1;
+            }
+            b',' if depth == 0 => {
+                end = i;
+                break;
+            }
+            _ => {}
+        }
+    }
+    Some((bracket, start, end.max(start)))
 }
 
 /// The last `:` at bracket depth zero outside strings (a `def` header's colon).
@@ -12482,6 +12733,84 @@ def f() -> None:
             "expected no errors, got: {:?}",
             errs.iter().map(|e| &e.message).collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn nullable_params_survive_a_wrapped_def_header() {
+        // The `?` classifier worked on the physical line, and on a
+        // continuation line `a: int? = None, b: int? = None` the whole-line
+        // annotation span stops at the FIRST `=` — so every later `?` read
+        // as the propagation operator and a wrapped signature lowered to a
+        // guard whose `return` sits in the middle of a parameter list.
+        // `_pyrepl.windows_console` in CPython's own stdlib has one.
+        let sources = [
+            "def scroll(\n    top: int, left: int? = None, right: int? = None\n) -> None:\n    pass\n",
+            "def f(\n    self, a: int? = None\n) -> None:\n    pass\n",
+            "def g(\n    m: dict[str, int?], n: int = 0\n) -> None:\n    pass\n",
+        ];
+        for src in sources {
+            let out = expand_sugar(src, true);
+            assert!(
+                !out.contains("__typhon_qi_"),
+                "a parameter annotation is not a propagation:\n{src}-> {out}"
+            );
+            assert!(
+                crate::parse_module(&preprocess(&out).python_source).is_ok(),
+                "wrapped signature must parse:\n{src}-> {out}"
+            );
+        }
+    }
+
+    #[test]
+    fn nullable_survives_a_wrapped_type_alias() {
+        // A continuation line carries no keyword of its own, so the `type`
+        // that makes the whole statement a type expression has to be read
+        // off the head of the logical line.
+        let src = "type Prov = Callable[\n    [str, int?], int\n]\n";
+        let out = expand_sugar(src, true);
+        assert!(!out.contains("__typhon_qi_"), "got: {out}");
+        assert!(
+            crate::parse_module(&preprocess(&out).python_source).is_ok(),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn module_level_subscript_nullable_is_never_a_propagation() {
+        // Python's legacy type-alias form. A propagation lowers to a
+        // `return`, which at module level CPython rejects outright — so a
+        // `?` inside a subscript there can only be nullable sugar. This
+        // used to emit a module-level `return` and the build produced a
+        // file that would not import.
+        for src in [
+            "Prov = Callable[[str, int?], int]\n",
+            "Prov = Callable[\n    [str, int?], int\n]\n",
+            "Alias = dict[str, int?]\n",
+        ] {
+            let out = expand_sugar(src, true);
+            assert!(!out.contains("return __typhon_qi_"), "{src}-> {out}");
+            assert!(
+                crate::parse_module(&preprocess(&out).python_source).is_ok(),
+                "{out}"
+            );
+        }
+    }
+
+    #[test]
+    fn value_propagation_still_lowers_after_the_wrapped_signature_fix() {
+        // The narrowing above must not swallow a real propagation.
+        let cases = [
+            "def go() -> Result[int, str]:\n    let v: int = a?\n    return Ok(v)\n",
+            "def go() -> Result[int, str]:\n    let t: int = sum([p(\"ab\")?, p(\"c\")?])\n    return Ok(t)\n",
+            "def go() -> Result[int, str]:\n    return Ok(d[k]?)\n",
+        ];
+        for src in cases {
+            let out = expand_sugar(src, true);
+            assert!(
+                out.contains("__typhon_q"),
+                "a value-position `?` must still lower:\n{src}-> {out}"
+            );
+        }
     }
 
     #[test]

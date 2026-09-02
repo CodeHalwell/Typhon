@@ -388,6 +388,58 @@ build byte-identically before and after, with nine files differing only
 in a `__typhon_guard_N` temporary whose number is derived from a line
 that moved.
 
+**A wrapped `def` signature could not carry a nullable parameter.** Found by
+running `tyc migrate` over the hosting CPython's whole `lib/python3.13`
+tree and asking whether the result parses. It didn't, 78 files out of
+1,114 — and the largest cluster was not a migrator bug at all:
+
+```typhon
+def scroll(
+    top: int, bottom: int, left: int? = None, right: int? = None
+) -> None:
+```
+
+`tyc check` rejected that. The `?` classifier ran on the *physical* line,
+and a continuation line's whole-line annotation span stops at the first
+`=` — so every later `?` read as the propagation operator and the
+signature lowered to a guard whose `return` sits mid-parameter-list. Three
+narrowings fix it, all of them additive (they can only turn a `?` the
+compiler called a value into a type, never the reverse). A `?` in a
+comma-separated element of a **parenthesised** list is a parameter
+annotation, scoped to that element rather than the line — parentheses only,
+so `{"k": self.cache?}` in a dict display keeps propagating. A continuation
+line now also reads the **head of its logical line**, which is where the
+`type` / `def` keyword that settles the question lives (`type Provider =
+Callable[` opens a type expression that runs for several lines). And at
+**module level** a `?` inside a subscript is always nullable sugar, because
+a propagation lowers to a `return` and there is no function there to return
+from — `Provider = Callable[[str, int?], int]`, Python's legacy type-alias
+form, used to *build* and then fail at import with a `return` outside a
+function.
+
+**Four more in `tyc migrate` itself, three of them corruption.** The
+rewrite loop counted brackets but tracked no strings, so docstring prose
+was read as code: a bullet whose item was `like:` on its own line came back
+as `let like:` (CPython's `importlib.metadata` has one), and an unbalanced
+bracket inside a docstring knocked the continuation flag out of step for
+the rest of the file. The `impl`-relocation seeded its bracket depth from
+an item's *first* line, so when the item began at a decorator the depth
+stayed zero through `def discover(` and the `) -> T:` closing the signature
+was read as the end of the item — the method's own body left orphaned in
+the class body. The same scan treated a docstring line at column zero (a
+backslash continuation puts one there) as the end of the item, splitting
+the literal in two. Migrate now shares the crate's single lexical scanner
+for all three, and its two private ones are gone. Separately,
+`@dataclass(frozen=True)` on a class *with a base* emitted `class X(Base)
+frozen:`, which is not the form the preprocessor accepts — the modifier
+binds to the name, ahead of the bases. And when a rewrite deleted the only
+statement of a block (a `Protocol` import that `interface` made dead), the
+header was left with no suite; a repair pass puts `pass` under it.
+
+1,110 of the 1,114 stdlib and site-packages files now migrate to source
+that parses, up from 1,036. The four that don't are deeply
+metaprogrammed (`typing_extensions`, `pkg_resources`, `yaml.resolver`).
+
 **A prelude name that only the VM could resolve.** `BaseModel` and
 `NewType` resolve without an import — the `model` and `newtype` lowerings
 introduce them — so naming either directly passes `tyc check`. Their

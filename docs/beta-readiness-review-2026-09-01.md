@@ -505,6 +505,44 @@ with every gate green at each step.
   precondition for ever adding `tyc fmt --check` to CI — but it is a style
   call, not a correctness one.
 
+- **Nobody had run `tyc migrate` over a real Python corpus either.** The
+  review fixed the panic it found by hand; a sweep of the hosting CPython's
+  whole `lib/python3.13` tree (1,114 files, stdlib plus site-packages)
+  asked the next question — does the output parse? — and 78 did not. The
+  biggest cluster was not the migrator's fault at all but a **compiler**
+  gap: a wrapped `def` header could not carry a nullable parameter, because
+  the `?` classifier worked on the physical line and a continuation line's
+  whole-line annotation span stops at the first `=`. `def scroll(\n  top:
+  int, left: int? = None, right: int? = None\n) -> None:` — as ordinary a
+  signature as exists — was rejected by `tyc check`. Adjacent to it, `?`
+  inside a subscript at module level (`Provider = Callable[[str, int?],
+  int]`, Python's legacy type-alias form) *built* and then failed at import
+  with a `return` outside a function. Three narrowings fix both, each of
+  them additive: a `?` in an element of a parenthesised list is a parameter
+  annotation; a continuation line reads the `type` / `def` keyword off the
+  head of its logical line; and at module level a `?` in a subscript is
+  never a propagation, since there is no function to return from.
+
+  The migrator's own share was four bugs, three of them corruption. Its
+  rewrite loop counted brackets but tracked no strings, so docstring prose
+  was read as code (a bullet reading `like:` came back as `let like:` —
+  `importlib.metadata` has one). The `impl` relocation seeded its bracket
+  depth from an item's first line, so a decorated method's multi-line
+  signature was cut in half and its body orphaned. The same scan read a
+  docstring line at column zero as the end of the method and split the
+  literal in two. And `@dataclass(frozen=True)` on a class with a base
+  emitted `class X(Base) frozen:` — not the order the preprocessor accepts.
+  Migrate now shares the crate's single lexical scanner, and its two private
+  ones are gone. **1,110 of 1,114 files now migrate to source that parses**,
+  up from 1,036; the four that do not are deeply metaprogrammed.
+
+  One thing the sweep surfaced is left open: `Alias = dict[str, int | None]`
+  — a plain assignment used as a type alias — fires `tyc::nullable_use`,
+  because the checker reads the subscript's arguments as values. That is
+  unrelated to `?` (hand-written `| None` does it too), and the Typhon
+  answer is `type Alias = ...`; whether the checker should recognise the
+  Python-legacy form is a design call, not a bug fix.
+
 - ~~**`tyc run --compile <file>` diagnostics name the scaffold.**~~ Closed:
   the staged build reports diagnostics under the path the user gave, and
   the scaffold turns on `traceback-remap`, so an uncaught exception's

@@ -234,7 +234,10 @@ Convert typed Python (`.py`) → Typhon (`.ty`) in one pass:
 - `class X(Generic[T]):` → `class X[T]:` (PEP 695). Multi-parameter, mixed bases, qualified `typing.Generic` forms all covered (v0.3.1). Module-level `T = TypeVar("T")` (incl. bounded / `constraints=`) is **dropped**. `TypeVar` / `Generic` imports elided when no longer referenced.
 - `NewType("X", T)` → `newtype X = T` (v0.5.0). Matching `from typing import NewType` entries pruned.
 - `class X(Protocol):` → `interface X:` (v0.5.0). `class X(Protocol[T]):` → `interface X[T]:`. Multi-base forms untouched.
-- `@dataclass(frozen=True[, ...])` → `class X frozen:` (v0.5.0). The `@dataclass` decorator and `from dataclasses import dataclass` are dropped (Typhon `class` emits dataclasses).
+- `@dataclass(frozen=True[, ...])` → `class X frozen:` (v0.5.0). The `@dataclass` decorator and `from dataclasses import dataclass` are dropped (Typhon `class` emits dataclasses). The modifier binds to the class **name**, ahead of any base list — `class X frozen(Base):`, `class X[T] frozen(Base):`.
+- A rewrite that empties a block (a `Protocol` import that `interface` made dead inside a version guard) leaves a `pass` under the header, so the output still has a suite.
+- Rewrites fire on **code only**: text inside a string literal is copied through verbatim, however much of it reads like code. A method travels into its `impl` block whole — wrapped signature, decorator stack, and a docstring whose backslash continuation reaches column zero.
+- Scale check: 1,110 of the 1,114 `.py` files in a CPython 3.13 `lib/` tree (stdlib + site-packages) migrate to source that parses. The four that do not are heavily metaprogrammed (`typing_extensions`, `pkg_resources`, `yaml.resolver`).
 - Module-level annotated assignments (`x: int = 1`) gain `let` (or `mut` if later reassigned).
 - Function-body plain assignments gain `let` on first occurrence per function, promoted to `mut` if the same name is reassigned anywhere else in the file (file-wide flag — deliberate over-approximation; `mut` on an unmutated binding still type-checks).
 - Class-body annotated assignments left untouched (those are field declarations).

@@ -573,12 +573,12 @@ impl LexMask {
     }
 
     /// Bracket depth on entry to line `line`.
-    pub(crate) fn line_entry_depth(&self, line: usize) -> i32 {
+    pub fn line_entry_depth(&self, line: usize) -> i32 {
         self.line_entry_depth.get(line).copied().unwrap_or(0)
     }
 
     /// Net bracket delta of line `line`.
-    pub(crate) fn line_bracket_delta(&self, line: usize) -> i32 {
+    pub fn line_bracket_delta(&self, line: usize) -> i32 {
         self.line_bracket_delta.get(line).copied().unwrap_or(0)
     }
 
