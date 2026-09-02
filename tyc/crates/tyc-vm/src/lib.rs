@@ -33,6 +33,7 @@ pub mod hashes;
 pub mod interp;
 pub mod pyhash;
 pub mod slots;
+mod unicode_data;
 pub mod value;
 
 use std::path::Path;
@@ -2671,6 +2672,83 @@ def main() -> None:
     except UnicodeDecodeError as e:
         if "position 0-1" not in str(e):
             raise ValueError(f"strict message should name the span: {e}")
+
+main()
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    #[test]
+    fn vm_unicode_properties_bytes_and_printf_match_cpython() {
+        let src = r#"
+def check(label: str, got: str, want: str) -> None:
+    if got != want:
+        raise ValueError(f"{label}: got {got!r}, want {want!r}")
+
+def main() -> None:
+    # `isdigit`, `isdecimal` and `isnumeric` are three different questions.
+    check("sup", f"{'²'.isdigit()}{'²'.isdecimal()}{'²'.isnumeric()}", "TrueFalseTrue")
+    check("half", f"{'½'.isdigit()}{'½'.isdecimal()}{'½'.isnumeric()}", "FalseFalseTrue")
+    check("arabic", f"{'٣'.isdigit()}{'٣'.isdecimal()}", "TrueTrue")
+    check("roman", f"{'Ⅷ'.isnumeric()}", "True")
+
+    # `isprintable()` rejects the format and separator characters too, and
+    # `repr()` escapes exactly what it rejects.
+    check("zwsp", f"{'\u200b'.isprintable()}{'\u200b'.isspace()}", "FalseFalse")
+    check("repr-zwsp", repr("\u200b"), "'\\u200b'")
+    check("repr-nbsp", repr("\xa0"), "'\\xa0'")
+    check("repr-tag", repr("\U000e0001"), "'\\U000e0001'")
+    check("repr-acc", repr("é"), "'é'")
+
+    # `\x1c`-`\x1f` are whitespace to Python but not to the White_Space
+    # property, so they split and strip.
+    check("split-sep", str("a\x1cb\x1dc".split()), "['a', 'b', 'c']")
+    check("strip-sep", repr("\x1c a \x1c".strip()), "'a'")
+    check("isspace-sep", f"{'\x1c'.isspace()}", "True")
+
+    # Titlecase is not uppercase for the digraphs, and `ß` expands.
+    check("digraph", "ǆemal".title(), "ǅemal")
+    check("sharp-title", "ß".title(), "Ss")
+    check("sharp-cap", "ß".capitalize(), "Ss")
+    check("digraph-cap", "ǆ".capitalize(), "ǅ")
+    check("sharp-swap", "ß".swapcase(), "SS")
+    check("dotted-swap", "İ".swapcase(), "i̇")
+
+    # A whitespace split with a maxsplit leaves the remainder verbatim.
+    check("split-max", str(" a b ".split(None, 1)), "['a', 'b ']")
+    check("rsplit-max", str(" a b c ".rsplit(None, 1)), "[' a b', 'c']")
+
+    # bytes carry the ASCII-only twin of most of the str surface.
+    check("b-isalpha", f"{b'abc'.isalpha()}{b'12'.isdigit()}{b' '.isspace()}", "TrueTrueTrue")
+    check("b-title", str(b"a1b".title()), "b'A1B'")
+    check("b-partition", str(b"a-b".partition(b"-")), "(b'a', b'-', b'b')")
+    check("b-rpartition", str(b"a-b-c".rpartition(b"-")), "(b'a-b', b'-', b'c')")
+    check("b-just", str(b"abc".center(7, b"*")) + str(b"abc".zfill(5)), "b'**abc**'b'00abc'")
+    check("b-splitlines", str(b"a\nb\rc\x0bd".splitlines()), "[b'a', b'b', b'c\\x0bd']")
+    check("b-hex", b"abc".hex(":") + " " + b"abc".hex(":", 2), "61:62:63 61:6263")
+    check("b-expandtabs", str(b"a\tb".expandtabs(4)), "b'a   b'")
+
+    # printf: `%u` is a `%d` alias, `%a` escapes, a precision is a digit count.
+    check("printf-u", "%u" % 3, "3")
+    check("printf-a", "%a" % "é", "'\\xe9'")
+    check("printf-prec", "%.3d|%.3x|%#.5x" % (5, 255, 255), "005|0ff|0x000ff")
+
+    # cp1252 is Latin-1 with the C1 block replaced.
+    check("cp1252", str("ab€".encode("cp1252")), "b'ab\\x80'")
+    check("cp1252-dec", b"\x80\xa0".decode("cp1252"), "€\xa0")
+    try:
+        let _ = "日".encode("cp1252")
+        raise ValueError("cp1252 has no entry for that character")
+    except UnicodeEncodeError as e:
+        check("cp1252-err", str(e), "'charmap' codec can't encode character '\\u65e5' in position 0: character maps to <undefined>")
+
+    # NaN comparisons answer False rather than raising.
+    let n: float = float("nan")
+    check("minmax", f"{max(1, n)} {max(n, 1)} {min(1, n)} {min(n, 1)}", "1 nan 1 nan")
+    check("nan-cmp", f"{n < 1}{n > 1}{n <= 1}{n >= 1}", "FalseFalseFalseFalse")
+    check("divmod-bool", str(divmod(True, 2)), "(0, 1)")
+    check("round-bool", f"{round(True)} {round(True, -1)}", "1 0")
+    print("ok")
 
 main()
 "#;

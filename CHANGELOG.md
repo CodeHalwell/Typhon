@@ -172,6 +172,45 @@ now. And `!a` in an f-string was a synonym for `!r`, leaving non-ASCII
 unescaped — `f"{'ü'!a}"` is `'\xfc'`. **The differential baseline falls to
 12.**
 
+**Unicode properties Rust's std does not have.** A twelfth wave took the
+string surface. `isdigit()`, `isdecimal()` and `isnumeric()` are three
+different questions in Python — `"²"` is a digit but not a decimal, `"½"` is
+numeric but neither — and the VM answered all three from Rust's
+`char::is_numeric`. `isprintable()` was a hand-rolled approximation that let
+the format and unassigned characters through, and `repr()` escapes exactly
+what it rejects, so a zero-width space or a soft hyphen printed *invisibly*
+where CPython writes `'\u200b'`. Python's whitespace is wider than the
+White_Space property (it counts `\x1c`-`\x1f`), so `split()`, `strip()` and
+`isspace()` disagreed on the separators. And there is no titlecase mapping in
+std at all: `"ǆemal".title()` gave `Ǆemal` for `ǅemal`, `"ß".title()` gave
+`SS` for `Ss`, while `swapcase()` took only the first character of a mapping
+that expands — `"ß"` became `S` and `"İ"` lost its combining dot. The five
+tables are generated from the hosting CPython by
+`scripts/gen-unicode-props.py`, alongside the case-folding ones. A whitespace
+`split()` with a `maxsplit` also trimmed the remainder CPython hands back
+verbatim (`" a b ".split(None, 1)` is `["a", "b "]`).
+
+**A bytes surface with a quarter of its methods missing.** `bytes` had 17 of
+CPython's 40 methods, and the rest raised `AttributeError` rather than
+falling back to anything: the `is*` predicates, `title`, `capitalize`,
+`swapcase`, `partition`, `rpartition`, `ljust`, `rjust`, `center`, `zfill`,
+`removeprefix`, `removesuffix`, `rfind`, `rindex`, `expandtabs` and
+`splitlines` are all there now, ASCII-only as CPython's are, and `hex()`
+takes its separator and group size. Alongside them the printf-style operator
+grew `%u` and `%a`, learned that a precision on an integer conversion is a
+minimum digit count (`"%.3d" % 5` is `005`), and gained the `cp1252` codec.
+
+**Comparisons that raised where CPython answers False.** Every ordering
+comparison went through a total order, so a NaN — which is unordered but
+perfectly comparable — became a `TypeError`: `max(1, float("nan"))`,
+`min(...)` and `sorted([3, float("nan"), 1])` all raised where CPython
+returns `1`, `1` and the list. Two numbers can only come back unordered
+because one is a NaN, so that case answers `False` now, and `min`/`max` ask
+the operator the way CPython does rather than demanding a total order. Two
+more `bool`-is-an-`int` gaps went with them: `divmod(True, 2)` returned the
+float pair `(0.0, 1.0)`, and `round(True)` raised. **The differential
+baseline falls to 9.**
+
 **A prelude name that only the VM could resolve.** `BaseModel` and
 `NewType` resolve without an import — the `model` and `newtype` lowerings
 introduce them — so naming either directly passes `tyc check`. Their

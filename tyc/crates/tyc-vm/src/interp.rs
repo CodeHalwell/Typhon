@@ -3427,7 +3427,10 @@ impl Interpreter {
         })
     }
 
-    fn cmp_op(&mut self, op: CmpOp, l: &Value, r: &Value) -> Result<bool, Unwind> {
+    /// One rich comparison, exactly as the operator itself performs it —
+    /// so a merely *false* answer (a NaN against a number) stays false
+    /// rather than becoming the `TypeError` a total ordering would need.
+    pub fn cmp_op(&mut self, op: CmpOp, l: &Value, r: &Value) -> Result<bool, Unwind> {
         // User-defined rich comparisons take priority when an operand is a
         // class instance (Python's `__eq__` / `__lt__` / … protocol).
         if matches!(l, Value::Instance(_)) || matches!(r, Value::Instance(_)) {
@@ -3493,24 +3496,31 @@ impl Interpreter {
             CmpOp::NotEq => !self.eq_values(l, r)?,
             CmpOp::Is => values_identical(l, r),
             CmpOp::IsNot => !values_identical(l, r),
+            // Two numbers can only come back unordered because one of them
+            // is a NaN, and CPython answers every NaN comparison `False`
+            // rather than raising. Anything else unordered is a type error.
             CmpOp::Lt => match l.py_cmp(r) {
                 Some(Less) => true,
                 Some(_) => false,
+                None if both_numeric(l, r) => false,
                 None => return Err(unorderable(l, "<", r)),
             },
             CmpOp::LtE => match l.py_cmp(r) {
                 Some(Less | Equal) => true,
                 Some(_) => false,
+                None if both_numeric(l, r) => false,
                 None => return Err(unorderable(l, "<=", r)),
             },
             CmpOp::Gt => match l.py_cmp(r) {
                 Some(Greater) => true,
                 Some(_) => false,
+                None if both_numeric(l, r) => false,
                 None => return Err(unorderable(l, ">", r)),
             },
             CmpOp::GtE => match l.py_cmp(r) {
                 Some(Greater | Equal) => true,
                 Some(_) => false,
+                None if both_numeric(l, r) => false,
                 None => return Err(unorderable(l, ">=", r)),
             },
             CmpOp::In => self.contains(r, l)?,
@@ -9279,6 +9289,29 @@ fn builtin_has_attr(value: &Value, attr: &str) -> bool {
                 | "count"
                 | "replace"
                 | "join"
+                | "splitlines"
+                | "capitalize"
+                | "center"
+                | "expandtabs"
+                | "isalnum"
+                | "isalpha"
+                | "isascii"
+                | "isdigit"
+                | "islower"
+                | "isspace"
+                | "istitle"
+                | "isupper"
+                | "ljust"
+                | "partition"
+                | "removeprefix"
+                | "removesuffix"
+                | "rfind"
+                | "rindex"
+                | "rjust"
+                | "rpartition"
+                | "swapcase"
+                | "title"
+                | "zfill"
         ),
         Value::List(_) => matches!(
             attr,
@@ -9543,9 +9576,13 @@ fn printf_format_with(
                 }
                 s
             }
-            'r' => {
+            'r' | 'a' => {
                 let v = take_arg(&keyed, values, &mut arg)?.clone();
                 let mut s = interp.repr_of(&v)?;
+                // `%a` is `%r` with every non-ASCII character escaped.
+                if conv == 'a' {
+                    s = crate::builtins::ascii_repr(&s);
+                }
                 if let Some(p) = precision {
                     s = s.chars().take(p).collect();
                 }
@@ -9563,11 +9600,12 @@ fn printf_format_with(
                     }
                 }
             }
-            'd' | 'i' => {
+            // `%u` is a deprecated alias for `%d`, still accepted.
+            'd' | 'i' | 'u' => {
                 let v = take_arg(&keyed, values, &mut arg)?;
                 let iv = v.to_bigint()?;
                 printf_signed(
-                    &iv.abs().to_str_radix(10),
+                    &pad_digits(&iv.abs().to_str_radix(10), precision),
                     iv.is_negative(),
                     flag_plus,
                     flag_space,
@@ -9578,11 +9616,14 @@ fn printf_format_with(
                 let iv = v.to_bigint()?;
                 let neg = iv.is_negative();
                 let abs = iv.abs();
-                let mut digits = match conv {
-                    'x' => abs.to_str_radix(16),
-                    'X' => abs.to_str_radix(16).to_uppercase(),
-                    _ => abs.to_str_radix(8),
-                };
+                let mut digits = pad_digits(
+                    &match conv {
+                        'x' => abs.to_str_radix(16),
+                        'X' => abs.to_str_radix(16).to_uppercase(),
+                        _ => abs.to_str_radix(8),
+                    },
+                    precision,
+                );
                 if flag_alt {
                     let prefix = match conv {
                         'x' => "0x",
@@ -9636,6 +9677,16 @@ fn printf_format_with(
         out.push_str(&pad_printf(&body, width, flag_minus, flag_zero, conv));
     }
     Ok(out)
+}
+
+/// On an integer conversion a precision is a *minimum digit count*, zero-filled
+/// on the left: `"%.3d" % 5` is `005`. It applies before the sign and any
+/// alternate-form prefix, so `"%#.5x" % 255` is `0x000ff`.
+fn pad_digits(digits: &str, precision: Option<usize>) -> String {
+    match precision {
+        Some(p) if digits.len() < p => format!("{}{digits}", "0".repeat(p - digits.len())),
+        _ => digits.to_owned(),
+    }
 }
 
 fn printf_signed(magnitude: &str, neg: bool, plus: bool, space: bool) -> String {
@@ -9865,6 +9916,14 @@ fn values_identical(a: &Value, b: &Value) -> bool {
         (Class(x), Class(y)) => Rc::ptr_eq(x, y),
         _ => false,
     }
+}
+
+/// Both operands are `int`, `float` or `bool` — the only pairs whose ordering
+/// can fail for a reason other than their types (a NaN). `complex` is
+/// deliberately excluded: CPython refuses to order it at all.
+fn both_numeric(l: &Value, r: &Value) -> bool {
+    let numeric = |v: &Value| matches!(v, Value::Int(_) | Value::Float(_) | Value::Bool(_));
+    numeric(l) && numeric(r)
 }
 
 /// CPython's `TypeError` for an ordering comparison between unorderable types.

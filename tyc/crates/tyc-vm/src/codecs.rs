@@ -19,6 +19,7 @@ enum Codec {
     Utf32,
     Utf32Le,
     Utf32Be,
+    Cp1252,
 }
 
 impl Codec {
@@ -32,6 +33,9 @@ impl Codec {
             Codec::Utf16Be => "utf-16-be",
             Codec::Utf32 | Codec::Utf32Le => "utf-32-le",
             Codec::Utf32Be => "utf-32-be",
+            // Every charmap codec answers to the same name in CPython's
+            // messages, whichever table it carries.
+            Codec::Cp1252 => "charmap",
         }
     }
 }
@@ -57,6 +61,7 @@ fn lookup(name: &str) -> Result<Codec, Unwind> {
         "utf-32" | "utf32" | "u32" => Codec::Utf32,
         "utf-32-le" | "utf-32le" | "utf32le" => Codec::Utf32Le,
         "utf-32-be" | "utf-32be" | "utf32be" => Codec::Utf32Be,
+        "cp1252" | "windows-1252" | "1252" => Codec::Cp1252,
         _ => {
             return Err(Unwind::Exception(VmException::new(
                 "LookupError",
@@ -128,6 +133,53 @@ fn encode_error(codec: Codec, chars: &[char], start: usize, end: usize, limit: u
     Unwind::Exception(VmException::new("UnicodeEncodeError", message))
 }
 
+/// Windows-1252: Latin-1 with 27 printable characters in place of the C1
+/// controls at 0x80-0x9F. `\0` marks the five bytes that stay undefined.
+#[rustfmt::skip]
+const CP1252_HIGH: [char; 32] = [
+    '\u{20AC}', '\0', '\u{201A}', '\u{192}', '\u{201E}', '\u{2026}', '\u{2020}', '\u{2021}',
+    '\u{2C6}', '\u{2030}', '\u{160}', '\u{2039}', '\u{152}', '\0', '\u{17D}', '\0',
+    '\0', '\u{2018}', '\u{2019}', '\u{201C}', '\u{201D}', '\u{2022}', '\u{2013}', '\u{2014}',
+    '\u{2DC}', '\u{2122}', '\u{161}', '\u{203A}', '\u{153}', '\0', '\u{17E}', '\u{178}',
+];
+
+/// The cp1252 byte for `c`, if the table has one. Everything below 0x80 and
+/// from 0xA0 up is its Latin-1 byte; the C1 block itself is unencodable.
+fn cp1252_byte(c: char) -> Option<u8> {
+    let n = c as u32;
+    if n < 0x80 || (0xa0..0x100).contains(&n) {
+        return Some(n as u8);
+    }
+    CP1252_HIGH
+        .iter()
+        .position(|&mapped| mapped != '\0' && mapped == c)
+        .map(|i| 0x80 + i as u8)
+}
+
+/// A charmap codec's encode failure. Unlike the fixed-width codecs it names
+/// no ordinal range: the character simply has no entry in the table.
+fn charmap_encode_error(codec: Codec, chars: &[char], start: usize, end: usize) -> Unwind {
+    let reason = "character maps to <undefined>";
+    let message = if end - start == 1 {
+        format!(
+            "'{}' codec can't encode character '{}' in position {}: {}",
+            codec.label(),
+            char_escape(chars[start]),
+            start,
+            reason
+        )
+    } else {
+        format!(
+            "'{}' codec can't encode characters in position {}-{}: {}",
+            codec.label(),
+            start,
+            end - 1,
+            reason
+        )
+    };
+    Unwind::Exception(VmException::new("UnicodeEncodeError", message))
+}
+
 /// `str.encode(encoding, errors)`.
 pub fn encode(s: &str, encoding: &str, errors: &str) -> Result<Vec<u8>, Unwind> {
     let codec = lookup(encoding)?;
@@ -157,6 +209,39 @@ pub fn encode(s: &str, encoding: &str, errors: &str) -> Result<Vec<u8>, Unwind> 
                 }
                 match handler(errors)? {
                     Handler::Strict => return Err(encode_error(codec, &chars, start, i, limit)),
+                    Handler::Ignore => {}
+                    Handler::Replace => out.extend(std::iter::repeat_n(b'?', i - start)),
+                    Handler::BackslashReplace => {
+                        for &c in &chars[start..i] {
+                            out.extend_from_slice(char_escape(c).as_bytes());
+                        }
+                    }
+                    Handler::XmlCharRefReplace => {
+                        for &c in &chars[start..i] {
+                            out.extend_from_slice(format!("&#{};", c as u32).as_bytes());
+                        }
+                    }
+                }
+            }
+            Ok(out)
+        }
+        Codec::Cp1252 => {
+            let chars: Vec<char> = s.chars().collect();
+            let mut out = Vec::with_capacity(chars.len());
+            let mut i = 0;
+            while i < chars.len() {
+                if let Some(b) = cp1252_byte(chars[i]) {
+                    out.push(b);
+                    i += 1;
+                    continue;
+                }
+                // A run of consecutive unmappable characters is one error.
+                let start = i;
+                while i < chars.len() && cp1252_byte(chars[i]).is_none() {
+                    i += 1;
+                }
+                match handler(errors)? {
+                    Handler::Strict => return Err(charmap_encode_error(codec, &chars, start, i)),
                     Handler::Ignore => {}
                     Handler::Replace => out.extend(std::iter::repeat_n(b'?', i - start)),
                     Handler::BackslashReplace => {
@@ -346,6 +431,30 @@ pub fn decode(bytes: &[u8], encoding: &str, errors: &str) -> Result<String, Unwi
             Ok(out)
         }
         Codec::Latin1 => Ok(bytes.iter().map(|&b| b as char).collect()),
+        Codec::Cp1252 => {
+            let mut out = String::with_capacity(bytes.len());
+            for (i, &b) in bytes.iter().enumerate() {
+                let mapped = if (0x80..0xa0).contains(&b) {
+                    CP1252_HIGH[(b - 0x80) as usize]
+                } else {
+                    b as char
+                };
+                if mapped == '\0' && b != 0 {
+                    handle_decode_error(
+                        codec,
+                        bytes,
+                        i,
+                        i + 1,
+                        "character maps to <undefined>",
+                        errors,
+                        &mut out,
+                    )?;
+                } else {
+                    out.push(mapped);
+                }
+            }
+            Ok(out)
+        }
         Codec::Utf16 | Codec::Utf16Le | Codec::Utf16Be => {
             let (data, big, label_codec) = match codec {
                 Codec::Utf16 => {

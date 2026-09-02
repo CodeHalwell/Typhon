@@ -191,7 +191,12 @@ package (`pydantic` has the placeholder above; `numpy`, `requests`,
   `isnumeric`, `istitle`, `expandtabs`. `strip` / `lstrip` / `rstrip`
   now honour their `chars` argument (previously silently ignored), and
   `str.format` stringifies values through a user `__str__`. Since
-  v1.0.0-beta.1 also `isascii`, `isidentifier`, `isprintable`.
+  v1.0.0-beta.1 also `isascii`, `isidentifier`, `isprintable`. The
+  character properties behind `isdigit` / `isdecimal` / `isnumeric` /
+  `isprintable` / `isspace`, and the titlecase mapping behind `title` /
+  `capitalize`, come from tables generated out of the hosting CPython
+  (`scripts/gen-unicode-props.py`) — Rust's std has none of them, and
+  `char::is_numeric` answers a different question from all three.
 - `list`: `append`, `extend`, `insert`, `pop`, `remove`, `index`, `count`,
   `clear`, `reverse`, `sort`, `copy`. Since v0.10.0 `sort` accepts
   `reverse=` / `key=` kwargs and honours a user `__lt__` / `__eq__`;
@@ -212,6 +217,14 @@ package (`pydantic` has the placeholder above; `numpy`, `requests`,
   arithmetic and `int()` (`-Colour.RED`, `int(Colour.RED)`), and
   `Perm.READ in (Perm.READ | Perm.WRITE)` is a flag bit-test — all
   v1.0.0-beta.1; a bare `1 in 3` still raises, as in CPython.
+- `bytes`: `decode`, `hex` (with a separator and group size),
+  `split` / `rsplit`, `splitlines`, `strip` / `lstrip` / `rstrip`, `join`,
+  `replace`, `startswith` / `endswith`, `find` / `index` / `rfind` /
+  `rindex`, `count`, `lower` / `upper` / `title` / `capitalize` /
+  `swapcase`, the `is*` predicates, `partition` / `rpartition`,
+  `ljust` / `rjust` / `center` / `zfill`, `removeprefix` / `removesuffix`
+  and `expandtabs` — ASCII-only, as CPython's are (v1.0.0-beta.1 filled
+  the surface out from 17 methods to CPython's 40).
 - `bytearray` (v1.0.0-beta.1): the mutable sibling of `bytes` —
   construction from bytes / an int / an iterable of ints / `str` plus an
   encoding, `append` / `extend` / `insert` / `pop` / `remove` / `clear` /

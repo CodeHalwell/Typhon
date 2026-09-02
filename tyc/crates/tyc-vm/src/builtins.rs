@@ -122,7 +122,13 @@ fn py_splitlines(s: &str, keepends: bool) -> Vec<String> {
 /// collapses runs of whitespace and drops leading/trailing empties.
 fn split_whitespace_max(s: &str, maxsplit: i64, from_right: bool) -> Vec<String> {
     if maxsplit < 0 {
-        return s.split_whitespace().map(|p| p.to_owned()).collect();
+        // Not `str::split_whitespace`: Python's notion of whitespace is wider
+        // than the White_Space property (it includes `\x1c`-`\x1f`).
+        return s
+            .split(unicode_is_space)
+            .filter(|p| !p.is_empty())
+            .map(|p| p.to_owned())
+            .collect();
     }
     let max = maxsplit as usize;
     if from_right {
@@ -131,7 +137,7 @@ fn split_whitespace_max(s: &str, maxsplit: i64, from_right: bool) -> Vec<String>
             let mut v = Vec::new();
             let mut start: Option<usize> = None;
             for (i, c) in s.char_indices() {
-                if c.is_whitespace() {
+                if unicode_is_space(c) {
                     if let Some(st) = start.take() {
                         v.push((st, i));
                     }
@@ -151,9 +157,10 @@ fn split_whitespace_max(s: &str, maxsplit: i64, from_right: bool) -> Vec<String>
         // them stays joined (interior whitespace preserved) as the first
         // piece.
         let split_point = words.len() - max;
-        let head_start = words[0].0;
+        // The head keeps its *leading* whitespace — `" a b c ".rsplit(None, 1)`
+        // is `[" a b", "c"]` — but not the run before the first kept word.
         let head_end = words[split_point - 1].1;
-        let mut out = vec![s[head_start..head_end].to_owned()];
+        let mut out = vec![s[..head_end].to_owned()];
         for (a, b) in &words[split_point..] {
             out.push(s[*a..*b].to_owned());
         }
@@ -165,7 +172,7 @@ fn split_whitespace_max(s: &str, maxsplit: i64, from_right: bool) -> Vec<String>
         loop {
             // Skip leading whitespace.
             while let Some(&(_, c)) = chars.peek() {
-                if c.is_whitespace() {
+                if unicode_is_space(c) {
                     chars.next();
                 } else {
                     break;
@@ -175,15 +182,16 @@ fn split_whitespace_max(s: &str, maxsplit: i64, from_right: bool) -> Vec<String>
                 break;
             };
             if out.len() == max {
-                // Remaining text (stripped of trailing whitespace) is the
-                // final piece, with interior whitespace preserved.
-                out.push(bytes[start..].trim_end().to_owned());
+                // Everything left is the final piece, verbatim: CPython keeps
+                // its trailing whitespace (`" a b ".split(None, 1)` is
+                // `["a", "b "]`), having skipped only the run before it.
+                out.push(bytes[start..].to_owned());
                 break;
             }
             // Consume the word.
             let mut end = bytes.len();
             while let Some(&(i, c)) = chars.peek() {
-                if c.is_whitespace() {
+                if unicode_is_space(c) {
                     end = i;
                     break;
                 }
@@ -443,8 +451,10 @@ pub fn install(interp: &mut Interpreter) {
                 );
             }
         }
-        match (a, b) {
-            (Value::Int(x), Value::Int(y)) => {
+        // `bool` is an `int` subclass, so `divmod(True, 2)` is the integer
+        // pair `(0, 1)`, not the floats a `to_float` fallback would give.
+        match (int_operand(a), int_operand(b)) {
+            (Some(x), Some(y)) => {
                 if y.is_zero() {
                     return Err(Unwind::Exception(crate::error::VmException::new(
                         "ZeroDivisionError",
@@ -452,8 +462,8 @@ pub fn install(interp: &mut Interpreter) {
                     )));
                 }
                 Ok(Value::Tuple(Rc::new(vec![
-                    Value::Int(x.div_floor(y)),
-                    Value::Int(x.mod_floor(y)),
+                    Value::Int(x.div_floor(&y)),
+                    Value::Int(x.mod_floor(&y)),
                 ])))
             }
             _ => {
@@ -1112,7 +1122,7 @@ pub fn install(interp: &mut Interpreter) {
             if sort_error.is_some() {
                 return std::cmp::Ordering::Equal;
             }
-            match i.value_cmp(a, b) {
+            match sort_ordering(i, a, b) {
                 Ok(o) => o,
                 Err(e) => {
                     sort_error = Some(e);
@@ -1321,88 +1331,96 @@ pub fn install(interp: &mut Interpreter) {
         }
     });
 
-    native!("round", |i, args| match args.first() {
-        // round(int, ndigits): non-negative ndigits is a no-op; a negative
-        // ndigits rounds to tens/hundreds/… (half-to-even, staying an int).
-        Some(Value::Int(i)) => {
-            use num_integer::Integer;
-            use num_traits::Zero;
-            match args.get(1) {
-                Some(n) if !matches!(n, Value::None) => {
-                    let nd = n.to_int()?;
-                    if nd >= 0 {
-                        Ok(Value::Int(i.clone()))
-                    } else if -nd > 10_000 {
-                        // Any in-memory integer rounds to 0 once the place
-                        // value exceeds its digit count; cap to avoid an
-                        // OOM/DoS building 10**(huge) (review: gemini).
-                        Ok(Value::Int(VmInt::from(0i64)))
-                    } else {
-                        let ib = i.to_bigint();
-                        let p = num_bigint::BigInt::from(10).pow((-nd) as u32);
-                        // Floor-divide so the remainder is always in [0, p).
-                        let q = ib.div_floor(&p);
-                        let r = &ib - &q * &p;
-                        let two_r = &r * 2;
-                        let rounded = if two_r < p {
-                            q
-                        } else if two_r > p {
-                            q + 1
-                        } else if (&q % num_bigint::BigInt::from(2)).is_zero() {
-                            q
+    native!("round", |i, args| {
+        // `bool` is an `int` subclass: `round(True)` is the *int* 1, and
+        // `round(True, -1)` is 0 just as `round(1, -1)` is.
+        let first = match args.first() {
+            Some(Value::Bool(b)) => Some(Value::Int(VmInt::from(*b as i64))),
+            other => other.cloned(),
+        };
+        match first.as_ref() {
+            // round(int, ndigits): non-negative ndigits is a no-op; a negative
+            // ndigits rounds to tens/hundreds/… (half-to-even, staying an int).
+            Some(Value::Int(i)) => {
+                use num_integer::Integer;
+                use num_traits::Zero;
+                match args.get(1) {
+                    Some(n) if !matches!(n, Value::None) => {
+                        let nd = n.to_int()?;
+                        if nd >= 0 {
+                            Ok(Value::Int(i.clone()))
+                        } else if -nd > 10_000 {
+                            // Any in-memory integer rounds to 0 once the place
+                            // value exceeds its digit count; cap to avoid an
+                            // OOM/DoS building 10**(huge) (review: gemini).
+                            Ok(Value::Int(VmInt::from(0i64)))
                         } else {
-                            q + 1
-                        };
-                        Ok(Value::Int(VmInt::from(rounded * &p)))
+                            let ib = i.to_bigint();
+                            let p = num_bigint::BigInt::from(10).pow((-nd) as u32);
+                            // Floor-divide so the remainder is always in [0, p).
+                            let q = ib.div_floor(&p);
+                            let r = &ib - &q * &p;
+                            let two_r = &r * 2;
+                            let rounded = if two_r < p {
+                                q
+                            } else if two_r > p {
+                                q + 1
+                            } else if (&q % num_bigint::BigInt::from(2)).is_zero() {
+                                q
+                            } else {
+                                q + 1
+                            };
+                            Ok(Value::Int(VmInt::from(rounded * &p)))
+                        }
                     }
+                    _ => Ok(Value::Int(i.clone())),
                 }
-                _ => Ok(Value::Int(i.clone())),
             }
-        }
-        Some(Value::Float(x)) => {
-            let x = *x;
-            match args.get(1) {
-                // round(x, ndigits) -> float, round-half-to-even on the
-                // actual f64 value. Rust's float formatting uses
-                // round-ties-to-even, matching CPython (so 2.675, which is
-                // really 2.67499..., rounds to 2.67).
-                Some(n) if !matches!(n, Value::None) => {
-                    let n = n.to_int()? as i32;
-                    if !x.is_finite() {
-                        return Ok(Value::Float(x));
+            Some(Value::Float(x)) => {
+                let x = *x;
+                match args.get(1) {
+                    // round(x, ndigits) -> float, round-half-to-even on the
+                    // actual f64 value. Rust's float formatting uses
+                    // round-ties-to-even, matching CPython (so 2.675, which is
+                    // really 2.67499..., rounds to 2.67).
+                    Some(n) if !matches!(n, Value::None) => {
+                        let n = n.to_int()? as i32;
+                        if !x.is_finite() {
+                            return Ok(Value::Float(x));
+                        }
+                        if n >= 0 {
+                            let s = format!("{:.*}", n as usize, x);
+                            Ok(Value::Float(s.parse::<f64>().unwrap_or(x)))
+                        } else {
+                            // Round to a negative decimal place (tens, hundreds…).
+                            let p = 10f64.powi(-n);
+                            Ok(Value::Float(round_half_even(x / p) * p))
+                        }
                     }
-                    if n >= 0 {
-                        let s = format!("{:.*}", n as usize, x);
-                        Ok(Value::Float(s.parse::<f64>().unwrap_or(x)))
-                    } else {
-                        // Round to a negative decimal place (tens, hundreds…).
-                        let p = 10f64.powi(-n);
-                        Ok(Value::Float(round_half_even(x / p) * p))
-                    }
+                    // round(x) -> int, round-half-to-even.
+                    // NaN and infinity have no integer value: CPython raises
+                    // `ValueError` / `OverflowError`, where a saturating cast
+                    // silently returned 0 / `i64::MAX`.
+                    _ => Ok(Value::Int(VmInt::from_bigint(
+                        Value::Float(round_half_even(x)).to_bigint()?,
+                    ))),
                 }
-                // round(x) -> int, round-half-to-even.
-                // NaN and infinity have no integer value: CPython raises
-                // `ValueError` / `OverflowError`, where a saturating cast
-                // silently returned 0 / `i64::MAX`.
-                _ => Ok(Value::Int(VmInt::from_bigint(
-                    Value::Float(round_half_even(x)).to_bigint()?,
-                ))),
             }
-        }
-        // A user `__round__(self[, ndigits])` — how `round()` reaches a
-        // `lazy let` proxy, a Decimal-like wrapper, or any custom numeric.
-        Some(v @ Value::Instance(_)) => {
-            let v = v.clone();
-            let extra: Vec<Value> = args.iter().skip(1).cloned().collect();
-            match i.call_dunder(&v, "__round__", extra)? {
-                Some(r) => Ok(r),
-                None => Err(type_error(format!(
-                    "type {} doesn't define __round__ method",
-                    v.type_name()
-                ))),
+            // A user `__round__(self[, ndigits])` — how `round()` reaches a
+            // `lazy let` proxy, a Decimal-like wrapper, or any custom numeric.
+            Some(v @ Value::Instance(_)) => {
+                let v = v.clone();
+                let extra: Vec<Value> = args.iter().skip(1).cloned().collect();
+                match i.call_dunder(&v, "__round__", extra)? {
+                    Some(r) => Ok(r),
+                    None => Err(type_error(format!(
+                        "type {} doesn't define __round__ method",
+                        v.type_name()
+                    ))),
+                }
             }
+            _ => Err(type_error("round() expected a number")),
         }
-        _ => Err(type_error("round() expected a number")),
     });
 
     native!("input", |_i, args| {
@@ -2299,6 +2317,24 @@ fn class_in_chain_rc(c: &Rc<crate::value::Class>, target: &Rc<crate::value::Clas
     c.bases.iter().any(|b| class_in_chain_rc(b, target))
 }
 
+/// The ordering a sort should use for one pair, asked the way CPython's sort
+/// asks it: `a < b`, then `b < a`. A pair where neither holds is a tie, which
+/// is how a NaN survives `sorted()` without raising.
+fn sort_ordering(
+    interp: &mut Interpreter,
+    a: &Value,
+    b: &Value,
+) -> Result<std::cmp::Ordering, Unwind> {
+    use ruff_python_ast::CmpOp;
+    if interp.cmp_op(CmpOp::Lt, a, b)? {
+        return Ok(std::cmp::Ordering::Less);
+    }
+    if interp.cmp_op(CmpOp::Lt, b, a)? {
+        return Ok(std::cmp::Ordering::Greater);
+    }
+    Ok(std::cmp::Ordering::Equal)
+}
+
 fn reduce_minmax(
     interp: &mut Interpreter,
     mut args: Vec<Value>,
@@ -2321,15 +2357,19 @@ fn reduce_minmax(
             if want_min { "min" } else { "max" }
         ))
     })?;
+    // CPython's `min`/`max` only ever ask `v < best` / `v > best`, so a
+    // comparison that is simply false — a NaN against a number — leaves the
+    // running best alone instead of raising: `max(1, nan)` is `1` and
+    // `max(nan, 1)` is `nan`. A genuinely incomparable pair (`max(1, "a")`)
+    // still raises, from the operator. Going through the operator also keeps
+    // a user-defined `__lt__` / `__gt__` on instances honoured.
+    let op = if want_min {
+        ruff_python_ast::CmpOp::Lt
+    } else {
+        ruff_python_ast::CmpOp::Gt
+    };
     for v in iter {
-        // Route through `value_cmp` (not the dunder-blind `Value::py_cmp`) so a
-        // user-defined `__lt__` on instances is honoured — matching `list.sort`
-        // and CPython. `py_cmp` returns `None` for instances, which collapsed to
-        // `Equal` here and made `min`/`max` return the first element.
-        let cmp = interp.value_cmp(&v, &best)?;
-        if (want_min && cmp == std::cmp::Ordering::Less)
-            || (!want_min && cmp == std::cmp::Ordering::Greater)
-        {
+        if interp.cmp_op(op, &v, &best)? {
             best = v;
         }
     }
@@ -8070,21 +8110,23 @@ fn str_method(
             }
             Value::Str(Rc::new(out))
         }
+        // With no argument these strip *Python's* whitespace, which is wider
+        // than Rust's `str::trim` (it includes `\x1c`-`\x1f`).
         "strip" => match strip_chars(args, "strip")? {
             Some(chars) => Value::Str(Rc::new(s.trim_matches(|c| chars.contains(&c)).to_owned())),
-            None => Value::Str(Rc::new(s.trim().to_owned())),
+            None => Value::Str(Rc::new(s.trim_matches(unicode_is_space).to_owned())),
         },
         "lstrip" => match strip_chars(args, "lstrip")? {
             Some(chars) => Value::Str(Rc::new(
                 s.trim_start_matches(|c| chars.contains(&c)).to_owned(),
             )),
-            None => Value::Str(Rc::new(s.trim_start().to_owned())),
+            None => Value::Str(Rc::new(s.trim_start_matches(unicode_is_space).to_owned())),
         },
         "rstrip" => match strip_chars(args, "rstrip")? {
             Some(chars) => Value::Str(Rc::new(
                 s.trim_end_matches(|c| chars.contains(&c)).to_owned(),
             )),
-            None => Value::Str(Rc::new(s.trim_end().to_owned())),
+            None => Value::Str(Rc::new(s.trim_end_matches(unicode_is_space).to_owned())),
         },
         "split" | "rsplit" => {
             // Keyword arguments (`maxsplit=`, `sep=`) arrive via the trailing
@@ -8282,12 +8324,14 @@ fn str_method(
                 Value::Int(VmInt::from(window.matches(&needle).count() as i64))
             }
         }
-        "isdigit" => Value::Bool(!s.is_empty() && s.chars().all(|c| c.is_ascii_digit())),
+        // `isdigit`, `isdecimal` and `isnumeric` are three different questions:
+        // `"²"` is a digit but not a decimal, `"½"` is numeric but neither.
+        "isdigit" => Value::Bool(!s.is_empty() && s.chars().all(unicode_is_digit)),
         // CPython: the empty string IS ascii (unlike every other `is*`).
         "isascii" => Value::Bool(s.is_ascii()),
         "isalpha" => Value::Bool(!s.is_empty() && s.chars().all(|c| c.is_alphabetic())),
         "isalnum" => Value::Bool(!s.is_empty() && s.chars().all(|c| c.is_alphanumeric())),
-        "isspace" => Value::Bool(!s.is_empty() && s.chars().all(|c| c.is_whitespace())),
+        "isspace" => Value::Bool(!s.is_empty() && s.chars().all(unicode_is_space)),
         // CPython: true iff there is at least one cased character and no
         // character of the opposite case (uncased chars like ',', ' ', digits
         // do not satisfy the predicate on their own).
@@ -8299,22 +8343,24 @@ fn str_method(
         }
         "title" => Value::Str(Rc::new(title_case(s))),
         "capitalize" => Value::Str(Rc::new(capitalize(s))),
-        "swapcase" => Value::Str(Rc::new(
-            s.chars()
-                .map(|c| {
-                    if c.is_uppercase() {
-                        c.to_lowercase().next().unwrap_or(c)
-                    } else if c.is_lowercase() {
-                        c.to_uppercase().next().unwrap_or(c)
-                    } else {
-                        c
-                    }
-                })
-                .collect(),
-        )),
-        "isnumeric" | "isdecimal" => {
-            Value::Bool(!s.is_empty() && s.chars().all(|c| c.is_numeric()))
+        // Swapping case can change a string's *length*: `ß` upper-cases to
+        // `SS` and `İ` lower-cases to `i` + a combining dot, so take the whole
+        // mapping rather than its first character.
+        "swapcase" => {
+            let mut out = String::with_capacity(s.len());
+            for c in s.chars() {
+                if c.is_uppercase() {
+                    out.extend(c.to_lowercase());
+                } else if c.is_lowercase() {
+                    out.extend(c.to_uppercase());
+                } else {
+                    out.push(c);
+                }
+            }
+            Value::Str(Rc::new(out))
         }
+        "isnumeric" => Value::Bool(!s.is_empty() && s.chars().all(unicode_is_numeric)),
+        "isdecimal" => Value::Bool(!s.is_empty() && s.chars().all(unicode_is_decimal)),
         "istitle" => Value::Bool(is_title_case(s)),
         // CPython: an identifier starts with a letter or `_` and continues
         // with letters, digits or `_` (the XID_Start / XID_Continue rule,
@@ -8330,12 +8376,9 @@ fn str_method(
             })
         }
         // CPython: the empty string IS printable; a string is printable when
-        // no character is "non-printable" (control / separator other than
-        // ASCII space / unassigned).
-        "isprintable" => Value::Bool(
-            s.chars()
-                .all(|c| c == ' ' || (!c.is_control() && !c.is_whitespace())),
-        ),
+        // no character is "non-printable" (control / format / separator other
+        // than ASCII space / surrogate / private-use / unassigned).
+        "isprintable" => Value::Bool(s.chars().all(unicode_is_printable)),
         "casefold" => {
             // Full Unicode case folding via the embedded C+F mappings, for
             // byte-exact parity with CPython's `str.casefold()`. `to_lowercase`
@@ -8590,6 +8633,17 @@ fn split_field_accessors(field: &str) -> (&str, Vec<FieldAccess>) {
 
 /// `ascii()`'s escaping of a `repr` string: every non-ASCII character
 /// becomes its `\xNN` / `\uNNNN` / `\UNNNNNNNN` escape.
+/// The integer behind an `int` or a `bool`; `None` for anything else.
+/// `bool` is an `int` subclass, so a builtin that special-cases integers has
+/// to accept it too.
+fn int_operand(v: &Value) -> Option<VmInt> {
+    match v {
+        Value::Int(i) => Some(i.clone()),
+        Value::Bool(b) => Some(VmInt::from(*b as i64)),
+        _ => None,
+    }
+}
+
 pub(crate) fn ascii_repr(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for c in text.chars() {
@@ -8795,6 +8849,25 @@ fn str_format_inner(
     Ok(Value::Str(Rc::new(out)))
 }
 
+/// Python's ASCII whitespace for `bytes`: `Py_ISSPACE`, which unlike Rust's
+/// `u8::is_ascii_whitespace` counts the vertical tab.
+fn ascii_is_space(c: u8) -> bool {
+    matches!(c, b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r')
+}
+
+/// The last offset at which `needle` occurs in `haystack`.
+fn rfind_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() {
+        return Some(haystack.len());
+    }
+    if needle.len() > haystack.len() {
+        return None;
+    }
+    (0..=haystack.len() - needle.len())
+        .rev()
+        .find(|&i| &haystack[i..i + needle.len()] == needle)
+}
+
 fn bytes_method(
     b: &Rc<Vec<u8>>,
     name: &str,
@@ -8818,13 +8891,269 @@ fn bytes_method(
             };
             Value::Str(Rc::new(crate::codecs::decode(b, &encoding, &errors)?))
         }
-        // `.hex()` -> lowercase hex string with no separators.
-        "hex" => {
-            let mut out = String::with_capacity(b.len() * 2);
-            for byte in b.iter() {
-                out.push_str(&format!("{:02x}", byte));
+        // `.splitlines()` — bytes have no Unicode line boundaries, so only
+        // `\n`, `\r` and `\r\n` split (`\x0b`, `\x1c`, `\x85`… do not).
+        "splitlines" => {
+            let (args, kw) = split_kwargs(args);
+            let keepends = match args.first() {
+                Some(v) => v.truthy(),
+                None => kw
+                    .iter()
+                    .rev()
+                    .find(|(k, _)| k == "keepends")
+                    .map(|(_, v)| v.truthy())
+                    .unwrap_or(false),
+            };
+            let mut out: Vec<Value> = Vec::new();
+            let mut cur: Vec<u8> = Vec::new();
+            let mut i = 0usize;
+            while i < b.len() {
+                let byte = b[i];
+                if byte == b'\n' || byte == b'\r' {
+                    let crlf = byte == b'\r' && b.get(i + 1) == Some(&b'\n');
+                    if keepends {
+                        cur.push(byte);
+                        if crlf {
+                            cur.push(b'\n');
+                        }
+                    }
+                    i += if crlf { 2 } else { 1 };
+                    out.push(Value::Bytes(Rc::new(std::mem::take(&mut cur))));
+                } else {
+                    cur.push(byte);
+                    i += 1;
+                }
             }
-            Value::Str(Rc::new(out))
+            if !cur.is_empty() {
+                out.push(Value::Bytes(Rc::new(cur)));
+            }
+            Value::List(Rc::new(RefCell::new(out)))
+        }
+        // `.hex()` -> lowercase hex. `hex(sep[, bytes_per_sep])` groups the
+        // output: a positive group size counts from the right, a negative one
+        // from the left, and zero means no separators at all.
+        "hex" => {
+            let (args, _) = split_kwargs(args);
+            let sep = match args.first() {
+                None | Some(Value::None) => None,
+                Some(v) => {
+                    let text = v.py_str();
+                    if text.chars().count() != 1 {
+                        return Err(value_error("sep must be length 1."));
+                    }
+                    Some(text)
+                }
+            };
+            let group = match args.get(1) {
+                Some(v) if !matches!(v, Value::None) => v.to_int()?,
+                _ => 1,
+            };
+            let hex_of = |chunk: &[u8]| -> String {
+                let mut out = String::with_capacity(chunk.len() * 2);
+                for byte in chunk {
+                    out.push_str(&format!("{byte:02x}"));
+                }
+                out
+            };
+            match (sep, group) {
+                (Some(sep), g) if g != 0 => {
+                    let step = g.unsigned_abs() as usize;
+                    let mut chunks: Vec<String> = Vec::new();
+                    if g > 0 {
+                        let mut end = b.len();
+                        while end > 0 {
+                            let start = end.saturating_sub(step);
+                            chunks.push(hex_of(&b[start..end]));
+                            end = start;
+                        }
+                        chunks.reverse();
+                    } else {
+                        let mut start = 0;
+                        while start < b.len() {
+                            let end = (start + step).min(b.len());
+                            chunks.push(hex_of(&b[start..end]));
+                            start = end;
+                        }
+                    }
+                    Value::Str(Rc::new(chunks.join(&sep)))
+                }
+                _ => Value::Str(Rc::new(hex_of(b))),
+            }
+        }
+        // The `is*` predicates are ASCII-only on bytes, and every one but
+        // `isascii` is false for the empty value.
+        "isalpha" => Value::Bool(!b.is_empty() && b.iter().all(u8::is_ascii_alphabetic)),
+        "isdigit" => Value::Bool(!b.is_empty() && b.iter().all(u8::is_ascii_digit)),
+        "isalnum" => Value::Bool(!b.is_empty() && b.iter().all(u8::is_ascii_alphanumeric)),
+        "isspace" => Value::Bool(!b.is_empty() && b.iter().copied().all(ascii_is_space)),
+        "isascii" => Value::Bool(b.is_ascii()),
+        "islower" => Value::Bool(
+            b.iter().any(u8::is_ascii_lowercase) && !b.iter().any(u8::is_ascii_uppercase),
+        ),
+        "isupper" => Value::Bool(
+            b.iter().any(u8::is_ascii_uppercase) && !b.iter().any(u8::is_ascii_lowercase),
+        ),
+        // Title case: every word (a run of letters) starts upper and continues
+        // lower, and there is at least one letter.
+        "istitle" => {
+            let mut cased = false;
+            let mut previous_is_letter = false;
+            let mut ok = true;
+            for &c in b.iter() {
+                if c.is_ascii_alphabetic() {
+                    cased = true;
+                    let want_upper = !previous_is_letter;
+                    if want_upper != c.is_ascii_uppercase() {
+                        ok = false;
+                        break;
+                    }
+                }
+                previous_is_letter = c.is_ascii_alphabetic();
+            }
+            Value::Bool(ok && cased)
+        }
+        "title" => {
+            let mut out = Vec::with_capacity(b.len());
+            let mut previous_is_letter = false;
+            for &c in b.iter() {
+                out.push(if !c.is_ascii_alphabetic() {
+                    c
+                } else if previous_is_letter {
+                    c.to_ascii_lowercase()
+                } else {
+                    c.to_ascii_uppercase()
+                });
+                previous_is_letter = c.is_ascii_alphabetic();
+            }
+            Value::Bytes(Rc::new(out))
+        }
+        "capitalize" => {
+            let mut out: Vec<u8> = b.iter().map(|c| c.to_ascii_lowercase()).collect();
+            if let Some(first) = out.first_mut() {
+                *first = first.to_ascii_uppercase();
+            }
+            Value::Bytes(Rc::new(out))
+        }
+        "swapcase" => Value::Bytes(Rc::new(
+            b.iter()
+                .map(|c| {
+                    if c.is_ascii_uppercase() {
+                        c.to_ascii_lowercase()
+                    } else {
+                        c.to_ascii_uppercase()
+                    }
+                })
+                .collect(),
+        )),
+        "partition" | "rpartition" => {
+            let sep = bytes_arg(single(args, name)?)?;
+            if sep.is_empty() {
+                return Err(value_error("empty separator"));
+            }
+            let hit = if name == "partition" {
+                find_subslice(b, &sep)
+            } else {
+                rfind_subslice(b, &sep)
+            };
+            let (head, mid, tail) = match hit {
+                Some(i) => (b[..i].to_vec(), sep.clone(), b[i + sep.len()..].to_vec()),
+                // The unmatched value goes at the *front* for `partition` and
+                // at the back for `rpartition`.
+                None if name == "partition" => (b.to_vec(), Vec::new(), Vec::new()),
+                None => (Vec::new(), Vec::new(), b.to_vec()),
+            };
+            Value::Tuple(Rc::new(vec![
+                Value::Bytes(Rc::new(head)),
+                Value::Bytes(Rc::new(mid)),
+                Value::Bytes(Rc::new(tail)),
+            ]))
+        }
+        "rfind" | "rindex" if !args.is_empty() => {
+            let needle = bytes_arg(&args[0])?;
+            match rfind_subslice(b, &needle) {
+                Some(i) => Value::Int(VmInt::from(i as i64)),
+                None if name == "rfind" => Value::Int(VmInt::from(-1)),
+                None => return Err(value_error("subsection not found")),
+            }
+        }
+        "ljust" | "rjust" | "center" => {
+            let width = match args.first() {
+                Some(v) => v.to_int()?.max(0) as usize,
+                None => return Err(type_error(format!("bytes.{name} requires a width"))),
+            };
+            let fill = match args.get(1) {
+                Some(v) => *bytes_arg(v)?.first().unwrap_or(&b' '),
+                None => b' ',
+            };
+            if b.len() >= width {
+                Value::Bytes(Rc::new(b.to_vec()))
+            } else {
+                let pad = width - b.len();
+                let mut out = Vec::with_capacity(width);
+                let (before, after) = match name {
+                    "ljust" => (0, pad),
+                    "rjust" => (pad, 0),
+                    // An odd pad leaves the extra byte on the right.
+                    _ => (pad / 2, pad - pad / 2),
+                };
+                out.extend(std::iter::repeat_n(fill, before));
+                out.extend_from_slice(b);
+                out.extend(std::iter::repeat_n(fill, after));
+                Value::Bytes(Rc::new(out))
+            }
+        }
+        "zfill" => {
+            let width = match args.first() {
+                Some(v) => v.to_int()?.max(0) as usize,
+                None => return Err(type_error("bytes.zfill requires a width")),
+            };
+            if b.len() >= width {
+                Value::Bytes(Rc::new(b.to_vec()))
+            } else {
+                // A leading sign stays in front of the zeros.
+                let signed = matches!(b.first(), Some(b'+') | Some(b'-'));
+                let mut out = Vec::with_capacity(width);
+                if signed {
+                    out.push(b[0]);
+                }
+                out.extend(std::iter::repeat_n(b'0', width - b.len()));
+                out.extend_from_slice(if signed { &b[1..] } else { b });
+                Value::Bytes(Rc::new(out))
+            }
+        }
+        "removeprefix" => {
+            let p = bytes_arg(single(args, "removeprefix")?)?;
+            Value::Bytes(Rc::new(b.strip_prefix(p.as_slice()).unwrap_or(b).to_vec()))
+        }
+        "removesuffix" => {
+            let p = bytes_arg(single(args, "removesuffix")?)?;
+            Value::Bytes(Rc::new(b.strip_suffix(p.as_slice()).unwrap_or(b).to_vec()))
+        }
+        "expandtabs" => {
+            let size = match args.first() {
+                Some(v) if !matches!(v, Value::None) => v.to_int()?.max(0) as usize,
+                _ => 8,
+            };
+            let mut out: Vec<u8> = Vec::with_capacity(b.len());
+            let mut column = 0usize;
+            for &c in b.iter() {
+                match c {
+                    b'\t' => {
+                        let advance = if size == 0 { 0 } else { size - column % size };
+                        out.extend(std::iter::repeat_n(b' ', advance));
+                        column += advance;
+                    }
+                    b'\n' | b'\r' => {
+                        out.push(c);
+                        column = 0;
+                    }
+                    _ => {
+                        out.push(c);
+                        column += 1;
+                    }
+                }
+            }
+            Value::Bytes(Rc::new(out))
         }
         "upper" => Value::Bytes(Rc::new(b.iter().map(|c| c.to_ascii_uppercase()).collect())),
         "lower" => Value::Bytes(Rc::new(b.iter().map(|c| c.to_ascii_lowercase()).collect())),
@@ -8834,7 +9163,7 @@ fn bytes_method(
             let parts: Vec<Vec<u8>> = match args.first() {
                 None | Some(Value::None) => {
                     // Split on ASCII whitespace runs, dropping empties.
-                    b.split(|c| c.is_ascii_whitespace())
+                    b.split(|c| ascii_is_space(*c))
                         .filter(|p| !p.is_empty())
                         .map(|p| p.to_vec())
                         .collect()
@@ -8856,7 +9185,7 @@ fn bytes_method(
         }
         "strip" | "lstrip" | "rstrip" => {
             let pred: Box<dyn Fn(u8) -> bool> = match args.first() {
-                None | Some(Value::None) => Box::new(|c: u8| c.is_ascii_whitespace()),
+                None | Some(Value::None) => Box::new(ascii_is_space),
                 Some(chars) => {
                     let set = bytes_arg(chars)?;
                     Box::new(move |c: u8| set.contains(&c))
@@ -11267,7 +11596,7 @@ fn title_case(s: &str) -> String {
     for c in s.chars() {
         if c.is_alphabetic() {
             if new_word {
-                out.extend(c.to_uppercase());
+                push_titlecase(&mut out, c);
             } else {
                 out.extend(c.to_lowercase());
             }
@@ -11284,10 +11613,64 @@ fn capitalize(s: &str) -> String {
     let mut it = s.chars();
     match it.next() {
         Some(c) => {
-            let mut out = c.to_uppercase().collect::<String>();
+            let mut out = String::with_capacity(s.len());
+            push_titlecase(&mut out, c);
             out.push_str(&it.as_str().to_lowercase());
             out
         }
         None => String::new(),
     }
+}
+
+/// Append `c`'s titlecase form. That is the uppercase one for almost every
+/// character, but not for the Latin digraphs — `ǆ` titlecases to `ǅ`, not
+/// `Ǆ` — nor for `ß`, whose titlecase is `Ss` where its uppercase is `SS`.
+fn push_titlecase(out: &mut String, c: char) {
+    match crate::unicode_data::TITLECASE.binary_search_by_key(&(c as u32), |(cp, _)| *cp) {
+        Ok(i) => out.push_str(crate::unicode_data::TITLECASE[i].1),
+        Err(_) => out.extend(c.to_uppercase()),
+    }
+}
+
+/// Whether `c` falls in one of the sorted, non-overlapping `(lo, hi)` runs.
+fn in_ranges(table: &[(u32, u32)], c: char) -> bool {
+    let cp = c as u32;
+    table
+        .binary_search_by(|(lo, hi)| {
+            if cp < *lo {
+                std::cmp::Ordering::Greater
+            } else if cp > *hi {
+                std::cmp::Ordering::Less
+            } else {
+                std::cmp::Ordering::Equal
+            }
+        })
+        .is_ok()
+}
+
+/// `str.isdecimal()` — general category Nd, the digits that carry positional
+/// value.
+pub(crate) fn unicode_is_decimal(c: char) -> bool {
+    in_ranges(crate::unicode_data::DECIMAL_RANGES, c)
+}
+
+/// `str.isdigit()` — the decimals plus superscripts and other digit forms.
+fn unicode_is_digit(c: char) -> bool {
+    in_ranges(crate::unicode_data::DIGIT_RANGES, c)
+}
+
+/// `str.isnumeric()` — everything carrying a numeric value, fractions included.
+fn unicode_is_numeric(c: char) -> bool {
+    in_ranges(crate::unicode_data::NUMERIC_RANGES, c)
+}
+
+/// `str.isspace()` — wider than Rust's `char::is_whitespace`, which follows
+/// the White_Space property alone and so misses `\x1c`-`\x1f`.
+fn unicode_is_space(c: char) -> bool {
+    in_ranges(crate::unicode_data::SPACE_RANGES, c)
+}
+
+/// `str.isprintable()`. `repr()` escapes exactly the characters this rejects.
+pub(crate) fn unicode_is_printable(c: char) -> bool {
+    !in_ranges(crate::unicode_data::UNPRINTABLE_RANGES, c)
 }

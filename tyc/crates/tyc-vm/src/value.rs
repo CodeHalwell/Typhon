@@ -2730,11 +2730,18 @@ pub(crate) fn python_repr_str(s: &str) -> String {
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 || c as u32 == 0x7f => {
-                out.push_str("\\x");
-                let hex = b"0123456789abcdef";
-                out.push(hex[(c as u32 as usize >> 4) & 0xf] as char);
-                out.push(hex[c as u32 as usize & 0xf] as char);
+            // CPython escapes exactly what `str.isprintable()` rejects — the
+            // controls, but also the format, separator, private-use and
+            // unassigned characters, which pass through invisibly otherwise.
+            c if !crate::builtins::unicode_is_printable(c) => {
+                let n = c as u32;
+                if n <= 0xff {
+                    out.push_str(&format!("\\x{n:02x}"));
+                } else if n <= 0xffff {
+                    out.push_str(&format!("\\u{n:04x}"));
+                } else {
+                    out.push_str(&format!("\\U{n:08x}"));
+                }
             }
             c => out.push(c),
         }

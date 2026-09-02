@@ -414,20 +414,30 @@ with every gate green at each step.
 
 ### What is still open
 
-- **The 13 remaining differential entries.** Each is a VM bug and the file
+- **The 9 remaining differential entries.** Each is a VM bug and the file
   names them. Four clusters remain. *Concurrency ordering* (`p8`,
   `14_go_spawn`, `02-multi-agent`): the VM runs coroutines sequentially, so
   interleaved output from `gather:` and `go` differs — inherent to the
   design and documented in `docs/vm.md`. *Pydantic validation* (three
   `structured-output` units): the VM constructs models but does not
   validate, so a program that prints pydantic's own error text cannot
-  match. *Deep Unicode and codecs* (`p2`, `sw_str`): casing beyond simple
-  fold, and the `utf-16` / `cp1252` codecs. *Numeric and stdlib corners*
-  (`p1` format specs for `_`-grouped hex/binary and `#`/`g`, `p12` binary
-  IO, `p13` complex and `math` last-bit differences,
-  `typevar_default`'s PEP 696 `__default__`, and `b_prelude`, where the
-  VM resolves prelude names CPython raises `NameError` for). None of them
-  is a *silent* wrong answer on the compiled path — they are VM-only.
+  match. *Sort order under an inconsistent comparator* (`p13`): every value
+  in `sorted([nan, 3, 1])` compares false against every other, so the
+  result is whatever the sort algorithm's internals do with that —
+  CPython's Timsort gives `[1, nan, 3]` where Rust's merge sort gives
+  `[nan, 1, 3]`. Matching it means porting `listsort.c`; the rest of the
+  line agrees. *Prelude and type-parameter reflection* (`b_prelude`, where
+  the VM resolves prelude names CPython raises `NameError` for, and
+  `typevar_default`, which reads PEP 696 `__default__` off
+  `__type_params__` — the VM erases type parameters at definition time).
+  None of them is a *silent* wrong answer on the compiled path — they are
+  VM-only.
+
+  The deep-Unicode and numeric clusters are closed: `p1`, `p2`, `p12` and
+  `sw_str` now agree, taking the format-spec mini-language, the character
+  properties behind `isdigit` / `isprintable` / `title`, the missing
+  two-thirds of the `bytes` method surface, the `cp1252` codec and the
+  printf-style operator's `%u` / `%a` / integer precision with them.
 - ~~**`tyc run --compile <file>` diagnostics name the scaffold.**~~ Closed:
   the staged build reports diagnostics under the path the user gave, and
   the scaffold turns on `traceback-remap`, so an uncaught exception's
